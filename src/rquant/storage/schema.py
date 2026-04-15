@@ -30,4 +30,13 @@ CREATE TABLE IF NOT EXISTS stock_basic (
 );
 """
 
-ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL]
+ADJ_FACTOR_DDL = """
+CREATE TABLE IF NOT EXISTS adj_factor (
+    ts_code     VARCHAR NOT NULL,
+    trade_date  DATE    NOT NULL,
+    adj_factor  DOUBLE  NOT NULL,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL]

@@ -79,6 +79,54 @@ class TushareAdapter:
         logger.info(f"Tushare daily 返回 {len(df)} 行")
         return df
 
+    def adj_factor(
+        self,
+        ts_codes: list[str],
+        start: date,
+        end: date,
+    ) -> pd.DataFrame:
+        """拉取复权因子。
+
+        Tushare `adj_factor` 接口返回：ts_code, trade_date, adj_factor
+        因子累计递增，最新交易日的因子最大。前复权公式：
+            qfq[t] = raw[t] * adj_factor[t] / adj_factor[latest]
+        """
+        codes_str = ",".join(ts_codes)
+        start_str = start.strftime("%Y%m%d")
+        end_str = end.strftime("%Y%m%d")
+
+        logger.info(
+            f"Tushare adj_factor 请求：codes={codes_str} start={start_str} end={end_str}"
+        )
+
+        try:
+            df = self._pro.adj_factor(
+                ts_code=codes_str,
+                start_date=start_str,
+                end_date=end_str,
+            )
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.adj_factor(
+                    ts_code=codes_str,
+                    start_date=start_str,
+                    end_date=end_str,
+                )
+            else:
+                raise RuntimeError(f"Tushare adj_factor 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(
+                f"Tushare adj_factor 返回空：codes={codes_str} {start_str}-{end_str}"
+            )
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+        logger.info(f"Tushare adj_factor 返回 {len(df)} 行")
+        return df
+
     def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
         """股票基础信息（代码 / 名称 / 行业 / 上市日期等）。
 

@@ -49,7 +49,9 @@ def main() -> None:
 
         daily_count = s.count_daily()
         basic_count = s.query("SELECT COUNT(*) AS c FROM stock_basic")["c"].iloc[0]
+        factor_count = s.count_adj_factor()
         _line("日线 daily_bar", f"{daily_count:,} 行")
+        _line("因子 adj_factor", f"{factor_count:,} 行")
         _line("基础 stock_basic", f"{int(basic_count):,} 行")
 
         if daily_count == 0:
@@ -80,7 +82,7 @@ def main() -> None:
             ORDER BY ts_code
             """
         )
-        print("\n【最新收盘样本】（可对照东方财富/同花顺核对数据真实性）")
+        print("\n【最新收盘样本 — 原始价】")
         for _, row in latest.iterrows():
             amount_yi = row["amount"] / 1e5
             print(
@@ -89,6 +91,29 @@ def main() -> None:
                 f"涨跌 {row['pct_chg']:>+6.2f}%  "
                 f"成交额 {amount_yi:>6.2f} 亿元"
             )
+
+        if factor_count > 0:
+            print("\n【前复权对比】（东方财富默认显示前复权 → 用 qfq_close 比对）")
+            print("  最新日 factor == ref，qfq 必等原始；取首日看真实效果：\n")
+            code_list = codes["ts_code"].tolist()
+            for code in code_list:
+                df_qfq = s.get_daily_qfq(code)
+                if df_qfq.empty:
+                    continue
+                first, last = df_qfq.iloc[0], df_qfq.iloc[-1]
+                print(
+                    f"  {code}  {first['trade_date']}  "
+                    f"原始 {first['raw_close']:>8.2f}  →  "
+                    f"前复权 {first['qfq_close']:>8.2f}  "
+                    f"(factor={first['adj_factor']:.4f} / ref={first['ref_factor']:.4f})"
+                )
+                print(
+                    f"  {code}  {last['trade_date']}  "
+                    f"原始 {last['raw_close']:>8.2f}  →  "
+                    f"前复权 {last['qfq_close']:>8.2f}  "
+                    f"(factor={last['adj_factor']:.4f} / ref={last['ref_factor']:.4f})"
+                )
+                print()
 
     print("\n✓ 所有基础设施就绪\n")
 

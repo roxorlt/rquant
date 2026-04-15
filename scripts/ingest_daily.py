@@ -38,19 +38,23 @@ def main() -> int:
     logger.info(f"开始拉取 {len(ts_codes)} 只股票的日线 [{args.start} → {args.end}]")
 
     adapter = TushareAdapter()
-    df = adapter.daily(ts_codes=ts_codes, start=args.start, end=args.end)
+    df_daily = adapter.daily(ts_codes=ts_codes, start=args.start, end=args.end)
 
-    if df.empty:
-        logger.warning("无数据返回，退出")
+    if df_daily.empty:
+        logger.warning("daily 无数据返回，退出")
         return 1
 
+    df_factor = adapter.adj_factor(ts_codes=ts_codes, start=args.start, end=args.end)
+
     with DuckDBStore() as store:
-        count = store.upsert_daily(df)
-        logger.info(f"入库完成，共 {count} 行")
+        n_daily = store.upsert_daily(df_daily)
+        n_factor = store.upsert_adj_factor(df_factor)
+        logger.info(f"入库完成：daily {n_daily} 行 + adj_factor {n_factor} 行")
 
         for code in ts_codes:
-            total = store.count_daily(code)
-            logger.info(f"  {code}: {total} 行")
+            d = store.count_daily(code)
+            f = store.count_adj_factor(code)
+            logger.info(f"  {code}: daily {d} 行 / adj_factor {f} 行")
 
     return 0
 
