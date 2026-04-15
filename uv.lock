@@ -593,6 +593,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
+    { name = "ta" },
     { name = "tushare" },
 ]
 
@@ -610,6 +611,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "ta", specifier = ">=0.11.0" },
     { name = "tushare", specifier = ">=1.4.29" },
 ]
 
@@ -697,6 +699,16 @@ sdist = { url = "https://files.pythonhosted.org/packages/7b/ae/2d9c981590ed9999a
 wheels = [
     { url = "https://files.pythonhosted.org/packages/46/2c/1462b1d0a634697ae9e55b3cecdcb64788e8b7d63f54d923fcd0bb140aed/soupsieve-2.8.3-py3-none-any.whl", hash = "sha256:ed64f2ba4eebeab06cc4962affce381647455978ffc1e36bb79a545b91f45a95", size = 37016, upload-time = "2026-01-20T04:27:01.012Z" },
 ]
+
+[[package]]
+name = "ta"
+version = "0.11.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pandas" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/9a/37d92a6b470dc9088612c2399a68f1a9ac22872d4e1eff416818e22ab11b/ta-0.11.0.tar.gz", hash = "sha256:de86af43418420bd6b088a2ea9b95483071bf453c522a8441bc2f12bcf8493fd", size = 25308, upload-time = "2023-11-02T13:53:35.434Z" }
 
 [[package]]
 name = "tqdm"

@@ -49,7 +49,11 @@ def main() -> None:
 
         daily_count = s.count_daily()
         basic_count = s.query("SELECT COUNT(*) AS c FROM stock_basic")["c"].iloc[0]
+        factor_count = s.count_adj_factor()
+        ind_count = s.count_indicators()
         _line("日线 daily_bar", f"{daily_count:,} 行")
+        _line("因子 adj_factor", f"{factor_count:,} 行")
+        _line("指标 daily_indicator", f"{ind_count:,} 行")
         _line("基础 stock_basic", f"{int(basic_count):,} 行")
 
         if daily_count == 0:
@@ -80,7 +84,7 @@ def main() -> None:
             ORDER BY ts_code
             """
         )
-        print("\n【最新收盘样本】（可对照东方财富/同花顺核对数据真实性）")
+        print("\n【最新收盘样本 — 原始价】")
         for _, row in latest.iterrows():
             amount_yi = row["amount"] / 1e5
             print(
@@ -89,6 +93,65 @@ def main() -> None:
                 f"涨跌 {row['pct_chg']:>+6.2f}%  "
                 f"成交额 {amount_yi:>6.2f} 亿元"
             )
+
+        if factor_count > 0:
+            print("\n【前复权对比】（东方财富默认显示前复权 → 用 qfq_close 比对）")
+            print("  最新日 factor == ref，qfq 必等原始；取首日看真实效果：\n")
+            code_list = codes["ts_code"].tolist()
+            for code in code_list:
+                df_qfq = s.get_daily_qfq(code)
+                if df_qfq.empty:
+                    continue
+                first, last = df_qfq.iloc[0], df_qfq.iloc[-1]
+                print(
+                    f"  {code}  {first['trade_date']}  "
+                    f"原始 {first['raw_close']:>8.2f}  →  "
+                    f"前复权 {first['qfq_close']:>8.2f}  "
+                    f"(factor={first['adj_factor']:.4f} / ref={first['ref_factor']:.4f})"
+                )
+                print(
+                    f"  {code}  {last['trade_date']}  "
+                    f"原始 {last['raw_close']:>8.2f}  →  "
+                    f"前复权 {last['qfq_close']:>8.2f}  "
+                    f"(factor={last['adj_factor']:.4f} / ref={last['ref_factor']:.4f})"
+                )
+                print()
+
+        if ind_count > 0:
+            print("\n【最新技术指标】（基于前复权价）")
+            latest_ind = s.query(
+                """
+                SELECT ts_code,
+                       strftime(trade_date,'%Y-%m-%d') AS trade_date,
+                       ma5, ma10, ma20, ma60,
+                       rsi6, rsi14,
+                       macd, macd_signal, macd_hist,
+                       kdj_k, kdj_d, kdj_j
+                FROM daily_indicator
+                WHERE trade_date = (SELECT MAX(trade_date) FROM daily_indicator)
+                ORDER BY ts_code
+                """
+            )
+            for _, r in latest_ind.iterrows():
+                print(f"\n  {r['ts_code']}  {r['trade_date']}")
+                print(
+                    f"    MA:   5={r['ma5']:>8.2f}  10={r['ma10']:>8.2f}  "
+                    f"20={r['ma20']:>8.2f}  60={r['ma60']:>8.2f}"
+                )
+                print(
+                    f"    RSI:  6={r['rsi6']:>6.2f}   14={r['rsi14']:>6.2f}    "
+                    f"(>70 超买 / <30 超卖)"
+                )
+                print(
+                    f"    MACD: {r['macd']:>7.2f}  signal={r['macd_signal']:>7.2f}  "
+                    f"hist={r['macd_hist']:>+7.2f}  "
+                    f"({'多头' if r['macd_hist'] > 0 else '空头'})"
+                )
+                print(
+                    f"    KDJ:  K={r['kdj_k']:>6.2f}  D={r['kdj_d']:>6.2f}  "
+                    f"J={r['kdj_j']:>6.2f}  "
+                    f"({'金叉(K>D)' if r['kdj_k'] > r['kdj_d'] else '死叉(K<D)'})"
+                )
 
     print("\n✓ 所有基础设施就绪\n")
 
