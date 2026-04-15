@@ -276,6 +276,17 @@ wheels = [
 ]
 
 [[package]]
+name = "mytt"
+version = "2.9.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0d/6f/b44045a021430d28addecc61059fb1a63a12f77b2826ca5c5c20b0b47988/MyTT-2.9.3.tar.gz", hash = "sha256:df627a1f8abe66bc75eceb577279db22451bef1c1fe30aa68e5e2e3c4690815b", size = 13075, upload-time = "2021-12-01T06:11:22.6Z" }
+
+[[package]]
 name = "numpy"
 version = "2.4.4"
 source = { registry = "https://pypi.org/simple" }
@@ -590,6 +601,7 @@ source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "loguru" },
+    { name = "mytt" },
     { name = "pandas" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -608,6 +620,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "mytt", specifier = ">=2.9.3" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },
     { name = "python-dotenv", specifier = ">=1.2.2" },

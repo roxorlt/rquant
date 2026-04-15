@@ -15,6 +15,7 @@ from loguru import logger
 from rquant.adapter import TushareAdapter
 from rquant.indicator import compute_indicators
 from rquant.logging import setup_logging
+from rquant.state import derive_state
 from rquant.storage import DuckDBStore
 
 
@@ -47,10 +48,17 @@ def main() -> int:
 
     df_factor = adapter.adj_factor(ts_codes=ts_codes, start=args.start, end=args.end)
 
+    # stock_basic 全量拉一次（~5000 行），用于 ST 判断和名字缓存
+    df_basic = adapter.stock_basic()
+    basic_map = {row["ts_code"]: row["name"] for _, row in df_basic.iterrows()}
+
     with DuckDBStore() as store:
         n_daily = store.upsert_daily(df_daily)
         n_factor = store.upsert_adj_factor(df_factor)
-        logger.info(f"入库完成：daily {n_daily} 行 + adj_factor {n_factor} 行")
+        n_basic = store.upsert_stock_basic(df_basic)
+        logger.info(
+            f"入库完成：daily {n_daily} / adj_factor {n_factor} / stock_basic {n_basic}"
+        )
 
         # 基于前复权价全量重算指标（小数据量下简单可靠）
         total_ind = 0
@@ -62,11 +70,28 @@ def main() -> int:
             total_ind += store.upsert_indicators(df_ind)
         logger.info(f"指标计算完成：{total_ind} 行")
 
+        # 派生状态字段（用原始价，涨停判断依赖真实 pre_close）
+        total_state = 0
+        for code in ts_codes:
+            df_raw = store.query(
+                f"SELECT trade_date, open, high, low, close, pre_close "
+                f"FROM daily_bar WHERE ts_code = '{code}' ORDER BY trade_date"
+            )
+            if df_raw.empty:
+                continue
+            name = basic_map.get(code)
+            df_state = derive_state(df_raw, ts_code=code, name=name)
+            total_state += store.upsert_state(df_state)
+        logger.info(f"派生状态计算完成：{total_state} 行")
+
         for code in ts_codes:
             d = store.count_daily(code)
             f = store.count_adj_factor(code)
             i = store.count_indicators(code)
-            logger.info(f"  {code}: daily {d} / adj_factor {f} / indicator {i}")
+            s = store.count_state(code)
+            logger.info(
+                f"  {code}: daily {d} / adj_factor {f} / indicator {i} / state {s}"
+            )
 
     return 0
 
