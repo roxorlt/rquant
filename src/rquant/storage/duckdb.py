@@ -125,6 +125,37 @@ class DuckDBStore:
             result = self._conn.execute("SELECT COUNT(*) FROM adj_factor").fetchone()
         return result[0] if result else 0
 
+    def upsert_indicators(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        self._conn.register("ind_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO daily_indicator
+            SELECT ts_code, trade_date,
+                   ma5, ma10, ma20, ma60,
+                   rsi6, rsi14,
+                   macd, macd_signal, macd_hist,
+                   kdj_k, kdj_d, kdj_j
+            FROM ind_tmp
+            """
+        )
+        self._conn.unregister("ind_tmp")
+
+        count = len(df)
+        logger.info(f"DuckDB upsert daily_indicator: {count} 行")
+        return count
+
+    def count_indicators(self, ts_code: str | None = None) -> int:
+        if ts_code:
+            result = self._conn.execute(
+                "SELECT COUNT(*) FROM daily_indicator WHERE ts_code = ?", [ts_code]
+            ).fetchone()
+        else:
+            result = self._conn.execute("SELECT COUNT(*) FROM daily_indicator").fetchone()
+        return result[0] if result else 0
+
     def upsert_stock_basic(self, df: pd.DataFrame) -> int:
         if df.empty:
             return 0

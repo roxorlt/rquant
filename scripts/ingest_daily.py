@@ -13,6 +13,7 @@ from datetime import date, datetime
 from loguru import logger
 
 from rquant.adapter import TushareAdapter
+from rquant.indicator import compute_indicators
 from rquant.logging import setup_logging
 from rquant.storage import DuckDBStore
 
@@ -51,10 +52,21 @@ def main() -> int:
         n_factor = store.upsert_adj_factor(df_factor)
         logger.info(f"入库完成：daily {n_daily} 行 + adj_factor {n_factor} 行")
 
+        # 基于前复权价全量重算指标（小数据量下简单可靠）
+        total_ind = 0
+        for code in ts_codes:
+            df_qfq = store.get_daily_qfq(code)
+            if df_qfq.empty:
+                continue
+            df_ind = compute_indicators(df_qfq)
+            total_ind += store.upsert_indicators(df_ind)
+        logger.info(f"指标计算完成：{total_ind} 行")
+
         for code in ts_codes:
             d = store.count_daily(code)
             f = store.count_adj_factor(code)
-            logger.info(f"  {code}: daily {d} 行 / adj_factor {f} 行")
+            i = store.count_indicators(code)
+            logger.info(f"  {code}: daily {d} / adj_factor {f} / indicator {i}")
 
     return 0
 

@@ -39,4 +39,24 @@ CREATE TABLE IF NOT EXISTS adj_factor (
 );
 """
 
-ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL]
+DAILY_INDICATOR_DDL = """
+CREATE TABLE IF NOT EXISTS daily_indicator (
+    ts_code     VARCHAR NOT NULL,
+    trade_date  DATE    NOT NULL,
+    ma5         DOUBLE,
+    ma10        DOUBLE,
+    ma20        DOUBLE,
+    ma60        DOUBLE,
+    rsi6        DOUBLE,
+    rsi14       DOUBLE,
+    macd        DOUBLE,
+    macd_signal DOUBLE,
+    macd_hist   DOUBLE,
+    kdj_k       DOUBLE,
+    kdj_d       DOUBLE,
+    kdj_j       DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL, DAILY_INDICATOR_DDL]

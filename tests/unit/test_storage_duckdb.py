@@ -145,3 +145,25 @@ class TestAdjFactor:
         assert len(df) == 2
         assert df.iloc[0]["trade_date"] == "2024-01-03"
         assert df.iloc[1]["trade_date"] == "2024-01-04"
+
+
+class TestIndicators:
+    def test_upsert_indicators(self, tmp_store: DuckDBStore) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "ma5": 10.0, "ma10": None, "ma20": None, "ma60": None,
+                    "rsi6": 55.0, "rsi14": 50.0,
+                    "macd": 0.1, "macd_signal": 0.05, "macd_hist": 0.05,
+                    "kdj_k": 60.0, "kdj_d": 55.0, "kdj_j": 70.0,
+                }
+            ]
+        )
+        count = tmp_store.upsert_indicators(df)
+        assert count == 1
+        assert tmp_store.count_indicators("000001.SZ") == 1
+
+    def test_empty_indicators_returns_zero(self, tmp_store: DuckDBStore) -> None:
+        assert tmp_store.upsert_indicators(pd.DataFrame()) == 0
