@@ -59,4 +59,25 @@ CREATE TABLE IF NOT EXISTS daily_indicator (
 );
 """
 
-ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL, DAILY_INDICATOR_DDL]
+DAILY_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS daily_state (
+    ts_code               VARCHAR NOT NULL,
+    trade_date            DATE    NOT NULL,
+    is_st                 BOOLEAN,
+    is_bj                 BOOLEAN,
+    board_type            VARCHAR,   -- main | gem | star | bj（主板/创业板/科创板/北交所）
+    limit_pct             DOUBLE,    -- 0.05 | 0.10 | 0.20 | 0.30
+    limit_up_price        DOUBLE,
+    limit_down_price      DOUBLE,
+    is_limit_up           BOOLEAN,
+    is_limit_down         BOOLEAN,
+    is_first_limit_up     BOOLEAN,   -- 今涨停且昨未涨停
+    is_yiziban            BOOLEAN,   -- 一字板（open=high=low=close 且涨停）
+    consecutive_limit_ups INTEGER,   -- 连板数（含今日，0 表示今日未涨停）
+    body_upper            DOUBLE,    -- max(open, close) 实体上沿
+    body_lower            DOUBLE,    -- min(open, close) 实体下沿
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL, DAILY_INDICATOR_DDL, DAILY_STATE_DDL]

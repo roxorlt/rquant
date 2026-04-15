@@ -51,9 +51,11 @@ def main() -> None:
         basic_count = s.query("SELECT COUNT(*) AS c FROM stock_basic")["c"].iloc[0]
         factor_count = s.count_adj_factor()
         ind_count = s.count_indicators()
+        state_count = s.count_state()
         _line("日线 daily_bar", f"{daily_count:,} 行")
         _line("因子 adj_factor", f"{factor_count:,} 行")
         _line("指标 daily_indicator", f"{ind_count:,} 行")
+        _line("状态 daily_state", f"{state_count:,} 行")
         _line("基础 stock_basic", f"{int(basic_count):,} 行")
 
         if daily_count == 0:
@@ -151,6 +153,73 @@ def main() -> None:
                     f"    KDJ:  K={r['kdj_k']:>6.2f}  D={r['kdj_d']:>6.2f}  "
                     f"J={r['kdj_j']:>6.2f}  "
                     f"({'金叉(K>D)' if r['kdj_k'] > r['kdj_d'] else '死叉(K<D)'})"
+                )
+
+        if state_count > 0:
+            print("\n【派生状态统计】（用于筛选规则：涨停/首板/一字板/连板）")
+            stat = s.query(
+                """
+                SELECT ts_code,
+                       COUNT(*) FILTER (WHERE is_limit_up) AS lu_days,
+                       COUNT(*) FILTER (WHERE is_limit_down) AS ld_days,
+                       COUNT(*) FILTER (WHERE is_first_limit_up) AS first_lu,
+                       COUNT(*) FILTER (WHERE is_yiziban) AS yizi,
+                       MAX(consecutive_limit_ups) AS max_streak,
+                       ANY_VALUE(board_type) AS board,
+                       ANY_VALUE(limit_pct) AS limit_pct,
+                       BOOL_OR(is_st) AS is_st
+                FROM daily_state
+                GROUP BY ts_code
+                ORDER BY ts_code
+                """
+            )
+            for _, r in stat.iterrows():
+                st_tag = " [ST]" if r["is_st"] else ""
+                print(
+                    f"\n  {r['ts_code']}{st_tag}  板块={r['board']}  "
+                    f"涨跌停限制={int(r['limit_pct']*100)}%"
+                )
+                print(
+                    f"    涨停 {int(r['lu_days']):>3} 次  "
+                    f"跌停 {int(r['ld_days']):>3} 次  "
+                    f"首板 {int(r['first_lu']):>3} 次  "
+                    f"一字板 {int(r['yizi']):>3} 次  "
+                    f"最大连板 {int(r['max_streak']) if r['max_streak'] is not None else 0}"
+                )
+
+            print("\n【最新一日派生状态】")
+            latest_state = s.query(
+                """
+                SELECT ts_code,
+                       strftime(trade_date,'%Y-%m-%d') AS trade_date,
+                       limit_up_price, limit_down_price,
+                       is_limit_up, is_limit_down,
+                       is_first_limit_up, is_yiziban,
+                       consecutive_limit_ups,
+                       body_upper, body_lower
+                FROM daily_state
+                WHERE trade_date = (SELECT MAX(trade_date) FROM daily_state)
+                ORDER BY ts_code
+                """
+            )
+            for _, r in latest_state.iterrows():
+                tags = []
+                if r["is_limit_up"]:
+                    tags.append("涨停")
+                if r["is_limit_down"]:
+                    tags.append("跌停")
+                if r["is_first_limit_up"]:
+                    tags.append("首板")
+                if r["is_yiziban"]:
+                    tags.append("一字板")
+                if int(r["consecutive_limit_ups"] or 0) >= 2:
+                    tags.append(f"{int(r['consecutive_limit_ups'])}连板")
+                tag_str = "  ⚡ " + " / ".join(tags) if tags else ""
+                print(
+                    f"  {r['ts_code']}  {r['trade_date']}  "
+                    f"涨停价 {r['limit_up_price']:>8.2f}  "
+                    f"跌停价 {r['limit_down_price']:>8.2f}  "
+                    f"实体[{r['body_lower']:.2f}, {r['body_upper']:.2f}]{tag_str}"
                 )
 
     print("\n✓ 所有基础设施就绪\n")

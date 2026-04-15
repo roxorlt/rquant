@@ -24,6 +24,31 @@
 
 ---
 
+## [v0.2.1] — 2026-04-16 — Week 3a: 派生字段层（daily_state）
+
+为 Week 3b 筛选规则引擎铺底：把「涨停/跌停/首板/一字板/连板/实体上下沿/板块/ST」这些 SQL 难表达的概念先算好落库，规则引擎只做 SELECT 过滤。
+
+### Added
+- `rquant.state.derive` 模块：基于日线原始价（非前复权，涨停判断必须用真 `pre_close`）推导 15 列派生字段
+  - `_classify_board(ts_code)`：688/689 → star，300/301 → gem，.BJ → bj，else main
+  - `_detect_st(name)`：忽略空格，识别 `ST` / `*ST` / `SST` 前缀
+  - `_limit_pct(is_st, board_type)`：ST 5% / 主板 10% / 创业板科创板 20% / 北交所 30%
+  - `derive_state(df_daily, ts_code, name)`：一次算完 `is_limit_up` / `is_first_limit_up` / `is_yiziban` / `consecutive_limit_ups` / `body_upper` / `body_lower`
+  - 涨停识别带 1 分价格容差（`close >= limit_up_price - 0.01`）
+- `schema.DAILY_STATE_DDL`：`daily_state` 表（15 列，PK = ts_code + trade_date）
+- `DuckDBStore.upsert_state` / `count_state` / `get_state`
+- 依赖：`mytt==2.9.3`（通达信/同花顺风格公式库，用其 `BARSLASTCOUNT` 算连板数）
+- `ingest_daily.py` 扩展：拉完 daily 后自动算派生字段落 `daily_state`；顺带拉一次全量 `stock_basic`（~5500 行）用于 ST 判断
+- `status.py` 扩展：展示每只股票的涨停/跌停/首板/一字板/最大连板统计，以及最新一日的涨跌停价和实体区间
+- 测试：新增 42 个单测（state 模块 37 个 + storage 5 个），累计 65 个全部通过
+
+### Verified
+- 赛力斯 601127.SH（华为概念股）2024-09-30 / 10-23 / 11-04 / 11-05 四次涨停识别正确，11-04+11-05 连板 2 正确，首板标记正确
+- 涨停价公式：`pre_close × (1 + limit_pct)` 对主板 10% / 创业板 20% 实测与东方财富一致
+- 宁德时代 2024-10-08 +18.70% 因不足 20% 限制 → `is_limit_up=False` 正确
+
+---
+
 ## [v0.2.0] — 2026-04-16 — Week 2: 复权因子 + 技术指标
 
 ### Added

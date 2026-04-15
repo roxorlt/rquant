@@ -167,3 +167,59 @@ class TestIndicators:
 
     def test_empty_indicators_returns_zero(self, tmp_store: DuckDBStore) -> None:
         assert tmp_store.upsert_indicators(pd.DataFrame()) == 0
+
+
+class TestDailyState:
+    def _state_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": date(2024, 1, 2),
+                    "is_st": False, "is_bj": False,
+                    "board_type": "main", "limit_pct": 0.10,
+                    "limit_up_price": 11.00, "limit_down_price": 9.00,
+                    "is_limit_up": True, "is_limit_down": False,
+                    "is_first_limit_up": True, "is_yiziban": False,
+                    "consecutive_limit_ups": 1,
+                    "body_upper": 11.0, "body_lower": 10.2,
+                },
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": date(2024, 1, 3),
+                    "is_st": False, "is_bj": False,
+                    "board_type": "main", "limit_pct": 0.10,
+                    "limit_up_price": 12.10, "limit_down_price": 9.90,
+                    "is_limit_up": True, "is_limit_down": False,
+                    "is_first_limit_up": False, "is_yiziban": True,
+                    "consecutive_limit_ups": 2,
+                    "body_upper": 12.10, "body_lower": 12.10,
+                },
+            ]
+        )
+
+    def test_upsert_state_inserts_rows(self, tmp_store: DuckDBStore) -> None:
+        count = tmp_store.upsert_state(self._state_df())
+        assert count == 2
+        assert tmp_store.count_state("600519.SH") == 2
+
+    def test_upsert_state_idempotent(self, tmp_store: DuckDBStore) -> None:
+        tmp_store.upsert_state(self._state_df())
+        tmp_store.upsert_state(self._state_df())
+        assert tmp_store.count_state("600519.SH") == 2
+
+    def test_empty_state_returns_zero(self, tmp_store: DuckDBStore) -> None:
+        assert tmp_store.upsert_state(pd.DataFrame()) == 0
+
+    def test_get_state_reads_back(self, tmp_store: DuckDBStore) -> None:
+        tmp_store.upsert_state(self._state_df())
+        df = tmp_store.get_state("600519.SH")
+        assert len(df) == 2
+        assert bool(df.iloc[1]["is_yiziban"])
+        assert df.iloc[1]["consecutive_limit_ups"] == 2
+
+    def test_get_state_respects_date_range(self, tmp_store: DuckDBStore) -> None:
+        tmp_store.upsert_state(self._state_df())
+        df = tmp_store.get_state("600519.SH", start="2024-01-03")
+        assert len(df) == 1
+        assert df.iloc[0]["trade_date"] == "2024-01-03"

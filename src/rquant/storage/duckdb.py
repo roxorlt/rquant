@@ -156,6 +156,68 @@ class DuckDBStore:
             result = self._conn.execute("SELECT COUNT(*) FROM daily_indicator").fetchone()
         return result[0] if result else 0
 
+    def upsert_state(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        self._conn.register("state_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO daily_state
+            SELECT ts_code, trade_date,
+                   is_st, is_bj, board_type, limit_pct,
+                   limit_up_price, limit_down_price,
+                   is_limit_up, is_limit_down,
+                   is_first_limit_up, is_yiziban,
+                   consecutive_limit_ups,
+                   body_upper, body_lower
+            FROM state_tmp
+            """
+        )
+        self._conn.unregister("state_tmp")
+
+        count = len(df)
+        logger.info(f"DuckDB upsert daily_state: {count} 行")
+        return count
+
+    def count_state(self, ts_code: str | None = None) -> int:
+        if ts_code:
+            result = self._conn.execute(
+                "SELECT COUNT(*) FROM daily_state WHERE ts_code = ?", [ts_code]
+            ).fetchone()
+        else:
+            result = self._conn.execute("SELECT COUNT(*) FROM daily_state").fetchone()
+        return result[0] if result else 0
+
+    def get_state(
+        self,
+        ts_code: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        params: list[str] = [ts_code]
+        where = "ts_code = ?"
+        if start:
+            where += " AND trade_date >= ?"
+            params.append(start)
+        if end:
+            where += " AND trade_date <= ?"
+            params.append(end)
+        sql = f"""
+        SELECT ts_code,
+               strftime(trade_date, '%Y-%m-%d') AS trade_date,
+               is_st, is_bj, board_type, limit_pct,
+               limit_up_price, limit_down_price,
+               is_limit_up, is_limit_down,
+               is_first_limit_up, is_yiziban,
+               consecutive_limit_ups,
+               body_upper, body_lower
+        FROM daily_state
+        WHERE {where}
+        ORDER BY trade_date
+        """
+        return self._conn.execute(sql, params).fetchdf()
+
     def upsert_stock_basic(self, df: pd.DataFrame) -> int:
         if df.empty:
             return 0
