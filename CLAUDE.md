@@ -1,0 +1,151 @@
+# rQuant 项目指令
+
+## 项目定位
+
+rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
+- 只做「条件筛选 + 实时监控 + 告警通知」
+- **明确暂时不做**：实盘下单、高频策略、Tick 级微观结构、Level2
+
+## 开发环境
+
+- **平台**：macOS（MacBook），**不要依赖只支持 Windows 的工具**（如 QMT 客户端、掘金客户端）
+- **Python**：3.11+
+- **包管理**：uv 优先（未定，下次决策）
+- **操作系统相关注意**：
+  - 避免装 TA-Lib（C 扩展 Mac 上麻烦），用 pandas-ta 替代
+  - 通达信协议用 mootdx（pytdx 活跃 fork），不用老 pytdx
+
+## 技术栈约束
+
+不要随意扩张，以下是已决定的栈：
+
+| 层 | 已选 | 不要选 |
+|---|---|---|
+| 数据 | Tushare Pro + AKShare + Ashare + mootdx | Wind/iFinD/Choice API（太贵）、miniQMT（需 Windows） |
+| 存储 | DuckDB（主）+ Parquet + SQLite（状态） | PostgreSQL（杀鸡用牛刀）、InfluxDB（不需要） |
+| 指标 | pandas-ta | TA-Lib（Mac 装麻烦） |
+| 调度 | APScheduler | Celery / Airflow（个人项目用不上） |
+| 日志 | loguru | 标准 logging（手动配置烦） |
+| UI | Streamlit | React/Vue 从零写（先别开分支） |
+| 通知 | cc2im（已有）或企业微信 webhook | 新搭通知系统 |
+
+## 代码风格
+
+- **类型注解必写**：函数签名全部 type hint
+- **Pydantic 模型**：所有跨层数据结构用 Pydantic，不要裸 dict 传递
+- **不写过度抽象**：MVP 阶段是函数式脚本 + 简单 class，不要设计"框架"
+- **不写注释写啥**：只在有非显式约束/坑时写注释
+
+## MVP 路径（必须按顺序）
+
+不要并行推进多个阶段。按周迭代：
+
+1. Week 1：数据接入 + DuckDB 存储 → **能跑再下一步**
+2. Week 2：指标计算
+3. Week 3：筛选规则（Python 函数）
+4. Week 4：调度（APScheduler）
+5. Week 5：盘中监控（Ashare 轮询）
+6. Week 6：通知（cc2im）
+7. Week 7：Streamlit 最小 UI
+
+## 验证规范
+
+- **改动可运行代码必须实际运行验证**，不只凭代码逻辑判断
+- **让用户试用时必须明确说明**：运行命令、Python 环境、版本号
+- **输出本地路径用完整绝对路径**，不用 `~` 或相对路径
+
+## 版本控制与部署
+
+### 基本原则
+
+- **main 永远可运行可部署**：任何时刻 checkout main 都能跑起来
+- **简化版 GitHub Flow**：只有 main + feature 分支，不搞 develop/release
+- 托管到 GitHub private 或 Gitea 自建，方便服务器 `git pull`
+
+### 分支命名规范
+
+```
+feat/weekN-xxx       # MVP 周迭代，如 feat/week1-data-ingestion
+feat/xxx             # MVP 后的新功能，如 feat/multi-factor-scoring
+fix/xxx              # bug 修复
+refactor/xxx         # 重构
+docs/xxx             # 文档
+chore/xxx            # 配置/工具链
+deploy/xxx           # 部署脚本/配置
+```
+
+### Commit 规范（Conventional Commits）
+
+每条 commit 必须带前缀：
+
+- `feat:` 新功能
+- `fix:` bug 修复
+- `docs:` 文档
+- `refactor:` 重构（不改行为）
+- `test:` 测试
+- `chore:` 构建/配置/依赖
+- `deploy:` 部署相关
+
+示例：
+```
+feat(data): add Tushare daily OHLCV ingestion with AKShare fallback
+fix(indicator): correct MA calculation when there are NaN values
+chore: init pyproject.toml with uv
+```
+
+### 版本号（SemVer）
+
+- **v0.x.0** = MVP 阶段每周小版本（v0.1.0 Week 1 完成，v0.7.0 MVP 完成）
+- **v1.0.0** = 第一次真正可用（能日常跑筛选 + 推送告警）
+- **v1.x.y** = 可用后的迭代
+- 主版本（2.0.0）保留给架构重大变更
+
+### 合 main 的硬规则
+
+每次合 main 前必须：
+
+1. ✅ 本地实际运行，核心路径能跑通（**不是只看代码**）
+2. ✅ 更新 `CHANGELOG.md` 的 `[Unreleased]` section
+3. ✅ 测试通过（有 test 的话）
+4. ✅ 打 tag：`git tag -a v0.X.0 -m "Week N: xxx"`
+5. ✅ 关键变更同步到 `README.md` 或相关 docs
+
+### Changelog
+
+**`CHANGELOG.md` 用 Keep a Changelog 格式**，每次合 main 时同步写。分类：
+
+- `Added` — 新功能
+- `Changed` — 已有功能变更
+- `Deprecated` — 即将废弃
+- `Removed` — 已移除
+- `Fixed` — bug 修复
+- `Security` — 安全相关
+
+### 秘钥与配置
+
+- **`.env` 不进 git**（Tushare token、企业微信 webhook 等）
+- **`.env.example` 进 git**，作为字段模板
+- 所有秘钥从 `.env` 读，代码里禁止硬编码
+
+### 部署纪律
+
+- **部署到服务器只用 tag 或 main 的特定 commit**，不要跟着 main HEAD 盲目 pull
+- **`DEPLOY.md` 记录每次部署**：日期 + tag + 备注 + 回滚命令（人肉 deploy log）
+- 部署环境和本地环境有差异时（路径、端口、定时任务），用 `.env` 区分，不改代码
+- MVP 阶段**先不上 Docker**，Python venv + systemd service 足够；等部署痛了再容器化
+- 每次部署前**本地/staging 跑通**再上服务器，不在 main 上直接调试
+
+## 边界守则（重要）
+
+当讨论到新功能时，先问：**这个需求是否属于「条件筛选 + 监控 + 告警」这个核心范围？**
+
+- 属于 → 可以做
+- 不属于（如：下单、高频、Tick 分析、策略自动优化）→ 提醒用户这超出了项目边界，是否要扩张
+
+这是个人项目最容易阵亡的原因——功能无限扩张。
+
+## 相关文件
+
+- 顶层设计：[README.md](README.md)
+- 数据源矩阵：[docs/data-sources-matrix.md](docs/data-sources-matrix.md)
+- 开源参考：[docs/references.md](docs/references.md)
