@@ -146,6 +146,18 @@ class TestDeriveState:
         assert bool(out.iloc[0]["is_st"])
         assert bool(out.iloc[0]["is_limit_up"])
 
+    def test_limit_price_round_half_up(self) -> None:
+        # ROUND_HALF_UP 语义：pre=3.30 × 1.05 = 3.465 必须进位到 3.47
+        # pandas.round(2) 会用银行家舍入给出 3.46，这里验证我们用的是 HALF_UP
+        df = pd.DataFrame(
+            [
+                self._mkbar("2024-01-02", 3.40, 3.47, 3.35, 3.47, 3.30),
+            ]
+        )
+        out = derive_state(df, "000004.SZ", "*ST国华")
+        assert out.iloc[0]["limit_up_price"] == 3.47  # 不是 3.46
+        assert out.iloc[0]["limit_down_price"] == 3.14  # 3.30 × 0.95 = 3.135 → 3.14
+
     def test_limit_up_with_tolerance(self) -> None:
         # close 比 limit_up_price 低 0.005（小于容差 0.01）应识别为涨停
         df = pd.DataFrame(

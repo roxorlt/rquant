@@ -15,9 +15,25 @@
 
 from __future__ import annotations
 
+from decimal import ROUND_HALF_UP, Decimal
+
 import pandas as pd
 from loguru import logger
 from MyTT import BARSLASTCOUNT, REF
+
+
+def _round_half_up(s: pd.Series) -> pd.Series:
+    """四舍五入到分（ROUND_HALF_UP）。
+
+    pandas Series.round(2) 用的是银行家舍入（half to even），
+    3.465 → 3.46；而交易所涨跌停价用的是四舍五入（half up），
+    3.465 → 3.47。用 Decimal 显式按 HALF_UP 处理。
+    """
+    return s.apply(
+        lambda x: float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        if pd.notna(x)
+        else x
+    )
 
 
 def _classify_board(ts_code: str) -> str:
@@ -86,9 +102,9 @@ def derive_state(
     low = df["low"].astype("float64")
     pre_close = df["pre_close"].astype("float64")
 
-    # 涨停价 / 跌停价（四舍五入到分）
-    limit_up_price = (pre_close * (1 + limit_pct)).round(2)
-    limit_down_price = (pre_close * (1 - limit_pct)).round(2)
+    # 涨停价 / 跌停价（四舍五入到分，ROUND_HALF_UP 对齐交易所/东财）
+    limit_up_price = _round_half_up(pre_close * (1 + limit_pct))
+    limit_down_price = _round_half_up(pre_close * (1 - limit_pct))
 
     # 涨停 / 跌停（容差 1 分，pre_close 缺失时为 False）
     valid = close.notna() & pre_close.notna() & (pre_close > 0)
