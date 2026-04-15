@@ -5,7 +5,7 @@
 ## [Unreleased]
 
 ### Added
-- 项目初始化：README + CLAUDE.md + docs/（data-sources-matrix、references）
+-
 
 ### Changed
 -
@@ -21,6 +21,31 @@
 
 ### Security
 -
+
+---
+
+## [v0.1.0] — 2026-04-16 — Week 1: 数据接入 + DuckDB 存储
+
+### Added
+- 项目 scaffold：uv 包管理 + Python 3.12 + pyproject.toml + ruff/pytest 配置
+- 配置层：`rquant.config.Settings`（Pydantic Settings 读 `.env`，校验 token 长度、自动创建目录）
+- 日志层：`rquant.logging.setup_logging`（loguru stderr + 按日轮转到 `logs/`，保留 30 天）
+- 数据模型：`rquant.models.DailyBar`（Pydantic，frozen）
+- Tushare Adapter：`rquant.adapter.TushareAdapter`
+  - `daily(ts_codes, start, end)` 拉日线 OHLCV，主 token 失败自动切备用
+  - `stock_basic(list_status)` 拉股票基础信息
+- DuckDB 存储：`rquant.storage.DuckDBStore`
+  - 建表 DDL 集中在 `schema.py`（`daily_bar` + `stock_basic`）
+  - `upsert_daily` / `upsert_stock_basic` 幂等写入
+  - context manager 支持
+- CLI：`scripts/ingest_daily.py` 一次性拉历史日线入库
+- 测试：8 个单测（config 4 + DuckDB 4），`tests/README.md` 规范说明
+
+### Infrastructure
+- 项目初始化：README + CLAUDE.md + docs/（data-sources-matrix、references）
+- CHANGELOG.md（Keep a Changelog 格式）+ .gitignore（Python + data/ + .env）
+- .env.example 模板，`.env` 忽略提交
+- git init + `v0.0.1` scaffold tag
 
 ---
 

@@ -1,0 +1,46 @@
+[project]
+name = "rquant"
+version = "0.1.0"
+description = "个人自用 A 股量化选股与盯盘平台：条件筛选 + 实时监控 + 告警通知"
+readme = "README.md"
+authors = [
+    { name = "roxorlt", email = "ltsms86@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.2",
+    "loguru>=0.7.3",
+    "pandas>=3.0.2",
+    "pydantic-settings>=2.13.1",
+    "python-dotenv>=1.2.2",
+    "tushare>=1.4.29",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.11,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "network: 需要联网的测试（默认跳过，用 -m network 显式跑）",
+    "integration: 集成测试（跨模块，可能较慢）",
+]
+addopts = "-v --strict-markers -m 'not network'"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-mock>=3.15.1",
+    "ruff>=0.15.10",
+]
