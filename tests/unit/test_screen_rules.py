@@ -3,9 +3,12 @@
 import pytest
 
 from rquant.screen.rules import (
+    above_ma,
     between,
     board_in,
     consecutive_ups_gte,
+    cross_above,
+    cross_below,
     first_limit_up,
     gt,
     gte,
@@ -16,6 +19,8 @@ from rquant.screen.rules import (
     not_bj,
     not_limit_up,
     not_st,
+    rsi_overbought,
+    rsi_oversold,
     yiziban,
 )
 from tests.fixtures.wide_frames import make_wide_frame
@@ -191,3 +196,69 @@ class TestCompareRules:
         assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
         assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
         assert not mask.loc[df["ts_code"] == "688001.SH"].iloc[0]
+
+
+class TestIndicatorRules:
+    def test_cross_above_today(self) -> None:
+        df = make_wide_frame(
+            lookback=2,
+            overrides={
+                # 300001 今日上穿：今 MA5 > MA20，昨 MA5 <= MA20
+                ("300001.SZ", "MA5[0]"): 12.0,
+                ("300001.SZ", "MA20[0]"): 10.0,
+                ("300001.SZ", "MA5[1]"): 9.0,
+                ("300001.SZ", "MA20[1]"): 10.0,
+                # 000001 未上穿：昨天已经在上方
+                ("000001.SZ", "MA5[0]"): 12.0,
+                ("000001.SZ", "MA20[0]"): 10.0,
+                ("000001.SZ", "MA5[1]"): 11.0,
+                ("000001.SZ", "MA20[1]"): 10.0,
+            },
+        )
+        rule = cross_above("MA5", "MA20")
+        mask = rule(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert rule.min_lookback == 1
+
+    def test_cross_below_today(self) -> None:
+        df = make_wide_frame(
+            lookback=2,
+            overrides={
+                ("000001.SZ", "MA5[0]"): 9.0,
+                ("000001.SZ", "MA20[0]"): 10.0,
+                ("000001.SZ", "MA5[1]"): 11.0,
+                ("000001.SZ", "MA20[1]"): 10.0,
+            },
+        )
+        mask = cross_below("MA5", "MA20")(df)
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_above_ma(self) -> None:
+        df = make_wide_frame(
+            overrides={
+                ("000001.SZ", "CLOSE[0]"): 15.0,
+                ("000001.SZ", "MA20[0]"): 10.0,
+                ("300001.SZ", "CLOSE[0]"): 8.0,
+                ("300001.SZ", "MA20[0]"): 10.0,
+            },
+        )
+        mask = above_ma(period=20)(df)
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_rsi_oversold(self) -> None:
+        df = make_wide_frame(
+            overrides={
+                ("000001.SZ", "RSI14[0]"): 25.0,
+                ("300001.SZ", "RSI14[0]"): 50.0,
+            }
+        )
+        mask = rsi_oversold()(df)
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_rsi_overbought(self) -> None:
+        df = make_wide_frame(overrides={("000001.SZ", "RSI14[0]"): 75.0})
+        mask = rsi_overbought()(df)
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]

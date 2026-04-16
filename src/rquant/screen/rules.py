@@ -127,3 +127,46 @@ def between(field: str, low: float, high: float) -> Rule:
         s = df[field]
         return (s >= low) & (s <= high)
     return _tag_lookback(_rule, _parse_lookback(field))
+
+
+def cross_above(fast: str, slow: str, offset: int = 0) -> Rule:
+    """fast 均线在 offset 日上穿 slow 均线。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        f0 = df[f"{fast}[{offset}]"]
+        s0 = df[f"{slow}[{offset}]"]
+        f1 = df[f"{fast}[{offset + 1}]"]
+        s1 = df[f"{slow}[{offset + 1}]"]
+        return (f0 > s0) & (f1 <= s1)
+    return _tag_lookback(_rule, offset + 1)
+
+
+def cross_below(fast: str, slow: str, offset: int = 0) -> Rule:
+    """fast 均线在 offset 日下穿 slow 均线。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        f0 = df[f"{fast}[{offset}]"]
+        s0 = df[f"{slow}[{offset}]"]
+        f1 = df[f"{fast}[{offset + 1}]"]
+        s1 = df[f"{slow}[{offset + 1}]"]
+        return (f0 < s0) & (f1 >= s1)
+    return _tag_lookback(_rule, offset + 1)
+
+
+def above_ma(period: int, offset: int = 0) -> Rule:
+    """CLOSE 在 offset 日高于 MA{period}。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return df[f"CLOSE[{offset}]"] > df[f"MA{period}[{offset}]"]
+    return _tag_lookback(_rule, offset)
+
+
+def rsi_oversold(period: int = 14, threshold: float = 30.0, offset: int = 0) -> Rule:
+    """RSI 低于阈值（默认 30）。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return df[f"RSI{period}[{offset}]"] < threshold
+    return _tag_lookback(_rule, offset)
+
+
+def rsi_overbought(period: int = 14, threshold: float = 70.0, offset: int = 0) -> Rule:
+    """RSI 高于阈值（默认 70）。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return df[f"RSI{period}[{offset}]"] > threshold
+    return _tag_lookback(_rule, offset)
