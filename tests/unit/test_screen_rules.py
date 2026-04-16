@@ -3,11 +3,16 @@
 import pytest
 
 from rquant.screen.rules import (
+    between,
     board_in,
     consecutive_ups_gte,
     first_limit_up,
+    gt,
+    gte,
     limit_down,
     limit_up,
+    lt,
+    lte,
     not_bj,
     not_limit_up,
     not_st,
@@ -128,3 +133,61 @@ class TestLimitRules:
         df = make_wide_frame(overrides={("000001.SZ", "IS_LIMIT_DOWN[0]"): True})
         mask = limit_down(offset=0)(df)
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+
+class TestCompareRules:
+    def test_gt_field_vs_field_cross_day(self) -> None:
+        # 300001.SZ 今高 > 昨收
+        df = make_wide_frame(
+            lookback=2,
+            overrides={
+                ("300001.SZ", "HIGH[0]"): 12.0,
+                ("300001.SZ", "CLOSE[1]"): 10.0,
+                ("000001.SZ", "HIGH[0]"): 10.0,
+                ("000001.SZ", "CLOSE[1]"): 12.0,
+            },
+        )
+        rule = gt("HIGH[0]", "CLOSE[1]")
+        mask = rule(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert rule.min_lookback == 1
+
+    def test_gt_field_vs_constant(self) -> None:
+        df = make_wide_frame(
+            overrides={("300001.SZ", "CLOSE[0]"): 15.0, ("000001.SZ", "CLOSE[0]"): 5.0},
+        )
+        rule = gt("CLOSE[0]", 10.0)
+        mask = rule(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert rule.min_lookback == 0
+
+    def test_lt(self) -> None:
+        df = make_wide_frame(
+            overrides={("000001.SZ", "CLOSE[0]"): 5.0, ("300001.SZ", "CLOSE[0]"): 15.0},
+        )
+        mask = lt("CLOSE[0]", 10.0)(df)
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_gte_boundary(self) -> None:
+        df = make_wide_frame(overrides={("000001.SZ", "CLOSE[0]"): 10.0})
+        assert gte("CLOSE[0]", 10.0)(df).loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_lte_boundary(self) -> None:
+        df = make_wide_frame(overrides={("000001.SZ", "CLOSE[0]"): 10.0})
+        assert lte("CLOSE[0]", 10.0)(df).loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_between(self) -> None:
+        df = make_wide_frame(
+            overrides={
+                ("000001.SZ", "CLOSE[0]"): 8.0,
+                ("300001.SZ", "CLOSE[0]"): 15.0,
+                ("688001.SH", "CLOSE[0]"): 25.0,
+            },
+        )
+        mask = between("CLOSE[0]", 10.0, 20.0)(df)
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "688001.SH"].iloc[0]

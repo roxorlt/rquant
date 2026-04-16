@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 
 import pandas as pd
@@ -76,3 +77,53 @@ def consecutive_ups_gte(n: int, offset: int = 0) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[col].fillna(0).astype(int) >= n
     return _tag_lookback(_rule, offset)
+
+
+_LOOKBACK_RE = re.compile(r"\[(\d+)\]$")
+
+
+def _parse_lookback(operand: str | float | int) -> int:
+    """从 'CLOSE[3]' 抽出 3；数字常数返回 0。"""
+    if isinstance(operand, (int, float)):
+        return 0
+    match = _LOOKBACK_RE.search(operand)
+    return int(match.group(1)) if match else 0
+
+
+def _resolve(df: pd.DataFrame, operand: str | float | int) -> pd.Series | float:
+    if isinstance(operand, (int, float)):
+        return operand
+    return df[operand]
+
+
+def gt(left: str | float, right: str | float) -> Rule:
+    """left > right，操作数可以是字段名字符串或数字常数。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return _resolve(df, left) > _resolve(df, right)
+    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+
+
+def lt(left: str | float, right: str | float) -> Rule:
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return _resolve(df, left) < _resolve(df, right)
+    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+
+
+def gte(left: str | float, right: str | float) -> Rule:
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return _resolve(df, left) >= _resolve(df, right)
+    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+
+
+def lte(left: str | float, right: str | float) -> Rule:
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return _resolve(df, left) <= _resolve(df, right)
+    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+
+
+def between(field: str, low: float, high: float) -> Rule:
+    """字段值在 [low, high] 闭区间。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        s = df[field]
+        return (s >= low) & (s <= high)
+    return _tag_lookback(_rule, _parse_lookback(field))
