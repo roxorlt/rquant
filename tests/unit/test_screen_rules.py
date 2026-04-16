@@ -1,5 +1,8 @@
 """筛选积木单测。"""
 
+import pytest
+
+from rquant.screen.rules import board_in, not_bj, not_st
 from tests.fixtures.wide_frames import make_wide_frame
 
 
@@ -28,3 +31,38 @@ class TestFixture:
         assert board["300001.SZ"] == "gem"
         assert board["688001.SH"] == "star"
         assert board["833001.BJ"] == "bj"
+
+
+class TestAttributeRules:
+    def test_not_st_excludes_st_stocks(self) -> None:
+        df = make_wide_frame(overrides={("000001.SZ", "is_st"): True})
+        mask = not_st()(df)
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_not_bj_excludes_bj_stocks(self) -> None:
+        df = make_wide_frame()
+        mask = not_bj()(df)
+        assert not mask.loc[df["ts_code"] == "833001.BJ"].iloc[0]
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    @pytest.mark.parametrize(
+        "whitelist,expected_allowed,expected_blocked",
+        [
+            (["main"], "000001.SZ", "300001.SZ"),
+            (["main", "gem"], "300001.SZ", "688001.SH"),
+            (["bj"], "833001.BJ", "000001.SZ"),
+        ],
+    )
+    def test_board_in_whitelist(
+        self, whitelist: list[str], expected_allowed: str, expected_blocked: str
+    ) -> None:
+        df = make_wide_frame()
+        mask = board_in(whitelist)(df)
+        assert mask.loc[df["ts_code"] == expected_allowed].iloc[0]
+        assert not mask.loc[df["ts_code"] == expected_blocked].iloc[0]
+
+    def test_attribute_rules_min_lookback_is_zero(self) -> None:
+        assert not_st().min_lookback == 0
+        assert not_bj().min_lookback == 0
+        assert board_in(["main"]).min_lookback == 0
