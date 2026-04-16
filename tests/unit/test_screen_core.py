@@ -47,6 +47,8 @@ class TestScreenCore:
         assert "MA20[0]" in result.columns
 
     def test_lookback_auto_inferred_from_rules(self) -> None:
+        # fixture lookback=3 is frame depth; inferred lookback passed to
+        # load_universe() is max(min_lookback) = max(0, 2) = 2
         df = make_wide_frame(lookback=3)
         from rquant.screen.rules import first_limit_up
 
@@ -54,15 +56,11 @@ class TestScreenCore:
         with patch("rquant.screen.core.load_universe") as mock_loader:
             mock_loader.return_value = df
             screen(trade_date="2026-04-15", rules=rules)
-            _, kwargs = mock_loader.call_args
-            assert kwargs.get("lookback", None) == 2 or mock_loader.call_args[0][1] == 2
+            assert mock_loader.call_args.kwargs["lookback"] == 2
 
     def test_explicit_lookback_overrides_inference(self) -> None:
         df = make_wide_frame(lookback=10)
         with patch("rquant.screen.core.load_universe") as mock_loader:
             mock_loader.return_value = df
             screen(trade_date="2026-04-15", rules=[not_st()], lookback=10)
-            assert (
-                mock_loader.call_args.kwargs.get("lookback") == 10
-                or (len(mock_loader.call_args.args) >= 2 and mock_loader.call_args.args[1] == 10)
-            )
+            assert mock_loader.call_args.kwargs["lookback"] == 10
