@@ -42,11 +42,13 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 
 1. Week 1：数据接入 + DuckDB 存储 → **能跑再下一步**
 2. Week 2：指标计算
-3. Week 3：筛选规则（Python 函数）
-4. Week 4：调度（APScheduler）
-5. Week 5：盘中监控（Ashare 轮询）
-6. Week 6：通知（cc2im）
-7. Week 7：Streamlit 最小 UI
+3. Week 3a：派生字段层（daily_state）
+4. Week 3b：筛选规则（Python 函数积木，命名对齐通达信/MyTT 风格）
+5. Week 4：调度（APScheduler）+ 筛选结果落库
+6. Week 5：盘中监控（Ashare 轮询）
+7. Week 6：通知（cc2im）
+8. Week 7：Streamlit UI + 自然语言输入（LLM → 积木调用）
+9. Week 8：通达信选股公式支持（解析器 → MyTT/积木）
 
 ## 验证规范
 

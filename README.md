@@ -73,16 +73,19 @@ tags: [quant, a-shares, personal-tool, python, macOS]
 | 通知 | cc2im（已有） / 企业微信 webhook | 复用已有基础设施 |
 | 测试 | pytest + 固定 fixture 数据 | 标准 |
 
-## MVP 路径（7 周）
+## MVP 路径（8 周）
 
 ```
-Week 1  [数据接入]  Tushare 拉日线 + AKShare 兜底 → DuckDB 存储能查
-Week 2  [指标计算]  pandas-ta 算 MA/MACD/RSI，落 DuckDB 缓存
-Week 3  [筛选规则]  先用 Python 函数硬编码 3 条规则，打印备选池
-Week 4  [调度]      APScheduler 每日 17:00 自动拉数+跑筛选
-Week 5  [实时监控]  Ashare 盘中轮询备选池，触发条件打印告警
-Week 6  [通知打通]  告警推送到微信/企业微信（接 cc2im）
-Week 7  [最小 UI]   Streamlit 面板：备选池 + 告警历史 + 规则开关
+Week 1   [数据接入]   Tushare 拉日线 + AKShare 兜底 → DuckDB 存储能查
+Week 2   [指标计算]   pandas-ta 算 MA/MACD/RSI/KDJ，落 DuckDB 缓存
+Week 3a  [派生字段]   涨跌停/首板/一字板/连板/板块/ST/实体上下沿 → daily_state 表
+Week 3b  [筛选规则]   原子条件"积木"函数库 + screen() 入口，支持多条件 AND + 跨日引用
+                     命名对齐通达信/MyTT 风格（为 Week 8 铺路）
+Week 4   [调度]       APScheduler 每日 17:00 自动拉数+跑筛选，结果落 screen_result 表
+Week 5   [实时监控]   Ashare 盘中轮询备选池，触发条件打印告警
+Week 6   [通知打通]   告警推送到微信/企业微信（接 cc2im）
+Week 7   [UI + NL]    Streamlit 面板 + 自然语言输入筛选条件（LLM → 积木调用）
+Week 8   [通达信代码] 支持粘贴通达信选股公式，解析器映射到 MyTT/积木执行
 ```
 
 **原则**：每周"能跑"再进下一步，不要并行推进。
@@ -137,7 +140,7 @@ rQuant/
 ## 开放决策（待想清楚）
 
 - [ ] 是 fork `myhhub/stock` 改还是从零写？**倾向从零但参考它**
-- [ ] 筛选规则用 Python 函数还是 YAML DSL？**MVP 先用函数，UI 化时再抽 DSL**
+- [x] 筛选规则用 Python 函数还是 YAML DSL？**最终路径**：MVP（Week 3b）用 Python 函数积木 → Week 7 加 NL 输入（LLM → 积木调用）→ Week 8 支持通达信选股公式。**不走 YAML DSL**，因为 NL + 通达信代码已覆盖配置化需求
 - [ ] 告警频率怎么防刷屏（去重 / 冷却期）？
 - [ ] 多因子综合打分还是条件硬筛选？**MVP 先硬筛选，迭代中加打分**
 - [ ] 移动端通知用哪条通道？**首选 cc2im 接微信**
