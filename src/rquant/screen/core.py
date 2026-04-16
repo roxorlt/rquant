@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Callable
-
 import pandas as pd
 
-from rquant.screen.loader import load_universe
-
-Rule = Callable[[pd.DataFrame], pd.Series]
+from rquant.screen.rules import Rule
 
 
 def screen(

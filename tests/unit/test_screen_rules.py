@@ -1,7 +1,5 @@
 """筛选积木单测。"""
 
-import pandas as pd
-
 from tests.fixtures.wide_frames import make_wide_frame
 
 
@@ -25,7 +23,7 @@ class TestFixture:
 
     def test_board_type_detection(self) -> None:
         df = make_wide_frame()
-        board = dict(zip(df["ts_code"], df["board_type"]))
+        board = dict(zip(df["ts_code"], df["board_type"], strict=True))
         assert board["000001.SZ"] == "main"
         assert board["300001.SZ"] == "gem"
         assert board["688001.SH"] == "star"
