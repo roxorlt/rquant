@@ -170,3 +170,13 @@ def rsi_overbought(period: int = 14, threshold: float = 70.0, offset: int = 0) -
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[f"RSI{period}[{offset}]"] > threshold
     return _tag_lookback(_rule, offset)
+
+
+def volume_ratio_gte(n: float, offset: int = 0, window: int = 5) -> Rule:
+    """某日成交量 ≥ n × 前 {window} 日成交量均值。"""
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        today = df[f"VOL[{offset}]"]
+        prev_cols = [f"VOL[{offset + i}]" for i in range(1, window + 1)]
+        mean_prev = df[prev_cols].mean(axis=1)
+        return today >= n * mean_prev
+    return _tag_lookback(_rule, offset + window)

@@ -21,6 +21,7 @@ from rquant.screen.rules import (
     not_st,
     rsi_overbought,
     rsi_oversold,
+    volume_ratio_gte,
     yiziban,
 )
 from tests.fixtures.wide_frames import make_wide_frame
@@ -262,3 +263,31 @@ class TestIndicatorRules:
         df = make_wide_frame(overrides={("000001.SZ", "RSI14[0]"): 75.0})
         mask = rsi_overbought()(df)
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+
+class TestVolumeRules:
+    def test_volume_ratio_gte(self) -> None:
+        df = make_wide_frame(
+            lookback=5,
+            overrides={
+                # 今量 100 / 前 5 日均量 10 = 10 倍
+                ("300001.SZ", "VOL[0]"): 100.0,
+                ("300001.SZ", "VOL[1]"): 10.0,
+                ("300001.SZ", "VOL[2]"): 10.0,
+                ("300001.SZ", "VOL[3]"): 10.0,
+                ("300001.SZ", "VOL[4]"): 10.0,
+                ("300001.SZ", "VOL[5]"): 10.0,
+                # 000001 今量 = 前 5 日均量，ratio = 1
+                ("000001.SZ", "VOL[0]"): 10.0,
+                ("000001.SZ", "VOL[1]"): 10.0,
+                ("000001.SZ", "VOL[2]"): 10.0,
+                ("000001.SZ", "VOL[3]"): 10.0,
+                ("000001.SZ", "VOL[4]"): 10.0,
+                ("000001.SZ", "VOL[5]"): 10.0,
+            },
+        )
+        rule = volume_ratio_gte(2.0)
+        mask = rule(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert rule.min_lookback == 5
