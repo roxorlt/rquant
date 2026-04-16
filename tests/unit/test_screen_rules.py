@@ -2,7 +2,17 @@
 
 import pytest
 
-from rquant.screen.rules import board_in, not_bj, not_st
+from rquant.screen.rules import (
+    board_in,
+    consecutive_ups_gte,
+    first_limit_up,
+    limit_down,
+    limit_up,
+    not_bj,
+    not_limit_up,
+    not_st,
+    yiziban,
+)
 from tests.fixtures.wide_frames import make_wide_frame
 
 
@@ -66,3 +76,55 @@ class TestAttributeRules:
         assert not_st().min_lookback == 0
         assert not_bj().min_lookback == 0
         assert board_in(["main"]).min_lookback == 0
+
+
+class TestLimitRules:
+    def test_limit_up_today(self) -> None:
+        df = make_wide_frame(overrides={("300001.SZ", "IS_LIMIT_UP[0]"): True})
+        mask = limit_up(offset=0)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_limit_up_yesterday(self) -> None:
+        df = make_wide_frame(
+            lookback=2,
+            overrides={("300001.SZ", "IS_LIMIT_UP[1]"): True},
+        )
+        mask = limit_up(offset=1)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert limit_up(offset=1).min_lookback == 1
+
+    def test_not_limit_up(self) -> None:
+        df = make_wide_frame(overrides={("300001.SZ", "IS_LIMIT_UP[0]"): True})
+        mask = not_limit_up(offset=0)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_first_limit_up(self) -> None:
+        df = make_wide_frame(
+            overrides={("300001.SZ", "IS_FIRST_LIMIT_UP[0]"): True},
+        )
+        mask = first_limit_up(offset=0)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_yiziban(self) -> None:
+        df = make_wide_frame(overrides={("300001.SZ", "IS_YIZIBAN[0]"): True})
+        mask = yiziban(offset=0)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_consecutive_ups_gte(self) -> None:
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "CONSECUTIVE_LIMIT_UPS[0]"): 2,
+                ("000001.SZ", "CONSECUTIVE_LIMIT_UPS[0]"): 1,
+            }
+        )
+        mask = consecutive_ups_gte(2)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_limit_down(self) -> None:
+        df = make_wide_frame(overrides={("000001.SZ", "IS_LIMIT_DOWN[0]"): True})
+        mask = limit_down(offset=0)(df)
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
