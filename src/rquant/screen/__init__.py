@@ -6,6 +6,8 @@ from rquant.screen.rules import (
     above_ma,
     between,
     board_in,
+    # 市值
+    circ_mv_lt,
     consecutive_ups_gte,
     # 指标
     cross_above,
@@ -39,4 +41,5 @@ __all__ = [
     "gt", "lt", "gte", "lte", "between",
     "cross_above", "cross_below", "above_ma", "rsi_oversold", "rsi_overbought",
     "volume_ratio_gte",
+    "circ_mv_lt",
 ]

@@ -71,6 +71,21 @@ def not_yiziban(offset: int = 0) -> Rule:
     return _bool_state_rule("IS_YIZIBAN", offset, negate=True)
 
 
+def circ_mv_lt(threshold_yi: float, offset: int = 0) -> Rule:
+    """流通市值 < threshold_yi 亿元。
+
+    Tushare circ_mv 单位是万元，1 亿 = 10000 万，
+    所以 threshold_yi * 10000 与 CIRC_MV[offset] 比较。
+    """
+    threshold_wan = threshold_yi * 10000
+    col = f"CIRC_MV[{offset}]"
+
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return df[col].fillna(float("inf")) < threshold_wan
+
+    return _tag_lookback(_rule, offset)
+
+
 def limit_down(offset: int = 0) -> Rule:
     """某日跌停。"""
     return _bool_state_rule("IS_LIMIT_DOWN", offset)

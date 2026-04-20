@@ -6,6 +6,7 @@ from rquant.screen.rules import (
     above_ma,
     between,
     board_in,
+    circ_mv_lt,
     consecutive_ups_gte,
     cross_above,
     cross_below,
@@ -300,6 +301,52 @@ class TestIndicatorRules:
         df = make_wide_frame(overrides={("000001.SZ", "RSI14[0]"): 75.0})
         mask = rsi_overbought()(df)
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+
+class TestCircMvRule:
+    def test_circ_mv_lt_passes_small_cap(self) -> None:
+        """100亿 = 1000000万 < 150亿 = 1500000万 → passes."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "CIRC_MV[0]"): 1000000.0,  # 100亿万元
+                ("000001.SZ", "CIRC_MV[0]"): 2000000.0,  # 200亿万元
+            },
+        )
+        mask = circ_mv_lt(150)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_circ_mv_lt_boundary(self) -> None:
+        """Exactly 150亿 = 1500000万 should NOT pass (strict <)."""
+        df = make_wide_frame(
+            overrides={("300001.SZ", "CIRC_MV[0]"): 1500000.0},
+        )
+        mask = circ_mv_lt(150)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_circ_mv_lt_nan_fails(self) -> None:
+        """NaN circ_mv should fail (fillna(inf) makes it exceed any threshold)."""
+        df = make_wide_frame()
+        df.loc[df["ts_code"] == "300001.SZ", "CIRC_MV[0]"] = float("nan")
+        mask = circ_mv_lt(150)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_circ_mv_lt_at_offset(self) -> None:
+        df = make_wide_frame(
+            lookback=2,
+            overrides={("300001.SZ", "CIRC_MV[1]"): 500000.0},  # 50亿
+        )
+        rule = circ_mv_lt(100, offset=1)
+        mask = rule(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert rule.min_lookback == 1
+
+    def test_circ_mv_lt_unit_conversion(self) -> None:
+        """Verify: 1亿 = 10000万元 conversion."""
+        df = make_wide_frame(overrides={("300001.SZ", "CIRC_MV[0]"): 9999.0})
+        assert circ_mv_lt(1)(df).loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        df = make_wide_frame(overrides={("300001.SZ", "CIRC_MV[0]"): 10001.0})
+        assert not circ_mv_lt(1)(df).loc[df["ts_code"] == "300001.SZ"].iloc[0]
 
 
 class TestVolumeRules:
