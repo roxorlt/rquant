@@ -14,10 +14,13 @@ from rquant.screen.rules import (
     gt,
     gte,
     has_lower_shadow,
+    has_prior_limit_up,
     limit_down,
     limit_up,
     lt,
     lte,
+    no_consec_ups_in_window,
+    no_limit_down_in_window,
     not_bj,
     not_limit_up,
     not_st,
@@ -484,3 +487,129 @@ class TestHasLowerShadow:
         )
         mask = has_lower_shadow(min_ratio=2.0, min_amplitude=0.01)(df)
         assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+
+class TestNoConsecUpsInWindow:
+    def test_passes_when_max_below_threshold(self) -> None:
+        df = make_wide_frame()
+        df["max_consec_ups_8d"] = 2
+        rule = no_consec_ups_in_window(threshold=3, window=8)
+        mask = rule(df)
+        assert mask.all()
+
+    def test_fails_when_max_equals_threshold(self) -> None:
+        df = make_wide_frame()
+        df["max_consec_ups_8d"] = 3
+        rule = no_consec_ups_in_window(threshold=3, window=8)
+        mask = rule(df)
+        assert not mask.any()
+
+    def test_fails_when_max_exceeds_threshold(self) -> None:
+        df = make_wide_frame()
+        df["max_consec_ups_8d"] = 5
+        rule = no_consec_ups_in_window(threshold=3, window=8)
+        mask = rule(df)
+        assert not mask.any()
+
+    def test_nan_treated_as_zero(self) -> None:
+        df = make_wide_frame()
+        df["max_consec_ups_8d"] = float("nan")
+        rule = no_consec_ups_in_window(threshold=3, window=8)
+        mask = rule(df)
+        assert mask.all()
+
+    def test_has_aggregate_request(self) -> None:
+        rule = no_consec_ups_in_window(threshold=3, window=8)
+        assert hasattr(rule, "aggregate_requests")
+        assert len(rule.aggregate_requests) == 1
+        req = rule.aggregate_requests[0]
+        assert req.name == "max_consec_ups_8d"
+        assert req.agg_func == "max"
+        assert req.window == 8
+        assert req.source_col == "consecutive_limit_ups"
+
+    def test_custom_window(self) -> None:
+        rule = no_consec_ups_in_window(threshold=2, window=5)
+        assert rule.aggregate_requests[0].name == "max_consec_ups_5d"
+        assert rule.aggregate_requests[0].window == 5
+
+
+class TestNoLimitDownInWindow:
+    def test_passes_when_no_limit_down(self) -> None:
+        df = make_wide_frame()
+        df["has_limit_down_30d"] = False
+        rule = no_limit_down_in_window(window=30)
+        mask = rule(df)
+        assert mask.all()
+
+    def test_fails_when_has_limit_down(self) -> None:
+        df = make_wide_frame()
+        df["has_limit_down_30d"] = True
+        rule = no_limit_down_in_window(window=30)
+        mask = rule(df)
+        assert not mask.any()
+
+    def test_nan_treated_as_no_limit_down(self) -> None:
+        df = make_wide_frame()
+        df["has_limit_down_30d"] = float("nan")
+        rule = no_limit_down_in_window(window=30)
+        mask = rule(df)
+        assert mask.all()
+
+    def test_has_aggregate_request(self) -> None:
+        rule = no_limit_down_in_window(window=30)
+        assert len(rule.aggregate_requests) == 1
+        req = rule.aggregate_requests[0]
+        assert req.name == "has_limit_down_30d"
+        assert req.agg_func == "any"
+        assert req.window == 30
+
+    def test_custom_window(self) -> None:
+        rule = no_limit_down_in_window(window=10)
+        assert rule.aggregate_requests[0].name == "has_limit_down_10d"
+
+
+class TestHasPriorLimitUp:
+    def test_passes_when_has_prior_limit_up(self) -> None:
+        df = make_wide_frame()
+        df["count_limit_up_90d_ex1"] = 2
+        rule = has_prior_limit_up(window=90, exclude_offset=1)
+        mask = rule(df)
+        assert mask.all()
+
+    def test_fails_when_no_prior_limit_up(self) -> None:
+        df = make_wide_frame()
+        df["count_limit_up_90d_ex1"] = 0
+        rule = has_prior_limit_up(window=90, exclude_offset=1)
+        mask = rule(df)
+        assert not mask.any()
+
+    def test_boundary_exactly_one(self) -> None:
+        df = make_wide_frame()
+        df["count_limit_up_90d_ex1"] = 1
+        rule = has_prior_limit_up(window=90, exclude_offset=1)
+        mask = rule(df)
+        assert mask.all()
+
+    def test_nan_treated_as_zero(self) -> None:
+        df = make_wide_frame()
+        df["count_limit_up_90d_ex1"] = float("nan")
+        rule = has_prior_limit_up(window=90, exclude_offset=1)
+        mask = rule(df)
+        assert not mask.any()
+
+    def test_has_aggregate_request_with_exclude(self) -> None:
+        rule = has_prior_limit_up(window=90, exclude_offset=1)
+        assert len(rule.aggregate_requests) == 1
+        req = rule.aggregate_requests[0]
+        assert req.name == "count_limit_up_90d_ex1"
+        assert req.agg_func == "count_nonzero"
+        assert req.window == 90
+        assert req.exclude_offset == 1
+
+    def test_custom_params(self) -> None:
+        rule = has_prior_limit_up(window=30, exclude_offset=2)
+        req = rule.aggregate_requests[0]
+        assert req.name == "count_limit_up_30d_ex2"
+        assert req.window == 30
+        assert req.exclude_offset == 2

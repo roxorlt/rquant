@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from rquant.screen.loader import load_universe
-from rquant.screen.rules import AggregateRequest
+from rquant.screen.rules import AggregateRequest, has_prior_limit_up, no_consec_ups_in_window, no_limit_down_in_window
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -321,3 +321,53 @@ class TestLoadUniverseAggregates:
         """Calling without aggregate_requests should work as before."""
         df = load_universe("2026-04-15", lookback=1, store=store)
         assert "CLOSE[0]" in df.columns
+
+
+class TestWindowRulesIntegration:
+    """End-to-end test: rule declares aggregate → loader generates SQL → rule evaluates."""
+
+    def test_no_consec_ups_in_window_integration(self, store: DuckDBStore) -> None:
+        """300001.SZ has max consecutive_limit_ups=2 in 8d window. threshold=3 → passes."""
+        rule = no_consec_ups_in_window(threshold=3, window=8)
+        reqs = rule.aggregate_requests
+        df = load_universe("2026-04-15", lookback=0, store=store, aggregate_requests=reqs)
+        mask = rule(df)
+        row_mask = mask.loc[df["ts_code"] == "300001.SZ"]
+        assert row_mask.iloc[0]
+
+    def test_no_consec_ups_in_window_fails(self, store: DuckDBStore) -> None:
+        """threshold=2: max_consec=2 NOT < 2 → fails."""
+        rule = no_consec_ups_in_window(threshold=2, window=8)
+        reqs = rule.aggregate_requests
+        df = load_universe("2026-04-15", lookback=0, store=store, aggregate_requests=reqs)
+        mask = rule(df)
+        row_mask = mask.loc[df["ts_code"] == "300001.SZ"]
+        assert not row_mask.iloc[0]
+
+    def test_no_limit_down_in_window_integration(self, store: DuckDBStore) -> None:
+        """300001.SZ has is_limit_down=True on 4/10. Window=8 covers 4/10 → fails."""
+        rule = no_limit_down_in_window(window=8)
+        reqs = rule.aggregate_requests
+        df = load_universe("2026-04-15", lookback=0, store=store, aggregate_requests=reqs)
+        mask = rule(df)
+        row_mask = mask.loc[df["ts_code"] == "300001.SZ"]
+        assert not row_mask.iloc[0]
+
+    def test_no_limit_down_passes_for_clean_stock(self, store: DuckDBStore) -> None:
+        """000001.SZ has no limit_down in any date → passes."""
+        rule = no_limit_down_in_window(window=8)
+        reqs = rule.aggregate_requests
+        df = load_universe("2026-04-15", lookback=0, store=store, aggregate_requests=reqs)
+        mask = rule(df)
+        row_mask = mask.loc[df["ts_code"] == "000001.SZ"]
+        assert row_mask.iloc[0]
+
+    def test_has_prior_limit_up_integration(self, store: DuckDBStore) -> None:
+        """300001.SZ has limit_up on 4/7 and 4/8 (excluding 4/15 at offset=0).
+        With window=8, exclude_offset=0 → count >= 1 → passes."""
+        rule = has_prior_limit_up(window=8, exclude_offset=0)
+        reqs = rule.aggregate_requests
+        df = load_universe("2026-04-15", lookback=0, store=store, aggregate_requests=reqs)
+        mask = rule(df)
+        row_mask = mask.loc[df["ts_code"] == "300001.SZ"]
+        assert row_mask.iloc[0]

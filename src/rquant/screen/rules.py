@@ -136,6 +136,76 @@ def has_lower_shadow(
     return _tag_lookback(_rule, offset)
 
 
+def no_consec_ups_in_window(threshold: int = 3, window: int = 8) -> Rule:
+    """近 window 日内无 threshold 连板（含）以上。
+
+    声明 AggregateRequest：近 window 日 consecutive_limit_ups 的 max。
+    规则：max_value < threshold。
+    """
+    agg_name = f"max_consec_ups_{window}d"
+    req = AggregateRequest(
+        name=agg_name,
+        source_table="daily_state",
+        source_col="consecutive_limit_ups",
+        agg_func="max",
+        window=window,
+    )
+
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return df[agg_name].fillna(0) < threshold
+
+    fn = _tag_lookback(_rule, 0)
+    fn = _tag_aggregates(fn, [req])
+    return fn
+
+
+def no_limit_down_in_window(window: int = 30) -> Rule:
+    """近 window 日无跌停。
+
+    声明 AggregateRequest：近 window 日 is_limit_down 的 any（BOOL_OR）。
+    规则：has_limit_down == False。
+    """
+    agg_name = f"has_limit_down_{window}d"
+    req = AggregateRequest(
+        name=agg_name,
+        source_table="daily_state",
+        source_col="is_limit_down",
+        agg_func="any",
+        window=window,
+    )
+
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return ~df[agg_name].fillna(False).astype(bool)
+
+    fn = _tag_lookback(_rule, 0)
+    fn = _tag_aggregates(fn, [req])
+    return fn
+
+
+def has_prior_limit_up(window: int = 90, exclude_offset: int = 1) -> Rule:
+    """近 window 日内（排除 T-exclude_offset 日）至少有 1 次涨停。
+
+    声明 AggregateRequest：近 window 日 is_limit_up 的 count_nonzero，排除 exclude_offset。
+    规则：count >= 1。
+    """
+    agg_name = f"count_limit_up_{window}d_ex{exclude_offset}"
+    req = AggregateRequest(
+        name=agg_name,
+        source_table="daily_state",
+        source_col="is_limit_up",
+        agg_func="count_nonzero",
+        window=window,
+        exclude_offset=exclude_offset,
+    )
+
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        return df[agg_name].fillna(0) >= 1
+
+    fn = _tag_lookback(_rule, 0)
+    fn = _tag_aggregates(fn, [req])
+    return fn
+
+
 def limit_down(offset: int = 0) -> Rule:
     """某日跌停。"""
     return _bool_state_rule("IS_LIMIT_DOWN", offset)

@@ -34,6 +34,10 @@ from rquant.screen.rules import (
     # 成交量
     volume_ratio_gte,
     yiziban,
+    # 窗口扫描
+    has_prior_limit_up,
+    no_consec_ups_in_window,
+    no_limit_down_in_window,
 )
 
 __all__ = [
@@ -46,4 +50,5 @@ __all__ = [
     "volume_ratio_gte",
     "circ_mv_lt",
     "has_lower_shadow",
+    "no_consec_ups_in_window", "no_limit_down_in_window", "has_prior_limit_up",
 ]
