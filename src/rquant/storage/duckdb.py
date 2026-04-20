@@ -209,6 +209,39 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert daily_basic: {count} 行")
         return count
 
+    def upsert_screen_result(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        self._conn.register("screen_result_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO screen_result
+            (trade_date, preset_name, ts_code, name, close, pct_chg, extra)
+            SELECT trade_date, preset_name, ts_code, name, close, pct_chg, extra
+            FROM screen_result_tmp
+            """
+        )
+        self._conn.unregister("screen_result_tmp")
+
+        count = len(df)
+        logger.info(f"DuckDB upsert screen_result: {count} 行")
+        return count
+
+    def query_screen_result(
+        self, trade_date: str, preset_name: str
+    ) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, name, close, pct_chg, extra
+            FROM screen_result
+            WHERE strftime(trade_date, '%Y-%m-%d') = ?
+              AND preset_name = ?
+            ORDER BY ts_code
+            """,
+            [trade_date, preset_name],
+        ).fetchdf()
+
     def count_daily_basic(self, ts_code: str | None = None) -> int:
         if ts_code:
             result = self._conn.execute(

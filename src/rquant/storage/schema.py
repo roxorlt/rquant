@@ -92,7 +92,22 @@ CREATE TABLE IF NOT EXISTS daily_basic (
 );
 """
 
+SCREEN_RESULT_DDL = """
+CREATE TABLE IF NOT EXISTS screen_result (
+    trade_date    DATE    NOT NULL,
+    preset_name   VARCHAR NOT NULL,
+    ts_code       VARCHAR NOT NULL,
+    name          VARCHAR,
+    close         DOUBLE,
+    pct_chg       DOUBLE,
+    extra         JSON,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trade_date, preset_name, ts_code)
+);
+"""
+
 ALL_DDL = [
     DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
+    SCREEN_RESULT_DDL,
 ]

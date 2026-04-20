@@ -265,3 +265,53 @@ class TestDailyBasic:
         tables = tmp_store.query("SHOW TABLES")
         names = set(tables["name"].tolist())
         assert "daily_basic" in names
+
+
+class TestScreenResult:
+    def test_upsert_and_query(self, tmp_store: DuckDBStore) -> None:
+        df = pd.DataFrame({
+            "trade_date": ["2026-04-18", "2026-04-18"],
+            "preset_name": ["n-shape-pool1", "n-shape-pool1"],
+            "ts_code": ["000001.SZ", "300001.SZ"],
+            "name": ["平安银行", "某科技"],
+            "close": [10.5, 25.0],
+            "pct_chg": [5.0, 3.2],
+            "extra": ['{"CIRC_MV[0]": 50000}', None],
+        })
+        n = tmp_store.upsert_screen_result(df)
+        assert n == 2
+
+        result = tmp_store.query_screen_result("2026-04-18", "n-shape-pool1")
+        assert len(result) == 2
+        assert list(result["ts_code"]) == ["000001.SZ", "300001.SZ"]
+
+    def test_upsert_idempotent(self, tmp_store: DuckDBStore) -> None:
+        df = pd.DataFrame({
+            "trade_date": ["2026-04-18"],
+            "preset_name": ["pool1"],
+            "ts_code": ["000001.SZ"],
+            "name": ["平安银行"],
+            "close": [10.0],
+            "pct_chg": [5.0],
+            "extra": [None],
+        })
+        tmp_store.upsert_screen_result(df)
+        df2 = df.copy()
+        df2["close"] = [11.0]
+        tmp_store.upsert_screen_result(df2)
+
+        result = tmp_store.query_screen_result("2026-04-18", "pool1")
+        assert len(result) == 1
+        assert result.iloc[0]["close"] == 11.0
+
+    def test_upsert_empty(self, tmp_store: DuckDBStore) -> None:
+        n = tmp_store.upsert_screen_result(pd.DataFrame())
+        assert n == 0
+
+    def test_query_not_found(self, tmp_store: DuckDBStore) -> None:
+        result = tmp_store.query_screen_result("2099-01-01", "nonexistent")
+        assert result.empty
+
+    def test_table_exists(self, tmp_store: DuckDBStore) -> None:
+        tables = tmp_store.query("SHOW TABLES")
+        assert "screen_result" in tables["name"].values
