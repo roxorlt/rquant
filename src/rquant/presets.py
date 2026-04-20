@@ -45,10 +45,10 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
             not_yiziban(offset=1),
             gt("HIGH[0]", "CLOSE[1]"),
             circ_mv_lt(150),
-            has_lower_shadow(1.5, 0.02, 0),
+            has_lower_shadow(0.5, 0.02, 0),
             no_consec_ups_in_window(3, 8),
             no_limit_down_in_window(30),
-            has_prior_limit_up(90, 1),
+            has_prior_limit_up(120, 1),
         ],
         include_columns=[
             "CIRC_MV[0]",
@@ -61,11 +61,11 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
         name="n-shape-pool2",
         description="N形态-Pool2：Pool1子集T+1实体收缩+下影线",
         depends_on="n-shape-pool1",
-        offset_days=1,
+        offset_days=2,
         rules=[
             lt("BODY_UPPER[0]", "BODY_UPPER[1]"),
             lt("BODY_LOWER[0]", "BODY_LOWER[1]"),
-            has_lower_shadow(1.5, 0.02, 0),
+            has_lower_shadow(0.5, 0.02, 0),
         ],
         include_columns=[
             "BODY_UPPER[0]",

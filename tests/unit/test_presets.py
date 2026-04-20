@@ -21,7 +21,7 @@ class TestScreenPreset:
     def test_pool2_depends_on_pool1(self) -> None:
         p = PRESET_SCREENS["n-shape-pool2"]
         assert p.depends_on == "n-shape-pool1"
-        assert p.offset_days == 1
+        assert p.offset_days == 2
 
     def test_pool2_has_3_rules(self) -> None:
         p = PRESET_SCREENS["n-shape-pool2"]
