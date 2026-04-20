@@ -4,11 +4,12 @@
 
 ## [Unreleased]
 
-### Added
--
-
 ### Changed
--
+- Pool 1 下影线阈值从 1.5 放宽至 0.5（下影/实体比），命中从 5 只提升至 12 只
+- Pool 1 前涨停窗口从 90 交易日放宽至 120 交易日
+- Pool 2 `offset_days` 从 1 改为 2，合并 T-1 + T-2 两天的父预设白名单
+- Pool 2 下影线阈值同步从 1.5 放宽至 0.5
+- `run_daily_pipeline()` 依赖链改为范围回溯：`offset_days=N` 表示合并 T-1 到 T-N 的父预设结果
 
 ---
 

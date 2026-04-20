@@ -116,32 +116,36 @@ def run_daily_pipeline(
             ts_whitelist: list[str] | None = None
 
             if preset.depends_on:
-                parent_date = _get_prev_trading_date(
-                    store, trade_date, preset.offset_days
-                )
-                if parent_date is None:
-                    logger.warning(
-                        f"{name}: 找不到 {preset.offset_days} "
-                        f"个交易日前的日期，跳过"
+                # offset_days=N 表示合并 T-1 到 T-N 的父预设结果
+                ts_whitelist = []
+                parent_dates = []
+                for offset in range(1, preset.offset_days + 1):
+                    parent_date = _get_prev_trading_date(
+                        store, trade_date, offset
+                    )
+                    if parent_date is None:
+                        continue
+                    parent_df = store.query_screen_result(
+                        parent_date, preset.depends_on
+                    )
+                    if not parent_df.empty:
+                        ts_whitelist.extend(parent_df["ts_code"].tolist())
+                        parent_dates.append(parent_date)
+
+                ts_whitelist = list(set(ts_whitelist))  # 去重
+
+                if not ts_whitelist:
+                    logger.info(
+                        f"{name}: 父预设 {preset.depends_on} "
+                        f"在 T-1~T-{preset.offset_days} 无命中，跳过"
                     )
                     summary[name] = 0
                     continue
 
-                parent_df = store.query_screen_result(
-                    parent_date, preset.depends_on
+                logger.info(
+                    f"{name}: 从 {parent_dates} 合并 "
+                    f"{len(ts_whitelist)} 只白名单"
                 )
-                ts_whitelist = (
-                    parent_df["ts_code"].tolist()
-                    if not parent_df.empty
-                    else []
-                )
-                if not ts_whitelist:
-                    logger.info(
-                        f"{name}: 父预设 {preset.depends_on} "
-                        f"在 {parent_date} 无命中，跳过"
-                    )
-                    summary[name] = 0
-                    continue
 
             result_df = screen(
                 trade_date=trade_date,
