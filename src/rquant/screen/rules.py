@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 

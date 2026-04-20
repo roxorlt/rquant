@@ -6,7 +6,12 @@ import pandas as pd
 import pytest
 
 from rquant.screen.loader import load_universe
-from rquant.screen.rules import AggregateRequest, has_prior_limit_up, no_consec_ups_in_window, no_limit_down_in_window
+from rquant.screen.rules import (
+    AggregateRequest,
+    has_prior_limit_up,
+    no_consec_ups_in_window,
+    no_limit_down_in_window,
+)
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -271,7 +276,7 @@ class TestLoadUniverseAggregates:
             "2026-04-15", lookback=1, store=store, aggregate_requests=[req]
         )
         row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
-        assert row["has_limit_down_8d"] is True or row["has_limit_down_8d"] == True
+        assert row["has_limit_down_8d"]
 
     def test_count_nonzero_aggregate(self, store: DuckDBStore) -> None:
         """300001.SZ has is_limit_up=True on 4/7, 4/8, 4/15. Count in 8-day window should be >=2."""

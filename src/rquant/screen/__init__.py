@@ -7,37 +7,29 @@ from rquant.screen.rules import (
     above_ma,
     between,
     board_in,
-    # 市值
     circ_mv_lt,
-    # 蜡烛形态
-    has_lower_shadow,
     consecutive_ups_gte,
-    # 指标
     cross_above,
     cross_below,
     first_limit_up,
-    # 比较
     gt,
     gte,
+    has_lower_shadow,
+    has_prior_limit_up,
     limit_down,
-    # 涨跌停 / 连板
     limit_up,
     lt,
     lte,
-    not_bj,
-    not_limit_up,
-    not_yiziban,
-    # 属性类
-    not_st,
-    rsi_overbought,
-    rsi_oversold,
-    # 成交量
-    volume_ratio_gte,
-    yiziban,
-    # 窗口扫描
-    has_prior_limit_up,
     no_consec_ups_in_window,
     no_limit_down_in_window,
+    not_bj,
+    not_limit_up,
+    not_st,
+    not_yiziban,
+    rsi_overbought,
+    rsi_oversold,
+    volume_ratio_gte,
+    yiziban,
 )
 
 __all__ = [

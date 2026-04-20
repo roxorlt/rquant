@@ -48,6 +48,24 @@ def main() -> int:
 
     df_factor = adapter.adj_factor(ts_codes=ts_codes, start=args.start, end=args.end)
 
+    # daily_basic: 按日逐天拉取（API 只支持单日查询）
+    logger.info("开始拉取 daily_basic（按日查询）")
+    from datetime import timedelta
+
+    all_basic_dfs: list = []
+    current = args.start
+    while current <= args.end:
+        try:
+            df_day_basic = adapter.daily_basic(ts_codes=ts_codes, trade_date=current)
+            if not df_day_basic.empty:
+                all_basic_dfs.append(df_day_basic)
+        except Exception as e:
+            logger.warning(f"daily_basic {current} 拉取失败，跳过：{e}")
+        current += timedelta(days=1)
+
+    import pandas as pd
+    df_all_basic = pd.concat(all_basic_dfs, ignore_index=True) if all_basic_dfs else pd.DataFrame()
+
     # stock_basic 全量拉一次（~5000 行），用于 ST 判断和名字缓存
     df_basic = adapter.stock_basic()
     basic_map = {row["ts_code"]: row["name"] for _, row in df_basic.iterrows()}
@@ -56,8 +74,10 @@ def main() -> int:
         n_daily = store.upsert_daily(df_daily)
         n_factor = store.upsert_adj_factor(df_factor)
         n_basic = store.upsert_stock_basic(df_basic)
+        n_daily_basic = store.upsert_daily_basic(df_all_basic) if not df_all_basic.empty else 0
         logger.info(
-            f"入库完成：daily {n_daily} / adj_factor {n_factor} / stock_basic {n_basic}"
+            f"入库完成：daily {n_daily} / adj_factor {n_factor} "
+            f"/ daily_basic {n_daily_basic} / stock_basic {n_basic}"
         )
 
         # 基于前复权价全量重算指标（小数据量下简单可靠）
@@ -87,10 +107,12 @@ def main() -> int:
         for code in ts_codes:
             d = store.count_daily(code)
             f = store.count_adj_factor(code)
+            b = store.count_daily_basic(code)
             i = store.count_indicators(code)
             s = store.count_state(code)
             logger.info(
-                f"  {code}: daily {d} / adj_factor {f} / indicator {i} / state {s}"
+                f"  {code}: daily {d} / adj_factor {f} / daily_basic {b} "
+                f"/ indicator {i} / state {s}"
             )
 
     return 0

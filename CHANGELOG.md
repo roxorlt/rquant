@@ -10,17 +10,29 @@
 ### Changed
 -
 
-### Deprecated
--
+---
 
-### Removed
--
+## [v0.3.1] — 2026-04-20 — Week 4a: daily_basic + N 形态积木
 
-### Fixed
--
+为 N 形态策略补全数据层和规则积木。新增 `daily_basic` 表接入流通市值/换手率/量比，宽表暴露 `BODY_UPPER[n]`/`BODY_LOWER[n]`/`CIRC_MV[n]`，6 个新积木 + AggregateRequest 长窗口聚合机制。
 
-### Security
--
+### Added
+- `daily_basic` 表（turnover_rate / volume_ratio / total_mv / circ_mv）
+  - `DuckDBStore.upsert_daily_basic()` / `count_daily_basic()`
+  - `TushareAdapter.daily_basic(ts_codes, trade_date)` — 单日查询
+  - `ingest_daily.py` 追加按日逐天拉取 daily_basic
+- 宽表扩展：
+  - `STATE_COLS_MAP` 新增 body_upper / body_lower → `BODY_UPPER[n]` / `BODY_LOWER[n]`
+  - 新增 `BASIC_COLS_MAP`（circ_mv / total_mv / turnover_rate）→ `CIRC_MV[n]` / `TOTAL_MV[n]` / `TURNOVER_RATE[n]`
+- AggregateRequest 机制：规则声明长窗口聚合需求（max / any / sum / count_nonzero），load_universe 动态生成 DuckDB SQL，支持 exclude_offset
+- 6 个新积木：
+  - `not_yiziban(offset)` — 某日非一字板
+  - `circ_mv_lt(threshold_yi, offset)` — 流通市值 < N 亿
+  - `has_lower_shadow(min_ratio, min_amplitude, offset)` — 下影线达标
+  - `no_consec_ups_in_window(threshold, window)` — 近 N 日无 M 连板
+  - `no_limit_down_in_window(window)` — 近 N 日无跌停
+  - `has_prior_limit_up(window, exclude_offset)` — 近 N 日（排除某日）有涨停
+- 测试：新增 ~50 个单测（storage 4 + loader 11 + rules 30+ + core 4），累计 162 个
 
 ---
 

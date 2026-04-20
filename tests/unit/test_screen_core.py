@@ -3,7 +3,14 @@
 from unittest.mock import patch
 
 from rquant.screen import screen
-from rquant.screen.rules import AggregateRequest, Rule, gt, not_bj, not_st, _tag_lookback, _tag_aggregates
+from rquant.screen.rules import (
+    AggregateRequest,
+    _tag_aggregates,
+    _tag_lookback,
+    gt,
+    not_bj,
+    not_st,
+)
 from tests.fixtures.wide_frames import make_wide_frame
 
 
