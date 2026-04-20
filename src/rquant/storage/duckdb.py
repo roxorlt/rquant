@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -240,6 +241,117 @@ class DuckDBStore:
             ORDER BY ts_code
             """,
             [trade_date, preset_name],
+        ).fetchdf()
+
+    # ── pool2_watch ──
+
+    def upsert_pool2_watch(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        self._conn.register("p2w_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO pool2_watch
+            (ts_code, entry_date, limit_up_date,
+             body_upper, body_lower,
+             level_40, level_30, level_20,
+             stop_strong, stop_weak, status)
+            SELECT ts_code, entry_date, limit_up_date,
+                   body_upper, body_lower,
+                   level_40, level_30, level_20,
+                   stop_strong, stop_weak, status
+            FROM p2w_tmp
+            """
+        )
+        self._conn.unregister("p2w_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert pool2_watch: {count} 行")
+        return count
+
+    def query_pool2_active(self) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, entry_date, limit_up_date,
+                   body_upper, body_lower,
+                   level_40, level_30, level_20,
+                   stop_strong, stop_weak, status
+            FROM pool2_watch
+            WHERE status = 'active'
+            ORDER BY entry_date DESC
+            """
+        ).fetchdf()
+
+    def update_pool2_exit(
+        self, ts_code: str, exit_date: date, exit_reason: str
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE pool2_watch
+            SET status = 'exited', exit_date = ?, exit_reason = ?
+            WHERE ts_code = ?
+            """,
+            [exit_date, exit_reason, ts_code],
+        )
+
+    def remove_pool2(self, ts_code: str) -> None:
+        self._conn.execute(
+            "DELETE FROM pool2_watch WHERE ts_code = ?", [ts_code]
+        )
+
+    def query_pool2_all(self) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, entry_date, limit_up_date,
+                   body_upper, body_lower,
+                   level_40, level_30, level_20,
+                   stop_strong, stop_weak,
+                   status, exit_date, exit_reason
+            FROM pool2_watch
+            ORDER BY status, entry_date DESC
+            """
+        ).fetchdf()
+
+    # ── monitor_event ──
+
+    def upsert_monitor_event(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        self._conn.register("mev_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO monitor_event
+            (trade_date, ts_code, level, trigger_price, level_price,
+             trigger_time, trigger_type, pool, body_upper, body_lower)
+            SELECT trade_date, ts_code, level, trigger_price, level_price,
+                   trigger_time, trigger_type, pool, body_upper, body_lower
+            FROM mev_tmp
+            """
+        )
+        self._conn.unregister("mev_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert monitor_event: {count} 行")
+        return count
+
+    def query_monitor_events(
+        self, trade_date: str, ts_code: str | None = None
+    ) -> pd.DataFrame:
+        if ts_code:
+            return self._conn.execute(
+                """
+                SELECT * FROM monitor_event
+                WHERE strftime(trade_date, '%Y-%m-%d') = ?
+                  AND ts_code = ?
+                ORDER BY trigger_time
+                """,
+                [trade_date, ts_code],
+            ).fetchdf()
+        return self._conn.execute(
+            """
+            SELECT * FROM monitor_event
+            WHERE strftime(trade_date, '%Y-%m-%d') = ?
+            ORDER BY trigger_time
+            """,
+            [trade_date],
         ).fetchdf()
 
     def count_daily_basic(self, ts_code: str | None = None) -> int:

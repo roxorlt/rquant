@@ -106,8 +106,43 @@ CREATE TABLE IF NOT EXISTS screen_result (
 );
 """
 
+POOL2_WATCH_DDL = """
+CREATE TABLE IF NOT EXISTS pool2_watch (
+    ts_code       VARCHAR   PRIMARY KEY,
+    entry_date    DATE      NOT NULL,
+    limit_up_date DATE      NOT NULL,
+    body_upper    DOUBLE    NOT NULL,
+    body_lower    DOUBLE    NOT NULL,
+    level_40      DOUBLE    NOT NULL,
+    level_30      DOUBLE    NOT NULL,
+    level_20      DOUBLE    NOT NULL,
+    stop_strong   DOUBLE    NOT NULL,
+    stop_weak     DOUBLE    NOT NULL,
+    status        VARCHAR   DEFAULT 'active',
+    exit_date     DATE,
+    exit_reason   VARCHAR,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+MONITOR_EVENT_DDL = """
+CREATE TABLE IF NOT EXISTS monitor_event (
+    trade_date    DATE      NOT NULL,
+    ts_code       VARCHAR   NOT NULL,
+    level         VARCHAR   NOT NULL,
+    trigger_price DOUBLE,
+    level_price   DOUBLE,
+    trigger_time  TIMESTAMP NOT NULL,
+    trigger_type  VARCHAR,
+    pool          VARCHAR,
+    body_upper    DOUBLE,
+    body_lower    DOUBLE,
+    PRIMARY KEY (trade_date, ts_code, level)
+);
+"""
+
 ALL_DDL = [
     DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
-    SCREEN_RESULT_DDL,
+    SCREEN_RESULT_DDL, POOL2_WATCH_DDL, MONITOR_EVENT_DDL,
 ]
