@@ -127,6 +127,51 @@ class TushareAdapter:
         logger.info(f"Tushare adj_factor 返回 {len(df)} 行")
         return df
 
+    def daily_basic(
+        self,
+        ts_codes: list[str],
+        trade_date: date,
+    ) -> pd.DataFrame:
+        """拉取每日基本面指标（换手率、量比、市值等）。
+
+        注意：Tushare daily_basic 接口只支持按单日查询（trade_date），
+        不支持 start_date/end_date 范围。
+        """
+        codes_str = ",".join(ts_codes)
+        trade_date_str = trade_date.strftime("%Y%m%d")
+
+        logger.info(
+            f"Tushare daily_basic 请求：codes={codes_str} trade_date={trade_date_str}"
+        )
+
+        try:
+            df = self._pro.daily_basic(
+                ts_code=codes_str,
+                trade_date=trade_date_str,
+                fields="ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv",
+            )
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.daily_basic(
+                    ts_code=codes_str,
+                    trade_date=trade_date_str,
+                    fields="ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv",
+                )
+            else:
+                raise RuntimeError(f"Tushare daily_basic 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(
+                f"Tushare daily_basic 返回空：codes={codes_str} date={trade_date_str}"
+            )
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+        logger.info(f"Tushare daily_basic 返回 {len(df)} 行")
+        return df
+
     def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
         """股票基础信息（代码 / 名称 / 行业 / 上市日期等）。
 

@@ -223,3 +223,45 @@ class TestDailyState:
         df = tmp_store.get_state("600519.SH", start="2024-01-03")
         assert len(df) == 1
         assert df.iloc[0]["trade_date"] == "2024-01-03"
+
+
+class TestDailyBasic:
+    def _basic_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": date(2026, 4, 15),
+                    "turnover_rate": 0.35,
+                    "volume_ratio": 1.2,
+                    "total_mv": 20000000.0,
+                    "circ_mv": 18000000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2026, 4, 15),
+                    "turnover_rate": 0.80,
+                    "volume_ratio": 0.9,
+                    "total_mv": 3000000.0,
+                    "circ_mv": 2800000.0,
+                },
+            ]
+        )
+
+    def test_upsert_daily_basic_inserts_rows(self, tmp_store: DuckDBStore) -> None:
+        count = tmp_store.upsert_daily_basic(self._basic_df())
+        assert count == 2
+        assert tmp_store.count_daily_basic("600519.SH") == 1
+
+    def test_upsert_daily_basic_idempotent(self, tmp_store: DuckDBStore) -> None:
+        tmp_store.upsert_daily_basic(self._basic_df())
+        tmp_store.upsert_daily_basic(self._basic_df())
+        assert tmp_store.count_daily_basic() == 2
+
+    def test_empty_daily_basic_returns_zero(self, tmp_store: DuckDBStore) -> None:
+        assert tmp_store.upsert_daily_basic(pd.DataFrame()) == 0
+
+    def test_daily_basic_table_exists_on_init(self, tmp_store: DuckDBStore) -> None:
+        tables = tmp_store.query("SHOW TABLES")
+        names = set(tables["name"].tolist())
+        assert "daily_basic" in names

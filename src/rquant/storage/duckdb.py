@@ -189,6 +189,35 @@ class DuckDBStore:
             result = self._conn.execute("SELECT COUNT(*) FROM daily_state").fetchone()
         return result[0] if result else 0
 
+    def upsert_daily_basic(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        self._conn.register("basic_mkt_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO daily_basic
+            SELECT ts_code, trade_date,
+                   turnover_rate, volume_ratio,
+                   total_mv, circ_mv
+            FROM basic_mkt_tmp
+            """
+        )
+        self._conn.unregister("basic_mkt_tmp")
+
+        count = len(df)
+        logger.info(f"DuckDB upsert daily_basic: {count} 行")
+        return count
+
+    def count_daily_basic(self, ts_code: str | None = None) -> int:
+        if ts_code:
+            result = self._conn.execute(
+                "SELECT COUNT(*) FROM daily_basic WHERE ts_code = ?", [ts_code]
+            ).fetchone()
+        else:
+            result = self._conn.execute("SELECT COUNT(*) FROM daily_basic").fetchone()
+        return result[0] if result else 0
+
     def get_state(
         self,
         ts_code: str,

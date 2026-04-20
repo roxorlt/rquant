@@ -80,4 +80,16 @@ CREATE TABLE IF NOT EXISTS daily_state (
 );
 """
 
-ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL, DAILY_INDICATOR_DDL, DAILY_STATE_DDL]
+DAILY_BASIC_DDL = """
+CREATE TABLE IF NOT EXISTS daily_basic (
+    ts_code        VARCHAR NOT NULL,
+    trade_date     DATE    NOT NULL,
+    turnover_rate  DOUBLE,
+    volume_ratio   DOUBLE,
+    total_mv       DOUBLE,
+    circ_mv        DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+ALL_DDL = [DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL, DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL]
