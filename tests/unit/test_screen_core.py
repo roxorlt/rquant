@@ -145,3 +145,47 @@ class TestAggregateCollection:
             assert "aggregate_requests" in call_kwargs
             assert len(call_kwargs["aggregate_requests"]) == 1
             assert call_kwargs["aggregate_requests"][0].name == "max_consec_ups_8d"
+
+
+class TestWhitelist:
+    def test_whitelist_filters_to_subset(self) -> None:
+        df = make_wide_frame()
+        with patch("rquant.screen.core.load_universe", return_value=df):
+            result = screen(
+                trade_date="2026-04-15",
+                rules=[not_st()],
+                ts_code_whitelist=["300001.SZ"],
+            )
+        assert list(result["ts_code"]) == ["300001.SZ"]
+
+    def test_whitelist_none_returns_all(self) -> None:
+        df = make_wide_frame()
+        with patch("rquant.screen.core.load_universe", return_value=df):
+            result = screen(
+                trade_date="2026-04-15",
+                rules=[not_st()],
+                ts_code_whitelist=None,
+            )
+        # Default fixture: 000001.SZ has is_st=False by default, plus 300001.SZ and 688001.SH
+        assert len(result) >= 2
+
+    def test_whitelist_empty_returns_empty(self) -> None:
+        df = make_wide_frame()
+        with patch("rquant.screen.core.load_universe", return_value=df):
+            result = screen(
+                trade_date="2026-04-15",
+                rules=[not_st()],
+                ts_code_whitelist=[],
+            )
+        assert len(result) == 0
+        assert "ts_code" in result.columns
+
+    def test_whitelist_with_nonexistent_code(self) -> None:
+        df = make_wide_frame()
+        with patch("rquant.screen.core.load_universe", return_value=df):
+            result = screen(
+                trade_date="2026-04-15",
+                rules=[not_st()],
+                ts_code_whitelist=["999999.SZ"],
+            )
+        assert len(result) == 0

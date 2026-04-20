@@ -33,6 +33,7 @@ def screen(
     lookback: int | None = None,
     include_columns: list[str] | None = None,
     store: DuckDBStore | None = None,
+    ts_code_whitelist: list[str] | None = None,
 ) -> pd.DataFrame:
     """筛选：给定 trade_date 和 rules，返回命中股票。
 
@@ -48,6 +49,9 @@ def screen(
     df = load_universe(
         trade_date, lookback=lookback, store=store, aggregate_requests=aggregates
     )
+
+    if ts_code_whitelist is not None:
+        df = df[df["ts_code"].isin(ts_code_whitelist)]
 
     if df.empty:
         cols = list(BASE_COLUMNS)
