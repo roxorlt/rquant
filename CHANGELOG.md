@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Added
+- `rquant ingest --date` 命令：按 trade_date 模式拉全市场 stock_basic + daily_bar + daily_basic + derive_state，约 30 秒完成
+- `rquant run-daily` 现在自动先 ingest 再 pipeline（`--no-ingest` 跳过）
+- `rquant serve` 的 cron 改为 ingest → pipeline 串联，数据未就绪时自动重试 3 次（间隔 15 分钟）
+- `deploy/com.roxor.rquant.plist`：macOS launchd 开机自启配置
+
 ### Changed
 - Pool 1 下影线阈值从 1.5 放宽至 0.5（下影/实体比），命中从 5 只提升至 12 只
 - Pool 1 前涨停窗口从 90 交易日放宽至 120 交易日
