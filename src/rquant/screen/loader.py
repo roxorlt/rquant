@@ -31,6 +31,14 @@ STATE_COLS_MAP = {
     "is_first_limit_up": "IS_FIRST_LIMIT_UP",
     "is_yiziban": "IS_YIZIBAN",
     "consecutive_limit_ups": "CONSECUTIVE_LIMIT_UPS",
+    "body_upper": "BODY_UPPER",
+    "body_lower": "BODY_LOWER",
+}
+
+BASIC_COLS_MAP = {
+    "circ_mv": "CIRC_MV",
+    "total_mv": "TOTAL_MV",
+    "turnover_rate": "TURNOVER_RATE",
 }
 
 
@@ -143,6 +151,18 @@ def load_universe(
         state_long = store._conn.execute(state_sql, in_universe + dates).fetchdf()
         state_wide = _wide_from_long(state_long, STATE_COLS_MAP, date_to_offset)
 
+        # daily_basic: circ_mv / total_mv / turnover_rate
+        basic_mkt_sql = f"""
+        SELECT ts_code,
+               strftime(trade_date, '%Y-%m-%d') AS trade_date_str,
+               {", ".join(BASIC_COLS_MAP.keys())}
+        FROM daily_basic
+        WHERE ts_code IN ({placeholders})
+          AND trade_date IN ({",".join(["?"] * len(dates))})
+        """
+        basic_mkt_long = store._conn.execute(basic_mkt_sql, in_universe + dates).fetchdf()
+        basic_mkt_wide = _wide_from_long(basic_mkt_long, BASIC_COLS_MAP, date_to_offset)
+
         # 不分日属性：取 T 日的 is_st / is_bj / board_type
         state_t0 = state_long[state_long["trade_date_str"] == t0_date][
             ["ts_code", "is_st", "is_bj", "board_type"]
@@ -157,7 +177,7 @@ def load_universe(
         # 合并所有
         out = universe.merge(basic, on="ts_code", how="left")
         out = out.merge(state_t0, on="ts_code", how="left")
-        for wide in (bar_wide, ind_wide, state_wide):
+        for wide in (bar_wide, ind_wide, state_wide, basic_mkt_wide):
             if not wide.empty:
                 out = out.merge(wide, on="ts_code", how="left")
 

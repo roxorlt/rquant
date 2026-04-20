@@ -80,6 +80,19 @@ def store(tmp_path) -> DuckDBStore:
          "body_upper": 21.5, "body_lower": 21.0},
     ])
     s.upsert_state(state)
+
+    daily_basic_data = pd.DataFrame([
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 14),
+         "turnover_rate": 1.5, "volume_ratio": 1.1,
+         "total_mv": 5000000.0, "circ_mv": 4000000.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 15),
+         "turnover_rate": 2.0, "volume_ratio": 1.3,
+         "total_mv": 6000000.0, "circ_mv": 5000000.0},
+        {"ts_code": "000001.SZ", "trade_date": date(2026, 4, 15),
+         "turnover_rate": 0.8, "volume_ratio": 0.9,
+         "total_mv": 30000000.0, "circ_mv": 28000000.0},
+    ])
+    s.upsert_daily_basic(daily_basic_data)
     yield s
     s.close()
 
@@ -131,3 +144,41 @@ class TestLoadUniverse:
         store.upsert_daily(extra)
         df = load_universe("2026-04-15", lookback=2, store=store)
         assert "900001.SH" not in set(df["ts_code"])
+
+
+class TestLoadUniverseBodyAndBasic:
+    def test_body_upper_lower_in_wide_table(self, store: DuckDBStore) -> None:
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        assert "BODY_UPPER[0]" in df.columns
+        assert "BODY_LOWER[0]" in df.columns
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["BODY_UPPER[0]"] == pytest.approx(12.5)
+        assert row["BODY_LOWER[0]"] == pytest.approx(11.0)
+
+    def test_body_upper_lower_at_offset_1(self, store: DuckDBStore) -> None:
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["BODY_UPPER[1]"] == pytest.approx(11.0)
+        assert row["BODY_LOWER[1]"] == pytest.approx(10.5)
+
+    def test_circ_mv_in_wide_table(self, store: DuckDBStore) -> None:
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        assert "CIRC_MV[0]" in df.columns
+        assert "TOTAL_MV[0]" in df.columns
+        assert "TURNOVER_RATE[0]" in df.columns
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["CIRC_MV[0]"] == pytest.approx(5000000.0)
+        assert row["TOTAL_MV[0]"] == pytest.approx(6000000.0)
+        assert row["TURNOVER_RATE[0]"] == pytest.approx(2.0)
+
+    def test_circ_mv_at_offset_1(self, store: DuckDBStore) -> None:
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["CIRC_MV[1]"] == pytest.approx(4000000.0)
+
+    def test_missing_daily_basic_gives_nan(self, store: DuckDBStore) -> None:
+        """stock 000001.SZ has daily_basic only for 4/15, not 4/14 — offset 1 should be NaN."""
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        row = df.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert row["CIRC_MV[0]"] == pytest.approx(28000000.0)
+        assert pd.isna(row["CIRC_MV[1]"])
