@@ -22,6 +22,8 @@ def make_wide_frame(
     - `MA5[n]`, `MA20[n]`, `MA60[n]`, `RSI14[n]`, `MACD[n]`
     - `IS_LIMIT_UP[n]`, `IS_LIMIT_DOWN[n]`, `IS_FIRST_LIMIT_UP[n]`, `IS_YIZIBAN[n]`,
       `CONSECUTIVE_LIMIT_UPS[n]`
+    - `BODY_UPPER[n]`, `BODY_LOWER[n]`
+    - `CIRC_MV[n]`, `TOTAL_MV[n]`, `TURNOVER_RATE[n]`
     - `is_st`, `is_bj`, `board_type`, `ts_code`, `name`
     """
     codes = codes or DEFAULT_CODES
@@ -36,6 +38,8 @@ def make_wide_frame(
         "IS_LIMIT_UP", "IS_LIMIT_DOWN", "IS_FIRST_LIMIT_UP", "IS_YIZIBAN",
     ]
     int_state_cols = ["CONSECUTIVE_LIMIT_UPS"]
+    float_state_cols = ["BODY_UPPER", "BODY_LOWER"]
+    basic_mkt_cols = ["CIRC_MV", "TOTAL_MV", "TURNOVER_RATE"]
 
     rows = []
     for code in codes:
@@ -60,6 +64,10 @@ def make_wide_frame(
                 row[f"{c}[{n}]"] = False
             for c in int_state_cols:
                 row[f"{c}[{n}]"] = 0
+            for c in float_state_cols:
+                row[f"{c}[{n}]"] = 0.0
+            for c in basic_mkt_cols:
+                row[f"{c}[{n}]"] = 0.0
         rows.append(row)
 
     df = pd.DataFrame(rows)

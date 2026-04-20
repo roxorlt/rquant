@@ -66,6 +66,11 @@ def yiziban(offset: int = 0) -> Rule:
     return _bool_state_rule("IS_YIZIBAN", offset)
 
 
+def not_yiziban(offset: int = 0) -> Rule:
+    """某日非一字板。"""
+    return _bool_state_rule("IS_YIZIBAN", offset, negate=True)
+
+
 def limit_down(offset: int = 0) -> Rule:
     """某日跌停。"""
     return _bool_state_rule("IS_LIMIT_DOWN", offset)

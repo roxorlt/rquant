@@ -19,6 +19,7 @@ from rquant.screen.rules import (
     not_bj,
     not_limit_up,
     not_st,
+    not_yiziban,
     rsi_overbought,
     rsi_oversold,
     volume_ratio_gte,
@@ -52,6 +53,14 @@ class TestFixture:
         assert board["300001.SZ"] == "gem"
         assert board["688001.SH"] == "star"
         assert board["833001.BJ"] == "bj"
+
+    def test_new_columns_in_fixture(self) -> None:
+        df = make_wide_frame(lookback=2)
+        assert "BODY_UPPER[0]" in df.columns
+        assert "BODY_LOWER[1]" in df.columns
+        assert "CIRC_MV[0]" in df.columns
+        assert "TOTAL_MV[2]" in df.columns
+        assert "TURNOVER_RATE[0]" in df.columns
 
 
 class TestAttributeRules:
@@ -139,6 +148,34 @@ class TestLimitRules:
         df = make_wide_frame(overrides={("000001.SZ", "IS_LIMIT_DOWN[0]"): True})
         mask = limit_down(offset=0)(df)
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_not_yiziban_passes_non_yiziban(self) -> None:
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "IS_YIZIBAN[0]"): False,
+                ("000001.SZ", "IS_YIZIBAN[0]"): True,
+            },
+        )
+        mask = not_yiziban(offset=0)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_not_yiziban_at_offset_1(self) -> None:
+        df = make_wide_frame(
+            lookback=2,
+            overrides={("300001.SZ", "IS_YIZIBAN[1]"): True},
+        )
+        mask = not_yiziban(offset=1)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+        assert not_yiziban(offset=1).min_lookback == 1
+
+    def test_not_yiziban_nan_treated_as_false(self) -> None:
+        """NaN in IS_YIZIBAN should be treated as False (not yiziban), so not_yiziban passes."""
+        df = make_wide_frame(lookback=1)
+        # Default IS_YIZIBAN[0] is False, so not_yiziban should pass
+        mask = not_yiziban(offset=0)(df)
+        assert mask.all()
 
 
 class TestCompareRules:
