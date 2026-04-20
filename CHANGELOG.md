@@ -12,6 +12,23 @@
 
 ---
 
+## [v0.4.0] — 2026-04-20 — Week 4b: 调度 + 流水线 + N 形态预设
+
+CLI 入口、APScheduler 调度、screen_result 落库、N 形态 Pool 1 + Pool 2 预设注册表、流水线依赖链编排。
+
+### Added
+- CLI：`rquant serve`（APScheduler cron，Mon-Fri 17:00）和 `rquant run-daily --date --preset` 子命令
+- `screen_result` 表：筛选命中结果落库（trade_date + preset_name + ts_code，extra JSON 列存附加字段）
+- `ScreenPreset` 数据类 + `PRESET_SCREENS` 注册表：Python 代码即策略声明，支持 depends_on 依赖链
+- N 形态预设：Pool 1（11 条规则，全市场）+ Pool 2（3 条规则，依赖 Pool 1 T-1 结果子集）
+- `run_daily_pipeline()`：按依赖拓扑排序遍历预设，子预设自动从父预设结果取 whitelist
+- `screen()` 新增 `ts_code_whitelist` 参数，支持在指定子集中筛选
+
+### Changed
+- `pyproject.toml`：新增 `apscheduler>=3.10` 依赖 + `[project.scripts]` 入口
+
+---
+
 ## [v0.3.1] — 2026-04-20 — Week 4a: daily_basic + N 形态积木
 
 为 N 形态策略补全数据层和规则积木。新增 `daily_basic` 表接入流通市值/换手率/量比，宽表暴露 `BODY_UPPER[n]`/`BODY_LOWER[n]`/`CIRC_MV[n]`，6 个新积木 + AggregateRequest 长窗口聚合机制。

@@ -76,10 +76,9 @@ def _resolve_execution_order(
     names: list[str] | None = None,
 ) -> list[str]:
     """按依赖拓扑排序：无 depends_on 的先跑。"""
-    if names:
-        selected = {n: presets[n] for n in names if n in presets}
-    else:
-        selected = presets
+    selected = (
+        {n: presets[n] for n in names if n in presets} if names else presets
+    )
 
     no_dep = [n for n, p in selected.items() if p.depends_on is None]
     has_dep = [n for n, p in selected.items() if p.depends_on is not None]
