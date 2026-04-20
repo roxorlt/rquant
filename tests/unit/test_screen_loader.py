@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from rquant.screen.loader import load_universe
+from rquant.screen.rules import AggregateRequest
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -93,6 +94,61 @@ def store(tmp_path) -> DuckDBStore:
          "total_mv": 30000000.0, "circ_mv": 28000000.0},
     ])
     s.upsert_daily_basic(daily_basic_data)
+
+    # Extra state data for aggregate testing (older dates need daily_bar too)
+    extra_daily = pd.DataFrame([
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 7), "open": 8.0,
+         "high": 9.0, "low": 7.5, "close": 8.5, "pre_close": 8.0,
+         "change": 0.5, "pct_chg": 6.25, "vol": 800.0, "amount": 6800.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 8), "open": 8.5,
+         "high": 9.5, "low": 8.0, "close": 9.0, "pre_close": 8.5,
+         "change": 0.5, "pct_chg": 5.88, "vol": 900.0, "amount": 8100.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 9), "open": 9.0,
+         "high": 10.0, "low": 9.0, "close": 9.5, "pre_close": 9.0,
+         "change": 0.5, "pct_chg": 5.56, "vol": 950.0, "amount": 9025.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 10), "open": 9.5,
+         "high": 10.5, "low": 9.0, "close": 10.0, "pre_close": 9.5,
+         "change": 0.5, "pct_chg": 5.26, "vol": 1100.0, "amount": 11000.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 11), "open": 10.0,
+         "high": 11.0, "low": 9.5, "close": 10.5, "pre_close": 10.0,
+         "change": 0.5, "pct_chg": 5.0, "vol": 1050.0, "amount": 11025.0},
+    ])
+    s.upsert_daily(extra_daily)
+
+    extra_state = pd.DataFrame([
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 7),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 9.60, "limit_down_price": 6.40,
+         "is_limit_up": True, "is_limit_down": False, "is_first_limit_up": True,
+         "is_yiziban": False, "consecutive_limit_ups": 1,
+         "body_upper": 8.5, "body_lower": 8.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 8),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 10.20, "limit_down_price": 6.80,
+         "is_limit_up": True, "is_limit_down": False, "is_first_limit_up": False,
+         "is_yiziban": False, "consecutive_limit_ups": 2,
+         "body_upper": 9.0, "body_lower": 8.5},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 9),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 10.80, "limit_down_price": 7.20,
+         "is_limit_up": False, "is_limit_down": False, "is_first_limit_up": False,
+         "is_yiziban": False, "consecutive_limit_ups": 0,
+         "body_upper": 9.5, "body_lower": 9.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 10),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 11.40, "limit_down_price": 7.60,
+         "is_limit_up": False, "is_limit_down": True, "is_first_limit_up": False,
+         "is_yiziban": False, "consecutive_limit_ups": 0,
+         "body_upper": 10.0, "body_lower": 9.5},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 11),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 12.00, "limit_down_price": 8.00,
+         "is_limit_up": False, "is_limit_down": False, "is_first_limit_up": False,
+         "is_yiziban": False, "consecutive_limit_ups": 0,
+         "body_upper": 10.5, "body_lower": 10.0},
+    ])
+    s.upsert_state(extra_state)
+
     yield s
     s.close()
 
@@ -182,3 +238,86 @@ class TestLoadUniverseBodyAndBasic:
         row = df.loc[df["ts_code"] == "000001.SZ"].iloc[0]
         assert row["CIRC_MV[0]"] == pytest.approx(28000000.0)
         assert pd.isna(row["CIRC_MV[1]"])
+
+
+class TestLoadUniverseAggregates:
+    def test_max_aggregate(self, store: DuckDBStore) -> None:
+        """300001.SZ has consecutive_limit_ups: [1,2,0,0,0,...,0,1] over window.
+        Max in 8-day window ending 4/15 should be 2."""
+        req = AggregateRequest(
+            name="max_consec_ups_8d",
+            source_table="daily_state",
+            source_col="consecutive_limit_ups",
+            agg_func="max",
+            window=8,
+        )
+        df = load_universe(
+            "2026-04-15", lookback=1, store=store, aggregate_requests=[req]
+        )
+        assert "max_consec_ups_8d" in df.columns
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["max_consec_ups_8d"] == 2
+
+    def test_any_aggregate(self, store: DuckDBStore) -> None:
+        """300001.SZ has is_limit_down=True on 4/10. any in 8-day window should be True."""
+        req = AggregateRequest(
+            name="has_limit_down_8d",
+            source_table="daily_state",
+            source_col="is_limit_down",
+            agg_func="any",
+            window=8,
+        )
+        df = load_universe(
+            "2026-04-15", lookback=1, store=store, aggregate_requests=[req]
+        )
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["has_limit_down_8d"] is True or row["has_limit_down_8d"] == True
+
+    def test_count_nonzero_aggregate(self, store: DuckDBStore) -> None:
+        """300001.SZ has is_limit_up=True on 4/7, 4/8, 4/15. Count in 8-day window should be >=2."""
+        req = AggregateRequest(
+            name="count_limit_up_8d",
+            source_table="daily_state",
+            source_col="is_limit_up",
+            agg_func="count_nonzero",
+            window=8,
+        )
+        df = load_universe(
+            "2026-04-15", lookback=1, store=store, aggregate_requests=[req]
+        )
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["count_limit_up_8d"] >= 2
+
+    def test_count_nonzero_with_exclude_offset(self, store: DuckDBStore) -> None:
+        """Exclude offset=0 (4/15, which has is_limit_up=True for 300001.SZ).
+        Count should decrease by 1."""
+        req_with = AggregateRequest(
+            name="count_limit_up_8d",
+            source_table="daily_state",
+            source_col="is_limit_up",
+            agg_func="count_nonzero",
+            window=8,
+        )
+        req_without = AggregateRequest(
+            name="count_limit_up_8d_ex0",
+            source_table="daily_state",
+            source_col="is_limit_up",
+            agg_func="count_nonzero",
+            window=8,
+            exclude_offset=0,
+        )
+        df = load_universe(
+            "2026-04-15", lookback=1, store=store,
+            aggregate_requests=[req_with, req_without],
+        )
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert row["count_limit_up_8d_ex0"] == row["count_limit_up_8d"] - 1
+
+    def test_empty_aggregates_no_extra_columns(self, store: DuckDBStore) -> None:
+        df = load_universe("2026-04-15", lookback=1, store=store, aggregate_requests=[])
+        assert "max_consec_ups_8d" not in df.columns
+
+    def test_no_aggregates_param_backward_compatible(self, store: DuckDBStore) -> None:
+        """Calling without aggregate_requests should work as before."""
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        assert "CLOSE[0]" in df.columns

@@ -3,6 +3,7 @@
 from rquant.screen.core import screen
 from rquant.screen.loader import load_universe
 from rquant.screen.rules import (
+    AggregateRequest,
     above_ma,
     between,
     board_in,
@@ -36,7 +37,7 @@ from rquant.screen.rules import (
 )
 
 __all__ = [
-    "screen", "load_universe",
+    "screen", "load_universe", "AggregateRequest",
     "not_st", "not_bj", "board_in",
     "limit_up", "not_limit_up", "first_limit_up", "yiziban", "not_yiziban", "limit_down",
     "consecutive_ups_gte",

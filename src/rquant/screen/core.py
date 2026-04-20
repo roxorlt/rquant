@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from rquant.screen.loader import load_universe
-from rquant.screen.rules import Rule
+from rquant.screen.rules import AggregateRequest, Rule
 from rquant.storage.duckdb import DuckDBStore
 
 BASE_COLUMNS = ["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]
@@ -13,6 +13,18 @@ BASE_COLUMNS = ["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]
 
 def _infer_lookback(rules: list[Rule]) -> int:
     return max((getattr(r, "min_lookback", 0) for r in rules), default=0)
+
+
+def _collect_aggregates(rules: list[Rule]) -> list[AggregateRequest]:
+    """从所有规则中收集去重后的 AggregateRequest 列表。"""
+    seen: set[str] = set()
+    result: list[AggregateRequest] = []
+    for rule in rules:
+        for req in getattr(rule, "aggregate_requests", []):
+            if req.name not in seen:
+                seen.add(req.name)
+                result.append(req)
+    return result
 
 
 def screen(
@@ -31,7 +43,11 @@ def screen(
     if lookback is None:
         lookback = _infer_lookback(rules)
 
-    df = load_universe(trade_date, lookback=lookback, store=store)
+    aggregates = _collect_aggregates(rules)
+
+    df = load_universe(
+        trade_date, lookback=lookback, store=store, aggregate_requests=aggregates
+    )
 
     if df.empty:
         cols = list(BASE_COLUMNS)

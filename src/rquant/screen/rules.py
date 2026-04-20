@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -13,6 +14,24 @@ Rule = Callable[[pd.DataFrame], pd.Series]
 def _tag_lookback(fn: Rule, n: int) -> Rule:
     """给规则函数挂上 min_lookback 属性，方便 screen() 推断总 lookback。"""
     fn.min_lookback = n  # type: ignore[attr-defined]
+    return fn
+
+
+@dataclass(frozen=True)
+class AggregateRequest:
+    """规则声明的长窗口聚合需求，由 load_universe() 执行 SQL 实现。"""
+
+    name: str               # 结果列名，如 "max_consec_ups_8d"
+    source_table: str       # "daily_state" | "daily_bar" | "daily_basic"
+    source_col: str         # "consecutive_limit_ups" | "is_limit_down" 等
+    agg_func: str           # "max" | "sum" | "any" | "count_nonzero"
+    window: int             # 交易日窗口大小
+    exclude_offset: int | None = None  # 排除某个 offset 的日期（从 T 日起算）
+
+
+def _tag_aggregates(fn: Rule, requests: list[AggregateRequest]) -> Rule:
+    """给规则函数挂上 aggregate_requests 属性。"""
+    fn.aggregate_requests = requests  # type: ignore[attr-defined]
     return fn
 
 

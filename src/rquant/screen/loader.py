@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from rquant.screen.rules import AggregateRequest
 from rquant.storage.duckdb import DuckDBStore
 
 PRICE_COLS_MAP = {
@@ -88,10 +89,87 @@ def _wide_from_long(
     return wide
 
 
+def _compute_aggregate(
+    store: DuckDBStore,
+    req: AggregateRequest,
+    t0_date: str,
+    ts_codes: list[str],
+) -> pd.DataFrame:
+    """根据 AggregateRequest 生成 DuckDB SQL，返回 (ts_code, <agg_col>) DataFrame。"""
+    placeholders = ",".join(["?"] * len(ts_codes))
+
+    # 找到 T 日前 window 个交易日的日期范围
+    date_sql = """
+    SELECT strftime(trade_date, '%Y-%m-%d') AS d
+    FROM (
+        SELECT DISTINCT trade_date FROM daily_bar
+        WHERE trade_date <= ?
+        ORDER BY trade_date DESC
+        LIMIT ?
+    )
+    ORDER BY d
+    """
+    date_rows = store._conn.execute(date_sql, [t0_date, req.window]).fetchall()
+    window_dates = [r[0] for r in date_rows]
+
+    if not window_dates:
+        return pd.DataFrame(columns=["ts_code", req.name])
+
+    # 排除 exclude_offset 对应的日期
+    if req.exclude_offset is not None:
+        # 获取完整日期列表（倒序），找到 offset 对应的日期
+        all_dates_sql = """
+        SELECT strftime(trade_date, '%Y-%m-%d') AS d
+        FROM (
+            SELECT DISTINCT trade_date FROM daily_bar
+            WHERE trade_date <= ?
+            ORDER BY trade_date DESC
+            LIMIT ?
+        )
+        ORDER BY d DESC
+        """
+        all_date_rows = store._conn.execute(
+            all_dates_sql, [t0_date, req.window]
+        ).fetchall()
+        all_dates_desc = [r[0] for r in all_date_rows]
+        if req.exclude_offset < len(all_dates_desc):
+            exclude_date = all_dates_desc[req.exclude_offset]
+            window_dates = [d for d in window_dates if d != exclude_date]
+
+    if not window_dates:
+        return pd.DataFrame(columns=["ts_code", req.name])
+
+    date_placeholders = ",".join(["?"] * len(window_dates))
+
+    # 根据 agg_func 生成 SQL
+    if req.agg_func == "max":
+        agg_expr = f"MAX({req.source_col})"
+    elif req.agg_func == "sum":
+        agg_expr = f"SUM({req.source_col})"
+    elif req.agg_func == "any":
+        agg_expr = f"BOOL_OR(CAST({req.source_col} AS BOOLEAN))"
+    elif req.agg_func == "count_nonzero":
+        agg_expr = f"SUM(CASE WHEN CAST({req.source_col} AS BOOLEAN) THEN 1 ELSE 0 END)"
+    else:
+        raise ValueError(f"Unsupported agg_func: {req.agg_func}")
+
+    sql = f"""
+    SELECT ts_code, {agg_expr} AS {req.name}
+    FROM {req.source_table}
+    WHERE ts_code IN ({placeholders})
+      AND strftime(trade_date, '%Y-%m-%d') IN ({date_placeholders})
+    GROUP BY ts_code
+    """
+    params = ts_codes + window_dates
+    result = store._conn.execute(sql, params).fetchdf()
+    return result
+
+
 def load_universe(
     trade_date: str,
     lookback: int = 5,
     store: DuckDBStore | None = None,
+    aggregate_requests: list[AggregateRequest] | None = None,
 ) -> pd.DataFrame:
     owns_store = store is None
     store = store or DuckDBStore()
@@ -180,6 +258,14 @@ def load_universe(
         for wide in (bar_wide, ind_wide, state_wide, basic_mkt_wide):
             if not wide.empty:
                 out = out.merge(wide, on="ts_code", how="left")
+
+        # 聚合列：根据 AggregateRequest 动态生成 SQL
+        if aggregate_requests:
+            t0_date_val = dates[0]  # T 日
+            for req in aggregate_requests:
+                agg_col = _compute_aggregate(store, req, t0_date_val, in_universe)
+                if not agg_col.empty:
+                    out = out.merge(agg_col, on="ts_code", how="left")
 
         # 默认值填充
         if "is_st" in out.columns:

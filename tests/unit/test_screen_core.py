@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 from rquant.screen import screen
-from rquant.screen.rules import gt, not_bj, not_st
+from rquant.screen.rules import AggregateRequest, Rule, gt, not_bj, not_st, _tag_lookback, _tag_aggregates
 from tests.fixtures.wide_frames import make_wide_frame
 
 
@@ -64,3 +64,77 @@ class TestScreenCore:
             mock_loader.return_value = df
             screen(trade_date="2026-04-15", rules=[not_st()], lookback=10)
             assert mock_loader.call_args.kwargs["lookback"] == 10
+
+
+class TestAggregateCollection:
+    def test_collect_aggregates_from_rules(self) -> None:
+        from rquant.screen.core import _collect_aggregates
+
+        def dummy_rule(df):
+            return df["ts_code"].notna()
+
+        dummy_rule = _tag_lookback(dummy_rule, 0)
+        req = AggregateRequest(
+            name="max_consec_ups_8d",
+            source_table="daily_state",
+            source_col="consecutive_limit_ups",
+            agg_func="max",
+            window=8,
+        )
+        dummy_rule = _tag_aggregates(dummy_rule, [req])
+
+        aggregates = _collect_aggregates([not_st(), dummy_rule])
+        assert len(aggregates) == 1
+        assert aggregates[0].name == "max_consec_ups_8d"
+
+    def test_collect_aggregates_deduplicates(self) -> None:
+        from rquant.screen.core import _collect_aggregates
+
+        req = AggregateRequest(
+            name="same_name", source_table="daily_state",
+            source_col="x", agg_func="max", window=5,
+        )
+
+        def r1(df):
+            return df["ts_code"].notna()
+        r1 = _tag_lookback(r1, 0)
+        r1 = _tag_aggregates(r1, [req])
+
+        def r2(df):
+            return df["ts_code"].notna()
+        r2 = _tag_lookback(r2, 0)
+        r2 = _tag_aggregates(r2, [req])
+
+        aggregates = _collect_aggregates([r1, r2])
+        assert len(aggregates) == 1
+
+    def test_collect_aggregates_empty_when_no_requests(self) -> None:
+        from rquant.screen.core import _collect_aggregates
+
+        aggregates = _collect_aggregates([not_st(), not_bj()])
+        assert aggregates == []
+
+    def test_screen_passes_aggregates_to_loader(self) -> None:
+        df = make_wide_frame()
+        df["max_consec_ups_8d"] = 0
+
+        req = AggregateRequest(
+            name="max_consec_ups_8d",
+            source_table="daily_state",
+            source_col="consecutive_limit_ups",
+            agg_func="max",
+            window=8,
+        )
+
+        def rule_with_agg(df):
+            return df["max_consec_ups_8d"] < 3
+        rule_with_agg = _tag_lookback(rule_with_agg, 0)
+        rule_with_agg = _tag_aggregates(rule_with_agg, [req])
+
+        with patch("rquant.screen.core.load_universe") as mock_loader:
+            mock_loader.return_value = df
+            screen(trade_date="2026-04-15", rules=[rule_with_agg])
+            call_kwargs = mock_loader.call_args.kwargs
+            assert "aggregate_requests" in call_kwargs
+            assert len(call_kwargs["aggregate_requests"]) == 1
+            assert call_kwargs["aggregate_requests"][0].name == "max_consec_ups_8d"
