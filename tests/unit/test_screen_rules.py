@@ -13,6 +13,7 @@ from rquant.screen.rules import (
     first_limit_up,
     gt,
     gte,
+    has_lower_shadow,
     limit_down,
     limit_up,
     lt,
@@ -375,3 +376,111 @@ class TestVolumeRules:
         assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
         assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
         assert rule.min_lookback == 5
+
+
+class TestHasLowerShadow:
+    def test_clear_lower_shadow_passes(self) -> None:
+        """O=10, H=11, L=8, C=10.5 → body_upper=10.5, body_lower=10,
+        lower_shadow=10-8=2, body=10.5-10=0.5, ratio=4.0 ≥ 1.5,
+        amplitude=(11-8)/8=0.375 ≥ 0.02 → passes."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "OPEN[0]"): 10.0,
+                ("300001.SZ", "HIGH[0]"): 11.0,
+                ("300001.SZ", "LOW[0]"): 8.0,
+                ("300001.SZ", "CLOSE[0]"): 10.5,
+                ("300001.SZ", "BODY_UPPER[0]"): 10.5,
+                ("300001.SZ", "BODY_LOWER[0]"): 10.0,
+            },
+        )
+        mask = has_lower_shadow(1.5, 0.02, 0)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_no_lower_shadow_fails(self) -> None:
+        """O=10, H=12, L=10, C=11 → body_upper=11, body_lower=10,
+        lower_shadow=10-10=0, ratio=0 < 1.5 → fails."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "OPEN[0]"): 10.0,
+                ("300001.SZ", "HIGH[0]"): 12.0,
+                ("300001.SZ", "LOW[0]"): 10.0,
+                ("300001.SZ", "CLOSE[0]"): 11.0,
+                ("300001.SZ", "BODY_UPPER[0]"): 11.0,
+                ("300001.SZ", "BODY_LOWER[0]"): 10.0,
+            },
+        )
+        mask = has_lower_shadow(1.5, 0.02, 0)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_doji_zero_body_fails(self) -> None:
+        """一字线/十字星: body=0 → has_body=False → fails regardless of shadow."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "HIGH[0]"): 11.0,
+                ("300001.SZ", "LOW[0]"): 9.0,
+                ("300001.SZ", "BODY_UPPER[0]"): 10.0,
+                ("300001.SZ", "BODY_LOWER[0]"): 10.0,
+            },
+        )
+        mask = has_lower_shadow(1.5, 0.02, 0)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_small_amplitude_fails(self) -> None:
+        """Shadow ratio OK but amplitude < 0.02 → fails.
+        O=10, H=10.1, L=9.95, C=10.05 → body_upper=10.05, body_lower=10,
+        lower_shadow=10-9.95=0.05, body=0.05, ratio=1.0 (< 1.5 anyway, but let's
+        test with min_ratio=0.5).
+        amplitude=(10.1-9.95)/9.95=0.015 < 0.02 → fails."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "HIGH[0]"): 10.1,
+                ("300001.SZ", "LOW[0]"): 9.95,
+                ("300001.SZ", "BODY_UPPER[0]"): 10.05,
+                ("300001.SZ", "BODY_LOWER[0]"): 10.0,
+            },
+        )
+        mask = has_lower_shadow(0.5, 0.02, 0)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_ratio_below_threshold_fails(self) -> None:
+        """lower_shadow / body < min_ratio → fails.
+        body_upper=11, body_lower=10, low=9.8 → shadow=0.2, body=1.0, ratio=0.2 < 1.5."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "HIGH[0]"): 12.0,
+                ("300001.SZ", "LOW[0]"): 9.8,
+                ("300001.SZ", "BODY_UPPER[0]"): 11.0,
+                ("300001.SZ", "BODY_LOWER[0]"): 10.0,
+            },
+        )
+        mask = has_lower_shadow(1.5, 0.02, 0)(df)
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    def test_at_offset_1(self) -> None:
+        df = make_wide_frame(
+            lookback=2,
+            overrides={
+                ("300001.SZ", "HIGH[1]"): 11.0,
+                ("300001.SZ", "LOW[1]"): 8.0,
+                ("300001.SZ", "BODY_UPPER[1]"): 10.5,
+                ("300001.SZ", "BODY_LOWER[1]"): 10.0,
+            },
+        )
+        rule = has_lower_shadow(1.5, 0.02, offset=1)
+        mask = rule(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+        assert rule.min_lookback == 1
+
+    def test_custom_thresholds(self) -> None:
+        """With min_ratio=2.0 (TA-Lib hammer standard):
+        shadow=2, body=0.5, ratio=4.0 ≥ 2.0 → passes."""
+        df = make_wide_frame(
+            overrides={
+                ("300001.SZ", "HIGH[0]"): 11.0,
+                ("300001.SZ", "LOW[0]"): 8.0,
+                ("300001.SZ", "BODY_UPPER[0]"): 10.5,
+                ("300001.SZ", "BODY_LOWER[0]"): 10.0,
+            },
+        )
+        mask = has_lower_shadow(min_ratio=2.0, min_amplitude=0.01)(df)
+        assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]

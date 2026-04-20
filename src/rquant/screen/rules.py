@@ -86,6 +86,37 @@ def circ_mv_lt(threshold_yi: float, offset: int = 0) -> Rule:
     return _tag_lookback(_rule, offset)
 
 
+def has_lower_shadow(
+    min_ratio: float = 1.5,
+    min_amplitude: float = 0.02,
+    offset: int = 0,
+) -> Rule:
+    """下影线达标：下影 / 实体 ≥ min_ratio 且振幅 ≥ min_amplitude。
+
+    - 下影线 = BODY_LOWER[offset] - LOW[offset]
+    - 实体 = BODY_UPPER[offset] - BODY_LOWER[offset]
+    - 振幅 = (HIGH[offset] - LOW[offset]) / LOW[offset]
+    - 实体为 0（一字线/十字星）直接返回 False
+    """
+    def _rule(df: pd.DataFrame) -> pd.Series:
+        body_lower = df[f"BODY_LOWER[{offset}]"]
+        body_upper = df[f"BODY_UPPER[{offset}]"]
+        low = df[f"LOW[{offset}]"]
+        high = df[f"HIGH[{offset}]"]
+
+        lower_shadow = body_lower - low
+        body = body_upper - body_lower
+        amplitude = (high - low) / low.replace(0, float("nan"))
+
+        has_body = body > 0
+        ratio_ok = lower_shadow / body.replace(0, float("nan")) >= min_ratio
+        amp_ok = amplitude >= min_amplitude
+
+        return has_body & ratio_ok & amp_ok
+
+    return _tag_lookback(_rule, offset)
+
+
 def limit_down(offset: int = 0) -> Rule:
     """某日跌停。"""
     return _bool_state_rule("IS_LIMIT_DOWN", offset)
