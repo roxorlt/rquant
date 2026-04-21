@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -102,3 +103,53 @@ class TestBuildWatchlist:
         items = build_watchlist(store, screen_date="2026-04-21")
         assert len(items) == 1
         assert items[0].pool == "pool2"
+
+
+class TestIsTradingDay:
+    @patch("rquant.monitor.ak")
+    def test_trading_day_returns_true(self, mock_ak) -> None:
+        from rquant.monitor import is_trading_day
+
+        mock_ak.tool_trade_date_hist_sina.return_value = pd.DataFrame(
+            {"trade_date": ["2026-04-21", "2026-04-22"]}
+        )
+        assert is_trading_day(date(2026, 4, 21)) is True
+
+    @patch("rquant.monitor.ak")
+    def test_non_trading_day_returns_false(self, mock_ak) -> None:
+        from rquant.monitor import is_trading_day
+
+        mock_ak.tool_trade_date_hist_sina.return_value = pd.DataFrame(
+            {"trade_date": ["2026-04-21", "2026-04-22"]}
+        )
+        assert is_trading_day(date(2026, 4, 19)) is False
+
+
+class TestFetchRealtimePrices:
+    @patch("rquant.monitor.ak")
+    def test_returns_price_and_low(self, mock_ak) -> None:
+        from rquant.monitor import fetch_realtime_prices
+
+        mock_ak.stock_zh_a_spot_em.return_value = pd.DataFrame({
+            "代码": ["002415", "300001", "600000"],
+            "最新价": [12.35, 15.00, 8.50],
+            "最低": [12.10, 14.80, 8.30],
+        })
+        result = fetch_realtime_prices(["002415.SZ", "300001.SZ"])
+        assert "002415.SZ" in result
+        assert result["002415.SZ"]["price"] == 12.35
+        assert result["002415.SZ"]["low"] == 12.10
+        assert "300001.SZ" in result
+        assert "600000.SH" not in result
+
+    @patch("rquant.monitor.ak")
+    def test_missing_stock_skipped(self, mock_ak) -> None:
+        from rquant.monitor import fetch_realtime_prices
+
+        mock_ak.stock_zh_a_spot_em.return_value = pd.DataFrame({
+            "代码": ["600000"],
+            "最新价": [8.50],
+            "最低": [8.30],
+        })
+        result = fetch_realtime_prices(["002415.SZ"])
+        assert result == {}

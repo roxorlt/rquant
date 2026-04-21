@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 
+import akshare as ak
 import pandas as pd
 from loguru import logger
 
@@ -122,3 +123,48 @@ def build_watchlist(
         f"pool1={sum(1 for i in items.values() if i.pool == 'pool1')})"
     )
     return list(items.values())
+
+
+def is_trading_day(check_date: date) -> bool:
+    """通过 akshare 交易日历检查是否为 A 股交易日。"""
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        trade_dates = set(
+            pd.to_datetime(df["trade_date"]).dt.date
+        )
+        return check_date in trade_dates
+    except Exception:
+        logger.error("获取交易日历失败，默认当作交易日")
+        return True
+
+
+def fetch_realtime_prices(
+    ts_codes: list[str],
+) -> dict[str, dict[str, float]]:
+    """批量获取实时行情，返回 {ts_code: {price, low}}。
+
+    akshare 代码格式 "002415"，rQuant 用 "002415.SZ"。
+    """
+    try:
+        df = ak.stock_zh_a_spot_em()
+    except Exception:
+        logger.error("akshare 实时行情获取失败")
+        return {}
+
+    # ts_code -> akshare 代码映射
+    code_map = {c.split(".")[0]: c for c in ts_codes}
+    wanted = set(code_map.keys())
+
+    result = {}
+    for _, row in df.iterrows():
+        ak_code = str(row["代码"])
+        if ak_code in wanted:
+            ts_code = code_map[ak_code]
+            price = row["最新价"]
+            low = row["最低"]
+            if pd.notna(price) and pd.notna(low):
+                result[ts_code] = {
+                    "price": float(price),
+                    "low": float(low),
+                }
+    return result
