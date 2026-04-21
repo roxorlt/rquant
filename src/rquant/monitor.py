@@ -234,6 +234,20 @@ def alert_price_level(item: WatchItem, level: str, price: float) -> None:
     logger.info(f"弹窗: {title} ¥{price:.2f}")
 
 
+def _count_trading_days_since(
+    store: DuckDBStore, entry_date: date, today: date
+) -> int:
+    """entry_date 到 today 之间有多少个交易日（含两端）。"""
+    row = store._conn.execute(
+        """
+        SELECT COUNT(DISTINCT trade_date) FROM daily_bar
+        WHERE trade_date >= ? AND trade_date <= ?
+        """,
+        [entry_date, today],
+    ).fetchone()
+    return row[0] if row else 0
+
+
 def alert_exit_confirm(
     ts_code: str,
     reason: str,
@@ -269,3 +283,85 @@ def alert_exit_confirm(
         capture_output=True, text=True,
     )
     return "踢出" in result.stdout
+
+
+def check_exits(store: DuckDBStore, today: date) -> None:
+    """收盘后检查 Pool 2 退出条件：跌破位 / 超期。"""
+    active = store.query_pool2_active()
+    if active.empty:
+        return
+
+    today_str = today.isoformat()
+
+    # 获取今日事件记录（用于标记已触达档位）
+    events_df = store.query_monitor_events(today_str)
+
+    for _, row in active.iterrows():
+        code = row["ts_code"]
+        # entry_date may come as date or datetime from DuckDB
+        raw_entry = row["entry_date"]
+        entry_date = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
+
+        stop_s = float(row["stop_strong"])
+        stop_w = float(row["stop_weak"])
+
+        # 取今日收盘价
+        close_row = store._conn.execute(
+            "SELECT close FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
+            [code, today],
+        ).fetchone()
+
+        if close_row is None:
+            continue
+
+        close_price = float(close_row[0])
+        days = _count_trading_days_since(store, entry_date, today)
+
+        # 已触达的档位
+        triggered: list[str] = []
+        if not events_df.empty:
+            stock_events = events_df[events_df["ts_code"] == code]
+            triggered = stock_events["level"].tolist()
+
+        levels = {
+            "40": float(row["level_40"]),
+            "30": float(row["level_30"]),
+            "20": float(row["level_20"]),
+        }
+        entry_str = str(entry_date)[5:]  # "04-18"
+
+        reason = None
+        exit_reason = None
+
+        # 条件 1：跌破止损
+        if close_price < stop_w:
+            reason = f"跌破弱止 ¥{stop_w:.2f}"
+            exit_reason = "breakdown"
+        elif close_price < stop_s:
+            reason = f"跌破强止 ¥{stop_s:.2f}"
+            exit_reason = "breakdown"
+        # 条件 2：超期
+        elif days >= 3:
+            reason = "观察期满"
+            exit_reason = "expired"
+
+        if reason is None:
+            continue
+
+        should_kick = alert_exit_confirm(
+            ts_code=code,
+            reason=reason,
+            entry_date=entry_str,
+            days_in_pool=days,
+            close_price=close_price,
+            levels=levels,
+            stop_strong=stop_s,
+            stop_weak=stop_w,
+            triggered_levels=triggered,
+        )
+
+        if should_kick:
+            store.update_pool2_exit(code, today, exit_reason)
+            logger.info(f"Pool 2 退出: {code} ({exit_reason})")
+        else:
+            logger.info(f"Pool 2 保留: {code}")

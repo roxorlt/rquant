@@ -295,3 +295,88 @@ class TestAlertExitConfirm:
             triggered_levels=["40"],
         )
         assert result is False
+
+
+class TestCheckExits:
+    def test_breakdown_detected(self, store: DuckDBStore) -> None:
+        from rquant.monitor import check_exits
+
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 18),
+            "limit_up_date": date(2026, 4, 17),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+
+        # Close price below stop_strong
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('002415.SZ', '2026-04-21', 12,12,11.5,11.65,12,0,0,1000,10000)"
+        )
+
+        with patch("rquant.monitor.alert_exit_confirm", return_value=True):
+            check_exits(store, date(2026, 4, 21))
+
+        active = store.query_pool2_active()
+        assert len(active) == 0
+
+    def test_expiry_detected(self, store: DuckDBStore) -> None:
+        from rquant.monitor import check_exits
+
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 16),  # 3+ trading days ago
+            "limit_up_date": date(2026, 4, 15),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+
+        # Close above stop levels but 3+ days old
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('002415.SZ', '2026-04-16', 12,13,11,12,11,1,5,1000,10000),"
+            "('002415.SZ', '2026-04-17', 12,13,11,12,11,1,5,1000,10000),"
+            "('002415.SZ', '2026-04-18', 12,13,11,12,11,1,5,1000,10000),"
+            "('002415.SZ', '2026-04-21', 12,13,11,12.5,12,0.5,5,1000,10000)"
+        )
+
+        with patch("rquant.monitor.alert_exit_confirm", return_value=True):
+            check_exits(store, date(2026, 4, 21))
+
+        active = store.query_pool2_active()
+        assert len(active) == 0
+
+    def test_user_keeps_stock(self, store: DuckDBStore) -> None:
+        from rquant.monitor import check_exits
+
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 16),
+            "limit_up_date": date(2026, 4, 15),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('002415.SZ', '2026-04-16', 12,13,11,12,11,1,5,1000,10000),"
+            "('002415.SZ', '2026-04-17', 12,13,11,12,11,1,5,1000,10000),"
+            "('002415.SZ', '2026-04-18', 12,13,11,12,11,1,5,1000,10000),"
+            "('002415.SZ', '2026-04-21', 12,13,11,12.5,12,0.5,5,1000,10000)"
+        )
+
+        with patch("rquant.monitor.alert_exit_confirm", return_value=False):
+            check_exits(store, date(2026, 4, 21))
+
+        active = store.query_pool2_active()
+        assert len(active) == 1
