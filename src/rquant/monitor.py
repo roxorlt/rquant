@@ -168,3 +168,42 @@ def fetch_realtime_prices(
                     "low": float(low),
                 }
     return result
+
+
+def check_levels(
+    item: WatchItem,
+    current_price: float,
+    daily_low: float,
+) -> list[dict]:
+    """检查实时价/当日最低是否触达各档位，返回新触发的事件列表。"""
+    levels = [
+        ("40", item.level_40),
+        ("30", item.level_30),
+        ("20", item.level_20),
+        ("strong", item.stop_strong),
+        ("weak", item.stop_weak),
+    ]
+
+    events = []
+    for level_name, level_price in levels:
+        if item.triggered[level_name]:
+            continue
+
+        if current_price <= level_price:
+            item.triggered[level_name] = True
+            events.append({
+                "level": level_name,
+                "trigger_price": current_price,
+                "level_price": level_price,
+                "trigger_type": "realtime",
+            })
+        elif daily_low <= level_price:
+            item.triggered[level_name] = True
+            events.append({
+                "level": level_name,
+                "trigger_price": daily_low,
+                "level_price": level_price,
+                "trigger_type": "daily_low",
+            })
+
+    return events

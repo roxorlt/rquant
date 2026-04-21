@@ -153,3 +153,63 @@ class TestFetchRealtimePrices:
         })
         result = fetch_realtime_prices(["002415.SZ"])
         assert result == {}
+
+
+class TestCheckLevels:
+    def _make_item(self) -> "WatchItem":
+        from rquant.monitor import WatchItem
+        return WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+        )
+
+    def test_no_trigger_above_all_levels(self) -> None:
+        from rquant.monitor import check_levels
+        item = self._make_item()
+        events = check_levels(item, current_price=12.50, daily_low=12.50)
+        assert events == []
+
+    def test_triggers_40_level(self) -> None:
+        from rquant.monitor import check_levels
+        item = self._make_item()
+        events = check_levels(item, current_price=12.30, daily_low=12.30)
+        assert len(events) == 1
+        assert events[0]["level"] == "40"
+        assert events[0]["trigger_type"] == "realtime"
+        assert item.triggered["40"] is True
+
+    def test_triggers_multiple_levels(self) -> None:
+        from rquant.monitor import check_levels
+        item = self._make_item()
+        events = check_levels(item, current_price=12.00, daily_low=12.00)
+        triggered_levels = {e["level"] for e in events}
+        assert "40" in triggered_levels
+        assert "30" in triggered_levels
+        assert "20" in triggered_levels
+
+    def test_daily_low_backup_trigger(self) -> None:
+        from rquant.monitor import check_levels
+        item = self._make_item()
+        # Price bounced back above 40, but daily low touched it
+        events = check_levels(item, current_price=12.50, daily_low=12.30)
+        assert len(events) == 1
+        assert events[0]["trigger_type"] == "daily_low"
+
+    def test_no_retrigger(self) -> None:
+        from rquant.monitor import check_levels
+        item = self._make_item()
+        check_levels(item, current_price=12.30, daily_low=12.30)
+        assert item.triggered["40"] is True
+
+        events2 = check_levels(item, current_price=12.30, daily_low=12.30)
+        assert events2 == []
+
+    def test_strong_stop_trigger(self) -> None:
+        from rquant.monitor import check_levels
+        item = self._make_item()
+        events = check_levels(item, current_price=11.75, daily_low=11.75)
+        levels = {e["level"] for e in events}
+        assert "strong" in levels
