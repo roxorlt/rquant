@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -213,3 +213,85 @@ class TestCheckLevels:
         events = check_levels(item, current_price=11.75, daily_low=11.75)
         levels = {e["level"] for e in events}
         assert "strong" in levels
+
+
+class TestAlertPriceLevel:
+    @patch("rquant.monitor.subprocess")
+    def test_formats_alert_correctly(self, mock_sub) -> None:
+        from rquant.monitor import WatchItem, alert_price_level
+
+        item = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+        )
+        alert_price_level(item, "30", 12.18)
+
+        mock_sub.Popen.assert_called_once()
+        cmd = mock_sub.Popen.call_args[0][0]
+        script = cmd[2]  # osascript -e "..."
+        assert "002415.SZ | 30%" in script
+        assert "current" in script
+        assert "12.18" in script
+        assert "强止" in script
+
+    @patch("rquant.monitor.subprocess")
+    def test_strong_stop_label(self, mock_sub) -> None:
+        from rquant.monitor import WatchItem, alert_price_level
+
+        item = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+        )
+        alert_price_level(item, "strong", 11.75)
+
+        cmd = mock_sub.Popen.call_args[0][0]
+        script = cmd[2]
+        assert "002415.SZ | 强止" in script
+
+
+class TestAlertExitConfirm:
+    @patch("rquant.monitor.subprocess")
+    def test_returns_true_on_kick(self, mock_sub) -> None:
+        from rquant.monitor import alert_exit_confirm
+
+        mock_sub.run.return_value = MagicMock(
+            stdout="button returned:踢出\n"
+        )
+        result = alert_exit_confirm(
+            ts_code="002415.SZ",
+            reason="跌破强止 ¥11.80",
+            entry_date="04-18",
+            days_in_pool=2,
+            close_price=11.65,
+            levels={"40": 12.36, "30": 12.22, "20": 12.08},
+            stop_strong=11.80,
+            stop_weak=11.52,
+            triggered_levels=["40"],
+        )
+        assert result is True
+
+    @patch("rquant.monitor.subprocess")
+    def test_returns_false_on_keep(self, mock_sub) -> None:
+        from rquant.monitor import alert_exit_confirm
+
+        mock_sub.run.return_value = MagicMock(
+            stdout="button returned:保留\n"
+        )
+        result = alert_exit_confirm(
+            ts_code="002415.SZ",
+            reason="观察期满",
+            entry_date="04-18",
+            days_in_pool=3,
+            close_price=12.50,
+            levels={"40": 12.36, "30": 12.22, "20": 12.08},
+            stop_strong=11.80,
+            stop_weak=11.52,
+            triggered_levels=["40"],
+        )
+        assert result is False

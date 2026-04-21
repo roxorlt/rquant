@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -207,3 +208,64 @@ def check_levels(
             })
 
     return events
+
+
+_LEVEL_LABELS = {
+    "40": "40%", "30": "30%", "20": "20%",
+    "strong": "强止", "weak": "弱止",
+}
+
+
+def alert_price_level(item: WatchItem, level: str, price: float) -> None:
+    """Popen osascript 弹出档位提醒（非阻塞）。"""
+    label = _LEVEL_LABELS.get(level, level)
+    title = f"{item.ts_code} | {label}"
+    body = (
+        f"current：¥{price:.2f}\\n"
+        f"40：¥{item.level_40:.2f} | 30：¥{item.level_30:.2f} | "
+        f"20：¥{item.level_20:.2f}\\n"
+        f"body：¥{item.body_lower:.2f} — ¥{item.body_upper:.2f}\\n"
+        f"强止：¥{item.stop_strong:.2f} | 弱止：¥{item.stop_weak:.2f}"
+    )
+    subprocess.Popen([
+        "osascript", "-e",
+        f'display alert "{title}" message "{body}"',
+    ])
+    logger.info(f"弹窗: {title} ¥{price:.2f}")
+
+
+def alert_exit_confirm(
+    ts_code: str,
+    reason: str,
+    entry_date: str,
+    days_in_pool: int,
+    close_price: float,
+    levels: dict[str, float],
+    stop_strong: float,
+    stop_weak: float,
+    triggered_levels: list[str],
+) -> bool:
+    """弹出退出确认弹窗，返回 True=踢出, False=保留。"""
+    # 已触达的档位标 ✓
+    l40 = f"¥{levels['40']:.2f}" + (" ✓" if "40" in triggered_levels else "")
+    l30 = f"¥{levels['30']:.2f}" + (" ✓" if "30" in triggered_levels else "")
+    l20 = f"¥{levels['20']:.2f}" + (" ✓" if "20" in triggered_levels else "")
+
+    title = f"{ts_code} | 退出确认"
+    body = (
+        f"{reason}\\n"
+        f"入池：{entry_date}（第{days_in_pool}天）\\n"
+        f"昨收：¥{close_price:.2f}\\n"
+        f"40：{l40} | 30：{l30} | 20：{l20}\\n"
+        f"强止：¥{stop_strong:.2f} | 弱止：¥{stop_weak:.2f}"
+    )
+
+    result = subprocess.run(
+        [
+            "osascript", "-e",
+            f'display alert "{title}" message "{body}" '
+            f'buttons {{"保留", "踢出"}} default button "保留"',
+        ],
+        capture_output=True, text=True,
+    )
+    return "踢出" in result.stdout
