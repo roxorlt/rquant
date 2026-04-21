@@ -5,12 +5,24 @@
 ## [Unreleased]
 
 ### Added
+- `rquant monitor` 命令：盘中实时监控 Pool 1 + Pool 2 标的价格
+  - akshare 实时行情轮询（5 秒间隔），检测 5 个档位（40%/30%/20%/强止/弱止）
+  - macOS 原生弹窗提醒（osascript display alert），非阻塞
+  - 当日最低价补漏机制，防止闪跌遗漏
+  - 交易日历检查（含中国节假日），非交易日自动跳过
+- `pool2_watch` 表：Pool 2 持久池，从每日快照升级为有进出机制的持久池子
+  - 入池：pipeline 跑完 Pool 2 筛选后自动同步
+  - 退出：收盘后检查跌破止损/超期（3 天），所有退出弹窗确认（踢出/保留）
+- `monitor_event` 表：盘中事件日志，记录每次档位触发详情
+- `rquant pool2 list / remove` 命令：查看和管理持久池
+- `deploy/com.roxor.rquant-monitor.plist`：盘中监控 launchd 自启配置
 - `rquant ingest --date` 命令：按 trade_date 模式拉全市场 stock_basic + daily_bar + daily_basic + derive_state，约 30 秒完成
 - `rquant run-daily` 现在自动先 ingest 再 pipeline（`--no-ingest` 跳过）
 - `rquant serve` 的 cron 改为 ingest → pipeline 串联，数据未就绪时自动重试 3 次（间隔 15 分钟）
 - `deploy/com.roxor.rquant.plist`：macOS launchd 开机自启配置
 
 ### Changed
+- `pipeline.py`：`run_daily_pipeline()` 尾部新增 pool2_watch 同步逻辑
 - Pool 1 下影线阈值从 1.5 放宽至 0.5（下影/实体比），命中从 5 只提升至 12 只
 - Pool 1 前涨停窗口从 90 交易日放宽至 120 交易日
 - Pool 2 `offset_days` 从 1 改为 2，合并 T-1 + T-2 两天的父预设白名单
