@@ -1,0 +1,124 @@
+"""盘中实时监控：加载 watchlist → 轮询 akshare → 档位检测 → 弹窗 + 存库。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+
+import pandas as pd
+from loguru import logger
+
+from rquant.pipeline import _compute_levels
+from rquant.storage.duckdb import DuckDBStore
+
+
+@dataclass
+class WatchItem:
+    """单只监控标的。"""
+    ts_code: str
+    pool: str  # 'pool1' or 'pool2'
+    limit_up_date: date
+    body_upper: float
+    body_lower: float
+    body: float
+    level_40: float
+    level_30: float
+    level_20: float
+    stop_strong: float
+    stop_weak: float
+    triggered: dict[str, bool] = field(default_factory=lambda: {
+        "40": False, "30": False, "20": False,
+        "strong": False, "weak": False,
+    })
+
+
+def _get_latest_screen_date(store: DuckDBStore) -> str | None:
+    """screen_result 中最新的 Pool 1 筛选日期。"""
+    row = store._conn.execute(
+        """
+        SELECT strftime(MAX(trade_date), '%Y-%m-%d')
+        FROM screen_result
+        WHERE preset_name = 'n-shape-pool1'
+        """
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def build_watchlist(
+    store: DuckDBStore,
+    screen_date: str | None = None,
+) -> list[WatchItem]:
+    """加载 Pool 2 active + 指定日期 Pool 1，去重后返回 watchlist。"""
+    items: dict[str, WatchItem] = {}
+
+    # 1. Pool 2 active（优先级高）
+    p2_df = store.query_pool2_active()
+    for _, row in p2_df.iterrows():
+        code = row["ts_code"]
+        bu, bl = float(row["body_upper"]), float(row["body_lower"])
+        items[code] = WatchItem(
+            ts_code=code,
+            pool="pool2",
+            limit_up_date=row["limit_up_date"],
+            body_upper=bu,
+            body_lower=bl,
+            body=bu - bl,
+            level_40=float(row["level_40"]),
+            level_30=float(row["level_30"]),
+            level_20=float(row["level_20"]),
+            stop_strong=float(row["stop_strong"]),
+            stop_weak=float(row["stop_weak"]),
+        )
+
+    # 2. Pool 1（screen_date 当天的，补充不在 Pool 2 中的）
+    sd = screen_date or _get_latest_screen_date(store)
+    if sd is None:
+        logger.warning("无 Pool 1 数据")
+        return list(items.values())
+
+    p1_df = store.query_screen_result(sd, "n-shape-pool1")
+    for _, row in p1_df.iterrows():
+        code = row["ts_code"]
+        if code in items:
+            continue  # Pool 2 优先
+
+        # 查涨停日 body
+        state_df = store._conn.execute(
+            """
+            SELECT trade_date, body_upper, body_lower
+            FROM daily_state
+            WHERE ts_code = ? AND is_first_limit_up = true
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            [code],
+        ).fetchdf()
+
+        if state_df.empty:
+            logger.warning(f"跳过 Pool 1 {code}：找不到涨停日")
+            continue
+
+        bu = float(state_df.iloc[0]["body_upper"])
+        bl = float(state_df.iloc[0]["body_lower"])
+        levels = _compute_levels(bu, bl)
+
+        items[code] = WatchItem(
+            ts_code=code,
+            pool="pool1",
+            limit_up_date=state_df.iloc[0]["trade_date"],
+            body_upper=bu,
+            body_lower=bl,
+            body=bu - bl,
+            level_40=levels["level_40"],
+            level_30=levels["level_30"],
+            level_20=levels["level_20"],
+            stop_strong=levels["stop_strong"],
+            stop_weak=levels["stop_weak"],
+        )
+
+    logger.info(
+        f"Watchlist: {len(items)} 只 "
+        f"(pool2={sum(1 for i in items.values() if i.pool == 'pool2')}, "
+        f"pool1={sum(1 for i in items.values() if i.pool == 'pool1')})"
+    )
+    return list(items.values())
