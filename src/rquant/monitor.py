@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 import akshare as ak
 import pandas as pd
@@ -365,3 +366,90 @@ def check_exits(store: DuckDBStore, today: date) -> None:
             logger.info(f"Pool 2 退出: {code} ({exit_reason})")
         else:
             logger.info(f"Pool 2 保留: {code}")
+
+
+def _now() -> datetime:
+    """当前时间（方便测试 mock）。"""
+    return datetime.now()
+
+
+def _is_trading_hours() -> bool:
+    """当前是否在交易时段（09:30-11:30 或 13:00-15:00）。"""
+    now = _now()
+    t = now.hour * 100 + now.minute
+    return (930 <= t <= 1130) or (1300 <= t <= 1500)
+
+
+def run_monitor(interval: int = 5) -> int:
+    """盘中监控主循环。"""
+    today = date.today()
+
+    if not is_trading_day(today):
+        logger.info(f"{today} 非交易日，退出")
+        return 0
+
+    with DuckDBStore() as store:
+        watchlist = build_watchlist(store)
+
+        if not watchlist:
+            logger.warning("Watchlist 为空，退出")
+            return 0
+
+        logger.info(f"开始监控 {len(watchlist)} 只，间隔 {interval} 秒")
+
+        ts_codes = [item.ts_code for item in watchlist]
+        item_map = {item.ts_code: item for item in watchlist}
+        today_str = today.isoformat()
+
+        while _is_trading_hours():
+            prices = fetch_realtime_prices(ts_codes)
+
+            for code, pdata in prices.items():
+                item = item_map.get(code)
+                if item is None:
+                    continue
+
+                events = check_levels(
+                    item, pdata["price"], pdata["low"]
+                )
+
+                for evt in events:
+                    # 存库
+                    evt_df = pd.DataFrame([{
+                        "trade_date": today,
+                        "ts_code": code,
+                        "level": evt["level"],
+                        "trigger_price": evt["trigger_price"],
+                        "level_price": evt["level_price"],
+                        "trigger_time": _now(),
+                        "trigger_type": evt["trigger_type"],
+                        "pool": item.pool,
+                        "body_upper": item.body_upper,
+                        "body_lower": item.body_lower,
+                    }])
+                    store.upsert_monitor_event(evt_df)
+
+                    # 弹窗
+                    alert_price_level(
+                        item, evt["level"], evt["trigger_price"]
+                    )
+
+            time.sleep(interval)
+
+        # 收盘后：事件汇总
+        all_events = store.query_monitor_events(today_str)
+        if not all_events.empty:
+            logger.info(f"当日事件汇总: {len(all_events)} 条")
+            for _, e in all_events.iterrows():
+                logger.info(
+                    f"  {e['ts_code']} {e['level']} "
+                    f"¥{e['trigger_price']:.2f} @ {e['trigger_time']}"
+                )
+        else:
+            logger.info("当日无事件触发")
+
+        # 收盘后：退出检查
+        check_exits(store, today)
+
+    logger.info("监控结束")
+    return 0

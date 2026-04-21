@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -380,3 +380,47 @@ class TestCheckExits:
 
         active = store.query_pool2_active()
         assert len(active) == 1
+
+
+class TestRunMonitor:
+    @patch("rquant.monitor.is_trading_day", return_value=False)
+    def test_exits_on_non_trading_day(self, _mock) -> None:
+        from rquant.monitor import run_monitor
+        result = run_monitor(interval=5)
+        assert result == 0
+
+    @patch("rquant.monitor.check_exits")
+    @patch("rquant.monitor.fetch_realtime_prices")
+    @patch("rquant.monitor.build_watchlist")
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._is_trading_hours")
+    @patch("rquant.monitor._now")
+    def test_polls_and_detects(
+        self, mock_now, mock_hours, _td, mock_build, mock_fetch, mock_exits
+    ) -> None:
+        from rquant.monitor import WatchItem, run_monitor
+
+        item = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+        )
+        mock_build.return_value = [item]
+        mock_fetch.return_value = {
+            "002415.SZ": {"price": 12.30, "low": 12.30}
+        }
+
+        # First call: trading hours. Second call: after close.
+        mock_hours.side_effect = [True, False]
+        mock_now.return_value = datetime(2026, 4, 21, 10, 0, 0)
+
+        with patch("rquant.monitor.alert_price_level"):
+            with patch("rquant.monitor.DuckDBStore") as MockStore:
+                mock_store = MockStore.return_value.__enter__.return_value
+                mock_store.upsert_monitor_event.return_value = 1
+                mock_store.query_monitor_events.return_value = pd.DataFrame()
+                run_monitor(interval=5)
+
+        assert item.triggered["40"] is True
