@@ -116,6 +116,44 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """启动盘中实时监控。"""
+    from rquant.monitor import run_monitor
+
+    setup_logging()
+    return run_monitor(interval=args.interval)
+
+
+def cmd_pool2(args: argparse.Namespace) -> int:
+    """管理 Pool 2 持久池。"""
+    from rquant.storage.duckdb import DuckDBStore
+
+    setup_logging()
+    with DuckDBStore() as store:
+        if args.pool2_action == "list":
+            df = store.query_pool2_all()
+            if df.empty:
+                logger.info("Pool 2 持久池为空")
+                return 0
+            for _, row in df.iterrows():
+                status_mark = "🟢" if row["status"] == "active" else "⬜"
+                logger.info(
+                    f"  {status_mark} {row['ts_code']} "
+                    f"入池 {row['entry_date']} "
+                    f"涨停 {row['limit_up_date']} "
+                    f"body ¥{row['body_lower']:.2f}-¥{row['body_upper']:.2f} "
+                    f"[{row['status']}]"
+                )
+            return 0
+
+        elif args.pool2_action == "remove":
+            store.remove_pool2(args.ts_code)
+            logger.info(f"已从 Pool 2 移除: {args.ts_code}")
+            return 0
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -148,6 +186,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="交易日期 YYYY-MM-DD (默认今天)",
     )
 
+    monitor_p = sub.add_parser("monitor", help="启动盘中实时监控")
+    monitor_p.add_argument(
+        "--interval", type=int, default=5,
+        help="轮询间隔秒数 (默认 5)",
+    )
+
+    pool2_p = sub.add_parser("pool2", help="管理 Pool 2 持久池")
+    pool2_sub = pool2_p.add_subparsers(dest="pool2_action")
+    pool2_sub.add_parser("list", help="列出 Pool 2 标的")
+    pool2_rm = pool2_sub.add_parser("remove", help="移除标的")
+    pool2_rm.add_argument("ts_code", type=str, help="股票代码 (如 002415.SZ)")
+
     return parser
 
 
@@ -162,6 +212,10 @@ def main() -> int:
         return cmd_run_daily(args)
     elif args.command == "ingest":
         return cmd_ingest(args)
+    elif args.command == "monitor":
+        return cmd_monitor(args)
+    elif args.command == "pool2":
+        return cmd_pool2(args)
     else:
         parser.print_help()
         return 0

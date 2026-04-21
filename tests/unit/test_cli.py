@@ -57,3 +57,30 @@ class TestCLISmoke:
         )
         assert result.returncode == 0
         assert "--date" in result.stdout
+
+
+class TestMonitorParser:
+    def test_default_interval(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["monitor"])
+        assert args.command == "monitor"
+        assert args.interval == 5
+
+    def test_custom_interval(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["monitor", "--interval", "10"])
+        assert args.interval == 10
+
+
+class TestPool2Parser:
+    def test_list(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["pool2", "list"])
+        assert args.command == "pool2"
+        assert args.pool2_action == "list"
+
+    def test_remove(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["pool2", "remove", "002415.SZ"])
+        assert args.pool2_action == "remove"
+        assert args.ts_code == "002415.SZ"
