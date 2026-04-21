@@ -116,7 +116,7 @@ def _sync_pool2_watch(store: DuckDBStore, trade_date: str) -> None:
         if code in existing_codes:
             continue
 
-        # 找涨停日：最近的 is_first_limit_up=True
+        # 找涨停日：Pool 2 筛选已保证涨停在近几日内，无需额外日期窗口
         state_df = store._conn.execute(
             """
             SELECT trade_date, body_upper, body_lower

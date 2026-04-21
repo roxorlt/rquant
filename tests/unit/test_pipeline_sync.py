@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -11,7 +10,6 @@ import pytest
 from rquant.pipeline import (
     _compute_levels,
     _sync_pool2_watch,
-    run_daily_pipeline,
 )
 from rquant.presets import ScreenPreset
 from rquant.screen.rules import not_st
