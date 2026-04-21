@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 import pandas as pd
 from loguru import logger
@@ -85,6 +86,72 @@ def _resolve_execution_order(
     return no_dep + has_dep
 
 
+def _compute_levels(body_upper: float, body_lower: float) -> dict[str, float]:
+    """根据涨停日实体算 5 个档位价。"""
+    body = body_upper - body_lower
+    return {
+        "level_40": body_lower + body * 0.4,
+        "level_30": body_lower + body * 0.3,
+        "level_20": body_lower + body * 0.2,
+        "stop_strong": body_lower,
+        "stop_weak": body_lower - body * 0.2,
+    }
+
+
+def _sync_pool2_watch(store: DuckDBStore, trade_date: str) -> None:
+    """将今日 Pool 2 screen_result 同步到 pool2_watch 持久池。
+
+    只添加新票（pool2_watch 中不存在或已 exited 的重新激活）。
+    """
+    pool2_sr = store.query_screen_result(trade_date, "n-shape-pool2")
+    if pool2_sr.empty:
+        return
+
+    existing = store.query_pool2_active()
+    existing_codes = set(existing["ts_code"].tolist()) if not existing.empty else set()
+
+    new_rows = []
+    for _, row in pool2_sr.iterrows():
+        code = row["ts_code"]
+        if code in existing_codes:
+            continue
+
+        # 找涨停日：最近的 is_first_limit_up=True
+        state_df = store._conn.execute(
+            """
+            SELECT trade_date, body_upper, body_lower
+            FROM daily_state
+            WHERE ts_code = ? AND is_first_limit_up = true
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            [code],
+        ).fetchdf()
+
+        if state_df.empty:
+            logger.warning(f"pool2_watch 同步跳过 {code}：找不到涨停日")
+            continue
+
+        limit_up_date = state_df.iloc[0]["trade_date"]
+        bu = float(state_df.iloc[0]["body_upper"])
+        bl = float(state_df.iloc[0]["body_lower"])
+        levels = _compute_levels(bu, bl)
+
+        new_rows.append({
+            "ts_code": code,
+            "entry_date": date.fromisoformat(trade_date),
+            "limit_up_date": limit_up_date,
+            "body_upper": bu,
+            "body_lower": bl,
+            **levels,
+            "status": "active",
+        })
+
+    if new_rows:
+        store.upsert_pool2_watch(pd.DataFrame(new_rows))
+        logger.info(f"pool2_watch 新增 {len(new_rows)} 只")
+
+
 def run_daily_pipeline(
     trade_date: str,
     preset_names: list[str] | None = None,
@@ -161,6 +228,9 @@ def run_daily_pipeline(
             hit_count = len(result_df)
             summary[name] = hit_count
             logger.info(f"  {name}: {hit_count} 命中")
+
+        # 同步 Pool 2 到持久池
+        _sync_pool2_watch(store, trade_date)
 
         logger.info(f"流水线完成 {trade_date}: {summary}")
         return summary
