@@ -36,6 +36,19 @@ def _ingest_with_retry(trade_date: str) -> int:
     return 0
 
 
+def _bridge_apscheduler_logging() -> None:
+    """将 APScheduler 的标准 logging 桥接到 loguru。"""
+    import logging
+
+    class LoguruHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            level = record.levelname
+            logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+    logging.getLogger("apscheduler").handlers = [LoguruHandler()]
+    logging.getLogger("apscheduler").setLevel(logging.INFO)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """启动 APScheduler 常驻进程。"""
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -43,23 +56,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from rquant.pipeline import run_daily_pipeline
 
     setup_logging()
+    _bridge_apscheduler_logging()
+
     scheduler = BlockingScheduler()
 
     @scheduler.scheduled_job(
-        "cron", hour=args.hour, minute=0, day_of_week="mon-fri"
+        "cron", hour=args.hour, minute=0, day_of_week="mon-fri",
+        misfire_grace_time=3600,  # 允许延迟 1 小时仍执行
+        coalesce=True,            # 多次 misfire 合并为一次执行
     )
     def daily_job() -> None:
         trade_date = date.today().isoformat()
         logger.info(f"=== 每日任务开始 {trade_date} ===")
 
-        bar_count = _ingest_with_retry(trade_date)
-        if bar_count == 0:
-            logger.warning(f"{trade_date} 非交易日或数据未就绪，跳过筛选")
-            return
+        try:
+            bar_count = _ingest_with_retry(trade_date)
+            if bar_count == 0:
+                logger.warning(f"{trade_date} 非交易日或数据未就绪，跳过筛选")
+                return
 
-        logger.info(f"数据就绪（{bar_count} 行），开始筛选...")
-        summary = run_daily_pipeline(trade_date)
-        logger.info(f"=== 每日任务完成: {summary} ===")
+            logger.info(f"数据就绪（{bar_count} 行），开始筛选...")
+            summary = run_daily_pipeline(trade_date)
+            logger.info(f"=== 每日任务完成: {summary} ===")
+        except Exception:
+            logger.exception(f"=== 每日任务异常 {trade_date} ===")
 
     def handle_signal(signum: int, frame: object) -> None:
         logger.info("收到退出信号，正在关闭调度器...")
