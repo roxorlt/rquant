@@ -62,7 +62,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     @scheduler.scheduled_job(
         "cron", hour=args.hour, minute=0, day_of_week="mon-fri",
-        misfire_grace_time=3600,  # 允许延迟 1 小时仍执行
+        misfire_grace_time=7200,  # 允许延迟 2 小时仍执行
         coalesce=True,            # 多次 misfire 合并为一次执行
     )
     def daily_job() -> None:
