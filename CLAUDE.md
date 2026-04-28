@@ -27,7 +27,7 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 | 调度 | APScheduler | Celery / Airflow（个人项目用不上） |
 | 日志 | loguru | 标准 logging（手动配置烦） |
 | UI | Streamlit | React/Vue 从零写（先别开分支） |
-| 通知 | cc2im（已有）或企业微信 webhook | 新搭通知系统 |
+| 通知 | PushDeer（参考 30-projects/xueqiuFollow/src/notifier.py），现阶段只推 admin（刘彤） | cc2im（受限于微信 token 限制）、企业微信 webhook、新搭通知系统 |
 
 ## 代码风格
 
@@ -46,7 +46,7 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 4. Week 3b：筛选规则（Python 函数积木，命名对齐通达信/MyTT 风格）
 5. Week 4：调度（APScheduler）+ 筛选结果落库
 6. Week 5：盘中监控（Ashare 轮询）
-7. Week 6：通知（cc2im）
+7. Week 6：通知（PushDeer）
 8. Week 7：Streamlit UI + 自然语言输入（LLM → 积木调用）
 9. Week 8：通达信选股公式支持（解析器 → MyTT/积木）
 
