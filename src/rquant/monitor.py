@@ -29,6 +29,8 @@ class WatchItem:
     level_20: float
     stop_strong: float
     stop_weak: float
+    name: str = ""
+    entry_date: date | None = None  # pool2 入池日；pool1 用 limit_up_date
     triggered: dict[str, bool] = field(default_factory=lambda: {
         "40": False, "30": False, "20": False,
         "strong": False, "weak": False,
@@ -59,6 +61,8 @@ def build_watchlist(
     for _, row in p2_df.iterrows():
         code = row["ts_code"]
         bu, bl = float(row["body_upper"]), float(row["body_lower"])
+        raw_entry = row["entry_date"]
+        entry_d = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
         items[code] = WatchItem(
             ts_code=code,
             pool="pool2",
@@ -71,6 +75,7 @@ def build_watchlist(
             level_20=float(row["level_20"]),
             stop_strong=float(row["stop_strong"]),
             stop_weak=float(row["stop_weak"]),
+            entry_date=entry_d,
         )
 
     # 2. Pool 1（screen_date 当天的，补充不在 Pool 2 中的）
@@ -105,10 +110,12 @@ def build_watchlist(
         bl = float(state_df.iloc[0]["body_lower"])
         levels = _compute_levels(bu, bl)
 
+        lu_raw = state_df.iloc[0]["trade_date"]
+        lu_date = lu_raw.date() if hasattr(lu_raw, "date") else lu_raw
         items[code] = WatchItem(
             ts_code=code,
             pool="pool1",
-            limit_up_date=state_df.iloc[0]["trade_date"],
+            limit_up_date=lu_date,
             body_upper=bu,
             body_lower=bl,
             body=bu - bl,
@@ -117,7 +124,20 @@ def build_watchlist(
             level_20=levels["level_20"],
             stop_strong=levels["stop_strong"],
             stop_weak=levels["stop_weak"],
+            entry_date=lu_date,  # pool1 用涨停日做参考
         )
+
+    # 3. 批量填充股票名称
+    if items:
+        codes = list(items.keys())
+        placeholders = ",".join("?" * len(codes))
+        name_df = store._conn.execute(
+            f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})",
+            codes,
+        ).fetchdf()
+        name_map = dict(zip(name_df["ts_code"], name_df["name"]))
+        for code, item in items.items():
+            item.name = name_map.get(code, "")
 
     logger.info(
         f"Watchlist: {len(items)} 只 "
@@ -215,24 +235,6 @@ _LEVEL_LABELS = {
     "40": "40%", "30": "30%", "20": "20%",
     "strong": "强止", "weak": "弱止",
 }
-
-
-def alert_price_level(item: WatchItem, level: str, price: float) -> None:
-    """Popen osascript 弹出档位提醒（非阻塞）。"""
-    label = _LEVEL_LABELS.get(level, level)
-    title = f"{item.ts_code} | {label}"
-    body = (
-        f"current：¥{price:.2f}\\n"
-        f"40：¥{item.level_40:.2f} | 30：¥{item.level_30:.2f} | "
-        f"20：¥{item.level_20:.2f}\\n"
-        f"body：¥{item.body_lower:.2f} — ¥{item.body_upper:.2f}\\n"
-        f"强止：¥{item.stop_strong:.2f} | 弱止：¥{item.stop_weak:.2f}"
-    )
-    subprocess.Popen([
-        "osascript", "-e",
-        f'display alert "{title}" message "{body}"',
-    ])
-    logger.info(f"弹窗: {title} ¥{price:.2f}")
 
 
 def _count_trading_days_since(
@@ -399,6 +401,8 @@ def _wait_for_market_open() -> None:
 
 def run_monitor(interval: int = 5) -> int:
     """盘中监控主循环。"""
+    from rquant.notify import notify
+
     today = date.today()
 
     if not is_trading_day(today):
@@ -417,6 +421,15 @@ def run_monitor(interval: int = 5) -> int:
         ts_codes = [item.ts_code for item in watchlist]
         item_map = {item.ts_code: item for item in watchlist}
         today_str = today.isoformat()
+        triggers_summary: dict[str, int] = {}
+
+        notify(
+            "heartbeat",
+            event="start",
+            watchlist_count=len(watchlist),
+            pool1_count=sum(1 for i in watchlist if i.pool == "pool1"),
+            pool2_count=sum(1 for i in watchlist if i.pool == "pool2"),
+        )
 
         _wait_for_market_open()
 
@@ -448,9 +461,33 @@ def run_monitor(interval: int = 5) -> int:
                     }])
                     store.upsert_monitor_event(evt_df)
 
-                    # 弹窗
-                    alert_price_level(
-                        item, evt["level"], evt["trigger_price"]
+                    triggers_summary[evt["level"]] = (
+                        triggers_summary.get(evt["level"], 0) + 1
+                    )
+
+                    days = _count_trading_days_since(
+                        store,
+                        item.entry_date or item.limit_up_date,
+                        today,
+                    )
+                    ref_date = item.entry_date or item.limit_up_date
+
+                    notify(
+                        "price_level",
+                        ts_code=code,
+                        name=item.name,
+                        level=evt["level"],
+                        trigger_price=evt["trigger_price"],
+                        body_upper=item.body_upper,
+                        body_lower=item.body_lower,
+                        level_40=item.level_40,
+                        level_30=item.level_30,
+                        level_20=item.level_20,
+                        stop_strong=item.stop_strong,
+                        stop_weak=item.stop_weak,
+                        pool=item.pool,
+                        entry_date=ref_date,
+                        days_in_pool=days,
                     )
 
             time.sleep(interval)
@@ -467,8 +504,15 @@ def run_monitor(interval: int = 5) -> int:
         else:
             logger.info("当日无事件触发")
 
-        # 收盘后：退出检查
-        check_exits(store, today)
+        # 收盘后：退出检查（Phase 4 改造为自动踢出 + 推送）
+        auto_kicked_count = check_exits(store, today)
+
+        notify(
+            "heartbeat",
+            event="stop",
+            triggers_summary=triggers_summary,
+            auto_kicked_count=auto_kicked_count or 0,
+        )
 
     logger.info("监控结束")
     return 0

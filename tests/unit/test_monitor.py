@@ -215,46 +215,6 @@ class TestCheckLevels:
         assert "strong" in levels
 
 
-class TestAlertPriceLevel:
-    @patch("rquant.monitor.subprocess")
-    def test_formats_alert_correctly(self, mock_sub) -> None:
-        from rquant.monitor import WatchItem, alert_price_level
-
-        item = WatchItem(
-            ts_code="002415.SZ", pool="pool2",
-            limit_up_date=date(2026, 4, 17),
-            body_upper=13.20, body_lower=11.80, body=1.40,
-            level_40=12.36, level_30=12.22, level_20=12.08,
-            stop_strong=11.80, stop_weak=11.52,
-        )
-        alert_price_level(item, "30", 12.18)
-
-        mock_sub.Popen.assert_called_once()
-        cmd = mock_sub.Popen.call_args[0][0]
-        script = cmd[2]  # osascript -e "..."
-        assert "002415.SZ | 30%" in script
-        assert "current" in script
-        assert "12.18" in script
-        assert "强止" in script
-
-    @patch("rquant.monitor.subprocess")
-    def test_strong_stop_label(self, mock_sub) -> None:
-        from rquant.monitor import WatchItem, alert_price_level
-
-        item = WatchItem(
-            ts_code="002415.SZ", pool="pool2",
-            limit_up_date=date(2026, 4, 17),
-            body_upper=13.20, body_lower=11.80, body=1.40,
-            level_40=12.36, level_30=12.22, level_20=12.08,
-            stop_strong=11.80, stop_weak=11.52,
-        )
-        alert_price_level(item, "strong", 11.75)
-
-        cmd = mock_sub.Popen.call_args[0][0]
-        script = cmd[2]
-        assert "002415.SZ | 强止" in script
-
-
 class TestAlertExitConfirm:
     @patch("rquant.monitor.subprocess")
     def test_returns_true_on_kick(self, mock_sub) -> None:
@@ -431,14 +391,16 @@ class TestRunMonitor:
         result = run_monitor(interval=5)
         assert result == 0
 
-    @patch("rquant.monitor.check_exits")
+    @patch("rquant.monitor._count_trading_days_since", return_value=4)
+    @patch("rquant.monitor.check_exits", return_value=0)
     @patch("rquant.monitor.fetch_realtime_prices")
     @patch("rquant.monitor.build_watchlist")
     @patch("rquant.monitor.is_trading_day", return_value=True)
     @patch("rquant.monitor._is_trading_hours")
     @patch("rquant.monitor._now")
     def test_polls_and_detects(
-        self, mock_now, mock_hours, _td, mock_build, mock_fetch, mock_exits
+        self, mock_now, mock_hours, _td, mock_build, mock_fetch, _exits,
+        _count_days,
     ) -> None:
         from rquant.monitor import WatchItem, run_monitor
 
@@ -448,6 +410,8 @@ class TestRunMonitor:
             body_upper=13.20, body_lower=11.80, body=1.40,
             level_40=12.36, level_30=12.22, level_20=12.08,
             stop_strong=11.80, stop_weak=11.52,
+            name="海康威视",
+            entry_date=date(2026, 4, 18),
         )
         mock_build.return_value = [item]
         mock_fetch.return_value = {
@@ -458,7 +422,7 @@ class TestRunMonitor:
         mock_hours.side_effect = [True, False]
         mock_now.return_value = datetime(2026, 4, 21, 10, 0, 0)
 
-        with patch("rquant.monitor.alert_price_level"):
+        with patch("rquant.notify.notify") as mock_notify:
             with patch("rquant.monitor.DuckDBStore") as MockStore:
                 mock_store = MockStore.return_value.__enter__.return_value
                 mock_store.upsert_monitor_event.return_value = 1
@@ -466,3 +430,9 @@ class TestRunMonitor:
                 run_monitor(interval=5)
 
         assert item.triggered["40"] is True
+
+        # heartbeat start + price_level (40) + heartbeat stop = 3 calls
+        scenes = [c.args[0] for c in mock_notify.call_args_list]
+        assert "heartbeat" in scenes
+        assert "price_level" in scenes
+        assert scenes.count("heartbeat") == 2  # start + stop

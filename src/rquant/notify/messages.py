@@ -55,6 +55,7 @@ def _build_price_level(
     title = f"{ts_code} {name} {label}档 ¥{trigger_price:.2f}"
 
     entry_str = str(entry_date)[:10]
+    date_label = "入池" if pool == "pool2" else "涨停"
     body = (
         f"# {ts_code} | {label}档触发 | 现价 ¥{trigger_price:.2f}\n"
         f"- bodyTop: ¥{body_upper:.2f}\n"
@@ -63,7 +64,7 @@ def _build_price_level(
         f"- 20档:    ¥{level_20:.2f}\n"
         f"- bodyBtm: ¥{body_lower:.2f}\n"
         f"- 强止：¥{stop_strong:.2f} | 弱止：¥{stop_weak:.2f}\n"
-        f"- {pool}，入池 {entry_str} 第 {days_in_pool} 日"
+        f"- {pool}，{date_label} {entry_str} 第 {days_in_pool} 日"
     )
     return title, body
 

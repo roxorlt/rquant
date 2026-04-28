@@ -57,6 +57,22 @@ class TestPriceLevel:
         )
         assert "强止档" in title
 
+    def test_pool1_uses_limit_up_label(self) -> None:
+        from rquant.notify.messages import build_message
+
+        _, body = build_message(
+            "price_level",
+            ts_code="300001.SZ", name="特锐德",
+            level="40", trigger_price=14.20,
+            body_upper=15.0, body_lower=13.0,
+            level_40=14.20, level_30=14.0, level_20=13.8,
+            stop_strong=13.0, stop_weak=12.7,
+            pool="pool1",
+            entry_date="2026-04-20",
+            days_in_pool=5,
+        )
+        assert "pool1，涨停 2026-04-20 第 5 日" in body
+
 
 class TestPool2Exit:
     def test_kicked_and_held(self) -> None:
