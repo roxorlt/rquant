@@ -382,6 +382,48 @@ class TestCheckExits:
         assert len(active) == 1
 
 
+class TestWaitForMarketOpen:
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_sleeps_until_open_when_just_before(self, mock_now, mock_sleep) -> None:
+        from rquant.monitor import _wait_for_market_open
+
+        mock_now.return_value = datetime(2026, 4, 28, 9, 29, 0)
+        _wait_for_market_open()
+
+        mock_sleep.assert_called_once()
+        slept = mock_sleep.call_args[0][0]
+        assert slept == pytest.approx(60, abs=1)
+
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_no_sleep_after_open(self, mock_now, mock_sleep) -> None:
+        from rquant.monitor import _wait_for_market_open
+
+        mock_now.return_value = datetime(2026, 4, 28, 10, 0, 0)
+        _wait_for_market_open()
+        mock_sleep.assert_not_called()
+
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_no_sleep_when_too_early(self, mock_now, mock_sleep) -> None:
+        from rquant.monitor import _wait_for_market_open
+
+        # 7 AM boot - don't sleep 2.5h, just exit
+        mock_now.return_value = datetime(2026, 4, 28, 7, 0, 0)
+        _wait_for_market_open()
+        mock_sleep.assert_not_called()
+
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_no_sleep_at_exactly_open(self, mock_now, mock_sleep) -> None:
+        from rquant.monitor import _wait_for_market_open
+
+        mock_now.return_value = datetime(2026, 4, 28, 9, 30, 0)
+        _wait_for_market_open()
+        mock_sleep.assert_not_called()
+
+
 class TestRunMonitor:
     @patch("rquant.monitor.is_trading_day", return_value=False)
     def test_exits_on_non_trading_day(self, _mock) -> None:

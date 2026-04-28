@@ -29,6 +29,9 @@
 - Pool 2 下影线阈值同步从 1.5 放宽至 0.5
 - `run_daily_pipeline()` 依赖链改为范围回溯：`offset_days=N` 表示合并 T-1 到 T-N 的父预设结果
 
+### Fixed
+- monitor 自动每日拉起：`com.roxor.rquant-monitor.plist` 加 `StartCalendarInterval` 09:29，`run_monitor` 加 `_wait_for_market_open()` 在 09:30 前 10 分钟内 sleep 到开盘
+
 ---
 
 ## [v0.4.0] — 2026-04-20 — Week 4b: 调度 + 流水线 + N 形态预设

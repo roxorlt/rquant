@@ -380,6 +380,23 @@ def _is_trading_hours() -> bool:
     return (930 <= t <= 1130) or (1300 <= t <= 1500)
 
 
+def _wait_for_market_open() -> None:
+    """如果当前时间在 09:30 前 10 分钟内，sleep 到 09:30 开盘。
+
+    用于 launchd 09:29 触发后等到 09:30 进轮询。超过 10 分钟提前的不等
+    （RunAtLoad 早晨开机/手动早执行场景），避免长时间空转。
+    """
+    now = _now()
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    if now >= market_open:
+        return
+    wait_seconds = (market_open - now).total_seconds()
+    if wait_seconds > 600:
+        return
+    logger.info(f"等待 {wait_seconds:.0f} 秒到 09:30 开盘")
+    time.sleep(wait_seconds)
+
+
 def run_monitor(interval: int = 5) -> int:
     """盘中监控主循环。"""
     today = date.today()
@@ -400,6 +417,8 @@ def run_monitor(interval: int = 5) -> int:
         ts_codes = [item.ts_code for item in watchlist]
         item_map = {item.ts_code: item for item in watchlist}
         today_str = today.isoformat()
+
+        _wait_for_market_open()
 
         while _is_trading_hours():
             prices = fetch_realtime_prices(ts_codes)
