@@ -32,6 +32,19 @@ class Settings(BaseSettings):
 
     app_env: Literal["dev", "prod"] = "dev"
 
+    pushdeer_keys: str = Field(default="")
+    pushdeer_endpoint: str = Field(default="https://api2.pushdeer.com/message/push")
+    notify_enabled: bool = True
+    notify_price_level: bool = True
+    notify_pool2_exit: bool = True
+    notify_daily_summary: bool = True
+    notify_error: bool = True
+    notify_heartbeat: bool = True
+
+    @property
+    def pushdeer_key_list(self) -> list[str]:
+        return [k.strip() for k in self.pushdeer_keys.split(",") if k.strip()]
+
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="after")
     @classmethod
     def ensure_dir_exists(cls, v: Path) -> Path:
