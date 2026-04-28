@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+---
+
+## [v0.5.1] — 2026-04-28 — Hotfixes: 调度可靠性 + monitor 自动拉起
+
+### Fixed
+- `rquant serve` APScheduler 可靠性：`misfire_grace_time` 从 1s → 3600s → 7200s（覆盖周末/长 sleep 后的 misfire），并加 stdlib logging bridge 输出 APS 内部错误
+- monitor 自动每日拉起：`com.roxor.rquant-monitor.plist` 加 `StartCalendarInterval` 09:29，`run_monitor` 加 `_wait_for_market_open()` 在 09:30 前 10 分钟内 sleep 到开盘
+
+---
+
+## [v0.5.0] — 2026-04-21 — Week 5a: 盘中实时监控 + Pool 2 持久池
+
 ### Added
 - `rquant monitor` 命令：盘中实时监控 Pool 1 + Pool 2 标的价格
   - akshare 实时行情轮询（5 秒间隔），检测 5 个档位（40%/30%/20%/强止/弱止）
@@ -28,9 +40,6 @@
 - Pool 2 `offset_days` 从 1 改为 2，合并 T-1 + T-2 两天的父预设白名单
 - Pool 2 下影线阈值同步从 1.5 放宽至 0.5
 - `run_daily_pipeline()` 依赖链改为范围回溯：`offset_days=N` 表示合并 T-1 到 T-N 的父预设结果
-
-### Fixed
-- monitor 自动每日拉起：`com.roxor.rquant-monitor.plist` 加 `StartCalendarInterval` 09:29，`run_monitor` 加 `_wait_for_market_open()` 在 09:30 前 10 分钟内 sleep 到开盘
 
 ---
 
