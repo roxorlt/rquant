@@ -70,7 +70,7 @@ tags: [quant, a-shares, personal-tool, python, macOS]
 | 配置 | Pydantic Settings + `.env` | 类型安全 |
 | 日志 | loguru | 零配置彩色日志 |
 | UI | Streamlit | Python 一把梭，一周出原型 |
-| 通知 | cc2im（已有） / 企业微信 webhook | 复用已有基础设施 |
+| 通知 | PushDeer（参考 xueqiuFollow） | 通道稳定，云端零迁移；cc2im 受限于微信 token |
 | 测试 | pytest + 固定 fixture 数据 | 标准 |
 
 ## MVP 路径（8 周）
@@ -83,7 +83,7 @@ Week 3b  [筛选规则]   原子条件"积木"函数库 + screen() 入口，支�
                      命名对齐通达信/MyTT 风格（为 Week 8 铺路）
 Week 4   [调度]       APScheduler 每日 17:00 自动拉数+跑筛选，结果落 screen_result 表
 Week 5   [实时监控]   Ashare 盘中轮询备选池，触发条件打印告警
-Week 6   [通知打通]   告警推送到微信/企业微信（接 cc2im）
+Week 6   [通知打通]   告警推送 PushDeer（5 类场景：档位/退出/汇总/异常/心跳）
 Week 7   [UI + NL]    Streamlit 面板 + 自然语言输入筛选条件（LLM → 积木调用）
 Week 8   [通达信代码] 支持粘贴通达信选股公式，解析器映射到 MyTT/积木执行
 ```
@@ -143,7 +143,7 @@ rQuant/
 - [x] 筛选规则用 Python 函数还是 YAML DSL？**最终路径**：MVP（Week 3b）用 Python 函数积木 → Week 7 加 NL 输入（LLM → 积木调用）→ Week 8 支持通达信选股公式。**不走 YAML DSL**，因为 NL + 通达信代码已覆盖配置化需求
 - [ ] 告警频率怎么防刷屏（去重 / 冷却期）？
 - [ ] 多因子综合打分还是条件硬筛选？**MVP 先硬筛选，迭代中加打分**
-- [ ] 移动端通知用哪条通道？**首选 cc2im 接微信**
+- [x] 移动端通知用哪条通道？**最终选 PushDeer**（cc2im 受限于微信 token；PushDeer iOS/Mac 双端 + 云端友好）
 
 ## 风险提示
 

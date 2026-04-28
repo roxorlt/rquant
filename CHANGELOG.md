@@ -6,6 +6,40 @@
 
 ---
 
+## [v0.6.0] — 2026-04-29 — Week 6: PushDeer 告警通知
+
+替换原计划的 cc2im（受限于微信 token 限制）为 PushDeer。完全替代 monitor.py 的 osascript 弹窗，云端零迁移成本。
+
+### Added
+- `notify` 独立模块（`src/rquant/notify/`）：
+  - `client.py` — PushDeerClient，多 key 并发推，timeout/异常都捕获不抛
+  - `messages.py` — 5 类场景消息构造（price_level / pool2_exit / daily_summary / error / heartbeat）
+  - `api.py` — `notify(scene, **kwargs)` 统一入口 + 总开关 + 各场景独立开关
+- `rquant notify-test` CLI 命令：直接推 PushDeer 测试消息验证通道
+- 5 类推送场景接入：
+  - **A 档位触发**：实时单条（替换 osascript 弹窗），价格阶梯从高到低展示（bodyTop / 40 / 30 / 20 / bodyBtm + 强弱止）
+  - **B Pool 2 退出汇总**：收盘后批量一条（无事件不推），breakdown 自动踢，expired 保留待用户决策
+  - **C 每日筛选汇总**：17:00 流水线完成后一条，含 Pool 1 命中名单 + Pool 2 持仓状态 + 耗时
+  - **D 系统异常**：cli/pipeline/monitor 入口 try/except 捕获后实时推（含 stack trace 前 15 行）
+  - **E Monitor 启停心跳**：09:30 启动 + 15:00 结束各一条
+- `WatchItem` 新增 `name` 和 `entry_date` 字段，`build_watchlist` 末尾批量从 `stock_basic` join 填股票名
+- `tests/conftest.py` autouse fixture：默认禁用真实 PushDeer 推送，避免测试副作用刷手机
+- 配置项 `.env`/`.env.example`：`PUSHDEER_KEYS` / `PUSHDEER_ENDPOINT` / `NOTIFY_*` 开关
+
+### Changed
+- `monitor.check_exits()` 改为自动化：breakdown 直接 `update_pool2_exit`，expired 保留 active 加入待决策列表，末尾推汇总，返回 `auto_kicked_count` 用于心跳统计
+- `pipeline.run_daily_pipeline()` 末尾计算耗时并触发 daily_summary 推送
+
+### Removed
+- `monitor.alert_price_level()`（osascript 弹窗，被 PushDeer 替代）
+- `monitor.alert_exit_confirm()`（osascript 退出确认弹窗，PushDeer 单向推无法承载交互决策）
+- `subprocess` 导入（不再使用）
+
+### Fixed
+- 测试套件：删除 osascript 相关测试用例（TestAlertPriceLevel / TestAlertExitConfirm），新增 32 个 notify 模块测试 + check_exits 重写后的 3 个测试
+
+---
+
 ## [v0.5.1] — 2026-04-28 — Hotfixes: 调度可靠性 + monitor 自动拉起
 
 ### Fixed
