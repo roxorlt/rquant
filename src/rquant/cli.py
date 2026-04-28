@@ -78,8 +78,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
             logger.info(f"数据就绪（{bar_count} 行），开始筛选...")
             summary = run_daily_pipeline(trade_date)
             logger.info(f"=== 每日任务完成: {summary} ===")
-        except Exception:
+        except Exception as e:
             logger.exception(f"=== 每日任务异常 {trade_date} ===")
+            from rquant.notify import notify
+            notify("error", component="daily_job", exc=e)
 
     def handle_signal(signum: int, frame: object) -> None:
         logger.info("收到退出信号，正在关闭调度器...")
@@ -142,6 +144,39 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
     setup_logging()
     return run_monitor(interval=args.interval)
+
+
+def cmd_notify_test(args: argparse.Namespace) -> int:
+    """推一条 PushDeer 测试消息验证通道。"""
+    from datetime import datetime
+
+    from rquant.config import settings
+    from rquant.notify.client import PushDeerClient
+
+    setup_logging()
+    keys = settings.pushdeer_key_list
+    if not keys:
+        logger.error("PUSHDEER_KEYS 未配置，请检查 .env")
+        return 1
+
+    client = PushDeerClient(keys, settings.pushdeer_endpoint)
+    title = "✅ rQuant 通道测试"
+    body = (
+        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"配置 keys: {len(keys)} 个\n"
+        f"这是测试消息，忽略即可"
+    )
+    results = client.push(title, body)
+
+    success = sum(1 for s, _ in results if s)
+    logger.info(f"测试发送完成: {success}/{len(results)} 成功")
+    for i, (s, err) in enumerate(results):
+        label = keys[i][:8] + "…"
+        if s:
+            logger.info(f"  ✅ {label}")
+        else:
+            logger.error(f"  ❌ {label}: {err}")
+    return 0 if success > 0 else 1
 
 
 def cmd_pool2(args: argparse.Namespace) -> int:
@@ -218,27 +253,42 @@ def build_parser() -> argparse.ArgumentParser:
     pool2_rm = pool2_sub.add_parser("remove", help="移除标的")
     pool2_rm.add_argument("ts_code", type=str, help="股票代码 (如 002415.SZ)")
 
+    sub.add_parser("notify-test", help="推一条 PushDeer 测试消息")
+
     return parser
 
 
 def main() -> int:
-    """CLI 入口函数。"""
+    """CLI 入口函数。一次性命令的异常顶层捕获后推 PushDeer。
+
+    serve 内的 daily_job 自有 try/except + notify，main 不重复抓。
+    """
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command == "serve":
-        return cmd_serve(args)
-    elif args.command == "run-daily":
-        return cmd_run_daily(args)
-    elif args.command == "ingest":
-        return cmd_ingest(args)
-    elif args.command == "monitor":
-        return cmd_monitor(args)
-    elif args.command == "pool2":
-        return cmd_pool2(args)
-    else:
+    dispatch = {
+        "serve": cmd_serve,
+        "run-daily": cmd_run_daily,
+        "ingest": cmd_ingest,
+        "monitor": cmd_monitor,
+        "pool2": cmd_pool2,
+        "notify-test": cmd_notify_test,
+    }
+    handler = dispatch.get(args.command)
+    if handler is None:
         parser.print_help()
         return 0
+
+    if args.command in ("serve", "notify-test"):
+        return handler(args)
+
+    try:
+        return handler(args)
+    except Exception as e:
+        logger.exception(f"=== {args.command} 异常 ===")
+        from rquant.notify import notify
+        notify("error", component=f"cli:{args.command}", exc=e)
+        return 1
 
 
 if __name__ == "__main__":

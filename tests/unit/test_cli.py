@@ -84,3 +84,106 @@ class TestPool2Parser:
         args = parser.parse_args(["pool2", "remove", "002415.SZ"])
         assert args.pool2_action == "remove"
         assert args.ts_code == "002415.SZ"
+
+
+class TestNotifyTestParser:
+    def test_notify_test_registered(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["notify-test"])
+        assert args.command == "notify-test"
+
+
+class TestCmdNotifyTest:
+    def test_no_keys_returns_1(self, monkeypatch) -> None:
+        from rquant.cli import cmd_notify_test
+        from unittest.mock import MagicMock
+
+        # Empty key_list -> should fail fast
+        import rquant.config as cfg_mod
+        monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "")
+
+        rc = cmd_notify_test(MagicMock())
+        assert rc == 1
+
+    def test_pushes_and_returns_0_on_success(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock, patch
+        from rquant.cli import cmd_notify_test
+
+        import rquant.config as cfg_mod
+        monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "k1,k2")
+
+        with patch("rquant.notify.client.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(json=lambda: {"code": 0})
+            rc = cmd_notify_test(MagicMock())
+
+        assert rc == 0
+        assert mock_post.call_count == 2  # 两个 key 都推
+
+    def test_partial_failure_returns_0_when_any_success(
+        self, monkeypatch
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+        from rquant.cli import cmd_notify_test
+
+        import rquant.config as cfg_mod
+        monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "k1,k2")
+
+        responses = [
+            MagicMock(json=lambda: {"code": 0}),
+            MagicMock(json=lambda: {"code": 1, "error": "bad key"}),
+        ]
+        with patch("rquant.notify.client.requests.post", side_effect=responses):
+            rc = cmd_notify_test(MagicMock())
+        assert rc == 0
+
+    def test_all_fail_returns_1(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock, patch
+        from rquant.cli import cmd_notify_test
+
+        import rquant.config as cfg_mod
+        monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "k1")
+
+        with patch("rquant.notify.client.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(json=lambda: {"code": 1, "error": "x"})
+            rc = cmd_notify_test(MagicMock())
+        assert rc == 1
+
+
+class TestMainErrorReporting:
+    def test_main_catches_run_daily_error_and_notifies(self, monkeypatch) -> None:
+        from unittest.mock import patch
+        from rquant.cli import main
+
+        # Force run-daily to raise
+        def boom(_args):
+            raise ValueError("test boom")
+
+        monkeypatch.setattr("rquant.cli.cmd_run_daily", boom)
+
+        with patch("sys.argv", ["rquant", "run-daily", "--no-ingest"]):
+            with patch("rquant.notify.notify") as mock_notify:
+                rc = main()
+
+        assert rc == 1
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        assert mock_notify.call_args.args[0] == "error"
+        assert call_kwargs["component"] == "cli:run-daily"
+        assert isinstance(call_kwargs["exc"], ValueError)
+
+    def test_main_does_not_wrap_serve(self, monkeypatch) -> None:
+        """serve 内部已自处理异常，main 不再加 try/except。"""
+        from unittest.mock import patch
+        from rquant.cli import main
+
+        def boom(_args):
+            raise ValueError("inner")
+
+        monkeypatch.setattr("rquant.cli.cmd_serve", boom)
+        with patch("sys.argv", ["rquant", "serve"]):
+            with patch("rquant.notify.notify") as mock_notify:
+                # main 让 serve 异常直接冒出来
+                import pytest
+                with pytest.raises(ValueError):
+                    main()
+                mock_notify.assert_not_called()
