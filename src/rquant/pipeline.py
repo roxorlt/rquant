@@ -162,8 +162,11 @@ def run_daily_pipeline(
     前置条件：trade_date 的 daily_bar / daily_indicator / daily_state
     数据已通过 ingest_daily.py 入库。
     """
+    import time as _time
+
     owns_store = store is None
     store = store or DuckDBStore()
+    started_at = _time.time()
 
     try:
         # 检查是否有数据
@@ -232,8 +235,74 @@ def run_daily_pipeline(
         # 同步 Pool 2 到持久池
         _sync_pool2_watch(store, trade_date)
 
-        logger.info(f"流水线完成 {trade_date}: {summary}")
+        elapsed = _time.time() - started_at
+        logger.info(f"流水线完成 {trade_date}: {summary} (耗时 {elapsed:.1f}s)")
+
+        _push_daily_summary(store, trade_date, elapsed)
+
         return summary
     finally:
         if owns_store:
             store.close()
+
+
+def _push_daily_summary(
+    store: DuckDBStore,
+    trade_date: str,
+    duration_seconds: float,
+) -> None:
+    """流水线完成后推 C 类汇总。"""
+    from rquant.notify import notify
+
+    pool1_df = store.query_screen_result(trade_date, "n-shape-pool1")
+    pool1_hits = [
+        {
+            "ts_code": row["ts_code"],
+            "name": row.get("name", ""),
+            "close": float(row["close"]),
+        }
+        for _, row in pool1_df.iterrows()
+    ]
+
+    pool2_df = store.query_pool2_active()
+    pool2_active: list[dict] = []
+    if not pool2_df.empty:
+        # 批量取股票名
+        codes = pool2_df["ts_code"].tolist()
+        placeholders = ",".join("?" * len(codes))
+        name_df = store._conn.execute(
+            f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})",
+            codes,
+        ).fetchdf()
+        name_map = dict(zip(name_df["ts_code"], name_df["name"]))
+
+        from datetime import date as _date
+        today = _date.fromisoformat(trade_date)
+        for _, row in pool2_df.iterrows():
+            raw_entry = row["entry_date"]
+            entry_d = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
+            days = _count_trading_days_since(store, entry_d, today)
+            pool2_active.append({
+                "ts_code": row["ts_code"],
+                "name": name_map.get(row["ts_code"], ""),
+                "entry_date": entry_d,
+                "days_in_pool": days,
+            })
+
+    notify(
+        "daily_summary",
+        trade_date=trade_date,
+        pool1_hits=pool1_hits,
+        pool2_active=pool2_active,
+        duration_seconds=duration_seconds,
+    )
+
+
+def _count_trading_days_since(store: DuckDBStore, entry_date, today) -> int:
+    """entry_date 到 today 之间有多少个交易日（含两端）。"""
+    row = store._conn.execute(
+        "SELECT COUNT(DISTINCT trade_date) FROM daily_bar "
+        "WHERE trade_date >= ? AND trade_date <= ?",
+        [entry_date, today],
+    ).fetchone()
+    return row[0] if row else 0

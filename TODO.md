@@ -103,6 +103,7 @@
 - [ ] 盘中分时明细（akshare 1min bars）
 - [ ] tick 数据存储（watchlist 50 只，约 1.5-2GB/年）
 - [ ] 前后端分离 GUI 产品化（rule registry + FastAPI + 前端）
+- [ ] `_count_trading_days_since` 重构：monitor.py 和 pipeline.py 各有一份相同实现，建议合并到 `DuckDBStore.count_trading_days_between(start, end)`（Week 6 PushDeer 接入时为减小 PR 范围暂留重复）
 
 ### Monitor 弹窗 UX 改进（2026-04-28 复盘发现）
 

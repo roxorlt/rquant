@@ -212,3 +212,62 @@ class TestRunDailyPipeline:
             result = run_daily_pipeline("2026-04-18", store=store)
             mock_scr.assert_not_called()
             assert result == {"child": 0}
+
+
+class TestDailySummaryPush:
+    def test_pushes_pool1_and_pool2(self, store: DuckDBStore) -> None:
+        from datetime import date
+
+        # daily_bar 让 pipeline 认为是交易日
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000001.SZ', '2026-04-28', 10,11,9,10.5,10,0.5,5,1000,10000)"
+        )
+        # 直接写入 screen_result 模拟流水线 Pool 1 命中
+        sr = pd.DataFrame([{
+            "trade_date": "2026-04-28",
+            "preset_name": "n-shape-pool1",
+            "ts_code": "600519.SH",
+            "name": "茅台",
+            "close": 1685.0,
+            "pct_chg": 1.5,
+            "extra": None,
+        }])
+        store.upsert_screen_result(sr)
+        # Pool 2 持仓
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 24),
+            "limit_up_date": date(2026, 4, 22),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+        # 股票名
+        store._conn.execute(
+            "INSERT INTO stock_basic (ts_code, name, area, industry, market, list_date) "
+            "VALUES ('002415.SZ', '海康威视', '广东', '安防', '主板', '2010-05-28')"
+        )
+
+        empty_preset = {
+            "noop": ScreenPreset(name="noop", description="", rules=[not_st()]),
+        }
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", empty_preset),
+            patch("rquant.pipeline.screen", return_value=pd.DataFrame()),
+            patch("rquant.notify.notify") as mock_notify,
+        ):
+            run_daily_pipeline("2026-04-28", store=store)
+
+        mock_notify.assert_called_once()
+        scene = mock_notify.call_args.args[0]
+        kwargs = mock_notify.call_args.kwargs
+        assert scene == "daily_summary"
+        assert kwargs["trade_date"] == "2026-04-28"
+        assert len(kwargs["pool1_hits"]) == 1
+        assert kwargs["pool1_hits"][0]["ts_code"] == "600519.SH"
+        assert len(kwargs["pool2_active"]) == 1
+        assert kwargs["pool2_active"][0]["name"] == "海康威视"
+        assert kwargs["duration_seconds"] >= 0
