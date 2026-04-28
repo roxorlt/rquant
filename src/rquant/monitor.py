@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -251,123 +250,89 @@ def _count_trading_days_since(
     return row[0] if row else 0
 
 
-def alert_exit_confirm(
-    ts_code: str,
-    reason: str,
-    entry_date: str,
-    days_in_pool: int,
-    close_price: float,
-    levels: dict[str, float],
-    stop_strong: float,
-    stop_weak: float,
-    triggered_levels: list[str],
-) -> bool:
-    """弹出退出确认弹窗，返回 True=踢出, False=保留。"""
-    # 已触达的档位标 ✓
-    l40 = f"¥{levels['40']:.2f}" + (" ✓" if "40" in triggered_levels else "")
-    l30 = f"¥{levels['30']:.2f}" + (" ✓" if "30" in triggered_levels else "")
-    l20 = f"¥{levels['20']:.2f}" + (" ✓" if "20" in triggered_levels else "")
+def check_exits(store: DuckDBStore, today: date) -> int:
+    """收盘后检查 Pool 2 退出。
 
-    title = f"{ts_code} | 退出确认"
-    body = (
-        f"{reason}\\n"
-        f"入池：{entry_date}（第{days_in_pool}天）\\n"
-        f"昨收：¥{close_price:.2f}\\n"
-        f"40：{l40} | 30：{l30} | 20：{l20}\\n"
-        f"强止：¥{stop_strong:.2f} | 弱止：¥{stop_weak:.2f}"
-    )
+    breakdown（跌破止损）→ 自动 update_pool2_exit
+    expired（超期 ≥3 日）→ 保留 active，加入待决策列表，由用户次日 CLI 处理
 
-    result = subprocess.run(
-        [
-            "osascript", "-e",
-            f'display alert "{title}" message "{body}" '
-            f'buttons {{"保留", "踢出"}} default button "保留"',
-        ],
-        capture_output=True, text=True,
-    )
-    return "踢出" in result.stdout
+    末尾推 notify('pool2_exit', ...) 汇总（无事件不推）。
+    Returns: 自动踢出数量。
+    """
+    from rquant.notify import notify
 
-
-def check_exits(store: DuckDBStore, today: date) -> None:
-    """收盘后检查 Pool 2 退出条件：跌破位 / 超期。"""
     active = store.query_pool2_active()
     if active.empty:
-        return
+        return 0
 
-    today_str = today.isoformat()
+    # 批量取股票名
+    codes = active["ts_code"].tolist()
+    placeholders = ",".join("?" * len(codes))
+    name_df = store._conn.execute(
+        f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})",
+        codes,
+    ).fetchdf()
+    name_map = dict(zip(name_df["ts_code"], name_df["name"]))
 
-    # 获取今日事件记录（用于标记已触达档位）
-    events_df = store.query_monitor_events(today_str)
+    auto_kicked: list[dict] = []
+    expired_held: list[dict] = []
 
     for _, row in active.iterrows():
         code = row["ts_code"]
-        # entry_date may come as date or datetime from DuckDB
         raw_entry = row["entry_date"]
         entry_date = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
 
         stop_s = float(row["stop_strong"])
         stop_w = float(row["stop_weak"])
 
-        # 取今日收盘价
         close_row = store._conn.execute(
             "SELECT close FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
             [code, today],
         ).fetchone()
-
         if close_row is None:
             continue
 
         close_price = float(close_row[0])
         days = _count_trading_days_since(store, entry_date, today)
 
-        # 已触达的档位
-        triggered: list[str] = []
-        if not events_df.empty:
-            stock_events = events_df[events_df["ts_code"] == code]
-            triggered = stock_events["level"].tolist()
-
-        levels = {
-            "40": float(row["level_40"]),
-            "30": float(row["level_30"]),
-            "20": float(row["level_20"]),
-        }
-        entry_str = str(entry_date)[5:]  # "04-18"
-
-        reason = None
-        exit_reason = None
-
-        # 条件 1：跌破止损
         if close_price < stop_w:
-            reason = f"跌破弱止 ¥{stop_w:.2f}"
-            exit_reason = "breakdown"
+            store.update_pool2_exit(code, today, "breakdown")
+            auto_kicked.append({
+                "ts_code": code,
+                "name": name_map.get(code, ""),
+                "close": close_price,
+                "threshold": stop_w,
+                "reason_label": "弱止",
+            })
+            logger.info(f"Pool 2 自动踢出: {code} 跌破弱止 ¥{stop_w:.2f}")
         elif close_price < stop_s:
-            reason = f"跌破强止 ¥{stop_s:.2f}"
-            exit_reason = "breakdown"
-        # 条件 2：超期
+            store.update_pool2_exit(code, today, "breakdown")
+            auto_kicked.append({
+                "ts_code": code,
+                "name": name_map.get(code, ""),
+                "close": close_price,
+                "threshold": stop_s,
+                "reason_label": "强止",
+            })
+            logger.info(f"Pool 2 自动踢出: {code} 跌破强止 ¥{stop_s:.2f}")
         elif days >= 3:
-            reason = "观察期满"
-            exit_reason = "expired"
+            expired_held.append({
+                "ts_code": code,
+                "name": name_map.get(code, ""),
+                "entry_date": entry_date,
+                "days_in_pool": days,
+            })
+            logger.info(f"Pool 2 超期保留: {code} 第 {days} 日")
 
-        if reason is None:
-            continue
-
-        should_kick = alert_exit_confirm(
-            ts_code=code,
-            reason=reason,
-            entry_date=entry_str,
-            days_in_pool=days,
-            close_price=close_price,
-            levels=levels,
-            stop_strong=stop_s,
-            stop_weak=stop_w,
-            triggered_levels=triggered,
+    if auto_kicked or expired_held:
+        notify(
+            "pool2_exit",
+            trade_date=today,
+            auto_kicked=auto_kicked,
+            expired_held=expired_held,
         )
 
-        if should_kick:
-            store.update_pool2_exit(code, today, exit_reason)
-            logger.info(f"Pool 2 退出: {code} ({exit_reason})")
-        else:
-            logger.info(f"Pool 2 保留: {code}")
+    return len(auto_kicked)
 
 
 def _now() -> datetime:

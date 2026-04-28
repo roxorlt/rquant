@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -215,50 +215,8 @@ class TestCheckLevels:
         assert "strong" in levels
 
 
-class TestAlertExitConfirm:
-    @patch("rquant.monitor.subprocess")
-    def test_returns_true_on_kick(self, mock_sub) -> None:
-        from rquant.monitor import alert_exit_confirm
-
-        mock_sub.run.return_value = MagicMock(
-            stdout="button returned:踢出\n"
-        )
-        result = alert_exit_confirm(
-            ts_code="002415.SZ",
-            reason="跌破强止 ¥11.80",
-            entry_date="04-18",
-            days_in_pool=2,
-            close_price=11.65,
-            levels={"40": 12.36, "30": 12.22, "20": 12.08},
-            stop_strong=11.80,
-            stop_weak=11.52,
-            triggered_levels=["40"],
-        )
-        assert result is True
-
-    @patch("rquant.monitor.subprocess")
-    def test_returns_false_on_keep(self, mock_sub) -> None:
-        from rquant.monitor import alert_exit_confirm
-
-        mock_sub.run.return_value = MagicMock(
-            stdout="button returned:保留\n"
-        )
-        result = alert_exit_confirm(
-            ts_code="002415.SZ",
-            reason="观察期满",
-            entry_date="04-18",
-            days_in_pool=3,
-            close_price=12.50,
-            levels={"40": 12.36, "30": 12.22, "20": 12.08},
-            stop_strong=11.80,
-            stop_weak=11.52,
-            triggered_levels=["40"],
-        )
-        assert result is False
-
-
 class TestCheckExits:
-    def test_breakdown_detected(self, store: DuckDBStore) -> None:
+    def test_breakdown_auto_kicks(self, store: DuckDBStore) -> None:
         from rquant.monitor import check_exits
 
         p2 = pd.DataFrame([{
@@ -272,19 +230,31 @@ class TestCheckExits:
         }])
         store.upsert_pool2_watch(p2)
 
-        # Close price below stop_strong
+        # Close price below stop_weak
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
-            "('002415.SZ', '2026-04-21', 12,12,11.5,11.65,12,0,0,1000,10000)"
+            "('002415.SZ', '2026-04-21', 12,12,11.5,11.40,12,0,0,1000,10000)"
         )
 
-        with patch("rquant.monitor.alert_exit_confirm", return_value=True):
-            check_exits(store, date(2026, 4, 21))
+        with patch("rquant.notify.notify") as mock_notify:
+            kicked = check_exits(store, date(2026, 4, 21))
 
+        assert kicked == 1
         active = store.query_pool2_active()
         assert len(active) == 0
 
-    def test_expiry_detected(self, store: DuckDBStore) -> None:
+        # Verify pool2_exit notification fired with auto_kicked
+        mock_notify.assert_called_once()
+        scene = mock_notify.call_args.args[0]
+        assert scene == "pool2_exit"
+        kwargs = mock_notify.call_args.kwargs
+        assert len(kwargs["auto_kicked"]) == 1
+        assert kwargs["auto_kicked"][0]["ts_code"] == "002415.SZ"
+        assert kwargs["auto_kicked"][0]["reason_label"] == "弱止"
+        assert kwargs["expired_held"] == []
+
+    def test_expired_held_active(self, store: DuckDBStore) -> None:
+        """超期不再自动踢出，保留 active 加入待决策列表。"""
         from rquant.monitor import check_exits
 
         p2 = pd.DataFrame([{
@@ -307,19 +277,28 @@ class TestCheckExits:
             "('002415.SZ', '2026-04-21', 12,13,11,12.5,12,0.5,5,1000,10000)"
         )
 
-        with patch("rquant.monitor.alert_exit_confirm", return_value=True):
-            check_exits(store, date(2026, 4, 21))
+        with patch("rquant.notify.notify") as mock_notify:
+            kicked = check_exits(store, date(2026, 4, 21))
 
+        assert kicked == 0
         active = store.query_pool2_active()
-        assert len(active) == 0
+        assert len(active) == 1  # 仍 active
 
-    def test_user_keeps_stock(self, store: DuckDBStore) -> None:
+        # Verify expired_held in notification
+        mock_notify.assert_called_once()
+        kwargs = mock_notify.call_args.kwargs
+        assert kwargs["auto_kicked"] == []
+        assert len(kwargs["expired_held"]) == 1
+        assert kwargs["expired_held"][0]["ts_code"] == "002415.SZ"
+
+    def test_no_events_no_notify(self, store: DuckDBStore) -> None:
+        """无任何退出事件时不推送。"""
         from rquant.monitor import check_exits
 
         p2 = pd.DataFrame([{
             "ts_code": "002415.SZ",
-            "entry_date": date(2026, 4, 16),
-            "limit_up_date": date(2026, 4, 15),
+            "entry_date": date(2026, 4, 20),  # only 1 day old
+            "limit_up_date": date(2026, 4, 19),
             "body_upper": 13.20, "body_lower": 11.80,
             "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
             "stop_strong": 11.80, "stop_weak": 11.52,
@@ -327,19 +306,17 @@ class TestCheckExits:
         }])
         store.upsert_pool2_watch(p2)
 
+        # Close well above stops, not expired
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
-            "('002415.SZ', '2026-04-16', 12,13,11,12,11,1,5,1000,10000),"
-            "('002415.SZ', '2026-04-17', 12,13,11,12,11,1,5,1000,10000),"
-            "('002415.SZ', '2026-04-18', 12,13,11,12,11,1,5,1000,10000),"
-            "('002415.SZ', '2026-04-21', 12,13,11,12.5,12,0.5,5,1000,10000)"
+            "('002415.SZ', '2026-04-21', 12,13,12,12.50,12,0.5,5,1000,10000)"
         )
 
-        with patch("rquant.monitor.alert_exit_confirm", return_value=False):
-            check_exits(store, date(2026, 4, 21))
+        with patch("rquant.notify.notify") as mock_notify:
+            kicked = check_exits(store, date(2026, 4, 21))
 
-        active = store.query_pool2_active()
-        assert len(active) == 1
+        assert kicked == 0
+        mock_notify.assert_not_called()
 
 
 class TestWaitForMarketOpen:
