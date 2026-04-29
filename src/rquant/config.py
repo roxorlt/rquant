@@ -34,6 +34,8 @@ class Settings(BaseSettings):
 
     pushdeer_keys: str = Field(default="")
     pushdeer_endpoint: str = Field(default="https://api2.pushdeer.com/message/push")
+    pushplus_tokens: str = Field(default="")
+    pushplus_endpoint: str = Field(default="http://www.pushplus.plus/send")
     notify_enabled: bool = True
     notify_price_level: bool = True
     notify_pool2_exit: bool = True
@@ -44,6 +46,10 @@ class Settings(BaseSettings):
     @property
     def pushdeer_key_list(self) -> list[str]:
         return [k.strip() for k in self.pushdeer_keys.split(",") if k.strip()]
+
+    @property
+    def pushplus_token_list(self) -> list[str]:
+        return [t.strip() for t in self.pushplus_tokens.split(",") if t.strip()]
 
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="after")
     @classmethod

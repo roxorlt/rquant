@@ -19,12 +19,17 @@ def mock_settings():
         m.notify_heartbeat = True
         m.pushdeer_key_list = ["k1"]
         m.pushdeer_endpoint = "https://api2.pushdeer.com/message/push"
+        m.pushplus_token_list = ["pp1"]
+        m.pushplus_endpoint = "http://www.pushplus.plus/send"
         yield m
 
 
 class TestNotifyDispatch:
+    @patch("rquant.notify.api.PushPlusClient")
     @patch("rquant.notify.api.PushDeerClient")
-    def test_calls_client_push(self, MockClient, mock_settings) -> None:
+    def test_calls_both_channels(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
         from rquant.notify.api import notify
 
         notify(
@@ -35,48 +40,66 @@ class TestNotifyDispatch:
             pool2_count=5,
         )
 
-        MockClient.assert_called_once_with(
+        MockPushDeer.assert_called_once_with(
             keys=["k1"],
             endpoint="https://api2.pushdeer.com/message/push",
         )
-        instance = MockClient.return_value
-        instance.push.assert_called_once()
+        MockPushPlus.assert_called_once_with(
+            tokens=["pp1"],
+            endpoint="http://www.pushplus.plus/send",
+        )
+        # 双通道都推
+        MockPushDeer.return_value.push.assert_called_once()
+        MockPushPlus.return_value.push.assert_called_once()
 
-        args, _ = instance.push.call_args
+        args, _ = MockPushDeer.return_value.push.call_args
         assert args[0] == "▶ Monitor 启动 10 只"
 
+    @patch("rquant.notify.api.PushPlusClient")
     @patch("rquant.notify.api.PushDeerClient")
-    def test_global_disabled_skips(self, MockClient, mock_settings) -> None:
+    def test_global_disabled_skips(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
         from rquant.notify.api import notify
 
         mock_settings.notify_enabled = False
         notify("heartbeat", event="start")
-        MockClient.assert_not_called()
+        MockPushDeer.assert_not_called()
+        MockPushPlus.assert_not_called()
 
+    @patch("rquant.notify.api.PushPlusClient")
     @patch("rquant.notify.api.PushDeerClient")
-    def test_per_scene_disabled_skips(self, MockClient, mock_settings) -> None:
+    def test_per_scene_disabled_skips(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
         from rquant.notify.api import notify
 
         mock_settings.notify_heartbeat = False
         notify("heartbeat", event="start")
-        MockClient.assert_not_called()
+        MockPushDeer.assert_not_called()
+        MockPushPlus.assert_not_called()
 
+    @patch("rquant.notify.api.PushPlusClient")
     @patch("rquant.notify.api.PushDeerClient")
     def test_message_build_failure_logged_not_raised(
-        self, MockClient, mock_settings
+        self, MockPushDeer, MockPushPlus, mock_settings
     ) -> None:
         from rquant.notify.api import notify
 
-        # heartbeat without event= raises in builder
         notify("heartbeat")  # missing required arg
-        MockClient.assert_not_called()
+        MockPushDeer.assert_not_called()
+        MockPushPlus.assert_not_called()
 
+    @patch("rquant.notify.api.PushPlusClient")
     @patch("rquant.notify.api.PushDeerClient")
-    def test_push_exception_swallowed(self, MockClient, mock_settings) -> None:
+    def test_push_exception_swallowed_independent(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
+        """单通道失败不影响另一通道。"""
         from rquant.notify.api import notify
 
-        MockClient.return_value.push.side_effect = RuntimeError("boom")
-        # Should not raise
+        MockPushDeer.return_value.push.side_effect = RuntimeError("pd boom")
+        # Should not raise; PushPlus 仍被调用
         notify(
             "heartbeat",
             event="start",
@@ -84,3 +107,4 @@ class TestNotifyDispatch:
             pool1_count=1,
             pool2_count=0,
         )
+        MockPushPlus.return_value.push.assert_called_once()

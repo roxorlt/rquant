@@ -147,36 +147,51 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
 
 def cmd_notify_test(args: argparse.Namespace) -> int:
-    """推一条 PushDeer 测试消息验证通道。"""
+    """推测试消息验证所有配置的通道（PushDeer + PushPlus）。"""
     from datetime import datetime
 
     from rquant.config import settings
-    from rquant.notify.client import PushDeerClient
+    from rquant.notify.client import PushDeerClient, PushPlusClient
 
     setup_logging()
     keys = settings.pushdeer_key_list
-    if not keys:
-        logger.error("PUSHDEER_KEYS 未配置，请检查 .env")
+    tokens = settings.pushplus_token_list
+    if not keys and not tokens:
+        logger.error("PUSHDEER_KEYS 和 PUSHPLUS_TOKENS 都未配置，请检查 .env")
         return 1
 
-    client = PushDeerClient(keys, settings.pushdeer_endpoint)
     title = "✅ rQuant 通道测试"
     body = (
         f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n"
-        f"配置 keys: {len(keys)} 个\n"
+        f"PushDeer keys: {len(keys)} 个 / PushPlus tokens: {len(tokens)} 个\n"
         f"这是测试消息，忽略即可"
     )
-    results = client.push(title, body)
 
-    success = sum(1 for s, _ in results if s)
-    logger.info(f"测试发送完成: {success}/{len(results)} 成功")
-    for i, (s, err) in enumerate(results):
-        label = keys[i][:8] + "…"
-        if s:
-            logger.info(f"  ✅ {label}")
-        else:
-            logger.error(f"  ❌ {label}: {err}")
-    return 0 if success > 0 else 1
+    total_success = 0
+    total_count = 0
+
+    if keys:
+        pd_results = PushDeerClient(keys, settings.pushdeer_endpoint).push(title, body)
+        for i, (s, err) in enumerate(pd_results):
+            label = "PushDeer " + keys[i][:8] + "…"
+            (logger.info if s else logger.error)(
+                f"  {'✅' if s else '❌'} {label}{'' if s else ': ' + str(err)}"
+            )
+        total_success += sum(1 for s, _ in pd_results if s)
+        total_count += len(pd_results)
+
+    if tokens:
+        pp_results = PushPlusClient(tokens, settings.pushplus_endpoint).push(title, body)
+        for i, (s, err) in enumerate(pp_results):
+            label = "PushPlus " + tokens[i][:8] + "…"
+            (logger.info if s else logger.error)(
+                f"  {'✅' if s else '❌'} {label}{'' if s else ': ' + str(err)}"
+            )
+        total_success += sum(1 for s, _ in pp_results if s)
+        total_count += len(pp_results)
+
+    logger.info(f"测试发送完成: {total_success}/{total_count} 成功")
+    return 0 if total_success > 0 else 1
 
 
 def cmd_pool2(args: argparse.Namespace) -> int:
