@@ -78,18 +78,18 @@ sudo systemctl reload nginx
 
 腾讯云轻量服务器控制台 → 防火墙 → 入站规则 → 添加：
 - 协议：TCP
-- 端口：8080
+- 端口：8081
 - 来源：`0.0.0.0/0`（公开访问）或限制为你 mac 公网 IP
 
 ### 6. 服务器侧验证
 
 ```bash
 # 本机回环测试
-curl -sI -u "rquant:${TOKEN}" http://localhost:8080/backup/latest.duckdb.gz | head -3
+curl -sI -u "rquant:${TOKEN}" http://localhost:8081/backup/latest.duckdb.gz | head -3
 # 期望：HTTP/1.1 200 OK
 
 # 元数据
-curl -s -u "rquant:${TOKEN}" http://localhost:8080/backup/latest.json | python3 -m json.tool
+curl -s -u "rquant:${TOKEN}" http://localhost:8081/backup/latest.json | python3 -m json.tool
 # 期望：{"snapshot_at": "...", "src_bytes": ..., "compressed_bytes": ...}
 ```
 
@@ -103,7 +103,7 @@ echo "" >> .env
 echo "# Backup HTTP API" >> .env
 echo "RQUANT_BACKUP_USER=rquant" >> .env
 echo "RQUANT_BACKUP_TOKEN=<服务器 TOKEN>" >> .env
-echo "RQUANT_BACKUP_URL=http://82.156.0.68:8080/backup" >> .env
+echo "RQUANT_BACKUP_URL=http://82.156.0.68:8081/backup" >> .env
 ```
 
 ### 2. 测试拉一次
