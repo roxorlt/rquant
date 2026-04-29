@@ -34,16 +34,122 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 简单 CSS 美化
+# 紧凑型 CSS 美化（参考 Linear / Vercel 风格）
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-    [data-testid="stMetricValue"] { font-size: 1.5rem; }
-    [data-testid="stMetricLabel"] { font-size: 0.85rem; color: #666; }
-    h2 { margin-top: 1rem; padding-top: 0.5rem; border-top: 1px solid #eee; }
-    h3 { font-size: 1.1rem; margin-bottom: 0.5rem; }
-    [data-testid="stDataFrame"] { font-size: 0.85rem; }
+    /* 全局缩小基础字号 */
+    html, body, [class*="st-"], .stMarkdown, .stText {
+        font-size: 13px;
+    }
+
+    /* Block 容器：限宽 + 紧凑 padding */
+    .block-container {
+        padding-top: 1.5rem !important;
+        padding-bottom: 1rem !important;
+        max-width: 1400px;
+    }
+
+    /* H1 顶部标题 */
+    h1, .stMarkdown h1 {
+        font-size: 1.5rem !important;
+        margin-bottom: 0.25rem !important;
+        font-weight: 700 !important;
+    }
+
+    /* H2 章节标题：小号大写 + 上方细线分隔 */
+    h2, .stMarkdown h2 {
+        font-size: 0.78rem !important;
+        margin-top: 1.5rem !important;
+        margin-bottom: 0.6rem !important;
+        padding-top: 0.6rem !important;
+        color: #6b7280 !important;
+        border-top: 1px solid #e5e7eb !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.08em !important;
+        font-weight: 600 !important;
+    }
+
+    /* H3 sub-section（容器内标题）*/
+    h3, .stMarkdown h3 {
+        font-size: 0.85rem !important;
+        margin-bottom: 0.5rem !important;
+        margin-top: 0 !important;
+        color: #374151 !important;
+        font-weight: 600 !important;
+    }
+
+    /* Metric 卡 */
+    [data-testid="stMetric"] {
+        padding: 0.3rem 0 !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.15rem !important;
+        font-weight: 600 !important;
+        line-height: 1.2 !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.7rem !important;
+        color: #6b7280 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.04em !important;
+        font-weight: 500 !important;
+    }
+    [data-testid="stMetricDelta"] {
+        font-size: 0.75rem !important;
+        font-weight: 500 !important;
+    }
+
+    /* DataFrame */
+    [data-testid="stDataFrame"] {
+        font-size: 0.78rem !important;
+    }
+    [data-testid="stDataFrame"] th {
+        font-size: 0.72rem !important;
+        font-weight: 600 !important;
+        color: #6b7280 !important;
+    }
+
+    /* Container border：细灰 + 圆角 */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid #e5e7eb !important;
+        border-radius: 6px !important;
+        padding: 0.75rem 1rem !important;
+        background: #fafafa !important;
+    }
+
+    /* Caption / 副文 */
+    [data-testid="stCaptionContainer"], .stCaption {
+        font-size: 0.72rem !important;
+        color: #9ca3af !important;
+    }
+
+    /* Divider 极细 */
+    hr {
+        margin: 0.75rem 0 !important;
+        border-color: #e5e7eb !important;
+    }
+
+    /* Alert（info / success / warning / error）紧凑 */
+    [data-testid="stAlert"] {
+        padding: 0.5rem 0.75rem !important;
+        font-size: 0.8rem !important;
+    }
+
+    /* Expander */
+    [data-testid="stExpander"] {
+        border: 1px solid #e5e7eb !important;
+        border-radius: 6px !important;
+    }
+    [data-testid="stExpander"] summary {
+        font-size: 0.8rem !important;
+        padding: 0.4rem 0.75rem !important;
+    }
+
+    /* 收紧 columns 之间间距 */
+    [data-testid="column"] {
+        padding: 0 0.4rem !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -163,14 +269,22 @@ def get_realtime_prices_sina() -> pd.DataFrame:
 
 
 hostname = socket.gethostname()
-col_title, col_meta = st.columns([3, 1])
+col_title, col_meta = st.columns([3, 2])
 with col_title:
-    st.markdown("# 📈 rQuant Health")
+    st.markdown(
+        "<div style='display:flex;align-items:baseline;gap:10px;'>"
+        "<span style='font-size:1.5rem;font-weight:700;letter-spacing:-0.02em;'>"
+        "📈 rQuant Health</span>"
+        "<span style='color:#9ca3af;font-size:0.78rem;'>云端业务健康看板</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 with col_meta:
     st.markdown(
-        f"<div style='text-align:right;color:#888;font-size:0.85rem;'>"
-        f"<b>{hostname}</b><br/>"
-        f"刷新于 {datetime.now(CST).strftime('%H:%M:%S')} · 每 {REFRESH_SECONDS}s 自动刷新"
+        f"<div style='text-align:right;color:#9ca3af;font-size:0.72rem;line-height:1.4;'>"
+        f"<span style='color:#6b7280;font-weight:500;'>{hostname}</span>"
+        f" · 渲染 {datetime.now(CST).strftime('%H:%M:%S')}"
+        f" · 每 {REFRESH_SECONDS}s 自动刷新"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -193,12 +307,15 @@ dashboard_active = dashboard_status.get("ActiveState") == "active"
 
 def _badge(label: str, ok: bool, sub: str = "") -> str:
     color = "#16a34a" if ok else "#dc2626"
-    icon = "✅" if ok else "❌"
+    dot = "●"
     return (
-        f"<span style='display:inline-block;padding:6px 14px;margin-right:10px;"
-        f"border-radius:8px;background:{color}1a;color:{color};font-size:0.9rem;"
-        f"border:1px solid {color}40;'>"
-        f"{icon} <b>{label}</b> {sub}</span>"
+        f"<span style='display:inline-flex;align-items:center;gap:6px;"
+        f"padding:4px 10px;margin-right:8px;border-radius:5px;"
+        f"background:{color}14;color:{color};font-size:0.72rem;"
+        f"font-weight:500;border:1px solid {color}33;'>"
+        f"<span style='font-size:0.7rem;'>{dot}</span>"
+        f"<b style='letter-spacing:0.02em;'>{label}</b>"
+        f"<span style='color:{color}aa;'>{sub}</span></span>"
     )
 
 
@@ -393,7 +510,7 @@ else:
             ),
             tooltip=[alt.Tooltip("date:O", title="日期"), alt.Tooltip("hits:Q", title="命中数")],
         )
-        .properties(height=260)
+        .properties(height=200)
     )
     text = (
         alt.Chart(trend)
