@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger rQuant daily pipeline at 17:00 Mon-Fri
+
+[Timer]
+# A 股交易日 17:00（Tushare daily 数据通常 16:30-17:00 就绪）
+OnCalendar=Mon..Fri *-*-* 17:00:00
+
+# 错过时间立即补执行（系统重启/休眠后追上）
+Persistent=true
+
+# 多个 timer 错峰，0-30s 随机延迟
+RandomizedDelaySec=30s
+
+Unit=rquant-daily.service
+
+[Install]
+WantedBy=timers.target

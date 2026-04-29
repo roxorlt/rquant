@@ -1,0 +1,25 @@
+[Unit]
+Description=rQuant Daily Pipeline (ingest + screen + Pool 2 sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant run-daily
+
+# 不自动重启（timer 下次触发会再来；oneshot 失败有 PushDeer D 类告警）
+Restart=no
+
+# 流水线最长 1 小时（含 ingest 重试 3×15min）
+TimeoutStartSec=3600
+
+# 标准输出和错误都进 journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

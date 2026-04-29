@@ -1,0 +1,29 @@
+[Unit]
+Description=rQuant Intraday Monitor (real-time price level alerts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant monitor
+
+# 异常崩溃自动拉起（akshare 网络抖动等），间隔 30s
+Restart=on-failure
+RestartSec=30s
+
+# 启动等 watchlist + akshare，最长 10 分钟
+TimeoutStartSec=600
+
+# monitor 自然退出（收盘后 return 0），systemd 不视为失败
+SuccessExitStatus=0
+
+# 标准输出和错误都进 journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

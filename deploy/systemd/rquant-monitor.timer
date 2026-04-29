@@ -1,0 +1,14 @@
+[Unit]
+Description=Trigger rQuant intraday monitor at 09:25 Mon-Fri
+
+[Timer]
+# 09:25 触发，monitor 内部 _wait_for_market_open 会 sleep 到 09:30 进轮询
+OnCalendar=Mon..Fri *-*-* 09:25:00
+
+# 错过时间不补（盘已开盘后再触发意义不大，下次开盘自然再来）
+Persistent=false
+
+Unit=rquant-monitor.service
+
+[Install]
+WantedBy=timers.target
