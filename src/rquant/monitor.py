@@ -164,21 +164,26 @@ def fetch_realtime_prices(
 ) -> dict[str, dict[str, float]]:
     """批量获取实时行情，返回 {ts_code: {price, low}}。
 
-    akshare 代码格式 "002415"，rQuant 用 "002415.SZ"。
+    用 akshare sina 源 stock_zh_a_spot——东方财富源 stock_zh_a_spot_em
+    在云服务器（如腾讯云）被屏蔽（Remote end closed）。
+
+    sina 代码格式 'sh600519' / 'sz000001' / 'bj920000'，按后 6 位匹配
+    rQuant ts_code（'600519.SH'）。
     """
     try:
-        df = ak.stock_zh_a_spot_em()
+        df = ak.stock_zh_a_spot()
     except Exception:
         logger.error("akshare 实时行情获取失败")
         return {}
 
-    # ts_code -> akshare 代码映射
     code_map = {c.split(".")[0]: c for c in ts_codes}
     wanted = set(code_map.keys())
 
     result = {}
     for _, row in df.iterrows():
-        ak_code = str(row["代码"])
+        raw_code = str(row["代码"])
+        # sina 代码带前缀 sh/sz/bj，取后 6 位；em 源是纯 6 位也兼容
+        ak_code = raw_code[-6:] if len(raw_code) >= 6 else raw_code
         if ak_code in wanted:
             ts_code = code_map[ak_code]
             price = row["最新价"]

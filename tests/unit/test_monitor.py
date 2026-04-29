@@ -130,8 +130,9 @@ class TestFetchRealtimePrices:
     def test_returns_price_and_low(self, mock_ak) -> None:
         from rquant.monitor import fetch_realtime_prices
 
-        mock_ak.stock_zh_a_spot_em.return_value = pd.DataFrame({
-            "代码": ["002415", "300001", "600000"],
+        # sina 源：代码带前缀 sh/sz/bj
+        mock_ak.stock_zh_a_spot.return_value = pd.DataFrame({
+            "代码": ["sz002415", "sz300001", "sh600000"],
             "最新价": [12.35, 15.00, 8.50],
             "最低": [12.10, 14.80, 8.30],
         })
@@ -146,13 +147,26 @@ class TestFetchRealtimePrices:
     def test_missing_stock_skipped(self, mock_ak) -> None:
         from rquant.monitor import fetch_realtime_prices
 
-        mock_ak.stock_zh_a_spot_em.return_value = pd.DataFrame({
-            "代码": ["600000"],
+        mock_ak.stock_zh_a_spot.return_value = pd.DataFrame({
+            "代码": ["sh600000"],
             "最新价": [8.50],
             "最低": [8.30],
         })
         result = fetch_realtime_prices(["002415.SZ"])
         assert result == {}
+
+    @patch("rquant.monitor.ak")
+    def test_handles_bj_prefix(self, mock_ak) -> None:
+        """北交所代码 bj920xxx 也能识别。"""
+        from rquant.monitor import fetch_realtime_prices
+
+        mock_ak.stock_zh_a_spot.return_value = pd.DataFrame({
+            "代码": ["bj920001"],
+            "最新价": [14.18],
+            "最低": [14.09],
+        })
+        result = fetch_realtime_prices(["920001.BJ"])
+        assert result["920001.BJ"]["price"] == 14.18
 
 
 class TestCheckLevels:
