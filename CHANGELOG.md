@@ -6,6 +6,58 @@
 
 ---
 
+## [v0.7.0] — 2026-04-29 — 云端部署 + 多通道通知 + Health Dashboard
+
+把 rQuant 从本地 macOS 单点搬到腾讯云轻量服务器（82.156.0.68）systemd 调度，
+解决本地笔记本休眠 APScheduler 死亡问题。增加 PushPlus 通道（不装 PushDeer
+的协作者）、Streamlit Health Dashboard、本地热备 rsync 同步。
+
+### Added
+- systemd timer + service（`deploy/systemd/`）：daily 17:00 + monitor 09:25
+  工作日触发，腾讯云 OpenCloudOS 9 验证通过
+- PushPlus 通道（`notify/client.py:PushPlusClient`）：微信公众号推送，给
+  不装 PushDeer 的用户（如美丞）；与 PushDeer 双通道独立失败
+- Health Dashboard（`src/rquant/dashboard/app.py`）：Streamlit 单页 9 个指标
+  - systemd 服务状态 / Watchlist / 今日触发事件 / 数据新鲜度 / 7 日趋势
+  - 通知通道 24h 成功率 / 本地 sync 状态 / Pool 2 实时价位 vs 档位
+  - Pool 2 行点击下钻：日 K candlestick + 分时（午休 11:30-13:00 跳过空段）
+  - 30s 自动刷新 + Linear/Vercel 风格紧凑 UI
+- 本地热备 rsync（`scripts/sync-from-cloud.sh` + `deploy/com.roxor.rquant-sync.plist`）：
+  - 盘中 09:30-15:05 + 日终 17:10-17:30 同步窗口
+  - rsync `--delay-updates` 原子 rename 保证 mac 端读到完整文件
+  - `--force` 选项手动触发；失败 PushDeer 告警
+- `notification_log` 表 + `notify/api.py` 写入推送日志（dashboard 读取展示）
+- `_to_sina_symbol` helper：ts_code → sina 代码格式（sh/sz/bj 前缀）
+- CLAUDE.md 新增"生产环境与协作模式"小节：服务器 IP / Hybrid 协作分工 /
+  通知通道分工
+- `deploy/dashboard.md` + `deploy/local-sync.md` + `deploy/systemd/README.md`：
+  部署 + nginx basic auth + 故障排查文档
+
+### Fixed
+- monitor `fetch_realtime_prices` 从 `stock_zh_a_spot_em`（东方财富，云端
+  腾讯云 IP 段被屏蔽）改 `stock_zh_a_spot`（sina HQ 接口），云端可用
+- dashboard K 线 / 分时 API 同步换 sina：`stock_zh_a_daily` +
+  `stock_zh_a_minute` 替代东方财富版本
+- dashboard DuckDB 写锁冲突优雅降级：query 返回 None 时 UI 显示等待提示，
+  不再裸抛错误堆栈（daily 流水线 ingest 期间 dashboard 自动降级）
+- dashboard UI 大幅紧凑化：字号 16→13px、metric 卡值 1.5→1.15rem、H2
+  改 Vercel 小号大写、container border 1px 浅灰圆角、健康 badge 扁平化
+- 分时图 11:30-13:00 午休空段：x 轴改 ordinal 跳过空段，加灰虚线分隔
+- dashboard Pool 2 实时价位：sina HQ 批量接口替代 ak.stock_zh_a_spot 全市场
+  拉取（300ms vs 3s），数字列严格 `%.2f` 格式
+- sync 窗口策略修正：原"每小时跑 + 业务时段跳过"改为"仅业务时段相关跑 +
+  其他时间不跑"，避免错过 monitor_event 实时备份
+- systemd timer NEXT 字段微秒时间戳转 UTC+8 + delta 显示"X 小时后"
+
+### Changed
+- `WatchItem` 加 `name` / `entry_date` 字段，`build_watchlist` 末尾批量
+  从 `stock_basic` join 填股票名（dashboard 用）
+- `_send_pushdeer` / `_send_pushplus` 写 `notification_log` 表记录每条
+  推送的 target/success/error_msg
+- `pyproject.toml` 新增 streamlit 依赖
+
+---
+
 ## [v0.6.0] — 2026-04-29 — Week 6: PushDeer 告警通知
 
 替换原计划的 cc2im（受限于微信 token 限制）为 PushDeer。完全替代 monitor.py 的 osascript 弹窗，云端零迁移成本。
