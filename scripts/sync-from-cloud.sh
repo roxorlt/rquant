@@ -18,6 +18,12 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG}"
 }
 
+# --force 跳过时段判断，立刻同步（手动调试用）
+force_mode=0
+if [[ "${1:-}" == "--force" ]]; then
+    force_mode=1
+fi
+
 # 同步窗口：盘中（拉 monitor_event 实时）+ 日终（拉流水线产出）。
 # 其他时段数据不变，跳过省资源。
 hour=$(date +%H)
@@ -32,18 +38,17 @@ elif (( hhmm >= 1710 && hhmm <= 1730 )); then
     sync_window="daily_after_pipeline"  # 日终窗口（17:10-17:30 内会触发 ~3 次，幂等覆盖）
 fi
 
-if [[ -z "${sync_window}" ]]; then
-    log "skip: not in sync window (hhmm=${hhmm})"
+if (( force_mode == 1 )); then
+    log "sync window: forced (manual)"
+elif [[ -z "${sync_window}" ]]; then
+    log "skip: not in sync window (hhmm=${hhmm}, use --force to override)"
     exit 0
-fi
-
-# 周末跳过盘中窗口（A 股不开市）
-if [[ "${sync_window}" == "intraday" && "${day_of_week}" -gt 5 ]]; then
+elif [[ "${sync_window}" == "intraday" && "${day_of_week}" -gt 5 ]]; then
     log "skip: weekend, no intraday data (dow=${day_of_week})"
     exit 0
+else
+    log "sync window: ${sync_window}"
 fi
-
-log "sync window: ${sync_window}"
 
 # rsync 重试 3 次（间隔 60s）
 for attempt in 1 2 3; do
