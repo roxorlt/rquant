@@ -6,6 +6,32 @@
 
 ---
 
+## [v0.8.0] — 2026-04-29 — Backup HTTP API（替换 rsync over SSH）
+
+云端备份从 SSH/rsync 切换到 HTTP basic auth + curl，绕开 fail2ban 阻断
+mac 端的 sync。同时为未来 API 化（FastAPI 产品化）打基础——nginx
+反代 + token 鉴权这套架构能直接扩展。
+
+### Added
+- `scripts/backup-snapshot.sh`：服务器侧 cp + gzip + atomic mv 生成一致性快照
+- `deploy/systemd/rquant-backup.{service,timer}`：盘中每 5min + 日终 17:30 触发
+- `deploy/nginx/rquant-backup.conf`：nginx `/backup/` static + basic auth +
+  `/dashboard/` reverse-proxy + auth
+- `deploy/backup-api.md`：完整部署 + 故障排查文档（含 HTTPS 升级路径）
+- dashboard 新增"☁️ 云端 Backup Snapshot"指标读 `backup/latest.json`：
+  显示 snapshot 大小 / 压缩比 / 最后同步时间
+
+### Changed
+- `scripts/sync-from-cloud.sh`：rsync over SSH → curl HTTP + basic auth
+  - 不再走 22 端口，绕开 fail2ban
+  - 失败重试从 3 次 → 2 次（HTTP 失败不触发 fail2ban，重试更安全）
+  - 传输 gzip 压缩文件，30-50% 体积减半
+- `.env.example` 新增 `RQUANT_BACKUP_USER` / `RQUANT_BACKUP_TOKEN` /
+  `RQUANT_BACKUP_URL`
+- `deploy/local-sync.md` 改为指向 backup-api.md 的 stub
+
+---
+
 ## [v0.7.0] — 2026-04-29 — 云端部署 + 多通道通知 + Health Dashboard
 
 把 rQuant 从本地 macOS 单点搬到腾讯云轻量服务器（82.156.0.68）systemd 调度，

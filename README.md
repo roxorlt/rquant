@@ -71,6 +71,7 @@ tags: [quant, a-shares, personal-tool, python, macOS]
 | 日志 | loguru | 零配置彩色日志 |
 | UI | Streamlit | Python 一把梭，一周出原型 |
 | 通知 | PushDeer（参考 xueqiuFollow） | 通道稳定，云端零迁移；cc2im 受限于微信 token |
+| 备份 API | nginx + basic auth + curl + gzip | HTTP API 化为 Week 7+ 产品化打基础 |
 | 测试 | pytest + 固定 fixture 数据 | 标准 |
 
 ## MVP 路径（8 周）
