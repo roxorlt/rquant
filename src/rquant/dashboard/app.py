@@ -290,6 +290,48 @@ def get_realtime_prices_sina() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300)
+def get_daily_kline(ts_code: str, days: int = 30) -> pd.DataFrame:
+    """日 K 历史。akshare stock_zh_a_hist。ts_code='002415.SZ'。"""
+    import akshare as ak
+    from datetime import date as _date, timedelta as _td
+
+    code = ts_code.split(".")[0]
+    end = _date.today()
+    start = end - _td(days=int(days * 1.6))  # 1.6× 覆盖周末
+    df = ak.stock_zh_a_hist(
+        symbol=code,
+        period="daily",
+        start_date=start.strftime("%Y%m%d"),
+        end_date=end.strftime("%Y%m%d"),
+        adjust="qfq",
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.tail(days).reset_index(drop=True)
+    df["涨跌"] = df["收盘"] - df["开盘"]
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_minute_kline(ts_code: str) -> pd.DataFrame:
+    """当日 1 分钟分时。akshare stock_zh_a_hist_min_em。"""
+    import akshare as ak
+
+    code = ts_code.split(".")[0]
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # 只保留当日
+        today_str = date.today().strftime("%Y-%m-%d")
+        df["时间"] = pd.to_datetime(df["时间"])
+        df = df[df["时间"].dt.strftime("%Y-%m-%d") == today_str]
+        return df.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
 # ── Header ──
 
 
@@ -723,20 +765,132 @@ else:
                 )
             if rows:
                 df = pd.DataFrame(rows)
+                num_cols = [
+                    "现价", "bodyTop", "40档", "30档", "20档",
+                    "bodyBtm", "强止", "弱止", "距40", "距强止",
+                ]
+                col_config = {
+                    c: st.column_config.NumberColumn(format="%.2f")
+                    for c in num_cols
+                }
 
-                def _color_dist(v):
-                    if v < 0:
-                        return "color:#dc2626;font-weight:bold"
-                    if v < 0.5:
-                        return "color:#f59e0b"
-                    return "color:#16a34a"
-
-                styled = df.style.map(_color_dist, subset=["距40", "距强止"])
-                st.dataframe(styled, hide_index=True, use_container_width=True)
-                st.caption(
-                    "💡 距档位列：红色 = 已穿过（应已触发）/ "
-                    "黄色 = 接近（< 0.5 元）/ 绿色 = 安全"
+                event = st.dataframe(
+                    df,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config=col_config,
+                    on_select="rerun",
+                    selection_mode="single-row",
                 )
+                st.caption(
+                    "💡 点击表格中某行查看该标的的日 K + 分时 / "
+                    "「距档位」红=已穿过、黄=接近(<0.5)、绿=安全"
+                )
+
+                # 选中行 → 显示详情
+                if event.selection.rows:
+                    sel_idx = event.selection.rows[0]
+                    sel_code = df.iloc[sel_idx]["代码"]
+                    sel_name = df.iloc[sel_idx]["名称"] or ""
+                    sel_levels = df.iloc[sel_idx]
+
+                    st.markdown(f"### 📈 {sel_code} {sel_name} 详情")
+
+                    detail_col_k, detail_col_m = st.columns([1, 1])
+
+                    # 日 K（最近 30 天）
+                    with detail_col_k:
+                        with st.container(border=True):
+                            st.markdown("**最近 30 日 K 线**")
+                            try:
+                                kline = get_daily_kline(sel_code, days=30)
+                                if kline.empty:
+                                    st.info("暂无日 K 数据")
+                                else:
+                                    base = alt.Chart(kline).encode(
+                                        x=alt.X(
+                                            "日期:O",
+                                            axis=alt.Axis(labelAngle=-30, labelFontSize=9),
+                                            title=None,
+                                        )
+                                    )
+                                    rule = base.mark_rule().encode(
+                                        y=alt.Y("最低:Q", scale=alt.Scale(zero=False), title="价格"),
+                                        y2="最高:Q",
+                                        color=alt.condition(
+                                            "datum.涨跌 >= 0",
+                                            alt.value("#dc2626"),
+                                            alt.value("#16a34a"),
+                                        ),
+                                    )
+                                    bar = base.mark_bar(size=6).encode(
+                                        y="开盘:Q",
+                                        y2="收盘:Q",
+                                        color=alt.condition(
+                                            "datum.涨跌 >= 0",
+                                            alt.value("#dc2626"),
+                                            alt.value("#16a34a"),
+                                        ),
+                                        tooltip=[
+                                            "日期", "开盘", "收盘", "最高", "最低",
+                                            "成交量",
+                                        ],
+                                    )
+
+                                    # 各档位横线
+                                    levels_data = pd.DataFrame([
+                                        {"label": "40档", "value": float(sel_levels["40档"])},
+                                        {"label": "30档", "value": float(sel_levels["30档"])},
+                                        {"label": "20档", "value": float(sel_levels["20档"])},
+                                        {"label": "强止", "value": float(sel_levels["强止"])},
+                                        {"label": "弱止", "value": float(sel_levels["弱止"])},
+                                    ])
+                                    level_lines = (
+                                        alt.Chart(levels_data)
+                                        .mark_rule(strokeDash=[3, 3], strokeWidth=1)
+                                        .encode(
+                                            y="value:Q",
+                                            color=alt.Color(
+                                                "label:N",
+                                                scale=alt.Scale(
+                                                    domain=["40档", "30档", "20档", "强止", "弱止"],
+                                                    range=["#fbbf24", "#f59e0b", "#dc2626", "#7c3aed", "#1e40af"],
+                                                ),
+                                                legend=alt.Legend(orient="top", title=None),
+                                            ),
+                                        )
+                                    )
+                                    chart_k = (rule + bar + level_lines).properties(height=260)
+                                    st.altair_chart(chart_k, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"日 K 加载失败: {e}")
+
+                    # 当日分时
+                    with detail_col_m:
+                        with st.container(border=True):
+                            st.markdown("**当日分时**")
+                            try:
+                                minute = get_minute_kline(sel_code)
+                                if minute.empty:
+                                    st.info("当日分时暂无数据")
+                                else:
+                                    chart_m = (
+                                        alt.Chart(minute)
+                                        .mark_line(color="#3b82f6", strokeWidth=1.5)
+                                        .encode(
+                                            x=alt.X("时间:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9)),
+                                            y=alt.Y(
+                                                "收盘:Q",
+                                                title="价格",
+                                                scale=alt.Scale(zero=False),
+                                            ),
+                                            tooltip=["时间", "开盘", "收盘", "最高", "最低"],
+                                        )
+                                        .properties(height=260)
+                                    )
+                                    st.altair_chart(chart_m, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"分时加载失败: {e}")
             else:
                 st.warning("未匹配到任何 Pool 2 标的的实时价格")
     except Exception as e:
