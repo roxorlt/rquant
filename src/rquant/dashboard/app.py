@@ -1,10 +1,8 @@
 """rQuant Health Dashboard。
 
-启动方式（本地或云端）：
+启动方式：
     streamlit run src/rquant/dashboard/app.py --server.port 8501 \\
         --server.address 0.0.0.0 --server.headless true
-
-显示 9 个核心指标，自动刷新 30 秒。读 DuckDB read-only 不阻塞业务写入。
 """
 
 from __future__ import annotations
@@ -15,6 +13,7 @@ import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import altair as alt
 import duckdb
 import pandas as pd
 import streamlit as st
@@ -22,19 +21,36 @@ import streamlit as st
 from rquant.config import settings
 
 REFRESH_SECONDS = 30
+CST = timezone(timedelta(hours=8))
 
 st.set_page_config(
     page_title="rQuant Health",
     page_icon="📈",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 st.markdown(
     f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">',
     unsafe_allow_html=True,
 )
 
+# 简单 CSS 美化
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+    [data-testid="stMetricValue"] { font-size: 1.5rem; }
+    [data-testid="stMetricLabel"] { font-size: 0.85rem; color: #666; }
+    h2 { margin-top: 1rem; padding-top: 0.5rem; border-top: 1px solid #eee; }
+    h3 { font-size: 1.1rem; margin-bottom: 0.5rem; }
+    [data-testid="stDataFrame"] { font-size: 0.85rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ── DuckDB 查询封装 ──
+
+# ── 工具函数 ──
 
 
 @st.cache_data(ttl=20)
@@ -46,9 +62,6 @@ def query_duckdb(sql: str, params: list | None = None) -> pd.DataFrame:
         return conn.execute(sql).fetchdf()
     finally:
         conn.close()
-
-
-# ── systemctl 查询 ──
 
 
 @st.cache_data(ttl=10)
@@ -96,12 +109,48 @@ def find_timer(timers: list[dict], unit_name: str) -> dict | None:
     return None
 
 
-# ── Real-time 行情（指标 #9） ──
+def fmt_us_timestamp(us: int | str | None) -> str:
+    """systemctl 输出的微秒时间戳转 UTC+8 字符串。"""
+    if not us:
+        return "—"
+    try:
+        us_int = int(us)
+        if us_int <= 0:
+            return "—"
+        dt = datetime.fromtimestamp(us_int / 1_000_000, tz=CST)
+        return dt.strftime("%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return str(us)
+
+
+def time_diff_human(target_us: int) -> str:
+    """目标微秒时间戳距现在多久（人类可读）。"""
+    if not target_us:
+        return ""
+    try:
+        target_dt = datetime.fromtimestamp(int(target_us) / 1_000_000, tz=CST)
+        now_dt = datetime.now(CST)
+        delta = target_dt - now_dt
+        total_min = int(delta.total_seconds() / 60)
+        if total_min < 0:
+            total_min = -total_min
+            prefix = ""
+            suffix = "前"
+        else:
+            prefix = ""
+            suffix = "后"
+        if total_min < 60:
+            return f"{prefix}{total_min} 分钟{suffix}"
+        hours = total_min / 60
+        if hours < 24:
+            return f"{prefix}{hours:.1f} 小时{suffix}"
+        return f"{prefix}{hours / 24:.1f} 天{suffix}"
+    except Exception:
+        return ""
 
 
 @st.cache_data(ttl=30)
 def get_realtime_prices_sina() -> pd.DataFrame:
-    """sina 源拉全市场实时行情，30s 缓存。"""
     import akshare as ak
 
     df = ak.stock_zh_a_spot()
@@ -114,131 +163,111 @@ def get_realtime_prices_sina() -> pd.DataFrame:
 
 
 hostname = socket.gethostname()
-st.title("📈 rQuant Health Dashboard")
-st.caption(
-    f"自动刷新 {REFRESH_SECONDS}s | 服务器: {hostname} | "
-    f"渲染时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-)
+col_title, col_meta = st.columns([3, 1])
+with col_title:
+    st.markdown("# 📈 rQuant Health")
+with col_meta:
+    st.markdown(
+        f"<div style='text-align:right;color:#888;font-size:0.85rem;'>"
+        f"<b>{hostname}</b><br/>"
+        f"刷新于 {datetime.now(CST).strftime('%H:%M:%S')} · 每 {REFRESH_SECONDS}s 自动刷新"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 today_iso = date.today().isoformat()
 
 
-# ── #1 #2: systemd 服务状态 ──
+# ── 总览健康条 ──
 
 
-st.header("🟢 systemd 服务状态")
-col_m, col_d = st.columns(2)
 timers = systemd_list_timers()
+monitor_status = systemd_show("rquant-monitor.service")
+daily_status = systemd_show("rquant-daily.service")
+dashboard_status = systemd_show("rquant-dashboard.service")
+
+monitor_active = monitor_status.get("ActiveState") == "active"
+daily_active = daily_status.get("ActiveState") in ("active", "inactive")  # idle 也算正常
+dashboard_active = dashboard_status.get("ActiveState") == "active"
+
+
+def _badge(label: str, ok: bool, sub: str = "") -> str:
+    color = "#16a34a" if ok else "#dc2626"
+    icon = "✅" if ok else "❌"
+    return (
+        f"<span style='display:inline-block;padding:6px 14px;margin-right:10px;"
+        f"border-radius:8px;background:{color}1a;color:{color};font-size:0.9rem;"
+        f"border:1px solid {color}40;'>"
+        f"{icon} <b>{label}</b> {sub}</span>"
+    )
+
+
+health_html = (
+    _badge(
+        "monitor",
+        monitor_active,
+        f"({monitor_status.get('SubState', '')})",
+    )
+    + _badge(
+        "daily",
+        daily_status.get("ActiveState") != "failed",
+        f"(上次 status={daily_status.get('ExecMainStatus', '?')})",
+    )
+    + _badge("dashboard", dashboard_active, "")
+)
+st.markdown(health_html, unsafe_allow_html=True)
+st.divider()
+
+
+# ── Section 1: systemd 服务详情 ──
+
+
+st.markdown("## 🟢 服务调度")
+col_m, col_d = st.columns(2)
 
 with col_m:
-    st.subheader("rquant-monitor")
-    monitor_status = systemd_show("rquant-monitor.service")
-    state = monitor_status.get("ActiveState", "unknown")
-    sub = monitor_status.get("SubState", "")
-    if state == "active":
-        enter = monitor_status.get("ActiveEnterTimestamp", "")
-        st.success(f"✅ Running ({sub})  启动: {enter}")
-    elif state == "inactive":
-        st.info(f"⚪ Inactive ({sub})  上次执行: status={monitor_status.get('ExecMainStatus', '?')}")
-    else:
-        st.error(f"❌ {state} ({sub})")
+    with st.container(border=True):
+        st.markdown("### rquant-monitor")
+        state = monitor_status.get("ActiveState", "unknown")
+        sub = monitor_status.get("SubState", "")
 
-    timer = find_timer(timers, "rquant-monitor.timer")
-    if timer:
-        st.metric("下次触发", timer.get("next", "?"))
-        if timer.get("last") and timer["last"] != "n/a":
-            st.caption(f"上次触发: {timer.get('last')}")
+        timer = find_timer(timers, "rquant-monitor.timer")
+        next_str = fmt_us_timestamp(timer.get("next") if timer else None)
+        last_str = fmt_us_timestamp(timer.get("last") if timer else None)
+
+        c1, c2 = st.columns(2)
+        c1.metric(
+            "当前状态",
+            f"{state}",
+            delta=sub if state == "active" else None,
+        )
+        c2.metric("下次触发", next_str, delta=time_diff_human(int(timer.get("next") or 0)) if timer else None)
+        st.caption(f"上次触发: {last_str}")
 
 with col_d:
-    st.subheader("rquant-daily")
-    daily_status = systemd_show("rquant-daily.service")
-    state = daily_status.get("ActiveState", "unknown")
-    if state == "active":
-        st.warning("🔄 Running (流水线执行中)")
-    elif state == "inactive":
-        st.success(
-            f"⚪ Idle  上次执行: status={daily_status.get('ExecMainStatus', '?')}"
+    with st.container(border=True):
+        st.markdown("### rquant-daily")
+        state = daily_status.get("ActiveState", "unknown")
+
+        timer = find_timer(timers, "rquant-daily.timer")
+        next_str = fmt_us_timestamp(timer.get("next") if timer else None)
+        last_str = fmt_us_timestamp(timer.get("last") if timer else None)
+        exec_status = daily_status.get("ExecMainStatus", "?")
+
+        c1, c2 = st.columns(2)
+        c1.metric(
+            "当前状态",
+            "Idle" if state == "inactive" else state,
+            delta=f"上次 status={exec_status}",
         )
-    else:
-        st.error(f"❌ {state}")
-
-    timer = find_timer(timers, "rquant-daily.timer")
-    if timer:
-        st.metric("下次触发", timer.get("next", "?"))
+        c2.metric("下次触发", next_str, delta=time_diff_human(int(timer.get("next") or 0)) if timer else None)
+        st.caption(f"上次触发: {last_str}")
 
 
-# ── #4: Watchlist ──
+# ── Section 2: 数据新鲜度 ──
 
 
-st.header("📋 当前 Watchlist")
-col_p2, col_p1 = st.columns(2)
-
-with col_p2:
-    st.subheader("Pool 2 (active)")
-    p2 = query_duckdb(
-        """
-        SELECT pw.ts_code, sb.name,
-               pw.entry_date, pw.body_lower, pw.body_upper,
-               pw.stop_strong, pw.stop_weak
-        FROM pool2_watch pw
-        LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
-        WHERE pw.status = 'active'
-        ORDER BY pw.entry_date DESC
-        """
-    )
-    if p2.empty:
-        st.info("Pool 2 暂无 active 标的")
-    else:
-        st.dataframe(p2, hide_index=True, use_container_width=True)
-
-with col_p1:
-    st.subheader(f"Pool 1 ({today_iso} 命中)")
-    p1 = query_duckdb(
-        """
-        SELECT ts_code, name, close, pct_chg
-        FROM screen_result
-        WHERE strftime(trade_date, '%Y-%m-%d') = ?
-          AND preset_name = 'n-shape-pool1'
-        ORDER BY ts_code
-        """,
-        [today_iso],
-    )
-    if p1.empty:
-        st.info("当日暂无 Pool 1 命中")
-    else:
-        st.dataframe(p1, hide_index=True, use_container_width=True)
-
-
-# ── #3: 今日触发事件 ──
-
-
-st.header("📍 今日触发事件")
-events = query_duckdb(
-    """
-    SELECT trigger_time, ts_code, level, trigger_price, level_price,
-           trigger_type, pool
-    FROM monitor_event
-    WHERE strftime(trade_date, '%Y-%m-%d') = ?
-    ORDER BY trigger_time DESC
-    """,
-    [today_iso],
-)
-
-if events.empty:
-    st.info("当日暂无触发事件")
-else:
-    col_count, col_table = st.columns([1, 4])
-    col_count.metric("今日总触发", len(events))
-    by_level = events["level"].value_counts().to_dict()
-    breakdown = " / ".join(f"{k} {v}" for k, v in by_level.items())
-    col_count.caption(breakdown)
-    col_table.dataframe(events, hide_index=True, use_container_width=True)
-
-
-# ── #5: 数据新鲜度 ──
-
-
-st.header("🗓️ 数据新鲜度")
+st.markdown("## 🗓️ 数据新鲜度")
 freshness = query_duckdb(
     """
     SELECT
@@ -252,14 +281,89 @@ row = freshness.iloc[0]
 fcols = st.columns(4)
 fcols[0].metric("最新 daily_bar", row["latest_daily_bar"] or "—")
 fcols[1].metric("最新 screen_result", row["latest_screen"] or "—")
-fcols[2].metric("daily_bar 行", f"{int(row['daily_bar_rows']):,}")
-fcols[3].metric("monitor_event 行", f"{int(row['event_rows']):,}")
+fcols[2].metric("daily_bar 总行数", f"{int(row['daily_bar_rows']):,}")
+fcols[3].metric("monitor_event 总行数", f"{int(row['event_rows']):,}")
 
 
-# ── #6: 最近 7 日 Pool 1 命中数趋势 ──
+# ── Section 3: Watchlist ──
 
 
-st.header("📊 最近 7 日 Pool 1 命中数")
+st.markdown("## 📋 当前 Watchlist")
+col_p2, col_p1 = st.columns([1, 1])
+
+with col_p2:
+    with st.container(border=True):
+        p2 = query_duckdb(
+            """
+            SELECT pw.ts_code AS 代码, sb.name AS 名称,
+                   strftime(pw.entry_date, '%m-%d') AS 入池,
+                   pw.body_lower AS bodyBtm, pw.body_upper AS bodyTop,
+                   pw.stop_strong AS 强止, pw.stop_weak AS 弱止
+            FROM pool2_watch pw
+            LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
+            WHERE pw.status = 'active'
+            ORDER BY pw.entry_date DESC
+            """
+        )
+        st.markdown(f"### Pool 2 active ({len(p2)} 只)")
+        if p2.empty:
+            st.info("Pool 2 暂无 active 标的")
+        else:
+            st.dataframe(p2, hide_index=True, use_container_width=True)
+
+with col_p1:
+    with st.container(border=True):
+        p1 = query_duckdb(
+            """
+            SELECT ts_code AS 代码, name AS 名称, close AS 收盘, pct_chg AS 涨跌
+            FROM screen_result
+            WHERE strftime(trade_date, '%Y-%m-%d') = ?
+              AND preset_name = 'n-shape-pool1'
+            ORDER BY ts_code
+            """,
+            [today_iso],
+        )
+        st.markdown(f"### Pool 1 候选 today ({len(p1)} 只)")
+        if p1.empty:
+            st.info("当日暂无 Pool 1 命中")
+        else:
+            st.dataframe(p1, hide_index=True, use_container_width=True)
+
+
+# ── Section 4: 今日触发事件 ──
+
+
+st.markdown("## 📍 今日触发事件")
+events = query_duckdb(
+    """
+    SELECT strftime(trigger_time, '%H:%M:%S') AS 时间,
+           ts_code AS 代码, level AS 档位,
+           trigger_price AS 触发价, level_price AS 档位价,
+           trigger_type AS 类型, pool
+    FROM monitor_event
+    WHERE strftime(trade_date, '%Y-%m-%d') = ?
+    ORDER BY trigger_time DESC
+    """,
+    [today_iso],
+)
+
+if events.empty:
+    st.info("当日暂无触发事件")
+else:
+    by_level = events["档位"].value_counts().to_dict()
+    cols = st.columns(6)
+    cols[0].metric("总触发", len(events))
+    for i, (k, v) in enumerate(
+        [("40", "40%"), ("30", "30%"), ("20", "20%"), ("strong", "强止"), ("weak", "弱止")]
+    ):
+        cols[i + 1].metric(v, by_level.get(k, 0))
+    st.dataframe(events, hide_index=True, use_container_width=True)
+
+
+# ── Section 5: 7 日 Pool 1 趋势 ──
+
+
+st.markdown("## 📊 最近 7 日 Pool 1 命中数")
 trend = query_duckdb(
     """
     SELECT strftime(trade_date, '%Y-%m-%d') AS date, COUNT(*) AS hits
@@ -274,13 +378,35 @@ trend = query_duckdb(
 if trend.empty:
     st.info("最近 7 日无 Pool 1 数据")
 else:
-    st.line_chart(trend.set_index("date")["hits"])
+    max_hits = max(int(trend["hits"].max()), 1)
+    y_max = int(max_hits * 1.2) + 1
+    chart = (
+        alt.Chart(trend)
+        .mark_line(point=alt.OverlayMarkDef(filled=True, size=80, color="#3b82f6"), color="#3b82f6", strokeWidth=2.5)
+        .encode(
+            x=alt.X("date:O", title=None, axis=alt.Axis(labelAngle=-30)),
+            y=alt.Y(
+                "hits:Q",
+                title="命中数",
+                scale=alt.Scale(domain=[0, y_max]),
+                axis=alt.Axis(grid=True, gridDash=[2, 4]),
+            ),
+            tooltip=[alt.Tooltip("date:O", title="日期"), alt.Tooltip("hits:Q", title="命中数")],
+        )
+        .properties(height=260)
+    )
+    text = (
+        alt.Chart(trend)
+        .mark_text(dy=-12, fontSize=11, color="#3b82f6")
+        .encode(x=alt.X("date:O"), y=alt.Y("hits:Q"), text=alt.Text("hits:Q"))
+    )
+    st.altair_chart(chart + text, use_container_width=True)
 
 
-# ── #7: 通知通道健康 ──
+# ── Section 6: 通知通道健康 ──
 
 
-st.header("📨 通知通道健康")
+st.markdown("## 📨 通知通道")
 try:
     rate = query_duckdb(
         """
@@ -295,35 +421,38 @@ try:
     if rate.empty:
         st.info("最近 24h 无推送记录")
     else:
-        ncols = st.columns(len(rate))
+        ncols = st.columns(max(len(rate), 2))
         for i, r in rate.iterrows():
             success_rate = r["ok"] / r["total"] * 100 if r["total"] else 0
+            color = "normal" if success_rate >= 95 else "inverse"
             ncols[i].metric(
-                f"{r['channel']} 24h",
+                f"{r['channel']} (24h)",
                 f"{int(r['ok'])}/{int(r['total'])}",
                 delta=f"{success_rate:.0f}% 成功",
-                delta_color="normal" if success_rate == 100 else "inverse",
+                delta_color=color,
             )
 
     notif = query_duckdb(
         """
-        SELECT sent_at, scene, channel, target, success, title, error_msg
+        SELECT strftime(sent_at, '%m-%d %H:%M') AS 时间,
+               scene AS 场景, channel AS 通道, target AS 目标,
+               success AS 成功, title AS 标题
         FROM notification_log
         ORDER BY sent_at DESC
-        LIMIT 20
+        LIMIT 30
         """
     )
     if not notif.empty:
-        with st.expander("📜 最近 20 条推送日志"):
+        with st.expander(f"📜 最近 {len(notif)} 条推送", expanded=False):
             st.dataframe(notif, hide_index=True, use_container_width=True)
 except duckdb.Error:
     st.info("notification_log 表暂无数据（首次推送后会自动生成）")
 
 
-# ── #8: 本地数据 sync 状态 ──
+# ── Section 7: 本地 sync ──
 
 
-st.header("💾 本地数据 sync 状态")
+st.markdown("## 💾 本地热备 sync")
 sync_marker = settings.data_dir / ".last-local-sync.json"
 if sync_marker.exists():
     try:
@@ -333,32 +462,38 @@ if sync_marker.exists():
         host = info.get("host", "?")
 
         scols = st.columns(3)
-        scols[0].metric("最后 sync", sync_at_str)
-        scols[1].metric("本地数据大小", f"{size_mb:.1f} MB")
-        scols[2].metric("本地主机", host)
+        scols[0].metric("本地主机", host)
+        scols[1].metric("数据大小", f"{size_mb:.1f} MB")
 
         if sync_at_str:
             sync_dt = datetime.fromisoformat(sync_at_str.replace("Z", "+00:00"))
             now_utc = datetime.now(timezone.utc)
             delta = now_utc - sync_dt
+            sync_local = sync_dt.astimezone(CST).strftime("%m-%d %H:%M:%S")
+
             if delta > timedelta(hours=2):
-                st.warning(
-                    f"⚠️ 上次 sync 在 {delta.total_seconds() / 3600:.1f} 小时前"
+                scols[2].metric(
+                    "最后 sync",
+                    sync_local,
+                    delta=f"{delta.total_seconds() / 3600:.1f} 小时前",
+                    delta_color="inverse",
                 )
             else:
-                st.success(
-                    f"✅ {int(delta.total_seconds() / 60)} 分钟前同步成功"
+                scols[2].metric(
+                    "最后 sync",
+                    sync_local,
+                    delta=f"{int(delta.total_seconds() / 60)} 分钟前",
                 )
     except Exception as e:
         st.error(f"sync marker 解析失败: {e}")
 else:
-    st.info("等待本地首次 sync 完成（marker 文件未生成）")
+    st.info("等待本地首次 sync（marker 文件未生成）")
 
 
-# ── #9: Pool 2 实时价位 ──
+# ── Section 8: Pool 2 实时价位 ──
 
 
-st.header("⚡ Pool 2 实时价位 vs 档位")
+st.markdown("## ⚡ Pool 2 实时价位 vs 档位")
 try:
     p2_active = query_duckdb(
         """
@@ -401,10 +536,19 @@ try:
             )
         if rows:
             df = pd.DataFrame(rows)
-            st.dataframe(df, hide_index=True, use_container_width=True)
+
+            def _color_dist(v):
+                if v < 0:
+                    return "color:#dc2626;font-weight:bold"
+                if v < 0.5:
+                    return "color:#f59e0b"
+                return "color:#16a34a"
+
+            styled = df.style.map(_color_dist, subset=["距40", "距强止"])
+            st.dataframe(styled, hide_index=True, use_container_width=True)
             st.caption(
-                "距档位 < 0 表示已穿过该档位（应已触发推送）；"
-                "可对比 monitor_event 表确认"
+                "💡 距档位列：红色 = 已穿过（应已触发）/ "
+                "黄色 = 接近（< 0.5 元）/ 绿色 = 安全"
             )
         else:
             st.warning("未匹配到任何 Pool 2 标的的实时价格")
@@ -414,6 +558,7 @@ except Exception as e:
 
 st.divider()
 st.caption(
-    f"rQuant Health Dashboard | 数据库: {settings.duckdb_path} | "
-    f"刷新间隔: {REFRESH_SECONDS}s"
+    f"DB: {settings.duckdb_path.name}  ·  "
+    f"Refresh: {REFRESH_SECONDS}s  ·  "
+    f"Last render: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}"
 )
