@@ -160,14 +160,39 @@ st.markdown(
 
 
 @st.cache_data(ttl=20)
-def query_duckdb(sql: str, params: list | None = None) -> pd.DataFrame:
-    conn = duckdb.connect(str(settings.duckdb_path), read_only=True)
+def query_duckdb(sql: str, params: list | None = None) -> pd.DataFrame | None:
+    """查询 DuckDB；锁冲突时返回 None（dashboard 优雅降级）。"""
+    try:
+        conn = duckdb.connect(str(settings.duckdb_path), read_only=True)
+    except duckdb.IOException as e:
+        if "Conflicting lock" in str(e):
+            return None
+        raise
     try:
         if params:
             return conn.execute(sql, params).fetchdf()
         return conn.execute(sql).fetchdf()
     finally:
         conn.close()
+
+
+@st.cache_data(ttl=10)
+def db_lock_holder() -> str | None:
+    """探测 DuckDB 是否被其他进程写锁占用。返回占用者 PID 字符串或 None。"""
+    try:
+        conn = duckdb.connect(str(settings.duckdb_path), read_only=True)
+        conn.close()
+        return None
+    except duckdb.IOException as e:
+        msg = str(e)
+        if "Conflicting lock" in msg:
+            import re
+
+            m = re.search(r"PID (\d+)", msg)
+            return m.group(1) if m else "unknown"
+        return None
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=10)
@@ -328,11 +353,21 @@ health_html = (
     + _badge(
         "daily",
         daily_status.get("ActiveState") != "failed",
-        f"(上次 status={daily_status.get('ExecMainStatus', '?')})",
+        f"({daily_status.get('SubState', '')})",
     )
     + _badge("dashboard", dashboard_active, "")
 )
 st.markdown(health_html, unsafe_allow_html=True)
+
+# DuckDB 写锁检测（daily 流水线 ingest 时会持有写锁，dashboard 让位）
+db_locked_pid = db_lock_holder()
+if db_locked_pid:
+    st.warning(
+        f"⏳ **数据库被流水线写锁占用**（PID `{db_locked_pid}`）— "
+        f"大概率是 daily 17:00 触发后 ingest 还在跑（最长 ~45 分钟，含 3 次重试）。"
+        f"业务数据相关 section 暂时降级，流水线完成后自动恢复。"
+    )
+
 st.divider()
 
 
@@ -385,114 +420,139 @@ with col_d:
 
 
 st.markdown("## 🗓️ 数据新鲜度")
-freshness = query_duckdb(
-    """
-    SELECT
-        (SELECT strftime(MAX(trade_date), '%Y-%m-%d') FROM daily_bar) AS latest_daily_bar,
-        (SELECT strftime(MAX(trade_date), '%Y-%m-%d') FROM screen_result) AS latest_screen,
-        (SELECT COUNT(*) FROM daily_bar) AS daily_bar_rows,
-        (SELECT COUNT(*) FROM monitor_event) AS event_rows
-    """
-)
-row = freshness.iloc[0]
-fcols = st.columns(4)
-fcols[0].metric("最新 daily_bar", row["latest_daily_bar"] or "—")
-fcols[1].metric("最新 screen_result", row["latest_screen"] or "—")
-fcols[2].metric("daily_bar 总行数", f"{int(row['daily_bar_rows']):,}")
-fcols[3].metric("monitor_event 总行数", f"{int(row['event_rows']):,}")
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+else:
+    freshness = query_duckdb(
+        """
+        SELECT
+            (SELECT strftime(MAX(trade_date), '%Y-%m-%d') FROM daily_bar) AS latest_daily_bar,
+            (SELECT strftime(MAX(trade_date), '%Y-%m-%d') FROM screen_result) AS latest_screen,
+            (SELECT COUNT(*) FROM daily_bar) AS daily_bar_rows,
+            (SELECT COUNT(*) FROM monitor_event) AS event_rows
+        """
+    )
+    if freshness is None:
+        st.info("⏳ 等流水线完成")
+    else:
+        row = freshness.iloc[0]
+        fcols = st.columns(4)
+        fcols[0].metric("最新 daily_bar", row["latest_daily_bar"] or "—")
+        fcols[1].metric("最新 screen_result", row["latest_screen"] or "—")
+        fcols[2].metric("daily_bar 总行数", f"{int(row['daily_bar_rows']):,}")
+        fcols[3].metric("monitor_event 总行数", f"{int(row['event_rows']):,}")
 
 
 # ── Section 3: Watchlist ──
 
 
 st.markdown("## 📋 当前 Watchlist")
-col_p2, col_p1 = st.columns([1, 1])
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+else:
+    col_p2, col_p1 = st.columns([1, 1])
 
-with col_p2:
-    with st.container(border=True):
-        p2 = query_duckdb(
-            """
-            SELECT pw.ts_code AS 代码, sb.name AS 名称,
-                   strftime(pw.entry_date, '%m-%d') AS 入池,
-                   pw.body_lower AS bodyBtm, pw.body_upper AS bodyTop,
-                   pw.stop_strong AS 强止, pw.stop_weak AS 弱止
-            FROM pool2_watch pw
-            LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
-            WHERE pw.status = 'active'
-            ORDER BY pw.entry_date DESC
-            """
-        )
-        st.markdown(f"### Pool 2 active ({len(p2)} 只)")
-        if p2.empty:
-            st.info("Pool 2 暂无 active 标的")
-        else:
-            st.dataframe(p2, hide_index=True, use_container_width=True)
+    with col_p2:
+        with st.container(border=True):
+            p2 = query_duckdb(
+                """
+                SELECT pw.ts_code AS 代码, sb.name AS 名称,
+                       strftime(pw.entry_date, '%m-%d') AS 入池,
+                       pw.body_lower AS bodyBtm, pw.body_upper AS bodyTop,
+                       pw.stop_strong AS 强止, pw.stop_weak AS 弱止
+                FROM pool2_watch pw
+                LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
+                WHERE pw.status = 'active'
+                ORDER BY pw.entry_date DESC
+                """
+            )
+            count = 0 if p2 is None else len(p2)
+            st.markdown(f"### Pool 2 active ({count} 只)")
+            if p2 is None:
+                st.info("⏳ 数据暂不可读")
+            elif p2.empty:
+                st.info("Pool 2 暂无 active 标的")
+            else:
+                st.dataframe(p2, hide_index=True, use_container_width=True)
 
-with col_p1:
-    with st.container(border=True):
-        p1 = query_duckdb(
-            """
-            SELECT ts_code AS 代码, name AS 名称, close AS 收盘, pct_chg AS 涨跌
-            FROM screen_result
-            WHERE strftime(trade_date, '%Y-%m-%d') = ?
-              AND preset_name = 'n-shape-pool1'
-            ORDER BY ts_code
-            """,
-            [today_iso],
-        )
-        st.markdown(f"### Pool 1 候选 today ({len(p1)} 只)")
-        if p1.empty:
-            st.info("当日暂无 Pool 1 命中")
-        else:
-            st.dataframe(p1, hide_index=True, use_container_width=True)
+    with col_p1:
+        with st.container(border=True):
+            p1 = query_duckdb(
+                """
+                SELECT ts_code AS 代码, name AS 名称, close AS 收盘, pct_chg AS 涨跌
+                FROM screen_result
+                WHERE strftime(trade_date, '%Y-%m-%d') = ?
+                  AND preset_name = 'n-shape-pool1'
+                ORDER BY ts_code
+                """,
+                [today_iso],
+            )
+            count = 0 if p1 is None else len(p1)
+            st.markdown(f"### Pool 1 候选 today ({count} 只)")
+            if p1 is None:
+                st.info("⏳ 数据暂不可读")
+            elif p1.empty:
+                st.info("当日暂无 Pool 1 命中")
+            else:
+                st.dataframe(p1, hide_index=True, use_container_width=True)
 
 
 # ── Section 4: 今日触发事件 ──
 
 
 st.markdown("## 📍 今日触发事件")
-events = query_duckdb(
-    """
-    SELECT strftime(trigger_time, '%H:%M:%S') AS 时间,
-           ts_code AS 代码, level AS 档位,
-           trigger_price AS 触发价, level_price AS 档位价,
-           trigger_type AS 类型, pool
-    FROM monitor_event
-    WHERE strftime(trade_date, '%Y-%m-%d') = ?
-    ORDER BY trigger_time DESC
-    """,
-    [today_iso],
-)
-
-if events.empty:
-    st.info("当日暂无触发事件")
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
 else:
-    by_level = events["档位"].value_counts().to_dict()
-    cols = st.columns(6)
-    cols[0].metric("总触发", len(events))
-    for i, (k, v) in enumerate(
-        [("40", "40%"), ("30", "30%"), ("20", "20%"), ("strong", "强止"), ("weak", "弱止")]
-    ):
-        cols[i + 1].metric(v, by_level.get(k, 0))
-    st.dataframe(events, hide_index=True, use_container_width=True)
+    events = query_duckdb(
+        """
+        SELECT strftime(trigger_time, '%H:%M:%S') AS 时间,
+               ts_code AS 代码, level AS 档位,
+               trigger_price AS 触发价, level_price AS 档位价,
+               trigger_type AS 类型, pool
+        FROM monitor_event
+        WHERE strftime(trade_date, '%Y-%m-%d') = ?
+        ORDER BY trigger_time DESC
+        """,
+        [today_iso],
+    )
+    if events is None:
+        st.info("⏳ 数据暂不可读")
+    elif events.empty:
+        st.info("当日暂无触发事件")
+    else:
+        by_level = events["档位"].value_counts().to_dict()
+        cols = st.columns(6)
+        cols[0].metric("总触发", len(events))
+        for i, (k, v) in enumerate(
+            [("40", "40%"), ("30", "30%"), ("20", "20%"), ("strong", "强止"), ("weak", "弱止")]
+        ):
+            cols[i + 1].metric(v, by_level.get(k, 0))
+        st.dataframe(events, hide_index=True, use_container_width=True)
 
 
 # ── Section 5: 7 日 Pool 1 趋势 ──
 
 
 st.markdown("## 📊 最近 7 日 Pool 1 命中数")
-trend = query_duckdb(
-    """
-    SELECT strftime(trade_date, '%Y-%m-%d') AS date, COUNT(*) AS hits
-    FROM screen_result
-    WHERE preset_name = 'n-shape-pool1'
-      AND trade_date >= (CAST(? AS DATE) - INTERVAL '7 days')
-    GROUP BY trade_date
-    ORDER BY trade_date
-    """,
-    [today_iso],
-)
-if trend.empty:
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+    trend = None
+else:
+    trend = query_duckdb(
+        """
+        SELECT strftime(trade_date, '%Y-%m-%d') AS date, COUNT(*) AS hits
+        FROM screen_result
+        WHERE preset_name = 'n-shape-pool1'
+          AND trade_date >= (CAST(? AS DATE) - INTERVAL '7 days')
+        GROUP BY trade_date
+        ORDER BY trade_date
+        """,
+        [today_iso],
+    )
+if trend is None:
+    pass  # 已显示等待提示
+elif trend.empty:
     st.info("最近 7 日无 Pool 1 数据")
 else:
     max_hits = max(int(trend["hits"].max()), 1)
@@ -524,46 +584,51 @@ else:
 
 
 st.markdown("## 📨 通知通道")
-try:
-    rate = query_duckdb(
-        """
-        SELECT channel,
-               COUNT(*) AS total,
-               SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok
-        FROM notification_log
-        WHERE sent_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours')
-        GROUP BY channel
-        """
-    )
-    if rate.empty:
-        st.info("最近 24h 无推送记录")
-    else:
-        ncols = st.columns(max(len(rate), 2))
-        for i, r in rate.iterrows():
-            success_rate = r["ok"] / r["total"] * 100 if r["total"] else 0
-            color = "normal" if success_rate >= 95 else "inverse"
-            ncols[i].metric(
-                f"{r['channel']} (24h)",
-                f"{int(r['ok'])}/{int(r['total'])}",
-                delta=f"{success_rate:.0f}% 成功",
-                delta_color=color,
-            )
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+else:
+    try:
+        rate = query_duckdb(
+            """
+            SELECT channel,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok
+            FROM notification_log
+            WHERE sent_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours')
+            GROUP BY channel
+            """
+        )
+        if rate is None:
+            st.info("⏳ 数据暂不可读")
+        elif rate.empty:
+            st.info("最近 24h 无推送记录")
+        else:
+            ncols = st.columns(max(len(rate), 2))
+            for i, r in rate.iterrows():
+                success_rate = r["ok"] / r["total"] * 100 if r["total"] else 0
+                color = "normal" if success_rate >= 95 else "inverse"
+                ncols[i].metric(
+                    f"{r['channel']} (24h)",
+                    f"{int(r['ok'])}/{int(r['total'])}",
+                    delta=f"{success_rate:.0f}% 成功",
+                    delta_color=color,
+                )
 
-    notif = query_duckdb(
-        """
-        SELECT strftime(sent_at, '%m-%d %H:%M') AS 时间,
-               scene AS 场景, channel AS 通道, target AS 目标,
-               success AS 成功, title AS 标题
-        FROM notification_log
-        ORDER BY sent_at DESC
-        LIMIT 30
-        """
-    )
-    if not notif.empty:
-        with st.expander(f"📜 最近 {len(notif)} 条推送", expanded=False):
-            st.dataframe(notif, hide_index=True, use_container_width=True)
-except duckdb.Error:
-    st.info("notification_log 表暂无数据（首次推送后会自动生成）")
+        notif = query_duckdb(
+            """
+            SELECT strftime(sent_at, '%m-%d %H:%M') AS 时间,
+                   scene AS 场景, channel AS 通道, target AS 目标,
+                   success AS 成功, title AS 标题
+            FROM notification_log
+            ORDER BY sent_at DESC
+            LIMIT 30
+            """
+        )
+        if notif is not None and not notif.empty:
+            with st.expander(f"📜 最近 {len(notif)} 条推送", expanded=False):
+                st.dataframe(notif, hide_index=True, use_container_width=True)
+    except duckdb.Error:
+        st.info("notification_log 表暂无数据（首次推送后会自动生成）")
 
 
 # ── Section 7: 本地 sync ──
@@ -611,66 +676,71 @@ else:
 
 
 st.markdown("## ⚡ Pool 2 实时价位 vs 档位")
-try:
-    p2_active = query_duckdb(
-        """
-        SELECT pw.ts_code, sb.name,
-               pw.body_upper, pw.body_lower,
-               pw.level_40, pw.level_30, pw.level_20,
-               pw.stop_strong, pw.stop_weak
-        FROM pool2_watch pw
-        LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
-        WHERE pw.status = 'active'
-        """
-    )
-    if p2_active.empty:
-        st.info("Pool 2 无 active 标的")
-    else:
-        prices = get_realtime_prices_sina()
-
-        rows = []
-        for _, p2 in p2_active.iterrows():
-            code_short = p2["ts_code"].split(".")[0]
-            price_row = prices[prices["code_short"] == code_short]
-            if price_row.empty:
-                continue
-            price = float(price_row.iloc[0]["最新价"])
-            rows.append(
-                {
-                    "代码": p2["ts_code"],
-                    "名称": p2.get("name") or "",
-                    "现价": round(price, 2),
-                    "bodyTop": round(p2["body_upper"], 2),
-                    "40档": round(p2["level_40"], 2),
-                    "30档": round(p2["level_30"], 2),
-                    "20档": round(p2["level_20"], 2),
-                    "bodyBtm": round(p2["body_lower"], 2),
-                    "强止": round(p2["stop_strong"], 2),
-                    "弱止": round(p2["stop_weak"], 2),
-                    "距40": round(price - p2["level_40"], 2),
-                    "距强止": round(price - p2["stop_strong"], 2),
-                }
-            )
-        if rows:
-            df = pd.DataFrame(rows)
-
-            def _color_dist(v):
-                if v < 0:
-                    return "color:#dc2626;font-weight:bold"
-                if v < 0.5:
-                    return "color:#f59e0b"
-                return "color:#16a34a"
-
-            styled = df.style.map(_color_dist, subset=["距40", "距强止"])
-            st.dataframe(styled, hide_index=True, use_container_width=True)
-            st.caption(
-                "💡 距档位列：红色 = 已穿过（应已触发）/ "
-                "黄色 = 接近（< 0.5 元）/ 绿色 = 安全"
-            )
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+else:
+    try:
+        p2_active = query_duckdb(
+            """
+            SELECT pw.ts_code, sb.name,
+                   pw.body_upper, pw.body_lower,
+                   pw.level_40, pw.level_30, pw.level_20,
+                   pw.stop_strong, pw.stop_weak
+            FROM pool2_watch pw
+            LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
+            WHERE pw.status = 'active'
+            """
+        )
+        if p2_active is None:
+            st.info("⏳ 数据暂不可读")
+        elif p2_active.empty:
+            st.info("Pool 2 无 active 标的")
         else:
-            st.warning("未匹配到任何 Pool 2 标的的实时价格")
-except Exception as e:
-    st.error(f"实时价位获取失败: {e}")
+            prices = get_realtime_prices_sina()
+
+            rows = []
+            for _, p2 in p2_active.iterrows():
+                code_short = p2["ts_code"].split(".")[0]
+                price_row = prices[prices["code_short"] == code_short]
+                if price_row.empty:
+                    continue
+                price = float(price_row.iloc[0]["最新价"])
+                rows.append(
+                    {
+                        "代码": p2["ts_code"],
+                        "名称": p2.get("name") or "",
+                        "现价": round(price, 2),
+                        "bodyTop": round(p2["body_upper"], 2),
+                        "40档": round(p2["level_40"], 2),
+                        "30档": round(p2["level_30"], 2),
+                        "20档": round(p2["level_20"], 2),
+                        "bodyBtm": round(p2["body_lower"], 2),
+                        "强止": round(p2["stop_strong"], 2),
+                        "弱止": round(p2["stop_weak"], 2),
+                        "距40": round(price - p2["level_40"], 2),
+                        "距强止": round(price - p2["stop_strong"], 2),
+                    }
+                )
+            if rows:
+                df = pd.DataFrame(rows)
+
+                def _color_dist(v):
+                    if v < 0:
+                        return "color:#dc2626;font-weight:bold"
+                    if v < 0.5:
+                        return "color:#f59e0b"
+                    return "color:#16a34a"
+
+                styled = df.style.map(_color_dist, subset=["距40", "距强止"])
+                st.dataframe(styled, hide_index=True, use_container_width=True)
+                st.caption(
+                    "💡 距档位列：红色 = 已穿过（应已触发）/ "
+                    "黄色 = 接近（< 0.5 元）/ 绿色 = 安全"
+                )
+            else:
+                st.warning("未匹配到任何 Pool 2 标的的实时价格")
+    except Exception as e:
+        st.error(f"实时价位获取失败: {e}")
 
 
 st.divider()
