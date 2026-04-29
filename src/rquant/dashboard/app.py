@@ -815,42 +815,68 @@ else:
     st.info("snapshot 未生成（systemd timer 还没触发或脚本失败）")
 
 
-st.markdown("## 💾 本地热备 sync")
-sync_marker = settings.data_dir / ".last-local-sync.json"
-if sync_marker.exists():
+st.markdown("## 💾 客户端 API 拉取")
+# 读 nginx /backup/ 专用 access log 推断"上次 mac 通过 API 拉取的时间"
+# 不再依赖 mac 主动上报 marker（v0.7.x 时代的 SSH 上报已废弃）
+backup_access_log = Path("/www/server/nginx/logs/rquant-backup-access.log")
+if not backup_access_log.exists():
+    st.info(
+        "暂无拉取记录（access log 未生成——nginx config 加了 access_log 后需 reload）"
+    )
+else:
     try:
-        info = json.loads(sync_marker.read_text())
-        sync_at_str = info.get("sync_at", "")
-        size_mb = info.get("local_size_bytes", 0) / 1024 / 1024
-        host = info.get("host", "?")
+        # 读最后 50 行，倒序找最近一次 GET .duckdb.gz 200 的记录
+        import re
 
-        scols = st.columns(3)
-        scols[0].metric("本地主机", host)
-        scols[1].metric("数据大小", f"{size_mb:.1f} MB")
+        lines = backup_access_log.read_text(errors="ignore").strip().splitlines()[-50:]
+        last_get_dt = None
+        last_get_ip = None
+        last_get_size_mb = None
+        for line in reversed(lines):
+            # log_format: $remote_addr [$time_iso8601] "$request" $status $body_bytes_sent
+            m = re.match(
+                r'^(\S+)\s+\[([^\]]+)\]\s+"GET (\S+)[^"]*"\s+(\d+)\s+(\d+)',
+                line,
+            )
+            if not m:
+                continue
+            ip, ts_str, path, status, body_bytes = m.groups()
+            if "latest.duckdb.gz" not in path or status != "200":
+                continue
+            try:
+                last_get_dt = datetime.fromisoformat(ts_str)
+                last_get_ip = ip
+                last_get_size_mb = int(body_bytes) / 1024 / 1024
+            except ValueError:
+                continue
+            break
 
-        if sync_at_str:
-            sync_dt = datetime.fromisoformat(sync_at_str.replace("Z", "+00:00"))
-            now_utc = datetime.now(timezone.utc)
-            delta = now_utc - sync_dt
-            sync_local = sync_dt.astimezone(CST).strftime("%m-%d %H:%M:%S")
+        if last_get_dt is None:
+            st.info("最近 50 条记录中没有成功的 GET /backup/latest.duckdb.gz")
+        else:
+            now = datetime.now(last_get_dt.tzinfo or CST)
+            delta = now - last_get_dt
+            local_str = last_get_dt.astimezone(CST).strftime("%m-%d %H:%M:%S")
 
-            if delta > timedelta(hours=2):
+            scols = st.columns(3)
+            scols[0].metric("客户端 IP", last_get_ip)
+            scols[1].metric("拉取大小", f"{last_get_size_mb:.1f} MB")
+
+            if delta > timedelta(hours=1):
                 scols[2].metric(
-                    "最后 sync",
-                    sync_local,
+                    "上次拉取",
+                    local_str,
                     delta=f"{delta.total_seconds() / 3600:.1f} 小时前",
                     delta_color="inverse",
                 )
             else:
                 scols[2].metric(
-                    "最后 sync",
-                    sync_local,
+                    "上次拉取",
+                    local_str,
                     delta=f"{int(delta.total_seconds() / 60)} 分钟前",
                 )
     except Exception as e:
-        st.error(f"sync marker 解析失败: {e}")
-else:
-    st.info("等待本地首次 sync（marker 文件未生成）")
+        st.error(f"access log 解析失败: {e}")
 
 
 # ── Section 8: Pool 2 实时价位 ──
