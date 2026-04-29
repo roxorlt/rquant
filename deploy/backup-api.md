@@ -11,7 +11,7 @@ mac 通过 HTTP（未来 HTTPS）+ basic auth 拉云端 DuckDB 快照。绕开 S
     → cp data/rquant.duckdb → backup/.tmp → gzip → atomic mv → backup/latest.duckdb.gz
     → 写 backup/latest.json 元数据
 
-  nginx :8080
+  nginx :8081
     /backup/ → static serve backup/ + basic auth
     /dashboard/ → reverse proxy 8501 + basic auth
 
@@ -74,7 +74,7 @@ sudo nginx -t   # 测语法
 sudo systemctl reload nginx
 ```
 
-### 5. 开 8080 端口（云防火墙）
+### 5. 开 8081 端口（云防火墙）
 
 腾讯云轻量服务器控制台 → 防火墙 → 入站规则 → 添加：
 - 协议：TCP
