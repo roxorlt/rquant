@@ -138,6 +138,50 @@ chore: init pyproject.toml with uv
 - MVP 阶段**先不上 Docker**，Python venv + systemd service 足够；等部署痛了再容器化
 - 每次部署前**本地/staging 跑通**再上服务器，不在 main 上直接调试
 
+## 生产环境与协作模式
+
+### 生产环境
+
+- **主部署**：腾讯云轻量服务器 `82.156.0.68`（用户名 `lighthouse`）
+  - OS：OpenCloudOS 9.2（RHEL 系，包管理 dnf）
+  - Python 3.11.6 + uv，代码在 `/home/lighthouse/rquant/`
+  - 装宝塔面板（pNjE）做管理：Web 终端 + 文件管理 + 内置 sshd 配置
+  - 调度用 systemd timer + service（unit 文件在 `deploy/systemd/`）
+- **本地 macOS**：开发 + 数据热备（rsync 拉云端 DuckDB），不再承担生产调度
+- **避坑**：不要写 `82.156.4.48`——那是错的 IP（之前误用过半天），所有服务器命令统一用 `82.156.0.68`
+
+### 数据冗余策略
+
+云端是写入主源（systemd timer 触发 daily / monitor），本地是热备（rsync 周期拉，业务时段跳过）。切换策略：**单点切换 B**——云端跑业务，本地仅热备 + 开发，不在两端并行写。
+
+### Hybrid 协作模式（Claude / 用户）
+
+部署、运维、生产数据修改时，**Claude 不直接 ssh 操作生产**，pair 模式分工。理由：
+
+- sudo 提示密码会卡 ssh 非交互命令
+- Claude 内置 sandbox 对修改共享数据库 / 远程文件的操作会触发权限拒绝（如本地 DuckDB 误改回滚也被拒过）
+- 首次部署的现场 debug 效率，pair > Claude 全自动 3-5 倍
+
+**分工表**：
+
+| Claude 做 | 用户做 |
+|----------|--------|
+| 写命令清单 / systemd unit / 部署脚本 | ssh 上服务器粘贴执行 |
+| 解析用户贴回来的输出，定位问题 | 把命令输出贴回 chat |
+| 写代码 / 跑测试 / commit / 推 git 分支 | sudo / destructive / 生产数据写入 |
+| 提供测试命令（如 `rquant notify-test`） | 实际跑命令触发副作用（推 PushDeer 给真实手机等） |
+
+**适用场景**：服务器配置、systemd 安装、首次数据迁移、生产数据修复（如误标记的 Pool 2 状态回滚）、SSH key 配对调试。
+
+**不适用**：纯本地开发、写代码、跑单测、git 分支/commit/push（这些 Claude 直接做，不打断）。
+
+### 通知通道
+
+- **PushDeer**：管理员刘彤的 iPhone + Mac，配 `.env` 的 `PUSHDEER_KEYS`（多 key 逗号分隔）
+- **PushPlus**：不装 PushDeer 的协作者（如美丞），配 `.env` 的 `PUSHPLUS_TOKENS`
+- 两通道独立调用、独立失败，互不影响
+- 验证命令：`rquant notify-test`（绕过场景开关，直接推一条测试消息到所有配置的通道）
+
 ## 边界守则（重要）
 
 当讨论到新功能时，先问：**这个需求是否属于「条件筛选 + 监控 + 告警」这个核心范围？**
