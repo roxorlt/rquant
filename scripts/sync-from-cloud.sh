@@ -107,8 +107,8 @@ $(tail -n 15 "${LOG}")
     exit 1
 fi
 
-# 解压
-if ! gunzip -c "${TMP_GZ}" > "${TMP_DB}" 2>>"${LOG}"; then
+# 解压（用 gzip -dc 替代 gunzip，避免对 .tmp 后缀严格检查）
+if ! gzip -dc "${TMP_GZ}" > "${TMP_DB}" 2>>"${LOG}"; then
     log "ERROR: gunzip failed"
     rm -f "${TMP_GZ}" "${TMP_DB}"
     exit 1
