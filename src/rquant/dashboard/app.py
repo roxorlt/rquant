@@ -977,21 +977,67 @@ else:
                                 if minute.empty:
                                     st.info("当日分时暂无数据")
                                 else:
-                                    chart_m = (
-                                        alt.Chart(minute)
-                                        .mark_line(color="#3b82f6", strokeWidth=1.5)
-                                        .encode(
-                                            x=alt.X("时间:T", title=None, axis=alt.Axis(format="%H:%M", labelFontSize=9)),
-                                            y=alt.Y(
-                                                "收盘:Q",
-                                                title="价格",
-                                                scale=alt.Scale(zero=False),
-                                            ),
-                                            tooltip=["时间", "开盘", "收盘", "最高", "最低"],
-                                        )
-                                        .properties(height=260)
+                                    # ordinal x 跳过午休 11:30-13:00 空段
+                                    minute = minute.copy()
+                                    minute["时间_str"] = minute["时间"].dt.strftime("%H:%M")
+
+                                    # 11:30 之后第一个数据点位置 → 画虚线分隔上下午
+                                    morning_end = minute[minute["时间"].dt.hour < 12]
+                                    afternoon_start_label = (
+                                        minute.iloc[len(morning_end)]["时间_str"]
+                                        if len(morning_end) < len(minute)
+                                        else None
                                     )
+
+                                    base_m = alt.Chart(minute).encode(
+                                        x=alt.X(
+                                            "时间_str:O",
+                                            sort=None,
+                                            title=None,
+                                            axis=alt.Axis(
+                                                labelOverlap="greedy",
+                                                labelFontSize=9,
+                                                tickCount=6,
+                                            ),
+                                        ),
+                                        y=alt.Y(
+                                            "收盘:Q",
+                                            title="价格",
+                                            scale=alt.Scale(zero=False),
+                                        ),
+                                    )
+                                    line_m = base_m.mark_line(
+                                        color="#3b82f6", strokeWidth=1.5
+                                    ).encode(
+                                        tooltip=[
+                                            alt.Tooltip("时间_str:N", title="时间"),
+                                            "开盘", "收盘", "最高", "最低",
+                                        ],
+                                    )
+
+                                    layers = [line_m]
+                                    if afternoon_start_label:
+                                        sep = (
+                                            alt.Chart(
+                                                pd.DataFrame(
+                                                    {"时间_str": [afternoon_start_label]}
+                                                )
+                                            )
+                                            .mark_rule(
+                                                strokeDash=[3, 3],
+                                                stroke="#9ca3af",
+                                                strokeWidth=1,
+                                            )
+                                            .encode(x="时间_str:O")
+                                        )
+                                        layers.append(sep)
+
+                                    chart_m = alt.layer(*layers).properties(height=260)
                                     st.altair_chart(chart_m, use_container_width=True)
+                                    if afternoon_start_label:
+                                        st.caption(
+                                            "💡 虚线 = 午休分隔（11:30 → 13:00 跳过）"
+                                        )
                             except Exception as e:
                                 st.error(f"分时加载失败: {e}")
             else:
