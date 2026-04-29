@@ -1,0 +1,17 @@
+[Unit]
+Description=rQuant DuckDB Snapshot for Backup API
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+ExecStart=/home/lighthouse/rquant/scripts/backup-snapshot.sh
+
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

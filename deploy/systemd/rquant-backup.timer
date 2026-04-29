@@ -1,0 +1,14 @@
+[Unit]
+Description=Trigger rQuant backup snapshot
+
+[Timer]
+# 盘中 09:30-15:05 每 5 分钟（systemd OnCalendar 范围语法）
+OnCalendar=Mon..Fri 09:30..15:05/5
+# 日终 17:30 一次（流水线 17:00 跑完后）
+OnCalendar=Mon..Fri 17:30
+
+Persistent=true
+Unit=rquant-backup.service
+
+[Install]
+WantedBy=timers.target
