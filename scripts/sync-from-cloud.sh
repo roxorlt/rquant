@@ -43,7 +43,18 @@ for attempt in 1 2 3; do
         "${CLOUD_HOST}:${CLOUD_PATH}" \
         "${LOCAL_PATH}" >> "${LOG}" 2>&1; then
         size=$(du -sh "${LOCAL_PATH}" | cut -f1)
+        size_bytes=$(du -sb "${LOCAL_PATH}" | cut -f1)
         log "sync OK (attempt ${attempt}, local size ${size})"
+
+        # 写 marker 到云端，供 dashboard 显示"本地最近 sync"状态
+        marker_json=$(cat <<EOF
+{"sync_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "local_size_bytes": ${size_bytes}, "host": "$(hostname -s)"}
+EOF
+)
+        echo "${marker_json}" | ssh -o ConnectTimeout=5 "${CLOUD_HOST}" \
+            "cat > ~/rquant/data/.last-local-sync.json" 2>>"${LOG}" || \
+            log "warn: marker upload failed (sync 本身已成功)"
+
         exit 0
     fi
     log "rsync failed (attempt ${attempt})"

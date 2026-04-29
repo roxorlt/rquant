@@ -141,8 +141,21 @@ CREATE TABLE IF NOT EXISTS monitor_event (
 );
 """
 
+NOTIFICATION_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS notification_log (
+    sent_at    TIMESTAMP NOT NULL,
+    scene      VARCHAR   NOT NULL,
+    channel    VARCHAR   NOT NULL,   -- pushdeer | pushplus
+    target     VARCHAR,                -- key/token 前 8 位
+    success    BOOLEAN   NOT NULL,
+    error_msg  VARCHAR,
+    title      VARCHAR
+);
+"""
+
 ALL_DDL = [
     DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
     SCREEN_RESULT_DDL, POOL2_WATCH_DDL, MONITOR_EVENT_DDL,
+    NOTIFICATION_LOG_DDL,
 ]
