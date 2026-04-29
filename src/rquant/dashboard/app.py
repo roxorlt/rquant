@@ -281,55 +281,157 @@ def time_diff_human(target_us: int) -> str:
 
 
 @st.cache_data(ttl=30)
-def get_realtime_prices_sina() -> pd.DataFrame:
-    import akshare as ak
+def get_realtime_quotes_batch(ts_codes: tuple[str, ...]) -> pd.DataFrame:
+    """批量拉 watchlist 实时价格，直接调 sina HQ 接口。
 
-    df = ak.stock_zh_a_spot()
-    df = df[["代码", "名称", "最新价", "最低", "最高"]].copy()
-    df["code_short"] = df["代码"].str[-6:]
-    return df
+    比 ak.stock_zh_a_spot() 拉全市场 5350 只快一个数量级
+    （目标 watchlist 通常 < 20 只，~300ms vs ~3s）。
+
+    sina HQ: https://hq.sinajs.cn/list=sh600519,sz000001 一次返回多只。
+    """
+    import re
+
+    import requests
+
+    if not ts_codes:
+        return pd.DataFrame(
+            columns=["代码", "code_short", "名称", "最新价", "最低", "最高"]
+        )
+
+    sina_codes = []
+    for ts in ts_codes:
+        parts = ts.split(".")
+        if len(parts) != 2:
+            continue
+        code, suffix = parts
+        prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix.upper(), "sh")
+        sina_codes.append(f"{prefix}{code}")
+
+    if not sina_codes:
+        return pd.DataFrame()
+
+    url = f"https://hq.sinajs.cn/list={','.join(sina_codes)}"
+    headers = {"Referer": "https://finance.sina.com.cn"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.encoding = "gbk"
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    pattern = re.compile(r'var hq_str_(\w+)="([^"]*)"')
+    for line in resp.text.split(";"):
+        match = pattern.search(line.strip())
+        if not match:
+            continue
+        sina_code = match.group(1)
+        fields = match.group(2).split(",")
+        if len(fields) < 6:
+            continue
+        try:
+            rows.append(
+                {
+                    "代码": sina_code,
+                    "code_short": sina_code[2:],
+                    "名称": fields[0],
+                    "最新价": float(fields[3]),
+                    "最低": float(fields[5]),
+                    "最高": float(fields[4]),
+                }
+            )
+        except (ValueError, IndexError):
+            continue
+    return pd.DataFrame(rows)
+
+
+def _to_sina_symbol(ts_code: str) -> str:
+    """600519.SH → sh600519；002415.SZ → sz002415。"""
+    code, suffix = ts_code.split(".")
+    prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix.upper(), "sh")
+    return f"{prefix}{code}"
 
 
 @st.cache_data(ttl=300)
 def get_daily_kline(ts_code: str, days: int = 30) -> pd.DataFrame:
-    """日 K 历史。akshare stock_zh_a_hist。ts_code='002415.SZ'。"""
+    """日 K 历史，sina 源（stock_zh_a_daily）——云端 OK，东方财富的
+    stock_zh_a_hist 在腾讯云被屏蔽。"""
     import akshare as ak
-    from datetime import date as _date, timedelta as _td
+    from datetime import date as _date
+    from datetime import timedelta as _td
 
-    code = ts_code.split(".")[0]
     end = _date.today()
     start = end - _td(days=int(days * 1.6))  # 1.6× 覆盖周末
-    df = ak.stock_zh_a_hist(
-        symbol=code,
-        period="daily",
-        start_date=start.strftime("%Y%m%d"),
-        end_date=end.strftime("%Y%m%d"),
-        adjust="qfq",
-    )
+
+    try:
+        df = ak.stock_zh_a_daily(
+            symbol=_to_sina_symbol(ts_code),
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            adjust="qfq",
+        )
+    except Exception:
+        return pd.DataFrame()
+
     if df is None or df.empty:
         return pd.DataFrame()
+
     df = df.tail(days).reset_index(drop=True)
+    # sina 字段是英文，统一转中文供图表用
+    df = df.rename(
+        columns={
+            "date": "日期",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量",
+        }
+    )
+    df["日期"] = df["日期"].astype(str)
     df["涨跌"] = df["收盘"] - df["开盘"]
     return df
 
 
 @st.cache_data(ttl=60)
 def get_minute_kline(ts_code: str) -> pd.DataFrame:
-    """当日 1 分钟分时。akshare stock_zh_a_hist_min_em。"""
+    """当日 1 分钟分时，sina 源（stock_zh_a_minute）。"""
     import akshare as ak
 
-    code = ts_code.split(".")[0]
     try:
-        df = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="")
-        if df is None or df.empty:
-            return pd.DataFrame()
-        # 只保留当日
-        today_str = date.today().strftime("%Y-%m-%d")
-        df["时间"] = pd.to_datetime(df["时间"])
-        df = df[df["时间"].dt.strftime("%Y-%m-%d") == today_str]
-        return df.reset_index(drop=True)
+        df = ak.stock_zh_a_minute(
+            symbol=_to_sina_symbol(ts_code),
+            period="1",
+            adjust="",
+        )
     except Exception:
         return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.rename(
+        columns={
+            "day": "时间",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量",
+        }
+    )
+    try:
+        df["时间"] = pd.to_datetime(df["时间"])
+    except Exception:
+        return pd.DataFrame()
+
+    # 只保留当日
+    today_str = date.today().strftime("%Y-%m-%d")
+    df = df[df["时间"].dt.strftime("%Y-%m-%d") == today_str]
+    # 字符串数值转 float
+    for col in ("开盘", "收盘", "最高", "最低"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.reset_index(drop=True)
 
 
 # ── Header ──
@@ -738,7 +840,8 @@ else:
         elif p2_active.empty:
             st.info("Pool 2 无 active 标的")
         else:
-            prices = get_realtime_prices_sina()
+            ts_codes_tuple = tuple(p2_active["ts_code"].tolist())
+            prices = get_realtime_quotes_batch(ts_codes_tuple)
 
             rows = []
             for _, p2 in p2_active.iterrows():
