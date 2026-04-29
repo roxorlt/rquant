@@ -61,7 +61,9 @@ ok=0
 http_status=""
 for attempt in 1 2; do
     log "curl attempt ${attempt}/2"
-    http_status=$(curl -sS --fail --max-time 60 \
+    # --max-time 600（10 分钟）：234MB 源文件 gzip 后 80-120MB，
+    # 5Mbps 带宽下需 ~3-5 分钟，留余量
+    http_status=$(curl -sS --fail --max-time 600 \
             --user "${RQUANT_BACKUP_USER}:${RQUANT_BACKUP_TOKEN}" \
             -o "${TMP_GZ}" \
             -w "%{http_code}" \
