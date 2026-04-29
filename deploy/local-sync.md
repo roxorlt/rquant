@@ -9,12 +9,18 @@
 | `scripts/sync-from-cloud.sh` | rsync 拉脚本（业务时段跳过 + 失败 PushDeer 告警） |
 | `deploy/com.roxor.rquant-sync.plist` | macOS launchd 配置（每小时触发 + 启动时跑一次） |
 
-## 业务时段（脚本内部跳过，避免拉到 DuckDB 写入中）
+## 同步窗口（脚本内部判断，仅在数据有变化的时段同步）
 
-- **09:30 – 15:00**：盘中 monitor 写入 `monitor_event` / `pool2_watch`
-- **17:00 – 17:10**：每日流水线写入 `daily_bar` / `screen_result`
+| 时段 | 频率 | 内容 |
+|------|------|------|
+| 09:30 – 15:05（盘中） | 每 5 分钟 | monitor_event 实时备份 |
+| 17:10 – 17:30（日终） | 每 5 分钟（窗口内 ~3 次幂等覆盖） | 流水线产出 daily_bar / screen_result / pool2_watch |
+| 周末 | 跳过盘中窗口（A 股不开市） | — |
+| 其他时间 | 跳过 | 数据不变 |
 
-其他时段（晚上 / 夜间 / 周末）正常 rsync。
+锁安全：rsync 加 `--delay-updates` 先拉临时文件再原子 rename，本地读时
+永远是完整状态。源 DuckDB 极小概率被 monitor 写入中（毫秒级）撞上 rsync
+（秒级）拉到 partial state——本地 DuckDB 打开损坏时下次 sync 自动覆盖修复。
 
 ## 安装
 

@@ -14,9 +14,10 @@
     <key>WorkingDirectory</key>
     <string>/Users/roxor/brain/30-projects/rQuant</string>
 
-    <!-- 每小时触发一次（业务时段脚本内部跳过） -->
+    <!-- 每 5 分钟触发；脚本内部判断同步窗口（盘中 09:30-15:05 + 日终 17:10-17:30），
+         其他时段直接 exit。盘中每 5 分钟备份 monitor_event，日终窗口覆盖流水线产出。 -->
     <key>StartInterval</key>
-    <integer>3600</integer>
+    <integer>300</integer>
 
     <!-- 笔记本启动 / launchd 加载时立即拉一次（追上离线期间的更新） -->
     <key>RunAtLoad</key>

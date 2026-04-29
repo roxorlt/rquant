@@ -18,27 +18,37 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG}"
 }
 
-# 业务时段判断（HHMM 格式）
+# 同步窗口：盘中（拉 monitor_event 实时）+ 日终（拉流水线产出）。
+# 其他时段数据不变，跳过省资源。
 hour=$(date +%H)
 minute=$(date +%M)
+day_of_week=$(date +%u)  # 1-7, 1=Mon
 hhmm=$((10#${hour} * 100 + 10#${minute}))
 
-skip_reason=""
-if (( hhmm >= 930 && hhmm <= 1500 )); then
-    skip_reason="trading hours (09:30-15:00)"
-elif (( hhmm >= 1700 && hhmm <= 1710 )); then
-    skip_reason="pipeline window (17:00-17:10)"
+sync_window=""
+if (( hhmm >= 930 && hhmm <= 1505 )); then
+    sync_window="intraday"  # 盘中实时（每 5 分钟 launchd 触发一次）
+elif (( hhmm >= 1710 && hhmm <= 1730 )); then
+    sync_window="daily_after_pipeline"  # 日终窗口（17:10-17:30 内会触发 ~3 次，幂等覆盖）
 fi
 
-if [[ -n "${skip_reason}" ]]; then
-    log "skip: ${skip_reason} (current: ${hhmm})"
+if [[ -z "${sync_window}" ]]; then
+    log "skip: not in sync window (hhmm=${hhmm})"
     exit 0
 fi
+
+# 周末跳过盘中窗口（A 股不开市）
+if [[ "${sync_window}" == "intraday" && "${day_of_week}" -gt 5 ]]; then
+    log "skip: weekend, no intraday data (dow=${day_of_week})"
+    exit 0
+fi
+
+log "sync window: ${sync_window}"
 
 # rsync 重试 3 次（间隔 60s）
 for attempt in 1 2 3; do
     log "rsync attempt ${attempt}/3 from ${CLOUD_HOST}:${CLOUD_PATH}"
-    if rsync -avz --delete \
+    if rsync -avz --delete --delay-updates \
         -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new" \
         "${CLOUD_HOST}:${CLOUD_PATH}" \
         "${LOCAL_PATH}" >> "${LOG}" 2>&1; then
