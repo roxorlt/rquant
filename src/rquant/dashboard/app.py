@@ -778,6 +778,43 @@ else:
 # ── Section 7: 本地 sync ──
 
 
+st.markdown("## ☁️ 云端 Backup Snapshot")
+backup_json = settings.data_dir.parent / "backup" / "latest.json"
+if backup_json.exists():
+    try:
+        info = json.loads(backup_json.read_text())
+        snap_at = info.get("snapshot_at", "")
+        src_mb = info.get("src_bytes", 0) / 1024 / 1024
+        gz_mb = info.get("compressed_bytes", 0) / 1024 / 1024
+
+        bcols = st.columns(3)
+        bcols[0].metric("snapshot 大小", f"{src_mb:.1f} MB")
+        bcols[1].metric("压缩后", f"{gz_mb:.1f} MB")
+
+        if snap_at:
+            snap_dt = datetime.fromisoformat(snap_at.replace("Z", "+00:00"))
+            now_utc = datetime.now(timezone.utc)
+            delta = now_utc - snap_dt
+            local_str = snap_dt.astimezone(CST).strftime("%m-%d %H:%M:%S")
+            if delta > timedelta(hours=1):
+                bcols[2].metric(
+                    "最后 snapshot",
+                    local_str,
+                    delta=f"{delta.total_seconds() / 3600:.1f} 小时前",
+                    delta_color="inverse",
+                )
+            else:
+                bcols[2].metric(
+                    "最后 snapshot",
+                    local_str,
+                    delta=f"{int(delta.total_seconds() / 60)} 分钟前",
+                )
+    except Exception as e:
+        st.error(f"snapshot 元数据解析失败: {e}")
+else:
+    st.info("snapshot 未生成（systemd timer 还没触发或脚本失败）")
+
+
 st.markdown("## 💾 本地热备 sync")
 sync_marker = settings.data_dir / ".last-local-sync.json"
 if sync_marker.exists():
