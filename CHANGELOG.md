@@ -8,7 +8,8 @@
 
 ## [v0.12.0] — 2026-04-30 — Week 7：自然语言选股（NL → 积木）
 
-dashboard 加 "🤖 NL 选股" Section 10：用户用一句中文描述筛选意图，DeepSeek-V4-Flash
+新建 `src/rquant/dashboard/nl_screen.py` 作为**独立 Streamlit 应用**（与监控看板
+完全隔离，独立 URL / 端口 / auth）：用户用一句中文描述筛选意图，DeepSeek-V4-Flash
 解析为结构化 ScreenPlan（按 stage 分层），可视化卡片预览/编辑后跑 screen()
 出表格，可一键保存为 user preset 接入 daily pipeline。
 
@@ -22,7 +23,9 @@ dashboard 加 "🤖 NL 选股" Section 10：用户用一句中文描述筛选意
   - `prompts.py`：system prompt + 4 条 few-shot examples（DeepSeek thinking 模式带 reasoning_content）
   - `client.py`：DeepSeekClient（OpenAI SDK + DeepSeek base_url），retry 3次指数回退 + jsonl 日志 + 澄清场景识别
 - `data/user_presets/*.json`：NL 输入保存的 preset，启动时合并到 PRESET_SCREENS（user/ 前缀）
-- `dashboard/app.py` Section 10：NL 选股 UI（输入 → 解析 → 分层卡片编辑 → 运行 → 表格 → 保存 preset），命中 0 时显示逐规则累加诊断
+- `src/rquant/dashboard/nl_screen.py`：**独立 Streamlit 应用**（不是 multi-page tab）。
+  本机 dev `streamlit run src/rquant/dashboard/nl_screen.py --server.port 8502`，
+  与 8501 监控看板互不干扰；NL 页面**无 meta refresh**，编辑时不会被打断。
 - `scripts/llm_smoke.py`：手动 smoke test（5 个真实 query，已验证）
 - `.env.example`：DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL
 - 40+ 单元测试覆盖 schema / registry / completeness / schema_export / dispatch / client mock / prompts / user_presets
@@ -32,12 +35,13 @@ dashboard 加 "🤖 NL 选股" Section 10：用户用一句中文描述筛选意
 - `pyproject.toml`：+ openai>=1.0（实际安装 2.33.0）
 - `src/rquant/config.py`：+ deepseek_api_key / deepseek_base_url / deepseek_model 字段 + deepseek_enabled property
 - `src/rquant/presets.py`：+ load_user_presets() loader，启动自动 merge `data/user_presets/*.json`
+- `src/rquant/dashboard/app.py`：保持原监控看板内容 + 路径不变（systemd 服务零迁移）
 
 ### Verified
 
 - 396 tests passing（baseline 340 + 56 新增）
 - 真实 DeepSeek API smoke test 5 个 query：4 个产出合理 plan，1 个模糊 query 走澄清路径
-- Dashboard healthcheck (`/_stcore/health`) 正常
+- 监控看板 (port 8502) + NL 页面 (port 8503) 各自 healthcheck `/_stcore/health` 通过
 - user preset roundtrip 验证：写 JSON → 重启读 PRESET_SCREENS → key 含 `user/` 前缀
 
 ### Why
@@ -45,6 +49,10 @@ dashboard 加 "🤖 NL 选股" Section 10：用户用一句中文描述筛选意
 `screen/rules.py` 已有 26 个积木但每次跑新组合必须翻函数列表写 Python。Week 7
 让用户用中文描述意图直接触达积木组合。Stage Cards 形态为 Week 7.5 真画布
 （streamlit-flow / react-flow）预留数据结构（每 stage 直接映射成节点）。
+
+**两 app 拆分而非 multi-page**：监控看板 30s 自动刷新（meta refresh）会打断 NL
+页面交互编辑；且未来部署上 nginx 反代时希望两页面分别配 auth（监控仅自己访问，
+NL 可选择性对外开放），独立 Streamlit 应用比 `st.navigation` 多页更天然。
 
 ---
 

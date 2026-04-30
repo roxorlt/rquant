@@ -1,4 +1,13 @@
-"""rQuant NL 选股页面 — 独立于监控看板，交互式 NL → 积木 → screen()。"""
+"""rQuant NL 选股页面 — 独立于监控看板的 Streamlit 应用。
+
+启动方式（本地开发）：
+    streamlit run src/rquant/dashboard/nl_screen.py --server.port 8502 \\
+        --server.address 0.0.0.0 --server.headless true
+
+监控看板跑在 8501（meta 30s 自动刷新），本页跑在 8502（不刷新，避免编辑时打断）。
+未来部署：两个 Streamlit 应用各自上 systemd timer + nginx 反代，可分别开启 auth：
+监控看板仅自己访问，NL 选股可选择性对外开放。
+"""
 
 from __future__ import annotations
 
@@ -16,6 +25,14 @@ from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
 from rquant.llm.dispatch import screen_with_plan_diagnostic
 from rquant.llm.schemas import ScreenPlan
 from rquant.storage.duckdb import DuckDBStore
+
+
+st.set_page_config(
+    page_title="rQuant NL 选股",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
 
 
 # ── 主体渲染 ──
