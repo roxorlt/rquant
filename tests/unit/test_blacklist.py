@@ -10,9 +10,11 @@ import pytest
 from rquant.risk.blacklist import (
     BlacklistEntry,
     annotate_blacklist,
+    export_blacklist_parquet,
     filter_blacklist,
     import_blacklist,
     load_active_blacklist,
+    load_blacklist_parquet,
     normalize_ts_code,
     parse_blacklist_pdf,
 )
@@ -178,3 +180,123 @@ class TestFilterAndAnnotate:
         clean, removed = filter_blacklist(["000016.SZ"], store=tmp_store)
         assert clean == ["000016.SZ"]
         assert removed == []
+
+
+class TestParquetRoundtrip:
+    """parquet 导入/导出闭环——v0.10.0 upload-api 推送后 mac → 云端。"""
+
+    def _entries(self) -> list[BlacklistEntry]:
+        return [
+            BlacklistEntry(
+                ts_code="000016.SZ", name="深康佳A",
+                risk_type="ST预警",
+                sub_categories=["净资产为负风险", "两年利润为负"],
+            ),
+            BlacklistEntry(
+                ts_code="600340.SH", name="华夏幸福",
+                risk_type="ST预警",
+                sub_categories=["净资产为负风险"],
+            ),
+        ]
+
+    def test_export_then_load_roundtrip(self, tmp_store, tmp_path: Path):
+        # mac 端：导入 PDF（这里用 entries 模拟）→ export-parquet
+        import_blacklist(
+            self._entries(),
+            list_label="430黑名单",
+            source_file="test.pdf",
+            store=tmp_store,
+            imported_at=date(2026, 4, 30),
+        )
+
+        out = tmp_path / "blacklist.parquet"
+        n = export_blacklist_parquet(tmp_store, out)
+        assert n == 2
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+        # 云端：用全新 store 模拟，load-parquet → 验证内容一致
+        with DuckDBStore(path=tmp_path / "cloud.duckdb") as cloud_store:
+            n_loaded = load_blacklist_parquet(out, cloud_store)
+            assert n_loaded == 2
+            active = load_active_blacklist(cloud_store, today=date(2026, 5, 1))
+            assert len(active) == 2
+            kj = active["000016.SZ"]
+            assert kj.name == "深康佳A"
+            assert kj.list_label == "430黑名单"
+            assert "净资产为负风险" in kj.sub_categories
+            assert kj.expires_at == date(2027, 4, 30)
+
+    def test_load_replaces_only_specified_label(self, tmp_store, tmp_path: Path):
+        # 先填两个 label
+        import_blacklist(
+            self._entries(),
+            list_label="430黑名单",
+            source_file="a.pdf",
+            store=tmp_store,
+        )
+        import_blacklist(
+            [BlacklistEntry(
+                ts_code="002415.SZ", name="海康威视",
+                risk_type="其他", sub_categories=["其他"],
+            )],
+            list_label="自定义名单",
+            source_file="b.pdf",
+            store=tmp_store,
+        )
+
+        # 导出"430黑名单" → 模拟云端 load-parquet --label 430黑名单
+        out = tmp_path / "430.parquet"
+        export_blacklist_parquet(tmp_store, out, list_label="430黑名单")
+
+        # 在云端 store load 回去（用 label 限定）
+        with DuckDBStore(path=tmp_path / "cloud.duckdb") as cloud_store:
+            # 先种一个不同 label 模拟云端已有数据
+            import_blacklist(
+                [BlacklistEntry(
+                    ts_code="999999.SZ", name="不该被删",
+                    risk_type="其他", sub_categories=["x"],
+                )],
+                list_label="other-list",
+                source_file="seed.pdf",
+                store=cloud_store,
+            )
+            load_blacklist_parquet(out, cloud_store, list_label="430黑名单")
+
+            all_inc = load_active_blacklist(cloud_store, include_expired=True)
+            # 应该有 430 的 2 条 + other-list 的 1 条 = 3
+            assert len(all_inc) == 3
+            assert "999999.SZ" in all_inc
+            assert all_inc["999999.SZ"].list_label == "other-list"
+
+    def test_load_full_table_replaces_all(self, tmp_store, tmp_path: Path):
+        import_blacklist(
+            self._entries(),
+            list_label="430黑名单",
+            source_file="a.pdf",
+            store=tmp_store,
+        )
+        out = tmp_path / "all.parquet"
+        export_blacklist_parquet(tmp_store, out)
+
+        with DuckDBStore(path=tmp_path / "cloud.duckdb") as cloud_store:
+            # 云端原本有干扰数据
+            import_blacklist(
+                [BlacklistEntry(
+                    ts_code="999999.SZ", name="将被全表覆盖删除",
+                    risk_type="其他", sub_categories=["x"],
+                )],
+                list_label="other-list",
+                source_file="seed.pdf",
+                store=cloud_store,
+            )
+            # 不传 list_label = 全表覆盖
+            n = load_blacklist_parquet(out, cloud_store, list_label=None)
+            assert n == 2
+            all_inc = load_active_blacklist(cloud_store, include_expired=True)
+            assert len(all_inc) == 2
+            assert "999999.SZ" not in all_inc
+
+    def test_load_missing_parquet_raises(self, tmp_store, tmp_path: Path):
+        with pytest.raises(FileNotFoundError):
+            load_blacklist_parquet(tmp_path / "nonexistent.parquet", tmp_store)

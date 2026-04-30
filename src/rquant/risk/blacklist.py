@@ -206,6 +206,91 @@ def import_blacklist(
     return len(entries)
 
 
+# ---------- Parquet 导入 / 导出（mac → 云端 round-trip） ----------
+
+def load_blacklist_parquet(
+    parquet_path: Path,
+    store: DuckDBStore,
+    list_label: str | None = None,
+) -> int:
+    """从 parquet 加载黑名单到 DuckDB risk_blacklist 表。
+
+    用于 v0.10.0 upload-api 推送后云端落库。
+
+    :param parquet_path: parquet 文件路径，columns 必须匹配 risk_blacklist schema
+    :param list_label: 仅替换该 label 的行（默认替换全表，便于跨 label 整体覆盖）
+    :return: 落库后该 label（或全表）的总行数
+    :raises ValueError: 文件不存在或 schema 不匹配（DuckDB 错误透传）
+    """
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"parquet 文件不存在: {parquet_path}")
+
+    if list_label:
+        store._conn.execute(
+            "DELETE FROM risk_blacklist WHERE list_label = ?", [list_label]
+        )
+    else:
+        store._conn.execute("DELETE FROM risk_blacklist")
+
+    store._conn.execute(
+        "INSERT INTO risk_blacklist SELECT * FROM read_parquet(?)",
+        [str(parquet_path)],
+    )
+
+    if list_label:
+        n = store._conn.execute(
+            "SELECT COUNT(*) FROM risk_blacklist WHERE list_label = ?",
+            [list_label],
+        ).fetchone()[0]
+    else:
+        n = store._conn.execute(
+            "SELECT COUNT(*) FROM risk_blacklist"
+        ).fetchone()[0]
+
+    logger.info(
+        f"从 parquet 加载黑名单: {n} 行 → {'list_label=' + list_label if list_label else '全表'}"
+    )
+    return n
+
+
+def export_blacklist_parquet(
+    store: DuckDBStore,
+    output_path: Path,
+    list_label: str | None = None,
+) -> int:
+    """导出 risk_blacklist 表到 parquet（用于 mac → 云端推送）。
+
+    :param output_path: 导出文件路径（父目录必须存在）
+    :param list_label: 仅导出该 label（默认导出全表）
+    :return: 导出的行数
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if list_label:
+        # CREATE VIEW 不支持 prepared param（DuckDB 限制），
+        # 改成 fetch → register DataFrame → COPY，全程参数绑定
+        df = store._conn.execute(
+            "SELECT * FROM risk_blacklist WHERE list_label = ?", [list_label]
+        ).fetchdf()
+        n = len(df)
+        store._conn.register("_bl_export_df", df)
+        store._conn.execute(
+            "COPY _bl_export_df TO ? (FORMAT PARQUET)", [str(output_path)]
+        )
+        store._conn.unregister("_bl_export_df")
+    else:
+        n = store._conn.execute("SELECT COUNT(*) FROM risk_blacklist").fetchone()[0]
+        store._conn.execute(
+            "COPY risk_blacklist TO ? (FORMAT PARQUET)", [str(output_path)]
+        )
+
+    logger.info(
+        f"导出黑名单 parquet: {n} 行 → {output_path} "
+        f"({'list_label=' + list_label if list_label else '全表'})"
+    )
+    return n
+
+
 # ---------- 查询 / 过滤 / 标签 ----------
 
 def load_active_blacklist(

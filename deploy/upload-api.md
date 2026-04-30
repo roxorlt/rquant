@@ -118,22 +118,59 @@ bash scripts/push-to-cloud.sh /tmp/foo.parquet
 文件落到 `data/uploads/`，owner 是 `www`，lighthouse 用 `sudo` 操作：
 
 ```bash
-# 例：把 risk_blacklist.parquet 移到 data/ 然后 import
+sudo mv /home/lighthouse/rquant/data/uploads/risk_blacklist.parquet \
+        /home/lighthouse/rquant/data/risk_blacklist.parquet
+sudo chown lighthouse:lighthouse /home/lighthouse/rquant/data/risk_blacklist.parquet
+```
+
+## 黑名单完整 round-trip（v0.10.3+ 标准流程）
+
+```
+[mac]                                            [cloud 82.156.0.68]
+ 1. PDF 落 ~/Downloads/                                 │
+ 2. rquant blacklist import <PDF>      ──┐              │
+    （PDF → 本地 DuckDB risk_blacklist 表）│              │
+ 3. rquant blacklist export-parquet      ──┤              │
+    （DuckDB → data/risk_blacklist.parquet）│              │
+ 4. bash scripts/push-to-cloud.sh        ──┼──HTTP PUT──→ 5. data/uploads/risk_blacklist.parquet
+    data/risk_blacklist.parquet            │              │
+                                          │              6. sudo mv uploads/* data/
+                                          │              7. rquant blacklist load-parquet
+                                          │                 data/risk_blacklist.parquet --label 430黑名单
+                                          │              8. rquant blacklist list  ← 验证 147 只
+                                          │              9. 等下次 daily 自动用
+```
+
+mac 端：
+
+```bash
+# 1-3. 一气呵成
+rquant blacklist import ~/Downloads/风险控制名单.pdf
+rquant blacklist export-parquet --output data/risk_blacklist.parquet
+# 4.
+bash scripts/push-to-cloud.sh data/risk_blacklist.parquet
+```
+
+云端：
+
+```bash
+# 5-6. mv（原 owner 是 www，用 sudo）
 sudo mv /home/lighthouse/rquant/data/uploads/risk_blacklist.parquet \
         /home/lighthouse/rquant/data/risk_blacklist.parquet
 sudo chown lighthouse:lighthouse /home/lighthouse/rquant/data/risk_blacklist.parquet
 
+# 7. load-parquet（用 --label 只覆盖该 list_label，保留其他 label 数据）
 cd /home/lighthouse/rquant
-.venv/bin/python -c "
-from rquant.storage.duckdb import DuckDBStore
-s = DuckDBStore()
-s._conn.execute(\"DELETE FROM risk_blacklist WHERE list_label = '430黑名单'\")
-s._conn.execute(\"INSERT INTO risk_blacklist SELECT * FROM read_parquet('data/risk_blacklist.parquet')\")
-n = s._conn.execute(\"SELECT COUNT(*) FROM risk_blacklist WHERE list_label = '430黑名单'\").fetchone()[0]
-print(f'imported {n} rows')
-s.close()
-"
+.venv/bin/rquant blacklist load-parquet \
+    data/risk_blacklist.parquet --label 430黑名单
+
+# 8. 验证
+.venv/bin/rquant blacklist list 2>&1 | tail -3
+.venv/bin/rquant blacklist check 600340.SH   # 华夏幸福，应命中
 ```
+
+不传 `--label` 是**全表覆盖**（删 `risk_blacklist` 全部行后 INSERT），适合从 mac 完全镜像云端。
+传 `--label X` 是**只覆盖该 label 的行**，不影响其他 label，适合多 label 共存场景。
 
 ## 故障排查
 
