@@ -22,6 +22,15 @@ log_event() {
     printf "%s %s\n" "$(date -Iseconds)" "$1" >> "${LOG_FILE}"
 }
 
+# 交易时段自检（09:30-15:00）：timer 范围 `09..14:*/2` 包含 09:00-09:28
+# 和 11:30-12:58 等非交易时段，本脚本自己 gate。
+NOW_HM=$(date +%H%M)
+NOW_HM_INT=$((10#${NOW_HM}))
+if (( NOW_HM_INT < 930 || NOW_HM_INT > 1500 )); then
+    log_event "out-of-window"
+    exit 0
+fi
+
 # 已 active：正常路径，直接退
 if systemctl is-active --quiet "${UNIT}"; then
     log_event "active"

@@ -156,7 +156,7 @@ class TestBuildDailyReport:
             unit="rquant-daily.service", active_state="inactive", sub_state="dead",
             start_today=None, exit_today=None, exit_status=None, duration_sec=None,
         )
-        watchdog = {"skip-clean-exit": 60}
+        watchdog = {"skip-clean-exit": 60, "out-of-window": 14}
         subject, body = build_daily_report(
             date(2026, 5, 1), is_trading_day_flag=False,
             monitor=monitor, daily=daily,
@@ -165,7 +165,9 @@ class TestBuildDailyReport:
         assert "非交易日" in subject
         assert "✅ monitor" in body
         assert "✅ watchdog" in body
-        assert "alert" not in body.split("watchdog")[1].split("\n")[0]  # watchdog 行无 alert
+        assert "skip=60" in body
+        # 不应把 out-of-window 算进 in-window 总数
+        assert "交易时段 60" in body
 
     def test_holiday_alert_storm(self):
         """节假日告警轰炸 bug 复现：watchdog alert > 0 就该红色警告。"""
@@ -188,6 +190,8 @@ class TestBuildDailyReport:
         )
         assert "⚠️ watchdog" in body
         assert "alert 60" in body or "**alert 60" in body
+        # 交易时段总数 = active + skip + alert
+        assert "交易时段 60" in body
 
     def test_trading_day_full_run(self):
         """交易日：monitor 跑足 5h 跨午休、watchdog 60 次 active、daily 17:00 未到——日报正常。"""
@@ -232,7 +236,7 @@ class TestBuildDailyReport:
         _, body = build_daily_report(
             date(2026, 5, 6), is_trading_day_flag=True,
             monitor=monitor, daily=daily,
-            watchdog_counts={"active": 60},
+            watchdog_counts={"active": 60, "out-of-window": 14},
             business=self._empty_business(),
         )
         assert "⚠️ monitor" in body
@@ -259,6 +263,7 @@ class TestBuildDailyReport:
             business=self._empty_business(),
         )
         assert "❌ watchdog" in body
+        assert "交易时段 0" in body
 
     def test_daily_failed(self):
         """daily 失败：明确显示 status code。"""
@@ -279,6 +284,29 @@ class TestBuildDailyReport:
             business=self._empty_business(),
         )
         assert "❌ daily: status=1" in body
+
+    def test_holiday_only_out_of_window(self):
+        """节假日 watchdog timer 触发但全在 09:30 前自检退（极端 edge case）。"""
+        monitor = ServiceSnapshot(
+            unit="rquant-monitor.service", active_state="inactive", sub_state="dead",
+            start_today=datetime(2026, 5, 1, 9, 25, 0),
+            exit_today=datetime(2026, 5, 1, 9, 25, 5),
+            exit_status=0, duration_sec=5,
+        )
+        daily = ServiceSnapshot(
+            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
+            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+        )
+        # 只有 out-of-window，没有 in-window 触发（不该出现，但测兜底）
+        _, body = build_daily_report(
+            date(2026, 5, 1), is_trading_day_flag=False,
+            monitor=monitor, daily=daily,
+            watchdog_counts={"out-of-window": 14},
+            business=self._empty_business(),
+        )
+        assert "ℹ️ watchdog" in body
+        assert "交易时段 0" in body
+        assert "盘外 14 次" in body
 
     def test_monitor_never_triggered(self):
         """monitor 今天根本没触发——timer 出问题。"""

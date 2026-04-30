@@ -6,6 +6,54 @@
 
 ---
 
+## [v0.11.1] — 2026-04-30 — Watchdog OnCalendar 语法 hotfix
+
+### Fixed
+- **`deploy/systemd/rquant-monitor-watchdog.timer`：v0.10.2 双段 OnCalendar
+  syntax 实际不工作**。部署后 `systemd-analyze calendar` 揭示：
+  - `Mon..Fri 09:30..11:30/2` → `Failed to parse: Invalid argument`（systemd
+    不接受跨小时的分钟范围）→ **早盘段整段静默丢弃**
+  - `Mon..Fri 13:00..15:00/2` 解析成功，但 `/2` 是 **2 秒**步进不是 2 分钟
+    → 下午段每 2s 触发一次（13:00-15:00 共 3600 次）
+  改为单行 `Mon..Fri *-*-* 09..14:*/2`（hour 范围 + 分钟 */2），watchdog 脚本
+  自检 09:30-15:00 交易窗口外 log `out-of-window` 静默退。
+
+### Added
+- `scripts/monitor-watchdog.sh` 加 NOW_HM 自检：09:30 前 / 15:00 后跑就 log
+  `out-of-window` 静默退（不调 systemctl is-active，不告警）
+- `health.py` 报告区分 in-window / out-of-window，避免冗余触发污染统计
+
+### Why
+v0.10.2 deploy 时 `systemctl list-timers` NEXT 显示 `Fri 13:00:08`（不是
+预期的 `Fri 09:30`），用 `systemd-analyze calendar` 验证才发现两个 syntax bug
+同时存在。如果不修，节后周二 5/6 上午盘 watchdog 完全缺席。
+
+### Tests
+- `TestBuildDailyReport.test_holiday_only_out_of_window`：out-of-window
+  统计独立计数，不污染 in-window 总数
+- 既有用例补 `out-of-window` 字段验证
+- 总数 340 → 341
+
+### Deploy
+```bash
+ssh lighthouse@82.156.0.68
+cd /home/lighthouse/rquant && git pull origin main
+sudo cp deploy/systemd/rquant-monitor-watchdog.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-monitor-watchdog.timer
+# 验证：next 应是 Fri 09:30:xx 而不是 Fri 13:00:xx
+systemctl list-timers rquant-monitor-watchdog.timer --no-pager
+# 看 systemd 实际解析（应见 09:00, 09:02, 09:04 ... 间隔 2min）
+systemd-analyze calendar 'Mon..Fri *-*-* 09..14:*/2' --iterations 6
+```
+
+### 顺手发现的 v0.7.0 旧 bug（不在本 PR 修）
+`rquant-backup.timer` 的 `OnCalendar=Mon..Fri 09:30..15:05/5` 也是无效语法
+——意味着 **intraday backup 自 v0.7.0 起从未跑过**，cloud `latest.duckdb.gz`
+一直是日终 17:30 那一份。证据：今天 timer LAST="-"。下个 PR 修。
+
+---
+
 ## [v0.11.0] — 2026-04-30 — 每日健康摘要（cloud 端 15:30 PushDeer 自报）
 
 ### Added
