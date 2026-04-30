@@ -49,24 +49,35 @@ def _build_price_level(
     pool: str,
     entry_date: date | str,
     days_in_pool: int,
+    blacklist_label: str | None = None,
+    blacklist_categories: list[str] | None = None,
 ) -> tuple[str, str]:
     """A. 档位触发。"""
     label = _LEVEL_LABELS.get(level, level)
-    title = f"{ts_code} {name} {label}档 ¥{trigger_price:.2f}"
+    prefix = f"[{blacklist_label}] " if blacklist_label else ""
+    title = f"{prefix}{ts_code} {name} {label}档 ¥{trigger_price:.2f}"
 
     entry_str = str(entry_date)[:10]
     date_label = "入池" if pool == "pool2" else "涨停"
-    body = (
-        f"# {ts_code} | {label}档触发 | 现价 ¥{trigger_price:.2f}\n"
-        f"- bodyTop: ¥{body_upper:.2f}\n"
-        f"- 40档:    ¥{level_40:.2f}\n"
-        f"- 30档:    ¥{level_30:.2f}\n"
-        f"- 20档:    ¥{level_20:.2f}\n"
-        f"- bodyBtm: ¥{body_lower:.2f}\n"
-        f"- 强止：¥{stop_strong:.2f} | 弱止：¥{stop_weak:.2f}\n"
-        f"- {pool}，{date_label} {entry_str} 第 {days_in_pool} 日"
-    )
-    return title, body
+    body_lines = [
+        f"# {ts_code} | {label}档触发 | 现价 ¥{trigger_price:.2f}",
+    ]
+    if blacklist_label:
+        cat_text = "、".join(blacklist_categories or []) if blacklist_categories else ""
+        body_lines.append(
+            f"> ⚠️ 在 **{blacklist_label}** 中"
+            + (f"：{cat_text}" if cat_text else "")
+        )
+    body_lines.extend([
+        f"- bodyTop: ¥{body_upper:.2f}",
+        f"- 40档:    ¥{level_40:.2f}",
+        f"- 30档:    ¥{level_30:.2f}",
+        f"- 20档:    ¥{level_20:.2f}",
+        f"- bodyBtm: ¥{body_lower:.2f}",
+        f"- 强止：¥{stop_strong:.2f} | 弱止：¥{stop_weak:.2f}",
+        f"- {pool}，{date_label} {entry_str} 第 {days_in_pool} 日",
+    ])
+    return title, "\n".join(body_lines)
 
 
 def _build_pool2_exit(
@@ -90,8 +101,9 @@ def _build_pool2_exit(
     if auto_kicked:
         parts.append("## 自动踢出（跌破止损）")
         for it in auto_kicked:
+            tag = f" [{it['blacklist_label']}]" if it.get("blacklist_label") else ""
             parts.append(
-                f"- {it['ts_code']} {it.get('name', '')} "
+                f"- {it['ts_code']} {it.get('name', '')}{tag} "
                 f"收盘 ¥{it['close']:.2f} < {it['reason_label']} ¥{it['threshold']:.2f}"
             )
     if expired_held:
@@ -99,8 +111,9 @@ def _build_pool2_exit(
         parts.append("## 待决策（超期已保留）")
         for it in expired_held:
             entry_str = str(it["entry_date"])[5:10]
+            tag = f" [{it['blacklist_label']}]" if it.get("blacklist_label") else ""
             parts.append(
-                f"- {it['ts_code']} {it.get('name', '')} "
+                f"- {it['ts_code']} {it.get('name', '')}{tag} "
                 f"入池 {entry_str} 第 {it['days_in_pool']} 日"
             )
             parts.append(f"  → `rquant pool2 remove {it['ts_code']}`")
@@ -130,8 +143,9 @@ def _build_daily_summary(
     parts: list[str] = ["## Pool 1 候选"]
     if pool1_hits:
         for it in pool1_hits:
+            tag = f" [{it['blacklist_label']}]" if it.get("blacklist_label") else ""
             parts.append(
-                f"- {it['ts_code']} {it.get('name', '')} 收 ¥{it['close']:.2f}"
+                f"- {it['ts_code']} {it.get('name', '')}{tag} 收 ¥{it['close']:.2f}"
             )
     else:
         parts.append("- （无）")
@@ -141,8 +155,9 @@ def _build_daily_summary(
     if pool2_active:
         for it in pool2_active:
             entry_str = str(it["entry_date"])[5:10]
+            tag = f" [{it['blacklist_label']}]" if it.get("blacklist_label") else ""
             parts.append(
-                f"- {it['ts_code']} {it.get('name', '')} "
+                f"- {it['ts_code']} {it.get('name', '')}{tag} "
                 f"入池 {entry_str} 第 {it['days_in_pool']} 日"
             )
     else:

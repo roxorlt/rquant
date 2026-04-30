@@ -224,6 +224,84 @@ def cmd_pool2(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_blacklist(args: argparse.Namespace) -> int:
+    """管理风险黑名单。"""
+    from datetime import date
+    from pathlib import Path
+
+    from rquant.risk.blacklist import (
+        import_blacklist,
+        load_active_blacklist,
+        parse_blacklist_pdf,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    setup_logging()
+
+    if args.blacklist_action == "import":
+        pdf = Path(args.pdf).expanduser()
+        if not pdf.exists():
+            logger.error(f"PDF 不存在: {pdf}")
+            return 1
+        entries = parse_blacklist_pdf(pdf)
+        with DuckDBStore() as store:
+            n = import_blacklist(
+                entries,
+                list_label=args.label,
+                source_file=pdf.name,
+                store=store,
+                validity_days=args.validity,
+            )
+        logger.info(f"导入完成：{n} 只 → '{args.label}'")
+        return 0
+
+    elif args.blacklist_action == "list":
+        with DuckDBStore() as store:
+            today = date.today()
+            blacklist = load_active_blacklist(
+                store,
+                list_label=args.label,
+                include_expired=args.include_expired,
+            )
+            if not blacklist:
+                logger.info("无活动黑名单")
+                return 0
+            for code, hit in sorted(blacklist.items()):
+                expired_mark = " [已过期]" if hit.is_expired else ""
+                days_left = (hit.expires_at - today).days
+                logger.info(
+                    f"  {code} {hit.name:8s} {hit.list_label} "
+                    f"(剩 {days_left}d, {len(hit.sub_categories)} 类){expired_mark}"
+                )
+            logger.info(f"共 {len(blacklist)} 只")
+        return 0
+
+    elif args.blacklist_action == "check":
+        with DuckDBStore() as store:
+            blacklist = load_active_blacklist(store, include_expired=True)
+        hit = blacklist.get(args.ts_code)
+        if hit is None:
+            logger.info(f"{args.ts_code} 不在任何黑名单中")
+            return 0
+        expired_mark = " [已过期]" if hit.is_expired else ""
+        logger.info(
+            f"{args.ts_code} {hit.name} 在 '{hit.list_label}'{expired_mark}\n"
+            f"  类别: {hit.sub_categories}\n"
+            f"  导入: {hit.imported_at} → 失效: {hit.expires_at}"
+        )
+        return 0
+
+    elif args.blacklist_action == "remove":
+        with DuckDBStore() as store:
+            n = store._conn.execute(
+                "DELETE FROM risk_blacklist WHERE list_label = ?", [args.label]
+            ).fetchone()
+        logger.info(f"已删除 list_label='{args.label}' 的所有条目")
+        return 0
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -268,6 +346,32 @@ def build_parser() -> argparse.ArgumentParser:
     pool2_rm = pool2_sub.add_parser("remove", help="移除标的")
     pool2_rm.add_argument("ts_code", type=str, help="股票代码 (如 002415.SZ)")
 
+    bl_p = sub.add_parser("blacklist", help="管理风险黑名单")
+    bl_sub = bl_p.add_subparsers(dest="blacklist_action")
+
+    bl_imp = bl_sub.add_parser("import", help="从 PDF 导入黑名单")
+    bl_imp.add_argument("pdf", type=str, help="PDF 路径")
+    bl_imp.add_argument(
+        "--label", type=str, default="430黑名单",
+        help="名单标签 (默认 430黑名单)",
+    )
+    bl_imp.add_argument(
+        "--validity", type=int, default=365,
+        help="有效期天数 (默认 365)",
+    )
+
+    bl_ls = bl_sub.add_parser("list", help="列出黑名单")
+    bl_ls.add_argument("--label", type=str, default=None, help="过滤 label")
+    bl_ls.add_argument(
+        "--include-expired", action="store_true", help="包含已过期条目"
+    )
+
+    bl_chk = bl_sub.add_parser("check", help="查询某只股票是否在黑名单")
+    bl_chk.add_argument("ts_code", type=str, help="股票代码 (如 600340.SH)")
+
+    bl_rm = bl_sub.add_parser("remove", help="删除整个 list_label")
+    bl_rm.add_argument("--label", type=str, required=True, help="要删除的 label")
+
     sub.add_parser("notify-test", help="推一条 PushDeer 测试消息")
 
     return parser
@@ -287,6 +391,7 @@ def main() -> int:
         "ingest": cmd_ingest,
         "monitor": cmd_monitor,
         "pool2": cmd_pool2,
+        "blacklist": cmd_blacklist,
         "notify-test": cmd_notify_test,
     }
     handler = dispatch.get(args.command)

@@ -153,9 +153,24 @@ CREATE TABLE IF NOT EXISTS notification_log (
 );
 """
 
+RISK_BLACKLIST_DDL = """
+CREATE TABLE IF NOT EXISTS risk_blacklist (
+    list_label      VARCHAR   NOT NULL,   -- 如 "430黑名单"
+    ts_code         VARCHAR   NOT NULL,
+    name            VARCHAR,
+    sub_categories  VARCHAR[],            -- 多类别合并（净资产为负 / 营收利润不达标 ...）
+    risk_type       VARCHAR,              -- ST预警
+    source_file     VARCHAR,
+    imported_at     DATE      NOT NULL,
+    expires_at      DATE      NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (list_label, ts_code)
+);
+"""
+
 ALL_DDL = [
     DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
     SCREEN_RESULT_DDL, POOL2_WATCH_DDL, MONITOR_EVENT_DDL,
-    NOTIFICATION_LOG_DDL,
+    NOTIFICATION_LOG_DDL, RISK_BLACKLIST_DDL,
 ]

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import altair as alt
@@ -355,9 +355,10 @@ def _to_sina_symbol(ts_code: str) -> str:
 def get_daily_kline(ts_code: str, days: int = 30) -> pd.DataFrame:
     """日 K 历史，sina 源（stock_zh_a_daily）——云端 OK，东方财富的
     stock_zh_a_hist 在腾讯云被屏蔽。"""
-    import akshare as ak
     from datetime import date as _date
     from datetime import timedelta as _td
+
+    import akshare as ak
 
     end = _date.today()
     start = end - _td(days=int(days * 1.6))  # 1.6× 覆盖周末
@@ -596,49 +597,55 @@ if db_locked_pid:
 else:
     col_p2, col_p1 = st.columns([1, 1])
 
-    with col_p2:
-        with st.container(border=True):
-            p2 = query_duckdb(
-                """
+    with col_p2, st.container(border=True):
+        p2 = query_duckdb(
+            """
                 SELECT pw.ts_code AS 代码, sb.name AS 名称,
                        strftime(pw.entry_date, '%m-%d') AS 入池,
                        pw.body_lower AS bodyBtm, pw.body_upper AS bodyTop,
-                       pw.stop_strong AS 强止, pw.stop_weak AS 弱止
+                       pw.stop_strong AS 强止, pw.stop_weak AS 弱止,
+                       CASE WHEN rb.list_label IS NOT NULL
+                            THEN '⚠️ ' || rb.list_label
+                            ELSE '' END AS 黑名单
                 FROM pool2_watch pw
                 LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
+                LEFT JOIN risk_blacklist rb
+                  ON pw.ts_code = rb.ts_code
+                 AND rb.expires_at >= CURRENT_DATE
                 WHERE pw.status = 'active'
                 ORDER BY pw.entry_date DESC
                 """
-            )
-            count = 0 if p2 is None else len(p2)
-            st.markdown(f"### Pool 2 active ({count} 只)")
-            if p2 is None:
-                st.info("⏳ 数据暂不可读")
-            elif p2.empty:
-                st.info("Pool 2 暂无 active 标的")
-            else:
-                st.dataframe(p2, hide_index=True, use_container_width=True)
+        )
+        count = 0 if p2 is None else len(p2)
+        bl_count = 0 if p2 is None else int((p2["黑名单"] != "").sum())
+        bl_suffix = f" · ⚠️ {bl_count}" if bl_count else ""
+        st.markdown(f"### Pool 2 active ({count} 只{bl_suffix})")
+        if p2 is None:
+            st.info("⏳ 数据暂不可读")
+        elif p2.empty:
+            st.info("Pool 2 暂无 active 标的")
+        else:
+            st.dataframe(p2, hide_index=True, use_container_width=True)
 
-    with col_p1:
-        with st.container(border=True):
-            p1 = query_duckdb(
-                """
+    with col_p1, st.container(border=True):
+        p1 = query_duckdb(
+            """
                 SELECT ts_code AS 代码, name AS 名称, close AS 收盘, pct_chg AS 涨跌
                 FROM screen_result
                 WHERE strftime(trade_date, '%Y-%m-%d') = ?
                   AND preset_name = 'n-shape-pool1'
                 ORDER BY ts_code
                 """,
-                [today_iso],
-            )
-            count = 0 if p1 is None else len(p1)
-            st.markdown(f"### Pool 1 候选 today ({count} 只)")
-            if p1 is None:
-                st.info("⏳ 数据暂不可读")
-            elif p1.empty:
-                st.info("当日暂无 Pool 1 命中")
-            else:
-                st.dataframe(p1, hide_index=True, use_container_width=True)
+            [today_iso],
+        )
+        count = 0 if p1 is None else len(p1)
+        st.markdown(f"### Pool 1 候选 today ({count} 只)")
+        if p1 is None:
+            st.info("⏳ 数据暂不可读")
+        elif p1.empty:
+            st.info("当日暂无 Pool 1 命中")
+        else:
+            st.dataframe(p1, hide_index=True, use_container_width=True)
 
 
 # ── Section 4: 今日触发事件 ──
@@ -793,7 +800,7 @@ if backup_json.exists():
 
         if snap_at:
             snap_dt = datetime.fromisoformat(snap_at.replace("Z", "+00:00"))
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(UTC)
             delta = now_utc - snap_dt
             local_str = snap_dt.astimezone(CST).strftime("%m-%d %H:%M:%S")
             if delta > timedelta(hours=1):
@@ -892,9 +899,13 @@ else:
             SELECT pw.ts_code, sb.name,
                    pw.body_upper, pw.body_lower,
                    pw.level_40, pw.level_30, pw.level_20,
-                   pw.stop_strong, pw.stop_weak
+                   pw.stop_strong, pw.stop_weak,
+                   rb.list_label AS blacklist_label
             FROM pool2_watch pw
             LEFT JOIN stock_basic sb ON pw.ts_code = sb.ts_code
+            LEFT JOIN risk_blacklist rb
+              ON pw.ts_code = rb.ts_code
+             AND rb.expires_at >= CURRENT_DATE
             WHERE pw.status = 'active'
             """
         )
@@ -913,10 +924,12 @@ else:
                 if price_row.empty:
                     continue
                 price = float(price_row.iloc[0]["最新价"])
+                bl_label = p2.get("blacklist_label")
                 rows.append(
                     {
                         "代码": p2["ts_code"],
                         "名称": p2.get("name") or "",
+                        "黑名单": f"⚠️ {bl_label}" if bl_label else "",
                         "现价": round(price, 2),
                         "bodyTop": round(p2["body_upper"], 2),
                         "40档": round(p2["level_40"], 2),
@@ -1032,81 +1045,166 @@ else:
                                 st.error(f"日 K 加载失败: {e}")
 
                     # 当日分时
-                    with detail_col_m:
-                        with st.container(border=True):
-                            st.markdown("**当日分时**")
-                            try:
-                                minute = get_minute_kline(sel_code)
-                                if minute.empty:
-                                    st.info("当日分时暂无数据")
-                                else:
-                                    # ordinal x 跳过午休 11:30-13:00 空段
-                                    minute = minute.copy()
-                                    minute["时间_str"] = minute["时间"].dt.strftime("%H:%M")
+                    with detail_col_m, st.container(border=True):
+                        st.markdown("**当日分时**")
+                        try:
+                            minute = get_minute_kline(sel_code)
+                            if minute.empty:
+                                st.info("当日分时暂无数据")
+                            else:
+                                # ordinal x 跳过午休 11:30-13:00 空段
+                                minute = minute.copy()
+                                minute["时间_str"] = minute["时间"].dt.strftime("%H:%M")
 
-                                    # 11:30 之后第一个数据点位置 → 画虚线分隔上下午
-                                    morning_end = minute[minute["时间"].dt.hour < 12]
-                                    afternoon_start_label = (
-                                        minute.iloc[len(morning_end)]["时间_str"]
-                                        if len(morning_end) < len(minute)
-                                        else None
-                                    )
+                                # 11:30 之后第一个数据点位置 → 画虚线分隔上下午
+                                morning_end = minute[minute["时间"].dt.hour < 12]
+                                afternoon_start_label = (
+                                    minute.iloc[len(morning_end)]["时间_str"]
+                                    if len(morning_end) < len(minute)
+                                    else None
+                                )
 
-                                    base_m = alt.Chart(minute).encode(
-                                        x=alt.X(
-                                            "时间_str:O",
-                                            sort=None,
-                                            title=None,
-                                            axis=alt.Axis(
-                                                labelOverlap="greedy",
-                                                labelFontSize=9,
-                                                tickCount=6,
-                                            ),
+                                base_m = alt.Chart(minute).encode(
+                                    x=alt.X(
+                                        "时间_str:O",
+                                        sort=None,
+                                        title=None,
+                                        axis=alt.Axis(
+                                            labelOverlap="greedy",
+                                            labelFontSize=9,
+                                            tickCount=6,
                                         ),
-                                        y=alt.Y(
-                                            "收盘:Q",
-                                            title="价格",
-                                            scale=alt.Scale(zero=False),
-                                        ),
-                                    )
-                                    line_m = base_m.mark_line(
-                                        color="#3b82f6", strokeWidth=1.5
-                                    ).encode(
-                                        tooltip=[
-                                            alt.Tooltip("时间_str:N", title="时间"),
-                                            "开盘", "收盘", "最高", "最低",
-                                        ],
-                                    )
+                                    ),
+                                    y=alt.Y(
+                                        "收盘:Q",
+                                        title="价格",
+                                        scale=alt.Scale(zero=False),
+                                    ),
+                                )
+                                line_m = base_m.mark_line(
+                                    color="#3b82f6", strokeWidth=1.5
+                                ).encode(
+                                    tooltip=[
+                                        alt.Tooltip("时间_str:N", title="时间"),
+                                        "开盘", "收盘", "最高", "最低",
+                                    ],
+                                )
 
-                                    layers = [line_m]
-                                    if afternoon_start_label:
-                                        sep = (
-                                            alt.Chart(
-                                                pd.DataFrame(
-                                                    {"时间_str": [afternoon_start_label]}
-                                                )
+                                layers = [line_m]
+                                if afternoon_start_label:
+                                    sep = (
+                                        alt.Chart(
+                                            pd.DataFrame(
+                                                {"时间_str": [afternoon_start_label]}
                                             )
-                                            .mark_rule(
-                                                strokeDash=[3, 3],
-                                                stroke="#9ca3af",
-                                                strokeWidth=1,
-                                            )
-                                            .encode(x="时间_str:O")
                                         )
-                                        layers.append(sep)
+                                        .mark_rule(
+                                            strokeDash=[3, 3],
+                                            stroke="#9ca3af",
+                                            strokeWidth=1,
+                                        )
+                                        .encode(x="时间_str:O")
+                                    )
+                                    layers.append(sep)
 
-                                    chart_m = alt.layer(*layers).properties(height=260)
-                                    st.altair_chart(chart_m, use_container_width=True)
-                                    if afternoon_start_label:
-                                        st.caption(
-                                            "💡 虚线 = 午休分隔（11:30 → 13:00 跳过）"
-                                        )
-                            except Exception as e:
-                                st.error(f"分时加载失败: {e}")
+                                chart_m = alt.layer(*layers).properties(height=260)
+                                st.altair_chart(chart_m, use_container_width=True)
+                                if afternoon_start_label:
+                                    st.caption(
+                                        "💡 虚线 = 午休分隔（11:30 → 13:00 跳过）"
+                                    )
+                        except Exception as e:
+                            st.error(f"分时加载失败: {e}")
             else:
                 st.warning("未匹配到任何 Pool 2 标的的实时价格")
     except Exception as e:
         st.error(f"实时价位获取失败: {e}")
+
+
+# ── Section 9: 风险黑名单状态 ──
+
+
+st.markdown("## 🛑 风险黑名单状态")
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+else:
+    bl_summary = query_duckdb(
+        """
+        SELECT list_label,
+               COUNT(*) AS n_total,
+               MAX(imported_at) AS imported_at,
+               MAX(expires_at)  AS expires_at
+        FROM risk_blacklist
+        GROUP BY list_label
+        ORDER BY MAX(expires_at) DESC
+        """
+    )
+    if bl_summary is None:
+        st.info("⏳ 数据暂不可读")
+    elif bl_summary.empty:
+        st.info(
+            "暂无黑名单。导入命令：`rquant blacklist import "
+            "~/Downloads/风险控制名单.pdf`"
+        )
+    else:
+        today_d = date.today()
+        cols = st.columns(min(len(bl_summary), 3) or 1)
+        for i, (_, r) in enumerate(bl_summary.iterrows()):
+            with cols[i % len(cols)], st.container(border=True):
+                label = r["list_label"]
+                expires = r["expires_at"]
+                if hasattr(expires, "date"):
+                    expires = expires.date()
+                days_left = (expires - today_d).days
+                expired = days_left < 0
+                near = 0 <= days_left <= 30
+
+                badge_color = (
+                    "#dc2626" if expired
+                    else ("#f59e0b" if near else "#16a34a")
+                )
+                badge_text = (
+                    f"已过期 {-days_left}d" if expired
+                    else (f"剩 {days_left}d" if near else f"剩 {days_left}d")
+                )
+
+                st.markdown(
+                    f"<div style='display:flex;align-items:baseline;"
+                    f"justify-content:space-between;'>"
+                    f"<span style='font-size:0.95rem;font-weight:600;'>"
+                    f"{label}</span>"
+                    f"<span style='padding:2px 8px;border-radius:4px;"
+                    f"background:{badge_color}1a;color:{badge_color};"
+                    f"font-size:0.7rem;font-weight:500;'>{badge_text}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<div style='color:#6b7280;font-size:0.78rem;"
+                    f"margin-top:4px;'>"
+                    f"{r['n_total']} 只 · 导入 {r['imported_at']} → "
+                    f"失效 {expires}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if expired:
+                    st.markdown(
+                        f"<div style='color:#dc2626;font-size:0.75rem;"
+                        f"margin-top:6px;'>"
+                        f"⚠️ 名单已过期，过滤仍在生效。请上传新版后用 "
+                        f"<code>rquant blacklist import &lt;pdf&gt; --label "
+                        f"{label}</code> 刷新。"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                elif near:
+                    st.markdown(
+                        "<div style='color:#f59e0b;font-size:0.75rem;"
+                        "margin-top:6px;'>"
+                        "⏰ 即将到期，建议尽快上传新版"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
 
 
 st.divider()

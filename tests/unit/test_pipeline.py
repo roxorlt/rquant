@@ -214,6 +214,74 @@ class TestRunDailyPipeline:
             assert result == {"child": 0}
 
 
+class TestBlacklistFilter:
+    def test_blacklisted_codes_are_dropped_before_upsert(self, store: DuckDBStore) -> None:
+        """流水线 upsert 前应过滤命中黑名单的标的，干净的票照常落库。"""
+        from datetime import date
+
+        from rquant.risk.blacklist import BlacklistEntry, import_blacklist
+
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000016.SZ', '2026-04-28', 1,1,1,1,1,0,0,0,0),"
+            "('600519.SH', '2026-04-28', 1,1,1,1,1,0,0,0,0)"
+        )
+        # 黑名单：000016.SZ 命中
+        import_blacklist(
+            [BlacklistEntry("000016.SZ", "深康佳A", "ST预警", ["净资产为负"])],
+            list_label="430黑名单",
+            source_file="test.pdf",
+            store=store,
+            imported_at=date(2026, 4, 28),
+        )
+        mock_df = pd.DataFrame({
+            "ts_code": ["000016.SZ", "600519.SH"],
+            "name": ["深康佳A", "贵州茅台"],
+            "CLOSE[0]": [3.0, 1685.0],
+            "PCT_CHG[0]": [0.0, 1.5],
+        })
+        test_presets = {
+            "test-pool": ScreenPreset(
+                name="test-pool", description="", rules=[not_st()],
+            ),
+        }
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", test_presets),
+            patch("rquant.pipeline.screen", return_value=mock_df),
+        ):
+            result = run_daily_pipeline("2026-04-28", store=store)
+
+        # screen 命中 2 只，过滤后只剩 1 只落库
+        assert result == {"test-pool": 1}
+        sr = store.query_screen_result("2026-04-28", "test-pool")
+        assert len(sr) == 1
+        assert sr.iloc[0]["ts_code"] == "600519.SH"
+
+    def test_no_filter_when_blacklist_empty(self, store: DuckDBStore) -> None:
+        """无黑名单时所有票正常落库。"""
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000016.SZ', '2026-04-28', 1,1,1,1,1,0,0,0,0)"
+        )
+        mock_df = pd.DataFrame({
+            "ts_code": ["000016.SZ"],
+            "name": ["深康佳A"],
+            "CLOSE[0]": [3.0],
+            "PCT_CHG[0]": [0.0],
+        })
+        test_presets = {
+            "test-pool": ScreenPreset(
+                name="test-pool", description="", rules=[not_st()],
+            ),
+        }
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", test_presets),
+            patch("rquant.pipeline.screen", return_value=mock_df),
+        ):
+            result = run_daily_pipeline("2026-04-28", store=store)
+        assert result == {"test-pool": 1}
+
+
 class TestDailySummaryPush:
     def test_pushes_pool1_and_pool2(self, store: DuckDBStore) -> None:
         from datetime import date

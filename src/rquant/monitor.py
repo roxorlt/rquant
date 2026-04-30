@@ -11,6 +11,7 @@ import pandas as pd
 from loguru import logger
 
 from rquant.pipeline import _compute_levels
+from rquant.risk.blacklist import load_active_blacklist
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -30,6 +31,8 @@ class WatchItem:
     stop_weak: float
     name: str = ""
     entry_date: date | None = None  # pool2 入池日；pool1 用 limit_up_date
+    blacklist_label: str | None = None
+    blacklist_categories: list[str] = field(default_factory=list)
     triggered: dict[str, bool] = field(default_factory=lambda: {
         "40": False, "30": False, "20": False,
         "strong": False, "weak": False,
@@ -137,6 +140,19 @@ def build_watchlist(
         name_map = dict(zip(name_df["ts_code"], name_df["name"]))
         for code, item in items.items():
             item.name = name_map.get(code, "")
+
+    # 4. 黑名单标签（保留全部，命中加 tag——已持仓不剔除）
+    blacklist = load_active_blacklist(store)
+    if blacklist:
+        tagged = 0
+        for code, item in items.items():
+            hit = blacklist.get(code)
+            if hit:
+                item.blacklist_label = hit.list_label
+                item.blacklist_categories = hit.sub_categories
+                tagged += 1
+        if tagged:
+            logger.warning(f"Watchlist 中 {tagged} 只命中黑名单（保留+标签）")
 
     logger.info(
         f"Watchlist: {len(items)} 只 "
@@ -278,6 +294,7 @@ def check_exits(store: DuckDBStore, today: date) -> int:
         codes,
     ).fetchdf()
     name_map = dict(zip(name_df["ts_code"], name_df["name"]))
+    blacklist = load_active_blacklist(store)
 
     auto_kicked: list[dict] = []
     expired_held: list[dict] = []
@@ -286,6 +303,7 @@ def check_exits(store: DuckDBStore, today: date) -> int:
         code = row["ts_code"]
         raw_entry = row["entry_date"]
         entry_date = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
+        bl_label = blacklist[code].list_label if code in blacklist else None
 
         stop_s = float(row["stop_strong"])
         stop_w = float(row["stop_weak"])
@@ -308,6 +326,7 @@ def check_exits(store: DuckDBStore, today: date) -> int:
                 "close": close_price,
                 "threshold": stop_w,
                 "reason_label": "弱止",
+                "blacklist_label": bl_label,
             })
             logger.info(f"Pool 2 自动踢出: {code} 跌破弱止 ¥{stop_w:.2f}")
         elif close_price < stop_s:
@@ -318,6 +337,7 @@ def check_exits(store: DuckDBStore, today: date) -> int:
                 "close": close_price,
                 "threshold": stop_s,
                 "reason_label": "强止",
+                "blacklist_label": bl_label,
             })
             logger.info(f"Pool 2 自动踢出: {code} 跌破强止 ¥{stop_s:.2f}")
         elif days >= 3:
@@ -326,6 +346,7 @@ def check_exits(store: DuckDBStore, today: date) -> int:
                 "name": name_map.get(code, ""),
                 "entry_date": entry_date,
                 "days_in_pool": days,
+                "blacklist_label": bl_label,
             })
             logger.info(f"Pool 2 超期保留: {code} 第 {days} 日")
 
@@ -458,6 +479,8 @@ def run_monitor(interval: int = 5) -> int:
                         pool=item.pool,
                         entry_date=ref_date,
                         days_in_pool=days,
+                        blacklist_label=item.blacklist_label,
+                        blacklist_categories=item.blacklist_categories,
                     )
 
             time.sleep(interval)
