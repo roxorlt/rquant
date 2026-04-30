@@ -1,0 +1,18 @@
+[Unit]
+Description=Trigger rQuant daily health report at 15:30 every day
+
+[Timer]
+# 每日 15:30 触发——A 股 15:00 收盘 + 30min 缓冲
+# 涵盖周末和节假日：报告会指出"非交易日"，watchdog 应 0 次告警
+OnCalendar=*-*-* 15:30:00
+
+# 错过补跑（系统重启 / 休眠后）
+Persistent=true
+
+# 与其他 timer 错峰
+RandomizedDelaySec=30s
+
+Unit=rquant-daily-report.service
+
+[Install]
+WantedBy=timers.target

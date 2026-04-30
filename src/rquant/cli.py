@@ -194,6 +194,15 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
     return 0 if total_success > 0 else 1
 
 
+def cmd_daily_report(args: argparse.Namespace) -> int:
+    """生成 + 推送当日健康摘要（systemd timer 15:30 自动跑）。"""
+    from rquant.health import generate_and_send_daily_report
+
+    setup_logging()
+    n = generate_and_send_daily_report(dry_run=args.dry_run)
+    return 0 if (args.dry_run or n > 0) else 1
+
+
 def cmd_alert(args: argparse.Namespace) -> int:
     """发一条运维告警（用于 systemd OnFailure / watchdog 等场景）。
 
@@ -456,6 +465,11 @@ def build_parser() -> argparse.ArgumentParser:
     bl_rm.add_argument("--label", type=str, required=True, help="要删除的 label")
 
     sub.add_parser("notify-test", help="推一条 PushDeer 测试消息")
+    dr_p = sub.add_parser("daily-report", help="生成并推送当日健康摘要（systemd timer 自动跑）")
+    dr_p.add_argument(
+        "--dry-run", action="store_true",
+        help="只打印不推送（mac 本地 smoke 测试用）",
+    )
 
     alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")
     alert_p.add_argument("--subject", required=True, help="告警主题")
@@ -481,14 +495,15 @@ def main() -> int:
         "blacklist": cmd_blacklist,
         "notify-test": cmd_notify_test,
         "alert": cmd_alert,
+        "daily-report": cmd_daily_report,
     }
     handler = dispatch.get(args.command)
     if handler is None:
         parser.print_help()
         return 0
 
-    # alert 自身就是用于错误兜底的，main 不该再吞它的异常包一层
-    if args.command in ("serve", "notify-test", "alert"):
+    # alert / daily-report 自身就是日常运维路径，main 不该再吞它的异常包一层
+    if args.command in ("serve", "notify-test", "alert", "daily-report"):
         return handler(args)
 
     try:
