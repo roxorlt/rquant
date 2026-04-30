@@ -18,8 +18,13 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
+from pydantic import ValidationError
+
 from rquant.config import settings
 from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
+from rquant.llm.dispatch import screen_with_plan
+from rquant.llm.schemas import ScreenPlan
+from rquant.storage.duckdb import DuckDBStore
 
 
 REFRESH_SECONDS = 30
@@ -1397,6 +1402,53 @@ else:
 
         with st.expander("📄 查看完整 plan JSON"):
             st.json(nl_plan_dict)
+
+        st.divider()
+        nl_col_run, nl_col_date = st.columns([1, 2])
+        with nl_col_date:
+            from datetime import date as _date
+
+            try:
+                _default_date = _date.fromisoformat(nl_plan_dict["trade_date"])
+            except (ValueError, KeyError):
+                _default_date = _date.today()
+            nl_run_date = st.date_input(
+                "trade_date",
+                value=_default_date,
+                key="nl_run_date_input",
+            )
+            nl_plan_dict["trade_date"] = nl_run_date.isoformat()
+        with nl_col_run:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button(
+                "🚀 运行", type="primary",
+                use_container_width=True, key="nl_run_btn",
+            ):
+                try:
+                    nl_plan_validated = ScreenPlan.model_validate(nl_plan_dict)
+                    nl_store = DuckDBStore(settings.duckdb_path)
+                    nl_df = screen_with_plan(nl_plan_validated, store=nl_store)
+                    st.session_state.nl_result_df = nl_df
+                except ValidationError as nl_e:
+                    st.error(f"plan 校验失败：{nl_e}")
+                    st.session_state.nl_result_df = None
+                except Exception as nl_e:
+                    st.error(f"运行失败：{type(nl_e).__name__}: {nl_e}")
+                    st.session_state.nl_result_df = None
+
+        nl_result_df = st.session_state.nl_result_df
+        if nl_result_df is not None:
+            st.markdown(f"### 📊 命中 **{len(nl_result_df)}** 只")
+            if len(nl_result_df) == 0:
+                st.warning(
+                    "无标的命中。检查规则参数是否过严，或调整 trade_date。"
+                )
+            else:
+                st.dataframe(
+                    nl_result_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     # 侧边栏：NL 查询历史
     with st.sidebar:
