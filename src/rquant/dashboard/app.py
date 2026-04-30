@@ -1450,6 +1450,79 @@ else:
                     hide_index=True,
                 )
 
+                st.divider()
+                nl_col_save_input, nl_col_save_btn = st.columns([3, 1])
+                with nl_col_save_input:
+                    nl_save_name = st.text_input(
+                        "保存为 preset 名（自动加 `user/` 前缀）",
+                        key="nl_save_name_input",
+                        placeholder="例：突破新高放量",
+                    )
+                with nl_col_save_btn:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button(
+                        "💾 保存",
+                        use_container_width=True,
+                        disabled=not nl_save_name.strip(),
+                        key="nl_save_btn",
+                    ):
+                        import re as _nl_re
+                        from datetime import datetime as _nl_dt
+
+                        # 文件名安全化：保留字母/数字/下划线/中文/横线
+                        nl_safe_name = _nl_re.sub(
+                            r"[^\w一-鿿_-]",
+                            "",
+                            nl_save_name.strip(),
+                        )
+                        if not nl_safe_name:
+                            st.error("名字含非法字符或为空")
+                        else:
+                            nl_user_presets_dir = (
+                                Path(settings.data_dir) / "user_presets"
+                            )
+                            nl_user_presets_dir.mkdir(parents=True, exist_ok=True)
+                            nl_preset_path = (
+                                nl_user_presets_dir / f"{nl_safe_name}.json"
+                            )
+                            if nl_preset_path.exists():
+                                st.error(
+                                    f"⚠️ 已有同名 preset："
+                                    f"{nl_safe_name}.json"
+                                )
+                            else:
+                                nl_payload = {
+                                    "name": nl_safe_name,
+                                    "description": (
+                                        st.session_state.nl_history[0]
+                                        if st.session_state.nl_history
+                                        else ""
+                                    ),
+                                    "rules": [
+                                        rc
+                                        for s in nl_plan_dict["stages"]
+                                        for rc in s["rules"]
+                                    ],
+                                    "include_columns": nl_plan_dict.get(
+                                        "include_columns", []
+                                    ),
+                                    "created_at": _nl_dt.now().isoformat(
+                                        timespec="seconds"
+                                    ),
+                                    "source": "nl_input",
+                                }
+                                nl_preset_path.write_text(
+                                    json.dumps(
+                                        nl_payload,
+                                        ensure_ascii=False,
+                                        indent=2,
+                                    ),
+                                    encoding="utf-8",
+                                )
+                                st.success(
+                                    f"✅ 已保存到 {nl_preset_path}"
+                                )
+
     # 侧边栏：NL 查询历史
     with st.sidebar:
         st.subheader("📜 NL 查询历史")
