@@ -6,6 +6,36 @@
 
 ---
 
+## [v0.10.2] — 2026-04-30 — Watchdog 节假日告警轰炸 hotfix
+
+### Fixed
+- **`scripts/monitor-watchdog.sh`：节假日 60 次/天告警轰炸 bug**。v0.10.1
+  watchdog timer 每 2min 巡检 monitor，但漏想了 A 股节假日场景：
+  - 09:25 monitor.timer 触发 → monitor `is_trading_day(today)` False 立刻退 0
+  - 09:30 watchdog 见 inactive → 推 PushDeer + systemctl start → monitor 又退
+  - 09:32 watchdog 又触发 → 又推 → 60 次/天告警
+  改为先看 `systemctl show ExecMainExitTimestamp/ExecMainStatus`：今天已
+  exit 0 过 → 静默不告警不重启（覆盖节假日 + 收盘后两个场景）
+
+### Why
+明日 Fri 2026-05-01 是 A 股劳动节假期（5/1-5/5 休市）。如果不修，刘哥手机
+凌晨开始就被 PushDeer 打爆。systemd OnCalendar 不支持中国节假日规则，所以
+watchdog 必须从 systemd state 推断"是否今日已正常完成"。
+
+### Deploy（仅一个文件 + reload，秒级）
+```bash
+ssh lighthouse@82.156.0.68
+cd /home/lighthouse/rquant && git pull origin main
+# scripts/ 在仓库内，不需要 cp 到 /etc，直接 git pull 就生效
+# 验证
+bash -n scripts/monitor-watchdog.sh && echo "syntax OK"
+# 可选：手动触发一次看效果（monitor 已 inactive 状态）
+sudo systemctl start rquant-monitor-watchdog.service
+sudo journalctl -u rquant-monitor-watchdog.service -n 20 --no-pager
+```
+
+---
+
 ## [v0.10.1] — 2026-04-30 — Monitor 跨午休 bug 修复 + 盘中守护 / OnFailure 告警
 
 ### Fixed
