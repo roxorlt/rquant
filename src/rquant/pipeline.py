@@ -9,6 +9,7 @@ import pandas as pd
 from loguru import logger
 
 from rquant.presets import PRESET_SCREENS, ScreenPreset
+from rquant.risk.blacklist import load_active_blacklist
 from rquant.screen.core import screen
 from rquant.storage.duckdb import DuckDBStore
 
@@ -181,6 +182,14 @@ def run_daily_pipeline(
         order = _resolve_execution_order(PRESET_SCREENS, preset_names)
         summary: dict[str, int] = {}
 
+        # 黑名单：在每个 preset upsert 前过滤新推荐（保留 pool2_watch 中已存在条目）
+        blacklist = load_active_blacklist(store)
+        if blacklist:
+            logger.info(
+                f"风险黑名单 active: {len(blacklist)} 只，"
+                f"将过滤所有 preset 新推荐"
+            )
+
         for name in order:
             preset = PRESET_SCREENS[name]
             ts_whitelist: list[str] | None = None
@@ -226,9 +235,19 @@ def run_daily_pipeline(
             )
 
             sr_df = _to_screen_result_df(result_df, trade_date, name)
+
+            if blacklist and not sr_df.empty:
+                hit_mask = sr_df["ts_code"].isin(blacklist.keys())
+                if hit_mask.any():
+                    removed = sr_df.loc[hit_mask, "ts_code"].tolist()
+                    sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
+                    logger.warning(
+                        f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}"
+                    )
+
             store.upsert_screen_result(sr_df)
 
-            hit_count = len(result_df)
+            hit_count = len(sr_df)
             summary[name] = hit_count
             logger.info(f"  {name}: {hit_count} 命中")
 
@@ -254,12 +273,19 @@ def _push_daily_summary(
     """流水线完成后推 C 类汇总。"""
     from rquant.notify import notify
 
+    blacklist = load_active_blacklist(store)
+
     pool1_df = store.query_screen_result(trade_date, "n-shape-pool1")
     pool1_hits = [
         {
             "ts_code": row["ts_code"],
             "name": row.get("name", ""),
             "close": float(row["close"]),
+            "blacklist_label": (
+                blacklist[row["ts_code"]].list_label
+                if row["ts_code"] in blacklist
+                else None
+            ),
         }
         for _, row in pool1_df.iterrows()
     ]
@@ -282,11 +308,15 @@ def _push_daily_summary(
             raw_entry = row["entry_date"]
             entry_d = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
             days = _count_trading_days_since(store, entry_d, today)
+            code = row["ts_code"]
             pool2_active.append({
-                "ts_code": row["ts_code"],
-                "name": name_map.get(row["ts_code"], ""),
+                "ts_code": code,
+                "name": name_map.get(code, ""),
                 "entry_date": entry_d,
                 "days_in_pool": days,
+                "blacklist_label": (
+                    blacklist[code].list_label if code in blacklist else None
+                ),
             })
 
     notify(

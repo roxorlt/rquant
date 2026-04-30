@@ -4,7 +4,29 @@
 
 ## [Unreleased]
 
----
+### Added — 风险控制黑名单（"430 黑名单"）
+
+PDF 风险名单解析 + DuckDB 落库 + 跨流水线分场景过滤/标签。1 年有效期，过期后
+dashboard 推提醒不静默失效。
+
+- `src/rquant/risk/blacklist.py`：PDF 解析（pypdf）→ 代码标准化（补前导 0 +
+  自动加 SH/SZ/BJ 后缀）→ 多类别合并 → DuckDB upsert（`replace=True` 覆盖同
+  list_label 旧数据）→ 过滤 / 标签 API（`filter_blacklist` 硬剔除、
+  `annotate_blacklist` 软标签）
+- `risk_blacklist` 表：`(list_label, ts_code)` 主键，`sub_categories[]` 多类别合并
+- Pipeline：`run_daily_pipeline` 在每个 preset 落库前过滤命中黑名单的 ts_code
+  （新推荐**剔除**），不影响已存在 pool2_watch 持仓
+- Monitor：`build_watchlist` 给已持仓 WatchItem 打 `blacklist_label` 标签
+  （**保留+标签**），档位触发推送 subject 加 `[430黑名单]` 前缀，body 加 ⚠️ 类别行
+- Pool 2 退出汇总 + 每日选股汇总：命中行加 `[430黑名单]` 标签
+- Dashboard：Pool 2 active / Pool 2 实时价位表加 `黑名单` 列；新增 Section 9
+  "🛑 风险黑名单状态"，显示标签 / 标的数 / 导入日 / 失效日 / 剩余天数 +
+  即将到期黄色警告 + 已过期红色警告（提示用 `rquant blacklist import` 刷新）
+- CLI `rquant blacklist {import,list,check,remove}`：从 PDF 导入 / 列出 /
+  查询单只 / 删除整个 list_label
+- pypdf 依赖加入 pyproject.toml
+
+
 
 ## [v0.8.0] — 2026-04-29 — Backup HTTP API（替换 rsync over SSH）
 
