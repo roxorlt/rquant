@@ -16,10 +16,12 @@
 - [x] CLI `rquant blacklist {import,list,check,remove}`
 - [x] 单测 + pipeline 集成测（22+2 用例）
 
-**剩余手动验收（merge 后）**：
-1. 在生产 DuckDB 上执行 `rquant blacklist import ~/Downloads/风险控制名单.pdf`
-2. 跑下一次 daily 流水线，确认黑名单内的票被 filter 掉（log 会有 `黑名单过滤剔除 N 只 → [...]`）
-3. 打开 dashboard 看 Section 9 显示 "430黑名单 · 147 只 · 剩 365d"
+**剩余手动验收（merge 后，依赖 v0.10.0 upload endpoint 部署完成）**：
+1. 本地 `rquant blacklist import ~/Downloads/风险控制名单.pdf` → 导出 parquet
+2. 本地 `bash scripts/push-to-cloud.sh data/risk_blacklist.parquet` 推到云端
+3. 服务器宝塔终端 `sudo mv uploads/risk_blacklist.parquet data/` + `python -c` import
+4. 重启 dashboard 验证 Section 9 显示 "430黑名单 · 147 只 · 剩 365d"
+5. 下次 daily 流水线（17:00）自动用，log 会有 `黑名单过滤剔除 N 只`
 
 ---
 
