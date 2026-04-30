@@ -234,22 +234,30 @@ def build_daily_report(
             )
 
     # === Watchdog ===
-    total = sum(watchdog_counts.values())
+    # in-window: timer 09..14 范围中真正落在 09:30-15:00 交易时段的触发
+    # out-of-window: 09:00-09:28 / 11:30 不算（脚本自检后静默退，仅记录）
     active_n = watchdog_counts.get("active", 0)
     skip_n = watchdog_counts.get("skip-clean-exit", 0)
     alert_n = watchdog_counts.get("alert-restart", 0)
-    if total == 0:
+    oow_n = watchdog_counts.get("out-of-window", 0)
+    in_window_total = active_n + skip_n + alert_n
+
+    if in_window_total == 0:
         if is_trading_day_flag:
-            lines.append("❌ watchdog: 0 次触发（timer 应每 2min 触发，09:30-15:00 共 ~60 次）")
+            lines.append("❌ watchdog: 交易时段 0 次触发（timer 应每 2min 触发）")
         else:
-            lines.append("ℹ️ watchdog: 0 次触发（非交易日不打扰，正常）")
+            lines.append(
+                f"ℹ️ watchdog: 交易时段 0 次触发"
+                + (f"（盘外 {oow_n} 次自检退）" if oow_n else "（非交易日不打扰）")
+            )
     elif alert_n == 0:
         lines.append(
-            f"✅ watchdog: 触发 {total} 次（active={active_n} skip={skip_n}），无告警"
+            f"✅ watchdog: 交易时段 {in_window_total} 次"
+            f"（active={active_n} skip={skip_n}），无告警"
         )
     else:
         lines.append(
-            f"⚠️ watchdog: 触发 {total} 次，**alert {alert_n} 次** "
+            f"⚠️ watchdog: 交易时段 {in_window_total} 次，**alert {alert_n} 次** "
             f"(active={active_n} skip={skip_n})——需查 journalctl"
         )
 
