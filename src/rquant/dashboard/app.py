@@ -20,7 +20,7 @@ import streamlit as st
 
 from rquant.config import settings
 from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
-from rquant.llm.schemas import ScreenPlan
+
 
 REFRESH_SECONDS = 30
 CST = timezone(timedelta(hours=8))
@@ -1249,8 +1249,8 @@ if not settings.deepseek_enabled:
         "请在 `.env` 中填入 DeepSeek API key。"
     )
 else:
-    if "nl_plan" not in st.session_state:
-        st.session_state.nl_plan = None
+    if "nl_plan_dict" not in st.session_state:
+        st.session_state.nl_plan_dict = None
     if "nl_history" not in st.session_state:
         st.session_state.nl_history = []
     if "nl_result_df" not in st.session_state:
@@ -1269,7 +1269,7 @@ else:
         )
     with nl_col_clear:
         if st.button("🗑 清空", use_container_width=True, key="nl_clear_btn"):
-            st.session_state.nl_plan = None
+            st.session_state.nl_plan_dict = None
             st.session_state.nl_result_df = None
             st.rerun()
 
@@ -1286,53 +1286,117 @@ else:
         with st.spinner("正在解析..."):
             try:
                 nl_plan_obj = nl_client.nl_to_screen_plan(nl_query, today=today_iso)
-                st.session_state.nl_plan = nl_plan_obj
+                st.session_state.nl_plan_dict = nl_plan_obj.model_dump()
                 st.session_state.nl_history.insert(0, nl_query)
                 st.session_state.nl_history = st.session_state.nl_history[:5]
             except LLMClarificationNeeded as e:
                 st.warning(f"💬 LLM 需要澄清：{e}")
-                st.session_state.nl_plan = None
+                st.session_state.nl_plan_dict = None
             except LLMError as e:
                 st.error(f"❌ LLM 调用失败：{e}")
-                st.session_state.nl_plan = None
+                st.session_state.nl_plan_dict = None
             except Exception as e:
                 st.error(f"❌ 未预期错误（{type(e).__name__}）：{e}")
-                st.session_state.nl_plan = None
+                st.session_state.nl_plan_dict = None
 
-    nl_plan: ScreenPlan | None = st.session_state.nl_plan
-    if nl_plan:
-        st.success(f"✅ 解析成功 · trade_date={nl_plan.trade_date}")
-        if nl_plan.rationale:
-            st.info(f"💭 {nl_plan.rationale}")
-        # Stage Cards 渲染
-        for nl_i, nl_stage in enumerate(nl_plan.stages):
+    nl_plan_dict = st.session_state.nl_plan_dict
+    if nl_plan_dict:
+        st.success(f"✅ 解析成功 · trade_date={nl_plan_dict['trade_date']}")
+        if nl_plan_dict.get("rationale"):
+            st.info(f"💭 {nl_plan_dict['rationale']}")
+
+        # 顶部：加新一层按钮
+        if st.button("➕ 在末尾加新一层", key="nl_add_stage_btn"):
+            nl_plan_dict["stages"].append({"label": "新分层", "rules": []})
+            st.rerun()
+
+        # Stage Cards 渲染（可编辑）
+        for nl_i, nl_stage in enumerate(nl_plan_dict["stages"]):
             with st.container(border=True):
-                nl_col_label, nl_col_count = st.columns([4, 1])
+                nl_col_label, nl_col_del_stage = st.columns([6, 1])
                 with nl_col_label:
-                    st.markdown(f"#### 🔹 第 {nl_i+1} 层 · **{nl_stage.label}**")
-                with nl_col_count:
-                    st.caption(f"{len(nl_stage.rules)} 条规则")
-
-                for nl_rule in nl_stage.rules:
-                    nl_args_str = ", ".join(
-                        f"{k}={v!r}" for k, v in nl_rule.args.items()
+                    nl_new_label = st.text_input(
+                        f"layer-{nl_i}",
+                        value=nl_stage["label"],
+                        key=f"nl_stage_label_{nl_i}",
+                        label_visibility="collapsed",
                     )
-                    if nl_args_str:
-                        st.markdown(f"- ✓ `{nl_rule.name}({nl_args_str})`")
-                    else:
-                        st.markdown(f"- ✓ `{nl_rule.name}()`")
+                    if nl_new_label != nl_stage["label"]:
+                        nl_plan_dict["stages"][nl_i]["label"] = nl_new_label
+                with nl_col_del_stage:
+                    if st.button("🗑", key=f"nl_del_stage_{nl_i}", help="删除整层"):
+                        nl_plan_dict["stages"].pop(nl_i)
+                        st.rerun()
 
-            # 卡片之间画箭头（最后一层不画）
-            if nl_i < len(nl_plan.stages) - 1:
+                # 列规则，每条带删除按钮
+                for nl_j, nl_rule in enumerate(nl_stage["rules"]):
+                    nl_args_str = ", ".join(
+                        f"{k}={v!r}" for k, v in nl_rule["args"].items()
+                    )
+                    nl_label = (
+                        f"`{nl_rule['name']}({nl_args_str})`"
+                        if nl_args_str
+                        else f"`{nl_rule['name']}()`"
+                    )
+                    nl_col_r, nl_col_del_r = st.columns([10, 1])
+                    with nl_col_r:
+                        st.markdown(f"- ✓ {nl_label}")
+                    with nl_col_del_r:
+                        if st.button(
+                            "✕", key=f"nl_del_rule_{nl_i}_{nl_j}",
+                            help="删除该规则",
+                        ):
+                            nl_plan_dict["stages"][nl_i]["rules"].pop(nl_j)
+                            st.rerun()
+
+                # 加规则下拉
+                with st.expander("➕ 加规则到本层"):
+                    from rquant.llm.registry import REGISTRY, get_rule_spec
+
+                    nl_rule_options = {
+                        f"{spec.name} — {spec.description}": spec.name
+                        for spec in REGISTRY
+                    }
+                    nl_chosen = st.selectbox(
+                        "选择积木",
+                        options=list(nl_rule_options.keys()),
+                        key=f"nl_add_rule_select_{nl_i}",
+                    )
+                    nl_args_json = st.text_area(
+                        "args（JSON）",
+                        value="{}",
+                        key=f"nl_add_rule_args_{nl_i}",
+                        height=68,
+                    )
+                    if st.button("加入", key=f"nl_add_rule_btn_{nl_i}"):
+                        try:
+                            nl_args = (
+                                json.loads(nl_args_json)
+                                if nl_args_json.strip()
+                                else {}
+                            )
+                            nl_rule_name = nl_rule_options[nl_chosen]
+                            # 用 RuleSpec.args_model 校验一遍
+                            get_rule_spec(nl_rule_name).args_model.model_validate(
+                                nl_args
+                            )
+                            nl_plan_dict["stages"][nl_i]["rules"].append(
+                                {"name": nl_rule_name, "args": nl_args}
+                            )
+                            st.rerun()
+                        except Exception as nl_e:
+                            st.error(f"args 校验失败：{nl_e}")
+
+            # 箭头（最后一层不画）
+            if nl_i < len(nl_plan_dict["stages"]) - 1:
                 st.markdown(
                     "<div style='text-align:center;color:#888;font-size:24px;"
                     "margin:-8px 0;'>↓</div>",
                     unsafe_allow_html=True,
                 )
 
-        # 完整 plan JSON 折叠区，方便 debug
         with st.expander("📄 查看完整 plan JSON"):
-            st.json(nl_plan.model_dump())
+            st.json(nl_plan_dict)
 
     # 侧边栏：NL 查询历史
     with st.sidebar:
