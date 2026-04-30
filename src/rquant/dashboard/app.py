@@ -1304,8 +1304,35 @@ else:
         st.success(f"✅ 解析成功 · trade_date={nl_plan.trade_date}")
         if nl_plan.rationale:
             st.info(f"💭 {nl_plan.rationale}")
-        # 暂时用 st.json 预览；下个 task 改为 Stage Cards
-        st.json(nl_plan.model_dump())
+        # Stage Cards 渲染
+        for nl_i, nl_stage in enumerate(nl_plan.stages):
+            with st.container(border=True):
+                nl_col_label, nl_col_count = st.columns([4, 1])
+                with nl_col_label:
+                    st.markdown(f"#### 🔹 第 {nl_i+1} 层 · **{nl_stage.label}**")
+                with nl_col_count:
+                    st.caption(f"{len(nl_stage.rules)} 条规则")
+
+                for nl_rule in nl_stage.rules:
+                    nl_args_str = ", ".join(
+                        f"{k}={v!r}" for k, v in nl_rule.args.items()
+                    )
+                    if nl_args_str:
+                        st.markdown(f"- ✓ `{nl_rule.name}({nl_args_str})`")
+                    else:
+                        st.markdown(f"- ✓ `{nl_rule.name}()`")
+
+            # 卡片之间画箭头（最后一层不画）
+            if nl_i < len(nl_plan.stages) - 1:
+                st.markdown(
+                    "<div style='text-align:center;color:#888;font-size:24px;"
+                    "margin:-8px 0;'>↓</div>",
+                    unsafe_allow_html=True,
+                )
+
+        # 完整 plan JSON 折叠区，方便 debug
+        with st.expander("📄 查看完整 plan JSON"):
+            st.json(nl_plan.model_dump())
 
     # 侧边栏：NL 查询历史
     with st.sidebar:
