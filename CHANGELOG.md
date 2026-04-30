@@ -6,6 +6,43 @@
 
 ---
 
+## [v0.11.2] — 2026-04-30 — Watchdog OnCalendar syntax fix v2
+
+### Fixed
+- **`deploy/systemd/rquant-monitor-watchdog.timer`：v0.11.1 的 `*-*-* 09..14:*/2`
+  **也**被 systemd 拒绝**（`Failed to parse calendar specification: Invalid
+  argument`）。timer 进入 `bad-setting` 状态，`Trigger: n/a`，完全不排队。
+  cloud `systemd-analyze calendar` 实测 4 个候选语法：
+
+  | 候选 | 结果 |
+  |---|---|
+  | `*-*-* 09..14:*/2` | ❌ Invalid（v0.11.1 推的） |
+  | `*-*-* 9..14:0/2` | ✅ Iteration#2 = 09:02:00（2 分钟步进） |
+  | `9:30/2` | ✅ 单小时 9:30/9:32/9:34 |
+  | `9:0/2` | ✅ 单小时 9:00/9:02/9:04 |
+
+  采用候选 2：`OnCalendar=Mon..Fri *-*-* 9..14:0/2`。
+  关键差异：minute 字段不接受 `*/N`（通配步进），但接受 `0/N`（显式 start=0 step=N）。
+
+### Why v0.11.1 没在 mac 测出
+mac 没装 systemd，本地测不了 OnCalendar 语法。v0.11.1 推的语法看起来"更通用"，
+但实测 systemd 还有更严的解析规则。这次 cloud 直接 `systemd-analyze` 4 个
+候选并行验证，找到能 work 的最简形式。
+
+### Deploy
+```bash
+ssh lighthouse@82.156.0.68
+cd /home/lighthouse/rquant && git pull origin main
+sudo cp deploy/systemd/rquant-monitor-watchdog.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-monitor-watchdog.timer
+# 验证：从 bad-setting 恢复，NEXT 显示 Fri 09:00:xx
+systemctl status rquant-monitor-watchdog.timer --no-pager | head -5
+systemctl list-timers rquant-monitor-watchdog.timer --no-pager
+```
+
+---
+
 ## [v0.11.1] — 2026-04-30 — Watchdog OnCalendar 语法 hotfix
 
 ### Fixed

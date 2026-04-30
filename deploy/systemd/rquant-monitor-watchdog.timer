@@ -2,18 +2,16 @@
 Description=Trigger rquant-monitor watchdog every 2 min during trading hours
 
 [Timer]
-# 09..14 时段每 2 分钟（hour 范围 + 分钟通配步进 2）。
+# 09..14 时段每 2 分钟。systemd OnCalendar 实测语法陷阱：
+#   ❌ `09:30..11:30/2`：跨小时分钟范围 → Invalid argument
+#   ❌ `13:00..15:00/2`：解析成功但 /2 是秒步进（每 2 秒触发一次）
+#   ❌ `09..14:*/2`：minute 字段用 `*/N` → Invalid argument
+#   ✅ `9..14:0/2`：minute 显式 start=0 step=2（已 systemd-analyze 验证）
 #
-# v0.10.2 用 `09:30..11:30/2` 双段语法，但 systemd 拒绝跨小时分钟范围
-# (`Failed to parse calendar specification: Invalid argument`)，整段
-# OnCalendar 静默丢弃；下午段 `13:00..15:00/2` 又被解析成 /2 秒步进
-# (Iteration #2 = 13:00:02)。结果上午零触发、下午 3600 次/2h，bug 双向。
-#
-# 改用 `09..14:*/2` 已知 systemd 接受的语法（hour 范围 + 分钟 */2 步进）。
 # 实际触发时段交给 watchdog 脚本判断（09:30-15:00 才动作，否则 log
-# out-of-window 静默退）。覆盖 09:00-09:28 + 11:30-12:58 这两段非交易时
+# out-of-window 静默退）。覆盖 09:00-09:28 + 11:00-12:58 这两段非交易时
 # 间是冗余触发，但 watchdog 看 monitor active 时静默退，无副作用。
-OnCalendar=Mon..Fri *-*-* 09..14:*/2
+OnCalendar=Mon..Fri *-*-* 9..14:0/2
 
 # 错过不补（盘外触发没意义）
 Persistent=false
