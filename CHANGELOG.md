@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
-### Added — 风险控制黑名单（"430 黑名单"）
+---
+
+## [v0.9.0] — 2026-04-30 — 风险控制黑名单（"430 黑名单"）
+
+### Added
 
 PDF 风险名单解析 + DuckDB 落库 + 跨流水线分场景过滤/标签。1 年有效期，过期后
 dashboard 推提醒不静默失效。
@@ -26,7 +30,11 @@ dashboard 推提醒不静默失效。
   查询单只 / 删除整个 list_label
 - pypdf 依赖加入 pyproject.toml
 
+### Verified
+- 本地 prod DB 导入 147 只 → Pool 2 active 中 1 只命中（`000952.SZ 广济药业` 年报审计风险）
+- 22 个 blacklist 单测 + 2 个 pipeline 集成测全部通过（总 297 / 297）
 
+---
 
 ## [v0.8.0] — 2026-04-29 — Backup HTTP API（替换 rsync over SSH）
 
