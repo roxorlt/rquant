@@ -62,7 +62,6 @@ class DeepSeekClient:
 
         t0 = time.monotonic()
         last_err: Exception | None = None
-        resp = None
         for attempt in range(1, self._max_retries + 1):
             try:
                 resp = self._client.chat.completions.create(
@@ -77,8 +76,8 @@ class DeepSeekClient:
                 last_err = e
                 logger.warning(f"DeepSeek attempt {attempt}/{self._max_retries} failed: {e}")
                 if attempt < self._max_retries:
-                    time.sleep(2 ** (attempt - 1))  # 1s / 2s / 4s
-        if resp is None:
+                    time.sleep(2 ** (attempt - 1))  # max_retries=3 → sleeps 1s, 2s
+        else:
             raise LLMError(f"DeepSeek 调用失败（{self._max_retries} 次重试均失败）: {last_err}")
 
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -156,16 +155,19 @@ class DeepSeekClient:
     ) -> None:
         if self._log_path is None:
             return
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "query": query,
-            "plan": plan,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-            "latency_ms": latency_ms,
-            "model": self._model,
-            "error": error,
-        }
-        with self._log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "query": query,
+                "plan": plan,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "latency_ms": latency_ms,
+                "model": self._model,
+                "error": error,
+            }
+            with self._log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"JSONL log write failed: {e}")
