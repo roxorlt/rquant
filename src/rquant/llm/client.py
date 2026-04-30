@@ -123,6 +123,10 @@ class DeepSeekClient:
             messages.append({
                 "role": "assistant",
                 "content": None,
+                # deepseek-v4-flash is a thinking model: multi-turn messages that
+                # include tool_calls in an assistant turn must carry reasoning_content
+                # (even empty string) or the API returns HTTP 400.
+                "reasoning_content": "",
                 "tool_calls": [{
                     "id": tool_call_id,
                     "type": "function",
