@@ -1,0 +1,22 @@
+[Unit]
+Description=rQuant Daily Health Report (15:30 PushDeer summary)
+After=network-online.target
+Wants=network-online.target
+
+# 自身失败也告警（OnFailure 链路）
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant daily-report
+
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

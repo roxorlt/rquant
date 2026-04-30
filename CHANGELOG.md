@@ -6,6 +6,63 @@
 
 ---
 
+## [v0.11.0] — 2026-04-30 — 每日健康摘要（cloud 端 15:30 PushDeer 自报）
+
+### Added
+- **`rquant daily-report [--dry-run]`** CLI：扫今日 systemd 状态 + watchdog
+  日志 + DuckDB 业务数据 → 拼成 PushDeer 摘要推到刘哥手机
+  - 交易日：monitor 应跑足 5h+ 跨午休、watchdog 应 60 次 active、price_level
+    事件计数、daily pipeline 状态
+  - 非交易日：monitor 应秒退、watchdog 应全 skip-clean-exit、提示业务不更新
+  - **`--dry-run`**：mac 本地 smoke 测试不推送（防呆）
+- **`src/rquant/health.py`**：`get_service_snapshot()` / `read_watchdog_log()`
+  / `count_today_business_data()` / `build_daily_report()` 模块化数据采集 + 报文构造
+- **`scripts/monitor-watchdog.sh`** 加结构化日志：每次调用 append 一行
+  `<ISO ts> <tag>` 到 `logs/watchdog-YYYY-MM-DD.log`
+  - tag ∈ {`active`, `skip-clean-exit`, `alert-restart`}
+- **`deploy/systemd/rquant-daily-report.{service,timer}`**：每日 15:30 自动跑
+  - 不依赖 journalctl 权限（systemctl show + 自记日志）
+  - 自身 OnFailure 也走 alert relay
+
+### Why
+之前一次性 schedule 验证 watchdog 节假日修复 + 跨午休回归不可行（远程 agent
+没 SSH / 没 brain 写入权 / 没 PushDeer 凭据）。把验证做成 cloud 端 systemd
+timer 反而**一举三得**：
+1. 5/1 节假日验证（明天即生效）
+2. 5/6 节后跨午休回归验证
+3. **长期日常 health monitoring**——以后任何 monitor / watchdog / daily 异常
+   都会被发现，不用人盯 dashboard
+
+### Tests
+- `TestParseSystemdTs` / `TestGetServiceSnapshot` / `TestReadWatchdogLog`
+  / `TestBuildDailyReport`：覆盖时间戳解析、systemd 失败兜底、watchdog log
+  统计、节假日干净跑 / 节假日告警轰炸 / 交易日跨午休正常 / 跨午休 bug 复发
+  / watchdog 0 触发 / daily 失败 / monitor 未触发等 8 种场景
+- 总数 321 → 340（+19）
+
+### Deploy
+```bash
+ssh lighthouse@82.156.0.68
+cd /home/lighthouse/rquant && git pull origin main
+
+# 装 daily-report systemd unit
+sudo cp deploy/systemd/rquant-daily-report.service /etc/systemd/system/
+sudo cp deploy/systemd/rquant-daily-report.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rquant-daily-report.timer
+
+# 立即跑一次验证（dry-run 不推；不带 --dry-run 推到手机）
+.venv/bin/rquant daily-report --dry-run
+.venv/bin/rquant daily-report   # 手机收到第一份日报
+
+# 看 timer 排上了没
+systemctl list-timers rquant-* --all --no-pager
+```
+
+明天 5/1 15:30 自动收到第一份"非交易日干净跑"日报。
+
+---
+
 ## [v0.10.3] — 2026-04-30 — Blacklist parquet round-trip CLI
 
 ### Added
