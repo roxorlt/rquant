@@ -6,6 +6,49 @@
 
 ---
 
+## [v0.11.3] — 2026-04-30 — Backup intraday timer 同根 bug 修复
+
+### Fixed
+- **`deploy/systemd/rquant-backup.timer`：v0.7.0 引入的 `09:30..15:05/5` 同样
+  被 systemd 拒收**（v0.11.1/v0.11.2 watchdog 同根 bug）。意味着自 v0.7.0
+  起 **intraday backup 从未跑过**，本地 `sync-from-cloud` 09:30-15:05 时段
+  拉到的 `.gz` 都是昨天 17:30 那份。
+- 改用 v0.11.2 验证过的 `9..15:0/5` 语法，09:00-15:55 每 5min 一次。
+
+### Why 现在才发现
+今天 sync log 显示 09:30-15:05 时段 `latest.duckdb.gz` 一直 208M 没变化
+——如果 intraday backup 在跑，每 5min 应有 KB 级变化。结合 watchdog
+踩同坑，确认 backup intraday 一直没 work。日终 17:30 那条 OnCalendar 用
+的是 `Mon..Fri 17:30` 简单语法，一直正常。
+
+### 影响范围
+- mac 端"热备"实际是日级别，不是 5min 级——但用户场景里没出过事，因为
+  daily 流水线 17:00-17:10 完成、17:30 backup snapshot 之前都不更新业务
+  数据，意外的分钟级回滚没发生过
+- 修复后 mac 本地 sync 在交易时段能拉到接近实时（5min 滞后）的 cloud 状态
+
+### Deploy
+```bash
+ssh lighthouse@82.156.0.68
+cd /home/lighthouse/rquant && git pull origin main
+
+# 部署前先验证语法（CLAUDE.md 新规：systemd 改动必须 cloud 端 systemd-analyze）
+systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/5' --iterations 5
+# 期望：Iteration#2 = 09:05:00（5 分钟步进）
+
+sudo cp deploy/systemd/rquant-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-backup.timer
+
+# 验证：从 bad-setting 恢复（如有），NEXT 应是下个 5min 边界
+systemctl status rquant-backup.timer --no-pager | head -5
+systemctl list-timers rquant-backup.timer --no-pager
+```
+
+5/1 节假日 Mon..Fri 不触发，下次 work 是 5/6 周二节后开盘。
+
+---
+
 ## [v0.11.2] — 2026-04-30 — Watchdog OnCalendar syntax fix v2
 
 ### Fixed
