@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     notify_error: bool = True
     notify_heartbeat: bool = True
 
+    # ===== LLM (Week 7) =====
+    deepseek_api_key: str = Field(default="")
+    deepseek_base_url: str = Field(default="https://api.deepseek.com")
+    deepseek_model: str = Field(default="deepseek-v4-flash")
+
+    @property
+    def deepseek_enabled(self) -> bool:
+        return bool(self.deepseek_api_key)
+
     @property
     def pushdeer_key_list(self) -> list[str]:
         return [k.strip() for k in self.pushdeer_keys.split(",") if k.strip()]
