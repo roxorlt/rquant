@@ -19,6 +19,8 @@ import pandas as pd
 import streamlit as st
 
 from rquant.config import settings
+from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
+from rquant.llm.schemas import ScreenPlan
 
 REFRESH_SECONDS = 30
 CST = timezone(timedelta(hours=8))
@@ -1234,6 +1236,88 @@ else:
                         "</div>",
                         unsafe_allow_html=True,
                     )
+
+
+# ── Section 10: 🤖 NL 选股 ──
+
+
+st.markdown("## 🤖 自然语言选股")
+
+if not settings.deepseek_enabled:
+    st.error(
+        "未配置 `DEEPSEEK_API_KEY`，本 section 不可用。"
+        "请在 `.env` 中填入 DeepSeek API key。"
+    )
+else:
+    if "nl_plan" not in st.session_state:
+        st.session_state.nl_plan = None
+    if "nl_history" not in st.session_state:
+        st.session_state.nl_history = []
+    if "nl_result_df" not in st.session_state:
+        st.session_state.nl_result_df = None
+
+    nl_query = st.text_input(
+        "输入选股需求（中文）",
+        placeholder="例：MA5 上穿 MA20 + 量比 > 2 + 流通市值 < 100 亿，昨天首板",
+        key="nl_query_input",
+    )
+
+    nl_col_run, nl_col_clear = st.columns([1, 1])
+    with nl_col_run:
+        nl_parse_clicked = st.button(
+            "🔍 解析", type="primary", use_container_width=True, key="nl_parse_btn"
+        )
+    with nl_col_clear:
+        if st.button("🗑 清空", use_container_width=True, key="nl_clear_btn"):
+            st.session_state.nl_plan = None
+            st.session_state.nl_result_df = None
+            st.rerun()
+
+    if nl_parse_clicked and nl_query.strip():
+        from datetime import date as _date
+
+        today_iso = _date.today().isoformat()
+        nl_client = DeepSeekClient(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            model=settings.deepseek_model,
+            log_path=Path(settings.log_dir) / "nl_queries.jsonl",
+        )
+        with st.spinner("正在解析..."):
+            try:
+                nl_plan_obj = nl_client.nl_to_screen_plan(nl_query, today=today_iso)
+                st.session_state.nl_plan = nl_plan_obj
+                st.session_state.nl_history.insert(0, nl_query)
+                st.session_state.nl_history = st.session_state.nl_history[:5]
+            except LLMClarificationNeeded as e:
+                st.warning(f"💬 LLM 需要澄清：{e}")
+                st.session_state.nl_plan = None
+            except LLMError as e:
+                st.error(f"❌ LLM 调用失败：{e}")
+                st.session_state.nl_plan = None
+            except Exception as e:
+                st.error(f"❌ 未预期错误（{type(e).__name__}）：{e}")
+                st.session_state.nl_plan = None
+
+    nl_plan: ScreenPlan | None = st.session_state.nl_plan
+    if nl_plan:
+        st.success(f"✅ 解析成功 · trade_date={nl_plan.trade_date}")
+        if nl_plan.rationale:
+            st.info(f"💭 {nl_plan.rationale}")
+        # 暂时用 st.json 预览；下个 task 改为 Stage Cards
+        st.json(nl_plan.model_dump())
+
+    # 侧边栏：NL 查询历史
+    with st.sidebar:
+        st.subheader("📜 NL 查询历史")
+        if not st.session_state.nl_history:
+            st.caption("（暂无）")
+        else:
+            for h in st.session_state.nl_history:
+                short = h[:30] + ("..." if len(h) > 30 else "")
+                if st.button(short, key=f"nl_hist_{hash(h)}"):
+                    st.session_state["nl_query_input"] = h
+                    st.rerun()
 
 
 st.divider()
