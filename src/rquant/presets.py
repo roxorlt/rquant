@@ -33,6 +33,66 @@ class ScreenPreset:
     offset_days: int = 0
 
 
+import json as _json
+from pathlib import Path as _Path
+
+from loguru import logger as _logger
+
+
+def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
+    """从 directory 下的 *.json 加载用户保存的 preset。
+
+    JSON 结构：
+        {
+          "name": "<base_name>",
+          "description": "<NL query>",
+          "rules": [{"name": "not_st", "args": {}}, ...],
+          "include_columns": [...],
+          "created_at": "...",
+          "source": "nl_input"
+        }
+
+    解析失败的文件跳过（记 warning），不影响其他 preset。
+
+    返回 dict 的 key 是 "user/{base_name}"，前缀强制隔离与代码内置 preset。
+    """
+    result: dict[str, ScreenPreset] = {}
+    if not directory.exists() or not directory.is_dir():
+        return result
+
+    # 局部 import 避免循环（registry 依赖 screen.rules）
+    from rquant.llm.dispatch import build_rules
+    from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
+
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            base_name = data["name"]
+            full_name = f"user/{base_name}"
+
+            # 把 rules（flat list）包成单 stage，复用 dispatch.build_rules 校验
+            plan = ScreenPlan(
+                trade_date="1900-01-01",  # placeholder，preset 落库时与日期无关
+                stages=[Stage(label="loaded", rules=[
+                    RuleCall(name=r["name"], args=r.get("args", {})) for r in data["rules"]
+                ])],
+                include_columns=data.get("include_columns", []),
+            )
+            rules = build_rules(plan)
+
+            result[full_name] = ScreenPreset(
+                name=full_name,
+                description=data.get("description", ""),
+                rules=rules,
+                include_columns=data.get("include_columns", []),
+            )
+        except Exception as e:
+            _logger.warning(f"加载 user preset 失败 {path.name}: {e}")
+            continue
+
+    return result
+
+
 PRESET_SCREENS: dict[str, ScreenPreset] = {
     "n-shape-pool1": ScreenPreset(
         name="n-shape-pool1",
@@ -75,3 +135,9 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
         ],
     ),
 }
+
+from rquant.config import settings as _settings
+
+# 启动时自动 merge user_presets 目录下所有 JSON
+_user_presets_dir = _Path(_settings.data_dir) / "user_presets"
+PRESET_SCREENS.update(load_user_presets(_user_presets_dir))
