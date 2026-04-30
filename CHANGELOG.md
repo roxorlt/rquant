@@ -6,6 +6,31 @@
 
 ---
 
+## [v0.10.3] — 2026-04-30 — Blacklist parquet round-trip CLI
+
+### Added
+- **`rquant blacklist export-parquet [--output PATH] [--label LABEL]`**：mac
+  端从 DuckDB 导出黑名单为 parquet（v0.9.0 时这步靠手撸 SQL）
+- **`rquant blacklist load-parquet <path> [--label LABEL]`**：云端把 parquet
+  落库到 DuckDB `risk_blacklist` 表（替换今天 v0.9.0 部署时被遗忘的
+  Python one-liner）
+  - 不传 `--label`：全表覆盖（适合 mac 完全镜像到云端）
+  - 传 `--label X`：只覆盖该 label 的行（多 label 共存场景）
+- **`deploy/upload-api.md`** 加完整 round-trip SOP（mac 1-2-3-4 → 云端 5-6-7-8）
+
+### Why
+v0.9.0 部署黑名单时 push parquet 上云成功，但**云端 import 进 DuckDB 这步
+被忘了**——`rquant blacklist import` 只接 PDF，没有 parquet 入口。结果今天
+（2026-04-30）发现黑名单过滤实际**没在跑**（pipeline 拿到空 dict）。这次
+补齐 round-trip CLI，下一次刷新（明年 4-30 续期）一行命令搞定。
+
+### Tests
+- `TestParquetRoundtrip`：4 用例覆盖 export → load 全流程、`--label` 选择性
+  覆盖、全表覆盖、文件不存在
+- 总数 317 → 321（+4），全绿
+
+---
+
 ## [v0.10.2] — 2026-04-30 — Watchdog 节假日告警轰炸 hotfix
 
 ### Fixed

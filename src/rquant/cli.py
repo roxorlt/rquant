@@ -266,8 +266,10 @@ def cmd_blacklist(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from rquant.risk.blacklist import (
+        export_blacklist_parquet,
         import_blacklist,
         load_active_blacklist,
+        load_blacklist_parquet,
         parse_blacklist_pdf,
     )
     from rquant.storage.duckdb import DuckDBStore
@@ -289,6 +291,30 @@ def cmd_blacklist(args: argparse.Namespace) -> int:
                 validity_days=args.validity,
             )
         logger.info(f"导入完成：{n} 只 → '{args.label}'")
+        return 0
+
+    elif args.blacklist_action == "load-parquet":
+        parquet = Path(args.parquet).expanduser().resolve()
+        if not parquet.exists():
+            logger.error(f"parquet 不存在: {parquet}")
+            return 1
+        with DuckDBStore() as store:
+            n = load_blacklist_parquet(
+                parquet, store, list_label=args.label,
+            )
+        logger.info(
+            f"parquet 落库完成：{n} 行 → "
+            f"{'list_label=' + args.label if args.label else '全表覆盖'}"
+        )
+        return 0
+
+    elif args.blacklist_action == "export-parquet":
+        out = Path(args.output).expanduser().resolve()
+        with DuckDBStore() as store:
+            n = export_blacklist_parquet(
+                store, out, list_label=args.label,
+            )
+        logger.info(f"parquet 导出完成：{n} 行 → {out}")
         return 0
 
     elif args.blacklist_action == "list":
@@ -385,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
     bl_p = sub.add_parser("blacklist", help="管理风险黑名单")
     bl_sub = bl_p.add_subparsers(dest="blacklist_action")
 
-    bl_imp = bl_sub.add_parser("import", help="从 PDF 导入黑名单")
+    bl_imp = bl_sub.add_parser("import", help="从 PDF 导入黑名单（mac 端用）")
     bl_imp.add_argument("pdf", type=str, help="PDF 路径")
     bl_imp.add_argument(
         "--label", type=str, default="430黑名单",
@@ -394,6 +420,27 @@ def build_parser() -> argparse.ArgumentParser:
     bl_imp.add_argument(
         "--validity", type=int, default=365,
         help="有效期天数 (默认 365)",
+    )
+
+    bl_load = bl_sub.add_parser(
+        "load-parquet", help="从 parquet 加载到 DuckDB（云端推送后用）"
+    )
+    bl_load.add_argument("parquet", type=str, help="parquet 文件路径")
+    bl_load.add_argument(
+        "--label", type=str, default=None,
+        help="只替换该 label 的行（默认全表覆盖）",
+    )
+
+    bl_exp = bl_sub.add_parser(
+        "export-parquet", help="导出黑名单到 parquet（mac 端推云前用）"
+    )
+    bl_exp.add_argument(
+        "--output", type=str, default="data/risk_blacklist.parquet",
+        help="输出路径 (默认 data/risk_blacklist.parquet)",
+    )
+    bl_exp.add_argument(
+        "--label", type=str, default=None,
+        help="只导出该 label（默认全表导出）",
     )
 
     bl_ls = bl_sub.add_parser("list", help="列出黑名单")
