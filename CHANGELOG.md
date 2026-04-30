@@ -6,6 +6,48 @@
 
 ---
 
+## [v0.12.0] — 2026-04-30 — Week 7：自然语言选股（NL → 积木）
+
+dashboard 加 "🤖 NL 选股" Section 10：用户用一句中文描述筛选意图，DeepSeek-V4-Flash
+解析为结构化 ScreenPlan（按 stage 分层），可视化卡片预览/编辑后跑 screen()
+出表格，可一键保存为 user preset 接入 daily pipeline。
+
+### Added
+
+- `src/rquant/llm/`：完整 LLM 集成模块
+  - `schemas.py`：ScreenPlan / Stage / RuleCall Pydantic 模型 + trade_date YYYY-MM-DD 验证
+  - `registry.py`：26 条积木 RuleSpec 注册表（Pydantic args model + examples + category）
+  - `schema_export.py`：to_openai_tools() 生成 OpenAI Tool Calls schema + build_rule_catalog_md() 系统提示用规则目录
+  - `dispatch.py`：ScreenPlan → list[Rule] → screen()，含 per-rule 累加命中诊断
+  - `prompts.py`：system prompt + 4 条 few-shot examples（DeepSeek thinking 模式带 reasoning_content）
+  - `client.py`：DeepSeekClient（OpenAI SDK + DeepSeek base_url），retry 3次指数回退 + jsonl 日志 + 澄清场景识别
+- `data/user_presets/*.json`：NL 输入保存的 preset，启动时合并到 PRESET_SCREENS（user/ 前缀）
+- `dashboard/app.py` Section 10：NL 选股 UI（输入 → 解析 → 分层卡片编辑 → 运行 → 表格 → 保存 preset），命中 0 时显示逐规则累加诊断
+- `scripts/llm_smoke.py`：手动 smoke test（5 个真实 query，已验证）
+- `.env.example`：DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL
+- 40+ 单元测试覆盖 schema / registry / completeness / schema_export / dispatch / client mock / prompts / user_presets
+
+### Changed
+
+- `pyproject.toml`：+ openai>=1.0（实际安装 2.33.0）
+- `src/rquant/config.py`：+ deepseek_api_key / deepseek_base_url / deepseek_model 字段 + deepseek_enabled property
+- `src/rquant/presets.py`：+ load_user_presets() loader，启动自动 merge `data/user_presets/*.json`
+
+### Verified
+
+- 396 tests passing（baseline 340 + 56 新增）
+- 真实 DeepSeek API smoke test 5 个 query：4 个产出合理 plan，1 个模糊 query 走澄清路径
+- Dashboard healthcheck (`/_stcore/health`) 正常
+- user preset roundtrip 验证：写 JSON → 重启读 PRESET_SCREENS → key 含 `user/` 前缀
+
+### Why
+
+`screen/rules.py` 已有 26 个积木但每次跑新组合必须翻函数列表写 Python。Week 7
+让用户用中文描述意图直接触达积木组合。Stage Cards 形态为 Week 7.5 真画布
+（streamlit-flow / react-flow）预留数据结构（每 stage 直接映射成节点）。
+
+---
+
 ## [v0.11.0] — 2026-04-30 — 每日健康摘要（cloud 端 15:30 PushDeer 自报）
 
 ### Added
