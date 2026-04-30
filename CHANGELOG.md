@@ -6,6 +6,30 @@
 
 ---
 
+## [v0.10.0] — 2026-04-30 — Upload HTTP API（与 Backup download 对称）
+
+mac → 云端的"配置数据"推送通道：nginx WebDAV PUT + 单独 basic auth。
+绕开 fail2ban，建立稳定的本地→云推送路径，下次 v0.9 黑名单续期、其他
+"本地生成 / 服务器消费"的小数据 push 都走这条。
+
+### Added
+- `deploy/nginx/rquant-backup.conf`：`/upload/` location with `dav_methods PUT`
+  + 文件后缀白名单（.parquet / .csv / .pdf / .json）+ 单独 htpasswd
+  `/www/server/nginx/conf/.rquant-upload.htpasswd`（与 backup token 隔离）
+- `scripts/push-to-cloud.sh`：客户端 wrapper，curl -T 上传，自动从 `.env`
+  读 user/token/url，参数 `<local-file> [<remote-name>]`
+- `deploy/upload-api.md`：部署 + 客户端用法 + 故障排查（含 dav_module 缺失
+  的 fallback、文件 owner=www 后续 sudo mv 处理）
+- `.env.example` 加 `RQUANT_UPLOAD_USER` / `RQUANT_UPLOAD_TOKEN` /
+  `RQUANT_UPLOAD_URL`
+
+### Why
+v0.9.0 部署黑名单时 fail2ban 卡住 SSH/SCP，不得不走宝塔 web。这次顺手建
+通道，下一次（明年 4-30 续期 / 其他类似的 push）直接 `bash
+scripts/push-to-cloud.sh data/risk_blacklist.parquet` 一行搞定。
+
+---
+
 ## [v0.9.0] — 2026-04-30 — 风险控制黑名单（"430 黑名单"）
 
 ### Added
