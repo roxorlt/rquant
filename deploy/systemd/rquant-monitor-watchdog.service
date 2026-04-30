@@ -1,0 +1,19 @@
+[Unit]
+Description=rQuant Monitor Watchdog (re-arm if dead during trading hours)
+After=rquant-monitor.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/scripts/monitor-watchdog.sh
+
+# watchdog 自身失败不应再触发 watchdog 链，简单 oneshot
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

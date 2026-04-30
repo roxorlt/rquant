@@ -194,6 +194,42 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
     return 0 if total_success > 0 else 1
 
 
+def cmd_alert(args: argparse.Namespace) -> int:
+    """发一条运维告警（用于 systemd OnFailure / watchdog 等场景）。
+
+    刻意做成最小接口：subject 必填，body 可选。直接走 PushDeer + PushPlus，
+    不依赖 notify scene 体系，避免被新增字段牵连。
+    """
+    from rquant.config import settings
+    from rquant.notify.client import PushDeerClient, PushPlusClient
+
+    setup_logging()
+    keys = settings.pushdeer_key_list
+    tokens = settings.pushplus_token_list
+    if not keys and not tokens:
+        logger.error("PUSHDEER_KEYS 和 PUSHPLUS_TOKENS 都未配置，alert 无处可发")
+        return 1
+
+    body = args.body or ""
+    success = 0
+    total = 0
+    if keys:
+        for s, err in PushDeerClient(keys, settings.pushdeer_endpoint).push(args.subject, body):
+            total += 1
+            success += int(s)
+            if not s:
+                logger.error(f"PushDeer 失败: {err}")
+    if tokens:
+        for s, err in PushPlusClient(tokens, settings.pushplus_endpoint).push(args.subject, body):
+            total += 1
+            success += int(s)
+            if not s:
+                logger.error(f"PushPlus 失败: {err}")
+
+    logger.info(f"alert 发送: {success}/{total} 成功 (subject={args.subject!r})")
+    return 0 if success > 0 else 1
+
+
 def cmd_pool2(args: argparse.Namespace) -> int:
     """管理 Pool 2 持久池。"""
     from rquant.storage.duckdb import DuckDBStore
@@ -374,6 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("notify-test", help="推一条 PushDeer 测试消息")
 
+    alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")
+    alert_p.add_argument("--subject", required=True, help="告警主题")
+    alert_p.add_argument("--body", default="", help="告警正文（可选）")
+
     return parser
 
 
@@ -393,13 +433,15 @@ def main() -> int:
         "pool2": cmd_pool2,
         "blacklist": cmd_blacklist,
         "notify-test": cmd_notify_test,
+        "alert": cmd_alert,
     }
     handler = dispatch.get(args.command)
     if handler is None:
         parser.print_help()
         return 0
 
-    if args.command in ("serve", "notify-test"):
+    # alert 自身就是用于错误兜底的，main 不该再吞它的异常包一层
+    if args.command in ("serve", "notify-test", "alert"):
         return handler(args)
 
     try:

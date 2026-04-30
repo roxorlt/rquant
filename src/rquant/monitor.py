@@ -366,18 +366,38 @@ def _now() -> datetime:
     return datetime.now()
 
 
-def _is_trading_hours() -> bool:
-    """当前是否在交易时段（09:30-11:30 或 13:00-15:00）。"""
-    now = _now()
+def _market_phase(now: datetime | None = None) -> str:
+    """A 股盘中阶段。
+
+    - pre        ≤ 09:29  开盘前
+    - morning    09:30-11:29  上午盘
+    - lunch      11:30-12:59  午休（不轮询行情，避免 akshare 限频且静态价无意义）
+    - afternoon  13:00-14:59  下午盘
+    - closed     ≥ 15:00      收盘后
+    """
+    now = now or _now()
     t = now.hour * 100 + now.minute
-    return (930 <= t <= 1130) or (1300 <= t <= 1500)
+    if t < 930:
+        return "pre"
+    if t < 1130:
+        return "morning"
+    if t < 1300:
+        return "lunch"
+    if t < 1500:
+        return "afternoon"
+    return "closed"
+
+
+def _is_trading_hours() -> bool:
+    """是否处于实盘可轮询时段（morning 或 afternoon）。"""
+    return _market_phase() in ("morning", "afternoon")
 
 
 def _wait_for_market_open() -> None:
     """如果当前时间在 09:30 前 10 分钟内，sleep 到 09:30 开盘。
 
-    用于 launchd 09:29 触发后等到 09:30 进轮询。超过 10 分钟提前的不等
-    （RunAtLoad 早晨开机/手动早执行场景），避免长时间空转。
+    用于 timer 09:25 触发后等到 09:30 进轮询。超过 10 分钟提前的不等
+    （早晨开机 / 手动早执行场景），避免长时间空转。
     """
     now = _now()
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -387,6 +407,16 @@ def _wait_for_market_open() -> None:
     if wait_seconds > 600:
         return
     logger.info(f"等待 {wait_seconds:.0f} 秒到 09:30 开盘")
+    time.sleep(wait_seconds)
+
+
+def _wait_for_afternoon_open() -> None:
+    """午休期间睡到 13:00 下午开盘。每次 sleep 至多 60s，便于循环响应中断。"""
+    now = _now()
+    afternoon_open = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    if now >= afternoon_open:
+        return
+    wait_seconds = min((afternoon_open - now).total_seconds(), 60.0)
     time.sleep(wait_seconds)
 
 
@@ -424,7 +454,29 @@ def run_monitor(interval: int = 5) -> int:
 
         _wait_for_market_open()
 
-        while _is_trading_hours():
+        last_phase: str | None = None
+        while True:
+            phase = _market_phase()
+
+            if phase != last_phase:
+                logger.info(f"phase: {last_phase or 'init'} → {phase}")
+                last_phase = phase
+
+            if phase == "closed":
+                break
+
+            if phase == "pre":
+                # 极少进入（_wait_for_market_open 已 sleep 到 09:30）
+                # 兜底：再等到开盘
+                _wait_for_market_open()
+                continue
+
+            if phase == "lunch":
+                # 午休不调 akshare（限频 + 静态价无意义），轻量 sleep 等下午开盘
+                _wait_for_afternoon_open()
+                continue
+
+            # phase in ("morning", "afternoon")
             prices = fetch_realtime_prices(ts_codes)
 
             for code, pdata in prices.items():

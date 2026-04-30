@@ -333,6 +333,82 @@ class TestCheckExits:
         mock_notify.assert_not_called()
 
 
+class TestMarketPhase:
+    """_market_phase 各时间边界判定。"""
+
+    @pytest.mark.parametrize("h,m,expected", [
+        (8, 0, "pre"),
+        (9, 24, "pre"),
+        (9, 29, "pre"),
+        (9, 30, "morning"),
+        (10, 0, "morning"),
+        (11, 29, "morning"),
+        (11, 30, "lunch"),
+        (12, 0, "lunch"),
+        (12, 59, "lunch"),
+        (13, 0, "afternoon"),
+        (14, 30, "afternoon"),
+        (14, 59, "afternoon"),
+        (15, 0, "closed"),
+        (15, 30, "closed"),
+        (23, 59, "closed"),
+    ])
+    def test_phase_boundaries(self, h, m, expected) -> None:
+        from rquant.monitor import _market_phase
+
+        result = _market_phase(datetime(2026, 4, 30, h, m, 0))
+        assert result == expected, f"{h:02d}:{m:02d} → got {result}, expected {expected}"
+
+    def test_is_trading_hours_only_morning_afternoon(self) -> None:
+        from rquant.monitor import _is_trading_hours
+
+        with patch("rquant.monitor._now") as mock_now:
+            for h, m, expected in [
+                (9, 0, False),    # pre
+                (10, 0, True),    # morning
+                (12, 0, False),   # lunch
+                (14, 0, True),    # afternoon
+                (15, 30, False),  # closed
+            ]:
+                mock_now.return_value = datetime(2026, 4, 30, h, m, 0)
+                assert _is_trading_hours() is expected, f"{h:02d}:{m:02d}"
+
+
+class TestWaitForAfternoonOpen:
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_sleeps_capped_at_60s(self, mock_now, mock_sleep) -> None:
+        """11:30 时距 13:00 还有 90min，每次只 sleep 60s（便于循环响应中断）。"""
+        from rquant.monitor import _wait_for_afternoon_open
+
+        mock_now.return_value = datetime(2026, 4, 30, 11, 30, 0)
+        _wait_for_afternoon_open()
+
+        mock_sleep.assert_called_once()
+        slept = mock_sleep.call_args[0][0]
+        assert slept == 60.0
+
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_sleeps_partial_when_close_to_open(self, mock_now, mock_sleep) -> None:
+        from rquant.monitor import _wait_for_afternoon_open
+
+        mock_now.return_value = datetime(2026, 4, 30, 12, 59, 30)
+        _wait_for_afternoon_open()
+
+        mock_sleep.assert_called_once()
+        assert mock_sleep.call_args[0][0] == pytest.approx(30, abs=1)
+
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._now")
+    def test_no_sleep_after_open(self, mock_now, mock_sleep) -> None:
+        from rquant.monitor import _wait_for_afternoon_open
+
+        mock_now.return_value = datetime(2026, 4, 30, 13, 5, 0)
+        _wait_for_afternoon_open()
+        mock_sleep.assert_not_called()
+
+
 class TestWaitForMarketOpen:
     @patch("rquant.monitor.time.sleep")
     @patch("rquant.monitor._now")
@@ -387,11 +463,13 @@ class TestRunMonitor:
     @patch("rquant.monitor.fetch_realtime_prices")
     @patch("rquant.monitor.build_watchlist")
     @patch("rquant.monitor.is_trading_day", return_value=True)
-    @patch("rquant.monitor._is_trading_hours")
+    @patch("rquant.monitor._wait_for_market_open")
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._market_phase")
     @patch("rquant.monitor._now")
     def test_polls_and_detects(
-        self, mock_now, mock_hours, _td, mock_build, mock_fetch, _exits,
-        _count_days,
+        self, mock_now, mock_phase, _sleep, _wait_open,
+        _td, mock_build, mock_fetch, _exits, _count_days,
     ) -> None:
         from rquant.monitor import WatchItem, run_monitor
 
@@ -409,8 +487,8 @@ class TestRunMonitor:
             "002415.SZ": {"price": 12.30, "low": 12.30}
         }
 
-        # First call: trading hours. Second call: after close.
-        mock_hours.side_effect = [True, False]
+        # 1st iter: morning. 2nd iter: closed → break.
+        mock_phase.side_effect = ["morning", "closed"]
         mock_now.return_value = datetime(2026, 4, 21, 10, 0, 0)
 
         with patch("rquant.notify.notify") as mock_notify:
@@ -427,3 +505,62 @@ class TestRunMonitor:
         assert "heartbeat" in scenes
         assert "price_level" in scenes
         assert scenes.count("heartbeat") == 2  # start + stop
+
+    @patch("rquant.monitor._count_trading_days_since", return_value=4)
+    @patch("rquant.monitor.check_exits", return_value=0)
+    @patch("rquant.monitor.fetch_realtime_prices")
+    @patch("rquant.monitor.build_watchlist")
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._wait_for_market_open")
+    @patch("rquant.monitor._wait_for_afternoon_open")
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._market_phase")
+    def test_crosses_lunch_break_without_exiting(
+        self, mock_phase, _sleep, mock_wait_pm, _wait_open,
+        _td, mock_build, mock_fetch, _exits, _count_days,
+    ) -> None:
+        """关键回归：morning → lunch → afternoon → closed 期间进程**不退出**。
+
+        bug 修前：上午 11:30 _is_trading_hours False → 立刻退出，下午无监控。
+        修后：lunch 阶段 sleep 等下午开盘，afternoon 继续轮询，15:00 才退。
+        """
+        from rquant.monitor import WatchItem, run_monitor
+
+        item = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+            name="海康威视",
+            entry_date=date(2026, 4, 18),
+        )
+        mock_build.return_value = [item]
+        # afternoon 阶段股价没跌破档位（避免跟踪 trigger 状态干扰断言）
+        mock_fetch.return_value = {
+            "002415.SZ": {"price": 13.00, "low": 12.50}
+        }
+
+        # 模拟一整天阶段流转
+        mock_phase.side_effect = [
+            "morning",    # 1: fetch
+            "morning",    # 2: fetch
+            "lunch",      # 3: sleep 等下午
+            "lunch",      # 4: sleep 等下午
+            "afternoon",  # 5: fetch
+            "afternoon",  # 6: fetch
+            "closed",     # 7: break
+        ]
+
+        with patch("rquant.notify.notify"):
+            with patch("rquant.monitor.DuckDBStore") as MockStore:
+                mock_store = MockStore.return_value.__enter__.return_value
+                mock_store.upsert_monitor_event.return_value = 1
+                mock_store.query_monitor_events.return_value = pd.DataFrame()
+                run_monitor(interval=5)
+
+        # morning + afternoon = 4 次 fetch；lunch 不该 fetch
+        assert mock_fetch.call_count == 4
+
+        # lunch 阶段进入 _wait_for_afternoon_open 至少 2 次
+        assert mock_wait_pm.call_count >= 2

@@ -1,27 +1,6 @@
 # rQuant TODO
 
-> 已完成项目阶段见 `CHANGELOG.md`。当前版本 v0.8.0（云端 systemd 调度 + dashboard + Backup HTTP API）。
-
----
-
-## P0：风险控制名单接入（"430 黑名单"）
-
-实现完成于分支 `feat/risk-blacklist`（待 merge）。
-
-- [x] PDF 解析（pypdf）+ 代码标准化（补前导 0 + 自动加 SH/SZ/BJ）+ 多类别合并
-- [x] DuckDB `risk_blacklist` 表 + import / load / filter / annotate API
-- [x] Pipeline 新推荐**剔除**（`run_daily_pipeline` 落库前 filter）
-- [x] Monitor 已持仓**保留+标签**（subject 加 `[430黑名单]` 前缀 + body ⚠️ 类别行）
-- [x] Dashboard 黑名单状态 Section + Pool 2 表 黑名单 列 + 过期红色提醒
-- [x] CLI `rquant blacklist {import,list,check,remove}`
-- [x] 单测 + pipeline 集成测（22+2 用例）
-
-**剩余手动验收（merge 后，依赖 v0.10.0 upload endpoint 部署完成）**：
-1. 本地 `rquant blacklist import ~/Downloads/风险控制名单.pdf` → 导出 parquet
-2. 本地 `bash scripts/push-to-cloud.sh data/risk_blacklist.parquet` 推到云端
-3. 服务器宝塔终端 `sudo mv uploads/risk_blacklist.parquet data/` + `python -c` import
-4. 重启 dashboard 验证 Section 9 显示 "430黑名单 · 147 只 · 剩 365d"
-5. 下次 daily 流水线（17:00）自动用，log 会有 `黑名单过滤剔除 N 只`
+> 已完成项目阶段见 `CHANGELOG.md`。当前版本 v0.10.0（Upload HTTP API + 黑名单部署完成）。
 
 ---
 

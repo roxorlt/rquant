@@ -475,8 +475,27 @@ daily_active = daily_status.get("ActiveState") in ("active", "inactive")  # idle
 dashboard_active = dashboard_status.get("ActiveState") == "active"
 
 
-def _badge(label: str, ok: bool, sub: str = "") -> str:
-    color = "#16a34a" if ok else "#dc2626"
+def _market_phase_now() -> str:
+    """09:30-11:30 morning / 11:30-13:00 lunch / 13:00-15:00 afternoon / 其他 closed/pre"""
+    now = datetime.now(CST)
+    t = now.hour * 100 + now.minute
+    if t < 930:
+        return "pre"
+    if t < 1130:
+        return "morning"
+    if t < 1300:
+        return "lunch"
+    if t < 1500:
+        return "afternoon"
+    return "closed"
+
+
+_MONITOR_EXPECTED_ACTIVE = {"morning", "afternoon"}
+
+
+def _badge(label: str, status: str, sub: str = "") -> str:
+    """status: 'ok' (green) | 'bad' (red) | 'idle' (gray)。"""
+    color = {"ok": "#16a34a", "bad": "#dc2626", "idle": "#9ca3af"}[status]
     dot = "●"
     return (
         f"<span style='display:inline-flex;align-items:center;gap:6px;"
@@ -489,18 +508,28 @@ def _badge(label: str, ok: bool, sub: str = "") -> str:
     )
 
 
+# monitor: 交易时段必须 active；非交易时段 idle 也算正常（盘前 / 午休 / 收盘后）
+_phase = _market_phase_now()
+if _phase in _MONITOR_EXPECTED_ACTIVE:
+    monitor_badge_status = "ok" if monitor_active else "bad"
+else:
+    monitor_badge_status = "ok" if monitor_active else "idle"
+
+# daily: failed 才算 bad；inactive(idle) 是常态
+daily_badge_status = "bad" if daily_status.get("ActiveState") == "failed" else "ok"
+
 health_html = (
     _badge(
         "monitor",
-        monitor_active,
-        f"({monitor_status.get('SubState', '')})",
+        monitor_badge_status,
+        f"({monitor_status.get('SubState', '')} · {_phase})",
     )
     + _badge(
         "daily",
-        daily_status.get("ActiveState") != "failed",
+        daily_badge_status,
         f"({daily_status.get('SubState', '')})",
     )
-    + _badge("dashboard", dashboard_active, "")
+    + _badge("dashboard", "ok" if dashboard_active else "bad", "")
 )
 st.markdown(health_html, unsafe_allow_html=True)
 
