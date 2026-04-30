@@ -56,6 +56,11 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 - **让用户试用时必须明确说明**：运行命令、Python 环境、版本号
 - **输出本地路径用完整绝对路径**，不用 `~` 或相对路径
 - **人工核验数据按时间倒序取**：从最新日期往旧找第一个满足测试条件的样本，找不到再往前推，并说明推了多少天
+- **systemd unit 改动（`deploy/systemd/*.{service,timer}`）部署前必须 cloud 端验证**：mac 没装 systemd，OnCalendar 等语法本地测不出。改动后**先让用户在云端跑 `systemd-analyze calendar '<spec>' --iterations 5`** 确认 parse 通过且 Iteration 间隔符合预期（如步进 2min 不是 2sec），**通过再 push**。已知坑：
+  - `HH:MM..HH:MM/N` 中 `/N` 是步进**秒**，不是分钟
+  - 跨小时分钟范围 `09:30..11:30/2` 整段被 `Invalid argument` 拒收
+  - minute 字段 `*/N` 通配步进**不接受**，但 `0/N` 显式起点接受
+  - 已知能 work 的 2min 步进语法：`OnCalendar=Mon..Fri *-*-* 9..14:0/2`
 
 ## 版本控制与部署
 
