@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class RuleCall(BaseModel):
@@ -34,6 +35,13 @@ class ScreenPlan(BaseModel):
     stages: list[Stage] = Field(default_factory=list)
     include_columns: list[str] = Field(default_factory=list)
     rationale: str = Field(default="")
+
+    @field_validator("trade_date")
+    @classmethod
+    def _trade_date_must_be_iso_date(cls, v: str) -> str:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            raise ValueError("trade_date must be YYYY-MM-DD format")
+        return v
 
     def flatten_rules(self) -> list[RuleCall]:
         """跨 stage 合并所有规则；语义上等价于 list of rules（AND 合取）。"""

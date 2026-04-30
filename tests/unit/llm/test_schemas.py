@@ -34,6 +34,10 @@ class TestStage:
         )
         assert len(s.rules) == 1
 
+    def test_empty_label_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Stage(label="", rules=[])
+
 
 class TestScreenPlan:
     def test_minimal(self) -> None:
@@ -53,8 +57,19 @@ class TestScreenPlan:
                 ]),
             ],
             rationale="测试",
+            include_columns=["CIRC_MV[0]"],
         )
         assert len(plan.stages) == 2
+        assert plan.rationale == "测试"
+        assert plan.include_columns == ["CIRC_MV[0]"]
+
+    def test_invalid_date_format_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ScreenPlan(trade_date="not-a-date", stages=[])
+
+    def test_short_date_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ScreenPlan(trade_date="2026-4-30", stages=[])
 
     def test_flatten_rules(self) -> None:
         plan = ScreenPlan(
