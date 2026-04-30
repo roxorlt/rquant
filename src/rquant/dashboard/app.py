@@ -1,8 +1,12 @@
-"""rQuant Health Dashboard。
+"""rQuant Health Dashboard 监控看板（独立 Streamlit 入口）。
 
 启动方式：
     streamlit run src/rquant/dashboard/app.py --server.port 8501 \\
         --server.address 0.0.0.0 --server.headless true
+
+此页面包含 Sections 1-9（systemd / 数据 / Watchlist / 事件 / K 线 / 黑名单等），
+30 秒 meta refresh。NL 选股是独立的 Streamlit 应用，跑在另一个端口，
+启动方式见 `src/rquant/dashboard/nl_screen.py` 文件头。
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from rquant.config import settings
+
 
 REFRESH_SECONDS = 30
 CST = timezone(timedelta(hours=8))

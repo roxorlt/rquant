@@ -4,12 +4,17 @@
 
 ---
 
-## MVP 收尾（剩 Week 7 / Week 8）
+## MVP 收尾（剩 Week 8）
 
-- [ ] **Week 7**：Streamlit UI 的**自然语言输入**（Dashboard 框架 v0.7.0 已上，NL → 积木调用尚未做）
-  - 输入示例："找出连续 3 天放量上涨且 MA5 上穿 MA20 的股票"
-  - LLM 解析 → 调用现有 rule registry 积木 → 结果回 dashboard
+- [x] **Week 7**：Streamlit UI 自然语言输入（v0.12.0，2026-04-30）
 - [ ] **Week 8**：通达信选股公式支持（解析器 → MyTT/积木）
+
+## Week 7.5（NL 选股下游优化）
+
+- [ ] 真节点画布 UI 升级：streamlit-flow / react-flow 集成，Stage 升级 Node，DAG 编辑
+  - 触发条件：v0.12.0 上线后用户实际使用反馈，确认 Stage Cards 不足
+- [ ] LLM-driven 画布操作：用户在画布上"问 LLM"添加节点 / 修改节点
+- [ ] preset 保存为子图模板，多 preset DAG 关系可视化
 
 ---
 

@@ -21,6 +21,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "streamlit>=1.57.0",
     "pypdf>=6.10.2",
+    "openai>=1.0",
 ]
 
 [build-system]
