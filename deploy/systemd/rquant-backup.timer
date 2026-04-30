@@ -2,8 +2,13 @@
 Description=Trigger rQuant backup snapshot
 
 [Timer]
-# 盘中 09:30-15:05 每 5 分钟（systemd OnCalendar 范围语法）
-OnCalendar=Mon..Fri 09:30..15:05/5
+# 盘中 09:00-15:55 每 5 分钟。
+# v0.11.3 修：原 `09:30..15:05/5` 被 systemd 拒收（Invalid argument），
+# 整段 OnCalendar 静默丢弃 → v0.7.0 起 intraday backup 从未跑过，本地
+# sync 一直拉日终 17:30 那份 .gz。改用 v0.11.2 已验证的 `H:M/N` 语法。
+# 09:00-09:25 / 15:05-15:55 是冗余触发，但 backup 脚本是 idempotent
+# `cp + gzip + atomic mv`，无副作用。
+OnCalendar=Mon..Fri *-*-* 9..15:0/5
 # 日终 17:30 一次（流水线 17:00 跑完后）
 OnCalendar=Mon..Fri 17:30
 
