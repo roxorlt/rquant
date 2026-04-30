@@ -1,0 +1,19 @@
+[Unit]
+Description=Trigger rquant-monitor watchdog every 2 min during trading hours
+
+[Timer]
+# 早盘 09:30-11:30 + 午盘 13:00-15:00，每 2 min 检查
+# systemd OnCalendar 不支持午休跳过，所以做两段
+OnCalendar=Mon..Fri 09:30..11:30/2
+OnCalendar=Mon..Fri 13:00..15:00/2
+
+# 错过不补（盘外触发没意义）
+Persistent=false
+
+# 多 timer 错峰（与 daily/backup timer 同步避撞）
+RandomizedDelaySec=10s
+
+Unit=rquant-monitor-watchdog.service
+
+[Install]
+WantedBy=timers.target

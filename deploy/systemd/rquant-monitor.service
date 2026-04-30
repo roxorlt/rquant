@@ -3,6 +3,9 @@ Description=rQuant Intraday Monitor (real-time price level alerts)
 After=network-online.target
 Wants=network-online.target
 
+# 失败时触发 alert relay 推 PushDeer（v0.10.1+）
+OnFailure=rquant-alert@%n.service
+
 [Service]
 Type=simple
 User=lighthouse

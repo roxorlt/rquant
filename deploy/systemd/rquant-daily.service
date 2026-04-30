@@ -3,6 +3,9 @@ Description=rQuant Daily Pipeline (ingest + screen + Pool 2 sync)
 After=network-online.target
 Wants=network-online.target
 
+# 失败时触发 alert relay 推 PushDeer（v0.10.1+）
+OnFailure=rquant-alert@%n.service
+
 [Service]
 Type=oneshot
 User=lighthouse

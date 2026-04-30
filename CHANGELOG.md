@@ -6,6 +6,65 @@
 
 ---
 
+## [v0.10.1] — 2026-04-30 — Monitor 跨午休 bug 修复 + 盘中守护 / OnFailure 告警
+
+### Fixed
+- **`src/rquant/monitor.py`：盘中监控在上午收盘时静默退出的 bug**。原 `while
+  _is_trading_hours()` 在 11:30 后跳出主循环 → systemd 标记 inactive(dead) →
+  下午 13:00 既不重启也不补触发，**每个交易日下午盘 13:00-15:00 实际无监控**。
+  改为五阶段状态机（pre / morning / lunch / afternoon / closed）：
+  - `_market_phase(now)`：根据时间分阶段（替代二值 `_is_trading_hours`）
+  - 主循环 `while True`：lunch 阶段调 `_wait_for_afternoon_open`（每次 ≤60s
+    sleep，便于响应中断）、closed 才 break
+  - lunch 阶段**不调 akshare**（限频保护 + 静态价无意义）
+- **现象**：`Apr 30 11:31:03 rquant-monitor.service: Deactivated successfully`
+  （code=0），下午盘看板上 monitor badge 显示红色 inactive(dead)。
+
+### Added
+- **`rquant alert --subject ... [--body ...]` CLI**：极简告警入口，独立于
+  scene 体系，给 systemd OnFailure / watchdog 等运维场景用，直接走 PushDeer
+  + PushPlus
+- **盘中 watchdog**：`deploy/systemd/rquant-monitor-watchdog.{service,timer}`
+  + `scripts/monitor-watchdog.sh`。每 2 分钟（仅 09:30-11:30 + 13:00-15:00）
+  检查 `rquant-monitor.service` 是否 active，不活则推 PushDeer 告警 + 自愈
+  `systemctl start`。盘外不触发，无打扰
+- **OnFailure 钩子**：`deploy/systemd/rquant-alert@.service` 模板。
+  `rquant-monitor.service` / `rquant-daily.service` 加 `OnFailure=
+  rquant-alert@%n.service`，service 失败的瞬间推 PushDeer，无需等用户主动
+  看 dashboard
+- **Dashboard 三态 badge**：`monitor` 红的判定改为「**仅交易时段且非 active
+  才红**」，盘前 / 午休 / 收盘后非 active 显示灰色 idle（避免假阳性）。
+  badge `_badge(label, status, sub)` 接 `"ok"|"bad"|"idle"` 三态字符串
+
+### Tests
+- `TestMarketPhase`：14 个时间边界用例（08:00 / 09:24 / 09:29 / 09:30 / 11:29
+  / 11:30 / 12:59 / 13:00 / 14:59 / 15:00 等）
+- `TestWaitForAfternoonOpen`：3 个用例验证 60s 上限 + 边界
+- `TestRunMonitor.test_crosses_lunch_break_without_exiting`：关键回归测——
+  morning → lunch → afternoon → closed 期间进程**不退出**，lunch 阶段不
+  fetch akshare
+- 总数 297 → 317（+20 用例），全绿
+
+### Deploy（cloud：82.156.0.68）
+```bash
+cd /home/lighthouse/rquant
+git pull origin main
+sudo cp deploy/systemd/rquant-{monitor,daily,monitor-watchdog,alert@}.{service,timer} /etc/systemd/system/ 2>/dev/null
+sudo cp deploy/systemd/rquant-monitor.service /etc/systemd/system/
+sudo cp deploy/systemd/rquant-daily.service /etc/systemd/system/
+sudo cp deploy/systemd/rquant-monitor-watchdog.service /etc/systemd/system/
+sudo cp deploy/systemd/rquant-monitor-watchdog.timer /etc/systemd/system/
+sudo cp deploy/systemd/rquant-alert@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rquant-monitor-watchdog.timer
+sudo systemctl restart rquant-dashboard
+# 验证
+.venv/bin/rquant alert --subject "[Test] v0.10.1 deployed" --body "OnFailure + watchdog 已上线"
+systemctl list-timers rquant-* --all --no-pager
+```
+
+---
+
 ## [v0.10.0] — 2026-04-30 — Upload HTTP API（与 Backup download 对称）
 
 mac → 云端的"配置数据"推送通道：nginx WebDAV PUT + 单独 basic auth。
