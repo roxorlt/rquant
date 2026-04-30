@@ -60,3 +60,17 @@ class TestBuildRules:
         )
         rules = build_rules(plan)
         assert len(rules) == 3
+
+
+class TestScreenWithPlanDiagnostic:
+    def test_empty_plan_returns_empty_diagnostics(self) -> None:
+        from rquant.llm.dispatch import screen_with_plan_diagnostic
+        from rquant.llm.schemas import ScreenPlan
+
+        plan = ScreenPlan(trade_date="2026-04-30", stages=[])
+        # store=None 路径在内部调到 screen() 时会自己起一个临时 store；
+        # 这里只验证 empty plan 走的早返回分支
+        # 因为没有 store 上的真实数据，screen() 会返回空 df
+        df, diag = screen_with_plan_diagnostic(plan, store=None)
+        assert diag == []
+        assert df is not None  # screen() 总是返回 DataFrame

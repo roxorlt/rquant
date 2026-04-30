@@ -1260,6 +1260,8 @@ else:
         st.session_state.nl_history = []
     if "nl_result_df" not in st.session_state:
         st.session_state.nl_result_df = None
+    if "nl_diagnostics" not in st.session_state:
+        st.session_state.nl_diagnostics = []
 
     nl_query = st.text_input(
         "输入选股需求（中文）",
@@ -1425,10 +1427,15 @@ else:
                 use_container_width=True, key="nl_run_btn",
             ):
                 try:
+                    from rquant.llm.dispatch import screen_with_plan_diagnostic
+
                     nl_plan_validated = ScreenPlan.model_validate(nl_plan_dict)
                     nl_store = DuckDBStore(settings.duckdb_path)
-                    nl_df = screen_with_plan(nl_plan_validated, store=nl_store)
+                    nl_df, nl_diag = screen_with_plan_diagnostic(
+                        nl_plan_validated, store=nl_store,
+                    )
                     st.session_state.nl_result_df = nl_df
+                    st.session_state.nl_diagnostics = nl_diag
                 except ValidationError as nl_e:
                     st.error(f"plan 校验失败：{nl_e}")
                     st.session_state.nl_result_df = None
@@ -1443,6 +1450,17 @@ else:
                 st.warning(
                     "无标的命中。检查规则参数是否过严，或调整 trade_date。"
                 )
+                nl_diag = st.session_state.get("nl_diagnostics", [])
+                if nl_diag:
+                    st.markdown("**逐条规则累加命中数（看哪条筛空）：**")
+                    nl_diag_df = pd.DataFrame(
+                        nl_diag, columns=["规则", "累加命中"]
+                    )
+                    st.dataframe(
+                        nl_diag_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             else:
                 st.dataframe(
                     nl_result_df,
