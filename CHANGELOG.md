@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`rquant pre-market-check`** + systemd timer：每个交易日 09:00（开盘前 30min）主动
+  跑 5 项体检，PushDeer 推一条「✅ 通过」/「⚠️ N 项要修」摘要。检查项：
+  - DuckDB 文件锁状态（多写锁持有者 = 5/6 incident 重现，直接 fail）
+  - 数据分区剩余空间（< 5GB warn）
+  - Tushare 积分余额（< 500 warn，附到期时间）
+  - 8 个 systemd unit 的 `is-active` 状态
+  - 近 24h 各 unit 的 ERROR 日志条数（≥ 10 warn）
+
+  失败项触发 `OnFailure=rquant-alert@%n.service` 兜底；warn 不触发 OnFailure（PushDeer
+  已经说明）。把 5/6 那种「9:30 monitor 启动失败才发现」的事故前移到 9:00 主动发现。
+
+  新增文件：
+  - `src/rquant/pre_market_check.py`
+  - `deploy/systemd/rquant-pre-market-check.service` + `.timer`
+
 ### Fixed
 
 - **nl-screen 独占 DuckDB 写锁导致 monitor crash-loop**（2026-05-06 节后首日真实回归）：

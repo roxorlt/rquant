@@ -1,0 +1,12 @@
+[Unit]
+Description=Trigger rQuant pre-market health check (Mon-Fri 09:00)
+
+[Timer]
+# 周一到周五 09:00:00 触发，比 monitor 09:25 启动早 25 分钟
+# 留时间处理任何 warn/fail（磁盘清理 / Tushare 续费 / 服务重启等）
+OnCalendar=Mon..Fri *-*-* 09:00:00
+Persistent=true
+Unit=rquant-pre-market-check.service
+
+[Install]
+WantedBy=timers.target
