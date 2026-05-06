@@ -5,6 +5,44 @@
 
 ---
 
+## 2026-05-06 · v0.12.1 · hotfix：nl-screen 只读 DuckDB
+
+**背景**：节后首日 09:30 开盘 monitor 启动失败，38 次 crash-loop + 持续 OnFailure
+PushDeer 告警。根因：`rquant-nl-screen.service`（自 4/30 部署起常驻）持有
+`/home/lighthouse/rquant/data/rquant.duckdb` 的写锁（PID 2597296），monitor 拿
+不到锁就退出。
+
+**部署内容**：
+
+- `DuckDBStore.__init__` 新增 `read_only: bool=False` 参数；read_only=True 时跳过
+  `_init_schema()` 的 DDL
+- `dashboard/nl_screen.py` 改用 `DuckDBStore(settings.duckdb_path, read_only=True)`
+  打开 DB（NL 选股是纯查询场景，与 `dashboard/app.py` 同模式）
+- 不动 systemd unit、nginx、依赖
+
+**入口**：无变化（NL screen 仍在 8502 / `/nl/`，monitor 仍 systemd 调度）
+
+**验证**：
+- 本地 smoke：read-only 开 DB 不锁、能读、写被拒 ✓
+- 云端 hotfix 流程：先停 nl-screen 释放锁 → reset-failed monitor → 起 monitor（active running）→ pull fix 分支 → restart nl-screen ✓
+- monitor PID 716834 自 09:49:58 起稳定，nl-screen restart 后 monitor PID 不变 ✓
+- ⏳ 待验：浏览器跑 NL query 时 monitor 不被踢（read-only + 写锁理论上不冲突，等真请求覆盖）
+
+**回滚命令**：
+
+```bash
+# 回到 v0.12.0
+cd /home/lighthouse/rquant
+git checkout v0.12.0
+sudo systemctl restart rquant-nl-screen.service
+# ⚠️ 回滚后会重现 nl-screen 占写锁问题，monitor 与 nl-screen 不能同时跑。
+#   要么停 monitor 让 nl-screen 用，要么停 nl-screen 让 monitor 用。
+```
+
+**预防**：未来任何想跟 monitor 共存的 DB 消费者（dashboard / nl-screen / 新增 Streamlit / 临时 CLI 查询）必须用 `read_only=True` 打开 DuckDB。
+
+---
+
 ## 2026-04-30 · v0.12.0 · Week 7 NL 选股
 
 **部署内容**：

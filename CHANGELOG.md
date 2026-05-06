@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **nl-screen 独占 DuckDB 写锁导致 monitor crash-loop**（2026-05-06 节后首日真实回归）：
+  `dashboard/nl_screen.py` 用默认 `DuckDBStore()` 打开 DB（写模式），与 `rquant-monitor`
+  抢锁，monitor 启动即 `IO Error: Could not set lock on file ...rquant.duckdb`，38 次
+  crash-loop + 持续 OnFailure 告警。修复：`DuckDBStore.__init__` 新增 `read_only: bool=False`
+  参数（read_only=True 时跳过 `_init_schema()`），`nl_screen.py` 改为 `read_only=True`
+  开 DB（NL 选股是纯查询场景，与 `dashboard/app.py` 一致）。
+  部署后 monitor 与 nl-screen 可共存。
+
 ---
 
 ## [v0.12.0] — 2026-04-30 — Week 7：自然语言选股（NL → 积木）
