@@ -134,21 +134,30 @@ def check_tushare_credits(token: str | None, warn_threshold: int = 500) -> Check
         return CheckResult("tushare", "fail", f"{type(e).__name__}: {str(e)[:80]}")
     if df is None or df.empty:
         return CheckResult("tushare", "warn", "user API 返回空")
-    # Tushare user API 返回字段：到期积分（中文）/ points（英文）/ 兼容老版本「积分」
+    # Tushare user API 一个 user_id 可能返回多行（基础积分 + 付费包），需要 sum
+    # 字段名：到期积分（中文）/ points（英文）/ 兼容老版本「积分」
     for col in ("到期积分", "积分", "points"):
         if col in df.columns:
             try:
-                pts = int(df.iloc[0][col])
+                pts = int(df[col].sum())
             except (ValueError, TypeError):
-                return CheckResult("tushare", "warn", f"{col} 字段非整数: {df.iloc[0][col]!r}")
-            expire = df.iloc[0].get("到期时间", "")
+                return CheckResult("tushare", "warn", f"{col} 字段无法 sum: {df[col].tolist()!r}")
+            # 取最早的到期时间（多行付费包可能不同到期）
+            expire = ""
+            if "到期时间" in df.columns:
+                try:
+                    expire = str(df["到期时间"].min())[:10]
+                except Exception:
+                    pass
             expire_msg = f"，{expire} 到期" if expire else ""
+            n_rows = len(df)
+            rows_msg = f"（{n_rows} 个积分包合计）" if n_rows > 1 else ""
             if pts < warn_threshold:
                 return CheckResult(
                     "tushare", "warn",
-                    f"{pts} 积分 (低于阈值 {warn_threshold}){expire_msg}",
+                    f"{pts} 积分{rows_msg} (低于阈值 {warn_threshold}){expire_msg}",
                 )
-            return CheckResult("tushare", "ok", f"{pts} 积分{expire_msg}")
+            return CheckResult("tushare", "ok", f"{pts} 积分{rows_msg}{expire_msg}")
     return CheckResult("tushare", "warn", f"无法识别积分字段：columns={list(df.columns)}")
 
 
