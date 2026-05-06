@@ -8,7 +8,7 @@ Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
 ExecStart=/home/lighthouse/rquant/.venv/bin/rquant alert \
-    --subject "[D] %i 失败（systemd OnFailure）" \
+    --subject "[RQ] %i 失败（systemd OnFailure）" \
     --body "在云端跑 'sudo journalctl -u %i -n 50' 看上下文"
 
 TimeoutStartSec=30

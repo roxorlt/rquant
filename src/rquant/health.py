@@ -182,7 +182,7 @@ def build_daily_report(
     """拼报文：(subject, body)。subject 短，body 多行细节。"""
     weekday_zh = "一二三四五六日"[today.weekday()]
     trading_label = "交易日" if is_trading_day_flag else "非交易日"
-    subject = f"📊 rQuant 日报 {today.isoformat()}（周{weekday_zh}·{trading_label}）"
+    subject = f"[RQ] 📊 日报 {today.isoformat()}（周{weekday_zh}·{trading_label}）"
 
     lines: list[str] = []
 

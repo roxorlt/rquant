@@ -60,7 +60,7 @@ fi
 # 真不活：告警 + 拉起
 log_event "alert-restart"
 "${RQUANT_BIN}" alert \
-    --subject "[D] ${UNIT} 不在跑（盘中）" \
+    --subject "[RQ] ${UNIT} 不在跑（盘中）" \
     --body "watchdog 自动尝试 systemctl start" || true
 
 systemctl start "${UNIT}"

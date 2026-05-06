@@ -36,6 +36,34 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 - **不写过度抽象**：MVP 阶段是函数式脚本 + 简单 class，不要设计"框架"
 - **不写注释写啥**：只在有非显式约束/坑时写注释
 
+## DuckDB 并发约束（强制）
+
+DuckDB 是**单写多读**架构，单一文件锁。`rquant-monitor` 是常驻写入者（盘中持续写
+`monitor_event` / `notification_log`）。**任何想跟 monitor 共存的 DuckDB 消费者必须
+用 `read_only=True` 打开**，否则会抢锁，导致 monitor `IO Error: Could not set lock
+on file ...rquant.duckdb` 进入 crash-loop（见 v0.12.1 hotfix）。
+
+**正确写法**：
+
+```python
+# 只读消费者（dashboard、nl-screen、临时 CLI 查询）
+store = DuckDBStore(settings.duckdb_path, read_only=True)
+# 或裸 connect
+conn = duckdb.connect(str(path), read_only=True)
+```
+
+**错误写法**（会锁死 monitor）：
+
+```python
+store = DuckDBStore()              # 默认写模式，跟 monitor 抢锁
+conn = duckdb.connect(str(path))   # 同上
+```
+
+**例外**：明确需要写的服务（`rquant-monitor` / `rquant-daily` / `rquant-backup`）按
+单写者约定串行调度，不能并发。watchdog 和 timer 安排要错开。
+
+新增 Streamlit / FastAPI / 临时脚本时，code review 必查这一条。
+
 ## MVP 路径（必须按顺序）
 
 不要并行推进多个阶段。按周迭代：
