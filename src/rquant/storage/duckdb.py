@@ -14,10 +14,11 @@ from rquant.storage.schema import ALL_DDL
 
 
 class DuckDBStore:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, read_only: bool = False) -> None:
         self.path = path or settings.duckdb_path
-        self._conn = duckdb.connect(str(self.path))
-        self._init_schema()
+        self._conn = duckdb.connect(str(self.path), read_only=read_only)
+        if not read_only:
+            self._init_schema()
 
     def _init_schema(self) -> None:
         for ddl in ALL_DDL:

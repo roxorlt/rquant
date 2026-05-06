@@ -217,7 +217,7 @@ if nl_plan_dict:
         ):
             try:
                 nl_plan_validated = ScreenPlan.model_validate(nl_plan_dict)
-                nl_store = DuckDBStore(settings.duckdb_path)
+                nl_store = DuckDBStore(settings.duckdb_path, read_only=True)
                 nl_df, nl_diag = screen_with_plan_diagnostic(
                     nl_plan_validated, store=nl_store,
                 )
