@@ -6,6 +6,18 @@
 
 ### Added
 
+- **`scripts/deploy.sh`**：云端一键部署脚本。功能：
+  - `git pull` 并展示变更文件
+  - `deploy/systemd/` 改动 → 自动 cp 到 `/etc/systemd/system/` + `daemon-reload`
+  - 新增的 `*.timer` 自动 `enable --now`
+  - 按 Python 路径 → service 关联表（在脚本里用 `svc_pattern()` case），
+    只 restart **运行中** 且**实际受影响** 的 service（不无脑全部重启）
+  - 改动的 `*.service` 文件本身也触发对应 service restart
+  - 输出部署后 timer + service 状态汇总
+
+  支持 `--dry-run`（只打印不执行）和 main-only 安全栏（非 main 分支拒绝跑）。
+  替代以前手动跑 5-7 条命令的部署流程，sudo 密码只输一次。
+
 - **`rquant pre-market-check`** + systemd timer：每个交易日 09:00（开盘前 30min）主动
   跑 5 项体检，PushDeer 推一条「✅ 通过」/「⚠️ N 项要修」摘要。检查项：
   - DuckDB 文件锁状态（多写锁持有者 = 5/6 incident 重现，直接 fail）
