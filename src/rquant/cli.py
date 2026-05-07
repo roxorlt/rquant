@@ -239,6 +239,43 @@ def cmd_alert(args: argparse.Namespace) -> int:
     return 0 if success > 0 else 1
 
 
+def cmd_pre_market_check(args: argparse.Namespace) -> int:
+    """开盘前主动体检（systemd timer Mon..Fri 09:00 触发）。
+
+    跑 pre_market_check.run_all_checks() → format_summary → PushDeer 推一条摘要。
+    任何 fail 项视为命令失败，触发 systemd OnFailure 兜底告警；warn 不触发 OnFailure
+    （已经在 PushDeer 里说明）。
+    """
+    from rquant.config import settings
+    from rquant.notify.client import PushDeerClient, PushPlusClient
+    from rquant.pre_market_check import format_summary, run_all_checks
+
+    setup_logging()
+    results = run_all_checks()
+    subject, body = format_summary(results)
+
+    print(subject)
+    print(body)
+
+    if not args.dry_run:
+        keys = settings.pushdeer_key_list
+        tokens = settings.pushplus_token_list
+        if not keys and not tokens:
+            logger.warning("PUSHDEER_KEYS / PUSHPLUS_TOKENS 都未配置，跳过推送")
+        else:
+            if keys:
+                for s, err in PushDeerClient(keys, settings.pushdeer_endpoint).push(subject, body):
+                    if not s:
+                        logger.error(f"PushDeer 失败: {err}")
+            if tokens:
+                for s, err in PushPlusClient(tokens, settings.pushplus_endpoint).push(subject, body):
+                    if not s:
+                        logger.error(f"PushPlus 失败: {err}")
+
+    fails = [r for r in results if r.status == "fail"]
+    return 1 if fails else 0
+
+
 def cmd_pool2(args: argparse.Namespace) -> int:
     """管理 Pool 2 持久池。"""
     from rquant.storage.duckdb import DuckDBStore
@@ -471,6 +508,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="只打印不推送（mac 本地 smoke 测试用）",
     )
 
+    pmc_p = sub.add_parser(
+        "pre-market-check", help="开盘前主动健康体检（systemd timer Mon..Fri 09:00 自动跑）",
+    )
+    pmc_p.add_argument(
+        "--dry-run", action="store_true",
+        help="只打印不推送（mac 本地 smoke 测试用）",
+    )
+
     alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")
     alert_p.add_argument("--subject", required=True, help="告警主题")
     alert_p.add_argument("--body", default="", help="告警正文（可选）")
@@ -496,6 +541,7 @@ def main() -> int:
         "notify-test": cmd_notify_test,
         "alert": cmd_alert,
         "daily-report": cmd_daily_report,
+        "pre-market-check": cmd_pre_market_check,
     }
     handler = dispatch.get(args.command)
     if handler is None:
@@ -503,7 +549,7 @@ def main() -> int:
         return 0
 
     # alert / daily-report 自身就是日常运维路径，main 不该再吞它的异常包一层
-    if args.command in ("serve", "notify-test", "alert", "daily-report"):
+    if args.command in ("serve", "notify-test", "alert", "daily-report", "pre-market-check"):
         return handler(args)
 
     try:

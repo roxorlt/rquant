@@ -1,0 +1,21 @@
+[Unit]
+Description=rQuant Pre-Market Health Check
+After=network-online.target
+Wants=network-online.target
+
+# 失败时（任何 fail 项导致 exit 1）触发 alert relay 推 PushDeer
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant pre-market-check
+
+# Tushare API 调用 + lsof + journalctl 总耗时一般 < 30s
+TimeoutStartSec=120
+
+StandardOutput=journal
+StandardError=journal
