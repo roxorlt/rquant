@@ -6,6 +6,21 @@
 
 ### Added
 
+- **`rquant preflight`**：手动触发的全家服务深度体检（5/6 incident 复盘 P2 #5）。
+  跟 `pre-market-check`（被动定时）的差别：preflight 是**主动深度** dry-run，
+  典型场景：节后第一天开盘前 / 大 PR merge 后 deploy 完 / 怀疑系统状态时随手跑。
+
+  5 项检查：
+  - `unit_files`：对 `deploy/systemd/*.{service,timer}` 跑 `systemd-analyze verify`
+  - `systemd_state`：8 个 unit 的 ActiveState/SubState/NRestarts/start 时间戳详情
+  - `duckdb_lock_detail`：lsof 列每个持有者的 PID + COMMAND + FD 模式（u/r/w）
+  - `data_freshness`：daily_bar / screen_result / monitor_event 最新 trade_date + 行数
+  - `smoke_screen`：跑一次 `n-shape-pool1` preset 端到端，确认 screen 流水线还活着
+
+  CLI: `rquant preflight [--notify]`（默认只 stdout markdown，--notify 推 PushDeer 摘要）。
+  非 timer，纯手动；本地 mac 跑 systemd 项自动 skip。
+
+
 - **`scripts/deploy.sh`**：云端一键部署脚本。功能：
   - `git pull` 并展示变更文件
   - `deploy/systemd/` 改动 → 自动 cp 到 `/etc/systemd/system/` + `daemon-reload`
