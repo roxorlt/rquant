@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`preflight unit_files` 误报 15/15 失败**：`systemd-analyze verify` 会顺带把
+  系统其他 unit（如腾讯云 `tat_agent.service` 的 `PIDFile= references a path
+  below legacy directory /var/run/` warning）的 stderr 也吐出来，原代码把「stderr
+  非空」一律算 fail。修：只看 exit code + 只把 stderr 中**包含本 unit 名**的行
+  当真错。
+- **`scripts/deploy.sh` services 状态多余 `unknown` 行**：bash `state=$(cmd ||
+  echo unknown)` 在 `cmd` 退码非 0 但有 stdout（systemctl is-active 对 inactive
+  退码 3 + 输出 "inactive"）时，`||` 会把 echo 也拼进 state，导致 "inactive\nunknown"
+  两行。改用 `state=$(cmd) && true; [[ -z $state ]] && state=unknown`。
+
 ### Added
 
 - **`rquant preflight`**：手动触发的全家服务深度体检（5/6 incident 复盘 P2 #5）。
