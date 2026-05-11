@@ -239,6 +239,42 @@ def cmd_alert(args: argparse.Namespace) -> int:
     return 0 if success > 0 else 1
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """全家服务深度体检（手动触发，dry-run，不重启服务）。
+
+    跑 5 项深度检查（unit verify / 服务详情 / DuckDB 锁布局 / 数据新鲜度 /
+    screen smoke），打印 markdown 报告到 stdout。--notify 推 PushDeer 摘要。
+
+    任何 fail → 退出码 1。
+    """
+    from rquant.config import settings
+    from rquant.notify.client import PushDeerClient, PushPlusClient
+    from rquant.preflight import format_pushdeer_summary, format_report, run_all_checks
+
+    setup_logging()
+    results = run_all_checks()
+    print(format_report(results))
+
+    if args.notify:
+        subject, body = format_pushdeer_summary(results)
+        keys = settings.pushdeer_key_list
+        tokens = settings.pushplus_token_list
+        if not keys and not tokens:
+            logger.warning("PUSHDEER_KEYS / PUSHPLUS_TOKENS 都未配置，跳过推送")
+        else:
+            if keys:
+                for s, err in PushDeerClient(keys, settings.pushdeer_endpoint).push(subject, body):
+                    if not s:
+                        logger.error(f"PushDeer 失败: {err}")
+            if tokens:
+                for s, err in PushPlusClient(tokens, settings.pushplus_endpoint).push(subject, body):
+                    if not s:
+                        logger.error(f"PushPlus 失败: {err}")
+
+    fails = [r for r in results if r.status == "fail"]
+    return 1 if fails else 0
+
+
 def cmd_pre_market_check(args: argparse.Namespace) -> int:
     """开盘前主动体检（systemd timer Mon..Fri 09:00 触发）。
 
@@ -516,6 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="只打印不推送（mac 本地 smoke 测试用）",
     )
 
+    pf_p = sub.add_parser(
+        "preflight", help="全家服务深度体检（手动触发，dry-run，不重启服务）",
+    )
+    pf_p.add_argument(
+        "--notify", action="store_true",
+        help="跑完推一条摘要到 PushDeer（默认只 stdout）",
+    )
+
     alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")
     alert_p.add_argument("--subject", required=True, help="告警主题")
     alert_p.add_argument("--body", default="", help="告警正文（可选）")
@@ -542,6 +586,7 @@ def main() -> int:
         "alert": cmd_alert,
         "daily-report": cmd_daily_report,
         "pre-market-check": cmd_pre_market_check,
+        "preflight": cmd_preflight,
     }
     handler = dispatch.get(args.command)
     if handler is None:
@@ -549,7 +594,10 @@ def main() -> int:
         return 0
 
     # alert / daily-report 自身就是日常运维路径，main 不该再吞它的异常包一层
-    if args.command in ("serve", "notify-test", "alert", "daily-report", "pre-market-check"):
+    if args.command in (
+        "serve", "notify-test", "alert",
+        "daily-report", "pre-market-check", "preflight",
+    ):
         return handler(args)
 
     try:
