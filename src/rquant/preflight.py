@@ -92,11 +92,18 @@ def verify_unit_files(systemd_dir: Path) -> CheckResult:
         except subprocess.TimeoutExpired:
             failed.append(f"{unit.name}: timeout")
             continue
-        # systemd-analyze verify: 0 = ok, 非 0 + stderr 有内容 = 报错
-        if r.returncode == 0 and not r.stderr.strip():
+        # systemd-analyze verify 退出码 != 0 才是真错；stderr 可能含其他系统 unit
+        # 的 warning（如 tat_agent.service 的 PIDFile legacy 提示），不该归到我们头上。
+        # 但若 stderr 里出现「我们这个 unit 名」的具体错误行，也算 fail。
+        own_errors = [
+            ln for ln in r.stderr.splitlines()
+            if unit.name in ln and ":" in ln
+        ]
+        if r.returncode == 0 and not own_errors:
             details.append(f"  ✓ {unit.name}")
         else:
-            failed.append(f"{unit.name}: {r.stderr.strip()[:120]}")
+            msg = "; ".join(own_errors)[:160] if own_errors else f"exit={r.returncode}"
+            failed.append(f"{unit.name}: {msg}")
             details.append(f"  ✗ {unit.name}")
 
     if failed:

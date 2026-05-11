@@ -177,7 +177,10 @@ systemctl list-timers --no-pager 'rquant-*' 2>/dev/null | head -12 | sed 's/^/  
 echo ""
 echo "  Services (rquant-*)："
 for s in rquant-monitor rquant-dashboard rquant-nl-screen; do
-    state=$(systemctl is-active "${s}.service" 2>/dev/null || echo "unknown")
+    # systemctl is-active 对 inactive 服务退码 3 + 输出 "inactive"；
+    # 用 cmd && true 让 set -uo pipefail 不挂；命令替换只取 stdout
+    state=$(systemctl is-active "${s}.service" 2>/dev/null) && true
+    [[ -z "${state}" ]] && state="unknown"
     echo "    ${s}.service: ${state}"
 done
 
