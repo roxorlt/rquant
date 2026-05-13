@@ -6,6 +6,12 @@
 
 ### Added
 
+- **Week 7.5 A spike — `src/rquant/dashboard/nl_canvas.py`**（独立 Streamlit 应用，端口 8503）：
+  用 `streamlit-flow-component` 渲染 `PRESET_SCREENS` 中所有 pool 为节点 + `depends_on`
+  关系为 edge。点节点 → 右侧面板显示 pool 描述 / 依赖 / 规则数 / 规则名列表 / include_columns。
+  spike 决策门已通过：playwright smoke 验证 0 console errors / 渲染 OK / click→state sync OK，
+  下一步走 B 阶段（接 per-rule diagnostic 漏斗 + 命中标的预览）。
+  依赖：`streamlit-flow-component>=1.6.1`。
 - **`scripts/sync-from-cloud.sh` 检测源 stale（5/13 复盘 Task #8）**：每次 sync 完
   额外拉 `latest.json` 取 `snapshot_at`，跟本地 `data/.last-sync-snapshot-at` 比较。
   intraday 时段下 snapshot_at 持续不变（源没在 5min 步进）→ 推 PushDeer
