@@ -6,6 +6,19 @@
 
 ### Added
 
+- **Week 7.5 B — NL 画布接入 per-rule diagnostic + 命中标的预览**（`src/rquant/dashboard/nl_canvas.py`）：
+  在 A spike 基础上加入完整 read-only 体验：
+  - 新增 `src/rquant/dashboard/canvas_diagnostic.py`：`diagnose_preset()` 一次 load_universe + 内存
+    incremental apply 规则（性能从 N 倍 SQL → 1 次 SQL + N 次 pandas mask）；递归处理
+    depends_on（父 preset 跑出 ts_codes 作为子 preset 的 ts_whitelist）
+  - DuckDB `read_only=True` 跟 monitor / nl-screen 共存（不抢写锁）
+  - `st.cache_data(ttl=300)` 缓存单 pool diagnostic 结果，避免重复点击重算
+  - 右侧面板：pool 元信息 / **diagnostic 漏斗表格**（规则名 / 保留数 / % of 初始）/ 命中标的表
+  - `latest_trade_date(store)` 自动选 daily_bar 最新交易日，无需用户输入
+- **`screen/rules._bool_state_rule` 增加 `__rquant_name__` 属性**：内部工厂闭包的 `__qualname__`
+  失意义（变成 `_bool_state_rule.<locals>._rule`），canvas diagnostic 显示规则名时退化为
+  "_bool_state_rule"。挂 friendly 名（如 `is_first_limit_up(1)` / `not_is_limit_up(0)`），
+  canvas 显示规则漏斗时识别度大幅提升。
 - **Week 7.5 A spike — `src/rquant/dashboard/nl_canvas.py`**（独立 Streamlit 应用，端口 8503）：
   用 `streamlit-flow-component` 渲染 `PRESET_SCREENS` 中所有 pool 为节点 + `depends_on`
   关系为 edge。点节点 → 右侧面板显示 pool 描述 / 依赖 / 规则数 / 规则名列表 / include_columns。

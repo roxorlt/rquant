@@ -1,28 +1,33 @@
-"""rQuant NL 选股 — 节点画布版（Week 7.5 A spike）。
+"""rQuant NL 选股 — 节点画布版（Week 7.5 B 阶段：只读画布 + diagnostic）。
 
 启动方式（本地开发）：
     streamlit run src/rquant/dashboard/nl_canvas.py --server.port 8503 \\
         --server.address 0.0.0.0 --server.headless true
 
-跟现有 nl_screen.py（Stage Cards 形态，8502）并存。spike 通过后会逐步替代。
+跟现有 nl_screen.py（Stage Cards 形态，8502）并存。C 阶段（规则 CRUD + NL 改）
+后再决定是否替代 nl_screen.py。
 
-A spike 目标（设计文档 §3.3）：
-  - 验证 streamlit-flow 在 Streamlit 1.57 上稳定渲染
-  - PRESET_SCREENS 全部 pool 转节点，depends_on 转 edge
-  - 点击节点右侧面板显示该 pool 的规则名 + 描述
-  - 通过 → B 阶段（接 per-rule diagnostic 漏斗 + 命中标的）
-  - 不通过 → 退 streamlit-agraph
+B 阶段功能：
+  - 全部 PRESET_SCREENS（builtin + user_presets/*.json）渲染为节点
+  - depends_on 关系渲染为带 offset 标签的 edge
+  - 节点点击 → 右侧面板：pool 描述 / 依赖 / per-rule diagnostic 漏斗 / 命中标的表
+  - DuckDB 用 read_only=True（跟 monitor / nl-screen 共存，不抢写锁）
+  - st.cache_data 缓存 diagnostic 结果（300s ttl），避免重复点击重跑 SQL
 """
 
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 from streamlit_flow import streamlit_flow
 from streamlit_flow.elements import StreamlitFlowEdge, StreamlitFlowNode
 from streamlit_flow.layouts import LayeredLayout
 from streamlit_flow.state import StreamlitFlowState
 
+from rquant.config import settings
+from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_date
 from rquant.presets import PRESET_SCREENS
+from rquant.storage.duckdb import DuckDBStore
 
 
 st.set_page_config(
@@ -32,37 +37,34 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-st.markdown("## 🧩 NL 选股画布 · A spike")
-st.caption(
-    "Week 7.5 A 阶段：验证 streamlit-flow 库可用。"
-    "渲染 PRESET_SCREENS 中所有 pool + depends_on edge。"
-    "B 阶段会接入 per-rule diagnostic 漏斗与命中标的预览。"
-)
+
+@st.cache_resource
+def _shared_store() -> DuckDBStore:
+    """整个 session 共享一个 read-only DuckDBStore，避免每次回调重开。"""
+    return DuckDBStore(settings.duckdb_path, read_only=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_diagnose(preset_name: str, trade_date: str) -> tuple[pd.DataFrame, list[tuple[str, int]]]:
+    """跨 rerun 缓存单个 pool 的 diagnostic + 命中表（5min TTL）。
+
+    参数都是 hashable 字符串；store 通过 _shared_store() 在内部取，不进 cache key。
+    """
+    return diagnose_preset(preset_name, trade_date, store=_shared_store())
 
 
 def _build_initial_state() -> StreamlitFlowState:
-    """从 PRESET_SCREENS 派生初始节点 + edge。
-
-    - 每个 ScreenPreset 一个节点，id = preset name
-    - 节点 content = markdown（名字 + 描述）
-    - depends_on != None → 一条 edge（source=depends_on, target=self）
-    - 入度 0 的节点标 node_type='input'，无被依赖的标 'output'，其他 'default'
-
-    所有节点起始 pos=(0,0)；交给 LayeredLayout 自动排版。
-    """
+    """PRESET_SCREENS → 节点 + edge。LayeredLayout 自动横向叠层。"""
     presets = list(PRESET_SCREENS.values())
     names = {p.name for p in presets}
-    referenced: set[str] = set()
-    for p in presets:
-        if p.depends_on and p.depends_on in names:
-            referenced.add(p.depends_on)
+    referenced = {p.depends_on for p in presets if p.depends_on in names}
 
     nodes: list[StreamlitFlowNode] = []
     for p in presets:
         is_input = p.depends_on is None
         is_output = p.name not in referenced
         if is_input and is_output:
-            node_type = "default"  # 孤立节点也走 default 视觉
+            node_type = "default"
         elif is_input:
             node_type = "input"
         elif is_output:
@@ -70,17 +72,14 @@ def _build_initial_state() -> StreamlitFlowState:
         else:
             node_type = "default"
 
-        content_lines = [f"### {p.name}", "", p.description, ""]
-        content_lines.append(f"`{len(p.rules)}` 条规则")
+        lines = [f"### {p.name}", "", p.description, "", f"`{len(p.rules)}` 条规则"]
         if p.depends_on:
-            content_lines.append(f"← `{p.depends_on}`（offset {p.offset_days}d）")
-        content = "\n".join(content_lines)
-
+            lines.append(f"← `{p.depends_on}` (offset {p.offset_days}d)")
         nodes.append(
             StreamlitFlowNode(
                 id=p.name,
                 pos=(0, 0),
-                data={"content": content},
+                data={"content": "\n".join(lines)},
                 node_type=node_type,
                 source_position="right",
                 target_position="left",
@@ -89,44 +88,44 @@ def _build_initial_state() -> StreamlitFlowState:
             )
         )
 
-    edges: list[StreamlitFlowEdge] = []
-    for p in presets:
-        if p.depends_on and p.depends_on in names:
-            edges.append(
-                StreamlitFlowEdge(
-                    id=f"{p.depends_on}->{p.name}",
-                    source=p.depends_on,
-                    target=p.name,
-                    animated=True,
-                    label=f"+{p.offset_days}d",
-                    marker_end={"type": "arrowclosed"},
-                )
-            )
+    edges = [
+        StreamlitFlowEdge(
+            id=f"{p.depends_on}->{p.name}",
+            source=p.depends_on,
+            target=p.name,
+            animated=True,
+            label=f"+{p.offset_days}d",
+            marker_end={"type": "arrowclosed"},
+        )
+        for p in presets
+        if p.depends_on and p.depends_on in names
+    ]
 
     return StreamlitFlowState(nodes=nodes, edges=edges)
 
 
-# 必须 stash 在 session_state，否则每次 rerun 重建会导致 infinite re-render（库的 README 强调）
+st.markdown("## 🧩 NL 选股画布")
+trade_date = latest_trade_date(_shared_store())
+st.caption(
+    f"trade_date = `{trade_date}`（DuckDB 最新交易日）· "
+    f"{len(PRESET_SCREENS)} 个 pool（builtin + `data/user_presets/*.json`）"
+)
+
+# 必须 stash 在 session_state，否则 streamlit_flow 库会 infinite re-render
 if "canvas_state" not in st.session_state:
     st.session_state.canvas_state = _build_initial_state()
 
-
-left, right = st.columns([0.65, 0.35], gap="medium")
+left, right = st.columns([0.6, 0.4], gap="medium")
 
 with left:
     st.session_state.canvas_state = streamlit_flow(
         key="nl_canvas",
         state=st.session_state.canvas_state,
-        layout=LayeredLayout(
-            direction="right",
-            node_node_spacing=80,
-            node_layer_spacing=180,
-        ),
+        layout=LayeredLayout(direction="right", node_node_spacing=80, node_layer_spacing=180),
         height=560,
         fit_view=True,
         show_controls=True,
         show_minimap=False,
-        # 只读模式：不让创建/删除/编辑
         allow_new_edges=False,
         enable_pane_menu=False,
         enable_node_menu=False,
@@ -141,36 +140,60 @@ with left:
         style={"border": "1px solid #ddd", "borderRadius": "8px"},
     )
 
+
+def _render_diagnostic_funnel(diagnostics: list[tuple[str, int]]) -> None:
+    """累加漏斗：每条规则一行 `name  保留数  % of 初始`。"""
+    if not diagnostics:
+        st.info("无规则")
+        return
+    initial = diagnostics[0][1] or 1  # 防除零
+    rows = []
+    for name, count in diagnostics:
+        pct = count / initial if initial else 0
+        rows.append({"规则": name, "保留": count, "% of 初始": f"{pct:.1%}"})
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        column_config={"保留": st.column_config.NumberColumn(format="%d")},
+        use_container_width=True,
+    )
+
+
 with right:
     selected_id = st.session_state.canvas_state.selected_id
     if not selected_id:
-        st.info("👈 点击左侧节点查看 pool 详情")
+        st.info("👈 点击左侧节点查看 pool 详情 / diagnostic / 命中标的")
     elif selected_id not in PRESET_SCREENS:
-        st.warning(f"未知节点 `{selected_id}`（spike 阶段不应该出现）")
+        st.warning(f"未知节点 `{selected_id}`")
     else:
         preset = PRESET_SCREENS[selected_id]
         st.markdown(f"### `{preset.name}`")
         st.caption(preset.description)
 
-        meta = []
+        meta_lines = []
         if preset.depends_on:
-            meta.append(f"**依赖**：`{preset.depends_on}` + offset `{preset.offset_days}d`")
+            meta_lines.append(
+                f"**依赖**：`{preset.depends_on}` + offset `{preset.offset_days}d`"
+            )
         else:
-            meta.append("**输入**：全市场")
-        meta.append(f"**规则数**：{len(preset.rules)}")
-        st.markdown("\n\n".join(meta))
+            meta_lines.append("**输入**：全市场")
+        meta_lines.append(f"**规则数**：{len(preset.rules)}")
+        st.markdown("\n\n".join(meta_lines))
 
-        st.markdown("**规则列表**")
-        for i, rule in enumerate(preset.rules, 1):
-            # Rule 是闭包（screen.rules 用 `def factory(): def _rule(df): ...; return _rule` 模式），
-            # __name__ 是 "_rule"，要从 __qualname__ 取外层 factory 名（如 "first_limit_up._rule" → "first_limit_up"）
-            qualname = getattr(rule, "__qualname__", "")
-            rule_name = qualname.split(".")[0] if qualname else getattr(rule, "__name__", "rule")
-            st.markdown(f"`{i:>2}` · `{rule_name}`")
+        with st.spinner("跑 diagnostic + 命中表…"):
+            try:
+                hits_df, diagnostics = _cached_diagnose(selected_id, trade_date)
+            except Exception as e:
+                st.error(f"diagnostic 失败：{e}")
+                hits_df, diagnostics = pd.DataFrame(), []
 
-        if preset.include_columns:
-            st.markdown("**额外字段**：" + " ".join(f"`{c}`" for c in preset.include_columns))
+        # —— 漏斗
+        st.markdown(f"**diagnostic 漏斗** (最终 `{len(hits_df)}` 只)")
+        _render_diagnostic_funnel(diagnostics)
 
-        # spike 阶段不接 diagnostic / 命中表（B 阶段才做）
-        st.markdown("---")
-        st.caption("ℹ️ B 阶段将在此显示 per-rule diagnostic 漏斗 + 命中标的列表")
+        # —— 命中表
+        st.markdown(f"**命中标的** · `{len(hits_df)}` 只")
+        if hits_df.empty:
+            st.caption("无命中（可能是当日数据不全 / 父预设为空）")
+        else:
+            st.dataframe(hits_df, hide_index=True, use_container_width=True, height=240)

@@ -62,6 +62,8 @@ def _bool_state_rule(col_base: str, offset: int, negate: bool = False) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         s = df[col].fillna(False).astype(bool)
         return ~s if negate else s
+    # Canvas diagnostic 用：内部工厂闭包的 __qualname__ 没有意义，挂上 friendly name
+    _rule.__rquant_name__ = f"{'not_' if negate else ''}{col_base.lower()}({offset})"  # type: ignore[attr-defined]
     return _tag_lookback(_rule, offset)
 
 
