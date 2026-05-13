@@ -313,7 +313,11 @@ def generate_and_send_daily_report(
     daily_snap = get_service_snapshot("rquant-daily.service", today)
     watchdog_counts = read_watchdog_log(settings.log_dir, today)
 
-    with DuckDBStore() as store:
+    # 5/13 复盘 Bug A：daily-report 不写 db（count_today_business_data 是纯 SELECT），
+    # 改 read_only=True 才能跟 monitor / nl-screen 共存。原默认写模式在 5/1 节假日
+    # 撞了 nl-screen 旧版持的写锁（PID 2597296），daily-report fatal exit。
+    # 套路同 v0.12.1 nl-screen hotfix。
+    with DuckDBStore(read_only=True) as store:
         business = count_today_business_data(store, today)
 
     subject, body = build_daily_report(

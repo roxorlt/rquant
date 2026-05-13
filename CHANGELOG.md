@@ -31,6 +31,13 @@
   脚本忘加 sudo → 死循环 40 分钟无法自愈。改：`systemctl start` 加 `sudo`；
   start 失败时再发 `[RQ][CRITICAL]` 升级告警（区分 sudoers / polkit / unit 错）。
   新增 watchdog 日志 tag `restart-failed`。
+- **`rquant daily-report` 用写模式开 DuckDB，撞别人持的写锁 fatal exit**
+  （5/1 翻车实锤，5/13 复盘 Bug A）：5/1 15:30 节假日 daily-report 触发时，
+  `DuckDBStore()` 用默认写模式打开活 DB，撞上 nl-screen 旧版（v0.12.1 hotfix
+  前还是写模式，PID 2597296）持的锁，立刻 `IOException: Could not set lock`
+  fatal exit。当日**没收到日报推送**。修：`health.generate_and_send_daily_report`
+  改用 `DuckDBStore(read_only=True)`（count_today_business_data 全是 SELECT，
+  本来就不需要写）。套路同 v0.12.1 nl-screen hotfix。
 - **`preflight unit_files` 误报 15/15 失败**：`systemd-analyze verify` 会顺带把
   系统其他 unit（如腾讯云 `tat_agent.service` 的 `PIDFile= references a path
   below legacy directory /var/run/` warning）的 stderr 也吐出来，原代码把「stderr
