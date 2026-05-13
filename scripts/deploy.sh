@@ -8,9 +8,11 @@
 # 干的事（按顺序）：
 #   1. git pull（无变化直接退）
 #   2. deploy/systemd/ 有改动 → cp 到 /etc/systemd/system + daemon-reload
-#   3. 改动里含新 timer → systemctl enable --now
+#   3. 启用新 timer + restart 已改 timer（让新 OnCalendar 生效）
 #   4. 按 src/rquant/* 改动路径关联 restart 受影响的 service（只动跑着的）
-#   5. 输出 systemd timer 状态 + 各 service is-active 汇总
+#   5. post-deploy 验证：所有改动的 timer 下次 trigger 在 24h 内（防 v0.11.3 翻车再发：
+#      OnCalendar 被 systemd 静默拒收 → timer 假装在跑但实际从不 trigger）
+#   6. 输出 systemd timer 状态 + 各 service is-active 汇总
 #
 # 安全约束：
 #   - 只在 main 分支上跑（不要在其他分支误部署）
@@ -100,27 +102,33 @@ else
     ok "无 systemd unit 改动"
 fi
 
-# ---------- 3. enable 新增的 timer ----------
+# ---------- 3. 启用新 timer + restart 已改 timer ----------
+#
+# 关键修复（v0.11.3 翻车教训）：daemon-reload 只是让 systemd 重新读 unit 文件，
+# 但已经在跑的 timer 实例仍用旧 OnCalendar。必须 restart 才能让新调度生效。
+#
+# - 已 enabled 的 timer：sudo systemctl restart（应用新 OnCalendar）
+# - 未 enabled 的 timer：sudo systemctl enable --now（首次启用 + 启动）
 
-step "[3/5] 启用新 timer"
-NEW_TIMER_FILES=$(echo "${SYSTEMD_CHANGED}" | grep "\.timer$" || true)
-ENABLED_COUNT=0
-for f in ${NEW_TIMER_FILES}; do
+step "[3/6] 启用 / 重启 timer（让新 OnCalendar 生效）"
+CHANGED_TIMER_FILES=$(echo "${SYSTEMD_CHANGED}" | grep "\.timer$" || true)
+TIMER_HANDLED=0
+for f in ${CHANGED_TIMER_FILES}; do
     t=$(basename "${f}")
-    # is-enabled 对未装的 unit 也会输出 disabled/static 等，需要先确认装好了
-    if ! systemctl is-enabled "${t}" 2>/dev/null | grep -qE "^enabled"; then
+    if systemctl is-enabled "${t}" 2>/dev/null | grep -qE "^enabled"; then
+        run "sudo systemctl restart '${t}'"
+        ok "↻ ${t} (restarted, 应用新 OnCalendar)"
+    else
         run "sudo systemctl enable --now '${t}'"
         ok "+ ${t} (enabled + started)"
-        ENABLED_COUNT=$((ENABLED_COUNT + 1))
-    else
-        ok "${t} 已 enabled，跳过"
     fi
+    TIMER_HANDLED=$((TIMER_HANDLED + 1))
 done
-[[ ${ENABLED_COUNT} -eq 0 && -z "${NEW_TIMER_FILES}" ]] && ok "无新 timer"
+[[ ${TIMER_HANDLED} -eq 0 ]] && ok "无 timer 改动"
 
 # ---------- 4. Python 改动 → restart 关联 service ----------
 
-step "[4/5] 检测 Python 改动 → restart 关联 service"
+step "[4/6] 检测 Python 改动 → restart 关联 service"
 
 # Python 路径 → service 关联（grep -E 模式）。新增 service 时往这个 case 加一行。
 svc_pattern() {
@@ -168,9 +176,55 @@ else
     done
 fi
 
-# ---------- 5. 状态汇总 ----------
+# ---------- 5. post-deploy 验证：改动的 timer 是否真在调度 ----------
+#
+# v0.11.3 翻车教训：OnCalendar 语法错误会被 systemd 静默拒收，整段丢弃。
+# `systemctl status` 看起来是 active (waiting)，但下次 trigger 实际是 24h 后
+# 甚至 "n/a"。这一步用 `list-timers --all` 检查改动 timer 的 NEXT 列：
+#   - NEXT 在 24h 内 → 正常
+#   - NEXT 是 "n/a" 或 > 24h → 翻车（OnCalendar 没生效），exit 1 让 caller 知道
+#
+# 跳过：dry-run、无 timer 改动
 
-step "[5/5] 部署后状态"
+step "[5/6] post-deploy 验证：改动的 timer NEXT trigger 在 24h 内"
+TIMER_FAIL=0
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    ok "dry-run，跳过验证"
+elif [[ -z "${CHANGED_TIMER_FILES}" ]]; then
+    ok "无 timer 改动，跳过验证"
+else
+    # 给 systemd 1s 应用 restart 后的下次 trigger 计算
+    sleep 1
+    for f in ${CHANGED_TIMER_FILES}; do
+        t=$(basename "${f}")
+        # list-timers 输出列：NEXT LEFT LAST PASSED UNIT ACTIVATES
+        # show -p NextElapseUSecRealtime 返回微秒 epoch 或 0（n/a）
+        next_us=$(systemctl show "${t}" -p NextElapseUSecRealtime --value 2>/dev/null)
+        if [[ -z "${next_us}" || "${next_us}" == "0" ]]; then
+            err "${t}: 下次 trigger = n/a（OnCalendar 可能被 systemd 拒收！）"
+            err "  排查：systemctl status ${t} / systemd-analyze calendar '<OnCalendar 表达式>'"
+            TIMER_FAIL=1
+            continue
+        fi
+        # 微秒 → 秒；跟当前时间比
+        next_s=$((next_us / 1000000))
+        now_s=$(date +%s)
+        delta=$((next_s - now_s))
+        if [[ ${delta} -lt 0 ]]; then
+            warn "${t}: 下次 trigger 在过去（${delta}s 前），可能正在 catch up"
+        elif [[ ${delta} -gt 86400 ]]; then
+            err "${t}: 下次 trigger 在 $(( delta / 3600 ))h 后（> 24h），OnCalendar 可能有问题"
+            TIMER_FAIL=1
+        else
+            human=$(date -d "@${next_s}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "${next_s}" '+%Y-%m-%d %H:%M:%S')
+            ok "${t}: 下次 trigger ${human}（${delta}s 后）"
+        fi
+    done
+fi
+
+# ---------- 6. 状态汇总 ----------
+
+step "[6/6] 部署后状态"
 echo ""
 echo "  Timers (rquant-*)："
 systemctl list-timers --no-pager 'rquant-*' 2>/dev/null | head -12 | sed 's/^/    /'
@@ -185,4 +239,8 @@ for s in rquant-monitor rquant-dashboard rquant-nl-screen; do
 done
 
 echo ""
+if [[ ${TIMER_FAIL} -eq 1 ]]; then
+    err "部署完成但有 timer 验证失败（${PRE_HEAD:0:7} → ${POST_HEAD:0:7}），见 step [5/6]"
+    exit 2
+fi
 ok "部署完成（${PRE_HEAD:0:7} → ${POST_HEAD:0:7}）"

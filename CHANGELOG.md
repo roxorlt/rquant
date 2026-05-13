@@ -6,6 +6,15 @@
 
 ### Fixed
 
+- **`scripts/deploy.sh` 已 enabled 的 timer daemon-reload 后没 restart，新 OnCalendar
+  从不生效**（v0.11.3 翻车根因，5/13 复盘）：v0.11.3 在 git 改对了
+  `rquant-backup.timer` 的 OnCalendar，但部署到云端后**timer 已经在 active 状态**，
+  daemon-reload 只重新读 unit 文件，没让 timer 用新调度——结果 backup intraday
+  自 v0.7.0 起从未真跑过（云端 timer 一直用旧的被 systemd 静默拒收的 OnCalendar）。
+  改 step [3] 逻辑：所有改动的 timer（不只是新增的）都执行 restart。
+- **`scripts/deploy.sh` 缺 post-deploy 验证，OnCalendar 拒收 silent fail**：新加
+  step [5/6]，用 `systemctl show -p NextElapseUSecRealtime --value` 检查每个改动
+  timer 的下次 trigger。`n/a` 或 > 24h → exit 2，让 caller 知道翻车。
 - **`preflight unit_files` 误报 15/15 失败**：`systemd-analyze verify` 会顺带把
   系统其他 unit（如腾讯云 `tat_agent.service` 的 `PIDFile= references a path
   below legacy directory /var/run/` warning）的 stderr 也吐出来，原代码把「stderr
