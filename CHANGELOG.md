@@ -15,6 +15,13 @@
 - **`scripts/deploy.sh` 缺 post-deploy 验证，OnCalendar 拒收 silent fail**：新加
   step [5/6]，用 `systemctl show -p NextElapseUSecRealtime --value` 检查每个改动
   timer 的下次 trigger。`n/a` 或 > 24h → exit 2，让 caller 知道翻车。
+- **`scripts/monitor-watchdog.sh` 调 systemctl 没加 sudo，自愈被 polkit 拒**
+  （5/6 翻车实锤，5/13 复盘）：5/6 09:30-09:48 monitor 没起来，watchdog 每 2min
+  检测到 → 发 alert → `systemctl start rquant-monitor.service` → polkit 返回
+  `Interactive authentication required`。`lighthouse` 用户**早已** `NOPASSWD ALL`，
+  脚本忘加 sudo → 死循环 40 分钟无法自愈。改：`systemctl start` 加 `sudo`；
+  start 失败时再发 `[RQ][CRITICAL]` 升级告警（区分 sudoers / polkit / unit 错）。
+  新增 watchdog 日志 tag `restart-failed`。
 - **`preflight unit_files` 误报 15/15 失败**：`systemd-analyze verify` 会顺带把
   系统其他 unit（如腾讯云 `tat_agent.service` 的 `PIDFile= references a path
   below legacy directory /var/run/` warning）的 stderr 也吐出来，原代码把「stderr
