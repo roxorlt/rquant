@@ -4,34 +4,21 @@
 
 ---
 
-## 🔥 P0 — 5/13 复盘暴露的三个 bug
+## 🔥 P0 — 5/13 复盘暴露的三个 bug（代码已修，等真实场景验证）
 
 > 详细时间线 / 根因 / 修复方案：[docs/incidents/2026-05-13-may1-and-may6-failures.md](docs/incidents/2026-05-13-may1-and-may6-failures.md)
->
-> 原 TODO 顶部的「5/1 daily-report」「5/6 节后首日」两个验证项**都翻车了**：5/1 daily-report DuckDB lock fatal exit，5/6 监控 watchdog 死循环 40min 无法自愈，并由此牵出潜伏 1 个月的 backup intraday 从未真跑过。
 
-- [ ] **Bug C · backup intraday 从未真跑过**（最紧急，今日热修）
-  - 现象：`~/rquant/backup/latest.duckdb.gz` mtime 卡在 5/12 17:30，盘中 5min 步进 = 0 次
-  - 根因：云端 `/etc/systemd/system/rquant-backup.timer` 是 v0.11.3 之前的坏语法 `09:30..15:05/5`（systemd 静默拒收）；git 里早改成 `9..15:0/5` 但**没部署到云端**
-  - 修复 PR：`fix/backup-timer-deploy-and-verify`
-    - ssh 立即热修：cp git unit → /etc/systemd/system + daemon-reload + restart timer
-    - `scripts/deploy.sh` 加 systemd unit 自动 diff + sync + reload + 验证 list-timers 下次 trigger 在 5min 内
-- [ ] **Bug A · daily-report 撞 DuckDB 写锁**（依赖 Bug C 先修好）
-  - 现象：5/1 15:30 / 17:00 两次 `IOException: Could not set lock on file ... rquant.duckdb` fatal exit
-  - 根因：daily-report 用默认写模式打开 DB（要写 `notification_log`），跟 nl-screen v0.12.1 hotfix 前的写模式撞锁；即使 nl-screen 修好了，monitor 自己也常驻写
-  - 修复 PR：`fix/daily-report-via-snapshot`
-    - daily-report 改为从 `backup/latest.duckdb.gz` 解压成临时副本 read-only 读，决不碰活 DB
-    - 不再写 `notification_log`（此表无消费者，未来要审计再独立到 SQLite）
-- [ ] **Bug B · watchdog 自愈失败**
-  - 现象：5/6 09:30-09:48 watchdog 检测到 monitor 不在跑，每 2min 试图 systemctl start 但被 polkit 拒；连发 8 条 alert 无法恢复，需用户人工 ssh 上去启
-  - 根因：watchdog.sh 调 `systemctl` 没加 `sudo` 前缀（lighthouse 早就有 NOPASSWD ALL，加 sudo 即修复）
-  - 修复 PR：`fix/watchdog-self-heal-sudo`
-    - `scripts/monitor-watchdog.sh` 所有 `systemctl` 调用前加 `sudo`
-    - 重启失败再发"升级告警"（区分一般 alert 和 systemctl 失败）
-- [ ] **Task #8 · 本地 sync 假阳性 OK**
-  - 现象：本地 sync log 每 5min 报"sync OK: 215M"，掩盖了云端 backup 没在跑的真相
-  - 修复 PR：`chore/sync-stale-detection`
-    - `scripts/sync-from-cloud.sh` 检测拉到的 `latest.duckdb.gz` mtime 跟上次比无变化且在 sync window 内 → 报 `WARNING: source stale`，推 PushDeer
+- [x] **Bug C · backup intraday 从未真跑过** → PR #8 `fix/backup-timer-deploy-and-verify` merged 2026-05-13；云端热修已生效（手动 cp + restart timer，5/13 17:30 + 5/14 09:00 起每 5min）
+- [x] **Bug A · daily-report 撞 DuckDB 写锁** → PR #10 `fix/daily-report-readonly-duckdb` merged 2026-05-13（修复时发现 daily-report 实际不写 db，方案简化为 `read_only=True` 一行 fix，没走最初设想的 snapshot 包装器）
+- [x] **Bug B · watchdog 自愈失败** → PR #9 `fix/watchdog-self-heal-sudo` merged 2026-05-13
+- [x] **Task #8 · 本地 sync 假阳性 OK** → PR #11 `chore/sync-stale-detection` merged 2026-05-13
+
+### ⏰ 明日 5/14 真实场景验证
+
+- [ ] **09:00+ backup intraday 真跑**：`stat ~/rquant/backup/latest.duckdb.gz` mtime 在 5min 内；`journalctl -u rquant-backup.service --since "today 09:00"` 见 ~7 次（9:00→9:30 期间）
+- [ ] **15:30 daily-report**：`journalctl -u rquant-daily-report.service --since "today 15:30"` 无 IOException，正常 exit 0，PushDeer 收到日报
+- [ ] **本地 mac sync stale**：本地下次 sync log 显示 `(snapshot_at=...)` 每 5min 变化，不再报 stale；如果 backup intraday 故障会自动 PushDeer
+- [ ] **monitor 真挂时 watchdog 自愈**：故意 `sudo systemctl stop rquant-monitor.service` 验证下次 watchdog（2min 内）能 sudo systemctl start 回来；或等真挂被动验证
 
 ---
 
