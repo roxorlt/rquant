@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/sync-from-cloud.sh` 检测源 stale（5/13 复盘 Task #8）**：每次 sync 完
+  额外拉 `latest.json` 取 `snapshot_at`，跟本地 `data/.last-sync-snapshot-at` 比较。
+  intraday 时段下 snapshot_at 持续不变（源没在 5min 步进）→ 推 PushDeer
+  `[RQ][WARN] backup intraday 卡住`，含云端排查命令。
+  防刷屏：相同 stale 状态 30 分钟内只推 1 条。
+  防 v0.11.3 翻车再发：本地 sync log 不再用 "sync OK: 215M" 假阳性掩盖源没在跑的真相。
+
 ### Fixed
 
 - **`scripts/deploy.sh` 已 enabled 的 timer daemon-reload 后没 restart，新 OnCalendar
