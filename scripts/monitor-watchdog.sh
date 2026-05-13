@@ -6,7 +6,12 @@
 # 每次调用追加一行到 logs/watchdog-YYYY-MM-DD.log，供 daily-report 统计：
 #   <ISO ts> active           monitor 活，正常路径
 #   <ISO ts> skip-clean-exit  今天已 exit 0 过（节假日 / 收盘后），静默
-#   <ISO ts> alert-restart    告警 + systemctl start
+#   <ISO ts> alert-restart    告警 + systemctl start 成功
+#   <ISO ts> restart-failed   告警 + systemctl start 失败 + 升级告警
+#
+# 5/13 复盘：systemctl 调用必须用 sudo。lighthouse 已 NOPASSWD ALL，但
+# `systemctl start` 直接调走 polkit 会被拒（`Interactive authentication
+# required`）。5/6 09:30-09:48 因此死循环 40 分钟无法自愈，需用户人工 ssh。
 
 set -uo pipefail
 
@@ -57,10 +62,17 @@ if [[ "${LAST_DATE}" == "${TODAY}" && "${LAST_STATUS}" == "0" ]]; then
     exit 0
 fi
 
-# 真不活：告警 + 拉起
-log_event "alert-restart"
+# 真不活：告警 + 拉起（用 sudo；详见 header 注释 5/13 复盘）
 "${RQUANT_BIN}" alert \
     --subject "[RQ] ${UNIT} 不在跑（盘中）" \
-    --body "watchdog 自动尝试 systemctl start" || true
+    --body "watchdog 自动尝试 sudo systemctl start" || true
 
-systemctl start "${UNIT}"
+if sudo systemctl start "${UNIT}"; then
+    log_event "alert-restart"
+else
+    # 重启失败：升级告警让用户立刻介入（sudoers / polkit / unit 配置问题）
+    log_event "restart-failed"
+    "${RQUANT_BIN}" alert \
+        --subject "[RQ][CRITICAL] ${UNIT} 重启失败，需人工介入" \
+        --body "watchdog 调用 sudo systemctl start ${UNIT} 失败。可能原因：sudoers 配置漏 / polkit 拒 / unit 自身错。立刻 ssh 上服务器排查。" || true
+fi
