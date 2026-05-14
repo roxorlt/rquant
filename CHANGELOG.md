@@ -6,6 +6,24 @@
 
 ### Added
 
+- **Week 7.5 C-Canvas-1 — 多画布切换 + Canvas CRUD**：
+  - 新增 `src/rquant/dashboard/canvas_files.py`：Canvas 持久化模块
+    - `data/canvases/<name>.json` schema：`{name, description, pool_refs, created_at, updated_at, source}`
+    - 虚拟默认画布 `__default__`（动态生成含全部 PRESET_SCREENS，不存盘，不可删）
+    - `list_canvases() / load_canvas(name) / save_canvas(...) / delete_canvas(...)`
+    - `add_pool_to_canvas(canvas, pool) / remove_pool_from_canvas / filter_pool_refs`
+  - 改 `src/rquant/dashboard/nl_canvas.py`：
+    - sidebar 加 Canvas 切换 selectbox（默认画布总在最前 + 文件系统 canvases 按名排序）
+    - 当前画布详情：📦 pool 数 / description / 复制 / 删除（默认不可删）
+    - "➕ 新建空 canvas" expander（base name + description → 创建空 canvas）
+    - 复制 canvas：保留 pool_refs 写新文件 + 切到新 canvas
+    - 删 canvas：unlink 文件 + active fallback 到默认
+    - `_build_initial_state(pool_refs)`：根据当前 canvas 的 pool_refs 过滤 PRESET_SCREENS，
+      切换 canvas 时画布只显示该 canvas 包含的 pool
+    - 「新建 user pool」「fork builtin」自动 `add_pool_to_canvas` 加到 active canvas
+      （默认 canvas 跳过 — 自动 include 所有 pool）
+
+
 - **Week 7.5 部署 — `rquant-canvas.service` (端口 8504) + nginx /canvas/ 反代**：
   - 新增 `deploy/systemd/rquant-canvas.service`：streamlit run nl_canvas.py 端口
     8504 / EnvironmentFile=/home/lighthouse/rquant/.env（复用 DEEPSEEK_API_KEY）
