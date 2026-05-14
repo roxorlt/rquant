@@ -6,6 +6,16 @@
 
 ### Added
 
+- **Week 7.5 C-Canvas-2 — Canvas 内 add/remove pool（pool 池 ↔ canvas 解耦）**：
+  - `canvas_files.canvas_membership_of(pool_name) -> list[str]`：返回引用该 pool 的
+    canvas 名列表（含默认 canvas，因其自动 include 全部）
+  - `canvas_files.set_canvas_pool_refs(canvas, pool_refs)`：直接 override（默认 canvas
+    不可改）
+  - sidebar 当前 canvas 详情下加「⚙ 管理 pool 成员」expander（仅非默认 canvas 显示）：
+    `st.multiselect` 列出全部 pool，default = 当前 pool_refs，「✓ 应用」覆盖写入
+  - 右侧 pool 详情顶部加「📋 在 N 个 canvas 中：默认 · canvasA · canvasB」caption
+
+
 - **Week 7.5 C-Canvas-1 — 多画布切换 + Canvas CRUD**：
   - 新增 `src/rquant/dashboard/canvas_files.py`：Canvas 持久化模块
     - `data/canvases/<name>.json` schema：`{name, description, pool_refs, created_at, updated_at, source}`
