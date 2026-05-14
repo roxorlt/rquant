@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from rquant.llm.schemas import RuleCall
 from rquant.screen.rules import (
     Rule,
     circ_mv_lt,
@@ -23,7 +24,12 @@ from rquant.screen.rules import (
 
 @dataclass
 class ScreenPreset:
-    """一套命名的筛选策略。"""
+    """一套命名的筛选策略。
+
+    rule_calls：跟 rules 一一对应的可序列化元数据（spec name + args）。builtin pool
+    手写维护（rules 用闭包，参数从闭包反查不出）；user pool 加载 JSON 时自然有。
+    canvas C.4：builtin "fork-to-user" 需要 rule_calls 才能写出可加载的 user JSON。
+    """
 
     name: str
     description: str
@@ -31,6 +37,7 @@ class ScreenPreset:
     include_columns: list[str] = field(default_factory=list)
     depends_on: str | None = None
     offset_days: int = 0
+    rule_calls: list[RuleCall] = field(default_factory=list)
 
 
 import json as _json
@@ -71,11 +78,12 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
             full_name = f"user/{base_name}"
 
             # 把 rules（flat list）包成单 stage，复用 dispatch.build_rules 校验
+            rule_calls = [
+                RuleCall(name=r["name"], args=r.get("args", {})) for r in data["rules"]
+            ]
             plan = ScreenPlan(
                 trade_date="1900-01-01",  # placeholder，preset 落库时与日期无关
-                stages=[Stage(label="loaded", rules=[
-                    RuleCall(name=r["name"], args=r.get("args", {})) for r in data["rules"]
-                ])],
+                stages=[Stage(label="loaded", rules=rule_calls)],
                 include_columns=data.get("include_columns", []),
             )
             rules = build_rules(plan)
@@ -84,6 +92,7 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
                 name=full_name,
                 description=data.get("description", ""),
                 rules=rules,
+                rule_calls=rule_calls,
                 include_columns=data.get("include_columns", []),
             )
         except Exception as e:
@@ -110,6 +119,20 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
             no_limit_down_in_window(30),
             has_prior_limit_up(120, 1),
         ],
+        # 跟 rules 一一对应；canvas C.4 fork-to-user 用
+        rule_calls=[
+            RuleCall(name="not_st", args={}),
+            RuleCall(name="not_bj", args={}),
+            RuleCall(name="first_limit_up", args={"offset": 1}),
+            RuleCall(name="not_limit_up", args={"offset": 0}),
+            RuleCall(name="not_yiziban", args={"offset": 1}),
+            RuleCall(name="gt", args={"left": "HIGH[0]", "right": "CLOSE[1]"}),
+            RuleCall(name="circ_mv_lt", args={"threshold_yi": 150}),
+            RuleCall(name="has_lower_shadow", args={"min_ratio": 0.5, "min_amplitude": 0.02, "offset": 0}),
+            RuleCall(name="no_consec_ups_in_window", args={"threshold": 3, "window": 8}),
+            RuleCall(name="no_limit_down_in_window", args={"window": 30}),
+            RuleCall(name="has_prior_limit_up", args={"window": 120, "exclude_offset": 1}),
+        ],
         include_columns=[
             "CIRC_MV[0]",
             "BODY_UPPER[0]",
@@ -126,6 +149,11 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
             lt("BODY_UPPER[0]", "BODY_UPPER[1]"),
             lt("BODY_LOWER[0]", "BODY_LOWER[1]"),
             has_lower_shadow(0.5, 0.02, 0),
+        ],
+        rule_calls=[
+            RuleCall(name="lt", args={"left": "BODY_UPPER[0]", "right": "BODY_UPPER[1]"}),
+            RuleCall(name="lt", args={"left": "BODY_LOWER[0]", "right": "BODY_LOWER[1]"}),
+            RuleCall(name="has_lower_shadow", args={"min_ratio": 0.5, "min_amplitude": 0.02, "offset": 0}),
         ],
         include_columns=[
             "BODY_UPPER[0]",

@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Week 7.5 C.4 — builtin pool fork-to-user**：
+  - `ScreenPreset` 加 `rule_calls: list[RuleCall]` 字段；presets.py 给两个 builtin
+    pool（n-shape-pool1 / pool2）手写维护 rule_calls 元数据（跟 rules 闭包列表
+    一一对应）。`load_user_presets` 也填 rule_calls 给 user pool
+  - 新增 `canvas_persistence.fork_builtin_to_user(builtin, target=None)`：把 builtin
+    的 rule_calls + description + include_columns 写到 `user_presets/<base>.json`
+  - canvas 右侧 builtin pool 详情加「🍴 Fork as user/<name>」按钮：fork 后 runtime
+    merge PRESET_SCREENS + 切 `active_pool_id` 到新 user pool + 重建画布 state，
+    无需重启 streamlit 即可编辑
+  - dirty 检测改用 `_normalize_rule_call`（通过 args_model 校验+dump），规避 widget
+    写回 int→float 类型差异导致的虚假 dirty banner
+
 ### Fixed
 
 - **Week 7.5 C.1.2 — 画布 selected_id 在 popover / 拖动后被重置 bug**

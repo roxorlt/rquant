@@ -25,6 +25,7 @@ from rquant.config import settings
 from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_date
 from rquant.dashboard.canvas_persistence import (
     base_name_of,
+    fork_builtin_to_user,
     is_user_pool,
     load_user_pool_raw,
     load_user_pool_rule_calls,
@@ -193,10 +194,15 @@ with left:
 
 # 同步：画布 state 是 react-flow 自己管的（含拖动后的节点位置 / zoom 等），需要保留。
 # active_pool_id 仅在新 selected_id 是合法 pool 名时更新；None / 未知值不覆盖。
+# 一次性 _skip_next_selected_sync：fork 等动作后，前端 react-flow 可能还记得旧
+# selected_id，需要跳过一次同步保留主动设置的 active_pool_id。
 st.session_state.canvas_state = new_canvas_state
-_new_sel = new_canvas_state.selected_id
-if _new_sel and _new_sel in PRESET_SCREENS:
-    st.session_state.active_pool_id = _new_sel
+if st.session_state.pop("_skip_next_selected_sync", False):
+    pass
+else:
+    _new_sel = new_canvas_state.selected_id
+    if _new_sel and _new_sel in PRESET_SCREENS:
+        st.session_state.active_pool_id = _new_sel
 
 
 # ── 右侧详情 ──
@@ -233,8 +239,23 @@ def _ensure_pending_loaded(selected_id: str) -> list[RuleCall]:
     return st.session_state[key]
 
 
+def _normalize_rule_call(rc: RuleCall) -> dict:
+    """通过 args_model 校验+dump 归一化 args 类型（如 int 150 → float 150.0 for
+    threshold_yi）。规避 widget 写回类型变化误判 dirty。spec 未注册时 fallback 到 raw。"""
+    from rquant.llm.registry import get_rule_spec
+
+    try:
+        spec = get_rule_spec(rc.name)
+        validated = spec.args_model.model_validate(rc.args)
+        return {"name": rc.name, "args": validated.model_dump()}
+    except Exception:
+        return {"name": rc.name, "args": rc.args}
+
+
 def _is_dirty(pending: list[RuleCall], initial: list[RuleCall]) -> bool:
-    return [rc.model_dump() for rc in pending] != [rc.model_dump() for rc in initial]
+    return [_normalize_rule_call(rc) for rc in pending] != [
+        _normalize_rule_call(rc) for rc in initial
+    ]
 
 
 def _render_dirty_banner(selected_id: str, pending: list[RuleCall], initial: list[RuleCall]) -> None:
@@ -350,11 +371,41 @@ with right:
 
         st.divider()
 
-        # —— 用户 pool：CRUD UI；builtin：read-only 提示
+        # —— 用户 pool：CRUD UI；builtin：read-only + Fork 按钮
         if is_user_pool(selected_id):
             _render_user_pool_crud(selected_id)
         else:
-            st.info("📖 builtin pool 只读 · fork-to-user 功能在后续 PR")
+            st.info("📖 builtin pool 只读 · 点下方按钮 fork 一份到 user/ 即可编辑")
+            cols = st.columns([0.65, 0.35])
+            cols[0].caption(f"会创建 `user_presets/{selected_id}.json`，含当前所有规则副本")
+            if cols[1].button(
+                f"🍴 Fork as user/{selected_id}",
+                key=f"fork_{selected_id}",
+                use_container_width=True,
+                type="primary",
+            ):
+                try:
+                    path = fork_builtin_to_user(selected_id)
+                    # runtime merge 新 user pool 到 PRESET_SCREENS（streamlit 单进程，安全）
+                    from rquant.presets import load_user_presets
+                    from pathlib import Path as _P
+                    PRESET_SCREENS.update(
+                        load_user_presets(_P(settings.data_dir) / "user_presets")
+                    )
+                    # 清画布 state 让 _build_initial_state 重新 include 新 pool
+                    st.session_state.pop("canvas_state", None)
+                    # 切到新 user pool（active_pool_id）
+                    st.session_state.active_pool_id = f"user/{selected_id}"
+                    # 一次性 flag：下一次 rerun 时跳过 streamlit_flow.selected_id 同步，
+                    # 否则 react-flow 内部状态还记得是 builtin selected，会把 active 覆盖回去
+                    st.session_state["_skip_next_selected_sync"] = True
+                    _cached_diagnose.clear()
+                    st.toast(f"✓ Fork OK：{path.name}")
+                    st.rerun()
+                except FileExistsError as e:
+                    st.warning(str(e))
+                except Exception as e:
+                    st.error(f"fork 失败：{e}")
 
         st.divider()
 
