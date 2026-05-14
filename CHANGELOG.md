@@ -6,6 +6,22 @@
 
 ### Added
 
+- **Week 7.5 C.2 — NL 改 user pool（DeepSeek + diff 预览）**：
+  - 新增 `prompts.build_edit_system_prompt(current_rule_calls)`：编辑场景 system
+    prompt 注入当前规则状态，让 LLM 在此基础上输出**完整新规则列表**（不是 patch）
+  - `DeepSeekClient.nl_to_screen_plan(query, today, *, current_rule_calls=None)`：
+    新增 optional 参数；传 current_rule_calls 时走编辑 prompt，None 时走原 few-shot
+    新建 prompt
+  - 新增 `src/rquant/dashboard/canvas_nl_edit.py`：
+    - `nl_edit_pool(query, current, today)` → list[RuleCall]
+    - `diff_rule_calls(old, new)` → (added, removed, unchanged)，args 通过
+      args_model 归一化避免类型差异误判
+  - user pool 详情底部加 NL 输入区：输指令 → 「📤 解析」→ diff 预览（➕ 绿色
+    新增 / ✕ 红色划线删除）→ 「✓ 应用提议到 pending」
+  - 用 `st.button(on_click=callback)` 模式而不是 `if st.button():` —— 后者在
+    input 改值紧接 button click 的 streamlit widget 嵌套场景下偶尔返回 False
+
+
 - **Week 7.5 C.3 — 画布 pool CRUD（新建 / 删除 user pool）**：
   - sidebar 加 expander「➕ 新建空 user pool」：输 base name + description → 创建
     空 user pool → runtime merge + 切 active；新 pool 立即出现在画布

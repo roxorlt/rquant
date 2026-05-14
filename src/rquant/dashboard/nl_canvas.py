@@ -23,6 +23,7 @@ from streamlit_flow.state import StreamlitFlowState
 
 from rquant.config import settings
 from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_date
+from rquant.dashboard.canvas_nl_edit import diff_rule_calls, nl_edit_pool
 from rquant.dashboard.canvas_persistence import (
     base_name_of,
     delete_user_pool,
@@ -36,6 +37,7 @@ from rquant.dashboard.canvas_rule_editor import (
     render_args_form,
     rule_spec_options,
 )
+from rquant.llm.client import LLMClarificationNeeded, LLMError
 from rquant.llm.schemas import RuleCall
 from rquant.presets import PRESET_SCREENS
 from rquant.storage.duckdb import DuckDBStore
@@ -372,6 +374,134 @@ def _render_add_rule_popover(selected_id: str, pending: list[RuleCall]) -> None:
             st.rerun()
 
 
+def _nl_parse_callback(selected_id: str, today: str) -> None:
+    """st.button on_click 回调：button click 那次 rerun **之前**同步执行。
+    用这个模式而不是 if st.button(): 是因为后者在 input → button 同 rerun 时
+    可能返回 False（streamlit 1.57 widget 嵌套场景观察到）。"""
+    nl_input_key = f"nl_input__{selected_id}"
+    pkey = f"nl_proposed__{selected_id}"
+    qkey = f"nl_query__{selected_id}"
+    ekey = f"nl_error__{selected_id}"
+    ckey = f"nl_clarify__{selected_id}"
+
+    # 清旧 transient 错误 / clarify
+    st.session_state.pop(ekey, None)
+    st.session_state.pop(ckey, None)
+
+    query = (st.session_state.get(nl_input_key, "") or "").strip()
+    if not query:
+        st.session_state[ekey] = "请先输入指令"
+        return
+    pending: list[RuleCall] = st.session_state.get(_pending_key(selected_id), [])
+    try:
+        proposed = nl_edit_pool(query, pending, today=today)
+        st.session_state[pkey] = proposed
+        st.session_state[qkey] = query
+    except LLMClarificationNeeded as e:
+        st.session_state[ckey] = str(e)
+    except LLMError as e:
+        st.session_state[ekey] = f"LLM 调用失败：{e}"
+    except Exception as e:
+        st.session_state[ekey] = f"解析失败：{e}"
+
+
+def _nl_apply_callback(selected_id: str) -> None:
+    pkey = f"nl_proposed__{selected_id}"
+    qkey = f"nl_query__{selected_id}"
+    proposed = st.session_state.get(pkey)
+    if proposed is None:
+        return
+    st.session_state[_pending_key(selected_id)] = proposed
+    st.session_state.pop(pkey, None)
+    st.session_state.pop(qkey, None)
+
+
+def _nl_clear_callback(selected_id: str) -> None:
+    for k in (
+        f"nl_proposed__{selected_id}",
+        f"nl_query__{selected_id}",
+        f"nl_error__{selected_id}",
+        f"nl_clarify__{selected_id}",
+    ):
+        st.session_state.pop(k, None)
+
+
+def _render_nl_edit_section(selected_id: str, pending: list[RuleCall]) -> None:
+    """C.2 NL 改 pool：DeepSeek 解析 → diff 预览 → 一键应用。
+
+    用 st.button on_click 回调而不是 `if st.button(): ...` —— 后者在 input 改值
+    紧接 button click 的场景下 button() 偶尔返回 False（widget rerun 时机问题）。
+    """
+    pkey = f"nl_proposed__{selected_id}"
+    qkey = f"nl_query__{selected_id}"
+    ekey = f"nl_error__{selected_id}"
+    ckey = f"nl_clarify__{selected_id}"
+    nl_input_key = f"nl_input__{selected_id}"
+
+    if not settings.deepseek_enabled:
+        st.warning("🧠 NL 改 pool：DEEPSEEK_API_KEY 未配置")
+        return
+
+    st.markdown("**🧠 NL 改 pool（DeepSeek）**")
+    st.caption("用一句话描述你想怎么改，LLM 会基于当前规则产出修改建议供预览")
+    st.text_input(
+        "指令",
+        key=nl_input_key,
+        placeholder="例：加 first_limit_up offset=1；删 circ_mv_lt",
+        label_visibility="collapsed",
+    )
+    cols = st.columns([0.75, 0.25])
+    cols[0].button(
+        "📤 解析",
+        key=f"nl_parse__{selected_id}",
+        type="primary",
+        use_container_width=True,
+        on_click=_nl_parse_callback,
+        args=(selected_id, trade_date),
+    )
+    cols[1].button(
+        "✕",
+        key=f"nl_clear__{selected_id}",
+        use_container_width=True,
+        help="清提议",
+        on_click=_nl_clear_callback,
+        args=(selected_id,),
+    )
+
+    # 渲染回调留下的 transient 反馈
+    if ekey in st.session_state:
+        st.error(st.session_state[ekey])
+    if ckey in st.session_state:
+        st.info(f"💬 LLM 需要澄清：\n\n{st.session_state[ckey]}")
+
+    # —— 显示 diff
+    proposed = st.session_state.get(pkey)
+    if proposed is None:
+        return
+    added, removed, unchanged = diff_rule_calls(pending, proposed)
+    st.markdown(
+        f"**diff 预览**：保留 {len(unchanged)} · ➕ 新增 {len(added)} · ✕ 删除 {len(removed)}"
+    )
+    for rc in added:
+        st.markdown(f"<span style='color:#2e7d32'>➕ `{rc.name}` `{rc.args}`</span>",
+                    unsafe_allow_html=True)
+    for rc in removed:
+        st.markdown(f"<span style='color:#c62828;text-decoration:line-through'>✕ `{rc.name}` `{rc.args}`</span>",
+                    unsafe_allow_html=True)
+    if not added and not removed:
+        st.caption("LLM 提议跟当前规则一致，无需改动")
+
+    st.button(
+        "✓ 应用提议到 pending",
+        key=f"nl_apply__{selected_id}",
+        type="primary",
+        use_container_width=True,
+        disabled=(not added and not removed),
+        on_click=_nl_apply_callback,
+        args=(selected_id,),
+    )
+
+
 def _render_user_pool_crud(selected_id: str) -> None:
     pending: list[RuleCall] = _ensure_pending_loaded(selected_id)
     initial: list[RuleCall] = _initial_pending(selected_id)
@@ -388,6 +518,9 @@ def _render_user_pool_crud(selected_id: str) -> None:
         _render_compact_rule_row(selected_id, i, rc, pending)
 
     _render_add_rule_popover(selected_id, pending)
+
+    # —— C.2: NL 改 pool（DeepSeek 解析 + diff 预览 + 一键应用）
+    _render_nl_edit_section(selected_id, pending)
 
     # —— C.3: 删除 user pool（二次确认）
     confirm_key = f"confirm_delete__{selected_id}"

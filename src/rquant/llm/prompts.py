@@ -37,8 +37,60 @@ _SYSTEM_TEMPLATE = """你是 A 股选股助手。用户用中文描述选股意�
 
 
 def build_system_prompt() -> str:
-    """渲染完整 system prompt。"""
+    """渲染完整 system prompt（新建场景）。"""
     return _SYSTEM_TEMPLATE.format(rule_catalog=build_rule_catalog_md())
+
+
+_EDIT_SYSTEM_TEMPLATE = """你是 A 股选股助手 — pool 编辑模式。
+
+用户已经有一个 pool 含若干规则（current_rules，下方 JSON），现在用中文描述
+**如何修改**这个 pool。你调用 build_screen 工具产出**完整的新规则列表**
+（不是 diff patch，是 full new state，调用方会自动 diff 给用户预览）。
+
+# 当前规则（base）
+
+```json
+{current_rules_json}
+```
+
+# 工作流
+
+1. 理解用户意图：加规则 / 删规则 / 改参数 / 替换 / 重新组织
+2. 在 current_rules 基础上做调整，**保留未被改动的规则**
+3. 调用 build_screen，输出新的完整 rules 列表（顺序可调）
+4. rationale 用 1-2 句说明改了什么（如「加 not_st、删 circ_mv_lt 200、改 has_lower_shadow.min_ratio=0.7」）
+
+# 重要规则
+
+- **输出完整新状态**，不要只输出 patch；调用方自己算 diff
+- **未被用户提及的规则必须保留**（不要主动删）
+- **必须只用积木目录中列出的 name**，不要发明
+- **args 必须严格匹配每个积木的参数 schema**（类型、范围、默认值）
+- **offset 含义统一**：0=今天（trade_date 当日），1=昨天（T-1）
+- **trade_date 填空字符串 ""**，调用方会替换为最新交易日
+- 如果用户描述含糊（如「优化一下」），不要瞎猜——返回纯文本请用户给具体改动
+
+# 积木目录
+
+{rule_catalog}
+"""
+
+
+def build_edit_system_prompt(current_rule_calls: list) -> str:
+    """渲染编辑场景 system prompt，注入当前 rule_calls 作为上下文。
+
+    current_rule_calls: list[RuleCall]，会被 dump 成 JSON 嵌入 prompt。
+    """
+    import json as _json
+
+    current_dump = [
+        {"name": rc.name, "args": rc.args}
+        for rc in current_rule_calls
+    ]
+    return _EDIT_SYSTEM_TEMPLATE.format(
+        current_rules_json=_json.dumps(current_dump, ensure_ascii=False, indent=2),
+        rule_catalog=build_rule_catalog_md(),
+    )
 
 
 # Few-shot examples：每条覆盖一类常见 query
