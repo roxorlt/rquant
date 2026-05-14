@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Week 7.5 C.1.2 — 画布 selected_id 在 popover / 拖动后被重置 bug**
+  （`src/rquant/dashboard/nl_canvas.py`）：用户反馈两个交互 bug：
+  (1) 在「➕ 加规则」popover 内点 selectbox / 加入按钮，rerun 时 streamlit-flow
+  返回 `state.selected_id = None`，右侧详情立刻退回「点击左侧节点」空状态；
+  (2) 拖动节点完成时 react-flow 也把 selected_id 清成 None，详情同样消失。
+  修：把当前选中 pool 单独存到 `st.session_state.active_pool_id`，只有在
+  streamlit-flow 返回的新 selected_id 是合法 pool 名（命中 `PRESET_SCREENS`）时
+  才更新；None / 未知值不覆盖。右侧详情读 `active_pool_id` 而不是
+  `canvas_state.selected_id`。
+  playwright e2e 自测 6 个 case 全过（click 节点 / click 空白 / 拖动 / popover
+  加规则 / 改 args / 保存写盘）。
+
 ### Changed
 
 - **Week 7.5 C.1.1 — 画布 UI 精致化**（`src/rquant/dashboard/nl_canvas.py`）：用户反馈

@@ -157,10 +157,19 @@ with st.sidebar:
 if "canvas_state" not in st.session_state:
     st.session_state.canvas_state = _build_initial_state()
 
+# active_pool_id 单独存 session_state，跟 streamlit-flow 内部 selected_id 解耦。
+# 修复 C.1.2 bug：
+#   1. popover 内选 selectbox / 点按钮后，rerun 时 streamlit-flow 返回的 state.selected_id
+#      在前端可能因 popover 占位 / "空白点击"判定 被设回 None
+#   2. 拖动节点完成时 react-flow 也会把 selected_id 设为 None
+#   只有在新 selected_id 是合法 pool 名时才更新 active，None / 未知值保留原值。
+if "active_pool_id" not in st.session_state:
+    st.session_state.active_pool_id = None
+
 left, right = st.columns([0.6, 0.4], gap="medium")
 
 with left:
-    st.session_state.canvas_state = streamlit_flow(
+    new_canvas_state = streamlit_flow(
         key="nl_canvas",
         state=st.session_state.canvas_state,
         layout=LayeredLayout(direction="right", node_node_spacing=80, node_layer_spacing=180),
@@ -181,6 +190,13 @@ with left:
         hide_watermark=True,
         style={"border": "1px solid #e6e6e6", "borderRadius": "8px"},
     )
+
+# 同步：画布 state 是 react-flow 自己管的（含拖动后的节点位置 / zoom 等），需要保留。
+# active_pool_id 仅在新 selected_id 是合法 pool 名时更新；None / 未知值不覆盖。
+st.session_state.canvas_state = new_canvas_state
+_new_sel = new_canvas_state.selected_id
+if _new_sel and _new_sel in PRESET_SCREENS:
+    st.session_state.active_pool_id = _new_sel
 
 
 # ── 右侧详情 ──
@@ -310,7 +326,9 @@ def _render_user_pool_crud(selected_id: str) -> None:
 
 
 with right:
-    selected_id = st.session_state.canvas_state.selected_id
+    # 用持久化的 active_pool_id 而不是 streamlit-flow 的 selected_id；
+    # selected_id 在拖动 / popover 等场景会被 react-flow 内部清成 None
+    selected_id = st.session_state.active_pool_id
     if not selected_id:
         st.markdown("### 🖱 点击左侧节点")
         st.caption("查看 pool 详情 / diagnostic 漏斗 / 命中标的 / 编辑规则")
