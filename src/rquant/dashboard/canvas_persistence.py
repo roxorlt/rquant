@@ -75,6 +75,15 @@ def save_user_pool(
     return path
 
 
+def delete_user_pool(base_name: str) -> bool:
+    """C.3：删 user_presets/<base>.json。文件不存在返回 False，删除成功返回 True。"""
+    path = user_pool_path(base_name)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
 def fork_builtin_to_user(builtin_name: str, target_base_name: str | None = None) -> Path:
     """C.4：把 builtin pool fork 成 user pool（写 user_presets/<base>.json）。
 

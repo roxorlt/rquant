@@ -25,6 +25,7 @@ from rquant.config import settings
 from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_date
 from rquant.dashboard.canvas_persistence import (
     base_name_of,
+    delete_user_pool,
     fork_builtin_to_user,
     is_user_pool,
     load_user_pool_raw,
@@ -140,6 +141,49 @@ with st.sidebar:
     st.caption(f"trade_date `{trade_date}`")
     st.caption(f"{len(PRESET_SCREENS)} 个 pool")
     st.divider()
+
+    # —— C.3: 新建 user pool（sidebar expander 表单）
+    with st.expander("➕ 新建空 user pool"):
+        new_base = st.text_input(
+            "name (base，不含 user/ 前缀)",
+            value="",
+            key="new_pool_base",
+            placeholder="my-screen-2026",
+        )
+        new_desc = st.text_input(
+            "description",
+            value="",
+            key="new_pool_desc",
+            placeholder="一句话描述这个 pool",
+        )
+        if st.button("创建", key="new_pool_btn", type="primary", use_container_width=True):
+            base = new_base.strip()
+            if not base:
+                st.warning("name 不能空")
+            elif f"user/{base}" in PRESET_SCREENS:
+                st.warning(f"user/{base} 已存在")
+            else:
+                try:
+                    save_user_pool(
+                        base,
+                        description=new_desc or f"user pool {base}",
+                        rule_calls=[],
+                        include_columns=[],
+                        source="canvas_new",
+                    )
+                    from rquant.presets import load_user_presets
+                    from pathlib import Path as _P
+                    PRESET_SCREENS.update(
+                        load_user_presets(_P(settings.data_dir) / "user_presets")
+                    )
+                    st.session_state.pop("canvas_state", None)
+                    st.session_state.active_pool_id = f"user/{base}"
+                    st.session_state["_skip_next_selected_sync"] = True
+                    st.toast(f"✓ 新建 user/{base}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"新建失败：{e}")
+
     if st.button("🔄 重置画布布局", use_container_width=True, help="重新自动叠层布局"):
         st.session_state.pop("canvas_state", None)
         st.rerun()
@@ -344,6 +388,44 @@ def _render_user_pool_crud(selected_id: str) -> None:
         _render_compact_rule_row(selected_id, i, rc, pending)
 
     _render_add_rule_popover(selected_id, pending)
+
+    # —— C.3: 删除 user pool（二次确认）
+    confirm_key = f"confirm_delete__{selected_id}"
+    if st.session_state.get(confirm_key):
+        st.error(f"⚠ 确认删除 `{selected_id}`？文件 `user_presets/{base_name_of(selected_id)}.json` 会被永久删除。")
+        cols = st.columns(2)
+        if cols[0].button("取消", key=f"cancel_del_{selected_id}", use_container_width=True):
+            st.session_state[confirm_key] = False
+            st.rerun()
+        if cols[1].button(
+            "确认删除", key=f"confirm_del_{selected_id}", type="primary", use_container_width=True
+        ):
+            base = base_name_of(selected_id)
+            try:
+                ok = delete_user_pool(base)
+                if not ok:
+                    st.warning(f"user/{base}.json 不存在")
+                else:
+                    PRESET_SCREENS.pop(selected_id, None)
+                    st.session_state.pop(_pending_key(selected_id), None)
+                    st.session_state.pop(confirm_key, None)
+                    st.session_state.pop("canvas_state", None)
+                    st.session_state.active_pool_id = None
+                    st.session_state["_skip_next_selected_sync"] = True
+                    _cached_diagnose.clear()
+                    st.toast(f"✓ 删除 user/{base}")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"删除失败：{e}")
+    else:
+        if st.button(
+            "🗑 删除此 user pool",
+            key=f"del_pool_btn_{selected_id}",
+            use_container_width=True,
+            help="物理删除 user_presets/<base>.json 文件",
+        ):
+            st.session_state[confirm_key] = True
+            st.rerun()
 
 
 with right:
