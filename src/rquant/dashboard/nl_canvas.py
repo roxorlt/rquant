@@ -82,16 +82,27 @@ st.markdown(
 )
 
 
-# ── 共享 store / diagnostic 缓存 ──
-
-@st.cache_resource
-def _shared_store() -> DuckDBStore:
-    return DuckDBStore(settings.duckdb_path, read_only=True)
+# ── Lazy DB 连接（避免 daily 17:00 拿不到 write lock）──
+#
+# 历史教训：旧版用 @st.cache_resource 缓存 DuckDBStore 实例 → 一旦用户访问 canvas
+# 触发 cache 建立，conn 永久持锁，daily 17:00 拿 exclusive write lock 失败 fatal。
+# 2026-05-14 17:00 真实事故见 PR fix-canvas-lock-leak。
+#
+# 现在改 lazy：每次 cache miss 才 `with DuckDBStore(read_only=True) as store:` 开关，
+# 函数返回后 conn 自动 close。@st.cache_data 仍缓存 diagnostic 结果，所以多次 click
+# 同一 pool 不会重连 DB。dashboard / nl-screen 跟 daily 之前共存就是这种模式。
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_diagnose(preset_name: str, trade_date: str) -> tuple[pd.DataFrame, list[tuple[str, int]]]:
-    return diagnose_preset(preset_name, trade_date, store=_shared_store())
+    with DuckDBStore(settings.duckdb_path, read_only=True) as store:
+        return diagnose_preset(preset_name, trade_date, store=store)
+
+
+def _read_latest_trade_date() -> str:
+    """每次 streamlit rerun 调用，conn 用完就 close。"""
+    with DuckDBStore(settings.duckdb_path, read_only=True) as store:
+        return latest_trade_date(store)
 
 
 def _build_initial_state(pool_refs: list[str] | None = None) -> StreamlitFlowState:
@@ -153,7 +164,7 @@ def _build_initial_state(pool_refs: list[str] | None = None) -> StreamlitFlowSta
 
 # ── Sidebar：工具栏 ──
 
-trade_date = latest_trade_date(_shared_store())
+trade_date = _read_latest_trade_date()
 
 with st.sidebar:
     st.markdown("### 🧩 rQuant 画布")

@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **canvas DuckDBStore 永久持锁导致 daily 17:00 拿 write lock 失败**（5/14 真实事故）：
+  `nl_canvas.py` 用 `@st.cache_resource` 缓存 `DuckDBStore` 实例 → 用户首次访问
+  canvas 触发 cache 建立 → conn 永久持锁不释放 → daily 17:00 拿不到 exclusive
+  write lock fatal exit（`Conflicting lock is held in ... PID xxx`）。
+  改用 lazy 模式：`_cached_diagnose` 和 `_read_latest_trade_date` 内部用
+  `with DuckDBStore(read_only=True) as store:` 自己开关 conn，函数返回后 conn
+  自动 close。`@st.cache_data(ttl=300)` 仍缓存 diagnostic 结果，重复 click 不重
+  连。dashboard / nl-screen 跟 daily 之前就是这种共存模式，没问题。
+
 ### Added
 
 - **Week 7.5 C-Canvas-2 — Canvas 内 add/remove pool（pool 池 ↔ canvas 解耦）**：
