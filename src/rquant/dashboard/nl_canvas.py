@@ -1,16 +1,15 @@
-"""rQuant NL 选股 — 节点画布版（Week 7.5 B + C.1）。
+"""rQuant 画布 — Pool 节点图 + 规则 CRUD（Week 7.5 B + C.1 + C.1.1 UI polish）。
 
 启动方式（本地开发）：
     streamlit run src/rquant/dashboard/nl_canvas.py --server.port 8503 \\
         --server.address 0.0.0.0 --server.headless true
 
-跟现有 nl_screen.py（Stage Cards 形态，8502）并存。C 阶段全部完成后再决定
-是否替代 nl_screen.py。
+阶段总览：
+  - B：read-only 画布 + per-rule diagnostic 漏斗 + 命中标的预览
+  - C.1：user/ 前缀 pool 的规则 CRUD（inline edit args / 删除 / 加规则 / 持久化）
+  - C.1.1：UI polish — CSS 隐 chrome / 节点拖动 / 紧凑规则行 / popover 加规则 / sidebar 工具栏
 
-B 阶段：read-only 画布 + per-rule diagnostic 漏斗 + 命中标的预览。
-C.1 阶段：user/ 前缀 pool 的规则 CRUD（inline edit args / × 删除 /
-  + 加规则 模板路径 / 保存 / 撤销）；builtin pool 仍只读（rules 是闭包，
-  反查不出 RuleCall args；fork-to-user 留到 C.X）。
+builtin pool 仍只读（rules 是闭包，args 反查不出；fork-to-user 推到后续）。
 """
 
 from __future__ import annotations
@@ -41,43 +40,60 @@ from rquant.storage.duckdb import DuckDBStore
 
 
 st.set_page_config(
-    page_title="rQuant NL 画布",
+    page_title="rQuant 画布",
     page_icon="🧩",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
 
+# ── CSS：让画布"全屏铺底"——压缩 streamlit 默认 padding，提高内容利用率 ──
+st.markdown(
+    """
+    <style>
+      /* 主容器 padding 收紧 */
+      .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
+      /* 顶部工具条 (Deploy 按钮等) 还在但更紧凑 */
+      header[data-testid="stHeader"] { height: 2.2rem; background: transparent; }
+      /* 把 streamlit-flow iframe 边框 / 圆角统一 */
+      iframe[src*="streamlit_flow"] { border-radius: 8px; }
+      /* 详情列：长内容时单独滚动 */
+      [data-testid="stColumn"]:nth-child(2) { max-height: 90vh; overflow-y: auto; padding-right: 0.5rem; }
+      /* 规则行紧凑：去掉 caption / divider 的上下大间距 */
+      .rule-row { padding: 0.25rem 0; border-bottom: 1px solid #eee; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ── 共享 store / diagnostic 缓存 ──
+
 @st.cache_resource
 def _shared_store() -> DuckDBStore:
-    """整个 session 共享一个 read-only DuckDBStore，避免每次回调重开。"""
     return DuckDBStore(settings.duckdb_path, read_only=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_diagnose(preset_name: str, trade_date: str) -> tuple[pd.DataFrame, list[tuple[str, int]]]:
-    """跨 rerun 缓存单个 pool 的 diagnostic + 命中表（5min TTL）。
-
-    参数都是 hashable 字符串；store 通过 _shared_store() 在内部取，不进 cache key。
-    """
     return diagnose_preset(preset_name, trade_date, store=_shared_store())
 
 
 def _build_initial_state() -> StreamlitFlowState:
-    """PRESET_SCREENS → 节点 + edge。LayeredLayout 自动横向叠层。"""
+    """PRESET_SCREENS → 节点 + edge。"""
     presets = list(PRESET_SCREENS.values())
     names = {p.name for p in presets}
     referenced = {p.depends_on for p in presets if p.depends_on in names}
 
     nodes: list[StreamlitFlowNode] = []
     for p in presets:
-        is_input = p.depends_on is None
-        is_output = p.name not in referenced
-        if is_input and is_output:
+        is_input_pool = p.depends_on is None
+        is_terminal = p.name not in referenced
+        if is_input_pool and is_terminal:
             node_type = "default"
-        elif is_input:
+        elif is_input_pool:
             node_type = "input"
-        elif is_output:
+        elif is_terminal:
             node_type = "output"
         else:
             node_type = "default"
@@ -93,7 +109,7 @@ def _build_initial_state() -> StreamlitFlowState:
                 node_type=node_type,
                 source_position="right",
                 target_position="left",
-                draggable=False,
+                draggable=True,      # C.1.1：允许拖动
                 deletable=False,
             )
         )
@@ -114,14 +130,30 @@ def _build_initial_state() -> StreamlitFlowState:
     return StreamlitFlowState(nodes=nodes, edges=edges)
 
 
-st.markdown("## 🧩 NL 选股画布")
-trade_date = latest_trade_date(_shared_store())
-st.caption(
-    f"trade_date = `{trade_date}`（DuckDB 最新交易日）· "
-    f"{len(PRESET_SCREENS)} 个 pool（builtin + `data/user_presets/*.json`）"
-)
+# ── Sidebar：工具栏 ──
 
-# 必须 stash 在 session_state，否则 streamlit_flow 库会 infinite re-render
+trade_date = latest_trade_date(_shared_store())
+
+with st.sidebar:
+    st.markdown("### 🧩 rQuant 画布")
+    st.caption(f"trade_date `{trade_date}`")
+    st.caption(f"{len(PRESET_SCREENS)} 个 pool")
+    st.divider()
+    if st.button("🔄 重置画布布局", use_container_width=True, help="重新自动叠层布局"):
+        st.session_state.pop("canvas_state", None)
+        st.rerun()
+    if st.button("🗑 清诊断缓存", use_container_width=True, help="下次点节点会重跑 SQL"):
+        _cached_diagnose.clear()
+        st.toast("已清缓存")
+    st.divider()
+    st.caption("**Pool 列表**")
+    for name in sorted(PRESET_SCREENS.keys()):
+        prefix = "🟦" if is_user_pool(name) else "⚪"
+        st.markdown(f"{prefix} `{name}`")
+
+
+# ── 主区：画布 + 详情，6:4 列 ──
+
 if "canvas_state" not in st.session_state:
     st.session_state.canvas_state = _build_initial_state()
 
@@ -132,7 +164,7 @@ with left:
         key="nl_canvas",
         state=st.session_state.canvas_state,
         layout=LayeredLayout(direction="right", node_node_spacing=80, node_layer_spacing=180),
-        height=560,
+        height=720,
         fit_view=True,
         show_controls=True,
         show_minimap=False,
@@ -147,20 +179,21 @@ with left:
         allow_zoom=True,
         min_zoom=0.3,
         hide_watermark=True,
-        style={"border": "1px solid #ddd", "borderRadius": "8px"},
+        style={"border": "1px solid #e6e6e6", "borderRadius": "8px"},
     )
 
 
+# ── 右侧详情 ──
+
 def _render_diagnostic_funnel(diagnostics: list[tuple[str, int]]) -> None:
-    """累加漏斗：每条规则一行 `name  保留数  % of 初始`。"""
     if not diagnostics:
-        st.info("无规则")
+        st.caption("无规则")
         return
-    initial = diagnostics[0][1] or 1  # 防除零
-    rows = []
-    for name, count in diagnostics:
-        pct = count / initial if initial else 0
-        rows.append({"规则": name, "保留": count, "% of 初始": f"{pct:.1%}"})
+    initial = diagnostics[0][1] or 1
+    rows = [
+        {"规则": name, "保留": count, "%": f"{(count / initial):.1%}" if initial else "—"}
+        for name, count in diagnostics
+    ]
     st.dataframe(
         pd.DataFrame(rows),
         hide_index=True,
@@ -174,9 +207,7 @@ def _pending_key(selected_id: str) -> str:
 
 
 def _initial_pending(selected_id: str) -> list[RuleCall]:
-    """C.1：从 user_presets/<base>.json 装载初始 RuleCall 列表到 pending。"""
-    base = base_name_of(selected_id)
-    return load_user_pool_rule_calls(base)
+    return load_user_pool_rule_calls(base_name_of(selected_id))
 
 
 def _ensure_pending_loaded(selected_id: str) -> list[RuleCall]:
@@ -186,106 +217,130 @@ def _ensure_pending_loaded(selected_id: str) -> list[RuleCall]:
     return st.session_state[key]
 
 
-def _render_user_pool_crud(selected_id: str, preset) -> None:
-    """C.1 CRUD UI：仅对 user/ 前缀生效。"""
+def _is_dirty(pending: list[RuleCall], initial: list[RuleCall]) -> bool:
+    return [rc.model_dump() for rc in pending] != [rc.model_dump() for rc in initial]
+
+
+def _render_dirty_banner(selected_id: str, pending: list[RuleCall], initial: list[RuleCall]) -> None:
     base = base_name_of(selected_id)
     raw = load_user_pool_raw(base) or {}
-    description = raw.get("description", preset.description)
-    include_columns = raw.get("include_columns", preset.include_columns)
+    description = raw.get("description", "")
+    include_columns = raw.get("include_columns", [])
 
-    pending: list[RuleCall] = _ensure_pending_loaded(selected_id)
-    initial: list[RuleCall] = _initial_pending(selected_id)
-    dirty = [rc.model_dump() for rc in pending] != [rc.model_dump() for rc in initial]
+    cols = st.columns([0.45, 0.25, 0.30])
+    cols[0].markdown(f"⚠ **未保存改动**（{len(pending)} 条规则 vs 磁盘 {len(initial)} 条）")
+    if cols[1].button("↩ 撤销", key=f"undo_{selected_id}", use_container_width=True):
+        st.session_state[_pending_key(selected_id)] = initial
+        st.rerun()
+    if cols[2].button(
+        "💾 保存", key=f"save_{selected_id}", type="primary", use_container_width=True
+    ):
+        try:
+            save_user_pool(
+                base,
+                description=description,
+                rule_calls=pending,
+                include_columns=include_columns,
+            )
+            _cached_diagnose.clear()
+            st.toast(f"✓ 已保存到 user_presets/{base}.json")
+        except Exception as e:
+            st.error(f"保存失败：{e}")
 
-    # —— Pending banner
-    if dirty:
-        c1, c2, c3 = st.columns([0.5, 0.25, 0.25])
-        c1.warning(f"⚠ {abs(len(pending) - len(initial))} 处改动未保存")
-        if c2.button("↩ 撤销", key=f"undo_{selected_id}", use_container_width=True):
-            st.session_state[_pending_key(selected_id)] = initial
-            st.rerun()
-        if c3.button("💾 保存", key=f"save_{selected_id}", type="primary", use_container_width=True):
-            try:
-                save_user_pool(
-                    base,
-                    description=description,
-                    rule_calls=pending,
-                    include_columns=include_columns,
-                )
-                # 清 cache 让 diagnostic / PRESET_SCREENS 下次重载
-                _cached_diagnose.clear()
-                st.success(f"✓ 已保存到 user_presets/{base}.json（重启 streamlit 让 PRESET_SCREENS 重载）")
-            except Exception as e:
-                st.error(f"保存失败：{e}")
 
-    st.markdown("**规则列表**")
-    if not pending:
-        st.caption("空 pool —— 用下面的 `+ 加规则` 加第一条")
-
-    # —— 每条规则一行
-    for i, rc in enumerate(pending):
-        with st.expander(f"`{i + 1}` · `{rc.name}` `{rc.args}`", expanded=False):
+def _render_compact_rule_row(selected_id: str, idx: int, rc: RuleCall, pending: list[RuleCall]) -> None:
+    """一条规则一行（紧凑无 expander）：`N · name`  |  args inline  |  [✓][×]"""
+    container = st.container(border=False)
+    with container:
+        st.markdown(f"<div class='rule-row'></div>", unsafe_allow_html=True)
+        # 第一行：序号 + 规则名 + args 表单（横向铺开）
+        header = st.columns([0.05, 0.40, 0.45, 0.05, 0.05])
+        header[0].markdown(f"**{idx + 1}**")
+        header[1].markdown(f"`{rc.name}`")
+        with header[2]:
             new_args = render_args_form(
                 rc.name,
                 rc.args,
-                key_prefix=f"{selected_id}_rule{i}",
+                key_prefix=f"{selected_id}_rule{idx}",
             )
-            cols = st.columns([0.7, 0.3])
-            if cols[0].button("应用参数", key=f"apply_{selected_id}_{i}"):
-                pending[i] = RuleCall(name=rc.name, args=new_args or {})
-                st.rerun()
-            if cols[1].button("× 删除", key=f"del_{selected_id}_{i}"):
-                pending.pop(i)
-                st.rerun()
+        # 检测 args 变化 → 自动更新 pending（无需"应用"按钮）
+        if new_args is not None and new_args != rc.args:
+            pending[idx] = RuleCall(name=rc.name, args=new_args)
+        if header[3].button("📋", key=f"dup_{selected_id}_{idx}", help="复制此规则"):
+            pending.insert(idx + 1, RuleCall(name=rc.name, args=dict(rc.args)))
+            st.rerun()
+        if header[4].button("✕", key=f"del_{selected_id}_{idx}", help="删除此规则"):
+            pending.pop(idx)
+            st.rerun()
 
-    # —— + 加规则（模板路径）
-    st.markdown("**+ 加规则（模板）**")
-    options = rule_spec_options()
-    labels = [label for _, label in options]
-    chosen_idx = st.selectbox(
-        "选规则",
-        range(len(options)),
-        format_func=lambda i: labels[i],
-        key=f"add_rule_select_{selected_id}",
-    )
-    chosen_name = options[chosen_idx][0]
-    st.caption("默认参数；加完后展开规则行调参数")
-    if st.button("➕ 加到 pending", key=f"add_btn_{selected_id}"):
-        pending.append(RuleCall(name=chosen_name, args={}))
-        st.rerun()
+
+def _render_add_rule_popover(selected_id: str, pending: list[RuleCall]) -> None:
+    """+ 加规则 用 popover，弹小窗选 RuleSpec + 一键加"""
+    with st.popover("➕ 加规则", use_container_width=True):
+        st.caption("选一条积木加到 pending（默认参数，加完上方可改）")
+        options = rule_spec_options()
+        chosen_idx = st.selectbox(
+            "规则",
+            range(len(options)),
+            format_func=lambda i: options[i][1],
+            key=f"add_rule_select_{selected_id}",
+            label_visibility="collapsed",
+        )
+        if st.button("加入", key=f"add_btn_{selected_id}", type="primary", use_container_width=True):
+            pending.append(RuleCall(name=options[chosen_idx][0], args={}))
+            st.rerun()
+
+
+def _render_user_pool_crud(selected_id: str) -> None:
+    pending: list[RuleCall] = _ensure_pending_loaded(selected_id)
+    initial: list[RuleCall] = _initial_pending(selected_id)
+
+    if _is_dirty(pending, initial):
+        _render_dirty_banner(selected_id, pending, initial)
+    else:
+        st.caption("💡 改任意参数后会出现「保存」按钮 · 改完点保存写盘")
+
+    if not pending:
+        st.caption("空 pool — 用下方 ➕ 加规则 开始")
+
+    for i, rc in enumerate(pending):
+        _render_compact_rule_row(selected_id, i, rc, pending)
+
+    _render_add_rule_popover(selected_id, pending)
 
 
 with right:
     selected_id = st.session_state.canvas_state.selected_id
     if not selected_id:
-        st.info("👈 点击左侧节点查看 pool 详情 / diagnostic / 命中标的")
+        st.markdown("### 🖱 点击左侧节点")
+        st.caption("查看 pool 详情 / diagnostic 漏斗 / 命中标的 / 编辑规则")
     elif selected_id not in PRESET_SCREENS:
         st.warning(f"未知节点 `{selected_id}`")
     else:
         preset = PRESET_SCREENS[selected_id]
+        # —— 标题 + meta 一行
         st.markdown(f"### `{preset.name}`")
-        st.caption(preset.description)
-
-        meta_lines = []
+        meta = []
         if preset.depends_on:
-            meta_lines.append(
-                f"**依赖**：`{preset.depends_on}` + offset `{preset.offset_days}d`"
-            )
+            meta.append(f"依赖 `{preset.depends_on}`（offset {preset.offset_days}d）")
         else:
-            meta_lines.append("**输入**：全市场")
-        meta_lines.append(f"**规则数**：{len(preset.rules)}")
-        st.markdown("\n\n".join(meta_lines))
+            meta.append("输入 全市场")
+        meta.append(f"{len(preset.rules)} 条规则")
+        st.caption(" · ".join(meta))
+        if preset.description:
+            st.caption(preset.description)
 
-        # —— C.1: user/ pool 编辑 UI；builtin 显示提示
+        st.divider()
+
+        # —— 用户 pool：CRUD UI；builtin：read-only 提示
         if is_user_pool(selected_id):
-            with st.container(border=True):
-                _render_user_pool_crud(selected_id, preset)
+            _render_user_pool_crud(selected_id)
         else:
-            st.info(
-                "💡 builtin pool 不可编辑（rules 是闭包，参数不可反查）。"
-                "要编辑请用 8502 端口 NL Screen 创建 user/ 副本，或等 fork-to-user 功能上线。"
-            )
+            st.info("📖 builtin pool 只读 · fork-to-user 功能在后续 PR")
 
+        st.divider()
+
+        # —— diagnostic 漏斗 + 命中表（折叠到 expander 节省视高）
         with st.spinner("跑 diagnostic + 命中表…"):
             try:
                 hits_df, diagnostics = _cached_diagnose(selected_id, trade_date)
@@ -293,13 +348,11 @@ with right:
                 st.error(f"diagnostic 失败：{e}")
                 hits_df, diagnostics = pd.DataFrame(), []
 
-        # —— 漏斗
-        st.markdown(f"**diagnostic 漏斗** (最终 `{len(hits_df)}` 只)")
-        _render_diagnostic_funnel(diagnostics)
+        with st.expander(f"📊 diagnostic 漏斗（最终 {len(hits_df)} 只）", expanded=True):
+            _render_diagnostic_funnel(diagnostics)
 
-        # —— 命中表
-        st.markdown(f"**命中标的** · `{len(hits_df)}` 只")
-        if hits_df.empty:
-            st.caption("无命中（可能是当日数据不全 / 父预设为空）")
-        else:
-            st.dataframe(hits_df, hide_index=True, use_container_width=True, height=240)
+        with st.expander(f"📋 命中标的（{len(hits_df)} 只）", expanded=False):
+            if hits_df.empty:
+                st.caption("无命中（当日数据不全 / 父预设为空）")
+            else:
+                st.dataframe(hits_df, hide_index=True, use_container_width=True, height=240)
