@@ -1,0 +1,27 @@
+[Unit]
+Description=rQuant 画布 - 节点画布 + Pool CRUD + NL 编辑 (Streamlit, independent app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/streamlit run \
+    /home/lighthouse/rquant/src/rquant/dashboard/nl_canvas.py \
+    --server.port 8504 \
+    --server.address 0.0.0.0 \
+    --server.headless true \
+    --browser.gatherUsageStats false
+
+Restart=always
+RestartSec=10
+TimeoutStartSec=60
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

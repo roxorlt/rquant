@@ -6,6 +6,14 @@
 
 ### Added
 
+- **Week 7.5 部署 — `rquant-canvas.service` (端口 8504) + nginx /canvas/ 反代**：
+  - 新增 `deploy/systemd/rquant-canvas.service`：streamlit run nl_canvas.py 端口
+    8504 / EnvironmentFile=/home/lighthouse/rquant/.env（复用 DEEPSEEK_API_KEY）
+  - 改 `deploy/nginx/rquant-backup.conf`：加 `location /canvas/` 反代到 8504，
+    复用 `.rquant-backup.htpasswd`
+  - 新增 `deploy/canvas.md`：详细部署清单 + 验证命令 + 故障排查
+  - 入口：`http://82.156.0.68:8081/canvas/`（基础认证同 dashboard / nl）
+
 - **Week 7.5 C.2 — NL 改 user pool（DeepSeek + diff 预览）**：
   - 新增 `prompts.build_edit_system_prompt(current_rule_calls)`：编辑场景 system
     prompt 注入当前规则状态，让 LLM 在此基础上输出**完整新规则列表**（不是 patch）
