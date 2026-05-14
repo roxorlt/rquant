@@ -23,6 +23,15 @@ from streamlit_flow.state import StreamlitFlowState
 
 from rquant.config import settings
 from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_date
+from rquant.dashboard.canvas_files import (
+    DEFAULT_NAME as CANVAS_DEFAULT_NAME,
+    add_pool_to_canvas,
+    delete_canvas,
+    filter_pool_refs,
+    list_canvases,
+    load_canvas,
+    save_canvas,
+)
 from rquant.dashboard.canvas_nl_edit import diff_rule_calls, nl_edit_pool
 from rquant.dashboard.canvas_persistence import (
     base_name_of,
@@ -83,9 +92,15 @@ def _cached_diagnose(preset_name: str, trade_date: str) -> tuple[pd.DataFrame, l
     return diagnose_preset(preset_name, trade_date, store=_shared_store())
 
 
-def _build_initial_state() -> StreamlitFlowState:
-    """PRESET_SCREENS → 节点 + edge。"""
-    presets = list(PRESET_SCREENS.values())
+def _build_initial_state(pool_refs: list[str] | None = None) -> StreamlitFlowState:
+    """根据 canvas 的 pool_refs 过滤 PRESET_SCREENS → 节点 + edge。
+
+    pool_refs=None 时回退到全部 pool（兼容老逻辑）。
+    """
+    if pool_refs is None:
+        presets = list(PRESET_SCREENS.values())
+    else:
+        presets = [PRESET_SCREENS[n] for n in pool_refs if n in PRESET_SCREENS]
     names = {p.name for p in presets}
     referenced = {p.depends_on for p in presets if p.depends_on in names}
 
@@ -141,10 +156,123 @@ trade_date = latest_trade_date(_shared_store())
 with st.sidebar:
     st.markdown("### 🧩 rQuant 画布")
     st.caption(f"trade_date `{trade_date}`")
-    st.caption(f"{len(PRESET_SCREENS)} 个 pool")
+
+    # —— C-Canvas-1: 多画布切换 ——
+    metas = list_canvases()
+    if "active_canvas" not in st.session_state:
+        st.session_state.active_canvas = CANVAS_DEFAULT_NAME
+    canvas_options = [m.name for m in metas]
+    canvas_display = {m.name: m.display_name for m in metas}
+    cur_idx = (
+        canvas_options.index(st.session_state.active_canvas)
+        if st.session_state.active_canvas in canvas_options
+        else 0
+    )
+    chosen = st.selectbox(
+        "当前画布",
+        canvas_options,
+        index=cur_idx,
+        format_func=lambda n: canvas_display.get(n, n),
+        key="canvas_picker",
+    )
+    if chosen != st.session_state.active_canvas:
+        st.session_state.active_canvas = chosen
+        st.session_state.pop("canvas_state", None)
+        st.session_state["_skip_next_selected_sync"] = True
+        st.rerun()
+
+    # —— 当前画布详情 + CRUD
+    try:
+        current_canvas = load_canvas(st.session_state.active_canvas)
+    except FileNotFoundError:
+        # 用户删了 canvas 但 session 还指向它 → fallback
+        st.session_state.active_canvas = CANVAS_DEFAULT_NAME
+        current_canvas = load_canvas(CANVAS_DEFAULT_NAME)
+
+    valid_pool_refs = filter_pool_refs(current_canvas)
+    st.caption(f"📦 {len(valid_pool_refs)} 个 pool" + ("（含 builtin + user）" if current_canvas.is_default else ""))
+    if current_canvas.description:
+        st.caption(current_canvas.description)
+
+    # 复制 / 删除 canvas（默认 canvas 不可改）
+    if not current_canvas.is_default:
+        cols = st.columns(2)
+        if cols[0].button("📋 复制", key="canvas_dup_btn", use_container_width=True, help="复制为新 canvas"):
+            st.session_state["_show_canvas_dup"] = True
+        if cols[1].button("🗑 删除", key="canvas_del_btn", use_container_width=True, help="删 canvas 文件，不删 pool"):
+            st.session_state["_show_canvas_del"] = True
+
+        if st.session_state.get("_show_canvas_dup"):
+            new_name = st.text_input("新 canvas 名", key="canvas_dup_name", placeholder=f"{current_canvas.name}-copy")
+            if st.button("✓ 确认复制", key="canvas_dup_ok", type="primary", use_container_width=True):
+                if not new_name.strip():
+                    st.warning("名字不能空")
+                else:
+                    try:
+                        save_canvas(
+                            new_name.strip(),
+                            description=current_canvas.description,
+                            pool_refs=list(current_canvas.pool_refs),
+                            source="canvas_dup",
+                        )
+                        st.session_state.active_canvas = new_name.strip()
+                        st.session_state.pop("canvas_state", None)
+                        st.session_state.pop("_show_canvas_dup", None)
+                        st.session_state["_skip_next_selected_sync"] = True
+                        st.toast(f"✓ 复制为 {new_name.strip()}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"复制失败：{e}")
+
+        if st.session_state.get("_show_canvas_del"):
+            st.error(f"⚠ 确认删 canvas `{current_canvas.name}`？只删文件，不删 pool。")
+            cols = st.columns(2)
+            if cols[0].button("取消", key="canvas_del_cancel", use_container_width=True):
+                st.session_state.pop("_show_canvas_del", None)
+                st.rerun()
+            if cols[1].button("✓ 确认删", key="canvas_del_ok", type="primary", use_container_width=True):
+                try:
+                    delete_canvas(current_canvas.name)
+                    st.session_state.active_canvas = CANVAS_DEFAULT_NAME
+                    st.session_state.pop("canvas_state", None)
+                    st.session_state.pop("_show_canvas_del", None)
+                    st.session_state["_skip_next_selected_sync"] = True
+                    st.toast(f"✓ 删 canvas {current_canvas.name}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"删除失败：{e}")
+
+    # —— 新建空 canvas
+    with st.expander("➕ 新建空 canvas"):
+        new_canvas_name = st.text_input("name", key="new_canvas_name", placeholder="my-strategy")
+        new_canvas_desc = st.text_input("description", key="new_canvas_desc", placeholder="一句话描述")
+        if st.button("创建", key="new_canvas_btn", type="primary", use_container_width=True):
+            nm = new_canvas_name.strip()
+            if not nm:
+                st.warning("name 不能空")
+            elif nm == CANVAS_DEFAULT_NAME:
+                st.warning(f"{CANVAS_DEFAULT_NAME} 是保留名")
+            elif nm in canvas_options:
+                st.warning(f"canvas {nm} 已存在")
+            else:
+                try:
+                    save_canvas(
+                        nm,
+                        description=new_canvas_desc or f"canvas {nm}",
+                        pool_refs=[],
+                        source="canvas_new",
+                    )
+                    st.session_state.active_canvas = nm
+                    st.session_state.pop("canvas_state", None)
+                    st.session_state["_skip_next_selected_sync"] = True
+                    st.toast(f"✓ 新建 canvas {nm}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"新建失败：{e}")
+
     st.divider()
 
-    # —— C.3: 新建 user pool（sidebar expander 表单）
+    # —— 新建 user pool（自动加到 active canvas）
     with st.expander("➕ 新建空 user pool"):
         new_base = st.text_input(
             "name (base，不含 user/ 前缀)",
@@ -178,8 +306,12 @@ with st.sidebar:
                     PRESET_SCREENS.update(
                         load_user_presets(_P(settings.data_dir) / "user_presets")
                     )
+                    # 自动加到当前 canvas（默认 canvas 自动 include 所有 pool，跳过）
+                    new_full = f"user/{base}"
+                    if not current_canvas.is_default:
+                        add_pool_to_canvas(current_canvas.name, new_full)
                     st.session_state.pop("canvas_state", None)
-                    st.session_state.active_pool_id = f"user/{base}"
+                    st.session_state.active_pool_id = new_full
                     st.session_state["_skip_next_selected_sync"] = True
                     st.toast(f"✓ 新建 user/{base}")
                     st.rerun()
@@ -193,8 +325,8 @@ with st.sidebar:
         _cached_diagnose.clear()
         st.toast("已清缓存")
     st.divider()
-    st.caption("**Pool 列表**")
-    for name in sorted(PRESET_SCREENS.keys()):
+    st.caption("**当前 canvas 含 pool**")
+    for name in valid_pool_refs:
         prefix = "🟦" if is_user_pool(name) else "⚪"
         st.markdown(f"{prefix} `{name}`")
 
@@ -202,7 +334,7 @@ with st.sidebar:
 # ── 主区：画布 + 详情，6:4 列 ──
 
 if "canvas_state" not in st.session_state:
-    st.session_state.canvas_state = _build_initial_state()
+    st.session_state.canvas_state = _build_initial_state(pool_refs=valid_pool_refs)
 
 # active_pool_id 单独存 session_state，跟 streamlit-flow 内部 selected_id 解耦。
 # 修复 C.1.2 bug：
@@ -607,6 +739,9 @@ with right:
                     PRESET_SCREENS.update(
                         load_user_presets(_P(settings.data_dir) / "user_presets")
                     )
+                    # 自动加到当前 canvas（默认 canvas 自动 include 所有 pool）
+                    if not current_canvas.is_default:
+                        add_pool_to_canvas(current_canvas.name, f"user/{selected_id}")
                     # 清画布 state 让 _build_initial_state 重新 include 新 pool
                     st.session_state.pop("canvas_state", None)
                     # 切到新 user pool（active_pool_id）
