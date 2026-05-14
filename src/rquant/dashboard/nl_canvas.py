@@ -1,18 +1,16 @@
-"""rQuant NL 选股 — 节点画布版（Week 7.5 B 阶段：只读画布 + diagnostic）。
+"""rQuant NL 选股 — 节点画布版（Week 7.5 B + C.1）。
 
 启动方式（本地开发）：
     streamlit run src/rquant/dashboard/nl_canvas.py --server.port 8503 \\
         --server.address 0.0.0.0 --server.headless true
 
-跟现有 nl_screen.py（Stage Cards 形态，8502）并存。C 阶段（规则 CRUD + NL 改）
-后再决定是否替代 nl_screen.py。
+跟现有 nl_screen.py（Stage Cards 形态，8502）并存。C 阶段全部完成后再决定
+是否替代 nl_screen.py。
 
-B 阶段功能：
-  - 全部 PRESET_SCREENS（builtin + user_presets/*.json）渲染为节点
-  - depends_on 关系渲染为带 offset 标签的 edge
-  - 节点点击 → 右侧面板：pool 描述 / 依赖 / per-rule diagnostic 漏斗 / 命中标的表
-  - DuckDB 用 read_only=True（跟 monitor / nl-screen 共存，不抢写锁）
-  - st.cache_data 缓存 diagnostic 结果（300s ttl），避免重复点击重跑 SQL
+B 阶段：read-only 画布 + per-rule diagnostic 漏斗 + 命中标的预览。
+C.1 阶段：user/ 前缀 pool 的规则 CRUD（inline edit args / × 删除 /
+  + 加规则 模板路径 / 保存 / 撤销）；builtin pool 仍只读（rules 是闭包，
+  反查不出 RuleCall args；fork-to-user 留到 C.X）。
 """
 
 from __future__ import annotations
@@ -26,6 +24,18 @@ from streamlit_flow.state import StreamlitFlowState
 
 from rquant.config import settings
 from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_date
+from rquant.dashboard.canvas_persistence import (
+    base_name_of,
+    is_user_pool,
+    load_user_pool_raw,
+    load_user_pool_rule_calls,
+    save_user_pool,
+)
+from rquant.dashboard.canvas_rule_editor import (
+    render_args_form,
+    rule_spec_options,
+)
+from rquant.llm.schemas import RuleCall
 from rquant.presets import PRESET_SCREENS
 from rquant.storage.duckdb import DuckDBStore
 
@@ -159,6 +169,92 @@ def _render_diagnostic_funnel(diagnostics: list[tuple[str, int]]) -> None:
     )
 
 
+def _pending_key(selected_id: str) -> str:
+    return f"pending_rules__{selected_id}"
+
+
+def _initial_pending(selected_id: str) -> list[RuleCall]:
+    """C.1：从 user_presets/<base>.json 装载初始 RuleCall 列表到 pending。"""
+    base = base_name_of(selected_id)
+    return load_user_pool_rule_calls(base)
+
+
+def _ensure_pending_loaded(selected_id: str) -> list[RuleCall]:
+    key = _pending_key(selected_id)
+    if key not in st.session_state:
+        st.session_state[key] = _initial_pending(selected_id)
+    return st.session_state[key]
+
+
+def _render_user_pool_crud(selected_id: str, preset) -> None:
+    """C.1 CRUD UI：仅对 user/ 前缀生效。"""
+    base = base_name_of(selected_id)
+    raw = load_user_pool_raw(base) or {}
+    description = raw.get("description", preset.description)
+    include_columns = raw.get("include_columns", preset.include_columns)
+
+    pending: list[RuleCall] = _ensure_pending_loaded(selected_id)
+    initial: list[RuleCall] = _initial_pending(selected_id)
+    dirty = [rc.model_dump() for rc in pending] != [rc.model_dump() for rc in initial]
+
+    # —— Pending banner
+    if dirty:
+        c1, c2, c3 = st.columns([0.5, 0.25, 0.25])
+        c1.warning(f"⚠ {abs(len(pending) - len(initial))} 处改动未保存")
+        if c2.button("↩ 撤销", key=f"undo_{selected_id}", use_container_width=True):
+            st.session_state[_pending_key(selected_id)] = initial
+            st.rerun()
+        if c3.button("💾 保存", key=f"save_{selected_id}", type="primary", use_container_width=True):
+            try:
+                save_user_pool(
+                    base,
+                    description=description,
+                    rule_calls=pending,
+                    include_columns=include_columns,
+                )
+                # 清 cache 让 diagnostic / PRESET_SCREENS 下次重载
+                _cached_diagnose.clear()
+                st.success(f"✓ 已保存到 user_presets/{base}.json（重启 streamlit 让 PRESET_SCREENS 重载）")
+            except Exception as e:
+                st.error(f"保存失败：{e}")
+
+    st.markdown("**规则列表**")
+    if not pending:
+        st.caption("空 pool —— 用下面的 `+ 加规则` 加第一条")
+
+    # —— 每条规则一行
+    for i, rc in enumerate(pending):
+        with st.expander(f"`{i + 1}` · `{rc.name}` `{rc.args}`", expanded=False):
+            new_args = render_args_form(
+                rc.name,
+                rc.args,
+                key_prefix=f"{selected_id}_rule{i}",
+            )
+            cols = st.columns([0.7, 0.3])
+            if cols[0].button("应用参数", key=f"apply_{selected_id}_{i}"):
+                pending[i] = RuleCall(name=rc.name, args=new_args or {})
+                st.rerun()
+            if cols[1].button("× 删除", key=f"del_{selected_id}_{i}"):
+                pending.pop(i)
+                st.rerun()
+
+    # —— + 加规则（模板路径）
+    st.markdown("**+ 加规则（模板）**")
+    options = rule_spec_options()
+    labels = [label for _, label in options]
+    chosen_idx = st.selectbox(
+        "选规则",
+        range(len(options)),
+        format_func=lambda i: labels[i],
+        key=f"add_rule_select_{selected_id}",
+    )
+    chosen_name = options[chosen_idx][0]
+    st.caption("默认参数；加完后展开规则行调参数")
+    if st.button("➕ 加到 pending", key=f"add_btn_{selected_id}"):
+        pending.append(RuleCall(name=chosen_name, args={}))
+        st.rerun()
+
+
 with right:
     selected_id = st.session_state.canvas_state.selected_id
     if not selected_id:
@@ -179,6 +275,16 @@ with right:
             meta_lines.append("**输入**：全市场")
         meta_lines.append(f"**规则数**：{len(preset.rules)}")
         st.markdown("\n\n".join(meta_lines))
+
+        # —— C.1: user/ pool 编辑 UI；builtin 显示提示
+        if is_user_pool(selected_id):
+            with st.container(border=True):
+                _render_user_pool_crud(selected_id, preset)
+        else:
+            st.info(
+                "💡 builtin pool 不可编辑（rules 是闭包，参数不可反查）。"
+                "要编辑请用 8502 端口 NL Screen 创建 user/ 副本，或等 fork-to-user 功能上线。"
+            )
 
         with st.spinner("跑 diagnostic + 命中表…"):
             try:
