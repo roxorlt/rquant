@@ -6,6 +6,14 @@
 
 ### Added
 
+- **Week 7.5 C.3 — 画布 pool CRUD（新建 / 删除 user pool）**：
+  - sidebar 加 expander「➕ 新建空 user pool」：输 base name + description → 创建
+    空 user pool → runtime merge + 切 active；新 pool 立即出现在画布
+  - user pool CRUD 底部加「🗑 删除此 user pool」按钮（二次确认）：物理删除
+    `user_presets/<base>.json` + 从 `PRESET_SCREENS` 移除 + 清 active + 重建画布
+  - 新增 `canvas_persistence.delete_user_pool(base_name) -> bool`
+  - 不在本 PR 范围（推后续）：edge 拖拽创建 / 右键删 edge / lookback_days 编辑
+
 - **Week 7.5 C.4 — builtin pool fork-to-user**：
   - `ScreenPreset` 加 `rule_calls: list[RuleCall]` 字段；presets.py 给两个 builtin
     pool（n-shape-pool1 / pool2）手写维护 rule_calls 元数据（跟 rules 闭包列表
