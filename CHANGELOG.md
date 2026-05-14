@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **systemd OnFailure 告警从单行 → markdown 包含排查/恢复命令**：5/14 真实事故复盘
+  发现 daily 17:00 失败时 alert 链路其实**成功推了 3/3** PushDeer，但 subject 太工程化
+  「[D] rquant-daily.service 失败（systemd OnFailure）」用户没注意。
+  改：
+  - 新增 `scripts/alert-on-failure.sh`：构造 markdown body 含 unit/host/time 表格 +
+    立即排查命令 + 通用恢复命令 + DuckDB 锁排查命令
+  - `deploy/systemd/rquant-alert@.service` ExecStart 改为调 wrapper script
+  - subject 改为「🚨 [RQ] %i 失败 — 立即排查」，emoji 让手机一眼看出严重性
+
 ### Fixed
 
 - **canvas DuckDBStore 永久持锁导致 daily 17:00 拿 write lock 失败**（5/14 真实事故）：
