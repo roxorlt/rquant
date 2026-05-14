@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Week 7.5 C.1.1 — 画布 UI 精致化**（`src/rquant/dashboard/nl_canvas.py`）：用户反馈
+  3 个痛点的修复——
+  - 页面标题改 "rQuant 画布"（去掉"选股"）；CSS 注入压缩 `.block-container` 顶部 padding +
+    把 streamlit header 缩到 2.2rem，画布顶到顶部
+  - 左侧 `st.sidebar` 工具栏：trade_date 显示 / 「🔄 重置画布布局」/「🗑 清诊断缓存」/ Pool
+    列表（🟦 user/⚪ builtin 区分）
+  - 画布高度 560 → 720，**节点 `draggable=True`**（用户可拖位置）
+  - 右侧详情列重做：
+    - 删 `st.expander` 包裹，规则改紧凑行（`N · name · args inline | 📋 复制 | ✕ 删除`）
+    - 参数 widget 改了 → 自动进 pending（取消原"应用参数"按钮）
+    - 加规则改 `st.popover` 弹出（小窗选规则 + 加入）
+    - diagnostic / 命中表折叠到 `st.expander`（默认展开漏斗、折叠命中表）
+    - dirty banner 单行：改动概述 + ↩ 撤销 + 💾 保存（按钮宽度均分）
+    - 顶部一行 💡 引导提示：「改参数自动进 pending，改完点保存写盘」
+
 ### Added
 
 - **Week 7.5 C.1 — NL 画布 user pool 规则 CRUD**（`src/rquant/dashboard/nl_canvas.py`）：
