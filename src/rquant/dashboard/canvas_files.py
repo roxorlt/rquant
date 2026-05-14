@@ -205,3 +205,38 @@ def filter_pool_refs(canvas: Canvas) -> list[str]:
     """过滤掉 canvas.pool_refs 中不在当前 PRESET_SCREENS 的 pool（pool 被删了）。"""
     from rquant.presets import PRESET_SCREENS
     return [p for p in canvas.pool_refs if p in PRESET_SCREENS]
+
+
+def canvas_membership_of(pool_name: str) -> list[str]:
+    """返回引用了 pool_name 的 canvas 名列表（含虚拟默认 canvas，因为它自动 include 全部）。
+
+    用法：在 pool 详情显示"该 pool 出现在哪些 canvas 中"。
+    """
+    members: list[str] = [DEFAULT_NAME]  # 默认 canvas 永远 include 全部 pool
+    cdir = canvas_dir()
+    if cdir.exists() and cdir.is_dir():
+        for path in sorted(cdir.glob("*.json")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if pool_name in raw.get("pool_refs", []):
+                    members.append(raw["name"])
+            except Exception:
+                continue
+    return members
+
+
+def set_canvas_pool_refs(canvas_name: str, pool_refs: list[str]) -> bool:
+    """C-Canvas-2: 直接 override canvas.pool_refs（用户在「管理 pool」弹窗多选后调用）。
+
+    默认 canvas 不可 override（自动 include 所有）。
+    """
+    if canvas_name == DEFAULT_NAME:
+        return False
+    canvas = load_canvas(canvas_name)
+    save_canvas(
+        canvas_name,
+        description=canvas.description,
+        pool_refs=pool_refs,
+        source="canvas_edit",
+    )
+    return True

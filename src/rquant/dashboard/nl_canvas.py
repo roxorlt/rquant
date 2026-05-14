@@ -26,11 +26,13 @@ from rquant.dashboard.canvas_diagnostic import diagnose_preset, latest_trade_dat
 from rquant.dashboard.canvas_files import (
     DEFAULT_NAME as CANVAS_DEFAULT_NAME,
     add_pool_to_canvas,
+    canvas_membership_of,
     delete_canvas,
     filter_pool_refs,
     list_canvases,
     load_canvas,
     save_canvas,
+    set_canvas_pool_refs,
 )
 from rquant.dashboard.canvas_nl_edit import diff_rule_calls, nl_edit_pool
 from rquant.dashboard.canvas_persistence import (
@@ -241,6 +243,27 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     st.error(f"删除失败：{e}")
+
+        # —— C-Canvas-2: 管理 pool 成员（仅非默认 canvas）
+        with st.expander("⚙ 管理 pool 成员"):
+            all_pool_names = sorted(PRESET_SCREENS.keys())
+            cur_pool_refs = filter_pool_refs(current_canvas)
+            chosen_pools = st.multiselect(
+                "勾选要包含的 pool",
+                all_pool_names,
+                default=cur_pool_refs,
+                key=f"canvas_pools_multi__{current_canvas.name}",
+                label_visibility="collapsed",
+            )
+            if st.button("✓ 应用", key="canvas_pools_apply", type="primary", use_container_width=True):
+                try:
+                    set_canvas_pool_refs(current_canvas.name, chosen_pools)
+                    st.session_state.pop("canvas_state", None)
+                    st.session_state["_skip_next_selected_sync"] = True
+                    st.toast(f"✓ 已更新 {current_canvas.name} 含 {len(chosen_pools)} 个 pool")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"应用失败：{e}")
 
     # —— 新建空 canvas
     with st.expander("➕ 新建空 canvas"):
@@ -715,6 +738,15 @@ with right:
         st.caption(" · ".join(meta))
         if preset.description:
             st.caption(preset.description)
+
+        # —— C-Canvas-2: 显示该 pool 出现在哪些 canvas
+        memberships = canvas_membership_of(selected_id)
+        if len(memberships) > 1:
+            non_default = [m for m in memberships if m != CANVAS_DEFAULT_NAME]
+            mship_str = "默认" + (" · " + " · ".join(non_default) if non_default else "")
+            st.caption(f"📋 在 `{len(memberships)}` 个 canvas 中：{mship_str}")
+        else:
+            st.caption("📋 只在默认 canvas")
 
         st.divider()
 
