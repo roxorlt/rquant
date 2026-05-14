@@ -6,6 +6,17 @@
 
 ### Added
 
+- **Week 7.5 C.1 — NL 画布 user pool 规则 CRUD**（`src/rquant/dashboard/nl_canvas.py`）：
+  user/ 前缀的 pool 现在可以在画布上**编辑规则**：
+  - 新增 `src/rquant/dashboard/canvas_persistence.py`：`load_user_pool_rule_calls()` /
+    `save_user_pool()`，读写 `user_presets/<base>.json`（schema 兼容 v0.12.0 nl_screen 落库格式）
+  - 新增 `src/rquant/dashboard/canvas_rule_editor.py`：基于 RuleSpec.args_model（Pydantic）
+    反射生成 inline 编辑 widget（int → number_input / float → number_input / bool → checkbox /
+    str → text_input）；`rule_spec_options()` 列所有 26 条积木供 `+ 加规则` 下拉
+  - 右侧面板新增 CRUD 块（仅 user/）：每条规则 expander（应用参数 / × 删除）+
+    `+ 加规则（模板）` 下拉 + `加到 pending` + Pending banner（撤销 / 保存）
+  - builtin pool（n-shape-pool1 / pool2）显示 info 提示「不可编辑」（rules 是闭包，参数
+    无法反查；fork-to-user 留到后续）
 - **Week 7.5 B — NL 画布接入 per-rule diagnostic + 命中标的预览**（`src/rquant/dashboard/nl_canvas.py`）：
   在 A spike 基础上加入完整 read-only 体验：
   - 新增 `src/rquant/dashboard/canvas_diagnostic.py`：`diagnose_preset()` 一次 load_universe + 内存
