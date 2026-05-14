@@ -73,3 +73,35 @@ def save_user_pool(
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def fork_builtin_to_user(builtin_name: str, target_base_name: str | None = None) -> Path:
+    """C.4：把 builtin pool fork 成 user pool（写 user_presets/<base>.json）。
+
+    依赖 builtin preset 已经填了 rule_calls（presets.py 维护）。
+    target_base_name 默认 = builtin_name。
+    若同名 user pool 已存在 → 抛 FileExistsError，避免无意覆盖。
+    """
+    # 局部 import 避开循环（canvas_persistence ← presets）
+    from rquant.presets import PRESET_SCREENS
+
+    if builtin_name not in PRESET_SCREENS:
+        raise KeyError(f"未知 preset：{builtin_name}")
+    preset = PRESET_SCREENS[builtin_name]
+    if not preset.rule_calls:
+        raise ValueError(
+            f"{builtin_name} 没有 rule_calls 元数据，无法 fork（builtin 需要维护 rule_calls）"
+        )
+
+    base = target_base_name or builtin_name
+    path = user_pool_path(base)
+    if path.exists():
+        raise FileExistsError(f"user/{base} 已存在：{path}（先删或换个名字再 fork）")
+
+    return save_user_pool(
+        base,
+        description=f"Fork from builtin/{builtin_name}：{preset.description}",
+        rule_calls=preset.rule_calls,
+        include_columns=preset.include_columns,
+        source="fork_from_builtin",
+    )
