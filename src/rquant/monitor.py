@@ -10,6 +10,7 @@ import akshare as ak
 import pandas as pd
 from loguru import logger
 
+from rquant.config import settings
 from rquant.pipeline import _compute_levels
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.storage.duckdb import DuckDBStore
@@ -274,11 +275,12 @@ def _count_trading_days_since(
 def check_exits(store: DuckDBStore, today: date) -> int:
     """收盘后检查 Pool 2 退出。
 
-    breakdown（跌破止损）→ 自动 update_pool2_exit
-    expired（超期 ≥3 日）→ 保留 active，加入待决策列表，由用户次日 CLI 处理
+    breakdown（跌破止损）→ 自动 update_pool2_exit(reason='breakdown')
+    aged_out（入池超过 pool2_max_age_days 个交易日）→ 自动 update_pool2_exit(reason='aged_out')
+    expired（超期 ≥3 日且未触发以上）→ 保留 active，加入待决策列表，由用户次日 CLI 处理
 
     末尾推 notify('pool2_exit', ...) 汇总（无事件不推）。
-    Returns: 自动踢出数量。
+    Returns: 自动踢出数量（breakdown + aged_out 合计）。
     """
     from rquant.notify import notify
 
@@ -323,6 +325,7 @@ def check_exits(store: DuckDBStore, today: date) -> int:
             auto_kicked.append({
                 "ts_code": code,
                 "name": name_map.get(code, ""),
+                "kind": "breakdown",
                 "close": close_price,
                 "threshold": stop_w,
                 "reason_label": "弱止",
@@ -334,12 +337,28 @@ def check_exits(store: DuckDBStore, today: date) -> int:
             auto_kicked.append({
                 "ts_code": code,
                 "name": name_map.get(code, ""),
+                "kind": "breakdown",
                 "close": close_price,
                 "threshold": stop_s,
                 "reason_label": "强止",
                 "blacklist_label": bl_label,
             })
             logger.info(f"Pool 2 自动踢出: {code} 跌破强止 ¥{stop_s:.2f}")
+        elif days > settings.pool2_max_age_days:
+            store.update_pool2_exit(code, today, "aged_out")
+            auto_kicked.append({
+                "ts_code": code,
+                "name": name_map.get(code, ""),
+                "kind": "aged_out",
+                "entry_date": entry_date,
+                "days_in_pool": days,
+                "threshold_days": settings.pool2_max_age_days,
+                "blacklist_label": bl_label,
+            })
+            logger.info(
+                f"Pool 2 自动踢出: {code} 已入池 {days} 日，"
+                f"超过阈值 {settings.pool2_max_age_days}"
+            )
         elif days >= 3:
             expired_held.append({
                 "ts_code": code,

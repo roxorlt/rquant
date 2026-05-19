@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Pool 2 aged-out 自动踢出阈值**：入池超过 `POOL2_MAX_AGE_DAYS`（默认 6 个交易日）
+  在收盘后由 `monitor.check_exits` 自动 `update_pool2_exit(reason='aged_out')`。
+  与已有 `breakdown`（跌破止损）并列为第二条硬退出路径，原 `days >= 3` 的
+  `expired_held` 早期提醒保留。
+  - `config.py` 增 `pool2_max_age_days: int = 6`，`.env.example` 同步加 `POOL2_MAX_AGE_DAYS`
+  - `pool2_exit` 通知 body 新增「## 自动踢出（超期）」分组，与「跌破止损」并列
+  - `auto_kicked` dict 增 `kind` 字段（`"breakdown"` | `"aged_out"`），缺省视为 `breakdown`
+
 ### Changed
 
 - **systemd OnFailure 告警从单行 → markdown 包含排查/恢复命令**：5/14 真实事故复盘

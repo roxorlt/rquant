@@ -88,7 +88,9 @@ def _build_pool2_exit(
 ) -> tuple[str, str]:
     """B. Pool 2 退出汇总。
 
-    auto_kicked: [{ts_code, name, close, threshold, reason_label}]
+    auto_kicked: kind=breakdown {ts_code, name, close, threshold, reason_label}
+                 kind=aged_out  {ts_code, name, entry_date, days_in_pool, threshold_days}
+                 缺省 kind 视为 breakdown（向后兼容）
     expired_held: [{ts_code, name, entry_date, days_in_pool}]
     """
     date_str = str(trade_date)[5:10]  # MM-DD
@@ -97,17 +99,33 @@ def _build_pool2_exit(
         f"踢出 {len(auto_kicked)} / 待决策 {len(expired_held)}"
     )
 
+    breakdown_items = [it for it in auto_kicked if it.get("kind", "breakdown") == "breakdown"]
+    aged_items = [it for it in auto_kicked if it.get("kind") == "aged_out"]
+
     parts: list[str] = []
-    if auto_kicked:
+    if breakdown_items:
         parts.append("## 自动踢出（跌破止损）")
-        for it in auto_kicked:
+        for it in breakdown_items:
             tag = f" [{it['blacklist_label']}]" if it.get("blacklist_label") else ""
             parts.append(
                 f"- {it['ts_code']} {it.get('name', '')}{tag} "
                 f"收盘 ¥{it['close']:.2f} < {it['reason_label']} ¥{it['threshold']:.2f}"
             )
+    if aged_items:
+        if parts:
+            parts.append("")
+        parts.append("## 自动踢出（超期）")
+        for it in aged_items:
+            entry_str = str(it["entry_date"])[5:10]
+            tag = f" [{it['blacklist_label']}]" if it.get("blacklist_label") else ""
+            parts.append(
+                f"- {it['ts_code']} {it.get('name', '')}{tag} "
+                f"入池 {entry_str} 第 {it['days_in_pool']} 日"
+                f"（阈值 {it['threshold_days']} 日）"
+            )
     if expired_held:
-        parts.append("")
+        if parts:
+            parts.append("")
         parts.append("## 待决策（超期已保留）")
         for it in expired_held:
             entry_str = str(it["entry_date"])[5:10]
