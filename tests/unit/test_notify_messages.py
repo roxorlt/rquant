@@ -115,6 +115,36 @@ class TestPool2Exit:
         assert "踢出 0 / 待决策 0" in title
         assert "无退出事件" in body
 
+    def test_aged_out_section(self) -> None:
+        """auto_kicked 中 kind=aged_out 的项渲染到独立的「超期踢出」分组。"""
+        from rquant.notify.messages import build_message
+
+        title, body = build_message(
+            "pool2_exit",
+            trade_date=date(2026, 4, 28),
+            auto_kicked=[
+                {
+                    "ts_code": "002415.SZ", "name": "海康",
+                    "kind": "breakdown",
+                    "close": 11.65, "threshold": 11.80,
+                    "reason_label": "弱止",
+                },
+                {
+                    "ts_code": "300001.SZ", "name": "特锐德",
+                    "kind": "aged_out",
+                    "entry_date": date(2026, 4, 18),
+                    "days_in_pool": 7, "threshold_days": 6,
+                },
+            ],
+            expired_held=[],
+        )
+        assert "踢出 2 / 待决策 0" in title
+        assert "## 自动踢出（跌破止损）" in body
+        assert "002415.SZ" in body
+        assert "## 自动踢出（超期）" in body
+        assert "300001.SZ 特锐德" in body
+        assert "第 7 日（阈值 6 日）" in body
+
 
 class TestDailySummary:
     def test_basic(self) -> None:

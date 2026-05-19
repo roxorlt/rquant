@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     notify_error: bool = True
     notify_heartbeat: bool = True
 
+    pool2_max_age_days: int = 6
+
     # ===== LLM (Week 7) =====
     deepseek_api_key: str = Field(default="")
     deepseek_base_url: str = Field(default="https://api.deepseek.com")

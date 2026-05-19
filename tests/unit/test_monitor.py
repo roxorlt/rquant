@@ -264,7 +264,57 @@ class TestCheckExits:
         kwargs = mock_notify.call_args.kwargs
         assert len(kwargs["auto_kicked"]) == 1
         assert kwargs["auto_kicked"][0]["ts_code"] == "002415.SZ"
+        assert kwargs["auto_kicked"][0]["kind"] == "breakdown"
         assert kwargs["auto_kicked"][0]["reason_label"] == "弱止"
+        assert kwargs["expired_held"] == []
+
+    def test_aged_out_auto_kicks(self, store: DuckDBStore) -> None:
+        """入池超过 pool2_max_age_days（默认 6 个交易日）自动踢出。"""
+        from rquant.monitor import check_exits
+
+        # 入池 2026-04-07，到 2026-04-21 含两端共 11 个交易日，> 6
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 7),
+            "limit_up_date": date(2026, 4, 3),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+
+        # 11 个交易日的 daily_bar，收盘价均高于强止
+        bars = ",".join(
+            f"('002415.SZ', '{d}', 12,13,11,12.5,12,0.5,5,1000,10000)"
+            for d in [
+                "2026-04-07", "2026-04-08", "2026-04-09", "2026-04-10",
+                "2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16",
+                "2026-04-17", "2026-04-20", "2026-04-21",
+            ]
+        )
+        store._conn.execute(f"INSERT INTO daily_bar VALUES {bars}")
+
+        with patch("rquant.notify.notify") as mock_notify:
+            kicked = check_exits(store, date(2026, 4, 21))
+
+        assert kicked == 1
+        active = store.query_pool2_active()
+        assert len(active) == 0
+
+        # 入库的 exit_reason 应为 aged_out，而非 breakdown
+        row = store._conn.execute(
+            "SELECT status, exit_reason FROM pool2_watch WHERE ts_code = ?",
+            ["002415.SZ"],
+        ).fetchone()
+        assert row == ("exited", "aged_out")
+
+        mock_notify.assert_called_once()
+        kwargs = mock_notify.call_args.kwargs
+        assert len(kwargs["auto_kicked"]) == 1
+        assert kwargs["auto_kicked"][0]["kind"] == "aged_out"
+        assert kwargs["auto_kicked"][0]["days_in_pool"] == 11
+        assert kwargs["auto_kicked"][0]["threshold_days"] == 6
         assert kwargs["expired_held"] == []
 
     def test_expired_held_active(self, store: DuckDBStore) -> None:
