@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     data_dir: Path
     duckdb_path: Path
+    duckdb_readonly_path: Path | None = None
     parquet_dir: Path
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -73,6 +74,13 @@ class Settings(BaseSettings):
     def ensure_duckdb_parent_exists(cls, v: Path) -> Path:
         v.parent.mkdir(parents=True, exist_ok=True)
         return v
+
+    @property
+    def duckdb_readonly_path_resolved(self) -> Path:
+        """副本路径未显式配置时，从主库路径派生（同目录、_ro 后缀）。"""
+        if self.duckdb_readonly_path is not None:
+            return self.duckdb_readonly_path
+        return self.duckdb_path.with_name(self.duckdb_path.stem + "_ro.duckdb")
 
 
 settings = Settings()  # type: ignore[call-arg]

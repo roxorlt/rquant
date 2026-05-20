@@ -1,0 +1,22 @@
+[Unit]
+Description=rQuant DuckDB Read-Only Replica Sync (for dashboard/canvas/nl-screen)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+ExecStart=/home/lighthouse/rquant/scripts/sync-readonly-replica.sh
+
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+# 副本验证失败 (exit 2) 是预期场景（cp 撞写入），不当告警
+# OnFailure 只在脚本崩溃 / 主库不存在 (exit 1) 时触发
+SuccessExitStatus=2
+OnFailure=rquant-alert@%n.service
+
+[Install]
+WantedBy=multi-user.target

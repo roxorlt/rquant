@@ -6,6 +6,24 @@
 
 ### Added
 
+- **DuckDB 只读副本 + dashboard / canvas / nl-screen 切读副本**（5/20 真实事故）：
+  monitor 盘中 9:25–15:00 持写锁期间，dashboard / canvas / nl-screen 任何直连主库的
+  `read_only=True` 连接都撞 `IOError: Could not set lock on file ...` —— CLAUDE.md 原
+  「单写多读 → read_only 可共存」表述是误读，DuckDB 实际行为是「写者持锁期间，任何新
+  open 都失败」。
+  - `scripts/sync-readonly-replica.sh`：cp 主库 + WAL → 用 DuckDB read_only 验证 tmp
+    可打开 → atomic mv 替换 `rquant_ro.duckdb`；验证失败 (exit 2) 保留旧副本，下个周期重试
+  - `deploy/systemd/rquant-replica-sync.{service,timer}`：工作日 9:00–15:00 每 5min +
+    15:10 + 17:30 + 周末早晚 backup；`SuccessExitStatus=2` 让验证失败不触发 alert
+  - `config.py` 增 `duckdb_readonly_path: Path | None`，留空则从 `duckdb_path` 派生
+    （同目录 `_ro.duckdb` 后缀）；新增 `duckdb_readonly_path_resolved` property
+  - `storage/duckdb.py` 增 `open_readonly_store()` / `open_readonly_connection()` 两个
+    helper：优先副本，副本不存在或损坏 → 降级主库 `read_only=True`（主库也撞锁时 raise
+    IOException 给 caller 渲染友好提示）
+  - `dashboard/nl_canvas.py`、`dashboard/nl_screen.py`、`dashboard/app.py` 三处直连主库的
+    read_only 调用全部切到 helper
+  - `CLAUDE.md` DuckDB 并发约束章节重写，修正认知偏差并给出新的正确写法
+
 - **Pool 2 aged-out 自动踢出阈值**：入池超过 `POOL2_MAX_AGE_DAYS`（默认 6 个交易日）
   在收盘后由 `monitor.check_exits` 自动 `update_pool2_exit(reason='aged_out')`。
   与已有 `breakdown`（跌破止损）并列为第二条硬退出路径，原 `days >= 3` 的

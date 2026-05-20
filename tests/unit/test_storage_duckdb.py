@@ -315,3 +315,79 @@ class TestScreenResult:
     def test_table_exists(self, tmp_store: DuckDBStore) -> None:
         tables = tmp_store.query("SHOW TABLES")
         assert "screen_result" in tables["name"].values
+
+
+class TestReadonlyHelpers:
+    """副本优先 + 主库 fallback。"""
+
+    def _make_db(self, path: Path, marker: str) -> None:
+        """建一个带 marker 表的 DuckDB，方便断言连接到的是哪个文件。"""
+        DuckDBStore(path=path).close()
+        import duckdb
+        c = duckdb.connect(str(path))
+        c.execute(f"CREATE TABLE marker (name VARCHAR); INSERT INTO marker VALUES ('{marker}');")
+        c.close()
+
+    def test_open_readonly_store_prefers_replica(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.storage import duckdb as duckdb_mod
+
+        primary = tmp_path / "main.duckdb"
+        replica = tmp_path / "main_ro.duckdb"
+        self._make_db(primary, "primary")
+        self._make_db(replica, "replica")
+
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_path", primary)
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_readonly_path", replica)
+
+        with duckdb_mod.open_readonly_store() as store:
+            row = store.query("SELECT name FROM marker").iloc[0]["name"]
+        assert row == "replica"
+
+    def test_open_readonly_store_falls_back_to_primary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.storage import duckdb as duckdb_mod
+
+        primary = tmp_path / "main.duckdb"
+        replica = tmp_path / "main_ro.duckdb"  # 不创建文件
+        self._make_db(primary, "primary")
+
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_path", primary)
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_readonly_path", replica)
+
+        with duckdb_mod.open_readonly_store() as store:
+            row = store.query("SELECT name FROM marker").iloc[0]["name"]
+        assert row == "primary"
+
+    def test_open_readonly_connection_prefers_replica(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.storage import duckdb as duckdb_mod
+
+        primary = tmp_path / "main.duckdb"
+        replica = tmp_path / "main_ro.duckdb"
+        self._make_db(primary, "primary")
+        self._make_db(replica, "replica")
+
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_path", primary)
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_readonly_path", replica)
+
+        conn = duckdb_mod.open_readonly_connection()
+        try:
+            name = conn.execute("SELECT name FROM marker").fetchone()[0]
+        finally:
+            conn.close()
+        assert name == "replica"
+
+    def test_readonly_path_resolved_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """duckdb_readonly_path 留空 → 从 duckdb_path 派生（_ro 后缀）。"""
+        from rquant.config import settings as cfg_settings
+
+        monkeypatch.setattr(cfg_settings, "duckdb_path", tmp_path / "rquant.duckdb")
+        monkeypatch.setattr(cfg_settings, "duckdb_readonly_path", None)
+
+        assert cfg_settings.duckdb_readonly_path_resolved == tmp_path / "rquant_ro.duckdb"

@@ -24,7 +24,7 @@ from rquant.config import settings
 from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
 from rquant.llm.dispatch import screen_with_plan_diagnostic
 from rquant.llm.schemas import ScreenPlan
-from rquant.storage.duckdb import DuckDBStore
+from rquant.storage.duckdb import open_readonly_store
 
 
 st.set_page_config(
@@ -217,10 +217,10 @@ if nl_plan_dict:
         ):
             try:
                 nl_plan_validated = ScreenPlan.model_validate(nl_plan_dict)
-                nl_store = DuckDBStore(settings.duckdb_path, read_only=True)
-                nl_df, nl_diag = screen_with_plan_diagnostic(
-                    nl_plan_validated, store=nl_store,
-                )
+                with open_readonly_store() as nl_store:
+                    nl_df, nl_diag = screen_with_plan_diagnostic(
+                        nl_plan_validated, store=nl_store,
+                    )
                 st.session_state.nl_result_df = nl_df
                 st.session_state.nl_diagnostics = nl_diag
             except ValidationError as nl_e:
