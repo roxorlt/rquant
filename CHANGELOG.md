@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **rquant-replica-sync.service OnFailure 误放 [Service] 段**：systemd 把
+  `[Service]` 段的 `OnFailure=` 静默 ignore（journalctl 提示 `Unknown key name
+  'OnFailure' in section 'Service'`），导致 sync 真崩溃时 alert 链路不触发。
+  移到 `[Unit]` 段（OnFailure 本来就属于 Unit 级别）。
+- **scripts/deploy.sh post-deploy timer 验证段 unbound variable**：systemd 252
+  （OpenCloudOS 9 / RHEL 9）上 `systemctl show -p NextElapseUSecRealtime --value`
+  返回**人类可读时间戳**字符串（"Wed 2026-05-20 11:50:00 CST"），不是微秒
+  数字。原代码 `next_s=$((next_us / 1000000))` 把 "Wed" 当变量名 → `set -u`
+  报 unbound variable，部署中断。改用 `date -d "${next_raw}" +%s` 解析。
+
 ### Added
 
 - **DuckDB 只读副本 + dashboard / canvas / nl-screen 切读副本**（5/20 真实事故）：

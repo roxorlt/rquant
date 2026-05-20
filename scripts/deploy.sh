@@ -197,17 +197,24 @@ else
     sleep 1
     for f in ${CHANGED_TIMER_FILES}; do
         t=$(basename "${f}")
-        # list-timers 输出列：NEXT LEFT LAST PASSED UNIT ACTIVATES
-        # show -p NextElapseUSecRealtime 返回微秒 epoch 或 0（n/a）
-        next_us=$(systemctl show "${t}" -p NextElapseUSecRealtime --value 2>/dev/null)
-        if [[ -z "${next_us}" || "${next_us}" == "0" ]]; then
+        # systemd 252 (OpenCloudOS 9 / RHEL 9) 上 `show -p NextElapseUSecRealtime --value`
+        # 返回的是**人类可读时间戳**（如 "Wed 2026-05-20 11:50:00 CST"），不是微秒数字。
+        # 5/20 翻车：原版做 `next_s=$((next_us / 1000000))` 时，算术展开把 "Wed" 当
+        # 变量名 → `set -u` 报 unbound variable。改用 date -d 解析时间戳字符串。
+        next_raw=$(systemctl show "${t}" -p NextElapseUSecRealtime --value 2>/dev/null)
+        if [[ -z "${next_raw}" || "${next_raw}" == "n/a" || "${next_raw}" == "0" ]]; then
             err "${t}: 下次 trigger = n/a（OnCalendar 可能被 systemd 拒收！）"
             err "  排查：systemctl status ${t} / systemd-analyze calendar '<OnCalendar 表达式>'"
             TIMER_FAIL=1
             continue
         fi
-        # 微秒 → 秒；跟当前时间比
-        next_s=$((next_us / 1000000))
+        # date -d 接受 systemctl 的时间戳格式（"Wed 2026-05-20 11:50:00 CST"）
+        next_s=$(date -d "${next_raw}" +%s 2>/dev/null || echo 0)
+        if [[ "${next_s}" == "0" ]]; then
+            err "${t}: 无法解析下次 trigger 时间戳: '${next_raw}'"
+            TIMER_FAIL=1
+            continue
+        fi
         now_s=$(date +%s)
         delta=$((next_s - now_s))
         if [[ ${delta} -lt 0 ]]; then

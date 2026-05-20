@@ -1,6 +1,9 @@
 [Unit]
 Description=rQuant DuckDB Read-Only Replica Sync (for dashboard/canvas/nl-screen)
 After=network-online.target
+# OnFailure 必须在 [Unit] 段（之前误放在 [Service] 段被 systemd 静默 ignore，
+# alert 链路永远不会触发；5/20 部署后 journalctl 发现）
+OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -13,10 +16,8 @@ TimeoutStartSec=120
 StandardOutput=journal
 StandardError=journal
 
-# 副本验证失败 (exit 2) 是预期场景（cp 撞写入），不当告警
-# OnFailure 只在脚本崩溃 / 主库不存在 (exit 1) 时触发
+# 副本验证失败 (exit 2) 是预期场景（cp 撞 monitor 写入），不算 failure，不触发 OnFailure
 SuccessExitStatus=2
-OnFailure=rquant-alert@%n.service
 
 [Install]
 WantedBy=multi-user.target
