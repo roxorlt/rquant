@@ -1,0 +1,19 @@
+[Unit]
+Description=Trigger rQuant DuckDB read-only replica sync
+
+[Timer]
+# 工作日 9-15 点每 5 分钟（盘中 monitor 在写主库，dashboard 必须看副本）
+# 用 v0.11.2 已验证的 H:M/N 语法（参考 rquant-backup.timer 历史教训）
+OnCalendar=Mon..Fri *-*-* 9..15:0/5
+# 盘后再多触发几次：daily 17:00 跑完后副本要尽快更新
+OnCalendar=Mon..Fri 15:10
+OnCalendar=Mon..Fri 17:30
+# 周末早晚各一次（即便没数据更新，也保证副本不被遗忘）
+OnCalendar=Sat,Sun 09:00
+OnCalendar=Sat,Sun 18:00
+
+Persistent=true
+Unit=rquant-replica-sync.service
+
+[Install]
+WantedBy=timers.target

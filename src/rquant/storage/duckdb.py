@@ -436,3 +436,45 @@ class DuckDBStore:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+# ── Read-only helpers (避开 monitor 写锁) ──────────────────────────────────────
+#
+# DuckDB 单文件锁：monitor 盘中 9:25-15:00 持写锁期间，任何新连接（含 read_only）
+# 都开不了。dashboard / canvas / nl-screen 这类只读消费者应优先连副本
+# (rquant_ro.duckdb)，由 rquant-replica-sync.timer 每 5min 同步。
+#
+# 副本不存在（首次部署 / sync 还没跑过）→ 降级主库 read_only（可能撞锁）
+# 副本损坏（cp 时撞 monitor fsync）→ 降级主库 read_only
+
+def _readonly_candidate_paths() -> list[Path]:
+    """返回 read_only 打开的候选路径列表，按优先级排序（副本在前）。"""
+    ro = settings.duckdb_readonly_path_resolved
+    if ro.exists():
+        return [ro, settings.duckdb_path]
+    return [settings.duckdb_path]
+
+
+def open_readonly_store() -> DuckDBStore:
+    """打开 DuckDBStore（read_only），优先副本，副本不可用降级主库。
+
+    主库也撞锁时 raise duckdb.IOException，由 caller 渲染友好提示。
+    """
+    paths = _readonly_candidate_paths()
+    for p in paths[:-1]:
+        try:
+            return DuckDBStore(p, read_only=True)
+        except duckdb.IOException as e:
+            logger.warning(f"副本打开失败 {p}: {e}，降级到主库 read_only")
+    return DuckDBStore(paths[-1], read_only=True)
+
+
+def open_readonly_connection() -> duckdb.DuckDBPyConnection:
+    """裸 duckdb.connect 版本，给 dashboard/app.py 用（它不走 DuckDBStore）。"""
+    paths = _readonly_candidate_paths()
+    for p in paths[:-1]:
+        try:
+            return duckdb.connect(str(p), read_only=True)
+        except duckdb.IOException as e:
+            logger.warning(f"副本打开失败 {p}: {e}，降级到主库 read_only")
+    return duckdb.connect(str(paths[-1]), read_only=True)

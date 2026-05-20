@@ -23,6 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from rquant.config import settings
+from rquant.storage.duckdb import open_readonly_connection
 
 
 REFRESH_SECONDS = 30
@@ -168,7 +169,7 @@ st.markdown(
 def query_duckdb(sql: str, params: list | None = None) -> pd.DataFrame | None:
     """查询 DuckDB；锁冲突时返回 None（dashboard 优雅降级）。"""
     try:
-        conn = duckdb.connect(str(settings.duckdb_path), read_only=True)
+        conn = open_readonly_connection()
     except duckdb.IOException as e:
         if "Conflicting lock" in str(e):
             return None
@@ -185,7 +186,7 @@ def query_duckdb(sql: str, params: list | None = None) -> pd.DataFrame | None:
 def db_lock_holder() -> str | None:
     """探测 DuckDB 是否被其他进程写锁占用。返回占用者 PID 字符串或 None。"""
     try:
-        conn = duckdb.connect(str(settings.duckdb_path), read_only=True)
+        conn = open_readonly_connection()
         conn.close()
         return None
     except duckdb.IOException as e:

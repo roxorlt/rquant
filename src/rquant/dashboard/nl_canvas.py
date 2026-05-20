@@ -51,7 +51,7 @@ from rquant.dashboard.canvas_rule_editor import (
 from rquant.llm.client import LLMClarificationNeeded, LLMError
 from rquant.llm.schemas import RuleCall
 from rquant.presets import PRESET_SCREENS
-from rquant.storage.duckdb import DuckDBStore
+from rquant.storage.duckdb import open_readonly_store
 
 
 st.set_page_config(
@@ -95,13 +95,13 @@ st.markdown(
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_diagnose(preset_name: str, trade_date: str) -> tuple[pd.DataFrame, list[tuple[str, int]]]:
-    with DuckDBStore(settings.duckdb_path, read_only=True) as store:
+    with open_readonly_store() as store:
         return diagnose_preset(preset_name, trade_date, store=store)
 
 
 def _read_latest_trade_date() -> str:
     """每次 streamlit rerun 调用，conn 用完就 close。"""
-    with DuckDBStore(settings.duckdb_path, read_only=True) as store:
+    with open_readonly_store() as store:
         return latest_trade_date(store)
 
 

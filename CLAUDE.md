@@ -38,31 +38,43 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 
 ## DuckDB 并发约束（强制）
 
-DuckDB 是**单写多读**架构，单一文件锁。`rquant-monitor` 是常驻写入者（盘中持续写
-`monitor_event` / `notification_log`）。**任何想跟 monitor 共存的 DuckDB 消费者必须
-用 `read_only=True` 打开**，否则会抢锁，导致 monitor `IO Error: Could not set lock
-on file ...rquant.duckdb` 进入 crash-loop（见 v0.12.1 hotfix）。
+DuckDB 是**单文件锁**：持写锁的进程在期间会**拒绝所有新连接（包括 `read_only=True`）**。
+原 v0.12.x 笔记里写的「单写多读 → read_only 可跟 writer 共存」是误读；DuckDB 实际行为
+是「写者持锁期间，任何新 open 都失败」（参考官方 docs/stable/connect/concurrency）。
 
-**正确写法**：
+**`rquant-monitor` 是常驻写入者**（盘中 9:25–15:00 持续写 `monitor_event` /
+`notification_log`），期间 dashboard / canvas / nl-screen 任何直连主库的 read_only
+连接都会撞 `IOError: Could not set lock on file ...`（5/20 真实事故）。
 
-```python
-# 只读消费者（dashboard、nl-screen、临时 CLI 查询）
-store = DuckDBStore(settings.duckdb_path, read_only=True)
-# 或裸 connect
-conn = duckdb.connect(str(path), read_only=True)
-```
-
-**错误写法**（会锁死 monitor）：
+### 正确写法：只读消费者读副本，写消费者写主库
 
 ```python
-store = DuckDBStore()              # 默认写模式，跟 monitor 抢锁
-conn = duckdb.connect(str(path))   # 同上
+# 只读消费者（dashboard / canvas / nl-screen / 临时 CLI 查询）
+from rquant.storage.duckdb import open_readonly_store, open_readonly_connection
+
+with open_readonly_store() as store:        # 优先副本，副本不可用降级主库
+    df = store.query_screen_result(...)
+
+# 裸 connect 版（dashboard/app.py 用）
+conn = open_readonly_connection()
 ```
 
-**例外**：明确需要写的服务（`rquant-monitor` / `rquant-daily` / `rquant-backup`）按
-单写者约定串行调度，不能并发。watchdog 和 timer 安排要错开。
+副本由 `rquant-replica-sync.timer` 每 5min 跑 `scripts/sync-readonly-replica.sh` 维护
+（cp 主库 + WAL → verify → atomic mv 替换 `rquant_ro.duckdb`），延迟最多 5min。
 
-新增 Streamlit / FastAPI / 临时脚本时，code review 必查这一条。
+### 错误写法（会跟 monitor 抢锁）
+
+```python
+store = DuckDBStore()                                       # 默认写模式
+conn = duckdb.connect(str(path))                            # 默认写模式
+store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘中撞写锁
+```
+
+### 写者串行调度
+
+明确需要写的服务（`rquant-monitor` / `rquant-daily` / `rquant-backup` / `rquant-replica-sync`
+本身只读不写主库，但同一时刻只能一个写者）按 systemd timer 约定串行，watchdog 和 timer
+错开。新增 Streamlit / FastAPI / 临时脚本时，code review 必查这一条。
 
 ## MVP 路径（必须按顺序）
 
