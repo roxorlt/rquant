@@ -770,51 +770,35 @@ else:
 
 
 st.markdown("## 📨 通知通道")
-if db_locked_pid:
-    st.info("⏳ 等流水线完成")
-else:
-    try:
-        rate = query_duckdb(
-            """
-            SELECT channel,
-                   COUNT(*) AS total,
-                   SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok
-            FROM notification_log
-            WHERE sent_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours')
-            GROUP BY channel
-            """
-        )
-        if rate is None:
-            st.info("⏳ 数据暂不可读")
-        elif rate.empty:
-            st.info("最近 24h 无推送记录")
-        else:
-            ncols = st.columns(max(len(rate), 2))
-            for i, r in rate.iterrows():
-                success_rate = r["ok"] / r["total"] * 100 if r["total"] else 0
-                color = "normal" if success_rate >= 95 else "inverse"
-                ncols[i].metric(
-                    f"{r['channel']} (24h)",
-                    f"{int(r['ok'])}/{int(r['total'])}",
-                    delta=f"{success_rate:.0f}% 成功",
-                    delta_color=color,
-                )
+# notification_log 现在是 JSONL 文件（pure read，无锁），不再受 monitor 写锁影响
+from rquant.notify.log import read_recent, read_since
 
-        notif = query_duckdb(
-            """
-            SELECT strftime(sent_at, '%m-%d %H:%M') AS 时间,
-                   scene AS 场景, channel AS 通道, target AS 目标,
-                   success AS 成功, title AS 标题
-            FROM notification_log
-            ORDER BY sent_at DESC
-            LIMIT 30
-            """
+last24h = read_since(hours=24)
+if last24h.empty:
+    st.info("最近 24h 无推送记录（notification_log.jsonl）")
+else:
+    rate = last24h.groupby("channel").agg(
+        total=("success", "size"),
+        ok=("success", "sum"),
+    ).reset_index()
+    ncols = st.columns(max(len(rate), 2))
+    for i, r in rate.iterrows():
+        success_rate = r["ok"] / r["total"] * 100 if r["total"] else 0
+        color = "normal" if success_rate >= 95 else "inverse"
+        ncols[i].metric(
+            f"{r['channel']} (24h)",
+            f"{int(r['ok'])}/{int(r['total'])}",
+            delta=f"{success_rate:.0f}% 成功",
+            delta_color=color,
         )
-        if notif is not None and not notif.empty:
-            with st.expander(f"📜 最近 {len(notif)} 条推送", expanded=False):
-                st.dataframe(notif, hide_index=True, use_container_width=True)
-    except duckdb.Error:
-        st.info("notification_log 表暂无数据（首次推送后会自动生成）")
+
+recent = read_recent(limit=30)
+if not recent.empty:
+    display = recent[["sent_at", "scene", "channel", "target", "success", "title"]].copy()
+    display["sent_at"] = display["sent_at"].str.slice(5, 16).str.replace("T", " ")
+    display.columns = ["时间", "场景", "通道", "目标", "成功", "标题"]
+    with st.expander(f"📜 最近 {len(display)} 条推送", expanded=False):
+        st.dataframe(display, hide_index=True, use_container_width=True)
 
 
 # ── Section 7: 本地 sync ──

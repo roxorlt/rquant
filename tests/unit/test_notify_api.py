@@ -9,8 +9,8 @@ import pytest
 
 @pytest.fixture()
 def mock_settings():
-    """提供可调整的 settings mock。"""
-    with patch("rquant.notify.api.settings") as m:
+    """提供可调整的 settings mock；同时 stub 日志写入避免污染真实 JSONL。"""
+    with patch("rquant.notify.api.settings") as m, patch("rquant.notify.api._log_notification"):
         m.notify_enabled = True
         m.notify_price_level = True
         m.notify_pool2_exit = True
