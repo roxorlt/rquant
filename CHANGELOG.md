@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **notification_log 从 DuckDB 表迁移到 JSONL 文件**（5/22 真实事故）：手动跑 push
+  （命令行 / inline python / `rquant notify-test`）在盘中（monitor 持写锁）写
+  `notification_log` 表撞 `IOError: Could not set lock on file ...`，3 条 channel log
+  全丢，dashboard 通知历史缺失。
+  - 新增 `src/rquant/notify/log.py`：append-only JSONL 写文件，OS 层 O_APPEND 短写
+    原子，多进程并发无锁；提供 `append() / read_recent() / read_since()` API
+  - `notify/api.py::_log_notification` 不再写 DuckDB，改调 `notify.log.append()`
+  - `dashboard/app.py` 「通知通道」section 两处 `query_duckdb FROM notification_log`
+    改读 JSONL（pandas groupby + 排序），移除「等流水线完成」分支（JSONL 无锁，永远能读）
+  - `storage/schema.py` 移除 `NOTIFICATION_LOG_DDL` 和 `ALL_DDL` 引用；云端旧表保留
+    备查不强制 drop（DuckDBStore._init_schema 不再 CREATE TABLE，旧表数据无影响）
+  - `sent_at` 改用 microseconds 精度，确保同秒内多条 append 的 sort 顺序稳定
+
 ### Fixed
 
 - **rquant-replica-sync.service OnFailure 误放 [Service] 段**：systemd 把
