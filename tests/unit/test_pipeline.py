@@ -282,6 +282,76 @@ class TestBlacklistFilter:
         assert result == {"test-pool": 1}
 
 
+class TestCheckExitsInDailyPipeline:
+    """daily pipeline 末尾必须调 monitor.check_exits（Pool 2 退出兜底，
+    避免 monitor 盘中被 restart SIGTERM 中断跳过收盘检查）。"""
+
+    def test_calls_check_exits_after_sync(self, store: DuckDBStore) -> None:
+        from datetime import date
+
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000001.SZ', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
+        )
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", {}),
+            patch("rquant.pipeline.screen", return_value=pd.DataFrame()),
+            patch("rquant.pipeline._sync_pool2_watch"),
+            patch("rquant.pipeline._push_daily_summary"),
+            patch("rquant.monitor.check_exits") as mock_check_exits,
+        ):
+            run_daily_pipeline("2026-04-18", store=store)
+
+        mock_check_exits.assert_called_once()
+        args = mock_check_exits.call_args.args
+        assert args[0] is store
+        assert args[1] == date(2026, 4, 18)
+
+    def test_aged_out_kicked_via_daily_pipeline(self, store: DuckDBStore) -> None:
+        """端到端：入池 10 个交易日的票，跑 daily 流水线被 aged_out 踢出。"""
+        from datetime import date
+
+        # 11 个交易日的 daily_bar：4/8 入池，到 4/22 共 11 个交易日（跳周末 4/11,12,18,19）
+        bars = ",".join(
+            f"('002415.SZ', '{d}', 12,13,12,12.50,12,0.5,5,1000,10000)"
+            for d in [
+                "2026-04-08", "2026-04-09", "2026-04-10",
+                "2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17",
+                "2026-04-20", "2026-04-21", "2026-04-22",
+            ]
+        )
+        store._conn.execute(f"INSERT INTO daily_bar VALUES {bars}")
+
+        # 入池 4/8，今天 4/22，days_in_pool = 11 > 6 → 该 aged_out
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 8),
+            "limit_up_date": date(2026, 4, 7),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,  # 收盘 12.50 > stop_strong
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+        store._conn.execute(
+            "INSERT INTO stock_basic (ts_code, name, area, industry, market, list_date) "
+            "VALUES ('002415.SZ', '海康威视', '广东', '安防', '主板', '2010-05-28')"
+        )
+
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", {}),
+            patch("rquant.pipeline.screen", return_value=pd.DataFrame()),
+            patch("rquant.notify.notify"),  # 不真推
+        ):
+            run_daily_pipeline("2026-04-22", store=store)
+
+        row = store._conn.execute(
+            "SELECT status, exit_date, exit_reason FROM pool2_watch WHERE ts_code = ?",
+            ["002415.SZ"],
+        ).fetchone()
+        assert row == ("exited", date(2026, 4, 22), "aged_out")
+
+
 class TestDailySummaryPush:
     def test_pushes_pool1_and_pool2(self, store: DuckDBStore) -> None:
         from datetime import date

@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **daily pipeline 末尾加 Pool 2 退出兜底检查**（5/25 发现，根因追溯到 PR #26）：
+  原 `check_exits`（aged_out + breakdown 踢出）只在 `monitor.run_monitor` 收盘后
+  调用，但 monitor 在盘中被 deploy / watchdog 等 restart 时 SIGTERM 中断会**跳过
+  整个 check_exits**。5/19→5/25 期间 PR #27 #28 #29 #30 #31 多次部署 restart
+  monitor，导致 aged_out 规则名义上启用但实际未执行，pool2 active 堆到 53 只。
+  - 在 `run_daily_pipeline` 末尾（`_sync_pool2_watch` 之后、`_push_daily_summary`
+    之前）lazy import `monitor.check_exits` 并调用一次
+  - daily 17:00 是 systemd oneshot timer，必跑完整流程，作为可靠兜底
+  - 重复执行无副作用：已 exited 的不在 active 池，幂等
+  - monitor 收盘后那次保留（双保险）
+
 ### Added
 
 - **Tushare token 到期 systemd 兜底提醒**（5/25 事故 follow-up）：因 `pro.user` 接口
