@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **pre-market-check tushare 积分检查降级为 warn 不再 fail**（5/25 真实事故）：
+  tushare 服务端 5/22 → 5/25 周末把内部 `user` 接口禁用，返回"请指定正确的接口名"。
+  没有公开替代品（tushare 没有官方查积分 API），但 token 整体可用（trade_cal /
+  daily 等业务接口仍正常）。原代码把 tushare exception 当 fail → 体检 exit 1 →
+  OnFailure 每天 9:00 推一条 alert 噪音。改为 warn：检查仍可见但不阻塞，真的
+  token 失效会在 daily pipeline 跑 ingest 时立即暴露并 fail。
+
 ### Changed
 
 - **notification_log 从 DuckDB 表迁移到 JSONL 文件**（5/22 真实事故）：手动跑 push
