@@ -1,0 +1,18 @@
+[Unit]
+Description=rQuant Tushare token 到期提醒（一次性 / 2027-03-13）
+After=network-online.target
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+ExecStart=/home/lighthouse/rquant/scripts/remind-tushare-token-renewal.sh
+
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

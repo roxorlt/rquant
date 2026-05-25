@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Tushare token 到期 systemd 兜底提醒**（5/25 事故 follow-up）：因 `pro.user` 接口
+  被 tushare 下线，没法再自动监控积分到期日，改用 systemd 一次性 timer 兜底。
+  - `scripts/remind-tushare-token-renewal.sh`：调 PushDeerClient 推一条「token
+    34 天后到期，去 web 端续费 / 换 token」的提醒
+  - `deploy/systemd/rquant-tushare-token-reminder.{service,timer}`：
+    `OnCalendar=2027-03-13 12:00:00`（周六中午，距 4/16 到期 34 天），`Persistent=true`
+    保证服务器停机错过时开机补跑
+
+### Changed
+
+- **deploy.sh post-deploy timer 验证阈值 24h → 365d**：支持长期一次性提醒 timer
+  （token 续费 / 节假日特殊提醒 等）。原 24h 阈值的初衷是检测 OnCalendar 被
+  systemd 静默拒收，但拒收的真正信号是 `NEXT=n/a`（已单独检测），不是 NEXT 远期。
+  放宽到 1 年仍保护原核心场景。
+
 ### Fixed
 
 - **pre-market-check tushare 积分检查降级为 warn 不再 fail**（5/25 真实事故）：
