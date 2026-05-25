@@ -1,0 +1,13 @@
+[Unit]
+Description=Trigger Tushare token 到期提醒（2027-03-13 周六 12:00 CST，token 4/16 到期）
+
+[Timer]
+# 一次性触发：2027-03-13（周六）12:00 CST
+# token 到期 2027-04-16，提前 34 天 → 周六中午用户在的时候提醒，方便当天去 web 端处理
+OnCalendar=2027-03-13 12:00:00
+# Persistent=true：如服务器停机错过 trigger，开机后立即补跑（避免错过提醒）
+Persistent=true
+Unit=rquant-tushare-token-reminder.service
+
+[Install]
+WantedBy=timers.target

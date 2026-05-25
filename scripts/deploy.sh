@@ -179,14 +179,20 @@ fi
 # ---------- 5. post-deploy 验证：改动的 timer 是否真在调度 ----------
 #
 # v0.11.3 翻车教训：OnCalendar 语法错误会被 systemd 静默拒收，整段丢弃。
-# `systemctl status` 看起来是 active (waiting)，但下次 trigger 实际是 24h 后
-# 甚至 "n/a"。这一步用 `list-timers --all` 检查改动 timer 的 NEXT 列：
-#   - NEXT 在 24h 内 → 正常
-#   - NEXT 是 "n/a" 或 > 24h → 翻车（OnCalendar 没生效），exit 1 让 caller 知道
+# `systemctl status` 看起来是 active (waiting)，但下次 trigger 实际是 "n/a"。
+# 这一步用 NextElapseUSecRealtime 检查改动 timer 的 NEXT：
+#   - NEXT = "n/a" → 翻车（OnCalendar 没生效），exit 2 让 caller 知道
+#   - NEXT 在过去 → 正在 catch up，warn
+#   - NEXT 在 1 年内 → 正常（包括日常 timer 和长期一次性提醒 timer）
+#   - NEXT > 1 年 → 极不寻常（如配错到 2099），exit 2
+#
+# 5/25 调整：阈值从 24h 放宽到 365d，支持长期一次性提醒（如 token 续费提醒
+# OnCalendar=2027-03-13）。原 24h 阈值的初衷是检测 OnCalendar 被静默拒收，
+# 但拒收的真正信号是 NEXT=n/a，不是 NEXT 远期，所以放宽到 1 年仍保护这一点。
 #
 # 跳过：dry-run、无 timer 改动
 
-step "[5/6] post-deploy 验证：改动的 timer NEXT trigger 在 24h 内"
+step "[5/6] post-deploy 验证：改动的 timer NEXT trigger 在 1 年内"
 TIMER_FAIL=0
 if [[ ${DRY_RUN} -eq 1 ]]; then
     ok "dry-run，跳过验证"
@@ -219,8 +225,8 @@ else
         delta=$((next_s - now_s))
         if [[ ${delta} -lt 0 ]]; then
             warn "${t}: 下次 trigger 在过去（${delta}s 前），可能正在 catch up"
-        elif [[ ${delta} -gt 86400 ]]; then
-            err "${t}: 下次 trigger 在 $(( delta / 3600 ))h 后（> 24h），OnCalendar 可能有问题"
+        elif [[ ${delta} -gt 31536000 ]]; then
+            err "${t}: 下次 trigger 在 $(( delta / 86400 ))d 后（> 1 年），OnCalendar 可能有问题"
             TIMER_FAIL=1
         else
             human=$(date -d "@${next_s}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "${next_s}" '+%Y-%m-%d %H:%M:%S')
