@@ -120,7 +120,15 @@ def check_disk_space(path: Path, warn_gb: float = 5.0) -> CheckResult:
 
 
 def check_tushare_credits(token: str | None, warn_threshold: int = 500) -> CheckResult:
-    """Tushare Pro 积分余额，<warn_threshold 报警。"""
+    """Tushare Pro 积分余额，<warn_threshold 报警。
+
+    本检查失败统一降级为 warn 而非 fail：
+    - 5/25 真实事故：tushare 服务端把内部 `user` 接口禁用（"请指定正确的接口名"），
+      没有公开替代品，但 token 整体可用（trade_cal 等业务接口仍正常）
+    - 积分查询挂掉对业务无影响（业务 ingest 用 daily / pro_bar 等接口）
+    - 真的 token 失效会在 daily pipeline 立即暴露并 fail，由那里触发 alert
+    - 体检每天 9:00 跑，如果 tushare 偶发故障 fail 会每天推一条噪音 alert
+    """
     if not token:
         return CheckResult("tushare", "skip", "TUSHARE_TOKEN_MAIN 未配置")
     try:
@@ -131,7 +139,7 @@ def check_tushare_credits(token: str | None, warn_threshold: int = 500) -> Check
         pro = ts.pro_api(token)
         df = pro.user(token=token)
     except Exception as e:
-        return CheckResult("tushare", "fail", f"{type(e).__name__}: {str(e)[:80]}")
+        return CheckResult("tushare", "warn", f"{type(e).__name__}: {str(e)[:80]}")
     if df is None or df.empty:
         return CheckResult("tushare", "warn", "user API 返回空")
     # Tushare user API 一个 user_id 可能返回多行（基础积分 + 付费包），需要 sum
