@@ -251,8 +251,19 @@ def run_daily_pipeline(
             summary[name] = hit_count
             logger.info(f"  {name}: {hit_count} 命中")
 
-        # 同步 Pool 2 到持久池
+        # 同步 Pool 2 到持久池（新涨停的票入池）
         _sync_pool2_watch(store, trade_date)
+
+        # Pool 2 退出检查（兜底）：原本由 monitor 15:00 收盘后跑，但 monitor 在盘中
+        # 被 deploy / watchdog 等 restart 时 SIGTERM 中断会跳过 check_exits，导致
+        # aged_out（超过 pool2_max_age_days）和 breakdown（跌破止损）的票留在池里。
+        # daily 17:00 是 oneshot timer 必跑，作为可靠兜底。重复执行无副作用：
+        # 已 exited 的不会再出现在 active，check_exits 内部按 active 池过滤。
+        from datetime import date as _date
+
+        from rquant.monitor import check_exits
+
+        check_exits(store, _date.fromisoformat(trade_date))
 
         elapsed = _time.time() - started_at
         logger.info(f"流水线完成 {trade_date}: {summary} (耗时 {elapsed:.1f}s)")
