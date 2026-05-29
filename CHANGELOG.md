@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **daily_basic 数据源临时缺失搞崩整条 pipeline**（5/29 真实事故）：5/29 daily_bar
+  拉到了但 tushare daily_basic 接口延迟返回空，ingest 静默跳过，screen 阶段
+  `circ_mv_lt` 引用 `CIRC_MV[0]` 列（已消失）→ `KeyError: 'CIRC_MV[0]'`，
+  `rquant-daily.service` exit 1。
+  - `screen/loader.py`：merge 后补全 daily_basic / daily_indicator 标准列的 `[0]`
+    为 NaN（float），让依赖列的规则拿 NaN 判定为 False（该股不入选），一个数据源
+    延迟不再搞崩全流程
+  - `ingest.py`：daily_basic 返回空时记 WARNING（不再静默），提示 `rquant run-daily
+    <date>` 重拉
+  - 恢复方式：tushare 数据就绪后 `rquant run-daily <date>` 重拉即补全
+
 ### Changed
 
 - **daily pipeline 末尾加 Pool 2 退出兜底检查**（5/25 发现，根因追溯到 PR #26）：

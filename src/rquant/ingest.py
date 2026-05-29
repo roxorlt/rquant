@@ -69,6 +69,15 @@ def ingest_daily(trade_date: str, store: DuckDBStore | None = None) -> int:
             ).dt.date
             store.upsert_daily_basic(df_basic_mkt)
             logger.info(f"daily_basic: {len(df_basic_mkt)} 行")
+        else:
+            # 5/29 真实事故：daily_bar 拉到了但 daily_basic tushare 延迟返回空，
+            # 旧代码静默跳过 → screen 阶段 circ_mv_lt 引用 CIRC_MV[0] 崩 KeyError。
+            # 现在 loader 会补 NaN 列不崩，但仍 WARNING 标记当天市值数据缺失，
+            # 方便事后用 `rquant run-daily <date>` 重拉补全。
+            logger.warning(
+                f"daily_basic {trade_date} 返回空（tushare 数据可能延迟未就绪），"
+                f"市值类筛选今日将失效；稍后可 `rquant run-daily {trade_date}` 重拉"
+            )
 
         # 4. derive_state（逐只派生涨停/首板/连板等）
         basic_map = {r["ts_code"]: r["name"] for _, r in df_basic.iterrows()}

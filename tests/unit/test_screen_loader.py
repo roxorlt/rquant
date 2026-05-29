@@ -244,6 +244,33 @@ class TestLoadUniverseBodyAndBasic:
         assert row["CIRC_MV[0]"] == pytest.approx(28000000.0)
         assert pd.isna(row["CIRC_MV[1]"])
 
+    def test_empty_daily_basic_table_keeps_circ_mv_col(self, store: DuckDBStore) -> None:
+        """5/29 事故回归：daily_basic 整表空（tushare 延迟）时，CIRC_MV[0] 列
+        仍应存在且全 NaN，而非消失导致 screen 规则 KeyError。"""
+        store._conn.execute("DELETE FROM daily_basic")
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        assert "CIRC_MV[0]" in df.columns
+        assert "TOTAL_MV[0]" in df.columns
+        assert "TURNOVER_RATE[0]" in df.columns
+        assert df["CIRC_MV[0]"].isna().all()
+
+    def test_empty_daily_basic_circ_mv_lt_does_not_crash(
+        self, store: DuckDBStore
+    ) -> None:
+        """5/29 事故端到端回归：daily_basic 整表空时，跑含 circ_mv_lt 的 screen
+        不再 KeyError，而是把缺市值的股全部排除（circ_mv_lt 内部 fillna(inf)）。"""
+        from rquant.screen.core import screen
+        from rquant.screen.rules import circ_mv_lt
+
+        store._conn.execute("DELETE FROM daily_basic")
+        result = screen(
+            trade_date="2026-04-15",
+            rules=[circ_mv_lt(150)],
+            store=store,
+        )
+        # 不抛 KeyError；缺市值 → 全部排除
+        assert result.empty
+
 
 class TestLoadUniverseAggregates:
     def test_max_aggregate(self, store: DuckDBStore) -> None:
