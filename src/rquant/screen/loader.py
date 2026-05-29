@@ -259,6 +259,17 @@ def load_universe(
             if not wide.empty:
                 out = out.merge(wide, on="ts_code", how="left")
 
+        # 数据源临时缺失（如 5/29 tushare daily_basic 延迟，整表 0 行）时，对应宽表为空
+        # → 列直接消失 → screen 规则引用 CIRC_MV[0] 崩 KeyError，整条 pipeline 挂掉。
+        # 这里补全 daily_basic / daily_indicator 标准列的 [0]（当日）为 NaN（float），
+        # 依赖该列的规则（如 circ_mv_lt 内部 .fillna(inf)）拿 NaN 得 False（该股不入选），
+        # 而非让一个数据源延迟搞崩全流程。PRICE/STATE 与 universe 同源不会整表空，不补。
+        for cmap in (IND_COLS_MAP, BASIC_COLS_MAP):
+            for dst in cmap.values():
+                col = f"{dst}[0]"
+                if col not in out.columns:
+                    out[col] = float("nan")
+
         # 聚合列：根据 AggregateRequest 动态生成 SQL
         if aggregate_requests:
             t0_date_val = dates[0]  # T 日
