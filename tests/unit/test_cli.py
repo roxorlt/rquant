@@ -187,3 +187,58 @@ class TestMainErrorReporting:
                 with pytest.raises(ValueError):
                     main()
                 mock_notify.assert_not_called()
+
+
+class TestIngestWithRetry:
+    """_ingest_with_retry 的网络异常重试（6/4 真实事故：tushare ReadTimeout）。"""
+
+    def test_network_error_retries_then_succeeds(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        import requests
+
+        from rquant import cli
+
+        # 前两次抛 ReadTimeout，第三次成功返回 5000 行
+        calls = []
+
+        def flaky(_date):
+            calls.append(1)
+            if len(calls) < 3:
+                raise requests.exceptions.ReadTimeout("boom")
+            return 5000
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", flaky)
+        with patch("rquant.cli.time.sleep"):  # 跳过真实 sleep
+            result = cli._ingest_with_retry("2026-06-04")
+
+        assert result == 5000
+        assert len(calls) == 3
+
+    def test_network_error_exhausted_reraises(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        import pytest
+        import requests
+
+        from rquant import cli
+
+        def always_timeout(_date):
+            raise requests.exceptions.ReadTimeout("persistent")
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", always_timeout)
+        with patch("rquant.cli.time.sleep"):
+            with pytest.raises(requests.exceptions.ReadTimeout):
+                cli._ingest_with_retry("2026-06-04")
+
+    def test_data_not_ready_retries_then_zero(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from rquant import cli
+
+        # 始终返回 0（数据未就绪），重试用尽后返回 0（不抛）
+        monkeypatch.setattr("rquant.ingest.ingest_daily", lambda _d: 0)
+        with patch("rquant.cli.time.sleep"):
+            result = cli._ingest_with_retry("2026-06-04")
+
+        assert result == 0

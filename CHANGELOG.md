@@ -6,6 +6,15 @@
 
 ### Fixed
 
+- **ingest 网络超时搞崩 daily pipeline**（6/4 真实事故）：6/4 17:00 拉 tushare
+  `stock_basic` 时 30s 读超时（`requests.exceptions.ReadTimeout`），
+  `rquant-daily.service` exit 1。根因：`_ingest_with_retry` 的重试只覆盖
+  `bar_count == 0`（数据未就绪），不捕获异常 → 网络抖动直接冒泡崩溃。
+  - `cli.py::_ingest_with_retry` 增 `requests.exceptions.RequestException` 捕获，
+    网络异常用短间隔（`_NETWORK_RETRY_INTERVAL = 60s`）重试，与"数据未就绪"的
+    15min 长间隔区分；重试用尽仍异常则抛出（触发 OnFailure 告警）
+  - 恢复方式：网络恢复后 `rquant run-daily --date <date>` 重拉
+
 - **daily_basic 数据源临时缺失搞崩整条 pipeline**（5/29 真实事故）：5/29 daily_bar
   拉到了但 tushare daily_basic 接口延迟返回空，ingest 静默跳过，screen 阶段
   `circ_mv_lt` 引用 `CIRC_MV[0]` 列（已消失）→ `KeyError: 'CIRC_MV[0]'`，

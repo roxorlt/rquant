@@ -12,17 +12,42 @@ from loguru import logger
 
 from rquant.logging import setup_logging
 
-# 数据未就绪时的重试配置
+# 重试配置
 _RETRY_COUNT = 3
-_RETRY_INTERVAL = 900  # 15 分钟
+_RETRY_INTERVAL = 900  # 数据未就绪：15 分钟（等 tushare 数据出来）
+_NETWORK_RETRY_INTERVAL = 60  # 网络异常：1 分钟（tushare 抖动通常很快恢复）
 
 
 def _ingest_with_retry(trade_date: str) -> int:
-    """拉取数据，未就绪时最多重试 _RETRY_COUNT 次。"""
+    """拉取数据，最多重试 _RETRY_COUNT 次。
+
+    两类可重试情况：
+    - 网络异常（ReadTimeout / ConnectionError 等）：6/4 真实事故，tushare
+      stock_basic 接口 30s 读超时，旧代码不捕获异常直接崩 → daily exit 1。
+      短间隔重试（抖动通常秒级恢复）。
+    - 数据未就绪（bar_count == 0）：非交易日或 tushare 数据当天还没出，长间隔重试。
+    """
+    import requests
+
     from rquant.ingest import ingest_daily
 
     for attempt in range(1, _RETRY_COUNT + 1):
-        bar_count = ingest_daily(trade_date)
+        try:
+            bar_count = ingest_daily(trade_date)
+        except requests.exceptions.RequestException as e:
+            if attempt < _RETRY_COUNT:
+                logger.warning(
+                    f"ingest 网络异常 {type(e).__name__}，"
+                    f"{_NETWORK_RETRY_INTERVAL}s 后重试 "
+                    f"({attempt}/{_RETRY_COUNT}): {e}"
+                )
+                time.sleep(_NETWORK_RETRY_INTERVAL)
+                continue
+            logger.error(
+                f"{trade_date} ingest 网络异常重试 {_RETRY_COUNT} 次仍失败: {e}"
+            )
+            raise
+
         if bar_count > 0:
             return bar_count
         if attempt < _RETRY_COUNT:
