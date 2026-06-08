@@ -47,4 +47,21 @@ sudo fuser -v /home/lighthouse/rquant/data/rquant.duckdb
 sudo systemctl restart rquant-canvas.service
 \`\`\`"
 
-exec "${RQUANT_BIN}" alert --subject "${SUBJECT}" --body "${BODY}"
+# 不用 exec：要在推送失败时落盘兜底（审计 PR2-E）。所有业务 service 的 OnFailure
+# 都汇到这里，若 PushDeer/PushPlus 全挂（网络抖动 / token 失效），告警会静默消失。
+# 落盘到 logs/alert-failures.jsonl，由 daily-report 扫描带出 + dashboard 可见，
+# 保证原始故障"至少在服务器上有记录"。
+if ! "${RQUANT_BIN}" alert --subject "${SUBJECT}" --body "${BODY}"; then
+    FAIL_LOG="${PROJECT_DIR}/logs/alert-failures.jsonl"
+    mkdir -p "${PROJECT_DIR}/logs"
+    # 用 python 写 json，避免 subject 含特殊字符破坏格式
+    "${PROJECT_DIR}/.venv/bin/python" - "$UNIT" "$HOST" "$TIME" "$SUBJECT" <<'PYEOF' >> "${FAIL_LOG}" || true
+import json, sys
+print(json.dumps({
+    "failed_at": sys.argv[3], "unit": sys.argv[1],
+    "host": sys.argv[2], "subject": sys.argv[4],
+}, ensure_ascii=False))
+PYEOF
+    echo "alert 推送失败，已落盘 ${FAIL_LOG}" >&2
+    exit 1
+fi

@@ -20,7 +20,7 @@ from pathlib import Path
 from loguru import logger
 
 from rquant.config import settings
-from rquant.storage.duckdb import DuckDBStore
+from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
 
 # ---------- systemd 状态 ----------
@@ -294,6 +294,32 @@ def build_daily_report(
 # ---------- 顶层入口 ----------
 
 
+def _read_recent_alert_failures(log_dir: Path, today: date) -> list[dict]:
+    """读 alert-failures.jsonl 中今日的"未送达告警"（PR2-E 兜底带出）。
+
+    alert-on-failure.sh 在 PushDeer/PushPlus 全推送失败时落盘到此文件，
+    daily-report 扫描后并入日报正文，保证告警黑洞至少能在日报里被看见。
+    """
+    import json
+
+    path = log_dir / "alert-failures.jsonl"
+    if not path.exists():
+        return []
+    today_str = today.isoformat()
+    out: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(rec.get("failed_at", "")).startswith(today_str):
+            out.append(rec)
+    return out
+
+
 def generate_and_send_daily_report(
     today: date | None = None,
     dry_run: bool = False,
@@ -313,16 +339,27 @@ def generate_and_send_daily_report(
     daily_snap = get_service_snapshot("rquant-daily.service", today)
     watchdog_counts = read_watchdog_log(settings.log_dir, today)
 
-    # 5/13 复盘 Bug A：daily-report 不写 db（count_today_business_data 是纯 SELECT），
-    # 改 read_only=True 才能跟 monitor / nl-screen 共存。原默认写模式在 5/1 节假日
-    # 撞了 nl-screen 旧版持的写锁（PID 2597296），daily-report fatal exit。
-    # 套路同 v0.12.1 nl-screen hotfix。
-    with DuckDBStore(read_only=True) as store:
+    # 5/13 复盘 Bug A：daily-report 不写 db（count_today_business_data 是纯 SELECT）。
+    # 进一步（审计 PR2-I）：改用 open_readonly_store() 优先读副本，彻底避开 monitor
+    # 写锁——原 DuckDBStore(read_only=True) 直连主库，monitor 因 watchdog 重启延后
+    # 退出 / backup 正持锁时仍会 IOError fatal exit。副本由 replica-sync.timer 维护。
+    with open_readonly_store() as store:
         business = count_today_business_data(store, today)
 
     subject, body = build_daily_report(
         today, trading_day, monitor_snap, daily_snap, watchdog_counts, business,
     )
+
+    # PR2-E：把今日"推送失败已落盘"的告警带进日报，避免告警黑洞
+    alert_fails = _read_recent_alert_failures(settings.log_dir, today)
+    if alert_fails:
+        lines = ["", "## ⚠️ 今日未送达告警（推送失败已落盘兜底）"]
+        for f in alert_fails:
+            lines.append(
+                f"- {f.get('failed_at', '?')} `{f.get('unit', '?')}` "
+                f"— {f.get('subject', '')}"
+            )
+        body += "\n" + "\n".join(lines)
 
     logger.info(f"日报 subject: {subject}")
     logger.info(f"日报 body:\n{body}")
