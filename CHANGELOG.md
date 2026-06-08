@@ -6,13 +6,30 @@
 
 ### Fixed
 
+- **daily / monitor 全面故障隔离（审计后系统性加固）**：连续多起"外部依赖临时故障
+  搞崩整条定时任务"事故（接口下线 / 数据延迟 / 网络超时）后，一次全面 review 给核心
+  定时任务加故障隔离，原则是"单点异常不拖垮整条流程"：
+  - `pipeline.py`：daily 流水线 preset 循环每个 preset 独立 try/except（失败标
+    `summary=-1` + 推 error 通知，继续其他 preset）；`_sync_pool2_watch` /
+    `check_exits` / `_push_daily_summary` 各自独立 try/except——保证某 preset 或
+    某步失败不连带打掉 `check_exits` 兜底（Pool 2 退出检查）
+  - `monitor.py`：盘中主循环单票 try/except（某只票存库 / notify / 日期计算异常不
+    终止整个盯盘进程）；`check_exits` 单票 try/except（某只票退出处理失败不中断整批）；
+    `fetch_realtime_prices` 加 akshare 列存在性校验（改列名时返回空而非 KeyError 崩）
+  - `cli.py::_ingest_with_retry` 重试范围从"仅 `RequestException`"扩到"所有 ingest
+    异常"——覆盖 tushare 服务端业务错误（限频 / 接口下线，客户端抛裸 `Exception`），
+    短间隔重试，耗尽仍失败则 `raise` 不吞
+  - `loader.py`：补列从"仅 IND/BASIC 的 `[0]`"扩到"IND/BASIC/STATE 各 offset + 标量
+    `is_st`/`is_bj`/`board_type` 默认值"——daily_state 整表缺失也不让 `not_st` /
+    `board_in` / Pool 2 的 `BODY_UPPER[1]` 引用崩
+  - 新增 7 个故障隔离单测，全量 427 passed
+
 - **ingest 网络超时搞崩 daily pipeline**（6/4 真实事故）：6/4 17:00 拉 tushare
   `stock_basic` 时 30s 读超时（`requests.exceptions.ReadTimeout`），
   `rquant-daily.service` exit 1。根因：`_ingest_with_retry` 的重试只覆盖
   `bar_count == 0`（数据未就绪），不捕获异常 → 网络抖动直接冒泡崩溃。
-  - `cli.py::_ingest_with_retry` 增 `requests.exceptions.RequestException` 捕获，
-    网络异常用短间隔（`_NETWORK_RETRY_INTERVAL = 60s`）重试，与"数据未就绪"的
-    15min 长间隔区分；重试用尽仍异常则抛出（触发 OnFailure 告警）
+  - `cli.py::_ingest_with_retry` 改为捕获所有 ingest 异常（见上条），短间隔
+    （`_NETWORK_RETRY_INTERVAL = 60s`）重试，与"数据未就绪"15min 长间隔区分
   - 恢复方式：网络恢复后 `rquant run-daily --date <date>` 重拉
 
 - **daily_basic 数据源临时缺失搞崩整条 pipeline**（5/29 真实事故）：5/29 daily_bar

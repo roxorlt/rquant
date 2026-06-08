@@ -242,3 +242,43 @@ class TestIngestWithRetry:
             result = cli._ingest_with_retry("2026-06-04")
 
         assert result == 0
+
+
+class TestIngestRetryBusinessError:
+    """_ingest_with_retry 也重试 tushare 服务端业务错误（裸 Exception，非 RequestException）。"""
+
+    def test_business_exception_retries_then_succeeds(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from rquant import cli
+
+        calls = []
+
+        def flaky(_date):
+            calls.append(1)
+            if len(calls) < 2:
+                # tushare 客户端业务错误抛裸 Exception（如限频/接口临时故障）
+                raise Exception("抱歉，您每分钟最多访问该接口600次")
+            return 5000
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", flaky)
+        with patch("rquant.cli.time.sleep"):
+            result = cli._ingest_with_retry("2026-06-04")
+
+        assert result == 5000
+        assert len(calls) == 2
+
+    def test_business_exception_exhausted_reraises(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        import pytest
+
+        from rquant import cli
+
+        def always_fail(_date):
+            raise Exception("接口下线")
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", always_fail)
+        with patch("rquant.cli.time.sleep"):
+            with pytest.raises(Exception, match="接口下线"):
+                cli._ingest_with_retry("2026-06-04")

@@ -22,29 +22,30 @@ def _ingest_with_retry(trade_date: str) -> int:
     """拉取数据，最多重试 _RETRY_COUNT 次。
 
     两类可重试情况：
-    - 网络异常（ReadTimeout / ConnectionError 等）：6/4 真实事故，tushare
-      stock_basic 接口 30s 读超时，旧代码不捕获异常直接崩 → daily exit 1。
-      短间隔重试（抖动通常秒级恢复）。
+    - ingest 抛异常（短间隔重试）：覆盖两种 tushare 故障——
+      a) 网络层异常（ReadTimeout / ConnectionError，6/4 事故）；
+      b) 服务端业务错误（限频 / 接口临时故障，tushare 客户端抛**裸 Exception**
+         而非 RequestException）。两者都该短重试。故用 `except Exception`——
+         真正的代码 bug 也会被重试，但重试耗尽后 `raise` 抛出不吞（daily 非实时，
+         延迟暴露可接受），换取对 tushare 抖动的鲁棒性。
     - 数据未就绪（bar_count == 0）：非交易日或 tushare 数据当天还没出，长间隔重试。
     """
-    import requests
-
     from rquant.ingest import ingest_daily
 
     for attempt in range(1, _RETRY_COUNT + 1):
         try:
             bar_count = ingest_daily(trade_date)
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             if attempt < _RETRY_COUNT:
                 logger.warning(
-                    f"ingest 网络异常 {type(e).__name__}，"
+                    f"ingest 异常 {type(e).__name__}，"
                     f"{_NETWORK_RETRY_INTERVAL}s 后重试 "
                     f"({attempt}/{_RETRY_COUNT}): {e}"
                 )
                 time.sleep(_NETWORK_RETRY_INTERVAL)
                 continue
             logger.error(
-                f"{trade_date} ingest 网络异常重试 {_RETRY_COUNT} 次仍失败: {e}"
+                f"{trade_date} ingest 重试 {_RETRY_COUNT} 次仍失败: {e}"
             )
             raise
 
