@@ -6,6 +6,13 @@
 
 ### Fixed
 
+- **watchdog 尾盘监控真空（审计 PR3-F）**：`rquant-monitor-watchdog.timer` 原
+  `OnCalendar=Mon..Fri *-*-* 9..14:0/2` 最后一次触发是 **14:58**，但脚本窗口到 15:00。
+  若 monitor 在 14:58–15:00（含 14:57-15:00 收盘集合竞价，A 股最关键时段）死掉，
+  下次 watchdog 要等次日 09:00，尾盘完全无守护。扩到 `9..15:0/2` 让 15:00 也触发一次
+  收尾检查（脚本 `NOW>1500` gate 让 15:00 动作、15:02+ 静默退）。
+  ⚠️ systemd unit 改动，merge 前须云端 `systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/2' --iterations 5` 确认步进 2min。
+
 - **daily_basic 数据源临时缺失搞崩整条 pipeline**（5/29 真实事故）：5/29 daily_bar
   拉到了但 tushare daily_basic 接口延迟返回空，ingest 静默跳过，screen 阶段
   `circ_mv_lt` 引用 `CIRC_MV[0]` 列（已消失）→ `KeyError: 'CIRC_MV[0]'`，

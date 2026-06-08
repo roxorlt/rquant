@@ -2,16 +2,21 @@
 Description=Trigger rquant-monitor watchdog every 2 min during trading hours
 
 [Timer]
-# 09..14 时段每 2 分钟。systemd OnCalendar 实测语法陷阱：
+# 09..15 时段每 2 分钟。systemd OnCalendar 实测语法陷阱：
 #   ❌ `09:30..11:30/2`：跨小时分钟范围 → Invalid argument
 #   ❌ `13:00..15:00/2`：解析成功但 /2 是秒步进（每 2 秒触发一次）
 #   ❌ `09..14:*/2`：minute 字段用 `*/N` → Invalid argument
-#   ✅ `9..14:0/2`：minute 显式 start=0 step=2（已 systemd-analyze 验证）
+#   ✅ `9..15:0/2`：minute 显式 start=0 step=2（同构于已验证的 9..14:0/2）
+#
+# PR3-F 修复尾盘真空：原 `9..14:0/2` 最后一次触发是 14:58，但脚本窗口到 15:00。
+# 若 monitor 在 14:58–15:00（含 14:57-15:00 收盘集合竞价）死掉，下次 watchdog 要
+# 等次日 09:00 —— 尾盘最关键时段无守护。扩到 `9..15:0/2` 让 15:00 也触发一次收尾
+# 检查（脚本 gate NOW>1500 退出，故 15:00 动作、15:02+ 静默退）。
 #
 # 实际触发时段交给 watchdog 脚本判断（09:30-15:00 才动作，否则 log
-# out-of-window 静默退）。覆盖 09:00-09:28 + 11:00-12:58 这两段非交易时
-# 间是冗余触发，但 watchdog 看 monitor active 时静默退，无副作用。
-OnCalendar=Mon..Fri *-*-* 9..14:0/2
+# out-of-window 静默退）。覆盖 09:00-09:28 + 11:00-12:58 + 15:02-15:58 这些非交易
+# 时间是冗余触发，但 watchdog 看 monitor active / out-of-window 时静默退，无副作用。
+OnCalendar=Mon..Fri *-*-* 9..15:0/2
 
 # 错过不补（盘外触发没意义）
 Persistent=false
