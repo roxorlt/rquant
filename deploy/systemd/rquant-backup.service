@@ -1,6 +1,8 @@
 [Unit]
 Description=rQuant DuckDB Snapshot for Backup API
 After=network-online.target
+# 备份连续失败（磁盘满 / 主库异常）应告警，否则本地热备一直拉到坏文件无感知（PR2-J）
+OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot

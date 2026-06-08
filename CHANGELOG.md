@@ -6,6 +6,23 @@
 
 ### Fixed
 
+- **告警链路可靠性加固（审计 PR2）**：全面 review 发现告警/兜底链路多处会静默失效。
+  - **告警黑洞兜底（E）**：`alert-on-failure.sh` 原用 `exec rquant alert`，PushDeer/
+    PushPlus 全推送失败时告警**静默消失**（所有业务 service 的 OnFailure 都汇到这里）。
+    改为捕获失败 → 落盘 `logs/alert-failures.jsonl`；`daily-report` 扫描当日记录并入
+    日报正文（`health.py::_read_recent_alert_failures`），保证故障"至少服务器有记录 +
+    日报能看见"。
+  - **守护/备份缺 OnFailure（J）**：`rquant-monitor-watchdog.service`（盘中 monitor
+    自愈的唯一通道）和 `rquant-backup.service` 都没配 OnFailure，自身崩了无人知。
+    各加 `OnFailure=rquant-alert@%n.service`（原 watchdog 注释"不应触发 watchdog 链"
+    是误解，alert 是独立 oneshot）。
+  - **token 提醒推送失败静默（M2）**：`remind-tushare-token-renewal.sh` 推送失败仍
+    exit 0（最后一句是 print），一次性 timer 触发后不再来 → 续费提醒永久丢。改为
+    全失败 `sys.exit(1)` 让 OnFailure 接管落盘兜底。
+  - **daily-report 直连主库（I）**：`health.py` 改用 `open_readonly_store()` 优先读
+    副本，避开 monitor 延后退出 / backup 持锁时的 `IOError` fatal exit（遵循
+    CLAUDE.md DuckDB 并发约定）。
+
 - **daily_basic 数据源临时缺失搞崩整条 pipeline**（5/29 真实事故）：5/29 daily_bar
   拉到了但 tushare daily_basic 接口延迟返回空，ingest 静默跳过，screen 阶段
   `circ_mv_lt` 引用 `CIRC_MV[0]` 列（已消失）→ `KeyError: 'CIRC_MV[0]'`，

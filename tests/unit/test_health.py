@@ -326,3 +326,48 @@ class TestBuildDailyReport:
         )
         assert "❌ monitor" in body
         assert "未触发" in body
+
+
+class TestAlertFailureReadout:
+    """PR2-E：daily-report 读 alert-failures.jsonl 带出未送达告警。"""
+
+    def test_reads_today_failures_only(self, tmp_path) -> None:
+        import json
+        from datetime import date
+
+        from rquant.health import _read_recent_alert_failures
+
+        log = tmp_path / "alert-failures.jsonl"
+        log.write_text(
+            json.dumps({"failed_at": "2026-06-08 17:00:43", "unit": "rquant-daily.service",
+                        "host": "vm", "subject": "x"}, ensure_ascii=False) + "\n"
+            + json.dumps({"failed_at": "2026-06-07 09:00:00", "unit": "old.service",
+                          "host": "vm", "subject": "y"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        out = _read_recent_alert_failures(tmp_path, date(2026, 6, 8))
+        assert len(out) == 1
+        assert out[0]["unit"] == "rquant-daily.service"
+
+    def test_missing_file_returns_empty(self, tmp_path) -> None:
+        from datetime import date
+
+        from rquant.health import _read_recent_alert_failures
+
+        assert _read_recent_alert_failures(tmp_path, date(2026, 6, 8)) == []
+
+    def test_skips_corrupted_lines(self, tmp_path) -> None:
+        import json
+        from datetime import date
+
+        from rquant.health import _read_recent_alert_failures
+
+        log = tmp_path / "alert-failures.jsonl"
+        log.write_text(
+            json.dumps({"failed_at": "2026-06-08 10:00:00", "unit": "a.service",
+                        "host": "vm", "subject": "x"}, ensure_ascii=False) + "\n"
+            + "garbage not json\n",
+            encoding="utf-8",
+        )
+        out = _read_recent_alert_failures(tmp_path, date(2026, 6, 8))
+        assert len(out) == 1
