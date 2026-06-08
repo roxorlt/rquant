@@ -193,6 +193,14 @@ def fetch_realtime_prices(
         logger.error("akshare 实时行情获取失败")
         return {}
 
+    # 列存在性校验：akshare 改列名时（"代码"/"最新价"/"最低"）整轮返回空而非
+    # 裸 KeyError 崩掉 monitor 进程。下一轮重试。
+    required = {"代码", "最新价", "最低"}
+    missing = required - set(df.columns)
+    if missing:
+        logger.error(f"akshare 实时行情列异常，缺 {missing}，本轮跳过")
+        return {}
+
     code_map = {c.split(".")[0]: c for c in ts_codes}
     wanted = set(code_map.keys())
 
@@ -302,72 +310,79 @@ def check_exits(store: DuckDBStore, today: date) -> int:
     expired_held: list[dict] = []
 
     for _, row in active.iterrows():
-        code = row["ts_code"]
-        raw_entry = row["entry_date"]
-        entry_date = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
-        bl_label = blacklist[code].list_label if code in blacklist else None
+        # 单票故障隔离：某只票数据异常 / update_pool2_exit 写入异常不应中断整批退出检查
+        try:
+            code = row["ts_code"]
+            raw_entry = row["entry_date"]
+            entry_date = raw_entry.date() if hasattr(raw_entry, "date") else raw_entry
+            bl_label = blacklist[code].list_label if code in blacklist else None
 
-        stop_s = float(row["stop_strong"])
-        stop_w = float(row["stop_weak"])
+            stop_s = float(row["stop_strong"])
+            stop_w = float(row["stop_weak"])
 
-        close_row = store._conn.execute(
-            "SELECT close FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
-            [code, today],
-        ).fetchone()
-        if close_row is None:
-            continue
+            close_row = store._conn.execute(
+                "SELECT close FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
+                [code, today],
+            ).fetchone()
+            if close_row is None:
+                continue
 
-        close_price = float(close_row[0])
-        days = _count_trading_days_since(store, entry_date, today)
+            close_price = float(close_row[0])
+            days = _count_trading_days_since(store, entry_date, today)
 
-        if close_price < stop_w:
-            store.update_pool2_exit(code, today, "breakdown")
-            auto_kicked.append({
-                "ts_code": code,
-                "name": name_map.get(code, ""),
-                "kind": "breakdown",
-                "close": close_price,
-                "threshold": stop_w,
-                "reason_label": "弱止",
-                "blacklist_label": bl_label,
-            })
-            logger.info(f"Pool 2 自动踢出: {code} 跌破弱止 ¥{stop_w:.2f}")
-        elif close_price < stop_s:
-            store.update_pool2_exit(code, today, "breakdown")
-            auto_kicked.append({
-                "ts_code": code,
-                "name": name_map.get(code, ""),
-                "kind": "breakdown",
-                "close": close_price,
-                "threshold": stop_s,
-                "reason_label": "强止",
-                "blacklist_label": bl_label,
-            })
-            logger.info(f"Pool 2 自动踢出: {code} 跌破强止 ¥{stop_s:.2f}")
-        elif days > settings.pool2_max_age_days:
-            store.update_pool2_exit(code, today, "aged_out")
-            auto_kicked.append({
-                "ts_code": code,
-                "name": name_map.get(code, ""),
-                "kind": "aged_out",
-                "entry_date": entry_date,
-                "days_in_pool": days,
-                "threshold_days": settings.pool2_max_age_days,
-                "blacklist_label": bl_label,
-            })
-            logger.info(
-                f"Pool 2 自动踢出: {code} 已入池 {days} 日，"
-                f"超过阈值 {settings.pool2_max_age_days}"
+            if close_price < stop_w:
+                store.update_pool2_exit(code, today, "breakdown")
+                auto_kicked.append({
+                    "ts_code": code,
+                    "name": name_map.get(code, ""),
+                    "kind": "breakdown",
+                    "close": close_price,
+                    "threshold": stop_w,
+                    "reason_label": "弱止",
+                    "blacklist_label": bl_label,
+                })
+                logger.info(f"Pool 2 自动踢出: {code} 跌破弱止 ¥{stop_w:.2f}")
+            elif close_price < stop_s:
+                store.update_pool2_exit(code, today, "breakdown")
+                auto_kicked.append({
+                    "ts_code": code,
+                    "name": name_map.get(code, ""),
+                    "kind": "breakdown",
+                    "close": close_price,
+                    "threshold": stop_s,
+                    "reason_label": "强止",
+                    "blacklist_label": bl_label,
+                })
+                logger.info(f"Pool 2 自动踢出: {code} 跌破强止 ¥{stop_s:.2f}")
+            elif days > settings.pool2_max_age_days:
+                store.update_pool2_exit(code, today, "aged_out")
+                auto_kicked.append({
+                    "ts_code": code,
+                    "name": name_map.get(code, ""),
+                    "kind": "aged_out",
+                    "entry_date": entry_date,
+                    "days_in_pool": days,
+                    "threshold_days": settings.pool2_max_age_days,
+                    "blacklist_label": bl_label,
+                })
+                logger.info(
+                    f"Pool 2 自动踢出: {code} 已入池 {days} 日，"
+                    f"超过阈值 {settings.pool2_max_age_days}"
+                )
+            elif days >= 3:
+                expired_held.append({
+                    "ts_code": code,
+                    "name": name_map.get(code, ""),
+                    "entry_date": entry_date,
+                    "days_in_pool": days,
+                    "blacklist_label": bl_label,
+                })
+                logger.info(f"Pool 2 超期保留: {code} 第 {days} 日")
+        except Exception:
+            logger.exception(
+                f"check_exits 单票处理失败，跳过: {row.get('ts_code', '?')}"
             )
-        elif days >= 3:
-            expired_held.append({
-                "ts_code": code,
-                "name": name_map.get(code, ""),
-                "entry_date": entry_date,
-                "days_in_pool": days,
-                "blacklist_label": bl_label,
-            })
-            logger.info(f"Pool 2 超期保留: {code} 第 {days} 日")
+            continue
 
     if auto_kicked or expired_held:
         notify(
@@ -499,60 +514,66 @@ def run_monitor(interval: int = 5) -> int:
             prices = fetch_realtime_prices(ts_codes)
 
             for code, pdata in prices.items():
-                item = item_map.get(code)
-                if item is None:
+                # 单票故障隔离：某只票的存库 / notify / 日期计算异常（盘中写锁竞争、
+                # DuckDB 临时 IOError、单条数据异常等）不应终止整个盯盘进程。
+                try:
+                    item = item_map.get(code)
+                    if item is None:
+                        continue
+
+                    events = check_levels(
+                        item, pdata["price"], pdata["low"]
+                    )
+
+                    for evt in events:
+                        # 存库
+                        evt_df = pd.DataFrame([{
+                            "trade_date": today,
+                            "ts_code": code,
+                            "level": evt["level"],
+                            "trigger_price": evt["trigger_price"],
+                            "level_price": evt["level_price"],
+                            "trigger_time": _now(),
+                            "trigger_type": evt["trigger_type"],
+                            "pool": item.pool,
+                            "body_upper": item.body_upper,
+                            "body_lower": item.body_lower,
+                        }])
+                        store.upsert_monitor_event(evt_df)
+
+                        triggers_summary[evt["level"]] = (
+                            triggers_summary.get(evt["level"], 0) + 1
+                        )
+
+                        days = _count_trading_days_since(
+                            store,
+                            item.entry_date or item.limit_up_date,
+                            today,
+                        )
+                        ref_date = item.entry_date or item.limit_up_date
+
+                        notify(
+                            "price_level",
+                            ts_code=code,
+                            name=item.name,
+                            level=evt["level"],
+                            trigger_price=evt["trigger_price"],
+                            body_upper=item.body_upper,
+                            body_lower=item.body_lower,
+                            level_40=item.level_40,
+                            level_30=item.level_30,
+                            level_20=item.level_20,
+                            stop_strong=item.stop_strong,
+                            stop_weak=item.stop_weak,
+                            pool=item.pool,
+                            entry_date=ref_date,
+                            days_in_pool=days,
+                            blacklist_label=item.blacklist_label,
+                            blacklist_categories=item.blacklist_categories,
+                        )
+                except Exception:
+                    logger.exception(f"monitor 单票处理失败，跳过: {code}")
                     continue
-
-                events = check_levels(
-                    item, pdata["price"], pdata["low"]
-                )
-
-                for evt in events:
-                    # 存库
-                    evt_df = pd.DataFrame([{
-                        "trade_date": today,
-                        "ts_code": code,
-                        "level": evt["level"],
-                        "trigger_price": evt["trigger_price"],
-                        "level_price": evt["level_price"],
-                        "trigger_time": _now(),
-                        "trigger_type": evt["trigger_type"],
-                        "pool": item.pool,
-                        "body_upper": item.body_upper,
-                        "body_lower": item.body_lower,
-                    }])
-                    store.upsert_monitor_event(evt_df)
-
-                    triggers_summary[evt["level"]] = (
-                        triggers_summary.get(evt["level"], 0) + 1
-                    )
-
-                    days = _count_trading_days_since(
-                        store,
-                        item.entry_date or item.limit_up_date,
-                        today,
-                    )
-                    ref_date = item.entry_date or item.limit_up_date
-
-                    notify(
-                        "price_level",
-                        ts_code=code,
-                        name=item.name,
-                        level=evt["level"],
-                        trigger_price=evt["trigger_price"],
-                        body_upper=item.body_upper,
-                        body_lower=item.body_lower,
-                        level_40=item.level_40,
-                        level_30=item.level_30,
-                        level_20=item.level_20,
-                        stop_strong=item.stop_strong,
-                        stop_weak=item.stop_weak,
-                        pool=item.pool,
-                        entry_date=ref_date,
-                        days_in_pool=days,
-                        blacklist_label=item.blacklist_label,
-                        blacklist_categories=item.blacklist_categories,
-                    )
 
             time.sleep(interval)
 

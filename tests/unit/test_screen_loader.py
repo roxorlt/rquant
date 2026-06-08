@@ -403,3 +403,38 @@ class TestWindowRulesIntegration:
         mask = rule(df)
         row_mask = mask.loc[df["ts_code"] == "300001.SZ"]
         assert row_mask.iloc[0]
+
+
+class TestLoadUniverseStateResilience:
+    """daily_state 整表缺失时标准列补全，不让 screen 规则 KeyError（审计 PR1-H）。"""
+
+    def test_empty_daily_state_keeps_scalar_and_offset_cols(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute("DELETE FROM daily_state")
+        df = load_universe("2026-04-15", lookback=1, store=store)
+        # 标量属性列补默认
+        assert "is_st" in df.columns
+        assert "is_bj" in df.columns
+        assert "board_type" in df.columns
+        assert df["is_st"].eq(False).all()
+        # STATE offset 列补全（含历史 offset [1]）
+        assert "BODY_UPPER[0]" in df.columns
+        assert "BODY_UPPER[1]" in df.columns
+        assert df["BODY_UPPER[0]"].isna().all()
+
+    def test_empty_daily_state_not_st_and_board_in_do_not_crash(
+        self, store: DuckDBStore
+    ) -> None:
+        from rquant.screen.core import screen
+        from rquant.screen.rules import board_in, not_st
+
+        store._conn.execute("DELETE FROM daily_state")
+        # not_st 引用 is_st、board_in 引用 board_type，整表缺时不应 KeyError
+        result = screen(
+            trade_date="2026-04-15",
+            rules=[not_st(), board_in(["main", "gem"])],
+            store=store,
+        )
+        # 不抛异常即通过（board_type 全 "" 不在白名单 → 全排除）
+        assert result.empty

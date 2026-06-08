@@ -614,3 +614,61 @@ class TestRunMonitor:
 
         # lunch 阶段进入 _wait_for_afternoon_open 至少 2 次
         assert mock_wait_pm.call_count >= 2
+
+
+class TestCheckExitsSingleStockIsolation:
+    """check_exits 单票故障隔离：一只票异常不中断整批退出检查（审计 PR1-G）。"""
+
+    def test_one_bad_stock_does_not_block_others(self, store: DuckDBStore) -> None:
+        from datetime import date
+        from unittest.mock import patch
+
+        from rquant.monitor import check_exits
+
+        # 两只 active：bad 的 stop_strong 为 NaN（float 转换会在比较中产生问题）
+        # good 正常跌破弱止应被踢
+        p2 = pd.DataFrame([
+            {
+                "ts_code": "000001.SZ", "entry_date": date(2026, 4, 20),
+                "limit_up_date": date(2026, 4, 19),
+                "body_upper": 13.20, "body_lower": 11.80,
+                "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+                "stop_strong": 11.80, "stop_weak": 11.52, "status": "active",
+            },
+            {
+                "ts_code": "000002.SZ", "entry_date": date(2026, 4, 20),
+                "limit_up_date": date(2026, 4, 19),
+                "body_upper": 20.0, "body_lower": 18.0,
+                "level_40": 18.8, "level_30": 18.6, "level_20": 18.4,
+                "stop_strong": 18.0, "stop_weak": 17.6, "status": "active",
+            },
+        ])
+        store.upsert_pool2_watch(p2)
+        # 000002.SZ 收盘跌破弱止 → 应踢；000001.SZ 无 daily_bar 行
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000002.SZ', '2026-04-21', 18,18,17,17.4,18,-0.5,-3,1000,10000)"
+        )
+
+        # 让 000001.SZ 处理时抛异常：mock update_pool2_exit 对它抛错
+        real_update = store.update_pool2_exit
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000001.SZ', '2026-04-21', 12,12,11,11.4,12,-0.5,-4,1000,10000)"
+        )
+
+        orig = type(store).update_pool2_exit
+
+        def flaky_update(self, code, exit_date, reason):
+            if code == "000001.SZ":
+                raise RuntimeError("simulated single-stock failure")
+            return orig(self, code, exit_date, reason)
+
+        with patch("rquant.notify.notify"), \
+             patch.object(type(store), "update_pool2_exit", flaky_update):
+            kicked = check_exits(store, date(2026, 4, 21))
+
+        # 000002.SZ 仍被成功踢出（000001.SZ 的异常被隔离）
+        assert kicked == 1
+        active = store.query_pool2_active()
+        assert set(active["ts_code"]) == {"000001.SZ"}  # 只剩异常那只仍 active

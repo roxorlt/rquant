@@ -187,3 +187,98 @@ class TestMainErrorReporting:
                 with pytest.raises(ValueError):
                     main()
                 mock_notify.assert_not_called()
+
+
+class TestIngestWithRetry:
+    """_ingest_with_retry 的网络异常重试（6/4 真实事故：tushare ReadTimeout）。"""
+
+    def test_network_error_retries_then_succeeds(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        import requests
+
+        from rquant import cli
+
+        # 前两次抛 ReadTimeout，第三次成功返回 5000 行
+        calls = []
+
+        def flaky(_date):
+            calls.append(1)
+            if len(calls) < 3:
+                raise requests.exceptions.ReadTimeout("boom")
+            return 5000
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", flaky)
+        with patch("rquant.cli.time.sleep"):  # 跳过真实 sleep
+            result = cli._ingest_with_retry("2026-06-04")
+
+        assert result == 5000
+        assert len(calls) == 3
+
+    def test_network_error_exhausted_reraises(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        import pytest
+        import requests
+
+        from rquant import cli
+
+        def always_timeout(_date):
+            raise requests.exceptions.ReadTimeout("persistent")
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", always_timeout)
+        with patch("rquant.cli.time.sleep"):
+            with pytest.raises(requests.exceptions.ReadTimeout):
+                cli._ingest_with_retry("2026-06-04")
+
+    def test_data_not_ready_retries_then_zero(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from rquant import cli
+
+        # 始终返回 0（数据未就绪），重试用尽后返回 0（不抛）
+        monkeypatch.setattr("rquant.ingest.ingest_daily", lambda _d: 0)
+        with patch("rquant.cli.time.sleep"):
+            result = cli._ingest_with_retry("2026-06-04")
+
+        assert result == 0
+
+
+class TestIngestRetryBusinessError:
+    """_ingest_with_retry 也重试 tushare 服务端业务错误（裸 Exception，非 RequestException）。"""
+
+    def test_business_exception_retries_then_succeeds(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        from rquant import cli
+
+        calls = []
+
+        def flaky(_date):
+            calls.append(1)
+            if len(calls) < 2:
+                # tushare 客户端业务错误抛裸 Exception（如限频/接口临时故障）
+                raise Exception("抱歉，您每分钟最多访问该接口600次")
+            return 5000
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", flaky)
+        with patch("rquant.cli.time.sleep"):
+            result = cli._ingest_with_retry("2026-06-04")
+
+        assert result == 5000
+        assert len(calls) == 2
+
+    def test_business_exception_exhausted_reraises(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        import pytest
+
+        from rquant import cli
+
+        def always_fail(_date):
+            raise Exception("接口下线")
+
+        monkeypatch.setattr("rquant.ingest.ingest_daily", always_fail)
+        with patch("rquant.cli.time.sleep"):
+            with pytest.raises(Exception, match="接口下线"):
+                cli._ingest_with_retry("2026-06-04")

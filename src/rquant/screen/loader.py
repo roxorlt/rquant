@@ -259,16 +259,20 @@ def load_universe(
             if not wide.empty:
                 out = out.merge(wide, on="ts_code", how="left")
 
-        # 数据源临时缺失（如 5/29 tushare daily_basic 延迟，整表 0 行）时，对应宽表为空
-        # → 列直接消失 → screen 规则引用 CIRC_MV[0] 崩 KeyError，整条 pipeline 挂掉。
-        # 这里补全 daily_basic / daily_indicator 标准列的 [0]（当日）为 NaN（float），
-        # 依赖该列的规则（如 circ_mv_lt 内部 .fillna(inf)）拿 NaN 得 False（该股不入选），
-        # 而非让一个数据源延迟搞崩全流程。PRICE/STATE 与 universe 同源不会整表空，不补。
-        for cmap in (IND_COLS_MAP, BASIC_COLS_MAP):
+        # 数据源临时缺失（如 5/29 daily_basic 延迟、daily_state/daily_indicator 整表缺）
+        # 时对应宽表为空 → 列消失 → screen 规则引用 CIRC_MV[0]/BODY_UPPER[1] 等崩
+        # KeyError，整条 pipeline 挂掉。这里补全 IND/BASIC/STATE 标准列在 lookback 内
+        # **各 offset**（不只当日 [0]）为 NaN（float）：
+        # - 数值规则（circ_mv_lt 内部 .fillna(inf)）拿 NaN 得 False（该股不入选）
+        # - bool 状态规则 _bool_state_rule 内部 .fillna(False)，NaN 安全
+        # PRICE 与 universe 同源（daily_bar 非空则必有 [0..lookback]），无需补。
+        max_offset = len(dates) - 1
+        for cmap in (IND_COLS_MAP, BASIC_COLS_MAP, STATE_COLS_MAP):
             for dst in cmap.values():
-                col = f"{dst}[0]"
-                if col not in out.columns:
-                    out[col] = float("nan")
+                for off in range(max_offset + 1):
+                    col = f"{dst}[{off}]"
+                    if col not in out.columns:
+                        out[col] = float("nan")
 
         # 聚合列：根据 AggregateRequest 动态生成 SQL
         if aggregate_requests:
@@ -278,11 +282,17 @@ def load_universe(
                 if not agg_col.empty:
                     out = out.merge(agg_col, on="ts_code", how="left")
 
-        # 默认值填充
-        if "is_st" in out.columns:
-            out["is_st"] = out["is_st"].fillna(False).astype(bool)
-        if "is_bj" in out.columns:
-            out["is_bj"] = out["is_bj"].fillna(False).astype(bool)
+        # 标量属性列默认值填充。daily_state 整表缺失时 state_t0 为空，is_st/is_bj/
+        # board_type 这三列会不存在 → not_st / not_bj / board_in 引用崩 KeyError，
+        # 所以先无条件补默认列再 fillna。
+        if "is_st" not in out.columns:
+            out["is_st"] = False
+        if "is_bj" not in out.columns:
+            out["is_bj"] = False
+        if "board_type" not in out.columns:
+            out["board_type"] = ""
+        out["is_st"] = out["is_st"].fillna(False).astype(bool)
+        out["is_bj"] = out["is_bj"].fillna(False).astype(bool)
 
         return out
     finally:
