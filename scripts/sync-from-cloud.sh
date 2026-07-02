@@ -5,11 +5,15 @@
 # - 失败重试 2 次（间隔 60s），最终失败 PushDeer 告警
 # - 5/13 新增：检测源 stale（snapshot_at 持续不变），intraday 时段下推 PushDeer
 #   防 v0.11.3 翻车再发：云端 backup.timer 假装在跑但 OnCalendar 被静默拒收
+# - 7/2 分家：下载只落 cloud_backup.duckdb，不再整文件替换 rquant.duckdb。
+#   原替换逻辑会把本地盘中 monitor 的写入打进被 unlink 的幽灵 inode，且残留
+#   WAL 与新文件代际错配（7/2 主库损坏事故）。生产表在日终窗口由
+#   `rquant research-sync` 合并进本地库，研究表按主键保留。
 
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOCAL_DATA_FILE="${PROJECT_DIR}/data/rquant.duckdb"
+LOCAL_DATA_FILE="${PROJECT_DIR}/data/cloud_backup.duckdb"
 LOG_DIR="${PROJECT_DIR}/logs"
 LOG="${LOG_DIR}/sync-from-cloud.log"
 ENV_FILE="${PROJECT_DIR}/.env"
@@ -117,9 +121,47 @@ if ! gzip -dc "${TMP_GZ}" > "${TMP_DB}" 2>>"${LOG}"; then
 fi
 rm -f "${TMP_GZ}"
 
-# atomic rename → 本地始终是完整文件
+# atomic rename → 本地始终是完整文件；顺手清掉备份文件的陈旧 WAL
+# （备份是纯下载工件，本地不该有进程写它，残留 WAL 只可能是垃圾）
+rm -f "${LOCAL_DATA_FILE}.wal"
 mv "${TMP_DB}" "${LOCAL_DATA_FILE}"
 size=$(du -h "${LOCAL_DATA_FILE}" | cut -f1)
+
+# ---------- 生产表合并（7/2 分家新增）----------
+# 只在日终窗口/手动 force 时合并：盘中本地 monitor 持研究库写锁，
+# research-sync 会撞锁；且盘中生产表本来就没有新日线数据
+if [[ "${sync_window:-}" != "intraday" ]]; then
+    RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
+    if "${RQUANT_BIN}" research-sync --backup "${LOCAL_DATA_FILE}" >>"${LOG}" 2>&1; then
+        log "research-sync OK: 生产表已合并进本地研究库"
+    else
+        log "ERROR: research-sync failed, sending PushDeer alert"
+        keys=$(grep "^PUSHDEER_KEYS=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
+        endpoint=$(grep "^PUSHDEER_ENDPOINT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
+        endpoint="${endpoint:-https://api2.pushdeer.com/message/push}"
+        title="❌ rQuant research-sync 失败"
+        body="云端备份已下载但合并进本地研究库失败。
+
+时间：$(date '+%Y-%m-%d %H:%M:%S')
+备份：${LOCAL_DATA_FILE}
+
+最近日志：
+\`\`\`
+$(tail -n 15 "${LOG}")
+\`\`\`"
+        IFS=',' read -ra KEY_ARR <<< "${keys}"
+        for key in "${KEY_ARR[@]}"; do
+            k=$(echo "${key}" | xargs)
+            [[ -n "${k}" ]] || continue
+            curl -s -X POST "${endpoint}" \
+                --data-urlencode "pushkey=${k}" \
+                --data-urlencode "text=${title}" \
+                --data-urlencode "desp=${body}" \
+                --data-urlencode "type=markdown" \
+                --max-time 10 >/dev/null 2>&1 || true
+        done
+    fi
+fi
 
 # ---------- Stale 检测（5/13 新增）----------
 # 拉 latest.json 比较 snapshot_at，identify 云端 backup 是否真在更新

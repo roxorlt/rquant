@@ -246,6 +246,31 @@ def cmd_rt_minute_daily_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_research_sync(args: argparse.Namespace) -> int:
+    """云端备份合并进本地研究库 / 从旧库恢复研究表。"""
+    from rquant.research_sync import restore_research_tables, sync_from_backup
+
+    setup_logging()
+    refresh = not args.no_refresh_replica
+
+    if args.restore_from:
+        tables = args.tables.split(",") if args.tables else None
+        report = restore_research_tables(
+            Path(args.restore_from), tables=tables, refresh_replica=refresh
+        )
+    else:
+        backup = Path(args.backup) if args.backup else None
+        report = sync_from_backup(backup, refresh_replica=refresh)
+
+    for t in report.tables:
+        mark = {"replace": "替换", "merge": "合并", "skipped": "跳过", "error": "失败"}[t.mode]
+        logger.info(f"  {t.table}: {mark} {t.rows:,} 行 {t.detail}")
+    logger.info(
+        f"replica: {'已刷新' if report.replica_refreshed else report.replica_detail}"
+    )
+    return 1 if report.has_errors else 0
+
+
 def cmd_moneyflow_backfill(args: argparse.Namespace) -> int:
     """拉取 Tushare 日级资金流并写入 moneyflow_daily。"""
     from rquant.adapter.tushare import TushareAdapter
@@ -960,6 +985,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="分钟频度 (默认 1min)",
     )
 
+    rs_p = sub.add_parser(
+        "research-sync",
+        help="云端备份(cloud_backup.duckdb)合并进本地研究库，或从旧库恢复研究表",
+    )
+    rs_p.add_argument(
+        "--backup", type=str, default=None,
+        help="云端备份文件路径（默认 data/cloud_backup.duckdb）",
+    )
+    rs_p.add_argument(
+        "--restore-from", type=str, default=None,
+        help="恢复模式：从指定旧库/旧副本按主键合并研究表",
+    )
+    rs_p.add_argument(
+        "--tables", type=str, default=None,
+        help="恢复模式下只处理这些表（逗号分隔，默认全部研究表）",
+    )
+    rs_p.add_argument(
+        "--no-refresh-replica", action="store_true",
+        help="跳过只读副本刷新",
+    )
+
     moneyflow_p = sub.add_parser(
         "moneyflow-backfill",
         help="拉取 Tushare 日级个股资金流并写入 moneyflow_daily",
@@ -1381,6 +1427,7 @@ def main() -> int:
         "monitor": cmd_monitor,
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
+        "research-sync": cmd_research_sync,
         "moneyflow-backfill": cmd_moneyflow_backfill,
         "minute-backfill": cmd_minute_backfill,
         "minute-replay-backfill": cmd_minute_replay_backfill,
