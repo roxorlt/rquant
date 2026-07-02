@@ -271,6 +271,16 @@ def cmd_research_sync(args: argparse.Namespace) -> int:
     return 1 if report.has_errors else 0
 
 
+def cmd_sentiment_recompute(args: argparse.Namespace) -> int:
+    """重算市场情绪/温度区间。"""
+    from rquant.market_context import recompute_market_sentiment_range
+
+    setup_logging()
+    rows = recompute_market_sentiment_range(args.start_date, args.end_date)
+    logger.info(f"market_sentiment_daily 重算完成: {rows} 行 ({args.start_date} ~ {args.end_date})")
+    return 0
+
+
 def cmd_moneyflow_backfill(args: argparse.Namespace) -> int:
     """拉取 Tushare 日级资金流并写入 moneyflow_daily。"""
     from rquant.adapter.tushare import TushareAdapter
@@ -286,6 +296,59 @@ def cmd_moneyflow_backfill(args: argparse.Namespace) -> int:
         rows = store.upsert_moneyflow_daily(df)
     logger.info(f"moneyflow 写入 moneyflow_daily: rows={rows}, date={args.date}")
     return 0
+
+
+def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
+    """全市场日线历史回补 + daily_state 全量重算。"""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.market_backfill import backfill_market_daily, recompute_daily_state
+
+    setup_logging()
+    with DuckDBStore() as store:
+        summary = backfill_market_daily(
+            args.start_date,
+            args.end_date,
+            store,
+            TushareAdapter(),
+            dry_run=args.dry_run,
+        )
+        logger.info(summary)
+        if not args.dry_run and not args.skip_state:
+            recompute_daily_state(store)
+    return 1 if summary["failed_dates"] else 0
+
+
+def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
+    """采集当日东财涨停池到 limit_up_pool_daily。"""
+    from rquant.limit_up_pool import capture_zt_pool
+
+    setup_logging()
+    trade_date = date.fromisoformat(args.date) if args.date else None
+    rows = capture_zt_pool(trade_date)
+    logger.info(f"zt-pool-capture 完成: rows={rows}")
+    return 0
+
+
+def cmd_limit_list_backfill(args: argparse.Namespace) -> int:
+    """Tushare 涨跌停/炸板榜历史回补，或 --today 当日增量。"""
+    from rquant.limit_list_backfill import backfill_limit_list, capture_today
+
+    setup_logging()
+    if args.today:
+        with DuckDBStore() as store:
+            rows = capture_today(store)
+        logger.info(f"limit-list-backfill --today 完成: rows={rows}")
+        return 0
+
+    if not args.start_date or not args.end_date:
+        logger.error("需要 --start-date 和 --end-date（或改用 --today 拉当天）")
+        return 1
+    with DuckDBStore() as store:
+        summary = backfill_limit_list(
+            args.start_date, args.end_date, store, dry_run=args.dry_run
+        )
+    logger.info(summary)
+    return 1 if summary["failed_dates"] else 0
 
 
 def cmd_minute_backfill(args: argparse.Namespace) -> int:
@@ -483,6 +546,7 @@ def cmd_auction_gap_minute_backfill(args: argparse.Namespace) -> int:
             min_ratio=args.min_ratio,
             max_ratio=args.max_ratio,
             ts_code=args.ts_code,
+            lookback_days=args.lookback_days,
             dry_run=args.dry_run,
         )
     logger.info(summary.model_dump())
@@ -1074,6 +1138,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="交易日期 YYYY-MM-DD",
     )
 
+    market_backfill_p = sub.add_parser(
+        "market-daily-backfill",
+        help="全市场日线历史回补（daily/daily_basic/adj_factor + daily_state 重算）",
+    )
+    market_backfill_p.add_argument(
+        "--start-date", type=str, required=True,
+        help="开始日期 YYYY-MM-DD",
+    )
+    market_backfill_p.add_argument(
+        "--end-date", type=str, required=True,
+        help="结束日期 YYYY-MM-DD",
+    )
+    market_backfill_p.add_argument(
+        "--dry-run", action="store_true",
+        help="只报告交易日数与预计请求数，不调 Tushare、不写库",
+    )
+    market_backfill_p.add_argument(
+        "--skip-state", action="store_true",
+        help="跳过回补后的 daily_state 全量重算",
+    )
+
+    zt_pool_p = sub.add_parser(
+        "zt-pool-capture",
+        help="采集当日东财涨停池到 limit_up_pool_daily（源只有当天数据，需每日采集）",
+    )
+    zt_pool_p.add_argument(
+        "--date", type=str, default=None,
+        help="交易日期 YYYY-MM-DD (默认今天)",
+    )
+
+    limit_list_p = sub.add_parser(
+        "limit-list-backfill",
+        help="Tushare 涨跌停/炸板榜（limit_list_d）回补到 limit_list_daily"
+             "（2020 起，U/D/Z 一次拿齐，不含 ST）",
+    )
+    limit_list_p.add_argument(
+        "--start-date", type=str, default=None,
+        help="开始日期 YYYY-MM-DD",
+    )
+    limit_list_p.add_argument(
+        "--end-date", type=str, default=None,
+        help="结束日期 YYYY-MM-DD",
+    )
+    limit_list_p.add_argument(
+        "--dry-run", action="store_true",
+        help="只报告交易日数与预计请求数，不调 Tushare、不写库",
+    )
+    limit_list_p.add_argument(
+        "--today", action="store_true",
+        help="只拉当天（日终增量），失败不炸、幂等可重跑",
+    )
+
     minute_p = sub.add_parser(
         "minute-backfill", help="回补 Pool 命中标的历史分钟线"
     )
@@ -1382,8 +1498,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="只回补单只股票，调试用",
     )
     auction_gap_minute_backfill_p.add_argument(
+        "--lookback-days", type=int, default=0,
+        help="窗口起点向前扩 N 个交易日（相对放量特征需要信号日前的历史分钟，默认 0）",
+    )
+    auction_gap_minute_backfill_p.add_argument(
         "--dry-run", action="store_true",
         help="只估算请求数，不调用 Tushare、不写库",
+    )
+
+    sentiment_p = sub.add_parser(
+        "sentiment-recompute",
+        help="重算市场情绪/温度指标（market_sentiment_daily，含 60 日新高占比等）",
+    )
+    sentiment_p.add_argument(
+        "--start-date", type=str, required=True,
+        help="开始日期 YYYY-MM-DD",
+    )
+    sentiment_p.add_argument(
+        "--end-date", type=str, required=True,
+        help="结束日期 YYYY-MM-DD",
     )
 
     pool2_p = sub.add_parser("pool2", help="管理 Pool 2 持久池")
@@ -1493,7 +1626,11 @@ def main() -> int:
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
         "research-sync": cmd_research_sync,
+        "sentiment-recompute": cmd_sentiment_recompute,
         "moneyflow-backfill": cmd_moneyflow_backfill,
+        "market-daily-backfill": cmd_market_daily_backfill,
+        "zt-pool-capture": cmd_zt_pool_capture,
+        "limit-list-backfill": cmd_limit_list_backfill,
         "minute-backfill": cmd_minute_backfill,
         "minute-replay-backfill": cmd_minute_replay_backfill,
         "auction-backfill": cmd_auction_backfill,

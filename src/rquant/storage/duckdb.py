@@ -690,6 +690,118 @@ class DuckDBStore:
             [position_id],
         ).fetchdf()
 
+    # ── limit_up_pool_daily ──
+
+    def upsert_limit_up_pool(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        if "source" not in payload.columns:
+            payload["source"] = "eastmoney"
+        self._conn.register("zt_pool_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO limit_up_pool_daily
+            (ts_code, trade_date, name, pct_chg, close, amount,
+             circ_mv, total_mv, turnover_rate, seal_amount,
+             first_seal_time, last_seal_time, break_count,
+             limit_up_stat, consecutive_boards, industry, source)
+            SELECT ts_code, trade_date, name, pct_chg, close, amount,
+                   circ_mv, total_mv, turnover_rate, seal_amount,
+                   first_seal_time, last_seal_time, break_count,
+                   limit_up_stat, consecutive_boards, industry, source
+            FROM zt_pool_tmp
+            """
+        )
+        self._conn.unregister("zt_pool_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert limit_up_pool_daily: {count} 行")
+        return count
+
+    def query_limit_up_pool(
+        self, trade_date: str | date | pd.Timestamp
+    ) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, trade_date, name, pct_chg, close, amount,
+                   circ_mv, total_mv, turnover_rate, seal_amount,
+                   first_seal_time, last_seal_time, break_count,
+                   limit_up_stat, consecutive_boards, industry, source
+            FROM limit_up_pool_daily
+            WHERE trade_date = ?
+            ORDER BY consecutive_boards DESC, ts_code
+            """,
+            [trade_date],
+        ).fetchdf()
+
+    # ── limit_list_daily ──
+
+    def upsert_limit_list(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        # Tushare 源字段名 limit 是 SQL 关键字，落库统一改名 limit_status
+        if "limit" in payload.columns and "limit_status" not in payload.columns:
+            payload = payload.rename(columns={"limit": "limit_status"})
+        self._conn.register("limit_list_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO limit_list_daily
+            (ts_code, trade_date, name, industry, close, pct_chg, amount,
+             limit_amount, float_mv, total_mv, turnover_ratio, fd_amount,
+             first_time, last_time, open_times, up_stat, limit_times, limit_status)
+            SELECT ts_code, trade_date, name, industry, close, pct_chg, amount,
+                   limit_amount, float_mv, total_mv, turnover_ratio, fd_amount,
+                   first_time, last_time, open_times, up_stat, limit_times, limit_status
+            FROM limit_list_tmp
+            """
+        )
+        self._conn.unregister("limit_list_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert limit_list_daily: {count} 行")
+        return count
+
+    def query_limit_list(
+        self,
+        trade_date: str | date | pd.Timestamp | None = None,
+        *,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        limit_status: str | None = None,
+    ) -> pd.DataFrame:
+        """按单日（trade_date）或区间（start/end）查涨跌停榜。
+
+        limit_status 可选过滤 U/D/Z；trade_date 与 start/end 互斥，
+        都不传视为调用方约定错误直接抛。
+        """
+        where: list[str] = []
+        params: list[object] = []
+        if trade_date is not None:
+            where.append("trade_date = ?")
+            params.append(trade_date)
+        else:
+            if start is not None:
+                where.append("trade_date >= ?")
+                params.append(start)
+            if end is not None:
+                where.append("trade_date <= ?")
+                params.append(end)
+        if not where:
+            raise ValueError("query_limit_list 需要 trade_date 或 start/end 区间")
+        if limit_status:
+            where.append("limit_status = ?")
+            params.append(limit_status)
+        sql = f"""
+            SELECT ts_code, trade_date, name, industry, close, pct_chg, amount,
+                   limit_amount, float_mv, total_mv, turnover_ratio, fd_amount,
+                   first_time, last_time, open_times, up_stat, limit_times,
+                   limit_status
+            FROM limit_list_daily
+            WHERE {" AND ".join(where)}
+            ORDER BY trade_date, limit_status, limit_times DESC, ts_code
+        """
+        return self._conn.execute(sql, params).fetchdf()
+
     def count_daily_basic(self, ts_code: str | None = None) -> int:
         if ts_code:
             result = self._conn.execute(

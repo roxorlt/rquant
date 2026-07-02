@@ -170,6 +170,10 @@ if (( force_mode == 1 )) || [[ "${sync_window}" != "intraday" ]]; then
             echo "${today}" > "${LAST_RESEARCH_SYNC_FILE}"
         fi
         log "research-sync OK: 生产表已合并进本地研究库"
+        # 涨停池只有当天有数据，历史无法回补；云端东财源被屏蔽，只能本地日终采
+        "${RQUANT_BIN}" zt-pool-capture >>"${LOG}" 2>&1 || log "WARN: zt-pool-capture failed（东财源偶发失败可接受，不告警）"
+        # 官方涨跌停榜（tushare limit_list_d）当日增量；漏采可事后 limit-list-backfill 补
+        "${RQUANT_BIN}" limit-list-backfill --today >>"${LOG}" 2>&1 || log "WARN: limit-list-backfill --today failed（可事后回补，不告警）"
     else
         merge_status="failed"
         if (( force_mode == 1 )); then

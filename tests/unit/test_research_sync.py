@@ -87,15 +87,19 @@ def _insert_paper_position(db_path: Path, position_id: str, status: str) -> None
 
 
 class TestSyncFromBackup:
-    def test_replace_and_merge(self, local_db: Path, backup_db: Path) -> None:
+    def test_merge_keeps_local_history_and_replace_tables_replaced(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        """日线族改 merge 语义（2020-2024 历史回补后）：本地旧 6-01 行保留，
+        云端 7-01 行进来；stock_basic 等云端权威表仍整表替换。"""
         report = sync_from_backup(backup_db, local_db, refresh_replica=False)
 
         conn = duckdb.connect(str(local_db), read_only=True)
-        # replace 表：整表换成云端 2 行，旧 6-01 行消失
+        # merge 表：本地独有 6-01 历史行保留 + 云端 7-01 两行进来
         daily = conn.execute(
             "SELECT trade_date, COUNT(*) FROM daily_bar GROUP BY 1 ORDER BY 1"
         ).fetchall()
-        assert daily == [(date(2026, 7, 1), 2)]
+        assert daily == [(date(2026, 6, 1), 1), (date(2026, 7, 1), 2)]
         # merge 表：本地 local_only + 云端 cloud_only 共存
         levels = {
             r[0] for r in conn.execute("SELECT level FROM monitor_event").fetchall()
@@ -107,8 +111,35 @@ class TestSyncFromBackup:
 
         assert not report.has_errors
         by_table = {t.table: t for t in report.tables}
-        assert by_table["daily_bar"].mode == "replace"
+        assert by_table["daily_bar"].mode == "merge"
+        assert by_table["stock_basic"].mode == "replace"
         assert by_table["monitor_event"].mode == "merge"
+
+    def test_daily_bar_pk_conflict_cloud_wins(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        """merge 语义下主键冲突云端赢：云端最新数据仍是权威。"""
+        conn = duckdb.connect(str(local_db))
+        conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) "
+            "VALUES ('600000.SH', DATE '2026-07-01', 999.0)"
+        )
+        conn.close()
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+        assert not report.has_errors
+
+        conn = duckdb.connect(str(local_db), read_only=True)
+        close = conn.execute(
+            "SELECT close FROM daily_bar "
+            "WHERE ts_code = '600000.SH' AND trade_date = DATE '2026-07-01'"
+        ).fetchone()[0]
+        local_only = conn.execute(
+            "SELECT COUNT(*) FROM daily_bar WHERE trade_date = DATE '2026-06-01'"
+        ).fetchone()[0]
+        conn.close()
+        assert close == 11.0
+        assert local_only == 1
 
     def test_backup_missing_reports_error_not_raise(
         self, local_db: Path, tmp_path: Path
@@ -158,7 +189,8 @@ class TestSyncFromBackup:
         assert not report.has_errors
 
         conn = duckdb.connect(str(local_db), read_only=True)
-        assert conn.execute("SELECT COUNT(*) FROM daily_bar").fetchone()[0] == 2
+        # merge 语义：本地 1 行 + 云端 2 行
+        assert conn.execute("SELECT COUNT(*) FROM daily_bar").fetchone()[0] == 3
         conn.close()
 
     def test_top_level_failure_reported_not_raised(
@@ -208,7 +240,8 @@ class TestSyncFromBackup:
 
         conn = duckdb.connect(str(local_db), read_only=True)
         assert conn.execute("SELECT COUNT(*) FROM monitor_event").fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM daily_bar").fetchone()[0] == 2
+        # merge 语义：本地 1 行 + 云端 2 行，重跑不重复
+        assert conn.execute("SELECT COUNT(*) FROM daily_bar").fetchone()[0] == 3
         conn.close()
 
 
@@ -243,8 +276,8 @@ class TestRestoreResearchTables:
     ) -> None:
         src = tmp_path / "src.duckdb"
         _make_backup_db(src)
-        with pytest.raises(ValueError, match="daily_bar"):
-            restore_research_tables(src, local_db, tables=["daily_bar"])
+        with pytest.raises(ValueError, match="screen_result"):
+            restore_research_tables(src, local_db, tables=["screen_result"])
 
     def test_restore_keeps_local_row_on_pk_conflict(
         self, tmp_path: Path, local_db: Path
@@ -398,3 +431,20 @@ def test_table_classification_complete() -> None:
     """新表进 schema 时强制在这里表态：replace 还是 merge。"""
     overlap = set(REPLACE_TABLES) & set(MERGE_TABLES)
     assert not overlap, f"表不能同时出现在两类：{overlap}"
+
+
+def test_backfilled_history_tables_are_merge() -> None:
+    """防回归：这些表若回到 REPLACE，下一次 research-sync 会把本地回补的
+    2020-2024 历史（及本地独有的涨停池采集、Tushare 涨跌停榜）整表抹掉。"""
+    must_merge = (
+        "daily_bar",
+        "daily_basic",
+        "adj_factor",
+        "daily_state",
+        "daily_indicator",
+        "limit_up_pool_daily",
+        "limit_list_daily",
+    )
+    for table in must_merge:
+        assert table in MERGE_TABLES, f"{table} 必须是 merge 语义"
+        assert table not in REPLACE_TABLES, f"{table} 不允许整表替换"

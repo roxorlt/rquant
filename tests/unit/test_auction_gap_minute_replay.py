@@ -23,6 +23,7 @@ def _seed_base(
     *,
     weak_open: bool = False,
     strong_seal: bool = False,
+    reopen: bool = False,
     next_auction_price: float = 10.85,
 ) -> None:
     dates = [
@@ -225,6 +226,34 @@ def _seed_base(
                 "source": "tushare",
             },
         ])
+    if reopen:
+        # 封住 → 开板（close 跌破涨停容差） → 尾盘再封住
+        minute_rows.extend([
+            {
+                "ts_code": "600000.SH",
+                "trade_time": datetime(2026, 6, 25, 10, 1),
+                "freq": "1min",
+                "open": 11.00,
+                "high": 11.00,
+                "low": 10.85,
+                "close": 10.90,
+                "vol": 1000,
+                "amount": 10900,
+                "source": "tushare",
+            },
+            {
+                "ts_code": "600000.SH",
+                "trade_time": datetime(2026, 6, 25, 10, 2),
+                "freq": "1min",
+                "open": 10.95,
+                "high": 11.00,
+                "low": 10.90,
+                "close": 11.00,
+                "vol": 1000,
+                "amount": 11000,
+                "source": "tushare",
+            },
+        ])
     minute_rows.append(
         {
             "ts_code": "600000.SH",
@@ -270,6 +299,7 @@ def test_auction_gap_minute_replay_waits_for_minute_b_and_uses_next_auction_s(
     assert row["exit_price"] == pytest.approx(10.85)
     assert row["exit_reason"] == "next_auction_weak"
     assert row["b_first_limit_up_time"] == pd.Timestamp("2026-06-25 10:00:00")
+    assert row["b_open_times"] == 0
     assert row["b_close_at_limit_up"]
     assert row["entry_signal_opening_segment"] == 1
     assert row["entry_signal_opening_segment_amount"] == pytest.approx(20940.0)
@@ -324,3 +354,54 @@ def test_auction_gap_minute_replay_tolerates_mild_weak_auction_after_strong_seal
     row = trades.iloc[0]
     assert row["b_limit_up_close_minutes"] == 3
     assert row["exit_reason"] == "time_1d"
+
+
+def test_b_day_strength_counts_seal_open_reseal_transitions() -> None:
+    from rquant.auction_gap_strategy import _b_day_strength
+
+    minutes = pd.DataFrame([
+        # 未封 → 封住 → 开板 → 再封 → 尾盘再开板：共 2 次开板，收盘未封住
+        {"trade_time": datetime(2026, 6, 25, 9, 31), "high": 10.90, "close": 10.80},
+        {"trade_time": datetime(2026, 6, 25, 9, 32), "high": 11.00, "close": 11.00},
+        {"trade_time": datetime(2026, 6, 25, 9, 33), "high": 11.00, "close": 10.90},
+        {"trade_time": datetime(2026, 6, 25, 9, 34), "high": 11.00, "close": 11.00},
+        {"trade_time": datetime(2026, 6, 25, 9, 35), "high": 11.00, "close": 10.95},
+    ])
+
+    strength = _b_day_strength(
+        minutes,
+        trading_date=date(2026, 6, 25),
+        limit_up_price=11.00,
+        price_tol=0.01,
+    )
+
+    assert strength["b_open_times"] == 2
+    assert strength["b_limit_up_touch_minutes"] == 4
+    assert strength["b_limit_up_close_minutes"] == 2
+    assert strength["b_close_at_limit_up"] is False
+
+
+def test_auction_gap_minute_replay_reports_reopen_count(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import (
+        AuctionGapMinuteReplayConfig,
+        run_auction_gap_minute_replay,
+    )
+
+    _seed_base(store, reopen=True)
+
+    trades = run_auction_gap_minute_replay(
+        store,
+        AuctionGapMinuteReplayConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            max_hold_days=1,
+        ),
+    )
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["b_open_times"] == 1
+    assert row["b_limit_up_close_minutes"] == 2
+    assert row["b_close_at_limit_up"]

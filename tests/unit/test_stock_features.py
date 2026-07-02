@@ -57,6 +57,79 @@ def test_build_daily_stock_features_price_position_and_accumulation(
     assert features["accum_ad_flow_5d_pct"] > 0
     assert features["accum_up_down_amount_ratio_5d"] > 1
     assert features["accum_close_position_avg_5d_pct"] > 50
+    # 只有 6 根日线：趋势因子数据不足返回 None，不报错
+    assert features["ma_alignment"] is None
+    assert features["price_percentile_250d"] is None
+
+
+def _seed_trend_history(
+    store: DuckDBStore,
+    ts_code: str,
+    closes: list[float],
+) -> date:
+    dates = [ts.date() for ts in pd.bdate_range("2025-06-02", periods=len(closes))]
+    rows = [
+        {
+            "ts_code": ts_code,
+            "trade_date": trade_date,
+            "open": close,
+            "high": close + 0.1,
+            "low": close - 0.1,
+            "close": close,
+            "pre_close": close,
+            "change": 0.0,
+            "pct_chg": 0.0,
+            "vol": 100.0,
+            "amount": close * 100.0,
+        }
+        for trade_date, close in zip(dates, closes, strict=True)
+    ]
+    store.upsert_daily(pd.DataFrame(rows))
+    return dates[-1]
+
+
+def test_trend_features_ma_alignment_and_price_percentile(
+    store: DuckDBStore,
+) -> None:
+    from rquant.stock_features import build_daily_stock_features
+
+    up_closes = [10.0 + idx * 0.05 for idx in range(260)]
+    down_closes = [30.0 - idx * 0.05 for idx in range(260)]
+    reference = _seed_trend_history(store, "600001.SH", up_closes)
+    _seed_trend_history(store, "600002.SH", down_closes)
+
+    up = build_daily_stock_features(store, "600001.SH", reference)
+    down = build_daily_stock_features(store, "600002.SH", reference)
+
+    # 单调上涨：MA5 > MA10 > MA20 > MA60，收盘价是 250 日最高
+    assert up["ma_alignment"] == 1
+    assert up["price_percentile_250d"] == pytest.approx(1.0)
+    # 单调下跌：均线空头排列，收盘价是 250 日最低（百分位 = 1/250）
+    assert down["ma_alignment"] == 0
+    assert down["price_percentile_250d"] == pytest.approx(1 / 250, abs=1e-4)
+
+
+def test_trend_features_partial_history_degrades_gracefully(
+    store: DuckDBStore,
+) -> None:
+    from rquant.stock_features import build_daily_stock_features
+
+    reference = _seed_trend_history(
+        store, "600003.SH", [10.0 + idx * 0.05 for idx in range(100)]
+    )
+    short_reference = _seed_trend_history(
+        store, "600004.SH", [10.0 + idx * 0.05 for idx in range(30)]
+    )
+
+    features = build_daily_stock_features(store, "600003.SH", reference)
+    short = build_daily_stock_features(store, "600004.SH", short_reference)
+
+    # 100 日够算 MA60 但不足 250 日百分位
+    assert features["ma_alignment"] == 1
+    assert features["price_percentile_250d"] is None
+    # 30 日连 MA60 都不够
+    assert short["ma_alignment"] is None
+    assert short["price_percentile_250d"] is None
 
 
 def test_build_intraday_relative_volume_uses_same_clock_history_only(

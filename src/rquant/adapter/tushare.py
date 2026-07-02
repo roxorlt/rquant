@@ -127,6 +127,124 @@ class TushareAdapter:
         logger.info(f"Tushare adj_factor 返回 {len(df)} 行")
         return df
 
+
+    def _call_by_date_with_backoff(
+        self, api_name: str, call, max_retries: int = 6
+    ) -> pd.DataFrame | None:
+        """回补类 by_date 调用的限频退避重试。
+
+        限频错误（"频率超限"）绝不切备用 token：备用是免费档，daily_basic
+        限频 1 次/分钟，切换等于把整个回补判死（2026-07-02 真实事故——主 token
+        瞬时超限触发粘性切换，960 个日期全灭）。原地 sleep 后用主 token 重试。
+        """
+        import time as _time
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                return call()
+            except Exception as e:
+                msg = str(e)
+                if attempt >= max_retries:
+                    raise RuntimeError(f"Tushare {api_name} 调用失败：{e}") from e
+                wait = 25.0 if ("频率" in msg or "超限" in msg) else 5.0
+                logger.warning(
+                    f"Tushare {api_name} 第 {attempt}/{max_retries} 次失败"
+                    f"（{wait}s 后重试）: {msg[:120]}"
+                )
+                _time.sleep(wait)
+        return None
+
+    def trade_cal(self, start: date, end: date) -> list[date]:
+        """交易日历（只返回开市日，升序）。
+
+        历史回补的日历必须走 trade_cal：本地 daily_bar 覆盖不到未入库的
+        早期区间（如 2020 年），从库里推日历会漏。
+        """
+        start_str = start.strftime("%Y%m%d")
+        end_str = end.strftime("%Y%m%d")
+        logger.info(f"Tushare trade_cal 请求：start={start_str} end={end_str}")
+
+        try:
+            df = self._pro.trade_cal(
+                exchange="SSE", start_date=start_str, end_date=end_str, is_open="1"
+            )
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.trade_cal(
+                    exchange="SSE", start_date=start_str, end_date=end_str, is_open="1"
+                )
+            else:
+                raise RuntimeError(f"Tushare trade_cal 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare trade_cal 返回空：{start_str}-{end_str}")
+            return []
+
+        dates = pd.to_datetime(df["cal_date"], format="%Y%m%d").dt.date.tolist()
+        logger.info(f"Tushare trade_cal 返回 {len(dates)} 个交易日")
+        return sorted(dates)
+
+    def daily_by_date(self, trade_date: date) -> pd.DataFrame:
+        """按交易日拉全市场日线（历史回补用，字段对齐 daily_bar 表）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        logger.info(f"Tushare daily(by_date) 请求：trade_date={ds}")
+
+        df = self._call_by_date_with_backoff(
+            "daily", lambda: self._pro.daily(trade_date=ds)
+        )
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare daily 返回空：trade_date={ds}")
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        df = df.sort_values("ts_code").reset_index(drop=True)
+        logger.info(f"Tushare daily(by_date) 返回 {len(df)} 行")
+        return df
+
+    def daily_basic_by_date(self, trade_date: date) -> pd.DataFrame:
+        """按交易日拉全市场每日基本面指标（历史回补用，字段对齐 daily_basic 表）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
+        logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
+
+        df = self._call_by_date_with_backoff(
+            "daily_basic", lambda: self._pro.daily_basic(trade_date=ds, fields=fields)
+        )
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare daily_basic 返回空：trade_date={ds}")
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        df = df.sort_values("ts_code").reset_index(drop=True)
+        logger.info(f"Tushare daily_basic(by_date) 返回 {len(df)} 行")
+        return df
+
+    def adj_factor_by_date(self, trade_date: date) -> pd.DataFrame:
+        """按交易日拉全市场复权因子（历史回补用，归一化对齐 adj_factor 方法）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        logger.info(f"Tushare adj_factor(by_date) 请求：trade_date={ds}")
+
+        df = self._call_by_date_with_backoff(
+            "adj_factor", lambda: self._pro.adj_factor(trade_date=ds)
+        )
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare adj_factor 返回空：trade_date={ds}")
+            return pd.DataFrame()
+
+        cols = ["ts_code", "trade_date", "adj_factor"]
+        missing = set(cols) - set(df.columns)
+        if missing:
+            raise RuntimeError(f"Tushare adj_factor 返回缺字段：{sorted(missing)}")
+
+        out = df[cols].copy()
+        out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d").dt.date
+        out = out.sort_values("ts_code").reset_index(drop=True)
+        logger.info(f"Tushare adj_factor(by_date) 返回 {len(out)} 行")
+        return out
+
     def stk_mins(
         self,
         ts_code: str,
@@ -364,6 +482,54 @@ class TushareAdapter:
         out = out.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
 
         logger.info(f"Tushare stk_auction 返回 {len(out)} 行")
+        return out
+
+    def limit_list_by_date(
+        self, trade_date: date, limit_type: str = ""
+    ) -> pd.DataFrame:
+        """按交易日拉涨跌停/炸板榜（limit_list_d，5000 积分，历史从 2020 起）。
+
+        limit_type 空串一次拿齐 U(涨停)/D(跌停)/Z(炸板)，省请求；单次上限
+        2500 行，A 股单日涨跌停+炸板远够不到，不需分页。不含 ST 股。
+        不切备用 token：备用 token 无此积分权限时会掩盖真实错误（同 stk_auction）。
+        """
+        ds = trade_date.strftime("%Y%m%d")
+        fields = (
+            "trade_date,ts_code,industry,name,close,pct_chg,amount,limit_amount,"
+            "float_mv,total_mv,turnover_ratio,fd_amount,first_time,last_time,"
+            "open_times,up_stat,limit_times,limit"
+        )
+        logger.info(
+            f"Tushare limit_list_d 请求：date={ds} limit_type={limit_type or 'ALL'}"
+        )
+
+        try:
+            df = self._pro.limit_list_d(
+                trade_date=ds, limit_type=limit_type, fields=fields
+            )
+        except Exception as e:
+            raise RuntimeError(f"Tushare limit_list_d 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare limit_list_d 返回空：date={ds}")
+            return pd.DataFrame()
+
+        required = [
+            "ts_code", "trade_date", "name", "industry", "close", "pct_chg",
+            "amount", "limit_amount", "float_mv", "total_mv", "turnover_ratio",
+            "fd_amount", "first_time", "last_time", "open_times", "up_stat",
+            "limit_times", "limit",
+        ]
+        missing = set(required) - set(df.columns)
+        if missing:
+            raise RuntimeError(f"Tushare limit_list_d 返回缺字段：{sorted(missing)}")
+
+        out = df[required].copy()
+        out["trade_date"] = pd.to_datetime(
+            out["trade_date"], format="%Y%m%d"
+        ).dt.date
+        out = out.sort_values(["limit", "ts_code"]).reset_index(drop=True)
+        logger.info(f"Tushare limit_list_d 返回 {len(out)} 行")
         return out
 
     def moneyflow(self, trade_date: date) -> pd.DataFrame:

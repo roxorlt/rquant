@@ -348,9 +348,15 @@ def backfill_auction_gap_minute_replay_window(
     min_ratio: float = 0.15,
     max_ratio: float = 5.0,
     ts_code: str | None = None,
+    lookback_days: int = 0,
     dry_run: bool = False,
 ) -> MinuteReplayBackfillSummary:
-    """回补集合竞价跳空候选从信号日到退出窗口的分钟线。"""
+    """回补集合竞价跳空候选从信号日到退出窗口的分钟线。
+
+    lookback_days > 0 时窗口起点向前扩 N 个交易日（信号日前的历史分钟，
+    供「同分钟历史放量/累计成交额分位」类特征计算；20 天 lookback + 持有窗
+    约 22 天 × 241 根 ≈ 5300 行，仍在 stk_mins 单请求 8000 行上限内）。
+    """
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
 
     start_d = _parse_date(start_date)
@@ -376,16 +382,22 @@ def backfill_auction_gap_minute_replay_window(
         window_dates = _window_trading_dates(calendar, signal_date, max_hold_days)
         if len(window_dates) <= 1:
             continue
+        fetch_start = window_dates[0]
+        if lookback_days > 0:
+            earlier = [d for d in calendar if d < signal_date]
+            fetch_start = earlier[-lookback_days] if len(earlier) >= lookback_days else (
+                earlier[0] if earlier else fetch_start
+            )
         requests.append((
             str(row["ts_code"]),
-            _dt(window_dates[0], time(9, 30)),
+            _dt(fetch_start, time(9, 30)),
             _dt(window_dates[-1], time(15, 0)),
         ))
 
     logger.info(
         f"集合竞价分钟 replay 回补计划: start={start_d} end={end_d} "
         f"candidates={len(candidates)} requests={len(requests)} hold={max_hold_days} "
-        f"freq={freq} dry_run={dry_run}"
+        f"lookback={lookback_days} freq={freq} dry_run={dry_run}"
     )
 
     if dry_run:
