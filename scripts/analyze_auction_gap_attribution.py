@@ -175,7 +175,9 @@ def search_rules(
                 "规则": " 且 ".join(f"{f} {op} {thr:.3g}" for f, op, thr in rule),
                 "训练笔数": n_train,
                 "训练均收益%": round(ret_train, 2),
-                "训练胜率%": round(_apply_rule(train, rule).pipe(lambda m: train.loc[m, "win"].mean()) * 100, 1),
+                "训练胜率%": round(
+                    train.loc[_apply_rule(train, rule), "win"].mean() * 100, 1
+                ),
                 "验证笔数": nv,
                 "验证均收益%": round(valid.loc[mv, "ret_pct"].mean(), 2) if nv else np.nan,
                 "验证胜率%": round(valid.loc[mv, "win"].mean() * 100, 1) if nv else np.nan,
@@ -205,7 +207,8 @@ def main() -> int:
     print(univariate_table(train).to_markdown(index=False), "\n")
     print("## 过滤规则搜索（训练段选优 → 验证段一次性评估）\n")
     baseline_v = valid.ret_pct.mean()
-    print(f"验证段基准：{len(valid)} 笔 / 均收益 {baseline_v:.2f}% / 胜率 {valid.win.mean()*100:.1f}%\n")
+    win_v = valid.win.mean() * 100
+    print(f"验证段基准：{len(valid)} 笔 / 均收益 {baseline_v:.2f}% / 胜率 {win_v:.1f}%\n")
     print(search_rules(train, valid).to_markdown(index=False))
     return 0
 
