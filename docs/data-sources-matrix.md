@@ -96,6 +96,19 @@ tags: [quant, data-source, a-shares, research]
 | ETF 申赎清单 | Tushare Pro | 日更 |
 | 北向资金 | Tushare Pro `hsgt_top10` | T+1（盘中估算无 L2） |
 
+## rQuant 当前接入状态（2026-07-01）
+
+| 场景 | 当前接入 | 数据表/命令 | 回测是否可无未来函数使用 | 备注 |
+|---|---|---|---|---|
+| 历史 1 分钟 K 线 | Tushare `stk_mins` | `minute_bar` / `rquant minute-backfill` | 可以 | 用于分钟级 replay、90 日价量分布、盘中放量基准。 |
+| 实时最新分钟 K 线 | Tushare `rt_min` | `minute_bar` / `rquant rt-minute-fetch` | 实盘监控可用；历史回测不用它 | 当前权限已验证可批量取多只股票最新分钟。 |
+| 实时分钟日累计 | Tushare `rt_min_daily` | `minute_bar` / `rquant rt-minute-daily-fetch` | 只用于当天已发生分钟补齐 | 适合盘中服务重启、漏轮询后补齐单只股票当天 9:30 至当前分钟。 |
+| 集合竞价 | Tushare `stk_auction` | `auction_bar` / `rquant auction-backfill` | 可以 | 2025-01-01 起有历史数据；缺失行可用 09:30 分钟 K 做保守 fallback。 |
+| 集合竞价 fallback | 09:30 `minute_bar` 合成 | `rquant auction-minute-fallback` | 可以 | 只补 Tushare 集合竞价缺行，不覆盖原始集合竞价。 |
+| 日级资金流 | Tushare `moneyflow` | `moneyflow_daily` / `rquant moneyflow-backfill` | 只能做盘后复盘/次日过滤 | 它是日级盘后数据，不能用于当日盘中 B 信号。 |
+| 外盘/内盘 | AKShare 腾讯分笔可查当前历史分笔 | 暂未落表 | 大样本历史回测不足 | 当前 `stock_zh_a_tick_tx_js` 无日期参数，不适合作为多年历史回测主源。 |
+| 盘中大单净量 | 待定 | 暂无 | 暂不可用 | 需要可靠的盘中订单流/资金流历史源；不能用盘后 `moneyflow` 冒充。 |
+
 ## 已知风险与对策
 
 | 风险 | 对策 |

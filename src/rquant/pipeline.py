@@ -163,10 +163,35 @@ def _notify_error_safe(component: str, exc: BaseException) -> None:
         logger.exception(f"notify error 失败 ({component})")
 
 
+def _run_minute_context_backfill(
+    store: DuckDBStore,
+    trade_date: str,
+    *,
+    lookback_days: int = 90,
+    freq: str = "1min",
+) -> None:
+    """日终筛选完成后回补当日 Pool1 的 90 日分钟上下文。"""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.intraday_backfill import backfill_pool1_minute_context
+
+    summary = backfill_pool1_minute_context(
+        store,
+        TushareAdapter(),
+        screen_date=trade_date,
+        lookback_days=lookback_days,
+        freq=freq,
+        preset_name="n-shape-pool1",
+    )
+    logger.info(f"日终分钟上下文回补完成: {summary.model_dump()}")
+
+
 def run_daily_pipeline(
     trade_date: str,
     preset_names: list[str] | None = None,
     store: DuckDBStore | None = None,
+    minute_backfill: bool | None = None,
+    minute_backfill_lookback_days: int = 90,
+    minute_backfill_freq: str = "1min",
 ) -> dict[str, int]:
     """遍历预设筛选并落库，返回 {preset_name: 命中数}。
 
@@ -177,6 +202,7 @@ def run_daily_pipeline(
 
     owns_store = store is None
     store = store or DuckDBStore()
+    should_minute_backfill = owns_store if minute_backfill is None else minute_backfill
     started_at = _time.time()
 
     try:
@@ -277,6 +303,18 @@ def run_daily_pipeline(
             logger.exception("_sync_pool2_watch 失败")
             _notify_error_safe("pipeline:sync_pool2", e)
 
+        if should_minute_backfill:
+            try:
+                _run_minute_context_backfill(
+                    store,
+                    trade_date,
+                    lookback_days=minute_backfill_lookback_days,
+                    freq=minute_backfill_freq,
+                )
+            except Exception as e:
+                logger.exception("_run_minute_context_backfill 失败")
+                _notify_error_safe("pipeline:minute_backfill", e)
+
         # Pool 2 退出检查（兜底）：原本由 monitor 15:00 收盘后跑，但 monitor 在盘中
         # 被 deploy / watchdog 等 restart 时 SIGTERM 中断会跳过 check_exits，导致
         # aged_out（超过 pool2_max_age_days）和 breakdown（跌破止损）的票留在池里。
@@ -343,7 +381,7 @@ def _push_daily_summary(
             f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})",
             codes,
         ).fetchdf()
-        name_map = dict(zip(name_df["ts_code"], name_df["name"]))
+        name_map = dict(zip(name_df["ts_code"], name_df["name"], strict=False))
 
         from datetime import date as _date
         today = _date.fromisoformat(trade_date)

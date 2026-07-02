@@ -135,6 +135,47 @@ class TestRunDailyPipeline:
         assert len(sr) == 1
         assert sr.iloc[0]["ts_code"] == "000001.SZ"
 
+    def test_can_run_minute_context_backfill_after_pool1_screen(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('600000.SH', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
+        )
+        mock_df = pd.DataFrame({
+            "ts_code": ["600000.SH"],
+            "name": ["浦发银行"],
+            "CLOSE[0]": [10.5],
+            "PCT_CHG[0]": [5.0],
+        })
+        test_presets = {
+            "n-shape-pool1": ScreenPreset(
+                name="n-shape-pool1", description="test", rules=[not_st()],
+            ),
+        }
+
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", test_presets),
+            patch("rquant.pipeline.screen", return_value=mock_df),
+            patch("rquant.pipeline._sync_pool2_watch"),
+            patch("rquant.monitor.check_exits"),
+            patch("rquant.pipeline._push_daily_summary"),
+            patch("rquant.pipeline._run_minute_context_backfill") as mock_backfill,
+        ):
+            run_daily_pipeline(
+                "2026-04-18",
+                store=store,
+                minute_backfill=True,
+                minute_backfill_lookback_days=90,
+            )
+
+        mock_backfill.assert_called_once_with(
+            store,
+            "2026-04-18",
+            lookback_days=90,
+            freq="1min",
+        )
+
     def test_specific_preset_only(self, store: DuckDBStore) -> None:
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "

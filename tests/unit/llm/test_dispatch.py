@@ -1,9 +1,11 @@
 """ScreenPlan → screen() 端到端测试（不调 LLM）。"""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from rquant.llm.dispatch import build_rules, screen_with_plan
+from rquant.llm.dispatch import build_rules
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
 
 
@@ -63,14 +65,16 @@ class TestBuildRules:
 
 
 class TestScreenWithPlanDiagnostic:
-    def test_empty_plan_returns_empty_diagnostics(self) -> None:
+    def test_empty_plan_returns_empty_diagnostics(self, tmp_path: Path) -> None:
         from rquant.llm.dispatch import screen_with_plan_diagnostic
         from rquant.llm.schemas import ScreenPlan
+        from rquant.storage.duckdb import DuckDBStore
 
         plan = ScreenPlan(trade_date="2026-04-30", stages=[])
-        # store=None 路径在内部调到 screen() 时会自己起一个临时 store；
-        # 这里只验证 empty plan 走的早返回分支
-        # 因为没有 store 上的真实数据，screen() 会返回空 df
-        df, diag = screen_with_plan_diagnostic(plan, store=None)
+        store = DuckDBStore(tmp_path / "dispatch.duckdb")
+        try:
+            df, diag = screen_with_plan_diagnostic(plan, store=store)
+        finally:
+            store.close()
         assert diag == []
         assert df is not None  # screen() 总是返回 DataFrame

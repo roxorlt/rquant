@@ -104,6 +104,39 @@ class TestBuildWatchlist:
         assert len(items) == 1
         assert items[0].pool == "pool2"
 
+    def test_hydrates_attack_reference_prices(self, store: DuckDBStore) -> None:
+        from rquant.monitor import build_watchlist
+
+        p2 = pd.DataFrame([{
+            "ts_code": "002415.SZ",
+            "entry_date": date(2026, 4, 18),
+            "limit_up_date": date(2026, 4, 17),
+            "body_upper": 13.20, "body_lower": 11.80,
+            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
+            "stop_strong": 11.80, "stop_weak": 11.52,
+            "status": "active",
+        }])
+        store.upsert_pool2_watch(p2)
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('002415.SZ', '2026-04-18', 12.0,13.0,11.8,12.5,12.0,0.5,4.17,1000,10000)"
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_state VALUES
+            ('002415.SZ', '2026-04-18', false, false, 'main', 0.10,
+             13.20, 10.80, false, false, false, false, 0, 12.50, 12.00)
+            """
+        )
+
+        items = build_watchlist(store)
+
+        assert len(items) == 1
+        assert items[0].reference_date == date(2026, 4, 18)
+        assert items[0].t_high == 13.0
+        assert items[0].t_close == 12.5
+        assert items[0].limit_up_price_next == 13.75
+
 
 class TestIsTradingDay:
     @patch("rquant.monitor.ak")
@@ -126,6 +159,36 @@ class TestIsTradingDay:
 
 
 class TestFetchRealtimePrices:
+    @patch("rquant.monitor.ak")
+    def test_returns_structured_quote_fields(self, mock_ak) -> None:
+        from rquant.monitor import fetch_realtime_quotes
+
+        mock_ak.stock_zh_a_spot.return_value = pd.DataFrame({
+            "代码": ["sz002415"],
+            "最新价": [12.35],
+            "最低": [12.10],
+            "今开": [12.25],
+            "最高": [12.80],
+            "昨收": [12.00],
+            "涨跌幅": [2.92],
+            "成交量": [100000.0],
+            "成交额": [1235000.0],
+        })
+
+        result = fetch_realtime_quotes(["002415.SZ"])
+
+        quote = result["002415.SZ"]
+        assert quote.ts_code == "002415.SZ"
+        assert quote.source == "sina"
+        assert quote.price == 12.35
+        assert quote.low == 12.10
+        assert quote.open == 12.25
+        assert quote.high == 12.80
+        assert quote.pre_close == 12.00
+        assert quote.pct_chg == 2.92
+        assert quote.volume == 100000.0
+        assert quote.amount == 1235000.0
+
     @patch("rquant.monitor.ak")
     def test_returns_price_and_low(self, mock_ak) -> None:
         from rquant.monitor import fetch_realtime_prices
@@ -169,64 +232,217 @@ class TestFetchRealtimePrices:
         assert result["920001.BJ"]["price"] == 14.18
 
 
-class TestCheckLevels:
-    def _make_item(self) -> "WatchItem":
+class TestIntradayMinuteQuoteProvider:
+    def test_builds_quote_from_rt_min_and_rt_min_daily(
+        self, store: DuckDBStore
+    ) -> None:
+        from rquant.monitor import IntradayMinuteQuoteProvider
+
+        class FakeAdapter:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[str, ...], str]] = []
+
+            def rt_min(self, ts_codes: list[str], freq: str = "1min") -> pd.DataFrame:
+                self.calls.append(("rt_min", tuple(ts_codes), freq))
+                return pd.DataFrame([
+                    {
+                        "ts_code": "002415.SZ",
+                        "trade_time": pd.Timestamp("2026-07-02 10:01:00"),
+                        "freq": "1min",
+                        "open": 12.70,
+                        "high": 12.90,
+                        "low": 12.60,
+                        "close": 12.80,
+                        "vol": 1000.0,
+                        "amount": 12800.0,
+                        "source": "tushare_rt",
+                    }
+                ])
+
+            def rt_min_daily(
+                self, ts_codes: list[str], freq: str = "1min"
+            ) -> pd.DataFrame:
+                self.calls.append(("rt_min_daily", tuple(ts_codes), freq))
+                return pd.DataFrame([
+                    {
+                        "ts_code": "002415.SZ",
+                        "trade_time": pd.Timestamp("2026-07-02 09:30:00"),
+                        "freq": "1min",
+                        "open": 12.00,
+                        "high": 12.20,
+                        "low": 11.90,
+                        "close": 12.10,
+                        "vol": 2000.0,
+                        "amount": 24100.0,
+                        "source": "tushare_rt_daily",
+                    },
+                    {
+                        "ts_code": "002415.SZ",
+                        "trade_time": pd.Timestamp("2026-07-02 10:00:00"),
+                        "freq": "1min",
+                        "open": 12.20,
+                        "high": 13.10,
+                        "low": 12.10,
+                        "close": 12.70,
+                        "vol": 3000.0,
+                        "amount": 38100.0,
+                        "source": "tushare_rt_daily",
+                    },
+                ])
+
+        adapter = FakeAdapter()
+        provider = IntradayMinuteQuoteProvider(
+            adapter=adapter,
+            store=store,
+            daily_refresh_seconds=300,
+        )
+
+        quotes = provider.fetch(["002415.SZ"])
+
+        assert adapter.calls == [
+            ("rt_min", ("002415.SZ",), "1min"),
+            ("rt_min_daily", ("002415.SZ",), "1min"),
+        ]
+        quote = quotes["002415.SZ"]
+        assert quote.source == "tushare_rt_minute"
+        assert quote.price == 12.80
+        assert quote.open == 12.00
+        assert quote.high == 13.10
+        assert quote.low == 11.90
+        assert quote.volume == 6000.0
+        assert quote.amount == 75000.0
+
+        persisted = store.query_minute_bars(
+            "002415.SZ",
+            pd.Timestamp("2026-07-02 09:30:00"),
+            pd.Timestamp("2026-07-02 10:01:00"),
+        )
+        assert len(persisted) == 3
+        assert set(persisted["source"]) == {"tushare_rt", "tushare_rt_daily"}
+
+
+class TestCheckAttackSignals:
+    def _make_item(self):
         from rquant.monitor import WatchItem
+
         return WatchItem(
             ts_code="002415.SZ", pool="pool2",
             limit_up_date=date(2026, 4, 17),
             body_upper=13.20, body_lower=11.80, body=1.40,
             level_40=12.36, level_30=12.22, level_20=12.08,
             stop_strong=11.80, stop_weak=11.52,
+            reference_date=date(2026, 4, 18),
+            t_high=13.00,
+            t_close=12.50,
+            limit_up_price_next=13.75,
         )
 
-    def test_no_trigger_above_all_levels(self) -> None:
-        from rquant.monitor import check_levels
-        item = self._make_item()
-        events = check_levels(item, current_price=12.50, daily_low=12.50)
-        assert events == []
+    def test_triggers_open_strength_and_break_high(self) -> None:
+        from rquant.monitor import RealtimeQuote, check_attack_signals
 
-    def test_triggers_40_level(self) -> None:
-        from rquant.monitor import check_levels
         item = self._make_item()
-        events = check_levels(item, current_price=12.30, daily_low=12.30)
-        assert len(events) == 1
-        assert events[0]["level"] == "40"
-        assert events[0]["trigger_type"] == "realtime"
-        assert item.triggered["40"] is True
+        quote = RealtimeQuote(
+            ts_code="002415.SZ",
+            price=13.05,
+            low=12.60,
+            open=12.88,
+            high=13.10,
+        )
 
-    def test_triggers_multiple_levels(self) -> None:
-        from rquant.monitor import check_levels
-        item = self._make_item()
-        events = check_levels(item, current_price=12.00, daily_low=12.00)
-        triggered_levels = {e["level"] for e in events}
-        assert "40" in triggered_levels
-        assert "30" in triggered_levels
-        assert "20" in triggered_levels
+        events = check_attack_signals(item, quote)
 
-    def test_daily_low_backup_trigger(self) -> None:
-        from rquant.monitor import check_levels
+        levels = {e["level"] for e in events}
+        assert "attack_open_strength" in levels
+        assert "attack_break_high" in levels
+        assert item.triggered["attack_open_strength"] is True
+        assert item.triggered["attack_break_high"] is True
+
+    def test_near_limit_requires_break_high_and_strong_carry(self) -> None:
+        from rquant.monitor import RealtimeQuote, check_attack_signals
+
         item = self._make_item()
-        # Price bounced back above 40, but daily low touched it
-        events = check_levels(item, current_price=12.50, daily_low=12.30)
-        assert len(events) == 1
-        assert events[0]["trigger_type"] == "daily_low"
+        quote = RealtimeQuote(
+            ts_code="002415.SZ",
+            price=13.58,
+            low=12.55,
+            open=12.70,
+            high=13.60,
+        )
+
+        events = check_attack_signals(item, quote)
+
+        levels = {e["level"] for e in events}
+        assert "attack_near_limit" in levels
+
+    def test_attack_signals_adjust_reference_levels_on_ex_right_day(self) -> None:
+        from rquant.monitor import RealtimeQuote, WatchItem, check_attack_signals
+
+        item = WatchItem(
+            ts_code="688662.SH", pool="pool1",
+            limit_up_date=date(2026, 6, 11),
+            body_upper=132.00, body_lower=124.00, body=8.00,
+            level_40=127.20, level_30=126.40, level_20=125.60,
+            stop_strong=124.00, stop_weak=122.40,
+            reference_date=date(2026, 6, 12),
+            t_high=153.60,
+            t_close=150.80,
+            limit_up_price_next=181.00,
+        )
+        quote = RealtimeQuote(
+            ts_code="688662.SH",
+            price=118.00,
+            low=115.80,
+            open=116.20,
+            high=118.20,
+            pre_close=115.70,
+        )
+
+        events = check_attack_signals(item, quote)
+
+        by_level = {event["level"]: event for event in events}
+        assert "attack_strong_carry" in by_level
+        assert "attack_break_high" in by_level
+        assert by_level["attack_strong_carry"]["level_price"] == pytest.approx(115.70)
+        assert by_level["attack_break_high"]["level_price"] == pytest.approx(
+            153.60 * 115.70 / 150.80
+        )
+
+    def test_no_attack_signal_without_reference_prices(self) -> None:
+        from rquant.monitor import RealtimeQuote, WatchItem, check_attack_signals
+
+        item = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+        )
+        quote = RealtimeQuote(
+            ts_code="002415.SZ",
+            price=13.58,
+            low=12.55,
+            open=12.70,
+            high=13.60,
+        )
+
+        assert check_attack_signals(item, quote) == []
 
     def test_no_retrigger(self) -> None:
-        from rquant.monitor import check_levels
-        item = self._make_item()
-        check_levels(item, current_price=12.30, daily_low=12.30)
-        assert item.triggered["40"] is True
+        from rquant.monitor import RealtimeQuote, check_attack_signals
 
-        events2 = check_levels(item, current_price=12.30, daily_low=12.30)
+        item = self._make_item()
+        quote = RealtimeQuote(
+            ts_code="002415.SZ",
+            price=13.05,
+            low=12.60,
+            open=12.88,
+            high=13.10,
+        )
+
+        check_attack_signals(item, quote)
+        events2 = check_attack_signals(item, quote)
+
         assert events2 == []
-
-    def test_strong_stop_trigger(self) -> None:
-        from rquant.monitor import check_levels
-        item = self._make_item()
-        events = check_levels(item, current_price=11.75, daily_low=11.75)
-        levels = {e["level"] for e in events}
-        assert "strong" in levels
 
 
 class TestCheckExits:
@@ -510,18 +726,18 @@ class TestRunMonitor:
 
     @patch("rquant.monitor._count_trading_days_since", return_value=4)
     @patch("rquant.monitor.check_exits", return_value=0)
-    @patch("rquant.monitor.fetch_realtime_prices")
+    @patch("rquant.monitor.IntradayMinuteQuoteProvider")
     @patch("rquant.monitor.build_watchlist")
     @patch("rquant.monitor.is_trading_day", return_value=True)
     @patch("rquant.monitor._wait_for_market_open")
     @patch("rquant.monitor.time.sleep")
     @patch("rquant.monitor._market_phase")
     @patch("rquant.monitor._now")
-    def test_polls_and_detects(
+    def test_ignores_pullback_levels(
         self, mock_now, mock_phase, _sleep, _wait_open,
-        _td, mock_build, mock_fetch, _exits, _count_days,
+        _td, mock_build, mock_provider_cls, _exits, _count_days,
     ) -> None:
-        from rquant.monitor import WatchItem, run_monitor
+        from rquant.monitor import RealtimeQuote, WatchItem, run_monitor
 
         item = WatchItem(
             ts_code="002415.SZ", pool="pool2",
@@ -533,32 +749,167 @@ class TestRunMonitor:
             entry_date=date(2026, 4, 18),
         )
         mock_build.return_value = [item]
-        mock_fetch.return_value = {
-            "002415.SZ": {"price": 12.30, "low": 12.30}
+        mock_provider = mock_provider_cls.return_value
+        mock_provider.fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=12.30,
+                low=12.30,
+            )
         }
 
         # 1st iter: morning. 2nd iter: closed → break.
         mock_phase.side_effect = ["morning", "closed"]
         mock_now.return_value = datetime(2026, 4, 21, 10, 0, 0)
 
-        with patch("rquant.notify.notify") as mock_notify:
-            with patch("rquant.monitor.DuckDBStore") as MockStore:
-                mock_store = MockStore.return_value.__enter__.return_value
-                mock_store.upsert_monitor_event.return_value = 1
-                mock_store.query_monitor_events.return_value = pd.DataFrame()
-                run_monitor(interval=5)
+        with (
+            patch("rquant.notify.notify") as mock_notify,
+            patch("rquant.monitor.DuckDBStore") as mock_store_cls,
+        ):
+            mock_store = mock_store_cls.return_value.__enter__.return_value
+            mock_store.upsert_monitor_event.return_value = 1
+            mock_store.query_monitor_events.return_value = pd.DataFrame()
+            run_monitor(interval=5)
 
-        assert item.triggered["40"] is True
+        assert "40" not in item.triggered
+        mock_store.upsert_monitor_event.assert_not_called()
 
-        # heartbeat start + price_level (40) + heartbeat stop = 3 calls
         scenes = [c.args[0] for c in mock_notify.call_args_list]
         assert "heartbeat" in scenes
-        assert "price_level" in scenes
         assert scenes.count("heartbeat") == 2  # start + stop
+        assert "price_level" not in scenes
 
     @patch("rquant.monitor._count_trading_days_since", return_value=4)
     @patch("rquant.monitor.check_exits", return_value=0)
-    @patch("rquant.monitor.fetch_realtime_prices")
+    @patch("rquant.monitor.fetch_realtime_quotes")
+    @patch("rquant.monitor.IntradayMinuteQuoteProvider")
+    @patch("rquant.monitor.build_watchlist")
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._wait_for_market_open")
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._market_phase")
+    @patch("rquant.monitor._now")
+    def test_uses_tushare_minute_quotes_and_falls_back_for_missing_codes(
+        self, mock_now, mock_phase, _sleep, _wait_open,
+        _td, mock_build, mock_provider_cls, mock_ak_fetch, _exits, _count_days,
+    ) -> None:
+        from rquant.monitor import RealtimeQuote, WatchItem, run_monitor
+
+        p2 = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+            name="海康威视",
+            entry_date=date(2026, 4, 18),
+        )
+        p1 = WatchItem(
+            ts_code="300001.SZ", pool="pool1",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=16.50, body_lower=14.80, body=1.70,
+            level_40=15.48, level_30=15.31, level_20=15.14,
+            stop_strong=14.80, stop_weak=14.46,
+            name="特锐德",
+            entry_date=date(2026, 4, 17),
+        )
+        mock_build.return_value = [p2, p1]
+        mock_provider = mock_provider_cls.return_value
+        mock_provider.fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=12.80,
+                low=11.90,
+                open=12.00,
+                high=13.10,
+                source="tushare_rt_minute",
+            )
+        }
+        mock_ak_fetch.return_value = {
+            "300001.SZ": RealtimeQuote(
+                ts_code="300001.SZ",
+                price=15.00,
+                low=14.90,
+                source="sina",
+            )
+        }
+        mock_phase.side_effect = ["morning", "closed"]
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
+
+        with (
+            patch("rquant.notify.notify"),
+            patch("rquant.monitor.DuckDBStore") as mock_store_cls,
+        ):
+            mock_store = mock_store_cls.return_value.__enter__.return_value
+            mock_store.upsert_monitor_event.return_value = 1
+            mock_store.query_monitor_events.return_value = pd.DataFrame()
+            run_monitor(interval=5)
+
+        mock_provider_cls.assert_called_once_with(store=mock_store)
+        mock_provider.fetch.assert_called_once_with(["002415.SZ", "300001.SZ"])
+        mock_ak_fetch.assert_called_once_with(["300001.SZ"])
+
+    @patch("rquant.monitor._count_trading_days_since", return_value=4)
+    @patch("rquant.monitor.check_exits", return_value=0)
+    @patch("rquant.monitor.fetch_realtime_quotes")
+    @patch("rquant.monitor.IntradayMinuteQuoteProvider")
+    @patch("rquant.monitor.build_watchlist")
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._wait_for_market_open")
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._market_phase")
+    @patch("rquant.monitor._now")
+    def test_falls_back_all_codes_when_tushare_has_no_fresh_data(
+        self, mock_now, mock_phase, _sleep, _wait_open,
+        _td, mock_build, mock_provider_cls, mock_ak_fetch, _exits, _count_days,
+    ) -> None:
+        from rquant.monitor import RealtimeQuote, WatchItem, run_monitor
+
+        item = WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+            name="海康威视",
+            entry_date=date(2026, 4, 18),
+        )
+        mock_build.return_value = [item]
+        mock_provider = mock_provider_cls.return_value
+        mock_provider.used_fresh_tushare = False
+        mock_provider.fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=12.80,
+                low=11.90,
+                source="tushare_rt_minute",
+            )
+        }
+        mock_ak_fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=12.82,
+                low=11.91,
+                source="sina",
+            )
+        }
+        mock_phase.side_effect = ["morning", "closed"]
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
+
+        with (
+            patch("rquant.notify.notify"),
+            patch("rquant.monitor.DuckDBStore") as mock_store_cls,
+        ):
+            mock_store = mock_store_cls.return_value.__enter__.return_value
+            mock_store.upsert_monitor_event.return_value = 1
+            mock_store.query_monitor_events.return_value = pd.DataFrame()
+            run_monitor(interval=5)
+
+        mock_ak_fetch.assert_called_once_with(["002415.SZ"])
+
+    @patch("rquant.monitor._count_trading_days_since", return_value=4)
+    @patch("rquant.monitor.check_exits", return_value=0)
+    @patch("rquant.monitor.IntradayMinuteQuoteProvider")
     @patch("rquant.monitor.build_watchlist")
     @patch("rquant.monitor.is_trading_day", return_value=True)
     @patch("rquant.monitor._wait_for_market_open")
@@ -567,14 +918,14 @@ class TestRunMonitor:
     @patch("rquant.monitor._market_phase")
     def test_crosses_lunch_break_without_exiting(
         self, mock_phase, _sleep, mock_wait_pm, _wait_open,
-        _td, mock_build, mock_fetch, _exits, _count_days,
+        _td, mock_build, mock_provider_cls, _exits, _count_days,
     ) -> None:
         """关键回归：morning → lunch → afternoon → closed 期间进程**不退出**。
 
         bug 修前：上午 11:30 _is_trading_hours False → 立刻退出，下午无监控。
         修后：lunch 阶段 sleep 等下午开盘，afternoon 继续轮询，15:00 才退。
         """
-        from rquant.monitor import WatchItem, run_monitor
+        from rquant.monitor import RealtimeQuote, WatchItem, run_monitor
 
         item = WatchItem(
             ts_code="002415.SZ", pool="pool2",
@@ -587,8 +938,13 @@ class TestRunMonitor:
         )
         mock_build.return_value = [item]
         # afternoon 阶段股价没跌破档位（避免跟踪 trigger 状态干扰断言）
-        mock_fetch.return_value = {
-            "002415.SZ": {"price": 13.00, "low": 12.50}
+        mock_provider = mock_provider_cls.return_value
+        mock_provider.fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=13.00,
+                low=12.50,
+            )
         }
 
         # 模拟一整天阶段流转
@@ -602,15 +958,17 @@ class TestRunMonitor:
             "closed",     # 7: break
         ]
 
-        with patch("rquant.notify.notify"):
-            with patch("rquant.monitor.DuckDBStore") as MockStore:
-                mock_store = MockStore.return_value.__enter__.return_value
-                mock_store.upsert_monitor_event.return_value = 1
-                mock_store.query_monitor_events.return_value = pd.DataFrame()
-                run_monitor(interval=5)
+        with (
+            patch("rquant.notify.notify"),
+            patch("rquant.monitor.DuckDBStore") as mock_store_cls,
+        ):
+            mock_store = mock_store_cls.return_value.__enter__.return_value
+            mock_store.upsert_monitor_event.return_value = 1
+            mock_store.query_monitor_events.return_value = pd.DataFrame()
+            run_monitor(interval=5)
 
         # morning + afternoon = 4 次 fetch；lunch 不该 fetch
-        assert mock_fetch.call_count == 4
+        assert mock_provider.fetch.call_count == 4
 
         # lunch 阶段进入 _wait_for_afternoon_open 至少 2 次
         assert mock_wait_pm.call_count >= 2
@@ -651,7 +1009,6 @@ class TestCheckExitsSingleStockIsolation:
         )
 
         # 让 000001.SZ 处理时抛异常：mock update_pool2_exit 对它抛错
-        real_update = store.update_pool2_exit
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
             "('000001.SZ', '2026-04-21', 12,12,11,11.4,12,-0.5,-4,1000,10000)"
