@@ -71,6 +71,51 @@ def test_upsert_and_query_minute_bars(store: DuckDBStore) -> None:
     assert out.iloc[0]["source"] == "tushare"
 
 
+def test_query_minute_bars_dedups_across_sources(store: DuckDBStore) -> None:
+    """C4：同一分钟盘中 rt_min（tushare_rt）与日终 stk_mins（tushare）双写时，
+    查询只返回权威 tushare 行，避免研究/回测把成交量翻倍计。"""
+    df = pd.DataFrame([
+        {  # 盘中实时快照
+            "ts_code": "600000.SH",
+            "trade_time": datetime(2023, 8, 25, 9, 30),
+            "freq": "1min",
+            "open": 6.98, "high": 7.00, "low": 6.98, "close": 7.00,
+            "vol": 100000.0, "amount": 700000.0,
+            "source": "tushare_rt",
+        },
+        {  # 同一分钟的日终权威 bar → 应胜出
+            "ts_code": "600000.SH",
+            "trade_time": datetime(2023, 8, 25, 9, 30),
+            "freq": "1min",
+            "open": 6.99, "high": 6.99, "low": 6.99, "close": 6.99,
+            "vol": 103700.0, "amount": 724863.0,
+            "source": "tushare",
+        },
+        {  # 只有实时源的分钟 → 无权威行时保留 rt 行
+            "ts_code": "600000.SH",
+            "trade_time": datetime(2023, 8, 25, 9, 31),
+            "freq": "1min",
+            "open": 6.99, "high": 7.02, "low": 6.97, "close": 7.02,
+            "vol": 807500.0, "amount": 5649956.0,
+            "source": "tushare_rt",
+        },
+    ])
+    assert store.upsert_minute_bars(df) == 3
+
+    out = store.query_minute_bars(
+        "600000.SH",
+        datetime(2023, 8, 25, 9, 30),
+        datetime(2023, 8, 25, 9, 31),
+    )
+    assert len(out) == 2
+    row_930 = out.iloc[0]
+    assert row_930["trade_time"] == pd.Timestamp("2023-08-25 09:30:00")
+    assert row_930["source"] == "tushare"
+    assert row_930["close"] == 6.99
+    assert row_930["vol"] == 103700.0
+    assert out.iloc[1]["source"] == "tushare_rt"
+
+
 def test_upsert_and_query_auction_bars(store: DuckDBStore) -> None:
     df = pd.DataFrame([
         {

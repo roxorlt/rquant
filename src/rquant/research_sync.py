@@ -13,7 +13,13 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
 
 表分两类：
 - REPLACE_TABLES：云端权威，整表替换（DELETE + INSERT，保留本地 DDL/主键）
-- MERGE_TABLES：双端追加流，按主键 INSERT OR REPLACE，绝不整表替换
+- MERGE_TABLES：双端追加流，按主键 INSERT OR REPLACE，绝不整表替换。
+  灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
+  缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
+
+错误语义：顶层失败（备份缺失 / 主库打不开 / ATTACH 失败）不抛异常，
+转成 has_errors 的报告返回——告警由 sync-from-cloud.sh 统一推，避免
+cli main() 的 notify 与脚本 PushDeer 双重告警。
 """
 
 from __future__ import annotations
@@ -100,6 +106,44 @@ def _rescue_stale_wal(db_path: Path) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(db_path))
 
 
+def _attach_readonly(
+    conn: duckdb.DuckDBPyConnection, path: Path, alias: str
+) -> None:
+    """ATTACH 只读库。duckdb 1.5.2 实测 ATTACH 不支持 ? 参数绑定，
+    路径只能拼字符串——单引号双写转义，防含 ' 的路径（如 roxor's backup）炸 SQL。
+    """
+    escaped = str(path).replace("'", "''")
+    conn.execute(f"ATTACH '{escaped}' AS {alias} (READ_ONLY)")
+
+
+def _failure_report(
+    source_path: Path, db_path: Path, detail: str
+) -> ResearchSyncReport:
+    logger.error(detail)
+    return ResearchSyncReport(
+        backup_path=str(source_path),
+        db_path=str(db_path),
+        tables=[TableSyncResult(table="<sync>", mode="error", detail=detail[:200])],
+        replica_refreshed=False,
+        replica_detail="同步失败，跳过副本刷新",
+    )
+
+
+def _refresh_replica_if_clean(
+    report: ResearchSyncReport, db_path: Path, refresh_replica: bool
+) -> None:
+    """有任何表同步失败时跳过副本刷新，避免把跨表不一致快照发布给 Strategy Lab。"""
+    if not refresh_replica:
+        return
+    if report.has_errors:
+        report.replica_refreshed = False
+        report.replica_detail = "存在同步失败的表，跳过副本刷新（避免发布跨表不一致快照）"
+        return
+    ok, detail = refresh_readonly_replica(db_path)
+    report.replica_refreshed = ok
+    report.replica_detail = detail
+
+
 def _common_columns(
     conn: duckdb.DuckDBPyConnection, table: str, alias: str
 ) -> tuple[list[str], list[str]]:
@@ -135,6 +179,14 @@ def _common_columns(
 def _sync_table(
     conn: duckdb.DuckDBPyConnection, table: str, alias: str, mode: str
 ) -> TableSyncResult:
+    """mode 三种执行策略：
+    - replace：整表 DELETE + INSERT（云端权威表）
+    - merge：INSERT OR REPLACE，主键冲突时源覆盖本地（云端持续同步）
+    - restore：INSERT OR IGNORE，主键冲突时保留本地（灾后恢复，只补缺失行）
+
+    注意返回的 TableSyncResult.mode 词汇固定为 replace|merge|skipped|error
+    （cli 渲染按此映射），restore 对外归类为 merge，detail 标注恢复语义。
+    """
     src_exists = conn.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         f"WHERE table_catalog = '{alias}' AND table_name = ?",
@@ -146,7 +198,7 @@ def _sync_table(
     cols, pk_cols = _common_columns(conn, table, alias)
     if not cols:
         return TableSyncResult(table=table, mode="skipped", detail="无共同列")
-    if mode == "merge" and any(pk not in cols for pk in pk_cols):
+    if mode in ("merge", "restore") and any(pk not in cols for pk in pk_cols):
         return TableSyncResult(
             table=table, mode="skipped", detail=f"备份缺主键列 {pk_cols}"
         )
@@ -162,6 +214,11 @@ def _sync_table(
                 f'INSERT INTO "{table}" ({col_list}) '
                 f'SELECT {col_list} FROM {alias}."{table}"'
             )
+        elif mode == "restore":
+            conn.execute(
+                f'INSERT OR IGNORE INTO "{table}" ({col_list}) '
+                f'SELECT {col_list} FROM {alias}."{table}"'
+            )
         else:
             conn.execute(
                 f'INSERT OR REPLACE INTO "{table}" ({col_list}) '
@@ -173,6 +230,13 @@ def _sync_table(
         logger.exception(f"research-sync 表 {table} 同步失败")
         return TableSyncResult(table=table, mode="error", detail=str(e)[:200])
 
+    if mode == "restore":
+        return TableSyncResult(
+            table=table,
+            mode="merge",
+            rows=src_rows,
+            detail="restore：冲突保留本地行，只补缺失行",
+        )
     return TableSyncResult(table=table, mode=mode, rows=src_rows)
 
 
@@ -209,27 +273,40 @@ def sync_from_backup(
     *,
     refresh_replica: bool = True,
 ) -> ResearchSyncReport:
-    """把云端备份里的生产表合并进本地研究库。"""
+    """把云端备份里的生产表合并进本地研究库。
+
+    顶层失败不抛异常，返回 has_errors 的报告（见模块 docstring 错误语义）。
+    """
     backup_path = backup_path or settings.data_dir / "cloud_backup.duckdb"
     db_path = db_path or settings.duckdb_path
 
     if not backup_path.exists():
-        raise FileNotFoundError(f"云端备份不存在：{backup_path}")
+        return _failure_report(
+            backup_path, db_path, f"云端备份不存在：{backup_path}"
+        )
 
-    conn = _rescue_stale_wal(db_path)
+    try:
+        conn = _rescue_stale_wal(db_path)
+    except Exception as e:
+        logger.exception("research-sync 打开主库失败")
+        return _failure_report(backup_path, db_path, f"打开主库失败：{e}")
+
     results: list[TableSyncResult] = []
     try:
         for ddl in ALL_DDL:
             conn.execute(ddl)
-        conn.execute(
-            f"ATTACH '{backup_path}' AS cloud_backup (READ_ONLY)"
-        )
+        _attach_readonly(conn, backup_path, "cloud_backup")
         for table in REPLACE_TABLES:
             results.append(_sync_table(conn, table, "cloud_backup", "replace"))
         for table in MERGE_TABLES:
             results.append(_sync_table(conn, table, "cloud_backup", "merge"))
         conn.execute("DETACH cloud_backup")
         conn.execute("CHECKPOINT")
+    except Exception as e:
+        logger.exception("research-sync 顶层失败")
+        results.append(
+            TableSyncResult(table="<sync>", mode="error", detail=str(e)[:200])
+        )
     finally:
         conn.close()
 
@@ -238,10 +315,7 @@ def sync_from_backup(
         db_path=str(db_path),
         tables=results,
     )
-    if refresh_replica:
-        ok, detail = refresh_readonly_replica(db_path)
-        report.replica_refreshed = ok
-        report.replica_detail = detail
+    _refresh_replica_if_clean(report, db_path, refresh_replica)
 
     synced = sum(t.rows for t in results if t.mode in ("replace", "merge"))
     logger.info(
@@ -258,7 +332,13 @@ def restore_research_tables(
     *,
     refresh_replica: bool = True,
 ) -> ResearchSyncReport:
-    """从旧库/旧副本按主键恢复研究表（灾后恢复用，只合并不替换）。"""
+    """从旧库/旧副本恢复研究表（灾后恢复用）。
+
+    INSERT OR IGNORE 语义：只补本地缺失的行，主键冲突时保留本地现值——
+    旧副本里的过期行（如今天已平仓的 paper_position 的旧 open 状态）
+    绝不覆盖本地。非法表名仍抛 ValueError（调用方约定错误应当炸），
+    其余顶层失败转成 has_errors 的报告返回。
+    """
     db_path = db_path or settings.duckdb_path
     tables = tables or list(MERGE_TABLES)
 
@@ -268,18 +348,30 @@ def restore_research_tables(
             f"只允许恢复 MERGE_TABLES 中的研究表，非法表：{unknown}"
         )
     if not source_path.exists():
-        raise FileNotFoundError(f"恢复源不存在：{source_path}")
+        return _failure_report(
+            source_path, db_path, f"恢复源不存在：{source_path}"
+        )
 
-    conn = _rescue_stale_wal(db_path)
+    try:
+        conn = _rescue_stale_wal(db_path)
+    except Exception as e:
+        logger.exception("research-restore 打开主库失败")
+        return _failure_report(source_path, db_path, f"打开主库失败：{e}")
+
     results: list[TableSyncResult] = []
     try:
         for ddl in ALL_DDL:
             conn.execute(ddl)
-        conn.execute(f"ATTACH '{source_path}' AS restore_src (READ_ONLY)")
+        _attach_readonly(conn, source_path, "restore_src")
         for table in tables:
-            results.append(_sync_table(conn, table, "restore_src", "merge"))
+            results.append(_sync_table(conn, table, "restore_src", "restore"))
         conn.execute("DETACH restore_src")
         conn.execute("CHECKPOINT")
+    except Exception as e:
+        logger.exception("research-restore 顶层失败")
+        results.append(
+            TableSyncResult(table="<sync>", mode="error", detail=str(e)[:200])
+        )
     finally:
         conn.close()
 
@@ -288,8 +380,5 @@ def restore_research_tables(
         db_path=str(db_path),
         tables=results,
     )
-    if refresh_replica:
-        ok, detail = refresh_readonly_replica(db_path)
-        report.replica_refreshed = ok
-        report.replica_detail = detail
+    _refresh_replica_if_clean(report, db_path, refresh_replica)
     return report

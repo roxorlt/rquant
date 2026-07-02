@@ -70,6 +70,7 @@ class IntradayMinuteQuoteProvider:
         store: DuckDBStore | None = None,
         freq: str = "1min",
         daily_refresh_seconds: int = 300,
+        rt_min_poll_seconds: int | None = None,
     ) -> None:
         if adapter is None:
             from rquant.adapter.tushare import TushareAdapter
@@ -79,21 +80,35 @@ class IntradayMinuteQuoteProvider:
         self._store = store
         self._freq = freq
         self._daily_refresh_seconds = daily_refresh_seconds
+        self._rt_min_poll_seconds = (
+            settings.rt_min_poll_seconds
+            if rt_min_poll_seconds is None
+            else rt_min_poll_seconds
+        )
         self._last_daily_refresh: datetime | None = None
+        self._last_rt_min_success: datetime | None = None
         self._bars: dict[tuple[str, pd.Timestamp], _CachedMinuteBar] = {}
         self.used_fresh_tushare = False
 
     def fetch(self, ts_codes: list[str]) -> dict[str, RealtimeQuote]:
-        """拉取分钟线、落库，并合成 {ts_code: RealtimeQuote}。"""
+        """拉取分钟线、落库，并合成 {ts_code: RealtimeQuote}。
+
+        rt_min 按 rt_min_poll_seconds 节流：主循环 interval（5s）比分钟级数据
+        更新快，距上次成功拉取不足节流间隔时跳过 API 调用、用内存缓存合成。
+        """
         if not ts_codes:
             return {}
 
         self.used_fresh_tushare = False
-        rt_min_ok = self._fetch_rt_min(ts_codes)
+        poll_due = self._should_poll_rt_min()
+        rt_min_ok = self._fetch_rt_min(ts_codes) if poll_due else False
         daily_ok = False
         if self._should_refresh_daily():
             daily_ok = self._fetch_rt_min_daily(ts_codes)
-        self.used_fresh_tushare = rt_min_ok or daily_ok
+        # 节流跳过 rt_min 时，上次成功拉取仍在新鲜窗口（2×节流间隔）内视为新鲜；
+        # 否则 run_monitor 会把全部 code 转 akshare 全量 fallback，节流反而放大调用量
+        rt_min_fresh = rt_min_ok or (not poll_due and self._rt_min_cache_fresh())
+        self.used_fresh_tushare = rt_min_fresh or daily_ok
 
         return {
             code: quote
@@ -107,6 +122,19 @@ class IntradayMinuteQuoteProvider:
         elapsed = (_now() - self._last_daily_refresh).total_seconds()
         return elapsed >= self._daily_refresh_seconds
 
+    def _should_poll_rt_min(self) -> bool:
+        if self._last_rt_min_success is None:
+            return True
+        elapsed = (_now() - self._last_rt_min_success).total_seconds()
+        return elapsed >= self._rt_min_poll_seconds
+
+    def _rt_min_cache_fresh(self) -> bool:
+        """上次成功 rt_min 拉取是否仍在新鲜窗口（2×节流间隔）内。"""
+        if self._last_rt_min_success is None:
+            return False
+        elapsed = (_now() - self._last_rt_min_success).total_seconds()
+        return elapsed < self._rt_min_poll_seconds * 2
+
     def _fetch_rt_min(self, ts_codes: list[str]) -> bool:
         try:
             df = self._adapter.rt_min(ts_codes, freq=self._freq)
@@ -114,7 +142,10 @@ class IntradayMinuteQuoteProvider:
             logger.exception("Tushare rt_min 获取失败，本轮保留已有分钟缓存")
             return False
         self._ingest_minute_frame(df)
-        return df is not None and not df.empty
+        ok = df is not None and not df.empty
+        if ok:
+            self._last_rt_min_success = _now()
+        return ok
 
     def _fetch_rt_min_daily(self, ts_codes: list[str]) -> bool:
         self._last_daily_refresh = _now()
@@ -775,6 +806,13 @@ def run_monitor(interval: int = 5) -> int:
 
     if not is_trading_day(today):
         logger.info(f"{today} 非交易日，退出")
+        return 0
+
+    # 收盘后启动（launchd RunAtLoad / 晚间手动）不打开写库：DuckDB 写连接期间
+    # 拒绝一切新连接，整晚占锁会挡日终 research-sync / 本地研究写入。
+    # 9:25 systemd 正常启动时 phase 是 pre，不受影响，_wait_for_market_open 会等到 9:30。
+    if _market_phase() == "closed":
+        logger.info("已过收盘（>=15:00），不启动盘中监控，退出")
         return 0
 
     with DuckDBStore() as store:

@@ -963,6 +963,9 @@ st.caption(f"渲染时间 {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
 
 PRESET_OPTIONS = ["n-shape-combined", "n-shape-pool1", "n-shape-pool2"]
 
+# 收益对比结果落盘时每张表最多保留的行数；超出部分只存在于当前会话内存
+COMPARE_SAVE_MAX_ROWS = 2000
+
 # form 内控件提交前不触发 rerun，日期边界按上一次提交（或默认）的池子/持有期先算
 _prev_preset = str(st.session_state.get("compare_preset", PRESET_OPTIONS[0]))
 _prev_hold = int(st.session_state.get("compare_hold_days", 1))
@@ -986,10 +989,12 @@ default_end = safe_end
 default_start = max(bounds_min, default_end - timedelta(days=30))
 
 # 换池子/持有期后旧日期可能越界，重置回默认，避免 date_input 抛越界异常
+_dates_were_reset = False
 for _date_key in ("compare_start", "compare_end"):
     _picked = st.session_state.get(_date_key)
     if isinstance(_picked, date) and not (bounds_min <= _picked <= safe_end):
         del st.session_state[_date_key]
+        _dates_were_reset = True
 
 with st.sidebar.form("compare_form"):
     preset_name = st.selectbox("候选池", PRESET_OPTIONS, key="compare_preset")
@@ -1032,6 +1037,15 @@ with st.sidebar.form("compare_form"):
         key="compare_variants",
     )
     run_clicked = st.form_submit_button("运行对比", type="primary", width="stretch")
+
+# 日期被重置时不静默执行：让用户看清新区间后再点一次，避免以为跑的是自己选的区间
+if _dates_were_reset:
+    st.warning(
+        f"所选日期超出当前候选池/持有期的可用范围，已重置为默认 "
+        f"{default_start:%Y-%m-%d} ~ {default_end:%Y-%m-%d}。"
+        "本次提交未执行回测，请确认日期后重新点「运行对比」。"
+    )
+    run_clicked = False
 
 selected_modes = _label_to_key(selected_mode_labels, ENTRY_LABELS)
 selected_variants = _label_to_key(selected_variant_labels, VARIANT_LABELS)
@@ -1130,7 +1144,7 @@ if run_clicked:
                 "策略对比汇总": summary,
                 "交易明细": trades,
             },
-            max_rows_per_table=2000,
+            max_rows_per_table=COMPARE_SAVE_MAX_ROWS,
         )
     )
     # 结果进 session_state：切 tab / 改控件触发 rerun 不再丢结果
@@ -1178,6 +1192,11 @@ with tab_compare:
         st.caption(
             f"Markdown: {compare_state['markdown_path']} · JSON: {compare_state['json_path']}"
         )
+        if len(trades) > COMPARE_SAVE_MAX_ROWS:
+            st.caption(
+                f"注意：本次交易明细共 {len(trades):,} 行，历史记录落盘截断至前 "
+                f"{COMPARE_SAVE_MAX_ROWS:,} 行；完整明细仅保留在当前会话内。"
+            )
         if not summary.empty:
             chart_df = summary.copy()
             chart_df["entry_label"] = chart_df["entry_mode"].map(ENTRY_LABELS)
@@ -1215,6 +1234,12 @@ with tab_trades:
         st.info("所选区间没有触发交易")
     else:
         st.caption(f"来自：{compare_state['title']} · 记录 `{compare_state['run_id']}`")
+        if len(compare_state["trades"]) > COMPARE_SAVE_MAX_ROWS:
+            st.caption(
+                f"注意：本次交易明细共 {len(compare_state['trades']):,} 行，"
+                f"历史记录落盘截断至前 {COMPARE_SAVE_MAX_ROWS:,} 行；"
+                "完整明细仅保留在当前会话内。"
+            )
         _show_dataframe(_display_trades(compare_state["trades"]))
 
 with tab_optimize:
@@ -1244,6 +1269,12 @@ with tab_optimize:
             """
         )
 
+    st.caption(
+        f"生效的 sidebar 参数：候选池 `{preset_name}` · 区间 "
+        f"{start_value:%Y-%m-%d} ~ {end_value:%Y-%m-%d} · "
+        f"入场 {'、'.join(selected_mode_labels)} · 风控 {'、'.join(selected_variant_labels)}。"
+        "在 sidebar 修改参数后需先点「运行对比」提交，这里才会用新参数。"
+    )
     with st.form("optimize_form"):
         oc1, oc2, oc3, oc4 = st.columns([1.2, 1.1, 1.0, 1.0])
         hold_selection = oc1.multiselect(
@@ -1337,26 +1368,38 @@ with tab_optimize:
     elif not score_profile_selection:
         st.warning("至少选择一个评分画像")
     elif optimize_background_clicked:
-        bg_run_id = launch_background_run({
-            "run_type": "n_shape_optimize",
-            "params": {
-                "start_date": start_value.isoformat(),
-                "end_date": end_value.isoformat(),
-                "preset_name": preset_name,
-                "entry_modes": list(selected_modes),
-                "profile_variants": list(selected_variants),
-                "hold_options": [int(v) for v in hold_selection],
-                "topn_options": [int(v) for v in topn_selection],
-                "score_profile_names": list(score_profile_selection),
-                "walk_forward_folds": int(walk_forward_folds),
-                "validation_ratio": float(validation_ratio),
-                "min_trades": int(min_trades),
-            },
-        })
-        st.success(
-            f"后台任务已启动：`{bg_run_id}`。可以关闭页面；"
-            "进度与取消入口在「历史记录」tab 顶部，跑完结果自动进历史记录。"
-        )
+        # 重复提交防护：已有同类型任务在跑时不再派生（连点会产生多个全量优化进程）
+        _running_same_type = [
+            item
+            for item in list_run_statuses()
+            if item.get("state") == "running" and item.get("run_type") == "n_shape_optimize"
+        ]
+        if _running_same_type:
+            st.warning(
+                f"已有同类型后台任务运行中：`{_running_same_type[0]['run_id']}`，"
+                "本次未启动新任务。可在「历史记录」tab 顶部取消它，或等它跑完再提交。"
+            )
+        else:
+            bg_run_id = launch_background_run({
+                "run_type": "n_shape_optimize",
+                "params": {
+                    "start_date": start_value.isoformat(),
+                    "end_date": end_value.isoformat(),
+                    "preset_name": preset_name,
+                    "entry_modes": list(selected_modes),
+                    "profile_variants": list(selected_variants),
+                    "hold_options": [int(v) for v in hold_selection],
+                    "topn_options": [int(v) for v in topn_selection],
+                    "score_profile_names": list(score_profile_selection),
+                    "walk_forward_folds": int(walk_forward_folds),
+                    "validation_ratio": float(validation_ratio),
+                    "min_trades": int(min_trades),
+                },
+            })
+            st.success(
+                f"后台任务已启动：`{bg_run_id}`。可以关闭页面；"
+                "进度与取消入口在「历史记录」tab 顶部，跑完结果自动进历史记录。"
+            )
     elif optimize_clicked:
         with st.spinner("正在自动枚举并排序策略组合..."):
             (
@@ -1438,6 +1481,11 @@ with tab_optimize:
         }
 
     optimize_state = st.session_state.get("optimize_result")
+    if optimize_state is None:
+        st.info(
+            "暂无自动优化结果。设置参数后点「生成排行榜」前台运行；"
+            "「后台运行」的结果在「历史记录」tab 查看。"
+        )
     if optimize_state is not None:
         rankings = optimize_state["rankings"]
         opt_trades = optimize_state["trades"]
@@ -1560,6 +1608,11 @@ with tab_optimize:
                         _show_dataframe(_display_trades(walk_forward_trades))
 
 with tab_auction:
+    st.caption(
+        f"生效的 sidebar 区间：{start_value:%Y-%m-%d} ~ {end_value:%Y-%m-%d}"
+        "（本 tab 是全市场策略，不受候选池影响）。"
+        "在 sidebar 修改区间后需先点「运行对比」提交，这里才会用新区间。"
+    )
     with st.form("auction_gap_form"):
         ac1, ac2, ac3, ac4, ac5 = st.columns([1.0, 1.2, 1.0, 1.0, 1.1])
         auction_gap_mode = ac1.selectbox(
@@ -2087,6 +2140,11 @@ with tab_coverage:
         if source_overview is not None and not source_overview.empty:
             with st.expander("分钟数据来源拆分", expanded=False):
                 _show_dataframe(source_overview, max_rows=50)
+    st.caption(
+        f"生效的 sidebar 参数：候选池 `{preset_name}` · 区间 "
+        f"{start_value:%Y-%m-%d} ~ {end_value:%Y-%m-%d}。"
+        "在 sidebar 修改参数后需先点「运行对比」提交，这里才会用新参数。"
+    )
     if st.button("计算当前区间覆盖率", width="stretch"):
         coverage_candidate_count = screen_candidate_count(
             start_value.isoformat(),

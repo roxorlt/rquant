@@ -62,10 +62,13 @@ def _status_path(run_id: str, base_dir: Path | None = None) -> Path:
 def write_run_status(status: LabRunStatus, *, base_dir: Path | None = None) -> Path:
     path = _status_path(status.run_id, base_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    # UI 侧随时在轮询读取：先写同目录临时文件再原子替换，避免读到半截 JSON
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(
         json.dumps(status.model_dump(mode="json"), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    os.replace(tmp_path, path)
     return path
 
 
@@ -75,8 +78,26 @@ def read_run_status(run_id: str, *, base_dir: Path | None = None) -> LabRunStatu
         return None
     try:
         return LabRunStatus.model_validate(json.loads(path.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, OSError, ValueError):
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        logger.debug(f"状态文件解析失败，按不存在处理: {path} ({e})")
         return None
+
+
+def _is_zombie(pid: int) -> bool:
+    """macOS 无 /proc，用 ps 查 stat 首字母：'Z' 是崩溃后未被回收的僵尸进程。"""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False  # ps 本身跑不了时退回 kill(0) 的判断，宁可误报存活
+    stat = result.stdout.strip()
+    if result.returncode != 0 or not stat:
+        return True  # kill(0) 成功后进程刚退出，ps 已查不到
+    return stat.startswith("Z")
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -90,7 +111,8 @@ def _pid_alive(pid: int | None) -> bool:
         return True
     except OSError:
         return False
-    return True
+    # kill(0) 对僵尸进程也会成功：崩溃的后台任务若没被 wait 回收会永久"运行中"
+    return not _is_zombie(pid)
 
 
 def _build_n_shape_optimize_run(params: dict[str, Any]) -> StrategyLabSavedRun:
@@ -283,7 +305,8 @@ def list_run_statuses(*, base_dir: Path | None = None) -> list[dict[str, Any]]:
     for path in sorted(out_dir.glob("*.status.json"), reverse=True):
         try:
             status = LabRunStatus.model_validate(json.loads(path.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError, ValueError):
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug(f"状态文件解析失败，跳过: {path} ({e})")
             continue
         item = status.model_dump(mode="json")
         if status.state == "running" and not _pid_alive(status.pid):
@@ -301,11 +324,32 @@ def cancel_background_run(run_id: str, *, base_dir: Path | None = None) -> bool:
         return False
     if status.pid:
         try:
-            os.killpg(os.getpgid(status.pid), signal.SIGTERM)
+            pgid = os.getpgid(status.pid)
         except (ProcessLookupError, PermissionError, OSError) as e:
             logger.warning(f"后台任务 {run_id} 进程 {status.pid} 无法终止（{e}），直接标记取消")
+        else:
+            # start_new_session 派生的子进程 pgid == 自身 pid；不相等说明该 pid
+            # 已被无关进程复用，killpg 会误杀别人的进程组，只标记状态不发信号
+            if pgid != status.pid:
+                logger.warning(
+                    f"后台任务 {run_id} 进程 {status.pid} 的进程组 {pgid} 与 pid 不符"
+                    "（疑似 pid 复用），跳过信号只标记取消"
+                )
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError) as e:
+                    logger.warning(
+                        f"后台任务 {run_id} 进程 {status.pid} 无法终止（{e}），直接标记取消"
+                    )
+    # 发信号后重读状态：子进程可能恰好已写完 done/error，
+    # 不能用 cancelled 覆盖掉 saved_run_id / error 信息
+    latest = read_run_status(run_id, base_dir=base_dir)
+    if latest is not None and latest.state in ("done", "error"):
+        logger.info(f"后台任务 {run_id} 在取消前已结束（{latest.state}），保留原状态不覆盖")
+        return False
     write_run_status(
-        status.model_copy(update={"state": "cancelled", "finished_at": _now()}),
+        (latest or status).model_copy(update={"state": "cancelled", "finished_at": _now()}),
         base_dir=base_dir,
     )
     logger.info(f"后台任务已取消: {run_id}")

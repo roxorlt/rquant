@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -95,6 +97,68 @@ class TestRunStatusFile:
 
         assert list_run_statuses(base_dir=tmp_path) == []
 
+    def test_write_is_atomic_no_tmp_leftover(self, tmp_path: Path) -> None:
+        """B1: 写状态走临时文件 + os.replace，目录里不残留 .tmp。"""
+        from rquant.dashboard.strategy_lab_worker import LabRunStatus, write_run_status
+
+        path = write_run_status(
+            LabRunStatus(run_id="run-atomic", run_type="n_shape_optimize", state="running"),
+            base_dir=tmp_path,
+        )
+        assert path.exists()
+        assert list(path.parent.glob("*.tmp")) == []
+
+    def test_read_corrupted_status_returns_none(self, tmp_path: Path) -> None:
+        """B1 读侧容错：半截 JSON 不崩，按不存在处理。"""
+        from rquant.dashboard.strategy_lab_worker import read_run_status
+
+        runs_dir = tmp_path / "strategy_lab_runs"
+        runs_dir.mkdir(parents=True)
+        (runs_dir / "run-broken.status.json").write_text('{"run_id": "run-bro', encoding="utf-8")
+        assert read_run_status("run-broken", base_dir=tmp_path) is None
+
+    def test_list_skips_corrupted_status_file(self, tmp_path: Path) -> None:
+        """B1 读侧容错：损坏的状态文件跳过，不影响其他条目。"""
+        from rquant.dashboard.strategy_lab_worker import (
+            LabRunStatus,
+            list_run_statuses,
+            write_run_status,
+        )
+
+        write_run_status(
+            LabRunStatus(run_id="run-good", run_type="n_shape_optimize", state="done"),
+            base_dir=tmp_path,
+        )
+        runs_dir = tmp_path / "strategy_lab_runs"
+        (runs_dir / "run-broken.status.json").write_text("{ 半截", encoding="utf-8")
+
+        statuses = list_run_statuses(base_dir=tmp_path)
+        assert [item["run_id"] for item in statuses] == ["run-good"]
+
+    def test_pid_alive_false_for_zombie(self) -> None:
+        """B3: 僵尸进程（已退出未回收）不算存活。"""
+        from rquant.dashboard.strategy_lab_worker import _pid_alive
+
+        proc = subprocess.Popen(["/bin/sleep", "0"])
+        try:
+            deadline = time.monotonic() + 5.0
+            became_zombie = False
+            while time.monotonic() < deadline:
+                stat = subprocess.run(
+                    ["ps", "-p", str(proc.pid), "-o", "stat="],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if stat.startswith("Z"):
+                    became_zombie = True
+                    break
+                time.sleep(0.05)
+            if not became_zombie:
+                pytest.skip("子进程未进入僵尸状态，环境可能自动回收")
+            assert _pid_alive(proc.pid) is False
+        finally:
+            proc.wait()
+
 
 class TestCancelBackgroundRun:
     def test_cancel_missing_run_returns_false(self, tmp_path: Path) -> None:
@@ -137,6 +201,71 @@ class TestCancelBackgroundRun:
         assert status is not None
         assert status.state == "cancelled"
         assert status.finished_at is not None
+
+    def test_cancel_skips_signal_when_pgid_mismatch(self, tmp_path: Path) -> None:
+        """B2: pid 被复用（pgid != pid）时不发信号，只标记取消，不误杀无关进程。"""
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        # 不带 start_new_session 派生：子进程 pgid 继承自 pytest，必然 != 自身 pid
+        proc = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            if os.getpgid(proc.pid) == proc.pid:
+                pytest.skip("子进程意外成为进程组组长，无法构造 pgid 不匹配场景")
+            worker.write_run_status(
+                worker.LabRunStatus(
+                    run_id="run-reused",
+                    run_type="n_shape_optimize",
+                    state="running",
+                    pid=proc.pid,
+                ),
+                base_dir=tmp_path,
+            )
+            assert worker.cancel_background_run("run-reused", base_dir=tmp_path) is True
+            # 未发信号：进程仍然活着
+            assert proc.poll() is None
+            status = worker.read_run_status("run-reused", base_dir=tmp_path)
+            assert status is not None
+            assert status.state == "cancelled"
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_cancel_does_not_overwrite_done_written_during_signal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """B4: cancel 与子进程写 done 竞争时，done 不被 cancelled 覆盖。"""
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        worker.write_run_status(
+            worker.LabRunStatus(
+                run_id="run-race",
+                run_type="n_shape_optimize",
+                state="running",
+                pid=424242,
+            ),
+            base_dir=tmp_path,
+        )
+        monkeypatch.setattr(worker.os, "getpgid", lambda pid: pid)
+
+        def fake_killpg(pgid: int, sig: int) -> None:
+            # 模拟子进程在信号到达前恰好写完 done
+            worker.write_run_status(
+                worker.LabRunStatus(
+                    run_id="run-race",
+                    run_type="n_shape_optimize",
+                    state="done",
+                    pid=424242,
+                    saved_run_id="saved-1",
+                ),
+                base_dir=tmp_path,
+            )
+
+        monkeypatch.setattr(worker.os, "killpg", fake_killpg)
+        assert worker.cancel_background_run("run-race", base_dir=tmp_path) is False
+        status = worker.read_run_status("run-race", base_dir=tmp_path)
+        assert status is not None
+        assert status.state == "done"
+        assert status.saved_run_id == "saved-1"
 
 
 class TestExecuteSpec:
@@ -329,3 +458,41 @@ class TestLabRunCli:
         status = worker.read_run_status("run-cli-bad", base_dir=tmp_path)
         assert status is not None
         assert status.state == "error"
+
+    def test_cmd_lab_run_corrupted_spec_writes_error_status(self, tmp_path: Path) -> None:
+        """B5: spec 损坏时按 <run_id>.spec.json 约定提取 run_id 写 error status。"""
+        import argparse
+
+        from rquant.cli import cmd_lab_run
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        runs_dir = tmp_path / "strategy_lab_runs"
+        runs_dir.mkdir(parents=True)
+        spec_path = runs_dir / "run-corrupt.spec.json"
+        spec_path.write_text("{ 这不是合法 JSON", encoding="utf-8")
+
+        code = cmd_lab_run(argparse.Namespace(spec=str(spec_path)))
+        assert code == 1
+        status = worker.read_run_status("run-corrupt", base_dir=tmp_path)
+        assert status is not None
+        assert status.state == "error"
+        assert "spec" in (status.error or "")
+        assert status.finished_at is not None
+
+    def test_main_does_not_wrap_lab_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """B5: lab-run 在 main() 豁免列表里，异常不再推 PushDeer 运维告警。"""
+        from unittest.mock import patch
+
+        from rquant.cli import main
+
+        def boom(_args: Any) -> int:
+            raise ValueError("inner")
+
+        monkeypatch.setattr("rquant.cli.cmd_lab_run", boom)
+        with (
+            patch("sys.argv", ["rquant", "lab-run", "--spec", "/tmp/x.json"]),
+            patch("rquant.notify.notify") as mock_notify,
+        ):
+            with pytest.raises(ValueError):
+                main()
+            mock_notify.assert_not_called()

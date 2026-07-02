@@ -33,6 +33,25 @@
   后重试）与副本撕裂防护（主库有活跃 WAL 时拒绝刷新副本）。
 - 卸载本地僵尸 LaunchAgent `com.roxor.rquant`（`serve --hour 17` 与云端
   daily 重复跑、重复推送，2026-05-20 起残留）。
+- **对抗式审查修复（23 项确认缺陷，55-agent workflow 双反驳验证）**，要点：
+  - `sync-from-cloud.sh`：日终合并加 `.last-research-sync-date` 记账 +
+    睡过 17:10-17:30 窗口后任意 tick 追赶补跑；mkdir 原子锁防并发截断；
+    `--force` 显式下载+合并；合并失败告警 30min cooldown
+  - `research-sync`：ATTACH 路径单引号转义（含 `'` 的备份卷路径不再炸）；
+    restore 改 `INSERT OR IGNORE`（旧副本不再覆盖本地已更新行）；
+    有表失败时跳过副本刷新（不发布跨表不一致快照）；顶层异常转报告
+    避免 CLI 与脚本双重告警
+  - monitor：`rt_min` 加 `RT_MIN_POLL_SECONDS`（默认 15s）节流，不再每
+    5s 打分钟级 API；闭市时段启动直接退出，不再整晚占 DuckDB 写锁
+  - 存储：`query_minute_bars` 跨 source 去重（stk_mins 优先于盘中 rt），
+    研究口径不再把同一分钟双计
+  - 云端 `rquant-daily.service` 加 `--skip-minute-backfill`：分钟历史只在
+    本地按需回补，不放大云端主库与三条 5 分钟拷贝链路
+  - Strategy Lab worker：状态文件原子写；cancel 校验进程组防 pid 复用误杀；
+    cancel/done TOCTOU 不再丢 `saved_run_id`；僵尸进程不再永久显示运行中；
+    后台任务防重复提交
+- `_detect_st` 容忍 NaN 名字（长区间回补遇退市票 join 不到 stock_basic
+  时不再 AttributeError 崩掉整个回补）。
 
 - **Tushare 全量接口审计与接入目录**：新增官方文档抓取脚本和结构化接口目录，
   用 `TUSHARE_COOKIE` 抓取 268 个文档入口、合并 MCP 元数据，并将 141 个

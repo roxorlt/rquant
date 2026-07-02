@@ -906,7 +906,9 @@ def cmd_blacklist(args: argparse.Namespace) -> int:
 def cmd_lab_run(args: argparse.Namespace) -> int:
     """执行 Strategy Lab 后台任务 spec（由 launch_background_run 派生的子进程调用）。
 
-    execute_spec 内部已把 error 写进 status 文件，这里只负责 exit code。
+    execute_spec 内部已把 error 写进 status 文件，这里只负责 exit code；
+    spec 本身缺失/损坏时 execute_spec 没机会写状态，按文件名约定
+    <run_id>.spec.json 提取 run_id 补写 error status，UI 不至于永远显示"运行中"。
     """
     import json
 
@@ -914,7 +916,41 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
 
     setup_logging()
     spec_path = Path(args.spec).expanduser().resolve()
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.exception(f"lab-run spec 读取/解析失败: {spec_path}")
+        try:
+            from datetime import datetime
+
+            from rquant.dashboard.strategy_lab_worker import (
+                CST,
+                LabRunStatus,
+                write_run_status,
+            )
+
+            run_id = spec_path.name.removesuffix(".spec.json")
+            if run_id == spec_path.name:
+                run_id = spec_path.stem
+            # spec 与 status 同目录（strategy_lab_runs/），从 spec 路径反推 base_dir
+            base_dir = (
+                spec_path.parent.parent
+                if spec_path.parent.name == "strategy_lab_runs"
+                else None
+            )
+            write_run_status(
+                LabRunStatus(
+                    run_id=run_id,
+                    run_type="unknown",
+                    state="error",
+                    finished_at=datetime.now(CST),
+                    error=f"spec 读取/解析失败: {type(e).__name__}: {e}",
+                ),
+                base_dir=base_dir,
+            )
+        except Exception:
+            logger.exception("lab-run 补写 error status 失败")
+        return 1
     try:
         run_id = execute_spec(spec)
     except Exception:
@@ -1481,10 +1517,11 @@ def main() -> int:
         parser.print_help()
         return 0
 
-    # alert / daily-report 自身就是日常运维路径，main 不该再吞它的异常包一层
+    # alert / daily-report 自身就是日常运维路径，main 不该再吞它的异常包一层；
+    # lab-run 的失败已有 status 文件 + UI 展示，不该再推运维告警
     if args.command in (
         "serve", "notify-test", "alert",
-        "daily-report", "pre-market-check", "preflight",
+        "daily-report", "pre-market-check", "preflight", "lab-run",
     ):
         return handler(args)
 

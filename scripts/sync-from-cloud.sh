@@ -9,6 +9,10 @@
 #   原替换逻辑会把本地盘中 monitor 的写入打进被 unlink 的幽灵 inode，且残留
 #   WAL 与新文件代际错配（7/2 主库损坏事故）。生产表在日终窗口由
 #   `rquant research-sync` 合并进本地库，研究表按主键保留。
+# - 7/2 加固：mkdir 锁防手动/launchd 并发互相截断 TMP 文件；日终合并按
+#   data/.last-research-sync-date 记账，睡过 17:10-17:30 窗口后任意 tick
+#   追赶补跑直到成功；--force 显式下载+合并（无论时段）；合并失败告警
+#   加 30min cooldown 防 catch_up 重试刷屏
 
 set -uo pipefail
 
@@ -17,9 +21,24 @@ LOCAL_DATA_FILE="${PROJECT_DIR}/data/cloud_backup.duckdb"
 LOG_DIR="${PROJECT_DIR}/logs"
 LOG="${LOG_DIR}/sync-from-cloud.log"
 ENV_FILE="${PROJECT_DIR}/.env"
+STATE_DIR="${PROJECT_DIR}/data"
+LAST_RESEARCH_SYNC_FILE="${STATE_DIR}/.last-research-sync-date"
+LAST_MERGE_ALERT_FILE="${STATE_DIR}/.last-merge-alert-at"
+MERGE_ALERT_COOLDOWN=1800  # 30 分钟：catch_up 每 5min 重试，失败别每 tick 都推
 
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" "${STATE_DIR}"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG}"; }
+
+# ---------- 并发互斥（7/2 加固）----------
+# TMP_GZ/TMP_DB 是固定路径，手动运行与 launchd tick 并发会互相截断。
+# macOS 无 flock 命令，用 mkdir 原子锁目录代替；trap 必须在 mkdir 成功
+# 之后才设置，否则锁被占时 exit 会误删别人的锁。
+LOCKDIR="${STATE_DIR}/.sync-from-cloud.lock"
+if ! mkdir "${LOCKDIR}" 2>/dev/null; then
+    log "skip: another sync-from-cloud instance holds lock (${LOCKDIR})"
+    exit 0
+fi
+trap 'rmdir "${LOCKDIR}" 2>/dev/null || true' EXIT
 
 # 加载 .env
 if [[ ! -f "${ENV_FILE}" ]]; then
@@ -40,11 +59,20 @@ if [[ "${1:-}" == "--force" ]]; then force_mode=1; fi
 # 时段判断
 hour=$(date +%H); minute=$(date +%M); dow=$(date +%u)
 hhmm=$((10#${hour} * 100 + 10#${minute}))
+today=$(date '+%Y-%m-%d')
 sync_window=""
 if (( hhmm >= 930 && hhmm <= 1505 )); then
     sync_window="intraday"
 elif (( hhmm >= 1710 && hhmm <= 1730 )); then
     sync_window="daily_after_pipeline"
+elif (( hhmm >= 1710 && dow <= 5 )); then
+    # 日终追赶（7/2 加固）：笔记本合盖睡过 17:10-17:30 窗口时，工作日
+    # >=17:10 的任意 tick 只要当天还没成功合并过就补跑，直到成功为止
+    last_research_sync=""
+    [[ -f "${LAST_RESEARCH_SYNC_FILE}" ]] && last_research_sync=$(cat "${LAST_RESEARCH_SYNC_FILE}")
+    if [[ "${last_research_sync}" != "${today}" ]]; then
+        sync_window="catch_up"
+    fi
 fi
 
 if (( force_mode == 1 )); then
@@ -128,19 +156,46 @@ mv "${TMP_DB}" "${LOCAL_DATA_FILE}"
 size=$(du -h "${LOCAL_DATA_FILE}" | cut -f1)
 
 # ---------- 生产表合并（7/2 分家新增）----------
-# 只在日终窗口/手动 force 时合并：盘中本地 monitor 持研究库写锁，
-# research-sync 会撞锁；且盘中生产表本来就没有新日线数据
-if [[ "${sync_window:-}" != "intraday" ]]; then
+# 盘中不合并：本地 monitor 持研究库写锁，research-sync 会撞锁，且盘中
+# 生产表本来就没有新日线数据。--force 例外：显式下载 + 合并（无论时段），
+# 合并失败风险自担（见下方失败日志提示）
+merge_status="skipped"
+if (( force_mode == 1 )) || [[ "${sync_window}" != "intraday" ]]; then
     RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
     if "${RQUANT_BIN}" research-sync --backup "${LOCAL_DATA_FILE}" >>"${LOG}" 2>&1; then
+        merge_status="ok"
+        # 只有 >=17:10 的成功合并才算"当日日终合并已完成"——盘前/盘中
+        # force 合并不含当晚 daily pipeline 的新数据，不能吃掉 catch_up
+        if (( hhmm >= 1710 )); then
+            echo "${today}" > "${LAST_RESEARCH_SYNC_FILE}"
+        fi
         log "research-sync OK: 生产表已合并进本地研究库"
     else
-        log "ERROR: research-sync failed, sending PushDeer alert"
-        keys=$(grep "^PUSHDEER_KEYS=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
-        endpoint=$(grep "^PUSHDEER_ENDPOINT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
-        endpoint="${endpoint:-https://api2.pushdeer.com/message/push}"
-        title="❌ rQuant research-sync 失败"
-        body="云端备份已下载但合并进本地研究库失败。
+        merge_status="failed"
+        if (( force_mode == 1 )); then
+            log "ERROR: research-sync failed（force 模式：可能撞盘中 monitor 写锁，请收盘后重试）"
+        else
+            log "ERROR: research-sync failed（状态文件不更新，下一个 tick 自动重试补跑）"
+        fi
+
+        # 防刷屏：距上次 merge 失败告警 ≥ MERGE_ALERT_COOLDOWN 才推
+        now_ts=$(date +%s)
+        should_alert=1
+        if [[ -f "${LAST_MERGE_ALERT_FILE}" ]]; then
+            last_alert_ts=$(cat "${LAST_MERGE_ALERT_FILE}")
+            if (( now_ts - last_alert_ts < MERGE_ALERT_COOLDOWN )); then
+                should_alert=0
+                remain=$(( MERGE_ALERT_COOLDOWN - (now_ts - last_alert_ts) ))
+                log "merge alert cooldown: ${remain}s 后才能再推"
+            fi
+        fi
+
+        if (( should_alert == 1 )); then
+            keys=$(grep "^PUSHDEER_KEYS=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
+            endpoint=$(grep "^PUSHDEER_ENDPOINT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
+            endpoint="${endpoint:-https://api2.pushdeer.com/message/push}"
+            title="❌ rQuant research-sync 失败"
+            body="云端备份已下载但合并进本地研究库失败（下一个 5min tick 会自动重试）。
 
 时间：$(date '+%Y-%m-%d %H:%M:%S')
 备份：${LOCAL_DATA_FILE}
@@ -149,17 +204,20 @@ if [[ "${sync_window:-}" != "intraday" ]]; then
 \`\`\`
 $(tail -n 15 "${LOG}")
 \`\`\`"
-        IFS=',' read -ra KEY_ARR <<< "${keys}"
-        for key in "${KEY_ARR[@]}"; do
-            k=$(echo "${key}" | xargs)
-            [[ -n "${k}" ]] || continue
-            curl -s -X POST "${endpoint}" \
-                --data-urlencode "pushkey=${k}" \
-                --data-urlencode "text=${title}" \
-                --data-urlencode "desp=${body}" \
-                --data-urlencode "type=markdown" \
-                --max-time 10 >/dev/null 2>&1 || true
-        done
+            IFS=',' read -ra KEY_ARR <<< "${keys}"
+            for key in "${KEY_ARR[@]}"; do
+                k=$(echo "${key}" | xargs)
+                [[ -n "${k}" ]] || continue
+                curl -s -X POST "${endpoint}" \
+                    --data-urlencode "pushkey=${k}" \
+                    --data-urlencode "text=${title}" \
+                    --data-urlencode "desp=${body}" \
+                    --data-urlencode "type=markdown" \
+                    --max-time 10 >/dev/null 2>&1 || true
+            done
+            echo "${now_ts}" > "${LAST_MERGE_ALERT_FILE}"
+            log "PushDeer merge 失败告警已推（cooldown ${MERGE_ALERT_COOLDOWN}s）"
+        fi
     fi
 fi
 
@@ -168,10 +226,15 @@ fi
 # 通用约定：服务端 backup-snapshot.sh 写 latest.json，含 {"snapshot_at": "<ISO>"}
 JSON_URL="${RQUANT_BACKUP_URL}/latest.json"
 TMP_JSON="${LOCAL_DATA_FILE}.json.tmp"
-STATE_DIR="${PROJECT_DIR}/data"
 LAST_SNAPSHOT_FILE="${STATE_DIR}/.last-sync-snapshot-at"
 LAST_STALE_ALERT_FILE="${STATE_DIR}/.last-stale-alert-at"
 STALE_ALERT_COOLDOWN=1800  # 30 分钟，避免 stale 持续时每 5min 都告警刷屏
+
+# 合并失败时后续日志不再谎报 "sync OK"（7/2 加固）
+sync_label="sync OK"
+if [[ "${merge_status}" == "failed" ]]; then
+    sync_label="download OK, merge FAILED"
+fi
 
 new_snapshot=""
 if curl -sS --fail --max-time 30 \
@@ -185,7 +248,7 @@ if curl -sS --fail --max-time 30 \
 fi
 
 if [[ -z "${new_snapshot}" ]]; then
-    log "sync OK: ${size} (latest.json 拉取/解析失败，跳过 stale 检查)"
+    log "${sync_label}: ${size} (latest.json 拉取/解析失败，跳过 stale 检查)"
 else
     last_snapshot=""
     [[ -f "${LAST_SNAPSHOT_FILE}" ]] && last_snapshot=$(cat "${LAST_SNAPSHOT_FILE}")
@@ -193,14 +256,14 @@ else
     if [[ -z "${last_snapshot}" ]]; then
         # 首次 sync，建立 baseline
         echo "${new_snapshot}" > "${LAST_SNAPSHOT_FILE}"
-        log "sync OK: ${size} (baseline snapshot_at=${new_snapshot})"
+        log "${sync_label}: ${size} (baseline snapshot_at=${new_snapshot})"
     elif [[ "${last_snapshot}" != "${new_snapshot}" ]]; then
         # 源文件有更新，正常
         echo "${new_snapshot}" > "${LAST_SNAPSHOT_FILE}"
-        log "sync OK: ${size} (snapshot_at=${new_snapshot})"
+        log "${sync_label}: ${size} (snapshot_at=${new_snapshot})"
     elif [[ "${sync_window}" != "intraday" ]]; then
         # 非 intraday 时段（如 daily_after_pipeline 17:10-17:30 抓的还是 17:30 那份）拉到一致是正常
-        log "sync OK: ${size} (snapshot_at 持续 ${new_snapshot}，非 intraday 时段，正常)"
+        log "${sync_label}: ${size} (snapshot_at 持续 ${new_snapshot}，非 intraday 时段，正常)"
     else
         # intraday 时段下源文件不动 → backup.timer 可能没在跑（v0.11.3 风险）
         log "WARN: source stale (snapshot_at=${new_snapshot} 跟上次一致); intraday backup 可能已停"

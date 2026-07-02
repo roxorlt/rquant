@@ -554,6 +554,9 @@ class DuckDBStore:
         *,
         freq: str = "1min",
     ) -> pd.DataFrame:
+        # minute_bar 主键含 source：盘中 rt_min 写 tushare_rt / 日终 stk_mins 写
+        # tushare，同一分钟可能 2-3 行。研究/回测出数必须去重（不去重成交量翻倍），
+        # 历史 stk_mins 是完整权威 bar，优先于盘中实时快照。
         return self._conn.execute(
             """
             SELECT ts_code, trade_time, freq, open, high, low, close, vol, amount, source
@@ -562,6 +565,14 @@ class DuckDBStore:
               AND freq = ?
               AND trade_time >= ?
               AND trade_time <= ?
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ts_code, trade_time, freq
+                ORDER BY CASE source
+                    WHEN 'tushare' THEN 0
+                    WHEN 'tushare_rt' THEN 1
+                    ELSE 2
+                END
+            ) = 1
             ORDER BY trade_time
             """,
             [ts_code, freq, start, end],

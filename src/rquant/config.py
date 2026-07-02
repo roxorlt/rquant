@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # akshare = 紧急回退开关（rt_min 权限到期 / 故障 / 止损时不改代码切回纯 akshare）
     intraday_quote_source: str = "tushare"
 
+    # 盘中 rt_min 轮询节流（秒）。monitor 主循环 interval=5s，但 rt_min 是分钟级
+    # 数据，5s 打一次 API 纯烧配额；距上次成功拉取不足该间隔时用内存缓存合成行情
+    rt_min_poll_seconds: int = 15
+
     # ===== LLM (Week 7) =====
     deepseek_api_key: str = Field(default="")
     deepseek_base_url: str = Field(default="https://api.deepseek.com")

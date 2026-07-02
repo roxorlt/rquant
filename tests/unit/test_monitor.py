@@ -321,6 +321,78 @@ class TestIntradayMinuteQuoteProvider:
         assert set(persisted["source"]) == {"tushare_rt", "tushare_rt_daily"}
 
 
+class TestRtMinThrottle:
+    """C1：rt_min 节流——主循环 interval=5s，分钟级数据不该 5s 打一次 API。"""
+
+    class _ThrottleAdapter:
+        def __init__(self) -> None:
+            self.rt_min_calls = 0
+            self.rt_min_daily_calls = 0
+
+        def rt_min(self, ts_codes: list[str], freq: str = "1min") -> pd.DataFrame:
+            self.rt_min_calls += 1
+            return pd.DataFrame([{
+                "ts_code": "002415.SZ",
+                "trade_time": pd.Timestamp("2026-07-02 10:00:00"),
+                "freq": "1min",
+                "open": 12.70, "high": 12.90, "low": 12.60, "close": 12.80,
+                "vol": 1000.0, "amount": 12800.0,
+                "source": "tushare_rt",
+            }])
+
+        def rt_min_daily(
+            self, ts_codes: list[str], freq: str = "1min"
+        ) -> pd.DataFrame:
+            self.rt_min_daily_calls += 1
+            return pd.DataFrame()
+
+    @patch("rquant.monitor._now")
+    def test_second_fetch_within_interval_uses_cache_and_stays_fresh(
+        self, mock_now
+    ) -> None:
+        from rquant.monitor import IntradayMinuteQuoteProvider
+
+        adapter = self._ThrottleAdapter()
+        provider = IntradayMinuteQuoteProvider(
+            adapter=adapter, store=None, rt_min_poll_seconds=15,
+        )
+
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
+        quotes1 = provider.fetch(["002415.SZ"])
+        assert adapter.rt_min_calls == 1
+        assert quotes1["002415.SZ"].price == 12.80
+        assert provider.used_fresh_tushare is True
+
+        # 5 秒后（< 15s 节流间隔）：跳过 rt_min API，仍从内存缓存合成 quotes；
+        # used_fresh_tushare 必须保持 True，否则 run_monitor 会把全部 code
+        # 转 akshare 全量 fallback，节流反而放大调用量
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 5)
+        quotes2 = provider.fetch(["002415.SZ"])
+        assert adapter.rt_min_calls == 1
+        assert quotes2["002415.SZ"].price == 12.80
+        assert provider.used_fresh_tushare is True
+
+    @patch("rquant.monitor._now")
+    def test_poll_resumes_after_interval_elapsed(self, mock_now) -> None:
+        from rquant.monitor import IntradayMinuteQuoteProvider
+
+        adapter = self._ThrottleAdapter()
+        provider = IntradayMinuteQuoteProvider(
+            adapter=adapter, store=None, rt_min_poll_seconds=15,
+        )
+
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
+        provider.fetch(["002415.SZ"])
+        assert adapter.rt_min_calls == 1
+
+        # 超过节流间隔后恢复真实 API 拉取
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 16)
+        quotes = provider.fetch(["002415.SZ"])
+        assert adapter.rt_min_calls == 2
+        assert quotes["002415.SZ"].price == 12.80
+        assert provider.used_fresh_tushare is True
+
+
 class TestCheckAttackSignals:
     def _make_item(self):
         from rquant.monitor import WatchItem
@@ -724,6 +796,37 @@ class TestRunMonitor:
         result = run_monitor(interval=5)
         assert result == 0
 
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._now")
+    def test_after_close_start_returns_without_opening_store(
+        self, mock_now, _td
+    ) -> None:
+        """C2：闭市后启动（如 17:10）不打开 DuckDB 写库直接退出，避免整晚占写锁。"""
+        from rquant.monitor import run_monitor
+
+        mock_now.return_value = datetime(2026, 7, 2, 17, 10, 0)
+        with patch("rquant.monitor.DuckDBStore") as mock_store_cls:
+            result = run_monitor(interval=5)
+
+        assert result == 0
+        mock_store_cls.assert_not_called()
+
+    @patch("rquant.monitor.build_watchlist", return_value=[])
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._now")
+    def test_pre_open_start_still_opens_store(
+        self, mock_now, _td, _build
+    ) -> None:
+        """9:25 systemd 盘前启动不被闭市 guard 误伤，照常打开写库进监控流程。"""
+        from rquant.monitor import run_monitor
+
+        mock_now.return_value = datetime(2026, 7, 2, 9, 25, 0)
+        with patch("rquant.monitor.DuckDBStore") as mock_store_cls:
+            result = run_monitor(interval=5)
+
+        assert result == 0
+        mock_store_cls.assert_called_once()
+
     @patch("rquant.monitor._count_trading_days_since", return_value=4)
     @patch("rquant.monitor.check_exits", return_value=0)
     @patch("rquant.monitor.IntradayMinuteQuoteProvider")
@@ -759,7 +862,8 @@ class TestRunMonitor:
         }
 
         # 1st iter: morning. 2nd iter: closed → break.
-        mock_phase.side_effect = ["morning", "closed"]
+        # 首个元素被启动时的闭市 guard 消费，之后 1 轮 morning + closed 收尾
+        mock_phase.side_effect = ["morning", "morning", "closed"]
         mock_now.return_value = datetime(2026, 4, 21, 10, 0, 0)
 
         with (
@@ -833,7 +937,8 @@ class TestRunMonitor:
                 source="sina",
             )
         }
-        mock_phase.side_effect = ["morning", "closed"]
+        # 首个元素被启动时的闭市 guard 消费，之后 1 轮 morning + closed 收尾
+        mock_phase.side_effect = ["morning", "morning", "closed"]
         mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
 
         with (
@@ -893,7 +998,8 @@ class TestRunMonitor:
                 source="sina",
             )
         }
-        mock_phase.side_effect = ["morning", "closed"]
+        # 首个元素被启动时的闭市 guard 消费，之后 1 轮 morning + closed 收尾
+        mock_phase.side_effect = ["morning", "morning", "closed"]
         mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
 
         with (
@@ -949,6 +1055,7 @@ class TestRunMonitor:
 
         # 模拟一整天阶段流转
         mock_phase.side_effect = [
+            "morning",    # 0: 启动时闭市 guard 消费
             "morning",    # 1: fetch
             "morning",    # 2: fetch
             "lunch",      # 3: sleep 等下午
@@ -1020,7 +1127,8 @@ class TestIntradayQuoteSourceSwitch:
                 source="sina",
             )
         }
-        mock_phase.side_effect = ["morning", "closed"]
+        # 首个元素被启动时的闭市 guard 消费，之后 1 轮 morning + closed 收尾
+        mock_phase.side_effect = ["morning", "morning", "closed"]
         mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
 
         with (
@@ -1065,7 +1173,8 @@ class TestIntradayQuoteSourceSwitch:
                 source="tushare_rt_minute",
             )
         }
-        mock_phase.side_effect = ["morning", "closed"]
+        # 首个元素被启动时的闭市 guard 消费，之后 1 轮 morning + closed 收尾
+        mock_phase.side_effect = ["morning", "morning", "closed"]
         mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
 
         with (
