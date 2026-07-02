@@ -974,6 +974,127 @@ class TestRunMonitor:
         assert mock_wait_pm.call_count >= 2
 
 
+class TestIntradayQuoteSourceSwitch:
+    """INTRADAY_QUOTE_SOURCE 紧急回退开关：akshare 时跳过 Tushare 分钟行情主源。"""
+
+    @staticmethod
+    def _watch_item():
+        from rquant.monitor import WatchItem
+
+        return WatchItem(
+            ts_code="002415.SZ", pool="pool2",
+            limit_up_date=date(2026, 4, 17),
+            body_upper=13.20, body_lower=11.80, body=1.40,
+            level_40=12.36, level_30=12.22, level_20=12.08,
+            stop_strong=11.80, stop_weak=11.52,
+            name="海康威视",
+            entry_date=date(2026, 4, 18),
+        )
+
+    @patch("rquant.monitor._count_trading_days_since", return_value=4)
+    @patch("rquant.monitor.check_exits", return_value=0)
+    @patch("rquant.monitor.fetch_realtime_quotes")
+    @patch("rquant.monitor.IntradayMinuteQuoteProvider")
+    @patch("rquant.monitor.build_watchlist")
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._wait_for_market_open")
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._market_phase")
+    @patch("rquant.monitor._now")
+    def test_akshare_source_skips_tushare_provider(
+        self, mock_now, mock_phase, _sleep, _wait_open,
+        _td, mock_build, mock_provider_cls, mock_ak_fetch, _exits, _count_days,
+        monkeypatch,
+    ) -> None:
+        from rquant.config import settings as cfg_settings
+        from rquant.monitor import RealtimeQuote, run_monitor
+
+        monkeypatch.setattr(cfg_settings, "intraday_quote_source", "akshare")
+
+        mock_build.return_value = [self._watch_item()]
+        mock_ak_fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=13.00,
+                low=12.50,
+                source="sina",
+            )
+        }
+        mock_phase.side_effect = ["morning", "closed"]
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
+
+        with (
+            patch("rquant.notify.notify"),
+            patch("rquant.monitor.DuckDBStore") as mock_store_cls,
+        ):
+            mock_store = mock_store_cls.return_value.__enter__.return_value
+            mock_store.upsert_monitor_event.return_value = 1
+            mock_store.query_monitor_events.return_value = pd.DataFrame()
+            run_monitor(interval=5)
+
+        mock_provider_cls.assert_not_called()
+        mock_ak_fetch.assert_called_once_with(["002415.SZ"])
+
+    @patch("rquant.monitor._count_trading_days_since", return_value=4)
+    @patch("rquant.monitor.check_exits", return_value=0)
+    @patch("rquant.monitor.fetch_realtime_quotes", return_value={})
+    @patch("rquant.monitor.IntradayMinuteQuoteProvider")
+    @patch("rquant.monitor.build_watchlist")
+    @patch("rquant.monitor.is_trading_day", return_value=True)
+    @patch("rquant.monitor._wait_for_market_open")
+    @patch("rquant.monitor.time.sleep")
+    @patch("rquant.monitor._market_phase")
+    @patch("rquant.monitor._now")
+    def test_tushare_source_constructs_provider(
+        self, mock_now, mock_phase, _sleep, _wait_open,
+        _td, mock_build, mock_provider_cls, _ak_fetch, _exits, _count_days,
+        monkeypatch,
+    ) -> None:
+        from rquant.config import settings as cfg_settings
+        from rquant.monitor import RealtimeQuote, run_monitor
+
+        monkeypatch.setattr(cfg_settings, "intraday_quote_source", "tushare")
+
+        mock_build.return_value = [self._watch_item()]
+        mock_provider = mock_provider_cls.return_value
+        mock_provider.fetch.return_value = {
+            "002415.SZ": RealtimeQuote(
+                ts_code="002415.SZ",
+                price=13.00,
+                low=12.50,
+                source="tushare_rt_minute",
+            )
+        }
+        mock_phase.side_effect = ["morning", "closed"]
+        mock_now.return_value = datetime(2026, 7, 2, 10, 0, 0)
+
+        with (
+            patch("rquant.notify.notify"),
+            patch("rquant.monitor.DuckDBStore") as mock_store_cls,
+        ):
+            mock_store = mock_store_cls.return_value.__enter__.return_value
+            mock_store.upsert_monitor_event.return_value = 1
+            mock_store.query_monitor_events.return_value = pd.DataFrame()
+            run_monitor(interval=5)
+
+        mock_provider_cls.assert_called_once_with(store=mock_store)
+        mock_provider.fetch.assert_called_once_with(["002415.SZ"])
+
+    def test_invalid_source_rejected_at_settings_validation(self) -> None:
+        from pydantic import ValidationError
+
+        from rquant.config import Settings
+
+        with pytest.raises(ValidationError, match="intraday_quote_source"):
+            Settings(intraday_quote_source="sina")
+
+    def test_blank_source_falls_back_to_tushare(self) -> None:
+        # .env 里 INTRADAY_QUOTE_SOURCE= 留空读到 ""，应回落默认 tushare
+        from rquant.config import Settings
+
+        assert Settings(intraday_quote_source="").intraday_quote_source == "tushare"
+
+
 class TestCheckExitsSingleStockIsolation:
     """check_exits 单票故障隔离：一只票异常不中断整批退出检查（审计 PR1-G）。"""
 

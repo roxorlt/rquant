@@ -790,13 +790,15 @@ def run_monitor(interval: int = 5) -> int:
         item_map = {item.ts_code: item for item in watchlist}
         today_str = today.isoformat()
         triggers_summary: dict[str, int] = {}
-        try:
-            quote_provider: IntradayMinuteQuoteProvider | None = (
-                IntradayMinuteQuoteProvider(store=store)
-            )
-        except Exception:
-            logger.exception("Tushare 分钟行情 provider 初始化失败，回退 akshare")
-            quote_provider = None
+        quote_provider: IntradayMinuteQuoteProvider | None = None
+        if settings.intraday_quote_source == "akshare":
+            # 紧急回退开关：rt_min 付费权限到期 / 接口故障时不改代码切回纯 akshare
+            logger.info("INTRADAY_QUOTE_SOURCE=akshare，主动关闭 Tushare 分钟行情主源")
+        else:
+            try:
+                quote_provider = IntradayMinuteQuoteProvider(store=store)
+            except Exception:
+                logger.exception("Tushare 分钟行情 provider 初始化失败，回退 akshare")
 
         notify(
             "heartbeat",
