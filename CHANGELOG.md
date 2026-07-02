@@ -6,6 +6,12 @@
 
 ### Added
 
+- **竞价跳空特征归因（roadmap #10）**：`scripts/analyze_auction_gap_attribution.py`
+  + `docs/analysis/2026-07-02-auction-gap-feature-attribution.md`。1028 笔全区间
+  归因结论：盈亏由收盘封板决定、每个入场位置期望均为负、最优过滤费后打平，
+  原始竞价跳空 + T+1 判死；附三个下一步决策项（lookback 回补 / 持有期改造 /
+  转回 N 字主线）。
+
 - **本地热备与研究库分家（`rquant research-sync`）**：云端快照改落
   `data/cloud_backup.duckdb` 纯备份工件，不再整文件替换本地主库；生产表
   （daily_bar/screen_result 等 9 张）从备份整表替换，研究表（minute_bar/
