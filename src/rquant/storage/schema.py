@@ -346,6 +346,34 @@ CREATE TABLE IF NOT EXISTS limit_up_pool_daily (
 );
 """
 
+# Tushare 官方涨跌停/炸板榜（limit_list_d，历史从 2020 起，不含 ST），可历史
+# 回补；与 limit_up_pool_daily（东财，只有当天数据、必须当日采集）互为交叉验证。
+# 源字段 limit（'U'涨停/'D'跌停/'Z'炸板）是 SQL 关键字，落库改名 limit_status。
+LIMIT_LIST_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS limit_list_daily (
+    ts_code        VARCHAR NOT NULL,
+    trade_date     DATE    NOT NULL,
+    name           VARCHAR,
+    industry       VARCHAR,
+    close          DOUBLE,
+    pct_chg        DOUBLE,
+    amount         DOUBLE,    -- 成交额
+    limit_amount   DOUBLE,    -- 板上成交金额（涨停无此值）
+    float_mv       DOUBLE,    -- 流通市值
+    total_mv       DOUBLE,
+    turnover_ratio DOUBLE,
+    fd_amount      DOUBLE,    -- 封单金额
+    first_time     VARCHAR,   -- 首次封板时间 '103551'
+    last_time      VARCHAR,
+    open_times     INTEGER,   -- 开板次数
+    up_stat        VARCHAR,   -- 涨停统计 'N/T'（N天/T次板）
+    limit_times    INTEGER,   -- 连板数
+    limit_status   VARCHAR NOT NULL,  -- U 涨停 / D 跌停 / Z 炸板（源字段名 limit）
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ts_code, trade_date, limit_status)
+);
+"""
+
 RISK_BLACKLIST_DDL = """
 CREATE TABLE IF NOT EXISTS risk_blacklist (
     list_label      VARCHAR   NOT NULL,   -- 如 "430黑名单"
@@ -370,5 +398,5 @@ ALL_DDL = [
     AUCTION_BAR_DDL, MINUTE_BAR_DDL, INTRADAY_FEATURE_SNAPSHOT_DDL,
     PAPER_POSITION_DDL, PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL, PAPER_POSITION_EVENT_DDL,
-    LIMIT_UP_POOL_DAILY_DDL, RISK_BLACKLIST_DDL,
+    LIMIT_UP_POOL_DAILY_DDL, LIMIT_LIST_DAILY_DDL, RISK_BLACKLIST_DDL,
 ]

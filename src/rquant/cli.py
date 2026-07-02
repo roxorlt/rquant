@@ -329,6 +329,28 @@ def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_limit_list_backfill(args: argparse.Namespace) -> int:
+    """Tushare 涨跌停/炸板榜历史回补，或 --today 当日增量。"""
+    from rquant.limit_list_backfill import backfill_limit_list, capture_today
+
+    setup_logging()
+    if args.today:
+        with DuckDBStore() as store:
+            rows = capture_today(store)
+        logger.info(f"limit-list-backfill --today 完成: rows={rows}")
+        return 0
+
+    if not args.start_date or not args.end_date:
+        logger.error("需要 --start-date 和 --end-date（或改用 --today 拉当天）")
+        return 1
+    with DuckDBStore() as store:
+        summary = backfill_limit_list(
+            args.start_date, args.end_date, store, dry_run=args.dry_run
+        )
+    logger.info(summary)
+    return 1 if summary["failed_dates"] else 0
+
+
 def cmd_minute_backfill(args: argparse.Namespace) -> int:
     """回补 Pool 命中标的历史分钟线。"""
     from rquant.adapter.tushare import TushareAdapter
@@ -1146,6 +1168,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="交易日期 YYYY-MM-DD (默认今天)",
     )
 
+    limit_list_p = sub.add_parser(
+        "limit-list-backfill",
+        help="Tushare 涨跌停/炸板榜（limit_list_d）回补到 limit_list_daily"
+             "（2020 起，U/D/Z 一次拿齐，不含 ST）",
+    )
+    limit_list_p.add_argument(
+        "--start-date", type=str, default=None,
+        help="开始日期 YYYY-MM-DD",
+    )
+    limit_list_p.add_argument(
+        "--end-date", type=str, default=None,
+        help="结束日期 YYYY-MM-DD",
+    )
+    limit_list_p.add_argument(
+        "--dry-run", action="store_true",
+        help="只报告交易日数与预计请求数，不调 Tushare、不写库",
+    )
+    limit_list_p.add_argument(
+        "--today", action="store_true",
+        help="只拉当天（日终增量），失败不炸、幂等可重跑",
+    )
+
     minute_p = sub.add_parser(
         "minute-backfill", help="回补 Pool 命中标的历史分钟线"
     )
@@ -1586,6 +1630,7 @@ def main() -> int:
         "moneyflow-backfill": cmd_moneyflow_backfill,
         "market-daily-backfill": cmd_market_daily_backfill,
         "zt-pool-capture": cmd_zt_pool_capture,
+        "limit-list-backfill": cmd_limit_list_backfill,
         "minute-backfill": cmd_minute_backfill,
         "minute-replay-backfill": cmd_minute_replay_backfill,
         "auction-backfill": cmd_auction_backfill,

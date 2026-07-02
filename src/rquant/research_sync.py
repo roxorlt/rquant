@@ -20,7 +20,8 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
   b) 日线族 daily_bar/daily_basic/adj_factor/daily_state/daily_indicator——
      2026-07 本地回补了 2020 起全市场历史，云端只有 2024-09 起；若保持
      整表替换，一次日终合并就会把回补历史全部抹掉
-  c) 本地独有采集 limit_up_pool_daily（云端东财源被屏蔽，永远没有）
+  c) 本地独有采集 limit_up_pool_daily（云端东财源被屏蔽，永远没有）与
+     limit_list_daily（Tushare 涨跌停榜本地回补 + 日终增量，云端 daily 不拉）
   灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
   缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
 
@@ -69,6 +70,7 @@ MERGE_TABLES: tuple[str, ...] = (
     "paper_position",
     "paper_position_event",
     "limit_up_pool_daily",
+    "limit_list_daily",
 )
 
 

@@ -469,6 +469,54 @@ class TushareAdapter:
         logger.info(f"Tushare stk_auction 返回 {len(out)} 行")
         return out
 
+    def limit_list_by_date(
+        self, trade_date: date, limit_type: str = ""
+    ) -> pd.DataFrame:
+        """按交易日拉涨跌停/炸板榜（limit_list_d，5000 积分，历史从 2020 起）。
+
+        limit_type 空串一次拿齐 U(涨停)/D(跌停)/Z(炸板)，省请求；单次上限
+        2500 行，A 股单日涨跌停+炸板远够不到，不需分页。不含 ST 股。
+        不切备用 token：备用 token 无此积分权限时会掩盖真实错误（同 stk_auction）。
+        """
+        ds = trade_date.strftime("%Y%m%d")
+        fields = (
+            "trade_date,ts_code,industry,name,close,pct_chg,amount,limit_amount,"
+            "float_mv,total_mv,turnover_ratio,fd_amount,first_time,last_time,"
+            "open_times,up_stat,limit_times,limit"
+        )
+        logger.info(
+            f"Tushare limit_list_d 请求：date={ds} limit_type={limit_type or 'ALL'}"
+        )
+
+        try:
+            df = self._pro.limit_list_d(
+                trade_date=ds, limit_type=limit_type, fields=fields
+            )
+        except Exception as e:
+            raise RuntimeError(f"Tushare limit_list_d 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare limit_list_d 返回空：date={ds}")
+            return pd.DataFrame()
+
+        required = [
+            "ts_code", "trade_date", "name", "industry", "close", "pct_chg",
+            "amount", "limit_amount", "float_mv", "total_mv", "turnover_ratio",
+            "fd_amount", "first_time", "last_time", "open_times", "up_stat",
+            "limit_times", "limit",
+        ]
+        missing = set(required) - set(df.columns)
+        if missing:
+            raise RuntimeError(f"Tushare limit_list_d 返回缺字段：{sorted(missing)}")
+
+        out = df[required].copy()
+        out["trade_date"] = pd.to_datetime(
+            out["trade_date"], format="%Y%m%d"
+        ).dt.date
+        out = out.sort_values(["limit", "ts_code"]).reset_index(drop=True)
+        logger.info(f"Tushare limit_list_d 返回 {len(out)} 行")
+        return out
+
     def moneyflow(self, trade_date: date) -> pd.DataFrame:
         """拉取日级个股资金流。
 
