@@ -45,6 +45,11 @@ from rquant.dashboard.strategy_lab_runs import (
     list_strategy_lab_runs,
     save_strategy_lab_run,
 )
+from rquant.dashboard.strategy_lab_worker import (
+    cancel_background_run,
+    launch_background_run,
+    list_run_statuses,
+)
 from rquant.storage.duckdb import open_readonly_connection, open_readonly_store
 from rquant.topn_selection import default_score_profiles
 from rquant.volume_profile import calculate_volume_profile
@@ -956,20 +961,13 @@ def _run_with_countdown(
 st.markdown("# 🧪 rQuant Strategy Lab")
 st.caption(f"渲染时间 {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
 
-preset_name = st.sidebar.selectbox(
-    "候选池",
-    ["n-shape-combined", "n-shape-pool1", "n-shape-pool2"],
-    index=0,
-)
-hold_days = st.sidebar.number_input(
-    "持有交易日",
-    min_value=1,
-    max_value=10,
-    value=1,
-    step=1,
-)
+PRESET_OPTIONS = ["n-shape-combined", "n-shape-pool1", "n-shape-pool2"]
 
-bounds_min, bounds_max, total_candidates = screen_bounds(preset_name)
+# form 内控件提交前不触发 rerun，日期边界按上一次提交（或默认）的池子/持有期先算
+_prev_preset = str(st.session_state.get("compare_preset", PRESET_OPTIONS[0]))
+_prev_hold = int(st.session_state.get("compare_hold_days", 1))
+
+bounds_min, bounds_max, total_candidates = screen_bounds(_prev_preset)
 calendar = trading_calendar()
 if bounds_min is None or bounds_max is None or not calendar:
     st.warning("暂无可回测数据")
@@ -978,7 +976,7 @@ if bounds_min is None or bounds_max is None or not calendar:
 safe_end = safe_replay_end_date(
     calendar,
     bounds_max,
-    max_hold_days=int(hold_days),
+    max_hold_days=_prev_hold,
 )
 if safe_end is None or safe_end < bounds_min:
     st.warning("可用交易日不足")
@@ -987,37 +985,56 @@ if safe_end is None or safe_end < bounds_min:
 default_end = safe_end
 default_start = max(bounds_min, default_end - timedelta(days=30))
 
-start_value = st.sidebar.date_input(
-    "开始日期",
-    value=default_start,
-    min_value=bounds_min,
-    max_value=safe_end,
-)
-end_value = st.sidebar.date_input(
-    "结束日期",
-    value=default_end,
-    min_value=bounds_min,
-    max_value=safe_end,
-)
+# 换池子/持有期后旧日期可能越界，重置回默认，避免 date_input 抛越界异常
+for _date_key in ("compare_start", "compare_end"):
+    _picked = st.session_state.get(_date_key)
+    if isinstance(_picked, date) and not (bounds_min <= _picked <= safe_end):
+        del st.session_state[_date_key]
 
-selected_mode_labels = st.sidebar.multiselect(
-    "入场模式",
-    list(ENTRY_LABELS.values()),
-    default=[ENTRY_LABELS["first_break"]],
-)
-selected_variant_labels = st.sidebar.multiselect(
-    "风控版本",
-    list(VARIANT_LABELS.values()),
-    default=[
-        VARIANT_LABELS["baseline"],
-        VARIANT_LABELS["vp_risk_only"],
-        VARIANT_LABELS["vp_90"],
-    ],
-)
+with st.sidebar.form("compare_form"):
+    preset_name = st.selectbox("候选池", PRESET_OPTIONS, key="compare_preset")
+    hold_days = st.number_input(
+        "持有交易日",
+        min_value=1,
+        max_value=10,
+        value=1,
+        step=1,
+        key="compare_hold_days",
+    )
+    start_value = st.date_input(
+        "开始日期",
+        value=default_start,
+        min_value=bounds_min,
+        max_value=safe_end,
+        key="compare_start",
+    )
+    end_value = st.date_input(
+        "结束日期",
+        value=default_end,
+        min_value=bounds_min,
+        max_value=safe_end,
+        key="compare_end",
+    )
+    selected_mode_labels = st.multiselect(
+        "入场模式",
+        list(ENTRY_LABELS.values()),
+        default=[ENTRY_LABELS["first_break"]],
+        key="compare_modes",
+    )
+    selected_variant_labels = st.multiselect(
+        "风控版本",
+        list(VARIANT_LABELS.values()),
+        default=[
+            VARIANT_LABELS["baseline"],
+            VARIANT_LABELS["vp_risk_only"],
+            VARIANT_LABELS["vp_90"],
+        ],
+        key="compare_variants",
+    )
+    run_clicked = st.form_submit_button("运行对比", type="primary", width="stretch")
+
 selected_modes = _label_to_key(selected_mode_labels, ENTRY_LABELS)
 selected_variants = _label_to_key(selected_variant_labels, VARIANT_LABELS)
-
-run_clicked = st.sidebar.button("运行对比", type="primary", width="stretch")
 
 overview = minute_overview()
 source_overview = minute_source_overview()
@@ -1064,9 +1081,6 @@ if not selected_modes or not selected_variants:
     ]
 )
 
-summary: pd.DataFrame | None = None
-trades: pd.DataFrame | None = None
-candidates_count = 0
 if run_clicked:
     compare_candidate_count = screen_candidate_count(
         start_value.isoformat(),
@@ -1080,21 +1094,70 @@ if run_clicked:
             "N字分钟回放",
             compare_estimated_seconds,
             lambda: strategy_compare_cached(
-            start_value.isoformat(),
-            end_value.isoformat(),
-            selected_modes,
-            selected_variants,
-            int(hold_days),
-            preset_name,
+                start_value.isoformat(),
+                end_value.isoformat(),
+                selected_modes,
+                selected_variants,
+                int(hold_days),
+                preset_name,
             ),
         )
+    compare_saved = save_strategy_lab_run(
+        build_strategy_lab_run(
+            run_type="n_shape_compare",
+            title=f"N字收益对比 {start_value:%Y-%m-%d} 至 {end_value:%Y-%m-%d}",
+            params={
+                "候选池": preset_name,
+                "开始日期": start_value,
+                "结束日期": end_value,
+                "入场模式": list(selected_modes),
+                "风控版本": list(selected_variants),
+                "持有交易日": int(hold_days),
+            },
+            metrics={
+                "区间候选": candidates_count,
+                "触发交易": int(summary["trades"].sum()) if not summary.empty else 0,
+                "平均收益%": (
+                    round(float(trades["ret_pct"].mean()), 4) if not trades.empty else None
+                ),
+                "胜率%": (
+                    round(float((trades["ret_pct"] > 0).mean() * 100), 2)
+                    if not trades.empty
+                    else None
+                ),
+            },
+            tables={
+                "策略对比汇总": summary,
+                "交易明细": trades,
+            },
+            max_rows_per_table=2000,
+        )
+    )
+    # 结果进 session_state：切 tab / 改控件触发 rerun 不再丢结果
+    st.session_state["compare_result"] = {
+        "summary": summary,
+        "trades": trades,
+        "candidates_count": candidates_count,
+        "run_id": compare_saved.run_id,
+        "title": compare_saved.title,
+        "markdown": compare_saved.markdown,
+        "markdown_path": str(compare_saved.markdown_path),
+        "json_path": str(compare_saved.json_path),
+    }
 
 with tab_compare:
-    if summary is None or trades is None:
+    compare_state = st.session_state.get("compare_result")
+    if compare_state is None:
         st.info("选择参数后运行对比")
     else:
+        summary = compare_state["summary"]
+        trades = compare_state["trades"]
+        st.caption(
+            f"当前结果：{compare_state['title']} · 记录 `{compare_state['run_id']}`"
+            "（已落盘，切 tab / 改参数不丢；重跑覆盖显示）"
+        )
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("区间候选", candidates_count)
+        k1.metric("区间候选", int(compare_state["candidates_count"]))
         k2.metric("触发交易", int(summary["trades"].sum()) if not summary.empty else 0)
         if trades.empty:
             k3.metric("平均收益", "—")
@@ -1104,6 +1167,17 @@ with tab_compare:
             k4.metric("胜率", f"{(trades['ret_pct'] > 0).mean() * 100:.1f}%")
 
         _show_dataframe(_display_summary(summary))
+        st.download_button(
+            "导出本次结果 Markdown",
+            data=compare_state["markdown"],
+            file_name=f"{compare_state['run_id']}.md",
+            mime="text/markdown",
+            width="stretch",
+            key=f"compare_download_{compare_state['run_id']}",
+        )
+        st.caption(
+            f"Markdown: {compare_state['markdown_path']} · JSON: {compare_state['json_path']}"
+        )
         if not summary.empty:
             chart_df = summary.copy()
             chart_df["entry_label"] = chart_df["entry_mode"].map(ENTRY_LABELS)
@@ -1134,12 +1208,14 @@ with tab_compare:
             st.altair_chart(chart, width="stretch")
 
 with tab_trades:
-    if trades is None:
+    compare_state = st.session_state.get("compare_result")
+    if compare_state is None:
         st.info("暂无回放结果")
-    elif trades.empty:
+    elif compare_state["trades"].empty:
         st.info("所选区间没有触发交易")
     else:
-        _show_dataframe(_display_trades(trades))
+        st.caption(f"来自：{compare_state['title']} · 记录 `{compare_state['run_id']}`")
+        _show_dataframe(_display_trades(compare_state["trades"]))
 
 with tab_optimize:
     with st.expander("自动优化说明书", expanded=False):
@@ -1160,61 +1236,70 @@ with tab_optimize:
 
             建议先小跑：入场模式选 1-2 个，风控版本选 1-2 个，持有期只选 1/2/3，
             topN 选 1/2/3，评分画像选 1-2 个，Walk-forward 先设 0。看到有希望的方向后，
-            再把范围扩大。
+            再把范围扩大。当前默认值就是这套“先小跑”配置（持有期 1/2/3 +
+            V1 基础评分 + Walk-forward 0）。
+
+            预计超过 10 分钟的组合建议点「后台运行」：任务在独立进程里跑，
+            关掉页面也不中断，进度和取消入口在「历史记录」tab 顶部。
             """
         )
 
-    oc1, oc2, oc3, oc4, oc5 = st.columns([1.2, 1.1, 1.0, 1.0, 1.2])
-    hold_selection = oc1.multiselect(
-        "持有期集合",
-        list(range(1, 11)),
-        default=list(range(1, 11)),
-        key="opt_hold_options",
-    )
-    topn_selection = oc2.multiselect(
-        "特征 topN",
-        [1, 2, 3, 5, 10],
-        default=[1, 2, 3],
-        key="opt_topn_options",
-    )
-    validation_ratio = oc3.slider(
-        "验证区间占比",
-        min_value=0.0,
-        max_value=0.5,
-        value=0.3,
-        step=0.1,
-        key="opt_validation_ratio",
-    )
-    min_trades = oc4.number_input(
-        "最少交易数",
-        min_value=1,
-        max_value=50,
-        value=5,
-        step=1,
-        key="opt_min_trades",
-    )
-    optimize_clicked = oc5.button(
-        "生成排行榜",
-        type="primary",
-        width="stretch",
-        key="opt_run",
-    )
-    pc1, pc2 = st.columns([3.0, 1.0])
-    score_profile_selection = pc1.multiselect(
-        "评分画像",
-        list(SCORE_PROFILE_LABELS.keys()),
-        default=list(SCORE_PROFILE_LABELS.keys()),
-        format_func=lambda value: SCORE_PROFILE_LABELS.get(value, value),
-        key="opt_score_profiles",
-    )
-    walk_forward_folds = pc2.number_input(
-        "Walk-forward折数",
-        min_value=0,
-        max_value=8,
-        value=0,
-        step=1,
-        key="opt_walk_forward_folds",
-    )
+    with st.form("optimize_form"):
+        oc1, oc2, oc3, oc4 = st.columns([1.2, 1.1, 1.0, 1.0])
+        hold_selection = oc1.multiselect(
+            "持有期集合",
+            list(range(1, 11)),
+            default=[1, 2, 3],
+            key="opt_hold_options",
+        )
+        topn_selection = oc2.multiselect(
+            "特征 topN",
+            [1, 2, 3, 5, 10],
+            default=[1, 2, 3],
+            key="opt_topn_options",
+        )
+        validation_ratio = oc3.slider(
+            "验证区间占比",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.3,
+            step=0.1,
+            key="opt_validation_ratio",
+        )
+        min_trades = oc4.number_input(
+            "最少交易数",
+            min_value=1,
+            max_value=50,
+            value=5,
+            step=1,
+            key="opt_min_trades",
+        )
+        pc1, pc2 = st.columns([3.0, 1.0])
+        score_profile_selection = pc1.multiselect(
+            "评分画像",
+            list(SCORE_PROFILE_LABELS.keys()),
+            default=list(SCORE_PROFILE_LABELS.keys())[:1],
+            format_func=lambda value: SCORE_PROFILE_LABELS.get(value, value),
+            key="opt_score_profiles",
+        )
+        walk_forward_folds = pc2.number_input(
+            "Walk-forward折数",
+            min_value=0,
+            max_value=8,
+            value=0,
+            step=1,
+            key="opt_walk_forward_folds",
+        )
+        ob1, ob2 = st.columns(2)
+        optimize_clicked = ob1.form_submit_button(
+            "生成排行榜",
+            type="primary",
+            width="stretch",
+        )
+        optimize_background_clicked = ob2.form_submit_button(
+            "后台运行",
+            width="stretch",
+        )
 
     opt_candidate_count = screen_candidate_count(
         start_value.isoformat(),
@@ -1251,6 +1336,27 @@ with tab_optimize:
         st.warning("至少选择一个特征 topN")
     elif not score_profile_selection:
         st.warning("至少选择一个评分画像")
+    elif optimize_background_clicked:
+        bg_run_id = launch_background_run({
+            "run_type": "n_shape_optimize",
+            "params": {
+                "start_date": start_value.isoformat(),
+                "end_date": end_value.isoformat(),
+                "preset_name": preset_name,
+                "entry_modes": list(selected_modes),
+                "profile_variants": list(selected_variants),
+                "hold_options": [int(v) for v in hold_selection],
+                "topn_options": [int(v) for v in topn_selection],
+                "score_profile_names": list(score_profile_selection),
+                "walk_forward_folds": int(walk_forward_folds),
+                "validation_ratio": float(validation_ratio),
+                "min_trades": int(min_trades),
+            },
+        })
+        st.success(
+            f"后台任务已启动：`{bg_run_id}`。可以关闭页面；"
+            "进度与取消入口在「历史记录」tab 顶部，跑完结果自动进历史记录。"
+        )
     elif optimize_clicked:
         with st.spinner("正在自动枚举并排序策略组合..."):
             (
@@ -1316,16 +1422,44 @@ with tab_optimize:
                 },
             )
         )
-        st.success(f"已保存研究记录：{saved_run.run_id}")
+        st.session_state["optimize_result"] = {
+            "rankings": rankings,
+            "trades": opt_trades,
+            "topn_rankings": topn_rankings,
+            "topn_trades": topn_trades,
+            "walk_forward_rankings": walk_forward_rankings,
+            "walk_forward_trades": walk_forward_trades,
+            "walk_forward_folds": int(walk_forward_folds),
+            "run_id": saved_run.run_id,
+            "title": saved_run.title,
+            "markdown": saved_run.markdown,
+            "markdown_path": str(saved_run.markdown_path),
+            "json_path": str(saved_run.json_path),
+        }
+
+    optimize_state = st.session_state.get("optimize_result")
+    if optimize_state is not None:
+        rankings = optimize_state["rankings"]
+        opt_trades = optimize_state["trades"]
+        topn_rankings = optimize_state["topn_rankings"]
+        topn_trades = optimize_state["topn_trades"]
+        walk_forward_rankings = optimize_state["walk_forward_rankings"]
+        walk_forward_trades = optimize_state["walk_forward_trades"]
+        st.success(
+            f"研究记录已保存：{optimize_state['run_id']}（切 tab 不丢；重跑覆盖显示）"
+        )
         st.download_button(
             "导出本次结果 Markdown",
-            data=saved_run.markdown,
-            file_name=f"{saved_run.run_id}.md",
+            data=optimize_state["markdown"],
+            file_name=f"{optimize_state['run_id']}.md",
             mime="text/markdown",
             width="stretch",
-            key=f"download_{saved_run.run_id}",
+            key=f"download_{optimize_state['run_id']}",
         )
-        st.caption(f"Markdown: {saved_run.markdown_path} · JSON: {saved_run.json_path}")
+        st.caption(
+            f"Markdown: {optimize_state['markdown_path']} · "
+            f"JSON: {optimize_state['json_path']}"
+        )
         if rankings.empty:
             st.info("没有可排序的策略结果")
         else:
@@ -1388,7 +1522,7 @@ with tab_optimize:
                     st.info("暂无 topN 样本")
                 else:
                     _show_dataframe(_display_trades(topn_trades))
-        if int(walk_forward_folds) > 0:
+        if int(optimize_state["walk_forward_folds"]) > 0:
             st.markdown("### Walk-forward 出样本排行")
             if walk_forward_rankings.empty:
                 st.info("没有可排序的 walk-forward 结果")
@@ -1506,30 +1640,8 @@ with tab_auction:
                     ),
                 )
             )
-
-        m1, m2, m3, m4 = st.columns(4)
         baseline_row = auction_metrics.iloc[0]
         minute_row = auction_metrics.iloc[1]
-        m1.metric("竞价候选", int(minute_row["候选"]))
-        m2.metric(
-            "当日上板率",
-            "—"
-            if pd.isna(baseline_row["当日上板率%"])
-            else f"{baseline_row['当日上板率%']:.1f}%",
-        )
-        m3.metric(
-            "竞价→次开均值",
-            "—"
-            if pd.isna(baseline_row["平均收益%"])
-            else f"{baseline_row['平均收益%']:.2f}%",
-        )
-        m4.metric(
-            "分钟B/S均值",
-            "—"
-            if pd.isna(minute_row["平均收益%"])
-            else f"{minute_row['平均收益%']:.2f}%",
-        )
-
         saved_run = save_strategy_lab_run(
             build_strategy_lab_run(
                 run_type="auction_gap",
@@ -1564,16 +1676,63 @@ with tab_auction:
                 },
             )
         )
-        st.success(f"已保存研究记录：{saved_run.run_id}")
+        st.session_state["auction_result"] = {
+            "metrics": auction_metrics,
+            "baseline": auction_baseline,
+            "minute_trades": auction_minute_trades,
+            "run_id": saved_run.run_id,
+            "title": saved_run.title,
+            "markdown": saved_run.markdown,
+            "markdown_path": str(saved_run.markdown_path),
+            "json_path": str(saved_run.json_path),
+        }
+
+    auction_state = st.session_state.get("auction_result")
+    if auction_state is None:
+        st.info("选择参数后运行集合竞价策略")
+    else:
+        auction_metrics = auction_state["metrics"]
+        auction_baseline = auction_state["baseline"]
+        auction_minute_trades = auction_state["minute_trades"]
+        baseline_row = auction_metrics.iloc[0]
+        minute_row = auction_metrics.iloc[1]
+        st.caption(
+            f"当前结果：{auction_state['title']} · 记录 `{auction_state['run_id']}`"
+            "（已落盘，切 tab 不丢；重跑覆盖显示）"
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("竞价候选", int(minute_row["候选"]))
+        m2.metric(
+            "当日上板率",
+            "—"
+            if pd.isna(baseline_row["当日上板率%"])
+            else f"{baseline_row['当日上板率%']:.1f}%",
+        )
+        m3.metric(
+            "竞价→次开均值",
+            "—"
+            if pd.isna(baseline_row["平均收益%"])
+            else f"{baseline_row['平均收益%']:.2f}%",
+        )
+        m4.metric(
+            "分钟B/S均值",
+            "—"
+            if pd.isna(minute_row["平均收益%"])
+            else f"{minute_row['平均收益%']:.2f}%",
+        )
+
         st.download_button(
             "导出本次结果 Markdown",
-            data=saved_run.markdown,
-            file_name=f"{saved_run.run_id}.md",
+            data=auction_state["markdown"],
+            file_name=f"{auction_state['run_id']}.md",
             mime="text/markdown",
             width="stretch",
-            key=f"download_{saved_run.run_id}",
+            key=f"download_{auction_state['run_id']}",
         )
-        st.caption(f"Markdown: {saved_run.markdown_path} · JSON: {saved_run.json_path}")
+        st.caption(
+            f"Markdown: {auction_state['markdown_path']} · JSON: {auction_state['json_path']}"
+        )
 
         _show_dataframe(auction_metrics)
         auction_chart_df = auction_metrics.rename(columns={"平均收益%": "mean_ret_pct"})
@@ -1624,8 +1783,6 @@ with tab_auction:
                 _show_dataframe(
                     auction_baseline[[c for c in cols if c in auction_baseline.columns]]
                 )
-    else:
-        st.info("选择参数后运行集合竞价策略")
 
 with tab_growth:
     growth_safe_end = safe_replay_end_date(calendar, calendar[-1], max_hold_days=10)
@@ -1664,94 +1821,94 @@ with tab_growth:
         ablation_specs = growth_board_ablation_specs()
         spec_labels = [spec.label for spec in ablation_specs]
         spec_by_label = {spec.label: spec for spec in ablation_specs}
-        gd1, gd2, gd3 = st.columns([1.0, 1.0, 1.0])
-        growth_start = gd1.date_input(
-            "开始日期",
-            value=growth_default_start,
-            min_value=calendar[0],
-            max_value=growth_safe_end,
-            key="growth_start_date",
-        )
-        growth_end = gd2.date_input(
-            "结束日期",
-            value=growth_default_end,
-            min_value=calendar[0],
-            max_value=growth_safe_end,
-            key="growth_end_date",
-        )
-        growth_hold_days = gd3.number_input(
-            "持有交易日",
-            min_value=1,
-            max_value=10,
-            value=1,
-            step=1,
-            key="growth_hold_days",
-        )
-        gf1, gf2, gf3, gf4, gf5 = st.columns([1.0, 1.0, 1.0, 1.0, 1.0])
-        growth_lookback = gf1.number_input(
-            "分时基准天数",
-            min_value=5,
-            max_value=90,
-            value=20,
-            step=5,
-            key="growth_lookback_days",
-        )
-        growth_min_hist = gf2.number_input(
-            "最少基准日",
-            min_value=3,
-            max_value=90,
-            value=10,
-            step=1,
-            key="growth_min_hist_days",
-        )
-        growth_min_cum = gf3.number_input(
-            "累计放量倍",
-            min_value=0.5,
-            max_value=10.0,
-            value=1.4,
-            step=0.1,
-            key="growth_min_cum_amount_ratio",
-        )
-        growth_min_same = gf4.number_input(
-            "同刻放量倍",
-            min_value=0.5,
-            max_value=20.0,
-            value=2.0,
-            step=0.1,
-            key="growth_min_same_minute_ratio",
-        )
-        growth_min_accel = gf5.number_input(
-            "5分加速度",
-            min_value=0.5,
-            max_value=20.0,
-            value=2.0,
-            step=0.1,
-            key="growth_min_accel_5m",
-        )
-        growth_require_vwap = st.checkbox(
-            "单策略：要求信号价强于当日 VWAP",
-            value=True,
-            key="growth_require_vwap",
-        )
-        growth_run_mode = st.radio(
-            "运行模式",
-            ["单策略回测", "消融对比"],
-            horizontal=True,
-            key="growth_run_mode",
-        )
-        growth_ablation_labels = st.multiselect(
-            "消融版本",
-            spec_labels,
-            default=spec_labels,
-            key="growth_ablation_labels",
-        )
-        st.caption("单策略回测只使用上方参数；消融对比会按所选版本自动改写过滤条件。")
-        run_growth_clicked = st.button(
-            "运行科创/创业放量策略",
-            type="primary",
-            width="stretch",
-            key="growth_run_button",
-        )
+        with st.form("growth_form"):
+            gd1, gd2, gd3 = st.columns([1.0, 1.0, 1.0])
+            growth_start = gd1.date_input(
+                "开始日期",
+                value=growth_default_start,
+                min_value=calendar[0],
+                max_value=growth_safe_end,
+                key="growth_start_date",
+            )
+            growth_end = gd2.date_input(
+                "结束日期",
+                value=growth_default_end,
+                min_value=calendar[0],
+                max_value=growth_safe_end,
+                key="growth_end_date",
+            )
+            growth_hold_days = gd3.number_input(
+                "持有交易日",
+                min_value=1,
+                max_value=10,
+                value=1,
+                step=1,
+                key="growth_hold_days",
+            )
+            gf1, gf2, gf3, gf4, gf5 = st.columns([1.0, 1.0, 1.0, 1.0, 1.0])
+            growth_lookback = gf1.number_input(
+                "分时基准天数",
+                min_value=5,
+                max_value=90,
+                value=20,
+                step=5,
+                key="growth_lookback_days",
+            )
+            growth_min_hist = gf2.number_input(
+                "最少基准日",
+                min_value=3,
+                max_value=90,
+                value=10,
+                step=1,
+                key="growth_min_hist_days",
+            )
+            growth_min_cum = gf3.number_input(
+                "累计放量倍",
+                min_value=0.5,
+                max_value=10.0,
+                value=1.4,
+                step=0.1,
+                key="growth_min_cum_amount_ratio",
+            )
+            growth_min_same = gf4.number_input(
+                "同刻放量倍",
+                min_value=0.5,
+                max_value=20.0,
+                value=2.0,
+                step=0.1,
+                key="growth_min_same_minute_ratio",
+            )
+            growth_min_accel = gf5.number_input(
+                "5分加速度",
+                min_value=0.5,
+                max_value=20.0,
+                value=2.0,
+                step=0.1,
+                key="growth_min_accel_5m",
+            )
+            growth_require_vwap = st.checkbox(
+                "单策略：要求信号价强于当日 VWAP",
+                value=True,
+                key="growth_require_vwap",
+            )
+            growth_run_mode = st.radio(
+                "运行模式",
+                ["单策略回测", "消融对比"],
+                horizontal=True,
+                key="growth_run_mode",
+            )
+            growth_ablation_labels = st.multiselect(
+                "消融版本",
+                spec_labels,
+                default=spec_labels,
+                key="growth_ablation_labels",
+            )
+            st.caption("单策略回测只使用上方参数；消融对比会按所选版本自动改写过滤条件。")
+            run_growth_clicked = st.form_submit_button(
+                "运行科创/创业放量策略",
+                type="primary",
+                width="stretch",
+            )
 
         st.caption(
             "当前可回测部分：过滤 ST/一字板、科创/创业板、均线多头排列、分钟级爆量 B、"
@@ -1831,21 +1988,6 @@ with tab_growth:
                     )
 
             row = growth_metrics.iloc[0]
-            gk1, gk2, gk3, gk4 = st.columns(4)
-            gk1.metric("触发交易", int(row["交易"]))
-            gk2.metric(
-                "当日上板率",
-                "—" if pd.isna(row["当日上板率%"]) else f"{row['当日上板率%']:.1f}%",
-            )
-            gk3.metric(
-                "平均收益",
-                "—" if pd.isna(row["平均收益%"]) else f"{row['平均收益%']:.2f}%",
-            )
-            gk4.metric(
-                "胜率",
-                "—" if pd.isna(row["胜率%"]) else f"{row['胜率%']:.1f}%",
-            )
-
             saved_run = save_strategy_lab_run(
                 build_strategy_lab_run(
                     run_type="growth_board_surge",
@@ -1876,24 +2018,59 @@ with tab_growth:
                     },
                 )
             )
-            st.success(f"已保存研究记录：{saved_run.run_id}")
+            st.session_state["growth_result"] = {
+                "metrics": growth_metrics,
+                "trades": growth_trades,
+                "run_id": saved_run.run_id,
+                "title": saved_run.title,
+                "markdown": saved_run.markdown,
+                "markdown_path": str(saved_run.markdown_path),
+                "json_path": str(saved_run.json_path),
+            }
+
+        growth_state = st.session_state.get("growth_result")
+        if growth_state is None:
+            st.info("选择参数后运行科创/创业放量策略")
+        else:
+            growth_metrics = growth_state["metrics"]
+            growth_trades = growth_state["trades"]
+            row = growth_metrics.iloc[0]
+            st.caption(
+                f"当前结果：{growth_state['title']} · 记录 `{growth_state['run_id']}`"
+                "（已落盘，切 tab 不丢；重跑覆盖显示）"
+            )
+            gk1, gk2, gk3, gk4 = st.columns(4)
+            gk1.metric("触发交易", int(row["交易"]))
+            gk2.metric(
+                "当日上板率",
+                "—" if pd.isna(row["当日上板率%"]) else f"{row['当日上板率%']:.1f}%",
+            )
+            gk3.metric(
+                "平均收益",
+                "—" if pd.isna(row["平均收益%"]) else f"{row['平均收益%']:.2f}%",
+            )
+            gk4.metric(
+                "胜率",
+                "—" if pd.isna(row["胜率%"]) else f"{row['胜率%']:.1f}%",
+            )
             st.download_button(
                 "导出本次结果 Markdown",
-                data=saved_run.markdown,
-                file_name=f"{saved_run.run_id}.md",
+                data=growth_state["markdown"],
+                file_name=f"{growth_state['run_id']}.md",
                 mime="text/markdown",
                 width="stretch",
-                key=f"download_{saved_run.run_id}",
+                key=f"download_{growth_state['run_id']}",
             )
-            st.caption(f"Markdown: {saved_run.markdown_path} · JSON: {saved_run.json_path}")
+            st.caption(
+                f"Markdown: {growth_state['markdown_path']} · "
+                f"JSON: {growth_state['json_path']}"
+            )
 
             _show_dataframe(growth_metrics)
             if growth_trades.empty:
                 st.info("所选区间没有触发交易")
             else:
                 _show_dataframe(_display_growth_board_trades(growth_trades))
-        else:
-            st.info("选择参数后运行科创/创业放量策略")
 
 with tab_coverage:
     if overview is not None and not overview.empty:
@@ -1936,11 +2113,13 @@ with tab_coverage:
             _show_dataframe(samples_df)
 
 with tab_exits:
-    if trades is None or trades.empty:
+    compare_state = st.session_state.get("compare_result")
+    if compare_state is None or compare_state["trades"].empty:
         st.info("暂无退出统计")
     else:
+        st.caption(f"来自：{compare_state['title']} · 记录 `{compare_state['run_id']}`")
         exits = (
-            trades.groupby(["entry_mode", "profile_variant", "exit_reason"])
+            compare_state["trades"].groupby(["entry_mode", "profile_variant", "exit_reason"])
             .agg(n=("ts_code", "count"), mean_ret=("ret_pct", "mean"))
             .reset_index()
         )
@@ -2123,6 +2302,37 @@ with tab_interfaces:
                 )
 
 with tab_history:
+    st.markdown("### 后台任务")
+    bg_statuses = list_run_statuses()
+    if not bg_statuses:
+        st.caption("暂无后台任务。自动优化 tab 的「后台运行」按钮会把任务放到这里。")
+    else:
+        if st.button("刷新后台任务状态", key="bg_status_refresh"):
+            st.rerun()
+        _BG_STATE_LABELS = {
+            "running": "🟢 运行中",
+            "done": "✅ 已完成",
+            "error": "❌ 失败",
+            "cancelled": "⏹ 已取消",
+        }
+        for bg in bg_statuses[:20]:
+            bc1, bc2, bc3 = st.columns([2.8, 1.0, 1.6])
+            bg_started = str(bg.get("started_at") or "")[:16].replace("T", " ")
+            bc1.markdown(f"`{bg['run_id']}`")
+            bc1.caption(
+                f"{RUN_TYPE_LABELS.get(bg['run_type'], bg['run_type'])} · 启动 {bg_started}"
+            )
+            bc2.markdown(_BG_STATE_LABELS.get(bg["state"], bg["state"]))
+            if bg["state"] == "running":
+                if bc3.button("取消", key=f"bg_cancel_{bg['run_id']}"):
+                    cancel_background_run(bg["run_id"])
+                    st.rerun()
+            elif bg["state"] == "done":
+                bc3.caption("结果已入下方历史记录")
+            elif bg.get("error"):
+                bc3.caption(str(bg["error"]))
+
+    st.markdown("### 历史记录")
     runs = list_strategy_lab_runs(limit=50)
     if not runs:
         st.info("暂无历史记录。运行一次自动优化或集合竞价跳空回测后，这里会自动出现。")

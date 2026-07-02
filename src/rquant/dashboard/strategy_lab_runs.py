@@ -16,6 +16,7 @@ from rquant.config import settings
 
 CST = timezone(timedelta(hours=8))
 RUN_TYPE_LABELS: dict[str, str] = {
+    "n_shape_compare": "N字收益对比",
     "n_shape_optimize": "N字自动优化",
     "auction_gap": "集合竞价跳空",
     "growth_board_surge": "科创/创业放量",

@@ -903,6 +903,27 @@ def cmd_blacklist(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lab_run(args: argparse.Namespace) -> int:
+    """执行 Strategy Lab 后台任务 spec（由 launch_background_run 派生的子进程调用）。
+
+    execute_spec 内部已把 error 写进 status 文件，这里只负责 exit code。
+    """
+    import json
+
+    from rquant.dashboard.strategy_lab_worker import execute_spec
+
+    setup_logging()
+    spec_path = Path(args.spec).expanduser().resolve()
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    try:
+        run_id = execute_spec(spec)
+    except Exception:
+        logger.exception("lab-run 执行失败（error 已写入 status 文件）")
+        return 1
+    logger.info(f"lab-run 完成: {run_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -1409,6 +1430,14 @@ def build_parser() -> argparse.ArgumentParser:
     alert_p.add_argument("--subject", required=True, help="告警主题")
     alert_p.add_argument("--body", default="", help="告警正文（可选）")
 
+    lab_run_p = sub.add_parser(
+        "lab-run", help="执行 Strategy Lab 后台任务 spec（UI「后台运行」派生，内部命令）",
+    )
+    lab_run_p.add_argument(
+        "--spec", type=str, required=True,
+        help="任务 spec JSON 路径（launch_background_run 生成）",
+    )
+
     return parser
 
 
@@ -1445,6 +1474,7 @@ def main() -> int:
         "daily-report": cmd_daily_report,
         "pre-market-check": cmd_pre_market_check,
         "preflight": cmd_preflight,
+        "lab-run": cmd_lab_run,
     }
     handler = dispatch.get(args.command)
     if handler is None:
