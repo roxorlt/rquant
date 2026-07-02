@@ -690,6 +690,50 @@ class DuckDBStore:
             [position_id],
         ).fetchdf()
 
+    # ── limit_up_pool_daily ──
+
+    def upsert_limit_up_pool(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        if "source" not in payload.columns:
+            payload["source"] = "eastmoney"
+        self._conn.register("zt_pool_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO limit_up_pool_daily
+            (ts_code, trade_date, name, pct_chg, close, amount,
+             circ_mv, total_mv, turnover_rate, seal_amount,
+             first_seal_time, last_seal_time, break_count,
+             limit_up_stat, consecutive_boards, industry, source)
+            SELECT ts_code, trade_date, name, pct_chg, close, amount,
+                   circ_mv, total_mv, turnover_rate, seal_amount,
+                   first_seal_time, last_seal_time, break_count,
+                   limit_up_stat, consecutive_boards, industry, source
+            FROM zt_pool_tmp
+            """
+        )
+        self._conn.unregister("zt_pool_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert limit_up_pool_daily: {count} 行")
+        return count
+
+    def query_limit_up_pool(
+        self, trade_date: str | date | pd.Timestamp
+    ) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, trade_date, name, pct_chg, close, amount,
+                   circ_mv, total_mv, turnover_rate, seal_amount,
+                   first_seal_time, last_seal_time, break_count,
+                   limit_up_stat, consecutive_boards, industry, source
+            FROM limit_up_pool_daily
+            WHERE trade_date = ?
+            ORDER BY consecutive_boards DESC, ts_code
+            """,
+            [trade_date],
+        ).fetchdf()
+
     def count_daily_basic(self, ts_code: str | None = None) -> int:
         if ts_code:
             result = self._conn.execute(

@@ -318,23 +318,20 @@ def _b_day_strength(
     limit_up_price: float,
     price_tol: float,
 ) -> dict[str, object]:
+    empty_strength: dict[str, object] = {
+        "b_first_limit_up_time": None,
+        "b_limit_up_touch_minutes": 0,
+        "b_limit_up_close_minutes": 0,
+        "b_open_times": 0,
+        "b_close_at_limit_up": False,
+    }
     if minutes.empty or limit_up_price <= 0:
-        return {
-            "b_first_limit_up_time": None,
-            "b_limit_up_touch_minutes": 0,
-            "b_limit_up_close_minutes": 0,
-            "b_close_at_limit_up": False,
-        }
+        return empty_strength
     day_minutes = minutes[
         pd.to_datetime(minutes["trade_time"]).dt.date == trading_date
     ].sort_values("trade_time")
     if day_minutes.empty:
-        return {
-            "b_first_limit_up_time": None,
-            "b_limit_up_touch_minutes": 0,
-            "b_limit_up_close_minutes": 0,
-            "b_close_at_limit_up": False,
-        }
+        return empty_strength
 
     touch_mask = day_minutes["high"] >= limit_up_price - price_tol
     close_mask = day_minutes["close"] >= limit_up_price - price_tol
@@ -343,10 +340,14 @@ def _b_day_strength(
         if bool(touch_mask.any())
         else None
     )
+    # 开板次数：封住状态（close 在涨停容差之上）转为跌破状态的次数，容差同涨停判定
+    sealed = close_mask.astype(bool).reset_index(drop=True)
+    open_times = int((sealed.shift(1, fill_value=False) & ~sealed).sum())
     return {
         "b_first_limit_up_time": first_time,
         "b_limit_up_touch_minutes": int(touch_mask.sum()),
         "b_limit_up_close_minutes": int(close_mask.sum()),
+        "b_open_times": open_times,
         "b_close_at_limit_up": bool(close_mask.iloc[-1]) if len(close_mask) else False,
     }
 
@@ -715,6 +716,7 @@ def _position_to_auction_gap_row(
         "b_first_limit_up_time": b_strength.get("b_first_limit_up_time"),
         "b_limit_up_touch_minutes": b_strength.get("b_limit_up_touch_minutes"),
         "b_limit_up_close_minutes": b_strength.get("b_limit_up_close_minutes"),
+        "b_open_times": b_strength.get("b_open_times"),
         "b_close_at_limit_up": b_strength.get("b_close_at_limit_up"),
         "next_trade_date": candidate["next_trade_date"],
         "stop_loss_price": position.stop_loss_price,

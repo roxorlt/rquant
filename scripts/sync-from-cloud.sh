@@ -170,6 +170,8 @@ if (( force_mode == 1 )) || [[ "${sync_window}" != "intraday" ]]; then
             echo "${today}" > "${LAST_RESEARCH_SYNC_FILE}"
         fi
         log "research-sync OK: 生产表已合并进本地研究库"
+        # 涨停池只有当天有数据，历史无法回补；云端东财源被屏蔽，只能本地日终采
+        "${RQUANT_BIN}" zt-pool-capture >>"${LOG}" 2>&1 || log "WARN: zt-pool-capture failed（东财源偶发失败可接受，不告警）"
     else
         merge_status="failed"
         if (( force_mode == 1 )); then

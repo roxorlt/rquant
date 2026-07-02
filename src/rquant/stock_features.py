@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict
 
 from rquant.storage.duckdb import DuckDBStore
 
+_MA_ALIGNMENT_WINDOWS = (5, 10, 20, 60)
+_PRICE_PERCENTILE_LOOKBACK = 250
+
 
 class StockFeatureSnapshot(BaseModel):
     """一只股票在某个 as-of 时点可观察到的候选特征。"""
@@ -218,6 +221,30 @@ def _accumulation_features(
     }
 
 
+def _trend_features(df: pd.DataFrame) -> dict[str, float | int | None]:
+    """均线多头排列与 250 日收盘百分位，价格基准与其他价格特征一致。
+
+    无复权因子数据时退化为原始价：除权除息日的价格跳变会扭曲均线比较，
+    与模块内其他价格特征的局限相同。窗口行数不足时返回 None 不报错。
+    """
+    out: dict[str, float | int | None] = {
+        "ma_alignment": None,
+        "price_percentile_250d": None,
+    }
+    if df.empty:
+        return out
+    closes = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(closes) >= max(_MA_ALIGNMENT_WINDOWS):
+        mas = [float(closes.tail(window).mean()) for window in _MA_ALIGNMENT_WINDOWS]
+        aligned = all(fast > slow for fast, slow in zip(mas, mas[1:], strict=False))
+        out["ma_alignment"] = 1 if aligned else 0
+    if len(closes) >= _PRICE_PERCENTILE_LOOKBACK:
+        window = closes.tail(_PRICE_PERCENTILE_LOOKBACK)
+        ref_close = float(window.iloc[-1])
+        out["price_percentile_250d"] = _round_optional(float((window <= ref_close).mean()))
+    return out
+
+
 def build_daily_stock_features(
     store: DuckDBStore,
     ts_code: str,
@@ -226,8 +253,9 @@ def build_daily_stock_features(
     price_lookbacks: tuple[int, ...] = (90, 120, 250),
     accumulation_lookback: int = 20,
 ) -> dict[str, float | int | None]:
-    """生成 T 日收盘后已知的价格位置与首板前吸筹代理特征。"""
-    max_rows = max(max(price_lookbacks), accumulation_lookback + 1)
+    """生成 T 日收盘后已知的价格位置、趋势与首板前吸筹代理特征。"""
+    trend_rows = max(max(_MA_ALIGNMENT_WINDOWS), _PRICE_PERCENTILE_LOOKBACK)
+    max_rows = max(max(price_lookbacks), accumulation_lookback + 1, trend_rows)
     daily = _query_daily_window(
         store,
         ts_code,
@@ -239,6 +267,7 @@ def build_daily_stock_features(
         return {}
     adjusted = _apply_reference_price_basis(store, ts_code, daily, reference_date)
     features = _price_position_features(adjusted, price_lookbacks)
+    features.update(_trend_features(adjusted))
     before_reference = adjusted[adjusted["trade_date"].apply(_as_date) < reference_date]
     features.update(_accumulation_features(before_reference, accumulation_lookback))
     return features

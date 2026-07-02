@@ -127,6 +127,109 @@ class TushareAdapter:
         logger.info(f"Tushare adj_factor 返回 {len(df)} 行")
         return df
 
+    def trade_cal(self, start: date, end: date) -> list[date]:
+        """交易日历（只返回开市日，升序）。
+
+        历史回补的日历必须走 trade_cal：本地 daily_bar 覆盖不到未入库的
+        早期区间（如 2020 年），从库里推日历会漏。
+        """
+        start_str = start.strftime("%Y%m%d")
+        end_str = end.strftime("%Y%m%d")
+        logger.info(f"Tushare trade_cal 请求：start={start_str} end={end_str}")
+
+        try:
+            df = self._pro.trade_cal(
+                exchange="SSE", start_date=start_str, end_date=end_str, is_open="1"
+            )
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.trade_cal(
+                    exchange="SSE", start_date=start_str, end_date=end_str, is_open="1"
+                )
+            else:
+                raise RuntimeError(f"Tushare trade_cal 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare trade_cal 返回空：{start_str}-{end_str}")
+            return []
+
+        dates = pd.to_datetime(df["cal_date"], format="%Y%m%d").dt.date.tolist()
+        logger.info(f"Tushare trade_cal 返回 {len(dates)} 个交易日")
+        return sorted(dates)
+
+    def daily_by_date(self, trade_date: date) -> pd.DataFrame:
+        """按交易日拉全市场日线（历史回补用，字段对齐 daily_bar 表）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        logger.info(f"Tushare daily(by_date) 请求：trade_date={ds}")
+
+        try:
+            df = self._pro.daily(trade_date=ds)
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.daily(trade_date=ds)
+            else:
+                raise RuntimeError(f"Tushare daily 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare daily 返回空：trade_date={ds}")
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        df = df.sort_values("ts_code").reset_index(drop=True)
+        logger.info(f"Tushare daily(by_date) 返回 {len(df)} 行")
+        return df
+
+    def daily_basic_by_date(self, trade_date: date) -> pd.DataFrame:
+        """按交易日拉全市场每日基本面指标（历史回补用，字段对齐 daily_basic 表）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
+        logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
+
+        try:
+            df = self._pro.daily_basic(trade_date=ds, fields=fields)
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.daily_basic(trade_date=ds, fields=fields)
+            else:
+                raise RuntimeError(f"Tushare daily_basic 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare daily_basic 返回空：trade_date={ds}")
+            return pd.DataFrame()
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
+        df = df.sort_values("ts_code").reset_index(drop=True)
+        logger.info(f"Tushare daily_basic(by_date) 返回 {len(df)} 行")
+        return df
+
+    def adj_factor_by_date(self, trade_date: date) -> pd.DataFrame:
+        """按交易日拉全市场复权因子（历史回补用，归一化对齐 adj_factor 方法）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        logger.info(f"Tushare adj_factor(by_date) 请求：trade_date={ds}")
+
+        try:
+            df = self._pro.adj_factor(trade_date=ds)
+        except Exception as e:
+            if self._switch_to_backup():
+                df = self._pro.adj_factor(trade_date=ds)
+            else:
+                raise RuntimeError(f"Tushare adj_factor 调用失败：{e}") from e
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare adj_factor 返回空：trade_date={ds}")
+            return pd.DataFrame()
+
+        cols = ["ts_code", "trade_date", "adj_factor"]
+        missing = set(cols) - set(df.columns)
+        if missing:
+            raise RuntimeError(f"Tushare adj_factor 返回缺字段：{sorted(missing)}")
+
+        out = df[cols].copy()
+        out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d").dt.date
+        out = out.sort_values("ts_code").reset_index(drop=True)
+        logger.info(f"Tushare adj_factor(by_date) 返回 {len(out)} 行")
+        return out
+
     def stk_mins(
         self,
         ts_code: str,

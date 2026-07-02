@@ -143,8 +143,19 @@ CREATE TABLE IF NOT EXISTS market_sentiment_daily (
     avg_pct_chg                  DOUBLE,
     median_pct_chg               DOUBLE,
     total_amount                 DOUBLE,
+    high_60d_ratio_pct           DOUBLE,   -- 收盘创60日新高标的占比（市场温度）
+    above_ma20_ratio_pct         DOUBLE,   -- 收盘在20日均线上方标的占比
     created_at                   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+"""
+
+# 已存在的表补温度列（CREATE IF NOT EXISTS 不会改旧表结构）
+MARKET_SENTIMENT_HIGH60_MIGRATION_DDL = """
+ALTER TABLE market_sentiment_daily ADD COLUMN IF NOT EXISTS high_60d_ratio_pct DOUBLE;
+"""
+
+MARKET_SENTIMENT_MA20_MIGRATION_DDL = """
+ALTER TABLE market_sentiment_daily ADD COLUMN IF NOT EXISTS above_ma20_ratio_pct DOUBLE;
 """
 
 SCREEN_RESULT_DDL = """
@@ -309,6 +320,32 @@ CREATE TABLE IF NOT EXISTS paper_position_event (
 # 5/22 真实事故：手动跑 push 在盘中（monitor 持写锁）写表撞 IOError 丢日志
 # 云端旧表保留备查不强制 drop；新写入走 rquant.notify.log.append（JSONL append-only）
 
+# 东财涨停池每日快照（akshare stock_zt_pool_em 只有当天有数据，历史返回空，
+# 必须每日采集）。封单/成交额、封单/流通市值等派生比值在查询侧算，不落库。
+LIMIT_UP_POOL_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS limit_up_pool_daily (
+    ts_code            VARCHAR NOT NULL,
+    trade_date         DATE    NOT NULL,
+    name               VARCHAR,
+    pct_chg            DOUBLE,
+    close              DOUBLE,    -- 最新价
+    amount             DOUBLE,    -- 成交额
+    circ_mv            DOUBLE,    -- 流通市值
+    total_mv           DOUBLE,
+    turnover_rate      DOUBLE,
+    seal_amount        DOUBLE,    -- 封板资金
+    first_seal_time    VARCHAR,   -- 首次封板时间 '092500'
+    last_seal_time     VARCHAR,
+    break_count        INTEGER,   -- 炸板次数
+    limit_up_stat      VARCHAR,   -- 涨停统计，如 '3/2'
+    consecutive_boards INTEGER,   -- 连板数
+    industry           VARCHAR,
+    source             VARCHAR DEFAULT 'eastmoney',
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ts_code, trade_date, source)
+);
+"""
+
 RISK_BLACKLIST_DDL = """
 CREATE TABLE IF NOT EXISTS risk_blacklist (
     list_label      VARCHAR   NOT NULL,   -- 如 "430黑名单"
@@ -328,9 +365,10 @@ ALL_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
     MONEYFLOW_DAILY_DDL, MARKET_SENTIMENT_DAILY_DDL,
+    MARKET_SENTIMENT_HIGH60_MIGRATION_DDL, MARKET_SENTIMENT_MA20_MIGRATION_DDL,
     SCREEN_RESULT_DDL, POOL2_WATCH_DDL, MONITOR_EVENT_DDL,
     AUCTION_BAR_DDL, MINUTE_BAR_DDL, INTRADAY_FEATURE_SNAPSHOT_DDL,
     PAPER_POSITION_DDL, PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL, PAPER_POSITION_EVENT_DDL,
-    RISK_BLACKLIST_DDL,
+    LIMIT_UP_POOL_DAILY_DDL, RISK_BLACKLIST_DDL,
 ]

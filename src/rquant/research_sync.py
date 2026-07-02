@@ -12,8 +12,15 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
 - 合并后原子刷新本地只读副本 rquant_ro.duckdb 供 Strategy Lab 读
 
 表分两类：
-- REPLACE_TABLES：云端权威，整表替换（DELETE + INSERT，保留本地 DDL/主键）
-- MERGE_TABLES：双端追加流，按主键 INSERT OR REPLACE，绝不整表替换。
+- REPLACE_TABLES：云端权威且本地无独有行，整表替换（DELETE + INSERT，
+  保留本地 DDL/主键）
+- MERGE_TABLES：本地存在独有行的表，按主键 INSERT OR REPLACE（主键冲突
+  云端赢——云端最新数据仍权威），绝不整表替换。三种来源：
+  a) 双端追加流（monitor 事件 / 分钟线 / 竞价 / 模拟盘）
+  b) 日线族 daily_bar/daily_basic/adj_factor/daily_state/daily_indicator——
+     2026-07 本地回补了 2020 起全市场历史，云端只有 2024-09 起；若保持
+     整表替换，一次日终合并就会把回补历史全部抹掉
+  c) 本地独有采集 limit_up_pool_daily（云端东财源被屏蔽，永远没有）
   灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
   缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
 
@@ -38,20 +45,20 @@ from rquant.storage.schema import ALL_DDL
 
 # 云端 daily/monitor 流水线权威产出，本地无独立增量 → 整表替换
 REPLACE_TABLES: tuple[str, ...] = (
-    "daily_bar",
     "stock_basic",
-    "adj_factor",
-    "daily_indicator",
-    "daily_state",
-    "daily_basic",
     "screen_result",
     "pool2_watch",
     "risk_blacklist",
 )
 
-# 双端都可能追加（本地研究回补 / 本地盘中 monitor / 未来云端 rt_min），
-# 按主键合并，本地独有行永不丢失
+# 本地存在独有行（历史回补 / 盘中 monitor / 本地采集），按主键合并：
+# 主键冲突云端赢，本地独有行永不丢失（分类依据见模块 docstring）
 MERGE_TABLES: tuple[str, ...] = (
+    "daily_bar",
+    "daily_basic",
+    "adj_factor",
+    "daily_state",
+    "daily_indicator",
     "monitor_event",
     "minute_bar",
     "auction_bar",
@@ -61,6 +68,7 @@ MERGE_TABLES: tuple[str, ...] = (
     "intraday_feature_snapshot",
     "paper_position",
     "paper_position_event",
+    "limit_up_pool_daily",
 )
 
 
