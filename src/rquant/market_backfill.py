@@ -18,7 +18,7 @@ from loguru import logger
 from rquant.storage.duckdb import DuckDBStore
 
 # Tushare 接口限流：~120ms 间隔（对齐 ingest._API_SLEEP）
-_API_SLEEP = 0.15
+_API_SLEEP = 0.35  # 3 接口并发下 ~170 次/分钟/接口，防触主 token 限频
 _REQUESTS_PER_DAY = 3  # daily + daily_basic + adj_factor
 _STATE_LOG_EVERY = 500
 

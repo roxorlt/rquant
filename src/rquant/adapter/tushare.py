@@ -127,6 +127,33 @@ class TushareAdapter:
         logger.info(f"Tushare adj_factor 返回 {len(df)} 行")
         return df
 
+
+    def _call_by_date_with_backoff(
+        self, api_name: str, call, max_retries: int = 6
+    ) -> pd.DataFrame | None:
+        """回补类 by_date 调用的限频退避重试。
+
+        限频错误（"频率超限"）绝不切备用 token：备用是免费档，daily_basic
+        限频 1 次/分钟，切换等于把整个回补判死（2026-07-02 真实事故——主 token
+        瞬时超限触发粘性切换，960 个日期全灭）。原地 sleep 后用主 token 重试。
+        """
+        import time as _time
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                return call()
+            except Exception as e:
+                msg = str(e)
+                if attempt >= max_retries:
+                    raise RuntimeError(f"Tushare {api_name} 调用失败：{e}") from e
+                wait = 25.0 if ("频率" in msg or "超限" in msg) else 5.0
+                logger.warning(
+                    f"Tushare {api_name} 第 {attempt}/{max_retries} 次失败"
+                    f"（{wait}s 后重试）: {msg[:120]}"
+                )
+                _time.sleep(wait)
+        return None
+
     def trade_cal(self, start: date, end: date) -> list[date]:
         """交易日历（只返回开市日，升序）。
 
@@ -162,13 +189,9 @@ class TushareAdapter:
         ds = trade_date.strftime("%Y%m%d")
         logger.info(f"Tushare daily(by_date) 请求：trade_date={ds}")
 
-        try:
-            df = self._pro.daily(trade_date=ds)
-        except Exception as e:
-            if self._switch_to_backup():
-                df = self._pro.daily(trade_date=ds)
-            else:
-                raise RuntimeError(f"Tushare daily 调用失败：{e}") from e
+        df = self._call_by_date_with_backoff(
+            "daily", lambda: self._pro.daily(trade_date=ds)
+        )
 
         if df is None or df.empty:
             logger.warning(f"Tushare daily 返回空：trade_date={ds}")
@@ -185,13 +208,9 @@ class TushareAdapter:
         fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
         logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
 
-        try:
-            df = self._pro.daily_basic(trade_date=ds, fields=fields)
-        except Exception as e:
-            if self._switch_to_backup():
-                df = self._pro.daily_basic(trade_date=ds, fields=fields)
-            else:
-                raise RuntimeError(f"Tushare daily_basic 调用失败：{e}") from e
+        df = self._call_by_date_with_backoff(
+            "daily_basic", lambda: self._pro.daily_basic(trade_date=ds, fields=fields)
+        )
 
         if df is None or df.empty:
             logger.warning(f"Tushare daily_basic 返回空：trade_date={ds}")
@@ -207,13 +226,9 @@ class TushareAdapter:
         ds = trade_date.strftime("%Y%m%d")
         logger.info(f"Tushare adj_factor(by_date) 请求：trade_date={ds}")
 
-        try:
-            df = self._pro.adj_factor(trade_date=ds)
-        except Exception as e:
-            if self._switch_to_backup():
-                df = self._pro.adj_factor(trade_date=ds)
-            else:
-                raise RuntimeError(f"Tushare adj_factor 调用失败：{e}") from e
+        df = self._call_by_date_with_backoff(
+            "adj_factor", lambda: self._pro.adj_factor(trade_date=ds)
+        )
 
         if df is None or df.empty:
             logger.warning(f"Tushare adj_factor 返回空：trade_date={ds}")
