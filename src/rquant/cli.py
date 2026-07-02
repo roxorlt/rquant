@@ -351,6 +351,39 @@ def cmd_limit_list_backfill(args: argparse.Namespace) -> int:
     return 1 if summary["failed_dates"] else 0
 
 
+def cmd_data_backfill(args: argparse.Namespace) -> int:
+    """统一数据集回补（dataset_backfill 注册表），--dataset all 跑全部。"""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.dataset_backfill import DATASETS, backfill_dataset
+
+    setup_logging()
+    if args.dataset != "all" and args.dataset not in DATASETS:
+        logger.error(
+            f"未知数据集：{args.dataset}"
+            f"（可用：all, {', '.join(sorted(DATASETS))}）"
+        )
+        return 1
+    if args.today:
+        start = end = date.today().isoformat()
+    elif args.start_date and args.end_date:
+        start, end = args.start_date, args.end_date
+    else:
+        logger.error("需要 --start-date 和 --end-date（或改用 --today 日终增量）")
+        return 1
+
+    names = list(DATASETS) if args.dataset == "all" else [args.dataset]
+    adapter = TushareAdapter()
+    has_failure = False
+    with DuckDBStore() as store:
+        for name in names:
+            summary = backfill_dataset(
+                name, start, end, store, adapter, dry_run=args.dry_run
+            )
+            logger.info(summary)
+            has_failure = has_failure or bool(summary["failed_dates"])
+    return 1 if has_failure else 0
+
+
 def cmd_minute_backfill(args: argparse.Namespace) -> int:
     """回补 Pool 命中标的历史分钟线。"""
     from rquant.adapter.tushare import TushareAdapter
@@ -1190,6 +1223,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="只拉当天（日终增量），失败不炸、幂等可重跑",
     )
 
+    data_backfill_p = sub.add_parser(
+        "data-backfill",
+        help="统一数据集回补（板块行情/成分/资金流/龙虎榜/开盘啦等，"
+             "注册表见 rquant.dataset_backfill.DATASETS）",
+    )
+    data_backfill_p.add_argument(
+        "--dataset", type=str, required=True,
+        help="数据集名（Tushare 接口名，如 ths_daily / moneyflow_dc / "
+             "top_list），all 跑全部",
+    )
+    data_backfill_p.add_argument(
+        "--start-date", type=str, default=None,
+        help="开始日期 YYYY-MM-DD（snapshot 数据集忽略）",
+    )
+    data_backfill_p.add_argument(
+        "--end-date", type=str, default=None,
+        help="结束日期 YYYY-MM-DD（snapshot 数据集取该日往前最近交易日）",
+    )
+    data_backfill_p.add_argument(
+        "--dry-run", action="store_true",
+        help="只报告交易日数与预计请求数，不调 Tushare、不写库",
+    )
+    data_backfill_p.add_argument(
+        "--today", action="store_true",
+        help="日终增量：start=end=今天（snapshot 数据集即刷新快照）",
+    )
+
     minute_p = sub.add_parser(
         "minute-backfill", help="回补 Pool 命中标的历史分钟线"
     )
@@ -1631,6 +1691,7 @@ def main() -> int:
         "market-daily-backfill": cmd_market_daily_backfill,
         "zt-pool-capture": cmd_zt_pool_capture,
         "limit-list-backfill": cmd_limit_list_backfill,
+        "data-backfill": cmd_data_backfill,
         "minute-backfill": cmd_minute_backfill,
         "minute-replay-backfill": cmd_minute_replay_backfill,
         "auction-backfill": cmd_auction_backfill,

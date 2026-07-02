@@ -374,6 +374,350 @@ CREATE TABLE IF NOT EXISTS limit_list_daily (
 );
 """
 
+# ═══ 统一数据集回补层（dataset_backfill）表 ═══
+# 字段全部按 2026-07-01 实测返回定义（见 adapter/tushare.py 各薄方法 docstring），
+# 本地回补权威、云端没有 → 全部走 research_sync 的 MERGE 语义。
+
+# 同花顺概念/行业指数日行情（ths_daily，实测 12 字段，无 amount）
+THS_INDEX_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS ths_index_daily (
+    ts_code        VARCHAR NOT NULL,
+    trade_date     DATE    NOT NULL,
+    open           DOUBLE,
+    high           DOUBLE,
+    low            DOUBLE,
+    close          DOUBLE,
+    pre_close      DOUBLE,
+    avg_price      DOUBLE,
+    change         DOUBLE,
+    pct_change     DOUBLE,
+    vol            DOUBLE,
+    turnover_rate  DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 东财板块日行情（dc_daily，2020 起，实测 13 字段）
+DC_INDEX_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS dc_index_daily (
+    ts_code        VARCHAR NOT NULL,
+    trade_date     DATE    NOT NULL,
+    open           DOUBLE,
+    high           DOUBLE,
+    low            DOUBLE,
+    close          DOUBLE,
+    change         DOUBLE,
+    pct_change     DOUBLE,
+    vol            DOUBLE,
+    amount         DOUBLE,
+    swing          DOUBLE,    -- 振幅
+    turnover_rate  DOUBLE,
+    category       VARCHAR,   -- 概念板块 / 行业板块 / 地域板块
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 同花顺板块列表快照（ths_index）。源字段 count/type 是 SQL 关键字，
+# 落库改名 member_count/board_type
+THS_BOARD_DDL = """
+CREATE TABLE IF NOT EXISTS ths_board (
+    ts_code       VARCHAR PRIMARY KEY,
+    name          VARCHAR,
+    member_count  INTEGER,
+    exchange      VARCHAR,
+    list_date     DATE,
+    board_type    VARCHAR,   -- N概念 I行业 R地域 S特色 ST风格
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# 东财板块列表快照（dc_index，源按 trade_date 出数，快照留当日行情概览）。
+# 源字段 leading 是 DuckDB 保留字（TRIM 语法），落库改名 leading_name
+DC_BOARD_DDL = """
+CREATE TABLE IF NOT EXISTS dc_board (
+    ts_code        VARCHAR PRIMARY KEY,
+    trade_date     DATE,
+    name           VARCHAR,
+    leading_name   VARCHAR,   -- 领涨股名称（源字段 leading）
+    leading_code   VARCHAR,
+    pct_change     DOUBLE,
+    leading_pct    DOUBLE,
+    total_mv       DOUBLE,
+    turnover_rate  DOUBLE,
+    up_num         INTEGER,
+    down_num       INTEGER,
+    idx_type       VARCHAR,   -- 概念板块 / 行业板块 / 地域板块
+    level          VARCHAR,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# 板块-成分映射快照（源字段 ts_code 是板块代码，落库改名 board_code）
+THS_BOARD_MEMBER_DDL = """
+CREATE TABLE IF NOT EXISTS ths_board_member (
+    board_code  VARCHAR NOT NULL,
+    con_code    VARCHAR NOT NULL,
+    con_name    VARCHAR,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (board_code, con_code)
+);
+"""
+
+DC_BOARD_MEMBER_DDL = """
+CREATE TABLE IF NOT EXISTS dc_board_member (
+    board_code  VARCHAR NOT NULL,
+    con_code    VARCHAR NOT NULL,
+    con_name    VARCHAR,
+    trade_date  DATE,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (board_code, con_code)
+);
+"""
+
+# moneyflow（Tushare 个股口径）全 20 字段补列：原表只落大单/特大单 vol 与净额，
+# dataset_backfill 回补小单/中单及全部 amount 字段
+_MONEYFLOW_FULL_COLS = (
+    "buy_sm_vol", "buy_sm_amount", "sell_sm_vol", "sell_sm_amount",
+    "buy_md_vol", "buy_md_amount", "sell_md_vol", "sell_md_amount",
+    "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",
+)
+MONEYFLOW_DAILY_FULL_MIGRATION_DDLS = [
+    f"ALTER TABLE moneyflow_daily ADD COLUMN IF NOT EXISTS {col} DOUBLE;"
+    for col in _MONEYFLOW_FULL_COLS
+]
+
+# 东财个股资金流（moneyflow_dc，2023-09 起，实测 15 字段，amount 单位万元）
+MONEYFLOW_DC_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_dc_daily (
+    ts_code              VARCHAR NOT NULL,
+    trade_date           DATE    NOT NULL,
+    name                 VARCHAR,
+    pct_change           DOUBLE,
+    close                DOUBLE,
+    net_amount           DOUBLE,
+    net_amount_rate      DOUBLE,
+    buy_elg_amount       DOUBLE,
+    buy_elg_amount_rate  DOUBLE,
+    buy_lg_amount        DOUBLE,
+    buy_lg_amount_rate   DOUBLE,
+    buy_md_amount        DOUBLE,
+    buy_md_amount_rate   DOUBLE,
+    buy_sm_amount        DOUBLE,
+    buy_sm_amount_rate   DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 同花顺个股资金流（moneyflow_ths，实测 13 字段）
+MONEYFLOW_THS_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_ths_daily (
+    ts_code             VARCHAR NOT NULL,
+    trade_date          DATE    NOT NULL,
+    name                VARCHAR,
+    pct_change          DOUBLE,
+    latest              DOUBLE,    -- 最新价
+    net_amount          DOUBLE,
+    net_d5_amount       DOUBLE,    -- 5日主力净额
+    buy_lg_amount       DOUBLE,
+    buy_lg_amount_rate  DOUBLE,
+    buy_md_amount       DOUBLE,
+    buy_md_amount_rate  DOUBLE,
+    buy_sm_amount       DOUBLE,
+    buy_sm_amount_rate  DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 同花顺行业资金流（moneyflow_ind_ths，实测 12 字段）
+MONEYFLOW_IND_THS_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_ind_ths_daily (
+    ts_code           VARCHAR NOT NULL,
+    trade_date        DATE    NOT NULL,
+    industry          VARCHAR,
+    lead_stock        VARCHAR,
+    close             DOUBLE,
+    pct_change        DOUBLE,
+    company_num       INTEGER,
+    pct_change_stock  DOUBLE,    -- 领涨股涨跌幅
+    close_price       DOUBLE,    -- 领涨股最新价
+    net_buy_amount    DOUBLE,
+    net_sell_amount   DOUBLE,
+    net_amount        DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 东财板块/概念资金流（moneyflow_ind_dc，实测 18 字段）。
+# 源字段 rank 是 SQL 关键字，落库改名 net_amount_rank
+MONEYFLOW_IND_DC_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_ind_dc_daily (
+    ts_code              VARCHAR NOT NULL,
+    trade_date           DATE    NOT NULL,
+    content_type         VARCHAR,   -- 行业 / 概念 / 地域
+    name                 VARCHAR,
+    pct_change           DOUBLE,
+    close                DOUBLE,
+    net_amount           DOUBLE,
+    net_amount_rate      DOUBLE,
+    buy_elg_amount       DOUBLE,
+    buy_elg_amount_rate  DOUBLE,
+    buy_lg_amount        DOUBLE,
+    buy_lg_amount_rate   DOUBLE,
+    buy_md_amount        DOUBLE,
+    buy_md_amount_rate   DOUBLE,
+    buy_sm_amount        DOUBLE,
+    buy_sm_amount_rate   DOUBLE,
+    buy_sm_amount_stock  VARCHAR,   -- 主力净流入最大股
+    net_amount_rank      INTEGER,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 同花顺概念资金流（moneyflow_cnt_ths，实测 12 字段）
+MONEYFLOW_CNT_THS_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_cnt_ths_daily (
+    ts_code           VARCHAR NOT NULL,
+    trade_date        DATE    NOT NULL,
+    name              VARCHAR,
+    lead_stock        VARCHAR,
+    close_price       DOUBLE,
+    pct_change        DOUBLE,
+    industry_index    DOUBLE,
+    company_num       INTEGER,
+    pct_change_stock  DOUBLE,
+    net_buy_amount    DOUBLE,
+    net_sell_amount   DOUBLE,
+    net_amount        DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
+# 东财大盘资金流（moneyflow_mkt_dc，1 行/日，实测 15 字段）
+MONEYFLOW_MKT_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_mkt_daily (
+    trade_date           DATE PRIMARY KEY,
+    close_sh             DOUBLE,
+    pct_change_sh        DOUBLE,
+    close_sz             DOUBLE,
+    pct_change_sz        DOUBLE,
+    net_amount           DOUBLE,
+    net_amount_rate      DOUBLE,
+    buy_elg_amount       DOUBLE,
+    buy_elg_amount_rate  DOUBLE,
+    buy_lg_amount        DOUBLE,
+    buy_lg_amount_rate   DOUBLE,
+    buy_md_amount        DOUBLE,
+    buy_md_amount_rate   DOUBLE,
+    buy_sm_amount        DOUBLE,
+    buy_sm_amount_rate   DOUBLE
+);
+"""
+
+# 龙虎榜每日明细（top_list，2005 起，实测 15 字段）。
+# 同票同日可因多个上榜理由重复出现 → reason 进主键。
+# 源数据偶发完全相同的重复行（2026-07-01 实测 6 行，字段全同），
+# upsert 批内去重无损
+TOP_LIST_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS top_list_daily (
+    trade_date     DATE    NOT NULL,
+    ts_code        VARCHAR NOT NULL,
+    name           VARCHAR,
+    close          DOUBLE,
+    pct_change     DOUBLE,
+    turnover_rate  DOUBLE,
+    amount         DOUBLE,
+    l_sell         DOUBLE,    -- 龙虎榜卖出额
+    l_buy          DOUBLE,    -- 龙虎榜买入额
+    l_amount       DOUBLE,    -- 龙虎榜成交额
+    net_amount     DOUBLE,
+    net_rate       DOUBLE,
+    amount_rate    DOUBLE,
+    float_values   DOUBLE,    -- 流通市值
+    reason         VARCHAR NOT NULL,
+    PRIMARY KEY (trade_date, ts_code, reason)
+);
+"""
+
+# 龙虎榜机构席位明细（top_inst，实测 10 字段）。
+# 一日一票多席位，同席位可同时上买入/卖出榜 → exalter/side/reason 进主键
+TOP_INST_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS top_inst_daily (
+    trade_date  DATE    NOT NULL,
+    ts_code     VARCHAR NOT NULL,
+    exalter     VARCHAR NOT NULL,   -- 营业部名称
+    side        VARCHAR NOT NULL,   -- 0 买入榜 / 1 卖出榜
+    reason      VARCHAR NOT NULL,
+    buy         DOUBLE,
+    buy_rate    DOUBLE,
+    sell        DOUBLE,
+    sell_rate   DOUBLE,
+    net_buy     DOUBLE,
+    PRIMARY KEY (trade_date, ts_code, exalter, side, reason)
+);
+"""
+
+# 开盘啦榜单（kpl_list，实测 24 字段）。tag（涨停/炸板/跌停/自然涨停/竞价）进主键
+KPL_LIST_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS kpl_list_daily (
+    ts_code         VARCHAR NOT NULL,
+    trade_date      DATE    NOT NULL,
+    tag             VARCHAR NOT NULL,
+    name            VARCHAR,
+    lu_time         VARCHAR,   -- 涨停时间 'HH:MM:SS'
+    ld_time         VARCHAR,
+    open_time       VARCHAR,   -- 开板时间
+    last_time       VARCHAR,
+    lu_desc         VARCHAR,   -- 涨停原因
+    theme           VARCHAR,
+    net_change      DOUBLE,    -- 主力净额
+    bid_amount      DOUBLE,    -- 竞价成交额
+    status          VARCHAR,   -- 首板 / N连板
+    bid_change      DOUBLE,
+    bid_turnover    DOUBLE,
+    lu_bid_vol      DOUBLE,
+    pct_chg         DOUBLE,
+    bid_pct_chg     DOUBLE,
+    rt_pct_chg      DOUBLE,
+    limit_order     DOUBLE,    -- 封单量
+    amount          DOUBLE,
+    turnover_rate   DOUBLE,
+    free_float      DOUBLE,
+    lu_limit_order  DOUBLE,    -- 最大封单
+    PRIMARY KEY (ts_code, trade_date, tag)
+);
+"""
+
+# 市场交易统计（daily_info，1 行/市场分段/日，实测 14 字段）
+MARKET_DAILY_INFO_DDL = """
+CREATE TABLE IF NOT EXISTS market_daily_info (
+    trade_date   DATE    NOT NULL,
+    ts_code      VARCHAR NOT NULL,   -- 市场分段代码 SH_A / SZ_A / SH_STAR ...
+    ts_name      VARCHAR,
+    com_count    INTEGER,
+    total_share  DOUBLE,
+    float_share  DOUBLE,
+    total_mv     DOUBLE,
+    float_mv     DOUBLE,
+    amount       DOUBLE,
+    vol          DOUBLE,
+    trans_count  DOUBLE,
+    pe           DOUBLE,
+    tr           DOUBLE,
+    exchange     VARCHAR,
+    PRIMARY KEY (trade_date, ts_code)
+);
+"""
+
+# 游资名录（hm_list，静态快照，实测 3 字段）。源字段 desc 是 SQL 关键字，改名 description
+HM_LIST_DDL = """
+CREATE TABLE IF NOT EXISTS hm_list (
+    name         VARCHAR PRIMARY KEY,
+    description  VARCHAR,
+    orgs         VARCHAR,   -- 关联机构 JSON 字符串
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 RISK_BLACKLIST_DDL = """
 CREATE TABLE IF NOT EXISTS risk_blacklist (
     list_label      VARCHAR   NOT NULL,   -- 如 "430黑名单"
@@ -399,4 +743,13 @@ ALL_DDL = [
     PAPER_POSITION_DDL, PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL, PAPER_POSITION_EVENT_DDL,
     LIMIT_UP_POOL_DAILY_DDL, LIMIT_LIST_DAILY_DDL, RISK_BLACKLIST_DDL,
+    # 统一数据集回补层（dataset_backfill）
+    THS_INDEX_DAILY_DDL, DC_INDEX_DAILY_DDL,
+    THS_BOARD_DDL, DC_BOARD_DDL, THS_BOARD_MEMBER_DDL, DC_BOARD_MEMBER_DDL,
+    *MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
+    MONEYFLOW_DC_DAILY_DDL, MONEYFLOW_THS_DAILY_DDL,
+    MONEYFLOW_IND_THS_DAILY_DDL, MONEYFLOW_IND_DC_DAILY_DDL,
+    MONEYFLOW_CNT_THS_DAILY_DDL, MONEYFLOW_MKT_DAILY_DDL,
+    TOP_LIST_DAILY_DDL, TOP_INST_DAILY_DDL,
+    KPL_LIST_DAILY_DDL, MARKET_DAILY_INFO_DDL, HM_LIST_DDL,
 ]

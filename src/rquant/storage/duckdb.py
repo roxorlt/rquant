@@ -863,6 +863,87 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert stock_basic: {count} 行")
         return count
 
+    # ── dataset_backfill 通用落库 ──
+    # 表名/列名拼进 SQL 前先过 information_schema 白名单（未知表直接抛），
+    # 列取 df 与目标表交集并全部加引号，防关键字撞车（limit/rank 之类已在
+    # normalize 层改名，这里是兜底）。
+
+    def _dataset_table_columns(self, table: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = ?",
+            [table],
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _dataset_pk_columns(self, table: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT unnest(constraint_column_names) FROM duckdb_constraints() "
+            "WHERE table_name = ? AND constraint_type = 'PRIMARY KEY'",
+            [table],
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _dataset_insert_cols(self, table: str, df: pd.DataFrame) -> list[str]:
+        cols = self._dataset_table_columns(table)
+        if not cols:
+            raise ValueError(f"未知数据表：{table}（schema.ALL_DDL 里没建过）")
+        use = [c for c in df.columns if c in cols]
+        if not use:
+            raise ValueError(f"{table} 与 DataFrame 无共同列：{list(df.columns)}")
+        return use
+
+    def upsert_dataset(self, table: str, df: pd.DataFrame) -> int:
+        """通用幂等 upsert：按 df 与目标表列交集 INSERT OR REPLACE。
+
+        同批次内主键重复先去重保留末行——INSERT OR REPLACE 对批内自冲突
+        直接报错，而榜单类源数据偶发重复行不值得整日失败。
+        """
+        if df.empty:
+            return 0
+        use = self._dataset_insert_cols(table, df)
+        pk = [c for c in self._dataset_pk_columns(table) if c in use]
+        payload = df.drop_duplicates(subset=pk, keep="last") if pk else df
+        quoted = ", ".join(f'"{c}"' for c in use)
+        self._conn.register("dataset_tmp", payload)
+        self._conn.execute(
+            f'INSERT OR REPLACE INTO "{table}" ({quoted}) '
+            f"SELECT {quoted} FROM dataset_tmp"
+        )
+        self._conn.unregister("dataset_tmp")
+        count = len(payload)
+        logger.info(f"DuckDB upsert {table}: {count} 行")
+        return count
+
+    def replace_dataset(self, table: str, df: pd.DataFrame) -> int:
+        """快照整表替换（事务内 DELETE + INSERT，成分调出即删）。
+
+        空 df 拒绝替换（源抽风返回空不该清掉现有快照），调用方约定错误抛。
+        """
+        if df.empty:
+            raise ValueError(f"replace_dataset 拒绝空快照：{table}")
+        use = self._dataset_insert_cols(table, df)
+        pk = [c for c in self._dataset_pk_columns(table) if c in use]
+        payload = df.drop_duplicates(subset=pk, keep="last") if pk else df
+        quoted = ", ".join(f'"{c}"' for c in use)
+        self._conn.register("dataset_tmp", payload)
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute(f'DELETE FROM "{table}"')
+            self._conn.execute(
+                f'INSERT INTO "{table}" ({quoted}) '
+                f"SELECT {quoted} FROM dataset_tmp"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._conn.unregister("dataset_tmp")
+        count = len(payload)
+        logger.info(f"DuckDB replace {table}: {count} 行（整表替换）")
+        return count
+
     def query(self, sql: str) -> pd.DataFrame:
         return self._conn.execute(sql).fetchdf()
 

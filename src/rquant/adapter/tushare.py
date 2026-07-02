@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime
 
 import pandas as pd
@@ -12,6 +13,9 @@ import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
+
+# 分页取数 / 多指数循环时相邻请求间隔（对齐 dataset_backfill._API_SLEEP）
+_PAGE_SLEEP = 0.35
 
 
 class TushareAdapter:
@@ -128,17 +132,15 @@ class TushareAdapter:
         return df
 
 
-    def _call_by_date_with_backoff(
+    def _call_with_backoff(
         self, api_name: str, call, max_retries: int = 6
     ) -> pd.DataFrame | None:
-        """回补类 by_date 调用的限频退避重试。
+        """回补类调用的限频退避重试（by_date / 分页 / 快照通用）。
 
         限频错误（"频率超限"）绝不切备用 token：备用是免费档，daily_basic
         限频 1 次/分钟，切换等于把整个回补判死（2026-07-02 真实事故——主 token
         瞬时超限触发粘性切换，960 个日期全灭）。原地 sleep 后用主 token 重试。
         """
-        import time as _time
-
         for attempt in range(1, max_retries + 1):
             try:
                 return call()
@@ -151,7 +153,7 @@ class TushareAdapter:
                     f"Tushare {api_name} 第 {attempt}/{max_retries} 次失败"
                     f"（{wait}s 后重试）: {msg[:120]}"
                 )
-                _time.sleep(wait)
+                time.sleep(wait)
         return None
 
     def trade_cal(self, start: date, end: date) -> list[date]:
@@ -189,7 +191,7 @@ class TushareAdapter:
         ds = trade_date.strftime("%Y%m%d")
         logger.info(f"Tushare daily(by_date) 请求：trade_date={ds}")
 
-        df = self._call_by_date_with_backoff(
+        df = self._call_with_backoff(
             "daily", lambda: self._pro.daily(trade_date=ds)
         )
 
@@ -208,7 +210,7 @@ class TushareAdapter:
         fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
         logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
 
-        df = self._call_by_date_with_backoff(
+        df = self._call_with_backoff(
             "daily_basic", lambda: self._pro.daily_basic(trade_date=ds, fields=fields)
         )
 
@@ -226,7 +228,7 @@ class TushareAdapter:
         ds = trade_date.strftime("%Y%m%d")
         logger.info(f"Tushare adj_factor(by_date) 请求：trade_date={ds}")
 
-        df = self._call_by_date_with_backoff(
+        df = self._call_with_backoff(
             "adj_factor", lambda: self._pro.adj_factor(trade_date=ds)
         )
 
@@ -643,3 +645,321 @@ class TushareAdapter:
         )
         logger.info(f"Tushare stock_basic 返回 {len(df)} 行")
         return df
+
+    # ══ 统一数据集回补层薄方法（dataset_backfill 注册表用） ══════════════════
+    # 各方法 docstring 里的字段清单为 2026-07-01 trade_date=20260701 实测返回。
+    # 共同约束：fields 显式、trade_date 归一化为 date、空返回容错、
+    # 全部经 _call_with_backoff 限频退避，不切备用 token（付费权限未必对齐）。
+
+    def _finalize_dataset(self, api_name: str, df: pd.DataFrame | None) -> pd.DataFrame:
+        """数据集取数收尾：空容错 + trade_date 归一化。"""
+        if df is None or df.empty:
+            logger.warning(f"Tushare {api_name} 返回空")
+            return pd.DataFrame()
+        df = df.copy()
+        if "trade_date" in df.columns:
+            df["trade_date"] = pd.to_datetime(
+                df["trade_date"], format="%Y%m%d"
+            ).dt.date
+        logger.info(f"Tushare {api_name} 返回 {len(df)} 行")
+        return df
+
+    def _dataset_by_date(
+        self, api_name: str, trade_date: date, fields: str
+    ) -> pd.DataFrame:
+        """按 trade_date 全市场取数的数据集接口共用入口。"""
+        ds = trade_date.strftime("%Y%m%d")
+        api = getattr(self._pro, api_name)
+        df = self._call_with_backoff(
+            api_name, lambda: api(trade_date=ds, fields=fields)
+        )
+        return self._finalize_dataset(api_name, df)
+
+    def _dataset_paged(
+        self,
+        api_name: str,
+        *,
+        fields: str,
+        page_size: int,
+        max_pages: int = 60,
+        **params: str,
+    ) -> pd.DataFrame:
+        """offset 分页全量拉取（dc_member 单页 8000 / ths_member 单页 6000 实测封顶）。
+
+        page_size 必须 ≤ 服务端单页上限：终止条件是「本页行数 < page_size」，
+        page_size 大于服务端上限会把被截断的整页误判为最后一页而提前结束。
+        """
+        api = getattr(self._pro, api_name)
+        frames: list[pd.DataFrame] = []
+        for page in range(max_pages):
+            offset = page * page_size
+            df = self._call_with_backoff(
+                api_name,
+                lambda off=offset: api(
+                    offset=off, limit=page_size, fields=fields, **params
+                ),
+            )
+            if df is None or df.empty:
+                break
+            frames.append(df)
+            if len(df) < page_size:
+                break
+            time.sleep(_PAGE_SLEEP)
+        else:
+            raise RuntimeError(
+                f"Tushare {api_name} 分页超过 {max_pages} 页仍未拉完，疑似异常"
+            )
+        if not frames:
+            return self._finalize_dataset(api_name, None)
+        return self._finalize_dataset(
+            api_name, pd.concat(frames, ignore_index=True)
+        )
+
+    # ── 板块日行情 ──
+
+    def ths_daily_by_date(self, trade_date: date) -> pd.DataFrame:
+        """同花顺概念/行业指数日行情。实测 12 字段：ts_code, trade_date, open,
+        high, low, close, pre_close, avg_price, change, pct_change, vol,
+        turnover_rate（无 amount）。"""
+        return self._dataset_by_date(
+            "ths_daily", trade_date,
+            fields="ts_code,trade_date,open,high,low,close,pre_close,"
+                   "avg_price,change,pct_change,vol,turnover_rate",
+        )
+
+    def dc_daily_by_date(self, trade_date: date) -> pd.DataFrame:
+        """东财板块日行情（2020 起）。实测 13 字段：ts_code, trade_date, close,
+        open, high, low, change, pct_change, vol, amount, swing,
+        turnover_rate, category。"""
+        return self._dataset_by_date(
+            "dc_daily", trade_date,
+            fields="ts_code,trade_date,open,high,low,close,change,"
+                   "pct_change,vol,amount,swing,turnover_rate,category",
+        )
+
+    # ── 板块静态 / 成分快照 ──
+
+    def ths_index_snapshot(self) -> pd.DataFrame:
+        """同花顺板块列表全量。实测 6 字段：ts_code, name, count, exchange,
+        list_date, type（count/type 落库前由 normalize 改名）。"""
+        return self._dataset_paged(
+            "ths_index",
+            fields="ts_code,name,count,exchange,list_date,type",
+            page_size=5000,
+        )
+
+    def ths_member_snapshot(self) -> pd.DataFrame:
+        """同花顺板块成分全量（实测无参可分页拉全量，单页 6000 封顶）。
+        实测 3 字段：ts_code(板块代码), con_code, con_name。"""
+        return self._dataset_paged(
+            "ths_member",
+            fields="ts_code,con_code,con_name",
+            page_size=6000,
+        )
+
+    def dc_index_snapshot(self, trade_date: date) -> pd.DataFrame:
+        """东财板块列表（源按 trade_date 出数）。实测 13 字段：ts_code,
+        trade_date, name, leading, leading_code, pct_change, leading_pct,
+        total_mv, turnover_rate, up_num, down_num, idx_type, level。"""
+        return self._dataset_by_date(
+            "dc_index", trade_date,
+            fields="ts_code,trade_date,name,leading,leading_code,pct_change,"
+                   "leading_pct,total_mv,turnover_rate,up_num,down_num,"
+                   "idx_type,level",
+        )
+
+    def dc_member_snapshot(self, trade_date: date) -> pd.DataFrame:
+        """东财板块成分（按日全量，实测单页 8000 封顶需分页）。
+        实测 4 字段：trade_date, ts_code(板块代码), con_code, name。"""
+        return self._dataset_paged(
+            "dc_member",
+            fields="trade_date,ts_code,con_code,name",
+            page_size=8000,
+            trade_date=trade_date.strftime("%Y%m%d"),
+        )
+
+    def hm_list_snapshot(self) -> pd.DataFrame:
+        """游资名录（静态快照，实测 110 行）。实测 3 字段：name, desc, orgs
+        （desc 落库前由 normalize 改名 description）。"""
+        return self._dataset_paged(
+            "hm_list", fields="name,desc,orgs", page_size=2000
+        )
+
+    # ── 资金流 ──
+
+    def moneyflow_full_by_date(self, trade_date: date) -> pd.DataFrame:
+        """个股资金流全 20 字段（2010 起）。实测：ts_code, trade_date,
+        buy_sm_vol, buy_sm_amount, sell_sm_vol, sell_sm_amount, buy_md_vol,
+        buy_md_amount, sell_md_vol, sell_md_amount, buy_lg_vol, buy_lg_amount,
+        sell_lg_vol, sell_lg_amount, buy_elg_vol, buy_elg_amount, sell_elg_vol,
+        sell_elg_amount, net_mf_vol, net_mf_amount。
+
+        与 moneyflow()（monitor 用的 8 字段窄口径）并存：本方法给
+        dataset_backfill 落 moneyflow_daily 全字段。"""
+        return self._dataset_by_date(
+            "moneyflow", trade_date,
+            fields="ts_code,trade_date,buy_sm_vol,buy_sm_amount,sell_sm_vol,"
+                   "sell_sm_amount,buy_md_vol,buy_md_amount,sell_md_vol,"
+                   "sell_md_amount,buy_lg_vol,buy_lg_amount,sell_lg_vol,"
+                   "sell_lg_amount,buy_elg_vol,buy_elg_amount,sell_elg_vol,"
+                   "sell_elg_amount,net_mf_vol,net_mf_amount",
+        )
+
+    def moneyflow_dc_by_date(self, trade_date: date) -> pd.DataFrame:
+        """东财个股资金流（2023-09 起）。实测 15 字段：trade_date, ts_code,
+        name, pct_change, close, net_amount, net_amount_rate, buy_elg_amount,
+        buy_elg_amount_rate, buy_lg_amount, buy_lg_amount_rate, buy_md_amount,
+        buy_md_amount_rate, buy_sm_amount, buy_sm_amount_rate。"""
+        return self._dataset_by_date(
+            "moneyflow_dc", trade_date,
+            fields="trade_date,ts_code,name,pct_change,close,net_amount,"
+                   "net_amount_rate,buy_elg_amount,buy_elg_amount_rate,"
+                   "buy_lg_amount,buy_lg_amount_rate,buy_md_amount,"
+                   "buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate",
+        )
+
+    def moneyflow_ths_by_date(self, trade_date: date) -> pd.DataFrame:
+        """同花顺个股资金流。实测 13 字段：trade_date, ts_code, name,
+        pct_change, latest, net_amount, net_d5_amount, buy_lg_amount,
+        buy_lg_amount_rate, buy_md_amount, buy_md_amount_rate, buy_sm_amount,
+        buy_sm_amount_rate。"""
+        return self._dataset_by_date(
+            "moneyflow_ths", trade_date,
+            fields="trade_date,ts_code,name,pct_change,latest,net_amount,"
+                   "net_d5_amount,buy_lg_amount,buy_lg_amount_rate,"
+                   "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
+                   "buy_sm_amount_rate",
+        )
+
+    def moneyflow_ind_ths_by_date(self, trade_date: date) -> pd.DataFrame:
+        """同花顺行业资金流。实测 12 字段：trade_date, ts_code, industry,
+        lead_stock, close, pct_change, company_num, pct_change_stock,
+        close_price, net_buy_amount, net_sell_amount, net_amount。"""
+        return self._dataset_by_date(
+            "moneyflow_ind_ths", trade_date,
+            fields="trade_date,ts_code,industry,lead_stock,close,pct_change,"
+                   "company_num,pct_change_stock,close_price,net_buy_amount,"
+                   "net_sell_amount,net_amount",
+        )
+
+    def moneyflow_ind_dc_by_date(self, trade_date: date) -> pd.DataFrame:
+        """东财板块/概念资金流。实测 18 字段：trade_date, content_type,
+        ts_code, name, pct_change, close, net_amount, net_amount_rate,
+        buy_elg_amount, buy_elg_amount_rate, buy_lg_amount, buy_lg_amount_rate,
+        buy_md_amount, buy_md_amount_rate, buy_sm_amount, buy_sm_amount_rate,
+        buy_sm_amount_stock, rank（rank 落库前由 normalize 改名）。"""
+        return self._dataset_by_date(
+            "moneyflow_ind_dc", trade_date,
+            fields="trade_date,content_type,ts_code,name,pct_change,close,"
+                   "net_amount,net_amount_rate,buy_elg_amount,"
+                   "buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
+                   "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
+                   "buy_sm_amount_rate,buy_sm_amount_stock,rank",
+        )
+
+    def moneyflow_cnt_ths_by_date(self, trade_date: date) -> pd.DataFrame:
+        """同花顺概念资金流。实测 12 字段：trade_date, ts_code, name,
+        lead_stock, close_price, pct_change, industry_index, company_num,
+        pct_change_stock, net_buy_amount, net_sell_amount, net_amount。"""
+        return self._dataset_by_date(
+            "moneyflow_cnt_ths", trade_date,
+            fields="trade_date,ts_code,name,lead_stock,close_price,pct_change,"
+                   "industry_index,company_num,pct_change_stock,"
+                   "net_buy_amount,net_sell_amount,net_amount",
+        )
+
+    def moneyflow_mkt_dc_by_date(self, trade_date: date) -> pd.DataFrame:
+        """东财大盘资金流（1 行/日）。实测 15 字段：trade_date, close_sh,
+        pct_change_sh, close_sz, pct_change_sz, net_amount, net_amount_rate,
+        buy_elg_amount, buy_elg_amount_rate, buy_lg_amount, buy_lg_amount_rate,
+        buy_md_amount, buy_md_amount_rate, buy_sm_amount, buy_sm_amount_rate。"""
+        return self._dataset_by_date(
+            "moneyflow_mkt_dc", trade_date,
+            fields="trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,"
+                   "net_amount,net_amount_rate,buy_elg_amount,"
+                   "buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
+                   "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
+                   "buy_sm_amount_rate",
+        )
+
+    # ── 龙虎榜 ──
+
+    def top_list_by_date(self, trade_date: date) -> pd.DataFrame:
+        """龙虎榜每日明细（2005 起）。实测 15 字段：trade_date, ts_code, name,
+        close, pct_change, turnover_rate, amount, l_sell, l_buy, l_amount,
+        net_amount, net_rate, amount_rate, float_values, reason。"""
+        return self._dataset_by_date(
+            "top_list", trade_date,
+            fields="trade_date,ts_code,name,close,pct_change,turnover_rate,"
+                   "amount,l_sell,l_buy,l_amount,net_amount,net_rate,"
+                   "amount_rate,float_values,reason",
+        )
+
+    def top_inst_by_date(self, trade_date: date) -> pd.DataFrame:
+        """龙虎榜机构席位明细。实测 10 字段：trade_date, ts_code, exalter,
+        buy, buy_rate, sell, sell_rate, net_buy, side, reason。"""
+        return self._dataset_by_date(
+            "top_inst", trade_date,
+            fields="trade_date,ts_code,exalter,buy,buy_rate,sell,sell_rate,"
+                   "net_buy,side,reason",
+        )
+
+    # ── 其他榜单 / 统计 ──
+
+    def kpl_list_by_date(self, trade_date: date) -> pd.DataFrame:
+        """开盘啦榜单。实测 24 字段：ts_code, name, trade_date, lu_time,
+        ld_time, open_time, last_time, lu_desc, tag, theme, net_change,
+        bid_amount, status, bid_change, bid_turnover, lu_bid_vol, pct_chg,
+        bid_pct_chg, rt_pct_chg, limit_order, amount, turnover_rate,
+        free_float, lu_limit_order。"""
+        return self._dataset_by_date(
+            "kpl_list", trade_date,
+            fields="ts_code,name,trade_date,lu_time,ld_time,open_time,"
+                   "last_time,lu_desc,tag,theme,net_change,bid_amount,status,"
+                   "bid_change,bid_turnover,lu_bid_vol,pct_chg,bid_pct_chg,"
+                   "rt_pct_chg,limit_order,amount,turnover_rate,free_float,"
+                   "lu_limit_order",
+        )
+
+    def daily_info_by_date(self, trade_date: date) -> pd.DataFrame:
+        """市场交易统计（每市场分段 1 行/日）。实测 14 字段：trade_date,
+        ts_code, ts_name, com_count, total_share, float_share, total_mv,
+        float_mv, amount, vol, trans_count, pe, tr, exchange。"""
+        return self._dataset_by_date(
+            "daily_info", trade_date,
+            fields="trade_date,ts_code,ts_name,com_count,total_share,"
+                   "float_share,total_mv,float_mv,amount,vol,trans_count,"
+                   "pe,tr,exchange",
+        )
+
+    # 主要指数白名单：上证/深成/创业板/科创50/北证50
+    MAJOR_INDEXES: tuple[str, ...] = (
+        "000001.SH", "399001.SZ", "399006.SZ", "000688.SH", "899050.BJ",
+    )
+
+    def index_daily_major_by_date(self, trade_date: date) -> pd.DataFrame:
+        """主要指数日线（写现有 index_daily_bar 表）。实测 11 字段：ts_code,
+        trade_date, close, open, high, low, pre_close, change, pct_chg, vol,
+        amount。实测不支持多代码合并请求，逐指数各打 1 次（5 次/日）；
+        单指数为空容错跳过（如 899050.BJ 在 2022-11 上市前）。"""
+        ds = trade_date.strftime("%Y%m%d")
+        fields = (
+            "ts_code,trade_date,open,high,low,close,pre_close,"
+            "change,pct_chg,vol,amount"
+        )
+        frames: list[pd.DataFrame] = []
+        for code in self.MAJOR_INDEXES:
+            df = self._call_with_backoff(
+                "index_daily",
+                lambda c=code: self._pro.index_daily(
+                    ts_code=c, trade_date=ds, fields=fields
+                ),
+            )
+            if df is not None and not df.empty:
+                frames.append(df)
+            time.sleep(_PAGE_SLEEP)
+        if not frames:
+            return self._finalize_dataset("index_daily", None)
+        return self._finalize_dataset(
+            "index_daily", pd.concat(frames, ignore_index=True)
+        )

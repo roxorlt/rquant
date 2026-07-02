@@ -435,7 +435,8 @@ def test_table_classification_complete() -> None:
 
 def test_backfilled_history_tables_are_merge() -> None:
     """防回归：这些表若回到 REPLACE，下一次 research-sync 会把本地回补的
-    2020-2024 历史（及本地独有的涨停池采集、Tushare 涨跌停榜）整表抹掉。"""
+    2020-2024 历史（及本地独有的涨停池采集、Tushare 涨跌停榜、统一数据集
+    回补层的所有表）整表抹掉。"""
     must_merge = (
         "daily_bar",
         "daily_basic",
@@ -444,6 +445,26 @@ def test_backfilled_history_tables_are_merge() -> None:
         "daily_indicator",
         "limit_up_pool_daily",
         "limit_list_daily",
+        # dataset_backfill 数据集表（本地回补权威，云端没有）
+        "ths_index_daily",
+        "dc_index_daily",
+        "ths_board",
+        "dc_board",
+        "ths_board_member",
+        "dc_board_member",
+        "moneyflow_daily",
+        "moneyflow_dc_daily",
+        "moneyflow_ths_daily",
+        "moneyflow_ind_ths_daily",
+        "moneyflow_ind_dc_daily",
+        "moneyflow_cnt_ths_daily",
+        "moneyflow_mkt_daily",
+        "top_list_daily",
+        "top_inst_daily",
+        "kpl_list_daily",
+        "market_daily_info",
+        "hm_list",
+        "index_daily_bar",
     )
     for table in must_merge:
         assert table in MERGE_TABLES, f"{table} 必须是 merge 语义"
