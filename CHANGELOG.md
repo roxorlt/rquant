@@ -6,6 +6,21 @@
 
 ### Added
 
+- **统一「按日数据集回补」层（`rquant data-backfill`）**：新增
+  `rquant/dataset_backfill.py` 注册表（`DatasetSpec` + `DATASETS`），一条管线
+  接入 19 个 Tushare 接口：板块日行情（ths_daily/dc_daily）、板块列表与成分
+  快照（ths_index/ths_member/dc_index/dc_member）、资金流 7 口径（moneyflow
+  全 20 字段 + dc/ths 个股 + ths 行业/概念 + dc 板块 + dc 大盘）、龙虎榜
+  （top_list/top_inst）、开盘啦榜单（kpl_list）、市场交易统计（daily_info）、
+  游资名录（hm_list）、主要指数日线（index_daily → 现有 index_daily_bar）。
+  by_date 模式复用 trade_cal 日历 + 单日故障隔离 + 幂等 upsert，snapshot 模式
+  一次拉全量整表替换（空快照拒绝替换）；限频退避统一走 adapter 泛化后的
+  `_call_with_backoff`（原 `_call_by_date_with_backoff`），dc_member/ths_member
+  经 offset 分页拉全量（实测单页 8000/6000 封顶）。全部 17 张新表 +
+  moneyflow_daily 迁移列注册进 research_sync `MERGE_TABLES`，日终合并不会
+  抹掉本地回补历史。CLI：`data-backfill --dataset <name|all> --start-date
+  --end-date [--dry-run]`，日终增量 `--dataset <name> --today`。
+
 - **竞价跳空特征归因（roadmap #10）**：`scripts/analyze_auction_gap_attribution.py`
   + `docs/analysis/2026-07-02-auction-gap-feature-attribution.md`。1028 笔全区间
   归因结论：盈亏由收盘封板决定、每个入场位置期望均为负、最优过滤费后打平，

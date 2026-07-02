@@ -71,6 +71,26 @@ MERGE_TABLES: tuple[str, ...] = (
     "paper_position_event",
     "limit_up_pool_daily",
     "limit_list_daily",
+    # 统一数据集回补层（dataset_backfill）：本地回补权威，云端没有。
+    # 快照表（ths_board*/dc_board*/hm_list）云端永远无同名表 → merge 是 no-op，
+    # 归入 MERGE 只为语义一致（本地独有行绝不被整表替换抹掉）
+    "ths_index_daily",
+    "dc_index_daily",
+    "ths_board",
+    "dc_board",
+    "ths_board_member",
+    "dc_board_member",
+    "moneyflow_dc_daily",
+    "moneyflow_ths_daily",
+    "moneyflow_ind_ths_daily",
+    "moneyflow_ind_dc_daily",
+    "moneyflow_cnt_ths_daily",
+    "moneyflow_mkt_daily",
+    "top_list_daily",
+    "top_inst_daily",
+    "kpl_list_daily",
+    "market_daily_info",
+    "hm_list",
 )
 
 
