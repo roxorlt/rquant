@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- **本地热备与研究库分家（`rquant research-sync`）**：云端快照改落
+  `data/cloud_backup.duckdb` 纯备份工件，不再整文件替换本地主库；生产表
+  （daily_bar/screen_result 等 9 张）从备份整表替换，研究表（minute_bar/
+  auction_bar/模拟盘等 9 张）按主键 merge，本地研究数据永不被热备冲掉。
+  支持 `--restore-from` 从旧副本恢复研究表；合并后原子刷新本地只读副本。
+- **盘中实时源紧急回退开关**：`INTRADAY_QUOTE_SOURCE=akshare` 可在不改代码
+  的情况下把 monitor 实时源从 Tushare rt_min 切回 akshare（权限到期/故障
+  止损用），默认 `tushare`。
+- **Strategy Lab 后台任务**：新增 `rquant lab-run --spec` 后台执行入口与
+  `strategy_lab_worker` 状态文件机制，自动优化可提交为后台任务、可取消，
+  关掉浏览器不再丢结果；「历史记录」页签可查看/管理后台任务。
+
+### Changed
+
+- **Strategy Lab 交互重构一期**：收益对比/交易明细/退出原因结果进
+  `st.session_state`（切页签不再丢）；收益对比结果同样落盘到历史记录；
+  sidebar 与自动优化/科创放量参数区包进 `st.form`（改参数不再整页刷新）；
+  自动优化默认值改为小跑组合（持有期 1/2/3 + 基础评分画像）。
+
 ### Fixed
 
 - **watchdog 尾盘监控真空（审计 PR3-F）**：`rquant-monitor-watchdog.timer` 原
@@ -12,6 +33,216 @@
   下次 watchdog 要等次日 09:00，尾盘完全无守护。扩到 `9..15:0/2` 让 15:00 也触发一次
   收尾检查（脚本 `NOW>1500` gate 让 15:00 动作、15:02+ 静默退）。
   ⚠️ systemd unit 改动，merge 前须云端 `systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/2' --iterations 5` 确认步进 2min。
+- **7/2 本地主库损坏事故根治**：`sync-from-cloud.sh` 整文件替换主库导致
+  盘中 monitor 写入丢进幽灵 inode、残留 WAL 代际错配打不开库。下载与合并
+  分离后杜绝；`research-sync` 内置陈旧 WAL 抢救（挪 `.corrupt-<ts>.bak`
+  后重试）与副本撕裂防护（主库有活跃 WAL 时拒绝刷新副本）。
+- 卸载本地僵尸 LaunchAgent `com.roxor.rquant`（`serve --hour 17` 与云端
+  daily 重复跑、重复推送，2026-05-20 起残留）。
+- **对抗式审查修复（23 项确认缺陷，55-agent workflow 双反驳验证）**，要点：
+  - `sync-from-cloud.sh`：日终合并加 `.last-research-sync-date` 记账 +
+    睡过 17:10-17:30 窗口后任意 tick 追赶补跑；mkdir 原子锁防并发截断；
+    `--force` 显式下载+合并；合并失败告警 30min cooldown
+  - `research-sync`：ATTACH 路径单引号转义（含 `'` 的备份卷路径不再炸）；
+    restore 改 `INSERT OR IGNORE`（旧副本不再覆盖本地已更新行）；
+    有表失败时跳过副本刷新（不发布跨表不一致快照）；顶层异常转报告
+    避免 CLI 与脚本双重告警
+  - monitor：`rt_min` 加 `RT_MIN_POLL_SECONDS`（默认 15s）节流，不再每
+    5s 打分钟级 API；闭市时段启动直接退出，不再整晚占 DuckDB 写锁
+  - 存储：`query_minute_bars` 跨 source 去重（stk_mins 优先于盘中 rt），
+    研究口径不再把同一分钟双计
+  - 云端 `rquant-daily.service` 加 `--skip-minute-backfill`：分钟历史只在
+    本地按需回补，不放大云端主库与三条 5 分钟拷贝链路
+  - Strategy Lab worker：状态文件原子写；cancel 校验进程组防 pid 复用误杀；
+    cancel/done TOCTOU 不再丢 `saved_run_id`；僵尸进程不再永久显示运行中；
+    后台任务防重复提交
+- `_detect_st` 容忍 NaN 名字（长区间回补遇退市票 join 不到 stock_basic
+  时不再 AttributeError 崩掉整个回补）。
+
+- **Tushare 全量接口审计与接入目录**：新增官方文档抓取脚本和结构化接口目录，
+  用 `TUSHARE_COOKIE` 抓取 268 个文档入口、合并 MCP 元数据，并将 141 个
+  A 股可调用接口转成 `tushare_interface_catalog`，按已接入、盘中/竞价、
+  策略特征、环境过滤、参考观察分层；Strategy Lab 新增“数据接口”页签，可按
+  阶段、状态、权限、能力标签筛选后续接入候选。
+  - 同步抓取购买页当前积分、积分商品、独立权限和套餐报价，写入
+    `tushare_account_score` / `tushare_purchase_goods` / `tushare_activity_packages`
+    独立表；接口目录按 API/doc_id 关联独立权限报价，并显示当前积分缺口和补积分
+    估算成本。
+  - 新增接口历史覆盖审计字段：`history_coverage_type` / `history_start` /
+    `history_coverage_note`，用于判断新权限开通后是否能立即回补历史数据；已确认
+    `stk_auction` 历史从 `2025-01` 开始，`rt_min_daily` 属于仅当日开盘以来。
+  - 新增盘中实时分钟与集合竞价迭代路线图：
+    `docs/plans/2026-06-26-intraday-rt-auction-roadmap.md`。
+- **集合竞价数据链路**：接入 Tushare Pro `stk_auction` 当日集合竞价成交接口，
+  新增 `auction_bar` 表和 `rquant auction-backfill` 命令，按本地 `daily_bar`
+  交易日历回补 2025-01 以来历史集合竞价数据。
+  - `auction_bar` 按 `(ts_code, trade_date, auction_type, source)` 幂等落库，
+    先支持 `open_realtime`，后续可扩展开盘/收盘盘后集合竞价接口
+  - `stk_auction` 与历史分钟一样不自动切备用 token，避免备用 token 未开独立权限时
+    掩盖真实权限错误
+  - 已完成 `2025-01-01` 至 `2026-06-26` 本地回补，实际非空数据范围为
+    `2025-01-16` 至 `2026-06-25`，共 `1,901,255` 行、`345` 个交易日
+- **集合竞价跳空高开策略回测**：新增 `rquant auction-gap-replay`，可将同花顺
+  “跳空高开 + 竞价量/近5日均量 + 今日未涨停 + 非 ST”动态分组规则转成可回放策略。
+  - 支持昨收跳空与昨高跳空两种 gap 口径，支持严格 ST 过滤和近似同花顺小写 `st`
+    过滤口径
+  - 按 Tushare 日线成交量单位自动换算“竞价量 / 近 5 日均量”，并用次一交易日开盘价
+    作为符合 A 股 T+1 的无未来函数基准离场
+  - 新增 `rquant auction-gap-minute-replay`：集合竞价只生成候选，B 日等待开盘后
+    1 分钟因子确认并用下一分钟开盘价成交；S 日结合 B 日封板强度、次日集合竞价强弱、
+    次日早盘 VWAP 破位和移动止盈止损
+  - 新增 `rquant auction-gap-minute-backfill`：先按集合竞价规则生成候选，再只回补
+    候选从信号日到退出窗口的分钟线，避免为了一条策略盲目补全市场全历史分钟线
+  - 已完成 `2026-04-16` 至 `2026-06-24` 集合竞价候选分钟窗口短区间回补：
+    `249` 个候选、`249` 次请求、`0` 失败，写入 `121,223` 行分钟线；首轮
+    分钟 B/S replay 为 `134` 笔交易、平均收益 `-1.51%`、胜率 `27.61%`
+  - 分钟因子层新增日内加速度和开盘段标记：保留同分钟历史基准、累计成交额进度基准，
+    并增加 5/10 分钟成交额加速度；9:30-9:32 暂作为可调 opening segment，不参与普通滚动加速度
+  - Strategy Lab 新增“集合竞价跳空”页签，对比“竞价直接 B/次日开盘 S”和
+    “竞价候选/分钟 B/S”的候选数、触发率、收益、胜率和弱竞价退出占比
+  - 新增中文分析文档：
+    `docs/plans/2026-06-26-auction-gap-strategy.md`
+- **盘中上攻信号监控**：基于 6/25 Pool1 / Pool2 次日涨停归因结果，先不新增高风险数据源，
+  改为吃满现有 AKShare/Sina 实时源已提供的 `今开` / `最高` / `昨收` / `涨跌幅` /
+  `成交量` / `成交额` 字段。
+  - 新增 `RealtimeQuote` Pydantic 行情模型和 `fetch_realtime_quotes()`，保留
+    `fetch_realtime_prices()` 兼容旧调用
+  - `build_watchlist()` 补齐 T 日高点、T 日收盘价、T+1 涨停价，供盘中上攻判断使用
+  - `monitor.check_attack_signals()` 新增开盘强、强承接、突破 T 高、临近涨停 4 类信号，
+    替代原 40/30/20/强止/弱止盘中回踩提醒
+  - 通知文案新增上攻信号标签（开盘强 / 强承接 / 突破T高 / 临近涨停）
+  - 新增 forward premium 目标函数复盘文档：不再只评估次日涨停，改看入池后 / 信号后
+    1、3、5、10 日最大溢价
+- **准实盘模拟盘止损基础**：新增 `rquant.paper` 纯逻辑模块和实施计划文档，
+  将 B 入场定义为候选池标的第一次触发 `attack_*` 信号，并在入场瞬间冻结
+  `entry_price` / `entry_signal` / `stop_loss_price` / `stop_loss_basis`。
+  - 初始止损线采用“结构止损优先、百分比兜底、入场价下方缓冲上限”的候选参数框架
+  - 支持 A 股 T+1 出口门禁：B 入场当天即使触发止损/止盈也不模拟卖出
+  - 支持普通止损、跳空止损、移动利润保护候选机制
+  - 每笔模拟仓冻结 `candidate_id`，后续用于历史分时 replay / walk-forward 对比，
+    不把 3% / 5% / 2.5% 这类临时值当作策略结论
+  - 同一只票同一交易日不重复开模拟仓
+- **历史分钟数据地基**：接入 Tushare Pro `stk_mins` 历史分钟接口，并新增分钟线 /
+  特征快照 / 模拟盘持仓事件相关表结构。
+  - 新增 `minute_bar` 表，按 `(ts_code, trade_time, freq, source)` 幂等落库
+  - 新增 `intraday_feature_snapshot` 表，预留 Pool1 入池后 90 日分钟价量结构特征
+  - 新增 `paper_position` / `paper_position_event` 表，支持后续模拟盘分批止盈、
+    移动保护、复盘事件流
+  - 新增 `rquant minute-backfill` 命令，可在 Pool1 出结果后回补标的前 N 个交易日
+    历史分钟；已用 `600000.SH` 2026-06-24 1min 数据端到端 smoke 写入 241 行
+- **历史分钟 replay 初版**：新增 `rquant.minute_replay` 和 CLI 固定路径：
+  `minute-replay-backfill` 先回补 T 日命中标的从 B 日到退出窗口的 1min 数据，
+  `minute-replay` 再按“B 日累计低点不破 T 收盘、累计高点突破 T 高点”触发模拟买入。
+  - replay 复用 `rquant.paper` 的 A 股 T+1、结构/百分比止损和移动利润保护逻辑
+  - 分钟内退出采用保守顺序：先按上一分钟已有止损/止盈线判断，再用本分钟高点更新
+    下一分钟移动止盈线，避免同一分钟 high/low 顺序的未来函数
+  - 新增除权/复权价格基准处理：盘中信号用实时 `昨收` 动态缩放 T 日参考价；模拟仓跨
+    价格断点时同步缩放成本、止损、止盈、移动止盈线，并保留 `entry_price_raw`
+    原始成交价用于复盘
+  - 新增 3 种入场模式对比：`first_break`（首次突破）、`break_retest`（突破后回踩确认）、
+    `late_confirm`（10:30 后确认），用于同一收益口径下做科学对照
+  - Streamlit dashboard 新增“分钟策略实验室”：支持日期区间、持有天数、入场模式多选，
+    展示触发率、均值/中位收益、胜率、跳空止损率、退出原因和交易明细
+  - 新增独立 Streamlit 页面 `src/rquant/dashboard/strategy_lab.py`（建议端口 8504），
+    将分钟 replay、90 日价量分布覆盖率检查、参数组合收益对比从健康看板中拆出，
+    避免与 30 秒健康监控刷新互相干扰
+  - 策略实验室新增“自动优化”页签，并新增 `rquant.strategy_optimizer`：
+    自动枚举入场模式 / 风控版本 / 持有期，按训练区间与验证区间生成策略排行榜，
+    避免人工逐个勾选组合
+  - 自动优化器新增“触发后按特征分取 topN”对比：先不改变交易触发，只比较
+    全量触发与每日 top1 / top2 / top3 / top5 等特征排序样本的训练/验证收益差异，
+    并在策略实验室中展示 topN 排行和入选样本
+  - topN 特征分升级为可配置评分画像：新增基础版、分时放量/建仓代理/高低位/市场环境
+    消融版，以及轻量权重偏置版；自动优化器可同时比较多个评分画像，并将画像名写入
+    candidate_id
+  - 新增 topN walk-forward 验证：按时间顺序生成 expanding-window 折，只用过去日期训练、
+    后续日期验证，并在策略实验室展示出样本排行和入选样本
+  - Strategy Lab 自动优化页签新增开跑前工作量与耗时估算，按区间候选、持有期、
+    入场模式、风控版本、topN、评分画像和 walk-forward 折数展示 replay 次数、
+    候选扫描量、topN 组合数和预计耗时；新增中文说明书
+    `docs/strategy-lab-auto-optimization-guide.md`
+  - Strategy Lab 新增研究历史记录：自动优化与集合竞价跳空每次运行后都会保存
+    Markdown + JSON 到 `data/strategy_lab_runs/`，页面新增“历史记录”页签，可回看、
+    下载 Markdown，并把结果文件路径暴露给后续 agent 分析
+  - 新增 Pool1+Pool2 合并 replay 口径 `n-shape-combined`：同日同代码重复时 Pool2
+    优先，用于把 Pool1 新候选与 Pool2 持续观察标的一起做策略研究
+  - 新增 replay trade cache、风控参数搜索和特征权重搜索模块：可复用已跑出的分钟
+    replay 样本，比较 stop loss / take profit / trailing stop 组合，以及不同特征组
+    权重乘数下的 topN 排序效果
+  - replay cache 下沉到入场事件层：新增 `ReplayEntrySnapshot` / `EntryReplayCache`，
+    将分钟信号识别、执行价、风控计划、退出分钟窗口和特征快照缓存起来；风控参数搜索
+    可先加载一次入场快照，再对多组 stop loss / take profit / trailing stop 做退出重放
+  - 新增 `volume_profile` 特征层，用历史分钟线近似计算 90 日价量分布所需的
+    VWAP、POC、70% value area、上/下方成交额占比，为后续买卖价、止盈止损动态化预留结构依据
+  - 90 日价量分布已接入 replay 风控：可按 POC 收复情况过滤入场，用下方筹码
+    支撑生成结构止损，用上方筹码压力或固定收益兜底生成止盈，并在 dashboard 中与
+    baseline 同口径对比
+  - 日终 daily pipeline 筛选完成后可自动回补当日 Pool1 的 90 日分钟上下文；
+    `rquant run-daily` 默认开启，可用 `--skip-minute-backfill` 跳过
+  - 已完成 2026-04-16 至 2026-06-24 Pool1 历史样本 90 日分钟上下文回补：
+    `minute_bar` 共 8,961,585 行、394 只股票、135 个交易日；479 个 Pool1
+    候选样本的 90 日价量分布覆盖率为 100%
+
+### Changed
+
+- **分钟 replay 成交口径更保守**：盘中强承接/突破信号在当前 1 分钟 K 收完后确认，
+  买入改为下一分钟开盘价成交，避免同一根分钟 K 内“看到 high/low/close 后仍按
+  当前 close 买入”的乐观假设；`PaperTradeConfig` 新增 `entry_slippage_pct` 预留滑点。
+- **90 日价量分布复权归一**：`calculate_volume_profile()` 在 `adj_factor` 可用时，
+  将历史分钟估算成交价缩放到参考日价格基准后再计算 POC / value area；
+  `ingest_daily()` 日终同步写入当日 `adj_factor`。
+
+### Removed
+
+- **盘中回踩档位提醒**：移除 `monitor.check_levels()` 和 40 / 30 / 20 / 强止 / 弱止
+  盘中事件触发逻辑。强止 / 弱止价位仍作为 Pool2 退出风控参考保留，不再用于盘中通知。
+
+### Fixed
+
+- **Tushare 历史分钟批量回补鲁棒性**：`stk_mins` 不再自动切换到备用 token
+  （备用 token 未必开通分钟权限，实测会退化成 1次/min 限频）；`minute-replay-backfill`
+  单只请求失败时记录 `failed_requests` 并继续后续标的，避免一只限频/异常打断整批回补。
+- **daily / monitor 全面故障隔离（审计后系统性加固）**：连续多起"外部依赖临时故障
+  搞崩整条定时任务"事故（接口下线 / 数据延迟 / 网络超时）后，一次全面 review 给核心
+  定时任务加故障隔离，原则是"单点异常不拖垮整条流程"：
+  - `pipeline.py`：daily 流水线 preset 循环每个 preset 独立 try/except（失败标
+    `summary=-1` + 推 error 通知，继续其他 preset）；`_sync_pool2_watch` /
+    `check_exits` / `_push_daily_summary` 各自独立 try/except——保证某 preset 或
+    某步失败不连带打掉 `check_exits` 兜底（Pool 2 退出检查）
+  - `monitor.py`：盘中主循环单票 try/except（某只票存库 / notify / 日期计算异常不
+    终止整个盯盘进程）；`check_exits` 单票 try/except（某只票退出处理失败不中断整批）；
+    `fetch_realtime_prices` 加 akshare 列存在性校验（改列名时返回空而非 KeyError 崩）
+  - `cli.py::_ingest_with_retry` 重试范围从"仅 `RequestException`"扩到"所有 ingest
+    异常"——覆盖 tushare 服务端业务错误（限频 / 接口下线，客户端抛裸 `Exception`），
+    短间隔重试，耗尽仍失败则 `raise` 不吞
+  - `loader.py`：补列从"仅 IND/BASIC 的 `[0]`"扩到"IND/BASIC/STATE 各 offset + 标量
+    `is_st`/`is_bj`/`board_type` 默认值"——daily_state 整表缺失也不让 `not_st` /
+    `board_in` / Pool 2 的 `BODY_UPPER[1]` 引用崩
+  - 新增 7 个故障隔离单测，全量 427 passed
+
+- **ingest 网络超时搞崩 daily pipeline**（6/4 真实事故）：6/4 17:00 拉 tushare
+  `stock_basic` 时 30s 读超时（`requests.exceptions.ReadTimeout`），
+  `rquant-daily.service` exit 1。根因：`_ingest_with_retry` 的重试只覆盖
+  `bar_count == 0`（数据未就绪），不捕获异常 → 网络抖动直接冒泡崩溃。
+  - `cli.py::_ingest_with_retry` 改为捕获所有 ingest 异常（见上条），短间隔
+    （`_NETWORK_RETRY_INTERVAL = 60s`）重试，与"数据未就绪"15min 长间隔区分
+  - 恢复方式：网络恢复后 `rquant run-daily --date <date>` 重拉
+- **告警链路可靠性加固（审计 PR2）**：全面 review 发现告警/兜底链路多处会静默失效。
+  - **告警黑洞兜底（E）**：`alert-on-failure.sh` 原用 `exec rquant alert`，PushDeer/
+    PushPlus 全推送失败时告警**静默消失**（所有业务 service 的 OnFailure 都汇到这里）。
+    改为捕获失败 → 落盘 `logs/alert-failures.jsonl`；`daily-report` 扫描当日记录并入
+    日报正文（`health.py::_read_recent_alert_failures`），保证故障"至少服务器有记录 +
+    日报能看见"。
+  - **守护/备份缺 OnFailure（J）**：`rquant-monitor-watchdog.service`（盘中 monitor
+    自愈的唯一通道）和 `rquant-backup.service` 都没配 OnFailure，自身崩了无人知。
+    各加 `OnFailure=rquant-alert@%n.service`（原 watchdog 注释"不应触发 watchdog 链"
+    是误解，alert 是独立 oneshot）。
+  - **token 提醒推送失败静默（M2）**：`remind-tushare-token-renewal.sh` 推送失败仍
+    exit 0（最后一句是 print），一次性 timer 触发后不再来 → 续费提醒永久丢。改为
+    全失败 `sys.exit(1)` 让 OnFailure 接管落盘兜底。
+  - **daily-report 直连主库（I）**：`health.py` 改用 `open_readonly_store()` 优先读
+    副本，避开 monitor 延后退出 / backup 持锁时的 `IOError` fatal exit（遵循
+    CLAUDE.md DuckDB 并发约定）。
 
 - **daily_basic 数据源临时缺失搞崩整条 pipeline**（5/29 真实事故）：5/29 daily_bar
   拉到了但 tushare daily_basic 接口延迟返回空，ingest 静默跳过，screen 阶段

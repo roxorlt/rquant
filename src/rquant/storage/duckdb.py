@@ -64,6 +64,40 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert adj_factor: {count} 行")
         return count
 
+    def upsert_index_daily(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        self._conn.register("index_daily_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO index_daily_bar
+            SELECT
+                ts_code, trade_date,
+                open, high, low, close,
+                pre_close, change, pct_chg,
+                vol, amount
+            FROM index_daily_tmp
+            """
+        )
+        self._conn.unregister("index_daily_tmp")
+
+        count = len(df)
+        logger.info(f"DuckDB upsert index_daily_bar: {count} 行")
+        return count
+
+    def query_index_daily(self, trade_date: date | str) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, trade_date, open, high, low, close,
+                   pre_close, change, pct_chg, vol, amount
+            FROM index_daily_bar
+            WHERE trade_date = ?
+            ORDER BY ts_code
+            """,
+            [trade_date],
+        ).fetchdf()
+
     def get_daily_qfq(
         self,
         ts_code: str,
@@ -211,6 +245,88 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert daily_basic: {count} 行")
         return count
 
+    def upsert_moneyflow_daily(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        if "source" not in payload.columns:
+            payload["source"] = "tushare"
+        self._conn.register("moneyflow_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO moneyflow_daily
+            (ts_code, trade_date, buy_lg_vol, sell_lg_vol,
+             buy_elg_vol, sell_elg_vol, large_net_vol,
+             large_net_amount, source)
+            SELECT ts_code, trade_date, buy_lg_vol, sell_lg_vol,
+                   buy_elg_vol, sell_elg_vol, large_net_vol,
+                   large_net_amount, source
+            FROM moneyflow_tmp
+            """
+        )
+        self._conn.unregister("moneyflow_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert moneyflow_daily: {count} 行")
+        return count
+
+    def query_moneyflow_daily(
+        self,
+        trade_date: str | date | pd.Timestamp,
+    ) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT ts_code, trade_date, buy_lg_vol, sell_lg_vol,
+                   buy_elg_vol, sell_elg_vol, large_net_vol,
+                   large_net_amount, source
+            FROM moneyflow_daily
+            WHERE trade_date = ?
+            ORDER BY ts_code
+            """,
+            [trade_date],
+        ).fetchdf()
+
+    def upsert_market_sentiment(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+
+        self._conn.register("market_sentiment_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO market_sentiment_daily
+            (trade_date, stock_count, up_count, down_count, flat_count,
+             limit_up_count, first_limit_up_count, limit_down_count, yiziban_count,
+             max_consecutive_limit_ups, high_board_count,
+             up_ratio_pct, limit_up_ratio_pct,
+             avg_pct_chg, median_pct_chg, total_amount)
+            SELECT trade_date, stock_count, up_count, down_count, flat_count,
+                   limit_up_count, first_limit_up_count, limit_down_count, yiziban_count,
+                   max_consecutive_limit_ups, high_board_count,
+                   up_ratio_pct, limit_up_ratio_pct,
+                   avg_pct_chg, median_pct_chg, total_amount
+            FROM market_sentiment_tmp
+            """
+        )
+        self._conn.unregister("market_sentiment_tmp")
+
+        count = len(df)
+        logger.info(f"DuckDB upsert market_sentiment_daily: {count} 行")
+        return count
+
+    def query_market_sentiment(self, trade_date: date | str) -> pd.DataFrame | None:
+        df = self._conn.execute(
+            """
+            SELECT trade_date, stock_count, up_count, down_count, flat_count,
+                   limit_up_count, first_limit_up_count, limit_down_count,
+                   yiziban_count, max_consecutive_limit_ups, high_board_count,
+                   up_ratio_pct, limit_up_ratio_pct,
+                   avg_pct_chg, median_pct_chg, total_amount
+            FROM market_sentiment_daily
+            WHERE trade_date = ?
+            """,
+            [trade_date],
+        ).fetchdf()
+        return None if df.empty else df
+
     def upsert_screen_result(self, df: pd.DataFrame) -> int:
         if df.empty:
             return 0
@@ -355,6 +471,225 @@ class DuckDBStore:
             [trade_date],
         ).fetchdf()
 
+    # ── auction_bar / minute_bar / intraday research ──
+
+    def upsert_auction_bars(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        if "source" not in payload.columns:
+            payload["source"] = "tushare"
+        if "auction_type" not in payload.columns:
+            payload["auction_type"] = "open_realtime"
+        self._conn.register("auction_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO auction_bar
+            (ts_code, trade_date, auction_type, price, vol, amount,
+             turnover_rate, volume_ratio, source)
+            SELECT ts_code, trade_date, auction_type, price, vol, amount,
+                   turnover_rate, volume_ratio, source
+            FROM auction_tmp
+            """
+        )
+        self._conn.unregister("auction_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert auction_bar: {count} 行")
+        return count
+
+    def query_auction_bars(
+        self,
+        trade_date: str | date | pd.Timestamp,
+        *,
+        auction_type: str | None = None,
+    ) -> pd.DataFrame:
+        if auction_type:
+            return self._conn.execute(
+                """
+                SELECT ts_code, trade_date, auction_type, price, vol, amount,
+                       turnover_rate, volume_ratio, source
+                FROM auction_bar
+                WHERE trade_date = ?
+                  AND auction_type = ?
+                ORDER BY ts_code
+                """,
+                [trade_date, auction_type],
+            ).fetchdf()
+        return self._conn.execute(
+            """
+            SELECT ts_code, trade_date, auction_type, price, vol, amount,
+                   turnover_rate, volume_ratio, source
+            FROM auction_bar
+            WHERE trade_date = ?
+            ORDER BY ts_code, auction_type
+            """,
+            [trade_date],
+        ).fetchdf()
+
+    def upsert_minute_bars(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        if "source" not in payload.columns:
+            payload["source"] = "tushare"
+        self._conn.register("minute_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO minute_bar
+            (ts_code, trade_time, freq, open, high, low, close, vol, amount, source)
+            SELECT ts_code, trade_time, freq, open, high, low, close, vol, amount, source
+            FROM minute_tmp
+            """
+        )
+        self._conn.unregister("minute_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert minute_bar: {count} 行")
+        return count
+
+    def query_minute_bars(
+        self,
+        ts_code: str,
+        start: str | date | pd.Timestamp,
+        end: str | date | pd.Timestamp,
+        *,
+        freq: str = "1min",
+    ) -> pd.DataFrame:
+        # minute_bar 主键含 source：盘中 rt_min 写 tushare_rt / 日终 stk_mins 写
+        # tushare，同一分钟可能 2-3 行。研究/回测出数必须去重（不去重成交量翻倍），
+        # 历史 stk_mins 是完整权威 bar，优先于盘中实时快照。
+        return self._conn.execute(
+            """
+            SELECT ts_code, trade_time, freq, open, high, low, close, vol, amount, source
+            FROM minute_bar
+            WHERE ts_code = ?
+              AND freq = ?
+              AND trade_time >= ?
+              AND trade_time <= ?
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ts_code, trade_time, freq
+                ORDER BY CASE source
+                    WHEN 'tushare' THEN 0
+                    WHEN 'tushare_rt' THEN 1
+                    ELSE 2
+                END
+            ) = 1
+            ORDER BY trade_time
+            """,
+            [ts_code, freq, start, end],
+        ).fetchdf()
+
+    def upsert_intraday_feature_snapshot(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        self._conn.register("ifs_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO intraday_feature_snapshot
+            (snapshot_id, ts_code, trade_date, as_of_time,
+             feature_set, lookback_days, payload, source)
+            SELECT snapshot_id, ts_code, trade_date, as_of_time,
+                   feature_set, lookback_days, CAST(payload AS JSON), source
+            FROM ifs_tmp
+            """
+        )
+        self._conn.unregister("ifs_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert intraday_feature_snapshot: {count} 行")
+        return count
+
+    # ── paper_position ──
+
+    def upsert_paper_position(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        payload = df.copy()
+        optional_cols = [
+            "exit_time", "exit_price", "exit_reason", "holding_trading_days",
+            "pnl_pct", "trailing_stop_price", "max_drawdown_pct",
+            "take_profit_basis", "feature_snapshot_id", "param_payload",
+        ]
+        for col in optional_cols:
+            if col not in payload.columns:
+                payload[col] = None
+        if "entry_price_raw" not in payload.columns:
+            payload["entry_price_raw"] = payload["entry_price"]
+        self._conn.register("pp_tmp", payload)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO paper_position
+            (position_id, trade_date, ts_code, name, pool,
+             entry_time, entry_price, entry_price_raw, entry_signal, candidate_id,
+             entry_level_price, entry_t_date, earliest_exit_date,
+             t_close, t_high, limit_up_price_next,
+             stop_loss_price, stop_loss_basis, stop_loss_pct,
+             take_profit_price, take_profit_pct, take_profit_basis, trailing_stop_pct,
+             trailing_stop_price, status, exit_time, exit_price, exit_reason,
+             holding_trading_days, pnl_pct, max_price_seen, max_drawdown_pct,
+             feature_snapshot_id, param_payload, updated_at)
+            SELECT position_id, trade_date, ts_code, name, pool,
+                   entry_time, entry_price, entry_price_raw, entry_signal, candidate_id,
+                   entry_level_price, entry_t_date, earliest_exit_date,
+                   t_close, t_high, limit_up_price_next,
+                   stop_loss_price, stop_loss_basis, stop_loss_pct,
+                   take_profit_price, take_profit_pct, take_profit_basis, trailing_stop_pct,
+                   trailing_stop_price, status, exit_time, exit_price, exit_reason,
+                   holding_trading_days, pnl_pct, max_price_seen, max_drawdown_pct,
+                   feature_snapshot_id, CAST(param_payload AS JSON), CURRENT_TIMESTAMP
+            FROM pp_tmp
+            """
+        )
+        self._conn.unregister("pp_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert paper_position: {count} 行")
+        return count
+
+    def query_active_paper_positions(self, trade_date: str | None = None) -> pd.DataFrame:
+        if trade_date:
+            return self._conn.execute(
+                """
+                SELECT * FROM paper_position
+                WHERE status = 'open'
+                  AND strftime(trade_date, '%Y-%m-%d') = ?
+                ORDER BY entry_time
+                """,
+                [trade_date],
+            ).fetchdf()
+        return self._conn.execute(
+            """
+            SELECT * FROM paper_position
+            WHERE status = 'open'
+            ORDER BY entry_time
+            """
+        ).fetchdf()
+
+    def upsert_paper_position_event(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        self._conn.register("ppe_tmp", df)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO paper_position_event
+            (event_id, position_id, event_time, event_type, price, size_pct, payload)
+            SELECT event_id, position_id, event_time, event_type,
+                   price, size_pct, CAST(payload AS JSON)
+            FROM ppe_tmp
+            """
+        )
+        self._conn.unregister("ppe_tmp")
+        count = len(df)
+        logger.info(f"DuckDB upsert paper_position_event: {count} 行")
+        return count
+
+    def query_paper_position_events(self, position_id: str) -> pd.DataFrame:
+        return self._conn.execute(
+            """
+            SELECT * FROM paper_position_event
+            WHERE position_id = ?
+            ORDER BY event_time
+            """,
+            [position_id],
+        ).fetchdf()
+
     def count_daily_basic(self, ts_code: str | None = None) -> int:
         if ts_code:
             result = self._conn.execute(
@@ -455,7 +790,35 @@ def _readonly_candidate_paths() -> list[Path]:
     return [settings.duckdb_path]
 
 
-def open_readonly_store() -> DuckDBStore:
+def _store_has_required_tables(
+    store: DuckDBStore,
+    required_tables: list[str] | tuple[str, ...] | None,
+) -> bool:
+    if not required_tables:
+        return True
+    rows = store._conn.execute(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'main'
+          AND table_name IN (
+        """
+        + ",".join("?" for _ in required_tables)
+        + ")",
+        list(required_tables),
+    ).fetchall()
+    existing = {row[0] for row in rows}
+    missing = set(required_tables) - existing
+    if missing:
+        logger.warning(f"只读库缺少表 {sorted(missing)}，尝试下一个候选库")
+        return False
+    return True
+
+
+def open_readonly_store(
+    *,
+    required_tables: list[str] | tuple[str, ...] | None = None,
+) -> DuckDBStore:
     """打开 DuckDBStore（read_only），优先副本，副本不可用降级主库。
 
     主库也撞锁时 raise duckdb.IOException，由 caller 渲染友好提示。
@@ -463,10 +826,19 @@ def open_readonly_store() -> DuckDBStore:
     paths = _readonly_candidate_paths()
     for p in paths[:-1]:
         try:
-            return DuckDBStore(p, read_only=True)
+            store = DuckDBStore(p, read_only=True)
+            if _store_has_required_tables(store, required_tables):
+                return store
+            store.close()
         except duckdb.IOException as e:
             logger.warning(f"副本打开失败 {p}: {e}，降级到主库 read_only")
-    return DuckDBStore(paths[-1], read_only=True)
+    store = DuckDBStore(paths[-1], read_only=True)
+    if not _store_has_required_tables(store, required_tables):
+        store.close()
+        raise duckdb.CatalogException(
+            f"required tables missing: {list(required_tables or [])}"
+        )
+    return store
 
 
 def open_readonly_connection() -> duckdb.DuckDBPyConnection:

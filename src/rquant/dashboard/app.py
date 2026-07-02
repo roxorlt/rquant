@@ -23,7 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from rquant.config import settings
-from rquant.storage.duckdb import open_readonly_connection
+from rquant.storage.duckdb import open_readonly_connection, open_readonly_store
 
 
 REFRESH_SECONDS = 30
@@ -180,6 +180,65 @@ def query_duckdb(sql: str, params: list | None = None) -> pd.DataFrame | None:
         return conn.execute(sql).fetchdf()
     finally:
         conn.close()
+
+
+@st.cache_data(ttl=120)
+def screen_result_date_bounds(
+    preset_name: str = "n-shape-pool1",
+) -> tuple[date | None, date | None]:
+    df = query_duckdb(
+        """
+        SELECT MIN(trade_date) AS min_date, MAX(trade_date) AS max_date
+        FROM screen_result
+        WHERE preset_name = ?
+        """,
+        [preset_name],
+    )
+    if df is None or df.empty or pd.isna(df.iloc[0]["min_date"]):
+        return None, None
+    min_date = df.iloc[0]["min_date"]
+    max_date = df.iloc[0]["max_date"]
+    return (
+        min_date.date() if hasattr(min_date, "date") else min_date,
+        max_date.date() if hasattr(max_date, "date") else max_date,
+    )
+
+
+@st.cache_data(ttl=120)
+def minute_data_overview() -> pd.DataFrame | None:
+    return query_duckdb(
+        """
+        SELECT COUNT(*) AS rows_count,
+               COUNT(DISTINCT ts_code) AS codes_count,
+               MIN(trade_time) AS min_time,
+               MAX(trade_time) AS max_time
+        FROM minute_bar
+        WHERE freq = '1min'
+          AND source = 'tushare'
+        """
+    )
+
+
+@st.cache_data(ttl=120)
+def strategy_compare_cached(
+    start_date: str,
+    end_date: str,
+    entry_modes: tuple[str, ...],
+    profile_variants: tuple[str, ...],
+    max_hold_days: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    from rquant.strategy_compare import run_entry_mode_comparison
+
+    with open_readonly_store() as store:
+        result = run_entry_mode_comparison(
+            store,
+            start_date=start_date,
+            end_date=end_date,
+            entry_modes=list(entry_modes),
+            profile_variants=list(profile_variants),
+            max_hold_days=max_hold_days,
+        )
+    return result.summary, result.trades, result.candidates_count
 
 
 @st.cache_data(ttl=10)
@@ -766,7 +825,213 @@ else:
     st.altair_chart(chart + text, use_container_width=True)
 
 
-# ── Section 6: 通知通道健康 ──
+# ── Section 6: 分钟策略实验室 ──
+
+
+st.markdown("## 🧪 分钟策略实验室")
+if db_locked_pid:
+    st.info("⏳ 等流水线完成")
+else:
+    bounds_min, bounds_max = screen_result_date_bounds()
+    overview = minute_data_overview()
+    if bounds_min is None or bounds_max is None:
+        st.info("暂无 Pool 1 日期范围")
+    else:
+        default_end = min(bounds_max, date(2026, 6, 22))
+        default_start = max(bounds_min, default_end - timedelta(days=21))
+        with st.container(border=True):
+            c1, c2, c3, c4, c5 = st.columns([1.0, 1.0, 0.9, 1.8, 2.2])
+            replay_start = c1.date_input(
+                "开始日期",
+                value=default_start,
+                min_value=bounds_min,
+                max_value=bounds_max,
+                key="replay_start",
+            )
+            replay_end = c2.date_input(
+                "结束日期",
+                value=default_end,
+                min_value=bounds_min,
+                max_value=bounds_max,
+                key="replay_end",
+            )
+            replay_hold = c3.number_input(
+                "持有交易日",
+                min_value=1,
+                max_value=10,
+                value=1,
+                step=1,
+                key="replay_hold",
+            )
+            mode_labels = {
+                "first_break": "第一次突破",
+                "break_retest": "突破回踩确认",
+                "late_confirm": "10:30后确认",
+                "vwap_confirm": "VWAP确认",
+                "amount_surge": "成交额突增",
+            }
+            selected_labels = c4.multiselect(
+                "入场模式",
+                list(mode_labels.values()),
+                default=list(mode_labels.values()),
+                key="replay_modes",
+            )
+            selected_modes = tuple(
+                key for key, label in mode_labels.items() if label in selected_labels
+            )
+            variant_labels = {
+                "baseline": "Baseline",
+                "vp_risk_only": "90日价量动态风控",
+                "vp_90": "90日价量过滤+风控",
+            }
+            selected_variant_labels = c5.multiselect(
+                "风控版本",
+                list(variant_labels.values()),
+                default=list(variant_labels.values()),
+                key="replay_profile_variants",
+            )
+            selected_variants = tuple(
+                key
+                for key, label in variant_labels.items()
+                if label in selected_variant_labels
+            )
+
+            if not selected_modes or not selected_variants:
+                st.warning("至少选择一个入场模式和一个风控版本")
+            else:
+                try:
+                    summary, trades, candidates_count = strategy_compare_cached(
+                        replay_start.isoformat(),
+                        replay_end.isoformat(),
+                        selected_modes,
+                        selected_variants,
+                        int(replay_hold),
+                    )
+                    m1, m2, m3, m4 = st.columns(4)
+                    total_trades = int(summary["trades"].sum()) if not summary.empty else 0
+                    m1.metric("候选数", candidates_count)
+                    m2.metric("触发交易", total_trades)
+                    if not trades.empty:
+                        m3.metric("平均收益", f"{trades['ret_pct'].mean():.2f}%")
+                        m4.metric("胜率", f"{(trades['ret_pct'] > 0).mean() * 100:.1f}%")
+                    else:
+                        m3.metric("平均收益", "—")
+                        m4.metric("胜率", "—")
+
+                    summary_display = summary.copy()
+                    summary_display["entry_mode"] = summary_display["entry_mode"].map(mode_labels)
+                    summary_display["profile_variant"] = summary_display[
+                        "profile_variant"
+                    ].map(variant_labels)
+                    summary_display = summary_display.rename(columns={
+                        "entry_mode": "入场模式",
+                        "profile_variant": "风控版本",
+                        "candidates": "候选",
+                        "trades": "交易",
+                        "trigger_rate_pct": "触发率%",
+                        "mean_ret_pct": "平均收益%",
+                        "median_ret_pct": "中位收益%",
+                        "win_rate_pct": "胜率%",
+                        "best_ret_pct": "最佳%",
+                        "worst_ret_pct": "最差%",
+                        "gap_stop_rate_pct": "跳空止损%",
+                    })
+                    st.dataframe(summary_display, hide_index=True, use_container_width=True)
+
+                    if not summary.empty:
+                        chart_df = summary.copy()
+                        chart_df["entry_mode"] = chart_df["entry_mode"].map(mode_labels)
+                        chart_df["profile_variant"] = chart_df["profile_variant"].map(
+                            variant_labels
+                        )
+                        chart_df["strategy_label"] = (
+                            chart_df["entry_mode"] + " / " + chart_df["profile_variant"]
+                        )
+                        compare_chart = (
+                            alt.Chart(chart_df)
+                            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+                            .encode(
+                                x=alt.X("strategy_label:N", title=None, sort=None),
+                                y=alt.Y("mean_ret_pct:Q", title="平均收益%"),
+                                color=alt.condition(
+                                    alt.datum.mean_ret_pct >= 0,
+                                    alt.value("#0f766e"),
+                                    alt.value("#b91c1c"),
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("entry_mode:N", title="模式"),
+                                    alt.Tooltip("profile_variant:N", title="风控"),
+                                    alt.Tooltip("trades:Q", title="交易"),
+                                    alt.Tooltip("mean_ret_pct:Q", title="平均收益%"),
+                                    alt.Tooltip("win_rate_pct:Q", title="胜率%"),
+                                    alt.Tooltip("gap_stop_rate_pct:Q", title="跳空止损%"),
+                                ],
+                            )
+                            .properties(height=180)
+                        )
+                        st.altair_chart(compare_chart, use_container_width=True)
+
+                    tab_trades, tab_exits, tab_data = st.tabs(["交易明细", "退出原因", "分钟数据"])
+                    with tab_trades:
+                        if trades.empty:
+                            st.info("所选区间没有触发交易")
+                        else:
+                            display = trades.copy()
+                            display["entry_mode"] = display["entry_mode"].map(mode_labels)
+                            display["profile_variant"] = display[
+                                "profile_variant"
+                            ].map(variant_labels)
+                            cols = [
+                                "entry_mode", "profile_variant",
+                                "signal_date", "ts_code", "name",
+                                "entry_time", "entry_price_raw", "entry_price",
+                                "stop_loss_basis", "take_profit_basis",
+                                "volume_profile_lookbacks", "volume_profile_rr",
+                                "exit_time", "exit_price", "exit_reason", "ret_pct",
+                            ]
+                            st.dataframe(
+                                display[[c for c in cols if c in display.columns]],
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+                    with tab_exits:
+                        if trades.empty:
+                            st.info("暂无退出分布")
+                        else:
+                            exits = (
+                                trades.groupby([
+                                    "entry_mode", "profile_variant", "exit_reason"
+                                ])
+                                .agg(n=("ts_code", "count"), mean_ret=("ret_pct", "mean"))
+                                .reset_index()
+                            )
+                            exits["entry_mode"] = exits["entry_mode"].map(mode_labels)
+                            exits["profile_variant"] = exits[
+                                "profile_variant"
+                            ].map(variant_labels)
+                            st.dataframe(exits, hide_index=True, use_container_width=True)
+                    with tab_data:
+                        if overview is None or overview.empty:
+                            st.info("暂无分钟线数据")
+                        else:
+                            row = overview.iloc[0]
+                            d1, d2, d3 = st.columns(3)
+                            d1.metric("分钟线行数", int(row["rows_count"]))
+                            d2.metric("覆盖股票", int(row["codes_count"]))
+                            d3.metric(
+                                "时间范围",
+                                f"{row['min_time']:%m-%d} → {row['max_time']:%m-%d}"
+                                if pd.notna(row["min_time"]) else "—",
+                            )
+                            st.caption(
+                                "90 日价量分布已接入入场过滤、止损、止盈和移动止盈参数；"
+                                "更完整的参数对比建议使用独立策略实验室页面。"
+                            )
+                except Exception as e:
+                    st.error(f"分钟策略对比失败: {e}")
+
+
+# ── Section 7: 通知通道健康 ──
 
 
 st.markdown("## 📨 通知通道")

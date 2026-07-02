@@ -225,6 +225,35 @@ class TestDailyState:
         assert df.iloc[0]["trade_date"] == "2024-01-03"
 
 
+class TestMoneyflowDaily:
+    def test_upsert_and_query_moneyflow_daily(self, tmp_store: DuckDBStore) -> None:
+        df = pd.DataFrame([
+            {
+                "ts_code": "300001.SZ",
+                "trade_date": date(2026, 6, 26),
+                "buy_lg_vol": 1200.0,
+                "sell_lg_vol": 700.0,
+                "buy_elg_vol": 500.0,
+                "sell_elg_vol": 100.0,
+                "large_net_vol": 900.0,
+                "large_net_amount": 1234.56,
+                "source": "tushare",
+            }
+        ])
+
+        assert tmp_store.upsert_moneyflow_daily(df) == 1
+        assert tmp_store.upsert_moneyflow_daily(df) == 1
+
+        out = tmp_store.query_moneyflow_daily(date(2026, 6, 26))
+        assert len(out) == 1
+        assert out.iloc[0]["ts_code"] == "300001.SZ"
+        assert out.iloc[0]["large_net_vol"] == 900.0
+        assert out.iloc[0]["large_net_amount"] == 1234.56
+
+    def test_empty_moneyflow_daily_returns_zero(self, tmp_store: DuckDBStore) -> None:
+        assert tmp_store.upsert_moneyflow_daily(pd.DataFrame()) == 0
+
+
 class TestDailyBasic:
     def _basic_df(self) -> pd.DataFrame:
         return pd.DataFrame(

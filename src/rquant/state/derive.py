@@ -48,8 +48,13 @@ def _classify_board(ts_code: str) -> str:
 
 
 def _detect_st(name: str | None) -> bool:
-    """从股票名称判断是否 ST。覆盖 ST / *ST / SST 前缀（含空格）。"""
-    if not name:
+    """从股票名称判断是否 ST。覆盖 ST / *ST / SST 前缀（含空格）。
+
+    name 可能是 DataFrame join 出来的 NaN（float）：stock_basic 只存当前
+    上市（list_status=L），历史区间里已退市的票 join 不到名字（7/2 长区间
+    回补真实崩过）。非 str 一律按非 ST 处理。
+    """
+    if not isinstance(name, str) or not name:
         return False
     n = name.upper().replace(" ", "").replace("\u3000", "")
     return n.startswith(("ST", "*ST", "SST"))
