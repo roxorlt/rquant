@@ -17,6 +17,23 @@ CREATE TABLE IF NOT EXISTS daily_bar (
 );
 """
 
+INDEX_DAILY_BAR_DDL = """
+CREATE TABLE IF NOT EXISTS index_daily_bar (
+    ts_code     VARCHAR NOT NULL,
+    trade_date  DATE    NOT NULL,
+    open        DOUBLE,
+    high        DOUBLE,
+    low         DOUBLE,
+    close       DOUBLE,
+    pre_close   DOUBLE,
+    change      DOUBLE,
+    pct_chg     DOUBLE,
+    vol         DOUBLE,
+    amount      DOUBLE,
+    PRIMARY KEY (ts_code, trade_date)
+);
+"""
+
 STOCK_BASIC_DDL = """
 CREATE TABLE IF NOT EXISTS stock_basic (
     ts_code     VARCHAR PRIMARY KEY,
@@ -92,6 +109,44 @@ CREATE TABLE IF NOT EXISTS daily_basic (
 );
 """
 
+MONEYFLOW_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS moneyflow_daily (
+    ts_code          VARCHAR NOT NULL,
+    trade_date       DATE    NOT NULL,
+    buy_lg_vol       DOUBLE,
+    sell_lg_vol      DOUBLE,
+    buy_elg_vol      DOUBLE,
+    sell_elg_vol     DOUBLE,
+    large_net_vol    DOUBLE,
+    large_net_amount DOUBLE,
+    source           VARCHAR DEFAULT 'tushare',
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ts_code, trade_date, source)
+);
+"""
+
+MARKET_SENTIMENT_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS market_sentiment_daily (
+    trade_date                   DATE PRIMARY KEY,
+    stock_count                  INTEGER,
+    up_count                     INTEGER,
+    down_count                   INTEGER,
+    flat_count                   INTEGER,
+    limit_up_count               INTEGER,
+    first_limit_up_count         INTEGER,
+    limit_down_count             INTEGER,
+    yiziban_count                INTEGER,
+    max_consecutive_limit_ups    INTEGER,
+    high_board_count             INTEGER,
+    up_ratio_pct                 DOUBLE,
+    limit_up_ratio_pct           DOUBLE,
+    avg_pct_chg                  DOUBLE,
+    median_pct_chg               DOUBLE,
+    total_amount                 DOUBLE,
+    created_at                   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 SCREEN_RESULT_DDL = """
 CREATE TABLE IF NOT EXISTS screen_result (
     trade_date    DATE    NOT NULL,
@@ -141,6 +196,115 @@ CREATE TABLE IF NOT EXISTS monitor_event (
 );
 """
 
+AUCTION_BAR_DDL = """
+CREATE TABLE IF NOT EXISTS auction_bar (
+    ts_code       VARCHAR NOT NULL,
+    trade_date    DATE    NOT NULL,
+    auction_type  VARCHAR NOT NULL,
+    price         DOUBLE,
+    vol           DOUBLE,
+    amount        DOUBLE,
+    turnover_rate DOUBLE,
+    volume_ratio  DOUBLE,
+    source        VARCHAR DEFAULT 'tushare',
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ts_code, trade_date, auction_type, source)
+);
+"""
+
+MINUTE_BAR_DDL = """
+CREATE TABLE IF NOT EXISTS minute_bar (
+    ts_code     VARCHAR   NOT NULL,
+    trade_time  TIMESTAMP NOT NULL,
+    freq        VARCHAR   NOT NULL,
+    open        DOUBLE,
+    high        DOUBLE,
+    low         DOUBLE,
+    close       DOUBLE,
+    vol         DOUBLE,
+    amount      DOUBLE,
+    source      VARCHAR   DEFAULT 'tushare',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ts_code, trade_time, freq, source)
+);
+"""
+
+INTRADAY_FEATURE_SNAPSHOT_DDL = """
+CREATE TABLE IF NOT EXISTS intraday_feature_snapshot (
+    snapshot_id   VARCHAR   PRIMARY KEY,
+    ts_code       VARCHAR   NOT NULL,
+    trade_date    DATE      NOT NULL,
+    as_of_time    TIMESTAMP NOT NULL,
+    feature_set   VARCHAR   NOT NULL,
+    lookback_days INTEGER,
+    payload       JSON,
+    source        VARCHAR,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+PAPER_POSITION_DDL = """
+CREATE TABLE IF NOT EXISTS paper_position (
+    position_id          VARCHAR PRIMARY KEY,
+    trade_date           DATE      NOT NULL,
+    ts_code              VARCHAR   NOT NULL,
+    name                 VARCHAR,
+    pool                 VARCHAR,
+    entry_time           TIMESTAMP NOT NULL,
+    entry_price          DOUBLE    NOT NULL,
+    entry_price_raw      DOUBLE,
+    entry_signal         VARCHAR   NOT NULL,
+    candidate_id         VARCHAR   NOT NULL,
+    entry_level_price    DOUBLE,
+    entry_t_date         DATE,
+    earliest_exit_date   DATE      NOT NULL,
+    t_close              DOUBLE,
+    t_high               DOUBLE,
+    limit_up_price_next  DOUBLE,
+    stop_loss_price      DOUBLE    NOT NULL,
+    stop_loss_basis      VARCHAR   NOT NULL,
+    stop_loss_pct        DOUBLE    NOT NULL,
+    take_profit_price    DOUBLE,
+    take_profit_pct      DOUBLE,
+    take_profit_basis    VARCHAR,
+    trailing_stop_pct    DOUBLE,
+    trailing_stop_price  DOUBLE,
+    status               VARCHAR   NOT NULL,
+    exit_time            TIMESTAMP,
+    exit_price           DOUBLE,
+    exit_reason          VARCHAR,
+    holding_trading_days INTEGER,
+    pnl_pct              DOUBLE,
+    max_price_seen       DOUBLE,
+    max_drawdown_pct     DOUBLE,
+    feature_snapshot_id  VARCHAR,
+    param_payload        JSON,
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL = """
+ALTER TABLE paper_position ADD COLUMN IF NOT EXISTS entry_price_raw DOUBLE;
+"""
+
+PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL = """
+ALTER TABLE paper_position ADD COLUMN IF NOT EXISTS take_profit_basis VARCHAR;
+"""
+
+PAPER_POSITION_EVENT_DDL = """
+CREATE TABLE IF NOT EXISTS paper_position_event (
+    event_id    VARCHAR   PRIMARY KEY,
+    position_id VARCHAR   NOT NULL,
+    event_time  TIMESTAMP NOT NULL,
+    event_type  VARCHAR   NOT NULL,
+    price       DOUBLE,
+    size_pct    DOUBLE,
+    payload     JSON,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 # notification_log 表已弃用（v0.13.x），迁移到 logs/notification_log.jsonl 文件
 # 5/22 真实事故：手动跑 push 在盘中（monitor 持写锁）写表撞 IOError 丢日志
 # 云端旧表保留备查不强制 drop；新写入走 rquant.notify.log.append（JSONL append-only）
@@ -161,8 +325,12 @@ CREATE TABLE IF NOT EXISTS risk_blacklist (
 """
 
 ALL_DDL = [
-    DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
+    DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
+    MONEYFLOW_DAILY_DDL, MARKET_SENTIMENT_DAILY_DDL,
     SCREEN_RESULT_DDL, POOL2_WATCH_DDL, MONITOR_EVENT_DDL,
+    AUCTION_BAR_DDL, MINUTE_BAR_DDL, INTRADAY_FEATURE_SNAPSHOT_DDL,
+    PAPER_POSITION_DDL, PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL,
+    PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL, PAPER_POSITION_EVENT_DDL,
     RISK_BLACKLIST_DDL,
 ]

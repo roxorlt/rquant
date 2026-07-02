@@ -1,7 +1,7 @@
-"""每日数据拉取：stock_basic → daily_bar → daily_basic → derive_state。
+"""每日数据拉取：stock_basic → daily_bar → adj_factor → daily_basic → derive_state。
 
 按 trade_date 模式拉全市场，适合每日自动化。
-跳过 adj_factor 和 indicators（当前筛选预设不依赖）。
+跳过 indicators（当前筛选预设不依赖）。
 """
 
 from __future__ import annotations
@@ -13,11 +13,20 @@ import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
+from rquant.market_context import sync_market_sentiment
 from rquant.state import derive_state
 from rquant.storage import DuckDBStore
 
 # Tushare 接口限流：~120ms 间隔
 _API_SLEEP = 0.15
+MARKET_INDEX_CODES = (
+    "000001.SH",  # 上证指数
+    "399001.SZ",  # 深证成指
+    "399006.SZ",  # 创业板指
+    "000300.SH",  # 沪深300
+    "000905.SH",  # 中证500
+    "000852.SH",  # 中证1000
+)
 
 
 def ingest_daily(trade_date: str, store: DuckDBStore | None = None) -> int:
@@ -57,7 +66,59 @@ def ingest_daily(trade_date: str, store: DuckDBStore | None = None) -> int:
         logger.info(f"daily_bar: {bar_count} 行")
         time.sleep(_API_SLEEP)
 
-        # 3. daily_basic（流通市值、换手率等）
+        # 3. index_daily_bar（市场指数状态）
+        logger.info(f"拉取 index_daily {trade_date}...")
+        index_frames: list[pd.DataFrame] = []
+        for index_code in MARKET_INDEX_CODES:
+            try:
+                index_df = pro.index_daily(
+                    ts_code=index_code,
+                    start_date=ds,
+                    end_date=ds,
+                )
+            except Exception as e:
+                logger.warning(f"index_daily {index_code} {trade_date} 拉取失败: {e}")
+                continue
+            if index_df is not None and not index_df.empty:
+                index_frames.append(index_df)
+            time.sleep(_API_SLEEP)
+        if index_frames:
+            df_index = pd.concat(index_frames, ignore_index=True)
+            df_index["trade_date"] = pd.to_datetime(
+                df_index["trade_date"], format="%Y%m%d"
+            ).dt.date
+            store.upsert_index_daily(df_index)
+            logger.info(f"index_daily_bar: {len(df_index)} 行")
+        else:
+            logger.warning(f"index_daily {trade_date} 返回空")
+
+        # 4. adj_factor（复权因子，供分钟价量分布跨除权/分红价位归一）
+        logger.info(f"拉取 adj_factor {trade_date}...")
+        try:
+            df_factor = pro.adj_factor(trade_date=ds)
+        except Exception as e:
+            df_factor = None
+            logger.warning(f"adj_factor {trade_date} 拉取失败，今日复权因子跳过: {e}")
+        if df_factor is not None and not df_factor.empty:
+            factor_cols = ["ts_code", "trade_date", "adj_factor"]
+            required_factor_cols = set(factor_cols)
+            if required_factor_cols.issubset(df_factor.columns):
+                df_factor = df_factor[factor_cols].copy()
+                df_factor["trade_date"] = pd.to_datetime(
+                    df_factor["trade_date"], format="%Y%m%d"
+                ).dt.date
+                store.upsert_adj_factor(df_factor)
+                logger.info(f"adj_factor: {len(df_factor)} 行")
+            else:
+                logger.warning(
+                    f"adj_factor {trade_date} 返回缺字段，跳过: "
+                    f"{sorted(required_factor_cols - set(df_factor.columns))}"
+                )
+        else:
+            logger.warning(f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子")
+        time.sleep(_API_SLEEP)
+
+        # 5. daily_basic（流通市值、换手率等）
         logger.info(f"拉取 daily_basic {trade_date}...")
         df_basic_mkt = pro.daily_basic(
             trade_date=ds,
@@ -79,7 +140,7 @@ def ingest_daily(trade_date: str, store: DuckDBStore | None = None) -> int:
                 f"市值类筛选今日将失效；稍后可 `rquant run-daily {trade_date}` 重拉"
             )
 
-        # 4. derive_state（逐只派生涨停/首板/连板等）
+        # 6. derive_state（逐只派生涨停/首板/连板等）
         basic_map = {r["ts_code"]: r["name"] for _, r in df_basic.iterrows()}
         codes = df_daily["ts_code"].unique().tolist()
         logger.info(f"派生 state: {len(codes)} 只...")
@@ -98,6 +159,8 @@ def ingest_daily(trade_date: str, store: DuckDBStore | None = None) -> int:
                 logger.info(f"  state: {i + 1}/{len(codes)}")
 
         logger.info(f"state 完成: {total_state} 行, {len(codes)} 只")
+        sentiment_rows = sync_market_sentiment(store, trade_date)
+        logger.info(f"market_sentiment_daily: {sentiment_rows} 行")
         return bar_count
 
     finally:

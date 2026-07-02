@@ -135,6 +135,47 @@ class TestRunDailyPipeline:
         assert len(sr) == 1
         assert sr.iloc[0]["ts_code"] == "000001.SZ"
 
+    def test_can_run_minute_context_backfill_after_pool1_screen(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('600000.SH', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
+        )
+        mock_df = pd.DataFrame({
+            "ts_code": ["600000.SH"],
+            "name": ["浦发银行"],
+            "CLOSE[0]": [10.5],
+            "PCT_CHG[0]": [5.0],
+        })
+        test_presets = {
+            "n-shape-pool1": ScreenPreset(
+                name="n-shape-pool1", description="test", rules=[not_st()],
+            ),
+        }
+
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", test_presets),
+            patch("rquant.pipeline.screen", return_value=mock_df),
+            patch("rquant.pipeline._sync_pool2_watch"),
+            patch("rquant.monitor.check_exits"),
+            patch("rquant.pipeline._push_daily_summary"),
+            patch("rquant.pipeline._run_minute_context_backfill") as mock_backfill,
+        ):
+            run_daily_pipeline(
+                "2026-04-18",
+                store=store,
+                minute_backfill=True,
+                minute_backfill_lookback_days=90,
+            )
+
+        mock_backfill.assert_called_once_with(
+            store,
+            "2026-04-18",
+            lookback_days=90,
+            freq="1min",
+        )
+
     def test_specific_preset_only(self, store: DuckDBStore) -> None:
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
@@ -409,3 +450,71 @@ class TestDailySummaryPush:
         assert len(kwargs["pool2_active"]) == 1
         assert kwargs["pool2_active"][0]["name"] == "海康威视"
         assert kwargs["duration_seconds"] >= 0
+
+
+class TestPipelineFaultIsolation:
+    """preset 故障隔离 + check_exits 兜底不被跳过（审计 PR1-A）。"""
+
+    def test_failing_preset_does_not_block_others_or_check_exits(
+        self, store: DuckDBStore
+    ) -> None:
+        from unittest.mock import patch
+
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000001.SZ', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
+        )
+        good_df = pd.DataFrame({
+            "ts_code": ["000001.SZ"], "name": ["x"],
+            "CLOSE[0]": [10.5], "PCT_CHG[0]": [5.0],
+        })
+        presets = {
+            "bad": ScreenPreset(name="bad", description="", rules=[not_st()]),
+            "good": ScreenPreset(name="good", description="", rules=[not_st()]),
+        }
+
+        calls = []
+
+        def screen_mock(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyError("BODY_UPPER[1]")  # 模拟某 preset 引用缺失列
+            return good_df
+
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", presets),
+            patch("rquant.pipeline.screen", side_effect=screen_mock),
+            patch("rquant.pipeline._sync_pool2_watch"),
+            patch("rquant.monitor.check_exits") as mock_ce,
+            patch("rquant.pipeline._push_daily_summary"),
+            patch("rquant.notify.notify"),
+        ):
+            result = run_daily_pipeline("2026-04-18", store=store)
+
+        # bad 失败标 -1，good 正常命中，互不影响
+        assert result["bad"] == -1
+        assert result["good"] == 1
+        # check_exits 兜底仍被调用（没被 preset 失败连带跳过）
+        mock_ce.assert_called_once()
+
+    def test_sync_pool2_failure_does_not_skip_check_exits(
+        self, store: DuckDBStore
+    ) -> None:
+        from unittest.mock import patch
+
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('000001.SZ', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
+        )
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", {}),
+            patch("rquant.pipeline.screen", return_value=pd.DataFrame()),
+            patch("rquant.pipeline._sync_pool2_watch", side_effect=RuntimeError("boom")),
+            patch("rquant.monitor.check_exits") as mock_ce,
+            patch("rquant.pipeline._push_daily_summary"),
+            patch("rquant.notify.notify"),
+        ):
+            run_daily_pipeline("2026-04-18", store=store)
+
+        # _sync_pool2_watch 崩了，check_exits 仍必须跑
+        mock_ce.assert_called_once()

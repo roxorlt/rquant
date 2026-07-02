@@ -46,6 +46,8 @@ class TestDetectST:
             ("SST 某某", True),
             ("", False),
             (None, False),
+            # 退市票 join 不到 stock_basic，名字是 NaN（float）——7/2 长区间回补真实崩过
+            (float("nan"), False),
         ],
     )
     def test_detect(self, name: str | None, expected: bool) -> None:

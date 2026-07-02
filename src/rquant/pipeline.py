@@ -153,10 +153,45 @@ def _sync_pool2_watch(store: DuckDBStore, trade_date: str) -> None:
         logger.info(f"pool2_watch 新增 {len(new_rows)} 只")
 
 
+def _notify_error_safe(component: str, exc: BaseException) -> None:
+    """推 error 通知，自身失败也不抛——避免"错误处理再出错"二次中断流程。"""
+    try:
+        from rquant.notify import notify
+
+        notify("error", component=component, exc=exc)
+    except Exception:
+        logger.exception(f"notify error 失败 ({component})")
+
+
+def _run_minute_context_backfill(
+    store: DuckDBStore,
+    trade_date: str,
+    *,
+    lookback_days: int = 90,
+    freq: str = "1min",
+) -> None:
+    """日终筛选完成后回补当日 Pool1 的 90 日分钟上下文。"""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.intraday_backfill import backfill_pool1_minute_context
+
+    summary = backfill_pool1_minute_context(
+        store,
+        TushareAdapter(),
+        screen_date=trade_date,
+        lookback_days=lookback_days,
+        freq=freq,
+        preset_name="n-shape-pool1",
+    )
+    logger.info(f"日终分钟上下文回补完成: {summary.model_dump()}")
+
+
 def run_daily_pipeline(
     trade_date: str,
     preset_names: list[str] | None = None,
     store: DuckDBStore | None = None,
+    minute_backfill: bool | None = None,
+    minute_backfill_lookback_days: int = 90,
+    minute_backfill_freq: str = "1min",
 ) -> dict[str, int]:
     """遍历预设筛选并落库，返回 {preset_name: 命中数}。
 
@@ -167,6 +202,7 @@ def run_daily_pipeline(
 
     owns_store = store is None
     store = store or DuckDBStore()
+    should_minute_backfill = owns_store if minute_backfill is None else minute_backfill
     started_at = _time.time()
 
     try:
@@ -191,84 +227,118 @@ def run_daily_pipeline(
             )
 
         for name in order:
-            preset = PRESET_SCREENS[name]
-            ts_whitelist: list[str] | None = None
+            # 单个 preset 故障隔离：某 preset 抛异常（规则引用缺失列、聚合 SQL 报错、
+            # user preset 规则坏掉等）不应拖垮其他 preset，更不能跳过后面的
+            # _sync_pool2_watch / check_exits（那会连带打掉 check_exits 兜底）。
+            try:
+                preset = PRESET_SCREENS[name]
+                ts_whitelist: list[str] | None = None
 
-            if preset.depends_on:
-                # offset_days=N 表示合并 T-1 到 T-N 的父预设结果
-                ts_whitelist = []
-                parent_dates = []
-                for offset in range(1, preset.offset_days + 1):
-                    parent_date = _get_prev_trading_date(
-                        store, trade_date, offset
-                    )
-                    if parent_date is None:
+                if preset.depends_on:
+                    # offset_days=N 表示合并 T-1 到 T-N 的父预设结果
+                    ts_whitelist = []
+                    parent_dates = []
+                    for offset in range(1, preset.offset_days + 1):
+                        parent_date = _get_prev_trading_date(
+                            store, trade_date, offset
+                        )
+                        if parent_date is None:
+                            continue
+                        parent_df = store.query_screen_result(
+                            parent_date, preset.depends_on
+                        )
+                        if not parent_df.empty:
+                            ts_whitelist.extend(parent_df["ts_code"].tolist())
+                            parent_dates.append(parent_date)
+
+                    ts_whitelist = list(set(ts_whitelist))  # 去重
+
+                    if not ts_whitelist:
+                        logger.info(
+                            f"{name}: 父预设 {preset.depends_on} "
+                            f"在 T-1~T-{preset.offset_days} 无命中，跳过"
+                        )
+                        summary[name] = 0
                         continue
-                    parent_df = store.query_screen_result(
-                        parent_date, preset.depends_on
-                    )
-                    if not parent_df.empty:
-                        ts_whitelist.extend(parent_df["ts_code"].tolist())
-                        parent_dates.append(parent_date)
 
-                ts_whitelist = list(set(ts_whitelist))  # 去重
-
-                if not ts_whitelist:
                     logger.info(
-                        f"{name}: 父预设 {preset.depends_on} "
-                        f"在 T-1~T-{preset.offset_days} 无命中，跳过"
+                        f"{name}: 从 {parent_dates} 合并 "
+                        f"{len(ts_whitelist)} 只白名单"
                     )
-                    summary[name] = 0
-                    continue
 
-                logger.info(
-                    f"{name}: 从 {parent_dates} 合并 "
-                    f"{len(ts_whitelist)} 只白名单"
+                result_df = screen(
+                    trade_date=trade_date,
+                    rules=preset.rules,
+                    include_columns=preset.include_columns or None,
+                    store=store,
+                    ts_code_whitelist=ts_whitelist,
                 )
 
-            result_df = screen(
-                trade_date=trade_date,
-                rules=preset.rules,
-                include_columns=preset.include_columns or None,
-                store=store,
-                ts_code_whitelist=ts_whitelist,
-            )
+                sr_df = _to_screen_result_df(result_df, trade_date, name)
 
-            sr_df = _to_screen_result_df(result_df, trade_date, name)
+                if blacklist and not sr_df.empty:
+                    hit_mask = sr_df["ts_code"].isin(blacklist.keys())
+                    if hit_mask.any():
+                        removed = sr_df.loc[hit_mask, "ts_code"].tolist()
+                        sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
+                        logger.warning(
+                            f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}"
+                        )
 
-            if blacklist and not sr_df.empty:
-                hit_mask = sr_df["ts_code"].isin(blacklist.keys())
-                if hit_mask.any():
-                    removed = sr_df.loc[hit_mask, "ts_code"].tolist()
-                    sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
-                    logger.warning(
-                        f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}"
-                    )
+                store.upsert_screen_result(sr_df)
 
-            store.upsert_screen_result(sr_df)
+                hit_count = len(sr_df)
+                summary[name] = hit_count
+                logger.info(f"  {name}: {hit_count} 命中")
+            except Exception as e:
+                summary[name] = -1  # -1 标记该 preset 失败，区别于 0 命中
+                logger.exception(f"preset {name} 执行失败，跳过，继续后续 preset")
+                _notify_error_safe(f"pipeline:preset:{name}", e)
+                continue
 
-            hit_count = len(sr_df)
-            summary[name] = hit_count
-            logger.info(f"  {name}: {hit_count} 命中")
+        # 同步 Pool 2 到持久池（新涨停的票入池）— 独立隔离
+        try:
+            _sync_pool2_watch(store, trade_date)
+        except Exception as e:
+            logger.exception("_sync_pool2_watch 失败")
+            _notify_error_safe("pipeline:sync_pool2", e)
 
-        # 同步 Pool 2 到持久池（新涨停的票入池）
-        _sync_pool2_watch(store, trade_date)
+        if should_minute_backfill:
+            try:
+                _run_minute_context_backfill(
+                    store,
+                    trade_date,
+                    lookback_days=minute_backfill_lookback_days,
+                    freq=minute_backfill_freq,
+                )
+            except Exception as e:
+                logger.exception("_run_minute_context_backfill 失败")
+                _notify_error_safe("pipeline:minute_backfill", e)
 
         # Pool 2 退出检查（兜底）：原本由 monitor 15:00 收盘后跑，但 monitor 在盘中
         # 被 deploy / watchdog 等 restart 时 SIGTERM 中断会跳过 check_exits，导致
         # aged_out（超过 pool2_max_age_days）和 breakdown（跌破止损）的票留在池里。
         # daily 17:00 是 oneshot timer 必跑，作为可靠兜底。重复执行无副作用：
         # 已 exited 的不会再出现在 active，check_exits 内部按 active 池过滤。
-        from datetime import date as _date
+        try:
+            from datetime import date as _date
 
-        from rquant.monitor import check_exits
+            from rquant.monitor import check_exits
 
-        check_exits(store, _date.fromisoformat(trade_date))
+            check_exits(store, _date.fromisoformat(trade_date))
+        except Exception as e:
+            logger.exception("check_exits 失败")
+            _notify_error_safe("pipeline:check_exits", e)
 
         elapsed = _time.time() - started_at
         logger.info(f"流水线完成 {trade_date}: {summary} (耗时 {elapsed:.1f}s)")
 
-        _push_daily_summary(store, trade_date, elapsed)
+        # 推送失败不应影响 pipeline 退出码（数据已落库，推送是旁路）
+        try:
+            _push_daily_summary(store, trade_date, elapsed)
+        except Exception as e:
+            logger.exception("_push_daily_summary 失败")
+            _notify_error_safe("pipeline:push_summary", e)
 
         return summary
     finally:
@@ -311,7 +381,7 @@ def _push_daily_summary(
             f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})",
             codes,
         ).fetchdf()
-        name_map = dict(zip(name_df["ts_code"], name_df["name"]))
+        name_map = dict(zip(name_df["ts_code"], name_df["name"], strict=False))
 
         from datetime import date as _date
         today = _date.fromisoformat(trade_date)

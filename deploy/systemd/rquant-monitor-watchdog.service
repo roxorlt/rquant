@@ -1,6 +1,10 @@
 [Unit]
 Description=rQuant Monitor Watchdog (re-arm if dead during trading hours)
 After=rquant-monitor.service
+# watchdog 是盘中 monitor 死亡的唯一自愈通道，它自己若早期崩溃（如 set -u 下
+# systemctl show 异常）会静默失效，monitor 真死时无人重启。OnFailure 与 watchdog
+# 链无关（alert 是独立 oneshot），原注释"不应触发 watchdog 链"是误解（PR2-J）。
+OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -10,7 +14,6 @@ WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
 ExecStart=/home/lighthouse/rquant/scripts/monitor-watchdog.sh
 
-# watchdog 自身失败不应再触发 watchdog 链，简单 oneshot
 TimeoutStartSec=60
 StandardOutput=journal
 StandardError=journal

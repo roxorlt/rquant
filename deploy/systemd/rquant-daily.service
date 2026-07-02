@@ -12,7 +12,16 @@ User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
-ExecStart=/home/lighthouse/rquant/.venv/bin/rquant run-daily
+
+# --skip-minute-backfill：云端不做分钟级研究，不给 Pool 标的回补 90 日 stk_mins。
+# 分钟历史只在本地 mac 按需回补，避免主库体积沿 replica-sync（每 5min 整库 cp）、
+# backup、本地热备下载三条整库拷贝链路放大。
+#
+# 已确认接受的运营风险（不改逻辑，仅记录）：
+# - 盘中 monitor 每 5s 写 minute_bar 后，replica-sync 的 cp 撞写概率增大，
+#   只读副本盘中滞后可能超 5min（verify 步骤兜底不会撕裂，只是滞后）
+# - daily 若因网络重试拖过 17:30，当晚 replica/backup 停在旧数据（次日自愈）
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant run-daily --skip-minute-backfill
 
 # 不自动重启（timer 下次触发会再来；oneshot 失败有 PushDeer D 类告警）
 Restart=no

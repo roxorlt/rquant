@@ -30,6 +30,10 @@ _LEVEL_LABELS = {
     "20": "20%",
     "strong": "强止",
     "weak": "弱止",
+    "attack_open_strength": "开盘强",
+    "attack_strong_carry": "强承接",
+    "attack_break_high": "突破T高",
+    "attack_near_limit": "临近涨停",
 }
 
 
@@ -54,13 +58,14 @@ def _build_price_level(
 ) -> tuple[str, str]:
     """A. 档位触发。"""
     label = _LEVEL_LABELS.get(level, level)
+    kind = "信号" if level.startswith("attack_") else "档"
     prefix = f"[{blacklist_label}] " if blacklist_label else ""
-    title = f"{prefix}{ts_code} {name} {label}档 ¥{trigger_price:.2f}"
+    title = f"{prefix}{ts_code} {name} {label}{kind} ¥{trigger_price:.2f}"
 
     entry_str = str(entry_date)[:10]
     date_label = "入池" if pool == "pool2" else "涨停"
     body_lines = [
-        f"# {ts_code} | {label}档触发 | 现价 ¥{trigger_price:.2f}",
+        f"# {ts_code} | {label}{kind}触发 | 现价 ¥{trigger_price:.2f}",
     ]
     if blacklist_label:
         cat_text = "、".join(blacklist_categories or []) if blacklist_categories else ""
