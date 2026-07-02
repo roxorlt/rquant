@@ -38,6 +38,11 @@ ENTRY_FEATURES: list[str] = [
     "entry_signal_amount_accel_5m",
     "entry_signal_amount_accel_10m",
     "entry_minute",
+    # T-1 日市场温度（join market_sentiment_daily，入场时点可知）
+    "mkt_high_60d_ratio_pct",
+    "mkt_above_ma20_ratio_pct",
+    "mkt_limit_up_count",
+    "mkt_up_ratio_pct",
 ]
 
 MIN_TRAIN_TRADES = 120  # 过滤后训练段最少笔数，低于此视为样本不足
@@ -82,6 +87,9 @@ def outcome_table(df: pd.DataFrame) -> pd.DataFrame:
 def univariate_table(train: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for f in ENTRY_FEATURES:
+        if f not in train.columns:
+            rows.append((f, 0, np.nan, np.nan, np.nan, "列不存在"))
+            continue
         s = pd.to_numeric(train[f], errors="coerce")
         valid = s.notna()
         n = int(valid.sum())
@@ -124,7 +132,8 @@ def search_rules(
     usable = [
         f
         for f in ENTRY_FEATURES
-        if pd.to_numeric(train[f], errors="coerce").notna().sum() >= MIN_VALID_COVERAGE
+        if f in train.columns
+        and pd.to_numeric(train[f], errors="coerce").notna().sum() >= MIN_VALID_COVERAGE
     ]
     quantiles = [0.2, 0.4, 0.6, 0.8]
     candidates: list[list[tuple[str, str, float]]] = []
