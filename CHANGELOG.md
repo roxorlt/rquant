@@ -6,6 +6,34 @@
 
 ### Added
 
+- **本地热备与研究库分家（`rquant research-sync`）**：云端快照改落
+  `data/cloud_backup.duckdb` 纯备份工件，不再整文件替换本地主库；生产表
+  （daily_bar/screen_result 等 9 张）从备份整表替换，研究表（minute_bar/
+  auction_bar/模拟盘等 9 张）按主键 merge，本地研究数据永不被热备冲掉。
+  支持 `--restore-from` 从旧副本恢复研究表；合并后原子刷新本地只读副本。
+- **盘中实时源紧急回退开关**：`INTRADAY_QUOTE_SOURCE=akshare` 可在不改代码
+  的情况下把 monitor 实时源从 Tushare rt_min 切回 akshare（权限到期/故障
+  止损用），默认 `tushare`。
+- **Strategy Lab 后台任务**：新增 `rquant lab-run --spec` 后台执行入口与
+  `strategy_lab_worker` 状态文件机制，自动优化可提交为后台任务、可取消，
+  关掉浏览器不再丢结果；「历史记录」页签可查看/管理后台任务。
+
+### Changed
+
+- **Strategy Lab 交互重构一期**：收益对比/交易明细/退出原因结果进
+  `st.session_state`（切页签不再丢）；收益对比结果同样落盘到历史记录；
+  sidebar 与自动优化/科创放量参数区包进 `st.form`（改参数不再整页刷新）；
+  自动优化默认值改为小跑组合（持有期 1/2/3 + 基础评分画像）。
+
+### Fixed
+
+- **7/2 本地主库损坏事故根治**：`sync-from-cloud.sh` 整文件替换主库导致
+  盘中 monitor 写入丢进幽灵 inode、残留 WAL 代际错配打不开库。下载与合并
+  分离后杜绝；`research-sync` 内置陈旧 WAL 抢救（挪 `.corrupt-<ts>.bak`
+  后重试）与副本撕裂防护（主库有活跃 WAL 时拒绝刷新副本）。
+- 卸载本地僵尸 LaunchAgent `com.roxor.rquant`（`serve --hour 17` 与云端
+  daily 重复跑、重复推送，2026-05-20 起残留）。
+
 - **Tushare 全量接口审计与接入目录**：新增官方文档抓取脚本和结构化接口目录，
   用 `TUSHARE_COOKIE` 抓取 268 个文档入口、合并 MCP 元数据，并将 141 个
   A 股可调用接口转成 `tushare_interface_catalog`，按已接入、盘中/竞价、

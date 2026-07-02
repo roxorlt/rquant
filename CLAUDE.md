@@ -195,9 +195,20 @@ chore: init pyproject.toml with uv
 - **本地 macOS**：开发 + 数据热备（rsync 拉云端 DuckDB），不再承担生产调度
 - **避坑**：不要写 `82.156.4.48`——那是错的 IP（之前误用过半天），所有服务器命令统一用 `82.156.0.68`
 
-### 数据冗余策略
+### 数据冗余策略（2026-07-02 分家后）
 
-云端是写入主源（systemd timer 触发 daily / monitor），本地是热备（rsync 周期拉，业务时段跳过）。切换策略：**单点切换 B**——云端跑业务，本地仅热备 + 开发，不在两端并行写。
+生产表（日线/筛选/池子）以云端为权威，研究表（分钟线/竞价/模拟盘）以本地为权威：
+
+- **云端**：systemd timer 跑 daily / monitor，生产表写云端主库
+- **本地热备落独立文件**：`sync-from-cloud.sh` 把云端快照下载到 `data/cloud_backup.duckdb`，
+  **绝不整文件替换 `rquant.duckdb`**（7/2 事故：整文件替换把本地盘中 monitor 的写入
+  打进被 unlink 的幽灵 inode，残留 WAL 与新文件代际错配，主库打不开）
+- **合并**：日终窗口由 `rquant research-sync` 把生产表从备份合并进本地 `rquant.duckdb`
+  （生产表整表替换、研究表按主键 merge），随后原子刷新本地只读副本 `rquant_ro.duckdb`
+- **本地盘中 monitor**（launchd `com.roxor.rquant-monitor`）写研究表进本地主库，
+  与云端 monitor 并存（云端管告警权威，本地管分钟落库 + 模拟盘实验）
+- **禁止**本地再跑 `rquant serve`（曾有僵尸 LaunchAgent `com.roxor.rquant` 本地 17:00
+  重复跑 daily，造成重复推送，2026-07-02 已卸载）
 
 ### Hybrid 协作模式（Claude / 用户）
 

@@ -195,21 +195,32 @@ chore: init pyproject.toml with uv
 - **本地 macOS**：开发 + 数据热备（rsync 拉云端 DuckDB），不再承担生产调度
 - **避坑**：不要写 `82.156.4.48`——那是错的 IP（之前误用过半天），所有服务器命令统一用 `82.156.0.68`
 
-### 数据冗余策略
+### 数据冗余策略（2026-07-02 分家后）
 
-云端是写入主源（systemd timer 触发 daily / monitor），本地是热备（rsync 周期拉，业务时段跳过）。切换策略：**单点切换 B**——云端跑业务，本地仅热备 + 开发，不在两端并行写。
+生产表（日线/筛选/池子）以云端为权威，研究表（分钟线/竞价/模拟盘）以本地为权威：
 
-### Hybrid 协作模式（Codex / 用户）
+- **云端**：systemd timer 跑 daily / monitor，生产表写云端主库
+- **本地热备落独立文件**：`sync-from-cloud.sh` 把云端快照下载到 `data/cloud_backup.duckdb`，
+  **绝不整文件替换 `rquant.duckdb`**（7/2 事故：整文件替换把本地盘中 monitor 的写入
+  打进被 unlink 的幽灵 inode，残留 WAL 与新文件代际错配，主库打不开）
+- **合并**：日终窗口由 `rquant research-sync` 把生产表从备份合并进本地 `rquant.duckdb`
+  （生产表整表替换、研究表按主键 merge），随后原子刷新本地只读副本 `rquant_ro.duckdb`
+- **本地盘中 monitor**（launchd `com.roxor.rquant-monitor`）写研究表进本地主库，
+  与云端 monitor 并存（云端管告警权威，本地管分钟落库 + 模拟盘实验）
+- **禁止**本地再跑 `rquant serve`（曾有僵尸 LaunchAgent `com.roxor.rquant` 本地 17:00
+  重复跑 daily，造成重复推送，2026-07-02 已卸载）
 
-部署、运维、生产数据修改时，**Codex 不直接 ssh 操作生产**，pair 模式分工。理由：
+### Hybrid 协作模式（Claude / 用户）
+
+部署、运维、生产数据修改时，**Claude 不直接 ssh 操作生产**，pair 模式分工。理由：
 
 - sudo 提示密码会卡 ssh 非交互命令
-- Codex 内置 sandbox 对修改共享数据库 / 远程文件的操作会触发权限拒绝（如本地 DuckDB 误改回滚也被拒过）
-- 首次部署的现场 debug 效率，pair > Codex 全自动 3-5 倍
+- Claude 内置 sandbox 对修改共享数据库 / 远程文件的操作会触发权限拒绝（如本地 DuckDB 误改回滚也被拒过）
+- 首次部署的现场 debug 效率，pair > Claude 全自动 3-5 倍
 
 **分工表**：
 
-| Codex 做 | 用户做 |
+| Claude 做 | 用户做 |
 |----------|--------|
 | 写命令清单 / systemd unit / 部署脚本 | ssh 上服务器粘贴执行 |
 | 解析用户贴回来的输出，定位问题 | 把命令输出贴回 chat |
@@ -218,7 +229,7 @@ chore: init pyproject.toml with uv
 
 **适用场景**：服务器配置、systemd 安装、首次数据迁移、生产数据修复（如误标记的 Pool 2 状态回滚）、SSH key 配对调试。
 
-**不适用**：纯本地开发、写代码、跑单测、git 分支/commit/push（这些 Codex 直接做，不打断）。
+**不适用**：纯本地开发、写代码、跑单测、git 分支/commit/push（这些 Claude 直接做，不打断）。
 
 ### 通知通道
 
