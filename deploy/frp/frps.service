@@ -1,0 +1,12 @@
+[Unit]
+Description=frp server (rQuant panorama tunnel)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frps -c /etc/frp/frps.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
