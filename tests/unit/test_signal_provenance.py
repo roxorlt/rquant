@@ -15,6 +15,8 @@ from rquant.signal_provenance import (
     AUCTION_GAP_MINUTE_STRATEGY,
     AUCTION_GAP_V1,
     AUCTION_GAP_V1_FACTORS,
+    GROWTH_SURGE_V1,
+    GROWTH_SURGE_V1_FACTORS,
     N_SHAPE_MINUTE_STRATEGY,
     N_SHAPE_V1,
     N_SHAPE_V1_FACTORS,
@@ -70,6 +72,32 @@ def test_n_shape_v1_factor_keys_locked() -> None:
     by_name = {spec.name: spec for spec in N_SHAPE_V1_FACTORS}
     assert by_name["rel_amount_same_minute_20d"].op is None
     assert by_name["market_above_ma20_ratio_pct"].op is None
+
+
+def test_growth_surge_v1_factor_keys_locked() -> None:
+    """科创/创业放量因子键名锁死；观察位与用户三条件的判定方向不得悄悄改动。"""
+    assert GROWTH_SURGE_V1 == "growth_surge_v1"
+    assert [spec.name for spec in GROWTH_SURGE_V1_FACTORS] == [
+        "rel_cum_amount_asof",
+        "rel_amount_same_minute",
+        "amount_accel_5m",
+        "classic_volume_ratio",
+        "inner_outer_ratio",
+        "large_net_vol_t1",
+        "price_percentile_250d",
+        "market_above_ma20_ratio_pct",
+    ]
+    by_name = {spec.name: spec for spec in GROWTH_SURGE_V1_FACTORS}
+    # 经典量比与市场温度只观察不判定
+    assert by_name["classic_volume_ratio"].op is None
+    assert by_name["market_above_ma20_ratio_pct"].op is None
+    # 用户口径：内盘>外盘（tick-rule 近似）判多，方向不得翻转
+    assert by_name["inner_outer_ratio"].op == ">"
+    assert by_name["inner_outer_ratio"].threshold == 1.0
+    # 大单净量为 T-1 口径（防未来函数）
+    assert by_name["large_net_vol_t1"].op == ">"
+    assert by_name["large_net_vol_t1"].basis == "t_minus_1"
+    assert by_name["price_percentile_250d"].op == "<="
 
 
 def test_build_signal_factors_supports_n_shape_v1() -> None:

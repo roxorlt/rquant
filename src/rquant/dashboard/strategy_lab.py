@@ -62,6 +62,7 @@ ENTRY_LABELS: dict[str, str] = {
     "late_confirm": "10:30后确认",
     "vwap_confirm": "VWAP确认",
     "amount_surge": "成交额突增",
+    "factor_confirm": "多因子确认",
 }
 VARIANT_LABELS: dict[str, str] = {
     "baseline": "Baseline",
@@ -302,6 +303,7 @@ def strategy_compare_cached(
     profile_variants: tuple[str, ...],
     max_hold_days: int,
     preset_name: str,
+    factor_score_threshold: float = 35.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, int]:
     from rquant.strategy_compare import run_entry_mode_comparison
 
@@ -314,6 +316,7 @@ def strategy_compare_cached(
             profile_variants=list(profile_variants),
             max_hold_days=max_hold_days,
             preset_name=preset_name,
+            factor_score_threshold=factor_score_threshold,
         )
     return result.summary, result.trades, result.candidates_count
 
@@ -1026,6 +1029,14 @@ with st.sidebar.form("compare_form"):
         default=[ENTRY_LABELS["first_break"]],
         key="compare_modes",
     )
+    factor_score_threshold = st.number_input(
+        "多因子确认阈值（仅「多因子确认」模式生效）",
+        min_value=0.0,
+        max_value=100.0,
+        value=35.0,
+        step=1.0,
+        key="compare_factor_threshold",
+    )
     selected_variant_labels = st.multiselect(
         "风控版本",
         list(VARIANT_LABELS.values()),
@@ -1114,6 +1125,7 @@ if run_clicked:
                 selected_variants,
                 int(hold_days),
                 preset_name,
+                float(factor_score_threshold),
             ),
         )
     compare_saved = save_strategy_lab_run(
@@ -1127,6 +1139,7 @@ if run_clicked:
                 "入场模式": list(selected_modes),
                 "风控版本": list(selected_variants),
                 "持有交易日": int(hold_days),
+                "多因子确认阈值": float(factor_score_threshold),
             },
             metrics={
                 "区间候选": candidates_count,

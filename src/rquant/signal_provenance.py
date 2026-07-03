@@ -38,6 +38,7 @@ AUCTION_GAP_MINUTE_STRATEGY = "auction_gap_minute"
 AUCTION_GAP_V1 = "auction_gap_v1"
 N_SHAPE_MINUTE_STRATEGY = "n_shape_minute"
 N_SHAPE_V1 = "n_shape_v1"
+GROWTH_SURGE_V1 = "growth_surge_v1"
 
 _COMPARE_OPS: dict[str, Callable[[float, float], bool]] = {
     ">=": operator.ge,
@@ -147,9 +148,52 @@ N_SHAPE_V1_FACTORS: tuple[FactorSpec, ...] = (
     ),
 )
 
+# 科创/创业板盘中放量追击多因子组（用户三条件 + 现有放量三件套 + 已验证低位因子）。
+# 日期口径：T = 信号日（当日盘中入场），T-1 = 前一交易日。
+# - 量比：rel_cum_amount_asof 是现有宽门的成交额口径（累计额/20 日同刻中位）；
+#   classic_volume_ratio 为经典量比观察值（当日每分钟均量 / T-1 收盘可知的 5 日
+#   每分钟均量），只记录不判定
+# - 内盘>外盘：盘中真实内外盘无历史数据，用分钟 tick-rule 近似（close 对比前一
+#   分钟 close：升=外盘/主动买，降=内盘/主动卖，平=均分；首分钟对比自身 open）。
+#   按用户口径「内盘大 + 大单净买 = 主力吸筹」判多：inner_outer_ratio > 1 命中
+# - 大单净量：T 日盘中不可知，用 T-1 moneyflow_daily.large_net_vol > 0 防未来函数
+#   （与用户口径「今日大单净量」存在 1 个交易日滞后）
+GROWTH_SURGE_V1_FACTORS: tuple[FactorSpec, ...] = (
+    FactorSpec(
+        name="rel_cum_amount_asof", label="累计放量(相对同刻中位)",
+        tier="minute", op=">=", threshold=1.4,
+    ),
+    FactorSpec(
+        name="rel_amount_same_minute", label="同刻放量(相对同分钟中位)",
+        tier="minute", op=">=", threshold=2.0,
+    ),
+    FactorSpec(
+        name="amount_accel_5m", label="分钟放量加速(5m)",
+        tier="minute", op=">=", threshold=2.0,
+    ),
+    FactorSpec(name="classic_volume_ratio", label="经典量比(观察)", tier="minute"),
+    FactorSpec(
+        name="inner_outer_ratio", label="内外盘比(tick-rule近似)",
+        tier="minute", op=">", threshold=1.0,
+    ),
+    FactorSpec(
+        name="large_net_vol_t1", label="大单净量(T-1)",
+        tier="snapshot", op=">", threshold=0.0, basis="t_minus_1",
+    ),
+    FactorSpec(
+        name="price_percentile_250d", label="250日收盘百分位",
+        tier="snapshot", op="<=", threshold=0.5, basis="t_minus_1",
+    ),
+    FactorSpec(
+        name="market_above_ma20_ratio_pct", label="市场温度(MA20上方占比)",
+        tier="market", basis="t_minus_1",
+    ),
+)
+
 FACTOR_SETS: dict[str, tuple[FactorSpec, ...]] = {
     AUCTION_GAP_V1: AUCTION_GAP_V1_FACTORS,
     N_SHAPE_V1: N_SHAPE_V1_FACTORS,
+    GROWTH_SURGE_V1: GROWTH_SURGE_V1_FACTORS,
 }
 
 

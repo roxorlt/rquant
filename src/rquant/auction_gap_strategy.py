@@ -27,12 +27,46 @@ from rquant.signal_provenance import (
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
 from rquant.stock_features import build_intraday_relative_volume_features
 from rquant.storage.duckdb import DuckDBStore
+from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
 
 GapMode = Literal["close", "strict_high"]
 StFilterMode = Literal["case_insensitive", "literal_lower", "none"]
 ExitMode = Literal["next_open"]
 AuctionGapMinuteEntryMode = Literal["vwap_push"]
 HoldPolicy = Literal["t1", "seal_hold"]
+
+# factor_confirm 对照实验（2026-07-02 归因终审已判死该策略线，此处只做低成本
+# 死刑复核）：不引入新因子，评分项全部来自 AUCTION_GAP_V1 既有键名（满分 100）。
+AUCTION_GAP_B_V1_SCORE_TERMS: tuple[FeatureScoreTerm, ...] = (
+    FeatureScoreTerm(
+        name="auction_vol_ratio_5d", group="auction", weight=20.0,
+        transform="log_ratio", cap=5.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="gap_pct_close", group="auction", weight=20.0,
+        transform="linear", low=0.0, high=6.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="vwap_position", group="minute", weight=15.0,
+        transform="linear", low=1.0, high=1.02, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="limit_progress", group="minute", weight=20.0,
+        transform="linear", low=0.2, high=1.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="support_ok", group="minute", weight=10.0,
+        transform="linear", low=0.0, high=1.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="rel_amount_same_minute_20d", group="minute", weight=10.0,
+        transform="log_ratio", cap=5.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="amount_accel_5m", group="minute", weight=5.0,
+        transform="log_ratio", cap=5.0, skip_if_missing=True,
+    ),
+)
 
 
 class AuctionGapConfig(BaseModel):
@@ -98,6 +132,9 @@ class AuctionGapMinuteReplayConfig(BaseModel):
     seal_hold_max_days: int = Field(default=3, ge=1, le=10)
     seal_hold_max_open_times: int = Field(default=0, ge=0, le=50)
     seal_hold_min_fd_to_circ_pct: float | None = Field(default=None, ge=0)
+    # 分钟 B 确认的多因子评分阈值（AUCTION_GAP_B_V1_SCORE_TERMS，None=现状不评分）。
+    # 归因终审已判死该策略线，这是低成本对照实验开关
+    factor_score_threshold: float | None = Field(default=None, ge=0)
     paper: PaperTradeConfig = Field(default_factory=PaperTradeConfig)
 
     def auction_config(self) -> AuctionGapConfig:
@@ -509,6 +546,26 @@ def _find_auction_gap_entry(
             current_day_amounts=amount_history,
             freq=config.freq,
         )
+        # 键名对齐 signal_provenance.AUCTION_GAP_V1_FACTORS（与全景页/未来 live 同一份 spec）
+        factor_values: dict[str, object] = {
+            "auction_vol_ratio_5d": float(candidate["auction_vol_ratio_5d"]),
+            "gap_pct_close": float(candidate["gap_pct_close"]),
+            "vwap_position": quote.price / price_floor if price_floor > 0 else None,
+            "limit_progress": limit_progress,
+            "support_ok": int(support_ok),
+            "rel_amount_same_minute_20d": intraday_features.get(
+                "signal_rel_amount_same_minute_20d"
+            ),
+            "amount_accel_5m": intraday_features.get("signal_amount_accel_5m"),
+        }
+        factor_score: float | None = None
+        if config.factor_score_threshold is not None:
+            factor_score = score_feature_terms(
+                factor_values, AUCTION_GAP_B_V1_SCORE_TERMS
+            )
+            if factor_score < config.factor_score_threshold:
+                amount_history.append((quote_time.time(), minute_amount))
+                continue
         signal_features = {
             "auction_price": auction_price,
             "auction_vol_ratio_5d": float(candidate["auction_vol_ratio_5d"]),
@@ -528,18 +585,11 @@ def _find_auction_gap_entry(
             "entry_signal_limit_progress": round(limit_progress, 4),
         }
         signal_features.update(intraday_features)
-        # 键名对齐 signal_provenance.AUCTION_GAP_V1_FACTORS（与全景页/未来 live 同一份 spec）
-        factor_values: dict[str, object] = {
-            "auction_vol_ratio_5d": float(candidate["auction_vol_ratio_5d"]),
-            "gap_pct_close": float(candidate["gap_pct_close"]),
-            "vwap_position": quote.price / price_floor if price_floor > 0 else None,
-            "limit_progress": limit_progress,
-            "support_ok": int(support_ok),
-            "rel_amount_same_minute_20d": intraday_features.get(
-                "signal_rel_amount_same_minute_20d"
-            ),
-            "amount_accel_5m": intraday_features.get("signal_amount_accel_5m"),
-        }
+        if config.factor_score_threshold is not None:
+            signal_features["auction_factor_score"] = factor_score
+            signal_features["auction_factor_score_threshold"] = (
+                config.factor_score_threshold
+            )
         provenance = SignalProvenance(
             strategy_name=AUCTION_GAP_MINUTE_STRATEGY,
             signal_factors=build_signal_factors(
@@ -905,6 +955,8 @@ def _position_to_auction_gap_row(
         "entry_signal_price": payload.get("entry_signal_price"),
         "entry_signal_vwap": payload.get("entry_signal_vwap"),
         "entry_signal_limit_progress": payload.get("entry_signal_limit_progress"),
+        "auction_factor_score": payload.get("auction_factor_score"),
+        "auction_factor_score_threshold": payload.get("auction_factor_score_threshold"),
         "entry_signal_minute_amount": payload.get("signal_minute_amount"),
         "entry_signal_cum_amount_asof": payload.get("signal_cum_amount_asof"),
         "entry_hist_same_minute_amount_median_20d": payload.get(

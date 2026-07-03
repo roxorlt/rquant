@@ -17,12 +17,59 @@ from rquant.paper import (
     mark_position_to_quote,
     open_position_from_signal,
 )
+from rquant.signal_provenance import GROWTH_SURGE_V1, build_signal_factors
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
-from rquant.stock_features import build_intraday_relative_volume_features
+from rquant.stock_features import (
+    build_daily_stock_features,
+    build_intraday_relative_volume_features,
+)
 from rquant.storage.duckdb import DuckDBStore
+from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
 
 UNSUPPORTED_ORDER_FLOW_CONDITIONS = (
-    "外盘/内盘、今日大单净量缺少可回测的盘中历史订单流数据"
+    "外盘/内盘、今日大单净量缺少可回测的盘中历史订单流数据；"
+    "以分钟 tick-rule 近似内外盘、T-1 moneyflow 大单净量代理"
+)
+
+# factor_confirm 评分阈值默认档：训练段（2025-04-28~2025-12-31）宽门入场分钟
+# growth_surge_b_v1 得分的中位档，见 jobs 回测 growth_backtest.md（2026-07-03）
+DEFAULT_GROWTH_FACTOR_SCORE_THRESHOLD = 45.0
+
+# 日线 vol 单位为手，分钟 vol 为股；经典量比分母按每交易日 240 个成交分钟折算
+_DAILY_VOL_UNIT_FACTOR = 100.0
+_TRADING_MINUTES_PER_DAY = 240.0
+
+# growth_surge_b_v1 权重表：确认层评分（满分 100），与 GROWTH_SURGE_V1_FACTORS
+# 命中矩阵同键名。放量三件套沿用 log_ratio（BASE_SCORE_TERMS 同款口径）；
+# inner_outer_ratio 按用户口径「内盘越大越强」线性加分；large_net_vol_t1 只看
+# 正负号（>0 即接近满分，linear low=0 high=1 手，实质二值化）；250 日低位为
+# 已验证方向（inverse_linear）。classic_volume_ratio 与市场温度只观察不计分。
+# 全部 skip_if_missing：缺数据按 0 贡献降级而非默认值路径。
+GROWTH_SURGE_B_V1_SCORE_TERMS: tuple[FeatureScoreTerm, ...] = (
+    FeatureScoreTerm(
+        name="rel_cum_amount_asof", group="volume", weight=20.0,
+        transform="log_ratio", cap=5.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="rel_amount_same_minute", group="volume", weight=15.0,
+        transform="log_ratio", cap=5.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="amount_accel_5m", group="volume", weight=5.0,
+        transform="log_ratio", cap=5.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="inner_outer_ratio", group="order_flow", weight=20.0,
+        transform="linear", low=1.0, high=2.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="large_net_vol_t1", group="order_flow", weight=15.0,
+        transform="linear", low=0.0, high=1.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="price_percentile_250d", group="trend", weight=25.0,
+        transform="inverse_linear", low=0.0, high=1.0, skip_if_missing=True,
+    ),
 )
 
 
@@ -42,6 +89,20 @@ class GrowthBoardSurgeConfig(BaseModel):
     use_accel_surge: bool = True
     require_vwap_strength: bool = True
     vwap_buffer_pct: float = Field(default=0.0, ge=0, lt=0.05)
+    # 用户三条件（2026-07-03）：量比宽门沿用 min_cum_amount_ratio（成交额口径）；
+    # 内盘>外盘为分钟 tick-rule 近似（升=外盘/降=内盘/平=均分，首分钟对比自身
+    # open）；大单净量用 T-1 moneyflow_daily.large_net_vol（T 日盘中不可知，防
+    # 未来函数，与用户口径「今日大单净量」有 1 个交易日滞后）
+    require_inner_outer: bool = False
+    min_inner_outer_ratio: float = Field(default=1.0, gt=0)
+    require_large_net_vol: bool = False
+    min_large_net_vol: float = 0.0
+    # factor_confirm：宽门（现有放量过滤）不动，入场加一层 growth_surge_b_v1
+    # 加权评分过阈值判定（minute_replay factor_confirm 同款「宽门+评分」模式）
+    enable_factor_confirm: bool = False
+    factor_score_threshold: float = Field(
+        default=DEFAULT_GROWTH_FACTOR_SCORE_THRESHOLD, ge=0
+    )
     max_hold_days: int = Field(default=1, ge=1, le=10)
     price_tol: float = Field(default=0.01, gt=0, lt=1)
     paper: PaperTradeConfig = Field(
@@ -52,6 +113,15 @@ class GrowthBoardSurgeConfig(BaseModel):
             trailing_stop_pct=0.03,
         )
     )
+
+    @property
+    def factor_layer_enabled(self) -> bool:
+        """任一用户条件闸门或评分确认开启时，才预取静态因子并输出命中矩阵。"""
+        return (
+            self.enable_factor_confirm
+            or self.require_inner_outer
+            or self.require_large_net_vol
+        )
 
 
 @dataclass(frozen=True)
@@ -357,6 +427,100 @@ def _extract_relative_volume_features(
     }
 
 
+def _tick_rule_split(
+    reference_price: float,
+    close: float,
+    vol: float,
+) -> tuple[float, float]:
+    """按 tick-rule 把单分钟成交量归为 (内盘增量, 外盘增量)。
+
+    close > 参照价记外盘（主动买）、< 记内盘（主动卖）、= 均分。
+    """
+    if vol <= 0:
+        return 0.0, 0.0
+    if close > reference_price:
+        return 0.0, vol
+    if close < reference_price:
+        return vol, 0.0
+    return vol / 2, vol / 2
+
+
+def _query_large_net_vol(
+    store: DuckDBStore,
+    ts_code: str,
+    trading_date: date,
+) -> float | None:
+    row = store._conn.execute(
+        """
+        SELECT large_net_vol
+        FROM moneyflow_daily
+        WHERE ts_code = ?
+          AND trade_date = ?
+        ORDER BY CASE WHEN source = 'tushare' THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        [ts_code, trading_date],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _query_avg_minute_vol_5d(
+    store: DuckDBStore,
+    ts_code: str,
+    as_of: date,
+) -> float | None:
+    """截至 T-1 的 5 日平均每分钟成交量（股），经典量比分母；不足 5 根日线记缺。"""
+    df = store._conn.execute(
+        """
+        SELECT vol
+        FROM daily_bar
+        WHERE ts_code = ?
+          AND trade_date <= ?
+        ORDER BY trade_date DESC
+        LIMIT 5
+        """,
+        [ts_code, as_of],
+    ).fetchdf()
+    vols = pd.to_numeric(df["vol"], errors="coerce").dropna() if not df.empty else df
+    if len(vols) < 5:
+        return None
+    return float(vols.mean()) * _DAILY_VOL_UNIT_FACTOR / _TRADING_MINUTES_PER_DAY
+
+
+def _query_above_ma20_ratio(
+    store: DuckDBStore,
+    trading_date: date,
+) -> float | None:
+    row = store._conn.execute(
+        """
+        SELECT above_ma20_ratio_pct
+        FROM market_sentiment_daily
+        WHERE trade_date = ?
+        """,
+        [trading_date],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _prefetch_growth_static_factors(
+    store: DuckDBStore,
+    *,
+    ts_code: str,
+    previous_date: date,
+) -> dict[str, float | int | None]:
+    """factor 层静态因子（T-1 收盘可知），每个候选最多取一次，缺数据记 None。"""
+    trend = build_daily_stock_features(store, ts_code, previous_date)
+    return {
+        "large_net_vol_t1": _query_large_net_vol(store, ts_code, previous_date),
+        "price_percentile_250d": trend.get("price_percentile_250d"),
+        "market_above_ma20_ratio_pct": _query_above_ma20_ratio(store, previous_date),
+    }
+
+
 def _passes_surge_filter(
     compact_features: dict[str, float | int | None],
     config: GrowthBoardSurgeConfig,
@@ -534,6 +698,17 @@ def _position_to_row(
         "signal_amount_accel_10m": payload.get("signal_amount_accel_10m"),
         "signal_vwap": payload.get("signal_vwap"),
         "signal_limit_progress_pct": payload.get("signal_limit_progress_pct"),
+        "inner_vol_asof": payload.get("inner_vol_asof"),
+        "outer_vol_asof": payload.get("outer_vol_asof"),
+        "inner_outer_ratio": payload.get("inner_outer_ratio"),
+        "classic_volume_ratio": payload.get("classic_volume_ratio"),
+        "large_net_vol_t1": payload.get("large_net_vol_t1"),
+        "price_percentile_250d": payload.get("price_percentile_250d"),
+        "market_above_ma20_ratio_pct": payload.get("market_above_ma20_ratio_pct"),
+        "growth_factor_score": payload.get("growth_factor_score"),
+        "growth_factor_score_threshold": payload.get("growth_factor_score_threshold"),
+        "growth_factor_hit_count": payload.get("growth_factor_hit_count"),
+        "growth_factor_evaluated_count": payload.get("growth_factor_evaluated_count"),
         "intraday_order_flow_available": False,
         "unsupported_intraday_conditions": UNSUPPORTED_ORDER_FLOW_CONDITIONS,
     }
@@ -556,6 +731,10 @@ def _find_entry_position(
 
     cum_vol = 0.0
     cum_amount = 0.0
+    inner_vol = 0.0
+    outer_vol = 0.0
+    prev_minute_close: float | None = None
+    static_factors: dict[str, float | int | None] | None = None
     clocked_amount_history: list[tuple[time, float]] = []
     for idx, row in day_minutes.iterrows():
         quote_time = _as_datetime(row["trade_time"])
@@ -565,6 +744,17 @@ def _find_entry_position(
             cum_vol += minute_vol
         if minute_amount > 0:
             cum_amount += minute_amount
+        if pd.notna(row["close"]):
+            minute_close = float(row["close"])
+            reference = prev_minute_close
+            if reference is None:
+                reference = (
+                    float(row["open"]) if pd.notna(row["open"]) else minute_close
+                )
+            inner_add, outer_add = _tick_rule_split(reference, minute_close, minute_vol)
+            inner_vol += inner_add
+            outer_vol += outer_add
+            prev_minute_close = minute_close
         vwap = cum_amount / cum_vol if cum_vol > 0 else None
         quote = _quote_from_close(row)
         if quote_time.time() < config.min_signal_time:
@@ -599,6 +789,48 @@ def _find_entry_position(
             clocked_amount_history.append((quote_time.time(), minute_amount))
             continue
 
+        inner_outer_ratio = (
+            round(inner_vol / outer_vol, 4) if outer_vol > 0 else None
+        )
+        if config.require_inner_outer and (
+            inner_outer_ratio is None
+            or inner_outer_ratio <= config.min_inner_outer_ratio
+        ):
+            clocked_amount_history.append((quote_time.time(), minute_amount))
+            continue
+        if config.factor_layer_enabled and static_factors is None:
+            static_factors = _prefetch_growth_static_factors(
+                store,
+                ts_code=candidate.ts_code,
+                previous_date=candidate.previous_date,
+            )
+        if config.require_large_net_vol:
+            large_net = (static_factors or {}).get("large_net_vol_t1")
+            # T-1 静态条件当日不再变化，不满足（含缺数据）直接放弃该候选
+            if large_net is None or float(large_net) <= config.min_large_net_vol:
+                return None
+        factor_score: float | None = None
+        raw_factor_values: dict[str, object] | None = None
+        if config.factor_layer_enabled:
+            raw_factor_values = {
+                **(static_factors or {}),
+                "rel_cum_amount_asof": features.get("signal_rel_cum_amount_asof"),
+                "rel_amount_same_minute": features.get(
+                    "signal_rel_amount_same_minute"
+                ),
+                "amount_accel_5m": features.get("signal_amount_accel_5m"),
+                "inner_outer_ratio": inner_outer_ratio,
+            }
+            factor_score = score_feature_terms(
+                raw_factor_values, GROWTH_SURGE_B_V1_SCORE_TERMS
+            )
+            if (
+                config.enable_factor_confirm
+                and factor_score < config.factor_score_threshold
+            ):
+                clocked_amount_history.append((quote_time.time(), minute_amount))
+                continue
+
         execution_index = idx + 1
         if execution_index >= len(day_minutes):
             return None
@@ -614,15 +846,58 @@ def _find_entry_position(
             if candidate.limit_up_price > candidate.pre_close
             else None
         )
+        avg_minute_vol_5d = _query_avg_minute_vol_5d(
+            store, candidate.ts_code, candidate.previous_date
+        )
+        classic_volume_ratio = (
+            round((cum_vol / (int(idx) + 1)) / avg_minute_vol_5d, 4)
+            if avg_minute_vol_5d is not None and avg_minute_vol_5d > 0
+            else None
+        )
         risk_payload = {
             **features,
             "signal_vwap": round(vwap, 4) if vwap is not None else None,
             "signal_limit_progress_pct": (
                 round(limit_progress, 4) if limit_progress is not None else None
             ),
+            "inner_vol_asof": round(inner_vol, 2),
+            "outer_vol_asof": round(outer_vol, 2),
+            "inner_outer_ratio": inner_outer_ratio,
+            "classic_volume_ratio": classic_volume_ratio,
             "intraday_order_flow_available": False,
             "unsupported_intraday_conditions": UNSUPPORTED_ORDER_FLOW_CONDITIONS,
         }
+        if raw_factor_values is not None:
+            raw_factor_values["classic_volume_ratio"] = classic_volume_ratio
+            matrix = build_signal_factors(
+                raw_factor_values,
+                factor_set=GROWTH_SURGE_V1,
+                threshold_overrides={
+                    "rel_cum_amount_asof": config.min_cum_amount_ratio,
+                    "rel_amount_same_minute": config.min_same_minute_amount_ratio,
+                    "amount_accel_5m": config.min_amount_accel_5m,
+                    "inner_outer_ratio": config.min_inner_outer_ratio,
+                    "large_net_vol_t1": config.min_large_net_vol,
+                },
+            )
+            risk_payload.update({
+                "large_net_vol_t1": (static_factors or {}).get("large_net_vol_t1"),
+                "price_percentile_250d": (
+                    (static_factors or {}).get("price_percentile_250d")
+                ),
+                "market_above_ma20_ratio_pct": (
+                    (static_factors or {}).get("market_above_ma20_ratio_pct")
+                ),
+                "growth_factor_score": factor_score,
+                "growth_factor_score_threshold": (
+                    config.factor_score_threshold
+                    if config.enable_factor_confirm
+                    else None
+                ),
+                "growth_factor_hit_count": matrix.hit_count,
+                "growth_factor_evaluated_count": matrix.evaluated_count,
+                "growth_signal_factors": matrix.to_json_payload(),
+            })
         risk_plan = PaperRiskPlan(payload=risk_payload)
         watch_item = _WatchItem(
             ts_code=candidate.ts_code,
@@ -636,9 +911,14 @@ def _find_entry_position(
             limit_up_price_next=candidate.limit_up_price,
             stop_weak=0.0,
         )
+        level = (
+            "growth_board_factor_confirm"
+            if config.enable_factor_confirm
+            else "growth_board_volume_surge"
+        )
         signal = {
-            "level": "growth_board_volume_surge",
-            "trigger_type": "growth_board_volume_surge",
+            "level": level,
+            "trigger_type": level,
             "level_price": candidate.limit_up_price,
             "signal_price": quote.price,
         }
@@ -665,8 +945,19 @@ def run_growth_board_surge_replay(
 ) -> pd.DataFrame:
     """回放“科创/创业板 + 均线多头 + 分钟放量”入场与 T+1 离场。
 
-    盘中入场只使用信号分钟及之前的数据；外盘/内盘和大单净量当前没有可
-    历史回放的数据源，因此输出缺口字段，不参与过滤。
+    盘中入场只使用信号分钟及之前的数据。用户三条件的可回测口径：
+
+    - 量比：沿用 ``min_cum_amount_ratio`` 成交额口径宽门；另输出经典量比观察值
+      ``classic_volume_ratio``（当日每分钟均量 / T-1 收盘可知的 5 日每分钟均量）
+    - 内盘>外盘：真实盘中内外盘无历史数据，用分钟 tick-rule 近似（close 对比前
+      一分钟 close：升=外盘、降=内盘、平=均分，首分钟对比自身 open），
+      ``require_inner_outer`` 开启时要求 inner/outer > ``min_inner_outer_ratio``
+    - 大单净量：T 日盘中不可知，用 T-1 ``moneyflow_daily.large_net_vol`` 防未来
+      函数（与用户口径「今日大单净量」有 1 个交易日滞后），
+      ``require_large_net_vol`` 开启时要求 > ``min_large_net_vol``
+
+    ``enable_factor_confirm`` 开启时宽门不动，入场再过 ``growth_surge_b_v1``
+    加权评分阈值（``factor_score_threshold``），命中矩阵随行输出。
     """
     cfg = config or GrowthBoardSurgeConfig()
     start = _as_date(start_date)
