@@ -438,6 +438,8 @@ class TestCmdAuctionGapReplay:
         args = MagicMock(
             start_date="2025-01-16",
             end_date="2026-06-24",
+            persist_positions=False,
+            run_id=None,
             gap_mode="close",
             min_ratio=0.15,
             max_ratio=5.0,
@@ -483,6 +485,8 @@ class TestCmdAuctionGapMinuteReplay:
         args = MagicMock(
             start_date="2025-01-16",
             end_date="2026-06-24",
+            persist_positions=False,
+            run_id=None,
             gap_mode="close",
             min_ratio=0.15,
             max_ratio=5.0,
@@ -532,6 +536,8 @@ class TestCmdAuctionGapMinuteBackfill:
         args = MagicMock(
             start_date="2025-01-16",
             end_date="2026-06-24",
+            persist_positions=False,
+            run_id=None,
             gap_mode="close",
             min_ratio=0.15,
             max_ratio=5.0,

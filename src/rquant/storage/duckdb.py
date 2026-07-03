@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -607,12 +609,17 @@ class DuckDBStore:
             "exit_time", "exit_price", "exit_reason", "holding_trading_days",
             "pnl_pct", "trailing_stop_price", "max_drawdown_pct",
             "take_profit_basis", "feature_snapshot_id", "param_payload",
+            "strategy_name", "signal_factors", "run_id",
         ]
         for col in optional_cols:
             if col not in payload.columns:
                 payload[col] = None
         if "entry_price_raw" not in payload.columns:
             payload["entry_price_raw"] = payload["entry_price"]
+        if "run_mode" not in payload.columns:
+            payload["run_mode"] = "live"
+        else:
+            payload["run_mode"] = payload["run_mode"].fillna("live")
         self._conn.register("pp_tmp", payload)
         self._conn.execute(
             """
@@ -625,7 +632,8 @@ class DuckDBStore:
              take_profit_price, take_profit_pct, take_profit_basis, trailing_stop_pct,
              trailing_stop_price, status, exit_time, exit_price, exit_reason,
              holding_trading_days, pnl_pct, max_price_seen, max_drawdown_pct,
-             feature_snapshot_id, param_payload, updated_at)
+             feature_snapshot_id, param_payload,
+             strategy_name, signal_factors, run_mode, run_id, updated_at)
             SELECT position_id, trade_date, ts_code, name, pool,
                    entry_time, entry_price, entry_price_raw, entry_signal, candidate_id,
                    entry_level_price, entry_t_date, earliest_exit_date,
@@ -634,7 +642,9 @@ class DuckDBStore:
                    take_profit_price, take_profit_pct, take_profit_basis, trailing_stop_pct,
                    trailing_stop_price, status, exit_time, exit_price, exit_reason,
                    holding_trading_days, pnl_pct, max_price_seen, max_drawdown_pct,
-                   feature_snapshot_id, CAST(param_payload AS JSON), CURRENT_TIMESTAMP
+                   feature_snapshot_id, CAST(param_payload AS JSON),
+                   strategy_name, CAST(signal_factors AS JSON), run_mode, run_id,
+                   CURRENT_TIMESTAMP
             FROM pp_tmp
             """
         )
@@ -661,6 +671,125 @@ class DuckDBStore:
             ORDER BY entry_time
             """
         ).fetchdf()
+
+    def query_paper_positions(
+        self,
+        start: date | str | None = None,
+        end: date | str | None = None,
+        *,
+        run_mode: str | None = "live",
+        strategy_name: str | None = None,
+        status: str | None = None,
+    ) -> pd.DataFrame:
+        """复盘查询：默认只看 live 仓（run_mode=None 时不过滤，含 replay）。"""
+        clauses: list[str] = []
+        params: list[object] = []
+        if start is not None:
+            clauses.append("trade_date >= ?")
+            params.append(start)
+        if end is not None:
+            clauses.append("trade_date <= ?")
+            params.append(end)
+        if run_mode is not None:
+            clauses.append("run_mode = ?")
+            params.append(run_mode)
+        if strategy_name is not None:
+            clauses.append("strategy_name = ?")
+            params.append(strategy_name)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._conn.execute(
+            f"""
+            SELECT * FROM paper_position
+            {where}
+            ORDER BY entry_time, position_id
+            """,
+            params,
+        ).fetchdf()
+
+    def aggregate_paper_positions_by_factor_hits(
+        self,
+        factors: Sequence[str],
+        *,
+        start: date | str | None = None,
+        end: date | str | None = None,
+        run_mode: str | None = "live",
+        strategy_name: str | None = None,
+    ) -> pd.DataFrame:
+        """按 signal_factors 因子命中组合切片（closed 仓），列 = 因子 hit 值 + 面板指标。
+
+        factors 键名必须来自 FactorSpec（如 limit_progress / rel_amount_same_minute_20d），
+        JSON path 无法参数绑定，因此对键名做白名单校验后拼接。
+        """
+        if not factors:
+            msg = "factors 不能为空"
+            raise ValueError(msg)
+        for factor in factors:
+            if not re.fullmatch(r"[A-Za-z0-9_]+", factor):
+                msg = f"非法因子键名: {factor!r}"
+                raise ValueError(msg)
+
+        dims = ",\n                   ".join(
+            f"json_extract_string(signal_factors, '$.factors.{factor}.hit')"
+            f' AS "{factor}"'
+            for factor in factors
+        )
+        group_by = ", ".join(str(i + 1) for i in range(len(factors)))
+        clauses = ["status = 'closed'", "signal_factors IS NOT NULL"]
+        params: list[object] = []
+        if run_mode is not None:
+            clauses.append("run_mode = ?")
+            params.append(run_mode)
+        if strategy_name is not None:
+            clauses.append("strategy_name = ?")
+            params.append(strategy_name)
+        if start is not None:
+            clauses.append("trade_date >= ?")
+            params.append(start)
+        if end is not None:
+            clauses.append("trade_date <= ?")
+            params.append(end)
+        return self._conn.execute(
+            f"""
+            SELECT {dims},
+                   COUNT(*) AS trades,
+                   ROUND(AVG(pnl_pct), 2) AS mean_ret,
+                   ROUND(MEDIAN(pnl_pct), 2) AS median_ret,
+                   ROUND(100.0 * SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END)
+                         / COUNT(*), 1) AS win_rate_pct,
+                   ROUND(AVG(max_drawdown_pct), 2) AS avg_mdd_pct
+            FROM paper_position
+            WHERE {" AND ".join(clauses)}
+            GROUP BY {group_by}
+            ORDER BY {group_by}
+            """,
+            params,
+        ).fetchdf()
+
+    def delete_paper_positions_by_run_id(self, run_id: str) -> int:
+        """整批删除某个 replay run 的模拟仓及其入场快照（重跑清理用）。"""
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM paper_position WHERE run_id = ?",
+            [run_id],
+        ).fetchone()[0]
+        self._conn.execute(
+            """
+            DELETE FROM intraday_feature_snapshot
+            WHERE snapshot_id IN (
+                SELECT feature_snapshot_id FROM paper_position
+                WHERE run_id = ? AND feature_snapshot_id IS NOT NULL
+            )
+            """,
+            [run_id],
+        )
+        self._conn.execute(
+            "DELETE FROM paper_position WHERE run_id = ?",
+            [run_id],
+        )
+        logger.info(f"DuckDB 清理 paper_position run_id={run_id}: {count} 行")
+        return int(count)
 
     def upsert_paper_position_event(self, df: pd.DataFrame) -> int:
         if df.empty:

@@ -6,6 +6,16 @@
 
 ### Added
 
+- **盘中市场全景页 P0**（`market_panorama.py`，端口 8506，仅本地）：涨停/跌停/
+  炸板实时计数 + 分钟 sparkline、东财板块资金流排行（行业/概念、额/率双排序）、
+  板块成交额排行（东财 1022 板块成分聚合，行业粗分兜底）、板块下钻成分股表
+  （含池内标记）；外部源故障灰态降级，全程只读副本零写主库。
+- **模拟盘信号溯源 P0**：paper_position 加 strategy_name / signal_factors JSON /
+  run_mode / run_id 列（幂等迁移）；FactorSpec 统一因子键名（auction_gap_v1，
+  与全景页共用）；`persist_position_with_provenance` 统一写入口（快照+仓位同
+  事务）；replay `--persist-positions --run-id` 可落库带溯源的模拟仓（默认不落），
+  复盘查询 `query_paper_positions` + 按因子命中四象限聚合。
+
 - **统一「按日数据集回补」层（`rquant data-backfill`）**：新增
   `rquant/dataset_backfill.py` 注册表（`DatasetSpec` + `DATASETS`），一条管线
   接入 19 个 Tushare 接口：板块日行情（ths_daily/dc_daily）、板块列表与成分
