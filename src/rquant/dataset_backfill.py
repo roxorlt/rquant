@@ -153,26 +153,33 @@ _KPL_CONS_PAGE_SIZE = 3000   # 实测单页上限 3000（limit=10000 也只回 3
 _KPL_CONS_FIELDS = "ts_code,name,con_name,con_code,trade_date,desc,hot_num"
 
 
+def _fetch_kpl_concept_cons_day(
+    adapter: DatasetBackfillAdapter, day: date
+) -> pd.DataFrame:
+    """开盘啦题材成分：单交易日分页拉取（快照窗口与日度回补共用）。
+
+    该接口 offset > 100,000 直接报「查询数据失败，请确认参数」（2026-07-03
+    实测撞墙），故按交易日逐日拉（每天约 3,400 行、2 页封顶），永远到不了深
+    offset。非交易日源空返回无害。
+    """
+    return adapter._dataset_paged(  # type: ignore[attr-defined]
+        "kpl_concept_cons",
+        fields=_KPL_CONS_FIELDS,
+        page_size=_KPL_CONS_PAGE_SIZE,
+        trade_date=day.strftime("%Y%m%d"),
+    )
+
+
 def _fetch_kpl_concept_cons(
     adapter: DatasetBackfillAdapter, as_of: date
 ) -> pd.DataFrame:
-    """开盘啦题材成分：按交易日逐日分页拉取。
-
-    不能用 start/end 区间一次性深分页：30 天窗口实际 10 万+ 行，而该接口
-    offset > 100,000 直接报「查询数据失败，请确认参数」（2026-07-03 实测撞墙）。
-    逐日拉每天约 3,400 行、2 页封顶，永远到不了深 offset；非交易日空返回无害。
-    """
+    """题材成分快照：拉 30 天窗口后每题材留最新打点（见 _norm_kpl_concept）。"""
     frames: list[pd.DataFrame] = []
     for offset_days in range(_KPL_CONS_WINDOW_DAYS, -1, -1):
         day = as_of - timedelta(days=offset_days)
         if day.weekday() >= 5:
             continue
-        df = adapter._dataset_paged(  # type: ignore[attr-defined]
-            "kpl_concept_cons",
-            fields=_KPL_CONS_FIELDS,
-            page_size=_KPL_CONS_PAGE_SIZE,
-            trade_date=day.strftime("%Y%m%d"),
-        )
+        df = _fetch_kpl_concept_cons_day(adapter, day)
         if df is not None and not df.empty:
             frames.append(df)
     if not frames:
@@ -198,6 +205,16 @@ def _norm_kpl_concept(df: pd.DataFrame) -> pd.DataFrame:
     out["hot_num"] = pd.to_numeric(out["hot_num"], errors="coerce")
     latest = out.groupby("board_code")["trade_date"].transform("max")
     return out[out["trade_date"] == latest].reset_index(drop=True)
+
+
+def _norm_kpl_concept_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """kpl_concept 日度：列映射同快照表，但**不做每题材留最新折叠**——日度
+    表按 (trade_date, board_code, con_code) 存每天的打点，回测才能按 ≤T 最近
+    一次打点还原信号日的题材成分。desc/description 不落日度表（列交集自动丢弃）。
+    """
+    out = df.rename(columns={"ts_code": "board_code", "name": "board_name"})
+    out["hot_num"] = pd.to_numeric(out["hot_num"], errors="coerce")
+    return out
 
 
 def _norm_daily_info(df: pd.DataFrame) -> pd.DataFrame:
@@ -303,6 +320,13 @@ DATASETS: dict[str, DatasetSpec] = {
             name="kpl_concept", table="kpl_concept_member", mode="snapshot",
             fetch=_fetch_kpl_concept_cons,
             normalize=_norm_kpl_concept,
+        ),
+        # 日度题材成分（逐日落库，不折叠）：回测按 ≤T 最近打点还原当日成分
+        DatasetSpec(
+            name="kpl_concept_daily", table="kpl_concept_member_daily",
+            mode="by_date",
+            fetch=_fetch_kpl_concept_cons_day,
+            normalize=_norm_kpl_concept_daily,
         ),
         DatasetSpec(
             name="daily_info", table="market_daily_info", mode="by_date",

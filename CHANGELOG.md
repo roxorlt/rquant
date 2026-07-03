@@ -6,6 +6,25 @@
 
 ### Added
 
+- **T 日板块集合竞价强度因子 + 日度题材成分表（board_auction_strength）**：
+  新增日度题材成分表 `kpl_concept_member_daily`（PK `(trade_date, board_code,
+  con_code)`，与快照表 `kpl_concept_member` 只留「当前成分」不同，本表逐日存
+  每天的打点，回测才能按 ≤T 最近打点还原信号日成分），配套 `data-backfill
+  --dataset kpl_concept_daily` 逐日回补（复用逐日分页，normalize 不折叠）。
+  新模块 `board_auction_strength(store, ts_code, signal_date, *,
+  membership_lookback_days=30, hist_days=20)`：候选票所在题材（≤T 最近打点还原
+  成分）在信号日集合竞价的整体强度——`board_gap_up_ratio`（题材内竞价价>昨收的
+  高开占比）、`board_auction_amount_ratio`（题材当日竞价总额 / 过去 hist_days
+  竞价总额中位）、`board_member_count`；一票多题材取资金比最强的题材；无题材
+  归属返回 None。昨收取 daily_bar 的 T-1、竞价价/额取 auction_bar 的 09:25
+  快照，全程 ≤signal_date（无未来函数）。接入 `growth_board_surge`：
+  `GrowthBoardSurgeConfig` 新增 `require_board_favor` / `min_board_gap_up_ratio`
+  / `min_board_auction_amount_ratio` 候选级闸门（早于分钟循环，缺归属/缺竞价
+  历史保守拦截），`GROWTH_SURGE_V1_FACTORS` 加 `board_gap_up_ratio` /
+  `board_auction_amount_ratio` 两个板块闸门因子（键名测试锁死），CLI
+  `growth-board-surge-replay --require-board-favor --min-board-gap-up-ratio
+  --min-board-auction-amount-ratio`（默认关=现状）。表进 `research_sync`
+  MERGE 语义（本地回补权威，云端没有，整表替换会抹历史）。
 - **科创/创业放量追击：用户三条件 + factor_confirm 评分确认
   （growth_board_surge）**：`GrowthBoardSurgeConfig` 新增开关组——
   ①量比：沿用 `min_cum_amount_ratio` 成交额口径宽门，另输出经典量比观察值

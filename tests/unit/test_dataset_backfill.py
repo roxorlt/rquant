@@ -22,6 +22,7 @@ from rquant.dataset_backfill import (
     DATASETS,
     _norm_hm_list,
     _norm_kpl_concept,
+    _norm_kpl_concept_daily,
     _norm_kpl_list,
     _norm_moneyflow,
     _norm_ths_index,
@@ -49,7 +50,8 @@ def test_registry_covers_expected_datasets() -> None:
         "moneyflow", "moneyflow_dc", "moneyflow_ths", "moneyflow_ind_ths",
         "moneyflow_ind_dc", "moneyflow_cnt_ths", "moneyflow_mkt_dc",
         "top_list", "top_inst",
-        "kpl_list", "kpl_concept", "daily_info", "hm_list", "index_daily",
+        "kpl_list", "kpl_concept", "kpl_concept_daily",
+        "daily_info", "hm_list", "index_daily",
     }
     assert set(DATASETS) == expected
 
@@ -394,6 +396,84 @@ def test_kpl_concept_snapshot_end_to_end(
     assert df.iloc[1]["board_name"] == "长鑫存储概念"
     assert pd.Timestamp(df.iloc[1]["trade_date"]).date() == date(2026, 7, 2)
     assert df.iloc[1]["description"] == "上榜理由"
+
+
+class _FakeKplDailyAdapter:
+    """kpl_concept_daily by_date：trade_cal 走假日历，_dataset_paged 逐日返回
+    该日专属成分（单页），验证日度落库不折叠、每天独立打点。"""
+
+    def __init__(self, per_day: dict[str, list[dict]]) -> None:
+        self._per_day = per_day
+        self.paged_calls: list[str] = []
+
+    def trade_cal(self, start: date, end: date) -> list[date]:
+        all_dates = [date(2026, 6, 30), date(2026, 7, 1)]
+        return [d for d in all_dates if start <= d <= end]
+
+    def _dataset_paged(self, api_name: str, **kwargs: object) -> pd.DataFrame:
+        trade_date = str(kwargs["trade_date"])
+        self.paged_calls.append(trade_date)
+        df = pd.DataFrame(self._per_day.get(trade_date, []))
+        # 真 TushareAdapter._dataset_paged 会把 trade_date 归一化为 date
+        if not df.empty:
+            df["trade_date"] = pd.to_datetime(
+                df["trade_date"], format="%Y%m%d"
+            ).dt.date
+        return df
+
+
+def test_kpl_concept_daily_by_date_keeps_each_days_stamp(store: DuckDBStore) -> None:
+    """日度题材成分：逐日落库、不折叠——同题材成分在两天各留一行。"""
+    adapter = _FakeKplDailyAdapter({
+        "20260630": [
+            _kpl_cons_row("000129.KP", "长鑫存储", "601133.SH", "20260630", hot="10"),
+        ],
+        "20260701": [
+            # 同题材次日多一只成分（调入）——两天打点都保留，非折叠
+            _kpl_cons_row("000129.KP", "长鑫存储", "601133.SH", "20260701", hot=20),
+            _kpl_cons_row("000129.KP", "长鑫存储", "600667.SH", "20260701", hot=30),
+        ],
+    })
+
+    summary = backfill_dataset(
+        "kpl_concept_daily", "2026-06-30", "2026-07-01", store, adapter,
+        api_sleep=0.0,
+    )
+
+    assert summary["mode"] == "by_date"
+    assert summary["table"] == "kpl_concept_member_daily"
+    assert summary["failed_dates"] == []
+    assert summary["rows"] == 3  # 6/30 一行 + 7/1 两行，不折叠
+    assert adapter.paged_calls == ["20260630", "20260701"]
+
+    df = store.query(
+        "SELECT * FROM kpl_concept_member_daily ORDER BY trade_date, con_code"
+    )
+    assert len(df) == 3
+    first = df.iloc[0]
+    assert pd.Timestamp(first["trade_date"]).date() == date(2026, 6, 30)
+    assert first["board_code"] == "000129.KP"  # ts_code 改名
+    assert first["board_name"] == "长鑫存储"
+    assert first["hot_num"] == 10  # 字符串热度数值化
+    assert "description" not in df.columns  # desc 不落日度表
+
+
+def test_norm_kpl_concept_daily_renames_without_folding() -> None:
+    df = pd.DataFrame([
+        {"ts_code": "000129.KP", "name": "长鑫存储", "con_code": "601133.SH",
+         "con_name": "柏诚股份", "trade_date": date(2026, 7, 2),
+         "desc": "理由", "hot_num": "3726"},
+        # 同题材旧打点：日度表不折叠，两行都保留
+        {"ts_code": "000129.KP", "name": "长鑫存储", "con_code": "600667.SH",
+         "con_name": "太极实业", "trade_date": date(2026, 7, 1),
+         "desc": "理由2", "hot_num": None},
+    ])
+    out = _norm_kpl_concept_daily(df)
+    assert len(out) == 2  # 不折叠
+    assert "board_code" in out.columns
+    assert "ts_code" not in out.columns
+    assert set(out["board_name"]) == {"长鑫存储"}
+    assert out.iloc[0]["hot_num"] == 3726
 
 
 def test_snapshot_dry_run_does_not_fetch(store: DuckDBStore) -> None:

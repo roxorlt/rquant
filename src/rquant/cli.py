@@ -681,6 +681,12 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         min_inner_outer_ratio=args.min_inner_outer_ratio,
         require_large_net_vol=args.require_large_net_vol,
         min_large_net_vol=args.min_large_net_vol,
+        require_fresh_surge=args.require_fresh_surge,
+        fresh_lookback_days=args.fresh_lookback_days,
+        min_listing_trading_days=args.min_listing_trading_days,
+        require_board_favor=args.require_board_favor,
+        min_board_gap_up_ratio=args.min_board_gap_up_ratio,
+        min_board_auction_amount_ratio=args.min_board_auction_amount_ratio,
         enable_factor_confirm=args.factor_confirm,
         factor_score_threshold=args.factor_score_threshold,
         max_hold_days=args.max_hold_days,
@@ -694,6 +700,8 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
     ]
     if config.factor_layer_enabled:
         required_tables += ["moneyflow_daily", "market_sentiment_daily"]
+    if config.require_board_favor:
+        required_tables += ["auction_bar", "kpl_concept_member_daily"]
     with open_readonly_store(required_tables=required_tables) as store:
         trades = run_growth_board_surge_replay(
             store,
@@ -1383,7 +1391,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="分钟频度 (默认 1min)",
     )
     growth_replay_p.add_argument(
-        "--min-signal-time", type=str, default="09:33",
+        "--min-signal-time", type=str, default="09:30",
         help="最早 B 信号时间 HH:MM (默认 09:33)",
     )
     growth_replay_p.add_argument(
@@ -1421,6 +1429,30 @@ def build_parser() -> argparse.ArgumentParser:
     growth_replay_p.add_argument(
         "--min-large-net-vol", type=float, default=0.0,
         help="T-1 大单净量下限，须严格大于 (默认 0)",
+    )
+    growth_replay_p.add_argument(
+        "--require-fresh-surge", action="store_true",
+        help="首爆过滤：放量当天之前 N 日没放量过（经典量比口径，用户条件）",
+    )
+    growth_replay_p.add_argument(
+        "--fresh-lookback-days", type=int, default=5,
+        help="首爆回看交易日数 (默认 5)",
+    )
+    growth_replay_p.add_argument(
+        "--min-listing-trading-days", type=int, default=0,
+        help="不做新股：上市不满 N 个交易日过滤 (默认 0=关闭；推荐 180)",
+    )
+    growth_replay_p.add_argument(
+        "--require-board-favor", action="store_true",
+        help="板块集合竞价强度闸门：候选票所在题材当日竞价整体达标才入场",
+    )
+    growth_replay_p.add_argument(
+        "--min-board-gap-up-ratio", type=float, default=0.5,
+        help="板块竞价高开占比下限 (默认 0.5)",
+    )
+    growth_replay_p.add_argument(
+        "--min-board-auction-amount-ratio", type=float, default=1.0,
+        help="板块竞价总额相对历史中位下限 (默认 1.0)",
     )
     growth_replay_p.add_argument(
         "--factor-confirm", action="store_true",

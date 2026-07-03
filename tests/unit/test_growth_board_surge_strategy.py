@@ -259,6 +259,52 @@ def test_growth_board_surge_filter_supports_ablation_flags() -> None:
     )
 
 
+def test_prior_days_had_surge_freshness(tmp_path) -> None:
+    """首爆过滤：前 N 日量比判定（放过量/首爆/数据不足）。"""
+    from datetime import date
+
+    from rquant.growth_board_surge_strategy import _prior_days_had_surge
+    from rquant.storage.duckdb import DuckDBStore
+
+    store = DuckDBStore(tmp_path / "fresh.duckdb")
+    # 600001：前 5 日量比全 <2（首爆）；600002：其中一日量比 3.5（前期放过量）
+    rows = []
+    for i, d in enumerate(range(11, 16)):  # 2026-06-11..15
+        rows.append(("600001.SH", f"2026-06-{d}", 1.2))
+        rows.append(("600002.SH", f"2026-06-{d}", 3.5 if i == 2 else 1.1))
+    for ts, d, vr in rows:
+        store._conn.execute(
+            "INSERT INTO daily_basic (ts_code, trade_date, volume_ratio) "
+            f"VALUES ('{ts}', DATE '{d}', {vr})"
+        )
+    signal = date(2026, 6, 16)
+    assert _prior_days_had_surge(store, "600001.SH", signal, 5, 2.0) is False  # 首爆
+    assert _prior_days_had_surge(store, "600002.SH", signal, 5, 2.0) is True   # 非首爆
+    # 数据不足（只有 5 行，要求 6 日）→ None 保守通过
+    assert _prior_days_had_surge(store, "600001.SH", signal, 6, 2.0) is None
+    store.close()
+
+
+def test_listed_trading_days_counts_prior_daily_bars(tmp_path) -> None:
+    """不做新股：信号日之前日线根数 ≈ 已上市交易日数。"""
+    from datetime import date
+
+    from rquant.growth_board_surge_strategy import _listed_trading_days
+    from rquant.storage.duckdb import DuckDBStore
+
+    store = DuckDBStore(tmp_path / "listing.duckdb")
+    for d in range(1, 21):  # 20 根日线，2026-06-0x..
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) "
+            f"VALUES ('300999.SZ', DATE '2026-06-{d:02d}', 10.0)"
+        )
+    signal = date(2026, 6, 21)
+    assert _listed_trading_days(store, "300999.SZ", signal) == 20
+    # 未上市的票 → 0
+    assert _listed_trading_days(store, "301000.SZ", signal) == 0
+    store.close()
+
+
 def test_growth_board_surge_replay_calculates_ma_from_daily_bar(
     store: DuckDBStore,
 ) -> None:
@@ -637,6 +683,150 @@ def test_growth_board_surge_classic_volume_ratio_observed(
     )
     expected = (cum_vol / 4) / (1000.0 * 100 / 240)
     assert row["classic_volume_ratio"] == pytest.approx(expected, abs=0.001)
+
+
+# ── 板块集合竞价强度闸门（require_board_favor）──
+
+
+def _auction_row(
+    ts_code: str, trade_date: date, price: float, amount: float
+) -> dict[str, object]:
+    return {
+        "ts_code": ts_code,
+        "trade_date": trade_date,
+        "auction_type": "open_realtime",
+        "price": price,
+        "vol": amount / price,
+        "amount": amount,
+        "turnover_rate": 1.0,
+        "volume_ratio": 1.0,
+        "source": "tushare",
+    }
+
+
+def _seed_board_favor(store: DuckDBStore) -> None:
+    """题材 000100.KP 含候选 300001.SZ + 300010.SZ，信号日 6/25 竞价强：
+    高开占比 1.0、竞价资金 6000 vs 历史中位 1000 → ratio 6.0。"""
+    x, peer = "300001.SZ", "300010.SZ"
+    punch = date(2026, 6, 24)  # ≤ 信号日 6/25 的最近打点
+    store.upsert_dataset("kpl_concept_member_daily", pd.DataFrame([
+        {"trade_date": punch, "board_code": "000100.KP", "board_name": "题材A",
+         "con_code": x, "con_name": "创业样本", "hot_num": 100},
+        {"trade_date": punch, "board_code": "000100.KP", "board_name": "题材A",
+         "con_code": peer, "con_name": "同板样本", "hot_num": 80},
+    ]))
+    # peer 的 T-1 昨收（300001.SZ 已由 base market 提供 6/24 close=10.4）
+    store.upsert_daily(pd.DataFrame([_daily_row(peer, date(2026, 6, 24), 10.0)]))
+    auctions = [
+        # 信号日 6/25：两只都高开（X>10.4、peer>10）
+        _auction_row(x, date(2026, 6, 25), 12.0, 3000.0),
+        _auction_row(peer, date(2026, 6, 25), 11.0, 3000.0),
+        # 历史 6/23、6/24：每日合计 1000 → 中位 1000
+        _auction_row(x, date(2026, 6, 24), 10.0, 500.0),
+        _auction_row(peer, date(2026, 6, 24), 10.0, 500.0),
+        _auction_row(x, date(2026, 6, 23), 10.0, 500.0),
+        _auction_row(peer, date(2026, 6, 23), 10.0, 500.0),
+    ]
+    store.upsert_auction_bars(pd.DataFrame(auctions))
+
+
+def test_growth_board_surge_board_favor_gate_allows_strong_board(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import (
+        GrowthBoardSurgeConfig,
+        run_growth_board_surge_replay,
+    )
+
+    _seed_base_market(store)
+    _seed_volume_surge_minutes(store)
+    _seed_board_favor(store)
+    common = {
+        "min_signal_time": time(9, 33),
+        "lookback_days": 2,
+        "min_hist_days": 2,
+        "min_cum_amount_ratio": 1.4,
+        "min_same_minute_amount_ratio": 2.0,
+    }
+
+    trades = run_growth_board_surge_replay(
+        store,
+        start_date=date(2026, 6, 25),
+        end_date=date(2026, 6, 25),
+        config=GrowthBoardSurgeConfig(
+            **common,
+            require_board_favor=True,
+            min_board_gap_up_ratio=0.5,
+            min_board_auction_amount_ratio=1.0,
+        ),
+    )
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["board_code"] == "000100.KP"
+    assert row["board_gap_up_ratio"] == pytest.approx(1.0)
+    assert row["board_auction_amount_ratio"] == pytest.approx(6.0)
+    assert row["board_member_count"] == 2
+
+
+def test_growth_board_surge_board_favor_gate_blocks_weak_amount(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import (
+        GrowthBoardSurgeConfig,
+        run_growth_board_surge_replay,
+    )
+
+    _seed_base_market(store)
+    _seed_volume_surge_minutes(store)
+    _seed_board_favor(store)
+    common = {
+        "min_signal_time": time(9, 33),
+        "lookback_days": 2,
+        "min_hist_days": 2,
+        "min_cum_amount_ratio": 1.4,
+        "min_same_minute_amount_ratio": 2.0,
+    }
+
+    # 资金比阈值抬到 99 → 不达标拦截
+    blocked = run_growth_board_surge_replay(
+        store,
+        start_date=date(2026, 6, 25),
+        end_date=date(2026, 6, 25),
+        config=GrowthBoardSurgeConfig(
+            **common,
+            require_board_favor=True,
+            min_board_auction_amount_ratio=99.0,
+        ),
+    )
+    assert blocked.empty
+
+
+def test_growth_board_surge_board_favor_gate_blocks_no_membership(
+    store: DuckDBStore,
+) -> None:
+    """无题材归属（未采集日度成分）→ require_board_favor 保守拦截。"""
+    from rquant.growth_board_surge_strategy import (
+        GrowthBoardSurgeConfig,
+        run_growth_board_surge_replay,
+    )
+
+    _seed_base_market(store)
+    _seed_volume_surge_minutes(store)
+    # 不 seed kpl_concept_member_daily / auction_bar → 无归属
+    trades = run_growth_board_surge_replay(
+        store,
+        start_date=date(2026, 6, 25),
+        end_date=date(2026, 6, 25),
+        config=GrowthBoardSurgeConfig(
+            min_signal_time=time(9, 33),
+            lookback_days=2,
+            min_hist_days=2,
+            min_cum_amount_ratio=1.4,
+            min_same_minute_amount_ratio=2.0,
+            require_board_favor=True,
+        ),
+    )
+    assert trades.empty
 
 
 def test_growth_board_surge_replay_filters_intraday_yiziban(store: DuckDBStore) -> None:
