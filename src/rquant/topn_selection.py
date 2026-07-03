@@ -32,6 +32,22 @@ class FeatureScoreTerm(BaseModel):
     center: float | None = None
     half_width: float | None = None
     cap: float | None = None
+    # 缺失值时该项贡献 0 分，而不是走 transform 的默认值路径。
+    # V2 新因子（新股无 250 日历史）必须开，V1 旧项保持原行为以便历史 run 可对比。
+    skip_if_missing: bool = False
+
+
+class EnvGateConfig(BaseModel):
+    """市场环境门控：市场级字段（T-1 可知）低于阈值时跳过当日或整体降权。
+
+    温度字段对同一 signal_date 的所有个股取值相同，multiplier>0 的降权
+    不改变当日内 topN 排序，只有 multiplier<=0（跳过当日）会改变选中集合。
+    字段缺失（trades 未带该列 / 当日无温度数据）时门控自动放行。
+    """
+
+    feature: str
+    min_value: float
+    multiplier: float = 0.0
 
 
 class FeatureScoreProfile(BaseModel):
@@ -42,6 +58,7 @@ class FeatureScoreProfile(BaseModel):
     terms: tuple[FeatureScoreTerm, ...]
     disabled_groups: tuple[str, ...] = ()
     group_multipliers: dict[str, float] = Field(default_factory=dict)
+    env_gate: EnvGateConfig | None = None
 
 
 def _num(value: object, default: float = 0.0) -> float:
@@ -170,17 +187,50 @@ BASE_SCORE_TERMS: tuple[FeatureScoreTerm, ...] = (
 )
 
 
+# 环境门控消费的市场温度列名。replay 明细当前不自带，
+# strategy_optimizer 会按 signal_date 从 market_sentiment_daily 补上。
+MARKET_TEMPERATURE_FEATURE = "market_above_ma20_ratio_pct"
+
+# 2026H1 上 above_ma20_ratio_pct 的 p30 约 27，取 30 大致门掉最冷的三成交易日。
+_ENV_GATE_MIN_ABOVE_MA20_PCT = 30.0
+
+_MA_ALIGNMENT_TERM = FeatureScoreTerm(
+    name="ma_alignment",
+    group="trend",
+    weight=6.0,
+    transform="linear",
+    low=0.0,
+    high=1.0,
+    skip_if_missing=True,
+)
+
+
+def _price_percentile_term(*, prefer_low: bool) -> FeatureScoreTerm:
+    """250 日价格百分位项：低位反转与高位动量两个方向假设各建一个画像。"""
+    return FeatureScoreTerm(
+        name="price_percentile_250d",
+        group="trend",
+        weight=8.0,
+        transform="inverse_linear" if prefer_low else "linear",
+        low=0.0,
+        high=1.0,
+        skip_if_missing=True,
+    )
+
+
 def build_score_profile(
     *,
     name: str,
     label: str,
     disabled_groups: tuple[str, ...] = (),
     group_multipliers: dict[str, float] | None = None,
+    extra_terms: tuple[FeatureScoreTerm, ...] = (),
+    env_gate: EnvGateConfig | None = None,
 ) -> FeatureScoreProfile:
     """从基础特征项生成一个可比较的评分画像。"""
     multipliers = group_multipliers or {}
     terms: list[FeatureScoreTerm] = []
-    for term in BASE_SCORE_TERMS:
+    for term in (*BASE_SCORE_TERMS, *extra_terms):
         if term.group in disabled_groups:
             continue
         multiplier = multipliers.get(term.group, 1.0)
@@ -191,6 +241,7 @@ def build_score_profile(
         terms=tuple(terms),
         disabled_groups=disabled_groups,
         group_multipliers=multipliers,
+        env_gate=env_gate,
     )
 
 
@@ -233,6 +284,25 @@ def default_score_profiles() -> list[FeatureScoreProfile]:
             label="偏重高低位结构",
             group_multipliers={"position": 1.5},
         ),
+        build_score_profile(
+            name="v2_low_position",
+            label="V2 低位反转：250日低百分位加分",
+            extra_terms=(_MA_ALIGNMENT_TERM, _price_percentile_term(prefer_low=True)),
+        ),
+        build_score_profile(
+            name="v2_momentum",
+            label="V2 高位动量：250日高百分位加分",
+            extra_terms=(_MA_ALIGNMENT_TERM, _price_percentile_term(prefer_low=False)),
+        ),
+        build_score_profile(
+            name="v2_env_gate",
+            label="V2 温度门控：T-1 MA20上方占比<30% 跳过当日",
+            env_gate=EnvGateConfig(
+                feature=MARKET_TEMPERATURE_FEATURE,
+                min_value=_ENV_GATE_MIN_ABOVE_MA20_PCT,
+                multiplier=0.0,
+            ),
+        ),
     ]
 
 
@@ -254,7 +324,22 @@ def resolve_score_profiles(names: list[str] | tuple[str, ...] | None) -> list[Fe
     return resolved
 
 
+def _is_missing(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return True
+    return not isfinite(float(value))
+
+
+def _env_gate_triggered(row: pd.Series, gate: EnvGateConfig) -> bool:
+    value = row.get(gate.feature)
+    if _is_missing(value):
+        return False
+    return float(value) < gate.min_value
+
+
 def _score_term(row: pd.Series, term: FeatureScoreTerm) -> float:
+    if term.skip_if_missing and _is_missing(row.get(term.name)):
+        return 0.0
     if term.transform == "log_ratio":
         return _score_log_ratio(row.get(term.name), cap=term.cap or 5.0)
     if term.transform == "linear":
@@ -273,6 +358,8 @@ def feature_score(row: pd.Series, score_profile: FeatureScoreProfile | None = No
     """
     profile = score_profile or resolve_score_profiles(["v1"])[0]
     score = sum(term.weight * _score_term(row, term) for term in profile.terms)
+    if profile.env_gate is not None and _env_gate_triggered(row, profile.env_gate):
+        score *= max(profile.env_gate.multiplier, 0.0)
     return round(score, 4)
 
 
@@ -293,6 +380,10 @@ def add_feature_scores(
     out["feature_score"] = out.apply(feature_score, axis=1, score_profile=profile)
     out["score_profile"] = profile.name
     out["score_profile_label"] = profile.label
+    if profile.env_gate is not None:
+        out["env_gate_triggered"] = out.apply(
+            _env_gate_triggered, axis=1, gate=profile.env_gate
+        )
     return out
 
 
@@ -310,7 +401,11 @@ def select_topn_by_feature_score(
         msg = "top_n must be >= 1"
         raise ValueError(msg)
 
-    scored = add_feature_scores(trades, score_profile=score_profile)
+    profile = score_profile or resolve_score_profiles(["v1"])[0]
+    scored = add_feature_scores(trades, score_profile=profile)
+    gate = profile.env_gate
+    if gate is not None and gate.multiplier <= 0 and "env_gate_triggered" in scored.columns:
+        scored = scored[~scored["env_gate_triggered"].fillna(False)].copy()
     group_key = group_col if group_col in scored.columns else "signal_date"
     ranked = scored.sort_values(
         [group_key, "feature_score", "entry_time", "ts_code"],

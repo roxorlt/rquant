@@ -32,6 +32,7 @@ GapMode = Literal["close", "strict_high"]
 StFilterMode = Literal["case_insensitive", "literal_lower", "none"]
 ExitMode = Literal["next_open"]
 AuctionGapMinuteEntryMode = Literal["vwap_push"]
+HoldPolicy = Literal["t1", "seal_hold"]
 
 
 class AuctionGapConfig(BaseModel):
@@ -89,6 +90,14 @@ class AuctionGapMinuteReplayConfig(BaseModel):
     next_morning_exit_until: time = time(10, 0)
     next_morning_vwap_break_buffer_pct: float = Field(default=0.003, ge=0, lt=0.05)
     price_tol: float = 0.01
+    # 封板质量驱动的条件持有期（归因报告 2026-07-02 决策项 B）：B 日收盘封住
+    # 且封板质量达标（官方 open_times ≤ 阈值，可选封单/流通市值占比下限）时，
+    # 持有时间上限从 max_hold_days 放宽到 seal_hold_max_days；竞价弱退/VWAP
+    # 破位/止损/移动止盈等退出条件照旧生效
+    seal_hold_enabled: bool = False
+    seal_hold_max_days: int = Field(default=3, ge=1, le=10)
+    seal_hold_max_open_times: int = Field(default=0, ge=0, le=50)
+    seal_hold_min_fd_to_circ_pct: float | None = Field(default=None, ge=0)
     paper: PaperTradeConfig = Field(default_factory=PaperTradeConfig)
 
     def auction_config(self) -> AuctionGapConfig:
@@ -358,6 +367,71 @@ def _b_day_strength(
     }
 
 
+def _query_limit_list_seal(
+    store: DuckDBStore,
+    ts_code: str,
+    trading_date: date,
+) -> pd.Series | None:
+    """查官方涨停榜（limit_list_daily，limit_status='U'）的封板质量字段。"""
+    df = store._conn.execute(
+        """
+        SELECT open_times, fd_amount, float_mv
+        FROM limit_list_daily
+        WHERE ts_code = ?
+          AND trade_date = ?
+          AND limit_status = 'U'
+        """,
+        [ts_code, trading_date],
+    ).fetchdf()
+    if df.empty:
+        return None
+    return df.iloc[0]
+
+
+def _resolve_hold_policy(
+    store: DuckDBStore,
+    candidate: pd.Series,
+    b_strength: dict[str, object],
+    config: AuctionGapMinuteReplayConfig,
+) -> tuple[HoldPolicy, int]:
+    """B 日收盘后决定持有策略：封住且封板质量达标 → seal_hold，否则 t1。
+
+    封板质量优先用官方 limit_list_daily（open_times / fd_amount / float_mv）；
+    官方缺行时回退分钟推算的 b_open_times（此时封单占比条件无从验证，跳过）。
+    """
+    if not config.seal_hold_enabled:
+        return "t1", config.max_hold_days
+    if not bool(b_strength.get("b_close_at_limit_up")):
+        return "t1", config.max_hold_days
+
+    official = _query_limit_list_seal(
+        store,
+        str(candidate["ts_code"]),
+        _as_date(candidate["signal_date"]),
+    )
+    if official is not None:
+        open_times = (
+            int(official["open_times"])
+            if pd.notna(official["open_times"])
+            else int(b_strength.get("b_open_times") or 0)
+        )
+        if open_times > config.seal_hold_max_open_times:
+            return "t1", config.max_hold_days
+        if config.seal_hold_min_fd_to_circ_pct is not None:
+            fd_amount = official["fd_amount"]
+            float_mv = official["float_mv"]
+            if pd.isna(fd_amount) or pd.isna(float_mv) or float(float_mv) <= 0:
+                # 封单强度无法验证时保守回 T+1
+                return "t1", config.max_hold_days
+            fd_to_circ_pct = float(fd_amount) / float(float_mv) * 100
+            if fd_to_circ_pct < config.seal_hold_min_fd_to_circ_pct:
+                return "t1", config.max_hold_days
+    else:
+        if int(b_strength.get("b_open_times") or 0) > config.seal_hold_max_open_times:
+            return "t1", config.max_hold_days
+    return "seal_hold", config.seal_hold_max_days
+
+
 def _find_auction_gap_entry(
     store: DuckDBStore,
     candidate: pd.Series,
@@ -541,6 +615,101 @@ def _next_auction_is_weak(
     return False
 
 
+def _run_daily_tail_exit(
+    store: DuckDBStore,
+    position: PaperPosition,
+    window_dates: list[date],
+    *,
+    last_scan_date: date,
+    config: AuctionGapMinuteReplayConfig,
+) -> PaperPosition | None:
+    """分钟数据没铺满持有窗口时，剩余交易日降级用日线近似退出。
+
+    多日持有（seal_hold）常见：候选分钟回补只覆盖 B 日到 T+1 窗口。逐日按
+    「开盘缺口 → 日内 low 触及止损/移动止盈 → 收盘更新移动止盈」近似复用
+    check_position_exit 语义，最后一个有日线的窗口日收盘平仓。全部缺日线时
+    返回 None，由调用方退回按最后一根分钟收盘平仓。
+    """
+    tail_dates = [trading_date for trading_date in window_dates if trading_date > last_scan_date]
+    previous_date = last_scan_date
+    last_seen: tuple[date, float] | None = None
+    for trading_date in tail_dates:
+        daily = _query_daily_bar(store, position.ts_code, trading_date)
+        if daily is None or pd.isna(daily["close"]):
+            continue
+        previous_daily = _query_daily_bar(store, position.ts_code, previous_date)
+        if (
+            previous_daily is not None
+            and pd.notna(previous_daily["close"])
+            and pd.notna(daily["pre_close"])
+        ):
+            position = adjust_open_position_price_basis(
+                position,
+                float(previous_daily["close"]),
+                float(daily["pre_close"]),
+            )
+        holding_days = _holding_days(window_dates, position.trade_date, trading_date)
+        open_price = float(daily["open"])
+        open_quote = _AuctionMinuteQuote(
+            ts_code=position.ts_code,
+            price=open_price,
+            low=open_price,
+            high=open_price,
+        )
+        open_event = check_position_exit(
+            position,
+            open_quote,
+            datetime.combine(trading_date, time(9, 30)),
+            config.paper,
+        )
+        if open_event is not None:
+            return _close_position(
+                position,
+                open_event.exit_time,
+                open_event.exit_price,
+                open_event.exit_reason,
+                holding_days,
+                {"exit_daily_fallback": True},
+            )
+        day_quote = _AuctionMinuteQuote(
+            ts_code=position.ts_code,
+            price=float(daily["close"]),
+            low=float(daily["low"]),
+            high=float(daily["high"]) if pd.notna(daily["high"]) else None,
+        )
+        day_event = check_position_exit(
+            position,
+            day_quote,
+            datetime.combine(trading_date, time(15, 0)),
+            config.paper,
+        )
+        if day_event is not None:
+            return _close_position(
+                position,
+                day_event.exit_time,
+                day_event.exit_price,
+                day_event.exit_reason,
+                holding_days,
+                {"exit_daily_fallback": True},
+            )
+        position = mark_position_to_quote(position, day_quote)
+        last_seen = (trading_date, float(daily["close"]))
+        previous_date = trading_date
+
+    if last_seen is None:
+        return None
+    exit_date, exit_close = last_seen
+    holding_days = _holding_days(window_dates, position.trade_date, exit_date)
+    return _close_position(
+        position,
+        datetime.combine(exit_date, time(15, 0)),
+        exit_close,
+        f"time_{holding_days}d",
+        holding_days,
+        {"exit_daily_fallback": True},
+    )
+
+
 def _run_auction_gap_exit_scan(
     store: DuckDBStore,
     position: PaperPosition,
@@ -556,7 +725,13 @@ def _run_auction_gap_exit_scan(
     next_date = _as_date(candidate["next_trade_date"])
     b_day_close = float(candidate["day_close"]) if pd.notna(candidate["day_close"]) else 0.0
     next_auction = _query_next_auction(store, position.ts_code, next_date)
-    if next_auction is not None and pd.notna(next_auction["price"]):
+    # price <= 0 是坏行情行（实测 auction_bar 偶发 price=0 的采集残行），
+    # 按无竞价数据处理，落到分钟扫描/日线降级，避免 -100% 假成交
+    if (
+        next_auction is not None
+        and pd.notna(next_auction["price"])
+        and float(next_auction["price"]) > 0
+    ):
         next_auction_price = float(next_auction["price"])
         next_auction_gap_pct = (
             (next_auction_price / b_day_close - 1) * 100
@@ -687,6 +862,16 @@ def _run_auction_gap_exit_scan(
 
     last = scan_minutes.iloc[-1]
     last_time = _as_datetime(last["trade_time"])
+    if last_time.date() < window_dates[-1]:
+        tail_exit = _run_daily_tail_exit(
+            store,
+            position,
+            window_dates,
+            last_scan_date=last_time.date(),
+            config=config,
+        )
+        if tail_exit is not None:
+            return tail_exit
     return _close_position(
         position,
         last_time,
@@ -700,12 +885,14 @@ def _position_to_auction_gap_row(
     position: PaperPosition,
     candidate: pd.Series,
     b_strength: dict[str, object],
+    hold_policy: HoldPolicy,
 ) -> dict[str, object]:
     payload = position.risk_payload or {}
     return {
         "ts_code": position.ts_code,
         "name": position.name,
         "strategy": "auction_gap_minute",
+        "hold_policy": hold_policy,
         "signal_date": candidate["signal_date"],
         "buy_date": position.trade_date,
         "auction_price": payload.get("auction_price"),
@@ -772,6 +959,7 @@ def _position_to_auction_gap_row(
         "exit_time": position.exit_time,
         "exit_price": position.exit_price,
         "exit_reason": position.exit_reason,
+        "exit_daily_fallback": bool(payload.get("exit_daily_fallback") or False),
         "holding_trading_days": position.holding_trading_days,
         "ret_pct": position.pnl_pct,
     }
@@ -1044,6 +1232,7 @@ def run_auction_gap_minute_replay(
     *,
     persist_positions: bool = False,
     run_id: str | None = None,
+    candidates: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """集合竞价只做候选池，B/S 均由可见分钟因子确认。
 
@@ -1051,13 +1240,18 @@ def run_auction_gap_minute_replay(
     并用下一分钟开盘价成交。
 
     S 日：先看次日集合竞价是否明显转弱；若不弱，再进入分钟线止损、移动止盈
-    与早盘 VWAP 破位扫描。
+    与早盘 VWAP 破位扫描。持有时间上限默认 max_hold_days；开启 seal_hold 时
+    B 日收盘封住且封板质量达标的仓位放宽到 seal_hold_max_days。
+
+    ``candidates`` 可传入 ``run_auction_gap_replay`` 的既有结果避免重复生成
+    （同一候选参数跑多组持有期网格时用）。
 
     ``persist_positions=True`` 时把闭环后的模拟仓带溯源写进 paper_position
     （run_mode='replay'，同一 ``run_id`` 可整批 DELETE 清理重跑）。落库路径
     必须在非盘中时段跑——盘中 monitor 持主库写锁（CLAUDE.md DuckDB 并发约束）。
     """
-    candidates = run_auction_gap_replay(store, config.auction_config())
+    if candidates is None:
+        candidates = run_auction_gap_replay(store, config.auction_config())
     if candidates.empty:
         return pd.DataFrame()
 
@@ -1069,20 +1263,24 @@ def run_auction_gap_minute_replay(
     if persist_positions and effective_run_id is None:
         effective_run_id = f"auction_gap_replay-{datetime.now():%Y%m%d%H%M%S}"
 
+    max_window_days = config.max_hold_days
+    if config.seal_hold_enabled:
+        max_window_days = max(max_window_days, config.seal_hold_max_days)
+
     rows: list[dict[str, object]] = []
     for _, candidate in candidates.iterrows():
         signal_date = _as_date(candidate["signal_date"])
-        window_dates = _window_trading_dates(calendar, signal_date, config.max_hold_days)
-        if len(window_dates) <= 1:
+        window_dates_full = _window_trading_dates(calendar, signal_date, max_window_days)
+        if len(window_dates_full) <= 1:
             continue
-        if _as_date(candidate["next_trade_date"]) not in window_dates:
+        if _as_date(candidate["next_trade_date"]) not in window_dates_full:
             continue
         _, signal_end = _day_bounds(signal_date)
-        _, window_end = _day_bounds(window_dates[-1])
+        _, window_end_full = _day_bounds(window_dates_full[-1])
         minutes = store.query_minute_bars(
             str(candidate["ts_code"]),
             datetime.combine(signal_date, time(9, 30)),
-            window_end,
+            window_end_full,
             freq=config.freq,
         )
         if minutes.empty:
@@ -1098,6 +1296,9 @@ def run_auction_gap_minute_replay(
             limit_up_price=float(candidate["limit_up_price"]),
             price_tol=config.price_tol,
         )
+        hold_policy, hold_days = _resolve_hold_policy(store, candidate, b_strength, config)
+        window_dates = window_dates_full[: hold_days + 1]
+        _, window_end = _day_bounds(window_dates[-1])
         exit_position = _run_auction_gap_exit_scan(
             store,
             position,
@@ -1120,7 +1321,9 @@ def run_auction_gap_minute_replay(
                 run_id=effective_run_id,
                 param_payload=config.paper.model_dump(),
             )
-        rows.append(_position_to_auction_gap_row(exit_position, candidate, b_strength))
+        rows.append(
+            _position_to_auction_gap_row(exit_position, candidate, b_strength, hold_policy)
+        )
 
     if not rows:
         return pd.DataFrame()

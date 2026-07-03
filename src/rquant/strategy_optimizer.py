@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from datetime import date
 
+import duckdb
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.minute_replay import MinuteFreq
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strategy_compare import EntryMode, ProfileVariant, run_entry_mode_comparison
-from rquant.topn_selection import FeatureScoreProfile, resolve_score_profiles, run_topn_comparison
+from rquant.topn_selection import (
+    MARKET_TEMPERATURE_FEATURE,
+    FeatureScoreProfile,
+    resolve_score_profiles,
+    run_topn_comparison,
+)
 from rquant.topn_walk_forward import build_expanding_folds, run_topn_walk_forward
 
 
@@ -69,6 +75,37 @@ def _screen_dates(
     out: list[date] = []
     for value in df["trade_date"].tolist():
         out.append(value.date() if hasattr(value, "date") else value)
+    return out
+
+
+def _attach_market_temperature(store: DuckDBStore, trades: pd.DataFrame) -> pd.DataFrame:
+    """给 replay 交易明细按 signal_date（相对入场日是 T-1）补市场温度列。
+
+    replay 明细当前不自带温度列；表缺列（老库）或当日无数据时留 NaN，
+    环境门控画像对缺失值自动放行，不影响 V1 等无门控画像。
+    """
+    if trades.empty or "signal_date" not in trades.columns:
+        return trades
+    if MARKET_TEMPERATURE_FEATURE in trades.columns:
+        return trades
+    try:
+        df = store._conn.execute(
+            """
+            SELECT trade_date, above_ma20_ratio_pct
+            FROM market_sentiment_daily
+            WHERE above_ma20_ratio_pct IS NOT NULL
+            """
+        ).fetchdf()
+    except duckdb.Error:
+        return trades
+    mapping = {
+        _parse_date(str(row["trade_date"])): float(row["above_ma20_ratio_pct"])
+        for _, row in df.iterrows()
+    }
+    out = trades.copy()
+    out[MARKET_TEMPERATURE_FEATURE] = out["signal_date"].map(
+        lambda value: mapping.get(_parse_date(str(value)))
+    )
     return out
 
 
@@ -247,6 +284,8 @@ def run_strategy_optimization(
             max_hold_days=hold_days,
             freq=freq,
         )
+        train_trades = _attach_market_temperature(store, train.trades)
+        test_trades = _attach_market_temperature(store, test.trades)
         train_summary = _prefix_summary(train.summary, "train", min_trades=min_trades)
         test_summary = _prefix_summary(test.summary, "test", min_trades=min_trades)
         merged = train_summary.merge(
@@ -257,7 +296,7 @@ def run_strategy_optimization(
         merged.insert(0, "max_hold_days", hold_days)
         ranking_frames.append(merged)
 
-        for split_name, trades in (("train", train.trades), ("test", test.trades)):
+        for split_name, trades in (("train", train_trades), ("test", test_trades)):
             if trades.empty:
                 continue
             payload = trades.copy()
@@ -266,12 +305,12 @@ def run_strategy_optimization(
             trade_frames.append(payload)
 
         train_topn, train_topn_trades = _topn_summary_by_strategy(
-            train.trades,
+            train_trades,
             top_n_options=topn_options,
             score_profiles=score_profiles,
         )
         test_topn, test_topn_trades = _topn_summary_by_strategy(
-            test.trades,
+            test_trades,
             top_n_options=topn_options,
             score_profiles=score_profiles,
         )
@@ -323,7 +362,7 @@ def run_strategy_optimization(
                 min_train_dates=min_train_dates,
             )
             walk = run_topn_walk_forward(
-                full.trades,
+                _attach_market_temperature(store, full.trades),
                 folds=folds,
                 top_n_options=topn_options,
                 score_profiles=score_profiles,

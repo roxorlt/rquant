@@ -373,6 +373,8 @@ class TestAuctionGapMinuteReplayParser:
         assert args.min_ratio == 0.15
         assert args.max_ratio == 5.0
         assert args.max_hold_days == 1
+        assert args.seal_hold_days is None
+        assert args.seal_hold_max_open_times == 0
         assert args.output is None
 
     def test_auction_gap_minute_replay_custom_args(self) -> None:
@@ -386,6 +388,8 @@ class TestAuctionGapMinuteReplayParser:
             "--min-ratio", "0.2",
             "--max-ratio", "2",
             "--max-hold-days", "2",
+            "--seal-hold-days", "3",
+            "--seal-hold-max-open-times", "1",
             "--output", "/private/tmp/auction-gap-minute.csv",
         ])
         assert args.gap_mode == "strict_high"
@@ -393,6 +397,8 @@ class TestAuctionGapMinuteReplayParser:
         assert args.min_ratio == 0.2
         assert args.max_ratio == 2.0
         assert args.max_hold_days == 2
+        assert args.seal_hold_days == 3
+        assert args.seal_hold_max_open_times == 1
         assert args.output == "/private/tmp/auction-gap-minute.csv"
 
 
@@ -492,6 +498,8 @@ class TestCmdAuctionGapMinuteReplay:
             max_ratio=5.0,
             st_filter="case_insensitive",
             max_hold_days=1,
+            seal_hold_days=None,
+            seal_hold_max_open_times=0,
             output=None,
         )
 

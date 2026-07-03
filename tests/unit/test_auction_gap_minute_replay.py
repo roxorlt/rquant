@@ -24,6 +24,8 @@ def _seed_base(
     weak_open: bool = False,
     strong_seal: bool = False,
     reopen: bool = False,
+    unseal_at_close: bool = False,
+    tail_days: bool = False,
     next_auction_price: float = 10.85,
 ) -> None:
     dates = [
@@ -78,6 +80,21 @@ def _seed_base(
             "amount": 54500.0,
         },
     ])
+    if tail_days:
+        # 持有窗口第 2 个交易日只有日线（分钟缺失），驱动日线降级退出路径
+        daily_rows.append({
+            "ts_code": "600000.SH",
+            "trade_date": date(2026, 6, 29),
+            "open": 11.0,
+            "high": 11.3,
+            "low": 10.85,
+            "close": 11.2,
+            "pre_close": 10.9,
+            "change": 0.3,
+            "pct_chg": 2.75,
+            "vol": 6000.0,
+            "amount": 66000.0,
+        })
     store.upsert_daily(pd.DataFrame(daily_rows))
     store.upsert_stock_basic(pd.DataFrame([{
         "ts_code": "600000.SH",
@@ -254,6 +271,20 @@ def _seed_base(
                 "source": "tushare",
             },
         ])
+    if unseal_at_close:
+        # 盘中封住但尾盘炸板：收盘 close 跌破涨停容差 → b_close_at_limit_up=False
+        minute_rows.append({
+            "ts_code": "600000.SH",
+            "trade_time": datetime(2026, 6, 25, 14, 55),
+            "freq": "1min",
+            "open": 11.00,
+            "high": 11.00,
+            "low": 10.88,
+            "close": 10.90,
+            "vol": 1000,
+            "amount": 10900,
+            "source": "tushare",
+        })
     minute_rows.append(
         {
             "ts_code": "600000.SH",
@@ -269,6 +300,35 @@ def _seed_base(
         }
     )
     store.upsert_minute_bars(pd.DataFrame(minute_rows))
+
+
+def _seed_limit_list(
+    store: DuckDBStore,
+    *,
+    open_times: int,
+    fd_amount: float = 5e7,
+    float_mv: float = 1e9,
+) -> None:
+    store.upsert_limit_list(pd.DataFrame([{
+        "ts_code": "600000.SH",
+        "trade_date": date(2026, 6, 25),
+        "name": "浦发银行",
+        "industry": "银行",
+        "close": 11.0,
+        "pct_chg": 10.0,
+        "amount": 55000.0,
+        "limit_amount": None,
+        "float_mv": float_mv,
+        "total_mv": float_mv,
+        "turnover_ratio": 1.0,
+        "fd_amount": fd_amount,
+        "first_time": "100000",
+        "last_time": "100000",
+        "open_times": open_times,
+        "up_stat": "1/1",
+        "limit_times": 1,
+        "limit_status": "U",
+    }]))
 
 
 def test_auction_gap_minute_replay_waits_for_minute_b_and_uses_next_auction_s(
@@ -405,3 +465,159 @@ def test_auction_gap_minute_replay_reports_reopen_count(
     assert row["b_open_times"] == 1
     assert row["b_limit_up_close_minutes"] == 2
     assert row["b_close_at_limit_up"]
+    assert row["hold_policy"] == "t1"
+
+
+def _seal_hold_config(**overrides: object) -> object:
+    from rquant.auction_gap_strategy import AuctionGapMinuteReplayConfig
+
+    params: dict[str, object] = {
+        "start_date": "2026-06-25",
+        "end_date": "2026-06-25",
+        "max_hold_days": 1,
+        "seal_hold_enabled": True,
+        "seal_hold_max_days": 2,
+        "seal_hold_max_open_times": 0,
+    }
+    params.update(overrides)
+    return AuctionGapMinuteReplayConfig(**params)
+
+
+def test_seal_hold_extends_hold_and_exits_via_daily_tail(
+    store: DuckDBStore,
+) -> None:
+    """封住 + 官方 0 开板 → seal_hold 延长持有，分钟缺失日走日线降级退出。"""
+    from rquant.auction_gap_strategy import run_auction_gap_minute_replay
+
+    _seed_base(store, strong_seal=True, tail_days=True, next_auction_price=10.75)
+    _seed_limit_list(store, open_times=0)
+
+    trades = run_auction_gap_minute_replay(store, _seal_hold_config())
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["hold_policy"] == "seal_hold"
+    assert row["exit_reason"] == "time_2d"
+    assert row["exit_time"] == pd.Timestamp("2026-06-29 15:00:00")
+    assert row["exit_price"] == pytest.approx(11.2)
+    assert row["holding_trading_days"] == 2
+    assert bool(row["exit_daily_fallback"])
+    assert row["ret_pct"] == pytest.approx(round((11.2 / 10.53 - 1) * 100, 4))
+
+
+def test_seal_hold_rejects_when_official_open_times_above_threshold(
+    store: DuckDBStore,
+) -> None:
+    """封住但官方开板 2 次（分钟推算 0 次）→ 官方口径优先，回 T+1。"""
+    from rquant.auction_gap_strategy import run_auction_gap_minute_replay
+
+    _seed_base(store, strong_seal=True, tail_days=True, next_auction_price=10.75)
+    _seed_limit_list(store, open_times=2)
+
+    trades = run_auction_gap_minute_replay(store, _seal_hold_config())
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["hold_policy"] == "t1"
+    assert row["exit_reason"] == "time_1d"
+    assert row["exit_time"] == pd.Timestamp("2026-06-26 09:30:00")
+
+
+def test_seal_hold_requires_close_at_limit_up(
+    store: DuckDBStore,
+) -> None:
+    """尾盘炸板（b_close_at_limit_up=False）→ 即使官方有 U 行也回 T+1。"""
+    from rquant.auction_gap_strategy import run_auction_gap_minute_replay
+
+    _seed_base(store, unseal_at_close=True, tail_days=True)
+    _seed_limit_list(store, open_times=0)
+
+    trades = run_auction_gap_minute_replay(store, _seal_hold_config())
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert not row["b_close_at_limit_up"]
+    assert row["hold_policy"] == "t1"
+    assert row["exit_reason"] == "next_auction_weak"
+
+
+def test_seal_hold_falls_back_to_minute_open_times_when_limit_list_missing(
+    store: DuckDBStore,
+) -> None:
+    """limit_list_daily 缺行 → 回退分钟推算 b_open_times=0 → 仍给 seal_hold。"""
+    from rquant.auction_gap_strategy import run_auction_gap_minute_replay
+
+    _seed_base(store, strong_seal=True, tail_days=True, next_auction_price=10.75)
+
+    trades = run_auction_gap_minute_replay(store, _seal_hold_config())
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["hold_policy"] == "seal_hold"
+    assert row["exit_reason"] == "time_2d"
+
+
+def test_seal_hold_fallback_rejects_minute_reopen(
+    store: DuckDBStore,
+) -> None:
+    """limit_list_daily 缺行 + 分钟推算开板 1 次 > 阈值 0 → 回 T+1。"""
+    from rquant.auction_gap_strategy import run_auction_gap_minute_replay
+
+    _seed_base(store, reopen=True, tail_days=True)
+
+    trades = run_auction_gap_minute_replay(store, _seal_hold_config())
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["b_open_times"] == 1
+    assert row["hold_policy"] == "t1"
+    assert row["exit_reason"] == "next_auction_weak"
+
+
+def test_zero_price_next_auction_row_is_ignored(store: DuckDBStore) -> None:
+    """次日 auction_bar 出现 price=0 的坏行 → 不按 0 元假成交，落到分钟扫描。"""
+    from rquant.auction_gap_strategy import (
+        AuctionGapMinuteReplayConfig,
+        run_auction_gap_minute_replay,
+    )
+
+    _seed_base(store)
+    store._conn.execute(
+        """
+        UPDATE auction_bar SET price = 0
+        WHERE ts_code = '600000.SH' AND trade_date = DATE '2026-06-26'
+        """
+    )
+
+    trades = run_auction_gap_minute_replay(
+        store,
+        AuctionGapMinuteReplayConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            max_hold_days=1,
+        ),
+    )
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["exit_reason"] != "next_auction_weak"
+    assert row["exit_price"] > 0
+    assert row["ret_pct"] > -100
+
+
+def test_resolve_hold_policy_fd_ratio_threshold(store: DuckDBStore) -> None:
+    """封单/流通市值占比条件：低于阈值回 T+1，达标给 seal_hold。"""
+    from rquant.auction_gap_strategy import _resolve_hold_policy
+
+    candidate = pd.Series({
+        "ts_code": "600000.SH",
+        "signal_date": date(2026, 6, 25),
+    })
+    b_strength: dict[str, object] = {"b_close_at_limit_up": True, "b_open_times": 0}
+
+    _seed_limit_list(store, open_times=0, fd_amount=1e6, float_mv=1e9)  # 0.1%
+    config = _seal_hold_config(seal_hold_min_fd_to_circ_pct=1.0)
+    assert _resolve_hold_policy(store, candidate, b_strength, config) == ("t1", 1)
+
+    _seed_limit_list(store, open_times=0, fd_amount=2e7, float_mv=1e9)  # 2%
+    assert _resolve_hold_policy(store, candidate, b_strength, config) == ("seal_hold", 2)

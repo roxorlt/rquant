@@ -519,6 +519,7 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
     )
 
     setup_logging()
+    seal_hold_enabled = args.seal_hold_days is not None
     config = AuctionGapMinuteReplayConfig(
         start_date=args.start_date,
         end_date=args.end_date,
@@ -527,8 +528,13 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         max_auction_vol_ratio_5d=args.max_ratio,
         st_filter=args.st_filter,
         max_hold_days=args.max_hold_days,
+        seal_hold_enabled=seal_hold_enabled,
+        seal_hold_max_days=args.seal_hold_days if seal_hold_enabled else 3,
+        seal_hold_max_open_times=args.seal_hold_max_open_times,
     )
     required_tables = ["auction_bar", "daily_bar", "daily_state", "minute_bar"]
+    if seal_hold_enabled:
+        required_tables.append("limit_list_daily")
     if args.persist_positions:
         # persist 要写 paper_position/快照表 → 必须写模式直连主库。
         # 盘中 monitor 持写锁会直接撞锁，明确警告后仍执行（撞锁自然报错）
@@ -569,7 +575,7 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
     preview_cols = [
         "signal_date", "ts_code", "name", "auction_price",
         "entry_time", "entry_price", "b_first_limit_up_time",
-        "b_close_at_limit_up", "exit_time", "exit_price",
+        "b_close_at_limit_up", "hold_policy", "exit_time", "exit_price",
         "exit_reason", "ret_pct",
     ]
     available_cols = [col for col in preview_cols if col in trades.columns]
@@ -1525,6 +1531,14 @@ def build_parser() -> argparse.ArgumentParser:
     auction_gap_minute_p.add_argument(
         "--max-hold-days", type=int, default=1,
         help="最多持有交易日数量 (默认 1)",
+    )
+    auction_gap_minute_p.add_argument(
+        "--seal-hold-days", type=int, default=None,
+        help="封板质量达标仓位的持有上限（交易日）；不传保持关闭（全部 T+1）",
+    )
+    auction_gap_minute_p.add_argument(
+        "--seal-hold-max-open-times", type=int, default=0,
+        help="seal_hold 允许的最大开板次数（官方 limit_list_daily.open_times，默认 0）",
     )
     auction_gap_minute_p.add_argument(
         "--output", type=str, default=None,
