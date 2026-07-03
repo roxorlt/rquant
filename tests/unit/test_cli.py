@@ -142,6 +142,12 @@ class TestGrowthBoardSurgeReplayParser:
         assert args.min_cum_amount_ratio == 1.4
         assert args.min_same_minute_amount_ratio == 2.0
         assert args.max_hold_days == 1
+        assert args.require_inner_outer is False
+        assert args.min_inner_outer_ratio == 1.0
+        assert args.require_large_net_vol is False
+        assert args.min_large_net_vol == 0.0
+        assert args.factor_confirm is False
+        assert args.factor_score_threshold == 45.0
         assert args.output is None
 
     def test_growth_board_surge_replay_custom_args(self) -> None:
@@ -157,6 +163,12 @@ class TestGrowthBoardSurgeReplayParser:
             "--min-cum-amount-ratio", "1.8",
             "--min-same-minute-amount-ratio", "3.0",
             "--max-hold-days", "2",
+            "--require-inner-outer",
+            "--min-inner-outer-ratio", "1.2",
+            "--require-large-net-vol",
+            "--min-large-net-vol", "100",
+            "--factor-confirm",
+            "--factor-score-threshold", "50",
             "--output", "/tmp/growth.csv",
         ])
         assert args.freq == "5min"
@@ -166,6 +178,12 @@ class TestGrowthBoardSurgeReplayParser:
         assert args.min_cum_amount_ratio == 1.8
         assert args.min_same_minute_amount_ratio == 3.0
         assert args.max_hold_days == 2
+        assert args.require_inner_outer is True
+        assert args.min_inner_outer_ratio == 1.2
+        assert args.require_large_net_vol is True
+        assert args.min_large_net_vol == 100.0
+        assert args.factor_confirm is True
+        assert args.factor_score_threshold == 50.0
         assert args.output == "/tmp/growth.csv"
 
 
@@ -388,6 +406,7 @@ class TestAuctionGapMinuteReplayParser:
         assert args.max_hold_days == 1
         assert args.seal_hold_days is None
         assert args.seal_hold_max_open_times == 0
+        assert args.factor_score_threshold is None
         assert args.output is None
 
     def test_auction_gap_minute_replay_custom_args(self) -> None:
@@ -403,6 +422,7 @@ class TestAuctionGapMinuteReplayParser:
             "--max-hold-days", "2",
             "--seal-hold-days", "3",
             "--seal-hold-max-open-times", "1",
+            "--factor-score-threshold", "45",
             "--output", "/private/tmp/auction-gap-minute.csv",
         ])
         assert args.gap_mode == "strict_high"
@@ -412,6 +432,7 @@ class TestAuctionGapMinuteReplayParser:
         assert args.max_hold_days == 2
         assert args.seal_hold_days == 3
         assert args.seal_hold_max_open_times == 1
+        assert args.factor_score_threshold == 45.0
         assert args.output == "/private/tmp/auction-gap-minute.csv"
 
 
@@ -777,6 +798,12 @@ class TestCmdGrowthBoardSurgeReplay:
             min_hist_days=10,
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
+            require_inner_outer=False,
+            min_inner_outer_ratio=1.0,
+            require_large_net_vol=False,
+            min_large_net_vol=0.0,
+            factor_confirm=False,
+            factor_score_threshold=45.0,
             max_hold_days=1,
             output=None,
         )

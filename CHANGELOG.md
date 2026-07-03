@@ -6,6 +6,31 @@
 
 ### Added
 
+- **科创/创业放量追击：用户三条件 + factor_confirm 评分确认
+  （growth_board_surge）**：`GrowthBoardSurgeConfig` 新增开关组——
+  ①量比：沿用 `min_cum_amount_ratio` 成交额口径宽门，另输出经典量比观察值
+  `classic_volume_ratio`（当日每分钟均量 / T-1 可知 5 日每分钟均量）；
+  ②内盘>外盘（`require_inner_outer`/`min_inner_outer_ratio`）：真实盘中内外盘
+  无历史数据，用分钟 tick-rule 近似（close 对比前一分钟 close，升=外盘/降=内盘/
+  平=均分，首分钟对比自身 open），按用户口径 inner/outer > 1 判多；
+  ③大单净量（`require_large_net_vol`/`min_large_net_vol`）：T 日盘中不可知，
+  用 T-1 `moneyflow_daily.large_net_vol` 防未来函数（与用户口径「今日」有一天
+  滞后）；④`enable_factor_confirm`/`factor_score_threshold`：宽门不动，入场再过
+  `growth_surge_b_v1` 加权评分（满分 100，复用 `score_feature_terms`；经典量比
+  与市场温度只观察不计分）。新 factor_set `GROWTH_SURGE_V1`（signal_provenance，
+  键名测试锁死），命中矩阵与观察值随交易行输出。CLI：`growth-board-surge-replay
+  --require-inner-outer --require-large-net-vol --factor-confirm
+  --factor-score-threshold`（默认全关=现状）。
+- **竞价跳空分钟 B 确认加评分对照实验（死刑复核）**：
+  `AuctionGapMinuteReplayConfig.factor_score_threshold`（默认 None=现状），
+  入场分钟用既有 `auction_gap_v1` 键名因子按 `AUCTION_GAP_B_V1_SCORE_TERMS`
+  打分过阈值（不引入新因子）；输出列 `auction_factor_score`。CLI：
+  `auction-gap-minute-replay --factor-score-threshold`。归因终审已判死该策略线，
+  此实验仅验证评分层是否翻案。
+- **Strategy Lab factor_confirm 可见**：入场模式增加「多因子确认」，sidebar
+  新增「多因子确认阈值」数字输入，经 `run_entry_mode_comparison` 透传，收益
+  对比与历史记录带阈值参数。
+
 - **N 字分钟级 B 点多因子确认（`entry_mode=factor_confirm`，设计文档
   2026-07-03-nshape-factor-confirm-design）**：minute_replay 新增确认层入场
   模式——宽门沿用 first_break 同门（强承接 + 破 T 高），B 决策改由

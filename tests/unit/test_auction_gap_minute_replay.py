@@ -416,6 +416,82 @@ def test_auction_gap_minute_replay_tolerates_mild_weak_auction_after_strong_seal
     assert row["exit_reason"] == "time_1d"
 
 
+def test_auction_gap_minute_replay_factor_threshold_none_keeps_baseline(
+    store: DuckDBStore,
+) -> None:
+    """factor_score_threshold 默认 None = 现状：不评分、不出分数列。"""
+    from rquant.auction_gap_strategy import (
+        AuctionGapMinuteReplayConfig,
+        run_auction_gap_minute_replay,
+    )
+
+    _seed_base(store)
+
+    trades = run_auction_gap_minute_replay(
+        store,
+        AuctionGapMinuteReplayConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            max_hold_days=1,
+        ),
+    )
+
+    assert len(trades) == 1
+    assert pd.isna(trades.iloc[0]["auction_factor_score"])
+
+
+def test_auction_gap_minute_replay_factor_threshold_delays_entry_to_higher_score(
+    store: DuckDBStore,
+) -> None:
+    """9:31 信号分钟得分 ~30 被阈值 40 拦下，9:32 得分 ~47.8 过阈值后下一分钟成交。"""
+    from rquant.auction_gap_strategy import (
+        AuctionGapMinuteReplayConfig,
+        run_auction_gap_minute_replay,
+    )
+
+    _seed_base(store)
+
+    trades = run_auction_gap_minute_replay(
+        store,
+        AuctionGapMinuteReplayConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            max_hold_days=1,
+            factor_score_threshold=40.0,
+        ),
+    )
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    # baseline 信号分钟是 9:31（9:32 开盘成交）；评分闸门把入场推迟到 9:32 信号
+    assert row["entry_time"] == pd.Timestamp("2026-06-25 10:00:00")
+    assert row["auction_factor_score"] == pytest.approx(47.75, abs=0.1)
+    assert row["auction_factor_score_threshold"] == pytest.approx(40.0)
+
+
+def test_auction_gap_minute_replay_factor_threshold_blocks_all_when_too_high(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import (
+        AuctionGapMinuteReplayConfig,
+        run_auction_gap_minute_replay,
+    )
+
+    _seed_base(store)
+
+    trades = run_auction_gap_minute_replay(
+        store,
+        AuctionGapMinuteReplayConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            max_hold_days=1,
+            factor_score_threshold=99.0,
+        ),
+    )
+
+    assert trades.empty
+
+
 def test_b_day_strength_counts_seal_open_reseal_transitions() -> None:
     from rquant.auction_gap_strategy import _b_day_strength
 

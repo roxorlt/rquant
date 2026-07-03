@@ -531,6 +531,7 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         seal_hold_enabled=seal_hold_enabled,
         seal_hold_max_days=args.seal_hold_days if seal_hold_enabled else 3,
         seal_hold_max_open_times=args.seal_hold_max_open_times,
+        factor_score_threshold=args.factor_score_threshold,
     )
     required_tables = ["auction_bar", "daily_bar", "daily_state", "minute_bar"]
     if seal_hold_enabled:
@@ -676,6 +677,12 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         min_hist_days=args.min_hist_days,
         min_cum_amount_ratio=args.min_cum_amount_ratio,
         min_same_minute_amount_ratio=args.min_same_minute_amount_ratio,
+        require_inner_outer=args.require_inner_outer,
+        min_inner_outer_ratio=args.min_inner_outer_ratio,
+        require_large_net_vol=args.require_large_net_vol,
+        min_large_net_vol=args.min_large_net_vol,
+        enable_factor_confirm=args.factor_confirm,
+        factor_score_threshold=args.factor_score_threshold,
         max_hold_days=args.max_hold_days,
     )
     required_tables = [
@@ -685,6 +692,8 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         "stock_basic",
         "minute_bar",
     ]
+    if config.factor_layer_enabled:
+        required_tables += ["moneyflow_daily", "market_sentiment_daily"]
     with open_readonly_store(required_tables=required_tables) as store:
         trades = run_growth_board_surge_replay(
             store,
@@ -1398,6 +1407,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="最多持有交易日数量，T+1 默认次日收盘前退出 (默认 1)",
     )
     growth_replay_p.add_argument(
+        "--require-inner-outer", action="store_true",
+        help="要求信号分钟内盘>外盘（分钟 tick-rule 近似，用户条件 2）",
+    )
+    growth_replay_p.add_argument(
+        "--min-inner-outer-ratio", type=float, default=1.0,
+        help="内盘/外盘比下限，须严格大于 (默认 1.0 即内盘>外盘)",
+    )
+    growth_replay_p.add_argument(
+        "--require-large-net-vol", action="store_true",
+        help="要求 T-1 moneyflow 大单净量>阈值（用户条件 3，T 日盘中不可知）",
+    )
+    growth_replay_p.add_argument(
+        "--min-large-net-vol", type=float, default=0.0,
+        help="T-1 大单净量下限，须严格大于 (默认 0)",
+    )
+    growth_replay_p.add_argument(
+        "--factor-confirm", action="store_true",
+        help="启用 growth_surge_b_v1 多因子评分确认层（宽门不动，评分过阈值才入场）",
+    )
+    growth_replay_p.add_argument(
+        "--factor-score-threshold", type=float, default=45.0,
+        help="factor_confirm 评分入场阈值，仅 --factor-confirm 时生效 (默认 45)",
+    )
+    growth_replay_p.add_argument(
         "--output", type=str, default=None,
         help="CSV 输出路径（可选）",
     )
@@ -1545,6 +1578,10 @@ def build_parser() -> argparse.ArgumentParser:
     auction_gap_minute_p.add_argument(
         "--seal-hold-max-open-times", type=int, default=0,
         help="seal_hold 允许的最大开板次数（官方 limit_list_daily.open_times，默认 0）",
+    )
+    auction_gap_minute_p.add_argument(
+        "--factor-score-threshold", type=float, default=None,
+        help="分钟 B 确认的 auction_gap_b_v1 评分阈值（不传=现状不评分；判死复核用）",
     )
     auction_gap_minute_p.add_argument(
         "--output", type=str, default=None,
