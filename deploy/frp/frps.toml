@@ -1,0 +1,6 @@
+# rQuant frp 服务端（腾讯云 82.156.0.68）
+# 放 /etc/frp/frps.toml；token 与 Mac 端 ~/.config/rquant-frp/frpc.toml 一致
+bindPort = 7100
+auth.token = "填入与 Mac 端相同的 token"
+# 穿透端口只绑回环：外部访问必须经 nginx（basic auth），不裸暴露
+proxyBindAddr = "127.0.0.1"
