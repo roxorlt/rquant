@@ -529,9 +529,26 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         max_hold_days=args.max_hold_days,
     )
     required_tables = ["auction_bar", "daily_bar", "daily_state", "minute_bar"]
-    with open_readonly_store(required_tables=required_tables) as store:
-        candidates = run_auction_gap_replay(store, config.auction_config())
-        trades = run_auction_gap_minute_replay(store, config)
+    if args.persist_positions:
+        # persist 要写 paper_position/快照表 → 必须写模式直连主库。
+        # 盘中 monitor 持写锁会直接撞锁，明确警告后仍执行（撞锁自然报错）
+        from datetime import datetime as _dt
+        now = _dt.now().time()
+        if dtime(9, 25) <= now <= dtime(15, 5):
+            logger.warning(
+                "盘中时段 persist 落库会与本地 monitor 抢写锁，建议收盘后执行"
+            )
+        with DuckDBStore() as store:
+            candidates = run_auction_gap_replay(store, config.auction_config())
+            trades = run_auction_gap_minute_replay(
+                store, config,
+                persist_positions=True,
+                run_id=args.run_id,
+            )
+    else:
+        with open_readonly_store(required_tables=required_tables) as store:
+            candidates = run_auction_gap_replay(store, config.auction_config())
+            trades = run_auction_gap_minute_replay(store, config)
 
     summary = summarize_auction_gap_minute_replay(
         trades,
@@ -1512,6 +1529,14 @@ def build_parser() -> argparse.ArgumentParser:
     auction_gap_minute_p.add_argument(
         "--output", type=str, default=None,
         help="CSV 输出路径（可选）",
+    )
+    auction_gap_minute_p.add_argument(
+        "--persist-positions", action="store_true",
+        help="模拟仓落库（run_mode=replay，带信号溯源；写主库，盘中会撞 monitor 写锁）",
+    )
+    auction_gap_minute_p.add_argument(
+        "--run-id", type=str, default=None,
+        help="落库批次标识（不传自动生成；可按 run_id 整批清理）",
     )
 
     auction_gap_minute_backfill_p = sub.add_parser(

@@ -18,6 +18,12 @@ from rquant.paper import (
     mark_position_to_quote,
     open_position_from_signal,
 )
+from rquant.signal_provenance import (
+    AUCTION_GAP_MINUTE_STRATEGY,
+    SignalProvenance,
+    build_signal_factors,
+    persist_position_with_provenance,
+)
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
 from rquant.stock_features import build_intraday_relative_volume_features
 from rquant.storage.duckdb import DuckDBStore
@@ -357,7 +363,7 @@ def _find_auction_gap_entry(
     candidate: pd.Series,
     minutes: pd.DataFrame,
     config: AuctionGapMinuteReplayConfig,
-) -> tuple[PaperPosition, dict[str, object]] | None:
+) -> tuple[PaperPosition, dict[str, object], SignalProvenance] | None:
     signal_date = _as_date(candidate["signal_date"])
     day_minutes = minutes[
         pd.to_datetime(minutes["trade_time"]).dt.date == signal_date
@@ -420,6 +426,15 @@ def _find_auction_gap_entry(
             limit_up_price_next=limit_up_price,
             stop_weak=0.0,
         )
+        intraday_features = build_intraday_relative_volume_features(
+            store,
+            str(candidate["ts_code"]),
+            quote_time,
+            current_minute_amount=minute_amount,
+            current_cum_amount=cum_amount,
+            current_day_amounts=amount_history,
+            freq=config.freq,
+        )
         signal_features = {
             "auction_price": auction_price,
             "auction_vol_ratio_5d": float(candidate["auction_vol_ratio_5d"]),
@@ -438,16 +453,31 @@ def _find_auction_gap_entry(
             "entry_signal_cum_high": cum_high,
             "entry_signal_limit_progress": round(limit_progress, 4),
         }
-        signal_features.update(
-            build_intraday_relative_volume_features(
-                store,
-                str(candidate["ts_code"]),
-                quote_time,
-                current_minute_amount=minute_amount,
-                current_cum_amount=cum_amount,
-                current_day_amounts=amount_history,
-                freq=config.freq,
-            )
+        signal_features.update(intraday_features)
+        # 键名对齐 signal_provenance.AUCTION_GAP_V1_FACTORS（与全景页/未来 live 同一份 spec）
+        factor_values: dict[str, object] = {
+            "auction_vol_ratio_5d": float(candidate["auction_vol_ratio_5d"]),
+            "gap_pct_close": float(candidate["gap_pct_close"]),
+            "vwap_position": quote.price / price_floor if price_floor > 0 else None,
+            "limit_progress": limit_progress,
+            "support_ok": int(support_ok),
+            "rel_amount_same_minute_20d": intraday_features.get(
+                "signal_rel_amount_same_minute_20d"
+            ),
+            "amount_accel_5m": intraday_features.get("signal_amount_accel_5m"),
+        }
+        provenance = SignalProvenance(
+            strategy_name=AUCTION_GAP_MINUTE_STRATEGY,
+            signal_factors=build_signal_factors(
+                factor_values,
+                threshold_overrides={
+                    "auction_vol_ratio_5d": config.min_auction_vol_ratio_5d,
+                    "limit_progress": config.min_limit_progress_pct,
+                },
+            ),
+            raw_payload=signal_features,
+            as_of_time=quote_time,
+            lookback_days=20,
         )
         risk_plan = PaperRiskPlan(payload=signal_features)
         position = open_position_from_signal(
@@ -464,7 +494,7 @@ def _find_auction_gap_entry(
             earliest_exit_date=_as_date(candidate["next_trade_date"]),
             risk_plan=risk_plan,
         )
-        return position, signal_features
+        return position, signal_features, provenance
     return None
 
 
@@ -1011,6 +1041,9 @@ def summarize_auction_gap_replay(trades: pd.DataFrame) -> AuctionGapSummary:
 def run_auction_gap_minute_replay(
     store: DuckDBStore,
     config: AuctionGapMinuteReplayConfig,
+    *,
+    persist_positions: bool = False,
+    run_id: str | None = None,
 ) -> pd.DataFrame:
     """集合竞价只做候选池，B/S 均由可见分钟因子确认。
 
@@ -1019,6 +1052,10 @@ def run_auction_gap_minute_replay(
 
     S 日：先看次日集合竞价是否明显转弱；若不弱，再进入分钟线止损、移动止盈
     与早盘 VWAP 破位扫描。
+
+    ``persist_positions=True`` 时把闭环后的模拟仓带溯源写进 paper_position
+    （run_mode='replay'，同一 ``run_id`` 可整批 DELETE 清理重跑）。落库路径
+    必须在非盘中时段跑——盘中 monitor 持主库写锁（CLAUDE.md DuckDB 并发约束）。
     """
     candidates = run_auction_gap_replay(store, config.auction_config())
     if candidates.empty:
@@ -1027,6 +1064,10 @@ def run_auction_gap_minute_replay(
     calendar = _trading_dates(store)
     if not calendar:
         return pd.DataFrame()
+
+    effective_run_id = run_id
+    if persist_positions and effective_run_id is None:
+        effective_run_id = f"auction_gap_replay-{datetime.now():%Y%m%d%H%M%S}"
 
     rows: list[dict[str, object]] = []
     for _, candidate in candidates.iterrows():
@@ -1050,7 +1091,7 @@ def run_auction_gap_minute_replay(
         entry = _find_auction_gap_entry(store, candidate, minutes, config)
         if entry is None:
             continue
-        position, _signal_features = entry
+        position, _signal_features, provenance = entry
         b_strength = _b_day_strength(
             minutes,
             trading_date=signal_date,
@@ -1070,6 +1111,15 @@ def run_auction_gap_minute_replay(
         )
         if exit_position is None:
             continue
+        if persist_positions:
+            persist_position_with_provenance(
+                store,
+                exit_position,
+                provenance,
+                run_mode="replay",
+                run_id=effective_run_id,
+                param_payload=config.paper.model_dump(),
+            )
         rows.append(_position_to_auction_gap_row(exit_position, candidate, b_strength))
 
     if not rows:
