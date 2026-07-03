@@ -136,7 +136,7 @@ class TestGrowthBoardSurgeReplayParser:
         ])
         assert args.command == "growth-board-surge-replay"
         assert args.freq == "1min"
-        assert args.min_signal_time == "09:33"
+        assert args.min_signal_time == "09:30"
         assert args.lookback_days == 20
         assert args.min_hist_days == 10
         assert args.min_cum_amount_ratio == 1.4
@@ -802,6 +802,9 @@ class TestCmdGrowthBoardSurgeReplay:
             min_inner_outer_ratio=1.0,
             require_large_net_vol=False,
             min_large_net_vol=0.0,
+            require_board_favor=False,
+            min_board_gap_up_ratio=0.5,
+            min_board_auction_amount_ratio=1.0,
             factor_confirm=False,
             factor_score_threshold=45.0,
             max_hold_days=1,

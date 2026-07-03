@@ -188,6 +188,17 @@ GROWTH_SURGE_V1_FACTORS: tuple[FactorSpec, ...] = (
         name="market_above_ma20_ratio_pct", label="市场温度(MA20上方占比)",
         tier="market", basis="t_minus_1",
     ),
+    # T 日板块集合竞价强度（候选票所在题材，按 ≤T 最近打点还原成分）：
+    # 高开占比与竞价资金相对历史都是「板块资金青睐度」的闸门方向（越高越强），
+    # 竞价快照 09:25 已知，无未来函数（口径见 board_auction_strength）
+    FactorSpec(
+        name="board_gap_up_ratio", label="板块竞价高开占比",
+        tier="snapshot", op=">=", threshold=0.5, basis="signal_date_auction",
+    ),
+    FactorSpec(
+        name="board_auction_amount_ratio", label="板块竞价资金相对历史",
+        tier="snapshot", op=">=", threshold=1.0, basis="signal_date_auction",
+    ),
 )
 
 FACTOR_SETS: dict[str, tuple[FactorSpec, ...]] = {

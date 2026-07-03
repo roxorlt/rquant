@@ -86,11 +86,17 @@ def test_growth_surge_v1_factor_keys_locked() -> None:
         "large_net_vol_t1",
         "price_percentile_250d",
         "market_above_ma20_ratio_pct",
+        "board_gap_up_ratio",
+        "board_auction_amount_ratio",
     ]
     by_name = {spec.name: spec for spec in GROWTH_SURGE_V1_FACTORS}
     # 经典量比与市场温度只观察不判定
     assert by_name["classic_volume_ratio"].op is None
     assert by_name["market_above_ma20_ratio_pct"].op is None
+    # 板块竞价强度为闸门方向（越高越强），竞价快照 09:25 已知
+    assert by_name["board_gap_up_ratio"].op == ">="
+    assert by_name["board_auction_amount_ratio"].op == ">="
+    assert by_name["board_auction_amount_ratio"].basis == "signal_date_auction"
     # 用户口径：内盘>外盘（tick-rule 近似）判多，方向不得翻转
     assert by_name["inner_outer_ratio"].op == ">"
     assert by_name["inner_outer_ratio"].threshold == 1.0

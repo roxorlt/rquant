@@ -8,6 +8,7 @@ from datetime import date, datetime, time
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.board_auction_strength import board_auction_strength
 from rquant.paper import (
     PaperPosition,
     PaperRiskPlan,
@@ -79,7 +80,10 @@ class GrowthBoardSurgeConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     freq: str = "1min"
-    min_signal_time: time = time(9, 33)
+    # 9:30 早入（用户 2026-07-03，v2 验证段确认真增益）：开盘四根均参与爆量判断。
+    # 9:30 集合竞价那根只走同刻口径（vs 历史 9:30），accel 因缺前序分钟天然失效，
+    # 不与前后连续竞价分钟比较——见 build_intraday_relative_volume_features。
+    min_signal_time: time = time(9, 30)
     lookback_days: int = Field(default=20, ge=1, le=90)
     min_hist_days: int = Field(default=10, ge=1, le=90)
     min_cum_amount_ratio: float = Field(default=1.4, gt=0)
@@ -97,6 +101,21 @@ class GrowthBoardSurgeConfig(BaseModel):
     min_inner_outer_ratio: float = Field(default=1.0, gt=0)
     require_large_net_vol: bool = False
     min_large_net_vol: float = 0.0
+    # 首爆过滤（用户 2026-07-03）：放量当天之前 N 个交易日没放量过 → 只打首次爆量。
+    # 日线口径用 daily_basic.volume_ratio（经典量比），前 N 日任一日 ≥ 阈值即非首爆。
+    # 数据不足（前 N 日量比缺行）保守视为通过，不误杀。
+    require_fresh_surge: bool = False
+    fresh_lookback_days: int = Field(default=5, ge=1, le=20)
+    fresh_max_prior_volume_ratio: float = Field(default=2.0, gt=0)
+    # 不做新股（用户 2026-07-03）：上市不满 N 个交易日过滤。用 daily_bar 里
+    # 信号日之前的日线根数近似「已上市交易日数」，不足则跳过。0=关闭。
+    min_listing_trading_days: int = Field(default=0, ge=0)
+    # 板块集合竞价强度闸门（候选级，用户 2026-07-03）：候选票所在题材（≤T 最近
+    # 打点还原成分）当日集合竞价整体强度不达标则跳过。板块高开占比与竞价资金
+    # 相对历史双阈值，竞价快照 09:25 已知（无未来函数，口径见 board_auction_strength）。
+    require_board_favor: bool = False
+    min_board_gap_up_ratio: float = Field(default=0.5, ge=0, le=1)
+    min_board_auction_amount_ratio: float = Field(default=1.0, gt=0)
     # factor_confirm：宽门（现有放量过滤）不动，入场加一层 growth_surge_b_v1
     # 加权评分过阈值判定（minute_replay factor_confirm 同款「宽门+评分」模式）
     enable_factor_confirm: bool = False
@@ -121,6 +140,7 @@ class GrowthBoardSurgeConfig(BaseModel):
             self.enable_factor_confirm
             or self.require_inner_outer
             or self.require_large_net_vol
+            or self.require_board_favor
         )
 
 
@@ -445,6 +465,46 @@ def _tick_rule_split(
     return vol / 2, vol / 2
 
 
+def _listed_trading_days(
+    store: DuckDBStore,
+    ts_code: str,
+    signal_date: date,
+) -> int:
+    """信号日之前已有的日线根数 ≈ 已上市交易日数（不做新股用）。"""
+    row = store._conn.execute(
+        "SELECT COUNT(*) FROM daily_bar WHERE ts_code = ? AND trade_date < ?",
+        [ts_code, signal_date],
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _prior_days_had_surge(
+    store: DuckDBStore,
+    ts_code: str,
+    signal_date: date,
+    lookback_days: int,
+    max_prior_volume_ratio: float,
+) -> bool | None:
+    """信号日之前 lookback_days 个交易日是否放量过（经典量比口径）。
+
+    返回 True=前期放过量（非首爆）、False=前期都没放量（首爆）、
+    None=数据不足（前期量比缺行，判定不了）。用 daily_basic.volume_ratio。
+    """
+    rows = store._conn.execute(
+        """
+        SELECT volume_ratio
+        FROM daily_basic
+        WHERE ts_code = ? AND trade_date < ? AND volume_ratio IS NOT NULL
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        [ts_code, signal_date, lookback_days],
+    ).fetchall()
+    if len(rows) < lookback_days:
+        return None
+    return any(float(r[0]) >= max_prior_volume_ratio for r in rows)
+
+
 def _query_large_net_vol(
     store: DuckDBStore,
     ts_code: str,
@@ -709,6 +769,10 @@ def _position_to_row(
         "growth_factor_score_threshold": payload.get("growth_factor_score_threshold"),
         "growth_factor_hit_count": payload.get("growth_factor_hit_count"),
         "growth_factor_evaluated_count": payload.get("growth_factor_evaluated_count"),
+        "board_code": payload.get("board_code"),
+        "board_gap_up_ratio": payload.get("board_gap_up_ratio"),
+        "board_auction_amount_ratio": payload.get("board_auction_amount_ratio"),
+        "board_member_count": payload.get("board_member_count"),
         "intraday_order_flow_available": False,
         "unsupported_intraday_conditions": UNSUPPORTED_ORDER_FLOW_CONDITIONS,
     }
@@ -720,6 +784,8 @@ def _find_entry_position(
     minutes: pd.DataFrame,
     window_dates: list[date],
     config: GrowthBoardSurgeConfig,
+    *,
+    board_strength: dict[str, object] | None = None,
 ) -> tuple[PaperPosition, pd.DataFrame] | None:
     day_minutes = minutes[
         pd.to_datetime(minutes["trade_time"]).dt.date == candidate.trade_date
@@ -821,6 +887,13 @@ def _find_entry_position(
                 "amount_accel_5m": features.get("signal_amount_accel_5m"),
                 "inner_outer_ratio": inner_outer_ratio,
             }
+            if board_strength is not None:
+                raw_factor_values["board_gap_up_ratio"] = board_strength.get(
+                    "board_gap_up_ratio"
+                )
+                raw_factor_values["board_auction_amount_ratio"] = (
+                    board_strength.get("board_auction_amount_ratio")
+                )
             factor_score = score_feature_terms(
                 raw_factor_values, GROWTH_SURGE_B_V1_SCORE_TERMS
             )
@@ -878,6 +951,10 @@ def _find_entry_position(
                     "amount_accel_5m": config.min_amount_accel_5m,
                     "inner_outer_ratio": config.min_inner_outer_ratio,
                     "large_net_vol_t1": config.min_large_net_vol,
+                    "board_gap_up_ratio": config.min_board_gap_up_ratio,
+                    "board_auction_amount_ratio": (
+                        config.min_board_auction_amount_ratio
+                    ),
                 },
             )
             risk_payload.update({
@@ -897,6 +974,14 @@ def _find_entry_position(
                 "growth_factor_hit_count": matrix.hit_count,
                 "growth_factor_evaluated_count": matrix.evaluated_count,
                 "growth_signal_factors": matrix.to_json_payload(),
+                "board_code": (board_strength or {}).get("board_code"),
+                "board_gap_up_ratio": (board_strength or {}).get("board_gap_up_ratio"),
+                "board_auction_amount_ratio": (
+                    (board_strength or {}).get("board_auction_amount_ratio")
+                ),
+                "board_member_count": (
+                    (board_strength or {}).get("board_member_count")
+                ),
             })
         risk_plan = PaperRiskPlan(payload=risk_payload)
         watch_item = _WatchItem(
@@ -956,6 +1041,10 @@ def run_growth_board_surge_replay(
       函数（与用户口径「今日大单净量」有 1 个交易日滞后），
       ``require_large_net_vol`` 开启时要求 > ``min_large_net_vol``
 
+    ``require_board_favor`` 开启时在候选级加一层板块集合竞价强度闸门（题材成分
+    按 ≤T 最近打点还原，竞价 09:25 已知无未来函数，口径见 board_auction_strength）：
+    板块高开占比与竞价资金相对历史双阈值不达标（含缺归属/缺竞价历史）跳过。
+
     ``enable_factor_confirm`` 开启时宽门不动，入场再过 ``growth_surge_b_v1``
     加权评分阈值（``factor_score_threshold``），命中矩阵随行输出。
     """
@@ -976,6 +1065,44 @@ def run_growth_board_surge_replay(
             continue
         _, window_end = _day_bounds(window_dates[-1])
         for candidate in _query_candidates(store, trading_date, previous_date):
+            # 不做新股（候选级）：上市不满 N 个交易日跳过
+            if cfg.min_listing_trading_days > 0 and (
+                _listed_trading_days(store, candidate.ts_code, trading_date)
+                < cfg.min_listing_trading_days
+            ):
+                continue
+            # 首爆过滤（候选级日线条件，早于分钟查询以省算力）：前 N 日放过量则跳过
+            if cfg.require_fresh_surge:
+                prior_surge = _prior_days_had_surge(
+                    store,
+                    candidate.ts_code,
+                    trading_date,
+                    cfg.fresh_lookback_days,
+                    cfg.fresh_max_prior_volume_ratio,
+                )
+                if prior_surge is True:
+                    continue
+            # 板块集合竞价强度闸门（候选级，早于分钟查询）：题材竞价整体不达标跳过。
+            # 缺题材归属或缺竞价历史（ratio=None）保守拦截，与其他闸门一致。
+            board_strength: dict[str, object] | None = None
+            if cfg.require_board_favor:
+                board_strength = board_auction_strength(
+                    store,
+                    candidate.ts_code,
+                    trading_date,
+                    hist_days=cfg.lookback_days,
+                )
+                if board_strength is None:
+                    continue
+                gap_ratio = board_strength.get("board_gap_up_ratio")
+                amt_ratio = board_strength.get("board_auction_amount_ratio")
+                if gap_ratio is None or float(gap_ratio) < cfg.min_board_gap_up_ratio:
+                    continue
+                if (
+                    amt_ratio is None
+                    or float(amt_ratio) < cfg.min_board_auction_amount_ratio
+                ):
+                    continue
             day_start, _ = _day_bounds(trading_date)
             minutes = store.query_minute_bars(
                 candidate.ts_code,
@@ -991,6 +1118,7 @@ def run_growth_board_surge_replay(
                 minutes,
                 window_dates,
                 cfg,
+                board_strength=board_strength,
             )
             if entry is None:
                 continue

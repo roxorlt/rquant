@@ -725,6 +725,24 @@ CREATE TABLE IF NOT EXISTS kpl_concept_member (
 );
 """
 
+# 开盘啦题材成分「日度」表（kpl_concept_daily）。与 kpl_concept_member 快照表
+# 的区别：快照表 PK (board_code, con_code) 只留每题材最近一次打点（当前成分），
+# 回测取不到「信号日 T 的历史成分」；本表 PK 含 trade_date，存每天的成分打点
+# （不折叠），供 board_auction_strength 按 ≤T 最近打点还原当日题材成分。
+# 源字段 ts_code 是题材代码 → board_code、name → board_name（同快照表惯例）。
+KPL_CONCEPT_MEMBER_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS kpl_concept_member_daily (
+    trade_date   DATE    NOT NULL,   -- 该题材成分的打点日
+    board_code   VARCHAR NOT NULL,   -- 题材代码（源字段 ts_code，如 000129.KP）
+    board_name   VARCHAR,
+    con_code     VARCHAR NOT NULL,
+    con_name     VARCHAR,
+    hot_num      BIGINT,             -- 个股热度
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trade_date, board_code, con_code)
+);
+"""
+
 # 市场交易统计（daily_info，1 行/市场分段/日，实测 14 字段）
 MARKET_DAILY_INFO_DDL = """
 CREATE TABLE IF NOT EXISTS market_daily_info (
@@ -794,6 +812,6 @@ ALL_DDL = [
     MONEYFLOW_IND_THS_DAILY_DDL, MONEYFLOW_IND_DC_DAILY_DDL,
     MONEYFLOW_CNT_THS_DAILY_DDL, MONEYFLOW_MKT_DAILY_DDL,
     TOP_LIST_DAILY_DDL, TOP_INST_DAILY_DDL,
-    KPL_LIST_DAILY_DDL, KPL_CONCEPT_MEMBER_DDL,
+    KPL_LIST_DAILY_DDL, KPL_CONCEPT_MEMBER_DDL, KPL_CONCEPT_MEMBER_DAILY_DDL,
     MARKET_DAILY_INFO_DDL, HM_LIST_DDL,
 ]
