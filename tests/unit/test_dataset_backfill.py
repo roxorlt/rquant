@@ -8,7 +8,7 @@ CLI 解析、adapter 分页取数逻辑。全部 mock，不触网。
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -17,8 +17,11 @@ import pytest
 from rquant.adapter.tushare import TushareAdapter
 from rquant.cli import build_parser
 from rquant.dataset_backfill import (
+    _KPL_CONS_PAGE_SIZE,
+    _KPL_CONS_WINDOW_DAYS,
     DATASETS,
     _norm_hm_list,
+    _norm_kpl_concept,
     _norm_kpl_list,
     _norm_moneyflow,
     _norm_ths_index,
@@ -46,7 +49,7 @@ def test_registry_covers_expected_datasets() -> None:
         "moneyflow", "moneyflow_dc", "moneyflow_ths", "moneyflow_ind_ths",
         "moneyflow_ind_dc", "moneyflow_cnt_ths", "moneyflow_mkt_dc",
         "top_list", "top_inst",
-        "kpl_list", "daily_info", "hm_list", "index_daily",
+        "kpl_list", "kpl_concept", "daily_info", "hm_list", "index_daily",
     }
     assert set(DATASETS) == expected
 
@@ -311,6 +314,88 @@ def test_snapshot_empty_fetch_keeps_existing(store: DuckDBStore) -> None:
     assert len(store.query("SELECT * FROM ths_board")) == 2
 
 
+class _StubKplConsPro:
+    """kpl_concept_cons 按 offset 出页的 stub（页用完返回空页）。"""
+
+    def __init__(self, pages: list[pd.DataFrame]) -> None:
+        self._pages = pages
+        self.calls: list[dict] = []
+
+    def kpl_concept_cons(self, **kwargs: object) -> pd.DataFrame:
+        self.calls.append(dict(kwargs))
+        idx = int(kwargs["offset"]) // int(kwargs["limit"])
+        if idx < len(self._pages):
+            return self._pages[idx]
+        return pd.DataFrame()
+
+
+class _FakeKplAdapter:
+    """trade_cal 走假日历，_dataset_paged 走真 TushareAdapter 分页逻辑。"""
+
+    def __init__(self, pro: _StubKplConsPro) -> None:
+        self._real = _adapter_with_pro(pro)
+
+    def trade_cal(self, start: date, end: date) -> list[date]:
+        all_dates = [date(2026, 6, 30), date(2026, 7, 2)]
+        return [d for d in all_dates if start <= d <= end]
+
+    def _dataset_paged(self, api_name: str, **kwargs: object) -> pd.DataFrame:
+        return self._real._dataset_paged(api_name, **kwargs)
+
+
+def _kpl_cons_row(
+    board: str, name: str, con: str, trade_date: str, hot: object = 100
+) -> dict:
+    return {
+        "ts_code": board, "name": name, "con_name": f"股{con[:6]}",
+        "con_code": con, "trade_date": trade_date, "desc": "上榜理由",
+        "hot_num": hot,
+    }
+
+
+def test_kpl_concept_snapshot_end_to_end(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """kpl_concept：30 天窗口分页取数 → 每题材留最新打点 → 整表替换落库。"""
+    monkeypatch.setattr("rquant.adapter.tushare._PAGE_SLEEP", 0.0)
+    monkeypatch.setattr("rquant.dataset_backfill._KPL_CONS_PAGE_SIZE", 2)
+    pro = _StubKplConsPro([
+        pd.DataFrame([
+            _kpl_cons_row("000129.KP", "长鑫存储概念", "601133.SH", "20260702"),
+            _kpl_cons_row("000129.KP", "长鑫存储概念", "600667.SH", "20260701"),
+        ]),
+        # 末页 1 行 < page_size → 分页终止
+        pd.DataFrame([
+            _kpl_cons_row("000084.KP", "人形机器人", "002472.SZ", "20260630"),
+        ]),
+    ])
+
+    summary = backfill_dataset(
+        "kpl_concept", "2026-07-02", "2026-07-02", store, _FakeKplAdapter(pro)
+    )
+
+    assert summary["mode"] == "snapshot"
+    assert summary["failed_dates"] == []
+    # 000129.KP 的 7/1 旧打点行被 normalize 丢弃
+    assert summary["rows"] == 2
+    # 逐日拉取（offset>100k 撞 API 墙，2026-07-03 实测）：每次调用带 trade_date
+    # 且都在窗口内、无 start/end 区间参数；页大小生效
+    assert all("trade_date" in c and "start_date" not in c for c in pro.calls)
+    window_start = date(2026, 7, 2) - timedelta(days=_KPL_CONS_WINDOW_DAYS)
+    for c in pro.calls:
+        d = date(int(c["trade_date"][:4]), int(c["trade_date"][4:6]), int(c["trade_date"][6:]))
+        assert window_start <= d <= date(2026, 7, 2)
+        assert d.weekday() < 5
+    assert all(c["limit"] == 2 for c in pro.calls)
+    assert "desc" in pro.calls[0]["fields"]
+
+    df = store.query("SELECT * FROM kpl_concept_member ORDER BY board_code")
+    assert df["con_code"].tolist() == ["002472.SZ", "601133.SH"]
+    assert df.iloc[1]["board_name"] == "长鑫存储概念"
+    assert pd.Timestamp(df.iloc[1]["trade_date"]).date() == date(2026, 7, 2)
+    assert df.iloc[1]["description"] == "上榜理由"
+
+
 def test_snapshot_dry_run_does_not_fetch(store: DuckDBStore) -> None:
     class _ExplodingAdapter(_FakeSnapshotAdapter):
         def ths_index_snapshot(self) -> pd.DataFrame:
@@ -342,6 +427,38 @@ def test_norm_kpl_list_pk_and_numeric_coercion() -> None:
     assert pd.isna(out.iloc[0]["bid_amount"])
     assert out.iloc[0]["bid_turnover"] == 3.5
     assert out.iloc[0]["lu_time"] == "14:54:12"
+
+
+def test_norm_kpl_concept_renames_and_keeps_latest_stamp() -> None:
+    """列映射（ts_code→board_code / name→board_name / desc→description）+
+    每题材只留最近一次打点（旧打点里已调出的成分不残留）。"""
+    df = pd.DataFrame([
+        {"ts_code": "000129.KP", "name": "长鑫存储概念", "con_code": "601133.SH",
+         "con_name": "柏诚股份", "trade_date": date(2026, 7, 2),
+         "desc": "参与长鑫洁净厂房建设", "hot_num": "3726"},
+        # 同题材 7/1 旧打点：整行丢弃（含 7/2 已调出的成分）
+        {"ts_code": "000129.KP", "name": "长鑫存储概念", "con_code": "600667.SH",
+         "con_name": "太极实业", "trade_date": date(2026, 7, 1),
+         "desc": "曾承接合肥长鑫项目", "hot_num": None},
+        {"ts_code": "000084.KP", "name": "人形机器人", "con_code": "002472.SZ",
+         "con_name": "双环传动", "trade_date": date(2026, 6, 30),
+         "desc": None, "hot_num": 10},
+    ])
+    out = _norm_kpl_concept(df)
+    assert set(out["board_code"]) == {"000129.KP", "000084.KP"}
+    assert "600667.SH" not in set(out["con_code"])
+    assert "desc" not in out.columns
+    assert "ts_code" not in out.columns
+    row = out[out["board_code"] == "000129.KP"].iloc[0]
+    assert row["board_name"] == "长鑫存储概念"
+    assert row["description"] == "参与长鑫洁净厂房建设"
+    assert row["hot_num"] == 3726  # 字符串热度被数值化
+
+
+def test_kpl_cons_page_size_at_server_cap() -> None:
+    """单页上限 2026-07-03 实测 3000（limit=10000 也只回 3000）：page_size
+    必须 ≤ 服务端上限，否则被截断的整页会被误判为末页提前终止。"""
+    assert _KPL_CONS_PAGE_SIZE == 3000
 
 
 def test_norm_top_inst_fills_pk_columns() -> None:

@@ -89,6 +89,7 @@ MERGE_TABLES: tuple[str, ...] = (
     "top_list_daily",
     "top_inst_daily",
     "kpl_list_daily",
+    "kpl_concept_member",
     "market_daily_info",
     "hm_list",
 )

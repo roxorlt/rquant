@@ -14,12 +14,14 @@ from rquant import panorama_data
 from rquant.panorama_data import (
     add_limit_prices,
     aggregate_board_amount,
+    aggregate_board_limit_ups,
     board_constituents,
     compute_market_pulse,
     fetch_market_snapshot,
     fetch_sector_fund_flow,
     industry_fallback_members,
     load_board_members,
+    load_kpl_concept_members,
     load_pool_flags,
 )
 from rquant.state.derive import derive_state
@@ -150,51 +152,200 @@ class TestMarketPulse:
         assert compute_market_pulse(df).total_count == 0
 
 
-def _em_flow_df() -> pd.DataFrame:
+# 东财 push2 diff 行（字段结构对齐 2026-07-03 实测 JSON）
+_EM_ROWS: list[dict] = [
+    {"f12": "BK1211", "f14": "汽车", "f2": 4117.15, "f3": 3.89,
+     "f62": 7549719296.0, "f184": 7.28, "f204": "比亚迪"},
+    {"f12": "BK0481", "f14": "汽车零部件", "f2": 46786.0, "f3": 4.29,
+     "f62": 6368454912.0, "f184": 7.52, "f204": "拓普集团"},
+    {"f12": "BK0475", "f14": "银行", "f2": 3300.0, "f3": "-",
+     "f62": -1.1e9, "f184": "-", "f204": "-"},
+]
+
+_FLOW_COLUMNS = ["board_name", "pct_chg", "main_net_amount", "main_net_rate", "leading_stock"]
+
+
+def _ths_flow_df() -> pd.DataFrame:
+    # 同花顺即时口径实测列（概念接口同样用「行业」列名，资金单位亿元）
     return pd.DataFrame(
         {
-            "序号": [1, 2, 3],
-            "名称": ["半导体", "白酒", "券商"],
-            "今日涨跌幅": [3.2, -0.5, 1.1],
-            "今日主力净流入-净额": [5.2e9, -1.1e9, 2.3e9],
-            "今日主力净流入-净占比": [8.5, -2.1, 3.3],
-            "今日主力净流入最大股": ["中芯国际", "贵州茅台", "东方财富"],
+            "序号": [1, 2],
+            "行业": ["贵金属", "电机"],
+            "行业指数": [4861.87, 3781.74],
+            "行业-涨跌幅": [6.04, 5.90],
+            "流入资金": [144.56, 43.38],
+            "流出资金": [130.69, 33.14],
+            "净额": [13.87, 10.25],
+            "公司家数": [14, 26],
+            "领涨股": ["西部黄金", "江苏雷利"],
+            "领涨股-涨跌幅": [10.02, 13.57],
+            "当前价": [25.91, 33.06],
         }
     )
 
 
-class TestSectorFundFlow:
-    def test_normalize_with_indicator_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(panorama_data, "_fetch_sector_fund_flow_raw", lambda s: _em_flow_df())
+class _FakeResp:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class TestSectorFundFlowRouting:
+    def test_direct_success_maps_em_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[dict] = []
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            calls.append(kwargs)
+            return _FakeResp({"data": {"diff": _EM_ROWS, "total": len(_EM_ROWS)}})
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
         df = fetch_sector_fund_flow()
-        assert list(df.columns) == [
-            "board_name", "pct_chg", "main_net_amount", "main_net_rate", "leading_stock",
-        ]
-        # 按净流入额降序
-        assert df["board_name"].tolist() == ["半导体", "券商", "白酒"]
-        assert df["main_net_amount"].iloc[0] == pytest.approx(5.2e9)
-        assert df["main_net_rate"].iloc[0] == pytest.approx(8.5)
+        assert df.attrs["route"] == "em_direct"
+        assert calls[0]["proxies"] is None
+        assert list(df.columns) == _FLOW_COLUMNS
+        # 按 f62 主力净流入额降序，单位元
+        assert df["board_name"].tolist() == ["汽车", "汽车零部件", "银行"]
+        assert df["main_net_amount"].iloc[0] == pytest.approx(7549719296.0)
+        assert df["pct_chg"].iloc[0] == pytest.approx(3.89)
+        assert df["main_net_rate"].iloc[0] == pytest.approx(7.28)
+        assert df["leading_stock"].iloc[0] == "比亚迪"
+        # "-" 占位被 coerce 成 NaN
+        bank = df[df["board_name"] == "银行"].iloc[0]
+        assert pd.isna(bank["pct_chg"]) and pd.isna(bank["main_net_rate"])
 
-    def test_five_day_prefix_still_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        renamed = _em_flow_df().rename(columns=lambda c: str(c).replace("今日", "5日"))
-        monkeypatch.setattr(panorama_data, "_fetch_sector_fund_flow_raw", lambda s: renamed)
+    def test_direct_paginates_until_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """实测单页被限 100 行（total≈496），须翻页取全量。"""
+        pages: list[int] = []
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            params = kwargs["params"]
+            pages.append(params["pn"])
+            row = {"f12": f"BK{params['pn']:04d}", "f14": f"板块{params['pn']}",
+                   "f3": 1.0, "f62": 1e9 - params["pn"], "f184": 1.0, "f204": "某股"}
+            diff = [row] * (100 if params["pn"] <= 2 else 50)
+            return _FakeResp({"data": {"diff": diff, "total": 250}})
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
         df = fetch_sector_fund_flow()
-        assert not df.empty
-        assert df["board_name"].iloc[0] == "半导体"
+        assert pages == [1, 2, 3]
+        assert len(df) == 250
 
-    def test_fetch_failure_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom(sector_type: str) -> pd.DataFrame:
-            raise ConnectionError("em down")
+    def test_direct_fails_socks_takes_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen_proxies: list[dict | None] = []
 
-        monkeypatch.setattr(panorama_data, "_fetch_sector_fund_flow_raw", boom)
-        assert fetch_sector_fund_flow().empty
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            seen_proxies.append(kwargs["proxies"])
+            if kwargs["proxies"] is None:
+                raise ConnectionError("RST by firewall")
+            return _FakeResp({"data": {"diff": _EM_ROWS, "total": len(_EM_ROWS)}})
 
-    def test_missing_required_column_returns_empty(
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "socks5h://127.0.0.1:9999")
+        df = fetch_sector_fund_flow()
+        assert df.attrs["route"] == "em_socks"
+        assert seen_proxies[0] is None
+        assert seen_proxies[1] == {
+            "http": "socks5h://127.0.0.1:9999",
+            "https": "socks5h://127.0.0.1:9999",
+        }
+        assert df["board_name"].iloc[0] == "汽车"
+
+    def test_socks_default_proxy_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen_proxies: list[dict | None] = []
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            seen_proxies.append(kwargs["proxies"])
+            if kwargs["proxies"] is None:
+                raise ConnectionError("RST")
+            return _FakeResp({"data": {"diff": _EM_ROWS, "total": len(_EM_ROWS)}})
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.delenv("RQUANT_PANORAMA_SOCKS", raising=False)
+        df = fetch_sector_fund_flow()
+        assert df.attrs["route"] == "em_socks"
+        assert seen_proxies[1]["https"] == "socks5h://127.0.0.1:1086"
+
+    def test_both_em_fail_ths_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        seen_types: list[str] = []
+
+        def fake_ths(sector_type: str) -> pd.DataFrame:
+            seen_types.append(sector_type)
+            return _ths_flow_df()
+
+        monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", fake_ths)
+        df = fetch_sector_fund_flow("概念资金流")
+        assert df.attrs["route"] == "ths"
+        assert seen_types == ["概念资金流"]
+        assert list(df.columns) == _FLOW_COLUMNS
+        # 净额单位亿元 → 元；无主力净占比 → NaN；领涨股为涨幅口径
+        assert df["board_name"].tolist() == ["贵金属", "电机"]
+        assert df["main_net_amount"].iloc[0] == pytest.approx(13.87e8)
+        assert df["pct_chg"].iloc[0] == pytest.approx(6.04)
+        assert df["main_net_rate"].isna().all()
+        assert df["leading_stock"].tolist() == ["西部黄金", "江苏雷利"]
+
+    def test_ths_missing_leading_stock_column(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        broken = _ths_flow_df().drop(columns=["领涨股", "领涨股-涨跌幅"])
+        monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", lambda s: broken)
+        df = fetch_sector_fund_flow()
+        assert df.attrs["route"] == "ths"
+        assert df["leading_stock"].isna().all()
+
+    def test_all_routes_fail_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
+
+        def ths_boom(sector_type: str) -> pd.DataFrame:
+            raise ConnectionError("ths 403")
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", ths_boom)
+        df = fetch_sector_fund_flow()
+        assert df.empty
+        assert df.attrs["route"] == "none"
+
+    def test_em_missing_amount_field_falls_through(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        broken = _em_flow_df().drop(columns=["今日主力净流入-净额"])
-        monkeypatch.setattr(panorama_data, "_fetch_sector_fund_flow_raw", lambda s: broken)
-        assert fetch_sector_fund_flow().empty
+        """东财返回 200 但缺 f62 → 该级视为空，落到 THS 兜底。"""
+        rows = [{"f12": "BK1", "f14": "汽车", "f3": 1.0}]
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            return _FakeResp({"data": {"diff": rows, "total": 1}})
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", lambda s: _ths_flow_df())
+        df = fetch_sector_fund_flow()
+        assert df.attrs["route"] == "ths"
 
 
 class TestBoardAggregation:
@@ -251,6 +402,97 @@ class TestBoardAggregation:
         assert board_constituents("BK404", self._members(), self._snapshot()).empty
 
 
+class TestBoardLimitUpAggregation:
+    """板块涨停排行聚合：口径对齐 compute_market_pulse（同容差同判定）。"""
+
+    def _snapshot(self) -> pd.DataFrame:
+        # 全部主板 10%：pre_close 10 → 涨停价 11.00
+        rows = [
+            # (code, price, high)
+            ("600001.SH", 11.00, 11.00),  # 涨停
+            ("600002.SH", 10.50, 11.00),  # 炸板（触 11 回落）
+            ("600003.SH", 11.00, 11.00),  # 涨停
+            ("600004.SH", 10.20, 10.30),  # 普通上涨
+            ("600005.SH", 0.0, 0.0),      # 停牌：不计入涨停/炸板
+        ]
+        df = pd.DataFrame(rows, columns=["ts_code", "price", "high"])
+        df["pre_close"] = 10.0
+        df["name"] = "普通票"
+        return add_limit_prices(df)
+
+    def _kpl_members(self) -> pd.DataFrame:
+        # 开盘啦口径：无 idx_type 列；题材成分互相重叠
+        return pd.DataFrame(
+            {
+                "board_code": ["KP1", "KP1", "KP1", "KP1", "KP2", "KP2", "KP3"],
+                "board_name": ["人形机器人"] * 4 + ["长鑫存储", "长鑫存储", "冷题材"],
+                "con_code": [
+                    "600001.SH", "600002.SH", "600004.SH", "600005.SH",
+                    "600001.SH", "600003.SH", "600004.SH",
+                ],
+            }
+        )
+
+    def test_counts_sort_and_zero_filter(self) -> None:
+        agg = aggregate_board_limit_ups(self._snapshot(), self._kpl_members())
+        # 冷题材 0 涨停不显示；KP2 涨停占比 100% > KP1 25% 同涨停数时靠前…
+        # 此处 KP2 2 涨停 > KP1 1 涨停，直接按涨停数降序
+        assert agg["board_code"].tolist() == ["KP2", "KP1"]
+        kp1 = agg[agg["board_code"] == "KP1"].iloc[0]
+        assert kp1["limit_up_count"] == 1
+        assert kp1["broken_count"] == 1
+        assert kp1["stock_count"] == 4  # 停牌票计成分数，不计涨停/炸板
+        assert kp1["limit_up_ratio_pct"] == pytest.approx(25.0)
+        kp2 = agg[agg["board_code"] == "KP2"].iloc[0]
+        assert kp2["limit_up_count"] == 2
+        assert kp2["broken_count"] == 0
+        assert kp2["limit_up_ratio_pct"] == pytest.approx(100.0)
+        assert "冷题材" not in set(agg["board_name"])
+
+    def test_tie_break_by_ratio(self) -> None:
+        members = pd.DataFrame(
+            {
+                "board_code": ["A", "A", "B"],
+                "board_name": ["大板块", "大板块", "小板块"],
+                "con_code": ["600001.SH", "600004.SH", "600003.SH"],
+            }
+        )
+        agg = aggregate_board_limit_ups(self._snapshot(), members)
+        # 同为 1 个涨停：小板块 100% 占比排在大板块 50% 前
+        assert agg["board_code"].tolist() == ["B", "A"]
+
+    def test_dc_members_idx_type_filter(self) -> None:
+        members = pd.DataFrame(
+            {
+                "board_code": ["BK1", "BK2"],
+                "board_name": ["半导体", "AI眼镜"],
+                "idx_type": ["行业板块", "概念板块"],
+                "con_code": ["600001.SH", "600003.SH"],
+            }
+        )
+        agg = aggregate_board_limit_ups(self._snapshot(), members, idx_type="概念板块")
+        assert agg["board_name"].tolist() == ["AI眼镜"]
+        # 开盘啦成分无 idx_type 列：idx_type 参数不生效，全量聚合
+        kpl = aggregate_board_limit_ups(self._snapshot(), self._kpl_members(), idx_type="概念板块")
+        assert not kpl.empty
+
+    def test_snapshot_without_limit_price_degrades_empty(self) -> None:
+        raw = self._snapshot().drop(columns=["limit_up_price"])
+        assert aggregate_board_limit_ups(raw, self._kpl_members()).empty
+
+    def test_empty_inputs(self) -> None:
+        assert aggregate_board_limit_ups(pd.DataFrame(), self._kpl_members()).empty
+        assert aggregate_board_limit_ups(self._snapshot(), pd.DataFrame()).empty
+
+    def test_no_limit_up_anywhere_returns_empty(self) -> None:
+        df = pd.DataFrame(
+            {"ts_code": ["600004.SH"], "price": [10.2], "high": [10.3], "pre_close": [10.0]}
+        )
+        df["name"] = "普通票"
+        snap = add_limit_prices(df)
+        assert aggregate_board_limit_ups(snap, self._kpl_members()).empty
+
+
 @pytest.fixture()
 def store(tmp_path: Path) -> Iterator[DuckDBStore]:
     s = DuckDBStore(tmp_path / "test.duckdb")
@@ -300,6 +542,22 @@ class TestDuckDBReaders:
         assert df["con_code"].tolist() == ["600519.SH"]  # industry 为空的不进兜底
         assert df.iloc[0]["board_name"] == "白酒"
         assert df.iloc[0]["idx_type"] == "行业板块"
+
+    def test_load_kpl_concept_members(self, store: DuckDBStore) -> None:
+        store._conn.execute(
+            """
+            INSERT INTO kpl_concept_member
+                (board_code, board_name, con_code, con_name, trade_date, description, hot_num)
+            VALUES ('000084.KP', '人形机器人', '002472.SZ', '双环传动', '2026-07-02', '理由', 10),
+                   ('000129.KP', '长鑫存储概念', '601133.SH', '柏诚股份', '2026-07-02', '理由', 20)
+            """
+        )
+        df = load_kpl_concept_members(store=store)
+        assert list(df.columns) == ["board_code", "board_name", "con_code"]
+        assert set(df["board_name"]) == {"人形机器人", "长鑫存储概念"}
+
+    def test_load_kpl_concept_members_empty_table(self, store: DuckDBStore) -> None:
+        assert load_kpl_concept_members(store=store).empty
 
     def test_load_pool_flags_latest_date_and_active_only(self, store: DuckDBStore) -> None:
         store._conn.execute(

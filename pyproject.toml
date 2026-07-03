@@ -23,6 +23,7 @@ dependencies = [
     "pypdf>=6.10.2",
     "openai>=1.0",
     "streamlit-flow-component>=1.6.1",
+    "pysocks>=1.7.1",
 ]
 
 [build-system]

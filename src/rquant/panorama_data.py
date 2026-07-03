@@ -5,13 +5,17 @@ akshare 断了页面不炸，UI 侧对空 DataFrame 渲染灰态。
 
 数据源与刷新节奏（TTL 由 UI 层 st.cache_data 控制）：
 - S1 新浪全市场快照 ``ak.stock_zh_a_spot``：30s（云端可用，但本页只在本地跑）
-- S2 东财板块资金流 ``ak.stock_sector_fund_flow_rank``：60s（云端被屏蔽，仅本地）
-- L  本地只读副本（dc_board / dc_board_member / screen_result / pool2_watch）：300s
+- S2 板块资金流：60s，三级路由 东财直连 → 东财·SOCKS 云端出口 → 同花顺即时兜底
+  （办公网出口 IP 被东财拉黑、同花顺云端 403，两者互补，见 fetch_sector_fund_flow）
+- L  本地只读副本（dc_board / dc_board_member / kpl_concept_member /
+  screen_result / pool2_watch）：300s
 
 DuckDB 只走 ``open_readonly_store()``（副本优先），本模块绝不写主库。
 """
 
 from __future__ import annotations
+
+import os
 
 import pandas as pd
 from loguru import logger
@@ -38,17 +42,25 @@ _SPOT_COLUMN_MAP: dict[str, str] = {
 _SPOT_REQUIRED = ("代码", "名称", "最新价", "昨收")
 _SPOT_NUMERIC = ("price", "open", "high", "low", "pre_close", "pct_chg", "volume", "amount")
 
-# 东财资金流列按「包含匹配」定位：列名带 indicator 前缀（今日/5日/10日），
-# 前缀漂移不应打断解析（limit_up_pool.py 缺列防御先例）。
-_FLOW_FIELD_PATTERNS: dict[str, str] = {
-    "board_name": "名称",
-    "pct_chg": "涨跌幅",
-    "main_net_amount": "主力净流入-净额",
-    "main_net_rate": "主力净流入-净占比",
-    "leading_stock": "主力净流入最大股",
+# 东财 push2 clist 字段映射（2026-07-03 实测 JSON）：
+#   f12 板块代码(BKxxxx) / f14 板块名称 / f2 板块指数点位 / f3 涨跌幅(%)
+#   f62 主力净流入额(元) / f184 主力净占比(%) / f204 主力净流入最大股 / f205 最大股代码
+_EM_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+_EM_FIELDS = "f12,f14,f3,f62,f184,f204"
+_EM_FS: dict[str, str] = {"行业资金流": "m:90+t:2", "概念资金流": "m:90+t:3"}
+_EM_PAGE_SIZE = 100  # 实测 pz=500 也只回 100 行（total≈496），须按 pn 翻页
+_EM_MAX_PAGES = 10
+_EM_DIRECT_TIMEOUT = 5.0
+_EM_SOCKS_TIMEOUT = 10.0
+_DEFAULT_SOCKS_PROXY = "socks5h://127.0.0.1:1086"
+
+# fetch_sector_fund_flow 的 df.attrs["route"] 取值 → UI 展示名
+ROUTE_LABELS: dict[str, str] = {
+    "em_direct": "东财直连",
+    "em_socks": "东财·云端出口",
+    "ths": "同花顺",
+    "none": "不可用",
 }
-_FLOW_REQUIRED = ("board_name", "main_net_amount")
-_FLOW_NUMERIC = ("pct_chg", "main_net_amount", "main_net_rate")
 
 
 class MarketPulse(BaseModel):
@@ -185,47 +197,135 @@ def compute_market_pulse(snapshot: pd.DataFrame, price_tol: float = PRICE_TOL) -
     )
 
 
-# ── S2 东财板块资金流 ──────────────────────────────────────────────────────────
+# ── S2 板块资金流（三级路由：东财直连 → 东财·SOCKS 出口 → 同花顺兜底） ─────────
 
 
-def _fetch_sector_fund_flow_raw(sector_type: str) -> pd.DataFrame:
+def _em_fetch_rows(
+    sector_type: str, proxies: dict[str, str] | None, timeout: float
+) -> list[dict]:
+    """东财 push2 clist 分页拉取，返回 diff 行列表（fid=f62 主力净流入降序）。"""
+    import requests
+
+    fs = _EM_FS.get(sector_type)
+    if fs is None:
+        raise ValueError(f"未知板块资金流类型: {sector_type}")
+    rows: list[dict] = []
+    for pn in range(1, _EM_MAX_PAGES + 1):
+        params = {
+            "pn": pn, "pz": _EM_PAGE_SIZE, "po": 1, "np": 1,
+            "fltt": 2, "invt": 2, "fid": "f62", "fs": fs, "fields": _EM_FIELDS,
+        }
+        resp = requests.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data") or {}
+        diff = data.get("diff") or []
+        if not diff:
+            break
+        rows.extend(diff)
+        if len(rows) >= int(data.get("total") or 0):
+            break
+    return rows
+
+
+def _normalize_em_flow(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    raw = pd.DataFrame(rows)
+    if "f14" not in raw.columns or "f62" not in raw.columns:
+        logger.warning("东财资金流关键字段缺失（f14/f62，接口字段可能变更）")
+        return pd.DataFrame()
+    out = pd.DataFrame(index=raw.index)
+    out["board_name"] = raw["f14"].astype(str)
+    # 盘前/停牌时数值字段可能给 "-"，coerce 成 NaN
+    for src, dst in (("f3", "pct_chg"), ("f62", "main_net_amount"), ("f184", "main_net_rate")):
+        out[dst] = pd.to_numeric(raw[src], errors="coerce") if src in raw.columns else float("nan")
+    out["leading_stock"] = raw["f204"] if "f204" in raw.columns else None
+    out = out[out["main_net_amount"].notna()].copy()
+    return out.sort_values("main_net_amount", ascending=False).reset_index(drop=True)
+
+
+def _fetch_ths_flow_raw(sector_type: str) -> pd.DataFrame:
     import akshare as ak
 
-    return ak.stock_sector_fund_flow_rank(indicator="今日", sector_type=sector_type)
+    if sector_type == "概念资金流":
+        return ak.stock_fund_flow_concept(symbol="即时")
+    return ak.stock_fund_flow_industry(symbol="即时")
+
+
+def _normalize_ths_flow(raw: pd.DataFrame) -> pd.DataFrame:
+    """同花顺即时资金流归一化。
+
+    实测列（2026-07-03，概念接口列名同样用「行业」）：序号/行业/行业指数/
+    行业-涨跌幅/流入资金/流出资金/净额/公司家数/领涨股/领涨股-涨跌幅/当前价。
+    资金列单位亿元；无主力净占比 → main_net_rate 置 NaN；领涨股是涨幅口径
+    （非东财的主力流入最大股）。
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    board_col = next((c for c in ("行业", "概念", "板块") if c in raw.columns), None)
+    net_col = next((c for c in raw.columns if "净额" in str(c)), None)
+    if board_col is None or net_col is None:
+        logger.warning("同花顺资金流列异常（板块/净额列缺失，列名可能变更）")
+        return pd.DataFrame()
+    pct_col = next((c for c in raw.columns if "涨跌幅" in str(c) and "领涨" not in str(c)), None)
+    lead_col = next((c for c in raw.columns if "领涨股" in str(c) and "涨跌幅" not in str(c)), None)
+
+    out = pd.DataFrame(index=raw.index)
+    out["board_name"] = raw[board_col].astype(str)
+    out["pct_chg"] = pd.to_numeric(raw[pct_col], errors="coerce") if pct_col else float("nan")
+    out["main_net_amount"] = pd.to_numeric(raw[net_col], errors="coerce") * 1e8
+    out["main_net_rate"] = float("nan")
+    out["leading_stock"] = raw[lead_col] if lead_col is not None else None
+    out = out[out["main_net_amount"].notna()].copy()
+    return out.sort_values("main_net_amount", ascending=False).reset_index(drop=True)
+
+
+def _with_route(df: pd.DataFrame, route: str) -> pd.DataFrame:
+    df.attrs["route"] = route
+    return df
 
 
 def fetch_sector_fund_flow(sector_type: str = "行业资金流") -> pd.DataFrame:
-    """东财板块资金流排行（今日口径）。
+    """板块资金流排行（今日口径），三级路由。
+
+    东财直连（办公网出口 IP 被拉黑时 0.1s 内 RST）→ 东财走 SOCKS 云端出口
+    （环境变量 RQUANT_PANORAMA_SOCKS 可覆盖代理地址，置空禁用该级）→
+    同花顺即时兜底（云端 403 但本地可用，与东财互补）→ 全失败返回空。
 
     返回列：board_name, pct_chg(%), main_net_amount(元), main_net_rate(%),
-    leading_stock。失败 / 缺必需列 → 空 DataFrame（东财反爬敏感，列名可能漂移）。
+    leading_stock；``df.attrs["route"]`` 标记实际数据路由（ROUTE_LABELS 的 key）。
     """
     try:
-        raw = _fetch_sector_fund_flow_raw(sector_type)
+        rows = _em_fetch_rows(sector_type, proxies=None, timeout=_EM_DIRECT_TIMEOUT)
+        df = _normalize_em_flow(rows)
+        if not df.empty:
+            return _with_route(df, "em_direct")
+        logger.warning(f"东财直连返回空: {sector_type}")
     except Exception as e:
-        logger.warning(f"板块资金流获取失败（东财源）: {sector_type} {type(e).__name__}: {e}")
-        return pd.DataFrame()
-    if raw is None or raw.empty:
-        logger.warning(f"板块资金流返回空: {sector_type}")
-        return pd.DataFrame()
+        logger.warning(f"东财直连失败: {sector_type} {type(e).__name__}: {e}")
 
-    resolved: dict[str, str] = {}
-    for dst, pattern in _FLOW_FIELD_PATTERNS.items():
-        matched = [c for c in raw.columns if pattern in str(c)]
-        if matched:
-            resolved[dst] = matched[0]
-    missing = set(_FLOW_REQUIRED) - set(resolved)
-    if missing:
-        logger.warning(f"板块资金流列异常，缺 {sorted(missing)}（东财列名可能变更），本轮跳过")
-        return pd.DataFrame()
+    socks = os.environ.get("RQUANT_PANORAMA_SOCKS", _DEFAULT_SOCKS_PROXY).strip()
+    if socks:
+        try:
+            proxies = {"http": socks, "https": socks}
+            rows = _em_fetch_rows(sector_type, proxies=proxies, timeout=_EM_SOCKS_TIMEOUT)
+            df = _normalize_em_flow(rows)
+            if not df.empty:
+                return _with_route(df, "em_socks")
+            logger.warning(f"东财 SOCKS 出口返回空: {sector_type}")
+        except Exception as e:
+            logger.warning(f"东财 SOCKS 出口失败: {sector_type} {type(e).__name__}: {e}")
 
-    out = pd.DataFrame(index=raw.index)
-    for dst in _FLOW_FIELD_PATTERNS:
-        out[dst] = raw[resolved[dst]] if dst in resolved else None
-    for col in _FLOW_NUMERIC:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out[out["main_net_amount"].notna()].copy()
-    return out.sort_values("main_net_amount", ascending=False).reset_index(drop=True)
+    try:
+        df = _normalize_ths_flow(_fetch_ths_flow_raw(sector_type))
+        if not df.empty:
+            return _with_route(df, "ths")
+        logger.warning(f"同花顺即时资金流返回空: {sector_type}")
+    except Exception as e:
+        logger.warning(f"同花顺即时资金流失败: {sector_type} {type(e).__name__}: {e}")
+
+    logger.warning(f"板块资金流三级路由全部失败: {sector_type}")
+    return _with_route(pd.DataFrame(), "none")
 
 
 # ── L2 东财板块成分（dc_board / dc_board_member，只读副本） ────────────────────
@@ -285,6 +385,31 @@ def industry_fallback_members(store: DuckDBStore | None = None) -> pd.DataFrame:
             store.close()
 
 
+def load_kpl_concept_members(store: DuckDBStore | None = None) -> pd.DataFrame:
+    """读开盘啦题材成分（kpl_concept_member 快照，打板语境粒度）。
+
+    返回列：board_code, board_name, con_code（与 load_board_members 对齐，
+    无 idx_type——开盘啦题材没有行业/概念之分）。
+    副本缺表（日终采集未首跑）/ 撞锁 → 空 DataFrame（UI 渲染灰态）。
+    """
+    owns = store is None
+    try:
+        store = store or open_readonly_store(required_tables=("kpl_concept_member",))
+    except Exception as e:
+        logger.warning(f"开盘啦题材成分只读库打开失败: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+    try:
+        return store._conn.execute(
+            "SELECT board_code, board_name, con_code FROM kpl_concept_member"
+        ).fetchdf()
+    except Exception as e:
+        logger.warning(f"开盘啦题材成分查询失败: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+    finally:
+        if owns:
+            store.close()
+
+
 # ── 板块聚合 / 下钻 ────────────────────────────────────────────────────────────
 
 
@@ -332,6 +457,71 @@ def aggregate_board_amount(
     )
     agg["limit_up_count"] = agg["limit_up_count"].astype(int)
     return agg
+
+
+def aggregate_board_limit_ups(
+    snapshot: pd.DataFrame,
+    members: pd.DataFrame,
+    idx_type: str | None = None,
+    price_tol: float = PRICE_TOL,
+) -> pd.DataFrame:
+    """板块涨停排行：带涨停价的快照 × 板块成分聚合。
+
+    涨停/炸板判定与 compute_market_pulse 同口径（同一 price_tol / 同一
+    limit_up_price 列，不另造口径）：
+    - 涨停：price ≥ limit_up_price − tol
+    - 炸板：high 触过涨停价但现价回落
+    - 停牌票（price 缺失或 ≤0）不计入任何计数
+
+    members 需要 board_code / board_name / con_code 三列（开盘啦
+    load_kpl_concept_members 与东财 load_board_members 均满足）；idx_type
+    只对带 idx_type 列的东财成分生效（地域板块已在 load_board_members 排除）。
+
+    返回列：board_code, board_name, limit_up_count, broken_count,
+    stock_count, limit_up_ratio_pct，按涨停数降序（同数按占比降序），
+    涨停数为 0 的板块不返回。概念成分互相重叠：计数只在板块内解释，
+    不跨板块求和。快照缺 limit_up_price 列 → 空 DataFrame（降级）。
+    """
+    if snapshot.empty or members.empty:
+        return pd.DataFrame()
+    if not {"price", "limit_up_price"}.issubset(snapshot.columns):
+        return pd.DataFrame()
+    m = members
+    if idx_type is not None and "idx_type" in members.columns:
+        m = members[members["idx_type"] == idx_type]
+    if m.empty:
+        return pd.DataFrame()
+
+    merged = m.merge(snapshot, left_on="con_code", right_on="ts_code", how="inner")
+    if merged.empty:
+        return pd.DataFrame()
+
+    valid = merged["price"].notna() & (merged["price"] > 0) & merged["limit_up_price"].notna()
+    is_limit_up = valid & (merged["price"] >= merged["limit_up_price"] - price_tol)
+    if "high" in merged.columns:
+        high = pd.to_numeric(merged["high"], errors="coerce")
+    else:
+        high = pd.Series(float("nan"), index=merged.index)
+    touched = valid & high.notna() & (high >= merged["limit_up_price"] - price_tol)
+    merged["_is_limit_up"] = is_limit_up
+    merged["_is_broken"] = touched & ~is_limit_up
+
+    agg = merged.groupby(["board_code", "board_name"], as_index=False).agg(
+        limit_up_count=("_is_limit_up", "sum"),
+        broken_count=("_is_broken", "sum"),
+        stock_count=("ts_code", "count"),
+    )
+    for c in ("limit_up_count", "broken_count", "stock_count"):
+        agg[c] = agg[c].astype(int)
+    agg = agg[agg["limit_up_count"] > 0].copy()
+    if agg.empty:
+        return pd.DataFrame()
+    agg["limit_up_ratio_pct"] = (
+        agg["limit_up_count"] / agg["stock_count"] * 100
+    ).round(1)
+    return agg.sort_values(
+        ["limit_up_count", "limit_up_ratio_pct"], ascending=False
+    ).reset_index(drop=True)
 
 
 def load_pool_flags(store: DuckDBStore | None = None) -> dict[str, str]:

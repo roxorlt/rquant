@@ -6,11 +6,13 @@
 
 端口约定：8501 健康 / 8502 nl_screen / 8503 nl_canvas / 8504 Lab / 8505 预留 / 8506 本页。
 
-区块：市场脉搏条（涨停/跌停/炸板 + 上涨占比 + 当日 sparkline）、板块资金流排行、
+区块：市场脉搏条（涨停/跌停/炸板 + 上涨占比 + 当日 sparkline）、板块资金流排行
+（三级路由：东财直连 → 东财·SOCKS 云端出口 → 同花顺即时兜底，caption 显示当前路由）、
+板块涨停排行（三口径 tab：开盘啦题材 / 东财概念 / 东财行业，与资金流并排）、
 板块成交额排行（dc_board_member 聚合，industry 兜底）、板块下钻成分表。
 B 信号因子矩阵为 P2 占位。
 
-刷新：st.fragment 60s 自动重跑，缓存分层 TTL——S1 快照 30s / S2 东财 60s / 本地副本 300s。
+刷新：st.fragment 60s 自动重跑，缓存分层 TTL——S1 快照 30s / S2 资金流 60s / 本地副本 300s。
 所有 DuckDB 读只走只读副本，绝不写主库（monitor 是唯一常驻写者）。
 """
 
@@ -23,15 +25,18 @@ import pandas as pd
 import streamlit as st
 
 from rquant.panorama_data import (
+    ROUTE_LABELS,
     MarketPulse,
     add_limit_prices,
     aggregate_board_amount,
+    aggregate_board_limit_ups,
     board_constituents,
     compute_market_pulse,
     fetch_market_snapshot,
     fetch_sector_fund_flow,
     industry_fallback_members,
     load_board_members,
+    load_kpl_concept_members,
     load_liquidity_baseline,
     load_pool_flags,
 )
@@ -69,6 +74,11 @@ def cached_members() -> tuple[pd.DataFrame, str]:
         return members, "dc"
     fallback = industry_fallback_members()
     return fallback, "industry"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_kpl_members() -> pd.DataFrame:
+    return load_kpl_concept_members()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -131,7 +141,7 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str) -> None:
 
 
 def render_fund_flow() -> None:
-    st.subheader("板块资金流排行（东财·今日）")
+    st.subheader("板块资金流排行（今日）")
     sort_key = st.radio(
         "排序", ["净流入额", "净流入率"], horizontal=True, key="flow_sort",
         label_visibility="collapsed",
@@ -140,8 +150,9 @@ def render_fund_flow() -> None:
     for tab, sector_type in zip(tabs, ["行业资金流", "概念资金流"], strict=True):
         with tab:
             flow = cached_fund_flow(sector_type)
+            route = flow.attrs.get("route", "none")
             if flow.empty:
-                st.info("东财资金流源暂不可用（限频/反爬/网络），稍后自动重试")
+                st.info("资金流三级路由均不可用（东财直连/云端出口/同花顺），稍后自动重试")
                 continue
             df = flow.copy()
             df["净流入额(亿)"] = (df["main_net_amount"] / 1e8).round(2)
@@ -160,6 +171,54 @@ def render_fund_flow() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+            note = "（无主力净占比，领涨股为涨幅口径）" if route == "ths" else ""
+            st.caption(f"数据路由：{ROUTE_LABELS.get(route, route)}{note}")
+
+
+def render_limit_up_rank(snapshot: pd.DataFrame, members: pd.DataFrame) -> None:
+    """板块涨停排行：三口径 tab（开盘啦题材默认 / 东财概念 / 东财行业）。"""
+    st.subheader("板块涨停排行")
+    if snapshot.empty or "limit_up_price" not in snapshot.columns:
+        st.info("快照不可用，暂无涨停排行")
+        return
+
+    kpl_members = cached_kpl_members()
+    specs: list[tuple[pd.DataFrame, str | None, str]] = [
+        (kpl_members, None, "开盘啦题材成分待日终采集首跑（data-backfill --dataset kpl_concept）"),
+        (members, "概念板块", "东财概念成分不可用"),
+        (members, "行业板块", "东财行业成分不可用"),
+    ]
+    tabs = st.tabs(["开盘啦题材", "东财概念", "东财行业"])
+    for tab, (m, idx_type, empty_msg) in zip(tabs, specs, strict=True):
+        with tab:
+            if m.empty or (
+                idx_type is not None
+                and "idx_type" in m.columns
+                and m[m["idx_type"] == idx_type].empty
+            ):
+                st.info(empty_msg)
+                continue
+            agg = aggregate_board_limit_ups(snapshot, m, idx_type=idx_type)
+            if agg.empty:
+                st.info("当前无板块出现涨停")
+                continue
+            df = agg.rename(
+                columns={
+                    "board_name": "板块",
+                    "limit_up_count": "涨停数",
+                    "broken_count": "炸板数",
+                    "stock_count": "成分数",
+                    "limit_up_ratio_pct": "涨停占比%",
+                }
+            )
+            st.dataframe(
+                df[["板块", "涨停数", "炸板数", "成分数", "涨停占比%"]].head(20),
+                use_container_width=True,
+                hide_index=True,
+            )
+    st.caption(
+        "涨停/炸板判定与市场脉搏同口径（现价对涨停价，容差 1 分）；概念成分互相重叠，不跨板块求和"
+    )
 
 
 def render_amount_rank(snapshot: pd.DataFrame, members: pd.DataFrame, source: str) -> str | None:
@@ -248,7 +307,7 @@ def render_drilldown(
 
 st.title("盘中市场全景")
 st.caption(
-    "仅本地运行（东财源云端被屏蔽）· 快照 30s / 东财 60s / 本地副本 300s 缓存 · "
+    "仅本地运行 · 快照 30s / 资金流 60s / 本地副本 300s 缓存 · "
     f"页面 {REFRESH_SECONDS}s 自动刷新 · 只读副本，不写主库"
 )
 
@@ -268,7 +327,9 @@ def render_body() -> None:
     with left:
         render_fund_flow()
     with right:
-        idx_type = render_amount_rank(snapshot, members, member_source)
+        render_limit_up_rank(snapshot, members)
+    st.divider()
+    idx_type = render_amount_rank(snapshot, members, member_source)
     st.divider()
     render_drilldown(snapshot, members, idx_type)
 

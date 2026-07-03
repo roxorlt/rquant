@@ -144,6 +144,62 @@ def _norm_kpl_list(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# kpl_concept_cons 快照回看窗口：源按「题材当日活跃」增量打点（2026-07-03 实测
+# 每天只写 3-8 个题材的全量成分，约 250-660 行/日），单日快照拼不出题材库，
+# 全量历史又深不见底（offset=100000 仍有 2025-12 数据）→ 拉窗口后每题材只留
+# 最近一次打点。30 天实测 ≈ 25 个题材 / 4.5 万行 / 15 页
+_KPL_CONS_WINDOW_DAYS = 30
+_KPL_CONS_PAGE_SIZE = 3000   # 实测单页上限 3000（limit=10000 也只回 3000）
+_KPL_CONS_FIELDS = "ts_code,name,con_name,con_code,trade_date,desc,hot_num"
+
+
+def _fetch_kpl_concept_cons(
+    adapter: DatasetBackfillAdapter, as_of: date
+) -> pd.DataFrame:
+    """开盘啦题材成分：按交易日逐日分页拉取。
+
+    不能用 start/end 区间一次性深分页：30 天窗口实际 10 万+ 行，而该接口
+    offset > 100,000 直接报「查询数据失败，请确认参数」（2026-07-03 实测撞墙）。
+    逐日拉每天约 3,400 行、2 页封顶，永远到不了深 offset；非交易日空返回无害。
+    """
+    frames: list[pd.DataFrame] = []
+    for offset_days in range(_KPL_CONS_WINDOW_DAYS, -1, -1):
+        day = as_of - timedelta(days=offset_days)
+        if day.weekday() >= 5:
+            continue
+        df = adapter._dataset_paged(  # type: ignore[attr-defined]
+            "kpl_concept_cons",
+            fields=_KPL_CONS_FIELDS,
+            page_size=_KPL_CONS_PAGE_SIZE,
+            trade_date=day.strftime("%Y%m%d"),
+        )
+        if df is not None and not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _norm_kpl_concept(df: pd.DataFrame) -> pd.DataFrame:
+    """kpl_concept_cons 实测字段：ts_code(题材代码), name, con_name, con_code,
+    trade_date, desc, hot_num。ts_code → board_code、name → board_name（对齐
+    成分表惯例）、desc 是 SQL 关键字 → description（沿用 hm_list 惯例）。
+
+    热门题材每天重复打点 → 每题材只留最近一次打点日的全量成分（旧打点里
+    已调出的成分不残留），PK (board_code, con_code) 落库。
+    """
+    out = df.rename(
+        columns={
+            "ts_code": "board_code",
+            "name": "board_name",
+            "desc": "description",
+        }
+    )
+    out["hot_num"] = pd.to_numeric(out["hot_num"], errors="coerce")
+    latest = out.groupby("board_code")["trade_date"].transform("max")
+    return out[out["trade_date"] == latest].reset_index(drop=True)
+
+
 def _norm_daily_info(df: pd.DataFrame) -> pd.DataFrame:
     """daily_info 实测 14 字段。trans_count 源里为 object（含 None）→ 数值化。"""
     out = df.copy()
@@ -242,6 +298,11 @@ DATASETS: dict[str, DatasetSpec] = {
             name="kpl_list", table="kpl_list_daily", mode="by_date",
             fetch=lambda a, d: a.kpl_list_by_date(d),
             normalize=_norm_kpl_list,
+        ),
+        DatasetSpec(
+            name="kpl_concept", table="kpl_concept_member", mode="snapshot",
+            fetch=_fetch_kpl_concept_cons,
+            normalize=_norm_kpl_concept,
         ),
         DatasetSpec(
             name="daily_info", table="market_daily_info", mode="by_date",
