@@ -462,6 +462,7 @@ def test_backfilled_history_tables_are_merge() -> None:
         "top_list_daily",
         "top_inst_daily",
         "kpl_list_daily",
+        "kpl_concept_member",
         "market_daily_info",
         "hm_list",
         "index_daily_bar",

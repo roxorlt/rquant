@@ -174,6 +174,8 @@ if (( force_mode == 1 )) || [[ "${sync_window}" != "intraday" ]]; then
         "${RQUANT_BIN}" zt-pool-capture >>"${LOG}" 2>&1 || log "WARN: zt-pool-capture failed（东财源偶发失败可接受，不告警）"
         # 官方涨跌停榜（tushare limit_list_d）当日增量；漏采可事后 limit-list-backfill 补
         "${RQUANT_BIN}" limit-list-backfill --today >>"${LOG}" 2>&1 || log "WARN: limit-list-backfill --today failed（可事后回补，不告警）"
+        # 开盘啦题材成分快照（30 天窗口整表替换，全景页涨停排行用）；失败次日重跑即补
+        "${RQUANT_BIN}" data-backfill --dataset kpl_concept --today >>"${LOG}" 2>&1 || log "WARN: data-backfill kpl_concept failed（快照可次日重跑，不告警）"
     else
         merge_status="failed"
         if (( force_mode == 1 )); then
