@@ -6,6 +6,21 @@
 
 ### Added
 
+- **N 字分钟级 B 点多因子确认（`entry_mode=factor_confirm`，设计文档
+  2026-07-03-nshape-factor-confirm-design）**：minute_replay 新增确认层入场
+  模式——宽门沿用 first_break 同门（强承接 + 破 T 高），B 决策改由
+  `n_shape_b_v1` 加权评分过阈值决定（满分 100，只装已验证方向弹药：竞价
+  强度/跳空、T 日官方封板质量、T-1 250 日低位百分位与均线多头、VWAP 位置；
+  已证伪的相对放量与市场温度只观察不计分）。静态因子每候选预取一次
+  （`_prefetch_nshape_static_factors`），缺数据按 0 贡献降级；入场快照
+  signal_features 带完整因子命中矩阵（`signal_provenance` 新增
+  `N_SHAPE_MINUTE_STRATEGY` / `N_SHAPE_V1` / `N_SHAPE_V1_FACTORS`，键名
+  三端锁死）。`topn_selection.score_feature_terms` 新增单项打分薄公共入口
+  （复用 `_score_term`，不复制 transform 公式）。CLI：`minute-replay
+  --entry-mode factor_confirm --factor-score-threshold`（默认 35，训练段网格中位档）；
+  `run_entry_mode_comparison` 支持透传阈值。回测结论见
+  docs/analysis/2026-07-03-nshape-factor-confirm.md。
+
 - **封板质量驱动的条件持有期（seal_hold，归因报告决策项 B）**：
   `AuctionGapMinuteReplayConfig` 新增 `seal_hold_*` 配置组——B 日收盘封住
   （`b_close_at_limit_up`）且封板质量达标（官方 `limit_list_daily.open_times`

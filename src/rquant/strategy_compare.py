@@ -8,7 +8,12 @@ from typing import Literal
 import pandas as pd
 from pydantic import BaseModel, ConfigDict
 
-from rquant.minute_replay import EntryMode, MinuteFreq, run_minute_strong_carry_replay
+from rquant.minute_replay import (
+    DEFAULT_FACTOR_SCORE_THRESHOLD,
+    EntryMode,
+    MinuteFreq,
+    run_minute_strong_carry_replay,
+)
 from rquant.paper import PaperTradeConfig
 from rquant.storage.duckdb import DuckDBStore
 from rquant.volume_profile import VolumeProfileRuleConfig
@@ -131,6 +136,7 @@ def run_entry_mode_comparison(
     max_hold_days: int = 1,
     freq: MinuteFreq = "1min",
     paper_config: PaperTradeConfig | None = None,
+    factor_score_threshold: float = DEFAULT_FACTOR_SCORE_THRESHOLD,
 ) -> StrategyComparisonResult:
     """按多个入场模式跑分钟 replay，并生成对比表。"""
     candidates_count = _candidate_count(store, start_date, end_date, preset_name)
@@ -150,6 +156,7 @@ def run_entry_mode_comparison(
                 max_hold_days=max_hold_days,
                 paper_config=paper_config,
                 volume_profile_config=_volume_profile_config(variant),
+                factor_score_threshold=factor_score_threshold,
             )
             if not trades.empty:
                 trades = trades.copy()

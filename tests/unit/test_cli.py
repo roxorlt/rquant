@@ -221,6 +221,7 @@ class TestMinuteReplayParser:
         assert args.preset == "n-shape-pool1"
         assert args.freq == "1min"
         assert args.entry_mode == "first_break"
+        assert args.factor_score_threshold == 35.0
         assert args.max_hold_days == 5
         assert not args.volume_profile
         assert args.volume_profile_lookbacks == [90]
@@ -247,6 +248,18 @@ class TestMinuteReplayParser:
         assert args.volume_profile
         assert args.volume_profile_lookbacks == [90]
         assert args.output == "/private/tmp/replay.csv"
+
+    def test_minute_replay_factor_confirm_args(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "minute-replay",
+            "--start-date", "2026-06-01",
+            "--end-date", "2026-06-24",
+            "--entry-mode", "factor_confirm",
+            "--factor-score-threshold", "65",
+        ])
+        assert args.entry_mode == "factor_confirm"
+        assert args.factor_score_threshold == 65.0
 
 
 class TestMinuteReplayBackfillParser:

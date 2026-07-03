@@ -24,11 +24,13 @@ from rquant.replay_entry_cache import (
     RiskReplayQuote,
     replay_entry_snapshots_to_trades,
 )
+from rquant.signal_provenance import N_SHAPE_V1, build_signal_factors
 from rquant.stock_features import (
     build_daily_stock_features,
     build_intraday_relative_volume_features,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
 from rquant.volume_profile import (
     VolumeProfile,
     VolumeProfileRuleConfig,
@@ -44,6 +46,7 @@ EntryMode = Literal[
     "late_confirm",
     "vwap_confirm",
     "amount_surge",
+    "factor_confirm",
 ]
 INDEX_CONTEXT_LABELS = {
     "000001.SH": "sse",
@@ -53,6 +56,52 @@ INDEX_CONTEXT_LABELS = {
     "000905.SH": "csi500",
     "000852.SH": "csi1000",
 }
+
+# factor_confirm 评分阈值默认档（训练段网格 28/35/42 的中位档 ≈ 训练段首信号分钟得分
+# 中位数，见 docs/analysis/2026-07-03-nshape-factor-confirm.md）
+DEFAULT_FACTOR_SCORE_THRESHOLD = 35.0
+
+# 日线 vol 单位为手，竞价 vol 为股，对齐 auction_gap_strategy.daily_vol_unit_factor
+_DAILY_VOL_UNIT_FACTOR = 100.0
+
+# N 字首板日回看窗口：pool1 首板在 T-1，pool2 在 T-2，留 1 天冗余
+_SEAL_LOOKBACK_TRADING_DAYS = 3
+
+# n_shape_b_v1 权重表：确认层评分（满分 100），与 N_SHAPE_V1_FACTORS 命中矩阵同键名。
+# 只放已验证方向的弹药（低位百分位/竞价强度/封板质量/VWAP 位置）；rel_amount 相对放量
+# 与市场温度已证伪收益方向，只进命中矩阵观察，不进权重表。全部 skip_if_missing：
+# 静态因子缺数据（limit_list 缺行/新股无 250 日历史）降级为 0 贡献而非满分/半分。
+# 数值区间按 N 字池训练段实测分布标定（B 日竞价量比中位数 ~0.013，非竞价跳空策略量级）。
+N_SHAPE_B_V1_SCORE_TERMS: tuple[FeatureScoreTerm, ...] = (
+    FeatureScoreTerm(
+        name="auction_vol_ratio_5d", group="auction", weight=20.0,
+        transform="log_ratio", cap=0.05, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="auction_gap_pct", group="auction", weight=10.0,
+        transform="linear", low=0.0, high=6.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="seal_open_times_t", group="seal", weight=15.0,
+        transform="inverse_linear", low=0.0, high=3.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="seal_fd_to_circ_pct_t", group="seal", weight=10.0,
+        transform="linear", low=0.0, high=10.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="price_percentile_250d", group="trend", weight=20.0,
+        transform="inverse_linear", low=0.0, high=1.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="ma_alignment", group="trend", weight=10.0,
+        transform="linear", low=0.0, high=1.0, skip_if_missing=True,
+    ),
+    FeatureScoreTerm(
+        name="vwap_position", group="minute", weight=15.0,
+        transform="linear", low=1.0, high=1.02, skip_if_missing=True,
+    ),
+)
 
 
 class MinuteReplayConfig(BaseModel):
@@ -71,6 +120,7 @@ class MinuteReplayConfig(BaseModel):
     amount_surge_lookback: int = Field(default=5, ge=1, le=30)
     amount_surge_min_prior_minutes: int = Field(default=2, ge=1, le=30)
     amount_surge_ratio: float = Field(default=2.0, gt=1, le=20)
+    factor_score_threshold: float = Field(default=DEFAULT_FACTOR_SCORE_THRESHOLD, ge=0)
     price_discontinuity_pct: float = Field(default=0.01, gt=0, lt=1)
     paper: PaperTradeConfig = Field(default_factory=PaperTradeConfig)
     volume_profile: VolumeProfileRuleConfig = Field(
@@ -238,6 +288,200 @@ def _query_daily_bar(
     return df.iloc[0]
 
 
+def _query_open_auction_bar(
+    store: DuckDBStore,
+    ts_code: str,
+    trading_date: date,
+) -> pd.Series | None:
+    """B 日开盘竞价行（tushare 优先于分钟回退源；price<=0 坏行按缺数据处理）。"""
+    df = store._conn.execute(
+        """
+        SELECT price, vol,
+               CASE WHEN source = 'tushare' THEN 0 ELSE 1 END AS source_priority
+        FROM auction_bar
+        WHERE ts_code = ?
+          AND trade_date = ?
+          AND auction_type = 'open_realtime'
+        ORDER BY source_priority
+        LIMIT 1
+        """,
+        [ts_code, trading_date],
+    ).fetchdf()
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    if pd.isna(row["price"]) or float(row["price"]) <= 0:
+        return None
+    return row
+
+
+def _query_avg_vol_5d(
+    store: DuckDBStore,
+    ts_code: str,
+    t_date: date,
+) -> float | None:
+    """截至 T 日的 5 日均量（股），不足 5 根日线视为缺数据（对齐 prev5_count==5 口径）。"""
+    df = store._conn.execute(
+        """
+        SELECT vol
+        FROM daily_bar
+        WHERE ts_code = ?
+          AND trade_date <= ?
+        ORDER BY trade_date DESC
+        LIMIT 5
+        """,
+        [ts_code, t_date],
+    ).fetchdf()
+    vols = pd.to_numeric(df["vol"], errors="coerce").dropna() if not df.empty else df
+    if len(vols) < 5:
+        return None
+    return float(vols.mean()) * _DAILY_VOL_UNIT_FACTOR
+
+
+def _query_circ_mv(
+    store: DuckDBStore,
+    ts_code: str,
+    trading_date: date,
+) -> float | None:
+    """daily_basic 流通市值，单位万元。"""
+    row = store._conn.execute(
+        """
+        SELECT circ_mv
+        FROM daily_basic
+        WHERE ts_code = ?
+          AND trade_date = ?
+        """,
+        [ts_code, trading_date],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    value = float(row[0])
+    return value if value > 0 else None
+
+
+def _query_above_ma20_ratio(
+    store: DuckDBStore,
+    trading_date: date,
+) -> float | None:
+    row = store._conn.execute(
+        """
+        SELECT above_ma20_ratio_pct
+        FROM market_sentiment_daily
+        WHERE trade_date = ?
+        """,
+        [trading_date],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _previous_trading_date(calendar: list[date], current: date) -> date | None:
+    previous: date | None = None
+    for trading_date in calendar:
+        if trading_date >= current:
+            break
+        previous = trading_date
+    return previous
+
+
+def _query_nshape_seal_quality(
+    store: DuckDBStore,
+    ts_code: str,
+    t_date: date,
+    calendar: list[date],
+) -> pd.Series | None:
+    """N 字首板日的官方封板质量（limit_list_daily limit_status='U'）。
+
+    首板不在 T 日（pool1 在 T-1，pool2 在 T-2），取 [T-3 个交易日, T] 内最近一条
+    涨停行；窗口内无行按缺数据处理。
+    """
+    prior = [d for d in calendar if d <= t_date]
+    if not prior:
+        return None
+    window = prior[-(_SEAL_LOOKBACK_TRADING_DAYS + 1):]
+    df = store._conn.execute(
+        """
+        SELECT trade_date, open_times, fd_amount, float_mv
+        FROM limit_list_daily
+        WHERE ts_code = ?
+          AND trade_date >= ?
+          AND trade_date <= ?
+          AND limit_status = 'U'
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
+        [ts_code, window[0], t_date],
+    ).fetchdf()
+    if df.empty:
+        return None
+    return df.iloc[0]
+
+
+def _prefetch_nshape_static_factors(
+    store: DuckDBStore,
+    *,
+    ts_code: str,
+    t_date: date,
+    buy_date: date,
+    calendar: list[date],
+    t_close_raw: float,
+) -> dict[str, float | int | None]:
+    """factor_confirm 的静态因子（daily tier），每个候选只取一次，缺数据记 None。
+
+    - 竞价强度/跳空：B 日 09:26 已知（auction_bar + B 日 pre_close）
+    - 封板质量：N 字首板日官方涨停榜（[T-3, T] 内最近 'U' 行，B 日已知）
+    - 低位/均线：T-1 收盘；温度：T-1 市场面（已证伪，只观察）
+    """
+    out: dict[str, float | int | None] = {
+        "auction_vol_ratio_5d": None,
+        "auction_gap_pct": None,
+        "seal_open_times_t": None,
+        "seal_fd_to_circ_pct_t": None,
+        "price_percentile_250d": None,
+        "ma_alignment": None,
+        "market_above_ma20_ratio_pct": None,
+    }
+
+    auction = _query_open_auction_bar(store, ts_code, buy_date)
+    if auction is not None:
+        buy_daily = _query_daily_bar(store, ts_code, buy_date)
+        pre_close = (
+            float(buy_daily["pre_close"])
+            if buy_daily is not None and pd.notna(buy_daily["pre_close"])
+            else t_close_raw
+        )
+        if pre_close > 0:
+            out["auction_gap_pct"] = round(
+                (float(auction["price"]) / pre_close - 1) * 100, 4
+            )
+        avg_vol_5d = _query_avg_vol_5d(store, ts_code, t_date)
+        if avg_vol_5d is not None and avg_vol_5d > 0 and pd.notna(auction["vol"]):
+            out["auction_vol_ratio_5d"] = round(float(auction["vol"]) / avg_vol_5d, 4)
+
+    seal = _query_nshape_seal_quality(store, ts_code, t_date, calendar)
+    if seal is not None:
+        if pd.notna(seal["open_times"]):
+            out["seal_open_times_t"] = int(seal["open_times"])
+        if pd.notna(seal["fd_amount"]):
+            fd_amount = float(seal["fd_amount"])
+            if pd.notna(seal["float_mv"]) and float(seal["float_mv"]) > 0:
+                circ_value = float(seal["float_mv"])
+            else:
+                circ_wan = _query_circ_mv(store, ts_code, _as_date(seal["trade_date"]))
+                circ_value = circ_wan * 1e4 if circ_wan is not None else 0.0
+            if circ_value > 0:
+                out["seal_fd_to_circ_pct_t"] = round(fd_amount / circ_value * 100, 4)
+
+    t_minus_1 = _previous_trading_date(calendar, t_date)
+    if t_minus_1 is not None:
+        trend = build_daily_stock_features(store, ts_code, t_minus_1)
+        out["price_percentile_250d"] = trend.get("price_percentile_250d")
+        out["ma_alignment"] = trend.get("ma_alignment")
+        out["market_above_ma20_ratio_pct"] = _query_above_ma20_ratio(store, t_minus_1)
+    return out
+
+
 def _query_market_sentiment(
     store: DuckDBStore,
     trading_date: date,
@@ -378,6 +622,7 @@ def _find_entry_snapshot(
     window_dates: list[date],
     config: MinuteReplayConfig,
     volume_profiles: list[VolumeProfile],
+    static_factors: dict[str, float | int | None] | None = None,
 ) -> ReplayEntrySnapshot | None:
     if item.t_close is None or item.t_high is None:
         return None
@@ -520,6 +765,53 @@ def _find_entry_snapshot(
                 )
                 if snapshot is not None:
                     return snapshot
+            if config.entry_mode == "factor_confirm":
+                # 宽门（is_signal）沿用 first_break 同门；确认层由 n_shape_b_v1
+                # 加权分过阈值决定。观察因子（rel_amount/温度）不进权重表，
+                # 得分只由静态因子 + vwap_position 决定，故过阈值后才查相对放量库。
+                vwap_position = (
+                    quote.price / vwap if vwap is not None and vwap > 0 else None
+                )
+                raw_factor_values: dict[str, object] = {
+                    **(static_factors or {}),
+                    "vwap_position": vwap_position,
+                }
+                factor_score = score_feature_terms(
+                    raw_factor_values, N_SHAPE_B_V1_SCORE_TERMS
+                )
+                if factor_score >= config.factor_score_threshold:
+                    rel_features = build_intraday_relative_volume_features(
+                        store,
+                        item.ts_code,
+                        quote_time,
+                        current_minute_amount=minute_amount,
+                        current_cum_amount=cum_amount,
+                        current_day_amounts=clocked_amount_history,
+                        freq=config.freq,
+                    )
+                    raw_factor_values["rel_amount_same_minute_20d"] = rel_features.get(
+                        "signal_rel_amount_same_minute_20d"
+                    )
+                    matrix = build_signal_factors(
+                        raw_factor_values, factor_set=N_SHAPE_V1
+                    )
+                    signal_features = {
+                        **rel_features,
+                        **raw_factor_values,
+                        "n_shape_factor_score": factor_score,
+                        "n_shape_factor_score_threshold": config.factor_score_threshold,
+                        "n_shape_factor_hit_count": matrix.hit_count,
+                        "n_shape_factor_evaluated_count": matrix.evaluated_count,
+                        "n_shape_signal_factors": matrix.to_json_payload(),
+                    }
+                    snapshot = _build_snapshot(
+                        "minute_factor_confirm",
+                        idx,
+                        quote,
+                        signal_features,
+                    )
+                    if snapshot is not None:
+                        return snapshot
             if (
                 config.entry_mode == "amount_surge"
                 and is_above_vwap
@@ -831,6 +1123,7 @@ def build_minute_replay_entry_snapshots(
     max_hold_days: int = 5,
     paper_config: PaperTradeConfig | None = None,
     volume_profile_config: VolumeProfileRuleConfig | None = None,
+    factor_score_threshold: float = DEFAULT_FACTOR_SCORE_THRESHOLD,
 ) -> list[ReplayEntrySnapshot]:
     """生成分钟 replay 的入场快照，供后续风控参数重放。"""
     config = MinuteReplayConfig(
@@ -838,6 +1131,7 @@ def build_minute_replay_entry_snapshots(
         freq=freq,
         entry_mode=entry_mode,
         max_hold_days=max_hold_days,
+        factor_score_threshold=factor_score_threshold,
         paper=paper_config or PaperTradeConfig(),
         volume_profile=volume_profile_config or VolumeProfileRuleConfig(),
     )
@@ -907,6 +1201,16 @@ def build_minute_replay_entry_snapshots(
             config,
             float(price_basis_ratio),
         )
+        static_factors: dict[str, float | int | None] | None = None
+        if config.entry_mode == "factor_confirm":
+            static_factors = _prefetch_nshape_static_factors(
+                store,
+                ts_code=item.ts_code,
+                t_date=t_date,
+                buy_date=buy_date,
+                calendar=calendar,
+                t_close_raw=float(daily_t["close"]),
+            )
         snapshot = _find_entry_snapshot(
             store,
             item,
@@ -916,6 +1220,7 @@ def build_minute_replay_entry_snapshots(
             window_dates,
             config,
             volume_profiles,
+            static_factors,
         )
         if snapshot is None:
             continue
@@ -927,6 +1232,15 @@ def build_minute_replay_entry_snapshots(
             )
             feature_payload.update(_query_market_sentiment(store, item.reference_date))
             feature_payload.update(_query_index_context(store, item.reference_date))
+        if config.entry_mode == "factor_confirm":
+            risk_payload = snapshot.risk_plan.payload
+            for key in (
+                "n_shape_factor_score",
+                "n_shape_factor_score_threshold",
+                "n_shape_factor_hit_count",
+                "n_shape_factor_evaluated_count",
+            ):
+                feature_payload[key] = risk_payload.get(key)
         snapshots.append(snapshot.model_copy(update={"feature_payload": feature_payload}))
 
     return snapshots
@@ -943,6 +1257,7 @@ def run_minute_strong_carry_replay(
     max_hold_days: int = 5,
     paper_config: PaperTradeConfig | None = None,
     volume_profile_config: VolumeProfileRuleConfig | None = None,
+    factor_score_threshold: float = DEFAULT_FACTOR_SCORE_THRESHOLD,
 ) -> pd.DataFrame:
     """回放 Pool 候选在次交易日盘中的强承接突破信号。
 
@@ -960,5 +1275,6 @@ def run_minute_strong_carry_replay(
         max_hold_days=max_hold_days,
         paper_config=paper,
         volume_profile_config=volume_profile_config,
+        factor_score_threshold=factor_score_threshold,
     )
     return replay_entry_snapshots_to_trades(snapshots, paper)

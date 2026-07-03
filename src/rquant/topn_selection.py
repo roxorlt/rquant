@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from math import isfinite, log1p
 from typing import Literal
 
@@ -349,6 +350,19 @@ def _score_term(row: pd.Series, term: FeatureScoreTerm) -> float:
     if term.transform == "band":
         return _score_band(row.get(term.name), term.center or 0.0, term.half_width or 1.0)
     return 0.0
+
+
+def score_feature_terms(
+    values: Mapping[str, object],
+    terms: Sequence[FeatureScoreTerm],
+) -> float:
+    """按给定评分项对一组原始因子值求加权总分。
+
+    _score_term 的薄公共入口，供 minute_replay 等画像体系之外的评分器复用，
+    避免复制 transform 公式。缺失值行为与画像一致（skip_if_missing 项记 0）。
+    """
+    row = pd.Series(dict(values), dtype=object)
+    return round(sum(term.weight * _score_term(row, term) for term in terms), 4)
 
 
 def feature_score(row: pd.Series, score_profile: FeatureScoreProfile | None = None) -> float:
