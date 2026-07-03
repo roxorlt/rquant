@@ -630,6 +630,7 @@ def cmd_minute_replay(args: argparse.Namespace) -> int:
             entry_mode=args.entry_mode,
             max_hold_days=args.max_hold_days,
             volume_profile_config=volume_profile_config,
+            factor_score_threshold=args.factor_score_threshold,
         )
 
     if args.output:
@@ -1330,8 +1331,13 @@ def build_parser() -> argparse.ArgumentParser:
             "late_confirm",
             "vwap_confirm",
             "amount_surge",
+            "factor_confirm",
         ],
         help="入场模式 (默认 first_break)",
+    )
+    replay_p.add_argument(
+        "--factor-score-threshold", type=float, default=35.0,
+        help="factor_confirm 的 n_shape_b_v1 评分入场阈值，仅该模式生效 (默认 35)",
     )
     replay_p.add_argument(
         "--max-hold-days", type=int, default=5,

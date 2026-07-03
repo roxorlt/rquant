@@ -15,6 +15,9 @@ from rquant.signal_provenance import (
     AUCTION_GAP_MINUTE_STRATEGY,
     AUCTION_GAP_V1,
     AUCTION_GAP_V1_FACTORS,
+    N_SHAPE_MINUTE_STRATEGY,
+    N_SHAPE_V1,
+    N_SHAPE_V1_FACTORS,
     FactorSpec,
     SignalProvenance,
     build_signal_factors,
@@ -46,6 +49,54 @@ def test_auction_gap_v1_factor_keys_locked() -> None:
         "amount_accel_5m",
         "market_temperature_high60",
     ]
+
+
+def test_n_shape_v1_factor_keys_locked() -> None:
+    """N 字 B 点确认因子键名三端同构（replay/live/全景页），改名必须升 factor_set 版本。"""
+    assert N_SHAPE_MINUTE_STRATEGY == "n_shape_minute"
+    assert N_SHAPE_V1 == "n_shape_v1"
+    assert [spec.name for spec in N_SHAPE_V1_FACTORS] == [
+        "auction_vol_ratio_5d",
+        "auction_gap_pct",
+        "seal_open_times_t",
+        "seal_fd_to_circ_pct_t",
+        "price_percentile_250d",
+        "ma_alignment",
+        "vwap_position",
+        "rel_amount_same_minute_20d",
+        "market_above_ma20_ratio_pct",
+    ]
+    # 已证伪方向的因子锁死为观察位（op=None），不得悄悄参与判定
+    by_name = {spec.name: spec for spec in N_SHAPE_V1_FACTORS}
+    assert by_name["rel_amount_same_minute_20d"].op is None
+    assert by_name["market_above_ma20_ratio_pct"].op is None
+
+
+def test_build_signal_factors_supports_n_shape_v1() -> None:
+    factors = build_signal_factors(
+        {
+            "auction_vol_ratio_5d": 2.0,
+            "auction_gap_pct": 3.1,
+            "seal_open_times_t": 0,
+            "seal_fd_to_circ_pct_t": 4.2,
+            "price_percentile_250d": 0.18,
+            "ma_alignment": 1,
+            "vwap_position": 1.006,
+            "rel_amount_same_minute_20d": 2.8,
+            "market_above_ma20_ratio_pct": 41.0,
+        },
+        factor_set=N_SHAPE_V1,
+    )
+
+    assert factors.factor_set == N_SHAPE_V1
+    assert set(factors.factors) == {spec.name for spec in N_SHAPE_V1_FACTORS}
+    assert factors.factors["seal_open_times_t"].hit is True  # 0 <= 1
+    assert factors.factors["price_percentile_250d"].hit is True  # 0.18 <= 0.5
+    assert factors.factors["ma_alignment"].hit is True
+    assert factors.factors["rel_amount_same_minute_20d"].hit is None
+    assert factors.factors["market_above_ma20_ratio_pct"].hit is None
+    assert factors.hit_count == 7
+    assert factors.evaluated_count == 7
 
 
 def test_factor_spec_threshold_validation() -> None:

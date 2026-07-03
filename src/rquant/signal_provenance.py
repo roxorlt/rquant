@@ -36,6 +36,8 @@ SIGNAL_FACTORS_SCHEMA_VERSION = 1
 
 AUCTION_GAP_MINUTE_STRATEGY = "auction_gap_minute"
 AUCTION_GAP_V1 = "auction_gap_v1"
+N_SHAPE_MINUTE_STRATEGY = "n_shape_minute"
+N_SHAPE_V1 = "n_shape_v1"
 
 _COMPARE_OPS: dict[str, Callable[[float, float], bool]] = {
     ">=": operator.ge,
@@ -103,8 +105,51 @@ AUCTION_GAP_V1_FACTORS: tuple[FactorSpec, ...] = (
     ),
 )
 
+# N 字分钟级 B 点多因子确认因子组（docs/plans/2026-07-03-nshape-factor-confirm-design.md 2 节）。
+# 日期口径：T = 池筛选日（非涨停日），B = 次日买入日，N 字首板在 T-1（pool1）/ T-2（pool2）。
+# 竞价因子 B 日 09:26 已知；封板质量为首板日（[T-3,T] 最近 'U' 行）收盘后官方数据；
+# 低位/均线/温度取 T-1 收盘（B 日无未来函数）。rel_amount 与温度为已证伪方向，
+# 只观察不判定（op=None）。命中阈值按 N 字池实测分布标定（竞价量比中位数 ~0.013）。
+N_SHAPE_V1_FACTORS: tuple[FactorSpec, ...] = (
+    FactorSpec(
+        name="auction_vol_ratio_5d", label="竞价量比(5日)",
+        tier="snapshot", op=">=", threshold=0.02, basis="b_open_auction",
+    ),
+    FactorSpec(
+        name="auction_gap_pct", label="竞价跳空幅度(%)",
+        tier="snapshot", op=">", threshold=0.0, basis="b_open_auction",
+    ),
+    FactorSpec(
+        name="seal_open_times_t", label="首板开板次数",
+        tier="snapshot", op="<=", threshold=1.0, basis="board_day",
+    ),
+    FactorSpec(
+        name="seal_fd_to_circ_pct_t", label="首板封单/流通市值(%)",
+        tier="snapshot", op=">=", threshold=1.0, basis="board_day",
+    ),
+    FactorSpec(
+        name="price_percentile_250d", label="250日收盘百分位",
+        tier="snapshot", op="<=", threshold=0.5, basis="t_minus_1",
+    ),
+    FactorSpec(name="ma_alignment", label="均线多头排列", tier="snapshot", op="bool",
+               basis="t_minus_1"),
+    FactorSpec(
+        name="vwap_position", label="VWAP位置(价/VWAP)",
+        tier="minute", op=">=", threshold=1.0,
+    ),
+    FactorSpec(
+        name="rel_amount_same_minute_20d", label="同分钟相对放量(20日)",
+        tier="minute",
+    ),
+    FactorSpec(
+        name="market_above_ma20_ratio_pct", label="市场温度(MA20上方占比)",
+        tier="market", basis="t_minus_1",
+    ),
+)
+
 FACTOR_SETS: dict[str, tuple[FactorSpec, ...]] = {
     AUCTION_GAP_V1: AUCTION_GAP_V1_FACTORS,
+    N_SHAPE_V1: N_SHAPE_V1_FACTORS,
 }
 
 

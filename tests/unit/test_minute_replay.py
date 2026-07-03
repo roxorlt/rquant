@@ -632,6 +632,201 @@ def test_replay_attaches_candidate_stock_features(store: DuckDBStore) -> None:
     assert row["signal_rel_cum_amount_asof_20d"] > 1
 
 
+# ── factor_confirm：宽门 + 多因子评分确认 ──
+
+
+def _seed_factor_confirm_statics(store: DuckDBStore) -> None:
+    """静态因子数据：T=6/24 封板质量、B=6/25 竞价、T 前 4 根日线补足 5 日均量。"""
+    store.upsert_daily(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_date": date(2026, 6, day),
+            "open": 9.8,
+            "high": 10.0,
+            "low": 9.6,
+            "close": 9.8,
+            "pre_close": 9.8,
+            "change": 0.0,
+            "pct_chg": 0.0,
+            "vol": 1,
+            "amount": 1,
+        }
+        for day in [18, 19, 22, 23]
+    ]))
+    store.upsert_limit_list(pd.DataFrame([{
+        "ts_code": "600000.SH",
+        "trade_date": date(2026, 6, 24),
+        "name": "浦发银行",
+        "industry": "银行",
+        "close": 10.0,
+        "pct_chg": 10.0,
+        "amount": 55000.0,
+        "limit_amount": None,
+        "float_mv": 8e8,
+        "total_mv": 1e9,
+        "turnover_ratio": 1.0,
+        "fd_amount": 8e7,
+        "first_time": "100000",
+        "last_time": "100000",
+        "open_times": 0,
+        "up_stat": "1/1",
+        "limit_times": 1,
+        "limit_status": "U",
+    }]))
+    store.upsert_auction_bars(pd.DataFrame([{
+        "ts_code": "600000.SH",
+        "trade_date": date(2026, 6, 25),
+        "auction_type": "open_realtime",
+        "price": 10.3,
+        "vol": 500.0,
+        "amount": 5150.0,
+        "turnover_rate": 0.1,
+        "volume_ratio": 1.0,
+        "source": "tushare",
+    }]))
+
+
+def test_factor_confirm_skips_when_score_below_threshold(store: DuckDBStore) -> None:
+    """宽门亮（first_break 可入场）但静态因子全缺、评分不过阈值 → 当日放弃。"""
+    from rquant.minute_replay import run_minute_strong_carry_replay
+
+    _seed_daily_and_screen(store)
+    _seed_minutes(store)
+
+    baseline = run_minute_strong_carry_replay(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="first_break",
+    )
+    assert len(baseline) == 1  # 宽门确实亮过
+
+    trades = run_minute_strong_carry_replay(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="factor_confirm",
+    )
+    assert trades.empty
+
+
+def test_factor_confirm_enters_with_matrix_when_score_passes(store: DuckDBStore) -> None:
+    from rquant.minute_replay import (
+        build_minute_replay_entry_snapshots,
+        run_minute_strong_carry_replay,
+    )
+    from rquant.signal_provenance import N_SHAPE_V1, N_SHAPE_V1_FACTORS
+
+    _seed_daily_and_screen(store)
+    _seed_minutes(store)
+    _seed_factor_confirm_statics(store)
+
+    # 09:32 信号分钟：竞价量比 5.0(20) + 跳空 3%(5) + 开板 0 次(15) + 封单 10%(10)
+    # + vwap_position 1.0089(6.65) ≈ 56.65 ≥ 35
+    trades = run_minute_strong_carry_replay(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="factor_confirm",
+    )
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["entry_signal"] == "minute_factor_confirm"
+    assert row["entry_time"] == pd.Timestamp("2026-06-25 09:33:00")
+    assert row["n_shape_factor_score"] == pytest.approx(56.65, abs=0.05)
+    assert row["n_shape_factor_score_threshold"] == pytest.approx(35.0)
+
+    snapshots = build_minute_replay_entry_snapshots(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="factor_confirm",
+    )
+    assert len(snapshots) == 1
+    payload = snapshots[0].risk_plan.payload
+    matrix = payload["n_shape_signal_factors"]
+    assert matrix["factor_set"] == N_SHAPE_V1
+    assert set(matrix["factors"]) <= {spec.name for spec in N_SHAPE_V1_FACTORS}
+    assert matrix["factors"]["auction_vol_ratio_5d"]["hit"] is True
+    assert matrix["factors"]["seal_open_times_t"]["hit"] is True
+    assert matrix["factors"]["vwap_position"]["hit"] is True
+    # 无 20 日分钟历史 → 观察因子相对放量缺席（区别于未命中）
+    assert "rel_amount_same_minute_20d" not in matrix["factors"]
+    # 新股/短历史：250 日百分位与均线缺数据 → 不出现在矩阵，评分按 0 贡献降级
+    assert "price_percentile_250d" not in matrix["factors"]
+    assert "ma_alignment" not in matrix["factors"]
+
+
+def test_factor_confirm_degrades_when_static_sources_missing(store: DuckDBStore) -> None:
+    """limit_list 缺行 / 无竞价 / 无 250 日历史 → 评分只剩 vwap 项，低阈值仍可入场。"""
+    from rquant.minute_replay import (
+        build_minute_replay_entry_snapshots,
+        run_minute_strong_carry_replay,
+    )
+
+    _seed_daily_and_screen(store)
+    _seed_minutes(store)
+
+    trades = run_minute_strong_carry_replay(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="factor_confirm",
+        factor_score_threshold=5.0,
+    )
+    assert len(trades) == 1
+    assert trades.iloc[0]["entry_signal"] == "minute_factor_confirm"
+    assert trades.iloc[0]["n_shape_factor_score"] == pytest.approx(6.65, abs=0.05)
+
+    snapshots = build_minute_replay_entry_snapshots(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="factor_confirm",
+        factor_score_threshold=5.0,
+    )
+    matrix = snapshots[0].risk_plan.payload["n_shape_signal_factors"]
+    assert set(matrix["factors"]) == {"vwap_position"}
+
+
+def test_factor_confirm_prefetches_static_factors_once(
+    store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """静态因子每候选只预取一次，不随信号分钟逐分钟查库。"""
+    from rquant import minute_replay
+
+    _seed_daily_and_screen(store)
+    _seed_minutes(store)
+
+    calls: list[str] = []
+    original = minute_replay._prefetch_nshape_static_factors
+
+    def counting(*args: object, **kwargs: object) -> dict[str, float | int | None]:
+        calls.append(str(kwargs.get("ts_code")))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(minute_replay, "_prefetch_nshape_static_factors", counting)
+
+    # 阈值设高使 09:32 / 09:33 两个信号分钟都被评估但不入场
+    trades = minute_replay.run_minute_strong_carry_replay(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        entry_mode="factor_confirm",
+        factor_score_threshold=99.0,
+    )
+    assert trades.empty
+    assert calls == ["600000.SH"]
+
+
 def test_replay_adjusts_price_discontinuity_window(store: DuckDBStore) -> None:
     from rquant.minute_replay import run_minute_strong_carry_replay
 
