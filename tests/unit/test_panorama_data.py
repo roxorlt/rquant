@@ -329,3 +329,53 @@ class TestDuckDBReaders:
 
     def test_load_pool_flags_empty(self, store: DuckDBStore) -> None:
         assert load_pool_flags(store=store) == {}
+
+
+class TestStrengthScore:
+    def test_strength_neutralizes_size(self) -> None:
+        """小票放量上攻的强度分应高于巨量但平庸的大票。"""
+        import pandas as pd
+
+        from rquant.panorama_data import add_strength_score
+
+        df = pd.DataFrame({
+            "ts_code": ["600000.SH", "300001.SZ"],
+            "name": ["大票", "小票"],
+            "price": [10.5, 11.8],
+            "pre_close": [10.0, 10.0],
+            "pct_chg": [5.0, 18.0],
+            "amount": [5e9, 8e8],
+            "limit_up_price": [11.0, 12.0],
+        })
+        liquidity = pd.DataFrame({
+            "ts_code": ["600000.SH", "300001.SZ"],
+            "circ_mv": [8_000_000.0, 300_000.0],  # 万元：800亿 vs 30亿
+            "avg_amount_5d": [4.8e9, 2.0e8],
+        })
+        out = add_strength_score(df, liquidity)
+        big = out.loc[out.ts_code == "600000.SH", "strength"].iloc[0]
+        small = out.loc[out.ts_code == "300001.SZ", "strength"].iloc[0]
+        assert small > big
+        # 换手强度：小票 8亿/30亿=26.7% >> 大票 50亿/800亿=6.3%
+        assert out.loc[out.ts_code == "300001.SZ", "turnover_pct"].iloc[0] > 20
+
+    def test_strength_without_liquidity_degrades(self) -> None:
+        """无流动性基准时强度分退化为可得分量均值，不报错。"""
+        import pandas as pd
+
+        from rquant.panorama_data import add_strength_score
+
+        df = pd.DataFrame({
+            "ts_code": ["600000.SH", "000001.SZ"],
+            "price": [10.5, 9.0],
+            "pre_close": [10.0, 10.0],
+            "pct_chg": [5.0, -10.0],
+            "amount": [1e9, 2e9],
+            "limit_up_price": [11.0, 11.0],
+        })
+        out = add_strength_score(df, None)
+        assert out["strength"].notna().all()
+        assert (
+            out.loc[out.ts_code == "600000.SH", "strength"].iloc[0]
+            > out.loc[out.ts_code == "000001.SZ", "strength"].iloc[0]
+        )

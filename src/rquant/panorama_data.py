@@ -373,12 +373,13 @@ def board_constituents(
     members: pd.DataFrame,
     snapshot: pd.DataFrame,
     pool_flags: dict[str, str] | None = None,
+    liquidity: pd.DataFrame | None = None,
     price_tol: float = PRICE_TOL,
 ) -> pd.DataFrame:
     """板块下钻成分股表。
 
-    返回列：ts_code, name, price, pct_chg(%), amount(元), is_limit_up, pools，
-    按 amount 降序。B 信号因子矩阵是 P2 范畴，此处只出快照行情 + 池内标记。
+    返回列含板块内强度分 strength（默认排序键，见 add_strength_score）、
+    换手强度、相对放量。B 信号因子矩阵是 P2 范畴。
     """
     if members.empty or snapshot.empty:
         return pd.DataFrame()
@@ -400,5 +401,96 @@ def board_constituents(
         df["is_limit_up"] = False
     flags = pool_flags or {}
     df["pools"] = df["ts_code"].map(flags).fillna("")
-    cols = ["ts_code", "name", "price", "pct_chg", "amount", "is_limit_up", "pools"]
-    return df[cols].sort_values("amount", ascending=False).reset_index(drop=True)
+    df = add_strength_score(df, liquidity)
+    cols = [
+        "ts_code", "name", "price", "pct_chg", "amount",
+        "strength", "turnover_pct", "rel_volume_5d",
+        "is_limit_up", "pools",
+    ]
+    cols = [c for c in cols if c in df.columns]
+    return df[cols].sort_values("strength", ascending=False).reset_index(drop=True)
+
+
+def load_liquidity_baseline(store: DuckDBStore | None = None) -> pd.DataFrame:
+    """流通市值 + 5 日均成交额基准（板块内强度分的分母）。
+
+    circ_mv 取 daily_basic 最新交易日（单位万元）；avg_amount_5d 取 daily_bar
+    最近 5 个交易日均值（tushare 单位千元 → 换算成元，与快照成交额同单位）。
+    只读库不可用 → 空表（强度分退化为涨幅+涨停进度两项）。
+    """
+    owns = store is None
+    try:
+        store = store or open_readonly_store(required_tables=("daily_basic", "daily_bar"))
+    except Exception as e:
+        logger.warning(f"流动性基准只读库打开失败: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+    try:
+        return store._conn.execute(
+            """
+            WITH latest AS (
+              SELECT ts_code, circ_mv FROM daily_basic
+              WHERE trade_date = (SELECT MAX(trade_date) FROM daily_basic)
+            ),
+            recent AS (
+              SELECT ts_code, AVG(amount) * 1000 AS avg_amount_5d
+              FROM (
+                SELECT ts_code, amount,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY ts_code ORDER BY trade_date DESC
+                       ) AS rn
+                FROM daily_bar
+              ) WHERE rn <= 5 GROUP BY ts_code
+            )
+            SELECT latest.ts_code, latest.circ_mv, recent.avg_amount_5d
+            FROM latest LEFT JOIN recent USING (ts_code)
+            """
+        ).fetchdf()
+    except Exception as e:
+        logger.warning(f"流动性基准查询失败: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+    finally:
+        if owns:
+            store.close()
+
+
+def add_strength_score(
+    df: pd.DataFrame, liquidity: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """板块内强度分（0-100）：中和市值/体量后的「谁真正强」。
+
+    四个分量在板块内做百分位排名后取均值（排名法抗极值）：
+    - 涨幅 pct_chg
+    - 换手强度 turnover_pct = 快照成交额 / 流通市值（中和市值）
+    - 相对放量 rel_volume_5d = 快照成交额 / 自身 5 日均额（中和自身体量；
+      盘中口径天然偏低，但板块内同一时刻横向可比）
+    - 涨停进度 = (price-pre_close)/(limit_up_price-pre_close)（中和 10/20cm 差异）
+    缺失分量不计入均值（新股无基准时退化为可得分量的均值）。
+    """
+    out = df.copy()
+    if liquidity is not None and not liquidity.empty:
+        out = out.merge(liquidity, on="ts_code", how="left")
+    if "circ_mv" in out.columns:
+        # circ_mv 单位万元 → 元
+        out["turnover_pct"] = out["amount"] / (out["circ_mv"] * 10000) * 100
+    if "avg_amount_5d" in out.columns:
+        out["rel_volume_5d"] = out["amount"] / out["avg_amount_5d"]
+    if {"limit_up_price", "pre_close"}.issubset(out.columns):
+        denom = out["limit_up_price"] - out["pre_close"]
+        out["_limit_progress"] = (out["price"] - out["pre_close"]) / denom.where(denom > 0)
+
+    parts = [
+        c for c in ("pct_chg", "turnover_pct", "rel_volume_5d", "_limit_progress")
+        if c in out.columns
+    ]
+    if parts:
+        ranks = pd.concat(
+            [out[c].rank(pct=True, na_option="keep") for c in parts], axis=1
+        )
+        out["strength"] = (ranks.mean(axis=1, skipna=True) * 100).round(1)
+    else:
+        out["strength"] = float("nan")
+    out = out.drop(columns=["circ_mv", "avg_amount_5d", "_limit_progress"], errors="ignore")
+    for c in ("turnover_pct", "rel_volume_5d"):
+        if c in out.columns:
+            out[c] = out[c].round(2)
+    return out

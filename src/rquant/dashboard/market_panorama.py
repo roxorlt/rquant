@@ -32,6 +32,7 @@ from rquant.panorama_data import (
     fetch_sector_fund_flow,
     industry_fallback_members,
     load_board_members,
+    load_liquidity_baseline,
     load_pool_flags,
 )
 
@@ -73,6 +74,10 @@ def cached_members() -> tuple[pd.DataFrame, str]:
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_pool_flags() -> dict[str, str]:
     return load_pool_flags()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_liquidity() -> pd.DataFrame:
+    return load_liquidity_baseline()
 
 
 # ── 渲染helpers ───────────────────────────────────────────────────────────────
@@ -209,7 +214,18 @@ def render_drilldown(
         format_func=lambda c: f"{labels[c]}（{amounts[c] / 1e8:.1f} 亿）",
         key="drill_board",
     )
-    cons = board_constituents(board_code, members, snapshot, cached_pool_flags())
+    sort_choice = st.radio(
+        "排序", ["强度分", "成交额", "涨幅"], horizontal=True, key="cons_sort",
+        help="强度分 = 板块内百分位均值（涨幅/换手强度/相对放量/涨停进度），中和市值与体量",
+    )
+    cons = board_constituents(
+        board_code, members, snapshot, cached_pool_flags(), liquidity=cached_liquidity()
+    )
+    if not cons.empty:
+        sort_map = {"强度分": "strength", "成交额": "amount", "涨幅": "pct_chg"}
+        by = sort_map[sort_choice]
+        if by in cons.columns:
+            cons = cons.sort_values(by, ascending=False).reset_index(drop=True)
     if cons.empty:
         st.info("该板块成分与快照无交集")
         return
