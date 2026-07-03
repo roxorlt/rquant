@@ -6,6 +6,17 @@
 
 ### Added
 
+- **封板质量驱动的条件持有期（seal_hold，归因报告决策项 B）**：
+  `AuctionGapMinuteReplayConfig` 新增 `seal_hold_*` 配置组——B 日收盘封住
+  （`b_close_at_limit_up`）且封板质量达标（官方 `limit_list_daily.open_times`
+  ≤ 阈值，可选封单金额/流通市值占比下限；官方缺行回退分钟推算 `b_open_times`）
+  的仓位持有上限从 `max_hold_days` 放宽到 `seal_hold_max_days`，竞价弱退/VWAP
+  破位/止损/移动止盈照旧生效；其余仓位维持 T+1。输出列加 `hold_policy`
+  （t1/seal_hold）。多日持有窗口分钟数据缺失时新增日线降级退出
+  （`_run_daily_tail_exit`，逐日近似 gap/止损/移动止盈，输出列
+  `exit_daily_fallback` 标记）。CLI：`auction-gap-minute-replay --seal-hold-days
+  --seal-hold-max-open-times`（默认关闭=现状）。
+
 - **盘中市场全景页 P0**（`market_panorama.py`，端口 8506，仅本地）：涨停/跌停/
   炸板实时计数 + 分钟 sparkline、东财板块资金流排行（行业/概念、额/率双排序）、
   板块成交额排行（东财 1022 板块成分聚合，行业粗分兜底）、板块下钻成分股表
