@@ -139,6 +139,14 @@
   load_daily_kline，_normalize_em_flow 保留 f12 板块码。单测 853→860，
   playwright e2e 8 条（冷启动/合表/联动/级联/性能/空态/屏效/真实模式）全过。
   见 docs/plans/2026-07-06-panorama-v2.md。
+- **板块集合竞价额历史窗口 20 日 → 3 日（board_hist_days 解耦）**：原先板块竞价额
+  相对历史的比较窗口误复用核心爆量因子的 `lookback_days`（20），改板块窗口会连带
+  改爆量同刻中位口径。解耦为独立字段 `GrowthBoardSurgeConfig.board_hist_days`
+  （默认 3），CLI 加 `--board-hist-days`（默认 3）。2026-07-04 实验（训练 ≤2025-12-31
+  / 验证 2026-01+）：3 日窗口在三档阈值上全面 ≥ 20 日，且把 g50a10 档从 v3 的
+  「训练段负贡献=噪音」升级为训练/验证同向的弱真信号（板块资金青睐是短周期情绪，
+  20 日中位摊平了当下强弱）。板块闸门本身仍默认关（对裸 9:30 基线增益薄、砍样本狠，
+  只作可选选择性/降尾部过滤器）。见 `docs/analysis/2026-07-04-growth-board-window-3d.md`。
 - **Strategy Lab 交互重构一期**：收益对比/交易明细/退出原因结果进
   `st.session_state`（切页签不再丢）；收益对比结果同样落盘到历史记录；
   sidebar 与自动优化/科创放量参数区包进 `st.form`（改参数不再整页刷新）；

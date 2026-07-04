@@ -116,6 +116,11 @@ class GrowthBoardSurgeConfig(BaseModel):
     require_board_favor: bool = False
     min_board_gap_up_ratio: float = Field(default=0.5, ge=0, le=1)
     min_board_auction_amount_ratio: float = Field(default=1.0, gt=0)
+    # 板块竞价额历史比较窗口，与核心爆量因子的 lookback_days 解耦（原先误复用
+    # lookback_days，改板块窗口会连带改爆量同刻中位口径）。默认 3：板块资金青睐是
+    # 短周期情绪，20 日中位把它摊平；3 日窗口在训练/验证两段都优于 20 日（2026-07-04
+    # 实验，见 docs/analysis/2026-07-04-growth-board-window-3d.md），故取 3。
+    board_hist_days: int = Field(default=3, ge=1, le=90)
     # factor_confirm：宽门（现有放量过滤）不动，入场加一层 growth_surge_b_v1
     # 加权评分过阈值判定（minute_replay factor_confirm 同款「宽门+评分」模式）
     enable_factor_confirm: bool = False
@@ -1090,7 +1095,7 @@ def run_growth_board_surge_replay(
                     store,
                     candidate.ts_code,
                     trading_date,
-                    hist_days=cfg.lookback_days,
+                    hist_days=cfg.board_hist_days,
                 )
                 if board_strength is None:
                     continue

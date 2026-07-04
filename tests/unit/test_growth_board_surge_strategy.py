@@ -873,3 +873,18 @@ def test_growth_board_surge_replay_filters_intraday_yiziban(store: DuckDBStore) 
     )
 
     assert trades.empty
+
+
+def test_board_hist_days_defaults_to_three_and_decoupled_from_lookback() -> None:
+    """板块竞价窗口 board_hist_days 默认 3，且与核心爆量窗口 lookback_days 解耦。
+
+    原先板块窗口误复用 lookback_days（20），2026-07-04 实验后独立成字段并改默认 3。
+    """
+    from rquant.growth_board_surge_strategy import GrowthBoardSurgeConfig
+
+    cfg = GrowthBoardSurgeConfig()
+    assert cfg.board_hist_days == 3
+    assert cfg.lookback_days == 20
+    # 改一个不动另一个
+    tuned = GrowthBoardSurgeConfig(lookback_days=10)
+    assert tuned.board_hist_days == 3
