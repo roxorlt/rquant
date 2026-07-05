@@ -139,6 +139,15 @@
   load_daily_kline，_normalize_em_flow 保留 f12 板块码。单测 853→860，
   playwright e2e 8 条（冷启动/合表/联动/级联/性能/空态/屏效/真实模式）全过。
   见 docs/plans/2026-07-06-panorama-v2.md。
+- **创业/科创放量策略退出结构：持仓 1→3 日 + 单票止损 −4%→−5%**：
+  `GrowthBoardSurgeConfig.max_hold_days` 默认 1→3，`paper.stop_loss_pct` 0.04→0.05
+  （take_profit 8% / trailing 3% 不动），CLI `--max-hold-days` 默认 1→3。2026-07-04
+  实验（训练 ≤2025-12-31 / 验证 2026-01+，入场不变同 546/748/1294 笔）：T+1 硬出把
+  赢家砍早了，放到 3 日让 2-3 日延续涨幅接住，均收益训练 2.96→4.61 / 验证 1.09→1.42
+  （同向为正=真增益）；止损 4%→5% 对 worst 值中性（尾部由隔夜 gap_stop 主导）。
+  同一实验验证板块窗口 3→2 更差（验证段 1.01 vs 1.78），维持 board_hist_days=3；
+  板块门本身仍默认关（更彩票化，可选过滤器）。见
+  `docs/analysis/2026-07-05-growth-exit-structure-hold3-stop5.md`。
 - **板块集合竞价额历史窗口 20 日 → 3 日（board_hist_days 解耦）**：原先板块竞价额
   相对历史的比较窗口误复用核心爆量因子的 `lookback_days`（20），改板块窗口会连带
   改爆量同刻中位口径。解耦为独立字段 `GrowthBoardSurgeConfig.board_hist_days`

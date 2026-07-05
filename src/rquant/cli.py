@@ -1412,8 +1412,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="当前分钟成交额相对历史同分钟中位数倍数 (默认 2.0)",
     )
     growth_replay_p.add_argument(
-        "--max-hold-days", type=int, default=1,
-        help="最多持有交易日数量，T+1 默认次日收盘前退出 (默认 1)",
+        "--max-hold-days", type=int, default=3,
+        help="最多持有交易日数量 (默认 3；接住 2-3 日延续涨幅，见退出结构报告)",
     )
     growth_replay_p.add_argument(
         "--require-inner-outer", action="store_true",

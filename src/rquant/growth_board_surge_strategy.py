@@ -127,12 +127,17 @@ class GrowthBoardSurgeConfig(BaseModel):
     factor_score_threshold: float = Field(
         default=DEFAULT_GROWTH_FACTOR_SCORE_THRESHOLD, ge=0
     )
-    max_hold_days: int = Field(default=1, ge=1, le=10)
+    # 持仓上限 3 日（用户 2026-07-04，验证段确认真增益）：T+1 硬出把赢家砍早了，
+    # 放到 3 日让 2-3 日延续涨幅接住，右尾变肥；训练/验证同向抬升（入场不变）。
+    # 见 docs/analysis/2026-07-05-growth-exit-structure-hold3-stop5.md。
+    max_hold_days: int = Field(default=3, ge=1, le=10)
     price_tol: float = Field(default=0.01, gt=0, lt=1)
+    # 单票止损 -5%（用户 2026-07-04）：尾部由隔夜 gap_stop 主导、非止损位，4%→5% 对
+    # worst 值中性，与持仓 3 日捆绑上（放宽止损避免多日持仓被日内噪音过早打出）。
     paper: PaperTradeConfig = Field(
         default_factory=lambda: PaperTradeConfig(
             candidate_id="growth_board_surge_v0",
-            stop_loss_pct=0.04,
+            stop_loss_pct=0.05,
             take_profit_pct=0.08,
             trailing_stop_pct=0.03,
         )
