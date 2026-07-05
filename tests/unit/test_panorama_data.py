@@ -45,10 +45,22 @@ def _sina_spot_df() -> pd.DataFrame:
     )
 
 
+def _kill_em_spot_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """打死东财两级（直连抛错 + 置空 SOCKS 禁用该级），强制快照走 sina 兜底。"""
+
+    def em_boom() -> pd.DataFrame:
+        raise ConnectionError("em down")
+
+    monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+    monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "")
+
+
 class TestFetchMarketSnapshot:
     def test_normalizes_columns_and_codes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _kill_em_spot_tiers(monkeypatch)
         monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
         df = fetch_market_snapshot()
+        assert df.attrs["route"] == "sina"
         # 'xx123' 后 6 位 'xx123' 非法代码被丢弃（实际 5 位）
         assert set(df["ts_code"]) == {
             "600519.SH", "300750.SZ", "688981.SH", "920008.BJ", "600222.SH",
@@ -66,16 +78,185 @@ class TestFetchMarketSnapshot:
         def boom() -> pd.DataFrame:
             raise ConnectionError("sina down")
 
+        _kill_em_spot_tiers(monkeypatch)
         monkeypatch.setattr(panorama_data, "_fetch_spot", boom)
-        assert fetch_market_snapshot().empty
+        df = fetch_market_snapshot()
+        assert df.empty
+        assert df.attrs["route"] == "none"
 
     def test_missing_required_column_returns_empty(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        _kill_em_spot_tiers(monkeypatch)
         monkeypatch.setattr(
             panorama_data, "_fetch_spot", lambda: _sina_spot_df().drop(columns=["昨收"])
         )
         assert fetch_market_snapshot().empty
+
+
+# ak.stock_zh_a_spot_em 风格中文列（成交量单位手）
+def _em_spot_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "序号": [1, 2, 3],
+            "代码": ["600519", "300750", "920008"],
+            "名称": ["贵州茅台", "宁德时代", "某北交所"],
+            "最新价": [1500.0, 250.0, 13.0],
+            "今开": [1480.0, 245.0, 12.5],
+            "最高": [1510.0, 252.0, 13.2],
+            "最低": [1475.0, 244.0, 12.4],
+            "昨收": [1490.0, 240.0, 12.0],
+            "涨跌幅": [0.67, 4.17, None],
+            "成交量": [10000.0, 200000.0, 5000.0],  # 手
+            "成交额": [1.5e9, 5e9, 6.5e6],
+        }
+    )
+
+
+# 东财 push2 clist 股票 diff 行（f5 成交量单位手；停牌票数值字段给 "-"）
+_EM_SPOT_ROWS: list[dict] = [
+    {"f12": "600519", "f14": "贵州茅台", "f2": 1500.0, "f17": 1480.0, "f15": 1510.0,
+     "f16": 1475.0, "f18": 1490.0, "f3": 0.67, "f5": 10000, "f6": 1.5e9},
+    {"f12": "300750", "f14": "宁德时代", "f2": 250.0, "f17": 245.0, "f15": 252.0,
+     "f16": 244.0, "f18": 240.0, "f3": 4.17, "f5": 200000, "f6": 5e9},
+    {"f12": "920008", "f14": "某北交所", "f2": "-", "f17": "-", "f15": "-",
+     "f16": "-", "f18": 12.0, "f3": "-", "f5": "-", "f6": "-"},
+]
+
+_SNAPSHOT_COLUMNS = [
+    "ts_code", "name", "price", "open", "high", "low", "pre_close",
+    "pct_chg", "volume", "amount",
+]
+
+
+class TestSnapshotRouting:
+    """全市场快照三级路由：东财直连 → 东财·SOCKS → 新浪兜底 → 全败空表。"""
+
+    def test_em_direct_normalizes_volume_to_shares(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", _em_spot_df)
+        df = fetch_market_snapshot()
+        assert df.attrs["route"] == "em_direct"
+        assert list(df.columns) == _SNAPSHOT_COLUMNS
+        mt = df[df["ts_code"] == "600519.SH"].iloc[0]
+        assert mt["volume"] == pytest.approx(1e6)  # 手 ×100 → 股
+        assert mt["amount"] == pytest.approx(1.5e9)  # 成交额已是元，不换算
+        assert mt["pct_chg"] == pytest.approx(0.67)
+        # 涨跌幅缺失 → price/pre_close 兜底
+        bj = df[df["ts_code"] == "920008.BJ"].iloc[0]
+        assert bj["pct_chg"] == pytest.approx((13.0 / 12.0 - 1) * 100)
+
+    def test_em_direct_missing_column_falls_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """em 返回 200 但缺必需列 → 该级视为空，落到下一级。"""
+        monkeypatch.setattr(
+            panorama_data, "_fetch_em_spot_direct",
+            lambda: _em_spot_df().drop(columns=["昨收"]),
+        )
+        monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "")
+        monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
+        df = fetch_market_snapshot()
+        assert df.attrs["route"] == "sina"
+
+    def test_direct_fails_socks_takes_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def em_boom() -> pd.DataFrame:
+            raise ConnectionError("blacklisted")
+
+        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+        seen: list[dict] = []
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            seen.append(kwargs)
+            return _FakeResp({"data": {"diff": _EM_SPOT_ROWS, "total": len(_EM_SPOT_ROWS)}})
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "socks5h://127.0.0.1:9999")
+        df = fetch_market_snapshot()
+        assert df.attrs["route"] == "em_socks"
+        assert seen[0]["proxies"] == {
+            "http": "socks5h://127.0.0.1:9999",
+            "https": "socks5h://127.0.0.1:9999",
+        }
+        assert seen[0]["params"]["fs"] == panorama_data._EM_SPOT_FS
+        assert list(df.columns) == _SNAPSHOT_COLUMNS
+        mt = df[df["ts_code"] == "600519.SH"].iloc[0]
+        assert mt["price"] == pytest.approx(1500.0)
+        assert mt["volume"] == pytest.approx(1e6)  # f5 手 ×100 → 股
+        assert mt["pct_chg"] == pytest.approx(0.67)
+        # 停牌票 "-" 占位被 coerce 成 NaN，行保留
+        bj = df[df["ts_code"] == "920008.BJ"].iloc[0]
+        assert pd.isna(bj["price"]) and pd.isna(bj["volume"])
+
+    def test_socks_paginates_until_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """服务端钳制单页行数时按 total 累积翻页取全量。"""
+
+        def em_boom() -> pd.DataFrame:
+            raise ConnectionError("blacklisted")
+
+        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+        pages: list[int] = []
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            params = kwargs["params"]
+            pages.append(params["pn"])
+            n = 100 if params["pn"] == 1 else 50
+            start = (params["pn"] - 1) * 100
+            diff = [
+                {"f12": f"{600000 + start + i:06d}", "f14": f"股{start + i}", "f2": 10.0,
+                 "f17": 9.9, "f15": 10.2, "f16": 9.8, "f18": 9.9, "f3": 1.0,
+                 "f5": 1000, "f6": 1e6}
+                for i in range(n)
+            ]
+            return _FakeResp({"data": {"diff": diff, "total": 150}})
+
+        import requests
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        df = fetch_market_snapshot()
+        assert pages == [1, 2]
+        assert len(df) == 150
+        assert df.attrs["route"] == "em_socks"
+
+    def test_both_em_fail_sina_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def em_boom() -> pd.DataFrame:
+            raise ConnectionError("blacklisted")
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("socks down")
+
+        import requests
+
+        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
+        df = fetch_market_snapshot()
+        assert df.attrs["route"] == "sina"
+        # sina 成交量已是股，不做 ×100 换算
+        mt = df[df["ts_code"] == "600519.SH"].iloc[0]
+        assert mt["volume"] == pytest.approx(1e6)
+
+    def test_all_routes_fail_empty_route_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def em_boom() -> pd.DataFrame:
+            raise ConnectionError("blacklisted")
+
+        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("socks down")
+
+        def sina_boom() -> pd.DataFrame:
+            raise ConnectionError("sina down")
+
+        import requests
+
+        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(panorama_data, "_fetch_spot", sina_boom)
+        df = fetch_market_snapshot()
+        assert df.empty
+        assert df.attrs["route"] == "none"
 
 
 class TestLimitPrices:
@@ -85,6 +266,7 @@ class TestLimitPrices:
         覆盖主板 10% / 创业板 20% / 科创板 20% / 北交所 30% / ST 5%，
         且含 half-up 舍入敏感样本（3.30×1.05=3.465 → 3.47，银行家舍入会给 3.46）。
         """
+        _kill_em_spot_tiers(monkeypatch)
         monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
         snap = add_limit_prices(fetch_market_snapshot())
         for _, row in snap.iterrows():
@@ -104,6 +286,7 @@ class TestLimitPrices:
             assert row["limit_down_price"] == expected["limit_down_price"], row["ts_code"]
 
     def test_st_half_up_rounding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _kill_em_spot_tiers(monkeypatch)
         monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
         snap = add_limit_prices(fetch_market_snapshot())
         st_row = snap[snap["ts_code"] == "600222.SH"].iloc[0]
@@ -162,7 +345,9 @@ _EM_ROWS: list[dict] = [
      "f62": -1.1e9, "f184": "-", "f204": "-"},
 ]
 
-_FLOW_COLUMNS = ["board_name", "pct_chg", "main_net_amount", "main_net_rate", "leading_stock"]
+_FLOW_COLUMNS = [
+    "board_code", "board_name", "pct_chg", "main_net_amount", "main_net_rate", "leading_stock",
+]
 
 
 def _ths_flow_df() -> pd.DataFrame:

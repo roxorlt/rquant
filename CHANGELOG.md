@@ -121,6 +121,24 @@
 
 ### Changed
 
+- **盘中市场全景 v2：屏效 + 性能 + 合表联动 + 个股图表**（8506，用户五点需求）：
+  ①屏效——单屏两栏布局（左 52% 板块总表 / 右 48% 下钻+图表），隐藏 Streamlit
+  顶栏、CSS 压缩边距、消灭全部 tab 与 divider，脉搏 sparkline 收进 popover，
+  1440×900 全区块首屏可见；②性能——聚合结果按快照时间戳缓存（cached_overview /
+  cached_constituents，交互零重算，实测体系切换→全区更新 105ms）、排序改
+  st.dataframe 列头点击（纯客户端零 rerun）、快照 TTL 30s→60s 对齐 fragment、
+  **全市场快照三级路由**（东财 spot 直连→SOCKS 云端出口→sina 兜底；sina
+  逐页爬全市场实测单次 >90s，是「切换等太久」的真实大头，东财路由盘中秒级）；
+  ③合表——资金流/成交额/涨停数合并为一张 build_board_overview 总表（东财 BK 码
+  +".DC" 与 dc_board 精确 join，ths 兜底按名 join；开盘啦体系无资金流口径自动隐列），
+  体系三选一 segmented_control；④联动——总表行选择→板块下钻（强度分默认序）；
+  ⑤级联——下钻行选择→个股图表（分时/5日/日K，altair 蜡烛红涨绿跌+MA5/10/20+量柱，
+  分时东财 trends2 直连→SOCKS→sina 三级路由，日K 只读副本+盘中快照拼当日 bar，
+  量纲股→手 ÷100 对齐）。新增 RQUANT_PANORAMA_FAKE=1 确定性 fixture 模式支撑
+  离线 e2e；panorama_data 新增 build_board_overview / fetch_intraday_trend /
+  load_daily_kline，_normalize_em_flow 保留 f12 板块码。单测 853→860，
+  playwright e2e 8 条（冷启动/合表/联动/级联/性能/空态/屏效/真实模式）全过。
+  见 docs/plans/2026-07-06-panorama-v2.md。
 - **Strategy Lab 交互重构一期**：收益对比/交易明细/退出原因结果进
   `st.session_state`（切页签不再丢）；收益对比结果同样落盘到历史记录；
   sidebar 与自动优化/科创放量参数区包进 `st.form`（改参数不再整页刷新）；
