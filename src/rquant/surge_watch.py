@@ -4,14 +4,19 @@
 检测层按 ``config.boards`` 收窄到创业/科创后两层判定，聚合推 PushDeer：
 
 - **粗筛（零外部调用）**：当日累计成交额 ≥ ``K_rough × 20 日均额 × 进度曲线(t)``
-  且 pct_chg>0、非 ST、有 20 日基线（缺基线的次新自动落选），只进候选不推送；
-- **确认层（近 3 天口径，用户 pinned）**：对新候选拉 tushare stk_mins 近 3 个
-  交易日 1min bars，构造 3 日同刻累计额中位基准，
-  ``rel_cum_3d = cum(t) / median_3d_same_time_cum(t) ≥ K_confirm`` 且现价 ≥ 当日
-  均价（快照 amount/volume 近似 VWAP，对齐回测 require_vwap_strength）才确认。
+  且 pct_chg>0、非 ST、有 20 日基线（缺基线的次新自动落选），只进候选不推送。
+  粗筛只负责「值不值得拉 tushare 确认」，不卡收益——2026-07-06 回测发现原 1.5×
+  会把候选挡在确认池外、延迟信号，故放松到 1.2×，让候选早进确认层。
+- **确认层（口径 v3，纯累计单条门）**：对新候选拉 tushare stk_mins 近 N（默认 4）个
+  交易日 1min bars，构造同刻累计额中位基准，
+  ``rel_cum = today_cum(t) / median_Nday_same_time_cum(t) ∈ [k_cum, ratio_cap]``
+  且 t 越过 skip_first_minutes（默认跳过 9:31 前，base 分母噪声大）即确认。
 
-口径说明（诚实标注）：确认层 3 日窗口与回测验证的 20 日不同源，K_rough/K_confirm
-为产品初始值（非回测标定）；报文尾注口径版本。
+口径演进（诚实标注）：v2 曾叠加 VWAP 门 + 单分钟增量门收紧，但 2026-07-06 全天真实
+分钟回测证明这些门把信号系统性拖到爆量展开后、买在阶段高点；纯累计口径买在爆量刚起
+（86% 在 10:00 前触发），完胜 v2。故 v3 移除两门（字段保留但默认关：k_delta_confirm=0、
+require_vwap=False），ratio_cap 上限挡极端出货毒尾（比值 11-20× 在负收益组扎堆）。
+报文尾注口径版本 v3。
 
 纪律（对齐 CLAUDE.md）：
 - **绝不写 DuckDB**：只在 9:25 启动时读一次只读副本预载 20 日均额 + kpl 题材成分，
@@ -150,21 +155,30 @@ def load_progress_curve(path: Path | None = None) -> np.ndarray:
 
 
 class SurgeConfig(BaseModel):
-    """surge-watch 判定参数（产品初始值，跑几天按实际量级调）。"""
+    """surge-watch 判定参数（口径 v3 纯累计，默认据 2026-07-06 全天真实分钟回测标定）。"""
 
-    k_rough: float = 1.5
-    # 确认层量比门：2026-07-06 全天真实分钟重放 + 24 组门槛扫描的 Pareto 收敛值。
-    # v1 默认 2.0 会推 81 只/天（预期 5-15）、胜率 32%；kc3.0 + 同分钟增量门 3.0× →
-    # 31 只/胜率 35.5%。逆选择上限：kc4.0 反而更差（样本更少却更噪），故封顶 3.0，
-    # 不要再往上抬。
-    k_confirm: float = 3.0
-    # 同分钟增量门：确认时点要求「当分钟增量 ≥ k_delta × 3 日同分钟中位」。
-    # 0 = 关闭。中位≤0 或增量缺失按不通过（None-fail 语义，对齐 step5 GatedWatcher）。
-    k_delta_confirm: float = 3.0
+    # 粗筛门：2026-07-06 回测发现 1.5× 会把候选挡在确认池外、延迟信号，放松到 1.2×
+    # 让候选早进确认层（粗筛只决定「值不值得拉 tushare」，真正的推送决策交给 rel_cum）。
+    k_rough: float = 1.2
+    # 确认层纯累计比值下门：rel_cum = today_cum / N日同刻累计中位 ≥ k_cum 才确认。
+    # 2026-07-06 全天真实分钟回测：纯累计（买爆量刚起）完胜 v2 曲线粗筛+VWAP门+增量门
+    # （门把信号拖到爆量展开后、买阶段高点）。示例 300499 从 v2 的 -2.30% 翻成 +2.83%。
+    k_cum: float = 2.5
+    # 累计比值上门（毒尾封顶）：rel_cum > ratio_cap 视为极端出货，不推——2026-07-06
+    # 回测里 ratio 11-20× 在负收益组扎堆（放巨量往往是出货而非启动）。
+    ratio_cap: float = 8.0
+    # 跳过开盘前 N 分钟确认：9:30 开盘首格恒不确认，再额外跳 skip_first_minutes 分钟。
+    # 默认 1 → 9:31 那格 today 只有 1-2 分钟累计、base 分母噪声大，9:32 起才确认。
+    skip_first_minutes: int = 1
+    # 单分钟增量门（v2 遗留，2026-07-06 回测证明拖累信号，v3 默认关）：>0 时确认要求
+    # 「当分钟增量 ≥ k_delta × N日同分钟中位」。0 = 关闭（默认）。
+    k_delta_confirm: float = 0.0
+    # VWAP 门（v2 遗留，同上默认关）：True 时确认要求现价 ≥ 当日均价（amount/volume）。
+    require_vwap: bool = False
     # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）则不推送（仍占「每票每日一次」
     # 名额、仍落 events 标 unbuyable）。0 = 只挡已封板；负值可整体关闭（room 恒 > 负值）。
     max_room_to_limit_pct: float = 1.0
-    confirm_lookback_days: int = 3
+    cum_lookback_days: int = 4       # 同刻累计中位回溯交易日数（v3 默认 4）
     max_per_push: int = 8            # 单条报文最多 N 只，超出折叠
     silent_until_hhmm: str = "09:33"  # 该时刻前只收集不推送
     tushare_rate_per_min: int = 2    # 确认层 stk_mins 限频（次/分）
@@ -189,10 +203,10 @@ class SurgeConfirmed(BaseModel):
     confirmed_at: str = ""            # HH:MM
     pct_chg: float = 0.0
     cum_amount: float = 0.0           # 当日累计成交额（元）
-    rel_cum_3d: float = 0.0           # cum / 3 日同刻累计额中位
+    rel_cum: float = 0.0              # today_cum / N 日同刻累计额中位（v3 纯累计核心判据）
     rough_ratio: float = 0.0          # cum / (20 日均额 × 曲线(t))
-    minute_delta: float | None = None       # 本分钟增量（元）
-    minute_delta_median_3d: float | None = None  # 3 日同分钟增量中位（元）
+    minute_delta: float | None = None       # 本分钟增量（元，v2 遗留研究字段）
+    minute_delta_median: float | None = None  # N 日同分钟增量中位（元，v2 遗留研究字段）
     room_to_limit_pct: float | None = None  # 距涨停空间（%）
     # confirmed（可买、推送）| unbuyable（距涨停≤门 / 已封板，只落 events 不推送）
     status: str = "confirmed"
@@ -621,7 +635,7 @@ class SurgeWatcher:
                     requeue.append(code)  # 延后重试，回队尾
                 continue
             self.confirm_cache[code] = build_three_day_baseline(
-                bars, now.date(), self.config.confirm_lookback_days
+                bars, now.date(), self.config.cum_lookback_days
             )
             self._evaluate(code, snapshot, now, gi)
         for code in requeue:
@@ -630,9 +644,15 @@ class SurgeWatcher:
                 self._pending_fetch.append(code)
 
     def _evaluate(self, code: str, snapshot: pd.DataFrame, now: datetime, gi: int) -> None:
-        """确认判定（口径 v2）：rel_cum_3d ≥ K_confirm 且现价 ≥ VWAP，再过同分钟增量门；
-        通过后若现价距涨停 ≤ max_room（或已封板）标 unbuyable 只落 events 不推送。"""
+        """确认判定（口径 v3 纯累计）：rel_cum = today_cum / N日同刻累计中位 ∈ [k_cum,
+        ratio_cap]，且 gi 越过 skip_first_minutes 即确认；VWAP 门 / 增量门 v3 默认关，
+        仅在 require_vwap / k_delta_confirm>0 时叠加。通过后若现价距涨停 ≤ max_room
+        （或已封板）标 unbuyable 只落 events 不推送。"""
         if code in self.pushed_today:
+            return
+        # skip_first_minutes：9:30 开盘首格（gi=0）恒不确认，再额外跳 skip_first_minutes
+        # 分钟。默认 1 → gi≤1（9:30/9:31）不确认，9:32 起才评估（base 分母噪声大）。
+        if gi <= self.config.skip_first_minutes:
             return
         base = self.confirm_cache.get(code)
         if base is None or base.days_used == 0:
@@ -649,18 +669,22 @@ class SurgeWatcher:
         if base_cum <= 0:
             return
         rel = float(amount) / base_cum
-        if rel < self.config.k_confirm:
+        # 纯累计单条门：比值须落在 [k_cum, ratio_cap]。低于下门量能不足；高于上门视为
+        # 极端出货毒尾（2026-07-06 回测 11-20× 扎堆负收益组）→ 不推。
+        if rel < self.config.k_cum or rel > self.config.ratio_cap:
             return
-        # VWAP 门：现价 ≥ 当日均价（amount/volume）
-        if volume is None or pd.isna(volume) or float(volume) <= 0:
-            return
-        vwap = float(amount) / float(volume)
-        if float(price) < vwap:
-            return
+        # VWAP 门（v3 默认关）：require_vwap 时才要求现价 ≥ 当日均价（amount/volume）。
+        if self.config.require_vwap:
+            if volume is None or pd.isna(volume) or float(volume) <= 0:
+                return
+            vwap = float(amount) / float(volume)
+            if float(price) < vwap:
+                return
 
         arr = self.cum_series.get(code)
         minute_delta = _minute_delta(arr, gi) if arr is not None else None
-        # 同分钟增量门：当分钟增量 ≥ k_delta × 3 日同分钟中位（中位≤0 / 增量缺失 → 不过）。
+        # 单分钟增量门（v3 默认关）：>0 时要求当分钟增量 ≥ k_delta × N日同分钟中位
+        # （中位≤0 / 增量缺失 → 不过，None-fail 语义）。
         if self.config.k_delta_confirm > 0:
             med = float(base.minute_median[gi])
             if med <= 0 or minute_delta is None or minute_delta < self.config.k_delta_confirm * med:
@@ -680,10 +704,10 @@ class SurgeWatcher:
             confirmed_at=now.strftime("%H:%M"),
             pct_chg=round(float(row.get("pct_chg", 0.0) or 0.0), 2),
             cum_amount=round(float(amount), 0),
-            rel_cum_3d=round(rel, 2),
+            rel_cum=round(rel, 2),
             rough_ratio=round(rough_ratio, 2),
             minute_delta=round(minute_delta, 0) if minute_delta is not None else None,
-            minute_delta_median_3d=round(float(base.minute_median[gi]), 0),
+            minute_delta_median=round(float(base.minute_median[gi]), 0),
             room_to_limit_pct=round(room, 2) if room is not None else None,
         )
         # 可买性守卫：现价距涨停 ≤ 门（或已封板 room≤0）→ 买不进，仅落 events 标 unbuyable。
@@ -761,29 +785,34 @@ def build_surge_messages(
     extra = len(confirmed) - len(shown)
     title = f"爆量 {hhmm} 新确认 {len(confirmed)} 只"
     lines = [f"# 爆量确认 {hhmm}（{len(confirmed)} 只）", ""]
+    n = config.cum_lookback_days
     for c in shown:
         theme = f"·{c.theme}" if c.theme else ""
         room = f" 距涨停{c.room_to_limit_pct:.1f}%" if c.room_to_limit_pct is not None else ""
+        # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
+        delta_txt = (
+            f"（本分钟{_fmt_amount(c.minute_delta)}/{n}日中位{_fmt_amount(c.minute_delta_median)}）"
+            if config.k_delta_confirm > 0
+            else ""
+        )
         lines.append(
             f"- {c.ts_code} {c.name}{theme} +{c.pct_chg:.1f}% "
-            f"量比3日{c.rel_cum_3d:.1f}× 累计{_fmt_amount(c.cum_amount)}"
-            f"（本分钟{_fmt_amount(c.minute_delta)}/3日中位{_fmt_amount(c.minute_delta_median_3d)}）"
-            f"{room}"
+            f"累计比{n}日{c.rel_cum:.1f}× 累计{_fmt_amount(c.cum_amount)}"
+            f"{delta_txt}{room}"
         )
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
     lines.append("")
     delta_seg = (
-        f" / 增量门{config.k_delta_confirm:g}×{config.confirm_lookback_days}d同分钟"
-        if config.k_delta_confirm > 0
-        else ""
+        f" / 增量门{config.k_delta_confirm:g}×{n}d同分钟" if config.k_delta_confirm > 0 else ""
     )
+    vwap_seg = " / VWAP门" if config.require_vwap else ""
     lines.append(
-        f"> 口径 v2: rough{config.k_rough:g}×20d·curve / "
-        f"confirm{config.k_confirm:g}×{config.confirm_lookback_days}d同刻{delta_seg}"
-        f" / VWAP门 / 距涨停>{config.max_room_to_limit_pct:g}%"
+        f"> 口径 v3(纯累计): rough{config.k_rough:g}×20d·curve / "
+        f"累计比值∈[{config.k_cum:g},{config.ratio_cap:g}]×{n}d同刻"
+        f" / skip前{config.skip_first_minutes}分(9:31){delta_seg}{vwap_seg}"
     )
-    lines.append("> ⚠️ 观察提示，非买入信号（收紧后按推送价持有到收盘均值仍为负）")
+    lines.append("> ⚠️ 观察提示，非买入信号")
     return [(title, "\n".join(lines))]
 
 
@@ -895,7 +924,8 @@ def run_surge_watch(
 
     logger.info(
         f"surge-watch 启动 day={day} 检测板块={config.boards} "
-        f"k_rough={config.k_rough} k_confirm={config.k_confirm} dry_run={dry_run}"
+        f"k_rough={config.k_rough} k_cum={config.k_cum} ratio_cap={config.ratio_cap} "
+        f"skip_first_minutes={config.skip_first_minutes} dry_run={dry_run}"
     )
     try:
         while True:
