@@ -1028,6 +1028,19 @@ def _normalize_sina_minute(raw: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["dt"]).reset_index(drop=True)[["dt", "price", "avg_price", "volume"]]
 
 
+def _trim_to_last_ndays(trend: pd.DataFrame, ndays: int) -> pd.DataFrame:
+    """只保留最近 ndays 个交易日的分钟数据。
+
+    新浪 ak.stock_zh_a_minute 不接受 ndays 参数、固定返回约 5 天，不裁剪会让分时
+    （ndays=1）被当成多日渲染成 5 日图。东财 trends2 天然按 ndays 返回，无需裁剪。
+    """
+    if trend.empty or ndays <= 0:
+        return trend
+    days = pd.to_datetime(trend["dt"]).dt.normalize()
+    keep = set(days.drop_duplicates().nlargest(ndays))
+    return trend[days.isin(keep)].reset_index(drop=True)
+
+
 def fetch_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
     """个股分时（ndays=1）/ 5 日线（ndays=5）。
 
@@ -1061,7 +1074,7 @@ def fetch_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
             logger.warning(f"trends2 SOCKS 出口失败: {ts_code} {type(e).__name__}: {e}")
 
     try:
-        df = _normalize_sina_minute(_fetch_sina_minute_raw(ts_code))
+        df = _trim_to_last_ndays(_normalize_sina_minute(_fetch_sina_minute_raw(ts_code)), ndays)
         if not df.empty:
             return _with_route(df, "sina")
         logger.warning(f"新浪分钟兜底返回空: {ts_code}")
