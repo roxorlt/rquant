@@ -687,6 +687,7 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         require_board_favor=args.require_board_favor,
         min_board_gap_up_ratio=args.min_board_gap_up_ratio,
         min_board_auction_amount_ratio=args.min_board_auction_amount_ratio,
+        board_hist_days=args.board_hist_days,
         enable_factor_confirm=args.factor_confirm,
         factor_score_threshold=args.factor_score_threshold,
         max_hold_days=args.max_hold_days,
@@ -1411,8 +1412,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="当前分钟成交额相对历史同分钟中位数倍数 (默认 2.0)",
     )
     growth_replay_p.add_argument(
-        "--max-hold-days", type=int, default=1,
-        help="最多持有交易日数量，T+1 默认次日收盘前退出 (默认 1)",
+        "--max-hold-days", type=int, default=3,
+        help="最多持有交易日数量 (默认 3；接住 2-3 日延续涨幅，见退出结构报告)",
     )
     growth_replay_p.add_argument(
         "--require-inner-outer", action="store_true",
@@ -1453,6 +1454,10 @@ def build_parser() -> argparse.ArgumentParser:
     growth_replay_p.add_argument(
         "--min-board-auction-amount-ratio", type=float, default=1.0,
         help="板块竞价总额相对历史中位下限 (默认 1.0)",
+    )
+    growth_replay_p.add_argument(
+        "--board-hist-days", type=int, default=3,
+        help="板块竞价额历史比较窗口天数 (默认 3；短窗口抓当下资金青睐)",
     )
     growth_replay_p.add_argument(
         "--factor-confirm", action="store_true",

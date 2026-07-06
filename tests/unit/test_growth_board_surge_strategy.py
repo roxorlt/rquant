@@ -206,6 +206,7 @@ def test_growth_board_surge_replay_uses_intraday_volume_signal(store: DuckDBStor
             min_signal_time=time(9, 33),
             lookback_days=2,
             min_hist_days=2,
+            max_hold_days=1,
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
         ),
@@ -364,6 +365,7 @@ def test_growth_board_surge_replay_calculates_ma_from_daily_bar(
             min_signal_time=time(9, 33),
             lookback_days=2,
             min_hist_days=2,
+            max_hold_days=1,
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
         ),
@@ -408,6 +410,7 @@ def test_growth_board_surge_replay_requires_next_day_exit_minutes(
             min_signal_time=time(9, 33),
             lookback_days=2,
             min_hist_days=2,
+            max_hold_days=1,
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
         ),
@@ -482,6 +485,7 @@ def test_growth_board_surge_inner_outer_gate_blocks_outer_dominant(
         "min_signal_time": time(9, 33),
         "lookback_days": 2,
         "min_hist_days": 2,
+        "max_hold_days": 1,
         "min_cum_amount_ratio": 1.4,
         "min_same_minute_amount_ratio": 2.0,
     }
@@ -518,6 +522,7 @@ def test_growth_board_surge_inner_outer_gate_allows_inner_dominant(
         "min_signal_time": time(9, 33),
         "lookback_days": 2,
         "min_hist_days": 2,
+        "max_hold_days": 1,
         "min_cum_amount_ratio": 1.4,
         "min_same_minute_amount_ratio": 2.0,
     }
@@ -560,6 +565,7 @@ def test_growth_board_surge_large_net_vol_gate_uses_t_minus_1(
         "min_signal_time": time(9, 33),
         "lookback_days": 2,
         "min_hist_days": 2,
+        "max_hold_days": 1,
         "min_cum_amount_ratio": 1.4,
         "min_same_minute_amount_ratio": 2.0,
     }
@@ -609,6 +615,7 @@ def test_growth_board_surge_factor_confirm_scores_and_gates(
         "min_signal_time": time(9, 33),
         "lookback_days": 2,
         "min_hist_days": 2,
+        "max_hold_days": 1,
         "min_cum_amount_ratio": 1.4,
         "min_same_minute_amount_ratio": 2.0,
     }
@@ -671,6 +678,7 @@ def test_growth_board_surge_classic_volume_ratio_observed(
             min_signal_time=time(9, 33),
             lookback_days=2,
             min_hist_days=2,
+            max_hold_days=1,
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
         ),
@@ -745,6 +753,7 @@ def test_growth_board_surge_board_favor_gate_allows_strong_board(
         "min_signal_time": time(9, 33),
         "lookback_days": 2,
         "min_hist_days": 2,
+        "max_hold_days": 1,
         "min_cum_amount_ratio": 1.4,
         "min_same_minute_amount_ratio": 2.0,
     }
@@ -783,6 +792,7 @@ def test_growth_board_surge_board_favor_gate_blocks_weak_amount(
         "min_signal_time": time(9, 33),
         "lookback_days": 2,
         "min_hist_days": 2,
+        "max_hold_days": 1,
         "min_cum_amount_ratio": 1.4,
         "min_same_minute_amount_ratio": 2.0,
     }
@@ -821,6 +831,7 @@ def test_growth_board_surge_board_favor_gate_blocks_no_membership(
             min_signal_time=time(9, 33),
             lookback_days=2,
             min_hist_days=2,
+            max_hold_days=1,
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
             require_board_favor=True,
@@ -873,3 +884,30 @@ def test_growth_board_surge_replay_filters_intraday_yiziban(store: DuckDBStore) 
     )
 
     assert trades.empty
+
+
+def test_exit_structure_defaults_hold3_stop5() -> None:
+    """退出结构默认：持仓上限 3 日、单票止损 -5%（用户 2026-07-04 验证段确认）。"""
+    from rquant.growth_board_surge_strategy import GrowthBoardSurgeConfig
+
+    cfg = GrowthBoardSurgeConfig()
+    assert cfg.max_hold_days == 3
+    assert cfg.paper.stop_loss_pct == 0.05
+    # take_profit / trailing 不动
+    assert cfg.paper.take_profit_pct == 0.08
+    assert cfg.paper.trailing_stop_pct == 0.03
+
+
+def test_board_hist_days_defaults_to_three_and_decoupled_from_lookback() -> None:
+    """板块竞价窗口 board_hist_days 默认 3，且与核心爆量窗口 lookback_days 解耦。
+
+    原先板块窗口误复用 lookback_days（20），2026-07-04 实验后独立成字段并改默认 3。
+    """
+    from rquant.growth_board_surge_strategy import GrowthBoardSurgeConfig
+
+    cfg = GrowthBoardSurgeConfig()
+    assert cfg.board_hist_days == 3
+    assert cfg.lookback_days == 20
+    # 改一个不动另一个
+    tuned = GrowthBoardSurgeConfig(lookback_days=10)
+    assert tuned.board_hist_days == 3

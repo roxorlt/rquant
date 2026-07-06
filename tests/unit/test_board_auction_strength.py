@@ -195,3 +195,35 @@ def test_board_auction_strength_missing_auction_history_ratio_none(
     assert result is not None
     assert result["board_auction_amount_ratio"] is None
     assert result["board_gap_up_ratio"] == pytest.approx(1.0)
+
+
+def test_board_auction_strength_hist_days_truncates_window(
+    store: DuckDBStore,
+) -> None:
+    """hist_days 只取最近 N 个历史竞价日：短窗口抓当下、长窗口摊平。
+
+    历史三日竞价额 5000/3000/1000（由近及远），信号日 4000：
+    - hist_days=1 → 中位 5000 → ratio 0.8（近端强，相对显弱）
+    - hist_days=3 → 中位 3000 → ratio 1.333（长窗口摊平）
+    """
+    ts = "300077.SZ"
+    store.upsert_dataset("kpl_concept_member_daily", pd.DataFrame([
+        _member("000500.KP", ts, _MEMBER_DATE),
+    ]))
+    store.upsert_daily(pd.DataFrame([{
+        **_daily(ts, _PREV, 10.0), "open": 10.0, "high": 10.0, "low": 10.0,
+        "pre_close": 10.0, "change": 0.0, "pct_chg": 0.0, "vol": 1.0,
+        "amount": 1.0,
+    }]))
+    store.upsert_auction_bars(pd.DataFrame([
+        _auction(ts, _SIGNAL, 11.0, 4000.0),
+        _auction(ts, date(2026, 2, 2), 10.0, 5000.0),   # 最近
+        _auction(ts, date(2026, 1, 30), 10.0, 3000.0),
+        _auction(ts, date(2026, 1, 29), 10.0, 1000.0),  # 最远
+    ]))
+
+    near = board_auction_strength(store, ts, _SIGNAL, hist_days=1)
+    far = board_auction_strength(store, ts, _SIGNAL, hist_days=3)
+    assert near is not None and far is not None
+    assert near["board_auction_amount_ratio"] == pytest.approx(0.8)
+    assert far["board_auction_amount_ratio"] == pytest.approx(4000 / 3000, abs=1e-4)

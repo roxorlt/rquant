@@ -141,7 +141,7 @@ class TestGrowthBoardSurgeReplayParser:
         assert args.min_hist_days == 10
         assert args.min_cum_amount_ratio == 1.4
         assert args.min_same_minute_amount_ratio == 2.0
-        assert args.max_hold_days == 1
+        assert args.max_hold_days == 3
         assert args.require_inner_outer is False
         assert args.min_inner_outer_ratio == 1.0
         assert args.require_large_net_vol is False
