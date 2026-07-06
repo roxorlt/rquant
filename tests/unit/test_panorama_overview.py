@@ -328,6 +328,33 @@ class TestFetchIntradayTrendU5:
         assert df["avg_price"].isna().all()  # 新浪无均价线
         assert df["price"].tolist() == [10.1, 10.2]
 
+    def test_sina_fallback_trims_to_ndays(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """新浪固定返回约 5 天分钟——分时(ndays=1)必须裁到最近一天，否则渲染成 5 日图。"""
+
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
+
+        import requests
+
+        monkeypatch.setattr(requests.Session, "get", fake_get)
+        # 三个交易日各两根分钟
+        rows = []
+        for day in ("2026-07-02", "2026-07-03", "2026-07-06"):
+            rows += [
+                {"day": f"{day} 09:31:00", "close": 10.0, "volume": 1000},
+                {"day": f"{day} 09:32:00", "close": 10.1, "volume": 1100},
+            ]
+        sina_raw = pd.DataFrame(rows)
+        monkeypatch.setattr(panorama_data, "_fetch_sina_minute_raw", lambda ts: sina_raw)
+
+        one = fetch_intraday_trend("600519.SH", ndays=1)
+        assert one.attrs["route"] == "sina"
+        assert pd.to_datetime(one["dt"]).dt.normalize().nunique() == 1  # 只剩最近一天
+        assert pd.to_datetime(one["dt"]).dt.date.max().isoformat() == "2026-07-06"
+
+        five = fetch_intraday_trend("600519.SH", ndays=5)
+        assert pd.to_datetime(five["dt"]).dt.normalize().nunique() == 3  # 不足 5 天，全保留
+
     def test_all_routes_fail_empty_route_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             raise ConnectionError("em unreachable")
