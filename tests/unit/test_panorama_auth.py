@@ -19,6 +19,7 @@ from rquant.panorama_auth import (
     UserStore,
     _build_set_cookie,
     _cookie_value,
+    derive_gate_token,
     hash_password,
     make_server,
     serve_auth,
@@ -28,6 +29,8 @@ from rquant.panorama_auth import (
 )
 
 _SECRET = "0123456789abcdef0123456789abcdef"
+# map 方案：登录成功下发的固定网关令牌（从 _SECRET 确定性派生，测试全程用它比对 cookie）。
+_GATE = derive_gate_token(_SECRET)
 
 
 # ===== U1 签名令牌 =====
@@ -153,7 +156,7 @@ class TestUserStore:
 def _running_server(tmp_path: Path) -> Iterator[tuple[str, int]]:
     store = UserStore(tmp_path / "users.txt")
     store.add("alice", "pw")
-    srv = make_server(_SECRET, tmp_path / "users.txt", host="127.0.0.1", port=0)
+    srv = make_server(_GATE, tmp_path / "users.txt", host="127.0.0.1", port=0)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     try:
@@ -197,8 +200,9 @@ class TestHttpEndpoints:
         assert location == "/"
         assert set_cookie is not None
         assert set_cookie.startswith(f"{COOKIE_NAME}=")
+        # map 方案：cookie 值是固定网关令牌（不再 per-user 签名令牌），且等于 GATE_TOKEN。
         token = set_cookie.split(";")[0].split("=", 1)[1]
-        assert verify_token(token, _SECRET) == "alice"
+        assert token == _GATE
 
     def test_post_wrong_returns_login_no_cookie(self, tmp_path: Path) -> None:
         with _running_server(tmp_path) as (host, port):
@@ -219,18 +223,17 @@ class TestHttpEndpoints:
         assert resp.status == 401
 
     def test_verify_valid_cookie_200(self, tmp_path: Path) -> None:
+        # map 方案：/verify 用 compare_digest 比对 cookie 是否等于固定网关令牌。
         with _running_server(tmp_path) as (host, port):
-            token = sign_token("alice", int(time.time()) + 3600, _SECRET)
             conn = http.client.HTTPConnection(host, port, timeout=5)
-            conn.request("GET", "/verify", headers={"Cookie": f"{COOKIE_NAME}={token}"})
+            conn.request("GET", "/verify", headers={"Cookie": f"{COOKIE_NAME}={_GATE}"})
             resp = conn.getresponse()
             resp.read()
         assert resp.status == 200
 
     def test_verify_tampered_cookie_401(self, tmp_path: Path) -> None:
         with _running_server(tmp_path) as (host, port):
-            token = sign_token("alice", int(time.time()) + 3600, _SECRET)
-            tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
+            tampered = _GATE[:-1] + ("0" if _GATE[-1] != "0" else "1")
             conn = http.client.HTTPConnection(host, port, timeout=5)
             conn.request(
                 "GET", "/verify", headers={"Cookie": f"{COOKIE_NAME}={tampered}"}
@@ -265,6 +268,10 @@ class TestCliParsing:
     def test_user_list_parses(self) -> None:
         args = build_parser().parse_args(["panorama-user-list"])
         assert args.command == "panorama-user-list"
+
+    def test_gate_token_parses(self) -> None:
+        args = build_parser().parse_args(["panorama-gate-token"])
+        assert args.command == "panorama-gate-token"
 
     def test_user_add_via_getpass_mock(self, tmp_path: Path, monkeypatch) -> None:
         import getpass as getpass_mod
@@ -312,6 +319,62 @@ class TestSecurity:
         assert _cookie_value("other=1") is None
         assert _cookie_value(f"{COOKIE_NAME}=xyz; other=1") == "xyz"
 
-    def test_secret_missing_raises_systemexit(self, tmp_path: Path) -> None:
+    def test_gate_token_missing_raises_systemexit(self, tmp_path: Path) -> None:
+        # 网关令牌为空（GATE_TOKEN 与 COOKIE_SECRET 均未配置）→ 登录服务拒绝启动。
         with pytest.raises(SystemExit):
             serve_auth("", tmp_path / "users.txt")
+
+
+# ===== U7 map 网关令牌派生 =====
+
+class TestGateTokenDerivation:
+    def test_deterministic(self) -> None:
+        # 同 secret 两次派生结果相同 → 重启后网关令牌稳定不变。
+        assert derive_gate_token(_SECRET) == derive_gate_token(_SECRET)
+
+    def test_differs_by_secret(self) -> None:
+        assert derive_gate_token(_SECRET) != derive_gate_token("another-secret-value")
+
+    def test_empty_secret_is_empty(self) -> None:
+        assert derive_gate_token("") == ""
+
+    def test_length_32_hex(self) -> None:
+        token = derive_gate_token(_SECRET)
+        assert len(token) == 32
+        assert all(c in "0123456789abcdef" for c in token)
+
+
+# ===== U8 panorama-gate-token CLI =====
+
+class TestGateTokenCli:
+    def test_prints_derived_token(self, capsys, monkeypatch) -> None:
+        # 未显式配 GATE_TOKEN → 从 cookie_secret 派生并打印到 stdout。
+        from rquant import cli
+        from rquant.config import settings
+
+        monkeypatch.setattr(settings, "panorama_gate_token", "")
+        monkeypatch.setattr(settings, "panorama_cookie_secret", _SECRET)
+        args = build_parser().parse_args(["panorama-gate-token"])
+        assert cli.cmd_panorama_gate_token(args) == 0
+        assert capsys.readouterr().out.strip() == derive_gate_token(_SECRET)
+
+    def test_explicit_token_overrides_secret(self, capsys, monkeypatch) -> None:
+        from rquant import cli
+        from rquant.config import settings
+
+        monkeypatch.setattr(settings, "panorama_gate_token", "explicit-token-abc123")
+        monkeypatch.setattr(settings, "panorama_cookie_secret", _SECRET)
+        args = build_parser().parse_args(["panorama-gate-token"])
+        assert cli.cmd_panorama_gate_token(args) == 0
+        assert capsys.readouterr().out.strip() == "explicit-token-abc123"
+
+    def test_unconfigured_returns_1_no_stdout(self, capsys, monkeypatch) -> None:
+        # GATE_TOKEN 与 COOKIE_SECRET 均空 → 返回 1，stdout 不打印空令牌（错误走 stderr）。
+        from rquant import cli
+        from rquant.config import settings
+
+        monkeypatch.setattr(settings, "panorama_gate_token", "")
+        monkeypatch.setattr(settings, "panorama_cookie_secret", "")
+        args = build_parser().parse_args(["panorama-gate-token"])
+        assert cli.cmd_panorama_gate_token(args) == 1
+        assert capsys.readouterr().out.strip() == ""

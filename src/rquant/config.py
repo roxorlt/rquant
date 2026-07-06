@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     panorama_users_path: Path | None = Field(
         default=None, validation_alias="RQUANT_PANORAMA_USERS_PATH"
     )
+    # map 网关令牌：云端 nginx 无 http_auth_request_module 时改用 map 静态比对 cookie，
+    # nginx 只认这一个字面值（不验 hmac 签名），所有已登录用户共用同一 cookie 值。
+    # 显式配置优先；为空时从 cookie_secret 确定性派生（见 panorama_gate_token_resolved），
+    # 免得再单独配一份、且重启后稳定不变。
+    panorama_gate_token: str = Field(
+        default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN"
+    )
 
     @property
     def deepseek_enabled(self) -> bool:
@@ -123,6 +130,19 @@ class Settings(BaseSettings):
         if self.panorama_users_path is not None:
             return self.panorama_users_path
         return self.data_dir / "panorama-users.txt"
+
+    @property
+    def panorama_gate_token_resolved(self) -> str:
+        """map 网关令牌：显式 RQUANT_PANORAMA_GATE_TOKEN 优先，否则从 cookie_secret 派生。
+
+        两者都为空则返回空串——由登录服务启动时 raise SystemExit 拦截，绝不静默降级。
+        """
+        # 延迟导入，避免 config 模块加载时把 http.server 一并拉进来。
+        from rquant.panorama_auth import derive_gate_token
+
+        if self.panorama_gate_token:
+            return self.panorama_gate_token
+        return derive_gate_token(self.panorama_cookie_secret)
 
 
 settings = Settings()  # type: ignore[call-arg]

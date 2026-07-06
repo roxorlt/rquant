@@ -1,22 +1,36 @@
 """全景页登录网关：微信友好的 cookie 登录服务（纯标准库，零第三方依赖）。
 
 背景：微信内置浏览器不支持 HTTP basic auth（不弹框、直接 401），无法登录。
-改成网页登录页 + 签名 cookie——微信浏览器原生支持 cookie 与表单 POST，朋友在微信里
+改成网页登录页 + cookie——微信浏览器原生支持 cookie 与表单 POST，朋友在微信里
 点链接即可登录。
 
 本模块只用标准库（http.server / hmac / hashlib / base64 / secrets / http.cookies /
 urllib.parse），刻意不 import loguru / pydantic 等第三方，保证登录网关可脱离主项目
-依赖独立运行、独立测试。凭据（SECRET / 用户库路径）由调用方（cli.py 读 settings）注入。
+依赖独立运行、独立测试。凭据（网关令牌 / 用户库路径）由调用方（cli.py 读 settings）注入。
+
+== map 固定令牌方案（当前默认，因云端 nginx 无 http_auth_request_module）==
+
+云端 nginx 编译时没有 ngx_http_auth_request_module，auth_request 指令不可用，无法在
+nginx 侧对每个用户的 hmac 签名令牌做子请求验签。改成 nginx `map` 静态比对：cookie 值
+是**一个固定的网关令牌**（GATE_TOKEN），nginx map 认这个字面值放行、default 0 拦截。
 
 三个端点（监听 127.0.0.1:8507，只给 nginx 反代，不直接对外）：
 - GET  /login   移动端友好登录表单（内联 CSS）；
-- POST /login   校验账号密码（pbkdf2），通过则 Set-Cookie 签名令牌 + 302 回 /；
-- GET  /verify  nginx auth_request 子请求调用，验签 + 验过期，200 / 401（空 body）。
+- POST /login   校验账号密码（pbkdf2），通过则 Set-Cookie 固定网关令牌 + 302 回 /；
+- GET  /verify  用 compare_digest 比对 cookie 是否等于网关令牌，200 / 401（空 body）。
+                map 方案下 nginx 自己做 map 比对、不调 /verify；此端点保留，供将来切回
+                支持 auth_request 的 nginx 环境用。
 
-签名令牌（无会话存储，自验证）：
-    payload = f"{user}|{exp_epoch}"
-    token   = base64url(payload) + "." + hmac_sha256(payload, SECRET).hexdigest()
-验签 = 重算 hmac 用 compare_digest 比对（防时序）+ exp > now。改 SECRET 即全体失效。
+网关令牌来源：显式 RQUANT_PANORAMA_GATE_TOKEN 优先，否则由 cookie_secret 确定性派生
+（derive_gate_token），保证重启稳定、部署少配一项。
+
+权衡（map 方案 vs 旧 auth_request 签名令牌方案）：
+- 所有已登录用户**共用同一个 cookie 令牌**，nginx 无法区分是谁——无法单独踢掉某个用户，
+  踢人 = 轮换 RQUANT_PANORAMA_GATE_TOKEN（+ 重生成 nginx map + reload），令**全体**重登。
+- 但 per-user 密码仍各自独立（UserStore 不动），登录审计（谁登录成功）在登录服务日志里
+  仍可分辨；被踢除的只是「持有旧令牌的浏览器」，账号本身照旧。
+- 签名令牌 sign_token / verify_token 函数保留（未来切回 auth_request 环境可复用），但
+  当前登录路径与 /verify 均改用固定网关令牌，不再走 hmac 签名。
 """
 
 from __future__ import annotations
@@ -94,6 +108,24 @@ def verify_token(token: str, secret: str, now: int | None = None) -> str | None:
     if exp <= current:
         return None
     return user
+
+
+# ===== map 网关令牌（固定字面值，nginx map 比对用）=====
+
+# HMAC 消息串（固定标签），密钥用 cookie_secret，与用户/时间无关 → 派生结果稳定。
+_GATE_TOKEN_LABEL = b"panorama-gate"
+
+
+def derive_gate_token(secret: str) -> str:
+    """从 cookie_secret 确定性派生 map 网关令牌（同 secret → 同 token，重启后不变）。
+
+    token = hmac_sha256(msg="panorama-gate", key=secret).hexdigest()[:32]。
+    secret 为空返回空串（交由启动逻辑 raise SystemExit，不静默用空令牌）。
+    """
+    if not secret:
+        return ""
+    mac = hmac.new(secret.encode("utf-8"), _GATE_TOKEN_LABEL, hashlib.sha256)
+    return mac.hexdigest()[:32]
 
 
 # ===== 密码哈希（pbkdf2_hmac，标准库）=====
@@ -284,9 +316,9 @@ def _cookie_value(cookie_header: str | None) -> str | None:
 
 
 def build_handler_class(
-    secret: str, store: UserStore
+    gate_token: str, store: UserStore
 ) -> type[BaseHTTPRequestHandler]:
-    """把 SECRET 与用户库绑进 handler 类（便于测试注入不同凭据）。"""
+    """把网关令牌与用户库绑进 handler 类（便于测试注入不同凭据）。"""
 
     class _AuthHandler(BaseHTTPRequestHandler):
         server_version = "rquant-panorama-auth/1.0"
@@ -312,9 +344,11 @@ def build_handler_class(
                 self._send_status(404)
 
         def _handle_verify(self) -> None:
+            # map 方案下 nginx 自行做 map 比对、不调本端点；保留供将来 auth_request 环境用。
+            # 固定网关令牌：compare_digest 比对 cookie 是否等于 GATE_TOKEN（防时序侧信道）。
             token = _cookie_value(self.headers.get("Cookie"))
-            user = verify_token(token, secret) if token else None
-            self._send_status(200 if user is not None else 401)
+            ok = token is not None and hmac.compare_digest(token, gate_token)
+            self._send_status(200 if ok else 401)
 
         def _handle_login_post(self) -> None:
             length = int(self.headers.get("Content-Length") or 0)
@@ -323,12 +357,13 @@ def build_handler_class(
             username = (form.get("username") or [""])[0].strip()
             password = (form.get("password") or [""])[0]
             if username and store.verify(username, password):
-                exp = int(time.time()) + SESSION_MAX_AGE
-                token = sign_token(username, exp, secret)
+                # per-user 密码校验通过后，下发**固定网关令牌**（所有用户共用同一 cookie 值，
+                # 供 nginx map 静态比对）。谁登录成功记在下方日志，审计仍能分辨。
+                _logger.info("登录成功 user=%s", username)
                 data = b""
                 self.send_response(302)
                 self.send_header("Location", "/")
-                self.send_header("Set-Cookie", _build_set_cookie(token))
+                self.send_header("Set-Cookie", _build_set_cookie(gate_token))
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
             else:
@@ -351,14 +386,14 @@ def build_handler_class(
 
 
 def make_server(
-    secret: str,
+    gate_token: str,
     users_path: Path,
     host: str = "127.0.0.1",
     port: int = DEFAULT_PORT,
 ) -> ThreadingHTTPServer:
     """构造登录服务（不阻塞，供测试在线程内 serve_forever）。"""
     store = UserStore(Path(users_path))
-    handler_cls = build_handler_class(secret, store)
+    handler_cls = build_handler_class(gate_token, store)
     return ThreadingHTTPServer((host, port), handler_cls)
 
 
@@ -374,19 +409,24 @@ def _configure_logging() -> None:
 
 
 def serve_auth(
-    secret: str,
+    gate_token: str,
     users_path: Path,
     host: str = "127.0.0.1",
     port: int = DEFAULT_PORT,
 ) -> int:
-    """启动登录服务（阻塞）。SECRET 为空则明确报错退出，绝不使用空密钥静默降级。"""
-    if not secret:
+    """启动登录服务（阻塞）。网关令牌为空则明确报错退出，绝不使用空令牌静默降级。
+
+    网关令牌为空 = RQUANT_PANORAMA_GATE_TOKEN 与 RQUANT_PANORAMA_COOKIE_SECRET 均未配置
+    （见 config.panorama_gate_token_resolved 派生逻辑）。
+    """
+    if not gate_token:
         raise SystemExit(
-            "RQUANT_PANORAMA_COOKIE_SECRET 未配置，登录服务拒绝启动"
-            "（`openssl rand -hex 32` 生成后写 .env，不使用空密钥）"
+            "RQUANT_PANORAMA_GATE_TOKEN / RQUANT_PANORAMA_COOKIE_SECRET 均未配置，"
+            "登录服务拒绝启动（`openssl rand -hex 32` 生成 SECRET 写 .env，或显式配置"
+            " GATE_TOKEN，不使用空令牌）"
         )
     _configure_logging()
-    httpd = make_server(secret, users_path, host, port)
+    httpd = make_server(gate_token, users_path, host, port)
     _logger.info("登录服务启动 http://%s:%s（用户库 %s）", host, port, users_path)
     try:
         httpd.serve_forever()
