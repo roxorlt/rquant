@@ -72,6 +72,11 @@ Thumbs.db
 
 # 项目本地数据（不进 git）
 data/
+# 盘中脉搏 / 午间战报自产数据（已被上面的 data/ 覆盖，显式列出便于检索）
+data/midday/
+data/reports/
+# 全景 poller 共享 drop（midday 等消费者只读）
+data/panorama_live/
 *.duckdb
 *.duckdb.wal
 *.parquet

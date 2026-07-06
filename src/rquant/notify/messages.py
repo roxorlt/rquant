@@ -17,6 +17,8 @@ def build_message(scene: str, **kwargs) -> tuple[str, str]:
         "daily_summary": _build_daily_summary,
         "error": _build_error,
         "heartbeat": _build_heartbeat,
+        "morning_pulse": _build_prerendered,
+        "midday_report": _build_prerendered,
     }
     builder = builders.get(scene)
     if builder is None:
@@ -35,6 +37,11 @@ _LEVEL_LABELS = {
     "attack_break_high": "突破T高",
     "attack_near_limit": "临近涨停",
 }
+
+
+def _build_prerendered(*, title: str, body: str) -> tuple[str, str]:
+    """F/G. 盘中脉搏 / 午间战报：报文已在 midday_briefing 渲染好，此处直通。"""
+    return title, body
 
 
 def _build_price_level(

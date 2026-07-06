@@ -17,6 +17,8 @@ Scene = Literal[
     "daily_summary",
     "error",
     "heartbeat",
+    "morning_pulse",
+    "midday_report",
 ]
 
 

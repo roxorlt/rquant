@@ -11,7 +11,22 @@ import threading
 import pandas as pd
 import pytest
 
-from rquant.panorama_poller import FLOW_TYPES, SNAPSHOT_KEY, SourcePoller
+from rquant.panorama_poller import (
+    FLOW_TYPES,
+    SNAPSHOT_KEY,
+    SourcePoller,
+    read_live_frame,
+    read_live_meta,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_drop_dir(tmp_path, monkeypatch):
+    """默认 drop 目录重定向到 tmp：测试绝不把 live drop 写进真实 data/。"""
+    monkeypatch.setattr(
+        "rquant.panorama_poller.default_live_drop_dir",
+        lambda: tmp_path / "panorama_live",
+    )
 
 
 class FakeClock:
@@ -241,3 +256,60 @@ class TestStatus:
         assert snap["age_seconds"] == pytest.approx(42.0)
         assert snap["route"] == "em_direct"
         assert snap["last_success_ts"] != ""
+
+
+class TestLiveDrop:
+    """成功槽位落盘共享 drop（midday_briefing 等消费者只读该目录）。"""
+
+    def test_success_writes_drop_files_and_meta(self, tmp_path) -> None:
+        drop = tmp_path / "live"
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=lambda allow: _snap_df("em_socks"),
+            flow_fetcher=lambda s: _flow_df(),
+            drop_dir=drop,
+        )
+        poller.poll_once()
+
+        assert (drop / "snapshot.parquet").exists()
+        for ft in FLOW_TYPES:
+            assert (drop / f"flow_{ft}.parquet").exists()
+        meta = read_live_meta(drop)
+        assert set(meta) == {SNAPSHOT_KEY, *FLOW_TYPES}
+        assert meta[SNAPSHOT_KEY]["route"] == "em_socks"
+        for entry in meta.values():
+            assert entry["as_of_iso"] and entry["written_at"]
+        # 回读帧与 slot 内容一致
+        frame = read_live_frame(drop, SNAPSHOT_KEY)
+        assert list(frame["ts_code"]) == ["600001.SH", "600002.SH", "600003.SH"]
+
+    def test_write_failure_does_not_break_loop(self, tmp_path) -> None:
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a dir")  # mkdir 撞文件 → 写入必然失败
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=lambda allow: _snap_df(),
+            flow_fetcher=lambda s: _flow_df(),
+            drop_dir=blocked,
+        )
+        poller.poll_once()  # 不抛
+        df, _, route = poller.snapshot()
+        assert not df.empty and route == "em_direct"  # slot 更新不受影响
+
+    def test_failed_source_not_written_others_are(self, tmp_path) -> None:
+        drop = tmp_path / "live"
+
+        def failing_snapshot(allow: bool) -> pd.DataFrame:
+            raise RuntimeError("boom")
+
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=failing_snapshot,
+            flow_fetcher=lambda s: _flow_df(),
+            drop_dir=drop,
+        )
+        poller.poll_once()
+        assert not (drop / "snapshot.parquet").exists()
+        meta = read_live_meta(drop)
+        assert SNAPSHOT_KEY not in meta
+        assert set(meta) == set(FLOW_TYPES)  # 资金流独立成功照写
