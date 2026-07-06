@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
@@ -29,6 +30,7 @@ from rquant.surge_watch import (
     grid_index,
     linear_progress_curve,
     load_progress_curve,
+    load_theme_map,
     run_simulate,
     run_surge_watch,
     series_to_frame,
@@ -688,3 +690,143 @@ class TestE1Simulate:
         assert by_code["300111.SZ"]["confirmed_at"] == "10:05"
         assert by_code["300111.SZ"]["theme"] == "人形机器人"
         assert all(p[0] == "surge_watch" for p in pushes)
+
+
+# ── U11 题材映射三级兜底链 ──────────────────────────────────────────────────────
+
+
+class _RawStore:
+    """轻量 store 桩：只暴露 ``_conn``（load_theme_map 传入路径 owns=False 不关闭）。"""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+
+@contextmanager
+def _capture_loguru(level: str = "INFO"):
+    """捕获 loguru 输出到 list（pytest caplog 抓不到 loguru，自建 sink）。"""
+    from loguru import logger
+
+    msgs: list[str] = []
+    sink_id = logger.add(lambda m: msgs.append(str(m)), level=level)
+    try:
+        yield msgs
+    finally:
+        logger.remove(sink_id)
+
+
+def _theme_store(tmp_path: Path, *, tables: dict[str, str]) -> _RawStore:
+    """建一个只含指定表的 tmp DuckDB（不走 DuckDBStore，避免 ALL_DDL 建满全表）。"""
+    import duckdb
+
+    conn = duckdb.connect(str(tmp_path / "theme.duckdb"))
+    for ddl in tables.values():
+        conn.execute(ddl)
+    return _RawStore(conn)
+
+
+_KPL_MEMBER_DDL = (
+    "CREATE TABLE kpl_concept_member "
+    "(board_code VARCHAR, board_name VARCHAR, con_code VARCHAR)"
+)
+_KPL_DAILY_DDL = (
+    "CREATE TABLE kpl_concept_member_daily "
+    "(trade_date DATE, board_code VARCHAR, board_name VARCHAR, con_code VARCHAR)"
+)
+_DC_BOARD_DDL = (
+    "CREATE TABLE dc_board (ts_code VARCHAR, name VARCHAR, idx_type VARCHAR)"
+)
+_DC_MEMBER_DDL = (
+    "CREATE TABLE dc_board_member (board_code VARCHAR, con_code VARCHAR)"
+)
+
+
+class TestU11ThemeMapFallback:
+    def test_level1_kpl_snapshot_hit(self, tmp_path: Path) -> None:
+        store = _theme_store(tmp_path, tables={"kpl": _KPL_MEMBER_DDL})
+        store._conn.executemany(
+            "INSERT INTO kpl_concept_member VALUES (?, ?, ?)",
+            [("000129.KP", "人形机器人", "300111.SZ"),
+             ("000130.KP", "存储", "300222.SZ")],
+        )
+        with _capture_loguru() as logs:
+            m = load_theme_map(store)
+        assert m == {"300111.SZ": "人形机器人", "300222.SZ": "存储"}
+        assert any("命中 kpl_concept_member" in x for x in logs)
+
+    def test_level1_keeps_first_theme_for_multi_board(self, tmp_path: Path) -> None:
+        store = _theme_store(tmp_path, tables={"kpl": _KPL_MEMBER_DDL})
+        store._conn.executemany(
+            "INSERT INTO kpl_concept_member VALUES (?, ?, ?)",
+            [("000129.KP", "人形机器人", "300111.SZ"),
+             ("000131.KP", "减速器", "300111.SZ")],  # 同票第二题材，应被忽略
+        )
+        m = load_theme_map(store)
+        assert m == {"300111.SZ": "人形机器人"}
+
+    def test_level2_daily_latest_date_when_snapshot_missing(self, tmp_path: Path) -> None:
+        store = _theme_store(tmp_path, tables={"daily": _KPL_DAILY_DDL})
+        store._conn.executemany(
+            "INSERT INTO kpl_concept_member_daily VALUES (?, ?, ?, ?)",
+            [(date(2026, 7, 2), "000130.KP", "旧题材", "300222.SZ"),
+             (date(2026, 7, 3), "000129.KP", "最新题材", "300111.SZ")],
+        )
+        with _capture_loguru() as logs:
+            m = load_theme_map(store)
+        # kpl_concept_member 缺表 → 降级到 daily，只取最新 trade_date 打点
+        assert m == {"300111.SZ": "最新题材"}
+        assert any("命中 kpl_concept_member_daily" in x for x in logs)
+
+    def test_level3_dc_concept_when_kpl_missing(self, tmp_path: Path) -> None:
+        store = _theme_store(
+            tmp_path, tables={"b": _DC_BOARD_DDL, "m": _DC_MEMBER_DDL}
+        )
+        store._conn.executemany(
+            "INSERT INTO dc_board VALUES (?, ?, ?)",
+            [("BK0001", "工程建设", "概念板块"),
+             ("BK0002", "钢铁行业", "行业板块")],  # 非概念，应被 WHERE 排除
+        )
+        store._conn.executemany(
+            "INSERT INTO dc_board_member VALUES (?, ?)",
+            [("BK0001", "601390.SH"), ("BK0002", "600019.SH")],
+        )
+        with _capture_loguru() as logs:
+            m = load_theme_map(store)
+        assert m == {"601390.SH": "工程建设"}  # 行业板块成分不入题材映射
+        assert any("命中 dc_board_member" in x for x in logs)
+
+    def test_level1_short_circuits_before_level3(self, tmp_path: Path) -> None:
+        store = _theme_store(
+            tmp_path,
+            tables={"kpl": _KPL_MEMBER_DDL, "b": _DC_BOARD_DDL, "m": _DC_MEMBER_DDL},
+        )
+        store._conn.execute(
+            "INSERT INTO kpl_concept_member VALUES ('000129.KP', 'kpl题材', '300111.SZ')"
+        )
+        store._conn.execute("INSERT INTO dc_board VALUES ('BK0001', 'dc题材', '概念板块')")
+        store._conn.execute("INSERT INTO dc_board_member VALUES ('BK0001', '300111.SZ')")
+        m = load_theme_map(store)
+        assert m == {"300111.SZ": "kpl题材"}  # 命中即止，不落到东财
+
+    def test_empty_level_falls_through(self, tmp_path: Path) -> None:
+        # kpl 表存在但空 → 降级到 daily（也空）→ 降级到东财概念（有数据）
+        store = _theme_store(
+            tmp_path,
+            tables={
+                "kpl": _KPL_MEMBER_DDL,
+                "daily": _KPL_DAILY_DDL,
+                "b": _DC_BOARD_DDL,
+                "m": _DC_MEMBER_DDL,
+            },
+        )
+        store._conn.execute("INSERT INTO dc_board VALUES ('BK0001', '东财题材', '概念板块')")
+        store._conn.execute("INSERT INTO dc_board_member VALUES ('BK0001', '601390.SH')")
+        m = load_theme_map(store)
+        assert m == {"601390.SH": "东财题材"}
+
+    def test_all_missing_returns_empty_no_raise(self, tmp_path: Path) -> None:
+        # 三级表全缺（云端只读副本无 kpl_* 也无 dc_board）→ 每级 CatalogException
+        # 被吞，返回空 dict，不炸
+        store = _theme_store(tmp_path, tables={})
+        m = load_theme_map(store)
+        assert m == {}
