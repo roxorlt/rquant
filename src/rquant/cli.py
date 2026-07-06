@@ -821,14 +821,20 @@ def cmd_surge_watch(args: argparse.Namespace) -> int:
     """
     from pathlib import Path as _Path
 
-    from rquant.surge_watch import run_simulate, run_surge_watch
+    from rquant.surge_watch import SurgeConfig, run_simulate, run_surge_watch
 
     setup_logging()
+    config = SurgeConfig(
+        k_confirm=args.k_confirm,
+        k_delta_confirm=args.k_delta,
+        max_room_to_limit_pct=args.max_room,
+    )
     if args.simulate:
-        return run_simulate(_Path(args.simulate), dry_run=args.dry_run)
+        return run_simulate(_Path(args.simulate), dry_run=args.dry_run, config=config)
     return run_surge_watch(
         dry_run=args.dry_run,
         force_session=args.force_session,
+        config=config,
         max_ticks=args.max_ticks,
     )
 
@@ -1829,6 +1835,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="跑完推一条摘要到 PushDeer（默认只 stdout）",
     )
 
+    from rquant.surge_watch import SurgeConfig
+
     sw_p = sub.add_parser(
         "surge-watch", help="每分钟爆量推送（云端 systemd timer 09:25 拉起，15:02 自退）",
     )
@@ -1845,6 +1853,19 @@ def build_parser() -> argparse.ArgumentParser:
     sw_p.add_argument(
         "--max-ticks", type=int, default=None,
         help="限定循环次数（dry-run / 盘后 smoke，默认跑到 15:02）",
+    )
+    sw_p.add_argument(
+        "--k-confirm", type=float, default=SurgeConfig.model_fields["k_confirm"].default,
+        help="确认层量比门（默认 3.0，2026-07-06 扫描 Pareto 值，逆选择上限勿超）",
+    )
+    sw_p.add_argument(
+        "--k-delta", type=float, default=SurgeConfig.model_fields["k_delta_confirm"].default,
+        help="同分钟增量门倍数（默认 3.0，0=关闭）",
+    )
+    sw_p.add_argument(
+        "--max-room", type=float,
+        default=SurgeConfig.model_fields["max_room_to_limit_pct"].default,
+        help="可买性守卫：现价距涨停 ≤ 该%%（或已封板）不推送（默认 1.0）",
     )
 
     alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")

@@ -140,7 +140,17 @@ class SurgeConfig(BaseModel):
     """surge-watch 判定参数（产品初始值，跑几天按实际量级调）。"""
 
     k_rough: float = 1.5
-    k_confirm: float = 2.0
+    # 确认层量比门：2026-07-06 全天真实分钟重放 + 24 组门槛扫描的 Pareto 收敛值。
+    # v1 默认 2.0 会推 81 只/天（预期 5-15）、胜率 32%；kc3.0 + 同分钟增量门 3.0× →
+    # 31 只/胜率 35.5%。逆选择上限：kc4.0 反而更差（样本更少却更噪），故封顶 3.0，
+    # 不要再往上抬。
+    k_confirm: float = 3.0
+    # 同分钟增量门：确认时点要求「当分钟增量 ≥ k_delta × 3 日同分钟中位」。
+    # 0 = 关闭。中位≤0 或增量缺失按不通过（None-fail 语义，对齐 step5 GatedWatcher）。
+    k_delta_confirm: float = 3.0
+    # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）则不推送（仍占「每票每日一次」
+    # 名额、仍落 events 标 unbuyable）。0 = 只挡已封板；负值可整体关闭（room 恒 > 负值）。
+    max_room_to_limit_pct: float = 1.0
     confirm_lookback_days: int = 3
     max_per_push: int = 8            # 单条报文最多 N 只，超出折叠
     silent_until_hhmm: str = "09:33"  # 该时刻前只收集不推送
@@ -169,6 +179,8 @@ class SurgeConfirmed(BaseModel):
     minute_delta: float | None = None       # 本分钟增量（元）
     minute_delta_median_3d: float | None = None  # 3 日同分钟增量中位（元）
     room_to_limit_pct: float | None = None  # 距涨停空间（%）
+    # confirmed（可买、推送）| unbuyable（距涨停≤门 / 已封板，只落 events 不推送）
+    status: str = "confirmed"
 
 
 class TickResult(BaseModel):
@@ -549,6 +561,8 @@ class SurgeWatcher:
         self._queued: set[str] = set()
         self._fetch_fail: dict[str, int] = {}
         self._pending_push: list[SurgeConfirmed] = []
+        # 可买性守卫拦下的确认：不进 _pending_push（不推送），但仍随本分钟 flush 落 events
+        self._pending_events: list[SurgeConfirmed] = []
         self.cum_series: dict[str, np.ndarray] = {}
 
     # ── 单分钟 tick ──────────────────────────────────────────────────────────
@@ -626,7 +640,8 @@ class SurgeWatcher:
                 self._pending_fetch.append(code)
 
     def _evaluate(self, code: str, snapshot: pd.DataFrame, now: datetime, gi: int) -> None:
-        """确认判定：rel_cum_3d ≥ K_confirm 且现价 ≥ 当日均价（VWAP 门）→ 入待推送。"""
+        """确认判定（口径 v2）：rel_cum_3d ≥ K_confirm 且现价 ≥ VWAP，再过同分钟增量门；
+        通过后若现价距涨停 ≤ max_room（或已封板）标 unbuyable 只落 events 不推送。"""
         if code in self.pushed_today:
             return
         base = self.confirm_cache.get(code)
@@ -655,6 +670,12 @@ class SurgeWatcher:
 
         arr = self.cum_series.get(code)
         minute_delta = _minute_delta(arr, gi) if arr is not None else None
+        # 同分钟增量门：当分钟增量 ≥ k_delta × 3 日同分钟中位（中位≤0 / 增量缺失 → 不过）。
+        if self.config.k_delta_confirm > 0:
+            med = float(base.minute_median[gi])
+            if med <= 0 or minute_delta is None or minute_delta < self.config.k_delta_confirm * med:
+                return
+
         curve_v = float(self.baseline.curve[gi]) or (1.0 / CURVE_POINTS)
         avg20 = self.baseline.avg_amount_20d.get(code)
         rough_ratio = float(amount) / (avg20 * curve_v) if avg20 else 0.0
@@ -675,17 +696,33 @@ class SurgeWatcher:
             minute_delta_median_3d=round(float(base.minute_median[gi]), 0),
             room_to_limit_pct=round(room, 2) if room is not None else None,
         )
+        # 可买性守卫：现价距涨停 ≤ 门（或已封板 room≤0）→ 买不进，仅落 events 标 unbuyable。
+        # 仍占「每票每日一次」名额：封板回落再爆当天已看过，防同一票反复刷屏。
+        # room 未知（缺涨停价）→ 无法判定不可买，按可买放行（fail-open）。
+        if room is not None and room <= self.config.max_room_to_limit_pct:
+            confirmed.status = "unbuyable"
+            self.pushed_today.add(code)
+            self._pending_events.append(confirmed)
+            return
         self.pushed_today.add(code)  # 每票每日仅推一次（入待推送即定）
         self._pending_push.append(confirmed)
 
     def _flush(self, now: datetime) -> TickResult:
-        """静默窗后聚合本分钟待推送为报文（单条 ≤N 只，超出折叠）。"""
-        if not self._pending_push or now.time() < self.config.silent_until:
+        """静默窗后聚合本分钟待推送为报文（单条 ≤N 只，超出折叠）。
+
+        pushes 只含可买确认（_pending_push）；confirmed（落 events）含可买 + 被可买性
+        守卫拦下的 unbuyable（_pending_events），后者不进报文但仍留研究痕迹。
+        """
+        if now.time() < self.config.silent_until:
             return TickResult()
-        batch = self._pending_push
+        if not self._pending_push and not self._pending_events:
+            return TickResult()
+        push_batch = self._pending_push
+        event_batch = self._pending_events
         self._pending_push = []
-        pushes = build_surge_messages(batch, now, self.config)
-        return TickResult(pushes=pushes, confirmed=batch)
+        self._pending_events = []
+        pushes = build_surge_messages(push_batch, now, self.config)
+        return TickResult(pushes=pushes, confirmed=push_batch + event_batch)
 
     def dump_series(self) -> pd.DataFrame:
         """当日累计额序列长表：ts_code, minute_idx, cum_amount（收盘落 parquet 研究）。"""
@@ -746,10 +783,17 @@ def build_surge_messages(
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
     lines.append("")
-    lines.append(
-        f"> 口径 v1: rough{config.k_rough:g}×20d·curve / "
-        f"confirm{config.k_confirm:g}×{config.confirm_lookback_days}d同刻 / VWAP门"
+    delta_seg = (
+        f" / 增量门{config.k_delta_confirm:g}×{config.confirm_lookback_days}d同分钟"
+        if config.k_delta_confirm > 0
+        else ""
     )
+    lines.append(
+        f"> 口径 v2: rough{config.k_rough:g}×20d·curve / "
+        f"confirm{config.k_confirm:g}×{config.confirm_lookback_days}d同刻{delta_seg}"
+        f" / VWAP门 / 距涨停>{config.max_room_to_limit_pct:g}%"
+    )
+    lines.append("> ⚠️ 观察提示，非买入信号（收紧后按推送价持有到收盘均值仍为负）")
     return [(title, "\n".join(lines))]
 
 
