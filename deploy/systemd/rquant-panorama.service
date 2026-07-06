@@ -1,0 +1,35 @@
+[Unit]
+Description=rQuant Intraday Panorama (Streamlit, 云端直跑)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+# EnvironmentFile 先加载 .env，随后 Environment= 覆盖生效——systemd 按出现顺序处理
+# 环境赋值，同名变量后者胜（systemd.exec: 后出现的 Environment=/EnvironmentFile= 覆盖前者）。
+# 这两项是云端部署形态专属，刻意写进 unit 不污染 .env：
+#   - 全景页 poller 第 0 路由读 surge-watch 同机落盘的全市场 parquet（本地文件分支，
+#     mtime 判新鲜 ≤120s，命中即零自拉；陈旧/缺失自动回落自拉三级路由）；
+#   - 云端无本地 SOCKS 出口，置空禁用该级（否则东财/资金流会徒劳重试 socks5h://127.0.0.1:1086）。
+Environment=RQUANT_CLOUD_FEED_URL=/home/lighthouse/rquant/data/surge_live/snapshot_full.parquet
+Environment=RQUANT_PANORAMA_SOCKS=
+ExecStart=/home/lighthouse/rquant/.venv/bin/streamlit run \
+    /home/lighthouse/rquant/src/rquant/dashboard/market_panorama.py \
+    --server.port 8506 \
+    --server.address 127.0.0.1 \
+    --server.headless true \
+    --browser.gatherUsageStats false
+
+Restart=always
+RestartSec=10
+TimeoutStartSec=60
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

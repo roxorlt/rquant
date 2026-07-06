@@ -25,6 +25,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
 
 import pandas as pd
@@ -44,8 +45,25 @@ _DEFAULT_COOLDOWN = 180.0
 _SINA_FAIL_THRESHOLD = 2
 _SINA_COOLDOWN = 300.0
 
-# 云端 feed（P2）：Mac 优先读云 nginx 暴露的 surge-watch 全市场快照，
-# 新鲜（Last-Modified ≤120s）则本机不再自拉。env 未配 → 返回 None，行为不变。
+# 分时段轮询节奏（云端 24/7 常驻的取数卫生）：交易时段每分钟，盘外/周末 600s——非盘中
+# 数据不变，没必要每分钟打源。盘中大多命中 surge 本地 feed（零请求），自拉只是兜底。
+_TRADING_START = dt_time(9, 0)
+_TRADING_END = dt_time(15, 10)
+
+
+def is_off_hours(now: datetime) -> bool:
+    """非交易时段判定（纯函数，now 注入可测）：工作日 09:00–15:10 为盘中，其余 → True。
+
+    周末恒 True；节假日不额外判（600s 打一次无害）。边界含端点：09:00、15:10 仍算盘中。
+    """
+    if now.weekday() >= 5:  # 周六/周日
+        return True
+    return not (_TRADING_START <= now.time() <= _TRADING_END)
+
+# 云端 feed 第 0 路由：优先读 surge-watch 全市场快照，新鲜（≤120s）则本机不自拉。
+# 两种形态——云端同机读本地 parquet 文件（mtime 判新鲜），Mac P2 走 HTTP（Last-Modified
+# 判新鲜）；由 RQUANT_CLOUD_FEED_URL 是否以 `/`、`file://` 开头路由。env 未配 → None，
+# 行为不变。
 _CLOUD_FEED_MAX_AGE = 120.0
 
 # ── 共享 drop 布局（poller 写、midday_briefing 等只读；纯 parquet 无 DuckDB 锁） ─
@@ -98,14 +116,48 @@ def _default_snapshot_fetcher(allow_sina: bool) -> pd.DataFrame:
 
 
 def _default_cloud_feed() -> tuple[pd.DataFrame, str] | None:
-    """P2 第 0 路由：GET RQUANT_CLOUD_FEED_URL（云端 surge 全市场 parquet）。
+    """第 0 路由：读 RQUANT_CLOUD_FEED_URL 指向的 surge 全市场 ``snapshot_full.parquet``。
 
-    env 未配 → None（现状零变化）。Last-Modified 距今 >120s（陈旧）/ 空 / HTTP 失败
-    → None，调用方回落现有三级路由。凭据走 RQUANT_CLOUD_FEED_USER/PASS（basic auth）。
+    env 未配 → None（现状零变化）。两种形态按 env 值路由：
+    - **本地文件**（值以 ``/`` 开头或 ``file://`` 前缀）：云端部署形态——全景页与
+      surge-watch 同机，直接读 surge 落盘的 parquet，mtime 判新鲜 ≤120s（陈旧/缺失
+      → None 回落自拉），无网络无凭据；
+    - **HTTP(S)**（P2 Mac 侧）：GET 云 nginx 暴露的 feed，Last-Modified ≤120s 判新鲜，
+      凭据走 RQUANT_CLOUD_FEED_USER/PASS（basic auth）。
+
+    命中即返回 ``(df, "cloud_feed")``；陈旧 / 空 / 失败一律 None，调用方回落现有三级路由。
     """
     url = os.environ.get("RQUANT_CLOUD_FEED_URL", "").strip()
     if not url:
         return None
+    if url.startswith(("/", "file://")):
+        return _local_cloud_feed(url)
+    return _http_cloud_feed(url)
+
+
+def _local_cloud_feed(url: str) -> tuple[pd.DataFrame, str] | None:
+    """本地文件分支：读 parquet，mtime 距今 ≤120s 才算新鲜；缺失/陈旧/空/损坏 → None。"""
+    path = Path(url[len("file://"):] if url.startswith("file://") else url)
+    try:
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > _CLOUD_FEED_MAX_AGE:
+            logger.warning(f"云端 feed 本地文件陈旧（{age:.0f}s>120s），回落自拉")
+            return None
+        df = pd.read_parquet(path)
+        if df is None or df.empty:
+            return None
+        if "limit_up_price" not in df.columns:
+            df = add_limit_prices(df)
+        return df, "cloud_feed"
+    except Exception as e:
+        logger.warning(f"云端 feed 本地读取失败，回落自拉: {type(e).__name__}: {e}")
+        return None
+
+
+def _http_cloud_feed(url: str) -> tuple[pd.DataFrame, str] | None:
+    """HTTP(S) 分支（P2 Mac）：GET + basic auth，Last-Modified ≤120s 判新鲜。"""
     from email.utils import parsedate_to_datetime
     from io import BytesIO
 
@@ -173,14 +225,19 @@ class SourcePoller:
         self,
         interval: float = 60.0,
         *,
+        off_hours_interval: float = 600.0,
         now: Callable[[], float] = time.monotonic,
+        wall_now: Callable[[], datetime] | None = None,
         snapshot_fetcher: Callable[[bool], pd.DataFrame] | None = None,
         flow_fetcher: Callable[[str], pd.DataFrame] | None = None,
         cloud_feed_fetcher: Callable[[], tuple[pd.DataFrame, str] | None] | None = None,
         drop_dir: Path | None = None,
     ) -> None:
         self._interval = interval
+        # 盘外/周末轮询间隔（云端常驻取数卫生）；判定用墙钟（wall_now，可注入）
+        self._off_hours_interval = off_hours_interval
         self._now = now
+        self._wall_now = wall_now or (lambda: datetime.now(CST))
         self._snapshot_fetcher = snapshot_fetcher or _default_snapshot_fetcher
         self._flow_fetcher = flow_fetcher or fetch_sector_fund_flow
         # 云端 feed 第 0 路由；默认读 env（未配 → None，行为不变）
@@ -224,13 +281,17 @@ class SourcePoller:
         """置 wake 事件让循环立即开跑一轮，不等待结果（调用方不阻塞）。"""
         self._wake.set()
 
+    def _current_interval(self) -> float:
+        """本轮 sleep 间隔：盘中（工作日 09:00–15:10）用 interval，盘外用 off_hours_interval。"""
+        return self._off_hours_interval if is_off_hours(self._wall_now()) else self._interval
+
     def _run(self) -> None:
         while not self._stopped:
             try:
                 self.poll_once()
             except Exception as e:  # 循环永不死
                 logger.warning(f"poller 轮询异常: {type(e).__name__}: {e}")
-            self._wake.wait(timeout=self._interval)
+            self._wake.wait(timeout=self._current_interval())
             self._wake.clear()
 
     # ── 拉取循环 ──────────────────────────────────────────────────────────────

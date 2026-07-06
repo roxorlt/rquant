@@ -1,6 +1,7 @@
 """每分钟爆量推送（surge-watch）：云端常驻单进程循环。
 
-盘中每分钟拉一次创业板+科创板全量快照，两层判定后聚合推 PushDeer：
+盘中每分钟拉一次**全市场**快照（一次取数兼作检测输入 + 全景页共享 feed），
+检测层按 ``config.boards`` 收窄到创业/科创后两层判定，聚合推 PushDeer：
 
 - **粗筛（零外部调用）**：当日累计成交额 ≥ ``K_rough × 20 日均额 × 进度曲线(t)``
   且 pct_chg>0、非 ST、有 20 日基线（缺基线的次新自动落选），只进候选不推送；
@@ -17,7 +18,8 @@
   全部载内存，盘中零 DB 访问；自产数据全 parquet/jsonl；
 - 时钟 / 数据源 / 推送 / sleep 全部可注入——单测不真 sleep、不碰网络；
 - em clist 快照复用 panorama_data 的加固 Session（每次全新 + trust_env=False +
-  桌面 UA + Connection:close），fs 换创业/科创。
+  桌面 UA + Connection:close），fs 用全市场串（与 panorama 同域），检测层过滤
+  ``config.boards``；全市场快照每分钟原子落 ``snapshot_full.parquet`` 供全景页共享。
 """
 
 from __future__ import annotations
@@ -37,9 +39,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from rquant.state.derive import _detect_st
+from rquant.state.derive import _classify_board, _detect_st
 
 CST = timezone(timedelta(hours=8))  # A 股墙钟（Asia/Shanghai）
 
@@ -63,19 +65,30 @@ EXIT_TIME = dt_time(15, 2)  # 15:02 自然退出（收盘后无新增量）
 
 DEFAULT_CURVE_FILENAME = "intraday_progress_curve.json"
 
-# 东财 clist fs 段：创业板 m:0+t:80、科创板 m:1+t:23（与已验证策略同域）
-_BOARD_FS: dict[str, str] = {
-    "gem": "m:0+t:80",
-    "star": "m:1+t:23",
-    "main_sh": "m:1+t:2",
-    "main_sz": "m:0+t:6",
-    "bj": "m:0+t:81+s:2048",
-}
+# 检测板块判定复用 state.derive._classify_board（ts_code 前缀 → main/gem/star/bj）：
+# surge 盘中只对创业(gem)/科创(star)检测；全市场快照拉回后在检测层按 config.boards
+# 过滤下来（取数范围=全市场，检测范围=config.boards，两者解耦）。
+_ALL_DETECTION_BOARDS = ("main", "gem", "star", "bj")
 _DEFAULT_SURGE_BOARDS = ("gem", "star")
 
 LIVE_DIR_NAME = "surge_live"
 
 _DEFAULT_SOCKS_PROXY = "socks5h://127.0.0.1:1086"
+
+
+def _boards_env() -> tuple[str, ...]:
+    """RQUANT_SURGE_BOARDS 覆盖**检测**板块（逗号分隔 gem/star/main/bj，或 all）；缺省创业+科创。
+
+    语义是检测范围（不是取数范围）：全市场快照拉回后在检测层按此过滤。无效值忽略、
+    全无效回落缺省。作 SurgeConfig.boards 的 default_factory（构造时读一次 env）。
+    """
+    raw = os.environ.get("RQUANT_SURGE_BOARDS", "").strip().lower()
+    if not raw:
+        return _DEFAULT_SURGE_BOARDS
+    if raw in ("all", "*"):
+        return _ALL_DETECTION_BOARDS
+    parts = [p.strip() for p in raw.split(",") if p.strip() in _ALL_DETECTION_BOARDS]
+    return tuple(dict.fromkeys(parts)) or _DEFAULT_SURGE_BOARDS
 
 
 def _grid_minute(t: dt_time) -> int:
@@ -157,7 +170,9 @@ class SurgeConfig(BaseModel):
     tushare_rate_per_min: int = 2    # 确认层 stk_mins 限频（次/分）
     tushare_max_retries: int = 3     # 单候选取数失败重试上限（延后不阻塞队列）
     miss_circuit_threshold: int = 5  # 快照连续 miss 触发降级告警 + 退避
-    boards: tuple[str, ...] = _DEFAULT_SURGE_BOARDS
+    # 检测范围（不是取数范围）：全市场快照在检测层按此过滤。默认创业+科创，
+    # RQUANT_SURGE_BOARDS 可覆盖（default_factory 构造时读 env）。
+    boards: tuple[str, ...] = Field(default_factory=_boards_env)
 
     @property
     def silent_until(self) -> dt_time:
@@ -323,28 +338,7 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
     return SurgeBaseline(avg_amount_20d=avg20, theme=theme, curve=curve)
 
 
-# ── 快照拉取（复用 panorama 加固 Session，fs 换创业/科创） ──────────────────────
-
-
-def _boards_env() -> tuple[str, ...]:
-    """RQUANT_SURGE_BOARDS 覆盖检测板块（逗号分隔 gem/star/main/all）；缺省创业+科创。"""
-    raw = os.environ.get("RQUANT_SURGE_BOARDS", "").strip().lower()
-    if not raw:
-        return _DEFAULT_SURGE_BOARDS
-    if raw in ("all", "*"):
-        return ("gem", "star", "main_sh", "main_sz", "bj")
-    parts: list[str] = []
-    for p in raw.split(","):
-        p = p.strip()
-        if p == "main":
-            parts.extend(["main_sh", "main_sz"])
-        elif p in _BOARD_FS:
-            parts.append(p)
-    return tuple(dict.fromkeys(parts)) or _DEFAULT_SURGE_BOARDS
-
-
-def _fs_for_boards(boards: tuple[str, ...]) -> str:
-    return ",".join(_BOARD_FS[b] for b in boards if b in _BOARD_FS)
+# ── 快照拉取（复用 panorama 加固 Session，全市场 fs） ──────────────────────────
 
 
 def _fetch_em_clist(fs: str, proxies: dict[str, str] | None, timeout: float) -> pd.DataFrame:
@@ -382,33 +376,15 @@ def _fetch_em_clist(fs: str, proxies: dict[str, str] | None, timeout: float) -> 
     return _normalize_em_spot_rows(rows)
 
 
-def fetch_board_snapshot(boards: tuple[str, ...] | None = None) -> pd.DataFrame:
-    """拉一次检测域快照（默认创业+科创），带涨停价，``df.attrs['route']`` 标注。
-
-    东财直连 → SOCKS 云端出口（RQUANT_PANORAMA_SOCKS，置空禁用）→ 空表 route=none
-    （本分钟 miss，由主循环熔断退避）。云端 IP 干净，直连通常一击即中。
-    """
-    from rquant.panorama_data import add_limit_prices
-
-    boards = boards or _boards_env()
-    fs = _fs_for_boards(boards)
-    for route, proxies, timeout in _snapshot_routes():
-        try:
-            df = _fetch_em_clist(fs, proxies=proxies, timeout=timeout)
-            if not df.empty:
-                out = add_limit_prices(df)
-                out.attrs["route"] = route
-                return out
-            logger.warning(f"surge 快照 {route} 返回空")
-        except Exception as e:
-            logger.warning(f"surge 快照 {route} 失败: {type(e).__name__}: {e}")
-    empty = pd.DataFrame()
-    empty.attrs["route"] = "none"
-    return empty
-
-
 def fetch_full_market_snapshot() -> pd.DataFrame:
-    """全市场快照（供 P2 Mac feed），带涨停价，route 标注。每 5 分钟拉一次。"""
+    """拉一次**全市场**快照（每分钟主循环调用），带涨停价，``df.attrs['route']`` 标注。
+
+    一次取数兼作两用：① 检测层按 ``config.boards`` 过滤（``_detection_domain``），
+    ② 原样落 ``snapshot_full.parquet`` 供全景页共享 feed。东财直连 → SOCKS 云端出口
+    （RQUANT_PANORAMA_SOCKS，置空禁用）→ 空表 route=none（本分钟 miss，主循环熔断退避）。
+    云端 IP 干净，直连通常一击即中。fs 用全市场串（panorama 的 ``_EM_SPOT_FS``：
+    沪深主板 + 创业 + 科创 + 北交所五段）。
+    """
     from rquant.panorama_data import _EM_SPOT_FS, add_limit_prices
 
     for route, proxies, timeout in _snapshot_routes():
@@ -418,11 +394,25 @@ def fetch_full_market_snapshot() -> pd.DataFrame:
                 out = add_limit_prices(df)
                 out.attrs["route"] = route
                 return out
+            logger.warning(f"surge 全市场快照 {route} 返回空")
         except Exception as e:
             logger.warning(f"surge 全市场快照 {route} 失败: {type(e).__name__}: {e}")
     empty = pd.DataFrame()
     empty.attrs["route"] = "none"
     return empty
+
+
+def _detection_domain(snapshot: pd.DataFrame, boards: tuple[str, ...]) -> pd.DataFrame:
+    """从全市场快照收窄到检测板块（``config.boards``，按 ts_code 前缀，复用 _classify_board）。
+
+    只收窄检测范围（行为与旧「只拉创业/科创」一致）；ST 排除仍留在 _rough_candidates。
+    snapshot_full 落盘用的是过滤前的全市场（含主板/ST 行）。空表或缺 ts_code 列原样返回。
+    """
+    if snapshot.empty or "ts_code" not in snapshot.columns:
+        return snapshot
+    board_set = set(boards)
+    mask = snapshot["ts_code"].astype(str).map(_classify_board).isin(board_set)
+    return snapshot[mask].reset_index(drop=True)
 
 
 def _snapshot_routes() -> list[tuple[str, dict[str, str] | None, float]]:
@@ -869,18 +859,20 @@ def run_surge_watch(
     now_fn: Callable[[], datetime] = _now_cst,
     sleep_fn: Callable[[float], None] = _time_module.sleep,
     snapshot_fetcher: Callable[[], pd.DataFrame] | None = None,
-    full_snapshot_fetcher: Callable[[], pd.DataFrame] | None = None,
     minute_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
     notify_fn: Callable[..., None] | None = None,
     is_trading_day_fn: Callable[[date], bool] | None = None,
     baseline: SurgeBaseline | None = None,
     max_ticks: int | None = None,
 ) -> int:
-    """常驻主循环：守卫 → 每分钟拉快照 → tick → 推送/落盘 → 15:02 退出。
+    """常驻主循环：守卫 → 每分钟拉**全市场**快照 → 落 snapshot_full → 检测层过滤 → tick
+    → 推送/落盘 → 15:02 退出。
 
-    时钟/源/推送/sleep 全可注入。非交易日即退；午休 sleep；快照连续 5 miss 推一条
-    降级告警（每日至多一条）并退避 60/120/300。``force_session`` 忽略时段守卫（盘后
-    验收）；``max_ticks`` 限定循环次数（dry-run/测试）。
+    一次全市场取数兼作两用：原样落 ``snapshot_full.parquet``（全景页共享 feed），并按
+    ``config.boards`` 收窄成检测输入喂 tick。``snapshot_fetcher`` 默认全市场取数器，返回
+    空 = 本分钟 miss。时钟/源/推送/sleep 全可注入。非交易日即退；午休 sleep；快照连续
+    5 miss 推一条降级告警（每日至多一条）并退避 60/120/300。``force_session`` 忽略时段
+    守卫（盘后验收）；``max_ticks`` 限定循环次数（dry-run/测试）。
     """
     config = config or SurgeConfig()
     day = now_fn().date()
@@ -890,8 +882,7 @@ def run_surge_watch(
         return 0
 
     baseline = baseline or preload_baseline()
-    snapshot_fetcher = snapshot_fetcher or (lambda: fetch_board_snapshot(config.boards))
-    full_snapshot_fetcher = full_snapshot_fetcher or fetch_full_market_snapshot
+    snapshot_fetcher = snapshot_fetcher or fetch_full_market_snapshot
     notify_fn = notify_fn or _default_notify
     live_dir = (base_dir or default_live_dir())
 
@@ -900,11 +891,10 @@ def run_surge_watch(
 
     miss_streak = 0
     degraded_alerted = False
-    last_full_minute: int | None = None
     ticks = 0
 
     logger.info(
-        f"surge-watch 启动 day={day} boards={config.boards} "
+        f"surge-watch 启动 day={day} 检测板块={config.boards} "
         f"k_rough={config.k_rough} k_confirm={config.k_confirm} dry_run={dry_run}"
     )
     try:
@@ -918,9 +908,9 @@ def run_surge_watch(
                 sleep_fn(30.0)
                 continue
 
-            snapshot = snapshot_fetcher()
-            route = snapshot.attrs.get("route", "none") if snapshot is not None else "none"
-            if snapshot is None or snapshot.empty:
+            full = snapshot_fetcher()
+            route = full.attrs.get("route", "none") if full is not None else "none"
+            if full is None or full.empty:
                 miss_streak += 1
                 logger.warning(f"surge 快照 miss（连续 {miss_streak}），route={route}")
                 if miss_streak >= config.miss_circuit_threshold:
@@ -939,15 +929,12 @@ def run_surge_watch(
                 continue
 
             miss_streak = 0
-            result = watcher.tick(snapshot, now)
-            atomic_write_parquet(snapshot, live_dir / "snapshot.parquet")
-
-            cur_minute = now.hour * 60 + now.minute
-            if last_full_minute is None or cur_minute - last_full_minute >= 5:
-                full = full_snapshot_fetcher()
-                if full is not None and not full.empty:
-                    atomic_write_parquet(full, live_dir / "snapshot_full.parquet")
-                    last_full_minute = cur_minute
+            # 全市场快照每分钟原子落盘（共享 feed：云端/Mac 全景页 poller 读它，与主循环同拍）
+            atomic_write_parquet(full, live_dir / "snapshot_full.parquet")
+            # 检测层收窄到 config.boards（行为与旧「只拉创业/科创」一致）
+            detection = _detection_domain(full, config.boards)
+            result = watcher.tick(detection, now)
+            atomic_write_parquet(detection, live_dir / "snapshot.parquet")
 
             if result.confirmed:
                 append_events(events_path, result.confirmed)

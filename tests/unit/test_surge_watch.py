@@ -21,6 +21,7 @@ from rquant.surge_watch import (
     SurgeConfig,
     SurgeConfirmed,
     SurgeWatcher,
+    _detection_domain,
     _is_lunch,
     _minute_delta,
     _rough_candidates,
@@ -404,7 +405,6 @@ class TestU7Guards:
             baseline=mk_baseline({}),
             is_trading_day_fn=lambda d: False,
             snapshot_fetcher=snap_fetch,
-            full_snapshot_fetcher=lambda: pd.DataFrame(),
             minute_fetcher=lambda c, d: pd.DataFrame(),
             notify_fn=lambda *a, **k: None,
             now_fn=lambda: datetime(2026, 7, 4, 10, 0, tzinfo=CST),
@@ -435,7 +435,6 @@ class TestU7Guards:
             base_dir=tmp_path,
             is_trading_day_fn=lambda d: True,
             snapshot_fetcher=lambda: mk_snap([]),   # 恒 miss
-            full_snapshot_fetcher=lambda: pd.DataFrame(),
             minute_fetcher=lambda c, d: pd.DataFrame(),
             notify_fn=lambda scene, **k: notifies.append((scene, k)),
             now_fn=now_fn,
@@ -585,7 +584,6 @@ class TestU10Push:
             base_dir=tmp_path,
             is_trading_day_fn=lambda dd: True,
             snapshot_fetcher=lambda: snap,
-            full_snapshot_fetcher=lambda: pd.DataFrame(),
             minute_fetcher=lambda c, dd: bars,
             notify_fn=lambda scene, **k: notifies.append((scene, k)),
             now_fn=now_fn,
@@ -1075,3 +1073,72 @@ class TestE2SimulateV2Gates:
         body = pushes[0][1]["body"]
         assert "爆F" in body and "拦E" not in body
         assert "口径 v2" in body and "观察提示，非买入信号" in body
+
+
+# ── U16 全市场重构（D1）：全市场取数 → 检测层过滤 config.boards ─────────────────
+
+
+class TestU16FullMarketRefactor:
+    """一次全市场快照兼作检测输入（过滤 boards + 排 ST）与共享 feed（snapshot_full 全落）。"""
+
+    def _full_market(self) -> pd.DataFrame:
+        """主板/创业/科创/北交所 + 一只 ST 创业股，amount 足够大（避免 rough 落选干扰）。"""
+        rows = [
+            {"ts_code": "600519.SH", "name": "主板甲", "price": 11, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # main
+            {"ts_code": "300111.SZ", "name": "创业乙", "price": 11, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # gem
+            {"ts_code": "688333.SH", "name": "科创丙", "price": 11, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # star
+            {"ts_code": "830001.BJ", "name": "北交丁", "price": 11, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # bj
+            {"ts_code": "300777.SZ", "name": "ST妖戊", "price": 11, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # gem 但 ST
+        ]
+        return mk_snap(rows)
+
+    def test_detection_domain_narrows_to_boards(self) -> None:
+        det = _detection_domain(self._full_market(), ("gem", "star"))
+        codes = set(det["ts_code"])
+        # 只留创业+科创（含 ST 创业股，ST 由 rough 排除，不在此过滤）；主板/北交所被过滤
+        assert codes == {"300111.SZ", "688333.SH", "300777.SZ"}
+        assert "600519.SH" not in codes and "830001.BJ" not in codes
+
+    def test_detection_domain_empty_passthrough(self) -> None:
+        empty = mk_snap([])
+        assert _detection_domain(empty, ("gem", "star")).empty
+
+    def test_rough_candidates_exclude_st_and_offboard(self) -> None:
+        full = self._full_market()
+        det = _detection_domain(full, ("gem", "star"))
+        base = mk_baseline({c: 1e6 for c in full["ts_code"]}, curve=flat_curve())
+        rough = _rough_candidates(det, base, SurgeConfig(), gi=30)
+        # 主板/北交所被检测层过滤、ST 创业被 rough 排 → 候选只剩非 ST 创业+科创
+        assert set(rough) == {"300111.SZ", "688333.SH"}
+
+    def test_snapshot_full_persists_main_rows_detection_narrowed(self, tmp_path: Path) -> None:
+        clock = {"t": datetime(2026, 7, 6, 10, 0, tzinfo=CST)}
+        run_surge_watch(
+            dry_run=True,
+            baseline=mk_baseline({}, curve=flat_curve()),
+            base_dir=tmp_path,
+            is_trading_day_fn=lambda d: True,
+            snapshot_fetcher=self._full_market,
+            minute_fetcher=lambda c, d: pd.DataFrame(),
+            notify_fn=lambda *a, **k: None,
+            now_fn=lambda: clock["t"],
+            sleep_fn=lambda s: clock.__setitem__("t", clock["t"] + timedelta(seconds=s)),
+            max_ticks=1,
+        )
+        full_back = pd.read_parquet(tmp_path / "snapshot_full.parquet")
+        assert "600519.SH" in set(full_back["ts_code"])   # 主板行进共享 feed
+        assert "830001.BJ" in set(full_back["ts_code"])
+        det_back = pd.read_parquet(tmp_path / "snapshot.parquet")
+        assert set(det_back["ts_code"]) == {"300111.SZ", "688333.SH", "300777.SZ"}
+
+    def test_full_market_fs_covers_all_segments(self) -> None:
+        """U4：surge 复用 panorama 全市场 fs（沪深主板+创业+科创+北交所，不再是两段）。"""
+        from rquant.panorama_data import _EM_SPOT_FS
+
+        for seg in ("m:0+t:6", "m:0+t:80", "m:1+t:2", "m:1+t:23", "m:0+t:81+s:2048"):
+            assert seg in _EM_SPOT_FS

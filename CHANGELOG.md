@@ -6,6 +6,37 @@
 
 ### Added
 
+- **全景页上云（云端直跑，零隧道）**：全景页从「Mac 拉数 + SSH 反向隧道」改为云端
+  常驻——手机/朋友任意网络直访 `82.156.0.68:28080`（basic auth）→ 云 127.0.0.1:8506
+  的 streamlit，poller 读同机 surge feed + 自拉兜底，零隧道、零 Mac 依赖（Mac 本地
+  8506 与隧道照常保留，两套跑同一代码）。落地：① `deploy/systemd/rquant-panorama.service`
+  （Type=simple/Restart=always，`--server.address 127.0.0.1`，unit 内 `Environment=` 覆盖
+  `RQUANT_CLOUD_FEED_URL` 指向本地 `snapshot_full.parquet` + 置空 `RQUANT_PANORAMA_SOCKS`）；
+  ② `deploy/nginx/rquant-panorama-cloud.conf`（28080 反代 8506，WebSocket 头齐全，沿用
+  `.htpasswd-panorama`）；③ `deploy/systemd/rquant-kpl-snapshot.{service,timer}`（工作日
+  16:35 跑 `rquant data-backfill --dataset kpl_concept --today` 把开盘啦题材成分写云端主库，
+  写者串行槽位：monitor 15:02 止 / daily 17:00 起 / backup·replica-sync 只读拷贝不写主库，
+  `Persistent=false` 避补跑撞 daily 写窗）；④ 部署清单
+  `docs/deploy/2026-07-06-panorama-cloud-deploy.md`。`deploy/tunnel/README.md` 标注已被取代。
+- **surge-watch 全市场单次取数重构（D1）**：盘中每分钟改为一次拉**全市场**快照
+  （复用 panorama `_EM_SPOT_FS` 五段：沪深主板+创业+科创+北交所），检测层按
+  `config.boards` 按 ts_code 前缀过滤回创业/科创（`_detection_domain` 复用
+  `_classify_board`，ST 仍在 `_rough_candidates` 排除，检测行为与旧「只拉创业/科创」
+  一致）；`snapshot_full.parquet` 落盘从每 5 分钟改为**每分钟与主循环同拍**（删掉独立的
+  full 拉取代码路径与 `full_snapshot_fetcher` 形参），请求量反降（原创业科创 + 独立全市场
+  两拉 → 一次全市场共用）。`RQUANT_SURGE_BOARDS` 保留为检测范围覆盖（default_factory）。
+- **panorama poller 云端 feed 本地文件分支（D1）+ 分时段节奏（D2）**：`_default_cloud_feed`
+  按 `RQUANT_CLOUD_FEED_URL` 值路由——`/` 开头或 `file://` 前缀走**本地文件**读
+  （mtime 判新鲜 ≤120s，云端同机形态；缺失/陈旧回落自拉），HTTP(S) 分支保留（Mac P2，
+  Last-Modified 判新鲜，零回归）；`SourcePoller` 新增 `off_hours_interval=600`——交易时段
+  （工作日 09:00–15:10）用 60s、盘外/周末 600s（`is_off_hours` 纯函数 now 注入可测），
+  云端 24/7 常驻的取数卫生。
+
+### Changed
+
+- **surge-watch 请求量与落盘节奏**：单进程每分钟只对 em 发一次全市场分页请求（兼作检测
+  输入与共享 feed），替代原「创业科创检测拉 + 每 5min 全市场拉」的双拉路径。
+
 - **每分钟爆量推送（surge-watch）+ 取数迁云端**：新模块
   `src/rquant/surge_watch.py` 与 CLI `rquant surge-watch [--dry-run] [--simulate DIR]
   [--force-session] [--max-ticks N]`（云端 systemd timer `Mon..Fri 09:25` 拉起、单进程
