@@ -46,12 +46,13 @@ def _sina_spot_df() -> pd.DataFrame:
 
 
 def _kill_em_spot_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """打死东财两级（直连抛错 + 置空 SOCKS 禁用该级），强制快照走 sina 兜底。"""
+    """打死东财两级（Session.get 抛错 + 置空 SOCKS 禁用该级），强制快照走 sina 兜底。"""
+    import requests
 
-    def em_boom() -> pd.DataFrame:
+    def boom(self: object, url: str, **kwargs: object) -> None:
         raise ConnectionError("em down")
 
-    monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+    monkeypatch.setattr(requests.Session, "get", boom)
     monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "")
 
 
@@ -94,25 +95,6 @@ class TestFetchMarketSnapshot:
         assert fetch_market_snapshot().empty
 
 
-# ak.stock_zh_a_spot_em 风格中文列（成交量单位手）
-def _em_spot_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "序号": [1, 2, 3],
-            "代码": ["600519", "300750", "920008"],
-            "名称": ["贵州茅台", "宁德时代", "某北交所"],
-            "最新价": [1500.0, 250.0, 13.0],
-            "今开": [1480.0, 245.0, 12.5],
-            "最高": [1510.0, 252.0, 13.2],
-            "最低": [1475.0, 244.0, 12.4],
-            "昨收": [1490.0, 240.0, 12.0],
-            "涨跌幅": [0.67, 4.17, None],
-            "成交量": [10000.0, 200000.0, 5000.0],  # 手
-            "成交额": [1.5e9, 5e9, 6.5e6],
-        }
-    )
-
-
 # 东财 push2 clist 股票 diff 行（f5 成交量单位手；停牌票数值字段给 "-"）
 _EM_SPOT_ROWS: list[dict] = [
     {"f12": "600519", "f14": "贵州茅台", "f2": 1500.0, "f17": 1480.0, "f15": 1510.0,
@@ -130,77 +112,83 @@ _SNAPSHOT_COLUMNS = [
 
 
 class TestSnapshotRouting:
-    """全市场快照三级路由：东财直连 → 东财·SOCKS → 新浪兜底 → 全败空表。"""
+    """全市场快照三级路由：东财 clist 直连 → 同实现走 SOCKS → 新浪兜底 → 全败空表。"""
 
     def test_em_direct_normalizes_volume_to_shares(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", _em_spot_df)
+        seen: list[dict] = []
+        sessions: list[object] = []
+
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            sessions.append(self)
+            seen.append(kwargs)
+            return _FakeResp({"data": {"diff": _EM_SPOT_ROWS, "total": len(_EM_SPOT_ROWS)}})
+
+        import requests
+
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         df = fetch_market_snapshot()
         assert df.attrs["route"] == "em_direct"
+        assert seen[0]["proxies"] is None  # 直连级不带代理
+        assert seen[0]["params"]["fs"] == panorama_data._EM_SPOT_FS
+        assert sessions[0].trust_env is False  # 加固 Session（不吸系统代理环境）
         assert list(df.columns) == _SNAPSHOT_COLUMNS
         mt = df[df["ts_code"] == "600519.SH"].iloc[0]
-        assert mt["volume"] == pytest.approx(1e6)  # 手 ×100 → 股
+        assert mt["volume"] == pytest.approx(1e6)  # f5 手 ×100 → 股
         assert mt["amount"] == pytest.approx(1.5e9)  # 成交额已是元，不换算
         assert mt["pct_chg"] == pytest.approx(0.67)
-        # 涨跌幅缺失 → price/pre_close 兜底
+        # 停牌票 "-" 占位 coerce 成 NaN、行保留；涨跌幅缺失时 price/pre_close 兜底
         bj = df[df["ts_code"] == "920008.BJ"].iloc[0]
-        assert bj["pct_chg"] == pytest.approx((13.0 / 12.0 - 1) * 100)
+        assert pd.isna(bj["price"]) and pd.isna(bj["volume"])
 
-    def test_em_direct_missing_column_falls_through(
+    def test_em_rows_missing_key_fields_fall_through(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """em 返回 200 但缺必需列 → 该级视为空，落到下一级。"""
-        monkeypatch.setattr(
-            panorama_data, "_fetch_em_spot_direct",
-            lambda: _em_spot_df().drop(columns=["昨收"]),
-        )
+        """em 返回 200 但缺 f12/f2 关键字段 → 该级视为空，落到 sina 兜底。"""
+        rows = [{"f14": "贵州茅台", "f3": 0.67}]
+
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            return _FakeResp({"data": {"diff": rows, "total": 1}})
+
+        import requests
+
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "")
         monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
         df = fetch_market_snapshot()
         assert df.attrs["route"] == "sina"
 
     def test_direct_fails_socks_takes_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def em_boom() -> pd.DataFrame:
-            raise ConnectionError("blacklisted")
-
-        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
         seen: list[dict] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             seen.append(kwargs)
+            if kwargs["proxies"] is None:
+                raise ConnectionError("blacklisted")
             return _FakeResp({"data": {"diff": _EM_SPOT_ROWS, "total": len(_EM_SPOT_ROWS)}})
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "socks5h://127.0.0.1:9999")
         df = fetch_market_snapshot()
         assert df.attrs["route"] == "em_socks"
-        assert seen[0]["proxies"] == {
+        assert seen[0]["proxies"] is None  # 先试直连
+        assert seen[1]["proxies"] == {
             "http": "socks5h://127.0.0.1:9999",
             "https": "socks5h://127.0.0.1:9999",
         }
-        assert seen[0]["params"]["fs"] == panorama_data._EM_SPOT_FS
         assert list(df.columns) == _SNAPSHOT_COLUMNS
         mt = df[df["ts_code"] == "600519.SH"].iloc[0]
         assert mt["price"] == pytest.approx(1500.0)
         assert mt["volume"] == pytest.approx(1e6)  # f5 手 ×100 → 股
-        assert mt["pct_chg"] == pytest.approx(0.67)
-        # 停牌票 "-" 占位被 coerce 成 NaN，行保留
-        bj = df[df["ts_code"] == "920008.BJ"].iloc[0]
-        assert pd.isna(bj["price"]) and pd.isna(bj["volume"])
 
-    def test_socks_paginates_until_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """服务端钳制单页行数时按 total 累积翻页取全量。"""
-
-        def em_boom() -> pd.DataFrame:
-            raise ConnectionError("blacklisted")
-
-        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
+    def test_direct_paginates_until_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """服务端钳制单页行数时按 total 累积翻页取全量（直连/SOCKS 共用实现）。"""
         pages: list[int] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             params = kwargs["params"]
             pages.append(params["pn"])
             n = 100 if params["pn"] == 1 else 50
@@ -215,23 +203,19 @@ class TestSnapshotRouting:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         df = fetch_market_snapshot()
         assert pages == [1, 2]
         assert len(df) == 150
-        assert df.attrs["route"] == "em_socks"
+        assert df.attrs["route"] == "em_direct"
 
     def test_both_em_fail_sina_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def em_boom() -> pd.DataFrame:
-            raise ConnectionError("blacklisted")
-
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
-            raise ConnectionError("socks down")
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
 
         import requests
 
-        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
         df = fetch_market_snapshot()
         assert df.attrs["route"] == "sina"
@@ -239,24 +223,49 @@ class TestSnapshotRouting:
         mt = df[df["ts_code"] == "600519.SH"].iloc[0]
         assert mt["volume"] == pytest.approx(1e6)
 
-    def test_all_routes_fail_empty_route_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def em_boom() -> pd.DataFrame:
-            raise ConnectionError("blacklisted")
+    def test_allow_sina_false_skips_sina_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """allow_sina=False（poller 对 sina 熔断中）→ 不碰 sina，直接空表。"""
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
-            raise ConnectionError("socks down")
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
+
+        sina_calls: list[int] = []
+
+        def sina_spy() -> pd.DataFrame:
+            sina_calls.append(1)
+            return _sina_spot_df()
+
+        import requests
+
+        monkeypatch.setattr(requests.Session, "get", fake_get)
+        monkeypatch.setattr(panorama_data, "_fetch_spot", sina_spy)
+        df = fetch_market_snapshot(allow_sina=False)
+        assert df.empty
+        assert df.attrs["route"] == "none"
+        assert sina_calls == []  # sina 级完全未被调用
+
+    def test_all_routes_fail_empty_route_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            raise ConnectionError("em unreachable")
 
         def sina_boom() -> pd.DataFrame:
             raise ConnectionError("sina down")
 
         import requests
 
-        monkeypatch.setattr(panorama_data, "_fetch_em_spot_direct", em_boom)
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setattr(panorama_data, "_fetch_spot", sina_boom)
         df = fetch_market_snapshot()
         assert df.empty
         assert df.attrs["route"] == "none"
+
+    def test_direct_tier_no_akshare_em_spot(self) -> None:
+        """直连级已改为自实现 clist（可注入加固 headers），不再调用 ak.stock_zh_a_spot_em。"""
+        import inspect
+
+        src = inspect.getsource(panorama_data)
+        assert "stock_zh_a_spot_em(" not in src  # 无调用点（注释里的名字提及不算）
+        assert not hasattr(panorama_data, "_fetch_em_spot_direct")
 
 
 class TestLimitPrices:
@@ -384,13 +393,13 @@ class TestSectorFundFlowRouting:
     def test_direct_success_maps_em_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[dict] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             calls.append(kwargs)
             return _FakeResp({"data": {"diff": _EM_ROWS, "total": len(_EM_ROWS)}})
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         df = fetch_sector_fund_flow()
         assert df.attrs["route"] == "em_direct"
         assert calls[0]["proxies"] is None
@@ -405,11 +414,30 @@ class TestSectorFundFlowRouting:
         bank = df[df["board_name"] == "银行"].iloc[0]
         assert pd.isna(bank["pct_chg"]) and pd.isna(bank["main_net_rate"])
 
+    def test_em_requests_use_hardened_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """东财请求必须走加固 Session：trust_env=False + UA/Referer/Connection:close。"""
+        captured: dict = {}
+
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
+            captured["trust_env"] = self.trust_env
+            captured["headers"] = dict(self.headers)
+            return _FakeResp({"data": {"diff": _EM_ROWS, "total": len(_EM_ROWS)}})
+
+        import requests
+
+        monkeypatch.setattr(requests.Session, "get", fake_get)
+        df = fetch_sector_fund_flow()
+        assert df.attrs["route"] == "em_direct"
+        assert captured["trust_env"] is False
+        assert "Chrome" in captured["headers"]["User-Agent"]
+        assert captured["headers"]["Referer"] == "https://quote.eastmoney.com/"
+        assert captured["headers"]["Connection"] == "close"
+
     def test_direct_paginates_until_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """实测单页被限 100 行（total≈496），须翻页取全量。"""
         pages: list[int] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             params = kwargs["params"]
             pages.append(params["pn"])
             row = {"f12": f"BK{params['pn']:04d}", "f14": f"板块{params['pn']}",
@@ -419,7 +447,7 @@ class TestSectorFundFlowRouting:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         df = fetch_sector_fund_flow()
         assert pages == [1, 2, 3]
         assert len(df) == 250
@@ -427,7 +455,7 @@ class TestSectorFundFlowRouting:
     def test_direct_fails_socks_takes_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen_proxies: list[dict | None] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             seen_proxies.append(kwargs["proxies"])
             if kwargs["proxies"] is None:
                 raise ConnectionError("RST by firewall")
@@ -435,7 +463,7 @@ class TestSectorFundFlowRouting:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "socks5h://127.0.0.1:9999")
         df = fetch_sector_fund_flow()
         assert df.attrs["route"] == "em_socks"
@@ -449,7 +477,7 @@ class TestSectorFundFlowRouting:
     def test_socks_default_proxy_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen_proxies: list[dict | None] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             seen_proxies.append(kwargs["proxies"])
             if kwargs["proxies"] is None:
                 raise ConnectionError("RST")
@@ -457,19 +485,19 @@ class TestSectorFundFlowRouting:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.delenv("RQUANT_PANORAMA_SOCKS", raising=False)
         df = fetch_sector_fund_flow()
         assert df.attrs["route"] == "em_socks"
         assert seen_proxies[1]["https"] == "socks5h://127.0.0.1:1086"
 
     def test_both_em_fail_ths_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             raise ConnectionError("em unreachable")
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         seen_types: list[str] = []
 
         def fake_ths(sector_type: str) -> pd.DataFrame:
@@ -489,12 +517,12 @@ class TestSectorFundFlowRouting:
         assert df["leading_stock"].tolist() == ["西部黄金", "江苏雷利"]
 
     def test_ths_missing_leading_stock_column(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             raise ConnectionError("em unreachable")
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         broken = _ths_flow_df().drop(columns=["领涨股", "领涨股-涨跌幅"])
         monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", lambda s: broken)
         df = fetch_sector_fund_flow()
@@ -502,7 +530,7 @@ class TestSectorFundFlowRouting:
         assert df["leading_stock"].isna().all()
 
     def test_all_routes_fail_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             raise ConnectionError("em unreachable")
 
         def ths_boom(sector_type: str) -> pd.DataFrame:
@@ -510,7 +538,7 @@ class TestSectorFundFlowRouting:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", ths_boom)
         df = fetch_sector_fund_flow()
         assert df.empty
@@ -522,12 +550,12 @@ class TestSectorFundFlowRouting:
         """东财返回 200 但缺 f62 → 该级视为空，落到 THS 兜底。"""
         rows = [{"f12": "BK1", "f14": "汽车", "f3": 1.0}]
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             return _FakeResp({"data": {"diff": rows, "total": 1}})
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setattr(panorama_data, "_fetch_ths_flow_raw", lambda s: _ths_flow_df())
         df = fetch_sector_fund_flow()
         assert df.attrs["route"] == "ths"

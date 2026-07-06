@@ -249,13 +249,13 @@ class TestFetchIntradayTrendU5:
     def test_em_direct_parse_types(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen: list[dict] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             seen.append(kwargs["params"])
             return _FakeResp(_trends_payload(240))
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         df = fetch_intraday_trend("600519.SH", ndays=1)
         assert df.attrs["route"] == "em_direct"
         assert list(df.columns) == ["dt", "price", "avg_price", "volume"]
@@ -271,13 +271,13 @@ class TestFetchIntradayTrendU5:
     def test_ndays5_secid_and_param(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen: list[dict] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             seen.append(kwargs["params"])
             return _FakeResp(_trends_payload(1200))
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         df = fetch_intraday_trend("300750.SZ", ndays=5)
         assert len(df) == 1200
         assert seen[0]["ndays"] == 5
@@ -286,7 +286,7 @@ class TestFetchIntradayTrendU5:
     def test_direct_fails_socks_takes_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen_proxies: list[dict | None] = []
 
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             seen_proxies.append(kwargs["proxies"])
             if kwargs["proxies"] is None:
                 raise ConnectionError("RST")
@@ -294,7 +294,7 @@ class TestFetchIntradayTrendU5:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setenv("RQUANT_PANORAMA_SOCKS", "socks5h://127.0.0.1:9999")
         df = fetch_intraday_trend("600519.SH")
         assert df.attrs["route"] == "em_socks"
@@ -305,12 +305,12 @@ class TestFetchIntradayTrendU5:
         }
 
     def test_em_all_fail_sina_fallback_avg_nan(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             raise ConnectionError("em unreachable")
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         sina_raw = pd.DataFrame(
             {
                 "day": ["2026-07-04 09:31:00", "2026-07-04 09:32:00"],
@@ -329,7 +329,7 @@ class TestFetchIntradayTrendU5:
         assert df["price"].tolist() == [10.1, 10.2]
 
     def test_all_routes_fail_empty_route_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(url: str, **kwargs: object) -> _FakeResp:
+        def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             raise ConnectionError("em unreachable")
 
         def sina_boom(ts_code: str) -> pd.DataFrame:
@@ -337,7 +337,7 @@ class TestFetchIntradayTrendU5:
 
         import requests
 
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         monkeypatch.setattr(panorama_data, "_fetch_sina_minute_raw", sina_boom)
         df = fetch_intraday_trend("600519.SH")
         assert df.empty
