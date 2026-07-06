@@ -3,14 +3,20 @@
 所有外部源调用集中在本模块，每个 fetcher 独立 try/except + 空态返回：
 akshare 断了页面不炸，UI 侧对空 DataFrame 渲染灰态。
 
-数据源与刷新节奏（TTL 由 UI 层 st.cache_data 控制）：
-- S1 全市场快照：60s，三级路由 东财 ``ak.stock_zh_a_spot_em`` 直连 → 东财 push2
-  clist·SOCKS 云端出口 → 新浪 ``ak.stock_zh_a_spot`` 兜底（sina 逐页 70 页，
-  盘外被限速单次可 >90s，只作最后兜底）
-- S2 板块资金流：60s，三级路由 东财直连 → 东财·SOCKS 云端出口 → 同花顺即时兜底
+数据源与刷新节奏（快照/资金流由 panorama_poller 后台拉取，其余 TTL 由 UI 层
+st.cache_data 控制）：
+- S1 全市场快照：三级路由 东财 push2 clist 直连 → 同一实现走 SOCKS 云端出口 →
+  新浪 ``ak.stock_zh_a_spot`` 兜底（sina 逐页 70 页，盘外被限速单次可 >90s，
+  只作最后兜底；``allow_sina=False`` 可跳过该级，熔断由 SourcePoller 管）
+- S2 板块资金流：三级路由 东财直连 → 东财·SOCKS 云端出口 → 同花顺即时兜底
   （办公网出口 IP 被东财拉黑、同花顺云端 403，两者互补，见 fetch_sector_fund_flow）
 - L  本地只读副本（dc_board / dc_board_member / kpl_concept_member /
   screen_result / pool2_watch）：300s
+
+东财全部请求（clist 快照/资金流 + trends2 分时）走 ``_em_session()``：每次全新
+Session + trust_env=False + 桌面 UA/Referer + Connection:close。2026-07-06 盘中
+事故：东财风控钉住长驻进程的连接状态（同进程连续 RST、新进程三路秒通），必须
+强制每次新 TCP/TLS 且不吸系统代理环境。
 
 DuckDB 只走 ``open_readonly_store()``（副本优先），本模块绝不写主库。
 """
@@ -18,11 +24,15 @@ DuckDB 只走 ``open_readonly_store()``（副本优先），本模块绝不写�
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    import requests
 
 from rquant.limit_up_pool import to_ts_code
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
@@ -57,7 +67,8 @@ _EM_DIRECT_TIMEOUT = 5.0
 _EM_SOCKS_TIMEOUT = 10.0
 _DEFAULT_SOCKS_PROXY = "socks5h://127.0.0.1:1086"
 
-# 东财 push2 clist 全市场股票快照（SOCKS 级自实现；直连级走 ak.stock_zh_a_spot_em）：
+# 东财 push2 clist 全市场股票快照（直连/SOCKS 两级同一套自实现分页——akshare 的
+# stock_zh_a_spot_em 无法注入加固 headers，已弃用）：
 #   fs 覆盖 沪主板/科创 + 深主板/创业 + 北交所；f5 成交量单位是**手**（sina 是股），
 #   归一时 ×100 保持 snapshot 列契约不变（volume=股, amount=元）
 _EM_SPOT_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
@@ -66,14 +77,19 @@ _EM_SPOT_FIELD_MAP: dict[str, str] = {
     "f14": "name", "f2": "price", "f17": "open", "f15": "high", "f16": "low",
     "f18": "pre_close", "f3": "pct_chg", "f5": "volume", "f6": "amount",
 }
-# ak.stock_zh_a_spot_em 中文列 → 标准列（成交量同为手，归一 ×100）
-_EM_SPOT_COLUMN_MAP: dict[str, str] = {
-    "名称": "name", "最新价": "price", "今开": "open", "最高": "high", "最低": "low",
-    "昨收": "pre_close", "涨跌幅": "pct_chg", "成交量": "volume", "成交额": "amount",
-}
-_EM_SPOT_REQUIRED = ("代码", "名称", "最新价", "昨收")
 _EM_SPOT_PAGE_SIZE = 1000  # 先请求 1000，服务端可能钳制单页行数，按 total 累积翻页
 _EM_SPOT_MAX_PAGES = 80  # 全市场 ~5700 只，即便被钳到 100/页也 60 页内取完
+
+# 东财请求加固 headers：桌面 Chrome UA + 行情站 Referer + Connection:close
+# （每请求新 TCP，配合每次全新 Session 防进程级连接状态被风控钉住）
+_EM_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://quote.eastmoney.com/",
+    "Connection": "close",
+}
 
 # 东财 push2his 分时（trends2）：data.trends 是逗号分隔字符串数组，
 # fields2=f51(时间) f53(价) f56(量) f58(均价) → 每行 "time,price,volume,avg"
@@ -123,10 +139,18 @@ def _fetch_spot() -> pd.DataFrame:
     return ak.stock_zh_a_spot()
 
 
-def _fetch_em_spot_direct() -> pd.DataFrame:
-    import akshare as ak
+def _em_session() -> requests.Session:
+    """东财专用加固 Session：每次全新 + trust_env=False + UA/Referer/Connection:close。
 
-    return ak.stock_zh_a_spot_em()
+    trust_env=False 不吸系统代理环境；Connection:close 每请求新 TCP——
+    避免长驻进程的连接指纹被东财风控钉住（2026-07-06 盘中事故根因）。
+    """
+    import requests
+
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update(_EM_HEADERS)
+    return session
 
 
 def _finalize_snapshot(out: pd.DataFrame) -> pd.DataFrame:
@@ -162,44 +186,28 @@ def _normalize_sina_spot(raw: pd.DataFrame) -> pd.DataFrame:
     return _finalize_snapshot(out)
 
 
-def _normalize_em_spot(raw: pd.DataFrame) -> pd.DataFrame:
-    """ak.stock_zh_a_spot_em 归一化：成交量单位手 → ×100 归一成股（对齐 sina 口径）。"""
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    missing = set(_EM_SPOT_REQUIRED) - set(raw.columns)
-    if missing:
-        logger.warning(f"东财快照列异常，缺 {sorted(missing)}，本级跳过")
-        return pd.DataFrame()
-    out = pd.DataFrame(index=raw.index)
-    out["ts_code"] = raw["代码"].astype(str).str[-6:].map(to_ts_code)
-    for src, dst in _EM_SPOT_COLUMN_MAP.items():
-        out[dst] = raw[src] if src in raw.columns else None
-    out = _finalize_snapshot(out)
-    if not out.empty:
-        out["volume"] = out["volume"] * 100
-    return out
-
-
 def _em_spot_fetch_rows(proxies: dict[str, str] | None, timeout: float) -> list[dict]:
-    """东财 push2 clist 全市场股票分页拉取（按 total 累积翻页防深页）。"""
-    import requests
+    """东财 push2 clist 全市场股票分页拉取（按 total 累积翻页防深页）。
 
+    直连（proxies=None）与 SOCKS 两级共用；加固 Session 见 _em_session。
+    """
     rows: list[dict] = []
-    for pn in range(1, _EM_SPOT_MAX_PAGES + 1):
-        params = {
-            "pn": pn, "pz": _EM_SPOT_PAGE_SIZE, "po": 1, "np": 1,
-            "fltt": 2, "invt": 2, "fid": "f6", "fs": _EM_SPOT_FS,
-            "fields": _EM_SPOT_FIELDS,
-        }
-        resp = requests.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
-        resp.raise_for_status()
-        data = (resp.json() or {}).get("data") or {}
-        diff = data.get("diff") or []
-        if not diff:
-            break
-        rows.extend(diff)
-        if len(rows) >= int(data.get("total") or 0):
-            break
+    with _em_session() as session:
+        for pn in range(1, _EM_SPOT_MAX_PAGES + 1):
+            params = {
+                "pn": pn, "pz": _EM_SPOT_PAGE_SIZE, "po": 1, "np": 1,
+                "fltt": 2, "invt": 2, "fid": "f6", "fs": _EM_SPOT_FS,
+                "fields": _EM_SPOT_FIELDS,
+            }
+            resp = session.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            diff = data.get("diff") or []
+            if not diff:
+                break
+            rows.extend(diff)
+            if len(rows) >= int(data.get("total") or 0):
+                break
     return rows
 
 
@@ -221,13 +229,14 @@ def _normalize_em_spot_rows(rows: list[dict]) -> pd.DataFrame:
     return out
 
 
-def fetch_market_snapshot() -> pd.DataFrame:
+def fetch_market_snapshot(allow_sina: bool = True) -> pd.DataFrame:
     """拉取全市场快照并归一化为英文列，三级路由。
 
-    东财 ``ak.stock_zh_a_spot_em`` 直连（单次调用，办公网被拉黑时秒败；akshare
-    内部超时不可控，包 try 兜底）→ 东财 push2 clist 走 SOCKS 云端出口（环境变量
-    RQUANT_PANORAMA_SOCKS 可覆盖代理地址，置空禁用该级）→ 新浪
-    ``ak.stock_zh_a_spot`` 兜底（逐页限速慢但稳）→ 全失败返回空。
+    东财 push2 clist 直连（自实现分页 + 加固 Session，办公网被拉黑时秒败）→
+    同一实现走 SOCKS 云端出口（环境变量 RQUANT_PANORAMA_SOCKS 可覆盖代理地址，
+    置空禁用该级）→ 新浪 ``ak.stock_zh_a_spot`` 兜底（逐页限速单次可 10-90s）→
+    全失败返回空。``allow_sina=False`` 跳过 sina 级——SourcePoller 对 sina 单独
+    熔断，不允许它反复吊死后台拉取循环。
 
     返回列：ts_code, name, price, open, high, low, pre_close, pct_chg,
     volume(股), amount(元)——东财成交量单位手，归一 ×100 保持列契约。
@@ -240,7 +249,8 @@ def fetch_market_snapshot() -> pd.DataFrame:
         return _with_route(_fake_snapshot(), "em_direct")
 
     try:
-        df = _normalize_em_spot(_fetch_em_spot_direct())
+        rows = _em_spot_fetch_rows(proxies=None, timeout=_EM_DIRECT_TIMEOUT)
+        df = _normalize_em_spot_rows(rows)
         if not df.empty:
             return _with_route(df, "em_direct")
         logger.warning("东财快照直连返回空")
@@ -259,13 +269,16 @@ def fetch_market_snapshot() -> pd.DataFrame:
         except Exception as e:
             logger.warning(f"东财快照 SOCKS 出口失败: {type(e).__name__}: {e}")
 
-    try:
-        df = _normalize_sina_spot(_fetch_spot())
-        if not df.empty:
-            return _with_route(df, "sina")
-        logger.warning("新浪快照兜底返回空")
-    except Exception as e:
-        logger.warning(f"新浪快照兜底失败: {type(e).__name__}: {e}")
+    if allow_sina:
+        try:
+            df = _normalize_sina_spot(_fetch_spot())
+            if not df.empty:
+                return _with_route(df, "sina")
+            logger.warning("新浪快照兜底返回空")
+        except Exception as e:
+            logger.warning(f"新浪快照兜底失败: {type(e).__name__}: {e}")
+    else:
+        logger.warning("sina 兜底级被跳过（熔断冷却中）")
 
     logger.warning("全市场快照三级路由全部失败")
     return _with_route(pd.DataFrame(), "none")
@@ -348,26 +361,25 @@ def _em_fetch_rows(
     sector_type: str, proxies: dict[str, str] | None, timeout: float
 ) -> list[dict]:
     """东财 push2 clist 分页拉取，返回 diff 行列表（fid=f62 主力净流入降序）。"""
-    import requests
-
     fs = _EM_FS.get(sector_type)
     if fs is None:
         raise ValueError(f"未知板块资金流类型: {sector_type}")
     rows: list[dict] = []
-    for pn in range(1, _EM_MAX_PAGES + 1):
-        params = {
-            "pn": pn, "pz": _EM_PAGE_SIZE, "po": 1, "np": 1,
-            "fltt": 2, "invt": 2, "fid": "f62", "fs": fs, "fields": _EM_FIELDS,
-        }
-        resp = requests.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
-        resp.raise_for_status()
-        data = (resp.json() or {}).get("data") or {}
-        diff = data.get("diff") or []
-        if not diff:
-            break
-        rows.extend(diff)
-        if len(rows) >= int(data.get("total") or 0):
-            break
+    with _em_session() as session:
+        for pn in range(1, _EM_MAX_PAGES + 1):
+            params = {
+                "pn": pn, "pz": _EM_PAGE_SIZE, "po": 1, "np": 1,
+                "fltt": 2, "invt": 2, "fid": "f62", "fs": fs, "fields": _EM_FIELDS,
+            }
+            resp = session.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            diff = data.get("diff") or []
+            if not diff:
+                break
+            rows.extend(diff)
+            if len(rows) >= int(data.get("total") or 0):
+                break
     return rows
 
 
@@ -960,9 +972,7 @@ def _trends_secid(ts_code: str) -> str:
 def _trends_get(
     secid: str, ndays: int, proxies: dict[str, str] | None, timeout: float
 ) -> dict:
-    """东财 push2his trends2 单次请求，返回原始 JSON dict。"""
-    import requests
-
+    """东财 push2his trends2 单次请求（加固 Session），返回原始 JSON dict。"""
     params = {
         "secid": secid,
         "fields1": "f1,f2,f3,f7",
@@ -971,7 +981,8 @@ def _trends_get(
         "ndays": ndays,
         "iscr": 0,
     }
-    resp = requests.get(_EM_TRENDS_URL, params=params, timeout=timeout, proxies=proxies)
+    with _em_session() as session:
+        resp = session.get(_EM_TRENDS_URL, params=params, timeout=timeout, proxies=proxies)
     resp.raise_for_status()
     return resp.json() or {}
 

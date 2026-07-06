@@ -13,31 +13,32 @@ v2 单屏两栏布局（消灭 tab / 消灭滑动，1440×900 基准）：
 - 右栏（48%）上半下钻成分表（行选择联动图表），下半个股图表
   （分时 / 5日 / 日K，segmented_control 切周期，altair 绘制）。
 
-缓存分层（st.cache_data，大 DataFrame 不做缓存入参——以 as_of 快照时间戳作键，
-函数内部再调上游缓存取数）：快照/资金流 60s、本地副本 300s、合表/下钻 120s、
-分时 60s、日K 600s。60s st.fragment 自动重跑，交互走 fragment 局部 rerun、列头排序
-走客户端零 rerun。所有 DuckDB 读只经 panorama_data（只读副本），UI 层绝不直连主库。
+取数架构（2026-07-06 盘中事故后重构）：快照 + 行业/概念资金流由 SourcePoller
+后台 daemon 线程 60s 循环拉取（每源独立熔断，sina 兜底级单独熔断），UI 只读
+last-known-good slot——渲染永不等取数。fragment run_every=60 只做纯渲染零网络；
+「立即刷新」触发 poller 立即开跑一轮（不阻塞渲染）。合表/下钻 st.cache_data 120s
+（键含 poller 给的 as_of，as_of 不变即命中）、本地副本 300s、分时 60s、日K 600s。
+所有 DuckDB 读只经 panorama_data（只读副本），UI 层绝不直连主库。
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 from rquant.panorama_data import (
     BOARD_SYSTEMS,
     ROUTE_LABELS,
     MarketPulse,
-    add_limit_prices,
     board_constituents,
     build_board_overview,
     compute_market_pulse,
     fetch_intraday_trend,
-    fetch_market_snapshot,
-    fetch_sector_fund_flow,
     industry_fallback_members,
     load_board_members,
     load_daily_kline,
@@ -45,6 +46,7 @@ from rquant.panorama_data import (
     load_liquidity_baseline,
     load_pool_flags,
 )
+from rquant.panorama_poller import SourcePoller
 
 CST = timezone(timedelta(hours=8))
 REFRESH_SECONDS = 60
@@ -86,22 +88,15 @@ st.set_page_config(
 )
 
 
-# ── 缓存层（TTL 矩阵见设计文档 §B1） ───────────────────────────────────────────
+# ── 取数层（快照/资金流走后台 poller，本地副本走 st.cache_data） ───────────────
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner="拉取全市场快照…")
-def cached_snapshot() -> tuple[pd.DataFrame, str, str]:
-    """全市场快照（带涨停价）+ 快照时间戳 + 路由。时间戳同时充当下游合表的缓存键。"""
-    raw = fetch_market_snapshot()
-    route = raw.attrs.get("route", "none")
-    return add_limit_prices(raw), datetime.now(CST).strftime("%H:%M:%S"), route
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_fund_flow(sector_type: str) -> tuple[pd.DataFrame, str]:
-    """板块资金流 + 路由标签（route 在 fetch 返回的新对象上取，先落成字符串免受缓存序列化影响）。"""
-    flow = fetch_sector_fund_flow(sector_type)
-    return flow, flow.attrs.get("route", "none")
+@st.cache_resource(show_spinner=False)
+def get_poller() -> SourcePoller:
+    """进程级单例后台拉取器（所有浏览器会话共享，消掉会话数×源数的请求放大）。"""
+    poller = SourcePoller(interval=float(REFRESH_SECONDS))
+    poller.start()
+    return poller
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -134,12 +129,13 @@ def cached_overview(system: str, as_of: str) -> tuple[pd.DataFrame, str | None]:
 
     返回 (总表, 资金流路由)；开盘啦题材不拉资金流 → 路由 None、资金流三列全 NaN。
     """
-    snapshot, _, _ = cached_snapshot()
+    poller = get_poller()
+    snapshot, _, _ = poller.snapshot()
     members, _ = cached_members()
     kpl_members = cached_kpl_members()
     flow_type = _SYSTEM_FLOW_TYPE.get(system)
     if flow_type is not None:
-        flow, route = cached_fund_flow(flow_type)
+        flow, route = poller.flow(flow_type)
     else:
         flow, route = pd.DataFrame(), None
     overview = build_board_overview(snapshot, members, kpl_members, flow, system)
@@ -153,7 +149,7 @@ def cached_constituents(board_code: str, as_of: str) -> pd.DataFrame:
     board_code 在东财（BKxxxx.DC）/ 开盘啦（xxxxxx.KP）/ industry 兜底三套命名空间内
     互不重叠，故东财 + 开盘啦成分按 board_code 合一即可唯一定位，无需再传体系。
     """
-    snapshot, _, _ = cached_snapshot()
+    snapshot, _, _ = get_poller().snapshot()
     members, _ = cached_members()
     kpl_members = cached_kpl_members()
     combined = _combined_members(members, kpl_members)
@@ -310,10 +306,26 @@ def _record_pulse_history(pulse: MarketPulse) -> pd.DataFrame:
     return df.melt("time", var_name="指标", value_name="家数")
 
 
-def render_pulse(snapshot: pd.DataFrame, as_of: str) -> None:
+def _snapshot_status_line(as_of: str, snap_route: str, status: dict) -> str:
+    """动态状态行：数据时间 + 新鲜度 + 快照路由；age>180s 加 ⚠️ 与错误摘要。"""
+    snap = status.get("snapshot") or {}
+    age = snap.get("age_seconds")
+    age_txt = f"{int(age)} 秒前" if age is not None else "—"
+    line = f"数据 {as_of}（{age_txt}）· 快照路由 {ROUTE_LABELS.get(snap_route, snap_route)}"
+    if age is not None and age > 180:
+        err = str(snap.get("last_error") or "").strip()
+        line = f"⚠️ {line} · 数据陈旧" + (f" · 最近错误：{err[:80]}" if err else "")
+    return line
+
+
+def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict) -> None:
     pulse = compute_market_pulse(snapshot)
     if pulse.total_count == 0:
-        st.info("快照源暂不可用（sina），等下一轮刷新")
+        # slot 保留 last-known-good：空快照 ⇔ 后台从未成功过（首轮或全路由熔断）
+        st.info("首轮拉取进行中（东财直连 → SOCKS 出口 → 新浪 依次尝试），页面不阻塞，稍候自动出数")
+        err = str((status.get("snapshot") or {}).get("last_error") or "").strip()
+        if err:
+            st.caption(f"最近错误：{err[:120]}")
         return
     spark = _record_pulse_history(pulse)  # 每轮都记，与 popover 是否展开无关
 
@@ -323,6 +335,7 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str) -> None:
     c3.metric("炸板", pulse.broken_count)
     c4.metric("上涨占比", f"{pulse.up_ratio_pct:.1f}%")
     c5.metric("涨/跌家数", f"{pulse.up_count} / {pulse.down_count}")
+    st.caption(_snapshot_status_line(as_of, snap_route, status))
     with c6, st.popover("📈", width="stretch"):
         st.caption(f"快照 {as_of} · 有效样本 {pulse.total_count} 只（停牌除外）")
         if not spark.empty and spark["time"].nunique() >= 2:
@@ -559,19 +572,30 @@ head_l, head_r = st.columns([5, 1])
 with head_l:
     st.markdown("### 盘中市场全景")
 with head_r:
-    if st.button("🔄 立即刷新", width="stretch", help="清缓存并整页重跑"):
-        st.cache_data.clear()
-        st.rerun()
+    if st.button("🔄 立即刷新", width="stretch", help="触发后台立即拉取一轮（不阻塞渲染）"):
+        get_poller().refresh_now()
 st.caption(
-    "仅本地运行 · 快照/资金流 60s、本地副本 300s、合表/下钻 120s、分时 60s、日K 600s 缓存 · "
-    f"页面 {REFRESH_SECONDS}s 自动刷新 · 只读副本，不写主库"
+    f"仅本地运行 · 后台拉取器 {REFRESH_SECONDS}s（快照/资金流，每源独立熔断）· "
+    "本地副本 300s / 合表下钻 120s / 分时 60s / 日K 600s 缓存 · "
+    f"页面 {REFRESH_SECONDS}s 自动刷新（纯渲染零等待）· 只读副本，不写主库"
 )
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def render_body() -> None:
-    snapshot, as_of, snap_route = cached_snapshot()
-    render_pulse(snapshot, as_of)
+    poller = get_poller()
+    snapshot, as_of, snap_route = poller.snapshot()
+    render_pulse(snapshot, as_of, snap_route, poller.status())
+
+    if not as_of:
+        # 首拉未完成：提示已经画上（render_pulse 首轮 info），1s 后重跑再看 slot
+        # ——只重读内存 slot 不碰网络，避免冷启动空页面干等 60s fragment 周期。
+        # scope="fragment" 仅在 fragment rerun 中合法，初始整页运行时降级整页重跑
+        time.sleep(1.0)
+        try:
+            st.rerun(scope="fragment")
+        except StreamlitAPIException:
+            st.rerun()
 
     left, right = st.columns([52, 48])
     with left:
