@@ -77,6 +77,65 @@ header[data-testid="stHeader"] {display: none;}
 [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p {font-size: 0.78rem;}
 [data-testid="stVerticalBlock"] {gap: 0.5rem;}
 [data-testid="stElementToolbar"] {display: none;}
+
+/* ── 移动端（窄屏 ≤768px）响应式屏效优化 ──────────────────────────
+   纯 CSS 媒体查询：PC（>768px）不受任何影响、逐像素保持原样；窄屏下把 st.columns
+   渲染的 flexbox 横排改造成竖排堆叠 + 换行 + 收紧高度。不改任何 Python 布局逻辑。
+   用 :has() 精准区分三类横排块（标题行 / 脉搏 metric 行 / 含 dataframe 的主两栏），
+   避免一刀切 flex-direction 误伤脉搏行。表格高度靠覆盖 stDataFrameResizable —
+   glide-grid 用 ResizeObserver 观察容器尺寸，改高后 canvas 自动 reflow、行仍可
+   滚动/触摸选择（已 Playwright 实测：client 238 / scroll 245 → 可滚）。
+   CSS 对选择器/声明间空白不敏感，长 :has() 规则跨行折行仅为过 E501，渲染等价。 */
+@media (max-width: 768px) {
+  .block-container {padding-top: 0.5rem; padding-left: 0.55rem; padding-right: 0.55rem;}
+  h3 {font-size: 1.25rem !important;}
+  [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {font-size: 0.66rem;}
+
+  /* 标题 + 立即刷新：竖排，刷新按钮变全宽触摸目标 */
+  [data-testid="stHorizontalBlock"]:has(h3) {flex-direction: column !important;}
+  [data-testid="stHorizontalBlock"]:has(h3) > [data-testid="stColumn"] {
+    width: 100% !important;
+    flex: 1 1 100% !important;
+  }
+
+  /* 主两栏（含板块总表/下钻的 [52,48]）→ 竖排堆叠：左总表在上、右下钻+个股图表在下 */
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stDataFrame"]) {
+    flex-direction: column !important;
+  }
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stDataFrame"])
+    > [data-testid="stColumn"] {
+    width: 100% !important;
+    flex: 1 1 100% !important;
+    min-width: 0 !important;
+  }
+
+  /* 脉搏 5 metric + sparkline popover：保持横排但换行（约 3 个/行）+ 缩字号，防挤压溢出 */
+  [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) {
+    flex-wrap: wrap !important;
+    gap: 0.2rem 0.4rem !important;
+  }
+  [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > [data-testid="stColumn"] {
+    flex: 1 0 30% !important;
+    min-width: 30% !important;
+  }
+  [data-testid="stMetricValue"] {font-size: 1.0rem; line-height: 1.1;}
+  [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p {font-size: 0.66rem;}
+
+  /* 体系/周期 segmented_control 按钮组换行不溢出 */
+  [data-testid="stButtonGroup"] {flex-wrap: wrap !important;}
+
+  /* 表格高度移动端收紧：板块总表（左列）560→360、下钻成分（右列）250→240 */
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stDataFrame"])
+    > [data-testid="stColumn"]:first-child [data-testid="stDataFrameResizable"] {
+    height: 360px !important;
+    max-height: 360px !important;
+  }
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stDataFrame"])
+    > [data-testid="stColumn"]:last-child [data-testid="stDataFrameResizable"] {
+    height: 240px !important;
+    max-height: 240px !important;
+  }
+}
 </style>
 """
 
