@@ -1,0 +1,29 @@
+[Unit]
+Description=rQuant Panorama Login Gate (cookie 登录服务, 微信友好)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+# EnvironmentFile 读 .env 里的 RQUANT_PANORAMA_COOKIE_SECRET（签名令牌密钥）；
+# 缺失该变量时 serve_auth 直接 SystemExit（Restart=always 会反复重启并在 journal
+# 反复打印拒启原因，部署时一眼可见）。
+EnvironmentFile=/home/lighthouse/rquant/.env
+# 登录服务只绑回环，只给 nginx auth_request / /login 反代，不直接对外。
+# 端口 8507 与 rquant-panorama-cloud.conf 的 /_panorama_auth、/login 反代目标一致。
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant panorama-auth-serve \
+    --host 127.0.0.1 \
+    --port 8507
+
+Restart=always
+RestartSec=10
+TimeoutStartSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

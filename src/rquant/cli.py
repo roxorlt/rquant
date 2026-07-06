@@ -1141,6 +1141,79 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_panorama_auth_serve(args: argparse.Namespace) -> int:
+    """启动全景页登录网关服务（标准库 http.server，systemd 拉起）。"""
+    from rquant.config import settings
+    from rquant.panorama_auth import serve_auth
+
+    setup_logging()
+    return serve_auth(
+        settings.panorama_cookie_secret,
+        settings.panorama_users_path_resolved,
+        host=args.host,
+        port=args.port,
+    )
+
+
+def cmd_panorama_user_add(args: argparse.Namespace) -> int:
+    """交互式添加/更新全景页登录用户（getpass 输密码两次确认，不回显）。"""
+    import getpass
+
+    from rquant.config import settings
+    from rquant.panorama_auth import UserStore
+
+    setup_logging()
+    pw1 = getpass.getpass(f"为 {args.name} 设置密码: ")
+    pw2 = getpass.getpass("再次输入确认: ")
+    if pw1 != pw2:
+        logger.error("两次输入不一致，未修改用户库")
+        return 1
+    if not pw1:
+        logger.error("密码不能为空，未修改用户库")
+        return 1
+
+    store = UserStore(settings.panorama_users_path_resolved)
+    existed = args.name in store.list_users()
+    try:
+        store.add(args.name, pw1)
+    except ValueError as e:
+        logger.error(f"用户名不合法: {e}")
+        return 1
+    logger.info(f"✅ 已{'更新' if existed else '添加'} {args.name}（用户库 {store.path}）")
+    return 0
+
+
+def cmd_panorama_user_remove(args: argparse.Namespace) -> int:
+    """移除全景页登录用户（不存在为 no-op）。"""
+    from rquant.config import settings
+    from rquant.panorama_auth import UserStore
+
+    setup_logging()
+    store = UserStore(settings.panorama_users_path_resolved)
+    if store.remove(args.name):
+        logger.info(f"已移除 {args.name}（用户库 {store.path}）")
+    else:
+        logger.warning(f"{args.name} 不在用户库，无需移除")
+    return 0
+
+
+def cmd_panorama_user_list(args: argparse.Namespace) -> int:
+    """列出全景页登录用户名（不含哈希）。"""
+    from rquant.config import settings
+    from rquant.panorama_auth import UserStore
+
+    setup_logging()
+    store = UserStore(settings.panorama_users_path_resolved)
+    users = store.list_users()
+    if not users:
+        logger.info(f"用户库为空（{store.path}）")
+        return 0
+    for name in users:
+        logger.info(f"  {name}")
+    logger.info(f"共 {len(users)} 个用户")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -1880,6 +1953,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="任务 spec JSON 路径（launch_background_run 生成）",
     )
 
+    pa_serve_p = sub.add_parser(
+        "panorama-auth-serve",
+        help="启动全景页登录网关服务（微信友好 cookie 登录，标准库 http.server）",
+    )
+    pa_serve_p.add_argument(
+        "--host", type=str, default="127.0.0.1",
+        help="监听地址 (默认 127.0.0.1，只给 nginx 反代)",
+    )
+    pa_serve_p.add_argument(
+        "--port", type=int, default=8507,
+        help="监听端口 (默认 8507)",
+    )
+
+    pa_add_p = sub.add_parser(
+        "panorama-user-add", help="添加/更新全景页登录用户（交互式输密码，覆盖同名）",
+    )
+    pa_add_p.add_argument("name", type=str, help="用户名（字母/数字/点/下划线/短横）")
+
+    pa_rm_p = sub.add_parser("panorama-user-remove", help="移除全景页登录用户")
+    pa_rm_p.add_argument("name", type=str, help="用户名")
+
+    sub.add_parser("panorama-user-list", help="列出全景页登录用户名（不含哈希）")
+
     return parser
 
 
@@ -1925,6 +2021,10 @@ def main() -> int:
         "preflight": cmd_preflight,
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
+        "panorama-auth-serve": cmd_panorama_auth_serve,
+        "panorama-user-add": cmd_panorama_user_add,
+        "panorama-user-remove": cmd_panorama_user_remove,
+        "panorama-user-list": cmd_panorama_user_list,
     }
     handler = dispatch.get(args.command)
     if handler is None:
@@ -1933,9 +2033,13 @@ def main() -> int:
 
     # alert / daily-report 自身就是日常运维路径，main 不该再吞它的异常包一层；
     # lab-run 的失败已有 status 文件 + UI 展示，不该再推运维告警
+    # panorama-auth-* 是独立登录网关，不依赖 notify 体系，SECRET 缺失走 SystemExit
+    # （非 Exception，本就不被下方 except 捕获），不该再包一层运维告警。
     if args.command in (
         "serve", "notify-test", "alert",
         "daily-report", "pre-market-check", "preflight", "lab-run",
+        "panorama-auth-serve", "panorama-user-add",
+        "panorama-user-remove", "panorama-user-list",
     ):
         return handler(args)
 
