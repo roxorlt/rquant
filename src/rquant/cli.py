@@ -1150,12 +1150,33 @@ def cmd_panorama_auth_serve(args: argparse.Namespace) -> int:
     from rquant.panorama_auth import serve_auth
 
     setup_logging()
+    # map 方案：登录成功下发固定网关令牌（显式配置优先，否则由 cookie_secret 派生）。
     return serve_auth(
-        settings.panorama_cookie_secret,
+        settings.panorama_gate_token_resolved,
         settings.panorama_users_path_resolved,
         host=args.host,
         port=args.port,
     )
+
+
+def cmd_panorama_gate_token(args: argparse.Namespace) -> int:
+    """打印当前生效的 map 网关令牌（部署时写进 nginx map 文件，只读打印无副作用）。
+
+    仅把令牌打到 stdout，供 `echo "\"$(rquant panorama-gate-token)\" 1;" | tee map` 取用；
+    未配置（GATE_TOKEN 与 COOKIE_SECRET 均空）时向 stderr 报错并返回 1，避免写入空令牌。
+    """
+    from rquant.config import settings
+
+    token = settings.panorama_gate_token_resolved
+    if not token:
+        print(
+            "RQUANT_PANORAMA_GATE_TOKEN / RQUANT_PANORAMA_COOKIE_SECRET 均未配置，"
+            "无法生成网关令牌",
+            file=sys.stderr,
+        )
+        return 1
+    print(token)
+    return 0
 
 
 def cmd_panorama_user_add(args: argparse.Namespace) -> int:
@@ -1992,6 +2013,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("panorama-user-list", help="列出全景页登录用户名（不含哈希）")
 
+    sub.add_parser(
+        "panorama-gate-token",
+        help="打印当前生效的 map 网关令牌（写进 nginx map 文件，只读）",
+    )
+
     return parser
 
 
@@ -2041,6 +2067,7 @@ def main() -> int:
         "panorama-user-add": cmd_panorama_user_add,
         "panorama-user-remove": cmd_panorama_user_remove,
         "panorama-user-list": cmd_panorama_user_list,
+        "panorama-gate-token": cmd_panorama_gate_token,
     }
     handler = dispatch.get(args.command)
     if handler is None:
@@ -2055,7 +2082,7 @@ def main() -> int:
         "serve", "notify-test", "alert",
         "daily-report", "pre-market-check", "preflight", "lab-run",
         "panorama-auth-serve", "panorama-user-add",
-        "panorama-user-remove", "panorama-user-list",
+        "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
     ):
         return handler(args)
 

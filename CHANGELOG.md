@@ -30,6 +30,19 @@
   `docs/deploy/2026-07-06-panorama-login-gate-deploy.md`（生成 SECRET、建用户、起 auth
   service、`nginx -V` 检查 auth_request、reload、微信实测、旧 `.htpasswd-panorama` 保留、
   回滚换回 basic auth 版）。旧 basic auth（`.htpasswd-panorama`）保留备用不删。
+  - **登录网关改 map 固定令牌方案（云端 nginx 无 auth_request 模块）**：云端 nginx 编译时
+    缺 `ngx_http_auth_request_module`（`nginx -V | grep auth_request` 无输出），
+    auth_request 指令跑不了，改用 nginx `map` 静态比对 cookie。登录成功后 `Set-Cookie` 下发
+    **固定网关令牌**（所有已登录用户共用同一 cookie 值，nginx map 认这个字面值放行、
+    `default 0` 拦截），不再是 per-user 签名令牌。网关令牌显式 `RQUANT_PANORAMA_GATE_TOKEN`
+    优先，否则由 `RQUANT_PANORAMA_COOKIE_SECRET` 确定性派生
+    （`hmac_sha256("panorama-gate", secret)[:32]`，重启稳定）。`GET /verify` 改为
+    `compare_digest(cookie, GATE_TOKEN)`（保留供将来 auth_request 环境用）；`sign_token` /
+    `verify_token` 保留（未来切回）。新增 CLI `panorama-gate-token`（打印生效令牌供部署写进
+    map 文件）+ config `panorama_gate_token` 字段 + `panorama_gate_token_resolved` property。
+    nginx conf 改为 map 版（`include rq-panorama-gate.map` + `if ($rq_panorama_ok = 0)`
+    302，auth_request 版留档在文件末尾注释）。**权衡**：无法单独踢某用户（踢人 = 轮换令牌
+    令全体重登），但 per-user 密码仍独立、登录审计可分辨谁登录。
 - **全景页上云（云端直跑，零隧道）**：全景页从「Mac 拉数 + SSH 反向隧道」改为云端
   常驻——手机/朋友任意网络直访 `82.156.0.68:28080`（basic auth）→ 云 127.0.0.1:8506
   的 streamlit，poller 读同机 surge feed + 自拉兜底，零隧道、零 Mac 依赖（Mac 本地
