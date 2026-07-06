@@ -813,6 +813,26 @@ def cmd_midday_report(args: argparse.Namespace) -> int:
     return run_midday_report(report_date=args.date, force=args.force, dry_run=args.dry_run)
 
 
+def cmd_surge_watch(args: argparse.Namespace) -> int:
+    """每分钟爆量推送（云端 systemd timer 09:25 拉起，15:02 自然退出）。
+
+    --simulate DIR：离线回放目录内快照 parquet 序列（可测性设施）；
+    --dry-run：全流程跑但不推送（打印报文）；--force-session：忽略时段守卫（盘后验收）。
+    """
+    from pathlib import Path as _Path
+
+    from rquant.surge_watch import run_simulate, run_surge_watch
+
+    setup_logging()
+    if args.simulate:
+        return run_simulate(_Path(args.simulate), dry_run=args.dry_run)
+    return run_surge_watch(
+        dry_run=args.dry_run,
+        force_session=args.force_session,
+        max_ticks=args.max_ticks,
+    )
+
+
 def cmd_alert(args: argparse.Namespace) -> int:
     """发一条运维告警（用于 systemd OnFailure / watchdog 等场景）。
 
@@ -1809,6 +1829,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="跑完推一条摘要到 PushDeer（默认只 stdout）",
     )
 
+    sw_p = sub.add_parser(
+        "surge-watch", help="每分钟爆量推送（云端 systemd timer 09:25 拉起，15:02 自退）",
+    )
+    sw_p.add_argument(
+        "--dry-run", action="store_true", help="全流程跑但不推送（打印报文，parquet 照落）",
+    )
+    sw_p.add_argument(
+        "--simulate", type=str, default=None,
+        help="离线回放目录内快照 parquet 序列（逐分钟，可测性设施）",
+    )
+    sw_p.add_argument(
+        "--force-session", action="store_true", help="忽略时段守卫（盘后验收用）",
+    )
+    sw_p.add_argument(
+        "--max-ticks", type=int, default=None,
+        help="限定循环次数（dry-run / 盘后 smoke，默认跑到 15:02）",
+    )
+
     alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")
     alert_p.add_argument("--subject", required=True, help="告警主题")
     alert_p.add_argument("--body", default="", help="告警正文（可选）")
@@ -1864,6 +1902,7 @@ def main() -> int:
         "midday-report": cmd_midday_report,
         "pre-market-check": cmd_pre_market_check,
         "preflight": cmd_preflight,
+        "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
     }
     handler = dispatch.get(args.command)

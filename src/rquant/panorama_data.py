@@ -108,6 +108,7 @@ ROUTE_LABELS: dict[str, str] = {
     "em_socks": "东财·云端出口",
     "ths": "同花顺",
     "sina": "新浪",
+    "cloud_feed": "云端feed",
     "none": "不可用",
 }
 

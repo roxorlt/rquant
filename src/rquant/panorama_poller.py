@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +43,10 @@ _DEFAULT_FAIL_THRESHOLD = 3
 _DEFAULT_COOLDOWN = 180.0
 _SINA_FAIL_THRESHOLD = 2
 _SINA_COOLDOWN = 300.0
+
+# 云端 feed（P2）：Mac 优先读云 nginx 暴露的 surge-watch 全市场快照，
+# 新鲜（Last-Modified ≤120s）则本机不再自拉。env 未配 → 返回 None，行为不变。
+_CLOUD_FEED_MAX_AGE = 120.0
 
 # ── 共享 drop 布局（poller 写、midday_briefing 等只读；纯 parquet 无 DuckDB 锁） ─
 
@@ -93,6 +97,45 @@ def _default_snapshot_fetcher(allow_sina: bool) -> pd.DataFrame:
     return df
 
 
+def _default_cloud_feed() -> tuple[pd.DataFrame, str] | None:
+    """P2 第 0 路由：GET RQUANT_CLOUD_FEED_URL（云端 surge 全市场 parquet）。
+
+    env 未配 → None（现状零变化）。Last-Modified 距今 >120s（陈旧）/ 空 / HTTP 失败
+    → None，调用方回落现有三级路由。凭据走 RQUANT_CLOUD_FEED_USER/PASS（basic auth）。
+    """
+    url = os.environ.get("RQUANT_CLOUD_FEED_URL", "").strip()
+    if not url:
+        return None
+    from email.utils import parsedate_to_datetime
+    from io import BytesIO
+
+    import requests
+
+    user = os.environ.get("RQUANT_CLOUD_FEED_USER", "").strip()
+    pwd = os.environ.get("RQUANT_CLOUD_FEED_PASS", "").strip()
+    auth = (user, pwd) if user else None
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.get(url, auth=auth, timeout=8.0)
+        resp.raise_for_status()
+        last_mod = resp.headers.get("Last-Modified")
+        if last_mod:
+            age = (datetime.now(UTC) - parsedate_to_datetime(last_mod)).total_seconds()
+            if age > _CLOUD_FEED_MAX_AGE:
+                logger.warning(f"云端 feed 陈旧（{age:.0f}s>120s），回落自拉")
+                return None
+        df = pd.read_parquet(BytesIO(resp.content))
+        if df is None or df.empty:
+            return None
+        if "limit_up_price" not in df.columns:
+            df = add_limit_prices(df)
+        return df, "cloud_feed"
+    except Exception as e:
+        logger.warning(f"云端 feed 拉取失败，回落自拉: {type(e).__name__}: {e}")
+        return None
+
+
 @dataclass
 class _SourceState:
     """单源 slot + 熔断状态（slot 由 SourcePoller._lock 保护）。"""
@@ -133,12 +176,15 @@ class SourcePoller:
         now: Callable[[], float] = time.monotonic,
         snapshot_fetcher: Callable[[bool], pd.DataFrame] | None = None,
         flow_fetcher: Callable[[str], pd.DataFrame] | None = None,
+        cloud_feed_fetcher: Callable[[], tuple[pd.DataFrame, str] | None] | None = None,
         drop_dir: Path | None = None,
     ) -> None:
         self._interval = interval
         self._now = now
         self._snapshot_fetcher = snapshot_fetcher or _default_snapshot_fetcher
         self._flow_fetcher = flow_fetcher or fetch_sector_fund_flow
+        # 云端 feed 第 0 路由；默认读 env（未配 → None，行为不变）
+        self._cloud_feed_fetcher = cloud_feed_fetcher or _default_cloud_feed
         self._drop_dir = drop_dir if drop_dir is not None else default_live_drop_dir()
         self._drop_meta: dict[str, dict] = {}  # 仅 poll 线程读写，无需加锁
         self._lock = threading.Lock()
@@ -206,6 +252,18 @@ class SourcePoller:
 
     def _poll_snapshot(self) -> None:
         state = self._states[SNAPSHOT_KEY]
+
+        # 第 0 路由：云端 feed 新鲜命中则本机不自拉（env 未配时 fetcher 返回 None）
+        cloud = self._cloud_feed_fetcher()
+        if cloud is not None:
+            cdf, croute = cloud
+            if cdf is not None and not cdf.empty:
+                mono = self._now()
+                with self._lock:
+                    state.mark_success(cdf, croute, mono, self._wall_clock())
+                self._write_drop(SNAPSHOT_KEY, cdf, croute)
+                return
+
         mono = self._now()
         if mono < state.cooling_until:
             return

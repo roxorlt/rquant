@@ -6,6 +6,35 @@
 
 ### Added
 
+- **每分钟爆量推送（surge-watch）+ 取数迁云端**：新模块
+  `src/rquant/surge_watch.py` 与 CLI `rquant surge-watch [--dry-run] [--simulate DIR]
+  [--force-session] [--max-ticks N]`（云端 systemd timer `Mon..Fri 09:25` 拉起、单进程
+  每分钟循环、15:02 自然退出）。盘中拉创业板+科创板全量快照（em clist 直连，复用
+  `panorama_data` 加固 Session：每次全新 + `trust_env=False` + 桌面 UA + Connection:close，
+  fs 换 `m:0+t:80` 创业 / `m:1+t:23` 科创），两层判定：**粗筛**（零外部调用）当日累计额
+  ≥ `K_rough(1.5) × 20日均额 × 进度曲线(t)` 且 pct_chg>0、非 ST、有 20 日基线；**确认层**
+  （近 3 天口径，用户 pinned）对新候选拉 tushare `stk_mins` 近 3 交易日 1min bars 构 3 日
+  同刻累计额中位，`rel_cum_3d = cum(t)/median_3d(t) ≥ K_confirm(2.0)` 且现价 ≥ 当日均价
+  （快照 amount/volume 近似 VWAP）。tushare 限频队列 2/分、当日缓存不重拉、失败延后重试；
+  每票每日仅推一次、9:33 前静默收集、单条 ≤8 只超出折叠；聚合一条 PushDeer（新 scene
+  `surge_watch`，**只 admin**，PushPlus 跳过）+ append `data/surge_live/events-*.jsonl`，
+  收盘落当日累计额序列 parquet。**绝不写 DuckDB**：仅启动预载只读副本 20 日均额 + kpl 题材，
+  盘中零 DB 访问；时钟/源/推送/sleep 全可注入（单测不真 sleep 不碰网络）。守卫：非交易日即退、
+  午休 sleep、快照连续 5 分钟 miss 推一条降级告警（error scene）并退避 60/120/300。
+  口径 v1: rough1.5×20d·curve / confirm2.0×3d同刻 / VWAP门（产品初始值，跑几天按量级调）。
+- **盘中累计成交额进度曲线标定**：`scripts/calibrate-intraday-curve.py` 从本地只读副本
+  `minute_bar`（1min，取当日恰好 241 根的干净股·日样本）在 DuckDB 侧两级中位聚合（股内
+  跨日中位 → 跨股中位）产出 `src/rquant/data/intraday_progress_curve.json`（241 点、单调
+  不减、首≈0.006 尾=1；本次 1716 只样本）。随包分发（importlib.resources 定位，`.gitignore`
+  加例外让 `src/rquant/data/*.json` 进 git）；surge-watch 启动加载，缺失 → 线性兜底 + warning。
+- **panorama poller 云端 feed 第 0 路由（P2）**：`SourcePoller` 快照新增最高优先级路由 ——
+  env `RQUANT_CLOUD_FEED_URL` 配置时 HTTP GET 云端 surge 全市场 `snapshot_full.parquet`
+  （basic auth 走 `RQUANT_CLOUD_FEED_USER/PASS`），Last-Modified ≤120s 新鲜则本机不再自拉；
+  **env 未配 → 行为与现状完全一致（零风险）**，陈旧/失败自动回落现有三级路由。配套
+  `deploy/nginx/rquant-backup.conf` 加 `/feed/` location（8081，静态 parquet + basic auth）。
+  surge-watch 每 5 分钟额外拉一次全市场快照落 `snapshot_full.parquet` 供 Mac 消费。
+  部署清单 `docs/deploy/2026-07-06-surge-watch-deploy.md`（deploy.sh + systemd-analyze
+  验证 + nginx location + .env 新增项 + 验证 curl）。
 - **盘中 30 分钟脉搏 + 午间战报（midday_briefing）**：新模块
   `src/rquant/midday_briefing.py` 与两条 CLI —— `rquant morning-pulse
   [--slot HH:MM] [--force] [--dry-run]`（launchd Mon..Fri 10:00/10:30/11:00/

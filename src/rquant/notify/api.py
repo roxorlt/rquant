@@ -19,7 +19,11 @@ Scene = Literal[
     "heartbeat",
     "morning_pulse",
     "midday_report",
+    "surge_watch",
 ]
+
+# 只推 admin（PushDeer）不推 PushPlus 的场景：爆量确认每分钟批次高频，只发刘彤
+_PUSHDEER_ONLY_SCENES: frozenset[str] = frozenset({"surge_watch"})
 
 
 def _scene_enabled(scene: str) -> bool:
@@ -53,6 +57,9 @@ def notify(scene: Scene, **kwargs) -> None:
             _log_notification(scene, "pushdeer", key[:8], success, err, title)
     except Exception as e:
         logger.error(f"通知 [{scene}] PushDeer 推送失败: {e}")
+
+    if scene in _PUSHDEER_ONLY_SCENES:
+        return  # 只 admin，跳过 PushPlus
 
     pushplus = PushPlusClient(
         tokens=settings.pushplus_token_list,

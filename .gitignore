@@ -77,12 +77,19 @@ data/midday/
 data/reports/
 # 全景 poller 共享 drop（midday 等消费者只读）
 data/panorama_live/
+# surge-watch 盘中自产数据（snapshot / events / series，同 panorama_live 不进 git）
+data/surge_live/
 *.duckdb
 *.duckdb.wal
 *.parquet
 *.sqlite
 *.sqlite3
 *.db
+
+# 例外：随包分发的标定产物必须进 git（上面 data/ 规则会误伤 src/rquant/data/）
+!src/rquant/data/
+!src/rquant/data/*.json
+!src/rquant/data/*.py
 
 # 日志
 logs/
