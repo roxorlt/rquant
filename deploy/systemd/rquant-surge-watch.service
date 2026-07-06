@@ -1,0 +1,37 @@
+[Unit]
+Description=rQuant Surge Watch (per-minute volume-surge push, GEM/STAR)
+After=network-online.target
+Wants=network-online.target
+
+# 失败时触发 alert relay 推 PushDeer
+OnFailure=rquant-alert@%n.service
+
+# 崩溃重启风暴护栏：10 分钟内最多 5 次拉起，超限 systemd 放弃（不无限重启）
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant surge-watch
+
+# 长跑单进程：09:25 timer 拉起，盘中每分钟循环，15:02 自然 return 0 退出。
+# 语义关键：
+#   - 15:02 正常退出 = exit 0 → SuccessExitStatus=0 视为成功，Restart=on-failure 不拉起
+#     （不会造成收盘后反复重启风暴）；
+#   - 盘中崩溃 = 非 0 退出 → 60s 后拉起续跑（配合上面 StartLimit 护栏）。
+Restart=on-failure
+RestartSec=60
+SuccessExitStatus=0
+
+# 启动预载只读副本 + 加载曲线，宽松给 5 分钟
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

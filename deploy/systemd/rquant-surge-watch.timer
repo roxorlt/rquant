@@ -1,0 +1,15 @@
+[Unit]
+Description=Trigger rQuant surge-watch at 09:25 Mon-Fri
+
+[Timer]
+# 09:25 拉起（与 monitor 同刻），程序内守卫 09:30 起进检测，15:02 自然退出。
+# 已知安全语法（固定时刻，非分钟步进），systemd-analyze calendar 可验。
+OnCalendar=Mon..Fri *-*-* 09:25:00
+
+# 错过时间不补（盘已开后再拉意义不大，下次开盘自然再来）
+Persistent=false
+
+Unit=rquant-surge-watch.service
+
+[Install]
+WantedBy=timers.target
