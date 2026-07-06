@@ -1,0 +1,23 @@
+[Unit]
+Description=Trigger rQuant KPL concept member snapshot at 16:35 Mon-Fri
+
+[Timer]
+# 16:35 收盘后写云端主库 kpl_concept_member 快照（开盘啦题材成分）。
+# 写者串行槽位（16:35 无并发写主库者）：
+#   - rquant-monitor 15:02 自然退出（盘中写者已停）；
+#   - rquant-daily 17:00 起（尚未启动）；
+#   - rquant-backup / rquant-replica-sync 只做只读 cp（backup-snapshot.sh 是 cp+gzip、
+#     replica-sync 是 cp 主库+WAL，均不写主库）——不与本 job 抢写锁。
+# replica-sync 时刻表在 15:10 与 17:30 之间无触发，故本快照 16:35 写入要等 17:30 那次
+# replica-sync 才带进只读副本（全景页读副本），当晚 17:30 后可见（非 5min 内）。
+# 固定时刻语法（非分钟步进），systemd-analyze calendar 可验。
+OnCalendar=Mon..Fri *-*-* 16:35:00
+
+# 错过不补跑：题材成分变化慢，漏一天次日自愈；且 Persistent=true 的补跑可能撞进
+# daily 17:00 的写库窗口（两写者抢 DuckDB 单文件锁），故明确 false。
+Persistent=false
+
+Unit=rquant-kpl-snapshot.service
+
+[Install]
+WantedBy=timers.target

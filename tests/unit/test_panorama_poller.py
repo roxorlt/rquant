@@ -6,7 +6,11 @@ daemon 线程 + threading.Event 同步（wait 带超时，无长 sleep）。
 
 from __future__ import annotations
 
+import os
 import threading
+import time
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -15,6 +19,8 @@ from rquant.panorama_poller import (
     FLOW_TYPES,
     SNAPSHOT_KEY,
     SourcePoller,
+    _default_cloud_feed,
+    is_off_hours,
     read_live_frame,
     read_live_meta,
 )
@@ -313,3 +319,99 @@ class TestLiveDrop:
         meta = read_live_meta(drop)
         assert SNAPSHOT_KEY not in meta
         assert set(meta) == set(FLOW_TYPES)  # 资金流独立成功照写
+
+
+class TestOffHoursInterval:
+    """D2 分时段节奏：盘中 interval、盘外/周末 off_hours_interval；边界 09:00/15:10。"""
+
+    def test_is_off_hours_boundaries(self) -> None:
+        # 2026-07-06 周一（工作日）
+        assert not is_off_hours(datetime(2026, 7, 6, 9, 0))     # 09:00 含端点，盘中
+        assert not is_off_hours(datetime(2026, 7, 6, 11, 30))
+        assert not is_off_hours(datetime(2026, 7, 6, 15, 10))   # 15:10 含端点，盘中
+        assert is_off_hours(datetime(2026, 7, 6, 8, 59))        # 盘前
+        assert is_off_hours(datetime(2026, 7, 6, 15, 11))       # 盘后
+        # 2026-07-04 周六 → 恒盘外
+        assert is_off_hours(datetime(2026, 7, 4, 10, 0))
+
+    def test_current_interval_switches_by_wall_clock(self) -> None:
+        wall = {"t": datetime(2026, 7, 6, 10, 0)}   # 盘中
+        poller = SourcePoller(
+            interval=60.0,
+            off_hours_interval=600.0,
+            wall_now=lambda: wall["t"],
+            snapshot_fetcher=lambda a: _snap_df(),
+            flow_fetcher=lambda s: _flow_df(),
+        )
+        assert poller._current_interval() == 60.0
+        wall["t"] = datetime(2026, 7, 6, 20, 0)     # 盘后
+        assert poller._current_interval() == 600.0
+        wall["t"] = datetime(2026, 7, 4, 10, 0)     # 周六
+        assert poller._current_interval() == 600.0
+
+
+class TestLocalCloudFeed:
+    """D1 本地文件云端 feed 分支：新鲜命中 / 陈旧回落 / 缺失回落 / file:// 前缀等价 / HTTP 回归。"""
+
+    def _write_feed(self, path: Path) -> None:
+        # 含 name+pre_close，缺 limit_up_price → 命中时补算（生产 surge 落盘已带此列）
+        df = pd.DataFrame(
+            {"ts_code": ["300001.SZ"], "name": ["创业甲"], "price": [10.0], "pre_close": [9.0]}
+        )
+        df.to_parquet(path, index=False)
+
+    def test_fresh_local_feed_hits_and_recomputes_limit(self, tmp_path, monkeypatch) -> None:
+        feed = tmp_path / "snapshot_full.parquet"
+        self._write_feed(feed)
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(feed))
+        result = _default_cloud_feed()
+        assert result is not None
+        df, route = result
+        assert route == "cloud_feed" and not df.empty
+        assert "limit_up_price" in df.columns          # 缺列即补算
+
+    def test_file_prefix_equivalent_to_bare_path(self, tmp_path, monkeypatch) -> None:
+        feed = tmp_path / "snapshot_full.parquet"
+        self._write_feed(feed)
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", f"file://{feed}")
+        result = _default_cloud_feed()
+        assert result is not None and result[1] == "cloud_feed"
+
+    def test_stale_local_feed_falls_back(self, tmp_path, monkeypatch) -> None:
+        feed = tmp_path / "snapshot_full.parquet"
+        self._write_feed(feed)
+        old = time.time() - 300                        # 5 分钟前 > 120s
+        os.utime(feed, (old, old))
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(feed))
+        assert _default_cloud_feed() is None
+
+    def test_missing_local_feed_falls_back(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(tmp_path / "nope.parquet"))
+        assert _default_cloud_feed() is None
+
+    def test_http_url_regression_unaffected(self, monkeypatch) -> None:
+        """非 / 非 file:// 前缀仍走 HTTP 分支（U9 HTTP 回归护栏）：无网直接失败回落 None。"""
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", "http://127.0.0.1:1/feed/x.parquet")
+        assert _default_cloud_feed() is None           # 连不上 → 回落
+
+    def test_local_feed_poller_no_self_fetch(self, tmp_path, monkeypatch) -> None:
+        """E2 微缩：poller 用真实本地读取，fresh 命中则 snapshot_fetcher spy 零调用。"""
+        feed = tmp_path / "snapshot_full.parquet"
+        self._write_feed(feed)
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(feed))
+        spy = {"n": 0}
+
+        def snap_fetch(allow: bool) -> pd.DataFrame:
+            spy["n"] += 1
+            return _snap_df()
+
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=snap_fetch,
+            flow_fetcher=lambda s: _flow_df(),
+            cloud_feed_fetcher=_default_cloud_feed,     # 真实本地读取路径
+            drop_dir=tmp_path / "live",
+        )
+        poller._poll_snapshot()
+        _, _, route = poller.snapshot()
+        assert route == "cloud_feed" and spy["n"] == 0

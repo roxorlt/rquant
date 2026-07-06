@@ -1,0 +1,31 @@
+[Unit]
+Description=rQuant KPL Concept Member Snapshot (开盘啦题材成分上云)
+After=network-online.target
+Wants=network-online.target
+
+# 失败时触发 alert relay 推 PushDeer（题材成分是全景页默认体系数据源，缺了默认体系空表）
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+
+# 写云端主库 kpl_concept_member 快照表（data-backfill snapshot 模式：拉全量 + 整表替换）。
+# --today：start=end=今天，snapshot 数据集取该日往前最近交易日的成分快照。
+# 写者串行槽位见 timer 注释。
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant data-backfill --dataset kpl_concept --today
+
+# oneshot 不自动重启（timer 次日再来；失败有 PushDeer D 类告警）
+Restart=no
+
+# 拉全量题材成分 + 写库，宽松给 10 分钟
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
