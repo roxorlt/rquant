@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  午间战报（midday-report）：Mon..Fri 的 12:00 触发一次。跑主 checkout
+  （/Users/roxor/brain/30-projects/rQuant）的 venv 与代码，与 monitor plist 同模式。
+  节假日兜底由 CLI 内部 is_trading_day 判定。一次性任务，不设 RunAtLoad / KeepAlive。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.roxor.rquant-midday-report</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/rquant</string>
+        <string>midday-report</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/roxor/brain/30-projects/rQuant</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/roxor/brain/30-projects/rQuant/logs/launchd-midday-report-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/roxor/brain/30-projects/rQuant/logs/launchd-midday-report-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

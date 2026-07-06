@@ -6,6 +6,37 @@
 
 ### Added
 
+- **盘中 30 分钟脉搏 + 午间战报（midday_briefing）**：新模块
+  `src/rquant/midday_briefing.py` 与两条 CLI —— `rquant morning-pulse
+  [--slot HH:MM] [--force] [--dry-run]`（launchd Mon..Fri 10:00/10:30/11:00/
+  11:30 各推一份 30 分钟脉搏，短、以增量为主）和 `rquant midday-report
+  [--date] [--force] [--dry-run]`（12:00 推午间战报，五节全量）。全程**只读**：
+  实时数据复用 `panorama_data` 三级路由（`fetch_market_snapshot` /
+  `add_limit_prices` / `fetch_sector_fund_flow` / `build_board_overview`），
+  T-1 数据只走 `open_readonly_store()`（连板现算的昨日涨停榜、候选池的 20 日
+  均额、持仓体检的活跃仓），**绝不写 DuckDB 主库**；自产数据落 parquet
+  （`data/midday/YYYY-MM-DD/`，pyarrow 引擎，无引擎降级 pickle）+ markdown
+  （`data/reports/midday/YYYY-MM-DD.md`，逐节幂等 upsert）+ `meta.json`（各槽位
+  route/fetched_at/pushed 去重）。槽位守卫：自动归槽容差 ±5min、迟到 >10min
+  跳过；`--force` 手动补跑绕过去重，`--dry-run` 全流程跑但不推送（parquet 照落）。
+  脉搏 Δ 来自与上一槽位 parquet 对比（首槽只报绝对值）；午间战报五节 =
+  情绪温度（各槽位涨停走势 + 昨日终值）/ 连板梯队（昨 N 板 + 今涨停现算）/
+  最强题材 Top5（kpl 口径 + 上午四槽位涨停演变）/ 下午候选观察池（创业·科创
+  半日量能预筛，daily_bar 千元 ×1000 对齐快照元）/ 持仓午间体检（空仓整节省略）。
+  notify 新增 `morning_pulse` / `midday_report` 两 scene（报文预渲染直通，只推
+  admin）。调度：`deploy/launchd/com.roxor.rquant-{morning-pulse,midday-report}.plist`
+  （跑主 checkout venv，Weekday 1-5 显式排周末，节假日兜底靠 CLI is_trading_day）
+  + `scripts/install-midday-launchd.sh`（幂等 bootout/bootstrap）。
+- **全机单一取数者：panorama poller 共享 drop（panorama_live）**：7/6 下午
+  办公网 IP 因全机多进程全天高频访问被东财+sina 双风控（直连/SOCKS 同时 RST、
+  sina 456），midday CLI 独立再拉三路只会雪上加霜。`SourcePoller` 每轮成功
+  槽位后原子落盘（tmp+rename）`data/panorama_live/`：`snapshot.parquet` +
+  `flow_{行业|概念}资金流.parquet` + `live_meta.json`（各源 as_of_iso/route/
+  written_at；落盘失败只 log 不影响轮询，进程重启合并磁盘旧 meta 不丢他源
+  记录）。midday 快照/资金流获取改三级优先：① 读共享 drop（快照 as_of ≤300s
+  新鲜才用，报文与 meta.json 的 route 标注「共享:{原route}」）→ ② 自拉三级
+  路由（总失败 sleep 60s 重试一次，仍在槽位容差内）→ ③ 降级短讯。drop 目录
+  进 .gitignore。
 - **T 日板块集合竞价强度因子 + 日度题材成分表（board_auction_strength）**：
   新增日度题材成分表 `kpl_concept_member_daily`（PK `(trade_date, board_code,
   con_code)`，与快照表 `kpl_concept_member` 只留「当前成分」不同，本表逐日存

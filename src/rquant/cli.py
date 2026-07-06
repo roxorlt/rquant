@@ -797,6 +797,22 @@ def cmd_daily_report(args: argparse.Namespace) -> int:
     return 0 if (args.dry_run or n > 0) else 1
 
 
+def cmd_morning_pulse(args: argparse.Namespace) -> int:
+    """盘中 30 分钟脉搏（launchd 10:00/10:30/11:00/11:30 自动跑）。"""
+    from rquant.midday_briefing import run_morning_pulse
+
+    setup_logging()
+    return run_morning_pulse(slot=args.slot, force=args.force, dry_run=args.dry_run)
+
+
+def cmd_midday_report(args: argparse.Namespace) -> int:
+    """午间战报（launchd 12:00 自动跑）。"""
+    from rquant.midday_briefing import run_midday_report
+
+    setup_logging()
+    return run_midday_report(report_date=args.date, force=args.force, dry_run=args.dry_run)
+
+
 def cmd_alert(args: argparse.Namespace) -> int:
     """发一条运维告警（用于 systemd OnFailure / watchdog 等场景）。
 
@@ -1758,6 +1774,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="只打印不推送（mac 本地 smoke 测试用）",
     )
 
+    mp_p = sub.add_parser(
+        "morning-pulse", help="盘中 30 分钟脉搏（launchd 10:00/10:30/11:00/11:30 自动跑）",
+    )
+    mp_p.add_argument(
+        "--slot", type=str, default=None,
+        help="手动补跑指定槽位 HH:MM（10:00/10:30/11:00/11:30）；不传按当前时间归槽",
+    )
+    mp_p.add_argument("--force", action="store_true", help="绕过当日去重，覆盖重跑")
+    mp_p.add_argument(
+        "--dry-run", action="store_true", help="全流程跑但不推送（打印报文，parquet 照落）",
+    )
+
+    mdr_p = sub.add_parser("midday-report", help="午间战报（launchd 12:00 自动跑）")
+    mdr_p.add_argument("--date", type=str, default=None, help="指定日期 YYYY-MM-DD（默认今天）")
+    mdr_p.add_argument("--force", action="store_true", help="绕过当日去重，覆盖重跑")
+    mdr_p.add_argument(
+        "--dry-run", action="store_true", help="全流程跑但不推送（打印报文，parquet 照落）",
+    )
+
     pmc_p = sub.add_parser(
         "pre-market-check", help="开盘前主动健康体检（systemd timer Mon..Fri 09:00 自动跑）",
     )
@@ -1825,6 +1860,8 @@ def main() -> int:
         "notify-test": cmd_notify_test,
         "alert": cmd_alert,
         "daily-report": cmd_daily_report,
+        "morning-pulse": cmd_morning_pulse,
+        "midday-report": cmd_midday_report,
         "pre-market-check": cmd_pre_market_check,
         "preflight": cmd_preflight,
         "lab-run": cmd_lab_run,

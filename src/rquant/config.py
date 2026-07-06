@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     notify_daily_summary: bool = True
     notify_error: bool = True
     notify_heartbeat: bool = True
+    notify_morning_pulse: bool = True
+    notify_midday_report: bool = True
 
     pool2_max_age_days: int = 6
 

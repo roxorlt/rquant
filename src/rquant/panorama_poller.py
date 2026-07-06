@@ -9,22 +9,28 @@ SOCKS 败 1s + sina 10-90s），交互全部排队。SourcePoller 把 快照 + �
 - 成功才覆盖 slot，失败保留旧数据只记 last_error；
 - 每源独立熔断：连败 ≥3 → 冷却 180s 内跳过；sina 兜底级特殊（连败 ≥2 →
   冷却 300s——它单次 10-90s，不允许反复吊死循环），由 allow_sina 参数控制；
-- 时钟可注入（now()），单测不碰网络不长 sleep。
-
-线程内绝不调 streamlit API；本模块不 import streamlit。
+- 时钟可注入（now()），单测不碰网络不长 sleep；
+- **成功槽位落盘共享 drop**（``data/panorama_live/``，parquet + live_meta.json，
+  tmp+rename 原子替换）：全机其他消费者（midday_briefing 等）优先读 drop 而非
+  自拉——2026-07-06 下午办公网 IP 因全天多进程高频访问被东财+sina 双风控，
+  全机必须只有 poller 一个取数者。落盘失败只 log，不影响轮询。
 """
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 from loguru import logger
 
+from rquant.config import settings
 from rquant.panorama_data import add_limit_prices, fetch_market_snapshot, fetch_sector_fund_flow
 
 CST = timezone(timedelta(hours=8))
@@ -37,6 +43,46 @@ _DEFAULT_FAIL_THRESHOLD = 3
 _DEFAULT_COOLDOWN = 180.0
 _SINA_FAIL_THRESHOLD = 2
 _SINA_COOLDOWN = 300.0
+
+# ── 共享 drop 布局（poller 写、midday_briefing 等只读；纯 parquet 无 DuckDB 锁） ─
+
+LIVE_DIR_NAME = "panorama_live"
+LIVE_META_FILE = "live_meta.json"
+
+
+def default_live_drop_dir() -> Path:
+    """默认 drop 目录（settings.data_dir 下，与 midday 落盘同根）。"""
+    return settings.data_dir / LIVE_DIR_NAME
+
+
+def live_frame_filename(key: str) -> str:
+    """drop 文件名：快照 → snapshot.parquet；资金流 → flow_{类型}.parquet。"""
+    return "snapshot.parquet" if key == SNAPSHOT_KEY else f"flow_{key}.parquet"
+
+
+def read_live_meta(drop_dir: Path) -> dict[str, dict]:
+    """读 live_meta.json（{源key: {as_of_iso, route, written_at}}）。缺失/损坏 → 空。"""
+    path = drop_dir / LIVE_META_FILE
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception as e:
+        logger.warning(f"live drop meta 读取失败 {path}: {type(e).__name__}: {e}")
+        return {}
+
+
+def read_live_frame(drop_dir: Path, key: str) -> pd.DataFrame | None:
+    """读单个 drop parquet。缺失/损坏 → None（调用方走自拉）。"""
+    path = drop_dir / live_frame_filename(key)
+    if not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        logger.warning(f"live drop 读取失败 {path}: {type(e).__name__}: {e}")
+        return None
 
 
 def _default_snapshot_fetcher(allow_sina: bool) -> pd.DataFrame:
@@ -87,11 +133,14 @@ class SourcePoller:
         now: Callable[[], float] = time.monotonic,
         snapshot_fetcher: Callable[[bool], pd.DataFrame] | None = None,
         flow_fetcher: Callable[[str], pd.DataFrame] | None = None,
+        drop_dir: Path | None = None,
     ) -> None:
         self._interval = interval
         self._now = now
         self._snapshot_fetcher = snapshot_fetcher or _default_snapshot_fetcher
         self._flow_fetcher = flow_fetcher or fetch_sector_fund_flow
+        self._drop_dir = drop_dir if drop_dir is not None else default_live_drop_dir()
+        self._drop_meta: dict[str, dict] = {}  # 仅 poll 线程读写，无需加锁
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stopped = False
@@ -175,6 +224,7 @@ class SourcePoller:
                 state.mark_success(df, route, mono, self._wall_clock())
                 if route == "sina":
                     self._sina.mark_success(pd.DataFrame(), route, mono, state.as_of)
+            self._write_drop(SNAPSHOT_KEY, df, route)
             return
         error = error or "三级路由全部失败（返回空）"
         with self._lock:
@@ -201,11 +251,42 @@ class SourcePoller:
         if df is not None and not df.empty:
             with self._lock:
                 state.mark_success(df, route, mono, self._wall_clock())
+            self._write_drop(sector_type, df, route)
             return
         error = error or "三级路由全部失败（返回空）"
         with self._lock:
             state.mark_failure(error, mono)
         logger.warning(f"poller 资金流拉取失败: {sector_type} {error}")
+
+    def _write_drop(self, key: str, df: pd.DataFrame, route: str) -> None:
+        """成功槽位落盘共享 drop（tmp+rename 原子替换）。
+
+        失败只 log 不打断轮询（drop 是「锦上添花」的共享层，不是主路径）。
+        仅 poll 线程调用：_drop_meta 无需加锁；df 写盘时已在 slot 内，视为只读。
+        首次写入时合并磁盘上已有 meta——进程重启后不丢其他源的记录。
+        """
+        try:
+            self._drop_dir.mkdir(parents=True, exist_ok=True)
+            if not self._drop_meta:
+                self._drop_meta = read_live_meta(self._drop_dir)
+            fname = live_frame_filename(key)
+            tmp = self._drop_dir / (fname + ".tmp")
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, self._drop_dir / fname)
+            now_iso = datetime.now(CST).isoformat(timespec="seconds")
+            self._drop_meta[key] = {
+                "as_of_iso": now_iso,
+                "route": route,
+                "written_at": now_iso,
+            }
+            meta_tmp = self._drop_dir / (LIVE_META_FILE + ".tmp")
+            meta_tmp.write_text(
+                json.dumps(self._drop_meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(meta_tmp, self._drop_dir / LIVE_META_FILE)
+        except Exception as e:
+            logger.warning(f"live drop 落盘失败（不影响轮询）: {key} {type(e).__name__}: {e}")
 
     # ── UI 读取口（last-known-good；调用方视为只读，不得原地修改） ────────────
 

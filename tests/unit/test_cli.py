@@ -80,6 +80,31 @@ class TestMonitorParser:
         assert args.interval == 10
 
 
+class TestMiddayBriefingParser:
+    def test_morning_pulse_defaults(self) -> None:
+        args = build_parser().parse_args(["morning-pulse"])
+        assert args.command == "morning-pulse"
+        assert args.slot is None
+        assert not args.force
+        assert not args.dry_run
+
+    def test_morning_pulse_args(self) -> None:
+        args = build_parser().parse_args(
+            ["morning-pulse", "--slot", "10:30", "--force", "--dry-run"]
+        )
+        assert args.slot == "10:30"
+        assert args.force
+        assert args.dry_run
+
+    def test_midday_report_args(self) -> None:
+        args = build_parser().parse_args(
+            ["midday-report", "--date", "2026-07-06", "--dry-run"]
+        )
+        assert args.command == "midday-report"
+        assert args.date == "2026-07-06"
+        assert args.dry_run
+
+
 class TestRtMinuteFetchParser:
     def test_rt_minute_fetch_defaults(self) -> None:
         parser = build_parser()
