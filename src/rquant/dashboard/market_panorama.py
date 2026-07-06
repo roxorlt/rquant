@@ -367,16 +367,21 @@ def render_overview(as_of: str, snap_route: str) -> tuple[str | None, str | None
     system = st.segmented_control(
         "体系",
         list(BOARD_SYSTEMS),
-        default=BOARD_SYSTEMS[0],
+        default=_KPL_SYSTEM,
         key="sys_seg",
         label_visibility="collapsed",
-    ) or BOARD_SYSTEMS[0]
+    ) or _KPL_SYSTEM
     is_kpl = system == _KPL_SYSTEM
 
     overview, route = cached_overview(system, as_of)
     if overview.empty:
         st.info(f"{system}：快照或板块成分不可用，暂无总表")
         return None, None
+    # 展示层默认涨停数降序（次键成交额防并列）——数据层契约（amount 降序）不动；
+    # 默认选中第一行随之变成涨停最多的板块，列头点击排序仍是客户端零 rerun
+    overview = overview.sort_values(
+        ["limit_up_count", "amount"], ascending=False
+    ).reset_index(drop=True)
 
     event = st.dataframe(
         _overview_display(overview, is_kpl),
@@ -388,7 +393,7 @@ def render_overview(as_of: str, snap_route: str) -> tuple[str | None, str | None
         height=560,
     )
     idx = _first_selected_row(event)
-    # 缓存刷新可能缩短表长，越界（含跨体系残留）一律回退默认第一行（成交额最大）
+    # 缓存刷新可能缩短表长，越界（含跨体系残留）一律回退默认第一行（涨停数最多）
     if idx is None or idx >= len(overview):
         idx = 0
     sel = overview.iloc[idx]
