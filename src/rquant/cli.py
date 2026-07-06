@@ -825,8 +825,11 @@ def cmd_surge_watch(args: argparse.Namespace) -> int:
 
     setup_logging()
     config = SurgeConfig(
-        k_confirm=args.k_confirm,
+        k_cum=args.k_cum,
+        ratio_cap=args.ratio_cap,
+        skip_first_minutes=args.skip_first_minutes,
         k_delta_confirm=args.k_delta,
+        require_vwap=args.require_vwap,
         max_room_to_limit_pct=args.max_room,
     )
     if args.simulate:
@@ -1928,12 +1931,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="限定循环次数（dry-run / 盘后 smoke，默认跑到 15:02）",
     )
     sw_p.add_argument(
-        "--k-confirm", type=float, default=SurgeConfig.model_fields["k_confirm"].default,
-        help="确认层量比门（默认 3.0，2026-07-06 扫描 Pareto 值，逆选择上限勿超）",
+        "--k-cum", type=float, default=SurgeConfig.model_fields["k_cum"].default,
+        help="确认层纯累计比值下门（默认 2.5，2026-07-06 全天分钟回测标定）",
+    )
+    sw_p.add_argument(
+        "--ratio-cap", type=float, default=SurgeConfig.model_fields["ratio_cap"].default,
+        help="累计比值上门/毒尾封顶（默认 8.0，超过视为极端出货不推）",
+    )
+    sw_p.add_argument(
+        "--skip-first-minutes", type=int,
+        default=SurgeConfig.model_fields["skip_first_minutes"].default,
+        help="跳过开盘前 N 分钟确认（默认 1，9:32 起才确认，base 分母噪声大）",
     )
     sw_p.add_argument(
         "--k-delta", type=float, default=SurgeConfig.model_fields["k_delta_confirm"].default,
-        help="同分钟增量门倍数（默认 3.0，0=关闭）",
+        help="单分钟增量门倍数（v2 遗留，默认 0=关闭）",
+    )
+    sw_p.add_argument(
+        "--require-vwap", action="store_true",
+        help="启用 VWAP 门（v2 遗留，默认关；现价 ≥ 当日均价才确认）",
     )
     sw_p.add_argument(
         "--max-room", type=float,

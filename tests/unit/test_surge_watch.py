@@ -1,7 +1,9 @@
-"""surge-watch 单测（U1-U12，全离线，注入时钟/mock 源，不真 sleep 不碰网络）。
+"""surge-watch 单测（全离线，注入时钟/mock 源，不真 sleep 不碰网络）。
 
-口径 v2: rough1.5×20d·curve / confirm3.0×3d同刻 / 增量门3.0×3d同分钟 / VWAP门 /
-可买性守卫（距涨停≤1%或已封板不推）。默认参数据 2026-07-06 全天真实分钟重放扫描。
+口径 v3（纯累计，2026-07-06 全天真实分钟回测标定）：rough1.2×20d·curve /
+确认层纯累计比值 rel_cum = today_cum / N(=4)日同刻累计中位 ∈ [k_cum2.5, ratio_cap8] /
+skip 开盘前 1 分（9:32 起确认）/ 可买性守卫（距涨停≤1%或已封板不推）。
+VWAP 门 + 单分钟增量门为 v2 遗留，v3 默认关（require_vwap=False、k_delta_confirm=0）。
 """
 
 from __future__ import annotations
@@ -81,6 +83,18 @@ def mk_minute_bars(
             t = (datetime.combine(d, start) + timedelta(minutes=i))
             rows.append({"ts_code": "X", "trade_time": t, "amount": float(a)})
     return pd.DataFrame(rows, columns=["ts_code", "trade_time", "amount"])
+
+
+def rel_amount(
+    bars: pd.DataFrame, gi: int, rel: float, *, today: date = date(2026, 7, 6), n: int = 4
+) -> float:
+    """反算使 rel_cum == rel 的当日累计额（snapshot amount）。
+
+    v3 纯累计比值有上下门 [k_cum, ratio_cap]，测试须把 rel 精确落在带内——直接用
+    N 日同刻累计中位 × rel 得到当日累计额，避免手算 (gi+1)×m。
+    """
+    base = build_three_day_baseline(bars, today, n)
+    return rel * float(base.cum_median[gi])
 
 
 # ── U1 曲线标定/加载 ────────────────────────────────────────────────────────────
@@ -171,13 +185,23 @@ class TestU2Rough:
         """
         cfg = SurgeConfig()
         gi = grid_index(dt_time(11, 0))
-        amount = 5e7  # 元
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
-                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
         base_yuan = mk_baseline({"300001.SZ": 1e8})       # 正确：1 亿元 → 高阈值
         base_thousand = mk_baseline({"300001.SZ": 1e5})   # 错误：当千元用 → 阈值 1000× 偏小
+        # 当日额压在元口径阈值之下（对 k_rough 放松鲁棒）：thousand 口径阈值小 1000×，误放行
+        amount = cfg.k_rough * 1e8 * float(base_yuan.curve[gi]) * 0.9
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
+                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
         assert _rough_candidates(snap, base_yuan, cfg, gi) == []
         assert _rough_candidates(snap, base_thousand, cfg, gi) == ["300001.SZ"]
+
+    def test_relaxed_rough_admits_earlier_candidate(self) -> None:
+        """粗筛放松 1.5→1.2：卡在 [1.2×,1.5×) 阈值带的当日额，v3 放行早入确认池，旧值挡下。"""
+        base, _cfg, gi = self._base()
+        amount = 1.35 * 1e8 * float(base.curve[gi])   # 300001 avg20=1e8，量在两阈值之间
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
+                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
+        assert _rough_candidates(snap, base, SurgeConfig(), gi) == ["300001.SZ"]   # v3 1.2 放行
+        assert _rough_candidates(snap, base, SurgeConfig(k_rough=1.5), gi) == []   # 旧 1.5 挡下
 
 
 # ── U3 分钟序列 ─────────────────────────────────────────────────────────────────
@@ -230,42 +254,80 @@ class TestU4Confirm:
         assert base.cum_median[2] == 600
         assert base.minute_median[0] == 200          # 同分钟增量中位
 
-    def test_confirm_boundary_and_vwap_gate(self) -> None:
-        curve = flat_curve()
-        base = mk_baseline({"300001.SZ": 1e6}, curve=curve)
+    def _confirm_watcher(self, **cfg_kw) -> tuple[SurgeWatcher, pd.DataFrame, datetime, int]:
+        """gi=2（09:32，skip_first_minutes=1 后首个可确认格），cum_median[2]=600。"""
+        base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
         bars = self._three_day_bars()
-        w = SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=lambda c, d: bars)
-        gi = 1  # 09:31，base_cum[1]=400、minute_median[1]=200
-        now = datetime(2026, 7, 6, 9, 31, tzinfo=CST)
-        # k_confirm=3.0：rel 恰好 3.0× → amount 1200；VWAP: price ≥ amount/volume；
-        # 增量门 3.0×minute_median(200)=600，minute_delta=1200 ≥600 通过
+        w = SurgeWatcher(base, config=SurgeConfig(**cfg_kw), minute_fetcher=lambda c, d: bars)
+        gi = 2
+        now = datetime(2026, 7, 6, 9, 32, tzinfo=CST)
+        cache = build_three_day_baseline(bars, now.date(), 4)
+        w.confirm_cache["300001.SZ"] = cache
+        assert cache.cum_median[gi] == 600
+        return w, bars, now, gi
+
+    def test_pure_cum_lower_boundary(self) -> None:
+        """纯累计下门 k_cum=2.5：rel 恰好 2.5（amount=1500）→ 确认；1499→2.498<2.5→拒。"""
+        w, _bars, now, gi = self._confirm_watcher()
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1200, "amount": 1200}])
-        w.cum_series["300001.SZ"] = np.full(CURVE_POINTS, np.nan)
-        w.cum_series["300001.SZ"][gi] = 1200
-        base_3d = build_three_day_baseline(self._three_day_bars(), now.date())
-        w.confirm_cache["300001.SZ"] = base_3d
-        assert base_3d.cum_median[gi] == 400
+                         "pct_chg": 5, "volume": 1e6, "amount": 1500}])
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today
-        assert w._pending_push[0].rel_cum_3d == 3.0
+        assert w._pending_push[0].rel_cum == 2.5
 
-    def test_vwap_reject(self) -> None:
-        base = mk_baseline({"300001.SZ": 1e6})
-        w = SurgeWatcher(base, minute_fetcher=lambda c, d: self._three_day_bars())
-        gi = 1
-        now = datetime(2026, 7, 6, 9, 31, tzinfo=CST)
-        # rel=1500/400=3.75 过 k_confirm(3.0)，但 price < vwap(=amount/volume=3.0) → VWAP 拒
+    def test_pure_cum_below_lower_rejected(self) -> None:
+        w, _bars, now, gi = self._confirm_watcher()
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 500, "amount": 1500}])
-        w.confirm_cache["300001.SZ"] = build_three_day_baseline(self._three_day_bars(), now.date())
+                         "pct_chg": 5, "volume": 1e6, "amount": 1499}])   # rel 2.498 < 2.5
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
+
+    def test_ratio_cap_upper_boundary(self) -> None:
+        """毒尾封顶 ratio_cap=8.0：rel 恰好 8.0（amount=4800）→ 确认（含上界）。"""
+        w, _bars, now, gi = self._confirm_watcher()
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
+                         "pct_chg": 5, "volume": 1e6, "amount": 4800}])
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" in w.pushed_today
+        assert w._pending_push[0].rel_cum == 8.0
+
+    def test_ratio_cap_toxic_tail_rejected(self) -> None:
+        """rel > ratio_cap 视为极端出货毒尾（放巨量往往出货）→ 不推。"""
+        w, _bars, now, gi = self._confirm_watcher()
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
+                         "pct_chg": 5, "volume": 1e6, "amount": 4801}])   # rel 8.002 > 8.0
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" not in w.pushed_today
+
+    def test_skip_first_minutes_blocks_before_eligible(self) -> None:
+        """skip_first_minutes=1：9:30(gi0)/9:31(gi1) 恒不确认，即便 rel 已过下门。"""
+        w, _bars, _now, _gi = self._confirm_watcher()
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
+                         "pct_chg": 5, "volume": 1e6, "amount": 4000}])   # rel≫2.5 于任意格
+        # 9:31（gi=1）被 skip 挡下，不确认
+        w._evaluate("300001.SZ", snap, datetime(2026, 7, 6, 9, 31, tzinfo=CST), 1)
+        assert "300001.SZ" not in w.pushed_today
+        # 9:32（gi=2）越过 skip → 确认
+        w._evaluate("300001.SZ", snap, datetime(2026, 7, 6, 9, 32, tzinfo=CST), 2)
+        assert "300001.SZ" in w.pushed_today
+
+    def test_vwap_gate_only_when_enabled(self) -> None:
+        """require_vwap=True 时才叠加 VWAP 门（v3 默认关）：price<vwap 则拒。"""
+        # rel=4800/600=8.0 落带内，但 price 1.0 < vwap(amount/volume=4800/1000=4.8) → 拒
+        w_on, _b, now, gi = self._confirm_watcher(require_vwap=True)
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
+                         "pct_chg": 5, "volume": 1000, "amount": 4800}])
+        w_on._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" not in w_on.pushed_today
+        # 默认关：同一 snap 不看 VWAP → 确认
+        w_off, _b2, now2, gi2 = self._confirm_watcher()
+        w_off._evaluate("300001.SZ", snap, now2, gi2)
+        assert "300001.SZ" in w_off.pushed_today
 
     def test_daily_cache_hit_no_refetch(self) -> None:
         """当日缓存命中不重拉（tushare spy 调用数）。"""
         calls: list[str] = []
-        # 大基线：过 rough 但 rel<K_confirm（cum 250k / 3日中位 300k = 0.83×）→ 不确认但已缓存
+        # 大基线：过 rough 但 rel<k_cum（cum 250k / N 日中位 300k = 0.83×）→ 不确认但已缓存
         big_bars = mk_minute_bars({
             self._today() - timedelta(days=i): [100000, 100000, 100000] for i in (1, 2, 3)
         })
@@ -280,7 +342,7 @@ class TestU4Confirm:
                          "pct_chg": 5, "volume": 1e6, "amount": 250000}])
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
         assert calls == ["300001.SZ"]
-        assert "300001.SZ" not in w.pushed_today      # rel<2.0 未确认
+        assert "300001.SZ" not in w.pushed_today      # rel<k_cum(2.5) 未确认
         # 下一分钟仍未确认，命中缓存不再拉
         w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
         assert calls == ["300001.SZ"]                # 无第二次取数
@@ -291,30 +353,35 @@ class TestU4Confirm:
 
 
 class TestU5DedupSilentFold:
-    def _confirming_watcher(self) -> SurgeWatcher:
+    def _bars(self) -> pd.DataFrame:
         d = date(2026, 7, 6)
-        # 241 根恒定额：同分钟中位 >0 全网格覆盖，10:00(gi30) 也能过增量门（v2 默认开）
-        bars = mk_minute_bars({d - timedelta(days=i): [10] * 241 for i in (1, 2, 3)})
-        base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
-        return SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=lambda c, dd: bars)
+        # 三日每分钟恒定 1e4（全 241 网格）→ cum_median[gi]=(gi+1)×1e4，rel 精确可控
+        return mk_minute_bars({d - timedelta(days=i): [1e4] * 241 for i in (1, 2, 3)})
 
-    def _snap(self) -> pd.DataFrame:
-        # amount 1e7 过 rough；rel=1e7/base_cum(30)≫2；VWAP: price100 ≥ vwap(1e7/1e6=10)
+    def _watcher(self) -> tuple[SurgeWatcher, pd.DataFrame]:
+        # avg20 微小 → rough 恒过；确认由纯累计比值决定，rel 由 snap amount 精确落带内
+        bars = self._bars()
+        base = mk_baseline({"300001.SZ": 1.0}, curve=flat_curve())
+        return SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=lambda c, dd: bars), bars
+
+    def _snap_at(self, gi: int, bars: pd.DataFrame, rel: float = 4.0) -> pd.DataFrame:
+        # amount = rel × N日同刻累计中位 → rel_cum 精确 = rel（落 [k_cum,ratio_cap]）
+        amount = rel_amount(bars, gi, rel)
         return mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
-                         "pct_chg": 5, "volume": 1e6, "amount": 1e7}])
+                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
 
     def test_once_per_day(self) -> None:
-        w = self._confirming_watcher()
-        snap = self._snap()
+        w, bars = self._watcher()
+        snap = self._snap_at(30, bars)               # gi30=10:00，rel=4 落带内
         r1 = w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
         assert r1.confirmed and r1.confirmed[0].ts_code == "300001.SZ"
         r2 = w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
         assert r2.confirmed == []                    # 每票每日仅推一次
 
     def test_silent_window_collects_then_flushes(self) -> None:
-        w = self._confirming_watcher()
-        snap = self._snap()
-        r_silent = w.tick(snap, datetime(2026, 7, 6, 9, 31, tzinfo=CST))  # 9:33 前
+        w, bars = self._watcher()
+        snap = self._snap_at(2, bars)                # gi2=9:32（skip 后首个可确认格）
+        r_silent = w.tick(snap, datetime(2026, 7, 6, 9, 32, tzinfo=CST))  # 9:33 前
         assert r_silent.pushes == [] and r_silent.confirmed == []
         assert len(w._pending_push) == 1             # 收集不丢
         r_flush = w.tick(mk_snap([]), datetime(2026, 7, 6, 9, 33, tzinfo=CST))
@@ -322,7 +389,7 @@ class TestU5DedupSilentFold:
 
     def test_fold_over_max(self) -> None:
         confirmed = [
-            SurgeConfirmed(ts_code=f"3000{i:02d}.SZ", name=f"n{i}", pct_chg=5.0, rel_cum_3d=3.0)
+            SurgeConfirmed(ts_code=f"3000{i:02d}.SZ", name=f"n{i}", pct_chg=5.0, rel_cum=3.0)
             for i in range(9)
         ]
         cfg = SurgeConfig()
@@ -340,8 +407,8 @@ class TestU5DedupSilentFold:
 class TestU6RateLimit:
     def _bars(self) -> pd.DataFrame:
         d = date(2026, 7, 6)
-        # 241 根恒定额：同分钟中位全网格 >0，10:00(gi30) 过增量门（v2 默认开）
-        return mk_minute_bars({d - timedelta(days=i): [1] * 241 for i in (1, 2, 3)})
+        # 三日每分钟恒定 1e5（全 241 网格）→ cum_median[gi]=(gi+1)×1e5，rel 精确可控
+        return mk_minute_bars({d - timedelta(days=i): [1e5] * 241 for i in (1, 2, 3)})
 
     def test_two_per_minute_fifo(self) -> None:
         calls: list[str] = []
@@ -356,7 +423,7 @@ class TestU6RateLimit:
         w = SurgeWatcher(
             mk_baseline(avg20, curve=flat_curve()), config=SurgeConfig(), minute_fetcher=spy
         )
-        # 全部 rel 高（amount 100 / base_cum 3 → 巨大），过 rough（amount≫阈值）
+        # amount 1e7 ≫ rough 阈值 → 全部入队（本例只验限频/FIFO，不看确认结果）
         snap = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
                          "pct_chg": 5, "volume": 100, "amount": 1e7} for c in codes])
         for k in range(6):
@@ -377,15 +444,17 @@ class TestU6RateLimit:
         codes = ["300000.SZ", "300001.SZ"]
         w = SurgeWatcher(mk_baseline({c: 1e6 for c in codes}, curve=flat_curve()),
                          config=SurgeConfig(), minute_fetcher=spy)
-        # volume 大使 VWAP 门通过（vwap=1e7/1e8=0.1 ≤ price1.0）→ 取数成功即确认
+        # amount 使 rel_cum=4 落带内（gi30，cum_median[30]=3.1e6）→ 取数成功即确认
+        amt0 = rel_amount(bars, 30, 4.0)
         snap = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e8, "amount": 1e7} for c in codes])
+                         "pct_chg": 5, "volume": 1e8, "amount": amt0} for c in codes])
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))  # 300000 失败, 300001 成功
         assert "300001.SZ" in w.pushed_today
         assert "300000.SZ" not in w.pushed_today
-        # 重试分钟累计额续增（2e7）→ 本分钟增量 1e7 过增量门（v2 默认开）
+        # 下一分钟（gi31）amount 相应 rel=4 → 300000 重试成功即确认
+        amt1 = rel_amount(bars, 31, 4.0)
         snap2 = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
-                          "pct_chg": 5, "volume": 1e8, "amount": 2e7} for c in codes])
+                          "pct_chg": 5, "volume": 1e8, "amount": amt1} for c in codes])
         w.tick(snap2, datetime(2026, 7, 6, 10, 1, tzinfo=CST))  # 300000 重试成功
         assert "300000.SZ" in w.pushed_today
 
@@ -455,13 +524,13 @@ class TestU8Persist:
     def test_events_jsonl_structure(self, tmp_path: Path) -> None:
         p = tmp_path / "events.jsonl"
         append_events(p, [SurgeConfirmed(ts_code="300001.SZ", name="n", theme="人形机器人",
-                                         confirmed_at="10:05", rel_cum_3d=2.5, cum_amount=9e7)])
+                                         confirmed_at="10:05", rel_cum=2.5, cum_amount=9e7)])
         append_events(p, [SurgeConfirmed(ts_code="688001.SH", name="m", confirmed_at="10:06")])
         lines = p.read_text(encoding="utf-8").strip().split("\n")
         assert len(lines) == 2
         rec = json.loads(lines[0])
         assert rec["ts_code"] == "300001.SZ" and rec["theme"] == "人形机器人"
-        assert rec["rel_cum_3d"] == 2.5
+        assert rec["rel_cum"] == 2.5
 
     def test_series_parquet_roundtrip(self, tmp_path: Path) -> None:
         cum = {"300001.SZ": np.full(CURVE_POINTS, np.nan)}
@@ -551,26 +620,28 @@ class TestU9CloudFeed:
 class TestU10Push:
     def test_message_structure_fields(self) -> None:
         c = SurgeConfirmed(ts_code="300001.SZ", name="机器人A", theme="人形机器人",
-                           pct_chg=8.3, rel_cum_3d=2.7, cum_amount=1.2e8,
-                           minute_delta=3e6, minute_delta_median_3d=1e6, room_to_limit_pct=4.5)
+                           pct_chg=8.3, rel_cum=2.7, cum_amount=1.2e8,
+                           minute_delta=3e6, minute_delta_median=1e6, room_to_limit_pct=4.5)
         now = datetime(2026, 7, 6, 10, 5, tzinfo=CST)
         title, body = build_surge_messages([c], now, SurgeConfig())[0]
         assert "10:05" in title
         assert "人形机器人" in body                   # 题材
-        assert "量比3日2.7×" in body                  # 量比
+        assert "累计比4日2.7×" in body                # 纯累计比值（N=4）
         assert "距涨停4.5%" in body                   # 距涨停空间
-        assert "口径 v2" in body                      # 尾注口径版本（v2 收紧）
-        assert "增量门3×3d同分钟" in body             # v2 新增同分钟增量门
-        assert "观察提示，非买入信号" in body          # v2 定位尾注
+        assert "口径 v3(纯累计)" in body              # 尾注口径版本
+        assert "累计比值∈[2.5,8]" in body            # 上下门口径
+        assert "skip前1分(9:31)" in body             # skip_first_minutes 口径
+        assert "增量门" not in body                   # v2 增量门 v3 默认关，报文不出现
+        assert "观察提示，非买入信号" in body          # 定位尾注
 
     def test_dry_run_no_push(self, tmp_path: Path, capsys) -> None:
         d = date(2026, 7, 6)
-        # 241 根恒定额：同分钟中位全网格 >0，10:00 过增量门（v2 默认开）
-        bars = mk_minute_bars({d - timedelta(days=i): [10] * 241 for i in (1, 2, 3)})
+        # 三日每分钟恒定 1e4 → cum_median[gi]=(gi+1)×1e4，amount 使 rel=4 落带内
+        bars = mk_minute_bars({d - timedelta(days=i): [1e4] * 241 for i in (1, 2, 3)})
         notifies: list = []
         clock = {"t": datetime(2026, 7, 6, 10, 0, tzinfo=CST)}
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e8, "amount": 1e7}])
+                         "pct_chg": 5, "volume": 1e8, "amount": rel_amount(bars, 30, 4.0)}])
 
         def now_fn() -> datetime:
             return clock["t"]
@@ -633,41 +704,41 @@ class TestNotifyScene:
 
 
 def _write_sim_fixture(sim_dir: Path) -> None:
-    """构造一天快照序列 fixture：A 10:05 爆量、B 09:31 爆量(9:33 才推)、C 粗筛过确认不过。"""
+    """一天快照序列 fixture（口径 v3 纯累计三戏路）：
+    - G 300111.SZ：9:31 累计已越 2.5×（rel 恒 3.0），但 skip_first_minutes 挡下 9:31、
+      9:32 才确认，静默窗持到 9:33 才推；
+    - H 300222.SZ：10:05 放巨量 rel=10× > ratio_cap(8) 毒尾 → 不推、无 event；
+    - K 688333.SH：累计不足 rel 恒 1.5× < k_cum(2.5) → 不推、无 event。
+    confirm_bars 三日恒定 m/min → cum_median[gi]=(gi+1)×m，snap amount 精确控 rel。"""
     day = date(2026, 7, 6)
     sim_dir.mkdir(parents=True, exist_ok=True)
-    codes = {"300111.SZ": "人形机器人", "300222.SZ": "存储芯片", "688333.SH": ""}
-    # baseline：avg20（元）+ 题材
+    per_min = {"300111.SZ": 1e5, "300222.SZ": 1e5, "688333.SH": 1e6}  # 确认基线 m/min
     (sim_dir / "baseline.json").write_text(json.dumps({
-        "avg20": {c: 5e7 for c in codes},
+        "avg20": {c: 1e4 for c in per_min},         # avg20 微小 → 粗筛恒过，候选早入确认池
         "theme": {"300111.SZ": "人形机器人", "300222.SZ": "存储芯片"},
     }), encoding="utf-8")
-    # confirm_bars：3 prior days × 241 根恒定额 → 同刻累计中位可控
-    #   A/B 每分钟 5e5（cum 小 → rel 大）；C 每分钟 3e6（cum 大 → rel<2）
-    per_min = {"300111.SZ": 5e5, "300222.SZ": 5e5, "688333.SH": 3e6}
     rows: list[dict] = []
-    for c in codes:
+    for c in per_min:
         for dd in (1, 2, 3):
             d0 = day - timedelta(days=dd)
             for i in range(241):
                 t = datetime.combine(d0, dt_time(9, 30)) + timedelta(minutes=i)
                 rows.append({"ts_code": c, "trade_time": t, "amount": per_min[c]})
     pd.DataFrame(rows).to_parquet(sim_dir / "confirm_bars.parquet", index=False)
-    # 逐分钟快照 09:30..10:06
+    # 逐分钟快照 09:30..10:06（morning gi == i），amount = rel × base_cum[i]=(i+1)×m
     for i in range(37):
         t = (datetime(2026, 7, 6, 9, 30) + timedelta(minutes=i)).time()
         hhmm = f"{t.hour:02d}{t.minute:02d}"
-        # 爆量前累计额压在开盘 rough 阈值（≈465k）之下，确保只在爆量分钟才成候选
-        a_amt = 2e8 if t >= dt_time(10, 5) else 3e5          # A 10:05 爆量
-        b_amt = 1e8 if t >= dt_time(9, 31) else 1e5          # B 09:31 爆量
-        c_amt = 1e8 if t >= dt_time(10, 5) else 3e5          # C 10:05 起过 rough
+        g_amt = 3.0 * (i + 1) * 1e5                          # G：rel 恒 3.0（9:31 即越 2.5）
+        h_amt = 1e4 if i < 35 else 10.0 * (i + 1) * 1e5      # H：10:05(i=35) rel=10 毒尾
+        k_amt = 1.5 * (i + 1) * 1e6                          # K：rel 恒 1.5 累计不足
         snap = mk_snap([
-            {"ts_code": "300111.SZ", "name": "机器人A", "price": 25, "pre_close": 22,
-             "pct_chg": 9, "volume": 1e7, "amount": a_amt},
-            {"ts_code": "300222.SZ", "name": "存储B", "price": 15, "pre_close": 13.5,
-             "pct_chg": 8, "volume": 1e7, "amount": b_amt},
-            {"ts_code": "688333.SH", "name": "科创C", "price": 30, "pre_close": 27,
-             "pct_chg": 7, "volume": 1e7, "amount": c_amt},
+            {"ts_code": "300111.SZ", "name": "机器人G", "price": 25, "pre_close": 22,
+             "pct_chg": 9, "volume": 1e7, "amount": g_amt},
+            {"ts_code": "300222.SZ", "name": "存储H", "price": 15, "pre_close": 13.5,
+             "pct_chg": 8, "volume": 1e7, "amount": h_amt},
+            {"ts_code": "688333.SH", "name": "科创K", "price": 30, "pre_close": 27,
+             "pct_chg": 7, "volume": 1e7, "amount": k_amt},
         ])
         snap.to_parquet(sim_dir / f"2026-07-06T{hhmm}.parquet", index=False)
 
@@ -687,16 +758,17 @@ class TestE1Simulate:
         events = (tmp_path / "live" / "events-2026-07-06.jsonl").read_text(encoding="utf-8")
         recs = [json.loads(x) for x in events.strip().split("\n")]
         by_code = {r["ts_code"]: r for r in recs}
-        # A、B 确认；C 粗筛过但确认不过 → 无 event
-        assert set(by_code) == {"300111.SZ", "300222.SZ"}
-        assert "688333.SH" not in by_code
-        # B 09:31 爆量但 09:33 才推（静默收集）
-        assert by_code["300222.SZ"]["confirmed_at"] == "09:31"
-        b_push = [p for p in pushes if "存储B" in p[1]["body"]][0]
-        assert "09:33" in b_push[1]["title"]         # 推送发生在 09:33 flush
-        # A 10:05 确认并推送，带题材
-        assert by_code["300111.SZ"]["confirmed_at"] == "10:05"
+        # 仅 G 确认；H 毒尾（rel>8）、K 累计不足（rel<2.5）粗筛过但纯累计门不过 → 无 event
+        assert set(by_code) == {"300111.SZ"}
+        assert "300222.SZ" not in by_code and "688333.SH" not in by_code
+        # G：9:31 rel 已 3.0>2.5，但 skip 挡到 9:32 才确认，静默窗持到 9:33 才推
+        assert by_code["300111.SZ"]["confirmed_at"] == "09:32"
+        assert by_code["300111.SZ"]["rel_cum"] == 3.0
         assert by_code["300111.SZ"]["theme"] == "人形机器人"
+        g_push = [p for p in pushes if "机器人G" in p[1]["body"]][0]
+        assert "09:33" in g_push[1]["title"]         # 推送发生在 09:33 flush
+        body = g_push[1]["body"]
+        assert "口径 v3(纯累计)" in body and "观察提示，非买入信号" in body
         assert all(p[0] == "surge_watch" for p in pushes)
 
 
@@ -840,24 +912,28 @@ class TestU11ThemeMapFallback:
         assert m == {}
 
 
-# ── U12 v2 默认值（2026-07-06 扫描收紧） ────────────────────────────────────────
+# ── U12 v3 默认值（2026-07-06 全天真实分钟回测标定） ─────────────────────────────
 
 
 class TestU12ConfigDefaults:
-    def test_v2_defaults(self) -> None:
+    def test_v3_defaults(self) -> None:
         cfg = SurgeConfig()
-        assert cfg.k_confirm == 3.0             # v1 2.0 → v2 3.0（Pareto，逆选择上限）
-        assert cfg.k_delta_confirm == 3.0       # 新增同分钟增量门，默认开
-        assert cfg.max_room_to_limit_pct == 1.0  # 可买性守卫，距涨停≤1% 不推
-        assert cfg.k_rough == 1.5               # 粗筛不动
-        assert cfg.confirm_lookback_days == 3
+        assert cfg.k_cum == 2.5                  # 纯累计下门（替代 v2 k_confirm=3.0）
+        assert cfg.ratio_cap == 8.0              # 毒尾封顶：比值 >8 视为极端出货不推
+        assert cfg.skip_first_minutes == 1       # 跳开盘前 1 分，9:32 起确认
+        assert cfg.cum_lookback_days == 4        # N 日同刻累计中位（v2 是 3）
+        assert cfg.k_delta_confirm == 0.0        # v2 增量门 v3 默认关
+        assert cfg.require_vwap is False         # v2 VWAP 门 v3 默认关
+        assert cfg.k_rough == 1.2                # 粗筛放松 1.5→1.2，候选早入确认池
+        assert cfg.max_room_to_limit_pct == 1.0  # 可买性守卫保留，距涨停≤1% 不推
 
 
 # ── U13 同分钟增量门 ────────────────────────────────────────────────────────────
 
 
 class TestU13DeltaGate:
-    """确认时点要求「当分钟增量 ≥ k_delta × 3日同分钟中位」。"""
+    """v2 遗留单分钟增量门（v3 默认关，须显式 k_delta>0 开启）：确认时点要求
+    「当分钟增量 ≥ k_delta × N日同分钟中位」。rel 统一压在带内以隔离增量门单因子。"""
 
     def _today(self) -> date:
         return date(2026, 7, 6)
@@ -868,49 +944,51 @@ class TestU13DeltaGate:
         return mk_minute_bars({d - timedelta(days=i): [100] * 241 for i in (1, 2, 3)})
 
     def _bars_no_gi30(self) -> pd.DataFrame:
-        # 三日仅前 3 分钟有量 → gi30 处 minute_median=0（中位≤0 场景）
+        # 三日仅前 3 分钟有量 → gi30 处 minute_median=0（中位≤0 场景，cum 由 cumsum 续 300）
         d = self._today()
         return mk_minute_bars({d - timedelta(days=i): [100, 100, 100] for i in (1, 2, 3)})
 
-    def _watcher(self, bars: pd.DataFrame, *, minute_delta: float, k_delta: float | None) -> tuple:
-        cfg = SurgeConfig() if k_delta is None else SurgeConfig(k_delta_confirm=k_delta)
+    def _watcher(self, bars: pd.DataFrame, *, minute_delta: float, k_delta: float) -> tuple:
+        cfg = SurgeConfig(k_delta_confirm=k_delta)   # v3 默认关，显式开增量门测门
         base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
         w = SurgeWatcher(base, config=cfg, minute_fetcher=lambda c, d: bars)
         gi = 30
         now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
-        w.confirm_cache["300001.SZ"] = build_three_day_baseline(bars, now.date())
+        w.confirm_cache["300001.SZ"] = build_three_day_baseline(bars, now.date(), 4)
+        # amount 使 rel_cum=4 稳落 [k_cum, ratio_cap]，把确认成败隔离到增量门单因子
+        amount = rel_amount(bars, gi, 4.0)
         arr = np.full(CURVE_POINTS, np.nan)
-        arr[gi - 1] = 1e7
-        arr[gi] = 1e7 + minute_delta      # 本分钟增量 = minute_delta
+        arr[gi - 1] = amount - minute_delta
+        arr[gi] = amount                  # 本分钟增量 = minute_delta
         w.cum_series["300001.SZ"] = arr
-        # amount 用累计值：rel = amount/cum_median[30] ≫ k_confirm，隔离出增量门单因子
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
-                         "pct_chg": 5, "volume": 1e6, "amount": arr[gi]}])
+                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
         return w, snap, now, gi
 
     def test_delta_gate_passes_at_boundary(self) -> None:
         # minute_median[30]=100，k_delta=3.0 → 门槛 300；增量 300 恰好 ≥ → 通过
-        w, snap, now, gi = self._watcher(self._bars_const(), minute_delta=300, k_delta=None)
+        w, snap, now, gi = self._watcher(self._bars_const(), minute_delta=300, k_delta=3.0)
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today
         assert w._pending_push and w._pending_push[0].minute_delta == 300
 
     def test_delta_gate_blocks_below_threshold(self) -> None:
         # 增量 299 < 300 → 拦截，不确认
-        w, snap, now, gi = self._watcher(self._bars_const(), minute_delta=299, k_delta=None)
+        w, snap, now, gi = self._watcher(self._bars_const(), minute_delta=299, k_delta=3.0)
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
         assert w._pending_push == []
 
     def test_delta_gate_median_non_positive_fails(self) -> None:
-        # gi30 同分钟中位=0（None-fail 语义）：即便增量巨大也不过
-        w, snap, now, gi = self._watcher(self._bars_no_gi30(), minute_delta=1e9, k_delta=None)
-        assert build_three_day_baseline(self._bars_no_gi30(), self._today()).minute_median[gi] == 0
+        # gi30 同分钟中位=0（None-fail 语义）：即便增量巨大也不过（rel 仍落带内）
+        w, snap, now, gi = self._watcher(self._bars_no_gi30(), minute_delta=1e6, k_delta=3.0)
+        base = build_three_day_baseline(self._bars_no_gi30(), self._today(), 4)
+        assert base.minute_median[gi] == 0
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
 
     def test_delta_gate_disabled_when_zero(self) -> None:
-        # k_delta=0 关门：中位=0 且增量极小也照常确认（其余门通过）
+        # k_delta=0 关门（v3 默认）：中位=0 且增量极小也照常确认（其余门通过）
         w, snap, now, gi = self._watcher(self._bars_no_gi30(), minute_delta=1, k_delta=0.0)
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today
@@ -932,14 +1010,15 @@ class TestU14Buyability:
         w = SurgeWatcher(base, config=cfg, minute_fetcher=lambda c, dd: bars)
         gi = 30
         now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
-        w.confirm_cache["300001.SZ"] = build_three_day_baseline(bars, now.date())
+        w.confirm_cache["300001.SZ"] = build_three_day_baseline(bars, now.date(), 4)
+        # amount 使 rel_cum=4 落带内 → 纯累计确认通过，唯一变量是可买性守卫
+        amount = rel_amount(bars, gi, 4.0)
         arr = np.full(CURVE_POINTS, np.nan)
-        arr[gi - 1] = 1e6
-        arr[gi] = 1e7           # 增量 9e6 ≫ 3×100，过增量门
+        arr[gi] = amount
         w.cum_series["300001.SZ"] = arr
-        # gem 20cm：limit_up = pre_close×1.2（mk_snap 默认档），rel≫k_confirm、VWAP 通过
+        # gem 20cm：limit_up = pre_close×1.2（mk_snap 默认档）
         snap = mk_snap([{"ts_code": "300001.SZ", "price": price, "pre_close": pre_close,
-                         "pct_chg": 8, "volume": 1e6, "amount": 1e7}])
+                         "pct_chg": 8, "volume": 1e6, "amount": amount}])
         return w, snap, now, gi
 
     def test_within_room_blocks_push_but_logs_event(self) -> None:
@@ -984,59 +1063,62 @@ class TestU15CliParse:
         from rquant.cli import build_parser
 
         args = build_parser().parse_args(
-            ["surge-watch", "--k-confirm", "2.5", "--k-delta", "0", "--max-room", "0.5"]
+            ["surge-watch", "--k-cum", "3.0", "--ratio-cap", "10", "--skip-first-minutes", "2",
+             "--k-delta", "1.5", "--require-vwap", "--max-room", "0.5"]
         )
-        assert args.k_confirm == 2.5
-        assert args.k_delta == 0.0
+        assert args.k_cum == 3.0
+        assert args.ratio_cap == 10.0
+        assert args.skip_first_minutes == 2
+        assert args.k_delta == 1.5
+        assert args.require_vwap is True
         assert args.max_room == 0.5
 
-    def test_gate_args_default_to_v2(self) -> None:
+    def test_gate_args_default_to_v3(self) -> None:
         from rquant.cli import build_parser
 
         args = build_parser().parse_args(["surge-watch"])
-        assert args.k_confirm == 3.0
-        assert args.k_delta == 3.0
+        assert args.k_cum == 2.5
+        assert args.ratio_cap == 8.0
+        assert args.skip_first_minutes == 1
+        assert args.k_delta == 0.0
+        assert args.require_vwap is False
         assert args.max_room == 1.0
 
 
-# ── E2 仿真路径 v2 门（增量门拦一只、可买性守卫拦一只、正常票照推） ─────────────
+# ── E2 仿真路径 v3 门（毒尾封顶拦一只、可买性守卫拦一只、正常票照推） ─────────────
 
 
-def _write_sim_v2_fixture(sim_dir: Path) -> None:
-    """一天快照序列：D 被增量门拦（无 event）、E 被可买性守卫拦（unbuyable event 不推）、
-    F 正常确认并推送。confirm_bars 精心构造使三条判定路径互相隔离。"""
+def _write_sim_v3_fixture(sim_dir: Path) -> None:
+    """一天快照序列：D 毒尾（rel=10>8）无 event、E 可买性守卫拦（unbuyable 不推）、
+    F 正常确认并推送。confirm_bars 三日恒定 1e5/min → cum_median[gi]=(gi+1)×1e5，
+    10:05(gi35) base_cum=3.6e6，snap amount = rel × base_cum 精确控 rel。"""
     day = date(2026, 7, 6)
     sim_dir.mkdir(parents=True, exist_ok=True)
-    names = {"300901.SZ": "妖D", "300902.SZ": "拦E", "300903.SZ": "爆F"}
+    names = {"300901.SZ": "毒D", "300902.SZ": "拦E", "300903.SZ": "爆F"}
     (sim_dir / "baseline.json").write_text(json.dumps({
-        "avg20": {c: 1e6 for c in names},          # 小基线 → 粗筛易过
+        "avg20": {c: 1e6 for c in names},          # 候选在爆量分钟入池（pre-boom 压 1e4 落选）
         "theme": {"300903.SZ": "存储芯片"},
     }), encoding="utf-8")
 
     rows: list[dict] = []
     for dd in (1, 2, 3):
         d0 = day - timedelta(days=dd)
-        # D 历史：仅 10:05(gi35) 有量 4e5 → cum_median[35]=4e5、minute_median[35]=4e5、其余 0
-        rows.append({"ts_code": "300901.SZ",
-                     "trade_time": datetime.combine(d0, dt_time(10, 5)), "amount": 4e5})
-        # E/F 历史：恒定 1e5/min（全 241 网格）→ cum_median[35]=3.6e6、minute_median[35]=1e5
-        for c in ("300902.SZ", "300903.SZ"):
+        for c in names:                             # 三票同基线 1e5/min（全 241 网格）
             for i in range(241):
                 t = datetime.combine(d0, dt_time(9, 30)) + timedelta(minutes=i)
                 rows.append({"ts_code": c, "trade_time": t, "amount": 1e5})
     pd.DataFrame(rows).to_parquet(sim_dir / "confirm_bars.parquet", index=False)
 
-    for i in range(37):                             # 09:30..10:06 逐分钟
+    for i in range(37):                             # 09:30..10:06 逐分钟（morning gi==i）
         t = (datetime(2026, 7, 6, 9, 30) + timedelta(minutes=i)).time()
         hhmm = f"{t.hour:02d}{t.minute:02d}"
-        boom = t >= dt_time(10, 5)
-        # D：累计缓涨 (i+1)×1e5，10:05 达 3.6e6（rel 过 k_confirm）但本分钟增量仅 1e5
-        #    < 3×minute_median(4e5)=1.2e6 → 增量门拦
-        d_amt = (i + 1) * 1e5
-        # E/F：10:05 前压 1e4（rel<k_confirm 不确认），10:05 跳 2e8（增量≈2e8 过增量门）
-        ef_amt = 2e8 if boom else 1e4
+        boom = i >= 35                              # 10:05 起爆量
+        base_cum = (i + 1) * 1e5
+        d_amt = 10.0 * base_cum if boom else 1e4    # D：rel=10 > ratio_cap(8) 毒尾
+        ef_amt = 4.0 * base_cum if boom else 1e4    # E/F：rel=4 落带内
         snap = mk_snap([
-            {"ts_code": "300901.SZ", "name": "妖D", "price": 11.0, "pre_close": 10,
+            # D：rel=10 毒尾 → 不确认、无 event（price/room 不影响，先被 cap 拦）
+            {"ts_code": "300901.SZ", "name": "毒D", "price": 11.0, "pre_close": 10,
              "pct_chg": 10, "volume": 1e7, "amount": d_amt},
             # E：limit_up=12.0，price 11.9 → room 0.84% ≤1% → 确认但 unbuyable
             {"ts_code": "300902.SZ", "name": "拦E", "price": 11.9, "pre_close": 10,
@@ -1048,10 +1130,10 @@ def _write_sim_v2_fixture(sim_dir: Path) -> None:
         snap.to_parquet(sim_dir / f"2026-07-06T{hhmm}.parquet", index=False)
 
 
-class TestE2SimulateV2Gates:
-    def test_delta_and_room_gates_in_simulate(self, tmp_path: Path) -> None:
-        sim_dir = tmp_path / "sim_v2"
-        _write_sim_v2_fixture(sim_dir)
+class TestE2SimulateV3Gates:
+    def test_cap_and_room_gates_in_simulate(self, tmp_path: Path) -> None:
+        sim_dir = tmp_path / "sim_v3"
+        _write_sim_v3_fixture(sim_dir)
         pushes: list[tuple] = []
         rc = run_simulate(
             sim_dir,
@@ -1062,17 +1144,18 @@ class TestE2SimulateV2Gates:
         assert rc == 0
         events = (tmp_path / "live" / "events-2026-07-06.jsonl").read_text(encoding="utf-8")
         by_code = {json.loads(x)["ts_code"]: json.loads(x) for x in events.strip().split("\n")}
-        # D 被增量门拦 → 根本不产生 event
+        # D 被毒尾封顶拦（rel>8）→ 根本不产生 event
         assert "300901.SZ" not in by_code
         # E 确认但可买性守卫拦 → 落 event 标 unbuyable
         assert by_code["300902.SZ"]["status"] == "unbuyable"
+        assert by_code["300902.SZ"]["rel_cum"] == 4.0
         # F 正常确认 → status confirmed
         assert by_code["300903.SZ"]["status"] == "confirmed"
         # 推送只含 F（买得进），不含 E（买不进）
         assert len(pushes) == 1
         body = pushes[0][1]["body"]
         assert "爆F" in body and "拦E" not in body
-        assert "口径 v2" in body and "观察提示，非买入信号" in body
+        assert "口径 v3(纯累计)" in body and "观察提示，非买入信号" in body
 
 
 # ── U16 全市场重构（D1）：全市场取数 → 检测层过滤 config.boards ─────────────────
