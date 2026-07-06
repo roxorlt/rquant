@@ -186,7 +186,7 @@ class SurgeBaseline:
     """启动预载的市场基线（全部载内存）。"""
 
     avg_amount_20d: dict[str, float]  # ts_code → 元（daily_bar 千元 ×1000）
-    theme: dict[str, str]             # ts_code → kpl 题材名（首个命中）
+    theme: dict[str, str]             # ts_code → 题材名（三级兜底链首个命中，见 load_theme_map）
     curve: np.ndarray                 # 241 点进度曲线
 
 
@@ -225,32 +225,68 @@ def load_avg_amount_20d(store=None) -> dict[str, float]:
     return {str(r.ts_code): float(r.avg_amount_20d) for r in df.itertuples()}
 
 
+# 题材映射三级兜底链（每级 con_code → 题材名，首个命中保留）：
+# 1. kpl_concept_member —— 开盘啦题材快照，本地日终采集权威（PK 每题材最近打点）；
+# 2. kpl_concept_member_daily —— 开盘啦题材日度表最新 trade_date 打点（本地有历史时）；
+# 3. dc_board_member JOIN dc_board（idx_type='概念板块'）—— 东财概念，云端只读副本大概率有。
+# 云端只读副本没有 kpl_*（题材成分是本地研究数据，数据分家未上云），靠第 3 级兜住。
+_THEME_MAP_FALLBACKS: tuple[tuple[str, str], ...] = (
+    ("kpl_concept_member", "SELECT board_name, con_code FROM kpl_concept_member"),
+    (
+        "kpl_concept_member_daily",
+        """
+        SELECT board_name, con_code
+        FROM kpl_concept_member_daily
+        WHERE trade_date = (SELECT MAX(trade_date) FROM kpl_concept_member_daily)
+        """,
+    ),
+    (
+        "dc_board_member",
+        """
+        SELECT b.name AS board_name, m.con_code
+        FROM dc_board_member m
+        JOIN dc_board b ON m.board_code = b.ts_code
+        WHERE b.idx_type = '概念板块'
+        """,
+    ),
+)
+
+
 def load_theme_map(store=None) -> dict[str, str]:
-    """con_code → 开盘啦题材名（首个命中）。缺表/撞锁 → 空 dict。"""
+    """con_code → 题材名（首个命中）。三级兜底链，逐级 try/except、命中即止。
+
+    依次尝试 kpl_concept_member（本地权威）→ kpl_concept_member_daily 最新打点 →
+    dc_board 东财概念（云端兜底）。某级缺表/撞锁/查空即降级下一级，三级全失败 →
+    空 dict（现状降级语义保留，主循环仍活，只是报文缺题材标签）。
+    """
     from rquant.storage.duckdb import open_readonly_store
 
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("kpl_concept_member",))
+        store = store or open_readonly_store()
     except Exception as e:
-        logger.warning(f"kpl 题材成分只读库打开失败: {type(e).__name__}: {e}")
+        logger.warning(f"题材映射只读库打开失败: {type(e).__name__}: {e}")
         return {}
     try:
-        df = store._conn.execute(
-            "SELECT board_name, con_code FROM kpl_concept_member"
-        ).fetchdf()
-    except Exception as e:
-        logger.warning(f"kpl 题材成分查询失败: {type(e).__name__}: {e}")
+        for level, sql in _THEME_MAP_FALLBACKS:
+            try:
+                df = store._conn.execute(sql).fetchdf()
+            except Exception as e:
+                logger.warning(f"题材映射 {level} 查询失败，降级下一级: {type(e).__name__}: {e}")
+                continue
+            mapping: dict[str, str] = {}
+            for r in df.itertuples():
+                code = str(r.con_code)
+                if code not in mapping:  # 一票多题材保留首个
+                    mapping[code] = str(r.board_name)
+            if mapping:
+                logger.info(f"surge 题材映射命中 {level}：{len(mapping)} 只")
+                return mapping
+            logger.debug(f"题材映射 {level} 无数据，降级下一级")
         return {}
     finally:
         if owns:
             store.close()
-    mapping: dict[str, str] = {}
-    for r in df.itertuples():
-        code = str(r.con_code)
-        if code not in mapping:
-            mapping[code] = str(r.board_name)
-    return mapping
 
 
 def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
