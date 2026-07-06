@@ -452,14 +452,51 @@ def render_drilldown(
 # ── 右栏下：个股图表（分时 / 5日 / 日K） ──────────────────────────────────────
 
 
+def _trend_axis(trend: pd.DataFrame) -> tuple[list[int], str]:
+    """分时/5日 x 轴（bar 序号 idx）刻度定位 + 标签映射表达式。
+
+    单日 → 5 个时段刻度（idx 0/1/4·1/2·3/4·末，标签 09:30/10:30/11:30·13:00/14:00/15:00，
+    午休折点用「11:30/13:00」双标）；多日 → 每日首根 idx 打日期标签（MM-DD）。
+    labelExpr 用 Vega indexof 把刻度值查回标签，axis values 限定刻度只落在这些 idx，
+    故 datum.value 必命中数组、无 -1 越界。
+    """
+    day = pd.to_datetime(trend["dt"]).dt.normalize()
+    day_starts = day.drop_duplicates()
+    if len(day_starts) <= 1:
+        n = len(trend)
+        values = sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})
+        labels = ["09:30", "10:30", "11:30/13:00", "14:00", "15:00"][: len(values)]
+    else:
+        values = [int(pos) for pos in day_starts.index]
+        labels = [d.strftime("%m-%d") for d in day_starts]
+    vals_arr = "[" + ",".join(str(v) for v in values) + "]"
+    labels_arr = "[" + ",".join(f"'{lbl}'" for lbl in labels) + "]"
+    label_expr = f"{labels_arr}[indexof({vals_arr}, datum.value)]"
+    return values, label_expr
+
+
 def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
-    """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱，x 轴共享。"""
+    """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱，x 轴共享。
+
+    x 轴用 bar 序号 idx（quantitative）而非真实时间 dt——非交易时段（午休/隔夜）
+    不占轴距，线天然连续无空档；轴刻度经 labelExpr 映射回时间/日期，tooltip 保留真实 dt。
+    """
+    trend = trend.reset_index(drop=True).assign(idx=lambda d: range(len(d)))
     has_avg = trend["avg_price"].notna().any()
-    x_price = alt.X("dt:T", title=None, axis=alt.Axis(labels=False, ticks=False))
+    values, label_expr = _trend_axis(trend)
+    x_scale = alt.Scale(nice=False, zero=False)
+    dt_tip = alt.Tooltip("dt:T", title="时间", format="%m-%d %H:%M")
+    x_price = alt.X(
+        "idx:Q", title=None, scale=x_scale, axis=alt.Axis(labels=False, ticks=False)
+    )
     price_line = (
         alt.Chart(trend)
         .mark_line(color="#2563eb")
-        .encode(x=x_price, y=alt.Y("price:Q", title=None, scale=alt.Scale(zero=False)))
+        .encode(
+            x=x_price,
+            y=alt.Y("price:Q", title=None, scale=alt.Scale(zero=False)),
+            tooltip=[dt_tip, alt.Tooltip("price:Q", title="价")],
+        )
     )
     layers = [price_line]
     if has_avg:
@@ -470,10 +507,20 @@ def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
         )
         layers.append(avg_line)
     price = alt.layer(*layers).properties(height=220)
+    x_vol = alt.X(
+        "idx:Q",
+        title=None,
+        scale=x_scale,
+        axis=alt.Axis(values=values, labelExpr=label_expr, labelAngle=0, labelOverlap=False),
+    )
     vol = (
         alt.Chart(trend)
         .mark_bar(color="#94a3b8")
-        .encode(x=alt.X("dt:T", title=None), y=alt.Y("volume:Q", title=None))
+        .encode(
+            x=x_vol,
+            y=alt.Y("volume:Q", title=None),
+            tooltip=[dt_tip, alt.Tooltip("volume:Q", title="量")],
+        )
         .properties(height=70)
     )
     return alt.vconcat(price, vol).resolve_scale(x="shared")

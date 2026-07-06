@@ -1227,10 +1227,30 @@ def _fake_liquidity_baseline() -> pd.DataFrame:
     )
 
 
+def _session_minute_stamps(day: pd.Timestamp) -> pd.DatetimeIndex:
+    """单个交易日的 240 根分钟时间戳：上午 09:30–11:29 + 下午 13:00–14:59。
+
+    含真实午休断裂（不产出 11:30–12:59 任一分钟），fake 分时/5日图才能复现空档，
+    修复（idx 序号轴消空档）方可视觉验证。
+    """
+    base = pd.Timestamp(day).normalize()
+    morning = pd.date_range(base + pd.Timedelta("9h30min"), periods=120, freq="min")
+    afternoon = pd.date_range(base + pd.Timedelta("13h"), periods=120, freq="min")
+    return morning.append(afternoon)
+
+
 def _fake_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
-    """分时/5日 fixture：240 根/日（5 日 1200 根），平滑正弦可画图，route=em_direct。"""
-    count = 240 * ndays
-    dt = pd.date_range("2026-07-06 09:30:00", periods=count, freq="min")
+    """分时/5日 fixture：每交易日 240 根真实时段时间戳（含午休断裂），5 日=5 组。
+
+    数值走连续 x=arange(count) 的平滑正弦（与旧版一致，只把 dt 换成真实交易时段），
+    route=em_direct。5 日锚定最近 ndays 个工作日（bdate_range），故 5 组各自独立日期。
+    """
+    per_day = 240
+    count = per_day * ndays
+    days = pd.bdate_range(end="2026-07-06", periods=ndays)
+    dt = pd.DatetimeIndex(
+        np.concatenate([_session_minute_stamps(day).to_numpy() for day in days])
+    )
     x = np.arange(count)
     price = np.round(20.0 + 2.0 * np.sin(x / 30.0) + x * 0.001, 2)
     avg_price = np.round(pd.Series(price).expanding().mean().to_numpy(), 2)
