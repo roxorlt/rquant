@@ -62,6 +62,17 @@ class Settings(BaseSettings):
     deepseek_base_url: str = Field(default="https://api.deepseek.com")
     deepseek_model: str = Field(default="deepseek-v4-flash")
 
+    # ===== 全景页登录网关（微信友好 cookie 登录，替代 basic auth）=====
+    # 签名令牌密钥：部署时 `openssl rand -hex 32` 生成一次写 .env；为空则登录服务拒绝启动。
+    # 用 validation_alias 对齐既有 RQUANT_* env 命名（poller/backup 同风格），
+    # systemd EnvironmentFile=.env 注入进程环境后由 Settings 读取。
+    panorama_cookie_secret: str = Field(
+        default="", validation_alias="RQUANT_PANORAMA_COOKIE_SECRET"
+    )
+    panorama_users_path: Path | None = Field(
+        default=None, validation_alias="RQUANT_PANORAMA_USERS_PATH"
+    )
+
     @property
     def deepseek_enabled(self) -> bool:
         return bool(self.deepseek_api_key)
@@ -105,6 +116,13 @@ class Settings(BaseSettings):
         if self.duckdb_readonly_path is not None:
             return self.duckdb_readonly_path
         return self.duckdb_path.with_name(self.duckdb_path.stem + "_ro.duckdb")
+
+    @property
+    def panorama_users_path_resolved(self) -> Path:
+        """用户库路径未显式配置时，落 data_dir 下 panorama-users.txt。"""
+        if self.panorama_users_path is not None:
+            return self.panorama_users_path
+        return self.data_dir / "panorama-users.txt"
 
 
 settings = Settings()  # type: ignore[call-arg]

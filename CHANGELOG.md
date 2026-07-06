@@ -6,6 +6,30 @@
 
 ### Added
 
+- **全景页微信友好登录网关（cookie 登录页替代 basic auth）**：微信内置浏览器不支持
+  HTTP basic auth（不弹框、直接 401，朋友进不去），改成网页登录页 + 签名 cookie——微信
+  原生支持 cookie 与表单 POST，点链接即可登录。新增 `src/rquant/panorama_auth.py`（**纯
+  标准库**，零第三方依赖：`http.server` / `hmac` / `hashlib.pbkdf2_hmac` / `base64` /
+  `secrets` / `http.cookies`）：监听 127.0.0.1:8507 三端点——`GET /login` 返回移动端友好
+  表单、`POST /login` 校验 pbkdf2（200000 迭代 + 随机 salt）通过则
+  `Set-Cookie: rq_panorama=<签名令牌>; Max-Age=2592000; HttpOnly; Path=/; SameSite=Lax`
+  + 302 回 `/`、`GET /verify` 供 nginx auth_request 子请求验签+验过期（200/401）。签名令牌
+  `base64url(user|exp).hmac_sha256(user|exp, SECRET)` 无会话存储自验证，验签用
+  `hmac.compare_digest` 防时序，`SECRET`（`RQUANT_PANORAMA_COOKIE_SECRET`）缺失则服务
+  **拒绝启动**（SystemExit，不用空密钥静默降级），改 SECRET 即全体失效（应急踢人）。用户库
+  `data/panorama-users.txt`（行 `user:pbkdf2_sha256$iter$salt$hash`，0600 权限，原子写）。
+  落地：① CLI 四子命令 `panorama-auth-serve`（--host/--port，默认 127.0.0.1:8507）/
+  `panorama-user-add <name>`（getpass 输密码两次确认）/ `panorama-user-remove` /
+  `panorama-user-list`；② config 新增 `panorama_cookie_secret` +
+  `panorama_users_path`（validation_alias 对齐 RQUANT_* env）；③
+  `deploy/systemd/rquant-panorama-auth.service`（Type=simple/Restart=always，
+  EnvironmentFile=.env 读 SECRET）；④ `deploy/nginx/rquant-panorama-cloud.conf` 改造为
+  auth_request 版（`/_panorama_auth` 内部端点透传 Cookie 给 8507 `/verify` + `/login`
+  反代 + `location /` 的 `auth_request` + `@go_login` 302，去掉 `auth_basic`；文件底部附
+  无 auth_request 模块时的 `map $cookie_rq_panorama` 静态令牌降级片段注释）；⑤ 部署清单
+  `docs/deploy/2026-07-06-panorama-login-gate-deploy.md`（生成 SECRET、建用户、起 auth
+  service、`nginx -V` 检查 auth_request、reload、微信实测、旧 `.htpasswd-panorama` 保留、
+  回滚换回 basic auth 版）。旧 basic auth（`.htpasswd-panorama`）保留备用不删。
 - **全景页上云（云端直跑，零隧道）**：全景页从「Mac 拉数 + SSH 反向隧道」改为云端
   常驻——手机/朋友任意网络直访 `82.156.0.68:28080`（basic auth）→ 云 127.0.0.1:8506
   的 streamlit，poller 读同机 surge feed + 自拉兜底，零隧道、零 Mac 依赖（Mac 本地
