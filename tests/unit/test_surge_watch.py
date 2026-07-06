@@ -1,6 +1,7 @@
-"""surge-watch 单测（U1-U10，全离线，注入时钟/mock 源，不真 sleep 不碰网络）。
+"""surge-watch 单测（U1-U12，全离线，注入时钟/mock 源，不真 sleep 不碰网络）。
 
-口径 v1: rough1.5×20d·curve / confirm2.0×3d同刻 / VWAP门。
+口径 v2: rough1.5×20d·curve / confirm3.0×3d同刻 / 增量门3.0×3d同分钟 / VWAP门 /
+可买性守卫（距涨停≤1%或已封板不推）。默认参数据 2026-07-06 全天真实分钟重放扫描。
 """
 
 from __future__ import annotations
@@ -233,28 +234,29 @@ class TestU4Confirm:
         base = mk_baseline({"300001.SZ": 1e6}, curve=curve)
         bars = self._three_day_bars()
         w = SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=lambda c, d: bars)
-        gi = 1  # 09:31，base_cum[1]=400
+        gi = 1  # 09:31，base_cum[1]=400、minute_median[1]=200
         now = datetime(2026, 7, 6, 9, 31, tzinfo=CST)
-        # rel = amount/400；恰好 2.0× → amount 800；VWAP: price ≥ amount/volume
+        # k_confirm=3.0：rel 恰好 3.0× → amount 1200；VWAP: price ≥ amount/volume；
+        # 增量门 3.0×minute_median(200)=600，minute_delta=1200 ≥600 通过
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 800, "amount": 800}])
+                         "pct_chg": 5, "volume": 1200, "amount": 1200}])
         w.cum_series["300001.SZ"] = np.full(CURVE_POINTS, np.nan)
-        w.cum_series["300001.SZ"][gi] = 800
+        w.cum_series["300001.SZ"][gi] = 1200
         base_3d = build_three_day_baseline(self._three_day_bars(), now.date())
         w.confirm_cache["300001.SZ"] = base_3d
         assert base_3d.cum_median[gi] == 400
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today
-        assert w._pending_push[0].rel_cum_3d == 2.0
+        assert w._pending_push[0].rel_cum_3d == 3.0
 
     def test_vwap_reject(self) -> None:
         base = mk_baseline({"300001.SZ": 1e6})
         w = SurgeWatcher(base, minute_fetcher=lambda c, d: self._three_day_bars())
         gi = 1
         now = datetime(2026, 7, 6, 9, 31, tzinfo=CST)
-        # price < vwap(=amount/volume=2.0) → 拒
+        # rel=1500/400=3.75 过 k_confirm(3.0)，但 price < vwap(=amount/volume=3.0) → VWAP 拒
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 500, "amount": 1000}])
+                         "pct_chg": 5, "volume": 500, "amount": 1500}])
         w.confirm_cache["300001.SZ"] = build_three_day_baseline(self._three_day_bars(), now.date())
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
@@ -290,7 +292,8 @@ class TestU4Confirm:
 class TestU5DedupSilentFold:
     def _confirming_watcher(self) -> SurgeWatcher:
         d = date(2026, 7, 6)
-        bars = mk_minute_bars({d - timedelta(days=i): [10, 10, 10] for i in (1, 2, 3)})
+        # 241 根恒定额：同分钟中位 >0 全网格覆盖，10:00(gi30) 也能过增量门（v2 默认开）
+        bars = mk_minute_bars({d - timedelta(days=i): [10] * 241 for i in (1, 2, 3)})
         base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
         return SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=lambda c, dd: bars)
 
@@ -336,7 +339,8 @@ class TestU5DedupSilentFold:
 class TestU6RateLimit:
     def _bars(self) -> pd.DataFrame:
         d = date(2026, 7, 6)
-        return mk_minute_bars({d - timedelta(days=i): [1, 1, 1] for i in (1, 2, 3)})
+        # 241 根恒定额：同分钟中位全网格 >0，10:00(gi30) 过增量门（v2 默认开）
+        return mk_minute_bars({d - timedelta(days=i): [1] * 241 for i in (1, 2, 3)})
 
     def test_two_per_minute_fifo(self) -> None:
         calls: list[str] = []
@@ -378,7 +382,10 @@ class TestU6RateLimit:
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))  # 300000 失败, 300001 成功
         assert "300001.SZ" in w.pushed_today
         assert "300000.SZ" not in w.pushed_today
-        w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))  # 300000 重试成功
+        # 重试分钟累计额续增（2e7）→ 本分钟增量 1e7 过增量门（v2 默认开）
+        snap2 = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
+                          "pct_chg": 5, "volume": 1e8, "amount": 2e7} for c in codes])
+        w.tick(snap2, datetime(2026, 7, 6, 10, 1, tzinfo=CST))  # 300000 重试成功
         assert "300000.SZ" in w.pushed_today
 
 
@@ -553,11 +560,14 @@ class TestU10Push:
         assert "人形机器人" in body                   # 题材
         assert "量比3日2.7×" in body                  # 量比
         assert "距涨停4.5%" in body                   # 距涨停空间
-        assert "口径 v1" in body                      # 尾注口径版本
+        assert "口径 v2" in body                      # 尾注口径版本（v2 收紧）
+        assert "增量门3×3d同分钟" in body             # v2 新增同分钟增量门
+        assert "观察提示，非买入信号" in body          # v2 定位尾注
 
     def test_dry_run_no_push(self, tmp_path: Path, capsys) -> None:
         d = date(2026, 7, 6)
-        bars = mk_minute_bars({d - timedelta(days=i): [10, 10, 10] for i in (1, 2, 3)})
+        # 241 根恒定额：同分钟中位全网格 >0，10:00 过增量门（v2 默认开）
+        bars = mk_minute_bars({d - timedelta(days=i): [10] * 241 for i in (1, 2, 3)})
         notifies: list = []
         clock = {"t": datetime(2026, 7, 6, 10, 0, tzinfo=CST)}
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
@@ -830,3 +840,238 @@ class TestU11ThemeMapFallback:
         store = _theme_store(tmp_path, tables={})
         m = load_theme_map(store)
         assert m == {}
+
+
+# ── U12 v2 默认值（2026-07-06 扫描收紧） ────────────────────────────────────────
+
+
+class TestU12ConfigDefaults:
+    def test_v2_defaults(self) -> None:
+        cfg = SurgeConfig()
+        assert cfg.k_confirm == 3.0             # v1 2.0 → v2 3.0（Pareto，逆选择上限）
+        assert cfg.k_delta_confirm == 3.0       # 新增同分钟增量门，默认开
+        assert cfg.max_room_to_limit_pct == 1.0  # 可买性守卫，距涨停≤1% 不推
+        assert cfg.k_rough == 1.5               # 粗筛不动
+        assert cfg.confirm_lookback_days == 3
+
+
+# ── U13 同分钟增量门 ────────────────────────────────────────────────────────────
+
+
+class TestU13DeltaGate:
+    """确认时点要求「当分钟增量 ≥ k_delta × 3日同分钟中位」。"""
+
+    def _today(self) -> date:
+        return date(2026, 7, 6)
+
+    def _bars_const(self) -> pd.DataFrame:
+        # 三日每分钟恒定 100（全 241 网格）→ minute_median=100、cum_median[gi]=(gi+1)*100
+        d = self._today()
+        return mk_minute_bars({d - timedelta(days=i): [100] * 241 for i in (1, 2, 3)})
+
+    def _bars_no_gi30(self) -> pd.DataFrame:
+        # 三日仅前 3 分钟有量 → gi30 处 minute_median=0（中位≤0 场景）
+        d = self._today()
+        return mk_minute_bars({d - timedelta(days=i): [100, 100, 100] for i in (1, 2, 3)})
+
+    def _watcher(self, bars: pd.DataFrame, *, minute_delta: float, k_delta: float | None) -> tuple:
+        cfg = SurgeConfig() if k_delta is None else SurgeConfig(k_delta_confirm=k_delta)
+        base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
+        w = SurgeWatcher(base, config=cfg, minute_fetcher=lambda c, d: bars)
+        gi = 30
+        now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
+        w.confirm_cache["300001.SZ"] = build_three_day_baseline(bars, now.date())
+        arr = np.full(CURVE_POINTS, np.nan)
+        arr[gi - 1] = 1e7
+        arr[gi] = 1e7 + minute_delta      # 本分钟增量 = minute_delta
+        w.cum_series["300001.SZ"] = arr
+        # amount 用累计值：rel = amount/cum_median[30] ≫ k_confirm，隔离出增量门单因子
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
+                         "pct_chg": 5, "volume": 1e6, "amount": arr[gi]}])
+        return w, snap, now, gi
+
+    def test_delta_gate_passes_at_boundary(self) -> None:
+        # minute_median[30]=100，k_delta=3.0 → 门槛 300；增量 300 恰好 ≥ → 通过
+        w, snap, now, gi = self._watcher(self._bars_const(), minute_delta=300, k_delta=None)
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" in w.pushed_today
+        assert w._pending_push and w._pending_push[0].minute_delta == 300
+
+    def test_delta_gate_blocks_below_threshold(self) -> None:
+        # 增量 299 < 300 → 拦截，不确认
+        w, snap, now, gi = self._watcher(self._bars_const(), minute_delta=299, k_delta=None)
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" not in w.pushed_today
+        assert w._pending_push == []
+
+    def test_delta_gate_median_non_positive_fails(self) -> None:
+        # gi30 同分钟中位=0（None-fail 语义）：即便增量巨大也不过
+        w, snap, now, gi = self._watcher(self._bars_no_gi30(), minute_delta=1e9, k_delta=None)
+        assert build_three_day_baseline(self._bars_no_gi30(), self._today()).minute_median[gi] == 0
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" not in w.pushed_today
+
+    def test_delta_gate_disabled_when_zero(self) -> None:
+        # k_delta=0 关门：中位=0 且增量极小也照常确认（其余门通过）
+        w, snap, now, gi = self._watcher(self._bars_no_gi30(), minute_delta=1, k_delta=0.0)
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" in w.pushed_today
+
+
+# ── U14 可买性守卫 ──────────────────────────────────────────────────────────────
+
+
+class TestU14Buyability:
+    """确认后现价距涨停 ≤ max_room（或已封板）→ 标 unbuyable，占名额、落 events、不推送。"""
+
+    def _confirmable(
+        self, *, price: float, pre_close: float, max_room: float | None = None
+    ) -> tuple:
+        d = date(2026, 7, 6)
+        bars = mk_minute_bars({d - timedelta(days=i): [100] * 241 for i in (1, 2, 3)})
+        cfg = SurgeConfig() if max_room is None else SurgeConfig(max_room_to_limit_pct=max_room)
+        base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
+        w = SurgeWatcher(base, config=cfg, minute_fetcher=lambda c, dd: bars)
+        gi = 30
+        now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
+        w.confirm_cache["300001.SZ"] = build_three_day_baseline(bars, now.date())
+        arr = np.full(CURVE_POINTS, np.nan)
+        arr[gi - 1] = 1e6
+        arr[gi] = 1e7           # 增量 9e6 ≫ 3×100，过增量门
+        w.cum_series["300001.SZ"] = arr
+        # gem 20cm：limit_up = pre_close×1.2（mk_snap 默认档），rel≫k_confirm、VWAP 通过
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": price, "pre_close": pre_close,
+                         "pct_chg": 8, "volume": 1e6, "amount": 1e7}])
+        return w, snap, now, gi
+
+    def test_within_room_blocks_push_but_logs_event(self) -> None:
+        # pre_close 100 → limit_up 120；price 119.5 → room 0.42% ≤1% → unbuyable
+        w, snap, now, gi = self._confirmable(price=119.5, pre_close=100)
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" in w.pushed_today          # 仍占「每票每日一次」名额
+        assert w._pending_push == []                  # 不进报文
+        assert len(w._pending_events) == 1
+        assert w._pending_events[0].status == "unbuyable"
+
+    def test_already_sealed_blocks(self) -> None:
+        # price = limit_up（封板）→ room 0 ≤1% → unbuyable
+        w, snap, now, gi = self._confirmable(price=120.0, pre_close=100)
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert w._pending_push == []
+        assert w._pending_events[0].status == "unbuyable"
+
+    def test_unbuyable_flushed_to_events_not_pushed(self) -> None:
+        # 过静默窗 flush：TickResult.confirmed 含 unbuyable（落 events），pushes 空
+        w, snap, now, gi = self._confirmable(price=119.5, pre_close=100)
+        w._evaluate("300001.SZ", snap, now, gi)
+        res = w._flush(now)
+        assert res.pushes == []
+        assert len(res.confirmed) == 1 and res.confirmed[0].status == "unbuyable"
+
+    def test_buyable_stock_unaffected(self) -> None:
+        # pre_close 100 → limit_up 120；price 110 → room 9.1% >1% → 正常推送
+        w, snap, now, gi = self._confirmable(price=110.0, pre_close=100)
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" in w.pushed_today
+        assert len(w._pending_push) == 1
+        assert w._pending_push[0].status == "confirmed"
+        assert w._pending_events == []
+
+
+# ── U15 CLI 门槛参数解析 ────────────────────────────────────────────────────────
+
+
+class TestU15CliParse:
+    def test_gate_args_parsed(self) -> None:
+        from rquant.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["surge-watch", "--k-confirm", "2.5", "--k-delta", "0", "--max-room", "0.5"]
+        )
+        assert args.k_confirm == 2.5
+        assert args.k_delta == 0.0
+        assert args.max_room == 0.5
+
+    def test_gate_args_default_to_v2(self) -> None:
+        from rquant.cli import build_parser
+
+        args = build_parser().parse_args(["surge-watch"])
+        assert args.k_confirm == 3.0
+        assert args.k_delta == 3.0
+        assert args.max_room == 1.0
+
+
+# ── E2 仿真路径 v2 门（增量门拦一只、可买性守卫拦一只、正常票照推） ─────────────
+
+
+def _write_sim_v2_fixture(sim_dir: Path) -> None:
+    """一天快照序列：D 被增量门拦（无 event）、E 被可买性守卫拦（unbuyable event 不推）、
+    F 正常确认并推送。confirm_bars 精心构造使三条判定路径互相隔离。"""
+    day = date(2026, 7, 6)
+    sim_dir.mkdir(parents=True, exist_ok=True)
+    names = {"300901.SZ": "妖D", "300902.SZ": "拦E", "300903.SZ": "爆F"}
+    (sim_dir / "baseline.json").write_text(json.dumps({
+        "avg20": {c: 1e6 for c in names},          # 小基线 → 粗筛易过
+        "theme": {"300903.SZ": "存储芯片"},
+    }), encoding="utf-8")
+
+    rows: list[dict] = []
+    for dd in (1, 2, 3):
+        d0 = day - timedelta(days=dd)
+        # D 历史：仅 10:05(gi35) 有量 4e5 → cum_median[35]=4e5、minute_median[35]=4e5、其余 0
+        rows.append({"ts_code": "300901.SZ",
+                     "trade_time": datetime.combine(d0, dt_time(10, 5)), "amount": 4e5})
+        # E/F 历史：恒定 1e5/min（全 241 网格）→ cum_median[35]=3.6e6、minute_median[35]=1e5
+        for c in ("300902.SZ", "300903.SZ"):
+            for i in range(241):
+                t = datetime.combine(d0, dt_time(9, 30)) + timedelta(minutes=i)
+                rows.append({"ts_code": c, "trade_time": t, "amount": 1e5})
+    pd.DataFrame(rows).to_parquet(sim_dir / "confirm_bars.parquet", index=False)
+
+    for i in range(37):                             # 09:30..10:06 逐分钟
+        t = (datetime(2026, 7, 6, 9, 30) + timedelta(minutes=i)).time()
+        hhmm = f"{t.hour:02d}{t.minute:02d}"
+        boom = t >= dt_time(10, 5)
+        # D：累计缓涨 (i+1)×1e5，10:05 达 3.6e6（rel 过 k_confirm）但本分钟增量仅 1e5
+        #    < 3×minute_median(4e5)=1.2e6 → 增量门拦
+        d_amt = (i + 1) * 1e5
+        # E/F：10:05 前压 1e4（rel<k_confirm 不确认），10:05 跳 2e8（增量≈2e8 过增量门）
+        ef_amt = 2e8 if boom else 1e4
+        snap = mk_snap([
+            {"ts_code": "300901.SZ", "name": "妖D", "price": 11.0, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e7, "amount": d_amt},
+            # E：limit_up=12.0，price 11.9 → room 0.84% ≤1% → 确认但 unbuyable
+            {"ts_code": "300902.SZ", "name": "拦E", "price": 11.9, "pre_close": 10,
+             "pct_chg": 19, "volume": 1e9, "amount": ef_amt},
+            # F：price 11 → room 9.1% >1% → 正常推送
+            {"ts_code": "300903.SZ", "name": "爆F", "price": 11.0, "pre_close": 10,
+             "pct_chg": 10, "volume": 1e9, "amount": ef_amt},
+        ])
+        snap.to_parquet(sim_dir / f"2026-07-06T{hhmm}.parquet", index=False)
+
+
+class TestE2SimulateV2Gates:
+    def test_delta_and_room_gates_in_simulate(self, tmp_path: Path) -> None:
+        sim_dir = tmp_path / "sim_v2"
+        _write_sim_v2_fixture(sim_dir)
+        pushes: list[tuple] = []
+        rc = run_simulate(
+            sim_dir,
+            dry_run=False,
+            base_dir=tmp_path / "live",
+            notify_fn=lambda scene, **k: pushes.append((scene, k)),
+        )
+        assert rc == 0
+        events = (tmp_path / "live" / "events-2026-07-06.jsonl").read_text(encoding="utf-8")
+        by_code = {json.loads(x)["ts_code"]: json.loads(x) for x in events.strip().split("\n")}
+        # D 被增量门拦 → 根本不产生 event
+        assert "300901.SZ" not in by_code
+        # E 确认但可买性守卫拦 → 落 event 标 unbuyable
+        assert by_code["300902.SZ"]["status"] == "unbuyable"
+        # F 正常确认 → status confirmed
+        assert by_code["300903.SZ"]["status"] == "confirmed"
+        # 推送只含 F（买得进），不含 E（买不进）
+        assert len(pushes) == 1
+        body = pushes[0][1]["body"]
+        assert "爆F" in body and "拦E" not in body
+        assert "口径 v2" in body and "观察提示，非买入信号" in body
