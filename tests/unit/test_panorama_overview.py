@@ -465,6 +465,37 @@ class TestFakeModeU7:
         assert (kl["close"] > kl["open"]).any()
         assert (kl["close"] < kl["open"]).any()
 
+    def test_fake_intraday_real_session_stamps_with_lunch_gap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """fake 分时 dt 覆盖 09:30–11:29 与 13:00–15:00 两段、不含 11:30–12:59 午休。
+
+        午休断裂是分时图空档修复（idx 序号轴）的可视验证前提，fake 必须复现。
+        """
+        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+        trend = panorama_data.fetch_intraday_trend("600001.SH", ndays=1)
+        assert len(trend) == 240
+        assert trend["dt"].dt.date.nunique() == 1
+        hm = trend["dt"].dt.strftime("%H:%M")
+        assert ((hm >= "09:30") & (hm <= "11:29")).sum() == 120
+        assert ((hm >= "13:00") & (hm <= "15:00")).sum() == 120
+        assert ((hm >= "11:30") & (hm <= "12:59")).sum() == 0
+        assert trend["dt"].iloc[0].strftime("%H:%M") == "09:30"
+        assert trend["dt"].iloc[-1].strftime("%H:%M") == "14:59"
+
+    def test_fake_5day_has_five_distinct_trading_days(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """5 日 fake 含 5 个交易日各 240 根真实时段时间戳（隔夜断裂，可视验证空档）。"""
+        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+        trend5 = panorama_data.fetch_intraday_trend("600001.SH", ndays=5)
+        assert len(trend5) == 1200
+        per_day = trend5.groupby(trend5["dt"].dt.date).size()
+        assert len(per_day) == 5
+        assert (per_day == 240).all()
+        hm = trend5["dt"].dt.strftime("%H:%M")
+        assert ((hm >= "11:30") & (hm <= "12:59")).sum() == 0
+
     def test_fake_snapshot_has_two_limit_ups(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
         snap = add_limit_prices(panorama_data.fetch_market_snapshot())
