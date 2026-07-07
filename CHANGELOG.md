@@ -38,6 +38,10 @@
 
 ### Added
 
+- **surge 爆量记录加"推送价"(入场价)**:SurgeConfirmed 新增 price 字段,确认时记当时价,
+  写入 events jsonl;全景页「爆量记录」tab 加"推送价"列。这是"标记标的→次日 S 点→
+  最终收益"闭环的入场价基准,此前台账缺此列无法算收益。
+
 - **全景页微信友好登录网关（cookie 登录页替代 basic auth）**：微信内置浏览器不支持
   HTTP basic auth（不弹框、直接 401，朋友进不去），改成网页登录页 + 签名 cookie——微信
   HTTP basic auth（不弹框、直接 401，朋友进不去），改成网页登录页 + 签名 cookie——微信

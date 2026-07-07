@@ -209,6 +209,7 @@ class SurgeConfirmed(BaseModel):
     name: str
     theme: str = ""
     confirmed_at: str = ""            # HH:MM
+    price: float = 0.0                # 推送当时价（入场价,供次日 S 点/最终收益闭环用）
     pct_chg: float = 0.0
     cum_amount: float = 0.0           # 当日累计成交额（元）
     rel_cum: float = 0.0              # today_cum / N 日同刻累计额中位（v3 纯累计核心判据）
@@ -976,6 +977,7 @@ class SurgeWatcher:
             name=str(row.get("name", "")),
             theme=self.theme_map.get(code, ""),
             confirmed_at=now.strftime("%H:%M"),
+            price=round(float(price), 2),  # 推送当时价 = 入场价
             pct_chg=round(float(row.get("pct_chg", 0.0) or 0.0), 2),
             cum_amount=round(today_cum, 0),  # 决策所用今日累计（rt_min_daily 精确 or 累加器近似）
             rel_cum=round(rel, 2),

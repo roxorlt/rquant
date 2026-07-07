@@ -30,7 +30,7 @@ def test_dedup_keeps_earliest_confirmed_at(tmp_path: Path) -> None:
         ),
         SurgeConfirmed(
             ts_code="300001.SZ", name="特锐德", theme="充电桩", confirmed_at="09:32",
-            pct_chg=4.0, cum_amount=2.1e8, rel_cum=2.8, room_to_limit_pct=6.0,
+            price=18.66, pct_chg=4.0, cum_amount=2.1e8, rel_cum=2.8, room_to_limit_pct=6.0,
             status="confirmed",
         ),
         SurgeConfirmed(
@@ -48,6 +48,7 @@ def test_dedup_keeps_earliest_confirmed_at(tmp_path: Path) -> None:
     row = df[df["ts_code"] == "300001.SZ"].iloc[0]
     assert row["confirmed_at"] == "09:32"  # 取最早那行
     assert row["rel_cum"] == 2.8
+    assert row["price"] == 18.66  # 推送价（入场价）随台账记录
     # unbuyable 行保留、字段完整
     unb = df[df["ts_code"] == "300750.SZ"].iloc[0]
     assert unb["status"] == "unbuyable"
