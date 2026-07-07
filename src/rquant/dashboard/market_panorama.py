@@ -45,6 +45,7 @@ from rquant.panorama_data import (
     load_kpl_concept_members,
     load_liquidity_baseline,
     load_pool_flags,
+    load_surge_log,
 )
 from rquant.panorama_poller import SourcePoller
 
@@ -232,6 +233,12 @@ def cached_trend(ts_code: str, ndays: int) -> tuple[pd.DataFrame, str]:
 def cached_kline(ts_code: str) -> pd.DataFrame:
     """日K 基础序列（只读副本 daily_bar）；当日临时 bar 拼接在 UI 层做（依赖实时快照）。"""
     return load_daily_kline(ts_code)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_surge_log(day_key: str) -> pd.DataFrame:
+    """当日爆量台账（键含当日字符串跨日自动失效；ttl 30s 让盘中增长的 jsonl 被读到）。"""
+    return load_surge_log()
 
 
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
@@ -675,6 +682,53 @@ def render_stock_chart(
         st.altair_chart(_kline_chart(kline), width="stretch")
 
 
+# ── 爆量记录 tab（当日 surge-watch 识别台账） ─────────────────────────────────
+
+_SURGE_STATUS_LABEL = {"confirmed": "🟢可买", "unbuyable": "🔴已涨停"}
+
+
+def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
+    """台账 → 展示列（中文列名、数值列合理 round、状态映射图标）。"""
+    n = len(df)
+
+    def col(name: str, default: object = "") -> pd.Series:
+        return df[name] if name in df.columns else pd.Series([default] * n)
+
+    return pd.DataFrame(
+        {
+            "时间": col("confirmed_at").astype(str),
+            "代码": col("ts_code").astype(str),
+            "名称": col("name").astype(str),
+            "题材": col("theme").astype(str),
+            "涨幅%": pd.to_numeric(col("pct_chg", float("nan")), errors="coerce").round(2),
+            "累计爆量倍数": pd.to_numeric(col("rel_cum", float("nan")), errors="coerce").round(2),
+            "累计额(亿)": (
+                pd.to_numeric(col("cum_amount", float("nan")), errors="coerce") / 1e8
+            ).round(2),
+            "距涨停%": (
+                pd.to_numeric(col("room_to_limit_pct", float("nan")), errors="coerce").round(1)
+            ),
+            "状态": col("status", "confirmed").map(
+                lambda s: _SURGE_STATUS_LABEL.get(str(s), str(s))
+            ),
+        }
+    )
+
+
+def render_surge_log() -> None:
+    """当日爆量台账：每标的取最早识别时刻，纯只读 events jsonl（缓存 30s 跟盘中增长）。"""
+    today = datetime.now(CST).date()
+    df = cached_surge_log(today.isoformat())
+    if df.empty:
+        st.info("今日暂无爆量记录（surge-watch 尚未识别到，或未到盘中）")
+        return
+    st.dataframe(_surge_log_display(df), hide_index=True, width="stretch", height=520)
+    st.caption(
+        "口径 v3 纯累计：今日9:30累计÷前4日同刻累计≥2.5 · 每标的取当日最早识别时刻"
+        f" · 观察提示非买入信号 · 共 {len(df)} 条"
+    )
+
+
 # ── 页面主体 ──────────────────────────────────────────────────────────────────
 
 st.markdown(_PANORAMA_CSS, unsafe_allow_html=True)
@@ -694,26 +748,34 @@ st.caption(
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def render_body() -> None:
+    # tabs 在 fragment 内创建 → 两个 tab 内容每 60s 随 fragment 重跑（爆量 tab 的
+    # cached_surge_log ttl 30s 保证读到盘中新增记录）；active tab 由前端保持不被弹回。
+    tab_panorama, tab_surge = st.tabs(["市场全景", "爆量记录"])
     poller = get_poller()
     snapshot, as_of, snap_route = poller.snapshot()
-    render_pulse(snapshot, as_of, snap_route, poller.status())
 
-    if not as_of:
-        # 首拉未完成：提示已经画上（render_pulse 首轮 info），1s 后重跑再看 slot
-        # ——只重读内存 slot 不碰网络，避免冷启动空页面干等 60s fragment 周期。
-        # scope="fragment" 仅在 fragment rerun 中合法，初始整页运行时降级整页重跑
-        time.sleep(1.0)
-        try:
-            st.rerun(scope="fragment")
-        except StreamlitAPIException:
-            st.rerun()
+    with tab_panorama:
+        render_pulse(snapshot, as_of, snap_route, poller.status())
 
-    left, right = st.columns([52, 48])
-    with left:
-        board_code, board_name = render_overview(as_of, snap_route)
-    with right:
-        ts_code, stock_name = render_drilldown(board_code, board_name, as_of)
-        render_stock_chart(ts_code, stock_name, snapshot)
+        if not as_of:
+            # 首拉未完成：提示已经画上（render_pulse 首轮 info），1s 后重跑再看 slot
+            # ——只重读内存 slot 不碰网络，避免冷启动空页面干等 60s fragment 周期。
+            # scope="fragment" 仅在 fragment rerun 中合法，初始整页运行时降级整页重跑
+            time.sleep(1.0)
+            try:
+                st.rerun(scope="fragment")
+            except StreamlitAPIException:
+                st.rerun()
+
+        left, right = st.columns([52, 48])
+        with left:
+            board_code, board_name = render_overview(as_of, snap_route)
+        with right:
+            ts_code, stock_name = render_drilldown(board_code, board_name, as_of)
+            render_stock_chart(ts_code, stock_name, snapshot)
+
+    with tab_surge:
+        render_surge_log()
 
 
 render_body()
