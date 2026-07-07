@@ -708,6 +708,7 @@ def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
             "代码": col("ts_code").astype(str),
             "名称": col("name").astype(str),
             "题材": col("theme").astype(str),
+            "推送价": pd.to_numeric(col("price", float("nan")), errors="coerce").round(2),
             "涨幅%": pd.to_numeric(col("pct_chg", float("nan")), errors="coerce").round(2),
             "累计爆量倍数": pd.to_numeric(col("rel_cum", float("nan")), errors="coerce").round(2),
             "累计额(亿)": (
