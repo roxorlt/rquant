@@ -16,10 +16,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from rquant.surge_watch import (
     CURVE_POINTS,
+    SNAPSHOT_FULL_NAME,
+    CumulativeTracker,
     SurgeBaseline,
     SurgeConfig,
     SurgeConfirmed,
@@ -32,6 +33,7 @@ from rquant.surge_watch import (
     atomic_write_parquet,
     build_surge_messages,
     build_three_day_baseline,
+    fetch_full_market_snapshot,
     grid_index,
     linear_progress_curve,
     load_progress_curve,
@@ -39,6 +41,7 @@ from rquant.surge_watch import (
     run_simulate,
     run_surge_watch,
     series_to_frame,
+    today_cum_series_from_rt_min_daily,
 )
 
 CST = timezone(timedelta(hours=8))
@@ -65,13 +68,48 @@ def flat_curve() -> np.ndarray:
 
 
 def mk_baseline(
-    avg20: dict[str, float], *, curve: np.ndarray | None = None, theme: dict[str, str] | None = None
+    avg20: dict[str, float], *, curve: np.ndarray | None = None,
+    theme: dict[str, str] | None = None,
+    code_universe: list[str] | None = None, name_map: dict[str, str] | None = None,
+    pre_close: dict[str, float] | None = None,
 ) -> SurgeBaseline:
     return SurgeBaseline(
         avg_amount_20d=avg20,
         theme=theme or {},
         curve=curve if curve is not None else flat_curve(),
+        code_universe=code_universe or [],
+        name_map=name_map or {},
+        pre_close=pre_close or {},
     )
+
+
+def mk_rt_min(rows: list[dict]) -> pd.DataFrame:
+    """构造 rt_min 原始返回（ts_code/close/vol/amount=当分钟量/trade_time，open/high/low 可选）。"""
+    cols = ["ts_code", "trade_time", "open", "high", "low", "close", "vol", "amount"]
+    filled = []
+    for r in rows:
+        row = {c: r.get(c) for c in cols}
+        if row.get("open") is None:
+            row["open"] = row.get("close")
+        if row.get("high") is None:
+            row["high"] = row.get("close")
+        if row.get("low") is None:
+            row["low"] = row.get("close")
+        filled.append(row)
+    df = pd.DataFrame(filled, columns=cols)
+    df["trade_time"] = pd.to_datetime(df["trade_time"])
+    return df
+
+
+def mk_rt_min_daily(amounts: list[float], *, start: dt_time = dt_time(9, 30),
+                    ts_code: str = "300001.SZ") -> pd.DataFrame:
+    """构造 rt_min_daily 当日全序列（当分钟量），从 start 起每分钟一根。"""
+    day = date(2026, 7, 6)
+    rows = []
+    for i, a in enumerate(amounts):
+        t = datetime.combine(day, start) + timedelta(minutes=i)
+        rows.append({"ts_code": ts_code, "trade_time": t, "amount": float(a)})
+    return pd.DataFrame(rows, columns=["ts_code", "trade_time", "amount"])
 
 
 def mk_minute_bars(
@@ -1220,58 +1258,289 @@ class TestU16FullMarketRefactor:
         det_back = pd.read_parquet(tmp_path / "snapshot.parquet")
         assert set(det_back["ts_code"]) == {"300111.SZ", "688333.SH", "300777.SZ"}
 
-    def test_full_market_fs_covers_all_segments(self) -> None:
-        """U4：surge 复用 panorama 全市场 fs（沪深主板+创业+科创+北交所，不再是两段）。"""
-        from rquant.panorama_data import _EM_SPOT_FS
+    def test_full_market_code_universe_covers_all_boards(self) -> None:
+        """rt_min 代码全集覆盖主板/创业/科创/北交所（全景 feed 需全市场，检测层再收窄）。"""
+        base = mk_baseline(
+            {}, code_universe=["600519.SH", "300111.SZ", "688333.SH", "830001.BJ"],
+            name_map={"600519.SH": "主板甲", "300111.SZ": "创业乙",
+                      "688333.SH": "科创丙", "830001.BJ": "北交丁"},
+            pre_close={c: 10.0 for c in ("600519.SH", "300111.SZ", "688333.SH", "830001.BJ")},
+        )
+        seen: dict[str, list[str]] = {}
 
-        for seg in ("m:0+t:6", "m:0+t:80", "m:1+t:2", "m:1+t:23", "m:0+t:81+s:2048"):
-            assert seg in _EM_SPOT_FS
+        def fake_rt_min(codes: list[str]) -> pd.DataFrame:
+            seen["codes"] = list(codes)
+            return mk_rt_min([
+                {"ts_code": c, "close": 11.0, "vol": 1e6, "amount": 5e8,
+                 "trade_time": "2026-07-06 10:00:00"} for c in codes
+            ])
 
-    def test_snapshot_sina_fallback_when_em_blocked(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """东财两路全掐（RemoteDisconnected）→ 降级新浪，拿到全市场而非零快照饿死。"""
-        import rquant.surge_watch as sw
+        out = fetch_full_market_snapshot(base, CumulativeTracker(), rt_min_fn=fake_rt_min)
+        for c in ("600519.SH", "300111.SZ", "688333.SH", "830001.BJ"):
+            assert c in seen["codes"]       # rt_min 请求全市场
+            assert c in set(out["ts_code"])
 
-        monkeypatch.delenv("RQUANT_PANORAMA_SOCKS", raising=False)
 
-        def em_blocked(*a: object, **k: object) -> pd.DataFrame:
+# ── U17 累加器（rt_min 当分钟量 → 当日累计，分钟去重/回退/seed）plan U1 ──────────
+
+
+class TestU17CumulativeTracker:
+    def _raw(self, amount: float, vol: float, tt: str, code: str = "300001.SZ") -> pd.DataFrame:
+        return pd.DataFrame([{"ts_code": code, "amount": float(amount),
+                              "volume": float(vol), "trade_time": pd.Timestamp(tt)}])
+
+    def test_same_minute_no_double_add(self) -> None:
+        t = CumulativeTracker()
+        d1 = t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
+        assert d1["amount"].iloc[0] == 100 and d1["volume"].iloc[0] == 10
+        # 同分钟重复 tick（如重试/同分钟内两次拉）→ 不重复累加
+        d2 = t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
+        assert d2["amount"].iloc[0] == 100 and d2["volume"].iloc[0] == 10
+
+    def test_new_minute_accumulates_amount_and_volume(self) -> None:
+        t = CumulativeTracker()
+        t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
+        d = t.update(self._raw(60, 6, "2026-07-07 09:32:00"))
+        assert d["amount"].iloc[0] == 160        # 累计额
+        assert d["volume"].iloc[0] == 16         # 累计量同步
+
+    def test_regression_minute_not_added(self) -> None:
+        t = CumulativeTracker()
+        t.update(self._raw(100, 10, "2026-07-07 09:32:00"))
+        # 分钟回退（乱序到货）→ 不加、不减，沿用既有累计
+        d = t.update(self._raw(999, 99, "2026-07-07 09:31:00"))
+        assert d["amount"].iloc[0] == 100 and d["volume"].iloc[0] == 10
+
+    def test_nan_amount_keeps_prev_cum(self) -> None:
+        t = CumulativeTracker()
+        t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
+        d = t.update(self._raw(np.nan, np.nan, "2026-07-07 09:32:00"))
+        assert d["amount"].iloc[0] == 100        # 当分钟量缺失 → 累计不变
+
+    def test_multi_code_independent(self) -> None:
+        t = CumulativeTracker()
+        raw = pd.DataFrame([
+            {"ts_code": "300001.SZ", "amount": 100.0, "volume": 10.0,
+             "trade_time": pd.Timestamp("2026-07-07 09:31:00")},
+            {"ts_code": "688001.SH", "amount": 50.0, "volume": 5.0,
+             "trade_time": pd.Timestamp("2026-07-07 09:31:00")},
+        ])
+        out = t.update(raw)
+        by = dict(zip(out["ts_code"], out["amount"], strict=True))
+        assert by["300001.SZ"] == 100 and by["688001.SH"] == 50
+
+
+# ── U18 rt_min 快照组装 + 单位（元/股不换算）plan U2 ─────────────────────────────
+
+
+class TestU18RtMinSnapshot:
+    def _base(self) -> SurgeBaseline:
+        return mk_baseline(
+            {}, code_universe=["300001.SZ", "600519.SH"],
+            name_map={"300001.SZ": "创业甲", "600519.SH": "贵州茅台"},
+            pre_close={"300001.SZ": 10.0, "600519.SH": 1700.0},
+        )
+
+    def test_normalize_columns_route_and_pct(self) -> None:
+        raw = mk_rt_min([
+            {"ts_code": "300001.SZ", "close": 11.0, "vol": 1e6, "amount": 5e7,
+             "trade_time": "2026-07-06 09:31:00"},
+            {"ts_code": "600519.SH", "close": 1710.0, "vol": 1e5, "amount": 8e7,
+             "trade_time": "2026-07-06 09:31:00"},
+        ])
+        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(),
+                                         rt_min_fn=lambda c: raw)
+        assert out.attrs["route"] == "tushare_rt"
+        r = out[out["ts_code"] == "300001.SZ"].iloc[0]
+        assert r["price"] == 11.0                        # price=close
+        assert r["pre_close"] == 10.0                     # 预载补齐
+        assert r["name"] == "创业甲"                       # 预载补齐（rt_min 无名称）
+        assert abs(r["pct_chg"] - 10.0) < 1e-9            # (11/10-1)*100
+        assert "limit_up_price" in out.columns            # add_limit_prices 已应用
+        # gem 20cm：limit_up = 10×1.2 = 12.0
+        assert abs(float(r["limit_up_price"]) - 12.0) < 1e-9
+
+    def test_amount_yuan_and_volume_share_no_conversion(self) -> None:
+        """单位核对：rt_min amount=元、vol=股，首分钟累计=当分钟量，不换算。"""
+        raw = mk_rt_min([{"ts_code": "300001.SZ", "close": 11.0, "vol": 1234567,
+                          "amount": 5e7, "trade_time": "2026-07-06 09:31:00"}])
+        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(),
+                                         rt_min_fn=lambda c: raw)
+        r = out[out["ts_code"] == "300001.SZ"].iloc[0]
+        assert r["amount"] == 5e7                          # 元，不换算
+        assert r["volume"] == 1234567                      # 股，不换算
+
+    def test_amount_accumulates_across_minutes(self) -> None:
+        base, tracker = self._base(), CumulativeTracker()
+        out1 = fetch_full_market_snapshot(base, tracker, rt_min_fn=lambda c: mk_rt_min(
+            [{"ts_code": "300001.SZ", "close": 11.0, "vol": 1e6, "amount": 5e7,
+              "trade_time": "2026-07-06 09:31:00"}]))
+        assert out1[out1["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 5e7
+        out2 = fetch_full_market_snapshot(base, tracker, rt_min_fn=lambda c: mk_rt_min(
+            [{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6, "amount": 3e7,
+              "trade_time": "2026-07-06 09:32:00"}]))
+        assert out2[out2["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 8e7  # 累计
+
+    def test_empty_rt_min_returns_none_route(self) -> None:
+        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(),
+                                         rt_min_fn=lambda c: pd.DataFrame())
+        assert out.attrs["route"] == "none" and out.empty
+
+    def test_rt_min_failure_returns_none_route(self) -> None:
+        """rt_min 失败（IP 反爬事故场景）→ route=none，本 tick miss（plan U5）。"""
+        def boom(codes: list[str]) -> pd.DataFrame:
             raise ConnectionError("Remote end closed connection without response")
 
-        sina_raw = pd.DataFrame({
-            "代码": ["sh600519", "sz300111"],
-            "名称": ["贵州茅台", "测试创业"],
-            "最新价": [1700.0, 12.0],
-            "今开": [1690.0, 11.5],
-            "最高": [1710.0, 12.5],
-            "最低": [1680.0, 11.0],
-            "昨收": [1695.0, 11.8],
-            "涨跌幅": [0.3, 1.7],
-            "成交量": [100, 200],
-            "成交额": [1e8, 2e6],
-        })
-        monkeypatch.setattr(sw, "_fetch_em_clist", em_blocked)
-        monkeypatch.setattr("rquant.panorama_data._fetch_spot", lambda: sina_raw)
+        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(), rt_min_fn=boom)
+        assert out.attrs["route"] == "none" and out.empty
 
-        out = sw.fetch_full_market_snapshot()
-        assert out.attrs["route"] == "sina"
-        assert not out.empty
-        assert "600519.SH" in set(out["ts_code"])
-        assert "limit_up_price" in out.columns  # add_limit_prices 已应用
+    def test_empty_code_universe_skips_fetch(self) -> None:
+        base = mk_baseline({}, code_universe=[])
+        called = {"n": 0}
 
-    def test_snapshot_all_routes_fail_returns_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+        def fn(codes: list[str]) -> pd.DataFrame:
+            called["n"] += 1
+            return mk_rt_min([{"ts_code": "300001.SZ", "close": 11.0, "vol": 1,
+                               "amount": 1, "trade_time": "2026-07-06 09:31:00"}])
+
+        out = fetch_full_market_snapshot(base, CumulativeTracker(), rt_min_fn=fn)
+        assert out.attrs["route"] == "none" and out.empty
+        assert called["n"] == 0                            # 无代码 → 不发请求
+
+
+# ── U19 重启 seed（读上一份当日 snapshot_full 续算）plan U3 ──────────────────────
+
+
+class TestU19RestartSeed:
+    def _base(self) -> SurgeBaseline:
+        return mk_baseline({}, code_universe=["300001.SZ"], name_map={"300001.SZ": "甲"},
+                           pre_close={"300001.SZ": 10.0})
+
+    def _prev_snapshot(self, day: date, amount: float, vol: float) -> pd.DataFrame:
+        """模拟上一份 snapshot_full（含累计 amount/volume + trade_time）。"""
+        return pd.DataFrame([{
+            "ts_code": "300001.SZ", "name": "甲", "price": 11.0, "pre_close": 10.0,
+            "pct_chg": 10.0, "volume": float(vol), "amount": float(amount),
+            "trade_time": pd.Timestamp(datetime.combine(day, dt_time(9, 31))),
+        }])
+
+    def test_seed_same_day_continues(self) -> None:
+        day = date(2026, 7, 6)
+        t = CumulativeTracker()
+        assert t.seed(self._prev_snapshot(day, 5e7, 1e6), day) == 1
+        # 续加 09:32 当分钟量 3e7 → 累计 8e7（承接 seed 的 5e7）
+        out = fetch_full_market_snapshot(self._base(), t, rt_min_fn=lambda c: mk_rt_min(
+            [{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6, "amount": 3e7,
+              "trade_time": "2026-07-06 09:32:00"}]))
+        assert out[out["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 8e7
+
+    def test_seed_other_day_from_zero(self) -> None:
+        day = date(2026, 7, 6)
+        t = CumulativeTracker()
+        # 上一份是 7-4（非当日）→ 不 seed
+        assert t.seed(self._prev_snapshot(date(2026, 7, 4), 5e7, 1e6), day) == 0
+        out = fetch_full_market_snapshot(self._base(), t, rt_min_fn=lambda c: mk_rt_min(
+            [{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6, "amount": 3e7,
+              "trade_time": "2026-07-06 09:32:00"}]))
+        assert out[out["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 3e7  # 从零，非 8e7
+
+    def test_run_seeds_from_prev_snapshot_full(self, tmp_path: Path) -> None:
+        """run 启动读 live_dir/snapshot_full.parquet 当日 → 累加器续算（端到端 seed）。"""
+        day = date(2026, 7, 6)
+        (tmp_path).mkdir(parents=True, exist_ok=True)
+        self._prev_snapshot(day, 5e7, 1e6).to_parquet(tmp_path / SNAPSHOT_FULL_NAME, index=False)
+        clock = {"t": datetime(2026, 7, 6, 9, 32, tzinfo=CST)}
+        # 注入 rt_min 网络层但保留 run 内部的默认 snapshot 组装（需 snapshot_fetcher=None）：
+        # 用 monkeypatch 替换默认 rt_min 取数器，验证累计从 seed 续到 8e7。
         import rquant.surge_watch as sw
 
-        monkeypatch.delenv("RQUANT_PANORAMA_SOCKS", raising=False)
-        monkeypatch.setattr(
-            sw, "_fetch_em_clist", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("x"))
-        )
-        monkeypatch.setattr(
-            "rquant.panorama_data._fetch_spot",
-            lambda: (_ for _ in ()).throw(ConnectionError("sina down")),
-        )
-        out = sw.fetch_full_market_snapshot()
-        assert out.attrs["route"] == "none"
-        assert out.empty
+        def fake_rt_min(codes: list[str]) -> pd.DataFrame:
+            return mk_rt_min([{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6,
+                               "amount": 3e7, "trade_time": "2026-07-06 09:32:00"}])
+
+        orig = sw._default_rt_min_fn
+        sw._default_rt_min_fn = fake_rt_min
+        try:
+            run_surge_watch(
+                dry_run=True,
+                baseline=self._base(),
+                base_dir=tmp_path,
+                is_trading_day_fn=lambda d: True,
+                today_cum_fetcher=lambda c, d: pd.DataFrame(),  # 确认层离线（退累加器）
+                minute_fetcher=lambda c, d: pd.DataFrame(),
+                notify_fn=lambda *a, **k: None,
+                now_fn=lambda: clock["t"],
+                sleep_fn=lambda s: clock.__setitem__(
+                    "t", clock["t"] + timedelta(seconds=s)),
+                max_ticks=1,
+            )
+        finally:
+            sw._default_rt_min_fn = orig
+        full = pd.read_parquet(tmp_path / SNAPSHOT_FULL_NAME)
+        assert full[full["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 8e7  # seed 续算
+
+
+# ── U20 确认层今日累计改 rt_min_daily（精确 cumsum，空则退累加器）plan U4 ────────
+
+
+class TestU20RtMinDailyConfirm:
+    def test_today_cum_series_cumsum_and_future_nan(self) -> None:
+        bars = mk_rt_min_daily([1e5, 1e5, 1e5])            # 09:30/31/32 各 1e5
+        arr = today_cum_series_from_rt_min_daily(bars)
+        assert arr[0] == 1e5 and arr[1] == 2e5 and arr[2] == 3e5  # cumsum
+        assert np.isnan(arr[3])                             # 未覆盖分钟 → NaN（不外推）
+
+    def test_empty_rt_min_daily_all_nan(self) -> None:
+        arr = today_cum_series_from_rt_min_daily(pd.DataFrame())
+        assert np.isnan(arr).all()
+
+    def _confirm_setup(self, *, today_cum_fetcher, snap_amount: float) -> tuple:
+        """gi=30（10:00）；stk_mins 基线三日恒 1e5/min → cum_median[30]=31e5=3.1e6。"""
+        d = date(2026, 7, 6)
+        bars = mk_minute_bars({d - timedelta(days=i): [1e5] * 241 for i in (1, 2, 3)})
+        base = mk_baseline({"300001.SZ": 1e4}, curve=flat_curve())  # avg20 微小 → rough 恒过
+        w = SurgeWatcher(base, config=SurgeConfig(),
+                         minute_fetcher=lambda c, dd: bars,
+                         today_cum_fetcher=today_cum_fetcher)
+        now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
+                         "pct_chg": 5, "volume": 1e8, "amount": snap_amount}])
+        return w, snap, now
+
+    def test_precise_rt_min_daily_drives_confirm(self) -> None:
+        """rt_min_daily 精确今日累计（rel=4 落带内）确认，即便快照累加器近似 rel<k_cum。"""
+        # rt_min_daily 31 分钟各 4e5 → cumsum[gi30]=1.24e7 → rel=1.24e7/3.1e6=4.0 落带内
+        daily = mk_rt_min_daily([4e5] * 31)
+
+        def fetch(c: str, d: date) -> pd.DataFrame:
+            return daily
+
+        # 快照 amount 仅 2e6 → 近似 rel=2e6/3.1e6=0.65<2.5，靠 rt_min_daily 精确值才确认
+        w, snap, now = self._confirm_setup(today_cum_fetcher=fetch, snap_amount=2e6)
+        res = w.tick(snap, now)                             # 10:00 已过静默窗，确认即 flush
+        assert "300001.SZ" in w.pushed_today
+        assert res.confirmed[0].rel_cum == 4.0
+        assert res.confirmed[0].cum_amount == round(1.24e7, 0)  # 精确 cumsum 值入报文
+
+    def test_empty_rt_min_daily_falls_back_to_accumulator(self) -> None:
+        """rt_min_daily 空 → 退快照累加器近似（不阻塞）：rel 由快照 amount 决定。"""
+        # 快照 amount = 1.24e7 → 累加器近似 rel=4.0 落带内 → 确认
+        w, snap, now = self._confirm_setup(
+            today_cum_fetcher=lambda c, d: pd.DataFrame(), snap_amount=1.24e7)
+        res = w.tick(snap, now)
+        assert "300001.SZ" in w.pushed_today
+        assert res.confirmed[0].rel_cum == 4.0
+        assert np.isnan(w.today_cum_series["300001.SZ"]).all()  # 缓存全 NaN（一天一调）
+
+    def test_rt_min_daily_fetched_once_per_candidate(self) -> None:
+        """rt_min_daily 一天一调：多 tick 未确认也不重拉（缓存命中）。"""
+        calls: list[str] = []
+
+        def fetch(c: str, d: date) -> pd.DataFrame:
+            calls.append(c)
+            return mk_rt_min_daily([1e4] * 31)             # rel 极小 → 不确认，留缓存
+
+        w, snap, now = self._confirm_setup(today_cum_fetcher=fetch, snap_amount=1e4)
+        w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
+        w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
+        assert calls == ["300001.SZ"]                      # 仅一次 rt_min_daily

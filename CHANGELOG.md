@@ -4,9 +4,42 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **surge/全景页全市场快照数据源：爬东财/新浪 → tushare `rt_min`（根治云端 IP 反爬）**：
+  2026-07-07 盘中云端 IP 被东财（RemoteDisconnected）+ 新浪（HTML 反爬页）双双拉黑，
+  surge 零快照饿死、一早无推送。token 认证的 tushare `rt_min` 一次拉全部 A 股（~5600 只）
+  从本机秒回、不吃 IP 反爬，是根治。落地（仅 `src/rquant/surge_watch.py`，不碰全景
+  poller/adapter）：
+  - **全市场快照改 rt_min + 累加器**：`fetch_full_market_snapshot(baseline, tracker)` 调
+    `rt_min(全 A 股代码, 1min)` 一次（代码全集/名称/昨收在启动时从只读副本 `stock_basic`
+    /`daily_bar` 预载，rt_min 不带名称/昨收），归一化成快照列（price=close、volume=vol、
+    amount=当分钟量）。**单位核对**（2026-07-07 本机实测）：rt_min `amount`=**元**（与
+    stk_mins 同族，300499 全日 stk_mins 合计 2.446936e9 元 = daily_bar 2.446936e6 千元
+    ×1000，逐位吻合）、`vol`=**股**（806400×39.88≈32.2M≈amount），与旧东财快照列契约
+    （volume=股/amount=元）一致，**无需换算**；唯 daily_bar 是千元（avg20 已 ×1000）。
+  - **`CumulativeTracker`（纯内存、可单测）**：per ts_code 记 `{last_minute, cum_amount,
+    cum_volume}`，仅当 rt_min 的 trade_time 分钟 **严格大于** 上次记录才累加该分钟
+    amount/vol（防同分钟重复计、防分钟回退），输出快照 amount/volume=当日累计（语义对齐
+    旧东财累计口径），price/涨停价用最新值 + `add_limit_prices`。
+  - **重启续算 seed**：run 启动读上一份 `snapshot_full.parquet`（须为当日、含 trade_time）
+    seed 累加器续到最近一 tick（重启只丢 tick 间隙，确认层 rt_min_daily 恒精确兜底）；
+    非当日不 seed（从零）。
+  - **确认层今日累计改 `rt_min_daily` 精确 cumsum**：新候选拉 `rt_min_daily(候选, 1min)`
+    当日全序列 cumsum 得精确今日累计（一天一调、缓存），前 N 日同刻基线仍用 stk_mins；
+    rt_min_daily 空/失败 → 退累加器近似 + warning（不阻塞）。
+  - **删 surge 侧东财/新浪/socks 路由**：移除 `_fetch_em_clist` / `_snapshot_routes` /
+    `_DEFAULT_SOCKS_PROXY` 及东财 clist/新浪 spot 依赖（全景页 poller 的东财三路 **保留**，
+    Mac 本机全景仍用，仅 surge 换源）；全景页经共享 feed（snapshot_full.parquet 现来自
+    tushare）间接受益，poller 代码零改动。
+  - 盘中零 DB 写不变（累加器纯内存、快照 parquet 原子写）；不新增依赖（tushare 已在）；
+    测试增补累加器/快照组装/seed/rt_min_daily 确认/rt_min 失败 miss 共 22 例（全离线 mock），
+    既有 mock `_fetch_em_clist` 用例迁到 mock 注入的 rt_min，simulate 三戏路输出不变。
+
 ### Added
 
 - **全景页微信友好登录网关（cookie 登录页替代 basic auth）**：微信内置浏览器不支持
+  HTTP basic auth（不弹框、直接 401，朋友进不去），改成网页登录页 + 签名 cookie——微信
   HTTP basic auth（不弹框、直接 401，朋友进不去），改成网页登录页 + 签名 cookie——微信
   原生支持 cookie 与表单 POST，点链接即可登录。新增 `src/rquant/panorama_auth.py`（**纯
   标准库**，零第三方依赖：`http.server` / `hmac` / `hashlib.pbkdf2_hmac` / `base64` /
