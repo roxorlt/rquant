@@ -23,7 +23,10 @@ DuckDB 只走 ``open_readonly_store()``（副本优先），本模块绝不写�
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -37,6 +40,8 @@ if TYPE_CHECKING:
 from rquant.limit_up_pool import to_ts_code
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
+
+_CST = timezone(timedelta(hours=8))  # A 股墙钟（当日 events 文件按此取「今日」）
 
 PRICE_TOL = 0.01
 
@@ -1126,6 +1131,61 @@ def load_daily_kline(
     for w in (5, 10, 20):
         df[f"ma{w}"] = df["close"].rolling(window=w, min_periods=w).mean()
     return df
+
+
+# ── surge-watch 当日爆量台账（只读 events jsonl，绝不写） ──────────────────────
+
+# events jsonl 每行 = 一只票的 SurgeConfirmed.model_dump()（见 surge_watch.SurgeConfirmed）。
+# 与 surge_watch.LIVE_DIR_NAME 对齐；此处硬编码字面量避免为一个只读消费者反向依赖
+# surge_watch（后者会拉进 tushare/state.derive 等重依赖）。
+_SURGE_LIVE_DIR_NAME = "surge_live"
+_SURGE_LOG_COLUMNS = [
+    "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+    "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+]
+
+
+def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> pd.DataFrame:
+    """读当日 surge-watch events jsonl，**每标的只保留 confirmed_at 最早的一行**，按时间升序。
+
+    默认读 ``settings.data_dir/surge_live/events-{day}.jsonl``（day 缺省今日 CST）；
+    ``live_dir`` 可注入（单测）。文件缺失/空 → 空表（带标准列）；坏行（非法 JSON /
+    非 dict / 缺 ts_code）逐行跳过，不让单条脏数据拖垮整表。confirmed_at 为定长
+    ``HH:MM``，字典序即时间序，故排序后按 ts_code 保留首行即当日最早识别时刻。
+    """
+    if day is None:
+        day = datetime.now(_CST).date()
+    if live_dir is None:
+        from rquant.config import settings
+
+        live_dir = settings.data_dir / _SURGE_LIVE_DIR_NAME
+    path = live_dir / f"events-{day.isoformat()}.jsonl"
+    if not path.exists():
+        return pd.DataFrame(columns=_SURGE_LOG_COLUMNS)
+
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and obj.get("ts_code"):
+            records.append(obj)
+    if not records:
+        return pd.DataFrame(columns=_SURGE_LOG_COLUMNS)
+
+    df = pd.DataFrame(records)
+    if "confirmed_at" not in df.columns:
+        df["confirmed_at"] = ""
+    df["confirmed_at"] = df["confirmed_at"].fillna("").astype(str)
+    return (
+        df.sort_values("confirmed_at", kind="stable")
+        .drop_duplicates(subset="ts_code", keep="first")
+        .reset_index(drop=True)
+    )
 
 
 # ── A4 Fake 模式确定性 fixture（RQUANT_PANORAMA_FAKE=1，e2e 可测性） ────────────
