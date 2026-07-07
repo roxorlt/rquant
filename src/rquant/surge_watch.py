@@ -18,13 +18,21 @@
 require_vwap=False），ratio_cap 上限挡极端出货毒尾（比值 11-20× 在负收益组扎堆）。
 报文尾注口径版本 v3。
 
+数据源（2026-07-07 事故后根治）：全市场快照改用 tushare ``rt_min``（token 认证，
+不吃 IP 反爬）。此前爬东财 push2 clist / 新浪快照，2026-07-07 盘中云端 IP 被东财
+（RemoteDisconnected）+ 新浪（HTML 反爬页）双双拉黑，surge 零快照饿死、一早无推送；
+tushare rt_min 一次拉全部 A 股（~5500 只）从本机秒回，是根治。``rt_min`` 每根返回
+**当分钟成交量/额**（非累计），``CumulativeTracker`` 按分钟去重累加成当日累计额，
+组装快照喂检测层 + 全景页共享 feed；确认层今日累计改用 ``rt_min_daily`` 单只当日全
+序列 cumsum（精确权威），前 N 日基线仍 stk_mins。
+
 纪律（对齐 CLAUDE.md）：
-- **绝不写 DuckDB**：只在 9:25 启动时读一次只读副本预载 20 日均额 + kpl 题材成分，
-  全部载内存，盘中零 DB 访问；自产数据全 parquet/jsonl；
+- **绝不写 DuckDB**：只在 9:25 启动时读一次只读副本预载 20 日均额 + kpl 题材成分
+  + 全 A 股代码全集/名称/昨收（rt_min 不带名称/昨收），全部载内存，盘中零 DB 访问；
+  累加器纯内存、自产数据全 parquet/jsonl；
 - 时钟 / 数据源 / 推送 / sleep 全部可注入——单测不真 sleep、不碰网络；
-- em clist 快照复用 panorama_data 的加固 Session（每次全新 + trust_env=False +
-  桌面 UA + Connection:close），fs 用全市场串（与 panorama 同域），检测层过滤
-  ``config.boards``；全市场快照每分钟原子落 ``snapshot_full.parquet`` 供全景页共享。
+- rt_min 全市场快照（含主板/创业/科创/北交所）每分钟原子落 ``snapshot_full.parquet``
+  供全景页共享 feed，检测层再按 ``config.boards`` 收窄到创业/科创。
 """
 
 from __future__ import annotations
@@ -36,7 +44,7 @@ import os
 import time as _time_module
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
@@ -78,7 +86,7 @@ _DEFAULT_SURGE_BOARDS = ("gem", "star")
 
 LIVE_DIR_NAME = "surge_live"
 
-_DEFAULT_SOCKS_PROXY = "socks5h://127.0.0.1:1086"
+SNAPSHOT_FULL_NAME = "snapshot_full.parquet"
 
 
 def _boards_env() -> tuple[str, ...]:
@@ -229,6 +237,10 @@ class SurgeBaseline:
     avg_amount_20d: dict[str, float]  # ts_code → 元（daily_bar 千元 ×1000）
     theme: dict[str, str]             # ts_code → 题材名（三级兜底链首个命中，见 load_theme_map）
     curve: np.ndarray                 # 241 点进度曲线
+    # rt_min 快照只带 ts_code/close/vol/amount，不带名称/昨收，故预载补齐（2026-07-07 换源）：
+    code_universe: list[str] = field(default_factory=list)  # 全 A 股代码（stock_basic，喂 rt_min）
+    name_map: dict[str, str] = field(default_factory=dict)   # ts_code → 名称（ST 判定 + 报文）
+    pre_close: dict[str, float] = field(default_factory=dict)  # ts_code → T-1 收盘（涨停价/涨幅）
 
 
 def load_avg_amount_20d(store=None) -> dict[str, float]:
@@ -330,12 +342,86 @@ def load_theme_map(store=None) -> dict[str, str]:
             store.close()
 
 
+def load_stock_meta(store=None) -> tuple[list[str], dict[str, str]]:
+    """全 A 股代码全集 + ts_code → 名称（rt_min 需代码全集、快照需名称做 ST 判定）。
+
+    优先读 stock_basic（含名称）；缺表则退回 daily_bar distinct ts_code（无名称）。
+    代码全集含主板/创业/科创/北交所（全景 feed 需全市场；检测层再 filter 创业科创）。
+    只读副本缺表/撞锁 → 空（rt_min 无代码可拉 → 快照 miss，主循环仍活）。
+    """
+    from rquant.storage.duckdb import open_readonly_store
+
+    owns = store is None
+    try:
+        store = store or open_readonly_store()
+    except Exception as e:
+        logger.warning(f"股票元数据只读库打开失败: {type(e).__name__}: {e}")
+        return [], {}
+    try:
+        try:
+            df = store._conn.execute("SELECT ts_code, name FROM stock_basic").fetchdf()
+            codes = [str(c) for c in df["ts_code"]]
+            names = {str(r.ts_code): str(r.name) for r in df.itertuples()}
+            return codes, names
+        except Exception as e:
+            logger.warning(
+                f"stock_basic 读取失败，退回 daily_bar 代码全集: {type(e).__name__}: {e}"
+            )
+        try:
+            df = store._conn.execute("SELECT DISTINCT ts_code FROM daily_bar").fetchdf()
+            return [str(c) for c in df["ts_code"]], {}
+        except Exception as e:
+            logger.warning(f"daily_bar 代码全集读取失败: {type(e).__name__}: {e}")
+            return [], {}
+    finally:
+        if owns:
+            store.close()
+
+
+def load_pre_close(store=None) -> dict[str, float]:
+    """各票 T-1 收盘价（ts_code → 元）：daily_bar 每票最新 trade_date 的 close。
+
+    rt_min 快照不带昨收，涨停价推算 + 涨幅计算靠此。缺表/撞锁 → 空（涨停价/涨幅缺失，
+    可买性守卫 fail-open、涨幅门落选，主循环仍活）。
+    """
+    from rquant.storage.duckdb import open_readonly_store
+
+    owns = store is None
+    try:
+        store = store or open_readonly_store(required_tables=("daily_bar",))
+    except Exception as e:
+        logger.warning(f"昨收只读库打开失败: {type(e).__name__}: {e}")
+        return {}
+    try:
+        df = store._conn.execute(
+            """
+            SELECT ts_code, close FROM (
+              SELECT ts_code, close,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY ts_code ORDER BY trade_date DESC
+                     ) AS rn
+              FROM daily_bar
+            ) WHERE rn = 1
+            """
+        ).fetchdf()
+    except Exception as e:
+        logger.warning(f"昨收查询失败: {type(e).__name__}: {e}")
+        return {}
+    finally:
+        if owns:
+            store.close()
+    return {str(r.ts_code): float(r.close) for r in df.itertuples() if not pd.isna(r.close)}
+
+
 def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
-    """启动预载：一次性打开只读副本读 20 日均额 + kpl 题材，加载进度曲线。"""
+    """启动预载：一次打开只读副本读 20 日均额 + kpl 题材 + 全 A 股代码/名称/昨收，加载进度曲线。"""
     from rquant.storage.duckdb import open_readonly_store
 
     avg20: dict[str, float] = {}
     theme: dict[str, str] = {}
+    codes: list[str] = []
+    names: dict[str, str] = {}
+    pre_close: dict[str, float] = {}
     try:
         store = open_readonly_store(required_tables=("daily_bar",))
     except Exception as e:
@@ -345,87 +431,189 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
         try:
             avg20 = load_avg_amount_20d(store)
             theme = load_theme_map(store)
+            codes, names = load_stock_meta(store)
+            pre_close = load_pre_close(store)
         finally:
             store.close()
     curve = load_progress_curve(curve_path)
-    logger.info(f"surge 基线预载：avg20={len(avg20)} 只、题材映射={len(theme)} 只")
-    return SurgeBaseline(avg_amount_20d=avg20, theme=theme, curve=curve)
-
-
-# ── 快照拉取（复用 panorama 加固 Session，全市场 fs） ──────────────────────────
-
-
-def _fetch_em_clist(fs: str, proxies: dict[str, str] | None, timeout: float) -> pd.DataFrame:
-    """东财 push2 clist 分页拉取给定 fs 的全量快照，归一化为标准快照列。
-
-    复用 panorama_data 的加固 Session + 归一化（f5 手 ×100 成股），仅 fs 可变——
-    不改 panorama 现有函数，只借其模块级构件。
-    """
-    from rquant.panorama_data import (
-        _EM_CLIST_URL,
-        _EM_SPOT_FIELDS,
-        _EM_SPOT_MAX_PAGES,
-        _EM_SPOT_PAGE_SIZE,
-        _em_session,
-        _normalize_em_spot_rows,
+    logger.info(
+        f"surge 基线预载：avg20={len(avg20)} 只、题材映射={len(theme)} 只、"
+        f"代码全集={len(codes)} 只、昨收={len(pre_close)} 只"
+    )
+    return SurgeBaseline(
+        avg_amount_20d=avg20, theme=theme, curve=curve,
+        code_universe=codes, name_map=names, pre_close=pre_close,
     )
 
-    rows: list[dict] = []
-    with _em_session() as session:
-        for pn in range(1, _EM_SPOT_MAX_PAGES + 1):
-            params = {
-                "pn": pn, "pz": _EM_SPOT_PAGE_SIZE, "po": 1, "np": 1,
-                "fltt": 2, "invt": 2, "fid": "f6", "fs": fs,
-                "fields": _EM_SPOT_FIELDS,
+
+# ── 全市场快照（tushare rt_min；2026-07-07 换源，token 认证不吃 IP 反爬） ────────
+#
+# 单位核对（2026-07-07 本机实测比对，归一到元）：
+#   - rt_min / rt_min_daily 的 amount = 当分钟成交额，**元**（与 stk_mins 同族）；
+#     实测 300499.SZ 2026-07-06 stk_mins 全日 amount 合计 = 2.446936e9 元，
+#     daily_bar 同日 amount = 2.446936e6 千元 ×1000 = 2.446936e9 元，逐位吻合。
+#   - rt_min vol = 当分钟成交量，**股**（806400 股 × 39.88 元 ≈ 32.2M ≈ amount）；
+#     与旧东财快照 volume（f5 手 ×100 归一后的股）同口径，快照 volume 列契约不变。
+#   结论：rt_min amount/vol 无需换算即对齐旧快照列契约（volume=股, amount=元）；
+#   唯 daily_bar 是千元（load_avg_amount_20d 已 ×1000），不涉 rt_min。
+
+_RT_MIN_SNAPSHOT_COLS = [
+    "ts_code", "name", "price", "open", "high", "low",
+    "pre_close", "pct_chg", "volume", "amount", "trade_time",
+]
+
+
+def _minute_of_day(ts: pd.Timestamp) -> int:
+    """时间戳 → 当日分钟序号（时×60+分），当日内严格单调，作累加器去重键。"""
+    return int(ts.hour) * 60 + int(ts.minute)
+
+
+class CumulativeTracker:
+    """rt_min 当分钟量 → 当日累计额/量累加器（纯内存，盘中零 DB）。
+
+    per ts_code 记 ``{last_minute, cum_amount, cum_volume}``：只在某只 rt_min 的
+    trade_time 分钟 **严格大于** 上次记录分钟时，才把该分钟 amount/vol 累加进当日累计
+    （防同分钟重复计、防分钟回退）。输出快照的 amount/volume = 累加后当日累计，
+    price/high/low/pre_close 用 rt_min 最新值——语义对齐旧东财快照（累计额/累计量）。
+
+    重启续算：``seed`` 从上一份当日 snapshot_full.parquet 读回累计额/量 + 最近分钟，
+    续到最近一 tick（重启只丢 tick 间隙，确认层 rt_min_daily 恒精确兜底）。
+    """
+
+    _CUM_COLS: tuple[str, ...] = ("amount", "volume")
+
+    def __init__(self) -> None:
+        self._cum: dict[str, dict[str, float]] = {}
+        self._last_minute: dict[str, int] = {}
+
+    def seed(self, prev: pd.DataFrame, day: date) -> int:
+        """从上一份 snapshot_full（须为 ``day`` 当日）seed 累计额/量 + 最近分钟。
+
+        仅 seed trade_time 属于 ``day`` 的行（非当日整份跳过，从零开始）；缺
+        trade_time 列（旧格式/首次运行）→ 0 seed。返回 seed 的股票数。
+        """
+        if prev is None or prev.empty:
+            return 0
+        if "trade_time" not in prev.columns or "amount" not in prev.columns:
+            return 0
+        seeded = 0
+        for r in prev.itertuples():
+            tt = getattr(r, "trade_time", None)
+            if tt is None or pd.isna(tt):
+                continue
+            ts = pd.Timestamp(tt)
+            if ts.date() != day:  # 非当日不 seed
+                continue
+            code = str(r.ts_code)
+            self._cum[code] = {
+                col: (float(getattr(r, col)) if getattr(r, col, None) is not None
+                      and not pd.isna(getattr(r, col, None)) else 0.0)
+                for col in self._CUM_COLS
             }
-            resp = session.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
-            resp.raise_for_status()
-            data = (resp.json() or {}).get("data") or {}
-            diff = data.get("diff") or []
-            if not diff:
-                break
-            rows.extend(diff)
-            if len(rows) >= int(data.get("total") or 0):
-                break
-    return _normalize_em_spot_rows(rows)
+            self._last_minute[code] = _minute_of_day(ts)
+            seeded += 1
+        return seeded
+
+    def update(self, raw: pd.DataFrame) -> pd.DataFrame:
+        """当分钟量快照 → 当日累计快照（amount/volume 就地替换为累计值）。
+
+        raw 每行是某只票的最新一根分钟 K（trade_time/amount=当分钟量/volume=当分钟量）。
+        仅当该只 trade_time 分钟 > 上次记录分钟才累加（否则沿用既有累计，防重复/回退）。
+        """
+        if raw is None or raw.empty:
+            return raw if raw is not None else pd.DataFrame()
+        df = raw.copy()
+        has_tt = "trade_time" in df.columns
+        out: dict[str, list[float]] = {col: [] for col in self._CUM_COLS}
+        for r in df.itertuples():
+            code = str(r.ts_code)
+            minute: int | None = None
+            if has_tt:
+                tt = getattr(r, "trade_time", None)
+                if tt is not None and not pd.isna(tt):
+                    minute = _minute_of_day(pd.Timestamp(tt))
+            cum = self._cum.setdefault(code, {c: 0.0 for c in self._CUM_COLS})
+            last = self._last_minute.get(code)
+            advance = minute is not None and (last is None or minute > last)
+            if advance:
+                for col in self._CUM_COLS:
+                    v = getattr(r, col, None)
+                    if v is not None and not pd.isna(v):
+                        cum[col] += float(v)
+                self._last_minute[code] = minute
+            for col in self._CUM_COLS:
+                out[col].append(cum[col])
+        for col in self._CUM_COLS:
+            df[col] = out[col]
+        return df
 
 
-def fetch_full_market_snapshot() -> pd.DataFrame:
-    """拉一次**全市场**快照（每分钟主循环调用），带涨停价，``df.attrs['route']`` 标注。
+def _normalize_rt_min(raw: pd.DataFrame, baseline: SurgeBaseline) -> pd.DataFrame:
+    """rt_min 原始 → 快照列（当分钟量，累加器待累计）。名称/昨收从预载补齐。
 
-    一次取数兼作两用：① 检测层按 ``config.boards`` 过滤（``_detection_domain``），
-    ② 原样落 ``snapshot_full.parquet`` 供全景页共享 feed。东财直连 → SOCKS（仅显式
-    配 RQUANT_PANORAMA_SOCKS 时）→ **新浪兜底**（东财掐云端 IP 时降级，2026-07-07
-    实盘事故：东财对云端每分钟全市场拉取反爬 RemoteDisconnected，旧版两路全灭饿死）
-    → 空表 route=none。fs 用全市场串（panorama 的 ``_EM_SPOT_FS``）。
+    rt_min 只带 ts_code/close/vol/amount，故 name 取预载 name_map（缺→ts_code、供 ST
+    判定/报文），pre_close 取预载 pre_close（缺→NaN、涨停价/涨幅随之 NaN），
+    pct_chg 由 price/pre_close 现算。amount=当分钟额（元）、volume=当分钟量（股）。
     """
-    from rquant.panorama_data import (
-        _EM_SPOT_FS,
-        _fetch_spot,
-        _normalize_sina_spot,
-        add_limit_prices,
-    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=_RT_MIN_SNAPSHOT_COLS)
+    codes = raw["ts_code"].astype(str)
+    out = pd.DataFrame(index=raw.index)
+    out["ts_code"] = codes
+    out["name"] = codes.map(lambda c: baseline.name_map.get(c, c))
+    out["price"] = pd.to_numeric(raw.get("close"), errors="coerce")
+    for col in ("open", "high", "low"):
+        out[col] = pd.to_numeric(raw.get(col), errors="coerce")
+    out["pre_close"] = codes.map(lambda c: baseline.pre_close.get(c, np.nan)).astype("float64")
+    out["pct_chg"] = (out["price"] / out["pre_close"] - 1) * 100
+    out["volume"] = pd.to_numeric(raw.get("vol"), errors="coerce")
+    out["amount"] = pd.to_numeric(raw.get("amount"), errors="coerce")
+    out["trade_time"] = pd.to_datetime(raw.get("trade_time"))
+    return out[_RT_MIN_SNAPSHOT_COLS].reset_index(drop=True)
 
-    for route, proxies, timeout in _snapshot_routes():
-        try:
-            df = _fetch_em_clist(_EM_SPOT_FS, proxies=proxies, timeout=timeout)
-            if not df.empty:
-                out = add_limit_prices(df)
-                out.attrs["route"] = route
-                return out
-            logger.warning(f"surge 全市场快照 {route} 返回空")
-        except Exception as e:
-            logger.warning(f"surge 全市场快照 {route} 失败: {type(e).__name__}: {e}")
-    # 新浪兜底：东财全掐时也能拿全市场（逐页慢，但有数据总好过零快照饿死）
+
+def _default_rt_min_fn(codes: list[str]) -> pd.DataFrame:
+    """默认 rt_min 取数：一次拉全 A 股最新分钟 K（token 认证，不吃 IP 反爬）。"""
+    from rquant.adapter.tushare import TushareAdapter
+
+    return TushareAdapter().rt_min(codes, "1min")
+
+
+def fetch_full_market_snapshot(
+    baseline: SurgeBaseline,
+    tracker: CumulativeTracker,
+    *,
+    rt_min_fn: Callable[[list[str]], pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """拉一次**全市场**快照（rt_min 全 A 股 → 累加器累计 → 涨停价），``attrs['route']`` 标注。
+
+    2026-07-07 换源：token 认证的 rt_min 一次拉全部 A 股当分钟 K，``CumulativeTracker``
+    按分钟去重累加成当日累计额/量，组装快照。一次取数兼两用：① 检测层按 ``config.boards``
+    过滤，② 原样落 ``snapshot_full.parquet`` 供全景页共享 feed。rt_min 空/失败 →
+    空表 route=none（本分钟 miss，熔断退避不变）；成功 route='tushare_rt'。
+    """
+    fn = rt_min_fn or _default_rt_min_fn
+    if not baseline.code_universe:
+        logger.warning("surge 全市场快照：代码全集为空（stock_basic 预载失败），本分钟 miss")
+        return _empty_snapshot()
     try:
-        df = _normalize_sina_spot(_fetch_spot())
-        if not df.empty:
-            out = add_limit_prices(df)
-            out.attrs["route"] = "sina"
-            return out
-        logger.warning("surge 全市场快照 sina 返回空")
+        raw = fn(baseline.code_universe)
     except Exception as e:
-        logger.warning(f"surge 全市场快照 sina 失败: {type(e).__name__}: {e}")
+        logger.warning(f"surge 全市场快照 rt_min 失败: {type(e).__name__}: {e}")
+        return _empty_snapshot()
+    if raw is None or raw.empty:
+        logger.warning("surge 全市场快照 rt_min 返回空")
+        return _empty_snapshot()
+    from rquant.panorama_data import add_limit_prices
+
+    normalized = _normalize_rt_min(raw, baseline)
+    cumulative = tracker.update(normalized)
+    out = add_limit_prices(cumulative)
+    out.attrs["route"] = "tushare_rt"
+    return out
+
+
+def _empty_snapshot() -> pd.DataFrame:
     empty = pd.DataFrame()
     empty.attrs["route"] = "none"
     return empty
@@ -442,16 +630,6 @@ def _detection_domain(snapshot: pd.DataFrame, boards: tuple[str, ...]) -> pd.Dat
     board_set = set(boards)
     mask = snapshot["ts_code"].astype(str).map(_classify_board).isin(board_set)
     return snapshot[mask].reset_index(drop=True)
-
-
-def _snapshot_routes() -> list[tuple[str, dict[str, str] | None, float]]:
-    # socks 是 Mac 本地代理专属;surge 跑在云端(无本地代理),默认关,仅显式配才试,
-    # 否则每分钟白连不存在的 127.0.0.1:1086 刷屏 Connection refused(2026-07-07 事故)
-    routes: list[tuple[str, dict[str, str] | None, float]] = [("em_direct", None, 5.0)]
-    socks = os.environ.get("RQUANT_PANORAMA_SOCKS", "").strip()
-    if socks:
-        routes.append(("em_socks", {"http": socks, "https": socks}, 10.0))
-    return routes
 
 
 # ── 确认层：3 日同刻基线（stk_mins） ────────────────────────────────────────────
@@ -514,6 +692,48 @@ def build_three_day_baseline(
     )
 
 
+# ── 确认层今日累计：rt_min_daily 精确 cumsum（2026-07-07 换源，替代快照近似累计） ──
+
+
+def today_cum_series_from_rt_min_daily(bars: pd.DataFrame) -> np.ndarray:
+    """rt_min_daily 当日全序列（当分钟量）→ 241 网格当日累计额序列（cumsum，元）。
+
+    每根当分钟 amount 按 trade_time 落 241 网格 cumsum；已填格之间的空档前向填充，
+    首根之前 / 末根之后留 NaN——超出 rt_min_daily 覆盖时刻（未来分钟）取 NaN，
+    确认层据此退回累加器近似（不会把陈旧累计当作现值）。空/缺字段 → 全 NaN。
+    """
+    arr = np.full(CURVE_POINTS, np.nan)
+    if bars is None or bars.empty:
+        return arr
+    if "trade_time" not in bars.columns or "amount" not in bars.columns:
+        return arr
+    df = bars.copy()
+    df["trade_time"] = pd.to_datetime(df["trade_time"])
+    df = df.sort_values("trade_time")
+    df["cumamt"] = pd.to_numeric(df["amount"], errors="coerce").cumsum()
+    for r in df.itertuples():
+        if pd.isna(r.cumamt):
+            continue
+        arr[grid_index(pd.Timestamp(r.trade_time).time())] = float(r.cumamt)  # 同格取分钟末
+    filled = np.where(~np.isnan(arr))[0]
+    if filled.size == 0:
+        return arr
+    last = np.nan
+    for i in range(int(filled[0]), int(filled[-1]) + 1):  # 仅覆盖区间内前向填充
+        if not np.isnan(arr[i]):
+            last = arr[i]
+        else:
+            arr[i] = last
+    return arr
+
+
+def _default_today_cum_fetcher(ts_code: str, today: date) -> pd.DataFrame:
+    """默认今日累计取数：rt_min_daily 单只当日开盘以来全序列（当分钟量）。"""
+    from rquant.adapter.tushare import TushareAdapter
+
+    return TushareAdapter().rt_min_daily([ts_code], "1min")
+
+
 # ── 主检测器 ────────────────────────────────────────────────────────────────────
 
 
@@ -568,16 +788,23 @@ class SurgeWatcher:
         *,
         config: SurgeConfig | None = None,
         minute_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
+        today_cum_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
         theme_map: dict[str, str] | None = None,
     ) -> None:
         self.baseline = baseline
         self.config = config or SurgeConfig()
         # 默认取数器在 run 注入；tick 单测必须显式传 fetcher（不碰网络）
         self._minute_fetcher = minute_fetcher or _default_minute_fetcher
+        # 今日累计精确取数（rt_min_daily）；None → 确认层今日累计退回快照累加器近似值。
+        # 刻意 opt-in：直接驱动 tick 的单测/simulate 不注入即走累加器近似（离线、不碰网络），
+        # 只有 run（真实盘中）注入 rt_min_daily 网络取数器取精确当日累计。
+        self._today_cum_fetcher = today_cum_fetcher
         self.theme_map = theme_map if theme_map is not None else baseline.theme
 
         self.pushed_today: set[str] = set()
         self.confirm_cache: dict[str, ThreeDayBaseline] = {}
+        # 今日累计精确序列缓存（rt_min_daily cumsum，一天一调；全 NaN=取数失败/空，退累加器）
+        self.today_cum_series: dict[str, np.ndarray] = {}
         self._pending_fetch: deque[str] = deque()
         self._queued: set[str] = set()
         self._fetch_fail: dict[str, int] = {}
@@ -654,11 +881,35 @@ class SurgeWatcher:
             self.confirm_cache[code] = build_three_day_baseline(
                 bars, now.date(), self.config.cum_lookback_days
             )
+            self._fetch_today_cum(code, now.date())
             self._evaluate(code, snapshot, now, gi)
         for code in requeue:
             if code not in self.pushed_today:
                 self._queued.add(code)
                 self._pending_fetch.append(code)
+
+    def _fetch_today_cum(self, code: str, today: date) -> None:
+        """新候选拉 rt_min_daily 精确今日累计序列（一天一调，缓存；失败→全 NaN 退累加器）。
+
+        opt-in：未注入 today_cum_fetcher（tick 单测/simulate）直接跳过，确认层退回快照
+        累加器近似值。已缓存不重拉（含失败缓存，避免每 tick 重打 rt_min_daily）。
+        """
+        if self._today_cum_fetcher is None or code in self.today_cum_series:
+            return
+        try:
+            bars = self._today_cum_fetcher(code, today)
+        except Exception as e:
+            logger.warning(
+                f"surge 今日累计 rt_min_daily 取数失败 {code}，退累加器近似: "
+                f"{type(e).__name__}: {e}"
+            )
+            self.today_cum_series[code] = np.full(CURVE_POINTS, np.nan)
+            return
+        if bars is None or bars.empty:
+            logger.warning(f"surge 今日累计 rt_min_daily 返回空 {code}，退累加器近似")
+            self.today_cum_series[code] = np.full(CURVE_POINTS, np.nan)
+            return
+        self.today_cum_series[code] = today_cum_series_from_rt_min_daily(bars)
 
     def _evaluate(self, code: str, snapshot: pd.DataFrame, now: datetime, gi: int) -> None:
         """确认判定（口径 v3 纯累计）：rel_cum = today_cum / N日同刻累计中位 ∈ [k_cum,
@@ -685,7 +936,13 @@ class SurgeWatcher:
         base_cum = float(base.cum_median[gi])
         if base_cum <= 0:
             return
-        rel = float(amount) / base_cum
+        # 今日累计（分子）：优先 rt_min_daily 精确 cumsum（2026-07-07 换源），该刻覆盖到位
+        # 才用；未注入 / 取数失败 / 超出覆盖时刻（future 分钟 NaN）→ 退快照累加器近似值。
+        today_cum = float(amount)
+        series = self.today_cum_series.get(code)
+        if series is not None and not np.isnan(series[gi]):
+            today_cum = float(series[gi])
+        rel = today_cum / base_cum
         # 纯累计单条门：比值须落在 [k_cum, ratio_cap]。低于下门量能不足；高于上门视为
         # 极端出货毒尾（2026-07-06 回测 11-20× 扎堆负收益组）→ 不推。
         if rel < self.config.k_cum or rel > self.config.ratio_cap:
@@ -720,7 +977,7 @@ class SurgeWatcher:
             theme=self.theme_map.get(code, ""),
             confirmed_at=now.strftime("%H:%M"),
             pct_chg=round(float(row.get("pct_chg", 0.0) or 0.0), 2),
-            cum_amount=round(float(amount), 0),
+            cum_amount=round(today_cum, 0),  # 决策所用今日累计（rt_min_daily 精确 or 累加器近似）
             rel_cum=round(rel, 2),
             rough_ratio=round(rough_ratio, 2),
             minute_delta=round(minute_delta, 0) if minute_delta is not None else None,
@@ -906,6 +1163,7 @@ def run_surge_watch(
     sleep_fn: Callable[[float], None] = _time_module.sleep,
     snapshot_fetcher: Callable[[], pd.DataFrame] | None = None,
     minute_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
+    today_cum_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
     notify_fn: Callable[..., None] | None = None,
     is_trading_day_fn: Callable[[date], bool] | None = None,
     baseline: SurgeBaseline | None = None,
@@ -915,10 +1173,11 @@ def run_surge_watch(
     → 推送/落盘 → 15:02 退出。
 
     一次全市场取数兼作两用：原样落 ``snapshot_full.parquet``（全景页共享 feed），并按
-    ``config.boards`` 收窄成检测输入喂 tick。``snapshot_fetcher`` 默认全市场取数器，返回
-    空 = 本分钟 miss。时钟/源/推送/sleep 全可注入。非交易日即退；午休 sleep；快照连续
-    5 miss 推一条降级告警（每日至多一条）并退避 60/120/300。``force_session`` 忽略时段
-    守卫（盘后验收）；``max_ticks`` 限定循环次数（dry-run/测试）。
+    ``config.boards`` 收窄成检测输入喂 tick。``snapshot_fetcher`` 默认基于 tushare rt_min
+    的全市场取数器（含累加器 + 重启 seed），返回空 = 本分钟 miss；``today_cum_fetcher``
+    默认 rt_min_daily 精确今日累计取数器（确认层用）。时钟/源/推送/sleep 全可注入。
+    非交易日即退；午休 sleep；快照连续 5 miss 推一条降级告警（每日至多一条）并退避
+    60/120/300。``force_session`` 忽略时段守卫（盘后验收）；``max_ticks`` 限定循环次数。
     """
     config = config or SurgeConfig()
     day = now_fn().date()
@@ -928,11 +1187,36 @@ def run_surge_watch(
         return 0
 
     baseline = baseline or preload_baseline()
-    snapshot_fetcher = snapshot_fetcher or fetch_full_market_snapshot
     notify_fn = notify_fn or _default_notify
     live_dir = (base_dir or default_live_dir())
 
-    watcher = SurgeWatcher(baseline, config=config, minute_fetcher=minute_fetcher)
+    # 默认全市场快照 = tushare rt_min + 累加器（token 认证不吃 IP 反爬，2026-07-07 换源）。
+    # 累加器 seed：上一份 snapshot_full.parquet 若为当日则续算（重启只丢 tick 间隙）。
+    # 仅当 snapshot_fetcher 未注入（真实盘中）时才启用 rt_min + rt_min_daily 网络默认；
+    # 注入 fake snapshot_fetcher 的单测同时不启用 today_cum_fetcher 网络默认（离线兜底累加器）。
+    use_real_sources = snapshot_fetcher is None
+    if use_real_sources:
+        tracker = CumulativeTracker()
+        prev_path = live_dir / SNAPSHOT_FULL_NAME
+        if prev_path.exists():
+            try:
+                seeded = tracker.seed(pd.read_parquet(prev_path), day)
+                if seeded:
+                    logger.info(f"surge 累加器 seed {seeded} 只（重启续算当日 snapshot_full）")
+            except Exception as e:
+                logger.warning(f"surge 累加器 seed 失败（从零开始）: {type(e).__name__}: {e}")
+
+        def _rt_min_snapshot() -> pd.DataFrame:
+            return fetch_full_market_snapshot(baseline, tracker)
+
+        snapshot_fetcher = _rt_min_snapshot
+    if today_cum_fetcher is None and use_real_sources:
+        today_cum_fetcher = _default_today_cum_fetcher
+
+    watcher = SurgeWatcher(
+        baseline, config=config,
+        minute_fetcher=minute_fetcher, today_cum_fetcher=today_cum_fetcher,
+    )
     events_path = live_dir / f"events-{day.isoformat()}.jsonl"
 
     miss_streak = 0
@@ -977,7 +1261,7 @@ def run_surge_watch(
 
             miss_streak = 0
             # 全市场快照每分钟原子落盘（共享 feed：云端/Mac 全景页 poller 读它，与主循环同拍）
-            atomic_write_parquet(full, live_dir / "snapshot_full.parquet")
+            atomic_write_parquet(full, live_dir / SNAPSHOT_FULL_NAME)
             # 检测层收窄到 config.boards（行为与旧「只拉创业/科创」一致）
             detection = _detection_domain(full, config.boards)
             result = watcher.tick(detection, now)
