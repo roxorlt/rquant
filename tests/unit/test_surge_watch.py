@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from rquant.surge_watch import (
     CURVE_POINTS,
@@ -1225,3 +1226,52 @@ class TestU16FullMarketRefactor:
 
         for seg in ("m:0+t:6", "m:0+t:80", "m:1+t:2", "m:1+t:23", "m:0+t:81+s:2048"):
             assert seg in _EM_SPOT_FS
+
+    def test_snapshot_sina_fallback_when_em_blocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """东财两路全掐（RemoteDisconnected）→ 降级新浪，拿到全市场而非零快照饿死。"""
+        import rquant.surge_watch as sw
+
+        monkeypatch.delenv("RQUANT_PANORAMA_SOCKS", raising=False)
+
+        def em_blocked(*a: object, **k: object) -> pd.DataFrame:
+            raise ConnectionError("Remote end closed connection without response")
+
+        sina_raw = pd.DataFrame({
+            "代码": ["sh600519", "sz300111"],
+            "名称": ["贵州茅台", "测试创业"],
+            "最新价": [1700.0, 12.0],
+            "今开": [1690.0, 11.5],
+            "最高": [1710.0, 12.5],
+            "最低": [1680.0, 11.0],
+            "昨收": [1695.0, 11.8],
+            "涨跌幅": [0.3, 1.7],
+            "成交量": [100, 200],
+            "成交额": [1e8, 2e6],
+        })
+        monkeypatch.setattr(sw, "_fetch_em_clist", em_blocked)
+        monkeypatch.setattr("rquant.panorama_data._fetch_spot", lambda: sina_raw)
+
+        out = sw.fetch_full_market_snapshot()
+        assert out.attrs["route"] == "sina"
+        assert not out.empty
+        assert "600519.SH" in set(out["ts_code"])
+        assert "limit_up_price" in out.columns  # add_limit_prices 已应用
+
+    def test_snapshot_all_routes_fail_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import rquant.surge_watch as sw
+
+        monkeypatch.delenv("RQUANT_PANORAMA_SOCKS", raising=False)
+        monkeypatch.setattr(
+            sw, "_fetch_em_clist", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("x"))
+        )
+        monkeypatch.setattr(
+            "rquant.panorama_data._fetch_spot",
+            lambda: (_ for _ in ()).throw(ConnectionError("sina down")),
+        )
+        out = sw.fetch_full_market_snapshot()
+        assert out.attrs["route"] == "none"
+        assert out.empty

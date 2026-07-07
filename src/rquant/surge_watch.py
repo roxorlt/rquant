@@ -394,12 +394,17 @@ def fetch_full_market_snapshot() -> pd.DataFrame:
     """拉一次**全市场**快照（每分钟主循环调用），带涨停价，``df.attrs['route']`` 标注。
 
     一次取数兼作两用：① 检测层按 ``config.boards`` 过滤（``_detection_domain``），
-    ② 原样落 ``snapshot_full.parquet`` 供全景页共享 feed。东财直连 → SOCKS 云端出口
-    （RQUANT_PANORAMA_SOCKS，置空禁用）→ 空表 route=none（本分钟 miss，主循环熔断退避）。
-    云端 IP 干净，直连通常一击即中。fs 用全市场串（panorama 的 ``_EM_SPOT_FS``：
-    沪深主板 + 创业 + 科创 + 北交所五段）。
+    ② 原样落 ``snapshot_full.parquet`` 供全景页共享 feed。东财直连 → SOCKS（仅显式
+    配 RQUANT_PANORAMA_SOCKS 时）→ **新浪兜底**（东财掐云端 IP 时降级，2026-07-07
+    实盘事故：东财对云端每分钟全市场拉取反爬 RemoteDisconnected，旧版两路全灭饿死）
+    → 空表 route=none。fs 用全市场串（panorama 的 ``_EM_SPOT_FS``）。
     """
-    from rquant.panorama_data import _EM_SPOT_FS, add_limit_prices
+    from rquant.panorama_data import (
+        _EM_SPOT_FS,
+        _fetch_spot,
+        _normalize_sina_spot,
+        add_limit_prices,
+    )
 
     for route, proxies, timeout in _snapshot_routes():
         try:
@@ -411,6 +416,16 @@ def fetch_full_market_snapshot() -> pd.DataFrame:
             logger.warning(f"surge 全市场快照 {route} 返回空")
         except Exception as e:
             logger.warning(f"surge 全市场快照 {route} 失败: {type(e).__name__}: {e}")
+    # 新浪兜底：东财全掐时也能拿全市场（逐页慢，但有数据总好过零快照饿死）
+    try:
+        df = _normalize_sina_spot(_fetch_spot())
+        if not df.empty:
+            out = add_limit_prices(df)
+            out.attrs["route"] = "sina"
+            return out
+        logger.warning("surge 全市场快照 sina 返回空")
+    except Exception as e:
+        logger.warning(f"surge 全市场快照 sina 失败: {type(e).__name__}: {e}")
     empty = pd.DataFrame()
     empty.attrs["route"] = "none"
     return empty
@@ -430,8 +445,10 @@ def _detection_domain(snapshot: pd.DataFrame, boards: tuple[str, ...]) -> pd.Dat
 
 
 def _snapshot_routes() -> list[tuple[str, dict[str, str] | None, float]]:
+    # socks 是 Mac 本地代理专属;surge 跑在云端(无本地代理),默认关,仅显式配才试,
+    # 否则每分钟白连不存在的 127.0.0.1:1086 刷屏 Connection refused(2026-07-07 事故)
     routes: list[tuple[str, dict[str, str] | None, float]] = [("em_direct", None, 5.0)]
-    socks = os.environ.get("RQUANT_PANORAMA_SOCKS", _DEFAULT_SOCKS_PROXY).strip()
+    socks = os.environ.get("RQUANT_PANORAMA_SOCKS", "").strip()
     if socks:
         routes.append(("em_socks", {"http": socks, "https": socks}, 10.0))
     return routes
