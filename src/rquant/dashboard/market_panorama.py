@@ -518,27 +518,34 @@ def render_drilldown(
 # ── 右栏下：个股图表（分时 / 5日 / 日K） ──────────────────────────────────────
 
 
-def _trend_axis(trend: pd.DataFrame) -> tuple[list[int], str]:
-    """分时/5日 x 轴（bar 序号 idx）刻度定位 + 标签映射表达式。
+# A 股 1min 交易日固定 240 根:上午 120(9:30-11:29)+ 下午 120(13:00-14:59),
+# 末根(idx 239)=15:00。bar 序号天然跳过午休,故 idx == 全天时段位置。
+_SESSION_BARS = 240
 
-    单日 → 5 个时段刻度（idx 0/1/4·1/2·3/4·末，标签 09:30/10:30/11:30·13:00/14:00/15:00，
-    午休折点用「11:30/13:00」双标）；多日 → 每日首根 idx 打日期标签（MM-DD）。
-    labelExpr 用 Vega indexof 把刻度值查回标签，axis values 限定刻度只落在这些 idx，
-    故 datum.value 必命中数组、无 -1 越界。
+
+def _trend_axis(trend: pd.DataFrame) -> tuple[list[int], str, list[int]]:
+    """分时/5日 x 轴（bar 序号 idx）刻度定位 + 标签映射 + x 轴定域。
+
+    单日 → 刻度钉死在**全天真实时段位置** 0/60/120/180/239（标签 09:30/10:30/
+    11:30·13:00/14:00/15:00），x 轴定域 [0, 239]——盘中数据不足整天时线只填左边一截、
+    停在当前时刻、右边留空,而非把半天数据拉伸铺满(2026-07-07 盘中 bug:99 根被按
+    条数等分刻度铺成整天,看着像 9:30-15:00 实际只到 11:11)。多日 → 每日首根打日期
+    标签,定域按数据实际范围。labelExpr 用 Vega indexof 把刻度值查回标签。
     """
     day = pd.to_datetime(trend["dt"]).dt.normalize()
     day_starts = day.drop_duplicates()
     if len(day_starts) <= 1:
-        n = len(trend)
-        values = sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})
-        labels = ["09:30", "10:30", "11:30/13:00", "14:00", "15:00"][: len(values)]
+        values = [0, 60, 120, 180, _SESSION_BARS - 1]
+        labels = ["09:30", "10:30", "11:30/13:00", "14:00", "15:00"]
+        domain = [0, _SESSION_BARS - 1]
     else:
         values = [int(pos) for pos in day_starts.index]
         labels = [d.strftime("%m-%d") for d in day_starts]
+        domain = [0, max(len(trend) - 1, 0)]
     vals_arr = "[" + ",".join(str(v) for v in values) + "]"
     labels_arr = "[" + ",".join(f"'{lbl}'" for lbl in labels) + "]"
     label_expr = f"{labels_arr}[indexof({vals_arr}, datum.value)]"
-    return values, label_expr
+    return values, label_expr, domain
 
 
 def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
@@ -549,8 +556,9 @@ def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
     """
     trend = trend.reset_index(drop=True).assign(idx=lambda d: range(len(d)))
     has_avg = trend["avg_price"].notna().any()
-    values, label_expr = _trend_axis(trend)
-    x_scale = alt.Scale(nice=False, zero=False)
+    values, label_expr, domain = _trend_axis(trend)
+    # 定域到全天(单日)或数据范围(多日):盘中数据不足整天时线停在当前、右边留空
+    x_scale = alt.Scale(nice=False, zero=False, domain=domain)
     dt_tip = alt.Tooltip("dt:T", title="时间", format="%m-%d %H:%M")
     x_price = alt.X(
         "idx:Q", title=None, scale=x_scale, axis=alt.Axis(labels=False, ticks=False)
