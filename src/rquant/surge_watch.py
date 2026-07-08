@@ -175,20 +175,21 @@ class SurgeConfig(BaseModel):
     # 累计比值上门（毒尾封顶）：rel_cum > ratio_cap 视为极端出货，不推——2026-07-06
     # 回测里 ratio 11-20× 在负收益组扎堆（放巨量往往是出货而非启动）。
     ratio_cap: float = 8.0
-    # 跳过开盘前 N 分钟确认：9:30 开盘首格恒不确认，再额外跳 skip_first_minutes 分钟。
-    # 默认 1 → 9:31 那格 today 只有 1-2 分钟累计、base 分母噪声大，9:32 起才确认。
-    skip_first_minutes: int = 1
+    # 跳过开盘前 N 分钟确认：9:30 开盘首格（gi=0，分母仅 1 分钟）恒不确认，再额外跳
+    # skip_first_minutes 分钟。0 → 9:31（gi=1）起即可确认（用户要求尽早推；代价是 9:31
+    # 分母只 2 分钟累计、rel 略抖，靠 rel∈[k_cum,ratio_cap] + 粗筛兜住）；1 → 9:32 起。
+    skip_first_minutes: int = 0
     # 单分钟增量门（v2 遗留，2026-07-06 回测证明拖累信号，v3 默认关）：>0 时确认要求
     # 「当分钟增量 ≥ k_delta × N日同分钟中位」。0 = 关闭（默认）。
     k_delta_confirm: float = 0.0
     # VWAP 门（v2 遗留，同上默认关）：True 时确认要求现价 ≥ 当日均价（amount/volume）。
     require_vwap: bool = False
-    # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）则不推送（仍占「每票每日一次」
-    # 名额、仍落 events 标 unbuyable）。0 = 只挡已封板；负值可整体关闭（room 恒 > 负值）。
+    # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）标 unbuyable（报文加「临近涨停」
+    # icon,仍推送、仍占「每票每日一次」名额）。0 = 只标已封板；负值可整体关闭（room 恒 > 负值）。
     max_room_to_limit_pct: float = 1.0
     cum_lookback_days: int = 4       # 同刻累计中位回溯交易日数（v3 默认 4）
     max_per_push: int = 8            # 单条报文最多 N 只，超出折叠
-    silent_until_hhmm: str = "09:33"  # 该时刻前只收集不推送
+    silent_until_hhmm: str = "09:31"  # 该时刻前只收集不推送（用户要求 9:31 起就推）
     tushare_rate_per_min: int = 2    # 确认层 stk_mins 限频（次/分）
     tushare_max_retries: int = 3     # 单候选取数失败重试上限（延后不阻塞队列）
     miss_circuit_threshold: int = 5  # 快照连续 miss 触发降级告警 + 退避
@@ -810,7 +811,7 @@ class SurgeWatcher:
         self._queued: set[str] = set()
         self._fetch_fail: dict[str, int] = {}
         self._pending_push: list[SurgeConfirmed] = []
-        # 可买性守卫拦下的确认：不进 _pending_push（不推送），但仍随本分钟 flush 落 events
+        # 保留字段（2026-07-08 起 unbuyable 也进 _pending_push 推送，本队列恒空，留作扩展）
         self._pending_events: list[SurgeConfirmed] = []
         self.cum_series: dict[str, np.ndarray] = {}
 
@@ -986,22 +987,19 @@ class SurgeWatcher:
             minute_delta_median=round(float(base.minute_median[gi]), 0),
             room_to_limit_pct=round(room, 2) if room is not None else None,
         )
-        # 可买性守卫：现价距涨停 ≤ 门（或已封板 room≤0）→ 买不进，仅落 events 标 unbuyable。
-        # 仍占「每票每日一次」名额：封板回落再爆当天已看过，防同一票反复刷屏。
-        # room 未知（缺涨停价）→ 无法判定不可买，按可买放行（fail-open）。
+        # 可买性守卫：现价距涨停 ≤ 门（或已封板 room≤0）→ 买不进，标 unbuyable，但**仍推送**
+        # （报文标「临近涨停」icon 让用户自行判断），不再吞掉——2026-07-07 回测证明最强的爆量
+        # 往往就是这批秒板票。room 未知（缺涨停价）→ 按可买（confirmed）放行（fail-open）。
         if room is not None and room <= self.config.max_room_to_limit_pct:
             confirmed.status = "unbuyable"
-            self.pushed_today.add(code)
-            self._pending_events.append(confirmed)
-            return
-        self.pushed_today.add(code)  # 每票每日仅推一次（入待推送即定）
+        self.pushed_today.add(code)  # 每票每日仅推一次（入待推送即定，含 unbuyable）
         self._pending_push.append(confirmed)
 
     def _flush(self, now: datetime) -> TickResult:
         """静默窗后聚合本分钟待推送为报文（单条 ≤N 只，超出折叠）。
 
-        pushes 只含可买确认（_pending_push）；confirmed（落 events）含可买 + 被可买性
-        守卫拦下的 unbuyable（_pending_events），后者不进报文但仍留研究痕迹。
+        pushes 含可买 + unbuyable（2026-07-08 起 unbuyable 也推、报文标「临近涨停」）；
+        confirmed（落 events）= push_batch + event_batch（后者恒空，保留结构）。
         """
         if now.time() < self.config.silent_until:
             return TickResult()
@@ -1062,9 +1060,15 @@ def build_surge_messages(
     title = f"爆量 {hhmm} 新确认 {len(confirmed)} 只"
     lines = [f"# 爆量确认 {hhmm}（{len(confirmed)} 只）", ""]
     n = config.cum_lookback_days
+    n_unbuyable = sum(1 for c in confirmed if c.status == "unbuyable")
     for c in shown:
         theme = f"·{c.theme}" if c.theme else ""
         room = f" 距涨停{c.room_to_limit_pct:.1f}%" if c.room_to_limit_pct is not None else ""
+        # 临近涨停/封板标记：买不进的确认票也推,加 icon 让用户自行判断（2026-07-08 起）。
+        flag = ""
+        if c.status == "unbuyable":
+            sealed = c.room_to_limit_pct is not None and c.room_to_limit_pct <= 0
+            flag = "🔒已封板 " if sealed else "🔔临近涨停 "
         # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
         delta_txt = (
             f"（本分钟{_fmt_amount(c.minute_delta)}/{n}日中位{_fmt_amount(c.minute_delta_median)}）"
@@ -1072,21 +1076,25 @@ def build_surge_messages(
             else ""
         )
         lines.append(
-            f"- {c.ts_code} {c.name}{theme} +{c.pct_chg:.1f}% "
+            f"- {flag}{c.ts_code} {c.name}{theme} +{c.pct_chg:.1f}% "
             f"累计比{n}日{c.rel_cum:.1f}× 累计{_fmt_amount(c.cum_amount)}"
             f"{delta_txt}{room}"
         )
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
     lines.append("")
+    if n_unbuyable > 0:
+        lines.append(f"> 🔔临近涨停/🔒已封板 {n_unbuyable} 只：现价贴近涨停，买入难度大，自行判断")
     delta_seg = (
         f" / 增量门{config.k_delta_confirm:g}×{n}d同分钟" if config.k_delta_confirm > 0 else ""
     )
     vwap_seg = " / VWAP门" if config.require_vwap else ""
+    first_gi = min(config.skip_first_minutes + 1, CURVE_POINTS - 1)
+    first_m = _GRID_MINUTES[first_gi]
     lines.append(
         f"> 口径 v3(纯累计): rough{config.k_rough:g}×20d·curve / "
         f"累计比值∈[{config.k_cum:g},{config.ratio_cap:g}]×{n}d同刻"
-        f" / skip前{config.skip_first_minutes}分(9:31){delta_seg}{vwap_seg}"
+        f" / {first_m // 60}:{first_m % 60:02d}起判{delta_seg}{vwap_seg}"
     )
     lines.append("> ⚠️ 观察提示，非买入信号")
     return [(title, "\n".join(lines))]
