@@ -418,12 +418,16 @@ class TestU5DedupSilentFold:
         assert r2.confirmed == []                    # 每票每日仅推一次
 
     def test_silent_window_collects_then_flushes(self) -> None:
-        w, bars = self._watcher()
-        snap = self._snap_at(2, bars)                # gi2=9:32（skip 后首个可确认格）
-        r_silent = w.tick(snap, datetime(2026, 7, 6, 9, 32, tzinfo=CST))  # 9:33 前
+        # 默认 silent_until=09:31 已无静默窗，用显式 09:35 测「窗内收集、窗后 flush」机制
+        bars = self._bars()
+        base = mk_baseline({"300001.SZ": 1.0}, curve=flat_curve())
+        w = SurgeWatcher(base, config=SurgeConfig(silent_until_hhmm="09:35"),
+                         minute_fetcher=lambda c, dd: bars)
+        snap = self._snap_at(2, bars)                # gi2=9:32（skip=0 可确认）
+        r_silent = w.tick(snap, datetime(2026, 7, 6, 9, 32, tzinfo=CST))  # 9:35 前
         assert r_silent.pushes == [] and r_silent.confirmed == []
         assert len(w._pending_push) == 1             # 收集不丢
-        r_flush = w.tick(mk_snap([]), datetime(2026, 7, 6, 9, 33, tzinfo=CST))
+        r_flush = w.tick(mk_snap([]), datetime(2026, 7, 6, 9, 35, tzinfo=CST))
         assert r_flush.pushes and r_flush.confirmed[0].ts_code == "300001.SZ"
 
     def test_fold_over_max(self) -> None:
@@ -669,7 +673,7 @@ class TestU10Push:
         assert "距涨停4.5%" in body                   # 距涨停空间
         assert "口径 v3(纯累计)" in body              # 尾注口径版本
         assert "累计比值∈[2.5,8]" in body            # 上下门口径
-        assert "skip前1分(9:31)" in body             # skip_first_minutes 口径
+        assert "9:31起判" in body                     # skip=0 → 9:31 起判（首个可确认格）
         assert "增量门" not in body                   # v2 增量门 v3 默认关，报文不出现
         assert "观察提示，非买入信号" in body          # 定位尾注
 
@@ -744,8 +748,8 @@ class TestNotifyScene:
 
 def _write_sim_fixture(sim_dir: Path) -> None:
     """一天快照序列 fixture（口径 v3 纯累计三戏路）：
-    - G 300111.SZ：9:31 累计已越 2.5×（rel 恒 3.0），但 skip_first_minutes 挡下 9:31、
-      9:32 才确认，静默窗持到 9:33 才推；
+    - G 300111.SZ：9:31 累计已越 2.5×（rel 恒 3.0），skip=0 → 9:31（gi=1）即确认，
+      silent_until=09:31 → 9:31 当刻就推（9:30 gi=0 首格仍恒不确认）；
     - H 300222.SZ：10:05 放巨量 rel=10× > ratio_cap(8) 毒尾 → 不推、无 event；
     - K 688333.SH：累计不足 rel 恒 1.5× < k_cum(2.5) → 不推、无 event。
     confirm_bars 三日恒定 m/min → cum_median[gi]=(gi+1)×m，snap amount 精确控 rel。"""
@@ -800,12 +804,12 @@ class TestE1Simulate:
         # 仅 G 确认；H 毒尾（rel>8）、K 累计不足（rel<2.5）粗筛过但纯累计门不过 → 无 event
         assert set(by_code) == {"300111.SZ"}
         assert "300222.SZ" not in by_code and "688333.SH" not in by_code
-        # G：9:31 rel 已 3.0>2.5，但 skip 挡到 9:32 才确认，静默窗持到 9:33 才推
-        assert by_code["300111.SZ"]["confirmed_at"] == "09:32"
+        # G：9:31 rel 已 3.0>2.5，skip=0 → 9:31 即确认，silent_until=09:31 → 9:31 当刻推
+        assert by_code["300111.SZ"]["confirmed_at"] == "09:31"
         assert by_code["300111.SZ"]["rel_cum"] == 3.0
         assert by_code["300111.SZ"]["theme"] == "人形机器人"
         g_push = [p for p in pushes if "机器人G" in p[1]["body"]][0]
-        assert "09:33" in g_push[1]["title"]         # 推送发生在 09:33 flush
+        assert "09:31" in g_push[1]["title"]         # 推送发生在 09:31
         body = g_push[1]["body"]
         assert "口径 v3(纯累计)" in body and "观察提示，非买入信号" in body
         assert all(p[0] == "surge_watch" for p in pushes)
@@ -959,7 +963,8 @@ class TestU12ConfigDefaults:
         cfg = SurgeConfig()
         assert cfg.k_cum == 2.5                  # 纯累计下门（替代 v2 k_confirm=3.0）
         assert cfg.ratio_cap == 8.0              # 毒尾封顶：比值 >8 视为极端出货不推
-        assert cfg.skip_first_minutes == 1       # 跳开盘前 1 分，9:32 起确认
+        assert cfg.skip_first_minutes == 0       # 9:31（gi=1）起即可确认（用户要求尽早推）
+        assert cfg.silent_until_hhmm == "09:31"  # 9:31 起就推
         assert cfg.cum_lookback_days == 4        # N 日同刻累计中位（v2 是 3）
         assert cfg.k_delta_confirm == 0.0        # v2 增量门 v3 默认关
         assert cfg.require_vwap is False         # v2 VWAP 门 v3 默认关
@@ -1037,7 +1042,7 @@ class TestU13DeltaGate:
 
 
 class TestU14Buyability:
-    """确认后现价距涨停 ≤ max_room（或已封板）→ 标 unbuyable，占名额、落 events、不推送。"""
+    """确认后距涨停 ≤ max_room（或已封板）→ 标 unbuyable，占名额、仍推送（报文加临近涨停 icon）。"""
 
     def _confirmable(
         self, *, price: float, pre_close: float, max_room: float | None = None
@@ -1060,29 +1065,39 @@ class TestU14Buyability:
                          "pct_chg": 8, "volume": 1e6, "amount": amount}])
         return w, snap, now, gi
 
-    def test_within_room_blocks_push_but_logs_event(self) -> None:
-        # pre_close 100 → limit_up 120；price 119.5 → room 0.42% ≤1% → unbuyable
+    def test_within_room_marked_unbuyable_still_pushed(self) -> None:
+        # pre_close 100 → limit_up 120；price 119.5 → room 0.42% ≤1% → 标 unbuyable，仍进待推送
         w, snap, now, gi = self._confirmable(price=119.5, pre_close=100)
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today          # 仍占「每票每日一次」名额
-        assert w._pending_push == []                  # 不进报文
-        assert len(w._pending_events) == 1
-        assert w._pending_events[0].status == "unbuyable"
+        assert len(w._pending_push) == 1              # unbuyable 也进报文
+        assert w._pending_push[0].status == "unbuyable"
+        assert w._pending_events == []                # 保留字段恒空
 
-    def test_already_sealed_blocks(self) -> None:
-        # price = limit_up（封板）→ room 0 ≤1% → unbuyable
+    def test_already_sealed_marked_still_pushed(self) -> None:
+        # price = limit_up（封板）→ room 0 ≤1% → 标 unbuyable，仍进待推送
         w, snap, now, gi = self._confirmable(price=120.0, pre_close=100)
         w._evaluate("300001.SZ", snap, now, gi)
-        assert w._pending_push == []
-        assert w._pending_events[0].status == "unbuyable"
+        assert len(w._pending_push) == 1
+        assert w._pending_push[0].status == "unbuyable"
 
-    def test_unbuyable_flushed_to_events_not_pushed(self) -> None:
-        # 过静默窗 flush：TickResult.confirmed 含 unbuyable（落 events），pushes 空
+    def test_unbuyable_pushed_with_near_limit_icon(self) -> None:
+        # 过静默窗 flush：unbuyable 也推,报文带「临近涨停」icon，且仍落 events
         w, snap, now, gi = self._confirmable(price=119.5, pre_close=100)
         w._evaluate("300001.SZ", snap, now, gi)
         res = w._flush(now)
-        assert res.pushes == []
+        assert len(res.pushes) == 1                   # 现在会推送
+        _title, body = res.pushes[0]
+        assert "🔔临近涨停" in body                    # room 0.42%>0 → 临近涨停 icon
+        assert "临近涨停/🔒已封板 1 只" in body         # 图例行
         assert len(res.confirmed) == 1 and res.confirmed[0].status == "unbuyable"
+
+    def test_sealed_pushed_with_locked_icon(self) -> None:
+        # 封板（room≤0）→ 🔒已封板 icon（区别于临近涨停）
+        w, snap, now, gi = self._confirmable(price=120.0, pre_close=100)
+        w._evaluate("300001.SZ", snap, now, gi)
+        _title, body = w._flush(now).pushes[0]
+        assert "🔒已封板" in body
 
     def test_buyable_stock_unaffected(self) -> None:
         # pre_close 100 → limit_up 120；price 110 → room 9.1% >1% → 正常推送
@@ -1118,7 +1133,7 @@ class TestU15CliParse:
         args = build_parser().parse_args(["surge-watch"])
         assert args.k_cum == 2.5
         assert args.ratio_cap == 8.0
-        assert args.skip_first_minutes == 1
+        assert args.skip_first_minutes == 0
         assert args.k_delta == 0.0
         assert args.require_vwap is False
         assert args.max_room == 1.0
@@ -1128,7 +1143,7 @@ class TestU15CliParse:
 
 
 def _write_sim_v3_fixture(sim_dir: Path) -> None:
-    """一天快照序列：D 毒尾（rel=10>8）无 event、E 可买性守卫拦（unbuyable 不推）、
+    """一天快照序列：D 毒尾（rel=10>8）无 event、E 可买性守卫标 unbuyable（仍推、标临近涨停）、
     F 正常确认并推送。confirm_bars 三日恒定 1e5/min → cum_median[gi]=(gi+1)×1e5，
     10:05(gi35) base_cum=3.6e6，snap amount = rel × base_cum 精确控 rel。"""
     day = date(2026, 7, 6)
@@ -1185,15 +1200,16 @@ class TestE2SimulateV3Gates:
         by_code = {json.loads(x)["ts_code"]: json.loads(x) for x in events.strip().split("\n")}
         # D 被毒尾封顶拦（rel>8）→ 根本不产生 event
         assert "300901.SZ" not in by_code
-        # E 确认但可买性守卫拦 → 落 event 标 unbuyable
+        # E 确认、可买性守卫标 unbuyable（仍落 event、仍推送）
         assert by_code["300902.SZ"]["status"] == "unbuyable"
         assert by_code["300902.SZ"]["rel_cum"] == 4.0
         # F 正常确认 → status confirmed
         assert by_code["300903.SZ"]["status"] == "confirmed"
-        # 推送只含 F（买得进），不含 E（买不进）
+        # 推送含 F（买得进）+ E（unbuyable，带临近涨停 icon），同分钟一条报文
         assert len(pushes) == 1
         body = pushes[0][1]["body"]
-        assert "爆F" in body and "拦E" not in body
+        assert "爆F" in body and "拦E" in body
+        assert "🔔临近涨停" in body                    # E 距涨停 0.84%>0 → 临近涨停 icon
         assert "口径 v3(纯累计)" in body and "观察提示，非买入信号" in body
 
 

@@ -6,6 +6,18 @@
 
 ### Changed
 
+- **surge 推送更早 + 临近涨停也推(2026-07-08,据 25 日回测校准)**:
+  - **9:31 起就推**(原 9:33):`skip_first_minutes` 1→0(9:31 gi=1 即可确认,9:30 首格仍恒不确认)、
+    `silent_until_hhmm` 09:33→09:31。盘中盯盘要尽早,代价是 9:31 分母仅 2 分钟累计、rel 略抖,
+    靠 rel∈[2.5,8]+粗筛兜住;报文口径行由硬编码"(9:31)"改为按 skip 动态显示"X:XX起判"。
+  - **临近涨停/封板的确认票也推**(原吞掉只落 events):`_evaluate` 里 unbuyable 不再只进
+    `_pending_events`,改进 `_pending_push` 照推,报文按距涨停加 icon——`🔔临近涨停`(0<room≤门)/
+    `🔒已封板`(room≤0),并加图例行"临近涨停/已封板 N 只:买入难度大,自行判断"。理由:2026-07-07
+    回测证明最强的爆量往往就是这批秒板票,吞掉等于漏掉最强信号。`max_room_to_limit_pct` 语义从
+    "不推"改为"标记仍推";`_pending_events` 保留恒空作扩展位。
+
+### Changed
+
 - **surge/全景页全市场快照数据源：爬东财/新浪 → tushare `rt_min`（根治云端 IP 反爬）**：
   2026-07-07 盘中云端 IP 被东财（RemoteDisconnected）+ 新浪（HTML 反爬页）双双拉黑，
   surge 零快照饿死、一早无推送。token 认证的 tushare `rt_min` 一次拉全部 A 股（~5600 只）
