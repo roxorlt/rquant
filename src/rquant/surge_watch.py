@@ -187,6 +187,14 @@ class SurgeConfig(BaseModel):
     # 名额、仍落 events 标 unbuyable）。0 = 只挡已封板；负值可整体关闭（room 恒 > 负值）。
     max_room_to_limit_pct: float = 1.0
     cum_lookback_days: int = 4       # 同刻累计中位回溯交易日数（v3 默认 4）
+    # 「前几日无爆量」门（2026-07-07 全天回放发现：前几日已大幅放量的「接力票」日内
+    # 均值 -4.16%、胜率仅 12%，是整篮子的主要拖累；剔除后从 -1.6% 抬到 -0.3%）。判据：
+    # 前 prior_quiet_lookback 交易日任一日「日成交额 ÷ 20 日均额」≥ prior_quiet_max_ratio
+    # → 视为「前几日已爆」（多为已启动的尾声/出货）→ 粗筛即否决，不进确认层。现有 rel 分母
+    # 用中位数会平滑掉单日爆量（T-1 独爆、其余安静仍触发），本门补这个洞，与 rel 互补。
+    require_prior_quiet: bool = True
+    prior_quiet_lookback: int = 3    # 回看前 N 交易日
+    prior_quiet_max_ratio: float = 2.5  # 前 N 日峰值量比 ≥ 此值即判「已爆」否决
     max_per_push: int = 8            # 单条报文最多 N 只，超出折叠
     silent_until_hhmm: str = "09:33"  # 该时刻前只收集不推送
     tushare_rate_per_min: int = 2    # 确认层 stk_mins 限频（次/分）
@@ -242,6 +250,7 @@ class SurgeBaseline:
     code_universe: list[str] = field(default_factory=list)  # 全 A 股代码（stock_basic，喂 rt_min）
     name_map: dict[str, str] = field(default_factory=dict)   # ts_code → 名称（ST 判定 + 报文）
     pre_close: dict[str, float] = field(default_factory=dict)  # ts_code → T-1 收盘（涨停价/涨幅）
+    prior_peak_ratio: dict[str, float] = field(default_factory=dict)  # ts_code → 前 N 日峰值量比
 
 
 def load_avg_amount_20d(store=None) -> dict[str, float]:
@@ -277,6 +286,56 @@ def load_avg_amount_20d(store=None) -> dict[str, float]:
         if owns:
             store.close()
     return {str(r.ts_code): float(r.avg_amount_20d) for r in df.itertuples()}
+
+
+def load_prior_peak_ratio(
+    avg20: dict[str, float], lookback: int = 3, store=None
+) -> dict[str, float]:
+    """各票前 lookback 交易日「日成交额 ÷ 20 日均额」的峰值（「前几日无爆量」门用）。
+
+    daily_bar 只读副本最新日 = 信号日 T 的 T-1（当日 daily 收盘后才有），故最近 lookback
+    日即「前 N 交易日」。amount 千元 ×1000 归元，除以 avg20（元）。缺表/撞锁/无 avg20 → 空
+    dict（gate fail-open：无数据不误杀，等同关门）。
+    """
+    from rquant.storage.duckdb import open_readonly_store
+
+    if not avg20 or lookback <= 0:
+        return {}
+    owns = store is None
+    try:
+        store = store or open_readonly_store(required_tables=("daily_bar",))
+    except Exception as e:
+        logger.warning(f"前几日量比只读库打开失败: {type(e).__name__}: {e}")
+        return {}
+    try:
+        df = store._conn.execute(
+            """
+            SELECT ts_code, amount FROM (
+              SELECT ts_code, amount,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY ts_code ORDER BY trade_date DESC
+                     ) AS rn
+              FROM daily_bar
+            ) WHERE rn <= ?
+            """,
+            [lookback],
+        ).fetchdf()
+    except Exception as e:
+        logger.warning(f"前几日量比查询失败: {type(e).__name__}: {e}")
+        return {}
+    finally:
+        if owns:
+            store.close()
+    peak: dict[str, float] = {}
+    for r in df.itertuples():
+        code = str(r.ts_code)
+        a = avg20.get(code)
+        if a is None or a <= 0 or pd.isna(r.amount):
+            continue
+        ratio = float(r.amount) * 1000 / a
+        if ratio > peak.get(code, 0.0):
+            peak[code] = ratio
+    return peak
 
 
 # 题材映射三级兜底链（每级 con_code → 题材名，首个命中保留）：
@@ -414,8 +473,10 @@ def load_pre_close(store=None) -> dict[str, float]:
     return {str(r.ts_code): float(r.close) for r in df.itertuples() if not pd.isna(r.close)}
 
 
-def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
-    """启动预载：一次打开只读副本读 20 日均额 + kpl 题材 + 全 A 股代码/名称/昨收，加载进度曲线。"""
+def preload_baseline(
+    curve_path: Path | None = None, prior_quiet_lookback: int = 3
+) -> SurgeBaseline:
+    """启动预载：只读副本读 20 日均额 + 前几日量比 + 题材 + 代码/名称/昨收，加载进度曲线。"""
     from rquant.storage.duckdb import open_readonly_store
 
     avg20: dict[str, float] = {}
@@ -423,6 +484,7 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
     codes: list[str] = []
     names: dict[str, str] = {}
     pre_close: dict[str, float] = {}
+    prior_peak: dict[str, float] = {}
     try:
         store = open_readonly_store(required_tables=("daily_bar",))
     except Exception as e:
@@ -431,6 +493,7 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
     if store is not None:
         try:
             avg20 = load_avg_amount_20d(store)
+            prior_peak = load_prior_peak_ratio(avg20, prior_quiet_lookback, store)
             theme = load_theme_map(store)
             codes, names = load_stock_meta(store)
             pre_close = load_pre_close(store)
@@ -438,12 +501,13 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
             store.close()
     curve = load_progress_curve(curve_path)
     logger.info(
-        f"surge 基线预载：avg20={len(avg20)} 只、题材映射={len(theme)} 只、"
-        f"代码全集={len(codes)} 只、昨收={len(pre_close)} 只"
+        f"surge 基线预载：avg20={len(avg20)} 只、前{prior_quiet_lookback}日量比={len(prior_peak)}、"
+        f"题材={len(theme)}、代码={len(codes)}、昨收={len(pre_close)}"
     )
     return SurgeBaseline(
         avg_amount_20d=avg20, theme=theme, curve=curve,
         code_universe=codes, name_map=names, pre_close=pre_close,
+        prior_peak_ratio=prior_peak,
     )
 
 
@@ -755,6 +819,11 @@ def _rough_candidates(
         code = str(r.ts_code)
         avg20 = baseline.avg_amount_20d.get(code)
         if avg20 is None or avg20 <= 0:
+            continue
+        # 「前几日无爆量」门：前 N 日峰值量比 ≥ 阈值 → 接力票，否决（数据缺→0→放行 fail-open）。
+        if config.require_prior_quiet and (
+            baseline.prior_peak_ratio.get(code, 0.0) >= config.prior_quiet_max_ratio
+        ):
             continue
         pct = getattr(r, "pct_chg", None)
         if pct is None or pd.isna(pct) or pct <= 0:
@@ -1083,10 +1152,14 @@ def build_surge_messages(
         f" / 增量门{config.k_delta_confirm:g}×{n}d同分钟" if config.k_delta_confirm > 0 else ""
     )
     vwap_seg = " / VWAP门" if config.require_vwap else ""
+    pq_seg = (
+        f" / 前{config.prior_quiet_lookback}日量比<{config.prior_quiet_max_ratio:g}"
+        if config.require_prior_quiet else ""
+    )
     lines.append(
         f"> 口径 v3(纯累计): rough{config.k_rough:g}×20d·curve / "
         f"累计比值∈[{config.k_cum:g},{config.ratio_cap:g}]×{n}d同刻"
-        f" / skip前{config.skip_first_minutes}分(9:31){delta_seg}{vwap_seg}"
+        f" / skip前{config.skip_first_minutes}分(9:31){pq_seg}{delta_seg}{vwap_seg}"
     )
     lines.append("> ⚠️ 观察提示，非买入信号")
     return [(title, "\n".join(lines))]
@@ -1188,7 +1261,7 @@ def run_surge_watch(
         logger.info(f"{day} 非交易日，surge-watch 退出")
         return 0
 
-    baseline = baseline or preload_baseline()
+    baseline = baseline or preload_baseline(prior_quiet_lookback=config.prior_quiet_lookback)
     notify_fn = notify_fn or _default_notify
     live_dir = (base_dir or default_live_dir())
 

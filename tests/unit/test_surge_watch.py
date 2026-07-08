@@ -36,6 +36,7 @@ from rquant.surge_watch import (
     fetch_full_market_snapshot,
     grid_index,
     linear_progress_curve,
+    load_prior_peak_ratio,
     load_progress_curve,
     load_theme_map,
     run_simulate,
@@ -72,6 +73,7 @@ def mk_baseline(
     theme: dict[str, str] | None = None,
     code_universe: list[str] | None = None, name_map: dict[str, str] | None = None,
     pre_close: dict[str, float] | None = None,
+    prior_peak_ratio: dict[str, float] | None = None,
 ) -> SurgeBaseline:
     return SurgeBaseline(
         avg_amount_20d=avg20,
@@ -80,6 +82,7 @@ def mk_baseline(
         code_universe=code_universe or [],
         name_map=name_map or {},
         pre_close=pre_close or {},
+        prior_peak_ratio=prior_peak_ratio or {},
     )
 
 
@@ -241,6 +244,46 @@ class TestU2Rough:
                          "pct_chg": 5, "volume": 1e6, "amount": amount}])
         assert _rough_candidates(snap, base, SurgeConfig(), gi) == ["300001.SZ"]   # v3 1.2 放行
         assert _rough_candidates(snap, base, SurgeConfig(k_rough=1.5), gi) == []   # 旧 1.5 挡下
+
+    def _snap_passing(self, base: SurgeBaseline, gi: int) -> pd.DataFrame:
+        """构造一条稳过粗筛量能门的快照（量 = 3× 阈值）。"""
+        amount = SurgeConfig().k_rough * 1e8 * float(base.curve[gi]) * 3
+        return mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
+                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
+
+    def test_prior_quiet_gate_rejects_repeat_surger(self) -> None:
+        """「前几日无爆量」门：前 N 日峰值量比 ≥ 阈值（接力票）→ 否决，即便量能过关。"""
+        curve = flat_curve()
+        gi = grid_index(dt_time(10, 5))
+        cfg = SurgeConfig()  # require_prior_quiet=True, prior_quiet_max_ratio=2.5
+        repeat = mk_baseline({"300001.SZ": 1e8}, curve=curve,
+                             prior_peak_ratio={"300001.SZ": 3.0})   # 前几日已爆 3×
+        fresh = mk_baseline({"300001.SZ": 1e8}, curve=curve,
+                            prior_peak_ratio={"300001.SZ": 1.4})    # 前几日安静
+        snap_r = self._snap_passing(repeat, gi)
+        snap_f = self._snap_passing(fresh, gi)
+        assert _rough_candidates(snap_r, repeat, cfg, gi) == []             # 接力票被否决
+        assert _rough_candidates(snap_f, fresh, cfg, gi) == ["300001.SZ"]   # 首次爆量放行
+
+    def test_prior_quiet_boundary_and_missing_fail_open(self) -> None:
+        """边界：恰等阈值否决（>=）；无前几日数据 → get 默认 0 → fail-open 放行。"""
+        curve = flat_curve()
+        gi = grid_index(dt_time(10, 5))
+        cfg = SurgeConfig()
+        at_thr = mk_baseline({"300001.SZ": 1e8}, curve=curve,
+                             prior_peak_ratio={"300001.SZ": 2.5})   # 恰等阈值
+        no_data = mk_baseline({"300001.SZ": 1e8}, curve=curve, prior_peak_ratio={})  # 缺数据
+        assert _rough_candidates(self._snap_passing(at_thr, gi), at_thr, cfg, gi) == []
+        assert _rough_candidates(self._snap_passing(no_data, gi), no_data, cfg, gi) == ["300001.SZ"]
+
+    def test_prior_quiet_gate_disabled(self) -> None:
+        """require_prior_quiet=False → 门关闭，接力票照样进候选（不误改现有行为）。"""
+        curve = flat_curve()
+        gi = grid_index(dt_time(10, 5))
+        cfg = SurgeConfig(require_prior_quiet=False)
+        repeat = mk_baseline({"300001.SZ": 1e8}, curve=curve,
+                             prior_peak_ratio={"300001.SZ": 9.0})
+        assert _rough_candidates(self._snap_passing(repeat, gi), repeat, cfg, gi) == ["300001.SZ"]
 
 
 # ── U3 分钟序列 ─────────────────────────────────────────────────────────────────
@@ -858,6 +901,42 @@ _DC_BOARD_DDL = (
 _DC_MEMBER_DDL = (
     "CREATE TABLE dc_board_member (board_code VARCHAR, con_code VARCHAR)"
 )
+_DAILY_BAR_DDL = (
+    "CREATE TABLE daily_bar (ts_code VARCHAR, trade_date DATE, amount DOUBLE)"
+)
+
+
+class TestU12PriorPeakRatio:
+    """load_prior_peak_ratio：前 N 交易日「日额×1000÷avg20」峰值，只看最近 N 日。"""
+
+    def _store(self, tmp_path: Path, rows: list[tuple[str, str, float]]) -> _RawStore:
+        store = _theme_store(tmp_path, tables={"d": _DAILY_BAR_DDL})
+        store._conn.executemany("INSERT INTO daily_bar VALUES (?, ?, ?)", rows)
+        return store
+
+    def test_peak_over_lookback_window_only(self, tmp_path: Path) -> None:
+        # 日额千元；avg20=1e8 元 → ratio = 千元×1000÷1e8
+        store = self._store(tmp_path, [
+            ("300001.SZ", "2026-07-06", 3e5),   # 最近，ratio 3.0
+            ("300001.SZ", "2026-07-03", 1e5),   # ratio 1.0
+            ("300001.SZ", "2026-07-02", 1.5e5),  # ratio 1.5
+            ("300001.SZ", "2026-06-30", 9e5),   # 更早，超窗，ratio 9.0 不应计入
+        ])
+        peak = load_prior_peak_ratio({"300001.SZ": 1e8}, lookback=3, store=store)
+        assert peak["300001.SZ"] == 3.0   # 窗内峰值 = 3.0，超窗 9.0 被排除
+
+    def test_missing_avg20_excluded(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, [
+            ("300001.SZ", "2026-07-06", 3e5),
+            ("301999.SZ", "2026-07-06", 5e5),   # 无 avg20 → 落选
+        ])
+        peak = load_prior_peak_ratio({"300001.SZ": 1e8}, lookback=3, store=store)
+        assert "301999.SZ" not in peak
+        assert peak["300001.SZ"] == 3.0
+
+    def test_empty_avg20_returns_empty(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, [("300001.SZ", "2026-07-06", 3e5)])
+        assert load_prior_peak_ratio({}, lookback=3, store=store) == {}
 
 
 class TestU11ThemeMapFallback:
