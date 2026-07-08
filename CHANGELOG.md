@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **surge 识别加「前几日无爆量」门（首次爆量因子，默认开启）**：2026-07-07 全天离线回放
+  发现——够格确认的 81 只票买在命中时刻、卖在当日收盘,均值 −1.6%、胜率 30%;按「前 3 交易日
+  峰值量比（日成交额 ÷ 20 日均额）」分档,**前几日已大爆（峰值 ≥ 2.5×）的 26 只「接力票」
+  均值 −4.16%、胜率仅 12%,是整篮子的主要拖累**,剔除后从 −1.6% 抬到 −0.3%、胜率抬到 40%
+  （相关系数 −0.31,前几日越安静收益越好）。现有 rel 分母用**中位数**会平滑掉单日爆量
+  （T-1 独爆、其余安静仍触发）,本门补这个洞、与 rel 互补。落地（仅 `surge_watch.py`）：
+  - `SurgeConfig` 新增 `require_prior_quiet=True` / `prior_quiet_lookback=3` /
+    `prior_quiet_max_ratio=2.5`;
+  - 启动预载 `load_prior_peak_ratio()`（只读副本 `daily_bar` 前 N 日 `amount×1000÷avg20`
+    峰值,盘中零 DB 访问）,填入 `SurgeBaseline.prior_peak_ratio`;
+  - 粗筛 `_rough_candidates` 加门:峰值量比 ≥ 阈值 → 否决,不进确认层（省 rt_min_daily 调用）;
+    数据缺 → get 默认 0 → fail-open 放行;`require_prior_quiet=False` 可整体关闭;
+  - 报文口径行加「前 N 日量比<阈值」段。真实副本冒烟:5739 只全填充、今日 282 只接力票会被否决,
+    抽查命中票量比与离线分析逐一吻合。**注:参数据单日证据标定,多日回测验证中。**
+
 ### Changed
 
 - **surge/全景页全市场快照数据源：爬东财/新浪 → tushare `rt_min`（根治云端 IP 反爬）**：
