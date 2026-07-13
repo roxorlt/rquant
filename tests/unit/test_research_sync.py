@@ -113,6 +113,88 @@ def _insert_trade_calendar_row(
 
 
 class TestSyncFromBackup:
+    def test_missing_authoritative_replace_table_errors_without_replica_publish(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        conn = duckdb.connect(str(local_db))
+        conn.execute(
+            "INSERT INTO stock_basic (ts_code, name) VALUES ('600000.SH', 'local')"
+        )
+        conn.close()
+        conn = duckdb.connect(str(backup_db))
+        conn.execute("DROP TABLE stock_basic")
+        conn.close()
+        refresh_calls = 0
+
+        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True, "must not refresh"
+
+        monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+        conn = duckdb.connect(str(local_db), read_only=True)
+        names = conn.execute(
+            "SELECT name FROM stock_basic WHERE ts_code = '600000.SH'"
+        ).fetchall()
+        conn.close()
+        result = next(item for item in report.tables if item.table == "stock_basic")
+        assert report.has_errors
+        assert result.mode == "error"
+        assert "authoritative" in result.detail
+        assert names == [("local",)]
+        assert refresh_calls == 0
+        assert not report.replica_refreshed
+
+    def test_missing_merge_table_remains_skipped(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        conn = duckdb.connect(str(backup_db))
+        conn.execute("DROP TABLE minute_bar")
+        conn.close()
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        result = next(item for item in report.tables if item.table == "minute_bar")
+        assert not report.has_errors
+        assert result.mode == "skipped"
+        assert "备份中无此表" in result.detail
+
+    def test_table_failure_rolls_back_all_primary_changes(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        local = duckdb.connect(str(local_db))
+        local.execute(
+            "INSERT INTO stock_basic (ts_code, name) VALUES ('600000.SH', 'local')"
+        )
+        local.close()
+        backup = duckdb.connect(str(backup_db))
+        backup.execute(
+            "INSERT INTO stock_basic (ts_code, name) VALUES ('000001.SZ', 'cloud')"
+        )
+        backup.execute("ALTER TABLE trade_calendar DROP COLUMN updated_at")
+        backup.close()
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        conn = duckdb.connect(str(local_db), read_only=True)
+        stocks = conn.execute(
+            "SELECT ts_code, name FROM stock_basic ORDER BY ts_code"
+        ).fetchall()
+        daily_dates = conn.execute(
+            "SELECT DISTINCT trade_date FROM daily_bar ORDER BY trade_date"
+        ).fetchall()
+        conn.close()
+        assert report.has_errors
+        assert stocks == [("600000.SH", "local")]
+        assert daily_dates == [(date(2026, 6, 1),)]
+        assert any("rolled back" in item.detail for item in report.tables)
+
     def test_uses_shared_schema_initializer(
         self,
         local_db: Path,
@@ -288,10 +370,18 @@ class TestSyncFromBackup:
         """A3：部分表失败时不刷新只读副本，避免发布跨表不一致快照。"""
         real_sync_table = research_sync._sync_table
 
-        def flaky(conn, table, alias, mode):  # noqa: ANN001
+        def flaky(  # noqa: ANN001
+            conn, table, alias, mode, *, manage_transaction=True
+        ):
             if table == "daily_bar":
                 return TableSyncResult(table=table, mode="error", detail="boom")
-            return real_sync_table(conn, table, alias, mode)
+            return real_sync_table(
+                conn,
+                table,
+                alias,
+                mode,
+                manage_transaction=manage_transaction,
+            )
 
         calls = {"n": 0}
 
@@ -1192,6 +1282,53 @@ class TestReplicaRefresh:
             assert "WAL" in detail
         finally:
             wal.unlink()
+
+    def test_refresh_blocks_writer_during_copy_and_keeps_previous_replica_on_failure(
+        self,
+        local_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        replica = tmp_path / "rquant_ro.duckdb"
+        ok, detail = refresh_readonly_replica(local_db, replica)
+        assert ok, detail
+        writer_blocked = False
+
+        def interrupted_copy(src: Path, dst: Path) -> None:
+            nonlocal writer_blocked
+            try:
+                writer = duckdb.connect(str(src))
+            except duckdb.Error:
+                writer_blocked = True
+            else:
+                try:
+                    writer.execute(
+                        "INSERT INTO daily_bar (ts_code, trade_date, close) "
+                        "VALUES ('000001.SZ', DATE '2026-07-13', 12.0)"
+                    )
+                finally:
+                    writer.close()
+            Path(dst).write_bytes(b"partial replica")
+            raise OSError("copy interrupted")
+
+        monkeypatch.setattr(research_sync.shutil, "copy2", interrupted_copy)
+
+        ok, detail = refresh_readonly_replica(local_db, replica)
+
+        assert not ok
+        assert "copy interrupted" in detail
+        assert writer_blocked
+        assert not replica.with_name(replica.name + ".sync-tmp").exists()
+        conn = duckdb.connect(str(replica), read_only=True)
+        assert conn.execute("SELECT COUNT(*) FROM minute_bar").fetchone()[0] == 2
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM daily_bar "
+                "WHERE ts_code = '000001.SZ' AND trade_date = DATE '2026-07-13'"
+            ).fetchone()[0]
+            == 0
+        )
+        conn.close()
 
 
 class TestStaleWalRescue:

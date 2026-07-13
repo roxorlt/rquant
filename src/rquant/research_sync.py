@@ -657,14 +657,18 @@ def _metadata_bundle_failure_results(
 
 
 def _sync_data_metadata_bundle(
-    conn: duckdb.DuckDBPyConnection, alias: str
+    conn: duckdb.DuckDBPyConnection,
+    alias: str,
+    *,
+    manage_transaction: bool = True,
 ) -> list[TableSyncResult]:
     """Validate and merge linked dataset metadata in one transaction."""
     current_table = DATA_METADATA_TABLES[0]
     transaction_started = False
     try:
-        conn.execute("BEGIN")
-        transaction_started = True
+        if manage_transaction:
+            conn.execute("BEGIN")
+            transaction_started = True
         present_tables = {
             str(row[0])
             for row in conn.execute(
@@ -675,8 +679,9 @@ def _sync_data_metadata_bundle(
             ).fetchall()
         }
         if not present_tables:
-            conn.execute("COMMIT")
-            transaction_started = False
+            if manage_transaction:
+                conn.execute("COMMIT")
+                transaction_started = False
             return [
                 TableSyncResult(
                     table=table,
@@ -726,8 +731,9 @@ def _sync_data_metadata_bundle(
         _merge_data_quality_issues(conn, alias)
         current_table = "dataset_snapshot"
         _merge_dataset_snapshots(conn, alias)
-        conn.execute("COMMIT")
-        transaction_started = False
+        if manage_transaction:
+            conn.execute("COMMIT")
+            transaction_started = False
     except Exception as exc:
         if transaction_started:
             try:
@@ -744,7 +750,12 @@ def _sync_data_metadata_bundle(
 
 
 def _sync_table(
-    conn: duckdb.DuckDBPyConnection, table: str, alias: str, mode: str
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    alias: str,
+    mode: str,
+    *,
+    manage_transaction: bool = True,
 ) -> TableSyncResult:
     """mode 三种执行策略：
     - replace：整表 DELETE + INSERT（云端权威表）
@@ -767,6 +778,12 @@ def _sync_table(
         [table],
     ).fetchone()[0]
     if not src_exists:
+        if mode == "replace":
+            return TableSyncResult(
+                table=table,
+                mode="error",
+                detail="authoritative replace source table is missing",
+            )
         return TableSyncResult(table=table, mode="skipped", detail="备份中无此表")
 
     cols, pk_cols = _common_columns(conn, table, alias)
@@ -800,8 +817,11 @@ def _sync_table(
             detail=f"trade_calendar merge missing columns: {missing}",
         )
 
+    transaction_started = False
     try:
-        conn.execute("BEGIN")
+        if manage_transaction:
+            conn.execute("BEGIN")
+            transaction_started = True
         if mode == "replace":
             conn.execute(f'DELETE FROM "{table}"')
             conn.execute(
@@ -859,9 +879,12 @@ def _sync_table(
                 f'INSERT OR REPLACE INTO "{table}" ({col_list}) '
                 f'SELECT {col_list} FROM {alias}."{table}"'
             )
-        conn.execute("COMMIT")
+        if manage_transaction:
+            conn.execute("COMMIT")
+            transaction_started = False
     except Exception as e:
-        conn.execute("ROLLBACK")
+        if transaction_started:
+            conn.execute("ROLLBACK")
         logger.exception(f"research-sync 表 {table} 同步失败")
         return TableSyncResult(table=table, mode="error", detail=str(e)[:200])
 
@@ -885,20 +908,28 @@ def refresh_readonly_replica(
     """
     db_path = db_path or settings.duckdb_path
     replica_path = replica_path or settings.duckdb_readonly_path_resolved
-    wal_path = db_path.with_name(db_path.name + ".wal")
-    if wal_path.exists():
-        return False, f"主库存在活跃 WAL（{wal_path.name}），跳过副本刷新"
-
     tmp = replica_path.with_name(replica_path.name + ".sync-tmp")
+    wal_path = db_path.with_name(db_path.name + ".wal")
+    guard: duckdb.DuckDBPyConnection | None = None
+    verify: duckdb.DuckDBPyConnection | None = None
     try:
+        guard = duckdb.connect(str(db_path), read_only=True)
+        if wal_path.exists():
+            return False, f"主库存在活跃 WAL（{wal_path.name}），跳过副本刷新"
         shutil.copy2(db_path, tmp)
         verify = duckdb.connect(str(tmp), read_only=True)
         verify.execute("SELECT COUNT(*) FROM daily_bar").fetchone()
         verify.close()
+        verify = None
         os.replace(tmp, replica_path)
     except Exception as e:
         tmp.unlink(missing_ok=True)
         return False, f"副本刷新失败：{e}"
+    finally:
+        if verify is not None:
+            verify.close()
+        if guard is not None:
+            guard.close()
     return True, "副本已刷新"
 
 
@@ -927,23 +958,88 @@ def sync_from_backup(
         return _failure_report(backup_path, db_path, f"打开主库失败：{e}")
 
     results: list[TableSyncResult] = []
+    transaction_started = False
+    failed_table: str | None = None
     try:
         initialize_schema(conn)
         _attach_readonly(conn, backup_path, "cloud_backup")
+        conn.execute("BEGIN")
+        transaction_started = True
         for table in REPLACE_TABLES:
-            results.append(_sync_table(conn, table, "cloud_backup", "replace"))
+            result = _sync_table(
+                conn,
+                table,
+                "cloud_backup",
+                "replace",
+                manage_transaction=False,
+            )
+            results.append(result)
+            if result.mode == "error":
+                failed_table = table
+                raise RuntimeError(result.detail)
         for table in MERGE_TABLES:
             if table in DATA_METADATA_TABLES:
                 continue
-            results.append(_sync_table(conn, table, "cloud_backup", "merge"))
-        results.extend(_sync_data_metadata_bundle(conn, "cloud_backup"))
+            result = _sync_table(
+                conn,
+                table,
+                "cloud_backup",
+                "merge",
+                manage_transaction=False,
+            )
+            results.append(result)
+            if result.mode == "error":
+                failed_table = table
+                raise RuntimeError(result.detail)
+        metadata_results = _sync_data_metadata_bundle(
+            conn,
+            "cloud_backup",
+            manage_transaction=False,
+        )
+        results.extend(metadata_results)
+        metadata_error = next(
+            (result for result in metadata_results if result.mode == "error"),
+            None,
+        )
+        if metadata_error is not None:
+            failed_table = metadata_error.table
+            raise RuntimeError(metadata_error.detail)
+        conn.execute("COMMIT")
+        transaction_started = False
         conn.execute("DETACH cloud_backup")
         conn.execute("CHECKPOINT")
     except Exception as e:
         logger.exception("research-sync 顶层失败")
-        results.append(
-            TableSyncResult(table="<sync>", mode="error", detail=str(e)[:200])
-        )
+        if transaction_started:
+            try:
+                conn.execute("ROLLBACK")
+                transaction_started = False
+            except duckdb.Error:
+                logger.exception("research-sync 跨表事务回滚失败")
+        if failed_table is None:
+            results.append(
+                TableSyncResult(
+                    table="<sync>", mode="error", detail=str(e)[:200]
+                )
+            )
+        else:
+            rollback_reason = f"rolled back after {failed_table} failed"
+            results = [
+                result.model_copy(
+                    update={
+                        "mode": (
+                            "error" if result.table == failed_table else "skipped"
+                        ),
+                        "rows": 0,
+                        "detail": (
+                            f"{result.detail}; all primary changes rolled back"
+                            if result.table == failed_table
+                            else rollback_reason
+                        )[:200],
+                    }
+                )
+                for result in results
+            ]
     finally:
         conn.close()
 
