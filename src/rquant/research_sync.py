@@ -498,7 +498,23 @@ def _validate_dataset_snapshot_conflicts(
                 )
 
 
-def _merge_dataset_snapshots(
+def _count_accepted_dataset_snapshots(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> int:
+    return int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {alias}.dataset_snapshot AS source
+            LEFT JOIN dataset_snapshot AS target USING (snapshot_id)
+            WHERE target.snapshot_id IS NULL
+               OR (target.status = 'building' AND source.status = 'ready')
+            """
+        ).fetchone()[0]
+    )
+
+
+def _stage_missing_dataset_snapshots(
     conn: duckdb.DuckDBPyConnection, alias: str
 ) -> None:
     conn.execute(
@@ -509,8 +525,8 @@ def _merge_dataset_snapshots(
          completed_at)
         SELECT source.snapshot_id, source.strategy_name, source.manifest_id,
                source.as_of_time, source.code_commit, source.origin,
-               source.status, source.table_watermarks,
-               source.quality_issue_ids, source.created_at, source.completed_at
+               'building', CAST('{{}}' AS JSON), CAST('[]' AS JSON),
+               source.created_at, NULL
         FROM {alias}.dataset_snapshot AS source
         WHERE NOT EXISTS (
             SELECT 1 FROM dataset_snapshot AS target
@@ -518,6 +534,11 @@ def _merge_dataset_snapshots(
         )
         """
     )
+
+
+def _promote_dataset_snapshots(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> None:
     conn.execute(
         f"""
         UPDATE dataset_snapshot AS target
@@ -552,9 +573,6 @@ def _merge_dataset_coverages(
         JOIN dataset_snapshot AS target_snapshot
           ON target_snapshot.snapshot_id = target.snapshot_id
          AND target_snapshot.status = 'ready'
-        JOIN {alias}.dataset_snapshot AS source_snapshot
-          ON source_snapshot.snapshot_id = source.snapshot_id
-         AND source_snapshot.status = 'ready'
         """
     ).fetchall()
     for row in overlapping:
@@ -580,6 +598,28 @@ def _merge_dataset_coverages(
                 f"conflicting dataset_coverage for ready snapshot: {key}"
             )
 
+    missing_ready = conn.execute(
+        f"""
+        SELECT source.snapshot_id, source.dataset_id, source.coverage_scope
+        FROM {alias}.dataset_coverage AS source
+        JOIN dataset_snapshot AS target_snapshot
+          ON target_snapshot.snapshot_id = source.snapshot_id
+         AND target_snapshot.status = 'ready'
+        LEFT JOIN dataset_coverage AS target
+          ON target.snapshot_id = source.snapshot_id
+         AND target.dataset_id = source.dataset_id
+         AND target.coverage_scope = source.coverage_scope
+        WHERE target.snapshot_id IS NULL
+        ORDER BY source.snapshot_id, source.dataset_id, source.coverage_scope
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing_ready is not None:
+        key = f"{missing_ready[0]}/{missing_ready[1]}/{missing_ready[2]}"
+        raise ValueError(
+            f"new dataset_coverage for ready snapshot is immutable: {key}"
+        )
+
     conn.execute(
         f"""
         UPDATE dataset_coverage AS target
@@ -591,13 +631,10 @@ def _merge_dataset_coverages(
             missing_reasons = source.missing_reasons,
             created_at = least(target.created_at, source.created_at)
         FROM {alias}.dataset_coverage AS source,
-             {alias}.dataset_snapshot AS source_snapshot,
              dataset_snapshot AS target_snapshot
         WHERE target.snapshot_id = source.snapshot_id
           AND target.dataset_id = source.dataset_id
           AND target.coverage_scope = source.coverage_scope
-          AND source_snapshot.snapshot_id = source.snapshot_id
-          AND source_snapshot.status = 'ready'
           AND target_snapshot.snapshot_id = target.snapshot_id
           AND target_snapshot.status = 'building'
         """
@@ -607,13 +644,10 @@ def _merge_dataset_coverages(
         UPDATE dataset_coverage AS target
         SET created_at = least(target.created_at, source.created_at)
         FROM {alias}.dataset_coverage AS source,
-             {alias}.dataset_snapshot AS source_snapshot,
              dataset_snapshot AS target_snapshot
         WHERE target.snapshot_id = source.snapshot_id
           AND target.dataset_id = source.dataset_id
           AND target.coverage_scope = source.coverage_scope
-          AND source_snapshot.snapshot_id = source.snapshot_id
-          AND source_snapshot.status = 'ready'
           AND target_snapshot.snapshot_id = target.snapshot_id
           AND target_snapshot.status = 'ready'
         """
@@ -629,9 +663,9 @@ def _merge_dataset_coverages(
                source.missing_count, source.coverage_ratio,
                source.missing_reasons, source.created_at
         FROM {alias}.dataset_coverage AS source
-        JOIN {alias}.dataset_snapshot AS source_snapshot
-          ON source_snapshot.snapshot_id = source.snapshot_id
-         AND source_snapshot.status = 'ready'
+        JOIN dataset_snapshot AS target_snapshot
+          ON target_snapshot.snapshot_id = source.snapshot_id
+         AND target_snapshot.status = 'building'
         WHERE NOT EXISTS (
             SELECT 1
             FROM dataset_coverage AS target
@@ -808,15 +842,6 @@ def _sync_data_metadata_bundle(
                 f"{', '.join(sorted(missing_tables))}"
             )
 
-        row_counts = {
-            table: int(
-                conn.execute(
-                    f'SELECT COUNT(*) FROM {alias}."{table}"'
-                ).fetchone()[0]
-            )
-            for table in DATA_METADATA_TABLES
-        }
-
         current_table = "dataset_snapshot"
         source_snapshots = _load_source_snapshots(conn, alias)
         current_table = "dataset_coverage"
@@ -832,13 +857,21 @@ def _sync_data_metadata_bundle(
         )
         _validate_dataset_snapshot_conflicts(conn, alias)
 
-        # Coverage reconciliation must see the target before snapshot promotion.
-        current_table = "dataset_coverage"
-        _merge_dataset_coverages(conn, alias)
+        accepted_counts = {
+            "dataset_snapshot": _count_accepted_dataset_snapshots(conn, alias),
+            "dataset_coverage": len(source_coverages),
+            "data_quality_issue": len(source_issues),
+        }
+
         current_table = "data_quality_issue"
         _merge_data_quality_issues(conn, alias)
         current_table = "dataset_snapshot"
-        _merge_dataset_snapshots(conn, alias)
+        _stage_missing_dataset_snapshots(conn, alias)
+        # Coverage must settle while source-ready parents are still building.
+        current_table = "dataset_coverage"
+        _merge_dataset_coverages(conn, alias)
+        current_table = "dataset_snapshot"
+        _promote_dataset_snapshots(conn, alias)
         if manage_transaction:
             conn.execute("COMMIT")
             transaction_started = False
@@ -858,7 +891,7 @@ def _sync_data_metadata_bundle(
         )
 
     return [
-        TableSyncResult(table=table, mode="merge", rows=row_counts[table])
+        TableSyncResult(table=table, mode="merge", rows=accepted_counts[table])
         for table in DATA_METADATA_TABLES
     ]
 

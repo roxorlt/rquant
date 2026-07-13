@@ -987,7 +987,44 @@ class TestSyncFromBackup:
         assert stored.created_at == t0
         assert stored.completed_at == t0 + timedelta(minutes=1)
 
-    def test_sync_building_source_cannot_regress_ready_coverage(
+    def test_sync_source_only_building_snapshot_and_coverage_together(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="building-source",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=7,
+            missing_reasons=("backfill still running",),
+            created_at=t0,
+        )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(coverage)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored_snapshot = local.get_dataset_snapshot(snapshot.snapshot_id)
+            stored_coverages = local.list_dataset_coverages(snapshot.snapshot_id)
+        by_table = {result.table: result for result in report.tables}
+        assert not report.has_errors
+        assert stored_snapshot == snapshot
+        assert stored_coverages == [coverage]
+        assert by_table["dataset_snapshot"].rows == 1
+        assert by_table["dataset_coverage"].rows == 1
+
+    def test_sync_building_source_conflicting_with_ready_coverage_fails(
         self, local_db: Path, backup_db: Path
     ) -> None:
         t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
@@ -1035,8 +1072,113 @@ class TestSyncFromBackup:
 
         with DuckDBStore(local_db) as local:
             stored = local.list_dataset_coverages(snapshot.snapshot_id)
-        assert not report.has_errors
+        coverage_result = next(
+            result
+            for result in report.tables
+            if result.table == "dataset_coverage"
+        )
+        assert report.has_errors
+        assert coverage_result.mode == "error"
+        assert coverage_result.rows == 0
+        assert "ready snapshot" in coverage_result.detail
         assert stored == [target_coverage]
+
+    def test_sync_building_source_identical_to_ready_is_idempotent_and_counted(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        target_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=9,
+            missing_reasons=("one missing",),
+            created_at=t0 + timedelta(minutes=1),
+        )
+        source_coverage = target_coverage.model_copy(update={"created_at": t0})
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.upsert_dataset_coverage(target_coverage)
+            local.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                DatasetSnapshotFinalization(
+                    completed_at=t0 + timedelta(minutes=2)
+                ),
+            )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(source_coverage)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored_snapshot = local.get_dataset_snapshot(snapshot.snapshot_id)
+            stored_coverages = local.list_dataset_coverages(snapshot.snapshot_id)
+        by_table = {result.table: result for result in report.tables}
+        assert not report.has_errors
+        assert stored_snapshot is not None
+        assert stored_snapshot.status == "ready"
+        assert stored_coverages == [source_coverage]
+        assert by_table["dataset_snapshot"].rows == 0
+        assert by_table["dataset_coverage"].rows == 1
+
+    def test_sync_orphan_coverage_rolls_back_entire_metadata_bundle(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        valid_snapshot = DatasetSnapshot.create(
+            strategy_name="valid-building",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        valid_coverage = DatasetCoverage(
+            snapshot_id=valid_snapshot.snapshot_id,
+            dataset_id="valid-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=1,
+            available_count=1,
+            created_at=t0,
+        )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(valid_snapshot)
+            backup.upsert_dataset_coverage(valid_coverage)
+            backup._conn.execute(
+                """
+                INSERT INTO dataset_coverage
+                (snapshot_id, dataset_id, coverage_scope, table_name,
+                 expected_count, available_count, missing_count, coverage_ratio,
+                 missing_reasons, created_at)
+                VALUES ('orphan-snapshot', 'orphan-bars', 'all', 'minute_bar',
+                        1, 1, 0, 1.0, CAST('[]' AS JSON), ?)
+                """,
+                [t0],
+            )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored_snapshot = local.get_dataset_snapshot(valid_snapshot.snapshot_id)
+            coverage_count = local._conn.execute(
+                "SELECT COUNT(*) FROM dataset_coverage"
+            ).fetchone()[0]
+        by_table = {result.table: result for result in report.tables}
+        assert report.has_errors
+        assert by_table["dataset_coverage"].mode == "error"
+        assert "missing dataset_snapshot" in by_table["dataset_coverage"].detail
+        assert stored_snapshot is None
+        assert coverage_count == 0
 
     def test_sync_conflicting_ready_coverage_fails_and_preserves_target(
         self, local_db: Path, backup_db: Path
