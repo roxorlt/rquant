@@ -414,6 +414,85 @@ def test_finalized_snapshot_rejects_changed_or_new_coverage_before_write(
         assert store.list_dataset_coverages(snapshot.snapshot_id) == [stored]
 
 
+def test_coverage_upsert_serializes_with_snapshot_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.data_metadata import (
+        DatasetCoverage,
+        DatasetSnapshot,
+        DatasetSnapshotFinalization,
+    )
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    db_path = tmp_path / "coverage-finalize-race.duckdb"
+    snapshot = DatasetSnapshot.create(
+        strategy_name="strategy",
+        as_of_time=t0,
+        code_commit="abc123",
+        origin="local",
+        created_at=t0,
+    )
+    initial = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=9,
+        missing_reasons=("one symbol absent",),
+        created_at=t0,
+    )
+    changed = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=10,
+        created_at=t0,
+    )
+    finalization = DatasetSnapshotFinalization(
+        completed_at=t0 + timedelta(minutes=1)
+    )
+
+    with DuckDBStore(db_path) as primary, DuckDBStore(db_path) as competitor:
+        primary.begin_dataset_snapshot(snapshot)
+        primary.upsert_dataset_coverage(initial)
+        real_get = primary.get_dataset_snapshot
+        finalization_outcomes: list[str] = []
+        interleaved = False
+
+        def get_with_concurrent_finalization(snapshot_id: str):  # noqa: ANN202
+            nonlocal interleaved
+            current = real_get(snapshot_id)
+            if not interleaved:
+                interleaved = True
+                try:
+                    competitor.finalize_dataset_snapshot(snapshot_id, finalization)
+                except ValueError:
+                    finalization_outcomes.append("rejected")
+                else:
+                    finalization_outcomes.append("committed")
+            return current
+
+        monkeypatch.setattr(
+            primary,
+            "get_dataset_snapshot",
+            get_with_concurrent_finalization,
+        )
+
+        stored = primary.upsert_dataset_coverage(changed)
+
+        assert finalization_outcomes == ["rejected"]
+        assert stored.available_count == 10
+        finalized = competitor.finalize_dataset_snapshot(
+            snapshot.snapshot_id, finalization
+        )
+        assert finalized.status == "ready"
+        assert primary.list_dataset_coverages(snapshot.snapshot_id) == [stored]
+
+
 def test_record_issue_ignores_stale_and_equal_detections(tmp_path: Path) -> None:
     from rquant.data_metadata import DataQualityIssue
 

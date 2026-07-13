@@ -542,6 +542,16 @@ class DuckDBStore:
         coverage = _revalidate_for_write(coverage)
         self._conn.execute("BEGIN")
         try:
+            # Touching the parent row serializes coverage writes with finalization.
+            touched = self._conn.execute(
+                "UPDATE dataset_snapshot SET status = status "
+                "WHERE snapshot_id = ? RETURNING snapshot_id",
+                [coverage.snapshot_id],
+            ).fetchone()
+            if touched is None:
+                raise KeyError(
+                    f"dataset snapshot not found: {coverage.snapshot_id}"
+                )
             snapshot = self.get_dataset_snapshot(coverage.snapshot_id)
             if snapshot is None:
                 raise KeyError(
