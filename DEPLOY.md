@@ -5,11 +5,12 @@
 
 ---
 
-## 2026-07-13 · v0.13.2 candidate · 受控自动发布（尚未部署）
+## 2026-07-13 · v0.13.2 · 受控自动发布
 
-**状态**：本地功能分支；等待 PR、CI、merge 和 tag。腾讯云当前仍为 `v0.13.0`。
+**状态**：已于 15:42-15:45 部署到腾讯云，commit
+`e3b48c0b358c4fd98748f4a57bb142c900294b4c`。
 
-**候选内容**：
+**部署内容**：
 
 - 精确 tag/SHA、main 归属与快进校验；tracked 脏文件和并发部署拒绝。
 - diff 自动计算服务重启；工作日 09:15-15:10 有重启需求时自动延期。
@@ -17,22 +18,34 @@
 - 依赖/preflight/服务健康失败自动回滚；审计写入 `logs/production-deploy.jsonl`。
 - 包含尚未上云的 `v0.13.1` preflight 只读副本热修复。
 
-**首次部署前置**：
+**首次引导**：
 
-1. 恢复本机到腾讯云的 SSH 密钥交换；当前 22 端口在 KEX 前由服务端主动关闭。
-2. root 验证并安装 `deploy/sudoers/rquant-production-deploy`（0440）。
-3. 因服务器尚无新部署器，首次由 Codex 做一次精确 SHA bootstrap；以后全部调用
+1. SSH 22 端口恢复后，使用已授权密钥登录 `lighthouse@82.156.0.68`。
+2. 从 `77f6ebf` 精确快进到 `v0.13.2`，执行 `uv sync --frozen`。
+3. `visudo` 校验通过后，安装
+   `/etc/sudoers.d/rquant-production-deploy`（root:root，0440）并复验授权。
+4. 以后的日常发布全部调用
    `scripts/deploy-production.sh --target <exact-ref>`。
 
-**部署后验证**：版本 `0.13.2`、两次 preflight 无 fail、受影响 active 服务健康、审计记录
-为 `deployed`。回滚基线为云端当前 commit `77f6ebf`。
+**验证**：
+
+- 环境包版本为 `0.13.2`，tracked 工作区干净，仅保留 untracked `backup/`。
+- 服务重启前后两次 preflight 均为 `ok=5 warn=0 fail=0 skip=0`。
+- 只重启发布前 active 的 canvas、dashboard、nl-screen、panorama-auth 和 panorama；
+  已按日程退出的 monitor 和 surge-watch 保持 inactive。
+- Dashboard `127.0.0.1:8501/_stcore/health` 返回 `ok`。
+- 受控入口复核返回 `already_current`，JSONL 审计时间为
+  `2026-07-13T15:45:10+08:00`。
+
+**回滚基线**：`77f6ebfb7782521e5c58ffc2e9226e20af9ac96c`；使用受控发布器的自动
+回滚链路，不手工改生产数据。
 
 ---
 
-## 2026-07-13 · v0.13.1 candidate · preflight 只读副本热修复（尚未部署）
+## 2026-07-13 · v0.13.1 · preflight 只读副本热修复
 
-**状态**：PR #73 已合并为 `347d57d`，annotated tag `v0.13.1` 已推送；尚未部署，将随
-`v0.13.2` 一并上云。
+**状态**：PR #73 已合并为 `347d57d`，annotated tag `v0.13.1` 已推送；修复已随
+`v0.13.2` 于 2026-07-13 一并上云。
 
 **候选内容**：
 
