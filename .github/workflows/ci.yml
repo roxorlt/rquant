@@ -22,11 +22,11 @@ jobs:
         python-version: ["3.11", "3.12"]
     env:
       TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
-      DATA_DIR: ${{ runner.temp }}/rquant/data
-      DUCKDB_PATH: ${{ runner.temp }}/rquant/data/test.duckdb
-      DUCKDB_READONLY_PATH: ${{ runner.temp }}/rquant/data/test_ro.duckdb
-      PARQUET_DIR: ${{ runner.temp }}/rquant/data/parquet
-      LOG_DIR: ${{ runner.temp }}/rquant/logs
+      DATA_DIR: ${{ github.workspace }}/.ci/data
+      DUCKDB_PATH: ${{ github.workspace }}/.ci/data/test.duckdb
+      DUCKDB_READONLY_PATH: ${{ github.workspace }}/.ci/data/test_ro.duckdb
+      PARQUET_DIR: ${{ github.workspace }}/.ci/data/parquet
+      LOG_DIR: ${{ github.workspace }}/.ci/logs
       NOTIFY_ENABLED: "false"
 
     steps:

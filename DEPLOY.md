@@ -13,6 +13,7 @@
 
 - `preflight` 的数据新鲜度与 smoke 筛选优先读取只读副本，避免盘中撞 monitor 主库写锁。
 - `lsof` 只有 `mem` 等未分类 FD 时改报“无法判断”，不再误报 monitor 未运行。
+- 修正 Stage 0 新增 CI 的上下文作用域，使 Python 3.11/3.12 矩阵能实际创建 job。
 - 不改数据库 schema、systemd unit、策略逻辑或生产数据。
 
 **部署后验证**：
