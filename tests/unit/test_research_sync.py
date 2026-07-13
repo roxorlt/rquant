@@ -93,6 +93,25 @@ def _insert_paper_position(db_path: Path, position_id: str, status: str) -> None
     conn.close()
 
 
+def _insert_trade_calendar_row(
+    db_path: Path,
+    *,
+    cal_date: date,
+    is_open: bool,
+    pretrade_date: date | None,
+    source: str,
+    updated_at: datetime,
+) -> None:
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO trade_calendar "
+        "(exchange, cal_date, is_open, pretrade_date, source, updated_at) "
+        "VALUES ('SSE', ?, ?, ?, ?, ?)",
+        [cal_date, is_open, pretrade_date, source, updated_at],
+    )
+    conn.close()
+
+
 class TestSyncFromBackup:
     def test_uses_shared_schema_initializer(
         self,
@@ -1289,6 +1308,148 @@ def test_trade_calendar_merge_keeps_local_history_and_cloud_wins(
         (date(2026, 6, 1), True, "local"),
         (date(2026, 7, 1), True, "tushare"),
     ]
+
+
+def test_trade_calendar_merge_preserves_newer_target_row(
+    local_db: Path, backup_db: Path
+) -> None:
+    newer_time = datetime(2026, 7, 1, 2, 0, tzinfo=UTC)
+    older_time = newer_time - timedelta(hours=1)
+    _insert_trade_calendar_row(
+        local_db,
+        cal_date=date(2026, 7, 1),
+        is_open=True,
+        pretrade_date=date(2026, 6, 30),
+        source="local-newer",
+        updated_at=newer_time,
+    )
+    _insert_trade_calendar_row(
+        backup_db,
+        cal_date=date(2026, 7, 1),
+        is_open=False,
+        pretrade_date=date(2026, 6, 27),
+        source="cloud-older",
+        updated_at=older_time,
+    )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    with DuckDBStore(local_db) as store:
+        row = store.get_trade_calendar_day("SSE", date(2026, 7, 1))
+    assert not report.has_errors
+    assert row is not None
+    assert row.is_open is True
+    assert row.pretrade_date == date(2026, 6, 30)
+    assert row.source == "local-newer"
+    assert row.updated_at == newer_time
+
+
+def test_trade_calendar_merge_equal_time_identical_facts_is_idempotent(
+    local_db: Path, backup_db: Path
+) -> None:
+    observed_at = datetime(2026, 7, 1, 2, 0, tzinfo=UTC)
+    for db_path, source in (
+        (local_db, "local-provenance"),
+        (backup_db, "cloud-provenance"),
+    ):
+        _insert_trade_calendar_row(
+            db_path,
+            cal_date=date(2026, 7, 1),
+            is_open=True,
+            pretrade_date=date(2026, 6, 30),
+            source=source,
+            updated_at=observed_at,
+        )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    with DuckDBStore(local_db) as store:
+        row = store.get_trade_calendar_day("SSE", date(2026, 7, 1))
+    assert not report.has_errors
+    assert row is not None
+    assert row.source == "local-provenance"
+    assert row.updated_at == observed_at
+
+
+def test_trade_calendar_merge_inserts_source_only_row(
+    local_db: Path, backup_db: Path
+) -> None:
+    observed_at = datetime(2026, 7, 2, 2, 0, tzinfo=UTC)
+    _insert_trade_calendar_row(
+        backup_db,
+        cal_date=date(2026, 7, 2),
+        is_open=True,
+        pretrade_date=date(2026, 7, 1),
+        source="cloud-only",
+        updated_at=observed_at,
+    )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    with DuckDBStore(local_db) as store:
+        row = store.get_trade_calendar_day("SSE", date(2026, 7, 2))
+    assert not report.has_errors
+    assert row is not None
+    assert row.source == "cloud-only"
+    assert row.updated_at == observed_at
+
+
+def test_trade_calendar_equal_time_conflict_rolls_back_and_skips_replica(
+    local_db: Path,
+    backup_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2026, 7, 1, 2, 0, tzinfo=UTC)
+    _insert_trade_calendar_row(
+        local_db,
+        cal_date=date(2026, 7, 1),
+        is_open=True,
+        pretrade_date=date(2026, 6, 30),
+        source="local",
+        updated_at=observed_at,
+    )
+    _insert_trade_calendar_row(
+        backup_db,
+        cal_date=date(2026, 7, 1),
+        is_open=False,
+        pretrade_date=date(2026, 6, 30),
+        source="conflict",
+        updated_at=observed_at,
+    )
+    _insert_trade_calendar_row(
+        backup_db,
+        cal_date=date(2026, 7, 2),
+        is_open=True,
+        pretrade_date=date(2026, 7, 1),
+        source="source-only",
+        updated_at=observed_at + timedelta(days=1),
+    )
+    replica_calls = 0
+
+    def spy_refresh(db_path: Path) -> tuple[bool, str]:
+        nonlocal replica_calls
+        replica_calls += 1
+        return True, "unexpected"
+
+    monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+    with DuckDBStore(local_db) as store:
+        rows = store.list_trade_calendar(
+            "SSE", date(2026, 7, 1), date(2026, 7, 2)
+        )
+    result = next(item for item in report.tables if item.table == "trade_calendar")
+    assert report.has_errors
+    assert result.mode == "error"
+    assert "equal updated_at" in result.detail
+    assert len(rows) == 1
+    assert rows[0].is_open is True
+    assert rows[0].source == "local"
+    assert rows[0].cal_date == date(2026, 7, 1)
+    assert replica_calls == 0
+    assert not report.replica_refreshed
+    assert "跳过副本刷新" in report.replica_detail
 
 
 def test_backfilled_history_tables_are_merge() -> None:

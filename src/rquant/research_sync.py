@@ -22,6 +22,7 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
      整表替换，一次日终合并就会把回补历史全部抹掉
   c) 本地独有采集 limit_up_pool_daily（云端东财源被屏蔽，永远没有）与
      limit_list_daily（Tushare 涨跌停榜本地回补 + 日终增量，云端 daily 不拉）
+  d) trade_calendar 按 updated_at 单调合并，等时事实冲突整表回滚
   灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
   缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
 - LOCAL_ONLY_TABLES：只描述本机状态，不从云端备份导入
@@ -52,6 +53,7 @@ from rquant.storage.duckdb import (
     _snapshot_from_row,
 )
 from rquant.storage.migrations import initialize_schema
+from rquant.trade_calendar import TradeCalendarConflictError
 
 # 云端 daily/monitor 流水线权威产出，本地无独立增量 → 整表替换
 REPLACE_TABLES: tuple[str, ...] = (
@@ -746,7 +748,7 @@ def _sync_table(
 ) -> TableSyncResult:
     """mode 三种执行策略：
     - replace：整表 DELETE + INSERT（云端权威表）
-    - merge：通常源覆盖本地；生命周期元数据按状态和事件时间协调
+    - merge：通常源覆盖本地；日历和生命周期元数据按事件时间协调
     - restore：INSERT OR IGNORE，主键冲突时保留本地（灾后恢复，只补缺失行）
 
     注意返回的 TableSyncResult.mode 词汇固定为 replace|merge|skipped|error
@@ -778,6 +780,26 @@ def _sync_table(
     col_list = ", ".join(cols)
     src_rows = conn.execute(f'SELECT COUNT(*) FROM {alias}."{table}"').fetchone()[0]
 
+    trade_calendar_columns = {
+        "exchange",
+        "cal_date",
+        "is_open",
+        "pretrade_date",
+        "source",
+        "updated_at",
+    }
+    if (
+        table == "trade_calendar"
+        and mode == "merge"
+        and not trade_calendar_columns <= set(cols)
+    ):
+        missing = sorted(trade_calendar_columns - set(cols))
+        return TableSyncResult(
+            table=table,
+            mode="error",
+            detail=f"trade_calendar merge missing columns: {missing}",
+        )
+
     try:
         conn.execute("BEGIN")
         if mode == "replace":
@@ -790,6 +812,47 @@ def _sync_table(
             conn.execute(
                 f'INSERT OR IGNORE INTO "{table}" ({col_list}) '
                 f'SELECT {col_list} FROM {alias}."{table}"'
+            )
+        elif table == "trade_calendar":
+            conflict = conn.execute(
+                f"""
+                SELECT source.exchange, source.cal_date,
+                       strftime(source.updated_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                FROM {alias}.trade_calendar AS source
+                JOIN trade_calendar AS target
+                  ON target.exchange = source.exchange
+                 AND target.cal_date = source.cal_date
+                WHERE source.updated_at = target.updated_at
+                  AND (
+                      source.is_open IS DISTINCT FROM target.is_open
+                      OR source.pretrade_date IS DISTINCT FROM target.pretrade_date
+                  )
+                ORDER BY source.exchange, source.cal_date
+                LIMIT 1
+                """
+            ).fetchone()
+            if conflict is not None:
+                raise TradeCalendarConflictError(
+                    str(conflict[0]),
+                    conflict[1],
+                    datetime.fromisoformat(
+                        str(conflict[2]).replace("Z", "+00:00")
+                    ),
+                )
+            conn.execute(
+                f"""
+                INSERT INTO trade_calendar
+                (exchange, cal_date, is_open, pretrade_date, source, updated_at)
+                SELECT exchange, cal_date, is_open, pretrade_date, source, updated_at
+                FROM {alias}.trade_calendar
+                ON CONFLICT (exchange, cal_date) DO UPDATE SET
+                    is_open = excluded.is_open,
+                    pretrade_date = excluded.pretrade_date,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                WHERE excluded.updated_at > trade_calendar.updated_at
+                """
             )
         else:
             conn.execute(

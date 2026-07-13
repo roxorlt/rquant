@@ -81,6 +81,28 @@ class TradeCalendarGapError(LookupError):
         super().__init__(detail)
 
 
+class TradeCalendarConflictError(ValueError):
+    """Two observations claim different business facts at the same time."""
+
+    exchange: str
+    cal_date: date
+    updated_at: datetime
+
+    def __init__(
+        self,
+        exchange: str,
+        cal_date: date,
+        updated_at: datetime,
+    ) -> None:
+        self.exchange = exchange
+        self.cal_date = cal_date
+        self.updated_at = updated_at
+        super().__init__(
+            "trade calendar conflict at equal updated_at for "
+            f"{exchange} {cal_date.isoformat()} ({updated_at.isoformat()})"
+        )
+
+
 class TradeCalendarAdapter(Protocol):
     def trade_cal_raw(
         self, start: date, end: date, exchange: str = "SSE"
@@ -89,6 +111,46 @@ class TradeCalendarAdapter(Protocol):
 
 class TradeCalendarStore(Protocol):
     def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int: ...
+
+
+def trade_calendar_business_facts(
+    row: TradeCalendarDay,
+) -> tuple[bool, date | None]:
+    return row.is_open, row.pretrade_date
+
+
+def deduplicate_trade_calendar_rows(
+    rows: Sequence[TradeCalendarDay],
+) -> list[TradeCalendarDay]:
+    """Select the newest observation per key and reject equal-time fact conflicts."""
+    observations: dict[tuple[str, date, datetime], TradeCalendarDay] = {}
+    for row in rows:
+        observation_key = (row.exchange, row.cal_date, row.updated_at)
+        current = observations.get(observation_key)
+        if current is None:
+            observations[observation_key] = row
+            continue
+        if trade_calendar_business_facts(row) != trade_calendar_business_facts(
+            current
+        ):
+            raise TradeCalendarConflictError(
+                row.exchange,
+                row.cal_date,
+                row.updated_at,
+            )
+        observations[observation_key] = min(
+            current,
+            row,
+            key=lambda item: item.source,
+        )
+
+    selected: dict[tuple[str, date], TradeCalendarDay] = {}
+    for row in observations.values():
+        key = (row.exchange, row.cal_date)
+        current = selected.get(key)
+        if current is None or row.updated_at > current.updated_at:
+            selected[key] = row
+    return [selected[key] for key in sorted(selected)]
 
 
 def _parse_civil_date(value: object, *, field_name: str) -> date:
@@ -163,7 +225,7 @@ def normalize_trade_calendar(
                 updated_at=normalized_at,
             )
         )
-    return sorted(rows, key=lambda row: (row.exchange, row.cal_date))
+    return deduplicate_trade_calendar_rows(rows)
 
 
 def _civil_dates(start: date, end: date) -> list[date]:
@@ -201,6 +263,15 @@ def refresh_trade_calendar(
     if wrong_exchange:
         raise ValueError(
             f"trade calendar provider returned unexpected exchanges: {wrong_exchange}"
+        )
+    outside_dates = sorted(
+        {row.cal_date for row in rows if row.cal_date < start or row.cal_date > end}
+    )
+    if outside_dates:
+        rendered = ", ".join(day.isoformat() for day in outside_dates)
+        raise ValueError(
+            "trade calendar provider returned dates outside requested range: "
+            f"{rendered}"
         )
     expected_dates = _civil_dates(start, end)
     fetched_dates = {row.cal_date for row in rows}

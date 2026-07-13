@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from rquant.adapter.tushare import TushareAdapter
 from rquant.storage.duckdb import DuckDBStore
 from rquant.trade_calendar import (
+    TradeCalendarConflictError,
     TradeCalendarDay,
     TradeCalendarGapError,
     normalize_trade_calendar,
@@ -279,6 +280,21 @@ def test_trade_cal_raw_empty_and_reversed_ranges_are_explicit() -> None:
     assert len(pro.calls) == 1
 
 
+def test_trade_cal_raw_and_wrapper_deduplicate_exact_provider_rows() -> None:
+    provider = pd.concat(
+        [_provider_calendar(), _provider_calendar().iloc[[3]]],
+        ignore_index=True,
+    )
+    pro = _StubTradeCalPro(provider)
+    adapter = _adapter_with_pro(pro)
+
+    raw = adapter.trade_cal_raw(date(2026, 1, 1), date(2026, 1, 5))
+    open_days = adapter.trade_cal(date(2026, 1, 1), date(2026, 1, 5))
+
+    assert len(raw) == 5
+    assert open_days == [date(2026, 1, 2), date(2026, 1, 5)]
+
+
 def test_upsert_get_list_and_missing_dates_are_typed_and_idempotent(
     store: DuckDBStore,
 ) -> None:
@@ -298,6 +314,150 @@ def test_upsert_get_list_and_missing_dates_are_typed_and_idempotent(
         "SSE", date(2026, 1, 1), date(2026, 1, 6)
     ) == [date(2026, 1, 6)]
     assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 5
+
+
+def test_upsert_older_row_never_overwrites_newer_stored_facts(
+    store: DuckDBStore,
+) -> None:
+    current = _day(
+        date(2026, 1, 5),
+        True,
+        pretrade_date=date(2026, 1, 2),
+        source="current",
+    )
+    stale = _day(
+        date(2026, 1, 5),
+        False,
+        pretrade_date=date(2025, 12, 31),
+        source="stale",
+        updated_at=UPDATED_AT - timedelta(hours=1),
+    )
+    store.upsert_trade_calendar([current])
+
+    assert store.upsert_trade_calendar([stale]) == 1
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == current
+
+
+def test_upsert_newer_row_updates_stored_facts_and_provenance(
+    store: DuckDBStore,
+) -> None:
+    current = _day(
+        date(2026, 1, 5),
+        True,
+        pretrade_date=date(2026, 1, 2),
+        source="current",
+    )
+    newer = _day(
+        date(2026, 1, 5),
+        False,
+        pretrade_date=date(2025, 12, 31),
+        source="newer",
+        updated_at=UPDATED_AT + timedelta(hours=1),
+    )
+    store.upsert_trade_calendar([current])
+
+    assert store.upsert_trade_calendar([newer]) == 1
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == newer
+
+
+def test_upsert_equal_time_identical_facts_is_idempotent(
+    store: DuckDBStore,
+) -> None:
+    current = _day(
+        date(2026, 1, 5),
+        True,
+        pretrade_date=date(2026, 1, 2),
+        source="current",
+    )
+    same_facts = current.model_copy(update={"source": "duplicate-provider"})
+    store.upsert_trade_calendar([current])
+
+    assert store.upsert_trade_calendar([same_facts]) == 1
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == current
+
+
+def test_upsert_equal_time_conflicting_facts_raises_without_overwrite(
+    store: DuckDBStore,
+) -> None:
+    current = _day(
+        date(2026, 1, 5),
+        True,
+        pretrade_date=date(2026, 1, 2),
+    )
+    conflict = _day(
+        date(2026, 1, 5),
+        False,
+        pretrade_date=date(2026, 1, 2),
+    )
+    store.upsert_trade_calendar([current])
+
+    with pytest.raises(TradeCalendarConflictError, match="equal updated_at"):
+        store.upsert_trade_calendar([conflict])
+
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == current
+
+
+def test_upsert_direct_duplicates_select_newest_independent_of_input_order(
+    store: DuckDBStore,
+) -> None:
+    older = _day(
+        date(2026, 1, 5),
+        True,
+        source="older",
+        updated_at=UPDATED_AT - timedelta(hours=1),
+    )
+    newer = _day(
+        date(2026, 1, 5),
+        False,
+        source="newer",
+        updated_at=UPDATED_AT + timedelta(hours=1),
+    )
+
+    assert store.upsert_trade_calendar([newer, older]) == 1
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == newer
+
+
+def test_upsert_exact_duplicates_are_deduplicated(store: DuckDBStore) -> None:
+    row = _day(date(2026, 1, 5), True)
+
+    assert store.upsert_trade_calendar([row, row]) == 1
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 1
+
+
+def test_upsert_duplicate_conflict_writes_zero_rows(store: DuckDBStore) -> None:
+    first = _day(date(2026, 1, 5), True)
+    conflict = _day(date(2026, 1, 5), False)
+    unrelated = _day(date(2026, 1, 6), True)
+
+    with pytest.raises(TradeCalendarConflictError, match="equal updated_at"):
+        store.upsert_trade_calendar([first, unrelated, conflict])
+
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_upsert_rejects_equal_time_conflict_hidden_behind_newer_duplicate(
+    store: DuckDBStore,
+) -> None:
+    older = _day(
+        date(2026, 1, 5),
+        True,
+        updated_at=UPDATED_AT - timedelta(hours=1),
+    )
+    newer = _day(
+        date(2026, 1, 5),
+        True,
+        updated_at=UPDATED_AT + timedelta(hours=1),
+    )
+    older_conflict = _day(
+        date(2026, 1, 5),
+        False,
+        updated_at=older.updated_at,
+    )
+
+    with pytest.raises(TradeCalendarConflictError, match="equal updated_at"):
+        store.upsert_trade_calendar([older, newer, older_conflict])
+
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
 
 
 def test_known_open_weekend_and_legal_holiday_are_not_calendar_gaps(
@@ -408,3 +568,107 @@ def test_refresh_empty_source_cannot_claim_coverage(store: DuckDBStore) -> None:
             end=date(2026, 1, 5),
             updated_at=UPDATED_AT,
         )
+
+
+def test_refresh_exact_duplicates_count_and_write_unique_civil_days(
+    store: DuckDBStore,
+) -> None:
+    provider = pd.concat(
+        [_provider_calendar(), _provider_calendar().iloc[[3]]],
+        ignore_index=True,
+    )
+
+    result = refresh_trade_calendar(
+        _RefreshAdapter(provider),
+        store,
+        exchange="SSE",
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 5),
+        updated_at=UPDATED_AT,
+    )
+
+    assert result.fetched_days == 5
+    assert result.upserted_days == 5
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 5
+
+
+def test_refresh_conflicting_duplicates_write_zero_rows(
+    store: DuckDBStore,
+) -> None:
+    conflict = _provider_calendar().iloc[[3]].copy()
+    conflict.loc[:, "is_open"] = "0"
+    provider = pd.concat([_provider_calendar(), conflict], ignore_index=True)
+
+    with pytest.raises(TradeCalendarConflictError, match="equal updated_at"):
+        refresh_trade_calendar(
+            _RefreshAdapter(provider),
+            store,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_refresh_out_of_range_date_writes_zero_rows(store: DuckDBStore) -> None:
+    outside = pd.DataFrame(
+        [
+            {
+                "exchange": "SSE",
+                "cal_date": "20251231",
+                "is_open": "1",
+                "pretrade_date": "20251230",
+            }
+        ]
+    )
+    provider = pd.concat([_provider_calendar(), outside], ignore_index=True)
+
+    with pytest.raises(ValueError, match="outside requested range"):
+        refresh_trade_calendar(
+            _RefreshAdapter(provider),
+            store,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_refresh_wrong_exchange_writes_zero_rows(store: DuckDBStore) -> None:
+    provider = _provider_calendar()
+    provider.loc[0, "exchange"] = "SZSE"
+
+    with pytest.raises(ValueError, match="unexpected exchanges"):
+        refresh_trade_calendar(
+            _RefreshAdapter(provider),
+            store,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_refresh_incomplete_provider_range_writes_zero_rows(
+    store: DuckDBStore,
+) -> None:
+    provider = _provider_calendar().iloc[1:].reset_index(drop=True)
+
+    with pytest.raises(TradeCalendarGapError) as gap:
+        refresh_trade_calendar(
+            _RefreshAdapter(provider),
+            store,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+    assert gap.value.missing_dates == (date(2026, 1, 5),)
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0

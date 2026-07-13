@@ -26,7 +26,13 @@ from rquant.data_metadata import (
     utc_now,
 )
 from rquant.storage.migrations import initialize_schema
-from rquant.trade_calendar import TradeCalendarDay, TradeCalendarGapError
+from rquant.trade_calendar import (
+    TradeCalendarConflictError,
+    TradeCalendarDay,
+    TradeCalendarGapError,
+    deduplicate_trade_calendar_rows,
+    trade_calendar_business_facts,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -173,11 +179,29 @@ class DuckDBStore:
         initialize_schema(self._conn)
 
     def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int:
-        validated = [_revalidate_for_write(row) for row in rows]
+        validated = deduplicate_trade_calendar_rows(
+            [_revalidate_for_write(row) for row in rows]
+        )
         if not validated:
             return 0
         self._conn.execute("BEGIN")
         try:
+            for incoming in validated:
+                existing = self.get_trade_calendar_day(
+                    incoming.exchange,
+                    incoming.cal_date,
+                )
+                if (
+                    existing is not None
+                    and existing.updated_at == incoming.updated_at
+                    and trade_calendar_business_facts(existing)
+                    != trade_calendar_business_facts(incoming)
+                ):
+                    raise TradeCalendarConflictError(
+                        incoming.exchange,
+                        incoming.cal_date,
+                        incoming.updated_at,
+                    )
             self._conn.executemany(
                 """
                 INSERT INTO trade_calendar
@@ -188,6 +212,7 @@ class DuckDBStore:
                     pretrade_date = excluded.pretrade_date,
                     source = excluded.source,
                     updated_at = excluded.updated_at
+                WHERE excluded.updated_at > trade_calendar.updated_at
                 """,
                 [
                     [
