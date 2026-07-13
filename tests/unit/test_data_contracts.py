@@ -5,15 +5,18 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, time, timedelta
+from inspect import Parameter, signature
 from pathlib import Path
 from types import MappingProxyType
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
 
+import rquant.data_contracts as contracts_module
 from rquant.data_contracts import (
     CONTRACTS_BY_ID,
     DATASET_CONTRACTS,
@@ -29,6 +32,7 @@ from rquant.dataset_backfill import DATASETS
 from rquant.storage.duckdb import DuckDBStore
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+BACKFILL_TABLES = {name: spec.table for name, spec in DATASETS.items()}
 
 EXPECTED_DATASET_IDS = (
     "daily_bar",
@@ -325,33 +329,76 @@ def test_registry_builder_rejects_duplicate_dataset_ids() -> None:
         build_contract_registry((contract, contract))
 
 
-def test_registry_validator_rejects_keys_that_disagree_with_models(
-    store: DuckDBStore,
-) -> None:
+def test_shape_validator_rejects_keys_that_disagree_with_models() -> None:
     contract = DATASET_CONTRACTS[0]
     with pytest.raises(ValueError, match="registry key"):
-        validate_contract_registry(
+        contracts_module.validate_contract_registry_shape(
             (contract,),
             {"not_daily_bar": contract},
-            store=store,
-            backfill_datasets=DATASETS,
         )
 
 
-def test_registry_validator_rejects_replacement_value_with_same_dataset_id(
-    store: DuckDBStore,
-) -> None:
+def test_shape_validator_rejects_replacement_value_with_same_dataset_id() -> None:
     contract = DATASET_CONTRACTS[0]
     replacement = DatasetContract.model_validate(
         {**contract.model_dump(), "table_name": "adj_factor"}
     )
 
     with pytest.raises(ValueError, match="registry value"):
-        validate_contract_registry(
+        contracts_module.validate_contract_registry_shape(
             (contract,),
             {contract.dataset_id: replacement},
-            store=store,
-            backfill_datasets=DATASETS,
+        )
+
+
+def test_shape_validator_rechecks_model_invariants() -> None:
+    contract = DATASET_CONTRACTS[0]
+    invalid_contract = contract.model_copy(update={"logical_key": ("not_in_pk",)})
+
+    with pytest.raises(ValidationError, match="logical_key"):
+        contracts_module.validate_contract_registry_shape(
+            (invalid_contract,),
+            {invalid_contract.dataset_id: invalid_contract},
+        )
+
+
+def test_full_validator_requires_explicit_external_dependencies() -> None:
+    parameters = signature(validate_contract_registry).parameters
+    assert parameters["connection"].kind is Parameter.KEYWORD_ONLY
+    assert parameters["connection"].default is Parameter.empty
+    assert parameters["backfill_tables"].kind is Parameter.KEYWORD_ONLY
+    assert parameters["backfill_tables"].default is Parameter.empty
+
+    unchecked_call = cast(Callable[..., None], validate_contract_registry)
+    with pytest.raises(TypeError, match="connection"):
+        unchecked_call(DATASET_CONTRACTS, CONTRACTS_BY_ID)
+
+
+def test_full_validator_rejects_missing_physical_table(store: DuckDBStore) -> None:
+    contract = DATASET_CONTRACTS[0]
+    missing_table_contract = DatasetContract.model_validate(
+        {**contract.model_dump(), "table_name": "missing_table"}
+    )
+    registry = build_contract_registry((missing_table_contract,))
+
+    with pytest.raises(ValueError, match="does not exist"):
+        validate_contract_registry(
+            (missing_table_contract,),
+            registry,
+            connection=store._conn,
+            backfill_tables=BACKFILL_TABLES,
+        )
+
+
+def test_full_validator_rejects_missing_backfill_mapping(store: DuckDBStore) -> None:
+    contract = CONTRACTS_BY_ID["ths_daily"]
+
+    with pytest.raises(ValueError, match="unknown backfill dataset id"):
+        validate_contract_registry(
+            (contract,),
+            {contract.dataset_id: contract},
+            connection=store._conn,
+            backfill_tables={},
         )
 
 
@@ -359,8 +406,8 @@ def test_contract_columns_and_primary_keys_match_fresh_schema(store: DuckDBStore
     validate_contract_registry(
         DATASET_CONTRACTS,
         CONTRACTS_BY_ID,
-        store=store,
-        backfill_datasets=DATASETS,
+        connection=store._conn,
+        backfill_tables=BACKFILL_TABLES,
     )
 
     for contract in DATASET_CONTRACTS:

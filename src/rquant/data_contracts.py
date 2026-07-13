@@ -6,9 +6,10 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol
+from typing import cast
 from zoneinfo import ZoneInfo
 
+import duckdb
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 EXCHANGE_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -594,10 +595,17 @@ def build_contract_registry(
     return MappingProxyType({contract.dataset_id: contract for contract in contracts})
 
 
-def _validate_registry_shape(
+def validate_contract_registry_shape(
     contracts: Sequence[DatasetContract],
     registry: Mapping[str, DatasetContract],
 ) -> None:
+    """Validate only immutable model and registry identity invariants."""
+
+    for contract in contracts:
+        DatasetContract.model_validate(contract.model_dump())
+    for contract in registry.values():
+        DatasetContract.model_validate(contract.model_dump())
+
     duplicates = _duplicate_dataset_ids(contracts)
     if duplicates:
         raise ValueError(f"duplicate dataset_id values: {', '.join(duplicates)}")
@@ -615,52 +623,31 @@ def _validate_registry_shape(
         raise ValueError("registry keys do not exactly cover the declared dataset ids")
 
 
-class BackfillDatasetSpec(Protocol):
-    name: str
-    table: str
-
-
-class ContractConnection(Protocol):
-    def execute(
-        self,
-        query: str,
-        parameters: Sequence[object] | None = None,
-    ) -> ContractConnection: ...
-
-    def fetchall(self) -> list[tuple[object, ...]]: ...
-
-    def fetchone(self) -> tuple[object, ...] | None: ...
-
-
-class ContractStore(Protocol):
-    _conn: ContractConnection
-
-
 def _validate_backfill_mappings(
     contracts: Sequence[DatasetContract],
-    backfill_datasets: Mapping[str, BackfillDatasetSpec],
+    backfill_tables: Mapping[str, str],
 ) -> None:
     for contract in contracts:
         if contract.backfill_dataset_id is None:
             continue
-        backfill = backfill_datasets.get(contract.backfill_dataset_id)
-        if backfill is None:
+        backfill_table = backfill_tables.get(contract.backfill_dataset_id)
+        if backfill_table is None:
             raise ValueError(f"unknown backfill dataset id: {contract.backfill_dataset_id}")
-        if backfill.table != contract.table_name:
+        if backfill_table != contract.table_name:
             raise ValueError(
                 "backfill table mismatch for "
-                f"{contract.dataset_id}: {backfill.table} != {contract.table_name}"
+                f"{contract.dataset_id}: {backfill_table} != {contract.table_name}"
             )
 
 
 def _validate_schema_contracts(
     contracts: Sequence[DatasetContract],
-    store: ContractStore,
+    connection: duckdb.DuckDBPyConnection,
 ) -> None:
     for contract in contracts:
         columns = {
             str(row[0])
-            for row in store._conn.execute(
+            for row in connection.execute(
                 """
                 SELECT column_name
                 FROM information_schema.columns
@@ -694,7 +681,7 @@ def _validate_schema_contracts(
                 f"{', '.join(sorted(missing_columns))}"
             )
 
-        primary_key_row = store._conn.execute(
+        primary_key_row = connection.execute(
             """
             SELECT constraint_column_names
             FROM duckdb_constraints()
@@ -706,7 +693,12 @@ def _validate_schema_contracts(
         ).fetchone()
         if primary_key_row is None:
             raise ValueError(f"contract table has no primary key: {contract.table_name}")
-        actual_primary_key = tuple(str(column) for column in primary_key_row[0])
+        primary_key_value = primary_key_row[0]
+        if not isinstance(primary_key_value, list) or not all(
+            isinstance(column, str) for column in primary_key_value
+        ):
+            raise ValueError(f"invalid primary key metadata for {contract.table_name}")
+        actual_primary_key = tuple(cast(list[str], primary_key_value))
         if actual_primary_key != contract.physical_primary_key:
             raise ValueError(
                 f"primary key mismatch for {contract.dataset_id}: "
@@ -716,20 +708,17 @@ def _validate_schema_contracts(
 
 def validate_contract_registry(
     contracts: Sequence[DatasetContract],
-    registry: Mapping[str, DatasetContract] | None = None,
+    registry: Mapping[str, DatasetContract],
     *,
-    store: ContractStore | None = None,
-    backfill_datasets: Mapping[str, BackfillDatasetSpec] | None = None,
+    connection: duckdb.DuckDBPyConnection,
+    backfill_tables: Mapping[str, str],
 ) -> None:
-    """Validate registry identity, backfill links, columns, and physical PKs."""
+    """Fully validate registry shape, backfill links, columns, and physical PKs."""
 
-    contract_registry = build_contract_registry(contracts) if registry is None else registry
-    _validate_registry_shape(contracts, contract_registry)
-    if backfill_datasets is not None:
-        _validate_backfill_mappings(contracts, backfill_datasets)
-    if store is not None:
-        _validate_schema_contracts(contracts, store)
+    validate_contract_registry_shape(contracts, registry)
+    _validate_backfill_mappings(contracts, backfill_tables)
+    _validate_schema_contracts(contracts, connection)
 
 
 CONTRACTS_BY_ID: Mapping[str, DatasetContract] = build_contract_registry(DATASET_CONTRACTS)
-_validate_registry_shape(DATASET_CONTRACTS, CONTRACTS_BY_ID)
+validate_contract_registry_shape(DATASET_CONTRACTS, CONTRACTS_BY_ID)
