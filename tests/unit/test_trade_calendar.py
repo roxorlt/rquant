@@ -397,6 +397,43 @@ def test_upsert_equal_time_conflicting_facts_raises_without_overwrite(
     assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == current
 
 
+def test_upsert_validates_every_observation_before_newer_duplicate_wins(
+    store: DuckDBStore,
+) -> None:
+    stored = _day(
+        date(2026, 1, 5),
+        True,
+        pretrade_date=date(2026, 1, 2),
+        source="stored",
+    )
+    equal_time_conflict = _day(
+        date(2026, 1, 5),
+        False,
+        pretrade_date=date(2026, 1, 2),
+        source="equal-time-conflict",
+    )
+    newer = _day(
+        date(2026, 1, 5),
+        False,
+        pretrade_date=date(2026, 1, 2),
+        source="newer",
+        updated_at=UPDATED_AT + timedelta(hours=1),
+    )
+    unrelated = _day(
+        date(2026, 1, 6),
+        True,
+        pretrade_date=date(2026, 1, 5),
+        source="unrelated",
+    )
+    store.upsert_trade_calendar([stored])
+
+    with pytest.raises(TradeCalendarConflictError, match="equal updated_at"):
+        store.upsert_trade_calendar([equal_time_conflict, newer, unrelated])
+
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 5)) == stored
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 6)) is None
+
+
 def test_upsert_direct_duplicates_select_newest_independent_of_input_order(
     store: DuckDBStore,
 ) -> None:

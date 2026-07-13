@@ -179,14 +179,12 @@ class DuckDBStore:
         initialize_schema(self._conn)
 
     def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int:
-        validated = deduplicate_trade_calendar_rows(
-            [_revalidate_for_write(row) for row in rows]
-        )
-        if not validated:
+        observations = [_revalidate_for_write(row) for row in rows]
+        if not observations:
             return 0
         self._conn.execute("BEGIN")
         try:
-            for incoming in validated:
+            for incoming in observations:
                 existing = self.get_trade_calendar_day(
                     incoming.exchange,
                     incoming.cal_date,
@@ -202,6 +200,7 @@ class DuckDBStore:
                         incoming.cal_date,
                         incoming.updated_at,
                     )
+            selected = deduplicate_trade_calendar_rows(observations)
             self._conn.executemany(
                 """
                 INSERT INTO trade_calendar
@@ -223,14 +222,14 @@ class DuckDBStore:
                         row.source,
                         row.updated_at,
                     ]
-                    for row in validated
+                    for row in selected
                 ],
             )
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
-        return len(validated)
+        return len(selected)
 
     def get_trade_calendar_day(
         self, exchange: str, cal_date: date
