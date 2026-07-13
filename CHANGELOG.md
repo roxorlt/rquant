@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **preflight 盘中只读检查撞 DuckDB 主库写锁**：`data_freshness` 与 `smoke_screen`
+  改用 `open_readonly_store()` 优先读取 `rquant_ro.duckdb`，并在退出时关闭连接；`lsof`
+  仅返回 `mem` 等未分类 FD 时改报预警，不再误判为“monitor 当前未跑”。
+
 ### Added
 
 - **研究可信度阶段 0 护栏**：新增 `research_manifest` 四级状态和证据校验；Strategy Lab

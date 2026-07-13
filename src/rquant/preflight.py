@@ -25,10 +25,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
-from loguru import logger
-
 from rquant.config import settings
-
 
 CheckStatus = Literal["ok", "warn", "fail", "skip"]
 
@@ -60,6 +57,15 @@ TABLE_FRESHNESS_DAYS = {
     "screen_result": 5,
     "monitor_event": 30,   # monitor_event 只有交易日有，宽松一点
 }
+
+SMOKE_SCREEN_TABLES = (
+    "screen_result",
+    "daily_bar",
+    "daily_indicator",
+    "daily_state",
+    "daily_basic",
+    "stock_basic",
+)
 
 
 # ---------- 1. systemd unit 文件验证 ----------
@@ -230,6 +236,10 @@ def detail_duckdb_lock(path: Path) -> CheckResult:
         details.append(f"    ... 还有 {len(ro_holders) - 5} 个")
     if other:
         details.append(f"  其他 FD 类型: {len(other)}")
+        for desc in other[:5]:
+            details.append(f"    {desc}")
+        if len(other) > 5:
+            details.append(f"    ... 还有 {len(other) - 5} 个")
 
     if len(rw_holders) > 1:
         return CheckResult(
@@ -241,6 +251,12 @@ def detail_duckdb_lock(path: Path) -> CheckResult:
         return CheckResult(
             "duckdb_lock_detail", "ok",
             f"单写锁正常 + {len(ro_holders)} 个读锁",
+            details,
+        )
+    if other:
+        return CheckResult(
+            "duckdb_lock_detail", "warn",
+            f"未识别到可分类写锁，但有 {len(other)} 个其他 FD；不能判断 monitor 未运行",
             details,
         )
     return CheckResult(
@@ -259,12 +275,13 @@ def check_data_freshness(
     """各核心表的最新 trade_date / row count / 距今天数。"""
     table_max_age = table_max_age or TABLE_FRESHNESS_DAYS
     try:
-        from rquant.storage.duckdb import DuckDBStore
-        store = DuckDBStore(read_only=True)
+        from rquant.storage.duckdb import open_readonly_store
+
+        store = open_readonly_store(required_tables=tuple(table_max_age))
     except Exception as e:
         return CheckResult(
             "data_freshness", "fail",
-            f"DuckDB 打开失败: {type(e).__name__}: {e}",
+            f"只读副本/主库打开失败: {type(e).__name__}: {e}",
         )
 
     today = date.today()
@@ -272,32 +289,38 @@ def check_data_freshness(
     has_warn = False
     has_fail = False
 
-    for table, max_days in table_max_age.items():
-        try:
-            row = store._conn.execute(
-                f"SELECT MAX(trade_date), COUNT(*) FROM {table}"
-            ).fetchone()
-        except Exception as e:
-            details.append(f"  ✗ {table}: 查询失败 {type(e).__name__}")
-            has_fail = True
-            continue
-        latest, total = row
-        if latest is None:
-            details.append(f"  ⚠ {table}: 空表")
-            has_warn = True
-            continue
-        # latest 可能是 date 或 str 视 DuckDB 版本而定
-        latest_date = (
-            latest if isinstance(latest, date) else datetime.fromisoformat(str(latest)).date()
-        )
-        age_days = (today - latest_date).days
-        line = f"  {table}: latest={latest_date} ({age_days}d ago), total={total:,} 行"
-        if age_days > max_days:
-            details.append(f"  ⚠ {line}")
-            details.append(f"    阈值 {max_days}d，落后 {age_days - max_days}d")
-            has_warn = True
-        else:
-            details.append(f"  ✓ {line}")
+    with store:
+        for table, max_days in table_max_age.items():
+            try:
+                row = store._conn.execute(
+                    f"SELECT MAX(trade_date), COUNT(*) FROM {table}"
+                ).fetchone()
+            except Exception as e:
+                details.append(f"  ✗ {table}: 查询失败 {type(e).__name__}")
+                has_fail = True
+                continue
+            latest, total = row
+            if latest is None:
+                details.append(f"  ⚠ {table}: 空表")
+                has_warn = True
+                continue
+            # latest 可能是 date 或 str 视 DuckDB 版本而定
+            latest_date = (
+                latest
+                if isinstance(latest, date)
+                else datetime.fromisoformat(str(latest)).date()
+            )
+            age_days = (today - latest_date).days
+            line = (
+                f"  {table}: latest={latest_date} ({age_days}d ago), "
+                f"total={total:,} 行"
+            )
+            if age_days > max_days:
+                details.append(f"  ⚠ {line}")
+                details.append(f"    阈值 {max_days}d，落后 {age_days - max_days}d")
+                has_warn = True
+            else:
+                details.append(f"  ✓ {line}")
 
     status = "fail" if has_fail else ("warn" if has_warn else "ok")
     n = len(table_max_age)
@@ -334,42 +357,51 @@ def smoke_screen() -> CheckResult:
     preset = PRESET_SCREENS[name]
 
     try:
-        from rquant.storage.duckdb import DuckDBStore
-        store = DuckDBStore(read_only=True)
-        latest_row = store._conn.execute(
-            "SELECT MAX(trade_date) FROM screen_result WHERE preset_name = ?",
-            [name],
-        ).fetchone()
+        from rquant.storage.duckdb import open_readonly_store
+
+        store = open_readonly_store(required_tables=SMOKE_SCREEN_TABLES)
     except Exception as e:
         return CheckResult(
             "smoke_screen", "fail",
-            f"DuckDB 探查失败: {type(e).__name__}: {e}",
+            f"只读副本/主库打开失败: {type(e).__name__}: {e}",
         )
 
-    latest = latest_row[0] if latest_row else None
-    if latest is None:
-        return CheckResult(
-            "smoke_screen", "warn",
-            f"preset {name} 在 screen_result 中无历史数据，跳过 smoke",
+    with store:
+        try:
+            latest_row = store._conn.execute(
+                "SELECT MAX(trade_date) FROM screen_result WHERE preset_name = ?",
+                [name],
+            ).fetchone()
+        except Exception as e:
+            return CheckResult(
+                "smoke_screen", "fail",
+                f"DuckDB 探查失败: {type(e).__name__}: {e}",
+            )
+
+        latest = latest_row[0] if latest_row else None
+        if latest is None:
+            return CheckResult(
+                "smoke_screen", "warn",
+                f"preset {name} 在 screen_result 中无历史数据，跳过 smoke",
+            )
+
+        trade_date_str = (
+            latest if isinstance(latest, str) else latest.isoformat()
         )
 
-    trade_date_str = (
-        latest if isinstance(latest, str) else latest.isoformat()
-    )
-
-    try:
-        start = datetime.now()
-        df = screen(
-            trade_date_str, preset.rules,
-            include_columns=preset.include_columns or None,
-            store=store,
-        )
-        elapsed = (datetime.now() - start).total_seconds()
-    except Exception as e:
-        return CheckResult(
-            "smoke_screen", "fail",
-            f"screen() 抛异常: {type(e).__name__}: {e}",
-        )
+        try:
+            start = datetime.now()
+            df = screen(
+                trade_date_str, preset.rules,
+                include_columns=preset.include_columns or None,
+                store=store,
+            )
+            elapsed = (datetime.now() - start).total_seconds()
+        except Exception as e:
+            return CheckResult(
+                "smoke_screen", "fail",
+                f"screen() 抛异常: {type(e).__name__}: {e}",
+            )
 
     summary = f"preset={name} trade_date={trade_date_str} hits={len(df)} 用时 {elapsed:.2f}s"
     if elapsed > 30:
