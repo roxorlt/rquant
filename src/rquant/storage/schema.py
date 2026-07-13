@@ -859,6 +859,34 @@ CREATE TABLE IF NOT EXISTS trade_calendar (
 );
 """
 
+STOCK_STATUS_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS stock_status_daily (
+    ts_code         VARCHAR     NOT NULL,
+    trade_date      DATE        NOT NULL,
+    name            VARCHAR,
+    is_st           BOOLEAN,
+    name_source     VARCHAR     NOT NULL,
+    st_source       VARCHAR,
+    available_at    TIMESTAMPTZ,
+    ingested_at     TIMESTAMPTZ NOT NULL,
+    conflict_reason VARCHAR,
+    PRIMARY KEY (ts_code, trade_date),
+    CHECK (length(trim(name_source)) > 0),
+    CHECK (name IS NULL OR length(trim(name)) > 0),
+    CHECK (st_source IS NULL OR length(trim(st_source)) > 0),
+    CHECK (conflict_reason IS NULL OR (name IS NULL AND is_st IS NULL)),
+    CHECK (
+        is_st IS NULL OR (
+            name IS NOT NULL
+            AND available_at IS NOT NULL
+            AND lower(trim(name_source)) NOT IN ('unknown', 'conflict')
+            AND st_source IS NOT NULL
+            AND lower(trim(st_source)) NOT IN ('unknown', 'conflict')
+        )
+    )
+);
+"""
+
 DATA_METADATA_TABLE_DDLS: tuple[str, ...] = (
     DATASET_SNAPSHOT_DDL,
     DATASET_COVERAGE_DDL,
@@ -900,6 +928,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     *LEGACY_MIGRATION_DDL,
     *DATA_METADATA_TABLE_DDLS,
     TRADE_CALENDAR_DDL,
+    STOCK_STATUS_DAILY_DDL,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

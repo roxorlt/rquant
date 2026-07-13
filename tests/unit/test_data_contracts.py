@@ -36,6 +36,7 @@ BACKFILL_TABLES = {name: spec.table for name, spec in DATASETS.items()}
 
 EXPECTED_DATASET_IDS = (
     "daily_bar",
+    "stock_status_daily",
     "minute_bar",
     "auction_bar",
     "adj_factor",
@@ -110,6 +111,17 @@ def test_registry_has_representative_mappings_and_known_earliest_dates() -> None
     assert CONTRACTS_BY_ID["moneyflow"].earliest_date == date(2010, 1, 1)
     assert CONTRACTS_BY_ID["moneyflow_dc"].earliest_date == date(2023, 9, 11)
     assert CONTRACTS_BY_ID["daily_bar"].earliest_date is None
+
+
+def test_stock_status_contract_uses_explicit_pit_timestamp() -> None:
+    contract = CONTRACTS_BY_ID["stock_status_daily"]
+
+    assert contract.table_name == "stock_status_daily"
+    assert contract.physical_primary_key == ("ts_code", "trade_date")
+    assert contract.event_time_column == "available_at"
+    assert contract.ingested_at_column == "ingested_at"
+    assert contract.price_basis is PriceBasis.NOT_APPLICABLE
+    assert contract.historized is True
 
 
 def test_registry_records_raw_facts_and_source_aware_physical_keys() -> None:
@@ -458,7 +470,7 @@ def test_opted_in_backfill_contracts_map_to_the_same_physical_table() -> None:
         for contract in DATASET_CONTRACTS
         if contract.backfill_dataset_id is not None
     }
-    assert opted_in == set(EXPECTED_DATASET_IDS[5:])
+    assert opted_in == set(EXPECTED_DATASET_IDS[6:])
     assert opted_in < set(DATASETS)
 
     for contract in DATASET_CONTRACTS:

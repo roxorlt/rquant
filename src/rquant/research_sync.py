@@ -47,6 +47,7 @@ from pydantic import BaseModel
 
 from rquant.config import settings
 from rquant.data_metadata import DataQualityIssue, DatasetCoverage, DatasetSnapshot
+from rquant.security_status import SecurityStatusWriteConflictError
 from rquant.storage.duckdb import (
     _coverage_from_row,
     _quality_issue_from_row,
@@ -72,6 +73,7 @@ MERGE_TABLES: tuple[str, ...] = (
     "adj_factor",
     "daily_state",
     "daily_indicator",
+    "stock_status_daily",
     "monitor_event",
     "minute_bar",
     "auction_bar",
@@ -1008,6 +1010,28 @@ def _sync_table(
             mode="error",
             detail=f"trade_calendar merge missing columns: {missing}",
         )
+    stock_status_columns = {
+        "ts_code",
+        "trade_date",
+        "name",
+        "is_st",
+        "name_source",
+        "st_source",
+        "available_at",
+        "ingested_at",
+        "conflict_reason",
+    }
+    if (
+        table == "stock_status_daily"
+        and mode == "merge"
+        and not stock_status_columns <= set(cols)
+    ):
+        missing = sorted(stock_status_columns - set(cols))
+        return TableSyncResult(
+            table=table,
+            mode="error",
+            detail=f"stock_status_daily merge missing columns: {missing}",
+        )
 
     transaction_started = False
     try:
@@ -1064,6 +1088,56 @@ def _sync_table(
                     source = excluded.source,
                     updated_at = excluded.updated_at
                 WHERE excluded.updated_at > trade_calendar.updated_at
+                """
+            )
+        elif table == "stock_status_daily":
+            conflict = conn.execute(
+                f"""
+                SELECT source.ts_code, source.trade_date,
+                       strftime(source.ingested_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                FROM {alias}.stock_status_daily AS source
+                JOIN stock_status_daily AS target
+                  USING (ts_code, trade_date)
+                WHERE source.ingested_at = target.ingested_at
+                  AND (
+                      source.name IS DISTINCT FROM target.name
+                      OR source.is_st IS DISTINCT FROM target.is_st
+                      OR source.name_source IS DISTINCT FROM target.name_source
+                      OR source.st_source IS DISTINCT FROM target.st_source
+                      OR source.available_at IS DISTINCT FROM target.available_at
+                      OR source.conflict_reason
+                         IS DISTINCT FROM target.conflict_reason
+                  )
+                ORDER BY source.trade_date DESC, source.ts_code
+                LIMIT 1
+                """
+            ).fetchone()
+            if conflict is not None:
+                raise SecurityStatusWriteConflictError(
+                    str(conflict[0]),
+                    conflict[1],
+                    datetime.fromisoformat(
+                        str(conflict[2]).replace("Z", "+00:00")
+                    ),
+                )
+            conn.execute(
+                f"""
+                INSERT INTO stock_status_daily
+                (ts_code, trade_date, name, is_st, name_source, st_source,
+                 available_at, ingested_at, conflict_reason)
+                SELECT ts_code, trade_date, name, is_st, name_source, st_source,
+                       available_at, ingested_at, conflict_reason
+                FROM {alias}.stock_status_daily
+                ON CONFLICT (ts_code, trade_date) DO UPDATE SET
+                    name = excluded.name,
+                    is_st = excluded.is_st,
+                    name_source = excluded.name_source,
+                    st_source = excluded.st_source,
+                    available_at = excluded.available_at,
+                    ingested_at = excluded.ingested_at,
+                    conflict_reason = excluded.conflict_reason
+                WHERE excluded.ingested_at > stock_status_daily.ingested_at
                 """
             )
         else:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import (
     BaseModel,
@@ -122,6 +122,82 @@ class AuditReport(QualityModel):
     @property
     def issue_ids(self) -> tuple[str, ...]:
         return tuple(finding.issue_id for finding in self.findings)
+
+
+def historical_security_status_audit_rules(
+    start: date,
+    end: date,
+    *,
+    sample_limit: int = 20,
+) -> tuple[AuditRule, ...]:
+    """Build blocking coverage rules for daily_bar-eligible historical status."""
+    if start > end:
+        raise ValueError("security status audit start must not be after end")
+    if sample_limit < 1:
+        raise ValueError("sample_limit must be positive")
+
+    def coverage_check(store: DuckDBStore) -> tuple[AuditFinding, ...]:
+        coverage = store.stock_status_coverage(
+            start,
+            end,
+            sample_limit=sample_limit,
+        )
+        categories = (
+            (
+                "missing",
+                coverage.missing_count,
+                coverage.missing_samples,
+                "daily_bar eligibility keys have no historical security status",
+            ),
+            (
+                "unknown",
+                coverage.unknown_count,
+                coverage.unknown_samples,
+                "historical ST status is unknown",
+            ),
+            (
+                "conflict",
+                coverage.conflict_count,
+                coverage.conflict_samples,
+                "historical security status sources conflict",
+            ),
+            (
+                "invalid",
+                coverage.invalid_count,
+                coverage.invalid_samples,
+                "historical security status violates fact invariants",
+            ),
+        )
+        return tuple(
+            AuditFinding(
+                rule_id="stock-status-coverage",
+                dataset_id="stock_status_daily",
+                severity="P0",
+                scope_key=(
+                    f"{category}/{start.isoformat()}/{end.isoformat()}"
+                ),
+                message=message,
+                evidence={
+                    "count": count,
+                    "samples": [
+                        f"{sample.ts_code}/{sample.trade_date.isoformat()}"
+                        for sample in samples
+                    ],
+                },
+            )
+            for category, count, samples, message in categories
+            if count > 0
+        )
+
+    return (
+        AuditRule(
+            rule_id="stock-status-coverage",
+            dataset_id="stock_status_daily",
+            severity="P0",
+            description="Aggregate blocking historical status coverage gaps",
+            check=coverage_check,
+        ),
+    )
 
 
 def run_audit(

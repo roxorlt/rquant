@@ -113,6 +113,32 @@ def _insert_trade_calendar_row(
     conn.close()
 
 
+def _insert_stock_status_row(
+    db_path: Path,
+    *,
+    name: str,
+    is_st: bool,
+    ingested_at: datetime,
+    trade_date: date = date(2026, 7, 1),
+) -> None:
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO stock_status_daily "
+        "(ts_code, trade_date, name, is_st, name_source, st_source, "
+        "available_at, ingested_at, conflict_reason) "
+        "VALUES ('600000.SH', ?, ?, ?, 'tushare.namechange', "
+        "'tushare.namechange', ?, ?, NULL)",
+        [
+            trade_date,
+            name,
+            is_st,
+            datetime.combine(trade_date, datetime.min.time(), tzinfo=UTC),
+            ingested_at,
+        ],
+    )
+    conn.close()
+
+
 class _ConnectionProxy:
     def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
         self._inner = inner
@@ -2105,6 +2131,145 @@ def test_trade_calendar_uses_merge_semantics() -> None:
     assert "trade_calendar" not in LOCAL_ONLY_TABLES
 
 
+def test_stock_status_daily_uses_merge_semantics() -> None:
+    assert "stock_status_daily" in MERGE_TABLES
+    assert "stock_status_daily" not in REPLACE_TABLES
+    assert "stock_status_daily" not in LOCAL_ONLY_TABLES
+
+
+def test_stock_status_merge_keeps_local_history_and_newer_cloud_wins(
+    local_db: Path, backup_db: Path
+) -> None:
+    local_conn = duckdb.connect(str(local_db))
+    local_conn.execute(
+        "INSERT INTO stock_status_daily VALUES "
+        "('600000.SH', DATE '2020-01-02', 'local-history', FALSE, "
+        "'tushare.namechange', 'tushare.namechange', "
+        "TIMESTAMPTZ '2020-01-02 01:25:00+00', "
+        "TIMESTAMPTZ '2026-07-14 00:00:00+00', NULL), "
+        "('600000.SH', DATE '2026-07-01', 'stale-local', FALSE, "
+        "'tushare.namechange', 'tushare.namechange', "
+        "TIMESTAMPTZ '2026-07-01 01:25:00+00', "
+        "TIMESTAMPTZ '2026-07-14 00:00:00+00', NULL)"
+    )
+    local_conn.close()
+    backup_conn = duckdb.connect(str(backup_db))
+    backup_conn.execute(
+        "INSERT INTO stock_status_daily VALUES "
+        "('600000.SH', DATE '2026-07-01', '*STcloud', TRUE, "
+        "'tushare.namechange', 'tushare.namechange+tushare.stock_st', "
+        "TIMESTAMPTZ '2026-07-01 01:25:00+00', "
+        "TIMESTAMPTZ '2026-07-14 01:00:00+00', NULL)"
+    )
+    backup_conn.close()
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    assert not report.has_errors
+    conn = duckdb.connect(str(local_db), read_only=True)
+    rows = conn.execute(
+        "SELECT trade_date, name, is_st FROM stock_status_daily ORDER BY trade_date"
+    ).fetchall()
+    conn.close()
+    assert rows == [
+        (date(2020, 1, 2), "local-history", False),
+        (date(2026, 7, 1), "*STcloud", True),
+    ]
+
+
+def test_stock_status_merge_preserves_newer_local_fact(
+    local_db: Path, backup_db: Path
+) -> None:
+    newer = datetime(2026, 7, 14, 2, tzinfo=UTC)
+    _insert_stock_status_row(
+        local_db,
+        name="local-newer",
+        is_st=False,
+        ingested_at=newer,
+    )
+    _insert_stock_status_row(
+        backup_db,
+        name="*STcloud-older",
+        is_st=True,
+        ingested_at=newer - timedelta(hours=1),
+    )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    conn = duckdb.connect(str(local_db), read_only=True)
+    row = conn.execute(
+        "SELECT name, is_st FROM stock_status_daily "
+        "WHERE ts_code = '600000.SH' AND trade_date = DATE '2026-07-01'"
+    ).fetchone()
+    conn.close()
+    assert not report.has_errors
+    assert row == ("local-newer", False)
+
+
+def test_stock_status_merge_equal_time_identical_fact_is_idempotent(
+    local_db: Path, backup_db: Path
+) -> None:
+    observed_at = datetime(2026, 7, 14, 2, tzinfo=UTC)
+    for db_path in (local_db, backup_db):
+        _insert_stock_status_row(
+            db_path,
+            name="same-fact",
+            is_st=False,
+            ingested_at=observed_at,
+        )
+
+    first = sync_from_backup(backup_db, local_db, refresh_replica=False)
+    second = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    conn = duckdb.connect(str(local_db), read_only=True)
+    rows = conn.execute(
+        "SELECT name, is_st FROM stock_status_daily "
+        "WHERE ts_code = '600000.SH' AND trade_date = DATE '2026-07-01'"
+    ).fetchall()
+    conn.close()
+    assert not first.has_errors
+    assert not second.has_errors
+    assert rows == [("same-fact", False)]
+
+
+def test_stock_status_equal_time_conflict_rolls_back_entire_sync(
+    local_db: Path, backup_db: Path
+) -> None:
+    observed_at = datetime(2026, 7, 14, 2, tzinfo=UTC)
+    _insert_stock_status_row(
+        local_db,
+        name="local-fact",
+        is_st=False,
+        ingested_at=observed_at,
+    )
+    _insert_stock_status_row(
+        backup_db,
+        name="*STcloud-conflict",
+        is_st=True,
+        ingested_at=observed_at,
+    )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    conn = duckdb.connect(str(local_db), read_only=True)
+    status = conn.execute(
+        "SELECT name, is_st FROM stock_status_daily "
+        "WHERE ts_code = '600000.SH' AND trade_date = DATE '2026-07-01'"
+    ).fetchone()
+    daily_dates = conn.execute(
+        "SELECT DISTINCT trade_date FROM daily_bar ORDER BY trade_date"
+    ).fetchall()
+    conn.close()
+    assert report.has_errors
+    assert status == ("local-fact", False)
+    assert daily_dates == [(date(2026, 6, 1),)]
+    stock_result = next(
+        result for result in report.tables if result.table == "stock_status_daily"
+    )
+    assert stock_result.mode == "error"
+    assert "equal ingested_at" in stock_result.detail
+
+
 def test_trade_calendar_merge_keeps_local_history_and_cloud_wins(
     local_db: Path, backup_db: Path
 ) -> None:
@@ -2291,6 +2456,7 @@ def test_backfilled_history_tables_are_merge() -> None:
         "adj_factor",
         "daily_state",
         "daily_indicator",
+        "stock_status_daily",
         "limit_up_pool_daily",
         "limit_list_daily",
         # dataset_backfill 数据集表（本地回补权威，云端没有）

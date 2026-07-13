@@ -23,6 +23,7 @@ from rquant.storage.schema import (
     PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+    STOCK_STATUS_DAILY_DDL,
     TRADE_CALENDAR_DDL,
 )
 
@@ -112,6 +113,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=3,
         name="authoritative trade calendar",
         statements=(TRADE_CALENDAR_DDL,),
+    ),
+    Migration(
+        version=4,
+        name="historical stock status facts",
+        statements=(STOCK_STATUS_DAILY_DDL,),
     ),
 )
 
