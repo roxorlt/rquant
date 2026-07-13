@@ -64,6 +64,7 @@ REPLACE_TABLES: tuple[str, ...] = (
 # 本地存在独有行（历史回补 / 盘中 monitor / 本地采集），按主键合并：
 # 主键冲突云端赢，本地独有行永不丢失（分类依据见模块 docstring）
 MERGE_TABLES: tuple[str, ...] = (
+    "trade_calendar",
     "daily_bar",
     "daily_basic",
     "adj_factor",

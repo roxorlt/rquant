@@ -13,6 +13,7 @@ import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
+from rquant.trade_calendar import normalize_trade_calendar
 
 # 分页取数 / 多指数循环时相邻请求间隔（对齐 dataset_backfill._API_SLEEP）
 _PAGE_SLEEP = 0.35
@@ -156,33 +157,62 @@ class TushareAdapter:
                 time.sleep(wait)
         return None
 
-    def trade_cal(self, start: date, end: date) -> list[date]:
-        """交易日历（只返回开市日，升序）。
-
-        历史回补的日历必须走 trade_cal：本地 daily_bar 覆盖不到未入库的
-        早期区间（如 2020 年），从库里推日历会漏。
-        """
+    def trade_cal_raw(
+        self, start: date, end: date, exchange: str = "SSE"
+    ) -> pd.DataFrame:
+        """Return all known civil dates, including weekends and exchange holidays."""
+        columns = ["exchange", "cal_date", "is_open", "pretrade_date"]
+        if start > end:
+            return pd.DataFrame(columns=columns)
         start_str = start.strftime("%Y%m%d")
         end_str = end.strftime("%Y%m%d")
-        logger.info(f"Tushare trade_cal 请求：start={start_str} end={end_str}")
+        logger.info(
+            f"Tushare trade_cal 请求：exchange={exchange} "
+            f"start={start_str} end={end_str}"
+        )
 
         try:
             df = self._pro.trade_cal(
-                exchange="SSE", start_date=start_str, end_date=end_str, is_open="1"
+                exchange=exchange, start_date=start_str, end_date=end_str
             )
         except Exception as e:
             if self._switch_to_backup():
                 df = self._pro.trade_cal(
-                    exchange="SSE", start_date=start_str, end_date=end_str, is_open="1"
+                    exchange=exchange, start_date=start_str, end_date=end_str
                 )
             else:
                 raise RuntimeError(f"Tushare trade_cal 调用失败：{e}") from e
 
         if df is None or df.empty:
             logger.warning(f"Tushare trade_cal 返回空：{start_str}-{end_str}")
-            return []
+            return pd.DataFrame(columns=columns)
 
-        dates = pd.to_datetime(df["cal_date"], format="%Y%m%d").dt.date.tolist()
+        rows = normalize_trade_calendar(df)
+        normalized = pd.DataFrame(
+            [
+                {
+                    "exchange": row.exchange,
+                    "cal_date": row.cal_date,
+                    "is_open": row.is_open,
+                    "pretrade_date": row.pretrade_date,
+                }
+                for row in rows
+            ],
+            columns=columns,
+        )
+        logger.info(f"Tushare trade_cal 返回 {len(normalized)} 个自然日")
+        return normalized
+
+    def trade_cal(self, start: date, end: date) -> list[date]:
+        """交易日历（只返回开市日，升序）。
+
+        历史回补的日历必须走 trade_cal：本地 daily_bar 覆盖不到未入库的
+        早期区间（如 2020 年），从库里推日历会漏。
+        """
+        df = self.trade_cal_raw(start, end)
+        if df.empty:
+            return []
+        dates = df.loc[df["is_open"].eq(True), "cal_date"].tolist()
         logger.info(f"Tushare trade_cal 返回 {len(dates)} 个交易日")
         return sorted(dates)
 

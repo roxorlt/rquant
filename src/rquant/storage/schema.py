@@ -847,6 +847,18 @@ CREATE TABLE IF NOT EXISTS data_quality_issue (
 );
 """
 
+TRADE_CALENDAR_DDL = """
+CREATE TABLE IF NOT EXISTS trade_calendar (
+    exchange      VARCHAR     NOT NULL,
+    cal_date      DATE        NOT NULL,
+    is_open       BOOLEAN     NOT NULL,
+    pretrade_date DATE,
+    source        VARCHAR     NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (exchange, cal_date)
+);
+"""
+
 DATA_METADATA_TABLE_DDLS: tuple[str, ...] = (
     DATASET_SNAPSHOT_DDL,
     DATASET_COVERAGE_DDL,
@@ -887,6 +899,7 @@ LEGACY_MIGRATION_DDL = [
 VERSIONED_COMPATIBILITY_DDL = [
     *LEGACY_MIGRATION_DDL,
     *DATA_METADATA_TABLE_DDLS,
+    TRADE_CALENDAR_DDL,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

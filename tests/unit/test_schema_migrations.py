@@ -54,12 +54,16 @@ def test_migration_is_frozen_and_derives_stable_checksum() -> None:
         formatted.name = "changed"  # type: ignore[misc]
 
 
-def test_published_v1_statements_and_checksum_are_fixed() -> None:
+def test_published_v1_v2_statements_and_checksums_are_fixed() -> None:
     assert isinstance(V1_LEGACY_COLUMN_ADDITIONS, tuple)
     assert MIGRATIONS[0].statements == V1_LEGACY_COLUMN_ADDITIONS
     assert (
         MIGRATIONS[0].checksum
         == "049827c760b87a12e4fa3bffc560d4ffd2d4ad974377c6c84e0f849268911720"
+    )
+    assert (
+        MIGRATIONS[1].checksum
+        == "22cde30e069a0286153f59b125241d1074771d388d5d1e2dc837b5cc1653ca1a"
     )
 
 
@@ -71,7 +75,7 @@ def test_v2_creates_metadata_tables_only_through_versioned_migration() -> None:
         "dataset_coverage",
         "data_quality_issue",
     }
-    assert [migration.version for migration in MIGRATIONS] == [1, 2]
+    assert [migration.version for migration in MIGRATIONS[:2]] == [1, 2]
     assert MIGRATIONS[1].statements == DATA_METADATA_TABLE_DDLS
     assert all(statement in ALL_DDL for statement in DATA_METADATA_TABLE_DDLS)
 
@@ -86,7 +90,7 @@ def test_v2_creates_metadata_tables_only_through_versioned_migration() -> None:
     assert not metadata_tables & before_v2
     assert [row[0] for row in _migration_rows(conn)] == [1]
 
-    initialize_schema(conn)
+    initialize_schema(conn, migrations=MIGRATIONS[:2])
     after_v2 = {
         row[0]
         for row in conn.execute(
@@ -109,6 +113,80 @@ def test_v2_creates_metadata_tables_only_through_versioned_migration() -> None:
             "'snapshot', 'dataset', 'scope', 'table', "
             "1, 1, 0, NULL, CAST('[]' AS JSON), CURRENT_TIMESTAMP)"
         )
+    conn.close()
+
+
+def test_v3_creates_trade_calendar_only_through_versioned_migration() -> None:
+    from rquant.storage.schema import ALL_DDL, TRADE_CALENDAR_DDL
+
+    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3]
+    assert MIGRATIONS[2].statements == (TRADE_CALENDAR_DDL,)
+    assert TRADE_CALENDAR_DDL in ALL_DDL
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:2])
+    before_v3 = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+    assert "trade_calendar" not in before_v3
+
+    initialize_schema(conn)
+    columns = conn.execute(
+        "SELECT column_name, is_nullable, data_type "
+        "FROM information_schema.columns "
+        "WHERE table_name = 'trade_calendar' ORDER BY ordinal_position"
+    ).fetchall()
+    primary_key = conn.execute(
+        "SELECT constraint_column_names FROM duckdb_constraints() "
+        "WHERE table_name = 'trade_calendar' AND constraint_type = 'PRIMARY KEY'"
+    ).fetchone()
+    foreign_keys = conn.execute(
+        "SELECT * FROM duckdb_constraints() "
+        "WHERE table_name = 'trade_calendar' AND constraint_type = 'FOREIGN KEY'"
+    ).fetchall()
+
+    assert columns == [
+        ("exchange", "NO", "VARCHAR"),
+        ("cal_date", "NO", "DATE"),
+        ("is_open", "NO", "BOOLEAN"),
+        ("pretrade_date", "YES", "DATE"),
+        ("source", "NO", "VARCHAR"),
+        ("updated_at", "NO", "TIMESTAMP WITH TIME ZONE"),
+    ]
+    assert primary_key == (["exchange", "cal_date"],)
+    assert foreign_keys == []
+    assert [row[0] for row in _migration_rows(conn)] == [1, 2, 3]
+    conn.close()
+
+
+def test_v3_failure_rolls_back_table_and_ledger() -> None:
+    from rquant.storage.schema import TRADE_CALENDAR_DDL
+
+    failing_v3 = Migration(
+        version=3,
+        name="authoritative trade calendar",
+        statements=(
+            TRADE_CALENDAR_DDL,
+            "INSERT INTO table_that_does_not_exist VALUES (1);",
+        ),
+    )
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:2])
+
+    with pytest.raises(duckdb.Error, match="table_that_does_not_exist"):
+        initialize_schema(conn, migrations=(*MIGRATIONS[:2], failing_v3))
+
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+    assert "trade_calendar" not in tables
+    assert [row[0] for row in _migration_rows(conn)] == [1, 2]
     conn.close()
 
 

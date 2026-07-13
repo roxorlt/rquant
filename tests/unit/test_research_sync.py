@@ -1251,6 +1251,46 @@ def test_data_metadata_tables_use_merge_semantics() -> None:
     assert not metadata_tables & set(LOCAL_ONLY_TABLES)
 
 
+def test_trade_calendar_uses_merge_semantics() -> None:
+    assert "trade_calendar" in MERGE_TABLES
+    assert "trade_calendar" not in REPLACE_TABLES
+    assert "trade_calendar" not in LOCAL_ONLY_TABLES
+
+
+def test_trade_calendar_merge_keeps_local_history_and_cloud_wins(
+    local_db: Path, backup_db: Path
+) -> None:
+    local_conn = duckdb.connect(str(local_db))
+    local_conn.execute(
+        "INSERT INTO trade_calendar VALUES "
+        "('SSE', DATE '2026-06-01', TRUE, DATE '2026-05-29', 'local', "
+        "TIMESTAMPTZ '2026-06-01 00:00:00+00'), "
+        "('SSE', DATE '2026-07-01', FALSE, DATE '2026-06-30', 'stale', "
+        "TIMESTAMPTZ '2026-07-01 00:00:00+00')"
+    )
+    local_conn.close()
+    backup_conn = duckdb.connect(str(backup_db))
+    backup_conn.execute(
+        "INSERT INTO trade_calendar VALUES "
+        "('SSE', DATE '2026-07-01', TRUE, DATE '2026-06-30', 'tushare', "
+        "TIMESTAMPTZ '2026-07-01 01:00:00+00')"
+    )
+    backup_conn.close()
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    conn = duckdb.connect(str(local_db), read_only=True)
+    rows = conn.execute(
+        "SELECT cal_date, is_open, source FROM trade_calendar ORDER BY cal_date"
+    ).fetchall()
+    conn.close()
+    assert not report.has_errors
+    assert rows == [
+        (date(2026, 6, 1), True, "local"),
+        (date(2026, 7, 1), True, "tushare"),
+    ]
+
+
 def test_backfilled_history_tables_are_merge() -> None:
     """防回归：这些表若回到 REPLACE，下一次 research-sync 会把本地回补的
     2020-2024 历史（及本地独有的涨停池采集、Tushare 涨跌停榜、统一数据集

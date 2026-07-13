@@ -23,6 +23,7 @@ from rquant.storage.schema import (
     PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+    TRADE_CALENDAR_DDL,
 )
 
 SCHEMA_MIGRATION_DDL = """
@@ -106,6 +107,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=2,
         name="research data metadata",
         statements=DATA_METADATA_TABLE_DDLS,
+    ),
+    Migration(
+        version=3,
+        name="authoritative trade calendar",
+        statements=(TRADE_CALENDAR_DDL,),
     ),
 )
 

@@ -7,7 +7,7 @@ import math
 import re
 from collections.abc import Sequence
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -26,6 +26,7 @@ from rquant.data_metadata import (
     utc_now,
 )
 from rquant.storage.migrations import initialize_schema
+from rquant.trade_calendar import TradeCalendarDay, TradeCalendarGapError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -150,6 +151,17 @@ def _issue_effective_time(issue: DataQualityIssue) -> datetime:
     return max(issue.last_seen_at, issue.resolved_at)
 
 
+def _trade_calendar_from_row(row: tuple[object, ...]) -> TradeCalendarDay:
+    return TradeCalendarDay(
+        exchange=str(row[0]),
+        cal_date=cast(date, row[1]),
+        is_open=cast(bool, row[2]),
+        pretrade_date=cast(date | None, row[3]),
+        source=str(row[4]),
+        updated_at=_utc_datetime_from_db(row[5]),
+    )
+
+
 class DuckDBStore:
     def __init__(self, path: Path | None = None, *, read_only: bool = False) -> None:
         self.path = path or settings.duckdb_path
@@ -159,6 +171,159 @@ class DuckDBStore:
 
     def _init_schema(self) -> None:
         initialize_schema(self._conn)
+
+    def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int:
+        validated = [_revalidate_for_write(row) for row in rows]
+        if not validated:
+            return 0
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.executemany(
+                """
+                INSERT INTO trade_calendar
+                (exchange, cal_date, is_open, pretrade_date, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (exchange, cal_date) DO UPDATE SET
+                    is_open = excluded.is_open,
+                    pretrade_date = excluded.pretrade_date,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    [
+                        row.exchange,
+                        row.cal_date,
+                        row.is_open,
+                        row.pretrade_date,
+                        row.source,
+                        row.updated_at,
+                    ]
+                    for row in validated
+                ],
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return len(validated)
+
+    def get_trade_calendar_day(
+        self, exchange: str, cal_date: date
+    ) -> TradeCalendarDay | None:
+        row = self._conn.execute(
+            """
+            SELECT exchange, cal_date, is_open, pretrade_date, source,
+                   strftime(updated_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS updated_at
+            FROM trade_calendar
+            WHERE exchange = ? AND cal_date = ?
+            """,
+            [exchange, cal_date],
+        ).fetchone()
+        return None if row is None else _trade_calendar_from_row(row)
+
+    def list_trade_calendar(
+        self, exchange: str, start: date, end: date
+    ) -> list[TradeCalendarDay]:
+        if start > end:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT exchange, cal_date, is_open, pretrade_date, source,
+                   strftime(updated_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS updated_at
+            FROM trade_calendar
+            WHERE exchange = ? AND cal_date BETWEEN ? AND ?
+            ORDER BY cal_date
+            """,
+            [exchange, start, end],
+        ).fetchall()
+        return [_trade_calendar_from_row(row) for row in rows]
+
+    def missing_trade_calendar_dates(
+        self, exchange: str, start: date, end: date
+    ) -> list[date]:
+        if start > end:
+            raise ValueError("trade calendar range start must not be after end")
+        present = {
+            row.cal_date for row in self.list_trade_calendar(exchange, start, end)
+        }
+        return [
+            start + timedelta(days=offset)
+            for offset in range((end - start).days + 1)
+            if start + timedelta(days=offset) not in present
+        ]
+
+    def is_trading_day(self, exchange: str, cal_date: date) -> bool:
+        row = self.get_trade_calendar_day(exchange, cal_date)
+        if row is None:
+            raise TradeCalendarGapError(exchange, [cal_date])
+        return row.is_open
+
+    def _require_calendar_range(
+        self, exchange: str, start: date, end: date
+    ) -> None:
+        missing = self.missing_trade_calendar_dates(exchange, start, end)
+        if missing:
+            raise TradeCalendarGapError(exchange, missing)
+
+    def _require_calendar_anchor(self, exchange: str, anchor: date) -> None:
+        if self.get_trade_calendar_day(exchange, anchor) is None:
+            raise TradeCalendarGapError(exchange, [anchor])
+
+    def previous_trading_day(
+        self, anchor: date, *, exchange: str = "SSE"
+    ) -> date:
+        self._require_calendar_anchor(exchange, anchor)
+        row = self._conn.execute(
+            "SELECT MAX(cal_date) FROM trade_calendar "
+            "WHERE exchange = ? AND cal_date < ? AND is_open",
+            [exchange, anchor],
+        ).fetchone()
+        candidate = None if row is None else cast(date | None, row[0])
+        if candidate is None:
+            raise TradeCalendarGapError(
+                exchange,
+                detail=f"no previous trading day in stored coverage for {exchange}",
+            )
+        self._require_calendar_range(exchange, candidate, anchor)
+        return candidate
+
+    def next_trading_day(
+        self, anchor: date, *, exchange: str = "SSE"
+    ) -> date:
+        self._require_calendar_anchor(exchange, anchor)
+        row = self._conn.execute(
+            "SELECT MIN(cal_date) FROM trade_calendar "
+            "WHERE exchange = ? AND cal_date > ? AND is_open",
+            [exchange, anchor],
+        ).fetchone()
+        candidate = None if row is None else cast(date | None, row[0])
+        if candidate is None:
+            raise TradeCalendarGapError(
+                exchange,
+                detail=f"no next trading day in stored coverage for {exchange}",
+            )
+        self._require_calendar_range(exchange, anchor, candidate)
+        return candidate
+
+    def latest_trading_day(
+        self, anchor: date, *, exchange: str = "SSE"
+    ) -> date:
+        self._require_calendar_anchor(exchange, anchor)
+        row = self._conn.execute(
+            "SELECT MAX(cal_date) FROM trade_calendar "
+            "WHERE exchange = ? AND cal_date <= ? AND is_open",
+            [exchange, anchor],
+        ).fetchone()
+        candidate = None if row is None else cast(date | None, row[0])
+        if candidate is None:
+            raise TradeCalendarGapError(
+                exchange,
+                detail=f"no latest trading day in stored coverage for {exchange}",
+            )
+        self._require_calendar_range(exchange, candidate, anchor)
+        return candidate
 
     def begin_dataset_snapshot(
         self, snapshot: DatasetSnapshot
