@@ -14,8 +14,8 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
 表分三类：
 - REPLACE_TABLES：云端权威且本地无独有行，整表替换（DELETE + INSERT，
   保留本地 DDL/主键）
-- MERGE_TABLES：本地存在独有行的表，按主键 INSERT OR REPLACE（主键冲突
-  云端赢——云端最新数据仍权威），绝不整表替换。三种来源：
+- MERGE_TABLES：本地存在独有行的表；普通表按主键合并，生命周期元数据表
+  按状态与事件时间协调，绝不整表替换。三种来源：
   a) 双端追加流（monitor 事件 / 分钟线 / 竞价 / 模拟盘）
   b) 日线族 daily_bar/daily_basic/adj_factor/daily_state/daily_indicator——
      2026-07 本地回补了 2020 起全市场历史，云端只有 2024-09 起；若保持
@@ -33,6 +33,7 @@ cli main() 的 notify 与脚本 PushDeer 双重告警。
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -214,12 +215,147 @@ def _common_columns(
     return [c for c in local_cols if c in src_cols], pk_cols
 
 
+def _merge_dataset_snapshots(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> None:
+    overlapping = conn.execute(
+        f"""
+        SELECT target.snapshot_id,
+               target.strategy_name, source.strategy_name,
+               target.manifest_id, source.manifest_id,
+               epoch_us(target.as_of_time), epoch_us(source.as_of_time),
+               target.code_commit, source.code_commit,
+               target.origin, source.origin,
+               target.status, source.status,
+               target.table_watermarks, source.table_watermarks,
+               target.quality_issue_ids, source.quality_issue_ids,
+               epoch_us(target.completed_at), epoch_us(source.completed_at)
+        FROM dataset_snapshot AS target
+        JOIN {alias}.dataset_snapshot AS source USING (snapshot_id)
+        """
+    ).fetchall()
+    for row in overlapping:
+        snapshot_id = str(row[0])
+        target_identity = (row[1], row[3], row[5], row[7], row[9])
+        source_identity = (row[2], row[4], row[6], row[8], row[10])
+        if target_identity != source_identity:
+            raise ValueError(
+                f"dataset_snapshot stable identity conflict: {snapshot_id}"
+            )
+        target_status, source_status = str(row[11]), str(row[12])
+        if target_status == source_status == "ready":
+            target_finalization = (
+                json.loads(str(row[13])),
+                json.loads(str(row[15])),
+                row[17],
+            )
+            source_finalization = (
+                json.loads(str(row[14])),
+                json.loads(str(row[16])),
+                row[18],
+            )
+            if target_finalization != source_finalization:
+                raise ValueError(
+                    "immutable dataset_snapshot finalization conflict: "
+                    f"{snapshot_id}"
+                )
+
+    conn.execute(
+        f"""
+        INSERT INTO dataset_snapshot
+        (snapshot_id, strategy_name, manifest_id, as_of_time, code_commit,
+         origin, status, table_watermarks, quality_issue_ids, created_at,
+         completed_at)
+        SELECT source.snapshot_id, source.strategy_name, source.manifest_id,
+               source.as_of_time, source.code_commit, source.origin,
+               source.status, source.table_watermarks,
+               source.quality_issue_ids, source.created_at, source.completed_at
+        FROM {alias}.dataset_snapshot AS source
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dataset_snapshot AS target
+            WHERE target.snapshot_id = source.snapshot_id
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        UPDATE dataset_snapshot AS target
+        SET status = 'ready',
+            table_watermarks = source.table_watermarks,
+            quality_issue_ids = source.quality_issue_ids,
+            completed_at = source.completed_at
+        FROM {alias}.dataset_snapshot AS source
+        WHERE target.snapshot_id = source.snapshot_id
+          AND target.status = 'building'
+          AND source.status = 'ready'
+        """
+    )
+
+
+def _merge_data_quality_issues(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> None:
+    conflict = conn.execute(
+        f"""
+        SELECT target.issue_id
+        FROM data_quality_issue AS target
+        JOIN {alias}.data_quality_issue AS source USING (issue_id)
+        WHERE target.rule_id IS DISTINCT FROM source.rule_id
+           OR target.dataset_id IS DISTINCT FROM source.dataset_id
+           OR target.scope_key IS DISTINCT FROM source.scope_key
+        LIMIT 1
+        """
+    ).fetchone()
+    if conflict is not None:
+        raise ValueError(
+            f"data_quality_issue stable identity conflict: {conflict[0]}"
+        )
+
+    conn.execute(
+        f"""
+        INSERT INTO data_quality_issue
+        (issue_id, rule_id, dataset_id, severity, status, scope_key, message,
+         evidence, first_seen_at, last_seen_at, resolved_at)
+        SELECT source.issue_id, source.rule_id, source.dataset_id,
+               source.severity, source.status, source.scope_key, source.message,
+               source.evidence, source.first_seen_at, source.last_seen_at,
+               source.resolved_at
+        FROM {alias}.data_quality_issue AS source
+        WHERE NOT EXISTS (
+            SELECT 1 FROM data_quality_issue AS target
+            WHERE target.issue_id = source.issue_id
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        UPDATE data_quality_issue AS target
+        SET severity = source.severity,
+            status = source.status,
+            message = source.message,
+            evidence = source.evidence,
+            first_seen_at = least(target.first_seen_at, source.first_seen_at),
+            last_seen_at = source.last_seen_at,
+            resolved_at = source.resolved_at
+        FROM {alias}.data_quality_issue AS source
+        WHERE target.issue_id = source.issue_id
+          AND greatest(
+              source.last_seen_at,
+              coalesce(source.resolved_at, source.last_seen_at)
+          ) > greatest(
+              target.last_seen_at,
+              coalesce(target.resolved_at, target.last_seen_at)
+          )
+        """
+    )
+
+
 def _sync_table(
     conn: duckdb.DuckDBPyConnection, table: str, alias: str, mode: str
 ) -> TableSyncResult:
     """mode 三种执行策略：
     - replace：整表 DELETE + INSERT（云端权威表）
-    - merge：INSERT OR REPLACE，主键冲突时源覆盖本地（云端持续同步）
+    - merge：通常源覆盖本地；生命周期元数据按状态和事件时间协调
     - restore：INSERT OR IGNORE，主键冲突时保留本地（灾后恢复，只补缺失行）
 
     注意返回的 TableSyncResult.mode 词汇固定为 replace|merge|skipped|error
@@ -257,6 +393,10 @@ def _sync_table(
                 f'INSERT OR IGNORE INTO "{table}" ({col_list}) '
                 f'SELECT {col_list} FROM {alias}."{table}"'
             )
+        elif table == "dataset_snapshot":
+            _merge_dataset_snapshots(conn, alias)
+        elif table == "data_quality_issue":
+            _merge_data_quality_issues(conn, alias)
         else:
             conn.execute(
                 f'INSERT OR REPLACE INTO "{table}" ({col_list}) '

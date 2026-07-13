@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
 import rquant.research_sync as research_sync
+from rquant.data_metadata import (
+    DataQualityIssue,
+    DatasetSnapshot,
+    DatasetSnapshotFinalization,
+)
 from rquant.research_sync import (
     LOCAL_ONLY_TABLES,
     MERGE_TABLES,
@@ -293,6 +298,160 @@ class TestSyncFromBackup:
         # merge 语义：本地 1 行 + 云端 2 行，重跑不重复
         assert conn.execute("SELECT COUNT(*) FROM daily_bar").fetchone()[0] == 3
         conn.close()
+
+    def test_sync_cannot_regress_ready_snapshot_to_building(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        finalization = DatasetSnapshotFinalization(
+            table_watermarks={"daily_bar": "ready-target"},
+            completed_at=t0 + timedelta(minutes=1),
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_dataset_snapshot(snapshot.snapshot_id)
+        assert not report.has_errors
+        assert stored is not None
+        assert stored.status == "ready"
+        assert stored.table_watermarks == {"daily_bar": "ready-target"}
+
+    def test_sync_older_open_cannot_replace_newer_resolution(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        initial = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P1",
+            scope_key="all",
+            message="initial",
+            observed_at=t0,
+        )
+        older_open = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P0",
+            scope_key="all",
+            message="older open",
+            evidence={"stale": True},
+            observed_at=t0 + timedelta(minutes=1),
+        )
+        with DuckDBStore(local_db) as local:
+            local.record_data_quality_issue(initial)
+            resolved = local.resolve_data_quality_issue(
+                initial.issue_id,
+                resolved_at=t0 + timedelta(minutes=2),
+            )
+        with DuckDBStore(backup_db) as backup:
+            backup.record_data_quality_issue(older_open)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_data_quality_issue(initial.issue_id)
+        assert not report.has_errors
+        assert stored == resolved
+
+    def test_sync_newer_detection_reopens_and_preserves_first_seen(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        initial = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P2",
+            scope_key="all",
+            message="initial",
+            observed_at=t0,
+        )
+        newer_open = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P0",
+            scope_key="all",
+            message="new detection",
+            evidence={"new": True},
+            observed_at=t0 + timedelta(minutes=3),
+        )
+        with DuckDBStore(local_db) as local:
+            local.record_data_quality_issue(initial)
+            local.resolve_data_quality_issue(
+                initial.issue_id,
+                resolved_at=t0 + timedelta(minutes=2),
+            )
+        with DuckDBStore(backup_db) as backup:
+            backup.record_data_quality_issue(newer_open)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_data_quality_issue(initial.issue_id)
+        assert not report.has_errors
+        assert stored is not None
+        assert stored.status == "open"
+        assert stored.first_seen_at == t0
+        assert stored.last_seen_at == t0 + timedelta(minutes=3)
+        assert stored.message == "new detection"
+        assert stored.resolved_at is None
+
+    def test_sync_reports_conflicting_ready_snapshot_finalization(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        target_finalization = DatasetSnapshotFinalization(
+            table_watermarks={"daily_bar": "target"},
+            completed_at=t0 + timedelta(minutes=1),
+        )
+        source_finalization = DatasetSnapshotFinalization(
+            table_watermarks={"daily_bar": "source"},
+            completed_at=t0 + timedelta(minutes=1),
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                target_finalization,
+            )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                source_finalization,
+            )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_dataset_snapshot(snapshot.snapshot_id)
+        assert report.has_errors
+        assert "immutable" in next(
+            result.detail
+            for result in report.tables
+            if result.table == "dataset_snapshot"
+        )
+        assert stored is not None
+        assert stored.table_watermarks == {"daily_bar": "target"}
 
 
 class TestRestoreResearchTables:
