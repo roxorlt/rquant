@@ -693,6 +693,277 @@ class TestSyncFromBackup:
         assert stored.message == "newest observation"
         assert stored.evidence == {"observation": "t10"}
 
+    def test_metadata_bundle_promotes_snapshot_and_source_coverage_together(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        source_snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        target_snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0 + timedelta(minutes=2),
+        )
+        target_coverage = DatasetCoverage(
+            snapshot_id=target_snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=8,
+            missing_reasons=("local building",),
+            created_at=t0 + timedelta(minutes=2),
+        )
+        source_coverage = DatasetCoverage(
+            snapshot_id=source_snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=9,
+            missing_reasons=("source ready",),
+            created_at=t0,
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(target_snapshot)
+            local.upsert_dataset_coverage(target_coverage)
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(source_snapshot)
+            backup.upsert_dataset_coverage(source_coverage)
+            backup.finalize_dataset_snapshot(
+                source_snapshot.snapshot_id,
+                DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+            )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored_snapshot = local.get_dataset_snapshot(source_snapshot.snapshot_id)
+            stored_coverage = local.list_dataset_coverages(source_snapshot.snapshot_id)
+        assert not report.has_errors
+        assert stored_snapshot is not None
+        assert stored_snapshot.status == "ready"
+        assert stored_snapshot.created_at == t0
+        assert stored_snapshot.completed_at == t0 + timedelta(minutes=1)
+        assert stored_coverage == [source_coverage]
+
+    def test_metadata_bundle_conflict_rolls_back_linked_rows_and_retry(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        source_issue = DataQualityIssue.detected(
+            rule_id="source-only",
+            dataset_id="minute-bars",
+            severity="P1",
+            scope_key="all",
+            message="must not leak",
+            observed_at=t0,
+        )
+        source_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="source-only",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=1,
+            available_count=1,
+            created_at=t0,
+        )
+        target_finalization = DatasetSnapshotFinalization(
+            table_watermarks={"daily_bar": "target"},
+            completed_at=t0 + timedelta(minutes=1),
+        )
+        source_finalization = DatasetSnapshotFinalization(
+            table_watermarks={"daily_bar": "source"},
+            quality_issue_ids=(source_issue.issue_id,),
+            completed_at=t0 + timedelta(minutes=1),
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                target_finalization,
+            )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.record_data_quality_issue(source_issue)
+            backup.upsert_dataset_coverage(source_coverage)
+            backup.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                source_finalization,
+            )
+        refresh_calls = 0
+
+        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True, "must not refresh"
+
+        monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+        first = sync_from_backup(backup_db, local_db, refresh_replica=True)
+        second = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored_snapshot = local.get_dataset_snapshot(snapshot.snapshot_id)
+            stored_coverage = local.list_dataset_coverages(snapshot.snapshot_id)
+            stored_issue = local.get_data_quality_issue(source_issue.issue_id)
+        first_results = {result.table: result for result in first.tables}
+        assert first.has_errors
+        assert second.has_errors
+        assert refresh_calls == 0
+        assert not first.replica_refreshed
+        assert "跳过副本刷新" in first.replica_detail
+        assert first_results["dataset_snapshot"].mode == "error"
+        assert first_results["dataset_coverage"].mode == "skipped"
+        assert first_results["data_quality_issue"].mode == "skipped"
+        assert stored_snapshot is not None
+        assert stored_snapshot.table_watermarks == {"daily_bar": "target"}
+        assert stored_snapshot.quality_issue_ids == ()
+        assert stored_coverage == []
+        assert stored_issue is None
+
+    def test_invalid_source_only_issue_rolls_back_bundle_and_replica(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="source-only",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=1,
+            available_count=1,
+            created_at=t0,
+        )
+        invalid_issue = DataQualityIssue.detected(
+            rule_id="invalid-timeline",
+            dataset_id="minute-bars",
+            severity="P1",
+            scope_key="all",
+            message="invalid source row",
+            observed_at=t0,
+        )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(coverage)
+            backup.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+            )
+            backup._conn.execute(
+                """
+                INSERT INTO data_quality_issue
+                (issue_id, rule_id, dataset_id, severity, status, scope_key,
+                 message, evidence, first_seen_at, last_seen_at, resolved_at)
+                VALUES (?, ?, ?, ?, 'resolved', ?, ?, CAST('{}' AS JSON), ?, ?, ?)
+                """,
+                [
+                    invalid_issue.issue_id,
+                    invalid_issue.rule_id,
+                    invalid_issue.dataset_id,
+                    invalid_issue.severity,
+                    invalid_issue.scope_key,
+                    invalid_issue.message,
+                    t0,
+                    t0 + timedelta(minutes=2),
+                    t0 + timedelta(minutes=1),
+                ],
+            )
+        refresh_calls = 0
+
+        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True, "must not refresh"
+
+        monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+        with DuckDBStore(local_db) as local:
+            snapshot_after = local.get_dataset_snapshot(snapshot.snapshot_id)
+            coverage_after = local.list_dataset_coverages(snapshot.snapshot_id)
+            issue_count = local._conn.execute(
+                "SELECT COUNT(*) FROM data_quality_issue WHERE issue_id = ?",
+                [invalid_issue.issue_id],
+            ).fetchone()[0]
+        results = {result.table: result for result in report.tables}
+        assert report.has_errors
+        assert refresh_calls == 0
+        assert not report.replica_refreshed
+        assert results["data_quality_issue"].mode == "error"
+        assert results["dataset_snapshot"].mode == "skipped"
+        assert results["dataset_coverage"].mode == "skipped"
+        assert snapshot_after is None
+        assert coverage_after == []
+        assert issue_count == 0
+
+    def test_ready_coverage_created_at_difference_keeps_earliest(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        finalization = DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=2))
+        target_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=9,
+            missing_reasons=("one missing",),
+            created_at=t0 + timedelta(minutes=1),
+        )
+        source_coverage = target_coverage.model_copy(update={"created_at": t0})
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.upsert_dataset_coverage(target_coverage)
+            local.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(source_coverage)
+            backup.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.list_dataset_coverages(snapshot.snapshot_id)
+        assert not report.has_errors
+        assert stored == [source_coverage]
+
 
 class TestRestoreResearchTables:
     def test_uses_shared_schema_initializer(
@@ -756,6 +1027,42 @@ class TestRestoreResearchTables:
         _make_backup_db(src)
         with pytest.raises(ValueError, match="screen_result"):
             restore_research_tables(src, local_db, tables=["screen_result"])
+
+    def test_restore_explicit_metadata_table_is_disallowed(
+        self, tmp_path: Path, local_db: Path
+    ) -> None:
+        source = tmp_path / "metadata-source.duckdb"
+        DuckDBStore(source).close()
+
+        with pytest.raises(ValueError, match="metadata|bundle"):
+            restore_research_tables(
+                source,
+                local_db,
+                tables=["dataset_snapshot"],
+                refresh_replica=False,
+            )
+
+    def test_restore_default_skips_linked_metadata_bundle(
+        self, tmp_path: Path, local_db: Path
+    ) -> None:
+        source = tmp_path / "default-source.duckdb"
+        DuckDBStore(source).close()
+
+        report = restore_research_tables(
+            source,
+            local_db,
+            refresh_replica=False,
+        )
+
+        metadata_tables = {
+            "dataset_snapshot",
+            "dataset_coverage",
+            "data_quality_issue",
+        }
+        assert not report.has_errors
+        assert metadata_tables.isdisjoint(
+            result.table for result in report.tables
+        )
 
     def test_restore_keeps_local_row_on_pk_conflict(
         self, tmp_path: Path, local_db: Path

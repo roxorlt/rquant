@@ -45,6 +45,12 @@ from loguru import logger
 from pydantic import BaseModel
 
 from rquant.config import settings
+from rquant.data_metadata import DataQualityIssue, DatasetCoverage, DatasetSnapshot
+from rquant.storage.duckdb import (
+    _coverage_from_row,
+    _quality_issue_from_row,
+    _snapshot_from_row,
+)
 from rquant.storage.migrations import initialize_schema
 
 # 云端 daily/monitor 流水线权威产出，本地无独立增量 → 整表替换
@@ -102,6 +108,12 @@ MERGE_TABLES: tuple[str, ...] = (
 )
 
 LOCAL_ONLY_TABLES: tuple[str, ...] = ("schema_migration",)
+
+DATA_METADATA_TABLES: tuple[str, ...] = (
+    "dataset_snapshot",
+    "dataset_coverage",
+    "data_quality_issue",
+)
 
 
 class TableSyncResult(BaseModel):
@@ -216,24 +228,130 @@ def _common_columns(
     return [c for c in local_cols if c in src_cols], pk_cols
 
 
-def _merge_dataset_snapshots(
+def _load_source_snapshots(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> dict[str, DatasetSnapshot]:
+    rows = conn.execute(
+        f"""
+        SELECT snapshot_id, strategy_name, manifest_id,
+               strftime(as_of_time AT TIME ZONE 'UTC',
+                        '%Y-%m-%dT%H:%M:%S.%fZ'),
+               code_commit, origin, status, table_watermarks,
+               quality_issue_ids,
+               strftime(created_at AT TIME ZONE 'UTC',
+                        '%Y-%m-%dT%H:%M:%S.%fZ'),
+               CASE WHEN completed_at IS NULL THEN NULL ELSE
+                   strftime(completed_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ')
+               END
+        FROM {alias}.dataset_snapshot
+        """
+    ).fetchall()
+    snapshots: dict[str, DatasetSnapshot] = {}
+    for row in rows:
+        try:
+            snapshot = _snapshot_from_row(row)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid source dataset_snapshot {row[0]}: {exc}"
+            ) from exc
+        snapshots[snapshot.snapshot_id] = snapshot
+    return snapshots
+
+
+def _load_source_coverages(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> list[DatasetCoverage]:
+    rows = conn.execute(
+        f"""
+        SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+               expected_count, available_count, missing_count,
+               coverage_ratio, missing_reasons,
+               strftime(created_at AT TIME ZONE 'UTC',
+                        '%Y-%m-%dT%H:%M:%S.%fZ')
+        FROM {alias}.dataset_coverage
+        """
+    ).fetchall()
+    coverages: list[DatasetCoverage] = []
+    for row in rows:
+        try:
+            coverages.append(_coverage_from_row(row))
+        except (TypeError, ValueError) as exc:
+            key = f"{row[0]}/{row[1]}/{row[2]}"
+            raise ValueError(
+                f"invalid source dataset_coverage {key}: {exc}"
+            ) from exc
+    return coverages
+
+
+def _load_source_quality_issues(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> dict[str, DataQualityIssue]:
+    rows = conn.execute(
+        f"""
+        SELECT issue_id, rule_id, dataset_id, severity, status, scope_key,
+               message, evidence,
+               strftime(first_seen_at AT TIME ZONE 'UTC',
+                        '%Y-%m-%dT%H:%M:%S.%fZ'),
+               strftime(last_seen_at AT TIME ZONE 'UTC',
+                        '%Y-%m-%dT%H:%M:%S.%fZ'),
+               CASE WHEN resolved_at IS NULL THEN NULL ELSE
+                   strftime(resolved_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ')
+               END
+        FROM {alias}.data_quality_issue
+        """
+    ).fetchall()
+    issues: dict[str, DataQualityIssue] = {}
+    for row in rows:
+        try:
+            issue = _quality_issue_from_row(row)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid source data_quality_issue {row[0]}: {exc}"
+            ) from exc
+        issues[issue.issue_id] = issue
+    return issues
+
+
+def _validate_source_coverage_references(
+    snapshots: dict[str, DatasetSnapshot],
+    coverages: list[DatasetCoverage],
+) -> None:
+    for coverage in coverages:
+        if coverage.snapshot_id not in snapshots:
+            raise ValueError(
+                "source dataset_coverage references missing dataset_snapshot: "
+                f"{coverage.snapshot_id}"
+            )
+
+
+def _validate_source_snapshot_issue_references(
+    conn: duckdb.DuckDBPyConnection,
+    snapshots: dict[str, DatasetSnapshot],
+    source_issues: dict[str, DataQualityIssue],
+) -> None:
+    target_issue_ids = {
+        str(row[0])
+        for row in conn.execute("SELECT issue_id FROM data_quality_issue").fetchall()
+    }
+    available_issue_ids = target_issue_ids | set(source_issues)
+    for snapshot in snapshots.values():
+        missing = [
+            issue_id
+            for issue_id in snapshot.quality_issue_ids
+            if issue_id not in available_issue_ids
+        ]
+        if missing:
+            raise ValueError(
+                "source dataset_snapshot references missing quality issues: "
+                f"{snapshot.snapshot_id}: {', '.join(missing)}"
+            )
+
+
+def _validate_dataset_snapshot_conflicts(
     conn: duckdb.DuckDBPyConnection, alias: str
 ) -> None:
-    invalid_source = conn.execute(
-        f"""
-        SELECT snapshot_id
-        FROM {alias}.dataset_snapshot
-        WHERE status = 'ready'
-          AND (completed_at IS NULL OR completed_at < created_at)
-        LIMIT 1
-        """
-    ).fetchone()
-    if invalid_source is not None:
-        raise ValueError(
-            "source ready dataset_snapshot has invalid created/completed timeline: "
-            f"{invalid_source[0]}"
-        )
-
     overlapping = conn.execute(
         f"""
         SELECT target.snapshot_id,
@@ -276,6 +394,10 @@ def _merge_dataset_snapshots(
                     f"{snapshot_id}"
                 )
 
+
+def _merge_dataset_snapshots(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> None:
     conn.execute(
         f"""
         INSERT INTO dataset_snapshot
@@ -320,8 +442,7 @@ def _merge_dataset_coverages(
                target.available_count, source.available_count,
                target.missing_count, source.missing_count,
                target.coverage_ratio, source.coverage_ratio,
-               target.missing_reasons, source.missing_reasons,
-               epoch_us(target.created_at), epoch_us(source.created_at)
+               target.missing_reasons, source.missing_reasons
         FROM dataset_coverage AS target
         JOIN {alias}.dataset_coverage AS source
           USING (snapshot_id, dataset_id, coverage_scope)
@@ -341,7 +462,6 @@ def _merge_dataset_coverages(
             row[9],
             row[11],
             json.loads(str(row[13])),
-            row[15],
         )
         source_payload = (
             row[4],
@@ -350,7 +470,6 @@ def _merge_dataset_coverages(
             row[10],
             row[12],
             json.loads(str(row[14])),
-            row[16],
         )
         if target_payload != source_payload:
             key = f"{row[0]}/{row[1]}/{row[2]}"
@@ -358,6 +477,44 @@ def _merge_dataset_coverages(
                 f"conflicting dataset_coverage for ready snapshot: {key}"
             )
 
+    conn.execute(
+        f"""
+        UPDATE dataset_coverage AS target
+        SET table_name = source.table_name,
+            expected_count = source.expected_count,
+            available_count = source.available_count,
+            missing_count = source.missing_count,
+            coverage_ratio = source.coverage_ratio,
+            missing_reasons = source.missing_reasons,
+            created_at = least(target.created_at, source.created_at)
+        FROM {alias}.dataset_coverage AS source,
+             {alias}.dataset_snapshot AS source_snapshot,
+             dataset_snapshot AS target_snapshot
+        WHERE target.snapshot_id = source.snapshot_id
+          AND target.dataset_id = source.dataset_id
+          AND target.coverage_scope = source.coverage_scope
+          AND source_snapshot.snapshot_id = source.snapshot_id
+          AND source_snapshot.status = 'ready'
+          AND target_snapshot.snapshot_id = target.snapshot_id
+          AND target_snapshot.status = 'building'
+        """
+    )
+    conn.execute(
+        f"""
+        UPDATE dataset_coverage AS target
+        SET created_at = least(target.created_at, source.created_at)
+        FROM {alias}.dataset_coverage AS source,
+             {alias}.dataset_snapshot AS source_snapshot,
+             dataset_snapshot AS target_snapshot
+        WHERE target.snapshot_id = source.snapshot_id
+          AND target.dataset_id = source.dataset_id
+          AND target.coverage_scope = source.coverage_scope
+          AND source_snapshot.snapshot_id = source.snapshot_id
+          AND source_snapshot.status = 'ready'
+          AND target_snapshot.snapshot_id = target.snapshot_id
+          AND target_snapshot.status = 'ready'
+        """
+    )
     conn.execute(
         f"""
         INSERT INTO dataset_coverage
@@ -372,9 +529,6 @@ def _merge_dataset_coverages(
         JOIN {alias}.dataset_snapshot AS source_snapshot
           ON source_snapshot.snapshot_id = source.snapshot_id
          AND source_snapshot.status = 'ready'
-        JOIN dataset_snapshot AS target_snapshot
-          ON target_snapshot.snapshot_id = source.snapshot_id
-         AND target_snapshot.status = 'ready'
         WHERE NOT EXISTS (
             SELECT 1
             FROM dataset_coverage AS target
@@ -481,6 +635,111 @@ def _merge_data_quality_issues(
         )
 
 
+def _metadata_bundle_failure_results(
+    failed_table: str, detail: str
+) -> list[TableSyncResult]:
+    rollback_detail = f"linked metadata bundle rolled back: {detail}"
+    return [
+        TableSyncResult(
+            table=table,
+            mode="error" if table == failed_table else "skipped",
+            detail=(
+                rollback_detail
+                if table == failed_table
+                else f"linked metadata bundle skipped after {failed_table} failed"
+            )[:200],
+        )
+        for table in DATA_METADATA_TABLES
+    ]
+
+
+def _sync_data_metadata_bundle(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> list[TableSyncResult]:
+    """Validate and merge linked dataset metadata in one transaction."""
+    current_table = DATA_METADATA_TABLES[0]
+    transaction_started = False
+    try:
+        conn.execute("BEGIN")
+        transaction_started = True
+        present_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                f"WHERE table_catalog = '{alias}' "
+                "AND table_name IN (?, ?, ?)",
+                list(DATA_METADATA_TABLES),
+            ).fetchall()
+        }
+        if not present_tables:
+            conn.execute("COMMIT")
+            transaction_started = False
+            return [
+                TableSyncResult(
+                    table=table,
+                    mode="skipped",
+                    detail="备份中无 linked metadata bundle",
+                )
+                for table in DATA_METADATA_TABLES
+            ]
+        missing_tables = set(DATA_METADATA_TABLES) - present_tables
+        if missing_tables:
+            current_table = next(
+                table for table in DATA_METADATA_TABLES if table in missing_tables
+            )
+            raise ValueError(
+                "incomplete linked metadata bundle; missing source tables: "
+                f"{', '.join(sorted(missing_tables))}"
+            )
+
+        row_counts = {
+            table: int(
+                conn.execute(
+                    f'SELECT COUNT(*) FROM {alias}."{table}"'
+                ).fetchone()[0]
+            )
+            for table in DATA_METADATA_TABLES
+        }
+
+        current_table = "dataset_snapshot"
+        source_snapshots = _load_source_snapshots(conn, alias)
+        current_table = "dataset_coverage"
+        source_coverages = _load_source_coverages(conn, alias)
+        _validate_source_coverage_references(
+            source_snapshots, source_coverages
+        )
+        current_table = "data_quality_issue"
+        source_issues = _load_source_quality_issues(conn, alias)
+        current_table = "dataset_snapshot"
+        _validate_source_snapshot_issue_references(
+            conn, source_snapshots, source_issues
+        )
+        _validate_dataset_snapshot_conflicts(conn, alias)
+
+        # Coverage reconciliation must see the target before snapshot promotion.
+        current_table = "dataset_coverage"
+        _merge_dataset_coverages(conn, alias)
+        current_table = "data_quality_issue"
+        _merge_data_quality_issues(conn, alias)
+        current_table = "dataset_snapshot"
+        _merge_dataset_snapshots(conn, alias)
+        conn.execute("COMMIT")
+        transaction_started = False
+    except Exception as exc:
+        if transaction_started:
+            try:
+                conn.execute("ROLLBACK")
+            except duckdb.Error:
+                logger.exception("research-sync linked metadata bundle 回滚失败")
+        logger.exception("research-sync linked metadata bundle 同步失败")
+        return _metadata_bundle_failure_results(current_table, str(exc))
+
+    return [
+        TableSyncResult(table=table, mode="merge", rows=row_counts[table])
+        for table in DATA_METADATA_TABLES
+    ]
+
+
 def _sync_table(
     conn: duckdb.DuckDBPyConnection, table: str, alias: str, mode: str
 ) -> TableSyncResult:
@@ -492,6 +751,13 @@ def _sync_table(
     注意返回的 TableSyncResult.mode 词汇固定为 replace|merge|skipped|error
     （cli 渲染按此映射），restore 对外归类为 merge，detail 标注恢复语义。
     """
+    if table in DATA_METADATA_TABLES:
+        return TableSyncResult(
+            table=table,
+            mode="error",
+            detail="linked dataset metadata must sync as one atomic bundle",
+        )
+
     src_exists = conn.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         f"WHERE table_catalog = '{alias}' AND table_name = ?",
@@ -524,12 +790,6 @@ def _sync_table(
                 f'INSERT OR IGNORE INTO "{table}" ({col_list}) '
                 f'SELECT {col_list} FROM {alias}."{table}"'
             )
-        elif table == "dataset_snapshot":
-            _merge_dataset_snapshots(conn, alias)
-        elif table == "dataset_coverage":
-            _merge_dataset_coverages(conn, alias)
-        elif table == "data_quality_issue":
-            _merge_data_quality_issues(conn, alias)
         else:
             conn.execute(
                 f'INSERT OR REPLACE INTO "{table}" ({col_list}) '
@@ -609,7 +869,10 @@ def sync_from_backup(
         for table in REPLACE_TABLES:
             results.append(_sync_table(conn, table, "cloud_backup", "replace"))
         for table in MERGE_TABLES:
+            if table in DATA_METADATA_TABLES:
+                continue
             results.append(_sync_table(conn, table, "cloud_backup", "merge"))
+        results.extend(_sync_data_metadata_bundle(conn, "cloud_backup"))
         conn.execute("DETACH cloud_backup")
         conn.execute("CHECKPOINT")
     except Exception as e:
@@ -646,11 +909,24 @@ def restore_research_tables(
 
     INSERT OR IGNORE 语义：只补本地缺失的行，主键冲突时保留本地现值——
     旧副本里的过期行（如今天已平仓的 paper_position 的旧 open 状态）
-    绝不覆盖本地。非法表名仍抛 ValueError（调用方约定错误应当炸），
-    其余顶层失败转成 has_errors 的报告返回。
+    绝不覆盖本地。linked dataset metadata 默认跳过，也不允许单表恢复，
+    避免破坏引用与生命周期。非法表名仍抛 ValueError（调用方约定错误
+    应当炸），其余顶层失败转成 has_errors 的报告返回。
     """
     db_path = db_path or settings.duckdb_path
-    tables = tables or list(MERGE_TABLES)
+    if tables is None:
+        tables = [
+            table for table in MERGE_TABLES if table not in DATA_METADATA_TABLES
+        ]
+    else:
+        metadata_tables = [
+            table for table in tables if table in DATA_METADATA_TABLES
+        ]
+        if metadata_tables:
+            raise ValueError(
+                "linked dataset metadata bundle cannot be restored partially: "
+                f"{metadata_tables}"
+            )
 
     unknown = [t for t in tables if t not in MERGE_TABLES]
     if unknown:
