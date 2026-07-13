@@ -150,10 +150,13 @@ data/                 本地数据与运行状态，不进 Git
 
 ## 部署纪律
 
-- 生产部署使用 tag 或指定 commit，不盲目跟随 main HEAD。
-- 云端 systemd、sudo 和生产数据修改采用 pair 模式，由用户执行命令并回传输出。
+- 日常代码发布由 Codex 代管，只部署已合并且 CI 全绿的 annotated tag 或指定完整 commit，
+  不盲目跟随 main HEAD。
+- 云端调用受控部署器，具备交易时段保护、最小 sudo 白名单、双 preflight、审计和自动回滚。
+- systemd/nginx、sudoers 安装和生产数据写入仍是单独授权的高风险变更。
 - systemd unit 修改必须先在云端通过 `systemd-analyze`/unit verify。
 - 每次实际部署在 [DEPLOY.md](DEPLOY.md) 追加版本、验证和回滚命令。
 
-完整项目约束见 [AGENTS.md](AGENTS.md)，数据源现状见
+操作说明见 [受控自动发布](docs/production-release.md)，完整项目约束见 [AGENTS.md](AGENTS.md)，
+数据源现状见
 [docs/data-sources-matrix.md](docs/data-sources-matrix.md)。

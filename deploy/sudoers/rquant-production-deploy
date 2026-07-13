@@ -1,0 +1,13 @@
+# Install as /etc/sudoers.d/rquant-production-deploy with mode 0440.
+# Validate before install: visudo -cf deploy/sudoers/rquant-production-deploy
+
+Cmnd_Alias RQUANT_SERVICE_RESTART = \
+    /usr/bin/systemctl restart rquant-canvas.service, \
+    /usr/bin/systemctl restart rquant-dashboard.service, \
+    /usr/bin/systemctl restart rquant-monitor.service, \
+    /usr/bin/systemctl restart rquant-nl-screen.service, \
+    /usr/bin/systemctl restart rquant-panorama-auth.service, \
+    /usr/bin/systemctl restart rquant-panorama.service, \
+    /usr/bin/systemctl restart rquant-surge-watch.service
+
+lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART
