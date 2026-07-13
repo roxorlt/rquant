@@ -5,6 +5,42 @@
 
 ---
 
+## 2026-07-14 · v0.14.0 · 阶段 1 PR-A 数据可信底座
+
+**状态**：PR #76 已 squash merge 为
+`bb6141982d65f5ed78ed59c24c6c694d11cbd0c1`，01:01-01:05 部署并完成生产迁移。
+
+**部署内容**：
+
+- 新增 checksum 固定、事务执行的 DuckDB migration v1-v3；项目版本更新为 `0.14.0`。
+- 新增数据集快照、覆盖率、质量问题、PIT 数据契约与权威交易日历基础能力。
+- 研究同步改为跨表原子事务；只读副本发布、回滚和提交结果按真实状态报告。
+- 此版本不修改策略触发、买卖规则或历史业务数据，不执行历史清理。
+
+**生产迁移**：
+
+- 迁移前在无写锁窗口生成 `backup/latest.duckdb.gz`：主库 264,515,584 bytes，
+  压缩快照 110,463,165 bytes，完成时间 `2026-07-14 01:03:31 +08:00`。
+- 创建 `schema_migration`、`dataset_snapshot`、`dataset_coverage`、
+  `data_quality_issue`、`trade_calendar`；账本精确记录 v1-v3 及固定 checksum。
+- 迁移后原表行数保持：`daily_bar=1,617,757`、`screen_result=848`、
+  `monitor_event=2,337`；`trade_calendar` 初始为 0 行，留给后续权威日历回补。
+- 原子刷新 `rquant_ro.duckdb`，主库与只读副本均为 264,515,584 bytes。
+
+**验证**：
+
+- 本地最终 HEAD：`1276 passed in 31.40s`；GitHub Actions Python 3.11/3.12 均通过。
+- 发布器状态为 `deployed`，仅重启部署前 active 的 canvas、dashboard、nl-screen、
+  panorama-auth 和 panorama；monitor、surge-watch 保持 inactive。
+- 部署后 preflight：`ok=5 warn=0 fail=0 skip=0`，smoke screen 命中 8。
+- 8501/8502/8504/8506 四个 Streamlit 健康端点均返回 `ok`。
+
+**回滚基线**：`e3b48c0b358c4fd98748f4a57bb142c900294b4c`。代码/依赖使用受控发布器
+自动回滚；新增空表为向后兼容 schema，代码回滚时可保留。如需文件级恢复，使用本次迁移前
+`backup/latest.duckdb.gz`，不得在服务运行时直接覆盖主库。
+
+---
+
 ## 2026-07-13 · v0.13.2 · 受控自动发布
 
 **状态**：已于 15:42-15:45 部署到腾讯云，commit
