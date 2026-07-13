@@ -1083,7 +1083,7 @@ class TestSyncFromBackup:
         assert "ready snapshot" in coverage_result.detail
         assert stored == [target_coverage]
 
-    def test_sync_building_source_identical_to_ready_is_idempotent_and_counted(
+    def test_sync_building_source_identical_to_ready_is_noop(
         self, local_db: Path, backup_db: Path
     ) -> None:
         t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
@@ -1127,9 +1127,9 @@ class TestSyncFromBackup:
         assert not report.has_errors
         assert stored_snapshot is not None
         assert stored_snapshot.status == "ready"
-        assert stored_coverages == [source_coverage]
+        assert stored_coverages == [target_coverage]
         assert by_table["dataset_snapshot"].rows == 0
-        assert by_table["dataset_coverage"].rows == 1
+        assert by_table["dataset_coverage"].rows == 0
 
     def test_sync_orphan_coverage_rolls_back_entire_metadata_bundle(
         self, local_db: Path, backup_db: Path
@@ -1320,6 +1320,74 @@ class TestSyncFromBackup:
         assert stored.message == "newest observation"
         assert stored.evidence == {"observation": "t10"}
 
+    def test_sync_quality_issue_counts_only_actual_reconciliation(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        initial = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P2",
+            scope_key="all",
+            message="initial",
+            evidence={"observation": "t0"},
+            observed_at=t0,
+        )
+        target_newer = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P1",
+            scope_key="all",
+            message="target newer",
+            evidence={"observation": "t10"},
+            observed_at=t0 + timedelta(minutes=10),
+        )
+        source_newest = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P0",
+            scope_key="all",
+            message="source newest",
+            evidence={"observation": "t20"},
+            observed_at=t0 + timedelta(minutes=20),
+        )
+        with DuckDBStore(local_db) as local:
+            local.record_data_quality_issue(initial)
+            local.record_data_quality_issue(target_newer)
+        with DuckDBStore(backup_db) as backup:
+            backup.record_data_quality_issue(initial)
+
+        stale = sync_from_backup(backup_db, local_db, refresh_replica=False)
+        with DuckDBStore(backup_db) as backup:
+            backup.record_data_quality_issue(source_newest)
+        newer = sync_from_backup(backup_db, local_db, refresh_replica=False)
+        idempotent = sync_from_backup(
+            backup_db, local_db, refresh_replica=False
+        )
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_data_quality_issue(initial.issue_id)
+        stale_rows = {
+            result.table: result.rows for result in stale.tables
+        }
+        newer_rows = {
+            result.table: result.rows for result in newer.tables
+        }
+        idempotent_rows = {
+            result.table: result.rows for result in idempotent.tables
+        }
+        assert not stale.has_errors
+        assert not newer.has_errors
+        assert not idempotent.has_errors
+        assert stale_rows["data_quality_issue"] == 0
+        assert newer_rows["data_quality_issue"] == 1
+        assert idempotent_rows["data_quality_issue"] == 0
+        assert stored is not None
+        assert stored.severity == "P0"
+        assert stored.last_seen_at == t0 + timedelta(minutes=20)
+        assert stored.message == "source newest"
+        assert stored.evidence == {"observation": "t20"}
+
     def test_metadata_bundle_promotes_snapshot_and_source_coverage_together(
         self, local_db: Path, backup_db: Path
     ) -> None:
@@ -1379,7 +1447,14 @@ class TestSyncFromBackup:
         assert stored_snapshot.status == "ready"
         assert stored_snapshot.created_at == t0
         assert stored_snapshot.completed_at == t0 + timedelta(minutes=1)
-        assert stored_coverage == [source_coverage]
+        assert stored_coverage == [
+            source_coverage.model_copy(
+                update={"created_at": target_coverage.created_at}
+            )
+        ]
+        by_table = {result.table: result for result in report.tables}
+        assert by_table["dataset_snapshot"].rows == 1
+        assert by_table["dataset_coverage"].rows == 1
 
     def test_metadata_bundle_conflict_rolls_back_linked_rows_and_retry(
         self,
@@ -1552,7 +1627,7 @@ class TestSyncFromBackup:
         assert coverage_after == []
         assert issue_count == 0
 
-    def test_ready_coverage_created_at_difference_keeps_earliest(
+    def test_ready_coverage_created_at_difference_preserves_target_write_once(
         self, local_db: Path, backup_db: Path
     ) -> None:
         t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
@@ -1588,8 +1663,11 @@ class TestSyncFromBackup:
 
         with DuckDBStore(local_db) as local:
             stored = local.list_dataset_coverages(snapshot.snapshot_id)
+        by_table = {result.table: result for result in report.tables}
         assert not report.has_errors
-        assert stored == [source_coverage]
+        assert stored == [target_coverage]
+        assert by_table["dataset_snapshot"].rows == 0
+        assert by_table["dataset_coverage"].rows == 0
 
 
 class TestRestoreResearchTables:

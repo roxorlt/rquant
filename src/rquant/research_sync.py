@@ -557,7 +557,7 @@ def _promote_dataset_snapshots(
 
 def _merge_dataset_coverages(
     conn: duckdb.DuckDBPyConnection, alias: str
-) -> None:
+) -> int:
     overlapping = conn.execute(
         f"""
         SELECT target.snapshot_id, target.dataset_id, target.coverage_scope,
@@ -566,15 +566,16 @@ def _merge_dataset_coverages(
                target.available_count, source.available_count,
                target.missing_count, source.missing_count,
                target.coverage_ratio, source.coverage_ratio,
-               target.missing_reasons, source.missing_reasons
+               target.missing_reasons, source.missing_reasons,
+               target_snapshot.status
         FROM dataset_coverage AS target
         JOIN {alias}.dataset_coverage AS source
           USING (snapshot_id, dataset_id, coverage_scope)
         JOIN dataset_snapshot AS target_snapshot
           ON target_snapshot.snapshot_id = target.snapshot_id
-         AND target_snapshot.status = 'ready'
         """
     ).fetchall()
+    changed_building_keys: list[tuple[str, str, str]] = []
     for row in overlapping:
         target_payload = (
             row[3],
@@ -592,10 +593,14 @@ def _merge_dataset_coverages(
             row[12],
             json.loads(str(row[14])),
         )
-        if target_payload != source_payload:
+        if row[15] == "ready" and target_payload != source_payload:
             key = f"{row[0]}/{row[1]}/{row[2]}"
             raise ValueError(
                 f"conflicting dataset_coverage for ready snapshot: {key}"
+            )
+        if row[15] == "building" and target_payload != source_payload:
+            changed_building_keys.append(
+                (str(row[0]), str(row[1]), str(row[2]))
             )
 
     missing_ready = conn.execute(
@@ -620,37 +625,44 @@ def _merge_dataset_coverages(
             f"new dataset_coverage for ready snapshot is immutable: {key}"
         )
 
-    conn.execute(
-        f"""
-        UPDATE dataset_coverage AS target
-        SET table_name = source.table_name,
-            expected_count = source.expected_count,
-            available_count = source.available_count,
-            missing_count = source.missing_count,
-            coverage_ratio = source.coverage_ratio,
-            missing_reasons = source.missing_reasons,
-            created_at = least(target.created_at, source.created_at)
-        FROM {alias}.dataset_coverage AS source,
-             dataset_snapshot AS target_snapshot
-        WHERE target.snapshot_id = source.snapshot_id
-          AND target.dataset_id = source.dataset_id
-          AND target.coverage_scope = source.coverage_scope
-          AND target_snapshot.snapshot_id = target.snapshot_id
-          AND target_snapshot.status = 'building'
-        """
-    )
-    conn.execute(
-        f"""
-        UPDATE dataset_coverage AS target
-        SET created_at = least(target.created_at, source.created_at)
-        FROM {alias}.dataset_coverage AS source,
-             dataset_snapshot AS target_snapshot
-        WHERE target.snapshot_id = source.snapshot_id
-          AND target.dataset_id = source.dataset_id
-          AND target.coverage_scope = source.coverage_scope
-          AND target_snapshot.snapshot_id = target.snapshot_id
-          AND target_snapshot.status = 'ready'
-        """
+    for snapshot_id, dataset_id, coverage_scope in changed_building_keys:
+        conn.execute(
+            f"""
+            UPDATE dataset_coverage AS target
+            SET table_name = source.table_name,
+                expected_count = source.expected_count,
+                available_count = source.available_count,
+                missing_count = source.missing_count,
+                coverage_ratio = source.coverage_ratio,
+                missing_reasons = source.missing_reasons
+            FROM {alias}.dataset_coverage AS source,
+                 dataset_snapshot AS target_snapshot
+            WHERE target.snapshot_id = source.snapshot_id
+              AND target.dataset_id = source.dataset_id
+              AND target.coverage_scope = source.coverage_scope
+              AND target_snapshot.snapshot_id = target.snapshot_id
+              AND target_snapshot.status = 'building'
+              AND target.snapshot_id = ?
+              AND target.dataset_id = ?
+              AND target.coverage_scope = ?
+            """,
+            [snapshot_id, dataset_id, coverage_scope],
+        )
+    inserted_count = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {alias}.dataset_coverage AS source
+            JOIN dataset_snapshot AS target_snapshot
+              ON target_snapshot.snapshot_id = source.snapshot_id
+             AND target_snapshot.status = 'building'
+            LEFT JOIN dataset_coverage AS target
+              ON target.snapshot_id = source.snapshot_id
+             AND target.dataset_id = source.dataset_id
+             AND target.coverage_scope = source.coverage_scope
+            WHERE target.snapshot_id IS NULL
+            """
+        ).fetchone()[0]
     )
     conn.execute(
         f"""
@@ -675,11 +687,12 @@ def _merge_dataset_coverages(
         )
         """
     )
+    return len(changed_building_keys) + inserted_count
 
 
 def _merge_data_quality_issues(
     conn: duckdb.DuckDBPyConnection, alias: str
-) -> None:
+) -> int:
     conflict = conn.execute(
         f"""
         SELECT target.issue_id
@@ -699,6 +712,7 @@ def _merge_data_quality_issues(
     overlapping = conn.execute(
         f"""
         SELECT target.issue_id,
+               target.status,
                target.severity, source.severity,
                target.message, source.message,
                target.evidence, source.evidence,
@@ -710,6 +724,16 @@ def _merge_data_quality_issues(
         """
     ).fetchall()
 
+    inserted_count = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {alias}.data_quality_issue AS source
+            LEFT JOIN data_quality_issue AS target USING (issue_id)
+            WHERE target.issue_id IS NULL
+            """
+        ).fetchone()[0]
+    )
     conn.execute(
         f"""
         INSERT INTO data_quality_issue
@@ -727,17 +751,18 @@ def _merge_data_quality_issues(
         """
     )
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    changed_count = 0
     for row in overlapping:
-        target_last_seen = int(row[9])
-        source_last_seen = int(row[10])
+        target_last_seen = int(row[10])
+        source_last_seen = int(row[11])
         source_observation_is_newer = source_last_seen > target_last_seen
-        severity = row[2] if source_observation_is_newer else row[1]
-        message = row[4] if source_observation_is_newer else row[3]
-        evidence = row[6] if source_observation_is_newer else row[5]
-        first_seen = min(int(row[7]), int(row[8]))
+        severity = row[3] if source_observation_is_newer else row[2]
+        message = row[5] if source_observation_is_newer else row[4]
+        evidence = row[7] if source_observation_is_newer else row[6]
+        first_seen = min(int(row[8]), int(row[9]))
         last_seen = max(target_last_seen, source_last_seen)
         resolution_events = [
-            int(value) for value in (row[11], row[12]) if value is not None
+            int(value) for value in (row[12], row[13]) if value is not None
         ]
         latest_resolution = (
             max(resolution_events) if resolution_events else None
@@ -752,6 +777,22 @@ def _merge_data_quality_issues(
             if status == "resolved" and latest_resolution is not None
             else None
         )
+        target_resolved_at = (
+            None
+            if row[12] is None
+            else epoch + timedelta(microseconds=int(row[12]))
+        )
+        target_changed = (
+            row[1] != status
+            or row[2] != severity
+            or row[4] != message
+            or json.loads(str(row[6])) != json.loads(str(evidence))
+            or int(row[8]) != first_seen
+            or target_last_seen != last_seen
+            or target_resolved_at != resolved_at
+        )
+        if not target_changed:
+            continue
         conn.execute(
             """
             UPDATE data_quality_issue
@@ -770,6 +811,8 @@ def _merge_data_quality_issues(
                 row[0],
             ],
         )
+        changed_count += 1
+    return inserted_count + changed_count
 
 
 def _metadata_bundle_failure_results(
@@ -858,18 +901,20 @@ def _sync_data_metadata_bundle(
         _validate_dataset_snapshot_conflicts(conn, alias)
 
         accepted_counts = {
-            "dataset_snapshot": _count_accepted_dataset_snapshots(conn, alias),
-            "dataset_coverage": len(source_coverages),
-            "data_quality_issue": len(source_issues),
+            "dataset_snapshot": _count_accepted_dataset_snapshots(conn, alias)
         }
 
         current_table = "data_quality_issue"
-        _merge_data_quality_issues(conn, alias)
+        accepted_counts["data_quality_issue"] = _merge_data_quality_issues(
+            conn, alias
+        )
         current_table = "dataset_snapshot"
         _stage_missing_dataset_snapshots(conn, alias)
         # Coverage must settle while source-ready parents are still building.
         current_table = "dataset_coverage"
-        _merge_dataset_coverages(conn, alias)
+        accepted_counts["dataset_coverage"] = _merge_dataset_coverages(
+            conn, alias
+        )
         current_table = "dataset_snapshot"
         _promote_dataset_snapshots(conn, alias)
         if manage_transaction:
