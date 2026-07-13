@@ -13,6 +13,7 @@ import rquant.storage.duckdb as duckdb_storage
 from rquant.storage.duckdb import DuckDBStore
 from rquant.storage.migrations import (
     MIGRATIONS,
+    V1_LEGACY_COLUMN_ADDITIONS,
     Migration,
     SchemaMigrationError,
     initialize_schema,
@@ -51,6 +52,15 @@ def test_migration_is_frozen_and_derives_stable_checksum() -> None:
         )
     with pytest.raises(ValidationError, match="frozen"):
         formatted.name = "changed"  # type: ignore[misc]
+
+
+def test_published_v1_statements_and_checksum_are_fixed() -> None:
+    assert isinstance(V1_LEGACY_COLUMN_ADDITIONS, tuple)
+    assert MIGRATIONS[0].statements == V1_LEGACY_COLUMN_ADDITIONS
+    assert (
+        MIGRATIONS[0].checksum
+        == "049827c760b87a12e4fa3bffc560d4ffd2d4ad974377c6c84e0f849268911720"
+    )
 
 
 def test_fresh_database_records_registered_migrations(tmp_path: Path) -> None:
@@ -184,6 +194,61 @@ def test_checksum_drift_rejects_startup() -> None:
         initialize_schema(conn, migrations=(changed,))
 
     assert _migration_rows(conn)[-1][2] == original.checksum
+    conn.close()
+
+
+def test_non_prefix_migration_ledger_rejects_startup() -> None:
+    first = Migration(
+        version=1,
+        name="prefix first",
+        statements=("CREATE TABLE prefix_first (id INTEGER);",),
+    )
+    second = Migration(
+        version=2,
+        name="prefix second",
+        statements=("CREATE TABLE prefix_second (id INTEGER);",),
+    )
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE schema_migration ("
+        "version INTEGER PRIMARY KEY, name VARCHAR NOT NULL, "
+        "checksum VARCHAR NOT NULL, applied_at TIMESTAMP NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO schema_migration VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        [second.version, second.name, second.checksum],
+    )
+
+    with pytest.raises(SchemaMigrationError, match="prefix"):
+        initialize_schema(conn, migrations=(first, second))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'prefix_first'"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_duplicate_migration_version_rejects_startup() -> None:
+    first = Migration(
+        version=1,
+        name="duplicate first",
+        statements=("CREATE TABLE duplicate_first (id INTEGER);",),
+    )
+    duplicate = Migration(
+        version=1,
+        name="duplicate second",
+        statements=("CREATE TABLE duplicate_second (id INTEGER);",),
+    )
+    conn = duckdb.connect(":memory:")
+
+    with pytest.raises(SchemaMigrationError, match="duplicate.*version 1"):
+        initialize_schema(conn, migrations=(first, duplicate))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name LIKE 'duplicate_%'"
+    ).fetchone()[0] == 0
     conn.close()
 
 

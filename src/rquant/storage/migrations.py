@@ -11,7 +11,18 @@ from typing import Any
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from rquant.storage.schema import BASE_DDL, LEGACY_MIGRATION_DDL
+from rquant.storage.schema import (
+    BASE_DDL,
+    MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
+    MARKET_SENTIMENT_MA20_MIGRATION_DDL,
+    MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
+    PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL,
+    PAPER_POSITION_RUN_ID_MIGRATION_DDL,
+    PAPER_POSITION_RUN_MODE_MIGRATION_DDL,
+    PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
+    PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
+    PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+)
 
 SCHEMA_MIGRATION_DDL = """
 CREATE TABLE IF NOT EXISTS schema_migration (
@@ -70,11 +81,25 @@ class Migration(BaseModel):
         return self
 
 
+# Published migration history is append-only. Never edit these statements;
+# every schema change must add a new Migration version instead.
+V1_LEGACY_COLUMN_ADDITIONS: tuple[str, ...] = (
+    MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
+    MARKET_SENTIMENT_MA20_MIGRATION_DDL,
+    PAPER_POSITION_ENTRY_RAW_MIGRATION_DDL,
+    PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+    PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
+    PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
+    PAPER_POSITION_RUN_MODE_MIGRATION_DDL,
+    PAPER_POSITION_RUN_ID_MIGRATION_DDL,
+    *MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
         name="legacy column additions",
-        statements=tuple(LEGACY_MIGRATION_DDL),
+        statements=V1_LEGACY_COLUMN_ADDITIONS,
     ),
 )
 
@@ -113,6 +138,13 @@ def _validate_applied_migrations(
                 f"database={applied_checksum}, code={migration.checksum}"
             )
         applied.add(version)
+    applied_versions = sorted(applied)
+    expected_prefix = sorted(registry)[: len(applied_versions)]
+    if applied_versions != expected_prefix:
+        raise SchemaMigrationError(
+            "applied schema migrations must form a registry prefix: "
+            f"applied={applied_versions}, expected={expected_prefix}"
+        )
     return applied
 
 
