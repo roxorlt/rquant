@@ -5,6 +5,28 @@
 
 ---
 
+## 2026-07-13 · v0.13.0 candidate · 研究可信度阶段 0（尚未部署）
+
+**状态**：仅本地功能分支，未修改腾讯云生产代码、systemd 或数据。
+
+**候选内容**：
+
+- Strategy Lab 研究记录增加四级可信度 manifest；旧记录自动降级为探索性。
+- 页面增加 N 字、科创/创业、集合竞价三项当前可信度警示。
+- 新增研究基线、中文总路线图和 GitHub Actions CI。
+- 版本元数据和 README 对齐到当前活跃项目状态。
+
+**部署前必须做**：
+
+1. 合并功能分支并确认 GitHub Actions 全绿。
+2. 本地启动 Strategy Lab，核验旧历史记录和 Markdown 导出。
+3. 本次没有 systemd 改动，无需更新 unit；部署仍使用 `scripts/deploy.sh` 的指定 commit。
+4. 实际部署后把本节“尚未部署”改为部署 commit、验证结果和回滚命令。
+
+**当前回滚**：无需回滚；生产尚未包含本候选。
+
+---
+
 ## 2026-05-06 · v0.12.1 · hotfix：nl-screen 只读 DuckDB
 
 **背景**：节后首日 09:30 开盘 monitor 启动失败，38 次 crash-loop + 持续 OnFailure

@@ -1,12 +1,12 @@
 [project]
 name = "rquant"
-version = "0.1.0"
+version = "0.13.0"
 description = "个人自用 A 股量化选股与盯盘平台：条件筛选 + 实时监控 + 告警通知"
 readme = "README.md"
 authors = [
     { name = "roxorlt", email = "ltsms86@gmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.2",
     "loguru>=0.7.3",
@@ -35,7 +35,7 @@ rquant = "rquant.cli:main"
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM"]
