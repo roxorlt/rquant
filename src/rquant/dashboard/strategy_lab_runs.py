@@ -13,6 +13,12 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.config import settings
+from rquant.research_manifest import (
+    RESEARCH_STATUS_LABELS,
+    ResearchManifest,
+    legacy_exploratory_manifest,
+    new_exploratory_manifest,
+)
 
 CST = timezone(timedelta(hours=8))
 RUN_TYPE_LABELS: dict[str, str] = {
@@ -44,6 +50,7 @@ class StrategyLabSavedRun(BaseModel):
     params: dict[str, Any]
     metrics: dict[str, Any]
     tables: list[StrategyLabRunTable]
+    manifest: ResearchManifest
     markdown: str
     json_path: Path | None = None
     markdown_path: Path | None = None
@@ -122,6 +129,63 @@ def _markdown_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def _research_manifest_markdown_lines(manifest: ResearchManifest) -> list[str]:
+    coverage = "未知"
+    if manifest.coverage_ratio is not None:
+        coverage = f"{manifest.coverage_ratio:.2%}"
+        if (
+            manifest.coverage_numerator is not None
+            and manifest.coverage_denominator is not None
+        ):
+            coverage += (
+                f"（{manifest.coverage_numerator:,}/"
+                f"{manifest.coverage_denominator:,}）"
+            )
+    data_range = "未知"
+    if manifest.data_start_date is not None and manifest.data_end_date is not None:
+        data_range = f"{manifest.data_start_date} 至 {manifest.data_end_date}"
+    lines = [
+        "## 研究可信度",
+        "",
+        f"- 状态：{RESEARCH_STATUS_LABELS[manifest.research_status]}",
+        f"- 原因：{manifest.status_reason}",
+        f"- 代码提交：`{manifest.code_commit or '未知'}`",
+        f"- 数据快照：`{manifest.dataset_snapshot_id or '未知'}`",
+        f"- 数据覆盖：{coverage}",
+        f"- 数据区间：{data_range}",
+        f"- 资格全集：{manifest.universe_definition or '未知'}",
+        f"- 执行模型：`{manifest.execution_model_version or '未知'}`",
+        f"- 成本模型：`{manifest.cost_model_version or '未知'}`",
+        f"- 严格样本外成交：{manifest.out_of_sample_trades or 0}",
+        f"- 前瞻验证：{manifest.forward_validation_days or 0} 日 / "
+        f"{manifest.forward_filled_trades or 0} 笔成交",
+    ]
+    if manifest.missing_evidence:
+        lines.append(f"- 缺失证据：{', '.join(manifest.missing_evidence)}")
+    lines.extend(f"- 注意：{warning}" for warning in manifest.warnings)
+    return lines
+
+
+def _inject_research_manifest_markdown(
+    markdown: str,
+    manifest: ResearchManifest,
+) -> str:
+    """给旧 Markdown 注入可信度段落，同时保留原有手工备注与大表。"""
+    original = markdown.strip()
+    if "## 研究可信度" in original:
+        return original + "\n"
+    section = "\n".join(_research_manifest_markdown_lines(manifest))
+    if not original:
+        return section + "\n"
+    first_line, separator, remainder = original.partition("\n")
+    if first_line.startswith("# "):
+        parts = [first_line, "", section]
+        if separator and remainder.strip():
+            parts.extend(["", remainder.lstrip()])
+        return "\n".join(parts).strip() + "\n"
+    return f"{section}\n\n{original}\n"
+
+
 def render_strategy_lab_markdown(run: StrategyLabSavedRun) -> str:
     """把研究记录渲染成可复制给 agent 继续讨论的 Markdown。"""
     lines = [
@@ -130,6 +194,8 @@ def render_strategy_lab_markdown(run: StrategyLabSavedRun) -> str:
         f"- 记录ID：`{run.run_id}`",
         f"- 类型：{RUN_TYPE_LABELS.get(run.run_type, run.run_type)}",
         f"- 生成时间：{run.created_at.astimezone(CST).strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        *_research_manifest_markdown_lines(run.manifest),
         "",
         "## 参数",
         "",
@@ -161,6 +227,7 @@ def build_strategy_lab_run(
     metrics: dict[str, Any],
     tables: dict[str, pd.DataFrame],
     max_rows_per_table: int = 500,
+    manifest: ResearchManifest | None = None,
 ) -> StrategyLabSavedRun:
     created_at = datetime.now(CST)
     saved_tables: list[StrategyLabRunTable] = []
@@ -182,6 +249,7 @@ def build_strategy_lab_run(
         params=_json_value(params),
         metrics=_json_value(metrics),
         tables=saved_tables,
+        manifest=manifest or new_exploratory_manifest(run_type),
         markdown="",
     )
     run.markdown = render_strategy_lab_markdown(run)
@@ -220,9 +288,24 @@ def load_strategy_lab_run(
     out_dir = strategy_lab_runs_dir(base_dir)
     json_path = out_dir / f"{run_id}.json"
     payload = json.loads(json_path.read_text(encoding="utf-8"))
+    is_legacy = "manifest" not in payload
+    if is_legacy:
+        payload["manifest"] = legacy_exploratory_manifest(
+            str(payload.get("run_type") or "unknown")
+        ).model_dump(mode="json")
     run = StrategyLabSavedRun.model_validate(payload)
     markdown_path = out_dir / f"{run_id}.md"
-    if markdown_path.exists():
+    if is_legacy:
+        original_markdown = (
+            markdown_path.read_text(encoding="utf-8")
+            if markdown_path.exists()
+            else run.markdown
+        )
+        run.markdown = _inject_research_manifest_markdown(
+            original_markdown,
+            run.manifest,
+        )
+    elif markdown_path.exists():
         run.markdown = markdown_path.read_text(encoding="utf-8")
     run.json_path = json_path
     run.markdown_path = markdown_path

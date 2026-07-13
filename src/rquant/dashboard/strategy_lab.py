@@ -50,6 +50,7 @@ from rquant.dashboard.strategy_lab_worker import (
     launch_background_run,
     list_run_statuses,
 )
+from rquant.research_manifest import CURRENT_RESEARCH_NOTICES, RESEARCH_STATUS_LABELS
 from rquant.storage.duckdb import open_readonly_connection, open_readonly_store
 from rquant.topn_selection import default_score_profiles
 from rquant.volume_profile import calculate_volume_profile
@@ -963,6 +964,20 @@ def _run_with_countdown(
 
 st.markdown("# 🧪 rQuant Strategy Lab")
 st.caption(f"渲染时间 {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
+with st.expander("研究可信度警示", expanded=True):
+    st.caption(
+        "收益排行不等于可用策略。当前记录必须先通过数据覆盖、无未来函数、可成交性和"
+        "严格样本外验证，才能进入模拟盘。基线见 "
+        "docs/analysis/2026-07-13-research-trust-baseline.md。"
+    )
+    for notice in CURRENT_RESEARCH_NOTICES:
+        message = f"**{notice.title}**：{notice.body}"
+        if notice.severity == "error":
+            st.error(message)
+        elif notice.severity == "warning":
+            st.warning(message)
+        else:
+            st.info(message)
 
 PRESET_OPTIONS = ["n-shape-combined", "n-shape-pool1", "n-shape-pool2"]
 
@@ -2412,7 +2427,8 @@ with tab_history:
             run = runs[index]
             created = run.created_at.astimezone(CST).strftime("%m-%d %H:%M")
             run_type = RUN_TYPE_LABELS.get(run.run_type, run.run_type)
-            return f"{created} · {run_type} · {run.title}"
+            status = RESEARCH_STATUS_LABELS[run.manifest.research_status]
+            return f"{created} · [{status}] {run_type} · {run.title}"
 
         selected_history = st.selectbox(
             "历史记录",
@@ -2421,13 +2437,19 @@ with tab_history:
             key="strategy_lab_history_select",
         )
         history_run = runs[int(selected_history)]
-        h1, h2, h3 = st.columns(3)
+        h1, h2, h3, h4 = st.columns(4)
         h1.metric("记录类型", RUN_TYPE_LABELS.get(history_run.run_type, history_run.run_type))
-        h2.metric("表格数", len(history_run.tables))
-        h3.metric(
+        h2.metric(
+            "可信度",
+            RESEARCH_STATUS_LABELS[history_run.manifest.research_status],
+        )
+        h3.metric("表格数", len(history_run.tables))
+        h4.metric(
             "生成时间",
             history_run.created_at.astimezone(CST).strftime("%m-%d %H:%M"),
         )
+        if history_run.manifest.research_status == "exploratory":
+            st.warning(history_run.manifest.status_reason)
         st.download_button(
             "下载 Markdown",
             data=history_run.markdown,
