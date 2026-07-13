@@ -14,6 +14,13 @@
 
 ### Added
 
+- **阶段 1 数据可信底座（PR-A）**：新增可校验 checksum、逐版本事务执行的 DuckDB
+  `schema_migration`；新增研究数据快照、覆盖率和质量问题元数据，并把三张关联表作为原子包
+  同步，避免云端/本地状态倒退或部分提交。首批 20 个策略数据集获得显式主键、价格口径、
+  历史起点、新鲜度和 Point-in-Time 可见性契约；集合竞价按真实来源区分 Tushare 09:26
+  与 09:30 分钟 fallback 09:31 的最早可用时间。新增权威 `trade_calendar` migration v3、
+  Tushare 全自然日日历接入、缺口检测和前/后/最近交易日 typed API；已知休市与未知缺数不再
+  混为一谈。此批次只建设数据契约和存储能力，尚未改动策略触发与回放查询。
 - **受控自动发布**：新增 `scripts/deploy-production.sh` / `rquant.ops.production_deploy`，
   仅部署 `origin/main` 中的精确 SemVer tag 或完整 SHA；包含 tracked 清洁检查、快进校验、
   diff 风险分类、交易时段重启保护、部署互斥锁、最小 sudo 服务白名单、双 preflight、
@@ -32,6 +39,9 @@
 
 ### Changed
 
+- 项目版本从 `0.13.2` 更新到 `0.14.0`；阶段 1 PR-A 引入版本化 DuckDB migration、
+  数据集快照/覆盖率/质量问题元数据、Point-in-Time 数据契约和权威交易日历。同步与
+  只读副本发布改为失败即阻断，并明确报告回滚、提交和副本发布的不确定状态。
 - 项目版本从 `0.13.1` 更新到 `0.13.2`；旧 `scripts/deploy.sh` 明确降为人工基础设施发布，
   不再用于无人值守代码部署。
 - 项目版本从长期失真的 `0.1.0` 对齐到当前 `0.13.0`；README 从 4 月 planning 草案更新为

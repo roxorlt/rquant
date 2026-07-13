@@ -2,17 +2,194 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 from collections.abc import Sequence
-from datetime import date
+from copy import deepcopy
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TypeVar, cast
 
 import duckdb
 import pandas as pd
 from loguru import logger
+from pydantic import BaseModel
 
 from rquant.config import settings
-from rquant.storage.schema import ALL_DDL
+from rquant.data_metadata import (
+    DataQualityIssue,
+    DatasetCoverage,
+    DatasetSnapshot,
+    DatasetSnapshotFinalization,
+    DatasetSnapshotWriteConflictError,
+    normalize_utc_datetime,
+    utc_now,
+)
+from rquant.storage.migrations import initialize_schema
+from rquant.trade_calendar import (
+    TradeCalendarConflictError,
+    TradeCalendarDay,
+    TradeCalendarGapError,
+    deduplicate_trade_calendar_rows,
+    trade_calendar_business_facts,
+)
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def _revalidate_for_write(model: ModelT) -> ModelT:
+    """Deep-copy and revalidate a frozen model before crossing into SQL."""
+    try:
+        payload = deepcopy(
+            model.model_dump(
+                mode="python",
+                exclude_computed_fields=True,
+                warnings="error",
+            )
+        )
+        return cast(
+            ModelT,
+            type(model).model_validate(payload),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{type(model).__name__} failed write-boundary validation: {exc}"
+        ) from exc
+
+
+def _utc_datetime_from_db(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"expected UTC datetime text from DuckDB, got {value!r}")
+    return normalize_utc_datetime(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
+def _snapshot_from_row(row: tuple[object, ...]) -> DatasetSnapshot:
+    snapshot = DatasetSnapshot(
+        strategy_name=str(row[1]),
+        manifest_id=None if row[2] is None else str(row[2]),
+        as_of_time=_utc_datetime_from_db(row[3]),
+        code_commit=str(row[4]),
+        origin=str(row[5]),
+        status=cast(str, row[6]),
+        table_watermarks=json.loads(str(row[7])),
+        quality_issue_ids=tuple(json.loads(str(row[8]))),
+        created_at=_utc_datetime_from_db(row[9]),
+        completed_at=(
+            None if row[10] is None else _utc_datetime_from_db(row[10])
+        ),
+    )
+    stored_id = str(row[0])
+    if snapshot.snapshot_id != stored_id:
+        raise ValueError(
+            "dataset_snapshot stable id mismatch: "
+            f"stored={stored_id}, derived={snapshot.snapshot_id}"
+        )
+    return snapshot
+
+
+def _coverage_from_row(row: tuple[object, ...]) -> DatasetCoverage:
+    coverage = DatasetCoverage(
+        snapshot_id=str(row[0]),
+        dataset_id=str(row[1]),
+        coverage_scope=str(row[2]),
+        table_name=str(row[3]),
+        expected_count=int(cast(int, row[4])),
+        available_count=int(cast(int, row[5])),
+        missing_reasons=tuple(json.loads(str(row[8]))),
+        created_at=_utc_datetime_from_db(row[9]),
+    )
+    stored_missing = int(cast(int, row[6]))
+    stored_ratio = cast(float | None, row[7])
+    ratio_matches = (
+        stored_ratio is None
+        if coverage.coverage_ratio is None
+        else stored_ratio is not None
+        and math.isclose(stored_ratio, coverage.coverage_ratio, abs_tol=1e-9)
+    )
+    if stored_missing != coverage.missing_count or not ratio_matches:
+        raise ValueError(
+            "dataset_coverage derived values disagree with persisted counts: "
+            f"snapshot_id={coverage.snapshot_id}, dataset_id={coverage.dataset_id}, "
+            f"coverage_scope={coverage.coverage_scope}"
+        )
+    return coverage
+
+
+def _quality_issue_from_row(row: tuple[object, ...]) -> DataQualityIssue:
+    issue = DataQualityIssue(
+        rule_id=str(row[1]),
+        dataset_id=str(row[2]),
+        severity=cast(str, row[3]),
+        status=cast(str, row[4]),
+        scope_key=str(row[5]),
+        message=str(row[6]),
+        evidence=json.loads(str(row[7])),
+        first_seen_at=_utc_datetime_from_db(row[8]),
+        last_seen_at=_utc_datetime_from_db(row[9]),
+        resolved_at=(
+            None if row[10] is None else _utc_datetime_from_db(row[10])
+        ),
+    )
+    stored_id = str(row[0])
+    if issue.issue_id != stored_id:
+        raise ValueError(
+            "data_quality_issue stable id mismatch: "
+            f"stored={stored_id}, derived={issue.issue_id}"
+        )
+    return issue
+
+
+def _snapshot_finalization_matches(
+    snapshot: DatasetSnapshot,
+    finalization: DatasetSnapshotFinalization,
+) -> bool:
+    return (
+        snapshot.status == "ready"
+        and snapshot.table_watermarks == finalization.table_watermarks
+        and snapshot.quality_issue_ids == finalization.quality_issue_ids
+        and snapshot.completed_at == finalization.completed_at
+    )
+
+
+def _coverage_payload_matches(
+    stored: DatasetCoverage,
+    requested: DatasetCoverage,
+) -> bool:
+    return (
+        stored.snapshot_id,
+        stored.dataset_id,
+        stored.coverage_scope,
+        stored.table_name,
+        stored.expected_count,
+        stored.available_count,
+        stored.missing_reasons,
+    ) == (
+        requested.snapshot_id,
+        requested.dataset_id,
+        requested.coverage_scope,
+        requested.table_name,
+        requested.expected_count,
+        requested.available_count,
+        requested.missing_reasons,
+    )
+
+
+def _issue_effective_time(issue: DataQualityIssue) -> datetime:
+    if issue.resolved_at is None:
+        return issue.last_seen_at
+    return max(issue.last_seen_at, issue.resolved_at)
+
+
+def _trade_calendar_from_row(row: tuple[object, ...]) -> TradeCalendarDay:
+    return TradeCalendarDay(
+        exchange=str(row[0]),
+        cal_date=cast(date, row[1]),
+        is_open=cast(bool, row[2]),
+        pretrade_date=cast(date | None, row[3]),
+        source=str(row[4]),
+        updated_at=_utc_datetime_from_db(row[5]),
+    )
 
 
 class DuckDBStore:
@@ -23,8 +200,759 @@ class DuckDBStore:
             self._init_schema()
 
     def _init_schema(self) -> None:
-        for ddl in ALL_DDL:
-            self._conn.execute(ddl)
+        initialize_schema(self._conn)
+
+    def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int:
+        observations = [_revalidate_for_write(row) for row in rows]
+        if not observations:
+            return 0
+        self._conn.execute("BEGIN")
+        try:
+            for incoming in observations:
+                existing = self.get_trade_calendar_day(
+                    incoming.exchange,
+                    incoming.cal_date,
+                )
+                if (
+                    existing is not None
+                    and existing.updated_at == incoming.updated_at
+                    and trade_calendar_business_facts(existing)
+                    != trade_calendar_business_facts(incoming)
+                ):
+                    raise TradeCalendarConflictError(
+                        incoming.exchange,
+                        incoming.cal_date,
+                        incoming.updated_at,
+                    )
+            selected = deduplicate_trade_calendar_rows(observations)
+            self._conn.executemany(
+                """
+                INSERT INTO trade_calendar
+                (exchange, cal_date, is_open, pretrade_date, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (exchange, cal_date) DO UPDATE SET
+                    is_open = excluded.is_open,
+                    pretrade_date = excluded.pretrade_date,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                WHERE excluded.updated_at > trade_calendar.updated_at
+                """,
+                [
+                    [
+                        row.exchange,
+                        row.cal_date,
+                        row.is_open,
+                        row.pretrade_date,
+                        row.source,
+                        row.updated_at,
+                    ]
+                    for row in selected
+                ],
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return len(selected)
+
+    def get_trade_calendar_day(
+        self, exchange: str, cal_date: date
+    ) -> TradeCalendarDay | None:
+        row = self._conn.execute(
+            """
+            SELECT exchange, cal_date, is_open, pretrade_date, source,
+                   strftime(updated_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS updated_at
+            FROM trade_calendar
+            WHERE exchange = ? AND cal_date = ?
+            """,
+            [exchange, cal_date],
+        ).fetchone()
+        return None if row is None else _trade_calendar_from_row(row)
+
+    def list_trade_calendar(
+        self, exchange: str, start: date, end: date
+    ) -> list[TradeCalendarDay]:
+        if start > end:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT exchange, cal_date, is_open, pretrade_date, source,
+                   strftime(updated_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS updated_at
+            FROM trade_calendar
+            WHERE exchange = ? AND cal_date BETWEEN ? AND ?
+            ORDER BY cal_date
+            """,
+            [exchange, start, end],
+        ).fetchall()
+        return [_trade_calendar_from_row(row) for row in rows]
+
+    def missing_trade_calendar_dates(
+        self, exchange: str, start: date, end: date
+    ) -> list[date]:
+        if start > end:
+            raise ValueError("trade calendar range start must not be after end")
+        present = {
+            row.cal_date for row in self.list_trade_calendar(exchange, start, end)
+        }
+        return [
+            start + timedelta(days=offset)
+            for offset in range((end - start).days + 1)
+            if start + timedelta(days=offset) not in present
+        ]
+
+    def is_trading_day(self, exchange: str, cal_date: date) -> bool:
+        row = self.get_trade_calendar_day(exchange, cal_date)
+        if row is None:
+            raise TradeCalendarGapError(exchange, [cal_date])
+        return row.is_open
+
+    def _require_calendar_range(
+        self, exchange: str, start: date, end: date
+    ) -> None:
+        missing = self.missing_trade_calendar_dates(exchange, start, end)
+        if missing:
+            raise TradeCalendarGapError(exchange, missing)
+
+    def _require_calendar_anchor(self, exchange: str, anchor: date) -> None:
+        if self.get_trade_calendar_day(exchange, anchor) is None:
+            raise TradeCalendarGapError(exchange, [anchor])
+
+    def previous_trading_day(
+        self, anchor: date, *, exchange: str = "SSE"
+    ) -> date:
+        self._require_calendar_anchor(exchange, anchor)
+        row = self._conn.execute(
+            "SELECT MAX(cal_date) FROM trade_calendar "
+            "WHERE exchange = ? AND cal_date < ? AND is_open",
+            [exchange, anchor],
+        ).fetchone()
+        candidate = None if row is None else cast(date | None, row[0])
+        if candidate is None:
+            raise TradeCalendarGapError(
+                exchange,
+                detail=f"no previous trading day in stored coverage for {exchange}",
+            )
+        self._require_calendar_range(exchange, candidate, anchor)
+        return candidate
+
+    def next_trading_day(
+        self, anchor: date, *, exchange: str = "SSE"
+    ) -> date:
+        self._require_calendar_anchor(exchange, anchor)
+        row = self._conn.execute(
+            "SELECT MIN(cal_date) FROM trade_calendar "
+            "WHERE exchange = ? AND cal_date > ? AND is_open",
+            [exchange, anchor],
+        ).fetchone()
+        candidate = None if row is None else cast(date | None, row[0])
+        if candidate is None:
+            raise TradeCalendarGapError(
+                exchange,
+                detail=f"no next trading day in stored coverage for {exchange}",
+            )
+        self._require_calendar_range(exchange, anchor, candidate)
+        return candidate
+
+    def latest_trading_day(
+        self, anchor: date, *, exchange: str = "SSE"
+    ) -> date:
+        self._require_calendar_anchor(exchange, anchor)
+        row = self._conn.execute(
+            "SELECT MAX(cal_date) FROM trade_calendar "
+            "WHERE exchange = ? AND cal_date <= ? AND is_open",
+            [exchange, anchor],
+        ).fetchone()
+        candidate = None if row is None else cast(date | None, row[0])
+        if candidate is None:
+            raise TradeCalendarGapError(
+                exchange,
+                detail=f"no latest trading day in stored coverage for {exchange}",
+            )
+        self._require_calendar_range(exchange, candidate, anchor)
+        return candidate
+
+    def begin_dataset_snapshot(
+        self, snapshot: DatasetSnapshot
+    ) -> DatasetSnapshot:
+        snapshot = _revalidate_for_write(snapshot)
+        if snapshot.status != "building":
+            raise ValueError("begin_dataset_snapshot requires a building snapshot")
+        self._conn.execute("BEGIN")
+        try:
+            existing = self.get_dataset_snapshot(snapshot.snapshot_id)
+            if existing is not None:
+                existing_identity = (
+                    existing.strategy_name,
+                    existing.manifest_id,
+                    existing.as_of_time,
+                    existing.code_commit,
+                    existing.origin,
+                )
+                requested_identity = (
+                    snapshot.strategy_name,
+                    snapshot.manifest_id,
+                    snapshot.as_of_time,
+                    snapshot.code_commit,
+                    snapshot.origin,
+                )
+                if existing_identity != requested_identity:
+                    raise ValueError(
+                        f"dataset snapshot id conflict: {snapshot.snapshot_id}"
+                    )
+                self._conn.execute("COMMIT")
+                return existing
+            self._conn.execute(
+                """
+                INSERT INTO dataset_snapshot
+                (snapshot_id, strategy_name, manifest_id, as_of_time, code_commit,
+                 origin, status, table_watermarks, quality_issue_ids, created_at,
+                 completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, ?)
+                """,
+                [
+                    snapshot.snapshot_id,
+                    snapshot.strategy_name,
+                    snapshot.manifest_id,
+                    snapshot.as_of_time,
+                    snapshot.code_commit,
+                    snapshot.origin,
+                    snapshot.status,
+                    json.dumps(snapshot.table_watermarks, sort_keys=True),
+                    json.dumps(snapshot.quality_issue_ids),
+                    snapshot.created_at,
+                    snapshot.completed_at,
+                ],
+            )
+            stored = self.get_dataset_snapshot(snapshot.snapshot_id)
+            if stored is None:
+                raise RuntimeError(
+                    "dataset snapshot insert was not persisted: "
+                    f"{snapshot.snapshot_id}"
+                )
+            self._conn.execute("COMMIT")
+            return stored
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def finalize_dataset_snapshot(
+        self,
+        snapshot_id: str,
+        finalization: DatasetSnapshotFinalization,
+    ) -> DatasetSnapshot:
+        finalization = _revalidate_for_write(finalization)
+        transaction_open = True
+        self._conn.execute("BEGIN")
+        try:
+            existing = self.get_dataset_snapshot(snapshot_id)
+            if existing is None:
+                raise KeyError(f"dataset snapshot not found: {snapshot_id}")
+            missing_issue_ids = self._missing_quality_issue_ids(
+                finalization.quality_issue_ids
+            )
+            if missing_issue_ids:
+                missing = ", ".join(missing_issue_ids)
+                raise KeyError(
+                    f"dataset snapshot quality issue references missing: {missing}"
+                )
+            if finalization.completed_at < existing.created_at:
+                raise ValueError(
+                    "snapshot completed_at cannot be earlier than created_at: "
+                    f"{snapshot_id}"
+                )
+            if existing.status == "ready":
+                if not _snapshot_finalization_matches(existing, finalization):
+                    raise ValueError(
+                        "dataset snapshot already finalized with different data: "
+                        f"{snapshot_id}"
+                    )
+                self._conn.execute("COMMIT")
+                transaction_open = False
+                return existing
+            try:
+                updated = self._conn.execute(
+                    """
+                    UPDATE dataset_snapshot
+                    SET status = 'ready',
+                        table_watermarks = CAST(? AS JSON),
+                        quality_issue_ids = CAST(? AS JSON),
+                        completed_at = ?
+                    WHERE snapshot_id = ? AND status = 'building'
+                    RETURNING snapshot_id
+                    """,
+                    [
+                        json.dumps(finalization.table_watermarks, sort_keys=True),
+                        json.dumps(finalization.quality_issue_ids),
+                        finalization.completed_at,
+                        snapshot_id,
+                    ],
+                ).fetchall()
+            except duckdb.TransactionException as exc:
+                self._conn.execute("ROLLBACK")
+                transaction_open = False
+                return self._snapshot_after_cas_loss(
+                    snapshot_id,
+                    finalization,
+                    conflict_cause=exc,
+                )
+            if not updated:
+                self._conn.execute("ROLLBACK")
+                transaction_open = False
+                return self._snapshot_after_cas_loss(snapshot_id, finalization)
+            finalized = self.get_dataset_snapshot(snapshot_id)
+            if finalized is None:
+                raise RuntimeError(
+                    f"dataset snapshot finalize was not persisted: {snapshot_id}"
+                )
+            self._conn.execute("COMMIT")
+            transaction_open = False
+            return finalized
+        except Exception:
+            if transaction_open:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def _snapshot_after_cas_loss(
+        self,
+        snapshot_id: str,
+        finalization: DatasetSnapshotFinalization,
+        *,
+        conflict_cause: Exception | None = None,
+    ) -> DatasetSnapshot:
+        current = self.get_dataset_snapshot(snapshot_id)
+        if current is not None and _snapshot_finalization_matches(
+            current, finalization
+        ):
+            return current
+        if current is None or current.status == "building":
+            conflict = DatasetSnapshotWriteConflictError(
+                "dataset snapshot write conflict; retry finalization: "
+                f"{snapshot_id}"
+            )
+            if conflict_cause is not None:
+                raise conflict from conflict_cause
+            raise conflict
+        raise ValueError(
+            "concurrent dataset snapshot finalization committed different data: "
+            f"{snapshot_id}"
+        )
+
+    def _missing_quality_issue_ids(
+        self, issue_ids: tuple[str, ...]
+    ) -> list[str]:
+        if not issue_ids:
+            return []
+        placeholders = ",".join("?" for _ in issue_ids)
+        rows = self._conn.execute(
+            f"SELECT issue_id FROM data_quality_issue "
+            f"WHERE issue_id IN ({placeholders})",
+            list(issue_ids),
+        ).fetchall()
+        existing = {str(row[0]) for row in rows}
+        return [issue_id for issue_id in issue_ids if issue_id not in existing]
+
+    def get_dataset_snapshot(self, snapshot_id: str) -> DatasetSnapshot | None:
+        row = self._conn.execute(
+            """
+            SELECT snapshot_id, strategy_name, manifest_id,
+                   strftime(as_of_time AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS as_of_time,
+                   code_commit, origin, status, table_watermarks,
+                   quality_issue_ids,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at,
+                   CASE WHEN completed_at IS NULL THEN NULL ELSE
+                       strftime(completed_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END AS completed_at
+            FROM dataset_snapshot
+            WHERE snapshot_id = ?
+            """,
+            [snapshot_id],
+        ).fetchone()
+        return None if row is None else _snapshot_from_row(row)
+
+    def upsert_dataset_coverage(
+        self, coverage: DatasetCoverage
+    ) -> DatasetCoverage:
+        coverage = _revalidate_for_write(coverage)
+        transaction_open = True
+        self._conn.execute("BEGIN")
+        try:
+            # Touching the parent row serializes coverage writes with finalization.
+            touched = self._conn.execute(
+                "UPDATE dataset_snapshot SET status = status "
+                "WHERE snapshot_id = ? RETURNING snapshot_id",
+                [coverage.snapshot_id],
+            ).fetchone()
+            if touched is None:
+                raise KeyError(
+                    f"dataset snapshot not found: {coverage.snapshot_id}"
+                )
+            snapshot = self.get_dataset_snapshot(coverage.snapshot_id)
+            if snapshot is None:
+                raise KeyError(
+                    f"dataset snapshot not found: {coverage.snapshot_id}"
+                )
+            if snapshot.status == "ready":
+                stored = self._conn.execute(
+                    """
+                    SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+                           expected_count, available_count, missing_count,
+                           coverage_ratio, missing_reasons,
+                           strftime(created_at AT TIME ZONE 'UTC',
+                                    '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at
+                    FROM dataset_coverage
+                    WHERE snapshot_id = ? AND dataset_id = ? AND coverage_scope = ?
+                    """,
+                    [
+                        coverage.snapshot_id,
+                        coverage.dataset_id,
+                        coverage.coverage_scope,
+                    ],
+                ).fetchone()
+                existing = None if stored is None else _coverage_from_row(stored)
+                if existing is None or not _coverage_payload_matches(
+                    existing, coverage
+                ):
+                    raise ValueError(
+                        "finalized dataset snapshot coverage is immutable: "
+                        f"{coverage.snapshot_id}/{coverage.dataset_id}/"
+                        f"{coverage.coverage_scope}"
+                    )
+                self._conn.execute("COMMIT")
+                transaction_open = False
+                return existing
+            self._conn.execute(
+                """
+                INSERT INTO dataset_coverage
+                (snapshot_id, dataset_id, coverage_scope, table_name,
+                 expected_count, available_count, missing_count, coverage_ratio,
+                 missing_reasons, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?)
+                ON CONFLICT (snapshot_id, dataset_id, coverage_scope) DO UPDATE SET
+                    table_name = excluded.table_name,
+                    expected_count = excluded.expected_count,
+                    available_count = excluded.available_count,
+                    missing_count = excluded.missing_count,
+                    coverage_ratio = excluded.coverage_ratio,
+                    missing_reasons = excluded.missing_reasons
+                """,
+                [
+                    coverage.snapshot_id,
+                    coverage.dataset_id,
+                    coverage.coverage_scope,
+                    coverage.table_name,
+                    coverage.expected_count,
+                    coverage.available_count,
+                    coverage.missing_count,
+                    coverage.coverage_ratio,
+                    json.dumps(coverage.missing_reasons),
+                    coverage.created_at,
+                ],
+            )
+            stored = self._conn.execute(
+                """
+                SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+                       expected_count, available_count, missing_count,
+                       coverage_ratio, missing_reasons,
+                       strftime(created_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at
+                FROM dataset_coverage
+                WHERE snapshot_id = ? AND dataset_id = ? AND coverage_scope = ?
+                """,
+                [
+                    coverage.snapshot_id,
+                    coverage.dataset_id,
+                    coverage.coverage_scope,
+                ],
+            ).fetchone()
+            if stored is None:
+                raise RuntimeError(
+                    "dataset coverage upsert was not persisted: "
+                    f"{coverage.snapshot_id}/{coverage.dataset_id}/"
+                    f"{coverage.coverage_scope}"
+                )
+            result = _coverage_from_row(stored)
+            self._conn.execute("COMMIT")
+            transaction_open = False
+            return result
+        except duckdb.TransactionException as exc:
+            if transaction_open:
+                self._conn.execute("ROLLBACK")
+                transaction_open = False
+            raise DatasetSnapshotWriteConflictError(
+                "dataset snapshot write conflict; retry coverage upsert: "
+                f"{coverage.snapshot_id}"
+            ) from exc
+        except Exception:
+            if transaction_open:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def list_dataset_coverages(self, snapshot_id: str) -> list[DatasetCoverage]:
+        rows = self._conn.execute(
+            """
+            SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+                   expected_count, available_count, missing_count,
+                   coverage_ratio, missing_reasons,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at
+            FROM dataset_coverage
+            WHERE snapshot_id = ?
+            ORDER BY dataset_id, coverage_scope
+            """,
+            [snapshot_id],
+        ).fetchall()
+        return [_coverage_from_row(row) for row in rows]
+
+    def record_data_quality_issue(
+        self, issue: DataQualityIssue
+    ) -> DataQualityIssue:
+        issue = _revalidate_for_write(issue)
+        if issue.status != "open":
+            raise ValueError("record_data_quality_issue requires an open issue")
+        self._conn.execute("BEGIN")
+        try:
+            existing = self.get_data_quality_issue(issue.issue_id)
+            if existing is not None and (
+                existing.rule_id,
+                existing.dataset_id,
+                existing.scope_key,
+            ) != (issue.rule_id, issue.dataset_id, issue.scope_key):
+                raise ValueError(
+                    f"data quality issue id conflict: {issue.issue_id}"
+                )
+            if existing is not None and issue.last_seen_at <= _issue_effective_time(
+                existing
+            ):
+                self._conn.execute("COMMIT")
+                return existing
+            if existing is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO data_quality_issue
+                    (issue_id, rule_id, dataset_id, severity, status, scope_key,
+                     message, evidence, first_seen_at, last_seen_at, resolved_at)
+                    VALUES (?, ?, ?, ?, 'open', ?, ?, CAST(? AS JSON), ?, ?, NULL)
+                    """,
+                    [
+                        issue.issue_id,
+                        issue.rule_id,
+                        issue.dataset_id,
+                        issue.severity,
+                        issue.scope_key,
+                        issue.message,
+                        json.dumps(issue.evidence, sort_keys=True),
+                        issue.first_seen_at,
+                        issue.last_seen_at,
+                    ],
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE data_quality_issue
+                    SET severity = ?, status = 'open', message = ?,
+                        evidence = CAST(? AS JSON), last_seen_at = ?,
+                        resolved_at = NULL
+                    WHERE issue_id = ?
+                      AND ? > greatest(
+                          last_seen_at,
+                          coalesce(resolved_at, last_seen_at)
+                      )
+                    """,
+                    [
+                        issue.severity,
+                        issue.message,
+                        json.dumps(issue.evidence, sort_keys=True),
+                        issue.last_seen_at,
+                        issue.issue_id,
+                        issue.last_seen_at,
+                    ],
+                )
+            stored = self.get_data_quality_issue(issue.issue_id)
+            if stored is None:
+                raise RuntimeError(
+                    "data quality issue upsert was not persisted: "
+                    f"{issue.issue_id}"
+                )
+            self._conn.execute("COMMIT")
+            return stored
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def get_data_quality_issue(self, issue_id: str) -> DataQualityIssue | None:
+        row = self._conn.execute(
+            """
+            SELECT issue_id, rule_id, dataset_id, severity, status, scope_key,
+                   message, evidence,
+                   strftime(first_seen_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS first_seen_at,
+                   strftime(last_seen_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS last_seen_at,
+                   CASE WHEN resolved_at IS NULL THEN NULL ELSE
+                       strftime(resolved_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END AS resolved_at
+            FROM data_quality_issue
+            WHERE issue_id = ?
+            """,
+            [issue_id],
+        ).fetchone()
+        return None if row is None else _quality_issue_from_row(row)
+
+    def resolve_data_quality_issue(
+        self,
+        issue_id: str,
+        *,
+        resolved_at: datetime | None = None,
+    ) -> DataQualityIssue:
+        timestamp_omitted = resolved_at is None
+        resolution_time = normalize_utc_datetime(
+            utc_now() if timestamp_omitted else resolved_at
+        )
+        existing = self.get_data_quality_issue(issue_id)
+        if existing is None:
+            raise KeyError(f"data quality issue not found: {issue_id}")
+        if existing.status == "resolved":
+            if timestamp_omitted or existing.resolved_at == resolution_time:
+                return existing
+            raise ValueError(
+                "data quality issue already resolved with different timestamp: "
+                f"{issue_id}"
+            )
+        if resolution_time < existing.last_seen_at:
+            raise ValueError(
+                "data quality issue resolved_at cannot be earlier than "
+                f"last_seen_at: {issue_id}"
+            )
+        for attempt in range(2):
+            self._conn.execute("BEGIN")
+            transaction_open = True
+            try:
+                updated = self._conn.execute(
+                    """
+                    UPDATE data_quality_issue
+                    SET status = 'resolved', resolved_at = ?
+                    WHERE issue_id = ?
+                      AND status = 'open'
+                      AND last_seen_at <= ?
+                    RETURNING issue_id
+                    """,
+                    [resolution_time, issue_id, resolution_time],
+                ).fetchall()
+                if not updated:
+                    self._conn.execute("ROLLBACK")
+                    transaction_open = False
+                    winner = self._resolution_after_cas_loss(
+                        issue_id,
+                        resolution_time,
+                        timestamp_omitted=timestamp_omitted,
+                    )
+                    if winner is not None:
+                        return winner
+                    if attempt == 0:
+                        continue
+                    raise RuntimeError(
+                        "data quality issue resolution lost repeated concurrent "
+                        f"updates: {issue_id}"
+                    )
+                resolved = self.get_data_quality_issue(issue_id)
+                if resolved is None:
+                    raise RuntimeError(
+                        "data quality issue resolution was not persisted: "
+                        f"{issue_id}"
+                    )
+                self._conn.execute("COMMIT")
+                transaction_open = False
+                return resolved
+            except duckdb.TransactionException as exc:
+                if transaction_open:
+                    self._conn.execute("ROLLBACK")
+                    transaction_open = False
+                winner = self._resolution_after_cas_loss(
+                    issue_id,
+                    resolution_time,
+                    timestamp_omitted=timestamp_omitted,
+                )
+                if winner is not None:
+                    return winner
+                if attempt == 0:
+                    continue
+                raise RuntimeError(
+                    "data quality issue resolution lost repeated concurrent "
+                    f"updates: {issue_id}"
+                ) from exc
+            except Exception:
+                if transaction_open:
+                    self._conn.execute("ROLLBACK")
+                raise
+        raise RuntimeError(f"data quality issue resolution failed: {issue_id}")
+
+    def _resolution_after_cas_loss(
+        self,
+        issue_id: str,
+        resolution_time: datetime,
+        *,
+        timestamp_omitted: bool,
+    ) -> DataQualityIssue | None:
+        current = self.get_data_quality_issue(issue_id)
+        if current is None:
+            raise KeyError(f"data quality issue not found after CAS loss: {issue_id}")
+        if current.status == "resolved":
+            if timestamp_omitted or current.resolved_at == resolution_time:
+                return current
+            raise ValueError(
+                "data quality issue already resolved with different timestamp: "
+                f"{issue_id}"
+            )
+        if resolution_time < current.last_seen_at:
+            raise ValueError(
+                "newer detection won resolution CAS; proposed resolved_at is "
+                f"earlier than last_seen_at: {issue_id}"
+            )
+        return None
+
+    def list_snapshot_quality_issues(
+        self, snapshot_id: str
+    ) -> list[DataQualityIssue]:
+        snapshot = self.get_dataset_snapshot(snapshot_id)
+        if snapshot is None or not snapshot.quality_issue_ids:
+            return []
+        placeholders = ",".join("?" for _ in snapshot.quality_issue_ids)
+        rows = self._conn.execute(
+            "SELECT issue_id, rule_id, dataset_id, severity, status, scope_key, "
+            "message, evidence, "
+            "strftime(first_seen_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ'), "
+            "strftime(last_seen_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ'), "
+            "CASE WHEN resolved_at IS NULL THEN NULL ELSE "
+            "strftime(resolved_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ') END "
+            f"FROM data_quality_issue WHERE issue_id IN ({placeholders})",
+            list(snapshot.quality_issue_ids),
+        ).fetchall()
+        issues_by_id = {
+            issue.issue_id: issue for issue in map(_quality_issue_from_row, rows)
+        }
+        missing_issue_ids = [
+            issue_id
+            for issue_id in snapshot.quality_issue_ids
+            if issue_id not in issues_by_id
+        ]
+        if missing_issue_ids:
+            missing = ", ".join(missing_issue_ids)
+            raise RuntimeError(
+                f"dataset snapshot references missing quality issue ids: {missing}"
+            )
+        return [
+            issues_by_id[issue_id]
+            for issue_id in snapshot.quality_issue_ids
+        ]
 
     def upsert_daily(self, df: pd.DataFrame) -> int:
         if df.empty:
