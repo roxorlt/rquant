@@ -94,6 +94,9 @@ MERGE_TABLES: tuple[str, ...] = (
     "kpl_concept_member_daily",
     "market_daily_info",
     "hm_list",
+    "dataset_snapshot",
+    "dataset_coverage",
+    "data_quality_issue",
 )
 
 LOCAL_ONLY_TABLES: tuple[str, ...] = ("schema_migration",)

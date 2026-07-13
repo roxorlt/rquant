@@ -789,6 +789,70 @@ CREATE TABLE IF NOT EXISTS risk_blacklist (
 );
 """
 
+DATASET_SNAPSHOT_DDL = """
+CREATE TABLE IF NOT EXISTS dataset_snapshot (
+    snapshot_id       VARCHAR     PRIMARY KEY,
+    strategy_name     VARCHAR     NOT NULL,
+    manifest_id       VARCHAR,
+    as_of_time        TIMESTAMPTZ NOT NULL,
+    code_commit       VARCHAR     NOT NULL,
+    origin            VARCHAR     NOT NULL,
+    status            VARCHAR     NOT NULL CHECK (status IN ('building', 'ready')),
+    table_watermarks  JSON        NOT NULL,
+    quality_issue_ids JSON        NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL,
+    completed_at      TIMESTAMPTZ
+);
+"""
+
+DATASET_COVERAGE_DDL = """
+CREATE TABLE IF NOT EXISTS dataset_coverage (
+    snapshot_id     VARCHAR     NOT NULL,
+    dataset_id      VARCHAR     NOT NULL,
+    coverage_scope  VARCHAR     NOT NULL,
+    table_name      VARCHAR     NOT NULL,
+    expected_count  BIGINT      NOT NULL CHECK (expected_count >= 0),
+    available_count BIGINT      NOT NULL CHECK (available_count >= 0),
+    missing_count   BIGINT      NOT NULL CHECK (missing_count >= 0),
+    coverage_ratio  DOUBLE,
+    missing_reasons JSON        NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (snapshot_id, dataset_id, coverage_scope),
+    CHECK (available_count + missing_count = expected_count),
+    CHECK (available_count <= expected_count),
+    CHECK (
+        (expected_count = 0 AND coverage_ratio IS NULL)
+        OR (
+            expected_count > 0
+            AND coverage_ratio IS NOT NULL
+            AND abs(coverage_ratio - available_count::DOUBLE / expected_count) <= 1e-9
+        )
+    )
+);
+"""
+
+DATA_QUALITY_ISSUE_DDL = """
+CREATE TABLE IF NOT EXISTS data_quality_issue (
+    issue_id       VARCHAR     PRIMARY KEY,
+    rule_id        VARCHAR     NOT NULL,
+    dataset_id     VARCHAR     NOT NULL,
+    severity       VARCHAR     NOT NULL CHECK (severity IN ('P0', 'P1', 'P2', 'P3')),
+    status         VARCHAR     NOT NULL CHECK (status IN ('open', 'resolved')),
+    scope_key      VARCHAR     NOT NULL,
+    message        VARCHAR     NOT NULL,
+    evidence       JSON        NOT NULL,
+    first_seen_at  TIMESTAMPTZ NOT NULL,
+    last_seen_at   TIMESTAMPTZ NOT NULL,
+    resolved_at    TIMESTAMPTZ
+);
+"""
+
+DATA_METADATA_TABLE_DDLS: tuple[str, ...] = (
+    DATASET_SNAPSHOT_DDL,
+    DATASET_COVERAGE_DDL,
+    DATA_QUALITY_ISSUE_DDL,
+)
+
 BASE_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
@@ -820,6 +884,11 @@ LEGACY_MIGRATION_DDL = [
     *MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
 ]
 
+VERSIONED_COMPATIBILITY_DDL = [
+    *LEGACY_MIGRATION_DDL,
+    *DATA_METADATA_TABLE_DDLS,
+]
+
 # Compatibility export for callers outside rQuant; schema initialization uses
 # BASE_DDL plus the versioned registry in storage.migrations.
-ALL_DDL = [*BASE_DDL, *LEGACY_MIGRATION_DDL]
+ALL_DDL = [*BASE_DDL, *VERSIONED_COMPATIBILITY_DDL]

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.storage.schema import (
     BASE_DDL,
+    DATA_METADATA_TABLE_DDLS,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
     MARKET_SENTIMENT_MA20_MIGRATION_DDL,
     MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
@@ -100,6 +101,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=1,
         name="legacy column additions",
         statements=V1_LEGACY_COLUMN_ADDITIONS,
+    ),
+    Migration(
+        version=2,
+        name="research data metadata",
+        statements=DATA_METADATA_TABLE_DDLS,
     ),
 )
 

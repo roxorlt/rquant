@@ -533,6 +533,18 @@ def test_schema_migration_is_local_only() -> None:
     assert "schema_migration" not in MERGE_TABLES
 
 
+def test_data_metadata_tables_use_merge_semantics() -> None:
+    metadata_tables = {
+        "dataset_snapshot",
+        "dataset_coverage",
+        "data_quality_issue",
+    }
+
+    assert metadata_tables <= set(MERGE_TABLES)
+    assert not metadata_tables & set(REPLACE_TABLES)
+    assert not metadata_tables & set(LOCAL_ONLY_TABLES)
+
+
 def test_backfilled_history_tables_are_merge() -> None:
     """防回归：这些表若回到 REPLACE，下一次 research-sync 会把本地回补的
     2020-2024 历史（及本地独有的涨停池采集、Tushare 涨跌停榜、统一数据集

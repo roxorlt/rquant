@@ -63,6 +63,55 @@ def test_published_v1_statements_and_checksum_are_fixed() -> None:
     )
 
 
+def test_v2_creates_metadata_tables_only_through_versioned_migration() -> None:
+    from rquant.storage.schema import ALL_DDL, DATA_METADATA_TABLE_DDLS
+
+    metadata_tables = {
+        "dataset_snapshot",
+        "dataset_coverage",
+        "data_quality_issue",
+    }
+    assert [migration.version for migration in MIGRATIONS] == [1, 2]
+    assert MIGRATIONS[1].statements == DATA_METADATA_TABLE_DDLS
+    assert all(statement in ALL_DDL for statement in DATA_METADATA_TABLE_DDLS)
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:1])
+    before_v2 = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+    assert not metadata_tables & before_v2
+    assert [row[0] for row in _migration_rows(conn)] == [1]
+
+    initialize_schema(conn)
+    after_v2 = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+    foreign_keys = conn.execute(
+        "SELECT table_name FROM duckdb_constraints() "
+        "WHERE constraint_type = 'FOREIGN KEY' "
+        "AND table_name IN ('dataset_snapshot', 'dataset_coverage', "
+        "'data_quality_issue')"
+    ).fetchall()
+
+    assert metadata_tables <= after_v2
+    assert [row[0] for row in _migration_rows(conn)] == [1, 2]
+    assert foreign_keys == []
+    with pytest.raises(duckdb.ConstraintException):
+        conn.execute(
+            "INSERT INTO dataset_coverage VALUES ("
+            "'snapshot', 'dataset', 'scope', 'table', "
+            "1, 1, 0, NULL, CAST('[]' AS JSON), CURRENT_TIMESTAMP)"
+        )
+    conn.close()
+
+
 def test_fresh_database_records_registered_migrations(tmp_path: Path) -> None:
     store = DuckDBStore(tmp_path / "fresh.duckdb")
 

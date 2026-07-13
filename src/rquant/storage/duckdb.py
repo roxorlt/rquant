@@ -2,17 +2,110 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import pandas as pd
 from loguru import logger
 
 from rquant.config import settings
+from rquant.data_metadata import (
+    DataQualityIssue,
+    DatasetCoverage,
+    DatasetSnapshot,
+    DatasetSnapshotFinalization,
+    normalize_utc_datetime,
+    utc_now,
+)
 from rquant.storage.migrations import initialize_schema
+
+
+def _utc_datetime_from_db(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"expected UTC datetime text from DuckDB, got {value!r}")
+    return normalize_utc_datetime(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
+def _snapshot_from_row(row: tuple[object, ...]) -> DatasetSnapshot:
+    snapshot = DatasetSnapshot(
+        strategy_name=str(row[1]),
+        manifest_id=None if row[2] is None else str(row[2]),
+        as_of_time=_utc_datetime_from_db(row[3]),
+        code_commit=str(row[4]),
+        origin=str(row[5]),
+        status=cast(str, row[6]),
+        table_watermarks=json.loads(str(row[7])),
+        quality_issue_ids=tuple(json.loads(str(row[8]))),
+        created_at=_utc_datetime_from_db(row[9]),
+        completed_at=(
+            None if row[10] is None else _utc_datetime_from_db(row[10])
+        ),
+    )
+    stored_id = str(row[0])
+    if snapshot.snapshot_id != stored_id:
+        raise ValueError(
+            "dataset_snapshot stable id mismatch: "
+            f"stored={stored_id}, derived={snapshot.snapshot_id}"
+        )
+    return snapshot
+
+
+def _coverage_from_row(row: tuple[object, ...]) -> DatasetCoverage:
+    coverage = DatasetCoverage(
+        snapshot_id=str(row[0]),
+        dataset_id=str(row[1]),
+        coverage_scope=str(row[2]),
+        table_name=str(row[3]),
+        expected_count=int(cast(int, row[4])),
+        available_count=int(cast(int, row[5])),
+        missing_reasons=tuple(json.loads(str(row[8]))),
+        created_at=_utc_datetime_from_db(row[9]),
+    )
+    stored_missing = int(cast(int, row[6]))
+    stored_ratio = cast(float | None, row[7])
+    ratio_matches = (
+        stored_ratio is None
+        if coverage.coverage_ratio is None
+        else stored_ratio is not None
+        and math.isclose(stored_ratio, coverage.coverage_ratio, abs_tol=1e-9)
+    )
+    if stored_missing != coverage.missing_count or not ratio_matches:
+        raise ValueError(
+            "dataset_coverage derived values disagree with persisted counts: "
+            f"snapshot_id={coverage.snapshot_id}, dataset_id={coverage.dataset_id}, "
+            f"coverage_scope={coverage.coverage_scope}"
+        )
+    return coverage
+
+
+def _quality_issue_from_row(row: tuple[object, ...]) -> DataQualityIssue:
+    issue = DataQualityIssue(
+        rule_id=str(row[1]),
+        dataset_id=str(row[2]),
+        severity=cast(str, row[3]),
+        status=cast(str, row[4]),
+        scope_key=str(row[5]),
+        message=str(row[6]),
+        evidence=json.loads(str(row[7])),
+        first_seen_at=_utc_datetime_from_db(row[8]),
+        last_seen_at=_utc_datetime_from_db(row[9]),
+        resolved_at=(
+            None if row[10] is None else _utc_datetime_from_db(row[10])
+        ),
+    )
+    stored_id = str(row[0])
+    if issue.issue_id != stored_id:
+        raise ValueError(
+            "data_quality_issue stable id mismatch: "
+            f"stored={stored_id}, derived={issue.issue_id}"
+        )
+    return issue
 
 
 class DuckDBStore:
@@ -24,6 +117,322 @@ class DuckDBStore:
 
     def _init_schema(self) -> None:
         initialize_schema(self._conn)
+
+    def begin_dataset_snapshot(
+        self, snapshot: DatasetSnapshot
+    ) -> DatasetSnapshot:
+        if snapshot.status != "building":
+            raise ValueError("begin_dataset_snapshot requires a building snapshot")
+        existing = self.get_dataset_snapshot(snapshot.snapshot_id)
+        if existing is not None:
+            existing_identity = (
+                existing.strategy_name,
+                existing.manifest_id,
+                existing.as_of_time,
+                existing.code_commit,
+                existing.origin,
+            )
+            requested_identity = (
+                snapshot.strategy_name,
+                snapshot.manifest_id,
+                snapshot.as_of_time,
+                snapshot.code_commit,
+                snapshot.origin,
+            )
+            if existing_identity != requested_identity:
+                raise ValueError(
+                    f"dataset snapshot id conflict: {snapshot.snapshot_id}"
+                )
+            return existing
+        self._conn.execute(
+            """
+            INSERT INTO dataset_snapshot
+            (snapshot_id, strategy_name, manifest_id, as_of_time, code_commit,
+             origin, status, table_watermarks, quality_issue_ids, created_at,
+             completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, ?)
+            """,
+            [
+                snapshot.snapshot_id,
+                snapshot.strategy_name,
+                snapshot.manifest_id,
+                snapshot.as_of_time,
+                snapshot.code_commit,
+                snapshot.origin,
+                snapshot.status,
+                json.dumps(snapshot.table_watermarks, sort_keys=True),
+                json.dumps(snapshot.quality_issue_ids),
+                snapshot.created_at,
+                snapshot.completed_at,
+            ],
+        )
+        stored = self.get_dataset_snapshot(snapshot.snapshot_id)
+        if stored is None:
+            raise RuntimeError(
+                f"dataset snapshot insert was not persisted: {snapshot.snapshot_id}"
+            )
+        return stored
+
+    def finalize_dataset_snapshot(
+        self,
+        snapshot_id: str,
+        finalization: DatasetSnapshotFinalization,
+    ) -> DatasetSnapshot:
+        existing = self.get_dataset_snapshot(snapshot_id)
+        if existing is None:
+            raise KeyError(f"dataset snapshot not found: {snapshot_id}")
+        if finalization.completed_at < existing.created_at:
+            raise ValueError(
+                "snapshot completed_at cannot be earlier than created_at: "
+                f"{snapshot_id}"
+            )
+        if existing.status == "ready":
+            same_finalization = (
+                existing.table_watermarks == finalization.table_watermarks
+                and existing.quality_issue_ids == finalization.quality_issue_ids
+                and existing.completed_at == finalization.completed_at
+            )
+            if not same_finalization:
+                raise ValueError(
+                    f"dataset snapshot already finalized with different data: {snapshot_id}"
+                )
+            return existing
+        self._conn.execute(
+            """
+            UPDATE dataset_snapshot
+            SET status = 'ready',
+                table_watermarks = CAST(? AS JSON),
+                quality_issue_ids = CAST(? AS JSON),
+                completed_at = ?
+            WHERE snapshot_id = ?
+            """,
+            [
+                json.dumps(finalization.table_watermarks, sort_keys=True),
+                json.dumps(finalization.quality_issue_ids),
+                finalization.completed_at,
+                snapshot_id,
+            ],
+        )
+        finalized = self.get_dataset_snapshot(snapshot_id)
+        if finalized is None:
+            raise RuntimeError(
+                f"dataset snapshot finalize was not persisted: {snapshot_id}"
+            )
+        return finalized
+
+    def get_dataset_snapshot(self, snapshot_id: str) -> DatasetSnapshot | None:
+        row = self._conn.execute(
+            """
+            SELECT snapshot_id, strategy_name, manifest_id,
+                   strftime(as_of_time AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS as_of_time,
+                   code_commit, origin, status, table_watermarks,
+                   quality_issue_ids,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at,
+                   CASE WHEN completed_at IS NULL THEN NULL ELSE
+                       strftime(completed_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END AS completed_at
+            FROM dataset_snapshot
+            WHERE snapshot_id = ?
+            """,
+            [snapshot_id],
+        ).fetchone()
+        return None if row is None else _snapshot_from_row(row)
+
+    def upsert_dataset_coverage(
+        self, coverage: DatasetCoverage
+    ) -> DatasetCoverage:
+        self._conn.execute(
+            """
+            INSERT INTO dataset_coverage
+            (snapshot_id, dataset_id, coverage_scope, table_name,
+             expected_count, available_count, missing_count, coverage_ratio,
+             missing_reasons, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?)
+            ON CONFLICT (snapshot_id, dataset_id, coverage_scope) DO UPDATE SET
+                table_name = excluded.table_name,
+                expected_count = excluded.expected_count,
+                available_count = excluded.available_count,
+                missing_count = excluded.missing_count,
+                coverage_ratio = excluded.coverage_ratio,
+                missing_reasons = excluded.missing_reasons
+            """,
+            [
+                coverage.snapshot_id,
+                coverage.dataset_id,
+                coverage.coverage_scope,
+                coverage.table_name,
+                coverage.expected_count,
+                coverage.available_count,
+                coverage.missing_count,
+                coverage.coverage_ratio,
+                json.dumps(coverage.missing_reasons),
+                coverage.created_at,
+            ],
+        )
+        stored = self._conn.execute(
+            """
+            SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+                   expected_count, available_count, missing_count,
+                   coverage_ratio, missing_reasons,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at
+            FROM dataset_coverage
+            WHERE snapshot_id = ? AND dataset_id = ? AND coverage_scope = ?
+            """,
+            [coverage.snapshot_id, coverage.dataset_id, coverage.coverage_scope],
+        ).fetchone()
+        if stored is None:
+            raise RuntimeError(
+                "dataset coverage upsert was not persisted: "
+                f"{coverage.snapshot_id}/{coverage.dataset_id}/{coverage.coverage_scope}"
+            )
+        return _coverage_from_row(stored)
+
+    def list_dataset_coverages(self, snapshot_id: str) -> list[DatasetCoverage]:
+        rows = self._conn.execute(
+            """
+            SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+                   expected_count, available_count, missing_count,
+                   coverage_ratio, missing_reasons,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at
+            FROM dataset_coverage
+            WHERE snapshot_id = ?
+            ORDER BY dataset_id, coverage_scope
+            """,
+            [snapshot_id],
+        ).fetchall()
+        return [_coverage_from_row(row) for row in rows]
+
+    def record_data_quality_issue(
+        self, issue: DataQualityIssue
+    ) -> DataQualityIssue:
+        if issue.status != "open":
+            raise ValueError("record_data_quality_issue requires an open issue")
+        existing = self.get_data_quality_issue(issue.issue_id)
+        if existing is not None and (
+            existing.rule_id,
+            existing.dataset_id,
+            existing.scope_key,
+        ) != (issue.rule_id, issue.dataset_id, issue.scope_key):
+            raise ValueError(f"data quality issue id conflict: {issue.issue_id}")
+        self._conn.execute(
+            """
+            INSERT INTO data_quality_issue
+            (issue_id, rule_id, dataset_id, severity, status, scope_key,
+             message, evidence, first_seen_at, last_seen_at, resolved_at)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, CAST(? AS JSON), ?, ?, NULL)
+            ON CONFLICT (issue_id) DO UPDATE SET
+                severity = excluded.severity,
+                status = 'open',
+                message = excluded.message,
+                evidence = excluded.evidence,
+                last_seen_at = greatest(
+                    data_quality_issue.last_seen_at,
+                    excluded.last_seen_at
+                ),
+                resolved_at = NULL
+            """,
+            [
+                issue.issue_id,
+                issue.rule_id,
+                issue.dataset_id,
+                issue.severity,
+                issue.scope_key,
+                issue.message,
+                json.dumps(issue.evidence, sort_keys=True),
+                issue.first_seen_at,
+                issue.last_seen_at,
+            ],
+        )
+        stored = self.get_data_quality_issue(issue.issue_id)
+        if stored is None:
+            raise RuntimeError(
+                f"data quality issue upsert was not persisted: {issue.issue_id}"
+            )
+        return stored
+
+    def get_data_quality_issue(self, issue_id: str) -> DataQualityIssue | None:
+        row = self._conn.execute(
+            """
+            SELECT issue_id, rule_id, dataset_id, severity, status, scope_key,
+                   message, evidence,
+                   strftime(first_seen_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS first_seen_at,
+                   strftime(last_seen_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS last_seen_at,
+                   CASE WHEN resolved_at IS NULL THEN NULL ELSE
+                       strftime(resolved_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END AS resolved_at
+            FROM data_quality_issue
+            WHERE issue_id = ?
+            """,
+            [issue_id],
+        ).fetchone()
+        return None if row is None else _quality_issue_from_row(row)
+
+    def resolve_data_quality_issue(
+        self,
+        issue_id: str,
+        *,
+        resolved_at: datetime | None = None,
+    ) -> DataQualityIssue:
+        existing = self.get_data_quality_issue(issue_id)
+        if existing is None:
+            raise KeyError(f"data quality issue not found: {issue_id}")
+        resolution_time = normalize_utc_datetime(resolved_at or utc_now())
+        if resolution_time < existing.last_seen_at:
+            raise ValueError(
+                "data quality issue resolved_at cannot be earlier than last_seen_at: "
+                f"{issue_id}"
+            )
+        self._conn.execute(
+            """
+            UPDATE data_quality_issue
+            SET status = 'resolved', resolved_at = ?
+            WHERE issue_id = ?
+            """,
+            [resolution_time, issue_id],
+        )
+        resolved = self.get_data_quality_issue(issue_id)
+        if resolved is None:
+            raise RuntimeError(
+                f"data quality issue resolution was not persisted: {issue_id}"
+            )
+        return resolved
+
+    def list_snapshot_quality_issues(
+        self, snapshot_id: str
+    ) -> list[DataQualityIssue]:
+        snapshot = self.get_dataset_snapshot(snapshot_id)
+        if snapshot is None or not snapshot.quality_issue_ids:
+            return []
+        placeholders = ",".join("?" for _ in snapshot.quality_issue_ids)
+        rows = self._conn.execute(
+            "SELECT issue_id, rule_id, dataset_id, severity, status, scope_key, "
+            "message, evidence, "
+            "strftime(first_seen_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ'), "
+            "strftime(last_seen_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ'), "
+            "CASE WHEN resolved_at IS NULL THEN NULL ELSE "
+            "strftime(resolved_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ') END "
+            f"FROM data_quality_issue WHERE issue_id IN ({placeholders})",
+            list(snapshot.quality_issue_ids),
+        ).fetchall()
+        issues_by_id = {
+            issue.issue_id: issue for issue in map(_quality_issue_from_row, rows)
+        }
+        return [
+            issues_by_id[issue_id]
+            for issue_id in snapshot.quality_issue_ids
+            if issue_id in issues_by_id
+        ]
 
     def upsert_daily(self, df: pd.DataFrame) -> int:
         if df.empty:
