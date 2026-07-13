@@ -38,14 +38,14 @@ def _tag_aggregates(fn: Rule, requests: list[AggregateRequest]) -> Rule:
 def not_st() -> Rule:
     """排除 ST / *ST / SST。"""
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return ~df["is_st"].astype(bool)
+        return df["is_st"].astype("boolean").eq(False).fillna(False)
     return _tag_lookback(_rule, 0)
 
 
 def not_bj() -> Rule:
     """排除北交所（= board_in(['main','gem','star']) 的快捷方式）。"""
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return ~df["is_bj"].astype(bool)
+        return df["is_bj"].astype("boolean").eq(False).fillna(False)
     return _tag_lookback(_rule, 0)
 
 
@@ -60,8 +60,8 @@ def board_in(boards: list[str]) -> Rule:
 def _bool_state_rule(col_base: str, offset: int, negate: bool = False) -> Rule:
     col = f"{col_base}[{offset}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
-        s = df[col].fillna(False).astype(bool)
-        return ~s if negate else s
+        expected = not negate
+        return df[col].astype("boolean").eq(expected).fillna(False)
     # Canvas diagnostic 用：内部工厂闭包的 __qualname__ 没有意义，挂上 friendly name
     _rule.__rquant_name__ = f"{'not_' if negate else ''}{col_base.lower()}({offset})"  # type: ignore[attr-defined]
     return _tag_lookback(_rule, offset)
@@ -154,7 +154,7 @@ def no_consec_ups_in_window(threshold: int = 3, window: int = 8) -> Rule:
     )
 
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return df[agg_name].fillna(0) < threshold
+        return df[agg_name].lt(threshold).fillna(False)
 
     fn = _tag_lookback(_rule, 0)
     fn = _tag_aggregates(fn, [req])
@@ -177,7 +177,7 @@ def no_limit_down_in_window(window: int = 30) -> Rule:
     )
 
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return ~df[agg_name].fillna(False).astype(bool)
+        return df[agg_name].astype("boolean").eq(False).fillna(False)
 
     fn = _tag_lookback(_rule, 0)
     fn = _tag_aggregates(fn, [req])
@@ -201,7 +201,7 @@ def has_prior_limit_up(window: int = 90, exclude_offset: int = 1) -> Rule:
     )
 
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return df[agg_name].fillna(0) >= 1
+        return df[agg_name].ge(1).fillna(False)
 
     fn = _tag_lookback(_rule, 0)
     fn = _tag_aggregates(fn, [req])

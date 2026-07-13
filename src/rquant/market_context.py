@@ -25,20 +25,20 @@ class MarketSentiment(BaseModel):
 
     trade_date: date
     stock_count: int
-    up_count: int
-    down_count: int
-    flat_count: int
-    limit_up_count: int
-    first_limit_up_count: int
-    limit_down_count: int
-    yiziban_count: int
-    max_consecutive_limit_ups: int
-    high_board_count: int
-    up_ratio_pct: float
-    limit_up_ratio_pct: float
-    avg_pct_chg: float
-    median_pct_chg: float
-    total_amount: float
+    up_count: int | None
+    down_count: int | None
+    flat_count: int | None
+    limit_up_count: int | None
+    first_limit_up_count: int | None
+    limit_down_count: int | None
+    yiziban_count: int | None
+    max_consecutive_limit_ups: int | None
+    high_board_count: int | None
+    up_ratio_pct: float | None
+    limit_up_ratio_pct: float | None
+    avg_pct_chg: float | None
+    median_pct_chg: float | None
+    total_amount: float | None
     high_60d_ratio_pct: float | None = None
     above_ma20_ratio_pct: float | None = None
 
@@ -56,38 +56,91 @@ def _as_date(value: object) -> date:
     raise ValueError(msg)
 
 
-def _safe_float(value: object) -> float:
-    return 0.0 if pd.isna(value) else float(value)
-
-
 def _safe_int(value: object) -> int:
     return 0 if pd.isna(value) else int(value)
 
 
+def _optional_float(value: object) -> float | None:
+    return None if pd.isna(value) else float(value)
+
+
+def _optional_int(value: object) -> int | None:
+    return None if pd.isna(value) else int(value)
+
+
 _BASE_AGGREGATE_SQL = """
+WITH eligible AS (
+    SELECT
+        db.*,
+        ds.is_limit_up,
+        ds.is_first_limit_up,
+        ds.is_limit_down,
+        ds.is_yiziban,
+        ds.consecutive_limit_ups,
+        status.ts_code IS NOT NULL
+            AND status.conflict_reason IS NULL
+            AND status.is_st IS NOT NULL
+            AND status.name IS NOT NULL
+            AND length(trim(status.name)) > 0
+            AND status.available_at IS NOT NULL
+            AND status.available_at <= (
+                CAST(db.trade_date AS TIMESTAMP) + INTERVAL '17 hours'
+            ) AT TIME ZONE 'Asia/Shanghai'
+            AND ds.ts_code IS NOT NULL
+            AND ds.is_st IS NOT DISTINCT FROM status.is_st
+            AS state_status_known
+    FROM daily_bar AS db
+    LEFT JOIN daily_state AS ds
+        ON ds.ts_code = db.ts_code AND ds.trade_date = db.trade_date
+    LEFT JOIN stock_status_daily AS status
+        ON status.ts_code = db.ts_code AND status.trade_date = db.trade_date
+    WHERE db.trade_date >= ? AND db.trade_date <= ?
+)
 SELECT
-    ds.trade_date,
+    trade_date,
     COUNT(*)::INTEGER AS stock_count,
-    SUM(CASE WHEN db.pct_chg > 0 THEN 1 ELSE 0 END)::INTEGER AS up_count,
-    SUM(CASE WHEN db.pct_chg < 0 THEN 1 ELSE 0 END)::INTEGER AS down_count,
-    SUM(CASE WHEN db.pct_chg = 0 THEN 1 ELSE 0 END)::INTEGER AS flat_count,
-    SUM(CASE WHEN ds.is_limit_up THEN 1 ELSE 0 END)::INTEGER AS limit_up_count,
-    SUM(CASE WHEN ds.is_first_limit_up THEN 1 ELSE 0 END)::INTEGER
-        AS first_limit_up_count,
-    SUM(CASE WHEN ds.is_limit_down THEN 1 ELSE 0 END)::INTEGER AS limit_down_count,
-    SUM(CASE WHEN ds.is_yiziban THEN 1 ELSE 0 END)::INTEGER AS yiziban_count,
-    MAX(COALESCE(ds.consecutive_limit_ups, 0))::INTEGER AS max_consecutive_limit_ups,
-    SUM(CASE WHEN COALESCE(ds.consecutive_limit_ups, 0) >= 3 THEN 1 ELSE 0 END)
-        ::INTEGER AS high_board_count,
-    AVG(db.pct_chg) AS avg_pct_chg,
-    MEDIAN(db.pct_chg) AS median_pct_chg,
-    SUM(db.amount) AS total_amount
-FROM daily_state ds
-INNER JOIN daily_bar db
-    ON ds.ts_code = db.ts_code AND ds.trade_date = db.trade_date
-WHERE ds.trade_date >= ? AND ds.trade_date <= ?
-GROUP BY ds.trade_date
-ORDER BY ds.trade_date
+    CASE WHEN COUNT(pct_chg) = COUNT(*)
+         THEN SUM(CASE WHEN pct_chg > 0 THEN 1 ELSE 0 END)::INTEGER END AS up_count,
+    CASE WHEN COUNT(pct_chg) = COUNT(*)
+         THEN SUM(CASE WHEN pct_chg < 0 THEN 1 ELSE 0 END)::INTEGER END AS down_count,
+    CASE WHEN COUNT(pct_chg) = COUNT(*)
+         THEN SUM(CASE WHEN pct_chg = 0 THEN 1 ELSE 0 END)::INTEGER END AS flat_count,
+    CASE WHEN COUNT(*) FILTER (
+                  WHERE state_status_known AND is_limit_up IS NOT NULL
+              ) = COUNT(*)
+         THEN SUM(CASE WHEN is_limit_up THEN 1 ELSE 0 END)::INTEGER
+         END AS limit_up_count,
+    CASE WHEN COUNT(*) FILTER (
+                  WHERE state_status_known AND is_first_limit_up IS NOT NULL
+              ) = COUNT(*)
+         THEN SUM(CASE WHEN is_first_limit_up THEN 1 ELSE 0 END)::INTEGER
+         END AS first_limit_up_count,
+    CASE WHEN COUNT(*) FILTER (
+                  WHERE state_status_known AND is_limit_down IS NOT NULL
+              ) = COUNT(*)
+         THEN SUM(CASE WHEN is_limit_down THEN 1 ELSE 0 END)::INTEGER
+         END AS limit_down_count,
+    CASE WHEN COUNT(*) FILTER (
+                  WHERE state_status_known AND is_yiziban IS NOT NULL
+              ) = COUNT(*)
+         THEN SUM(CASE WHEN is_yiziban THEN 1 ELSE 0 END)::INTEGER
+         END AS yiziban_count,
+    CASE WHEN COUNT(*) FILTER (
+                  WHERE state_status_known AND consecutive_limit_ups IS NOT NULL
+              ) = COUNT(*)
+         THEN MAX(consecutive_limit_ups)::INTEGER
+         END AS max_consecutive_limit_ups,
+    CASE WHEN COUNT(*) FILTER (
+                  WHERE state_status_known AND consecutive_limit_ups IS NOT NULL
+              ) = COUNT(*)
+         THEN SUM(CASE WHEN consecutive_limit_ups >= 3 THEN 1 ELSE 0 END)::INTEGER
+         END AS high_board_count,
+    CASE WHEN COUNT(pct_chg) = COUNT(*) THEN AVG(pct_chg) END AS avg_pct_chg,
+    CASE WHEN COUNT(pct_chg) = COUNT(*) THEN MEDIAN(pct_chg) END AS median_pct_chg,
+    CASE WHEN COUNT(amount) = COUNT(*) THEN SUM(amount) END AS total_amount
+FROM eligible
+GROUP BY trade_date
+ORDER BY trade_date
 """
 
 # 市场温度：60 日新高占比 + 20 日均线上方占比，全部在 SQL 窗口函数里算，
@@ -106,12 +159,15 @@ WITH bounds AS (
 windowed AS (
     SELECT
         db.trade_date,
+        db.ts_code,
         db.close,
         db.vol,
         MAX(db.close) OVER w_high AS high_window_max,
-        COUNT(db.close) OVER w_high AS high_window_rows,
+        COUNT(*) OVER w_high AS high_window_total_rows,
+        COUNT(db.close) OVER w_high AS high_window_known_rows,
         AVG(db.close) OVER w_ma AS ma_close,
-        COUNT(db.close) OVER w_ma AS ma_window_rows
+        COUNT(*) OVER w_ma AS ma_window_total_rows,
+        COUNT(db.close) OVER w_ma AS ma_window_known_rows
     FROM daily_bar db, bounds
     WHERE db.trade_date >= bounds.cutoff
       AND db.trade_date <= ?
@@ -127,16 +183,52 @@ windowed AS (
 )
 SELECT
     trade_date,
-    COUNT(*)::INTEGER AS traded_count,
-    SUM(CASE WHEN high_window_rows >= {_HIGH_LOOKBACK_DAYS} AND close >= high_window_max
-             THEN 1 ELSE 0 END)::INTEGER AS high_60d_count,
-    SUM(CASE WHEN ma_window_rows >= {_MA_DAYS} AND close > ma_close
-             THEN 1 ELSE 0 END)::INTEGER AS above_ma20_count
+    COUNT(*) FILTER (WHERE close IS NOT NULL AND vol > 0)::INTEGER AS traded_count,
+    CASE
+        WHEN COUNT(*) FILTER (
+                WHERE vol IS NULL OR (vol > 0 AND close IS NULL)
+             ) > 0
+          OR COUNT(*) FILTER (
+                WHERE close IS NOT NULL
+                  AND vol > 0
+                  AND high_window_total_rows >= {_HIGH_LOOKBACK_DAYS}
+                  AND high_window_known_rows < {_HIGH_LOOKBACK_DAYS}
+             ) > 0
+        THEN NULL
+        ELSE SUM(
+            CASE
+                WHEN close IS NOT NULL
+                 AND vol > 0
+                 AND high_window_total_rows >= {_HIGH_LOOKBACK_DAYS}
+                 AND close >= high_window_max
+                THEN 1 ELSE 0
+            END
+        )::INTEGER
+    END AS high_60d_count,
+    CASE
+        WHEN COUNT(*) FILTER (
+                WHERE vol IS NULL OR (vol > 0 AND close IS NULL)
+             ) > 0
+          OR COUNT(*) FILTER (
+                WHERE close IS NOT NULL
+                  AND vol > 0
+                  AND ma_window_total_rows >= {_MA_DAYS}
+                  AND ma_window_known_rows < {_MA_DAYS}
+             ) > 0
+        THEN NULL
+        ELSE SUM(
+            CASE
+                WHEN close IS NOT NULL
+                 AND vol > 0
+                 AND ma_window_total_rows >= {_MA_DAYS}
+                 AND close > ma_close
+                THEN 1 ELSE 0
+            END
+        )::INTEGER
+    END AS above_ma20_count
 FROM windowed
 WHERE trade_date >= ?
   AND trade_date <= ?
-  AND close IS NOT NULL
-  AND vol > 0
 GROUP BY trade_date
 ORDER BY trade_date
 """
@@ -158,9 +250,15 @@ def _query_market_temperature(
         if traded <= 0:
             out[_as_date(row["trade_date"])] = (None, None)
             continue
+        high_60d_count = _optional_int(row["high_60d_count"])
+        above_ma20_count = _optional_int(row["above_ma20_count"])
         out[_as_date(row["trade_date"])] = (
-            round(_safe_int(row["high_60d_count"]) / traded * 100, 4),
-            round(_safe_int(row["above_ma20_count"]) / traded * 100, 4),
+            None
+            if high_60d_count is None
+            else round(high_60d_count / traded * 100, 4),
+            None
+            if above_ma20_count is None
+            else round(above_ma20_count / traded * 100, 4),
         )
     return out
 
@@ -170,28 +268,46 @@ def _row_to_sentiment(
     temperature: tuple[float | None, float | None],
 ) -> MarketSentiment:
     stock_count = _safe_int(row["stock_count"])
-    up_count = _safe_int(row["up_count"])
-    limit_up_count = _safe_int(row["limit_up_count"])
-    up_ratio_pct = up_count / stock_count * 100 if stock_count else 0.0
-    limit_up_ratio_pct = limit_up_count / stock_count * 100 if stock_count else 0.0
+    up_count = _optional_int(row["up_count"])
+    limit_up_count = _optional_int(row["limit_up_count"])
+    up_ratio_pct = (
+        up_count / stock_count * 100
+        if up_count is not None and stock_count
+        else None
+    )
+    limit_up_ratio_pct = (
+        limit_up_count / stock_count * 100
+        if limit_up_count is not None and stock_count
+        else None
+    )
     high_60d_ratio_pct, above_ma20_ratio_pct = temperature
     return MarketSentiment(
         trade_date=_as_date(row["trade_date"]),
         stock_count=stock_count,
         up_count=up_count,
-        down_count=_safe_int(row["down_count"]),
-        flat_count=_safe_int(row["flat_count"]),
+        down_count=_optional_int(row["down_count"]),
+        flat_count=_optional_int(row["flat_count"]),
         limit_up_count=limit_up_count,
-        first_limit_up_count=_safe_int(row["first_limit_up_count"]),
-        limit_down_count=_safe_int(row["limit_down_count"]),
-        yiziban_count=_safe_int(row["yiziban_count"]),
-        max_consecutive_limit_ups=_safe_int(row["max_consecutive_limit_ups"]),
-        high_board_count=_safe_int(row["high_board_count"]),
-        up_ratio_pct=round(up_ratio_pct, 4),
-        limit_up_ratio_pct=round(limit_up_ratio_pct, 4),
-        avg_pct_chg=round(_safe_float(row["avg_pct_chg"]), 4),
-        median_pct_chg=round(_safe_float(row["median_pct_chg"]), 4),
-        total_amount=_safe_float(row["total_amount"]),
+        first_limit_up_count=_optional_int(row["first_limit_up_count"]),
+        limit_down_count=_optional_int(row["limit_down_count"]),
+        yiziban_count=_optional_int(row["yiziban_count"]),
+        max_consecutive_limit_ups=_optional_int(row["max_consecutive_limit_ups"]),
+        high_board_count=_optional_int(row["high_board_count"]),
+        up_ratio_pct=None if up_ratio_pct is None else round(up_ratio_pct, 4),
+        limit_up_ratio_pct=(
+            None if limit_up_ratio_pct is None else round(limit_up_ratio_pct, 4)
+        ),
+        avg_pct_chg=(
+            None
+            if (avg_pct_chg := _optional_float(row["avg_pct_chg"])) is None
+            else round(avg_pct_chg, 4)
+        ),
+        median_pct_chg=(
+            None
+            if (median_pct_chg := _optional_float(row["median_pct_chg"])) is None
+            else round(median_pct_chg, 4)
+        ),
+        total_amount=_optional_float(row["total_amount"]),
         high_60d_ratio_pct=high_60d_ratio_pct,
         above_ma20_ratio_pct=above_ma20_ratio_pct,
     )
