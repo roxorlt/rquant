@@ -542,10 +542,37 @@ class DuckDBStore:
         coverage = _revalidate_for_write(coverage)
         self._conn.execute("BEGIN")
         try:
-            if self.get_dataset_snapshot(coverage.snapshot_id) is None:
+            snapshot = self.get_dataset_snapshot(coverage.snapshot_id)
+            if snapshot is None:
                 raise KeyError(
                     f"dataset snapshot not found: {coverage.snapshot_id}"
                 )
+            if snapshot.status == "ready":
+                stored = self._conn.execute(
+                    """
+                    SELECT snapshot_id, dataset_id, coverage_scope, table_name,
+                           expected_count, available_count, missing_count,
+                           coverage_ratio, missing_reasons,
+                           strftime(created_at AT TIME ZONE 'UTC',
+                                    '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at
+                    FROM dataset_coverage
+                    WHERE snapshot_id = ? AND dataset_id = ? AND coverage_scope = ?
+                    """,
+                    [
+                        coverage.snapshot_id,
+                        coverage.dataset_id,
+                        coverage.coverage_scope,
+                    ],
+                ).fetchone()
+                existing = None if stored is None else _coverage_from_row(stored)
+                if existing != coverage:
+                    raise ValueError(
+                        "finalized dataset snapshot coverage is immutable: "
+                        f"{coverage.snapshot_id}/{coverage.dataset_id}/"
+                        f"{coverage.coverage_scope}"
+                    )
+                self._conn.execute("COMMIT")
+                return existing
             self._conn.execute(
                 """
                 INSERT INTO dataset_coverage

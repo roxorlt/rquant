@@ -54,7 +54,7 @@ def test_migration_is_frozen_and_derives_stable_checksum() -> None:
         formatted.name = "changed"  # type: ignore[misc]
 
 
-def test_published_v1_v2_statements_and_checksums_are_fixed() -> None:
+def test_published_v1_v2_v3_statements_and_checksums_are_fixed() -> None:
     assert isinstance(V1_LEGACY_COLUMN_ADDITIONS, tuple)
     assert MIGRATIONS[0].statements == V1_LEGACY_COLUMN_ADDITIONS
     assert (
@@ -64,6 +64,10 @@ def test_published_v1_v2_statements_and_checksums_are_fixed() -> None:
     assert (
         MIGRATIONS[1].checksum
         == "22cde30e069a0286153f59b125241d1074771d388d5d1e2dc837b5cc1653ca1a"
+    )
+    assert (
+        MIGRATIONS[2].checksum
+        == "b4420de06471ba1fc4594e4a1cd264da0f70e718fd6221a45940345061ad300d"
     )
 
 
@@ -321,6 +325,24 @@ def test_checksum_drift_rejects_startup() -> None:
         initialize_schema(conn, migrations=(changed,))
 
     assert _migration_rows(conn)[-1][2] == original.checksum
+    conn.close()
+
+
+def test_name_drift_rejects_startup() -> None:
+    migration = Migration(
+        version=903,
+        name="registered name",
+        statements=("CREATE TABLE name_probe (id INTEGER);",),
+    )
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=(migration,))
+    conn.execute(
+        "UPDATE schema_migration SET name = 'tampered name' WHERE version = 903"
+    )
+
+    with pytest.raises(SchemaMigrationError, match=r"version 903.*name"):
+        initialize_schema(conn, migrations=(migration,))
+
     conn.close()
 
 

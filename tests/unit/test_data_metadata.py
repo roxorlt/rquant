@@ -314,6 +314,106 @@ def test_metadata_queries_and_transitions_explain_missing_ids(tmp_path: Path) ->
             store.resolve_data_quality_issue("missing")
 
 
+def test_finalized_snapshot_allows_exact_coverage_retry(tmp_path: Path) -> None:
+    from rquant.data_metadata import (
+        DatasetCoverage,
+        DatasetSnapshot,
+        DatasetSnapshotFinalization,
+    )
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    snapshot = DatasetSnapshot.create(
+        strategy_name="strategy",
+        as_of_time=t0,
+        code_commit="abc123",
+        origin="local",
+        created_at=t0,
+    )
+    coverage = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=9,
+        missing_reasons=("one symbol absent",),
+        created_at=t0,
+    )
+
+    with DuckDBStore(tmp_path / "ready-coverage-retry.duckdb") as store:
+        store.begin_dataset_snapshot(snapshot)
+        stored = store.upsert_dataset_coverage(coverage)
+        store.finalize_dataset_snapshot(
+            snapshot.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+        )
+
+        assert store.upsert_dataset_coverage(coverage) == stored
+        assert store.list_dataset_coverages(snapshot.snapshot_id) == [stored]
+
+
+def test_finalized_snapshot_rejects_changed_or_new_coverage_before_write(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_metadata import (
+        DatasetCoverage,
+        DatasetSnapshot,
+        DatasetSnapshotFinalization,
+    )
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    snapshot = DatasetSnapshot.create(
+        strategy_name="strategy",
+        as_of_time=t0,
+        code_commit="abc123",
+        origin="local",
+        created_at=t0,
+    )
+    coverage = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=9,
+        missing_reasons=("one symbol absent",),
+        created_at=t0,
+    )
+    changed = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=10,
+        created_at=t0,
+    )
+    new_coverage = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="daily-bars",
+        coverage_scope="trade-date:2026-07-12",
+        table_name="daily_bar",
+        expected_count=1,
+        available_count=1,
+        created_at=t0,
+    )
+
+    with DuckDBStore(tmp_path / "ready-coverage-immutable.duckdb") as store:
+        store.begin_dataset_snapshot(snapshot)
+        stored = store.upsert_dataset_coverage(coverage)
+        store.finalize_dataset_snapshot(
+            snapshot.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+        )
+
+        with pytest.raises(ValueError, match="finalized.*coverage"):
+            store.upsert_dataset_coverage(changed)
+        with pytest.raises(ValueError, match="finalized.*coverage"):
+            store.upsert_dataset_coverage(new_coverage)
+
+        assert store.list_dataset_coverages(snapshot.snapshot_id) == [stored]
+
+
 def test_record_issue_ignores_stale_and_equal_detections(tmp_path: Path) -> None:
     from rquant.data_metadata import DataQualityIssue
 

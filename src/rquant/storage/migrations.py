@@ -144,6 +144,11 @@ def _validate_applied_migrations(
                 f"schema migration version {version} ({applied_name}) "
                 "is applied in the database but missing from the code registry"
             )
+        if applied_name != migration.name:
+            raise SchemaMigrationError(
+                f"schema migration version {version} name mismatch: "
+                f"database={applied_name}, code={migration.name}"
+            )
         if applied_checksum != migration.checksum:
             raise SchemaMigrationError(
                 f"schema migration version {version} checksum mismatch: "
