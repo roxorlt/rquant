@@ -182,6 +182,43 @@ class SecurityStatusBackfillResult(SecurityStatusModel):
     conflict_count: int = Field(ge=0)
     source_issue_count: int = Field(ge=0)
     source_issue_dates: tuple[date, ...] = ()
+    namechange_logical_api_operations: int = Field(default=0, ge=0)
+    stock_st_logical_api_operations: int = Field(default=0, ge=0)
+
+    @property
+    def namechange_request_count(self) -> int:
+        """Compatibility alias counting logical calls, not adapter retries."""
+        return self.namechange_logical_api_operations
+
+    @property
+    def stock_st_request_count(self) -> int:
+        """Compatibility alias counting logical calls, not adapter retries."""
+        return self.stock_st_logical_api_operations
+
+
+class SecurityStatusPrefetchBatch(SecurityStatusModel):
+    rows: tuple[SecurityStatusDaily, ...] = ()
+    source_as_of: date
+    namechange_logical_api_operations: int = Field(ge=0)
+    stock_st_logical_api_operations: int = Field(ge=0)
+    source_issue_count: int = Field(ge=0)
+    source_issue_dates: tuple[date, ...] = ()
+
+    @property
+    def namechange_request_count(self) -> int:
+        """Compatibility alias counting logical calls, not adapter retries."""
+        return self.namechange_logical_api_operations
+
+    @property
+    def stock_st_request_count(self) -> int:
+        """Compatibility alias counting logical calls, not adapter retries."""
+        return self.stock_st_logical_api_operations
+
+
+class SecurityStatusNameChangeContext(SecurityStatusModel):
+    history: NameChangeHistory
+    source_as_of: date
+    logical_api_operations: int = Field(ge=0)
 
 
 class NameChangeTruncatedError(RuntimeError):
@@ -238,6 +275,21 @@ class SecurityStatusConcurrentWriteError(RuntimeError):
     """A concurrent commit conflict requires retrying the status batch."""
 
 
+class SecurityStatusEligibilityChangedError(RuntimeError):
+    """Planned daily-bar eligibility changed before status apply."""
+
+    def __init__(self, missing_keys: Sequence[DailySecurityKey]) -> None:
+        self.missing_keys = tuple(missing_keys)
+        sample = ", ".join(
+            f"{key.ts_code} {key.trade_date.isoformat()}"
+            for key in self.missing_keys[:3]
+        )
+        super().__init__(
+            "daily-bar eligibility changed before security status apply"
+            + (f": {sample}" if sample else "")
+        )
+
+
 def security_status_business_facts(
     row: SecurityStatusDaily,
 ) -> tuple[object, ...]:
@@ -287,17 +339,44 @@ class SecurityStatusAdapter(Protocol):
 
 
 class SecurityStatusStore(Protocol):
-    def list_daily_security_dates(self, start: date, end: date) -> list[date]: ...
+    def __enter__(self) -> SecurityStatusStore: ...
+
+    def __exit__(self, *args: object) -> None: ...
+
+    def list_daily_security_dates(
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
+    ) -> list[date]: ...
 
     def list_incomplete_stock_status_dates(
-        self, start: date, end: date
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
     ) -> list[date]: ...
 
     def list_daily_security_keys(
-        self, start: date, end: date
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
     ) -> list[DailySecurityKey]: ...
 
-    def upsert_stock_status(self, rows: Sequence[SecurityStatusDaily]) -> int: ...
+    def list_incomplete_stock_status_keys(
+        self, keys: Sequence[DailySecurityKey]
+    ) -> list[DailySecurityKey]: ...
+
+    def upsert_stock_status(
+        self,
+        rows: Sequence[SecurityStatusDaily],
+        *,
+        require_daily_keys: bool = False,
+    ) -> int: ...
 
 
 def normalize_name(value: object) -> tuple[str | None, bool | None]:
@@ -709,6 +788,23 @@ def _add_years(value: date, years: int) -> date:
         return value.replace(month=2, day=28, year=value.year + years)
 
 
+def count_namechange_windows(start: date, end: date, *, window_years: int = 3) -> int:
+    """Count the bounded provider requests used by ``fetch_namechange_history``."""
+    if start > end:
+        raise ValueError("namechange start must not be after end")
+    if window_years < 1:
+        raise ValueError("window_years must be positive")
+    count = 0
+    window_start = start
+    while window_start <= end:
+        window_end = min(_add_years(window_start, window_years), end)
+        count += 1
+        if window_end >= end:
+            break
+        window_start = window_end
+    return count
+
+
 def fetch_namechange_history(
     adapter: SecurityStatusAdapter,
     *,
@@ -776,10 +872,185 @@ def fetch_stock_st_history(
     )
 
 
+def prefetch_namechange_context(
+    adapter: SecurityStatusAdapter,
+    *,
+    start: date,
+    source_as_of: date,
+    ts_code: str | None = None,
+    window_years: int = 3,
+    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time_module.sleep,
+) -> SecurityStatusNameChangeContext:
+    """Fetch reusable name history without opening or mutating storage."""
+    history = fetch_namechange_history(
+        adapter,
+        start=start,
+        end=source_as_of,
+        ts_code=ts_code,
+        window_years=window_years,
+        request_interval_seconds=request_interval_seconds,
+        sleep=sleep,
+    )
+    return SecurityStatusNameChangeContext(
+        history=history,
+        source_as_of=source_as_of,
+        logical_api_operations=count_namechange_windows(
+            start,
+            source_as_of,
+            window_years=window_years,
+        ),
+    )
+
+
+def prefetch_security_status_for_date(
+    adapter: SecurityStatusAdapter,
+    keys: Sequence[DailySecurityKey],
+    *,
+    namechange_context: SecurityStatusNameChangeContext,
+    ingested_at: datetime,
+    strict_stock_st_crosscheck: bool = False,
+    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time_module.sleep,
+) -> SecurityStatusPrefetchBatch:
+    """Materialize one date from reusable names plus one remote ST operation."""
+    _require_aware(ingested_at, field_name="ingested_at")
+    ordered_keys = tuple(
+        sorted(set(keys), key=lambda item: (item.ts_code, item.trade_date))
+    )
+    if not ordered_keys:
+        return SecurityStatusPrefetchBatch(
+            source_as_of=namechange_context.source_as_of,
+            namechange_logical_api_operations=0,
+            stock_st_logical_api_operations=0,
+            source_issue_count=len(namechange_context.history.issues),
+        )
+    trade_dates = {key.trade_date for key in ordered_keys}
+    if len(trade_dates) != 1:
+        raise ValueError("per-date status prefetch requires exactly one trade date")
+    trade_date = next(iter(trade_dates))
+    if namechange_context.source_as_of < trade_date:
+        raise ValueError("source_as_of must not be before eligibility date")
+    stock_st = fetch_stock_st_history(
+        adapter,
+        trade_date,
+        request_interval_seconds=request_interval_seconds,
+        sleep=sleep,
+    )
+    if strict_stock_st_crosscheck and not stock_st.is_complete:
+        raise StockSTIncompleteError(trade_date, stock_st.issues)
+    rows = materialize_security_status(
+        ordered_keys,
+        namechange_context.history,
+        stock_st,
+        ingested_at=ingested_at,
+    )
+    issues = (*namechange_context.history.issues, *stock_st.issues)
+    issue_dates = {
+        issue.trade_date for issue in issues if issue.trade_date is not None
+    }
+    return SecurityStatusPrefetchBatch(
+        rows=tuple(rows),
+        source_as_of=namechange_context.source_as_of,
+        namechange_logical_api_operations=0,
+        stock_st_logical_api_operations=1,
+        source_issue_count=len(issues),
+        source_issue_dates=tuple(
+            sorted(issue_dates, reverse=True)[:SOURCE_ISSUE_DATE_SAMPLE_LIMIT]
+        ),
+    )
+
+
+def prefetch_security_status(
+    adapter: SecurityStatusAdapter,
+    keys: Sequence[DailySecurityKey],
+    *,
+    ingested_at: datetime,
+    source_as_of: date | None = None,
+    namechange_start: date = NAMECHANGE_EARLIEST_DATE,
+    window_years: int = 3,
+    strict_stock_st_crosscheck: bool = False,
+    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time_module.sleep,
+) -> SecurityStatusPrefetchBatch:
+    """Fetch and materialize a complete typed batch without touching storage."""
+    _require_aware(ingested_at, field_name="ingested_at")
+    ordered_keys = tuple(
+        sorted(set(keys), key=lambda item: (item.ts_code, item.trade_date))
+    )
+    resolved_source_as_of = source_as_of or ingested_at.astimezone(SHANGHAI).date()
+    if not ordered_keys:
+        return SecurityStatusPrefetchBatch(
+            source_as_of=resolved_source_as_of,
+            namechange_logical_api_operations=0,
+            stock_st_logical_api_operations=0,
+            source_issue_count=0,
+        )
+    eligibility_end = max(key.trade_date for key in ordered_keys)
+    if resolved_source_as_of < eligibility_end:
+        raise ValueError("source_as_of must not be before eligibility end")
+
+    fetch_start = min(namechange_start, min(key.trade_date for key in ordered_keys))
+    codes = sorted({key.ts_code for key in ordered_keys})
+    namechange_code = codes[0] if len(codes) == 1 else None
+    namechanges = fetch_namechange_history(
+        adapter,
+        start=fetch_start,
+        end=resolved_source_as_of,
+        ts_code=namechange_code,
+        window_years=window_years,
+        request_interval_seconds=request_interval_seconds,
+        sleep=sleep,
+    )
+    observations: list[StockSTObservation] = []
+    stock_issues: list[SecurityStatusSourceIssue] = []
+    stock_complete = True
+    trade_dates = sorted({key.trade_date for key in ordered_keys})
+    for trade_date in trade_dates:
+        history = fetch_stock_st_history(
+            adapter,
+            trade_date,
+            request_interval_seconds=request_interval_seconds,
+            sleep=sleep,
+        )
+        if strict_stock_st_crosscheck and not history.is_complete:
+            raise StockSTIncompleteError(trade_date, history.issues)
+        observations.extend(history.observations)
+        stock_issues.extend(history.issues)
+        stock_complete = stock_complete and history.is_complete
+    stock_st = StockSTHistory(
+        observations=tuple(observations),
+        issues=tuple(stock_issues),
+        is_complete=stock_complete,
+    )
+    rows = materialize_security_status(
+        ordered_keys,
+        namechanges,
+        stock_st,
+        ingested_at=ingested_at,
+    )
+    issues = (*namechanges.issues, *stock_st.issues)
+    issue_dates = {
+        issue.trade_date for issue in issues if issue.trade_date is not None
+    }
+    return SecurityStatusPrefetchBatch(
+        rows=tuple(rows),
+        source_as_of=resolved_source_as_of,
+        namechange_logical_api_operations=count_namechange_windows(
+            fetch_start, resolved_source_as_of, window_years=window_years
+        ),
+        stock_st_logical_api_operations=len(trade_dates),
+        source_issue_count=len(issues),
+        source_issue_dates=tuple(
+            sorted(issue_dates, reverse=True)[:SOURCE_ISSUE_DATE_SAMPLE_LIMIT]
+        ),
+    )
+
+
 def backfill_historical_security_status(
     adapter: SecurityStatusAdapter,
-    store: SecurityStatusStore,
     *,
+    store_factory: Callable[[], SecurityStatusStore],
     start: date,
     end: date,
     ingested_at: datetime,
@@ -787,23 +1058,73 @@ def backfill_historical_security_status(
     namechange_start: date = NAMECHANGE_EARLIEST_DATE,
     window_years: int = 3,
     missing_only: bool = True,
+    eligible_keys: Sequence[DailySecurityKey] | None = None,
+    ts_codes: Sequence[str] | None = None,
     strict_stock_st_crosscheck: bool = False,
     request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
     sleep: Callable[[float], None] = time_module.sleep,
 ) -> SecurityStatusBackfillResult:
-    """Backfill actual daily_bar keys; provider completeness is checked before writes."""
+    """Plan exact keys, fetch remotely with no store open, then apply once."""
     if start > end:
         raise ValueError("security-status backfill start must not be after end")
+    if eligible_keys is not None and ts_codes is not None:
+        raise ValueError("eligible_keys and ts_codes are mutually exclusive scopes")
     _require_aware(ingested_at, field_name="ingested_at")
     resolved_source_as_of = source_as_of or ingested_at.astimezone(SHANGHAI).date()
     if resolved_source_as_of < end:
         raise ValueError("source_as_of must not be before eligibility end")
-    trade_dates = (
-        store.list_incomplete_stock_status_dates(start, end)
-        if missing_only
-        else store.list_daily_security_dates(start, end)
+    normalized_codes = (
+        None if ts_codes is None else tuple(sorted(set(ts_codes)))
     )
-    if not trade_dates:
+    if normalized_codes == ():
+        return SecurityStatusBackfillResult(
+            start=start,
+            end=end,
+            source_as_of=resolved_source_as_of,
+            eligible_count=0,
+            upserted_count=0,
+            unknown_count=0,
+            conflict_count=0,
+            source_issue_count=0,
+        )
+
+    with store_factory() as planning_store:
+        if eligible_keys is not None:
+            requested = tuple(
+                sorted(
+                    set(eligible_keys),
+                    key=lambda item: (item.trade_date, item.ts_code),
+                )
+            )
+            if any(not start <= key.trade_date <= end for key in requested):
+                raise ValueError("eligible key is outside the requested interval")
+            if missing_only:
+                scoped_keys = planning_store.list_incomplete_stock_status_keys(
+                    requested
+                )
+            else:
+                requested_codes = sorted({key.ts_code for key in requested})
+                available = set(
+                    planning_store.list_daily_security_keys(
+                        start,
+                        end,
+                        ts_codes=requested_codes,
+                    )
+                )
+                scoped_keys = [key for key in requested if key in available]
+        else:
+            daily_keys = planning_store.list_daily_security_keys(
+                start,
+                end,
+                ts_codes=normalized_codes,
+            )
+            scoped_keys = (
+                planning_store.list_incomplete_stock_status_keys(daily_keys)
+                if missing_only
+                else daily_keys
+            )
+
+    if not scoped_keys:
         return SecurityStatusBackfillResult(
             start=start,
             end=end,
@@ -815,62 +1136,34 @@ def backfill_historical_security_status(
             source_issue_count=0,
             source_issue_dates=(),
         )
-    namechanges = fetch_namechange_history(
+    batch = prefetch_security_status(
         adapter,
-        start=min(namechange_start, start),
-        end=resolved_source_as_of,
+        scoped_keys,
+        ingested_at=ingested_at,
+        source_as_of=resolved_source_as_of,
+        namechange_start=min(namechange_start, start),
         window_years=window_years,
+        strict_stock_st_crosscheck=strict_stock_st_crosscheck,
         request_interval_seconds=request_interval_seconds,
         sleep=sleep,
     )
-    eligible_count = 0
-    upserted_count = 0
-    unknown_count = 0
-    conflict_count = 0
-    source_issue_count = len(namechanges.issues)
-    source_issue_dates = {
-        issue.trade_date
-        for issue in namechanges.issues
-        if issue.trade_date is not None
-    }
-    for trade_date in trade_dates:
-        keys = store.list_daily_security_keys(trade_date, trade_date)
-        stock_st = fetch_stock_st_history(
-            adapter,
-            trade_date,
-            request_interval_seconds=request_interval_seconds,
-            sleep=sleep,
+    with store_factory() as writer:
+        upserted_count = writer.upsert_stock_status(
+            batch.rows,
+            require_daily_keys=True,
         )
-        if strict_stock_st_crosscheck and not stock_st.is_complete:
-            raise StockSTIncompleteError(trade_date, stock_st.issues)
-        source_issue_count += len(stock_st.issues)
-        source_issue_dates.update(
-            issue.trade_date
-            for issue in stock_st.issues
-            if issue.trade_date is not None
-        )
-        rows = materialize_security_status(
-            keys,
-            namechanges,
-            stock_st,
-            ingested_at=ingested_at,
-        )
-        eligible_count += len(keys)
-        upserted_count += store.upsert_stock_status(rows)
-        unknown_count += sum(row.is_st is None for row in rows)
-        conflict_count += sum(row.conflict_reason is not None for row in rows)
     return SecurityStatusBackfillResult(
         start=start,
         end=end,
         source_as_of=resolved_source_as_of,
-        eligible_count=eligible_count,
+        eligible_count=len(scoped_keys),
         upserted_count=upserted_count,
-        unknown_count=unknown_count,
-        conflict_count=conflict_count,
-        source_issue_count=source_issue_count,
-        source_issue_dates=tuple(
-            sorted(source_issue_dates, reverse=True)[
-                :SOURCE_ISSUE_DATE_SAMPLE_LIMIT
-            ]
+        unknown_count=sum(row.is_st is None for row in batch.rows),
+        conflict_count=sum(row.conflict_reason is not None for row in batch.rows),
+        source_issue_count=batch.source_issue_count,
+        source_issue_dates=batch.source_issue_dates,
+        namechange_logical_api_operations=(
+            batch.namechange_logical_api_operations
         ),
+        stock_st_logical_api_operations=batch.stock_st_logical_api_operations,
     )

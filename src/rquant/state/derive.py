@@ -1,43 +1,66 @@
-"""派生状态字段计算。
+"""Point-in-time daily state derivation from prices, status, and trade calendar.
 
-用 MyTT（通达信风格函数）组装以下字段：
-- ST / 北交所 / 板块分类
-- 涨停价 / 跌停价（分档：ST 5% / 主板 10% / 创业板科创板 20% / 北交所 30%）
-- is_limit_up / is_limit_down（容差 1 分）
-- is_first_limit_up（今涨停 且 昨未涨停）
-- is_yiziban（4 价相等 且 涨停）
-- consecutive_limit_ups（连板数，BARSLASTCOUNT 直接对应通达信语义）
-- body_upper / body_lower（实体上下沿 = max/min(open, close)）
-
-涨跌停规则历史沿革比较复杂（创业板 2020-08-24 从 10% 改 20%、主板 2023-05-01
-起全面注册制等），MVP 阶段按**当前规则**算，不回溯历史规则差异。
+IPO and relisting no-price-limit windows are not inferred from the first stored
+bar. Until an authoritative eligibility fact is available, callers must treat
+those windows as unsupported rather than assuming an exchange price cap.
 """
 
 from __future__ import annotations
 
+from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger
-from MyTT import BARSLASTCOUNT, REF
+from pandas.api.types import is_bool
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+DAILY_STATE_DECISION_TIME = time(15, 0)
+CHINEXT_20_PERCENT_START = date(2020, 8, 24)
+_STATUS_REQUIRED_COLUMNS = {
+    "ts_code",
+    "trade_date",
+    "name",
+    "is_st",
+    "available_at",
+}
 
 
-def _round_half_up(s: pd.Series) -> pd.Series:
-    """四舍五入到分（ROUND_HALF_UP）。
+class DailyStateSeed(BaseModel):
+    """Immediate authoritative predecessor state for incremental derivation."""
 
-    pandas Series.round(2) 用的是银行家舍入（half to even），
-    3.465 → 3.46；而交易所涨跌停价用的是四舍五入（half up），
-    3.465 → 3.47。用 Decimal 显式按 HALF_UP 处理。
-    """
-    return s.apply(
-        lambda x: float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        if pd.notna(x)
-        else x
-    )
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    trade_date: date
+    is_limit_up: bool | None
+    consecutive_limit_ups: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_chain(self) -> DailyStateSeed:
+        if self.is_limit_up is None and self.consecutive_limit_ups is not None:
+            raise ValueError("unknown predecessor cannot have a consecutive count")
+        if self.is_limit_up is False and self.consecutive_limit_ups != 0:
+            raise ValueError("non-limit predecessor must have consecutive count zero")
+        if self.is_limit_up is True and self.consecutive_limit_ups == 0:
+            raise ValueError("limit-up predecessor count must be positive or unknown")
+        return self
+
+
+def _round_half_up(series: pd.Series) -> pd.Series:
+    """Round exchange limit prices to cents using ROUND_HALF_UP."""
+    return series.apply(
+        lambda value: float(
+            Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
+        if pd.notna(value)
+        else pd.NA
+    ).astype("Float64")
 
 
 def _classify_board(ts_code: str) -> str:
-    """按 ts_code 判定板块。返回 main/gem/star/bj。"""
+    """Classify a Tushare code as main/gem/star/bj."""
     if ts_code.endswith(".BJ"):
         return "bj"
     if ts_code.startswith(("688", "689")):
@@ -48,91 +71,264 @@ def _classify_board(ts_code: str) -> str:
 
 
 def _detect_st(name: str | None) -> bool:
-    """从股票名称判断是否 ST。覆盖 ST / *ST / SST 前缀（含空格）。
-
-    name 可能是 DataFrame join 出来的 NaN（float）：stock_basic 只存当前
-    上市（list_status=L），历史区间里已退市的票 join 不到名字（7/2 长区间
-    回补真实崩过）。非 str 一律按非 ST 处理。
-    """
+    """Detect ST prefixes for live snapshot consumers, never historical derivation."""
     if not isinstance(name, str) or not name:
         return False
-    n = name.upper().replace(" ", "").replace("\u3000", "")
-    return n.startswith(("ST", "*ST", "SST"))
+    normalized = name.upper().replace(" ", "").replace("\u3000", "")
+    return normalized.startswith(("ST", "*ST", "SST"))
 
 
 def _limit_pct(is_st: bool, board_type: str) -> float:
-    """涨跌停幅度。"""
-    if is_st:
-        return 0.05
+    """Return the current simplified exchange limit percentage."""
     if board_type == "bj":
         return 0.30
     if board_type in ("gem", "star"):
         return 0.20
-    return 0.10
+    return 0.05 if is_st else 0.10
+
+
+def _historical_limit_pct(
+    is_st: bool,
+    board_type: str,
+    trade_date: date,
+) -> float:
+    if board_type == "gem" and trade_date < CHINEXT_20_PERCENT_START:
+        return 0.05 if is_st else 0.10
+    return _limit_pct(is_st, board_type)
+
+
+def _civil_date(value: object) -> date | None:
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return pd.Timestamp(value).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _aware_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        return None
+    if isinstance(value, pd.Timestamp):
+        resolved = value.to_pydatetime()
+    elif isinstance(value, datetime):
+        resolved = value
+    else:
+        return None
+    if resolved.tzinfo is None or resolved.utcoffset() is None:
+        return None
+    return resolved
+
+
+def _has_conflict(value: object) -> bool:
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        return True
+    if isinstance(value, bool):
+        return value
+    return bool(str(value).strip())
+
+
+def _status_by_trade_date(
+    status_daily: pd.DataFrame,
+    *,
+    ts_code: str,
+) -> dict[date, bool]:
+    if status_daily.empty:
+        return {}
+    missing = _STATUS_REQUIRED_COLUMNS - set(status_daily.columns)
+    conflict_column = (
+        "conflict_reason"
+        if "conflict_reason" in status_daily.columns
+        else "conflict"
+        if "conflict" in status_daily.columns
+        else None
+    )
+    if missing or conflict_column is None:
+        details = sorted(missing | ({"conflict_reason"} if conflict_column is None else set()))
+        raise ValueError(f"status_daily missing required columns: {details}")
+
+    candidates: dict[date, list[bool]] = {}
+    for row in status_daily.to_dict(orient="records"):
+        if row["ts_code"] != ts_code:
+            continue
+        trade_date = _civil_date(row["trade_date"])
+        if trade_date is None or _has_conflict(row[conflict_column]):
+            continue
+        is_st = row["is_st"]
+        if not is_bool(is_st):
+            continue
+        name = row["name"]
+        if not isinstance(name, str) or not name.strip():
+            continue
+        available_at = _aware_datetime(row["available_at"])
+        decision_at = datetime.combine(
+            trade_date,
+            DAILY_STATE_DECISION_TIME,
+            tzinfo=SHANGHAI,
+        )
+        if available_at is None or available_at > decision_at:
+            continue
+        candidates.setdefault(trade_date, []).append(bool(is_st))
+
+    return {
+        trade_date: values[0]
+        for trade_date, values in candidates.items()
+        if len(values) == 1
+    }
+
+
+def _nullable_limit_chain(
+    is_limit_up: pd.Series,
+    trade_dates: list[date | None],
+    expected_pretrade_dates: list[date | None],
+    seed: DailyStateSeed | None,
+) -> tuple[pd.Series, pd.Series]:
+    first_values: list[object] = []
+    consecutive_values: list[object] = []
+    previous_count = seed.consecutive_limit_ups if seed is not None else None
+    previous_observed_date = seed.trade_date if seed is not None else None
+    for value, trade_date, expected_pretrade_date in zip(
+        is_limit_up,
+        trade_dates,
+        expected_pretrade_dates,
+        strict=True,
+    ):
+        has_authoritative_predecessor = (
+            previous_observed_date is not None
+            and expected_pretrade_date is not None
+            and expected_pretrade_date == previous_observed_date
+        )
+        if pd.isna(value):
+            first_values.append(pd.NA)
+            consecutive_values.append(pd.NA)
+            previous_count = None
+        elif not bool(value):
+            first_values.append(False)
+            consecutive_values.append(0)
+            previous_count = 0
+        elif previous_count is None or not has_authoritative_predecessor:
+            first_values.append(pd.NA)
+            consecutive_values.append(pd.NA)
+            previous_count = None
+        else:
+            first_values.append(previous_count == 0)
+            previous_count += 1
+            consecutive_values.append(previous_count)
+        previous_observed_date = trade_date
+    return (
+        pd.Series(first_values, index=is_limit_up.index, dtype="boolean"),
+        pd.Series(consecutive_values, index=is_limit_up.index, dtype="Int64"),
+    )
 
 
 def derive_state(
     df_daily: pd.DataFrame,
     ts_code: str,
-    name: str | None = None,
+    status_daily: pd.DataFrame,
     price_tol: float = 0.01,
+    *,
+    seed: DailyStateSeed | None = None,
 ) -> pd.DataFrame:
-    """计算一只股票的派生状态字段。
+    """Derive one security's daily state using exact-date point-in-time status.
 
-    Args:
-        df_daily: 日线 DataFrame，必须含 trade_date, open, high, low, close, pre_close，
-                  按 trade_date 升序。**用原始价（不复权）**，涨停判断基于真实 pre_close。
-        ts_code: 股票代码（带后缀，如 600519.SH）
-        name: 股票名称（用于 ST 判断）
-        price_tol: 价格比较容差（默认 0.01 元，即 1 分）
-
-    Returns:
-        DataFrame（14 列），列顺序与 schema.DAILY_STATE_DDL 对齐
+    A status fact is usable only when it belongs to ``ts_code`` and the exact
+    trade date, is non-conflicting, has an explicit boolean ``is_st``, and was
+    visible by that date's 15:00 Asia/Shanghai decision timestamp.
     """
     if df_daily.empty:
         return pd.DataFrame()
 
     df = df_daily.sort_values("trade_date").reset_index(drop=True)
+    status_by_date = _status_by_trade_date(status_daily, ts_code=ts_code)
+    trade_dates = [_civil_date(value) for value in df["trade_date"]]
+    if "expected_pretrade_date" in df.columns:
+        expected_pretrade_dates = [
+            _civil_date(value) for value in df["expected_pretrade_date"]
+        ]
+    else:
+        expected_pretrade_dates = [None] * len(df)
+    is_st = pd.Series(
+        [status_by_date.get(trade_date, pd.NA) for trade_date in trade_dates],
+        dtype="boolean",
+    )
 
-    # 固定字段（不随日期变）
-    is_st = _detect_st(name)
     is_bj = ts_code.endswith(".BJ")
     board_type = _classify_board(ts_code)
-    limit_pct = _limit_pct(is_st, board_type)
+    limit_pct = pd.Series(
+        [
+            pd.NA
+            if pd.isna(value) or trade_date is None
+            else _historical_limit_pct(bool(value), board_type, trade_date)
+            for value, trade_date in zip(is_st, trade_dates, strict=True)
+        ],
+        dtype="Float64",
+    )
 
-    # 逐日字段
-    open_ = df["open"].astype("float64")
-    close = df["close"].astype("float64")
-    high = df["high"].astype("float64")
-    low = df["low"].astype("float64")
-    pre_close = df["pre_close"].astype("float64")
+    open_ = pd.to_numeric(df["open"], errors="coerce").astype("Float64")
+    close = pd.to_numeric(df["close"], errors="coerce").astype("Float64")
+    high = pd.to_numeric(df["high"], errors="coerce").astype("Float64")
+    low = pd.to_numeric(df["low"], errors="coerce").astype("Float64")
+    pre_close = pd.to_numeric(df["pre_close"], errors="coerce").astype("Float64")
 
-    # 涨停价 / 跌停价（四舍五入到分，ROUND_HALF_UP 对齐交易所/东财）
     limit_up_price = _round_half_up(pre_close * (1 + limit_pct))
     limit_down_price = _round_half_up(pre_close * (1 - limit_pct))
 
-    # 涨停 / 跌停（容差 1 分，pre_close 缺失时为 False）
-    valid = close.notna() & pre_close.notna() & (pre_close > 0)
-    is_limit_up = valid & (close >= limit_up_price - price_tol)
-    is_limit_down = valid & (close <= limit_down_price + price_tol)
+    known_status = is_st.notna()
+    valid_price = close.notna() & pre_close.notna() & (pre_close > 0)
+    is_limit_up = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    is_limit_down = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    comparable = known_status & valid_price
+    is_limit_up.loc[comparable] = (
+        close.loc[comparable] >= limit_up_price.loc[comparable] - price_tol
+    )
+    is_limit_down.loc[comparable] = (
+        close.loc[comparable] <= limit_down_price.loc[comparable] + price_tol
+    )
 
-    # 首板：今涨停 且 昨未涨停（REF = 昨日值；MyTT 返回 ndarray，包回 Series）
-    prev_is_lu = pd.Series(
-        REF(is_limit_up.astype(float), 1), index=is_limit_up.index
-    ).fillna(0).astype(bool)
-    is_first_limit_up = is_limit_up & ~prev_is_lu
+    is_first_limit_up, consecutive = _nullable_limit_chain(
+        is_limit_up,
+        trade_dates,
+        expected_pretrade_dates,
+        seed,
+    )
 
-    # 一字板：4 价极差 ≤ 容差 且 涨停
     ohlc = pd.concat([high, low, open_, close], axis=1)
-    rng = ohlc.max(axis=1) - ohlc.min(axis=1)
-    is_yiziban = is_limit_up & (rng.abs() <= price_tol)
+    cent_ohlc = pd.concat(
+        [_round_half_up(series) for _, series in ohlc.items()],
+        axis=1,
+    )
+    equal_at_cent = cent_ohlc.eq(cent_ohlc.iloc[:, 0], axis=0).all(axis=1)
+    is_yiziban = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    known_limit_up = is_limit_up.notna()
+    complete_ohlc = ohlc.notna().all(axis=1)
+    observable_yiziban = known_limit_up & complete_ohlc
+    is_yiziban.loc[observable_yiziban] = False
+    flat_limit_up = (
+        observable_yiziban & is_limit_up.fillna(False) & equal_at_cent
+    )
+    is_yiziban.loc[flat_limit_up] = True
 
-    # 连板数：MyTT BARSLASTCOUNT 直接对应通达信语义（包回 Series）
-    consecutive = pd.Series(
-        BARSLASTCOUNT(is_limit_up), index=is_limit_up.index
-    ).astype("Int64")
-
-    # 实体上下沿
     body_upper = pd.concat([open_, close], axis=1).max(axis=1)
     body_lower = pd.concat([open_, close], axis=1).min(axis=1)
 

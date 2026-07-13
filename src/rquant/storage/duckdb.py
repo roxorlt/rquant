@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 
 import duckdb
 import pandas as pd
@@ -31,6 +31,7 @@ from rquant.security_status import (
     SecurityStatusConcurrentWriteError,
     SecurityStatusCoverage,
     SecurityStatusDaily,
+    SecurityStatusEligibilityChangedError,
     SecurityStatusWriteConflictError,
     deduplicate_security_status_rows,
 )
@@ -311,49 +312,87 @@ class DuckDBStore:
         initialize_schema(self._conn)
 
     def list_daily_security_keys(
-        self, start: date, end: date
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
     ) -> list[DailySecurityKey]:
         if start > end:
             raise ValueError("daily security key start must not be after end")
+        code_scope = tuple(sorted(set(ts_codes or ())))
+        if ts_codes is not None and not code_scope:
+            return []
+        code_predicate = "AND ts_code = ANY(?)" if code_scope else ""
+        parameters: list[object] = [start, end]
+        if code_scope:
+            parameters.append(list(code_scope))
         rows = self._conn.execute(
-            """
+            f"""
             SELECT ts_code, trade_date
             FROM daily_bar
             WHERE trade_date BETWEEN ? AND ?
+              {code_predicate}
             ORDER BY ts_code, trade_date
             """,
-            [start, end],
+            parameters,
         ).fetchall()
         return [
             DailySecurityKey(ts_code=str(ts_code), trade_date=cast(date, trade_date))
             for ts_code, trade_date in rows
         ]
 
-    def list_daily_security_dates(self, start: date, end: date) -> list[date]:
+    def list_daily_security_dates(
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
+    ) -> list[date]:
         if start > end:
             raise ValueError("daily security date start must not be after end")
+        code_scope = tuple(sorted(set(ts_codes or ())))
+        if ts_codes is not None and not code_scope:
+            return []
+        code_predicate = "AND ts_code = ANY(?)" if code_scope else ""
+        parameters: list[object] = [start, end]
+        if code_scope:
+            parameters.append(list(code_scope))
         rows = self._conn.execute(
-            """
+            f"""
             SELECT DISTINCT trade_date
             FROM daily_bar
             WHERE trade_date BETWEEN ? AND ?
+              {code_predicate}
             ORDER BY trade_date
             """,
-            [start, end],
+            parameters,
         ).fetchall()
         return [cast(date, row[0]) for row in rows]
 
     def list_incomplete_stock_status_dates(
-        self, start: date, end: date
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
     ) -> list[date]:
         if start > end:
             raise ValueError("stock status date start must not be after end")
+        code_scope = tuple(sorted(set(ts_codes or ())))
+        if ts_codes is not None and not code_scope:
+            return []
+        code_predicate = "AND daily.ts_code = ANY(?)" if code_scope else ""
+        parameters: list[object] = [start, end]
+        if code_scope:
+            parameters.append(list(code_scope))
         rows = self._conn.execute(
             f"""
             SELECT DISTINCT daily.trade_date
             FROM daily_bar AS daily
             LEFT JOIN stock_status_daily AS status USING (ts_code, trade_date)
             WHERE daily.trade_date BETWEEN ? AND ?
+              {code_predicate}
               AND (
                   status.ts_code IS NULL
                   OR status.is_st IS NULL
@@ -361,13 +400,53 @@ class DuckDBStore:
               )
             ORDER BY daily.trade_date
             """,
-            [start, end],
+            parameters,
         ).fetchall()
         return [cast(date, row[0]) for row in rows]
 
+    def list_incomplete_stock_status_keys(
+        self, keys: Sequence[DailySecurityKey]
+    ) -> list[DailySecurityKey]:
+        ordered = sorted(set(keys), key=lambda key: (key.ts_code, key.trade_date))
+        if not ordered:
+            return []
+        stage_name = "_rquant_status_key_scope"
+        frame = pd.DataFrame(
+            [(key.ts_code, key.trade_date) for key in ordered],
+            columns=["ts_code", "trade_date"],
+        )
+        try:
+            self._conn.register(stage_name, frame)
+            rows = self._conn.execute(
+                f"""
+                SELECT daily.ts_code, daily.trade_date
+                FROM {stage_name} AS scope
+                INNER JOIN daily_bar AS daily USING (ts_code, trade_date)
+                LEFT JOIN stock_status_daily AS status USING (ts_code, trade_date)
+                WHERE status.ts_code IS NULL
+                   OR status.is_st IS NULL
+                   OR {_INVALID_STOCK_STATUS_PREDICATE}
+                ORDER BY daily.ts_code, daily.trade_date
+                """
+            ).fetchall()
+        finally:
+            self._conn.unregister(stage_name)
+        return [
+            DailySecurityKey(ts_code=str(ts_code), trade_date=cast(date, trade_date))
+            for ts_code, trade_date in rows
+        ]
+
     def upsert_stock_status(
-        self, rows: Sequence[SecurityStatusDaily]
+        self,
+        rows: Sequence[SecurityStatusDaily],
+        *,
+        transaction_mode: Literal["standalone", "existing"] = "standalone",
+        require_daily_keys: bool = False,
     ) -> int:
+        if transaction_mode not in {"standalone", "existing"}:
+            raise ValueError(
+                "stock status transaction_mode must be 'standalone' or 'existing'"
+            )
         observations = _validate_security_status_rows(rows)
         if not observations:
             return 0
@@ -379,8 +458,31 @@ class DuckDBStore:
         try:
             self._conn.register(stage_name, stage)
             stage_registered = True
-            self._conn.execute("BEGIN")
-            transaction_open = True
+            if transaction_mode == "standalone":
+                self._conn.execute("BEGIN")
+                transaction_open = True
+            if require_daily_keys:
+                # Writers are serialized by contract; revalidate exact keys in
+                # this writer transaction instead of adding FK or broad locks.
+                missing_rows = self._conn.execute(
+                    f"""
+                    SELECT DISTINCT stage.ts_code, stage.trade_date
+                    FROM {stage_name} AS stage
+                    LEFT JOIN daily_bar AS daily USING (ts_code, trade_date)
+                    WHERE daily.ts_code IS NULL
+                    ORDER BY stage.trade_date, stage.ts_code
+                    """
+                ).fetchall()
+                if missing_rows:
+                    raise SecurityStatusEligibilityChangedError(
+                        [
+                            DailySecurityKey(
+                                ts_code=str(ts_code),
+                                trade_date=cast(date, trade_date),
+                            )
+                            for ts_code, trade_date in missing_rows
+                        ]
+                    )
             conflict = self._conn.execute(
                 f"""
                 SELECT stage.ts_code, stage.trade_date,
@@ -434,8 +536,9 @@ class DuckDBStore:
                 WHERE excluded.ingested_at > stock_status_daily.ingested_at
                 """
             )
-            self._conn.execute("COMMIT")
-            transaction_open = False
+            if transaction_mode == "standalone":
+                self._conn.execute("COMMIT")
+                transaction_open = False
         except BaseException as primary:
             retryable_conflict = _is_retryable_stock_status_upsert_error(primary)
             rollback_error: BaseException | None = None

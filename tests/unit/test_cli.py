@@ -67,6 +67,157 @@ class TestCLISmoke:
         assert "--date" in result.stdout
 
 
+class TestCmdMarketDailyBackfill:
+    def test_remote_backfill_finishes_before_recompute_writer_opens(
+        self,
+        monkeypatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant.cli import cmd_market_daily_backfill
+
+        writer_active = False
+        events: list[str] = []
+
+        class _Store:
+            def __enter__(self):
+                nonlocal writer_active
+                assert writer_active is False
+                writer_active = True
+                events.append("writer_enter")
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                nonlocal writer_active
+                writer_active = False
+                events.append("writer_exit")
+
+        store_factory = MagicMock(side_effect=_Store)
+        adapter = object()
+
+        def fake_backfill(*args, **kwargs):
+            assert writer_active is False
+            assert args == ("2020-01-01", "2020-01-02", adapter)
+            assert kwargs["store_factory"] is store_factory
+            events.append("remote_backfill")
+            return {"failed_dates": [], "affected_codes": ["600000.SH"]}
+
+        def fake_recompute(store, *, codes, status_mode):
+            assert writer_active is True
+            assert isinstance(store, _Store)
+            assert codes == ["600000.SH"]
+            assert status_mode == "verified_no_fetch"
+            events.append("recompute")
+            return 1
+
+        monkeypatch.setattr("rquant.cli.DuckDBStore", store_factory)
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            MagicMock(return_value=adapter),
+        )
+        monkeypatch.setattr(
+            "rquant.market_backfill.backfill_market_daily",
+            fake_backfill,
+        )
+        monkeypatch.setattr(
+            "rquant.market_backfill.recompute_daily_state",
+            fake_recompute,
+        )
+        args = MagicMock(
+            start_date="2020-01-01",
+            end_date="2020-01-02",
+            dry_run=False,
+            skip_state_recompute=False,
+        )
+
+        result = cmd_market_daily_backfill(args)
+
+        assert result == 0
+        assert events == [
+            "remote_backfill",
+            "writer_enter",
+            "recompute",
+            "writer_exit",
+        ]
+
+    def test_skip_state_recompute_keeps_invalidated_tails_without_rebuild(
+        self,
+        monkeypatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant.cli import cmd_market_daily_backfill
+
+        store_factory = MagicMock()
+        recompute = MagicMock()
+        monkeypatch.setattr("rquant.cli.DuckDBStore", store_factory)
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            MagicMock(return_value=object()),
+        )
+        monkeypatch.setattr(
+            "rquant.market_backfill.backfill_market_daily",
+            MagicMock(
+                return_value={
+                    "failed_dates": [],
+                    "affected_codes": ["600000.SH"],
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            "rquant.market_backfill.recompute_daily_state",
+            recompute,
+        )
+
+        result = cmd_market_daily_backfill(
+            MagicMock(
+                start_date="2020-01-01",
+                end_date="2020-01-02",
+                dry_run=False,
+                skip_state_recompute=True,
+            )
+        )
+
+        assert result == 0
+        store_factory.assert_not_called()
+        recompute.assert_not_called()
+
+    def test_parser_names_state_recompute_and_keeps_hidden_legacy_alias(
+        self,
+    ) -> None:
+        parser = build_parser()
+        required = [
+            "market-daily-backfill",
+            "--start-date",
+            "2020-01-01",
+            "--end-date",
+            "2020-01-02",
+        ]
+
+        renamed = parser.parse_args([*required, "--skip-state-recompute"])
+        legacy = parser.parse_args([*required, "--skip-state"])
+
+        assert renamed.skip_state_recompute is True
+        assert legacy.skip_state_recompute is True
+
+    def test_market_backfill_help_explains_tail_invalidation(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "rquant.cli",
+                "market-daily-backfill",
+                "--help",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "--skip-state-recompute" in result.stdout
+        assert "陈旧状态尾部" in result.stdout
+
+
 class TestMonitorParser:
     def test_default_interval(self) -> None:
         parser = build_parser()

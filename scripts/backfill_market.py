@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections.abc import Callable, Sequence
+from datetime import date
 
 from loguru import logger
 from tqdm import tqdm
@@ -37,6 +39,74 @@ def get_dates_to_backfill(store: DuckDBStore, start: str) -> list[str]:
     return need
 
 
+def ingest_backfill_date(
+    trade_date: str,
+    *,
+    ingest: Callable[..., int] | None = None,
+) -> int:
+    """Write one date while leaving its dependent state tail invalidated."""
+    if ingest is None:
+        from rquant.ingest import ingest_daily
+
+        ingest = ingest_daily
+    return ingest(trade_date, state_mode="invalidate_tail")
+
+
+def finalize_backfill_state(
+    successful_dates: Sequence[str],
+    *,
+    store_factory: Callable[[], DuckDBStore] = DuckDBStore,
+    recompute: Callable[..., int] | None = None,
+    recompute_sentiment: Callable[..., int] | None = None,
+) -> tuple[int, int]:
+    """Rebuild affected state once, then refresh its sentiment dependency."""
+    parsed_dates = sorted({date.fromisoformat(value) for value in successful_dates})
+    if not parsed_dates:
+        return 0, 0
+    if recompute is None:
+        from rquant.market_backfill import recompute_daily_state
+
+        recompute = recompute_daily_state
+    if recompute_sentiment is None:
+        from rquant.market_context import recompute_market_sentiment_range
+
+        recompute_sentiment = recompute_market_sentiment_range
+
+    with store_factory() as store:
+        codes = [
+            str(row[0])
+            for row in store._conn.execute(
+                """
+                SELECT DISTINCT ts_code
+                FROM daily_bar
+                WHERE trade_date = ANY(?)
+                ORDER BY ts_code
+                """,
+                [parsed_dates],
+            ).fetchall()
+        ]
+        if not codes:
+            return 0, 0
+        state_rows = recompute(
+            store,
+            codes=codes,
+            status_mode="verified_no_fetch",
+        )
+        last_date = store._conn.execute(
+            "SELECT max(trade_date) FROM daily_bar"
+        ).fetchone()[0]
+        sentiment_rows = (
+            recompute_sentiment(
+                parsed_dates[0],
+                last_date,
+                store=store,
+            )
+            if last_date is not None
+            else 0
+        )
+    return state_rows, sentiment_rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="回填全市场历史数据")
     parser.add_argument("--start", type=str, default="2025-04-21")
@@ -61,10 +131,9 @@ def main() -> int:
     total = len(dates)
     print(f"待回填: {total} 个交易日 ({dates[0]} ~ {dates[-1]})\n")
 
-    from rquant.ingest import ingest_daily
-
     success = 0
     fail = 0
+    successful_dates: list[str] = []
     t0 = time.time()
 
     pbar = tqdm(total=total, desc="总进度", unit="天", ncols=70,
@@ -75,11 +144,11 @@ def main() -> int:
         t1 = time.time()
 
         try:
-            with DuckDBStore() as store:
-                count = ingest_daily(d, store=store)
+            count = ingest_backfill_date(d)
             dt = time.time() - t1
             if count > 0:
                 success += 1
+                successful_dates.append(d)
                 tqdm.write(f"  ✓ {d}  {count} 行  {dt:.0f}s")
             else:
                 fail += 1
@@ -95,6 +164,19 @@ def main() -> int:
             time.sleep(args.sleep)
 
     pbar.close()
+    if successful_dates:
+        try:
+            state_rows, sentiment_rows = finalize_backfill_state(
+                successful_dates
+            )
+            print(
+                f"状态尾部统一重算: state {state_rows} 行 / "
+                f"sentiment {sentiment_rows} 行"
+            )
+        except Exception as error:
+            fail += 1
+            print(f"状态尾部统一重算失败: {error}")
+            logger.exception("状态尾部统一重算失败")
     elapsed = (time.time() - t0) / 60
     print(f"\n✅ 回填完成: 成功 {success}, 跳过/失败 {fail}, 耗时 {elapsed:.0f} 分钟")
     return 0 if fail == 0 else 1

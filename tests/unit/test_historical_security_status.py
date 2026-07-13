@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+import rquant.security_status as security_status
 import rquant.storage.duckdb as duckdb_storage
 from rquant.adapter.tushare import TushareAdapter
 from rquant.security_status import (
@@ -25,6 +27,8 @@ from rquant.security_status import (
     SecurityStatusConcurrentWriteError,
     SecurityStatusCoverage,
     SecurityStatusDaily,
+    SecurityStatusEligibilityChangedError,
+    SecurityStatusPrefetchBatch,
     SecurityStatusWriteConflictError,
     StockSTHistory,
     StockSTIncompleteError,
@@ -36,6 +40,7 @@ from rquant.security_status import (
     normalize_name,
     normalize_namechange_history,
     normalize_stock_st_history,
+    prefetch_security_status,
 )
 from rquant.storage.duckdb import DuckDBStore
 
@@ -462,21 +467,23 @@ def test_backfill_source_as_of_finds_late_announcement_independent_of_target_end
     calls: list[tuple[date, date]] = []
     for target_end in (date(2020, 1, 2), date(2020, 1, 3)):
         adapter = _LateAnnouncementAdapter()
-        with DuckDBStore(tmp_path / f"late-{target_end}.duckdb") as store:
+        db_path = tmp_path / f"late-{target_end}.duckdb"
+        with DuckDBStore(db_path) as store:
             store._conn.execute(
                 "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
                 "('600000.SH', DATE '2020-01-02', 10)"
             )
-            result = backfill_historical_security_status(
-                adapter,
-                store,
-                start=date(2020, 1, 2),
-                end=target_end,
-                source_as_of=date(2020, 1, 5),
-                namechange_start=date(2020, 1, 1),
-                ingested_at=INGESTED_AT,
-                request_interval_seconds=0,
-            )
+        result = backfill_historical_security_status(
+            adapter,
+            store_factory=lambda db_path=db_path: DuckDBStore(db_path),
+            start=date(2020, 1, 2),
+            end=target_end,
+            source_as_of=date(2020, 1, 5),
+            namechange_start=date(2020, 1, 1),
+            ingested_at=INGESTED_AT,
+            request_interval_seconds=0,
+        )
+        with DuckDBStore(db_path, read_only=True) as store:
             stored_rows.append(
                 store.list_stock_status(date(2020, 1, 2), date(2020, 1, 2))[0]
             )
@@ -507,6 +514,257 @@ class _BackfillAdapter(_WindowedAdapter):
         )
 
 
+def test_backfill_closes_planning_store_before_provider_calls(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "two-phase-status.duckdb"
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close)
+            VALUES ('600000.SH', DATE '2020-01-02', 10)
+            """
+        )
+
+    class _LockProbeAdapter(_BackfillAdapter):
+        def _probe(self) -> None:
+            with DuckDBStore(db_path, read_only=True):
+                pass
+
+        def namechange_raw(
+            self,
+            start_date: date,
+            end_date: date,
+            ts_code: str | None = None,
+        ) -> pd.DataFrame:
+            self._probe()
+            return super().namechange_raw(start_date, end_date, ts_code)
+
+        def stock_st_raw(self, trade_date: date) -> pd.DataFrame:
+            self._probe()
+            return super().stock_st_raw(trade_date)
+
+    result = backfill_historical_security_status(
+        _LockProbeAdapter(),
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        source_as_of=date(2020, 1, 2),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
+
+    assert result.upserted_count == 1
+
+
+def test_backfill_rejects_key_deleted_between_plan_and_apply(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "status-key-deleted.duckdb"
+    target = _key(date(2020, 1, 2))
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close)
+            VALUES (?, ?, 10)
+            """,
+            [target.ts_code, target.trade_date],
+        )
+
+    class _DeletingAdapter(_BackfillAdapter):
+        def namechange_raw(
+            self,
+            start_date: date,
+            end_date: date,
+            ts_code: str | None = None,
+        ) -> pd.DataFrame:
+            with DuckDBStore(db_path) as concurrent_writer:
+                concurrent_writer._conn.execute(
+                    "DELETE FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
+                    [target.ts_code, target.trade_date],
+                )
+            return super().namechange_raw(start_date, end_date, ts_code)
+
+    with pytest.raises(SecurityStatusEligibilityChangedError) as exc_info:
+        backfill_historical_security_status(
+            _DeletingAdapter(),
+            store_factory=lambda: DuckDBStore(db_path),
+            start=target.trade_date,
+            end=target.trade_date,
+            source_as_of=target.trade_date,
+            namechange_start=date(2020, 1, 1),
+            ingested_at=INGESTED_AT,
+            request_interval_seconds=0,
+        )
+
+    assert exc_info.value.missing_keys == (target,)
+    with DuckDBStore(db_path, read_only=True) as store:
+        assert store.list_stock_status(target.trade_date, target.trade_date) == []
+
+
+def test_backfill_empty_code_scope_skips_store_and_provider_calls() -> None:
+    adapter = _StreamingAdapter()
+    store_calls = 0
+
+    def store_factory() -> DuckDBStore:
+        nonlocal store_calls
+        store_calls += 1
+        raise AssertionError("empty scope must not open storage")
+
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=store_factory,
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        ts_codes=[],
+        source_as_of=date(2020, 1, 2),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
+
+    assert result.eligible_count == 0
+    assert store_calls == 0
+    assert adapter.provider_calls == []
+
+
+def test_prefetch_materializes_typed_batch_without_store_access() -> None:
+    adapter = _BackfillAdapter()
+    keys = [
+        _key(date(2020, 1, 2)),
+        _key(date(2020, 1, 3)),
+    ]
+
+    batch = prefetch_security_status(
+        adapter,
+        keys,
+        source_as_of=date(2020, 1, 3),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
+
+    assert isinstance(batch, SecurityStatusPrefetchBatch)
+    assert [(row.trade_date, row.is_st) for row in batch.rows] == [
+        (date(2020, 1, 2), False),
+        (date(2020, 1, 3), False),
+    ]
+    assert batch.namechange_request_count == 1
+    assert batch.stock_st_request_count == 2
+    assert adapter.calls == [
+        (date(2020, 1, 1), date(2020, 1, 3), "600000.SH")
+    ]
+    assert adapter.stock_dates == [date(2020, 1, 2), date(2020, 1, 3)]
+
+
+class _ScopedAdapter:
+    def __init__(self) -> None:
+        self.namechange_codes: list[str | None] = []
+        self.stock_dates: list[date] = []
+
+    def namechange_raw(
+        self,
+        start_date: date,
+        end_date: date,
+        ts_code: str | None = None,
+    ) -> pd.DataFrame:
+        del start_date, end_date
+        self.namechange_codes.append(ts_code)
+        codes = [ts_code] if ts_code else ["000001.SZ", "600000.SH"]
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": code,
+                    "name": "平安银行" if code == "000001.SZ" else "浦发银行",
+                    "start_date": "20200101",
+                    "end_date": None,
+                    "ann_date": "20200101",
+                    "change_reason": "normal",
+                }
+                for code in codes
+            ]
+        )
+
+    def stock_st_raw(self, trade_date: date) -> pd.DataFrame:
+        self.stock_dates.append(trade_date)
+        return pd.DataFrame(columns=list(security_status._STOCK_ST_COLUMNS))
+
+
+def test_backfill_ts_code_scope_cannot_write_other_daily_codes(tmp_path: Path) -> None:
+    adapter = _ScopedAdapter()
+    db_path = tmp_path / "scoped-code.duckdb"
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
+            "('000001.SZ', DATE '2020-01-02', 10), "
+            "('600000.SH', DATE '2020-01-02', 11)"
+        )
+
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        ts_codes=["000001.SZ"],
+        source_as_of=date(2020, 1, 2),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
+    with DuckDBStore(db_path, read_only=True) as store:
+        stored = store.list_stock_status(date(2020, 1, 2), date(2020, 1, 2))
+
+    assert result.eligible_count == 1
+    assert [row.ts_code for row in stored] == ["000001.SZ"]
+    assert adapter.namechange_codes == ["000001.SZ"]
+
+
+def test_backfill_eligible_key_scope_and_parameterized_store_lookup(
+    tmp_path: Path,
+) -> None:
+    adapter = _ScopedAdapter()
+    target = _key(date(2020, 1, 2), "600000.SH")
+    db_path = tmp_path / "scoped-key.duckdb"
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
+            "('000001.SZ', DATE '2020-01-02', 10), "
+            "('600000.SH', DATE '2020-01-02', 11)"
+        )
+
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        eligible_keys=[target],
+        source_as_of=date(2020, 1, 2),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        missing_only=False,
+        request_interval_seconds=0,
+    )
+    with DuckDBStore(db_path, read_only=True) as store:
+        stored = store.list_stock_status(date(2020, 1, 2), date(2020, 1, 2))
+        exact = store.list_daily_security_keys(
+            date(2020, 1, 2),
+            date(2020, 1, 2),
+            ts_codes=["600000.SH"],
+        )
+        injected = store.list_daily_security_keys(
+            date(2020, 1, 2),
+            date(2020, 1, 2),
+            ts_codes=["600000.SH') OR TRUE --"],
+        )
+
+    assert result.eligible_count == 1
+    assert [(row.ts_code, row.trade_date) for row in stored] == [
+        (target.ts_code, target.trade_date)
+    ]
+    assert exact == [target]
+    assert injected == []
+
+
 def test_backfill_uses_daily_bar_eligibility_and_store_is_typed_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -517,24 +775,24 @@ def test_backfill_uses_daily_bar_eligibility_and_store_is_typed_idempotent(
             "('600000.SH', DATE '2020-01-02', 10), "
             "('600000.SH', DATE '2020-01-03', 11)"
         )
-        adapter = _BackfillAdapter()
-
-        result = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 1),
-            end=date(2020, 1, 3),
-            ingested_at=INGESTED_AT,
-            request_interval_seconds=0,
-        )
-        repeated = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 1),
-            end=date(2020, 1, 3),
-            ingested_at=INGESTED_AT + timedelta(seconds=1),
-            request_interval_seconds=0,
-        )
+    adapter = _BackfillAdapter()
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 1),
+        end=date(2020, 1, 3),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
+    repeated = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 1),
+        end=date(2020, 1, 3),
+        ingested_at=INGESTED_AT + timedelta(seconds=1),
+        request_interval_seconds=0,
+    )
+    with DuckDBStore(db_path, read_only=True) as store:
         stored = store.list_stock_status(date(2020, 1, 1), date(2020, 1, 3))
         coverage = store.stock_status_coverage(
             date(2020, 1, 1), date(2020, 1, 3)
@@ -1450,6 +1708,35 @@ def test_upsert_exact_equal_time_retry_is_idempotent(tmp_path: Path) -> None:
     assert stored == [row]
 
 
+def test_upsert_existing_transaction_rolls_back_with_caller(tmp_path: Path) -> None:
+    row = _stored_status()
+
+    with DuckDBStore(tmp_path / "status-caller-transaction.duckdb") as store:
+        store._conn.execute("BEGIN")
+        store.upsert_stock_status((row,), transaction_mode="existing")
+        store._conn.execute("ROLLBACK")
+        stored = store.list_stock_status(date(2020, 1, 2), date(2020, 1, 2))
+
+    assert stored == []
+
+
+def test_upsert_existing_transaction_keeps_equal_time_conflict_check(
+    tmp_path: Path,
+) -> None:
+    existing = _stored_status()
+    conflict = _stored_status(name="*ST浦发", is_st=True)
+
+    with DuckDBStore(tmp_path / "status-caller-conflict.duckdb") as store:
+        store.upsert_stock_status((existing,))
+        store._conn.execute("BEGIN")
+        with pytest.raises(SecurityStatusWriteConflictError):
+            store.upsert_stock_status((conflict,), transaction_mode="existing")
+        store._conn.execute("ROLLBACK")
+        stored = store.list_stock_status(date(2020, 1, 2), date(2020, 1, 2))
+
+    assert stored == [existing]
+
+
 class _StreamingAdapter:
     def __init__(self, *, fail_on: date | None = None) -> None:
         self.fail_on = fail_on
@@ -1508,42 +1795,48 @@ def _insert_three_status_days(store: DuckDBStore) -> None:
     )
 
 
-def test_backfill_queries_and_writes_one_trade_date_at_a_time(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_backfill_plans_exact_keys_before_remote_prefetch(tmp_path: Path) -> None:
     adapter = _StreamingAdapter()
-    with DuckDBStore(tmp_path / "streaming.duckdb") as store:
+    db_path = tmp_path / "streaming.duckdb"
+    with DuckDBStore(db_path) as store:
         _insert_three_status_days(store)
-        real_list = store.list_daily_security_keys
-        key_ranges: list[tuple[date, date]] = []
+    key_ranges: list[tuple[date, date]] = []
 
-        def list_one_day(start: date, end: date) -> list[DailySecurityKey]:
+    class _TrackingStore(DuckDBStore):
+        def list_daily_security_keys(
+            self,
+            start: date,
+            end: date,
+            *,
+            ts_codes: Sequence[str] | None = None,
+        ) -> list[DailySecurityKey]:
             key_ranges.append((start, end))
-            assert start == end
-            return real_list(start, end)
+            return super().list_daily_security_keys(
+                start,
+                end,
+                ts_codes=ts_codes,
+            )
 
-        monkeypatch.setattr(store, "list_daily_security_keys", list_one_day)
-        result = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 2),
-            end=date(2020, 1, 6),
-            source_as_of=date(2020, 1, 6),
-            namechange_start=date(2020, 1, 1),
-            ingested_at=INGESTED_AT,
-            request_interval_seconds=0,
-        )
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: _TrackingStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 6),
+        source_as_of=date(2020, 1, 6),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
 
-    expected_dates = [date(2020, 1, 2), date(2020, 1, 3), date(2020, 1, 6)]
-    assert key_ranges == [(day, day) for day in expected_dates]
+    assert key_ranges == [(date(2020, 1, 2), date(2020, 1, 6))]
     assert result.eligible_count == 3
     assert result.upserted_count == 3
 
 
 def test_backfill_resume_processes_only_incomplete_dates(tmp_path: Path) -> None:
     adapter = _StreamingAdapter()
-    with DuckDBStore(tmp_path / "resume-incomplete.duckdb") as store:
+    db_path = tmp_path / "resume-incomplete.duckdb"
+    with DuckDBStore(db_path) as store:
         _insert_three_status_days(store)
         store.upsert_stock_status(
             (
@@ -1561,27 +1854,27 @@ def test_backfill_resume_processes_only_incomplete_dates(tmp_path: Path) -> None
             )
         )
 
-        first = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 2),
-            end=date(2020, 1, 6),
-            source_as_of=date(2020, 1, 6),
-            namechange_start=date(2020, 1, 1),
-            ingested_at=INGESTED_AT + timedelta(seconds=1),
-            request_interval_seconds=0,
-        )
-        calls_after_first = list(adapter.provider_calls)
-        second = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 2),
-            end=date(2020, 1, 6),
-            source_as_of=date(2020, 1, 6),
-            namechange_start=date(2020, 1, 1),
-            ingested_at=INGESTED_AT + timedelta(seconds=2),
-            request_interval_seconds=0,
-        )
+    first = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 6),
+        source_as_of=date(2020, 1, 6),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT + timedelta(seconds=1),
+        request_interval_seconds=0,
+    )
+    calls_after_first = list(adapter.provider_calls)
+    second = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 6),
+        source_as_of=date(2020, 1, 6),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT + timedelta(seconds=2),
+        request_interval_seconds=0,
+    )
 
     assert calls_after_first == [
         "namechange",
@@ -1595,28 +1888,80 @@ def test_backfill_resume_processes_only_incomplete_dates(tmp_path: Path) -> None
     assert second.upserted_count == 0
 
 
+def test_backfill_missing_only_refreshes_individual_key_not_complete_peer(
+    tmp_path: Path,
+) -> None:
+    adapter = _ScopedAdapter()
+    day = date(2020, 1, 2)
+    complete = _stored_status(ts_code="000001.SZ", name="平安银行")
+    db_path = tmp_path / "individual-missing-key.duckdb"
+    snapshot_sql = """
+        SELECT ts_code, trade_date::VARCHAR, name, is_st, name_source,
+               st_source, available_at::VARCHAR, ingested_at::VARCHAR,
+               conflict_reason
+        FROM stock_status_daily
+        WHERE ts_code = ? AND trade_date = ?
+    """
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
+            "('000001.SZ', DATE '2020-01-02', 10), "
+            "('600000.SH', DATE '2020-01-02', 11)"
+        )
+        store.upsert_stock_status((complete,))
+        before = store._conn.execute(
+            snapshot_sql,
+            [complete.ts_code, day],
+        ).fetchone()
+
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=day,
+        end=day,
+        source_as_of=day,
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT + timedelta(seconds=1),
+        request_interval_seconds=0,
+    )
+    with DuckDBStore(db_path, read_only=True) as store:
+        after = store._conn.execute(
+            snapshot_sql,
+            [complete.ts_code, day],
+        ).fetchone()
+        stored = store.list_stock_status(day, day)
+
+    assert result.eligible_count == 1
+    assert before == after
+    assert [(row.ts_code, row.ingested_at) for row in stored] == [
+        ("000001.SZ", INGESTED_AT),
+        ("600000.SH", INGESTED_AT + timedelta(seconds=1)),
+    ]
+
+
 def test_backfill_missing_only_false_forces_complete_date_refresh(
     tmp_path: Path,
 ) -> None:
     adapter = _StreamingAdapter()
-    with DuckDBStore(tmp_path / "force-refresh.duckdb") as store:
+    db_path = tmp_path / "force-refresh.duckdb"
+    with DuckDBStore(db_path) as store:
         store._conn.execute(
             "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
             "('600000.SH', DATE '2020-01-02', 10)"
         )
         store.upsert_stock_status((_stored_status(),))
 
-        result = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 2),
-            end=date(2020, 1, 2),
-            source_as_of=date(2020, 1, 2),
-            namechange_start=date(2020, 1, 1),
-            ingested_at=INGESTED_AT + timedelta(seconds=1),
-            missing_only=False,
-            request_interval_seconds=0,
-        )
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        source_as_of=date(2020, 1, 2),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT + timedelta(seconds=1),
+        missing_only=False,
+        request_interval_seconds=0,
+    )
 
     assert adapter.provider_calls == ["namechange", "stock_st:2020-01-02"]
     assert result.eligible_count == 1
@@ -1626,23 +1971,24 @@ def test_backfill_missing_only_false_forces_complete_date_refresh(
 def test_backfill_uses_injectable_request_throttle(tmp_path: Path) -> None:
     adapter = _StreamingAdapter()
     sleeps: list[float] = []
-    with DuckDBStore(tmp_path / "throttle.duckdb") as store:
+    db_path = tmp_path / "throttle.duckdb"
+    with DuckDBStore(db_path) as store:
         store._conn.execute(
             "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
             "('600000.SH', DATE '2020-01-02', 10), "
             "('600000.SH', DATE '2020-01-03', 11)"
         )
-        backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 2),
-            end=date(2020, 1, 3),
-            source_as_of=date(2020, 1, 3),
-            namechange_start=date(2020, 1, 1),
-            ingested_at=INGESTED_AT,
-            request_interval_seconds=0.12,
-            sleep=sleeps.append,
-        )
+    backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 3),
+        source_as_of=date(2020, 1, 3),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0.12,
+        sleep=sleeps.append,
+    )
 
     assert adapter.provider_calls == [
         "namechange",
@@ -1656,22 +2002,24 @@ def test_stock_st_at_provider_cap_fails_before_writing_that_day(
     tmp_path: Path,
 ) -> None:
     adapter = _CappedStockSTAdapter()
-    with DuckDBStore(tmp_path / "stock-st-cap.duckdb") as store:
+    db_path = tmp_path / "stock-st-cap.duckdb"
+    with DuckDBStore(db_path) as store:
         store._conn.execute(
             "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
             "('600000.SH', DATE '2020-01-02', 10)"
         )
-        with pytest.raises(StockSTTruncatedError, match="1000"):
-            backfill_historical_security_status(
-                adapter,
-                store,
-                start=date(2020, 1, 2),
-                end=date(2020, 1, 2),
-                source_as_of=date(2020, 1, 2),
-                namechange_start=date(2020, 1, 1),
-                ingested_at=INGESTED_AT,
-                request_interval_seconds=0,
-            )
+    with pytest.raises(StockSTTruncatedError, match="1000"):
+        backfill_historical_security_status(
+            adapter,
+            store_factory=lambda: DuckDBStore(db_path),
+            start=date(2020, 1, 2),
+            end=date(2020, 1, 2),
+            source_as_of=date(2020, 1, 2),
+            namechange_start=date(2020, 1, 1),
+            ingested_at=INGESTED_AT,
+            request_interval_seconds=0,
+        )
+    with DuckDBStore(db_path, read_only=True) as store:
         stored_count = store._conn.execute(
             "SELECT COUNT(*) FROM stock_status_daily"
         ).fetchone()[0]
@@ -1682,21 +2030,23 @@ def test_post_2016_empty_stock_st_warns_without_negating_namechange_fact(
     tmp_path: Path,
 ) -> None:
     adapter = _StreamingAdapter()
-    with DuckDBStore(tmp_path / "stock-st-empty-warning.duckdb") as store:
+    db_path = tmp_path / "stock-st-empty-warning.duckdb"
+    with DuckDBStore(db_path) as store:
         store._conn.execute(
             "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
             "('600000.SH', DATE '2020-01-02', 10)"
         )
-        result = backfill_historical_security_status(
-            adapter,
-            store,
-            start=date(2020, 1, 2),
-            end=date(2020, 1, 2),
-            source_as_of=date(2020, 1, 2),
-            namechange_start=date(2020, 1, 1),
-            ingested_at=INGESTED_AT,
-            request_interval_seconds=0,
-        )
+    result = backfill_historical_security_status(
+        adapter,
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 2),
+        source_as_of=date(2020, 1, 2),
+        namechange_start=date(2020, 1, 1),
+        ingested_at=INGESTED_AT,
+        request_interval_seconds=0,
+    )
+    with DuckDBStore(db_path, read_only=True) as store:
         stored = store.list_stock_status(date(2020, 1, 2), date(2020, 1, 2))
 
     assert result.source_issue_count == 1
@@ -1711,30 +2061,32 @@ def test_strict_stock_st_crosscheck_fails_closed_on_empty_response(
     tmp_path: Path,
 ) -> None:
     adapter = _StreamingAdapter()
-    with DuckDBStore(tmp_path / "stock-st-strict.duckdb") as store:
+    db_path = tmp_path / "stock-st-strict.duckdb"
+    with DuckDBStore(db_path) as store:
         store._conn.execute(
             "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
             "('600000.SH', DATE '2020-01-02', 10)"
         )
-        with pytest.raises(StockSTIncompleteError, match="incomplete"):
-            backfill_historical_security_status(
-                adapter,
-                store,
-                start=date(2020, 1, 2),
-                end=date(2020, 1, 2),
-                source_as_of=date(2020, 1, 2),
-                namechange_start=date(2020, 1, 1),
-                ingested_at=INGESTED_AT,
-                strict_stock_st_crosscheck=True,
-                request_interval_seconds=0,
-            )
+    with pytest.raises(StockSTIncompleteError, match="incomplete"):
+        backfill_historical_security_status(
+            adapter,
+            store_factory=lambda: DuckDBStore(db_path),
+            start=date(2020, 1, 2),
+            end=date(2020, 1, 2),
+            source_as_of=date(2020, 1, 2),
+            namechange_start=date(2020, 1, 1),
+            ingested_at=INGESTED_AT,
+            strict_stock_st_crosscheck=True,
+            request_interval_seconds=0,
+        )
+    with DuckDBStore(db_path, read_only=True) as store:
         stored_count = store._conn.execute(
             "SELECT COUNT(*) FROM stock_status_daily"
         ).fetchone()[0]
     assert stored_count == 0
 
 
-def test_backfill_failure_keeps_completed_days_and_audit_reports_remainder(
+def test_backfill_remote_failure_writes_no_partial_batch_and_audit_reports_all(
     tmp_path: Path,
 ) -> None:
     from rquant.data_quality import historical_security_status_audit_rules, run_audit
@@ -1743,25 +2095,24 @@ def test_backfill_failure_keeps_completed_days_and_audit_reports_remainder(
     adapter = _StreamingAdapter(fail_on=date(2020, 1, 3))
     with DuckDBStore(db_path) as store:
         _insert_three_status_days(store)
-        with pytest.raises(RuntimeError, match="2020-01-03"):
-            backfill_historical_security_status(
-                adapter,
-                store,
-                start=date(2020, 1, 2),
-                end=date(2020, 1, 6),
-                source_as_of=date(2020, 1, 6),
-                namechange_start=date(2020, 1, 1),
-                ingested_at=INGESTED_AT,
-                request_interval_seconds=0,
-            )
+    with pytest.raises(RuntimeError, match="2020-01-03"):
+        backfill_historical_security_status(
+            adapter,
+            store_factory=lambda: DuckDBStore(db_path),
+            start=date(2020, 1, 2),
+            end=date(2020, 1, 6),
+            source_as_of=date(2020, 1, 6),
+            namechange_start=date(2020, 1, 1),
+            ingested_at=INGESTED_AT,
+            request_interval_seconds=0,
+        )
+    with DuckDBStore(db_path, read_only=True) as store:
         stored = store.list_stock_status(date(2020, 1, 2), date(2020, 1, 6))
         coverage = store.stock_status_coverage(date(2020, 1, 2), date(2020, 1, 6))
 
-    assert [(row.trade_date, row.is_st) for row in stored] == [
-        (date(2020, 1, 2), False)
-    ]
-    assert coverage.persisted_count == 1
-    assert coverage.missing_count == 2
+    assert stored == []
+    assert coverage.persisted_count == 0
+    assert coverage.missing_count == 3
 
     rules = historical_security_status_audit_rules(
         date(2020, 1, 2), date(2020, 1, 6)
@@ -1772,4 +2123,4 @@ def test_backfill_failure_keeps_completed_days_and_audit_reports_remainder(
         finding for finding in report.findings if finding.scope_key.startswith("missing/")
     )
     assert missing.severity == "P0"
-    assert missing.evidence["count"] == 2
+    assert missing.evidence["count"] == 3

@@ -299,22 +299,31 @@ def cmd_moneyflow_backfill(args: argparse.Namespace) -> int:
 
 
 def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
-    """全市场日线历史回补 + daily_state 全量重算。"""
+    """全市场日线历史回补，再对失效的 daily_state 做一次重算。"""
     from rquant.adapter.tushare import TushareAdapter
     from rquant.market_backfill import backfill_market_daily, recompute_daily_state
 
     setup_logging()
-    with DuckDBStore() as store:
-        summary = backfill_market_daily(
-            args.start_date,
-            args.end_date,
-            store,
-            TushareAdapter(),
-            dry_run=args.dry_run,
-        )
-        logger.info(summary)
-        if not args.dry_run and not args.skip_state:
-            recompute_daily_state(store)
+    summary = backfill_market_daily(
+        args.start_date,
+        args.end_date,
+        TushareAdapter(),
+        store_factory=DuckDBStore,
+        dry_run=args.dry_run,
+    )
+    logger.info(summary)
+    affected_codes = summary.get("affected_codes", [])
+    if (
+        not args.dry_run
+        and not args.skip_state_recompute
+        and affected_codes
+    ):
+        with DuckDBStore() as store:
+            recompute_daily_state(
+                store,
+                codes=affected_codes,
+                status_mode="verified_no_fetch",
+            )
     return 1 if summary["failed_dates"] else 0
 
 
@@ -1354,7 +1363,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     market_backfill_p = sub.add_parser(
         "market-daily-backfill",
-        help="全市场日线历史回补（daily/daily_basic/adj_factor + daily_state 重算）",
+        help="全市场日线历史回补，并在最后统一重算 daily_state",
     )
     market_backfill_p.add_argument(
         "--start-date", type=str, required=True,
@@ -1369,8 +1378,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="只报告交易日数与预计请求数，不调 Tushare、不写库",
     )
     market_backfill_p.add_argument(
-        "--skip-state", action="store_true",
-        help="跳过回补后的 daily_state 全量重算",
+        "--skip-state-recompute",
+        dest="skip_state_recompute",
+        action="store_true",
+        help="跳过最终 daily_state 重算；逐日写入仍会删除受影响日期起的陈旧状态尾部",
+    )
+    market_backfill_p.add_argument(
+        "--skip-state",
+        dest="skip_state_recompute",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     zt_pool_p = sub.add_parser(

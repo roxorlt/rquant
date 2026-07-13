@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -289,7 +290,23 @@ class TestLimitPrices:
                     "pre_close": [row["pre_close"]],
                 }
             )
-            expected = derive_state(daily, row["ts_code"], name=row["name"]).iloc[0]
+            compact_name = str(row["name"]).upper().replace(" ", "")
+            status = pd.DataFrame(
+                {
+                    "ts_code": [row["ts_code"]],
+                    "trade_date": [date(2026, 7, 3)],
+                    "name": [row["name"]],
+                    "is_st": pd.Series(
+                        [compact_name.startswith(("ST", "*ST", "SST"))],
+                        dtype="boolean",
+                    ),
+                    "available_at": [
+                        datetime(2026, 7, 3, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai"))
+                    ],
+                    "conflict_reason": [None],
+                }
+            )
+            expected = derive_state(daily, row["ts_code"], status).iloc[0]
             assert row["limit_pct"] == expected["limit_pct"], row["ts_code"]
             assert row["limit_up_price"] == expected["limit_up_price"], row["ts_code"]
             assert row["limit_down_price"] == expected["limit_down_price"], row["ts_code"]
