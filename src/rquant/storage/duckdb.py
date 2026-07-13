@@ -22,6 +22,7 @@ from rquant.data_metadata import (
     DatasetCoverage,
     DatasetSnapshot,
     DatasetSnapshotFinalization,
+    DatasetSnapshotWriteConflictError,
     normalize_utc_datetime,
     utc_now,
 )
@@ -148,6 +149,29 @@ def _snapshot_finalization_matches(
         and snapshot.table_watermarks == finalization.table_watermarks
         and snapshot.quality_issue_ids == finalization.quality_issue_ids
         and snapshot.completed_at == finalization.completed_at
+    )
+
+
+def _coverage_payload_matches(
+    stored: DatasetCoverage,
+    requested: DatasetCoverage,
+) -> bool:
+    return (
+        stored.snapshot_id,
+        stored.dataset_id,
+        stored.coverage_scope,
+        stored.table_name,
+        stored.expected_count,
+        stored.available_count,
+        stored.missing_reasons,
+    ) == (
+        requested.snapshot_id,
+        requested.dataset_id,
+        requested.coverage_scope,
+        requested.table_name,
+        requested.expected_count,
+        requested.available_count,
+        requested.missing_reasons,
     )
 
 
@@ -465,10 +489,14 @@ class DuckDBStore:
                         snapshot_id,
                     ],
                 ).fetchall()
-            except duckdb.TransactionException:
+            except duckdb.TransactionException as exc:
                 self._conn.execute("ROLLBACK")
                 transaction_open = False
-                return self._snapshot_after_cas_loss(snapshot_id, finalization)
+                return self._snapshot_after_cas_loss(
+                    snapshot_id,
+                    finalization,
+                    conflict_cause=exc,
+                )
             if not updated:
                 self._conn.execute("ROLLBACK")
                 transaction_open = False
@@ -490,12 +518,22 @@ class DuckDBStore:
         self,
         snapshot_id: str,
         finalization: DatasetSnapshotFinalization,
+        *,
+        conflict_cause: Exception | None = None,
     ) -> DatasetSnapshot:
         current = self.get_dataset_snapshot(snapshot_id)
         if current is not None and _snapshot_finalization_matches(
             current, finalization
         ):
             return current
+        if current is None or current.status == "building":
+            conflict = DatasetSnapshotWriteConflictError(
+                "dataset snapshot write conflict; retry finalization: "
+                f"{snapshot_id}"
+            )
+            if conflict_cause is not None:
+                raise conflict from conflict_cause
+            raise conflict
         raise ValueError(
             "concurrent dataset snapshot finalization committed different data: "
             f"{snapshot_id}"
@@ -540,6 +578,7 @@ class DuckDBStore:
         self, coverage: DatasetCoverage
     ) -> DatasetCoverage:
         coverage = _revalidate_for_write(coverage)
+        transaction_open = True
         self._conn.execute("BEGIN")
         try:
             # Touching the parent row serializes coverage writes with finalization.
@@ -575,13 +614,16 @@ class DuckDBStore:
                     ],
                 ).fetchone()
                 existing = None if stored is None else _coverage_from_row(stored)
-                if existing != coverage:
+                if existing is None or not _coverage_payload_matches(
+                    existing, coverage
+                ):
                     raise ValueError(
                         "finalized dataset snapshot coverage is immutable: "
                         f"{coverage.snapshot_id}/{coverage.dataset_id}/"
                         f"{coverage.coverage_scope}"
                     )
                 self._conn.execute("COMMIT")
+                transaction_open = False
                 return existing
             self._conn.execute(
                 """
@@ -635,9 +677,19 @@ class DuckDBStore:
                 )
             result = _coverage_from_row(stored)
             self._conn.execute("COMMIT")
+            transaction_open = False
             return result
+        except duckdb.TransactionException as exc:
+            if transaction_open:
+                self._conn.execute("ROLLBACK")
+                transaction_open = False
+            raise DatasetSnapshotWriteConflictError(
+                "dataset snapshot write conflict; retry coverage upsert: "
+                f"{coverage.snapshot_id}"
+            ) from exc
         except Exception:
-            self._conn.execute("ROLLBACK")
+            if transaction_open:
+                self._conn.execute("ROLLBACK")
             raise
 
     def list_dataset_coverages(self, snapshot_id: str) -> list[DatasetCoverage]:

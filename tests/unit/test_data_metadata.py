@@ -352,6 +352,58 @@ def test_finalized_snapshot_allows_exact_coverage_retry(tmp_path: Path) -> None:
         assert store.list_dataset_coverages(snapshot.snapshot_id) == [stored]
 
 
+def test_finalized_snapshot_coverage_retry_ignores_write_once_created_at(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_metadata import (
+        DatasetCoverage,
+        DatasetSnapshot,
+        DatasetSnapshotFinalization,
+    )
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    snapshot = DatasetSnapshot.create(
+        strategy_name="strategy",
+        as_of_time=t0,
+        code_commit="abc123",
+        origin="local",
+        created_at=t0,
+    )
+    initial = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=8,
+        missing_reasons=("two symbols absent",),
+        created_at=t0,
+    )
+    accepted_request = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=9,
+        missing_reasons=("one symbol absent",),
+        created_at=t0 + timedelta(minutes=1),
+    )
+
+    with DuckDBStore(tmp_path / "ready-coverage-created-at.duckdb") as store:
+        store.begin_dataset_snapshot(snapshot)
+        store.upsert_dataset_coverage(initial)
+        stored = store.upsert_dataset_coverage(accepted_request)
+        assert stored.created_at == t0
+        store.finalize_dataset_snapshot(
+            snapshot.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=2)),
+        )
+
+        assert store.upsert_dataset_coverage(accepted_request) == stored
+        assert store.list_dataset_coverages(snapshot.snapshot_id) == [stored]
+
+
 def test_finalized_snapshot_rejects_changed_or_new_coverage_before_write(
     tmp_path: Path,
 ) -> None:
@@ -422,6 +474,7 @@ def test_coverage_upsert_serializes_with_snapshot_finalization(
         DatasetCoverage,
         DatasetSnapshot,
         DatasetSnapshotFinalization,
+        DatasetSnapshotWriteConflictError,
     )
 
     t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
@@ -460,20 +513,20 @@ def test_coverage_upsert_serializes_with_snapshot_finalization(
         primary.begin_dataset_snapshot(snapshot)
         primary.upsert_dataset_coverage(initial)
         real_get = primary.get_dataset_snapshot
-        finalization_outcomes: list[str] = []
+        finalization_conflicts: list[DatasetSnapshotWriteConflictError] = []
         interleaved = False
 
-        def get_with_concurrent_finalization(snapshot_id: str):  # noqa: ANN202
+        def get_with_concurrent_finalization(
+            snapshot_id: str,
+        ) -> DatasetSnapshot | None:
             nonlocal interleaved
             current = real_get(snapshot_id)
             if not interleaved:
                 interleaved = True
                 try:
                     competitor.finalize_dataset_snapshot(snapshot_id, finalization)
-                except ValueError:
-                    finalization_outcomes.append("rejected")
-                else:
-                    finalization_outcomes.append("committed")
+                except DatasetSnapshotWriteConflictError as exc:
+                    finalization_conflicts.append(exc)
             return current
 
         monkeypatch.setattr(
@@ -484,12 +537,94 @@ def test_coverage_upsert_serializes_with_snapshot_finalization(
 
         stored = primary.upsert_dataset_coverage(changed)
 
-        assert finalization_outcomes == ["rejected"]
+        assert len(finalization_conflicts) == 1
+        assert snapshot.snapshot_id in str(finalization_conflicts[0])
         assert stored.available_count == 10
         finalized = competitor.finalize_dataset_snapshot(
             snapshot.snapshot_id, finalization
         )
         assert finalized.status == "ready"
+        assert primary.list_dataset_coverages(snapshot.snapshot_id) == [stored]
+
+
+def test_finalization_serializes_with_coverage_upsert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.data_metadata import (
+        DatasetCoverage,
+        DatasetSnapshot,
+        DatasetSnapshotFinalization,
+        DatasetSnapshotWriteConflictError,
+    )
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    db_path = tmp_path / "finalize-coverage-race.duckdb"
+    snapshot = DatasetSnapshot.create(
+        strategy_name="strategy",
+        as_of_time=t0,
+        code_commit="abc123",
+        origin="local",
+        created_at=t0,
+    )
+    initial = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=9,
+        missing_reasons=("one symbol absent",),
+        created_at=t0,
+    )
+    changed = DatasetCoverage(
+        snapshot_id=snapshot.snapshot_id,
+        dataset_id="minute-bars",
+        coverage_scope="trade-date:2026-07-13",
+        table_name="minute_bar",
+        expected_count=10,
+        available_count=10,
+        created_at=t0,
+    )
+    finalization = DatasetSnapshotFinalization(
+        completed_at=t0 + timedelta(minutes=1)
+    )
+
+    with DuckDBStore(db_path) as primary, DuckDBStore(db_path) as finalizer:
+        primary.begin_dataset_snapshot(snapshot)
+        stored = primary.upsert_dataset_coverage(initial)
+        real_get = finalizer.get_dataset_snapshot
+        coverage_conflicts: list[DatasetSnapshotWriteConflictError] = []
+        snapshot_reads = 0
+
+        def get_with_concurrent_coverage(
+            snapshot_id: str,
+        ) -> DatasetSnapshot | None:
+            nonlocal snapshot_reads
+            current = real_get(snapshot_id)
+            snapshot_reads += 1
+            if snapshot_reads == 2:
+                try:
+                    primary.upsert_dataset_coverage(changed)
+                except DatasetSnapshotWriteConflictError as exc:
+                    coverage_conflicts.append(exc)
+            return current
+
+        monkeypatch.setattr(
+            finalizer,
+            "get_dataset_snapshot",
+            get_with_concurrent_coverage,
+        )
+
+        finalized = finalizer.finalize_dataset_snapshot(
+            snapshot.snapshot_id, finalization
+        )
+
+        assert finalized.status == "ready"
+        assert len(coverage_conflicts) == 1
+        assert snapshot.snapshot_id in str(coverage_conflicts[0])
+        with pytest.raises(ValueError, match="finalized.*coverage"):
+            primary.upsert_dataset_coverage(changed)
         assert primary.list_dataset_coverages(snapshot.snapshot_id) == [stored]
 
 
@@ -777,7 +912,9 @@ def test_finalize_snapshot_cas_preserves_concurrent_winner(
         real_get = primary.get_dataset_snapshot
         interleaved = False
 
-        def get_with_concurrent_winner(snapshot_id: str):  # noqa: ANN202
+        def get_with_concurrent_winner(
+            snapshot_id: str,
+        ) -> DatasetSnapshot | None:
             nonlocal interleaved
             current = real_get(snapshot_id)
             if not interleaved:

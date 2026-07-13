@@ -27,6 +27,10 @@ QualityEvidence: TypeAlias = dict[str, JsonValue]
 TableWatermarks: TypeAlias = dict[str, str]
 
 
+class DatasetSnapshotWriteConflictError(RuntimeError):
+    """A retryable conflict between concurrent snapshot metadata writers."""
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
