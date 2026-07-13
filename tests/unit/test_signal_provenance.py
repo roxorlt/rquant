@@ -550,10 +550,10 @@ def test_auction_gap_replay_persist_flag(store: DuckDBStore) -> None:
 # ── research_sync 兼容（新列走列交集自动兼容）──
 
 
-def test_research_sync_merges_paper_position_from_old_schema_backup(
+def test_restore_research_tables_merges_paper_position_from_old_schema_backup(
     tmp_path: Path,
 ) -> None:
-    from rquant.research_sync import sync_from_backup
+    from rquant.research_sync import restore_research_tables
 
     backup_path = tmp_path / "cloud_backup.duckdb"
     conn = duckdb.connect(str(backup_path))
@@ -578,10 +578,16 @@ def test_research_sync_merges_paper_position_from_old_schema_backup(
     )
     local.close()
 
-    report = sync_from_backup(backup_path, db_path, refresh_replica=False)
+    report = restore_research_tables(
+        backup_path,
+        db_path,
+        tables=["paper_position"],
+        refresh_replica=False,
+    )
     assert not report.has_errors
     paper_result = next(t for t in report.tables if t.table == "paper_position")
     assert paper_result.mode == "merge"
+    assert "restore" in paper_result.detail
     assert paper_result.rows == 1
 
     check = duckdb.connect(str(db_path), read_only=True)
@@ -589,5 +595,5 @@ def test_research_sync_merges_paper_position_from_old_schema_backup(
         "SELECT position_id, run_mode, run_id FROM paper_position ORDER BY position_id"
     ).fetchall()
     check.close()
-    # 云端行按列交集合并、新列吃 DEFAULT；本地 replay 行不丢
+    # 旧研究备份按列交集恢复，新列吃 DEFAULT；本地 replay 行不丢
     assert rows == [("p-cloud", "live", None), ("p-local", "replay", "run-L")]

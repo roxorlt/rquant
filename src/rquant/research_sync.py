@@ -197,6 +197,15 @@ def _refresh_replica_if_clean(
     ok, detail = refresh_readonly_replica(db_path)
     report.replica_refreshed = ok
     report.replica_detail = detail
+    if not ok:
+        report.tables.append(
+            TableSyncResult(
+                table="<replica>",
+                mode="error",
+                rows=0,
+                detail=detail[:200],
+            )
+        )
 
 
 def _transaction_failure_results(
@@ -207,13 +216,34 @@ def _transaction_failure_results(
     rollback_confirmed: bool,
     rollback_error: Exception | None,
 ) -> list[TableSyncResult]:
-    if rollback_confirmed:
-        transaction_detail = "all primary changes rolled back"
-    else:
+    if not rollback_confirmed:
         rollback_message = str(rollback_error) if rollback_error else "unknown error"
         transaction_detail = (
+            "outcome unconfirmed; changes may be durable; "
             f"rollback failed/unconfirmed ({rollback_message})"
         )
+        rewritten = [
+            result.model_copy(
+                update={
+                    "mode": "error",
+                    "rows": 0,
+                    "detail": f"{transaction_detail}; {result.detail}"[:200],
+                }
+            )
+            for result in results
+        ]
+        if not any(result.mode == "error" for result in results):
+            rewritten.append(
+                TableSyncResult(
+                    table=failure_table,
+                    mode="error",
+                    rows=0,
+                    detail=f"{transaction_detail}; {cause}"[:200],
+                )
+            )
+        return rewritten
+
+    transaction_detail = "all primary changes rolled back"
 
     rewritten: list[TableSyncResult] = []
     has_error_result = False
@@ -250,6 +280,23 @@ def _transaction_failure_results(
             )
         )
     return rewritten
+
+
+def _close_replica_connection_safely(
+    connection: duckdb.DuckDBPyConnection,
+    label: str,
+) -> None:
+    try:
+        connection.close()
+    except Exception:
+        logger.exception(f"副本刷新清理 {label} 连接失败，已抑制异常")
+
+
+def _remove_replica_temp_safely(tmp: Path) -> None:
+    try:
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        logger.exception(f"副本刷新清理临时文件失败，已抑制异常：{tmp}")
 
 
 def _common_columns(
@@ -982,21 +1029,31 @@ def refresh_readonly_replica(
     try:
         guard = duckdb.connect(str(db_path), read_only=True)
         if wal_path.exists():
-            return False, f"主库存在活跃 WAL（{wal_path.name}），跳过副本刷新"
+            raise RuntimeError(
+                f"主库存在活跃 WAL（{wal_path.name}），跳过副本刷新"
+            )
         shutil.copy2(db_path, tmp)
         verify = duckdb.connect(str(tmp), read_only=True)
         verify.execute("SELECT COUNT(*) FROM daily_bar").fetchone()
-        verify.close()
+        try:
+            verify.close()
+        except Exception as exc:
+            raise RuntimeError(f"verify close failed: {exc}") from exc
         verify = None
+        try:
+            guard.close()
+        except Exception as exc:
+            raise RuntimeError(f"guard close failed: {exc}") from exc
+        guard = None
         os.replace(tmp, replica_path)
     except Exception as e:
-        tmp.unlink(missing_ok=True)
+        _remove_replica_temp_safely(tmp)
         return False, f"副本刷新失败：{e}"
     finally:
         if verify is not None:
-            verify.close()
+            _close_replica_connection_safely(verify, "verify")
         if guard is not None:
-            guard.close()
+            _close_replica_connection_safely(guard, "guard")
     return True, "副本已刷新"
 
 

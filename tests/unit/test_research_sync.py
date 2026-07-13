@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -112,6 +113,53 @@ def _insert_trade_calendar_row(
     conn.close()
 
 
+class _ConnectionProxy:
+    def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+        self._inner = inner
+
+    def execute(
+        self, query: str, *args: Any, **kwargs: Any
+    ) -> duckdb.DuckDBPyConnection:
+        return self._inner.execute(query, *args, **kwargs)
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _RollbackFailingConnection(_ConnectionProxy):
+    def execute(
+        self, query: str, *args: Any, **kwargs: Any
+    ) -> duckdb.DuckDBPyConnection:
+        if query.strip().upper() == "ROLLBACK":
+            raise duckdb.TransactionException("forced rollback failure")
+        return super().execute(query, *args, **kwargs)
+
+
+class _CommitThenRaiseConnection(_ConnectionProxy):
+    def execute(
+        self, query: str, *args: Any, **kwargs: Any
+    ) -> duckdb.DuckDBPyConnection:
+        result = super().execute(query, *args, **kwargs)
+        if query.strip().upper() == "COMMIT":
+            raise duckdb.TransactionException("commit acknowledgement lost")
+        return result
+
+
+class _CloseFailingConnection(_ConnectionProxy):
+    def __init__(
+        self, inner: duckdb.DuckDBPyConnection, failure_message: str
+    ) -> None:
+        super().__init__(inner)
+        self._failure_message = failure_message
+
+    def close(self) -> None:
+        self._inner.close()
+        raise duckdb.IOException(self._failure_message)
+
+
 class TestSyncFromBackup:
     def test_missing_authoritative_replace_table_errors_without_replica_publish(
         self,
@@ -129,7 +177,10 @@ class TestSyncFromBackup:
         conn.close()
         refresh_calls = 0
 
-        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+        def spy_refresh(
+            db_path: Path | None = None,
+            replica_path: Path | None = None,
+        ) -> tuple[bool, str]:
             nonlocal refresh_calls
             refresh_calls += 1
             return True, "must not refresh"
@@ -164,6 +215,37 @@ class TestSyncFromBackup:
         assert not report.has_errors
         assert result.mode == "skipped"
         assert "备份中无此表" in result.detail
+
+    def test_attempted_replica_refresh_failure_is_report_error(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail_refresh(
+            db_path: Path | None = None,
+            replica_path: Path | None = None,
+        ) -> tuple[bool, str]:
+            del db_path, replica_path
+            return False, "replica lock failure"
+
+        monkeypatch.setattr(
+            research_sync,
+            "refresh_readonly_replica",
+            fail_refresh,
+        )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+        replica_result = next(
+            result for result in report.tables if result.table == "<replica>"
+        )
+        assert report.has_errors
+        assert not report.replica_refreshed
+        assert report.replica_detail == "replica lock failure"
+        assert replica_result.mode == "error"
+        assert replica_result.rows == 0
+        assert replica_result.detail == "replica lock failure"
 
     def test_table_failure_rolls_back_all_primary_changes(
         self, local_db: Path, backup_db: Path
@@ -214,9 +296,14 @@ class TestSyncFromBackup:
         real_sync_table = research_sync._sync_table
         refresh_calls = 0
 
-        def raising_sync_table(  # noqa: ANN001
-            conn, table, alias, mode, *, manage_transaction=True
-        ):
+        def raising_sync_table(
+            conn: Any,
+            table: str,
+            alias: str,
+            mode: str,
+            *,
+            manage_transaction: bool = True,
+        ) -> TableSyncResult:
             if table == "daily_bar":
                 raise RuntimeError("direct table failure")
             return real_sync_table(
@@ -227,7 +314,10 @@ class TestSyncFromBackup:
                 manage_transaction=manage_transaction,
             )
 
-        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+        def spy_refresh(
+            db_path: Path | None = None,
+            replica_path: Path | None = None,
+        ) -> tuple[bool, str]:
             nonlocal refresh_calls
             refresh_calls += 1
             return True, "must not refresh"
@@ -260,9 +350,13 @@ class TestSyncFromBackup:
         backup_db: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        def raising_metadata_sync(  # noqa: ANN001
-            conn, alias, *, manage_transaction=True
-        ):
+        def raising_metadata_sync(
+            conn: Any,
+            alias: str,
+            *,
+            manage_transaction: bool = True,
+        ) -> list[TableSyncResult]:
+            del conn, alias, manage_transaction
             raise RuntimeError("direct metadata failure")
 
         monkeypatch.setattr(
@@ -293,24 +387,17 @@ class TestSyncFromBackup:
         real_connect = duckdb.connect
         refresh_calls = 0
 
-        class RollbackFailingConnection:
-            def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
-                self._inner = inner
+        def open_with_failed_rollback(path: Path) -> _RollbackFailingConnection:
+            return _RollbackFailingConnection(real_connect(str(path)))
 
-            def execute(self, query: str, *args, **kwargs):  # noqa: ANN002, ANN003
-                if query.strip().upper() == "ROLLBACK":
-                    raise duckdb.TransactionException("forced rollback failure")
-                return self._inner.execute(query, *args, **kwargs)
-
-            def __getattr__(self, name: str):  # noqa: ANN204
-                return getattr(self._inner, name)
-
-        def open_with_failed_rollback(path: Path):  # noqa: ANN202
-            return RollbackFailingConnection(real_connect(str(path)))
-
-        def table_error(  # noqa: ANN001
-            conn, table, alias, mode, *, manage_transaction=True
-        ):
+        def table_error(
+            conn: Any,
+            table: str,
+            alias: str,
+            mode: str,
+            *,
+            manage_transaction: bool = True,
+        ) -> TableSyncResult:
             if table == "daily_bar":
                 return TableSyncResult(
                     table=table,
@@ -325,7 +412,10 @@ class TestSyncFromBackup:
                 manage_transaction=manage_transaction,
             )
 
-        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+        def spy_refresh(
+            db_path: Path | None = None,
+            replica_path: Path | None = None,
+        ) -> tuple[bool, str]:
             nonlocal refresh_calls
             refresh_calls += 1
             return True, "must not refresh"
@@ -343,16 +433,58 @@ class TestSyncFromBackup:
         by_table = {result.table: result for result in report.tables}
         assert report.has_errors
         assert by_table["daily_bar"].mode == "error"
-        assert "rollback failed/unconfirmed" in by_table["daily_bar"].detail
-        assert by_table["stock_basic"].mode == "skipped"
+        assert "outcome unconfirmed" in by_table["daily_bar"].detail
+        assert by_table["stock_basic"].mode == "error"
         assert by_table["stock_basic"].rows == 0
-        assert "rollback failed/unconfirmed" in by_table["stock_basic"].detail
+        assert "changes may be durable" in by_table["stock_basic"].detail
         assert all(
             "all primary changes rolled back" not in result.detail
             for result in report.tables
         )
         assert refresh_calls == 0
         assert not report.replica_refreshed
+
+    def test_commit_acknowledgement_failure_marks_all_outcomes_unknown(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        backup = duckdb.connect(str(backup_db))
+        backup.execute(
+            "INSERT INTO stock_basic (ts_code, name) VALUES ('000001.SZ', 'durable')"
+        )
+        backup.close()
+        real_connect = duckdb.connect
+
+        def open_with_ambiguous_commit(path: Path) -> _CommitThenRaiseConnection:
+            return _CommitThenRaiseConnection(real_connect(str(path)))
+
+        monkeypatch.setattr(
+            research_sync,
+            "_rescue_stale_wal",
+            open_with_ambiguous_commit,
+        )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        assert report.has_errors
+        assert all(result.rows == 0 for result in report.tables)
+        assert all(result.mode == "error" for result in report.tables)
+        assert all(
+            "outcome unconfirmed; changes may be durable" in result.detail
+            for result in report.tables
+        )
+        commit_result = next(
+            result for result in report.tables if result.table == "<commit>"
+        )
+        assert "commit acknowledgement lost" in commit_result.detail
+
+        conn = real_connect(str(local_db), read_only=True)
+        assert conn.execute(
+            "SELECT name FROM stock_basic WHERE ts_code = '000001.SZ'"
+        ).fetchall() == [("durable",)]
+        conn.close()
 
     def test_metadata_error_with_failed_outer_rollback_never_claims_rollback(
         self,
@@ -363,25 +495,20 @@ class TestSyncFromBackup:
         real_connect = duckdb.connect
         refresh_calls = 0
 
-        class RollbackFailingConnection:
-            def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
-                self._inner = inner
+        def open_with_failed_rollback(path: Path) -> _RollbackFailingConnection:
+            return _RollbackFailingConnection(real_connect(str(path)))
 
-            def execute(self, query: str, *args, **kwargs):  # noqa: ANN002, ANN003
-                if query.strip().upper() == "ROLLBACK":
-                    raise duckdb.TransactionException("forced rollback failure")
-                return self._inner.execute(query, *args, **kwargs)
-
-            def __getattr__(self, name: str):  # noqa: ANN204
-                return getattr(self._inner, name)
-
-        def open_with_failed_rollback(path: Path):  # noqa: ANN202
-            return RollbackFailingConnection(real_connect(str(path)))
-
-        def fail_metadata_load(conn, alias):  # noqa: ANN001, ARG001
+        def fail_metadata_load(
+            conn: duckdb.DuckDBPyConnection,
+            alias: str,
+        ) -> dict[str, DatasetSnapshot]:
+            del conn, alias
             raise ValueError("forced metadata validation failure")
 
-        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+        def spy_refresh(
+            db_path: Path | None = None,
+            replica_path: Path | None = None,
+        ) -> tuple[bool, str]:
             nonlocal refresh_calls
             refresh_calls += 1
             return True, "must not refresh"
@@ -402,11 +529,9 @@ class TestSyncFromBackup:
 
         assert report.has_errors
         assert all(result.rows == 0 for result in report.tables)
-        assert all(
-            result.mode in {"skipped", "error"} for result in report.tables
-        )
+        assert all(result.mode == "error" for result in report.tables)
         assert any(
-            "rollback failed/unconfirmed" in result.detail
+            "outcome unconfirmed; changes may be durable" in result.detail
             for result in report.tables
             if result.mode == "error"
         )
@@ -420,7 +545,11 @@ class TestSyncFromBackup:
         backup_db: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        def fail_metadata_load(conn, alias):  # noqa: ANN001, ARG001
+        def fail_metadata_load(
+            conn: duckdb.DuckDBPyConnection,
+            alias: str,
+        ) -> dict[str, DatasetSnapshot]:
+            del conn, alias
             raise ValueError("forced standalone metadata failure")
 
         monkeypatch.setattr(
@@ -1576,6 +1705,102 @@ class TestReplicaRefresh:
             == 0
         )
         conn.close()
+
+    def test_verify_close_failure_keeps_previous_replica(
+        self,
+        local_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        replica = tmp_path / "rquant_ro.duckdb"
+        ok, detail = refresh_readonly_replica(local_db, replica)
+        assert ok, detail
+        local = duckdb.connect(str(local_db))
+        local.execute(
+            "INSERT INTO minute_bar "
+            "(ts_code, trade_time, freq, open, high, low, close, source) "
+            "VALUES ('000001.SZ', TIMESTAMP '2026-07-13 09:33:00', "
+            "'1min', 1, 1, 1, 1, 'test')"
+        )
+        local.close()
+        real_connect = duckdb.connect
+        tmp_replica = replica.with_name(replica.name + ".sync-tmp")
+
+        def connect_with_verify_close_failure(
+            database: str | Path,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            connection = real_connect(str(database), *args, **kwargs)
+            if Path(database) == tmp_replica:
+                return _CloseFailingConnection(
+                    connection,
+                    "verify close failed",
+                )
+            return connection
+
+        monkeypatch.setattr(
+            research_sync.duckdb,
+            "connect",
+            connect_with_verify_close_failure,
+        )
+
+        ok, detail = refresh_readonly_replica(local_db, replica)
+
+        assert not ok
+        assert "verify close failed" in detail
+        assert not tmp_replica.exists()
+        check = real_connect(str(replica), read_only=True)
+        assert check.execute("SELECT COUNT(*) FROM minute_bar").fetchone()[0] == 2
+        check.close()
+
+    def test_guard_close_failure_keeps_previous_replica(
+        self,
+        local_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        replica = tmp_path / "rquant_ro.duckdb"
+        ok, detail = refresh_readonly_replica(local_db, replica)
+        assert ok, detail
+        local = duckdb.connect(str(local_db))
+        local.execute(
+            "INSERT INTO minute_bar "
+            "(ts_code, trade_time, freq, open, high, low, close, source) "
+            "VALUES ('000001.SZ', TIMESTAMP '2026-07-13 09:33:00', "
+            "'1min', 1, 1, 1, 1, 'test')"
+        )
+        local.close()
+        real_connect = duckdb.connect
+        tmp_replica = replica.with_name(replica.name + ".sync-tmp")
+
+        def connect_with_guard_close_failure(
+            database: str | Path,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            connection = real_connect(str(database), *args, **kwargs)
+            if Path(database) == local_db and kwargs.get("read_only") is True:
+                return _CloseFailingConnection(
+                    connection,
+                    "guard close failed",
+                )
+            return connection
+
+        monkeypatch.setattr(
+            research_sync.duckdb,
+            "connect",
+            connect_with_guard_close_failure,
+        )
+
+        ok, detail = refresh_readonly_replica(local_db, replica)
+
+        assert not ok
+        assert "guard close failed" in detail
+        assert not tmp_replica.exists()
+        check = real_connect(str(replica), read_only=True)
+        assert check.execute("SELECT COUNT(*) FROM minute_bar").fetchone()[0] == 2
+        check.close()
 
 
 class TestStaleWalRescue:
