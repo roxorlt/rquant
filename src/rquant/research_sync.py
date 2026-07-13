@@ -692,15 +692,22 @@ def _merge_data_quality_issues(
 
 
 def _metadata_bundle_failure_results(
-    failed_table: str, detail: str
+    failed_table: str,
+    detail: str,
+    *,
+    rollback_confirmed: bool,
 ) -> list[TableSyncResult]:
-    rollback_detail = f"linked metadata bundle rolled back: {detail}"
+    failure_detail = (
+        f"linked metadata bundle rolled back: {detail}"
+        if rollback_confirmed
+        else f"linked metadata bundle failed/aborted: {detail}"
+    )
     return [
         TableSyncResult(
             table=table,
             mode="error" if table == failed_table else "skipped",
             detail=(
-                rollback_detail
+                failure_detail
                 if table == failed_table
                 else f"linked metadata bundle skipped after {failed_table} failed"
             )[:200],
@@ -718,6 +725,7 @@ def _sync_data_metadata_bundle(
     """Validate and merge linked dataset metadata in one transaction."""
     current_table = DATA_METADATA_TABLES[0]
     transaction_started = False
+    rollback_confirmed = False
     try:
         if manage_transaction:
             conn.execute("BEGIN")
@@ -791,10 +799,16 @@ def _sync_data_metadata_bundle(
         if transaction_started:
             try:
                 conn.execute("ROLLBACK")
+                transaction_started = False
+                rollback_confirmed = True
             except duckdb.Error:
                 logger.exception("research-sync linked metadata bundle 回滚失败")
         logger.exception("research-sync linked metadata bundle 同步失败")
-        return _metadata_bundle_failure_results(current_table, str(exc))
+        return _metadata_bundle_failure_results(
+            current_table,
+            str(exc),
+            rollback_confirmed=rollback_confirmed,
+        )
 
     return [
         TableSyncResult(table=table, mode="merge", rows=row_counts[table])

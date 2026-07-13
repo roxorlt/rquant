@@ -354,6 +354,94 @@ class TestSyncFromBackup:
         assert refresh_calls == 0
         assert not report.replica_refreshed
 
+    def test_metadata_error_with_failed_outer_rollback_never_claims_rollback(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_connect = duckdb.connect
+        refresh_calls = 0
+
+        class RollbackFailingConnection:
+            def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+                self._inner = inner
+
+            def execute(self, query: str, *args, **kwargs):  # noqa: ANN002, ANN003
+                if query.strip().upper() == "ROLLBACK":
+                    raise duckdb.TransactionException("forced rollback failure")
+                return self._inner.execute(query, *args, **kwargs)
+
+            def __getattr__(self, name: str):  # noqa: ANN204
+                return getattr(self._inner, name)
+
+        def open_with_failed_rollback(path: Path):  # noqa: ANN202
+            return RollbackFailingConnection(real_connect(str(path)))
+
+        def fail_metadata_load(conn, alias):  # noqa: ANN001, ARG001
+            raise ValueError("forced metadata validation failure")
+
+        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True, "must not refresh"
+
+        monkeypatch.setattr(
+            research_sync,
+            "_rescue_stale_wal",
+            open_with_failed_rollback,
+        )
+        monkeypatch.setattr(
+            research_sync,
+            "_load_source_snapshots",
+            fail_metadata_load,
+        )
+        monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+        assert report.has_errors
+        assert all(result.rows == 0 for result in report.tables)
+        assert all(
+            result.mode in {"skipped", "error"} for result in report.tables
+        )
+        assert any(
+            "rollback failed/unconfirmed" in result.detail
+            for result in report.tables
+            if result.mode == "error"
+        )
+        assert all("rolled back" not in result.detail for result in report.tables)
+        assert refresh_calls == 0
+        assert not report.replica_refreshed
+
+    def test_standalone_metadata_failure_confirms_internal_rollback(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail_metadata_load(conn, alias):  # noqa: ANN001, ARG001
+            raise ValueError("forced standalone metadata failure")
+
+        monkeypatch.setattr(
+            research_sync,
+            "_load_source_snapshots",
+            fail_metadata_load,
+        )
+        conn = duckdb.connect(str(local_db))
+        research_sync._attach_readonly(conn, backup_db, "cloud_backup")
+
+        results = research_sync._sync_data_metadata_bundle(
+            conn,
+            "cloud_backup",
+            manage_transaction=True,
+        )
+
+        error = next(result for result in results if result.mode == "error")
+        assert "linked metadata bundle rolled back" in error.detail
+        conn.execute("DETACH cloud_backup")
+        conn.close()
+
     def test_uses_shared_schema_initializer(
         self,
         local_db: Path,
