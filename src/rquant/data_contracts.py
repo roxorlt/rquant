@@ -5,17 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from enum import StrEnum
-from pathlib import Path
 from types import MappingProxyType
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from rquant.dataset_backfill import DATASETS
-from rquant.storage.duckdb import DuckDBStore
-
 EXCHANGE_TIMEZONE = ZoneInfo("Asia/Shanghai")
-_AUCTION_VISIBLE_AT = time(9, 25)
 
 
 class PriceBasis(StrEnum):
@@ -67,6 +63,18 @@ class FreshnessRule(ContractModel):
         return self.max_trading_session_lag is not None or self.max_wall_clock_lag is not None
 
 
+class SourceAvailability(ContractModel):
+    source: str = Field(min_length=1)
+    available_at: time
+
+    @field_validator("available_at")
+    @classmethod
+    def validate_exchange_local_time(cls, value: time) -> time:
+        if value.tzinfo is not None:
+            raise ValueError("available_at must be an Asia/Shanghai local wall-clock time")
+        return value
+
+
 class DatasetContract(ContractModel):
     dataset_id: str = Field(min_length=1)
     table_name: str = Field(min_length=1)
@@ -76,6 +84,7 @@ class DatasetContract(ContractModel):
     event_date_column: str | None = None
     event_time_column: str | None = None
     ingested_at_column: str | None = None
+    source_availability: tuple[SourceAvailability, ...] = ()
     price_basis: PriceBasis
     visibility: VisibilityRule
     freshness: FreshnessRule
@@ -120,6 +129,17 @@ class DatasetContract(ContractModel):
             if self.historized:
                 raise ValueError("UNKNOWN visibility cannot claim a historized dataset")
 
+        availability_sources = tuple(item.source for item in self.source_availability)
+        if self.visibility is VisibilityRule.AUCTION_0925:
+            if len(availability_sources) != len(set(availability_sources)) or set(
+                availability_sources
+            ) != set(self.sources):
+                raise ValueError(
+                    "source availability must exactly cover contract sources without duplicates"
+                )
+        elif self.source_availability:
+            raise ValueError("source availability is only valid for AUCTION_0925 contracts")
+
         if self.visibility is not VisibilityRule.UNKNOWN and not self.freshness.has_known_lag:
             raise ValueError("known visibility requires a known freshness lag")
         return self
@@ -130,12 +150,14 @@ class DatasetContract(ContractModel):
         as_of_time: datetime,
         event_date: date | None = None,
         event_time: datetime | None = None,
+        source: str | None = None,
     ) -> bool:
         return is_visible(
             self,
             as_of_time=as_of_time,
             event_date=event_date,
             event_time=event_time,
+            source=source,
         )
 
 
@@ -167,6 +189,7 @@ def is_visible(
     as_of_time: datetime,
     event_date: date | None = None,
     event_time: datetime | None = None,
+    source: str | None = None,
 ) -> bool:
     """Evaluate one event using conservative Asia/Shanghai PIT visibility."""
 
@@ -181,16 +204,22 @@ def is_visible(
     if contract.visibility is VisibilityRule.PANEL_CLOSE_NEXT_SESSION:
         return local_event_date < local_as_of.date()
 
+    availability = next(
+        (item for item in contract.source_availability if item.source == source),
+        None,
+    )
+    if availability is None:
+        raise ValueError(f"unknown or missing source for {contract.dataset_id}: {source!r}")
     if local_event_date < local_as_of.date():
         return True
     if local_event_date > local_as_of.date():
         return False
-    auction_cutoff = datetime.combine(
+    source_cutoff = datetime.combine(
         local_event_date,
-        _AUCTION_VISIBLE_AT,
+        availability.available_at,
         tzinfo=EXCHANGE_TIMEZONE,
     )
-    return local_as_of >= auction_cutoff
+    return local_as_of >= source_cutoff
 
 
 def _session_freshness(
@@ -256,6 +285,13 @@ DATASET_CONTRACTS: tuple[DatasetContract, ...] = (
         logical_key=("ts_code", "trade_date", "auction_type"),
         event_date_column="trade_date",
         ingested_at_column="created_at",
+        source_availability=(
+            SourceAvailability(source="tushare", available_at=time(9, 26)),
+            SourceAvailability(
+                source="minute_0930_fallback",
+                available_at=time(9, 31),
+            ),
+        ),
         price_basis=PriceBasis.RAW,
         visibility=VisibilityRule.AUCTION_0925,
         freshness=_session_freshness("trade_date", lag=0),
@@ -570,16 +606,44 @@ def _validate_registry_shape(
             raise ValueError(
                 f"registry key {key!r} does not match model id {contract.dataset_id!r}"
             )
+    declared_by_id = {contract.dataset_id: contract for contract in contracts}
+    for key, contract in registry.items():
+        if declared_by_id.get(key) != contract:
+            raise ValueError(f"registry value for {key!r} differs from declared contract")
     expected_ids = {contract.dataset_id for contract in contracts}
     if len(registry) != len(contracts) or set(registry) != expected_ids:
         raise ValueError("registry keys do not exactly cover the declared dataset ids")
 
 
-def _validate_backfill_mappings(contracts: Sequence[DatasetContract]) -> None:
+class BackfillDatasetSpec(Protocol):
+    name: str
+    table: str
+
+
+class ContractConnection(Protocol):
+    def execute(
+        self,
+        query: str,
+        parameters: Sequence[object] | None = None,
+    ) -> ContractConnection: ...
+
+    def fetchall(self) -> list[tuple[object, ...]]: ...
+
+    def fetchone(self) -> tuple[object, ...] | None: ...
+
+
+class ContractStore(Protocol):
+    _conn: ContractConnection
+
+
+def _validate_backfill_mappings(
+    contracts: Sequence[DatasetContract],
+    backfill_datasets: Mapping[str, BackfillDatasetSpec],
+) -> None:
     for contract in contracts:
         if contract.backfill_dataset_id is None:
             continue
-        backfill = DATASETS.get(contract.backfill_dataset_id)
+        backfill = backfill_datasets.get(contract.backfill_dataset_id)
         if backfill is None:
             raise ValueError(f"unknown backfill dataset id: {contract.backfill_dataset_id}")
         if backfill.table != contract.table_name:
@@ -591,7 +655,7 @@ def _validate_backfill_mappings(contracts: Sequence[DatasetContract]) -> None:
 
 def _validate_schema_contracts(
     contracts: Sequence[DatasetContract],
-    store: DuckDBStore,
+    store: ContractStore,
 ) -> None:
     for contract in contracts:
         columns = {
@@ -654,19 +718,18 @@ def validate_contract_registry(
     contracts: Sequence[DatasetContract],
     registry: Mapping[str, DatasetContract] | None = None,
     *,
-    store: DuckDBStore | None = None,
+    store: ContractStore | None = None,
+    backfill_datasets: Mapping[str, BackfillDatasetSpec] | None = None,
 ) -> None:
     """Validate registry identity, backfill links, columns, and physical PKs."""
 
     contract_registry = build_contract_registry(contracts) if registry is None else registry
     _validate_registry_shape(contracts, contract_registry)
-    _validate_backfill_mappings(contracts)
+    if backfill_datasets is not None:
+        _validate_backfill_mappings(contracts, backfill_datasets)
     if store is not None:
         _validate_schema_contracts(contracts, store)
-        return
-    with DuckDBStore(Path(":memory:")) as fresh_store:
-        _validate_schema_contracts(contracts, fresh_store)
 
 
 CONTRACTS_BY_ID: Mapping[str, DatasetContract] = build_contract_registry(DATASET_CONTRACTS)
-validate_contract_registry(DATASET_CONTRACTS, CONTRACTS_BY_ID)
+_validate_registry_shape(DATASET_CONTRACTS, CONTRACTS_BY_ID)

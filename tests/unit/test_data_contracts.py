@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
@@ -116,6 +119,46 @@ def test_registry_records_raw_facts_and_source_aware_physical_keys() -> None:
     assert minute.physical_primary_key == ("ts_code", "trade_time", "freq", "source")
     assert minute.logical_key == ("ts_code", "trade_time", "freq")
     assert "source" not in minute.logical_key
+
+
+def test_auction_contract_declares_exact_per_source_availability() -> None:
+    auction = CONTRACTS_BY_ID["auction_bar"]
+    assert tuple(
+        (availability.source, availability.available_at)
+        for availability in auction.source_availability
+    ) == (
+        ("tushare", time(9, 26)),
+        ("minute_0930_fallback", time(9, 31)),
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        auction.source_availability[0].available_at = time(9, 25)  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "availability_sources",
+    [
+        ("primary",),
+        ("primary", "primary"),
+        ("primary", "unknown"),
+    ],
+)
+def test_source_availability_must_exactly_cover_contract_sources(
+    availability_sources: tuple[str, ...],
+) -> None:
+    availability_type = type(CONTRACTS_BY_ID["auction_bar"].source_availability[0])
+    availability = tuple(
+        availability_type(source=source, available_at=time(9, 26))
+        for source in availability_sources
+    )
+
+    with pytest.raises(ValidationError, match="source availability"):
+        _contract(
+            sources=("primary", "fallback"),
+            physical_primary_key=("ts_code", "trade_date", "source"),
+            visibility=VisibilityRule.AUCTION_0925,
+            source_availability=availability,
+        )
 
 
 def test_board_and_moneyflow_daily_contracts_are_never_same_day_intraday() -> None:
@@ -291,11 +334,34 @@ def test_registry_validator_rejects_keys_that_disagree_with_models(
             (contract,),
             {"not_daily_bar": contract},
             store=store,
+            backfill_datasets=DATASETS,
+        )
+
+
+def test_registry_validator_rejects_replacement_value_with_same_dataset_id(
+    store: DuckDBStore,
+) -> None:
+    contract = DATASET_CONTRACTS[0]
+    replacement = DatasetContract.model_validate(
+        {**contract.model_dump(), "table_name": "adj_factor"}
+    )
+
+    with pytest.raises(ValueError, match="registry value"):
+        validate_contract_registry(
+            (contract,),
+            {contract.dataset_id: replacement},
+            store=store,
+            backfill_datasets=DATASETS,
         )
 
 
 def test_contract_columns_and_primary_keys_match_fresh_schema(store: DuckDBStore) -> None:
-    validate_contract_registry(DATASET_CONTRACTS, CONTRACTS_BY_ID, store=store)
+    validate_contract_registry(
+        DATASET_CONTRACTS,
+        CONTRACTS_BY_ID,
+        store=store,
+        backfill_datasets=DATASETS,
+    )
 
     for contract in DATASET_CONTRACTS:
         columns = {
@@ -402,29 +468,75 @@ def test_minute_visibility_rejects_missing_or_nonsensical_event_time() -> None:
         )
 
 
-def test_auction_visibility_uses_0925_asia_shanghai_cutoff() -> None:
+@pytest.mark.parametrize(
+    ("source", "last_hidden", "first_visible"),
+    [
+        (
+            "tushare",
+            datetime(2026, 7, 13, 9, 25, 59, tzinfo=SHANGHAI),
+            datetime(2026, 7, 13, 9, 26, tzinfo=SHANGHAI),
+        ),
+        (
+            "minute_0930_fallback",
+            datetime(2026, 7, 13, 9, 30, 59, tzinfo=SHANGHAI),
+            datetime(2026, 7, 13, 9, 31, tzinfo=SHANGHAI),
+        ),
+    ],
+)
+def test_auction_visibility_uses_source_physical_availability(
+    source: str,
+    last_hidden: datetime,
+    first_visible: datetime,
+) -> None:
     contract = CONTRACTS_BY_ID["auction_bar"]
     event_date = date(2026, 7, 13)
 
     assert not is_visible(
         contract,
-        as_of_time=datetime(2026, 7, 13, 9, 24, 59, tzinfo=SHANGHAI),
+        as_of_time=last_hidden,
         event_date=event_date,
+        source=source,
     )
     assert is_visible(
         contract,
-        as_of_time=datetime(2026, 7, 13, 9, 25, tzinfo=SHANGHAI),
+        as_of_time=first_visible,
         event_date=event_date,
-    )
-    assert is_visible(
-        contract,
-        as_of_time=datetime(2026, 7, 13, 1, 25, tzinfo=UTC),
-        event_date=event_date,
+        source=source,
     )
     assert is_visible(
         contract,
         as_of_time=datetime(2026, 7, 13, 9, 0, tzinfo=SHANGHAI),
         event_date=date(2026, 7, 10),
+        source=source,
+    )
+
+
+@pytest.mark.parametrize("source", [None, "unknown"])
+def test_auction_visibility_rejects_omitted_or_unknown_source(
+    source: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="source"):
+        is_visible(
+            CONTRACTS_BY_ID["auction_bar"],
+            as_of_time=datetime(2026, 7, 13, 9, 31, tzinfo=SHANGHAI),
+            event_date=date(2026, 7, 13),
+            source=source,
+        )
+    with pytest.raises(ValueError, match="source"):
+        is_visible(
+            CONTRACTS_BY_ID["auction_bar"],
+            as_of_time=datetime(2026, 7, 13, 9, 31, tzinfo=SHANGHAI),
+            event_date=date(2026, 7, 10),
+            source=source,
+        )
+
+
+def test_non_auction_visibility_remains_source_independent() -> None:
+    assert is_visible(
+        CONTRACTS_BY_ID["daily_bar"],
+        as_of_time=datetime(2026, 7, 13, 10, 0, tzinfo=SHANGHAI),
+        event_date=date(2026, 7, 10),
+        source="not-a-declared-source",
     )
 
 
@@ -443,3 +555,47 @@ def test_visibility_api_requires_timezone_aware_as_of_time(dataset_id: str) -> N
             CONTRACTS_BY_ID[dataset_id],
             as_of_time=datetime(2026, 7, 13, 10, 0),
         )
+
+
+def test_data_contracts_import_is_config_free_and_filesystem_pure(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    required_settings = {
+        "TUSHARE_TOKEN_MAIN",
+        "DATA_DIR",
+        "DUCKDB_PATH",
+        "DUCKDB_READONLY_PATH",
+        "PARQUET_DIR",
+        "LOG_DIR",
+    }
+    clean_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in required_settings and not key.startswith("RQUANT_")
+    }
+    clean_env["PYTHONPATH"] = str(project_root / "src")
+    clean_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    before = tuple(tmp_path.iterdir())
+    script = """
+import sys
+import rquant.data_contracts
+
+for forbidden in (
+    "rquant.config",
+    "rquant.dataset_backfill",
+    "rquant.storage",
+    "rquant.storage.duckdb",
+):
+    assert forbidden not in sys.modules, forbidden
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert tuple(tmp_path.iterdir()) == before
