@@ -14,6 +14,11 @@
 
 ### Added
 
+- **受控自动发布**：新增 `scripts/deploy-production.sh` / `rquant.ops.production_deploy`，
+  仅部署 `origin/main` 中的精确 SemVer tag 或完整 SHA；包含 tracked 清洁检查、快进校验、
+  diff 风险分类、交易时段重启保护、部署互斥锁、最小 sudo 服务白名单、双 preflight、
+  JSONL 审计和失败自动回滚。Codex 可在 CI 全绿后代管 PR merge、annotated tag 与日常
+  腾讯云发布；systemd/nginx/生产数据操作继续单独授权。
 - **研究可信度阶段 0 护栏**：新增 `research_manifest` 四级状态和证据校验；Strategy Lab
   新记录自动保存代码 commit，旧 JSON 记录保持可读但自动降级为“探索性”；Markdown 导出
   增加资格全集、数据区间、覆盖率、数据快照、执行/成本模型和缺失证据。脏工作树 commit
@@ -27,6 +32,8 @@
 
 ### Changed
 
+- 项目版本从 `0.13.1` 更新到 `0.13.2`；旧 `scripts/deploy.sh` 明确降为人工基础设施发布，
+  不再用于无人值守代码部署。
 - 项目版本从长期失真的 `0.1.0` 对齐到当前 `0.13.0`；README 从 4 月 planning 草案更新为
   云端生产/本地研究分工、实际入口、DuckDB 并发约束和当前策略可信度。
 

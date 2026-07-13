@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 云端部署一键脚本（lighthouse 用户在 /home/lighthouse/rquant 跑）。
 #
+# 仅保留给 systemd unit 等人工基础设施发布；不得用于无人值守代码发布。
+# 日常受控发布使用 scripts/deploy-production.sh --target <exact-tag-or-sha>。
+#
 # 用法:
 #   bash scripts/deploy.sh           # 拉代码 → 同步 systemd → enable 新 timer → restart 关联 service
 #   bash scripts/deploy.sh --dry-run # 只打印动作，不真改

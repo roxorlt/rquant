@@ -210,26 +210,26 @@ chore: init pyproject.toml with uv
 - **禁止**本地再跑 `rquant serve`（曾有僵尸 LaunchAgent `com.roxor.rquant` 本地 17:00
   重复跑 daily，造成重复推送，2026-07-02 已卸载）
 
-### Hybrid 协作模式（Claude / 用户）
+### 受控自动发布模式（Codex 代管）
 
-部署、运维、生产数据修改时，**Claude 不直接 ssh 操作生产**，pair 模式分工。理由：
+用户已授权 Codex 代管日常 PR merge、tag 和腾讯云代码部署。自动化必须走固定安全链路，
+不是任意生产权限：
 
-- sudo 提示密码会卡 ssh 非交互命令
-- Claude 内置 sandbox 对修改共享数据库 / 远程文件的操作会触发权限拒绝（如本地 DuckDB 误改回滚也被拒过）
-- 首次部署的现场 debug 效率，pair > Claude 全自动 3-5 倍
+1. PR 仅在 mergeable 且 Python 3.11/3.12 CI 全绿后 squash merge；随后创建 annotated
+   SemVer tag，tag 必须指向合并后的 `origin/main` commit。
+2. 腾讯云日常发布只允许通过
+   `bash scripts/deploy-production.sh --target <exact-tag-or-full-sha>`；禁止盲拉 main。
+3. Codex 可直接 SSH 做只读诊断和调用上述部署器，不再要求用户粘贴普通部署命令。
+4. 部署器只接受干净 tracked worktree、main 内精确 target 和快进更新；使用部署锁、
+   `uv sync --frozen`、双 preflight、JSONL 审计及失败自动回滚。
+5. 需要重启的发布在工作日 09:15-15:10 自动延期；不存在 force/emergency 绕过。
+6. sudo 仅允许 `deploy/sudoers/rquant-production-deploy` 中逐条列出的 rQuant service restart。
+7. `deploy/systemd/`、`deploy/nginx/`、`deploy/frp/`、生产数据库写入/修复、密钥轮换和其他
+   destructive 操作仍属高风险变更，必须取得用户单独明确授权，不得借自动发布器绕过。
+8. SSH、sudo 白名单或回滚链路不可用时，发布状态是 blocked；不得改走宝塔/API 等未审计旁路。
 
-**分工表**：
-
-| Claude 做 | 用户做 |
-|----------|--------|
-| 写命令清单 / systemd unit / 部署脚本 | ssh 上服务器粘贴执行 |
-| 解析用户贴回来的输出，定位问题 | 把命令输出贴回 chat |
-| 写代码 / 跑测试 / commit / 推 git 分支 | sudo / destructive / 生产数据写入 |
-| 提供测试命令（如 `rquant notify-test`） | 实际跑命令触发副作用（推 PushDeer 给真实手机等） |
-
-**适用场景**：服务器配置、systemd 安装、首次数据迁移、生产数据修复（如误标记的 Pool 2 状态回滚）、SSH key 配对调试。
-
-**不适用**：纯本地开发、写代码、跑单测、git 分支/commit/push（这些 Claude 直接做，不打断）。
+完整操作说明见 `docs/production-release.md`。旧 `scripts/deploy.sh` 仅用于用户明确授权的
+人工基础设施发布，不用于无人值守代码部署。
 
 ### 通知通道
 

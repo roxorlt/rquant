@@ -5,9 +5,34 @@
 
 ---
 
+## 2026-07-13 · v0.13.2 candidate · 受控自动发布（尚未部署）
+
+**状态**：本地功能分支；等待 PR、CI、merge 和 tag。腾讯云当前仍为 `v0.13.0`。
+
+**候选内容**：
+
+- 精确 tag/SHA、main 归属与快进校验；tracked 脏文件和并发部署拒绝。
+- diff 自动计算服务重启；工作日 09:15-15:10 有重启需求时自动延期。
+- 仅允许 7 个 rQuant 长驻服务走 `sudo -n systemctl restart`；基础设施变更自动拒绝。
+- 依赖/preflight/服务健康失败自动回滚；审计写入 `logs/production-deploy.jsonl`。
+- 包含尚未上云的 `v0.13.1` preflight 只读副本热修复。
+
+**首次部署前置**：
+
+1. 恢复本机到腾讯云的 SSH 密钥交换；当前 22 端口在 KEX 前由服务端主动关闭。
+2. root 验证并安装 `deploy/sudoers/rquant-production-deploy`（0440）。
+3. 因服务器尚无新部署器，首次由 Codex 做一次精确 SHA bootstrap；以后全部调用
+   `scripts/deploy-production.sh --target <exact-ref>`。
+
+**部署后验证**：版本 `0.13.2`、两次 preflight 无 fail、受影响 active 服务健康、审计记录
+为 `deployed`。回滚基线为云端当前 commit `77f6ebf`。
+
+---
+
 ## 2026-07-13 · v0.13.1 candidate · preflight 只读副本热修复（尚未部署）
 
-**状态**：本地热修复分支，尚未合并或部署。
+**状态**：PR #73 已合并为 `347d57d`，annotated tag `v0.13.1` 已推送；尚未部署，将随
+`v0.13.2` 一并上云。
 
 **候选内容**：
 
