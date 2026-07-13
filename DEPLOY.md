@@ -5,25 +5,47 @@
 
 ---
 
-## 2026-07-13 · v0.13.0 candidate · 研究可信度阶段 0（尚未部署）
+## 2026-07-13 · v0.13.1 candidate · preflight 只读副本热修复（尚未部署）
 
-**状态**：仅本地功能分支，未修改腾讯云生产代码、systemd 或数据。
+**状态**：本地热修复分支，尚未合并或部署。
 
 **候选内容**：
+
+- `preflight` 的数据新鲜度与 smoke 筛选优先读取只读副本，避免盘中撞 monitor 主库写锁。
+- `lsof` 只有 `mem` 等未分类 FD 时改报“无法判断”，不再误报 monitor 未运行。
+- 修正 Stage 0 新增 CI 的上下文作用域，使 Python 3.11/3.12 矩阵能实际创建 job。
+- 不改数据库 schema、systemd unit、策略逻辑或生产数据。
+
+**部署后验证**：
+
+1. `rquant.__version__` 输出 `0.13.1`。
+2. monitor 运行期间执行 `.venv/bin/rquant preflight`，不再出现 DuckDB conflicting lock。
+3. `duckdb_lock_detail` 可以预警未分类 FD，但不应因此令 preflight 失败。
+
+**回滚命令**：`git checkout 77f6ebf && /home/lighthouse/.local/bin/uv sync --frozen`
+
+---
+
+## 2026-07-13 · v0.13.0 · 研究可信度阶段 0
+
+**状态**：已部署到腾讯云，commit `77f6ebf`。
+
+**部署内容**：
 
 - Strategy Lab 研究记录增加四级可信度 manifest；旧记录自动降级为探索性。
 - 页面增加 N 字、科创/创业、集合竞价三项当前可信度警示。
 - 新增研究基线、中文总路线图和 GitHub Actions CI。
 - 版本元数据和 README 对齐到当前活跃项目状态。
 
-**部署前必须做**：
+**验证**：
 
-1. 合并功能分支并确认 GitHub Actions 全绿。
-2. 本地启动 Strategy Lab，核验旧历史记录和 Markdown 导出。
-3. 本次没有 systemd 改动，无需更新 unit；部署仍使用 `scripts/deploy.sh` 的指定 commit。
-4. 实际部署后把本节“尚未部署”改为部署 commit、验证结果和回滚命令。
+- `uv sync --frozen` 完成，包版本由 `0.1.0` 更新到 `0.13.0`。
+- `git rev-parse --short HEAD` 为 `77f6ebf`，`rquant.__version__` 为 `0.13.0`。
+- 26 个 systemd unit 验证通过，9 个生产 unit 状态正常，monitor 盘中 active/running。
+- preflight 的数据新鲜度与 smoke 检查因直连主库撞 monitor 写锁而失败；部署本身正常，
+  该问题由上方 `v0.13.1` 热修复处理。
 
-**当前回滚**：无需回滚；生产尚未包含本候选。
+**回滚命令**：`git checkout 20eadf9 && /home/lighthouse/.local/bin/uv sync --frozen`
 
 ---
 

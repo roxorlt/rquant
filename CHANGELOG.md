@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **preflight 盘中只读检查撞 DuckDB 主库写锁**：`data_freshness` 与 `smoke_screen`
+  改用 `open_readonly_store()` 优先读取 `rquant_ro.duckdb`，并在退出时关闭连接；`lsof`
+  仅返回 `mem` 等未分类 FD 时改报预警，不再误判为“monitor 当前未跑”。
+- **GitHub Actions 无法创建 CI job**：workflow 顶层环境变量不再引用尚不可用的
+  `runner.temp`，改用该位置允许的 `github.workspace` 作为测试数据目录。
+
 ### Added
 
 - **研究可信度阶段 0 护栏**：新增 `research_manifest` 四级状态和证据校验；Strategy Lab
