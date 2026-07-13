@@ -1,0 +1,222 @@
+"""Versioned DuckDB schema migration behavior."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+import duckdb
+import pytest
+from pydantic import ValidationError
+
+import rquant.storage.duckdb as duckdb_storage
+from rquant.storage.duckdb import DuckDBStore
+from rquant.storage.migrations import (
+    MIGRATIONS,
+    Migration,
+    SchemaMigrationError,
+    initialize_schema,
+)
+
+
+def _migration_rows(
+    conn: duckdb.DuckDBPyConnection,
+) -> list[tuple[int, str, str, datetime]]:
+    return conn.execute(
+        "SELECT version, name, checksum, applied_at "
+        "FROM schema_migration ORDER BY version"
+    ).fetchall()
+
+
+def test_migration_is_frozen_and_derives_stable_checksum() -> None:
+    formatted = Migration(
+        version=900,
+        name="create probe",
+        statements=("\n  CREATE TABLE probe (id INTEGER);\n",),
+    )
+    same_content = Migration(
+        version=900,
+        name="create probe",
+        statements=("CREATE TABLE probe (id INTEGER);",),
+    )
+
+    assert formatted.checksum == same_content.checksum
+    assert len(formatted.checksum) == 64
+    with pytest.raises(ValidationError, match="checksum"):
+        Migration(
+            version=900,
+            name="create probe",
+            statements=("CREATE TABLE probe (id INTEGER);",),
+            checksum="caller-controlled",
+        )
+    with pytest.raises(ValidationError, match="frozen"):
+        formatted.name = "changed"  # type: ignore[misc]
+
+
+def test_fresh_database_records_registered_migrations(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "fresh.duckdb")
+
+    rows = _migration_rows(store._conn)
+    assert [(version, name, checksum) for version, name, checksum, _ in rows] == [
+        (migration.version, migration.name, migration.checksum)
+        for migration in MIGRATIONS
+    ]
+    assert all(isinstance(applied_at, datetime) for *_, applied_at in rows)
+    store.close()
+
+
+def test_legacy_database_upgrades_and_second_open_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE market_sentiment_daily (trade_date DATE PRIMARY KEY)"
+    )
+    conn.execute(
+        "CREATE TABLE paper_position (position_id VARCHAR PRIMARY KEY)"
+    )
+    conn.execute(
+        "CREATE TABLE moneyflow_daily ("
+        "ts_code VARCHAR, trade_date DATE, source VARCHAR, "
+        "PRIMARY KEY (ts_code, trade_date, source))"
+    )
+    conn.close()
+
+    first = DuckDBStore(db_path)
+    first_rows = _migration_rows(first._conn)
+    sentiment_columns = {
+        row[0]
+        for row in first._conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'market_sentiment_daily'"
+        ).fetchall()
+    }
+    position_columns = {
+        row[0]
+        for row in first._conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'paper_position'"
+        ).fetchall()
+    }
+    moneyflow_columns = {
+        row[0]
+        for row in first._conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'moneyflow_daily'"
+        ).fetchall()
+    }
+    first.close()
+
+    second = DuckDBStore(db_path)
+    second_rows = _migration_rows(second._conn)
+    second.close()
+
+    assert {"high_60d_ratio_pct", "above_ma20_ratio_pct"} <= sentiment_columns
+    assert {
+        "entry_price_raw",
+        "take_profit_basis",
+        "strategy_name",
+        "signal_factors",
+        "run_mode",
+        "run_id",
+    } <= position_columns
+    assert {"buy_sm_vol", "sell_elg_amount"} <= moneyflow_columns
+    assert second_rows == first_rows
+
+
+def test_applied_migration_is_not_executed_twice() -> None:
+    migration = Migration(
+        version=900,
+        name="non-idempotent probe",
+        statements=("CREATE TABLE migration_once (id INTEGER);",),
+    )
+    conn = duckdb.connect(":memory:")
+
+    initialize_schema(conn, migrations=(migration,))
+    initialize_schema(conn, migrations=(migration,))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM schema_migration WHERE version = 900"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_failed_migration_rolls_back_ddl_and_ledger() -> None:
+    migration = Migration(
+        version=901,
+        name="rollback probe",
+        statements=(
+            "CREATE TABLE rollback_probe (id INTEGER);",
+            "INSERT INTO table_that_does_not_exist VALUES (1);",
+        ),
+    )
+    conn = duckdb.connect(":memory:")
+
+    with pytest.raises(duckdb.Error, match="table_that_does_not_exist"):
+        initialize_schema(conn, migrations=(migration,))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'rollback_probe'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM schema_migration WHERE version = 901"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_checksum_drift_rejects_startup() -> None:
+    original = Migration(
+        version=902,
+        name="checksum probe",
+        statements=("CREATE TABLE checksum_probe (id INTEGER);",),
+    )
+    changed = Migration(
+        version=902,
+        name="checksum probe",
+        statements=("CREATE TABLE checksum_probe (id BIGINT);",),
+    )
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=(original,))
+
+    with pytest.raises(SchemaMigrationError, match=r"version 902.*checksum"):
+        initialize_schema(conn, migrations=(changed,))
+
+    assert _migration_rows(conn)[-1][2] == original.checksum
+    conn.close()
+
+
+def test_duckdb_store_uses_shared_initializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[duckdb.DuckDBPyConnection] = []
+    real_initialize_schema = duckdb_storage.initialize_schema
+
+    def spy_initialize_schema(conn: duckdb.DuckDBPyConnection) -> None:
+        calls.append(conn)
+        real_initialize_schema(conn)
+
+    monkeypatch.setattr(duckdb_storage, "initialize_schema", spy_initialize_schema)
+    store = DuckDBStore(tmp_path / "store.duckdb")
+
+    assert calls == [store._conn]
+    store.close()
+
+
+def test_read_only_store_does_not_run_migrations(tmp_path: Path) -> None:
+    db_path = tmp_path / "readonly.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE legacy_probe (id INTEGER)")
+    conn.close()
+
+    store = DuckDBStore(db_path, read_only=True)
+    tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+    store.close()
+
+    assert tables == {"legacy_probe"}

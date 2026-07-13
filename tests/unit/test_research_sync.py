@@ -10,6 +10,7 @@ import pytest
 
 import rquant.research_sync as research_sync
 from rquant.research_sync import (
+    LOCAL_ONLY_TABLES,
     MERGE_TABLES,
     REPLACE_TABLES,
     TableSyncResult,
@@ -87,6 +88,55 @@ def _insert_paper_position(db_path: Path, position_id: str, status: str) -> None
 
 
 class TestSyncFromBackup:
+    def test_uses_shared_schema_initializer(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[duckdb.DuckDBPyConnection] = []
+        real_initialize_schema = research_sync.initialize_schema
+
+        def spy_initialize_schema(conn: duckdb.DuckDBPyConnection) -> None:
+            calls.append(conn)
+            real_initialize_schema(conn)
+
+        monkeypatch.setattr(
+            research_sync, "initialize_schema", spy_initialize_schema
+        )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        assert not report.has_errors
+        assert len(calls) == 1
+
+    def test_schema_migration_is_not_imported_from_backup(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        local_conn = duckdb.connect(str(local_db))
+        local_rows = local_conn.execute(
+            "SELECT version, name, checksum FROM schema_migration ORDER BY version"
+        ).fetchall()
+        local_conn.close()
+
+        backup_conn = duckdb.connect(str(backup_db))
+        backup_conn.execute(
+            "UPDATE schema_migration SET name = 'cloud-only', "
+            "checksum = 'cloud-only'"
+        )
+        backup_conn.close()
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        conn = duckdb.connect(str(local_db), read_only=True)
+        after_rows = conn.execute(
+            "SELECT version, name, checksum FROM schema_migration ORDER BY version"
+        ).fetchall()
+        conn.close()
+        assert not report.has_errors
+        assert "schema_migration" not in {result.table for result in report.tables}
+        assert after_rows == local_rows
+
     def test_merge_keeps_local_history_and_replace_tables_replaced(
         self, local_db: Path, backup_db: Path
     ) -> None:
@@ -246,6 +296,35 @@ class TestSyncFromBackup:
 
 
 class TestRestoreResearchTables:
+    def test_uses_shared_schema_initializer(
+        self,
+        tmp_path: Path,
+        local_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = tmp_path / "source.duckdb"
+        DuckDBStore(source).close()
+        calls: list[duckdb.DuckDBPyConnection] = []
+        real_initialize_schema = research_sync.initialize_schema
+
+        def spy_initialize_schema(conn: duckdb.DuckDBPyConnection) -> None:
+            calls.append(conn)
+            real_initialize_schema(conn)
+
+        monkeypatch.setattr(
+            research_sync, "initialize_schema", spy_initialize_schema
+        )
+
+        report = restore_research_tables(
+            source,
+            local_db,
+            tables=["minute_bar"],
+            refresh_replica=False,
+        )
+
+        assert not report.has_errors
+        assert len(calls) == 1
+
     def test_restore_merges_research_only(
         self, tmp_path: Path, local_db: Path
     ) -> None:
@@ -427,10 +506,31 @@ class TestStaleWalRescue:
             _rescue_stale_wal(local_db)
 
 
-def test_table_classification_complete() -> None:
-    """新表进 schema 时强制在这里表态：replace 还是 merge。"""
-    overlap = set(REPLACE_TABLES) & set(MERGE_TABLES)
-    assert not overlap, f"表不能同时出现在两类：{overlap}"
+def test_table_classification_complete(tmp_path: Path) -> None:
+    """新表进 schema 时强制在 replace、merge、local-only 中表态。"""
+    store = DuckDBStore(tmp_path / "classification.duckdb")
+    schema_tables = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main'"
+        ).fetchall()
+    }
+    store.close()
+    replace = set(REPLACE_TABLES)
+    merge = set(MERGE_TABLES)
+    local_only = set(LOCAL_ONLY_TABLES)
+
+    assert not replace & merge
+    assert not replace & local_only
+    assert not merge & local_only
+    assert replace | merge | local_only == schema_tables
+
+
+def test_schema_migration_is_local_only() -> None:
+    assert "schema_migration" in LOCAL_ONLY_TABLES
+    assert "schema_migration" not in REPLACE_TABLES
+    assert "schema_migration" not in MERGE_TABLES
 
 
 def test_backfilled_history_tables_are_merge() -> None:

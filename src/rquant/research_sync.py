@@ -11,7 +11,7 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
   研究表（分钟线/竞价/模拟盘）由本地回补和 monitor 直接写
 - 合并后原子刷新本地只读副本 rquant_ro.duckdb 供 Strategy Lab 读
 
-表分两类：
+表分三类：
 - REPLACE_TABLES：云端权威且本地无独有行，整表替换（DELETE + INSERT，
   保留本地 DDL/主键）
 - MERGE_TABLES：本地存在独有行的表，按主键 INSERT OR REPLACE（主键冲突
@@ -24,6 +24,7 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
      limit_list_daily（Tushare 涨跌停榜本地回补 + 日终增量，云端 daily 不拉）
   灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
   缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
+- LOCAL_ONLY_TABLES：只描述本机状态，不从云端备份导入
 
 错误语义：顶层失败（备份缺失 / 主库打不开 / ATTACH 失败）不抛异常，
 转成 has_errors 的报告返回——告警由 sync-from-cloud.sh 统一推，避免
@@ -42,7 +43,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from rquant.config import settings
-from rquant.storage.schema import ALL_DDL
+from rquant.storage.migrations import initialize_schema
 
 # 云端 daily/monitor 流水线权威产出，本地无独立增量 → 整表替换
 REPLACE_TABLES: tuple[str, ...] = (
@@ -94,6 +95,8 @@ MERGE_TABLES: tuple[str, ...] = (
     "market_daily_info",
     "hm_list",
 )
+
+LOCAL_ONLY_TABLES: tuple[str, ...] = ("schema_migration",)
 
 
 class TableSyncResult(BaseModel):
@@ -325,8 +328,7 @@ def sync_from_backup(
 
     results: list[TableSyncResult] = []
     try:
-        for ddl in ALL_DDL:
-            conn.execute(ddl)
+        initialize_schema(conn)
         _attach_readonly(conn, backup_path, "cloud_backup")
         for table in REPLACE_TABLES:
             results.append(_sync_table(conn, table, "cloud_backup", "replace"))
@@ -392,8 +394,7 @@ def restore_research_tables(
 
     results: list[TableSyncResult] = []
     try:
-        for ddl in ALL_DDL:
-            conn.execute(ddl)
+        initialize_schema(conn)
         _attach_readonly(conn, source_path, "restore_src")
         for table in tables:
             results.append(_sync_table(conn, table, "restore_src", "restore"))

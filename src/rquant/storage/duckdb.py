@@ -12,7 +12,7 @@ import pandas as pd
 from loguru import logger
 
 from rquant.config import settings
-from rquant.storage.schema import ALL_DDL
+from rquant.storage.migrations import initialize_schema
 
 
 class DuckDBStore:
@@ -23,8 +23,7 @@ class DuckDBStore:
             self._init_schema()
 
     def _init_schema(self) -> None:
-        for ddl in ALL_DDL:
-            self._conn.execute(ddl)
+        initialize_schema(self._conn)
 
     def upsert_daily(self, df: pd.DataFrame) -> int:
         if df.empty:
