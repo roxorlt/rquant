@@ -195,6 +195,165 @@ class TestSyncFromBackup:
         assert daily_dates == [(date(2026, 6, 1),)]
         assert any("rolled back" in item.detail for item in report.tables)
 
+    def test_direct_table_exception_zeroes_prior_results_and_names_table(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        local = duckdb.connect(str(local_db))
+        local.execute(
+            "INSERT INTO stock_basic (ts_code, name) VALUES ('600000.SH', 'local')"
+        )
+        local.close()
+        backup = duckdb.connect(str(backup_db))
+        backup.execute(
+            "INSERT INTO stock_basic (ts_code, name) VALUES ('000001.SZ', 'cloud')"
+        )
+        backup.close()
+        real_sync_table = research_sync._sync_table
+        refresh_calls = 0
+
+        def raising_sync_table(  # noqa: ANN001
+            conn, table, alias, mode, *, manage_transaction=True
+        ):
+            if table == "daily_bar":
+                raise RuntimeError("direct table failure")
+            return real_sync_table(
+                conn,
+                table,
+                alias,
+                mode,
+                manage_transaction=manage_transaction,
+            )
+
+        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True, "must not refresh"
+
+        monkeypatch.setattr(research_sync, "_sync_table", raising_sync_table)
+        monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+        by_table = {result.table: result for result in report.tables}
+        assert report.has_errors
+        assert by_table["stock_basic"].mode == "skipped"
+        assert by_table["stock_basic"].rows == 0
+        assert "rolled back" in by_table["stock_basic"].detail
+        assert by_table["daily_bar"].mode == "error"
+        assert by_table["daily_bar"].rows == 0
+        assert "direct table failure" in by_table["daily_bar"].detail
+        assert all(result.rows == 0 for result in report.tables)
+        assert refresh_calls == 0
+
+        conn = duckdb.connect(str(local_db), read_only=True)
+        assert conn.execute(
+            "SELECT ts_code, name FROM stock_basic"
+        ).fetchall() == [("600000.SH", "local")]
+        conn.close()
+
+    def test_direct_metadata_exception_zeroes_results_and_names_bundle(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def raising_metadata_sync(  # noqa: ANN001
+            conn, alias, *, manage_transaction=True
+        ):
+            raise RuntimeError("direct metadata failure")
+
+        monkeypatch.setattr(
+            research_sync,
+            "_sync_data_metadata_bundle",
+            raising_metadata_sync,
+        )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        by_table = {result.table: result for result in report.tables}
+        assert report.has_errors
+        assert by_table["daily_bar"].mode == "skipped"
+        assert by_table["daily_bar"].rows == 0
+        assert "rolled back" in by_table["daily_bar"].detail
+        assert by_table["<metadata_bundle>"].mode == "error"
+        assert by_table["<metadata_bundle>"].rows == 0
+        assert "direct metadata failure" in by_table["<metadata_bundle>"].detail
+        assert all(result.rows == 0 for result in report.tables)
+
+    def test_rollback_failure_is_reported_as_unconfirmed(
+        self,
+        local_db: Path,
+        backup_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_sync_table = research_sync._sync_table
+        real_connect = duckdb.connect
+        refresh_calls = 0
+
+        class RollbackFailingConnection:
+            def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+                self._inner = inner
+
+            def execute(self, query: str, *args, **kwargs):  # noqa: ANN002, ANN003
+                if query.strip().upper() == "ROLLBACK":
+                    raise duckdb.TransactionException("forced rollback failure")
+                return self._inner.execute(query, *args, **kwargs)
+
+            def __getattr__(self, name: str):  # noqa: ANN204
+                return getattr(self._inner, name)
+
+        def open_with_failed_rollback(path: Path):  # noqa: ANN202
+            return RollbackFailingConnection(real_connect(str(path)))
+
+        def table_error(  # noqa: ANN001
+            conn, table, alias, mode, *, manage_transaction=True
+        ):
+            if table == "daily_bar":
+                return TableSyncResult(
+                    table=table,
+                    mode="error",
+                    detail="forced table failure",
+                )
+            return real_sync_table(
+                conn,
+                table,
+                alias,
+                mode,
+                manage_transaction=manage_transaction,
+            )
+
+        def spy_refresh(db_path=None, replica_path=None):  # noqa: ANN001
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True, "must not refresh"
+
+        monkeypatch.setattr(
+            research_sync,
+            "_rescue_stale_wal",
+            open_with_failed_rollback,
+        )
+        monkeypatch.setattr(research_sync, "_sync_table", table_error)
+        monkeypatch.setattr(research_sync, "refresh_readonly_replica", spy_refresh)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=True)
+
+        by_table = {result.table: result for result in report.tables}
+        assert report.has_errors
+        assert by_table["daily_bar"].mode == "error"
+        assert "rollback failed/unconfirmed" in by_table["daily_bar"].detail
+        assert by_table["stock_basic"].mode == "skipped"
+        assert by_table["stock_basic"].rows == 0
+        assert "rollback failed/unconfirmed" in by_table["stock_basic"].detail
+        assert all(
+            "all primary changes rolled back" not in result.detail
+            for result in report.tables
+        )
+        assert refresh_calls == 0
+        assert not report.replica_refreshed
+
     def test_uses_shared_schema_initializer(
         self,
         local_db: Path,

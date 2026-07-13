@@ -199,6 +199,59 @@ def _refresh_replica_if_clean(
     report.replica_detail = detail
 
 
+def _transaction_failure_results(
+    results: list[TableSyncResult],
+    *,
+    failure_table: str,
+    cause: Exception,
+    rollback_confirmed: bool,
+    rollback_error: Exception | None,
+) -> list[TableSyncResult]:
+    if rollback_confirmed:
+        transaction_detail = "all primary changes rolled back"
+    else:
+        rollback_message = str(rollback_error) if rollback_error else "unknown error"
+        transaction_detail = (
+            f"rollback failed/unconfirmed ({rollback_message})"
+        )
+
+    rewritten: list[TableSyncResult] = []
+    has_error_result = False
+    for result in results:
+        if result.mode == "error":
+            has_error_result = True
+            detail = f"{transaction_detail}; {result.detail}"[:200]
+            rewritten.append(
+                result.model_copy(
+                    update={"mode": "error", "rows": 0, "detail": detail}
+                )
+            )
+        else:
+            rewritten.append(
+                result.model_copy(
+                    update={
+                        "mode": "skipped",
+                        "rows": 0,
+                        "detail": (
+                            f"{transaction_detail}; sync aborted after "
+                            f"{failure_table} failed"
+                        )[:200],
+                    }
+                )
+            )
+
+    if not has_error_result:
+        rewritten.append(
+            TableSyncResult(
+                table=failure_table,
+                mode="error",
+                rows=0,
+                detail=f"{transaction_detail}; {cause}"[:200],
+            )
+        )
+    return rewritten
+
+
 def _common_columns(
     conn: duckdb.DuckDBPyConnection, table: str, alias: str
 ) -> tuple[list[str], list[str]]:
@@ -960,12 +1013,14 @@ def sync_from_backup(
     results: list[TableSyncResult] = []
     transaction_started = False
     failed_table: str | None = None
+    current_table: str | None = None
     try:
         initialize_schema(conn)
         _attach_readonly(conn, backup_path, "cloud_backup")
         conn.execute("BEGIN")
         transaction_started = True
         for table in REPLACE_TABLES:
+            current_table = table
             result = _sync_table(
                 conn,
                 table,
@@ -980,6 +1035,7 @@ def sync_from_backup(
         for table in MERGE_TABLES:
             if table in DATA_METADATA_TABLES:
                 continue
+            current_table = table
             result = _sync_table(
                 conn,
                 table,
@@ -991,6 +1047,7 @@ def sync_from_backup(
             if result.mode == "error":
                 failed_table = table
                 raise RuntimeError(result.detail)
+        current_table = "<metadata_bundle>"
         metadata_results = _sync_data_metadata_bundle(
             conn,
             "cloud_backup",
@@ -1004,42 +1061,41 @@ def sync_from_backup(
         if metadata_error is not None:
             failed_table = metadata_error.table
             raise RuntimeError(metadata_error.detail)
+        current_table = "<commit>"
         conn.execute("COMMIT")
         transaction_started = False
+        current_table = "<detach>"
         conn.execute("DETACH cloud_backup")
+        current_table = "<checkpoint>"
         conn.execute("CHECKPOINT")
     except Exception as e:
         logger.exception("research-sync 顶层失败")
-        if transaction_started:
+        failed_in_transaction = transaction_started
+        rollback_confirmed = False
+        rollback_error: Exception | None = None
+        if failed_in_transaction:
             try:
                 conn.execute("ROLLBACK")
                 transaction_started = False
-            except duckdb.Error:
+                rollback_confirmed = True
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
                 logger.exception("research-sync 跨表事务回滚失败")
-        if failed_table is None:
+        if failed_in_transaction:
+            failure_table = failed_table or current_table or "<sync>"
+            results = _transaction_failure_results(
+                results,
+                failure_table=failure_table,
+                cause=e,
+                rollback_confirmed=rollback_confirmed,
+                rollback_error=rollback_error,
+            )
+        else:
             results.append(
                 TableSyncResult(
                     table="<sync>", mode="error", detail=str(e)[:200]
                 )
             )
-        else:
-            rollback_reason = f"rolled back after {failed_table} failed"
-            results = [
-                result.model_copy(
-                    update={
-                        "mode": (
-                            "error" if result.table == failed_table else "skipped"
-                        ),
-                        "rows": 0,
-                        "detail": (
-                            f"{result.detail}; all primary changes rolled back"
-                            if result.table == failed_table
-                            else rollback_reason
-                        )[:200],
-                    }
-                )
-                for result in results
-            ]
     finally:
         conn.close()
 
