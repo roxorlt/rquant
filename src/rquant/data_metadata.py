@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Literal, Self, TypeAlias
@@ -34,6 +35,17 @@ def normalize_utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("business datetime must be timezone-aware UTC")
     return value.astimezone(UTC)
+
+
+def _validate_finite_json(value: JsonValue) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("JSON numeric values must be finite")
+    if isinstance(value, list):
+        for item in value:
+            _validate_finite_json(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _validate_finite_json(item)
 
 
 def stable_sha256(
@@ -200,6 +212,12 @@ class DataQualityIssue(MetadataModel):
     def validate_business_time(cls, value: datetime | None) -> datetime | None:
         return None if value is None else normalize_utc_datetime(value)
 
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, value: QualityEvidence) -> QualityEvidence:
+        _validate_finite_json(value)
+        return value
+
     @model_validator(mode="after")
     def validate_lifecycle(self) -> DataQualityIssue:
         if self.last_seen_at < self.first_seen_at:
@@ -208,8 +226,8 @@ class DataQualityIssue(MetadataModel):
             raise ValueError("open data quality issue cannot have resolved_at")
         if self.status == "resolved" and self.resolved_at is None:
             raise ValueError("resolved data quality issue requires resolved_at")
-        if self.resolved_at is not None and self.resolved_at < self.first_seen_at:
-            raise ValueError("resolved_at cannot be earlier than first_seen_at")
+        if self.resolved_at is not None and self.resolved_at < self.last_seen_at:
+            raise ValueError("resolved_at cannot be earlier than last_seen_at")
         return self
 
     @computed_field

@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections.abc import Sequence
+from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from typing import TypeVar, cast
@@ -32,11 +33,17 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 def _revalidate_for_write(model: ModelT) -> ModelT:
     """Deep-copy and revalidate a frozen model before crossing into SQL."""
     try:
-        payload = model.model_dump_json(
-            exclude_computed_fields=True,
-            warnings="error",
+        payload = deepcopy(
+            model.model_dump(
+                mode="python",
+                exclude_computed_fields=True,
+                warnings="error",
+            )
         )
-        return cast(ModelT, type(model).model_validate_json(payload))
+        return cast(
+            ModelT,
+            type(model).model_validate(payload),
+        )
     except ValueError as exc:
         raise ValueError(
             f"{type(model).__name__} failed write-boundary validation: {exc}"
@@ -525,54 +532,111 @@ class DuckDBStore:
         *,
         resolved_at: datetime | None = None,
     ) -> DataQualityIssue:
+        timestamp_omitted = resolved_at is None
+        resolution_time = normalize_utc_datetime(
+            utc_now() if timestamp_omitted else resolved_at
+        )
         existing = self.get_data_quality_issue(issue_id)
         if existing is None:
             raise KeyError(f"data quality issue not found: {issue_id}")
         if existing.status == "resolved":
-            if resolved_at is None:
-                return existing
-            resolution_time = normalize_utc_datetime(resolved_at)
-            if resolution_time == existing.resolved_at:
+            if timestamp_omitted or existing.resolved_at == resolution_time:
                 return existing
             raise ValueError(
                 "data quality issue already resolved with different timestamp: "
                 f"{issue_id}"
             )
-        resolution_time = normalize_utc_datetime(
-            utc_now() if resolved_at is None else resolved_at
-        )
         if resolution_time < existing.last_seen_at:
             raise ValueError(
-                "data quality issue resolved_at cannot be earlier than last_seen_at: "
+                "data quality issue resolved_at cannot be earlier than "
+                f"last_seen_at: {issue_id}"
+            )
+        for attempt in range(2):
+            self._conn.execute("BEGIN")
+            transaction_open = True
+            try:
+                updated = self._conn.execute(
+                    """
+                    UPDATE data_quality_issue
+                    SET status = 'resolved', resolved_at = ?
+                    WHERE issue_id = ?
+                      AND status = 'open'
+                      AND last_seen_at <= ?
+                    RETURNING issue_id
+                    """,
+                    [resolution_time, issue_id, resolution_time],
+                ).fetchall()
+                if not updated:
+                    self._conn.execute("ROLLBACK")
+                    transaction_open = False
+                    winner = self._resolution_after_cas_loss(
+                        issue_id,
+                        resolution_time,
+                        timestamp_omitted=timestamp_omitted,
+                    )
+                    if winner is not None:
+                        return winner
+                    if attempt == 0:
+                        continue
+                    raise RuntimeError(
+                        "data quality issue resolution lost repeated concurrent "
+                        f"updates: {issue_id}"
+                    )
+                resolved = self.get_data_quality_issue(issue_id)
+                if resolved is None:
+                    raise RuntimeError(
+                        "data quality issue resolution was not persisted: "
+                        f"{issue_id}"
+                    )
+                self._conn.execute("COMMIT")
+                transaction_open = False
+                return resolved
+            except duckdb.TransactionException as exc:
+                if transaction_open:
+                    self._conn.execute("ROLLBACK")
+                    transaction_open = False
+                winner = self._resolution_after_cas_loss(
+                    issue_id,
+                    resolution_time,
+                    timestamp_omitted=timestamp_omitted,
+                )
+                if winner is not None:
+                    return winner
+                if attempt == 0:
+                    continue
+                raise RuntimeError(
+                    "data quality issue resolution lost repeated concurrent "
+                    f"updates: {issue_id}"
+                ) from exc
+            except Exception:
+                if transaction_open:
+                    self._conn.execute("ROLLBACK")
+                raise
+        raise RuntimeError(f"data quality issue resolution failed: {issue_id}")
+
+    def _resolution_after_cas_loss(
+        self,
+        issue_id: str,
+        resolution_time: datetime,
+        *,
+        timestamp_omitted: bool,
+    ) -> DataQualityIssue | None:
+        current = self.get_data_quality_issue(issue_id)
+        if current is None:
+            raise KeyError(f"data quality issue not found after CAS loss: {issue_id}")
+        if current.status == "resolved":
+            if timestamp_omitted or current.resolved_at == resolution_time:
+                return current
+            raise ValueError(
+                "data quality issue already resolved with different timestamp: "
                 f"{issue_id}"
             )
-        updated = self._conn.execute(
-            """
-            UPDATE data_quality_issue
-            SET status = 'resolved', resolved_at = ?
-            WHERE issue_id = ? AND status = 'open'
-            RETURNING issue_id
-            """,
-            [resolution_time, issue_id],
-        ).fetchall()
-        if not updated:
-            current = self.get_data_quality_issue(issue_id)
-            if current is not None and current.status == "resolved":
-                if resolved_at is None or current.resolved_at == resolution_time:
-                    return current
-                raise ValueError(
-                    "data quality issue already resolved with different timestamp: "
-                    f"{issue_id}"
-                )
-            raise RuntimeError(
-                f"data quality issue resolution lost without winner: {issue_id}"
+        if resolution_time < current.last_seen_at:
+            raise ValueError(
+                "newer detection won resolution CAS; proposed resolved_at is "
+                f"earlier than last_seen_at: {issue_id}"
             )
-        resolved = self.get_data_quality_issue(issue_id)
-        if resolved is None:
-            raise RuntimeError(
-                f"data quality issue resolution was not persisted: {issue_id}"
-            )
-        return resolved
+        return None
 
     def list_snapshot_quality_issues(
         self, snapshot_id: str

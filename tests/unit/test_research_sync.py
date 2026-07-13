@@ -11,6 +11,7 @@ import pytest
 import rquant.research_sync as research_sync
 from rquant.data_metadata import (
     DataQualityIssue,
+    DatasetCoverage,
     DatasetSnapshot,
     DatasetSnapshotFinalization,
 )
@@ -364,7 +365,14 @@ class TestSyncFromBackup:
         with DuckDBStore(local_db) as local:
             stored = local.get_data_quality_issue(initial.issue_id)
         assert not report.has_errors
-        assert stored == resolved
+        assert stored is not None
+        assert stored.status == "resolved"
+        assert stored.first_seen_at == t0
+        assert stored.last_seen_at == t0 + timedelta(minutes=1)
+        assert stored.resolved_at == resolved.resolved_at
+        assert stored.severity == "P0"
+        assert stored.message == "older open"
+        assert stored.evidence == {"stale": True}
 
     def test_sync_newer_detection_reopens_and_preserves_first_seen(
         self, local_db: Path, backup_db: Path
@@ -452,6 +460,238 @@ class TestSyncFromBackup:
         )
         assert stored is not None
         assert stored.table_watermarks == {"daily_bar": "target"}
+
+    def test_sync_promotes_snapshot_with_earliest_created_at(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        source_snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        target_snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0 + timedelta(minutes=2),
+        )
+        finalization = DatasetSnapshotFinalization(
+            table_watermarks={"daily_bar": "ready-source"},
+            completed_at=t0 + timedelta(minutes=1),
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(target_snapshot)
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(source_snapshot)
+            backup.finalize_dataset_snapshot(
+                source_snapshot.snapshot_id,
+                finalization,
+            )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_dataset_snapshot(source_snapshot.snapshot_id)
+        assert not report.has_errors
+        assert stored is not None
+        assert stored.status == "ready"
+        assert stored.created_at == t0
+        assert stored.completed_at == t0 + timedelta(minutes=1)
+
+    def test_sync_building_source_cannot_regress_ready_coverage(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        target_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=9,
+            missing_reasons=("target missing one",),
+            created_at=t0,
+        )
+        source_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=8,
+            missing_reasons=("source missing two",),
+            created_at=t0,
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.upsert_dataset_coverage(target_coverage)
+            local.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                DatasetSnapshotFinalization(
+                    completed_at=t0 + timedelta(minutes=1)
+                ),
+            )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(source_coverage)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.list_dataset_coverages(snapshot.snapshot_id)
+        assert not report.has_errors
+        assert stored == [target_coverage]
+
+    def test_sync_conflicting_ready_coverage_fails_and_preserves_target(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        finalization = DatasetSnapshotFinalization(
+            completed_at=t0 + timedelta(minutes=1)
+        )
+        target_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=9,
+            created_at=t0,
+        )
+        source_coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=8,
+            created_at=t0,
+        )
+        with DuckDBStore(local_db) as local:
+            local.begin_dataset_snapshot(snapshot)
+            local.upsert_dataset_coverage(target_coverage)
+            local.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(source_coverage)
+            backup.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.list_dataset_coverages(snapshot.snapshot_id)
+        coverage_result = next(
+            result
+            for result in report.tables
+            if result.table == "dataset_coverage"
+        )
+        assert report.has_errors
+        assert coverage_result.mode == "error"
+        assert "conflict" in coverage_result.detail
+        assert stored == [target_coverage]
+
+    def test_sync_ready_coverage_new_and_identical_rows_are_idempotent(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        snapshot = DatasetSnapshot.create(
+            strategy_name="strategy",
+            as_of_time=t0,
+            code_commit="abc123",
+            origin="shared",
+            created_at=t0,
+        )
+        coverage = DatasetCoverage(
+            snapshot_id=snapshot.snapshot_id,
+            dataset_id="minute-bars",
+            coverage_scope="all",
+            table_name="minute_bar",
+            expected_count=10,
+            available_count=9,
+            missing_reasons=("one missing",),
+            created_at=t0,
+        )
+        with DuckDBStore(backup_db) as backup:
+            backup.begin_dataset_snapshot(snapshot)
+            backup.upsert_dataset_coverage(coverage)
+            backup.finalize_dataset_snapshot(
+                snapshot.snapshot_id,
+                DatasetSnapshotFinalization(
+                    completed_at=t0 + timedelta(minutes=1)
+                ),
+            )
+
+        first = sync_from_backup(backup_db, local_db, refresh_replica=False)
+        second = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.list_dataset_coverages(snapshot.snapshot_id)
+        assert not first.has_errors
+        assert not second.has_errors
+        assert stored == [coverage]
+
+    def test_sync_reconciles_issue_observation_and_resolution_timelines(
+        self, local_db: Path, backup_db: Path
+    ) -> None:
+        t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+        target_observation = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P0",
+            scope_key="all",
+            message="newest observation",
+            evidence={"observation": "t10"},
+            observed_at=t0 + timedelta(minutes=10),
+        )
+        source_observation = DataQualityIssue.detected(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P2",
+            scope_key="all",
+            message="old observation",
+            evidence={"observation": "t0"},
+            observed_at=t0,
+        )
+        with DuckDBStore(local_db) as local:
+            local.record_data_quality_issue(target_observation)
+        with DuckDBStore(backup_db) as backup:
+            backup.record_data_quality_issue(source_observation)
+            backup.resolve_data_quality_issue(
+                source_observation.issue_id,
+                resolved_at=t0 + timedelta(minutes=12),
+            )
+
+        report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+        with DuckDBStore(local_db) as local:
+            stored = local.get_data_quality_issue(target_observation.issue_id)
+        assert not report.has_errors
+        assert stored is not None
+        assert stored.status == "resolved"
+        assert stored.first_seen_at == t0
+        assert stored.last_seen_at == t0 + timedelta(minutes=10)
+        assert stored.resolved_at == t0 + timedelta(minutes=12)
+        assert stored.severity == "P0"
+        assert stored.message == "newest observation"
+        assert stored.evidence == {"observation": "t10"}
 
 
 class TestRestoreResearchTables:

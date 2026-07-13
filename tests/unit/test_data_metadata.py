@@ -620,3 +620,150 @@ def test_finalize_snapshot_cas_preserves_concurrent_winner(
         assert stored.status == "ready"
         assert stored.table_watermarks == {"daily_bar": "winner"}
         assert stored.completed_at == winner.completed_at
+
+
+def test_resolved_issue_rejects_resolution_before_last_observation() -> None:
+    from rquant.data_metadata import DataQualityIssue
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+
+    with pytest.raises(ValidationError, match="resolved_at.*last_seen_at"):
+        DataQualityIssue(
+            rule_id="minute-coverage",
+            dataset_id="minute-bars",
+            severity="P1",
+            status="resolved",
+            scope_key="all",
+            message="invalid timeline",
+            first_seen_at=t0,
+            last_seen_at=t0 + timedelta(minutes=2),
+            resolved_at=t0 + timedelta(minutes=1),
+        )
+
+
+def test_resolve_issue_cas_rejects_concurrent_newer_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.data_metadata import DataQualityIssue
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    db_path = tmp_path / "resolve-cas.duckdb"
+    initial = DataQualityIssue.detected(
+        rule_id="minute-coverage",
+        dataset_id="minute-bars",
+        severity="P1",
+        scope_key="all",
+        message="initial",
+        observed_at=t0,
+    )
+    newer = DataQualityIssue.detected(
+        rule_id="minute-coverage",
+        dataset_id="minute-bars",
+        severity="P0",
+        scope_key="all",
+        message="newer detection wins",
+        evidence={"observation": "t2"},
+        observed_at=t0 + timedelta(minutes=2),
+    )
+
+    with DuckDBStore(db_path) as primary, DuckDBStore(db_path) as competitor:
+        primary.record_data_quality_issue(initial)
+        real_get = primary.get_data_quality_issue
+        interleaved = False
+
+        def get_with_newer_detection(issue_id: str):  # noqa: ANN202
+            nonlocal interleaved
+            current = real_get(issue_id)
+            if not interleaved:
+                interleaved = True
+                competitor.record_data_quality_issue(newer)
+            return current
+
+        monkeypatch.setattr(
+            primary,
+            "get_data_quality_issue",
+            get_with_newer_detection,
+        )
+
+        with pytest.raises(ValueError, match="last_seen_at|newer detection"):
+            primary.resolve_data_quality_issue(
+                initial.issue_id,
+                resolved_at=t0 + timedelta(minutes=1),
+            )
+
+        stored = real_get(initial.issue_id)
+        assert stored is not None
+        assert stored.status == "open"
+        assert stored.last_seen_at == t0 + timedelta(minutes=2)
+        assert stored.resolved_at is None
+        assert stored.message == "newer detection wins"
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"value": float("nan")},
+        {"nested": {"values": [float("inf")]}},
+        {"nested": [{"value": float("-inf")}]},
+    ],
+    ids=("nan", "nested-positive-infinity", "nested-negative-infinity"),
+)
+def test_quality_issue_rejects_non_finite_evidence(
+    evidence: dict[str, object],
+) -> None:
+    from rquant.data_metadata import DataQualityIssue
+
+    with pytest.raises(ValidationError, match="finite"):
+        DataQualityIssue.detected(
+            rule_id="finite-evidence",
+            dataset_id="minute-bars",
+            severity="P1",
+            scope_key="all",
+            message="invalid evidence",
+            evidence=evidence,  # type: ignore[arg-type]
+            observed_at=datetime(2026, 7, 13, 6, 0, tzinfo=UTC),
+        )
+
+
+def test_issue_write_boundary_rejects_mutated_non_finite_evidence(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_metadata import DataQualityIssue
+
+    t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    ordinary_evidence = {
+        "sample": {"values": [1.5, None, True], "symbol": "600000.SH"}
+    }
+    ordinary = DataQualityIssue.detected(
+        rule_id="finite-evidence",
+        dataset_id="minute-bars",
+        severity="P1",
+        scope_key="ordinary",
+        message="ordinary nested evidence",
+        evidence=ordinary_evidence,
+        observed_at=t0,
+    )
+    mutated = DataQualityIssue.detected(
+        rule_id="finite-evidence",
+        dataset_id="minute-bars",
+        severity="P1",
+        scope_key="mutated",
+        message="mutated nested evidence",
+        evidence={"sample": {"values": [1.5]}},
+        observed_at=t0,
+    )
+    sample = mutated.evidence["sample"]
+    assert isinstance(sample, dict)
+    values = sample["values"]
+    assert isinstance(values, list)
+    values.append(float("nan"))
+
+    with DuckDBStore(tmp_path / "finite-evidence.duckdb") as store:
+        stored = store.record_data_quality_issue(ordinary)
+        assert stored.evidence == ordinary_evidence
+        assert store.get_data_quality_issue(ordinary.issue_id) == stored
+
+        with pytest.raises(ValueError, match="finite|write-boundary"):
+            store.record_data_quality_issue(mutated)
+        assert store.get_data_quality_issue(mutated.issue_id) is None

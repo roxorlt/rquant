@@ -37,6 +37,7 @@ import json
 import os
 import shutil
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -218,6 +219,21 @@ def _common_columns(
 def _merge_dataset_snapshots(
     conn: duckdb.DuckDBPyConnection, alias: str
 ) -> None:
+    invalid_source = conn.execute(
+        f"""
+        SELECT snapshot_id
+        FROM {alias}.dataset_snapshot
+        WHERE status = 'ready'
+          AND (completed_at IS NULL OR completed_at < created_at)
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_source is not None:
+        raise ValueError(
+            "source ready dataset_snapshot has invalid created/completed timeline: "
+            f"{invalid_source[0]}"
+        )
+
     overlapping = conn.execute(
         f"""
         SELECT target.snapshot_id,
@@ -283,11 +299,89 @@ def _merge_dataset_snapshots(
         SET status = 'ready',
             table_watermarks = source.table_watermarks,
             quality_issue_ids = source.quality_issue_ids,
+            created_at = least(target.created_at, source.created_at),
             completed_at = source.completed_at
         FROM {alias}.dataset_snapshot AS source
         WHERE target.snapshot_id = source.snapshot_id
           AND target.status = 'building'
           AND source.status = 'ready'
+        """
+    )
+
+
+def _merge_dataset_coverages(
+    conn: duckdb.DuckDBPyConnection, alias: str
+) -> None:
+    overlapping = conn.execute(
+        f"""
+        SELECT target.snapshot_id, target.dataset_id, target.coverage_scope,
+               target.table_name, source.table_name,
+               target.expected_count, source.expected_count,
+               target.available_count, source.available_count,
+               target.missing_count, source.missing_count,
+               target.coverage_ratio, source.coverage_ratio,
+               target.missing_reasons, source.missing_reasons,
+               epoch_us(target.created_at), epoch_us(source.created_at)
+        FROM dataset_coverage AS target
+        JOIN {alias}.dataset_coverage AS source
+          USING (snapshot_id, dataset_id, coverage_scope)
+        JOIN dataset_snapshot AS target_snapshot
+          ON target_snapshot.snapshot_id = target.snapshot_id
+         AND target_snapshot.status = 'ready'
+        JOIN {alias}.dataset_snapshot AS source_snapshot
+          ON source_snapshot.snapshot_id = source.snapshot_id
+         AND source_snapshot.status = 'ready'
+        """
+    ).fetchall()
+    for row in overlapping:
+        target_payload = (
+            row[3],
+            row[5],
+            row[7],
+            row[9],
+            row[11],
+            json.loads(str(row[13])),
+            row[15],
+        )
+        source_payload = (
+            row[4],
+            row[6],
+            row[8],
+            row[10],
+            row[12],
+            json.loads(str(row[14])),
+            row[16],
+        )
+        if target_payload != source_payload:
+            key = f"{row[0]}/{row[1]}/{row[2]}"
+            raise ValueError(
+                f"conflicting dataset_coverage for ready snapshot: {key}"
+            )
+
+    conn.execute(
+        f"""
+        INSERT INTO dataset_coverage
+        (snapshot_id, dataset_id, coverage_scope, table_name, expected_count,
+         available_count, missing_count, coverage_ratio, missing_reasons,
+         created_at)
+        SELECT source.snapshot_id, source.dataset_id, source.coverage_scope,
+               source.table_name, source.expected_count, source.available_count,
+               source.missing_count, source.coverage_ratio,
+               source.missing_reasons, source.created_at
+        FROM {alias}.dataset_coverage AS source
+        JOIN {alias}.dataset_snapshot AS source_snapshot
+          ON source_snapshot.snapshot_id = source.snapshot_id
+         AND source_snapshot.status = 'ready'
+        JOIN dataset_snapshot AS target_snapshot
+          ON target_snapshot.snapshot_id = source.snapshot_id
+         AND target_snapshot.status = 'ready'
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM dataset_coverage AS target
+            WHERE target.snapshot_id = source.snapshot_id
+              AND target.dataset_id = source.dataset_id
+              AND target.coverage_scope = source.coverage_scope
+        )
         """
     )
 
@@ -311,6 +405,20 @@ def _merge_data_quality_issues(
             f"data_quality_issue stable identity conflict: {conflict[0]}"
         )
 
+    overlapping = conn.execute(
+        f"""
+        SELECT target.issue_id,
+               target.severity, source.severity,
+               target.message, source.message,
+               target.evidence, source.evidence,
+               epoch_us(target.first_seen_at), epoch_us(source.first_seen_at),
+               epoch_us(target.last_seen_at), epoch_us(source.last_seen_at),
+               epoch_us(target.resolved_at), epoch_us(source.resolved_at)
+        FROM data_quality_issue AS target
+        JOIN {alias}.data_quality_issue AS source USING (issue_id)
+        """
+    ).fetchall()
+
     conn.execute(
         f"""
         INSERT INTO data_quality_issue
@@ -327,27 +435,50 @@ def _merge_data_quality_issues(
         )
         """
     )
-    conn.execute(
-        f"""
-        UPDATE data_quality_issue AS target
-        SET severity = source.severity,
-            status = source.status,
-            message = source.message,
-            evidence = source.evidence,
-            first_seen_at = least(target.first_seen_at, source.first_seen_at),
-            last_seen_at = source.last_seen_at,
-            resolved_at = source.resolved_at
-        FROM {alias}.data_quality_issue AS source
-        WHERE target.issue_id = source.issue_id
-          AND greatest(
-              source.last_seen_at,
-              coalesce(source.resolved_at, source.last_seen_at)
-          ) > greatest(
-              target.last_seen_at,
-              coalesce(target.resolved_at, target.last_seen_at)
-          )
-        """
-    )
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    for row in overlapping:
+        target_last_seen = int(row[9])
+        source_last_seen = int(row[10])
+        source_observation_is_newer = source_last_seen > target_last_seen
+        severity = row[2] if source_observation_is_newer else row[1]
+        message = row[4] if source_observation_is_newer else row[3]
+        evidence = row[6] if source_observation_is_newer else row[5]
+        first_seen = min(int(row[7]), int(row[8]))
+        last_seen = max(target_last_seen, source_last_seen)
+        resolution_events = [
+            int(value) for value in (row[11], row[12]) if value is not None
+        ]
+        latest_resolution = (
+            max(resolution_events) if resolution_events else None
+        )
+        status = (
+            "resolved"
+            if latest_resolution is not None and latest_resolution >= last_seen
+            else "open"
+        )
+        resolved_at = (
+            epoch + timedelta(microseconds=latest_resolution)
+            if status == "resolved" and latest_resolution is not None
+            else None
+        )
+        conn.execute(
+            """
+            UPDATE data_quality_issue
+            SET severity = ?, status = ?, message = ?, evidence = CAST(? AS JSON),
+                first_seen_at = ?, last_seen_at = ?, resolved_at = ?
+            WHERE issue_id = ?
+            """,
+            [
+                severity,
+                status,
+                message,
+                json.dumps(json.loads(str(evidence)), sort_keys=True),
+                epoch + timedelta(microseconds=first_seen),
+                epoch + timedelta(microseconds=last_seen),
+                resolved_at,
+                row[0],
+            ],
+        )
 
 
 def _sync_table(
@@ -395,6 +526,8 @@ def _sync_table(
             )
         elif table == "dataset_snapshot":
             _merge_dataset_snapshots(conn, alias)
+        elif table == "dataset_coverage":
+            _merge_dataset_coverages(conn, alias)
         elif table == "data_quality_issue":
             _merge_data_quality_issues(conn, alias)
         else:
