@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pandas as pd
+
+from rquant.security_status import SHANGHAI, SecurityStatusDaily
+from rquant.storage.duckdb import DuckDBStore
 
 
 def test_safe_replay_end_date_keeps_full_exit_window() -> None:
@@ -283,3 +286,112 @@ def test_estimate_strategy_optimization_workload_counts_walk_forward_cost() -> N
     assert estimate.topn_combinations == 96
     assert estimate.walk_forward_topn_combinations == 480
     assert estimate.estimated_seconds == 15.576
+
+
+def test_query_growth_board_candidates_uses_exact_point_in_time_status(
+    tmp_path,
+) -> None:
+    from rquant.dashboard.strategy_lab_data import query_growth_board_candidates
+
+    store = DuckDBStore(tmp_path / "strategy-lab.duckdb")
+    signal_date = date(2026, 6, 25)
+    codes = [f"30000{index}.SZ" for index in range(1, 9)]
+    store.upsert_daily(pd.DataFrame([
+        {
+            "ts_code": ts_code,
+            "trade_date": signal_date,
+            "open": 10.0,
+            "high": 10.2,
+            "low": 9.8,
+            "close": 10.1,
+            "pre_close": 10.0,
+            "change": 0.1,
+            "pct_chg": 1.0,
+            "vol": 1000.0,
+            "amount": 10000.0,
+        }
+        for ts_code in codes
+    ]))
+    store.upsert_stock_basic(pd.DataFrame([
+        {
+            "ts_code": ts_code,
+            "symbol": ts_code[:6],
+            "name": "*ST当前名",
+            "area": "深圳",
+            "industry": "测试",
+            "list_date": "20200101",
+            "market": "创业板",
+        }
+        for ts_code in (codes[0], codes[6])
+    ]))
+    store._conn.execute(
+        "INSERT INTO daily_state (ts_code, trade_date, is_st) VALUES (?, ?, TRUE)",
+        [codes[6], signal_date],
+    )
+
+    def status(
+        ts_code: str,
+        trade_date: date,
+        *,
+        name: str | None,
+        is_st: bool | None,
+        available_at: datetime | None = None,
+        conflict_reason: str | None = None,
+    ) -> SecurityStatusDaily:
+        return SecurityStatusDaily(
+            ts_code=ts_code,
+            trade_date=trade_date,
+            name=name,
+            is_st=is_st,
+            name_source="test_name" if conflict_reason is None else "conflict",
+            st_source="test_st" if is_st is not None else None,
+            available_at=available_at,
+            ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
+            conflict_reason=conflict_reason,
+        )
+
+    boundary = datetime(2026, 6, 25, 9, 30, tzinfo=SHANGHAI)
+    store.upsert_stock_status((
+        status(codes[0], signal_date, name="历史一号", is_st=False, available_at=boundary),
+        status(codes[1], signal_date, name="*ST历史二号", is_st=True, available_at=boundary),
+        status(
+            codes[3],
+            date(2026, 6, 24),
+            name="历史四号前日",
+            is_st=False,
+            available_at=datetime(2026, 6, 24, 9, 30, tzinfo=SHANGHAI),
+        ),
+        status(
+            codes[3],
+            date(2026, 6, 26),
+            name="历史四号后日",
+            is_st=False,
+            available_at=datetime(2026, 6, 26, 9, 30, tzinfo=SHANGHAI),
+        ),
+        status(
+            codes[4],
+            signal_date,
+            name=None,
+            is_st=None,
+            conflict_reason="test_conflict",
+        ),
+        status(
+            codes[5],
+            signal_date,
+            name="历史六号",
+            is_st=False,
+            available_at=datetime(2026, 6, 25, 9, 30, 1, tzinfo=SHANGHAI),
+        ),
+        status(codes[6], signal_date, name="历史七号", is_st=False, available_at=boundary),
+        status(codes[7], signal_date, name=None, is_st=None),
+    ))
+
+    candidates = query_growth_board_candidates(
+        store._conn,
+        start_date=signal_date,
+        end_date=signal_date,
+    )
+
+    assert candidates["ts_code"].tolist() == [codes[0], codes[6]]
+    assert candidates["name"].tolist() == ["历史一号", "历史七号"]
+    store.close()

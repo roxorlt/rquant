@@ -6,7 +6,7 @@ import argparse
 import signal
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from datetime import time as dtime
 from pathlib import Path
 
@@ -86,6 +86,43 @@ def _parse_hhmm(value: str) -> dtime:
     except ValueError as e:
         msg = f"时间格式应为 HH:MM: {value}"
         raise argparse.ArgumentTypeError(msg) from e
+
+
+def _parse_iso_date(value: str) -> date:
+    """Parse the exact YYYY-MM-DD CLI form."""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"日期格式应为 YYYY-MM-DD: {value}") from e
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError(f"日期格式应为 YYYY-MM-DD: {value}")
+    return parsed
+
+
+def _parse_sha256(value: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) != 64:
+        raise argparse.ArgumentTypeError("plan id 必须是 64 位 SHA256")
+    try:
+        int(normalized, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("plan id 必须是 64 位 SHA256") from exc
+    return normalized
+
+
+class _RQuantArgumentParser(argparse.ArgumentParser):
+    def parse_args(
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        if getattr(parsed, "command", None) == "zt-pool-repair":
+            apply_requested = bool(getattr(parsed, "apply", False))
+            plan_supplied = getattr(parsed, "plan_id", None) is not None
+            if apply_requested != plan_supplied:
+                self.error("真正执行修复必须同时传 --apply 和 --plan-id")
+        return parsed
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -271,6 +308,41 @@ def cmd_research_sync(args: argparse.Namespace) -> int:
     return 1 if report.has_errors else 0
 
 
+def cmd_trade_calendar_bootstrap(args: argparse.Namespace) -> int:
+    """Bootstrap a complete authoritative SSE civil-date calendar."""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.trade_calendar import (
+        fetch_trade_calendar_rows,
+        persist_verified_trade_calendar,
+    )
+
+    setup_logging()
+    if args.start_date > args.end_date:
+        logger.error("trade calendar start date must not be after end date")
+        return 2
+
+    rows = fetch_trade_calendar_rows(
+        TushareAdapter(),
+        exchange="SSE",
+        start=args.start_date,
+        end=args.end_date,
+    )
+    with DuckDBStore() as store:
+        result = persist_verified_trade_calendar(
+            store,
+            rows,
+            exchange="SSE",
+            start=args.start_date,
+            end=args.end_date,
+        )
+    logger.info(
+        "trade calendar bootstrap complete: "
+        f"exchange=SSE, range={args.start_date}..{args.end_date}, "
+        f"processed={result.upserted_days}, verified={result.requested_days}"
+    )
+    return 0
+
+
 def cmd_sentiment_recompute(args: argparse.Namespace) -> int:
     """重算市场情绪/温度区间。"""
     from rquant.market_context import recompute_market_sentiment_range
@@ -299,33 +371,81 @@ def cmd_moneyflow_backfill(args: argparse.Namespace) -> int:
 
 
 def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
-    """全市场日线历史回补 + daily_state 全量重算。"""
+    """全市场日线历史回补，再对失效的 daily_state 做一次重算。"""
     from rquant.adapter.tushare import TushareAdapter
     from rquant.market_backfill import backfill_market_daily, recompute_daily_state
 
     setup_logging()
-    with DuckDBStore() as store:
-        summary = backfill_market_daily(
-            args.start_date,
-            args.end_date,
-            store,
-            TushareAdapter(),
-            dry_run=args.dry_run,
-        )
-        logger.info(summary)
-        if not args.dry_run and not args.skip_state:
-            recompute_daily_state(store)
+    summary = backfill_market_daily(
+        args.start_date,
+        args.end_date,
+        TushareAdapter(),
+        store_factory=DuckDBStore,
+        dry_run=args.dry_run,
+    )
+    logger.info(summary)
+    affected_codes = summary.get("affected_codes", [])
+    if (
+        not args.dry_run
+        and not args.skip_state_recompute
+        and affected_codes
+    ):
+        with DuckDBStore() as store:
+            recompute_daily_state(
+                store,
+                codes=affected_codes,
+                status_mode="verified_no_fetch",
+            )
     return 1 if summary["failed_dates"] else 0
 
 
 def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
     """采集当日东财涨停池到 limit_up_pool_daily。"""
-    from rquant.limit_up_pool import capture_zt_pool
+    from rquant.limit_up_pool import (
+        LimitUpPoolCaptureError,
+        capture_zt_pool,
+    )
 
     setup_logging()
     trade_date = date.fromisoformat(args.date) if args.date else None
-    rows = capture_zt_pool(trade_date)
+    try:
+        rows = capture_zt_pool(trade_date)
+    except LimitUpPoolCaptureError as exc:
+        logger.error(f"zt-pool-capture 被阻断: {exc}")
+        return 1
     logger.info(f"zt-pool-capture 完成: rows={rows}")
+    return 0
+
+
+def cmd_zt_pool_repair(args: argparse.Namespace) -> int:
+    """Dry-run or CAS-apply the closed-day limit-up-pool repair."""
+    from rquant.data_quality import (
+        LimitUpPoolRepairBlockedError,
+        LimitUpPoolRepairNoOpError,
+        LimitUpPoolRepairPlanMismatchError,
+        apply_limit_up_pool_closed_day_repair,
+        build_limit_up_pool_closed_day_repair_plan,
+    )
+
+    setup_logging()
+    with DuckDBStore() as store:
+        if not args.apply:
+            plan = build_limit_up_pool_closed_day_repair_plan(store)
+            logger.info(f"zt-pool-repair dry-run:\n{plan.model_dump_json(indent=2)}")
+            return 1 if plan.status == "blocked" else 0
+        try:
+            result = apply_limit_up_pool_closed_day_repair(
+                store,
+                args.plan_id,
+            )
+        except (
+            LimitUpPoolRepairBlockedError,
+            LimitUpPoolRepairNoOpError,
+            LimitUpPoolRepairPlanMismatchError,
+        ) as exc:
+            logger.error(f"zt-pool-repair 拒绝执行: {exc}")
+            return 1
+    logger.info(f"zt-pool-repair applied:\n{result.model_dump_json(indent=2)}")
     return 0
 
 
@@ -481,7 +601,12 @@ def cmd_auction_gap_replay(args: argparse.Namespace) -> int:
         st_filter=args.st_filter,
     )
     with open_readonly_store(
-        required_tables=["auction_bar", "daily_bar", "daily_state"]
+        required_tables=[
+            "auction_bar",
+            "daily_bar",
+            "daily_state",
+            "stock_status_daily",
+        ]
     ) as store:
         trades = run_auction_gap_replay(store, config)
 
@@ -533,7 +658,13 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         seal_hold_max_open_times=args.seal_hold_max_open_times,
         factor_score_threshold=args.factor_score_threshold,
     )
-    required_tables = ["auction_bar", "daily_bar", "daily_state", "minute_bar"]
+    required_tables = [
+        "auction_bar",
+        "daily_bar",
+        "daily_state",
+        "minute_bar",
+        "stock_status_daily",
+    ]
     if seal_hold_enabled:
         required_tables.append("limit_list_daily")
     if args.persist_positions:
@@ -696,8 +827,8 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         "daily_bar",
         "daily_indicator",
         "daily_state",
-        "stock_basic",
         "minute_bar",
+        "stock_status_daily",
     ]
     if config.factor_layer_enabled:
         required_tables += ["moneyflow_daily", "market_sentiment_daily"]
@@ -1240,7 +1371,7 @@ def cmd_panorama_user_list(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
-    parser = argparse.ArgumentParser(
+    parser = _RQuantArgumentParser(
         prog="rquant", description="rQuant 量化选股平台"
     )
     sub = parser.add_subparsers(dest="command")
@@ -1341,6 +1472,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="跳过只读副本刷新",
     )
 
+    calendar_p = sub.add_parser(
+        "trade-calendar-bootstrap",
+        help="从 Tushare 初始化权威 SSE 交易日历",
+    )
+    calendar_p.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        default=date(2020, 1, 1),
+        help="开始日期 YYYY-MM-DD (默认 2020-01-01)",
+    )
+    calendar_p.add_argument(
+        "--end-date",
+        type=_parse_iso_date,
+        default=date(date.today().year, 12, 31),
+        help="结束日期 YYYY-MM-DD (默认运行当年 12-31)",
+    )
+
     moneyflow_p = sub.add_parser(
         "moneyflow-backfill",
         help="拉取 Tushare 日级个股资金流并写入 moneyflow_daily",
@@ -1354,7 +1502,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     market_backfill_p = sub.add_parser(
         "market-daily-backfill",
-        help="全市场日线历史回补（daily/daily_basic/adj_factor + daily_state 重算）",
+        help="全市场日线历史回补，并在最后统一重算 daily_state",
     )
     market_backfill_p.add_argument(
         "--start-date", type=str, required=True,
@@ -1369,8 +1517,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="只报告交易日数与预计请求数，不调 Tushare、不写库",
     )
     market_backfill_p.add_argument(
-        "--skip-state", action="store_true",
-        help="跳过回补后的 daily_state 全量重算",
+        "--skip-state-recompute",
+        dest="skip_state_recompute",
+        action="store_true",
+        help="跳过最终 daily_state 重算；逐日写入仍会删除受影响日期起的陈旧状态尾部",
+    )
+    market_backfill_p.add_argument(
+        "--skip-state",
+        dest="skip_state_recompute",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     zt_pool_p = sub.add_parser(
@@ -1380,6 +1536,22 @@ def build_parser() -> argparse.ArgumentParser:
     zt_pool_p.add_argument(
         "--date", type=str, default=None,
         help="交易日期 YYYY-MM-DD (默认今天)",
+    )
+
+    zt_repair_p = sub.add_parser(
+        "zt-pool-repair",
+        help="生成休市日污染修复计划；显式确认 plan id 后原子执行",
+    )
+    zt_repair_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="执行已确认的修复计划（必须同时传 --plan-id）",
+    )
+    zt_repair_p.add_argument(
+        "--plan-id",
+        type=_parse_sha256,
+        default=None,
+        help="dry-run 输出的 64 位 plan id（必须同时传 --apply）",
     )
 
     limit_list_p = sub.add_parser(
@@ -2037,10 +2209,12 @@ def main() -> int:
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
         "research-sync": cmd_research_sync,
+        "trade-calendar-bootstrap": cmd_trade_calendar_bootstrap,
         "sentiment-recompute": cmd_sentiment_recompute,
         "moneyflow-backfill": cmd_moneyflow_backfill,
         "market-daily-backfill": cmd_market_daily_backfill,
         "zt-pool-capture": cmd_zt_pool_capture,
+        "zt-pool-repair": cmd_zt_pool_repair,
         "limit-list-backfill": cmd_limit_list_backfill,
         "data-backfill": cmd_data_backfill,
         "minute-backfill": cmd_minute_backfill,

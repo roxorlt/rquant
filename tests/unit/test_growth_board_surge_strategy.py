@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 import pandas as pd
 import pytest
 
+from rquant.security_status import SHANGHAI, SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -16,6 +17,55 @@ def store(tmp_path) -> Iterator[DuckDBStore]:
     s = DuckDBStore(tmp_path / "test.duckdb")
     yield s
     s.close()
+
+
+def _status_row(
+    ts_code: str,
+    trade_date: date,
+    *,
+    name: str | None,
+    is_st: bool | None,
+    available_at: datetime | None = None,
+    conflict_reason: str | None = None,
+) -> SecurityStatusDaily:
+    return SecurityStatusDaily(
+        ts_code=ts_code,
+        trade_date=trade_date,
+        name=name,
+        is_st=is_st,
+        name_source="test_name" if conflict_reason is None else "conflict",
+        st_source="test_st" if is_st is not None else None,
+        available_at=available_at,
+        ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
+        conflict_reason=conflict_reason,
+    )
+
+
+def _known_status(
+    ts_code: str,
+    trade_date: date,
+    *,
+    name: str,
+    is_st: bool = False,
+    hour: int = 9,
+    minute: int = 25,
+    second: int = 0,
+) -> SecurityStatusDaily:
+    return _status_row(
+        ts_code,
+        trade_date,
+        name=name,
+        is_st=is_st,
+        available_at=datetime(
+            trade_date.year,
+            trade_date.month,
+            trade_date.day,
+            hour,
+            minute,
+            second,
+            tzinfo=SHANGHAI,
+        ),
+    )
 
 
 def _daily_row(ts_code: str, trade_date: date, close: float) -> dict[str, object]:
@@ -40,6 +90,7 @@ def _state_row(
     *,
     board_type: str,
     limit_up_price: float,
+    limit_pct: float = 0.20,
     is_yiziban: bool = False,
 ) -> dict[str, object]:
     return {
@@ -48,7 +99,7 @@ def _state_row(
         "is_st": False,
         "is_bj": False,
         "board_type": board_type,
-        "limit_pct": 0.20,
+        "limit_pct": limit_pct,
         "limit_up_price": limit_up_price,
         "limit_down_price": limit_up_price / 1.5,
         "is_limit_up": False,
@@ -127,7 +178,7 @@ def _seed_base_market(store: DuckDBStore) -> None:
         {
             "ts_code": "300001.SZ",
             "symbol": "300001",
-            "name": "创业样本",
+            "name": "*ST当前创业",
             "area": "深圳",
             "industry": "测试",
             "list_date": "20200101",
@@ -152,6 +203,15 @@ def _seed_base_market(store: DuckDBStore) -> None:
             "market": "主板",
         },
     ]))
+    store.upsert_stock_status(tuple(
+        _known_status(ts_code, trade_date, name=name)
+        for trade_date in dates
+        for ts_code, name in (
+            ("300001.SZ", "历史创业"),
+            ("688001.SH", "历史科创"),
+            ("600001.SH", "历史主板"),
+        )
+    ))
     store.upsert_state(pd.DataFrame([
         _state_row("300001.SZ", date(2026, 6, 25), board_type="gem", limit_up_price=13.0),
         _state_row("300001.SZ", date(2026, 6, 26), board_type="gem", limit_up_price=13.2),
@@ -197,7 +257,22 @@ def test_growth_board_surge_replay_uses_intraday_volume_signal(store: DuckDBStor
 
     _seed_base_market(store)
     _seed_volume_surge_minutes(store)
-
+    signal_date = date(2026, 6, 25)
+    store._conn.execute(
+        "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+        ["300001.SZ", signal_date],
+    )
+    store.upsert_stock_status(
+        (
+            _known_status(
+                "300001.SZ",
+                signal_date,
+                name="历史创业",
+                hour=9,
+                minute=33,
+            ),
+        )
+    )
     trades = run_growth_board_surge_replay(
         store,
         start_date=date(2026, 6, 25),
@@ -217,12 +292,213 @@ def test_growth_board_surge_replay_uses_intraday_volume_signal(store: DuckDBStor
     assert row["ts_code"] == "300001.SZ"
     assert row["entry_time"] == datetime(2026, 6, 25, 9, 34)
     assert row["entry_signal"] == "growth_board_volume_surge"
+    assert row["name"] == "历史创业"
     assert row["signal_rel_cum_amount_asof"] == pytest.approx(1.75)
     assert row["signal_rel_amount_same_minute"] == pytest.approx(3.0)
     assert row["hist_intraday_days"] == 2
     assert row["intraday_order_flow_available"] is False
     assert "外盘/内盘" in row["unsupported_intraday_conditions"]
     assert row["ret_pct"] > 0
+
+
+@pytest.mark.parametrize(
+    "status_case",
+    ["true", "missing", "adjacent_only", "conflict", "nullable", "future"],
+)
+def test_growth_board_surge_replay_requires_known_non_st_status(
+    store: DuckDBStore,
+    status_case: str,
+) -> None:
+    from rquant.growth_board_surge_strategy import (
+        GrowthBoardSurgeConfig,
+        run_growth_board_surge_replay,
+    )
+
+    _seed_base_market(store)
+    _seed_volume_surge_minutes(store)
+    signal_date = date(2026, 6, 25)
+    if status_case == "missing":
+        store._conn.execute(
+            "DELETE FROM stock_status_daily WHERE ts_code = ?",
+            ["300001.SZ"],
+        )
+    else:
+        store._conn.execute(
+            "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+            ["300001.SZ", signal_date],
+        )
+        if status_case == "true":
+            store.upsert_stock_status((
+                _known_status(
+                    "300001.SZ",
+                    signal_date,
+                    name="*ST历史创业",
+                    is_st=True,
+                    hour=9,
+                    minute=33,
+                ),
+            ))
+        elif status_case == "conflict":
+            store.upsert_stock_status((
+                _status_row(
+                    "300001.SZ",
+                    signal_date,
+                    name=None,
+                    is_st=None,
+                    conflict_reason="test_conflict",
+                ),
+            ))
+        elif status_case == "nullable":
+            store.upsert_stock_status((
+                _status_row(
+                    "300001.SZ",
+                    signal_date,
+                    name=None,
+                    is_st=None,
+                ),
+            ))
+        elif status_case == "future":
+            store.upsert_stock_status((
+                _known_status(
+                    "300001.SZ",
+                    signal_date,
+                    name="历史创业",
+                    hour=9,
+                    minute=33,
+                    second=1,
+                ),
+            ))
+
+    trades = run_growth_board_surge_replay(
+        store,
+        start_date=signal_date,
+        end_date=signal_date,
+        config=GrowthBoardSurgeConfig(
+            min_signal_time=time(9, 33),
+            lookback_days=2,
+            min_hist_days=2,
+            max_hold_days=1,
+            min_cum_amount_ratio=1.4,
+            min_same_minute_amount_ratio=2.0,
+        ),
+    )
+
+    assert trades.empty
+
+
+def test_growth_board_candidates_use_historical_gem_limit_pct_before_2020_reform(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import _query_candidates
+
+    signal_date = date(2020, 8, 21)
+    previous_date = date(2020, 8, 20)
+    daily = _daily_row("300001.SZ", signal_date, 10.1)
+    daily["pre_close"] = 10.0
+    store.upsert_daily(pd.DataFrame([daily]))
+    store.upsert_indicators(
+        pd.DataFrame(
+            [
+                _indicator_row("300001.SZ", previous_date, bull=True),
+            ]
+        )
+    )
+    store.upsert_stock_status(
+        (
+            _known_status(
+                "300001.SZ",
+                signal_date,
+                name="历史创业板",
+                hour=9,
+                minute=30,
+            ),
+        )
+    )
+    store.upsert_state(
+        pd.DataFrame(
+            [
+                _state_row(
+                    "300001.SZ",
+                    signal_date,
+                    board_type="gem",
+                    limit_pct=0.10,
+                    limit_up_price=11.0,
+                ),
+            ]
+        )
+    )
+
+    candidates = _query_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].limit_up_price == pytest.approx(11.00)
+
+
+def test_growth_board_candidates_exclude_unsupported_price_limit_state(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import _query_candidates
+
+    signal_date = date(2026, 6, 25)
+    previous_date = date(2026, 6, 24)
+    store.upsert_daily(
+        pd.DataFrame(
+            [
+                _daily_row("300001.SZ", signal_date, 10.1),
+            ]
+        )
+    )
+    store.upsert_indicators(
+        pd.DataFrame(
+            [
+                _indicator_row("300001.SZ", previous_date, bull=True),
+            ]
+        )
+    )
+    store.upsert_stock_status((_known_status("300001.SZ", signal_date, name="上市初期样本"),))
+    unsupported = _state_row(
+        "300001.SZ",
+        signal_date,
+        board_type="gem",
+        limit_up_price=12.0,
+    )
+    unsupported["limit_pct"] = None
+    unsupported["limit_up_price"] = None
+    unsupported["is_limit_up"] = None
+    unsupported["is_first_limit_up"] = None
+    unsupported["is_yiziban"] = None
+    unsupported["consecutive_limit_ups"] = None
+    store.upsert_state(pd.DataFrame([unsupported]))
+
+    candidates = _query_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+
+    assert candidates == []
+
+
+def test_growth_board_surge_replay_uses_default_config_when_omitted(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import run_growth_board_surge_replay
+
+    _seed_base_market(store)
+
+    trades = run_growth_board_surge_replay(
+        store,
+        start_date=date(2026, 6, 23),
+        end_date=date(2026, 6, 23),
+    )
+
+    assert trades.empty
 
 
 def test_growth_board_surge_filter_supports_ablation_flags() -> None:
@@ -332,6 +608,10 @@ def test_growth_board_surge_replay_calculates_ma_from_daily_bar(
     }]))
     signal_date = dates[-2]
     exit_date = dates[-1]
+    store.upsert_stock_status(tuple(
+        _known_status(ts_code, trade_date, name="历史无指标样本")
+        for trade_date in dates
+    ))
     store.upsert_state(pd.DataFrame([
         _state_row(ts_code, signal_date, board_type="gem", limit_up_price=20.0),
     ]))

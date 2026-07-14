@@ -26,19 +26,324 @@ LAST_RESEARCH_SYNC_FILE="${STATE_DIR}/.last-research-sync-date"
 LAST_MERGE_ALERT_FILE="${STATE_DIR}/.last-merge-alert-at"
 MERGE_ALERT_COOLDOWN=1800  # 30 分钟：catch_up 每 5min 重试，失败别每 tick 都推
 
-mkdir -p "${LOG_DIR}" "${STATE_DIR}"
+# ---------- 参数 ----------
+force_mode=0
+skip_post_sync_captures=0
+while (( $# > 0 )); do
+    case "$1" in
+        --force)
+            force_mode=1
+            ;;
+        --skip-post-sync-captures)
+            skip_post_sync_captures=1
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if ! mkdir -p "${LOG_DIR}" "${STATE_DIR}"; then
+    echo "ERROR: failed to create data/log directories" >&2
+    exit 1
+fi
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG}"; }
 
 # ---------- 并发互斥（7/2 加固）----------
 # TMP_GZ/TMP_DB 是固定路径，手动运行与 launchd tick 并发会互相截断。
-# macOS 无 flock 命令，用 mkdir 原子锁目录代替；trap 必须在 mkdir 成功
-# 之后才设置，否则锁被占时 exit 会误删别人的锁。
+# macOS 无 flock 命令，用 mkdir 原子锁目录 + PID 所有权代替。SIGKILL
+# 遗留目录由下一次运行识别死 PID 后恢复；trap 只删除自己持有的锁。
 LOCKDIR="${STATE_DIR}/.sync-from-cloud.lock"
-if ! mkdir "${LOCKDIR}" 2>/dev/null; then
-    log "skip: another sync-from-cloud instance holds lock (${LOCKDIR})"
+LOCK_PID_FILE="${LOCKDIR}/pid"
+LOCK_PID_TMP_FILE="${LOCK_PID_FILE}.tmp.$$"
+LOCK_PID_PUBLISH_RETRIES=8
+LOCK_PID_PUBLISH_DELAY=0.1
+lock_owned=0
+lock_pid=""
+lock_pid_present=0
+
+acquire_lock() {
+    if ! mkdir "${LOCKDIR}" 2>/dev/null; then
+        return 1
+    fi
+    if ! printf '%s\n' "$$" > "${LOCK_PID_TMP_FILE}"; then
+        rm -f "${LOCK_PID_TMP_FILE}"
+        rmdir "${LOCKDIR}" 2>/dev/null || true
+        return 2
+    fi
+    if ! mv "${LOCK_PID_TMP_FILE}" "${LOCK_PID_FILE}"; then
+        rm -f "${LOCK_PID_TMP_FILE}"
+        rmdir "${LOCKDIR}" 2>/dev/null || true
+        return 2
+    fi
+    lock_owned=1
+    return 0
+}
+
+cleanup_lock() {
+    local owner_pid=""
+    rm -f "${LOCK_PID_TMP_FILE}"
+    if (( lock_owned != 1 )); then
+        return
+    fi
+    [[ -f "${LOCK_PID_FILE}" ]] && owner_pid=$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)
+    if [[ "${owner_pid}" == "$$" ]]; then
+        rm -f "${LOCK_PID_FILE}"
+        rmdir "${LOCKDIR}" 2>/dev/null || true
+    fi
+    lock_owned=0
+}
+
+read_lock_owner() {
+    lock_pid=""
+    lock_pid_present=0
+    if [[ -f "${LOCK_PID_FILE}" ]]; then
+        lock_pid_present=1
+        lock_pid=$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)
+    fi
+}
+
+lock_owner_is_active() {
+    lock_owner_is_complete && kill -0 "${lock_pid}" 2>/dev/null
+}
+
+lock_owner_is_complete() {
+    [[ "${lock_pid}" =~ ^[1-9][0-9]*$ ]]
+}
+
+wait_for_lock_owner_publication() {
+    local attempt
+    for (( attempt = 0; attempt < LOCK_PID_PUBLISH_RETRIES; attempt += 1 )); do
+        sleep "${LOCK_PID_PUBLISH_DELAY}"
+        read_lock_owner
+        if lock_owner_is_complete; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+inspect_interrupted_lock_publication() {
+    local dotglob_was_set=0
+    local nullglob_was_set=0
+    local entry
+    local tmp_file
+    local tmp_pid
+    local confirmed_tmp_pid
+    local -a entries=()
+    local -a tmp_files=()
+    local -a unknown_entries=()
+
+    shopt -q dotglob && dotglob_was_set=1
+    shopt -q nullglob && nullglob_was_set=1
+    shopt -s dotglob nullglob
+    entries=("${LOCKDIR}"/*)
+    (( dotglob_was_set == 1 )) || shopt -u dotglob
+    (( nullglob_was_set == 1 )) || shopt -u nullglob
+
+    for entry in "${entries[@]}"; do
+        if [[ "${entry}" == "${LOCK_PID_FILE}" ]]; then
+            continue
+        fi
+        if [[ "${entry}" == "${LOCK_PID_FILE}.tmp."* ]] \
+                && [[ -f "${entry}" ]] && [[ ! -L "${entry}" ]]; then
+            tmp_files+=("${entry}")
+        else
+            unknown_entries+=("${entry}")
+        fi
+    done
+
+    if (( ${#unknown_entries[@]} > 0 || ${#tmp_files[@]} > 1 )); then
+        return 2
+    fi
+    if (( ${#tmp_files[@]} == 0 )); then
+        return 0
+    fi
+
+    tmp_file="${tmp_files[0]}"
+    tmp_pid=$(cat "${tmp_file}" 2>/dev/null || true)
+    if [[ "${tmp_pid}" =~ ^[1-9][0-9]*$ ]] \
+            && kill -0 "${tmp_pid}" 2>/dev/null; then
+        lock_pid="${tmp_pid}"
+        return 4
+    fi
+
+    if [[ ! -f "${tmp_file}" ]] || [[ -L "${tmp_file}" ]]; then
+        return 3
+    fi
+    confirmed_tmp_pid=$(cat "${tmp_file}" 2>/dev/null || true)
+    if [[ "${confirmed_tmp_pid}" != "${tmp_pid}" ]]; then
+        return 3
+    fi
+    if [[ "${confirmed_tmp_pid}" =~ ^[1-9][0-9]*$ ]] \
+            && kill -0 "${confirmed_tmp_pid}" 2>/dev/null; then
+        lock_pid="${confirmed_tmp_pid}"
+        return 4
+    fi
+    if ! rm -f "${tmp_file}"; then
+        return 2
+    fi
+    log "recover stale lock publication: pid=${tmp_pid:-invalid} (${tmp_file})"
+    return 5
+}
+
+exit_for_active_lock() {
+    log "skip: active sync-from-cloud pid=${lock_pid} holds lock (${LOCKDIR})"
+    if (( force_mode == 1 )); then
+        exit 75
+    fi
     exit 0
+}
+
+recover_observed_stale_lock() {
+    local observed_pid="$1"
+    local observed_pid_present="$2"
+
+    read_lock_owner
+    if [[ "${lock_pid}" != "${observed_pid}" ]] \
+            || (( lock_pid_present != observed_pid_present )); then
+        return 3
+    fi
+    if lock_owner_is_active; then
+        return 4
+    fi
+
+    if (( observed_pid_present == 0 )); then
+        if rmdir "${LOCKDIR}" 2>/dev/null; then
+            log "recover stale lock: pid=missing (${LOCKDIR})"
+            return 0
+        fi
+        return 3
+    fi
+
+    log "recover stale lock: pid=${observed_pid:-invalid} (${LOCKDIR})"
+    if ! rm -f "${LOCK_PID_FILE}"; then
+        return 2
+    fi
+    if rmdir "${LOCKDIR}" 2>/dev/null; then
+        return 0
+    fi
+    return 3
+}
+
+if acquire_lock; then
+    :
+else
+    lock_result=$?
+    if (( lock_result == 2 )) || [[ ! -d "${LOCKDIR}" ]]; then
+        log "ERROR: failed to create sync lock (${LOCKDIR})"
+        exit 1
+    fi
+
+    stale_lock_removed=0
+    for (( lock_check = 0; lock_check < 3; lock_check += 1 )); do
+        read_lock_owner
+        if ! lock_owner_is_complete; then
+            wait_for_lock_owner_publication || true
+        fi
+        if lock_owner_is_active; then
+            exit_for_active_lock
+        fi
+        if ! lock_owner_is_complete; then
+            inspect_interrupted_lock_publication
+            interrupted_result=$?
+            case "${interrupted_result}" in
+                0|5)
+                    ;;
+                2)
+                    log "ERROR: interrupted lock publication is not safely removable (${LOCKDIR})"
+                    exit 1
+                    ;;
+                4)
+                    exit_for_active_lock
+                    ;;
+                3)
+                    continue
+                    ;;
+            esac
+        fi
+
+        observed_pid="${lock_pid}"
+        observed_pid_present=${lock_pid_present}
+        recover_observed_stale_lock "${observed_pid}" "${observed_pid_present}"
+        recover_result=$?
+        case "${recover_result}" in
+            0)
+                stale_lock_removed=1
+                break
+                ;;
+            2)
+                log "ERROR: stale lock is not safely removable (${LOCKDIR})"
+                exit 1
+                ;;
+            4)
+                exit_for_active_lock
+                ;;
+            3)
+                continue
+                ;;
+        esac
+    done
+    if (( stale_lock_removed != 1 )); then
+        read_lock_owner
+        if lock_owner_is_active; then
+            exit_for_active_lock
+        fi
+        log "ERROR: sync lock changed during stale recovery (${LOCKDIR})"
+        exit 1
+    fi
+
+    if acquire_lock; then
+        :
+    else
+        retry_result=$?
+        if [[ -d "${LOCKDIR}" ]]; then
+            read_lock_owner
+            if ! lock_owner_is_complete; then
+                wait_for_lock_owner_publication || true
+            fi
+            if lock_owner_is_active; then
+                exit_for_active_lock
+            fi
+            if ! lock_owner_is_complete; then
+                inspect_interrupted_lock_publication
+                interrupted_result=$?
+                case "${interrupted_result}" in
+                    4)
+                        exit_for_active_lock
+                        ;;
+                    2|3)
+                        log "ERROR: interrupted lock publication changed after stale recovery (${LOCKDIR})"
+                        exit 1
+                        ;;
+                    5)
+                        read_lock_owner
+                        observed_pid="${lock_pid}"
+                        observed_pid_present=${lock_pid_present}
+                        recover_observed_stale_lock \
+                            "${observed_pid}" "${observed_pid_present}"
+                        retry_cleanup_result=$?
+                        if (( retry_cleanup_result == 4 )); then
+                            exit_for_active_lock
+                        fi
+                        log "ERROR: stale lock publication interrupted lock retry (${LOCKDIR})"
+                        exit 1
+                        ;;
+                esac
+            fi
+            log "skip: another sync-from-cloud won stale-lock recovery (${LOCKDIR})"
+            if (( force_mode == 1 )); then
+                exit 75
+            fi
+            exit 0
+        fi
+        log "ERROR: failed to create sync lock after stale recovery (${LOCKDIR}, rc=${retry_result})"
+        exit 1
+    fi
 fi
-trap 'rmdir "${LOCKDIR}" 2>/dev/null || true' EXIT
+trap cleanup_lock EXIT
 
 # 加载 .env
 if [[ ! -f "${ENV_FILE}" ]]; then
@@ -52,9 +357,62 @@ set -a; source "${ENV_FILE}"; set +a
 : "${RQUANT_BACKUP_TOKEN:?missing RQUANT_BACKUP_TOKEN in .env}"
 : "${RQUANT_BACKUP_URL:?missing RQUANT_BACKUP_URL in .env}"
 
-# --force 跳过时段判断（手动调试用）
-force_mode=0
-if [[ "${1:-}" == "--force" ]]; then force_mode=1; fi
+send_sync_failure_alert() {
+    local failure_detail="$1"
+    local now_ts
+    local should_alert=1
+    local last_alert_ts=""
+    local remain
+    local keys
+    local endpoint
+    local title
+    local body
+    local key
+    local k
+    local -a key_arr=()
+
+    now_ts=$(date +%s)
+    if [[ -f "${LAST_MERGE_ALERT_FILE}" ]]; then
+        last_alert_ts=$(cat "${LAST_MERGE_ALERT_FILE}")
+        if [[ "${last_alert_ts}" =~ ^[0-9]+$ ]] \
+                && (( now_ts - last_alert_ts < MERGE_ALERT_COOLDOWN )); then
+            should_alert=0
+            remain=$(( MERGE_ALERT_COOLDOWN - (now_ts - last_alert_ts) ))
+            log "sync alert cooldown: ${remain}s 后才能再推"
+        fi
+    fi
+    if (( should_alert == 0 )); then
+        return
+    fi
+
+    keys=$(grep "^PUSHDEER_KEYS=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
+    endpoint=$(grep "^PUSHDEER_ENDPOINT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
+    endpoint="${endpoint:-https://api2.pushdeer.com/message/push}"
+    title="❌ rQuant sync-from-cloud 失败"
+    body="云端备份同步未完整完成，下一个 tick 会自动重试。
+
+时间：$(date '+%Y-%m-%d %H:%M:%S')
+备份：${LOCAL_DATA_FILE}
+原因：${failure_detail}
+
+最近日志：
+\`\`\`
+$(tail -n 15 "${LOG}")
+\`\`\`"
+    IFS=',' read -ra key_arr <<< "${keys}"
+    for key in "${key_arr[@]}"; do
+        k=$(echo "${key}" | xargs)
+        [[ -n "${k}" ]] || continue
+        curl -s -X POST "${endpoint}" \
+            --data-urlencode "pushkey=${k}" \
+            --data-urlencode "text=${title}" \
+            --data-urlencode "desp=${body}" \
+            --data-urlencode "type=markdown" \
+            --max-time 10 >/dev/null 2>&1 || true
+    done
+    echo "${now_ts}" > "${LAST_MERGE_ALERT_FILE}"
+    log "PushDeer sync 失败告警已推（cooldown ${MERGE_ALERT_COOLDOWN}s）"
+}
 
 # 时段判断
 hour=$(date +%H); minute=$(date +%M); dow=$(date +%u)
@@ -152,7 +510,11 @@ rm -f "${TMP_GZ}"
 # atomic rename → 本地始终是完整文件；顺手清掉备份文件的陈旧 WAL
 # （备份是纯下载工件，本地不该有进程写它，残留 WAL 只可能是垃圾）
 rm -f "${LOCAL_DATA_FILE}.wal"
-mv "${TMP_DB}" "${LOCAL_DATA_FILE}"
+if ! mv "${TMP_DB}" "${LOCAL_DATA_FILE}"; then
+    log "ERROR: failed to replace local cloud backup"
+    rm -f "${TMP_DB}"
+    exit 1
+fi
 size=$(du -h "${LOCAL_DATA_FILE}" | cut -f1)
 
 # ---------- 生产表合并（7/2 分家新增）----------
@@ -160,70 +522,65 @@ size=$(du -h "${LOCAL_DATA_FILE}" | cut -f1)
 # 生产表本来就没有新日线数据。--force 例外：显式下载 + 合并（无论时段），
 # 合并失败风险自担（见下方失败日志提示）
 merge_status="skipped"
+post_sync_status="skipped"
+final_status=0
 if (( force_mode == 1 )) || [[ "${sync_window}" != "intraday" ]]; then
     RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
     if "${RQUANT_BIN}" research-sync --backup "${LOCAL_DATA_FILE}" >>"${LOG}" 2>&1; then
         merge_status="ok"
-        # 只有 >=17:10 的成功合并才算"当日日终合并已完成"——盘前/盘中
-        # force 合并不含当晚 daily pipeline 的新数据，不能吃掉 catch_up
-        if (( hhmm >= 1710 )); then
-            echo "${today}" > "${LAST_RESEARCH_SYNC_FILE}"
-        fi
         log "research-sync OK: 生产表已合并进本地研究库"
-        # 涨停池只有当天有数据，历史无法回补；云端东财源被屏蔽，只能本地日终采
-        "${RQUANT_BIN}" zt-pool-capture >>"${LOG}" 2>&1 || log "WARN: zt-pool-capture failed（东财源偶发失败可接受，不告警）"
-        # 官方涨跌停榜（tushare limit_list_d）当日增量；漏采可事后 limit-list-backfill 补
-        "${RQUANT_BIN}" limit-list-backfill --today >>"${LOG}" 2>&1 || log "WARN: limit-list-backfill --today failed（可事后回补，不告警）"
-        # 开盘啦题材成分快照（30 天窗口整表替换，全景页涨停排行用）；失败次日重跑即补
-        "${RQUANT_BIN}" data-backfill --dataset kpl_concept --today >>"${LOG}" 2>&1 || log "WARN: data-backfill kpl_concept failed（快照可次日重跑，不告警）"
+        if (( skip_post_sync_captures == 0 )); then
+            captures_ok=1
+            # 涨停池只有当天有数据，历史无法回补；云端东财源被屏蔽，只能本地日终采
+            if ! "${RQUANT_BIN}" zt-pool-capture >>"${LOG}" 2>&1; then
+                captures_ok=0
+                post_sync_status="failed"
+                final_status=1
+                log "ERROR: zt-pool-capture failed（当天数据不可历史回补，状态不记完成）"
+                send_sync_failure_alert "zt-pool-capture 失败（当天数据不可历史回补）"
+            fi
+            # 官方涨跌停榜（tushare limit_list_d）当日增量；漏采可事后 limit-list-backfill 补
+            if ! "${RQUANT_BIN}" limit-list-backfill --today >>"${LOG}" 2>&1; then
+                captures_ok=0
+                [[ "${post_sync_status}" == "failed" ]] || post_sync_status="incomplete"
+                log "WARN: limit-list-backfill --today failed（可事后回补，状态不记完成）"
+            fi
+            # 开盘啦题材成分快照（30 天窗口整表替换，全景页涨停排行用）；失败次日重跑即补
+            if ! "${RQUANT_BIN}" data-backfill --dataset kpl_concept --today >>"${LOG}" 2>&1; then
+                captures_ok=0
+                [[ "${post_sync_status}" == "failed" ]] || post_sync_status="incomplete"
+                log "WARN: data-backfill kpl_concept failed（快照可次日重跑，状态不记完成）"
+            fi
+            if (( captures_ok == 1 )); then
+                post_sync_status="ok"
+            fi
+        else
+            post_sync_status="skipped"
+            log "post-sync captures skipped by --skip-post-sync-captures"
+        fi
+
+        sync_complete=0
+        if (( skip_post_sync_captures == 1 )) || [[ "${post_sync_status}" == "ok" ]]; then
+            sync_complete=1
+        fi
+        # 盘前/盘中 force 不含当晚 daily pipeline 数据，不能吃掉日终 catch_up。
+        if (( sync_complete == 1 && hhmm >= 1710 )); then
+            if ! echo "${today}" > "${LAST_RESEARCH_SYNC_FILE}"; then
+                final_status=1
+                log "ERROR: failed to record completed research sync"
+                send_sync_failure_alert "日终同步完成状态写入失败"
+            fi
+        fi
     else
         merge_status="failed"
+        final_status=1
         if (( force_mode == 1 )); then
             log "ERROR: research-sync failed（force 模式：可能撞盘中 monitor 写锁，请收盘后重试）"
         else
             log "ERROR: research-sync failed（状态文件不更新，下一个 tick 自动重试补跑）"
         fi
 
-        # 防刷屏：距上次 merge 失败告警 ≥ MERGE_ALERT_COOLDOWN 才推
-        now_ts=$(date +%s)
-        should_alert=1
-        if [[ -f "${LAST_MERGE_ALERT_FILE}" ]]; then
-            last_alert_ts=$(cat "${LAST_MERGE_ALERT_FILE}")
-            if (( now_ts - last_alert_ts < MERGE_ALERT_COOLDOWN )); then
-                should_alert=0
-                remain=$(( MERGE_ALERT_COOLDOWN - (now_ts - last_alert_ts) ))
-                log "merge alert cooldown: ${remain}s 后才能再推"
-            fi
-        fi
-
-        if (( should_alert == 1 )); then
-            keys=$(grep "^PUSHDEER_KEYS=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
-            endpoint=$(grep "^PUSHDEER_ENDPOINT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '\n\r')
-            endpoint="${endpoint:-https://api2.pushdeer.com/message/push}"
-            title="❌ rQuant research-sync 失败"
-            body="云端备份已下载但合并进本地研究库失败（下一个 5min tick 会自动重试）。
-
-时间：$(date '+%Y-%m-%d %H:%M:%S')
-备份：${LOCAL_DATA_FILE}
-
-最近日志：
-\`\`\`
-$(tail -n 15 "${LOG}")
-\`\`\`"
-            IFS=',' read -ra KEY_ARR <<< "${keys}"
-            for key in "${KEY_ARR[@]}"; do
-                k=$(echo "${key}" | xargs)
-                [[ -n "${k}" ]] || continue
-                curl -s -X POST "${endpoint}" \
-                    --data-urlencode "pushkey=${k}" \
-                    --data-urlencode "text=${title}" \
-                    --data-urlencode "desp=${body}" \
-                    --data-urlencode "type=markdown" \
-                    --max-time 10 >/dev/null 2>&1 || true
-            done
-            echo "${now_ts}" > "${LAST_MERGE_ALERT_FILE}"
-            log "PushDeer merge 失败告警已推（cooldown ${MERGE_ALERT_COOLDOWN}s）"
-        fi
+        send_sync_failure_alert "research-sync 失败（主库合并或副本刷新未完成）"
     fi
 fi
 
@@ -240,6 +597,10 @@ STALE_ALERT_COOLDOWN=1800  # 30 分钟，避免 stale 持续时每 5min 都告�
 sync_label="sync OK"
 if [[ "${merge_status}" == "failed" ]]; then
     sync_label="download OK, merge FAILED"
+elif [[ "${post_sync_status}" == "failed" ]]; then
+    sync_label="download/merge OK, post-sync FAILED"
+elif [[ "${post_sync_status}" == "incomplete" ]]; then
+    sync_label="download/merge OK, post-sync INCOMPLETE"
 fi
 
 new_snapshot=""
@@ -318,3 +679,5 @@ URL：${RQUANT_BACKUP_URL}/latest.duckdb.gz
         fi
     fi
 fi
+
+exit "${final_status}"

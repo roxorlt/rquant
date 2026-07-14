@@ -1,5 +1,6 @@
 """筛选积木单测。"""
 
+import pandas as pd
 import pytest
 
 from rquant.screen.rules import (
@@ -75,11 +76,29 @@ class TestAttributeRules:
         assert not mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
         assert mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
 
+    def test_not_st_fails_closed_on_unknown(self) -> None:
+        df = make_wide_frame()
+        df["is_st"] = df["is_st"].astype("boolean")
+        df.loc[df["ts_code"] == "300001.SZ", "is_st"] = pd.NA
+
+        mask = not_st()(df)
+
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
     def test_not_bj_excludes_bj_stocks(self) -> None:
         df = make_wide_frame()
         mask = not_bj()(df)
         assert not mask.loc[df["ts_code"] == "833001.BJ"].iloc[0]
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    def test_not_bj_fails_closed_on_unknown(self) -> None:
+        df = make_wide_frame()
+        df["is_bj"] = df["is_bj"].astype("boolean")
+        df.loc[df["ts_code"] == "300001.SZ", "is_bj"] = pd.NA
+
+        mask = not_bj()(df)
+
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
 
     @pytest.mark.parametrize(
         "whitelist,expected_allowed,expected_blocked",
@@ -124,6 +143,35 @@ class TestLimitRules:
         mask = not_limit_up(offset=0)(df)
         assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+    @pytest.mark.parametrize("rule", [limit_up(), first_limit_up(), yiziban(), limit_down()])
+    def test_positive_bool_rules_fail_closed_on_unknown(self, rule) -> None:
+        df = make_wide_frame()
+        column = {
+            "is_limit_up(0)": "IS_LIMIT_UP[0]",
+            "is_first_limit_up(0)": "IS_FIRST_LIMIT_UP[0]",
+            "is_yiziban(0)": "IS_YIZIBAN[0]",
+            "is_limit_down(0)": "IS_LIMIT_DOWN[0]",
+        }[rule.__rquant_name__]
+        df[column] = df[column].astype("boolean")
+        df.loc[df["ts_code"] == "300001.SZ", column] = pd.NA
+
+        mask = rule(df)
+
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+    @pytest.mark.parametrize(
+        ("rule", "column"),
+        [(not_limit_up(), "IS_LIMIT_UP[0]"), (not_yiziban(), "IS_YIZIBAN[0]")],
+    )
+    def test_negated_bool_rules_fail_closed_on_unknown(self, rule, column: str) -> None:
+        df = make_wide_frame()
+        df[column] = df[column].astype("boolean")
+        df.loc[df["ts_code"] == "300001.SZ", column] = pd.NA
+
+        mask = rule(df)
+
+        assert not mask.loc[df["ts_code"] == "300001.SZ"].iloc[0]
 
     def test_first_limit_up(self) -> None:
         df = make_wide_frame(
@@ -175,10 +223,8 @@ class TestLimitRules:
         assert mask.loc[df["ts_code"] == "000001.SZ"].iloc[0]
         assert not_yiziban(offset=1).min_lookback == 1
 
-    def test_not_yiziban_nan_treated_as_false(self) -> None:
-        """NaN in IS_YIZIBAN should be treated as False (not yiziban), so not_yiziban passes."""
+    def test_not_yiziban_passes_explicit_false(self) -> None:
         df = make_wide_frame(lookback=1)
-        # Default IS_YIZIBAN[0] is False, so not_yiziban should pass
         mask = not_yiziban(offset=0)(df)
         assert mask.all()
 
@@ -511,12 +557,12 @@ class TestNoConsecUpsInWindow:
         mask = rule(df)
         assert not mask.any()
 
-    def test_nan_treated_as_zero(self) -> None:
+    def test_unknown_fails_closed(self) -> None:
         df = make_wide_frame()
         df["max_consec_ups_8d"] = float("nan")
         rule = no_consec_ups_in_window(threshold=3, window=8)
         mask = rule(df)
-        assert mask.all()
+        assert not mask.any()
 
     def test_has_aggregate_request(self) -> None:
         rule = no_consec_ups_in_window(threshold=3, window=8)
@@ -549,12 +595,12 @@ class TestNoLimitDownInWindow:
         mask = rule(df)
         assert not mask.any()
 
-    def test_nan_treated_as_no_limit_down(self) -> None:
+    def test_unknown_fails_closed(self) -> None:
         df = make_wide_frame()
         df["has_limit_down_30d"] = float("nan")
         rule = no_limit_down_in_window(window=30)
         mask = rule(df)
-        assert mask.all()
+        assert not mask.any()
 
     def test_has_aggregate_request(self) -> None:
         rule = no_limit_down_in_window(window=30)

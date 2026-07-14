@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,7 +20,7 @@ from rquant.paper import (
     open_position_from_signal,
 )
 from rquant.signal_provenance import GROWTH_SURGE_V1, build_signal_factors
-from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
+from rquant.state.derive import _classify_board
 from rquant.stock_features import (
     build_daily_stock_features,
     build_intraday_relative_volume_features,
@@ -39,6 +40,7 @@ DEFAULT_GROWTH_FACTOR_SCORE_THRESHOLD = 45.0
 # 日线 vol 单位为手，分钟 vol 为股；经典量比分母按每交易日 240 个成交分钟折算
 _DAILY_VOL_UNIT_FACTOR = 100.0
 _TRADING_MINUTES_PER_DAY = 240.0
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # growth_surge_b_v1 权重表：确认层评分（满分 100），与 GROWTH_SURGE_V1_FACTORS
 # 命中矩阵同键名。放量三件套沿用 log_ratio（BASE_SCORE_TERMS 同款口径）；
@@ -269,7 +271,9 @@ def _query_candidates(
     store: DuckDBStore,
     trading_date: date,
     previous_date: date,
+    min_signal_time: time = time(9, 30),
 ) -> list[_GrowthBoardCandidate]:
+    decision_at = datetime.combine(trading_date, min_signal_time, tzinfo=SHANGHAI)
     raw = store._conn.execute(
         """
         WITH ma_base AS (
@@ -328,17 +332,30 @@ def _query_candidates(
         )
         SELECT db.ts_code,
                db.pre_close,
-               sb.name,
-               ds.is_st,
-               ds.board_type,
-               ds.limit_pct,
-               ds.limit_up_price,
+               status.name,
+               status.is_st AS status_is_st,
+               CASE
+                   WHEN status.ts_code IS NOT NULL
+                    AND status.conflict_reason IS NULL
+                    AND status.name IS NOT NULL
+                    AND length(trim(status.name)) > 0
+                    AND status.is_st IS NOT NULL
+                    AND status.available_at IS NOT NULL
+                    AND status.available_at <= ?
+                   THEN TRUE
+                   ELSE FALSE
+               END AS status_known,
+               ds.is_st AS state_is_st,
+               ds.board_type AS state_board_type,
+               ds.limit_pct AS state_limit_pct,
+               ds.limit_up_price AS state_limit_up_price,
                COALESCE(di.ma5, dma.ma5_calc) AS ma5,
                COALESCE(di.ma10, dma.ma10_calc) AS ma10,
                COALESCE(di.ma20, dma.ma20_calc) AS ma20,
                COALESCE(di.ma60, dma.ma60_calc) AS ma60
         FROM daily_bar db
-        LEFT JOIN stock_basic sb ON db.ts_code = sb.ts_code
+        LEFT JOIN stock_status_daily status
+          ON db.ts_code = status.ts_code AND db.trade_date = status.trade_date
         LEFT JOIN daily_state ds
           ON db.ts_code = ds.ts_code AND db.trade_date = ds.trade_date
         LEFT JOIN daily_indicator di
@@ -347,7 +364,7 @@ def _query_candidates(
           ON db.ts_code = dma.ts_code AND dma.trade_date = ?
         WHERE db.trade_date = ?
         """,
-        [previous_date, previous_date, trading_date],
+        [decision_at, previous_date, previous_date, trading_date],
     ).fetchdf()
     if raw.empty:
         return []
@@ -355,16 +372,15 @@ def _query_candidates(
     candidates: list[_GrowthBoardCandidate] = []
     for _, row in raw.iterrows():
         ts_code = str(row["ts_code"])
-        name = "" if pd.isna(row["name"]) else str(row["name"])
-        is_st = (
-            bool(row["is_st"]) if pd.notna(row["is_st"]) else bool(_detect_st(name))
-        )
+        if not bool(row["status_known"]) or bool(row["status_is_st"]):
+            continue
+        name = str(row["name"]).strip()
         board_type = (
-            str(row["board_type"])
-            if pd.notna(row["board_type"]) and str(row["board_type"])
+            str(row["state_board_type"])
+            if pd.notna(row["state_board_type"]) and str(row["state_board_type"])
             else _classify_board(ts_code)
         )
-        if is_st or board_type not in {"gem", "star"}:
+        if board_type not in {"gem", "star"}:
             continue
         ma_values = [row["ma5"], row["ma10"], row["ma20"], row["ma60"]]
         if any(pd.isna(value) for value in ma_values):
@@ -374,16 +390,14 @@ def _query_candidates(
             continue
         if pd.isna(row["pre_close"]) or float(row["pre_close"]) <= 0:
             continue
-        limit_pct = (
-            float(row["limit_pct"])
-            if pd.notna(row["limit_pct"])
-            else _limit_pct(False, board_type)
-        )
-        limit_up_price = (
-            float(row["limit_up_price"])
-            if pd.notna(row["limit_up_price"])
-            else float(_round_half_up(float(row["pre_close"]) * (1 + limit_pct)))
-        )
+        state_matches_status = pd.notna(row["state_is_st"]) and not bool(row["state_is_st"])
+        if (
+            not state_matches_status
+            or pd.isna(row["state_limit_pct"])
+            or pd.isna(row["state_limit_up_price"])
+        ):
+            continue
+        limit_up_price = float(row["state_limit_up_price"])
         candidates.append(
             _GrowthBoardCandidate(
                 ts_code=ts_code,
@@ -1074,7 +1088,12 @@ def run_growth_board_surge_replay(
         if len(window_dates) <= cfg.max_hold_days:
             continue
         _, window_end = _day_bounds(window_dates[-1])
-        for candidate in _query_candidates(store, trading_date, previous_date):
+        for candidate in _query_candidates(
+            store,
+            trading_date,
+            previous_date,
+            cfg.min_signal_time,
+        ):
             # 不做新股（候选级）：上市不满 N 个交易日跳过
             if cfg.min_listing_trading_days > 0 and (
                 _listed_trading_days(store, candidate.ts_code, trading_date)

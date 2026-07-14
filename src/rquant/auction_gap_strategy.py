@@ -24,7 +24,10 @@ from rquant.signal_provenance import (
     build_signal_factors,
     persist_position_with_provenance,
 )
-from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
+from rquant.state.derive import (
+    _classify_board,
+    _round_half_up,
+)
 from rquant.stock_features import build_intraday_relative_volume_features
 from rquant.storage.duckdb import DuckDBStore
 from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
@@ -34,6 +37,8 @@ StFilterMode = Literal["case_insensitive", "literal_lower", "none"]
 ExitMode = Literal["next_open"]
 AuctionGapMinuteEntryMode = Literal["vwap_push"]
 HoldPolicy = Literal["t1", "seal_hold"]
+
+_AUCTION_GAP_MINIMUM_COLUMNS = ["signal_date", "ts_code", "name"]
 
 # factor_confirm 对照实验（2026-07-02 归因终审已判死该策略线，此处只做低成本
 # 死刑复核）：不引入新因子，评分项全部来自 AUCTION_GAP_V1 既有键名（满分 100）。
@@ -1028,19 +1033,32 @@ def run_auction_gap_replay(
     """
     auction = store._conn.execute(
         """
-        SELECT ts_code, trade_date, price, vol, amount, turnover_rate, volume_ratio,
-               source
-        FROM auction_bar
-        WHERE trade_date >= ?
-          AND trade_date <= ?
-          AND auction_type = 'open_realtime'
-          AND price IS NOT NULL
-          AND vol > 0
+        SELECT auction.ts_code,
+               auction.trade_date,
+               auction.price,
+               auction.vol,
+               auction.amount,
+               auction.turnover_rate,
+               auction.volume_ratio,
+               auction.source,
+               status.name AS status_name,
+               status.is_st AS status_is_st,
+               status.available_at AS status_available_at,
+               status.conflict_reason AS status_conflict_reason
+        FROM auction_bar AS auction
+        LEFT JOIN stock_status_daily AS status
+          ON auction.ts_code = status.ts_code
+         AND auction.trade_date = status.trade_date
+        WHERE auction.trade_date >= ?
+          AND auction.trade_date <= ?
+          AND auction.auction_type = 'open_realtime'
+          AND auction.price IS NOT NULL
+          AND auction.vol > 0
         """,
         [config.start_date, config.end_date],
     ).fetchdf()
     if auction.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
     source_priority = auction["source"].map({
         "tushare": 0,
         "minute_0930_fallback": 1,
@@ -1052,6 +1070,31 @@ def run_auction_gap_replay(
         .drop(columns=["_source_priority"])
         .reset_index(drop=True)
     )
+    signal_dates = pd.to_datetime(auction["trade_date"])
+    decision_at = (
+        signal_dates.dt.tz_localize("Asia/Shanghai")
+        + pd.Timedelta(hours=9, minutes=25)
+    )
+    available_at = pd.to_datetime(auction["status_available_at"], utc=True)
+    status_known = (
+        auction["status_conflict_reason"].isna()
+        & auction["status_name"].notna()
+        & auction["status_name"].astype("string").str.strip().ne("")
+        & auction["status_is_st"].notna()
+        & available_at.notna()
+        & available_at.le(decision_at)
+    ).fillna(False)
+    auction = auction.loc[status_known].copy()
+    if auction.empty:
+        return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
+    auction["name"] = auction["status_name"].astype("string").str.strip()
+    auction["is_st"] = auction["status_is_st"].astype(bool)
+    auction = auction.drop(columns=[
+        "status_name",
+        "status_is_st",
+        "status_available_at",
+        "status_conflict_reason",
+    ])
 
     daily = store._conn.execute(
         """
@@ -1069,10 +1112,6 @@ def run_auction_gap_replay(
         FROM daily_state
         """
     ).fetchdf()
-    stock_basic = store._conn.execute(
-        "SELECT ts_code, name FROM stock_basic"
-    ).fetchdf()
-
     for frame in (auction, daily, state):
         frame["trade_date"] = pd.to_datetime(frame["trade_date"])
 
@@ -1124,6 +1163,10 @@ def run_auction_gap_replay(
 
     current_state = state.rename(
         columns={
+            "is_st": "state_is_st",
+            "board_type": "state_board_type",
+            "limit_pct": "state_limit_pct",
+            "limit_up_price": "state_limit_up_price",
             "is_limit_up": "hit_limit_up_today",
             "is_yiziban": "hit_yiziban_today",
         }
@@ -1179,26 +1222,21 @@ def run_auction_gap_replay(
         )
         .merge(next_daily, on=["ts_code", "next_trade_date"], how="left")
         .merge(next_state, on=["ts_code", "next_trade_date"], how="left")
-        .merge(stock_basic, on="ts_code", how="left")
     )
-    computed_is_st = out["name"].apply(_detect_st)
     computed_board_type = out["ts_code"].apply(_classify_board)
-    computed_limit_pct = pd.Series(
-        [
-            _limit_pct(bool(is_st), str(board_type))
-            for is_st, board_type in zip(
-                computed_is_st,
-                computed_board_type,
-                strict=False,
-            )
-        ],
-        index=out.index,
+    out["board_type"] = out["state_board_type"].combine_first(computed_board_type)
+    state_matches_status = (
+        out["state_is_st"].notna()
+        & out["state_is_st"].astype("boolean").eq(out["is_st"].astype("boolean"))
+    ).fillna(False)
+    out["limit_pct"] = out["state_limit_pct"].where(state_matches_status)
+    calculated_limit_up = _round_half_up(out["pre_close"] * (1 + out["limit_pct"]))
+    out["limit_up_price"] = (
+        out["state_limit_up_price"]
+        .where(state_matches_status)
+        .combine_first(calculated_limit_up.where(out["limit_pct"].notna()))
+        .where(out["limit_pct"].notna())
     )
-    computed_limit_up = _round_half_up(out["pre_close"] * (1 + computed_limit_pct))
-    out["is_st"] = out["is_st"].combine_first(computed_is_st)
-    out["board_type"] = out["board_type"].combine_first(computed_board_type)
-    out["limit_pct"] = out["limit_pct"].combine_first(computed_limit_pct)
-    out["limit_up_price"] = out["limit_up_price"].combine_first(computed_limit_up)
     if "hit_limit_up_today" in out.columns:
         calc_hit_limit = pd.Series(pd.NA, index=out.index, dtype="boolean")
         has_day_close = out["day_close"].notna() & out["limit_up_price"].notna()
@@ -1207,7 +1245,14 @@ def run_auction_gap_replay(
             >= out.loc[has_day_close, "limit_up_price"] - config.price_tol
         )
         out["hit_limit_up_today"] = (
-            out["hit_limit_up_today"].astype("boolean").combine_first(calc_hit_limit)
+            out["hit_limit_up_today"]
+            .astype("boolean")
+            .where(state_matches_status)
+            .combine_first(calc_hit_limit)
+        )
+    if "hit_yiziban_today" in out.columns:
+        out["hit_yiziban_today"] = (
+            out["hit_yiziban_today"].astype("boolean").where(state_matches_status)
         )
     out = out[out["prev5_count"] == 5].copy()
     out["auction_vol_ratio_5d"] = out["auction_vol"] / out["avg_vol_5d"]
@@ -1228,10 +1273,9 @@ def run_auction_gap_replay(
     )
     mask &= out["entry_price"] < out["limit_up_price"] - config.price_tol
     if config.st_filter == "case_insensitive":
-        mask &= ~out["is_st"].fillna(False).astype(bool)
-        mask &= ~out["name"].fillna("").str.lower().str.contains("st", regex=False)
+        mask &= ~out["is_st"].astype(bool)
     elif config.st_filter == "literal_lower":
-        mask &= ~out["name"].fillna("").str.contains("st", regex=False)
+        mask &= ~out["name"].str.contains("st", regex=False, na=False)
     elif config.st_filter != "none":
         raise ValueError(f"unsupported st_filter: {config.st_filter}")
     if config.require_next_day:

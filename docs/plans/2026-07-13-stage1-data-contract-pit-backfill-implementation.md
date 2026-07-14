@@ -8,6 +8,10 @@
 
 **技术栈：** Python 3.11+、Pydantic、DuckDB、SQLite、pandas、argparse、pytest、ruff。
 
+**执行状态（2026-07-14）：** PR-A 已随 v0.14.0 部署；PR-B Tasks 6-11 已完成实现和审查，
+全量 1682 项测试通过，待合并为 v0.15.0 并按受控顺序完成云端/本地交易日历 bootstrap；
+PR-C、PR-D 尚未完成。
+
 ---
 
 ## 交付批次
@@ -220,27 +224,115 @@ after 计数。
 
 ### Task 7：历史证券名称/ST 状态
 
+Task 7 按顺序拆成三个子任务，避免存储、派生和策略旁路同时改动：
+
+#### Task 7A：历史状态事实表、回补与覆盖审计
+
 **Files:**
+- Create: `src/rquant/security_status.py`
 - Modify: `src/rquant/storage/schema.py`
+- Modify: `src/rquant/storage/migrations.py`
 - Modify: `src/rquant/storage/duckdb.py`
-- Modify: `src/rquant/state/derive.py`
-- Modify: `src/rquant/ingest.py`
-- Modify: `src/rquant/market_backfill.py`
-- Modify: `src/rquant/screen/loader.py`
+- Modify: `src/rquant/adapter/tushare.py`
+- Modify: `src/rquant/data_quality.py`
+- Modify: `src/rquant/data_contracts.py`
+- Modify: `src/rquant/research_sync.py`
 - Create: `tests/unit/test_historical_security_status.py`
 
-先构造“戴帽前/戴帽期/摘帽后/未知”失败测试；新增按日状态表并按交易日 join。未知状态不得
-静默等于非 ST；在历史状态回补完成前，对依赖 ST 过滤的正式研究产生 P0 issue。
+新增 `stock_status_daily(ts_code, trade_date)`，名称和 `is_st` 均允许 NULL，显式表达 unknown；
+记录来源、`available_at` 和写入时间。历史主事实使用 Tushare `namechange` 的有效名称区间，按
+日期窗口分片、规范化去重后物化到 `daily_bar` 的实际资格键。`stock_st` 只用于确认 ST 正例和
+交叉核验：空返回或未命中绝不能证明非 ST；与历史名称冲突时保守标 unknown/P0。`st` 接口当前
+账号无权限且首版不需要。
+
+回补前或存在区间空洞、冲突时，质量规则必须产生 P0 issue。单次接口结果达到行数上限时按不
+完整失败，不能把截断结果当全量。`stock_basic.name` 只代表当前快照，禁止用于历史兜底。
+
+#### Task 7B：日线派生与筛选层采用按日状态
+
+**Files:**
+- Modify: `src/rquant/state/derive.py`
+- Modify: `src/rquant/state/__init__.py`
+- Modify: `src/rquant/ingest.py`
+- Modify: `src/rquant/market_backfill.py`
+- Modify: `src/rquant/security_status.py`
+- Modify: `src/rquant/storage/duckdb.py`
+- Modify: `src/rquant/cli.py`
+- Modify: `src/rquant/screen/loader.py`
+- Modify: `src/rquant/screen/rules.py`
+- Modify: `src/rquant/market_context.py`
+- Modify: `scripts/ingest_daily.py`
+- Modify: `scripts/backfill_market.py`
+- Modify: `tests/unit/test_state.py`
+- Create: `tests/unit/test_ingest.py`
+- Modify: `tests/unit/test_market_backfill.py`
+- Modify: `tests/unit/test_screen_loader.py`
+- Modify: `tests/unit/test_screen_rules.py`
+- Create: `tests/unit/test_ingest_scripts.py`
+- Modify: `tests/unit/test_historical_security_status.py`
+- Modify: `tests/unit/test_cli.py`
+- Modify: `tests/integration/test_screen_e2e.py`
+
+先构造“戴帽前/戴帽期/摘帽后/未知”失败测试。`derive_state()` 必须消费逐日 nullable 状态，
+且只有 `available_at <=` 对应派生或回放的决策时点才可见；只按交易日 join 仍属于 PIT 泄漏。
+unknown 时涨跌停幅度、价格和涨停/首板/一字板/连板派生标记不可用，并中断跨日连板链；
+`load_universe()` 按 `(ts_code, trade_date)` 取历史名称/ST，缺行、冲突和未来才可见均保留 NULL，
+不得回退 `daily_state` 或当前 `stock_basic`。`not_st()` 与所有否定型/“窗口内无……”规则只允许
+事实明确时通过；窗口聚合和市场情绪也必须携带完整性，不得让 SQL 聚合忽略 NULL 后伪造零值。
+重算历史状态不得再读取当前 `stock_basic.name`。
+
+日常 ingest 的远端请求必须在 writer 打开前完成，状态/行情/派生写入同事务；历史日期更正要更新
+受影响的状态与指标未来尾部。全市场历史回补按日短写入并先失效状态尾部，全部日期结束后只重算
+一次，不能在每个日期重复扫描多年历史。涨跌停幅度按历史制度日期计算：创业板 2020-08-24
+前后及风险警示比例必须区分，科创板/北交所风险警示不得误套主板 5%。IPO、重新上市和其他无
+涨跌幅限制窗口在取得权威逐日资格事实前标为不支持，正式研究必须排除，不能从第一根已有 K 线
+猜测。
+
+#### Task 7C：清除策略专用的当前名称旁路
+
+**Files:**
+- Modify: `src/rquant/auction_gap_strategy.py`
+- Modify: `src/rquant/growth_board_surge_strategy.py`
+- Modify: `src/rquant/dashboard/strategy_lab.py`
+- Modify: corresponding unit tests
+
+竞价回放、科创/创业放量候选和 Lab 候选计数都必须按历史交易日 join
+`stock_status_daily`，删除当前名称推断 ST 的 fallback。普通筛选、策略回放和统计分母使用同一
+状态来源后，Task 7 才算完成。
+
+### Task 7.5：权威交易日历 bootstrap
+
+**Files:**
+- Modify: `src/rquant/cli.py`
+- Modify: `src/rquant/trade_calendar.py`
+- Modify: `scripts/sync-from-cloud.sh`
+- Modify: `tests/unit/test_trade_calendar.py`
+- Modify: `tests/unit/test_cli.py`
+
+PR-A 只创建了 `trade_calendar`，生产表当前仍为空。增加幂等的日历回补入口，先在云端覆盖研究
+区间并同步到本地，再启用 Task 8 的 fail-closed 守卫。同步脚本增加显式
+`--skip-post-sync-captures`，避免日历尚未核验就自动 capture。部署顺序必须是“暂停相关采集 ->
+部署代码 -> 回补并核验云端主库/副本日历 -> 同步并核验本地主库/副本 -> 手工试跑 capture ->
+恢复调度”，否则所有日期都会因日历 unknown 被拒绝。
 
 ### Task 8：涨停池交易日守卫与修复计划
 
 **Files:**
 - Modify: `src/rquant/limit_up_pool.py`
+- Modify: `src/rquant/data_quality.py`
+- Modify: `src/rquant/storage/schema.py`
+- Modify: `src/rquant/storage/migrations.py`
+- Modify: `src/rquant/storage/duckdb.py`
+- Modify: `src/rquant/research_sync.py`
 - Modify: `src/rquant/cli.py`
 - Create: `tests/unit/test_limit_up_pool_calendar_guard.py`
 
-非交易日 capture 拒写并记录 issue。修复命令先生成 dry-run 报告，只有明确 `--apply` 才删除，
-并保留审计记录；不能直接在部署脚本里清生产数据。
+capture 在远端抓取前和最终写入前各检查一次权威日历：已知休市日拒写并记录 issue；日历
+unknown 必须 fail closed、产生 P0 并返回非零，不能按休市日静默删除。修复命令先生成带排序
+候选主键、before count 和稳定 plan id 的 dry-run 报告；apply 必须同时显式传入 `--apply` 和
+dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则零删除。只允许删除日历明确为
+休市日的行；unknown 先补日历。删除、after count 和持久化 repair audit 同事务提交，不能直接
+在部署脚本里清生产数据。
 
 ### Task 9：日线/分钟一致性审计
 
@@ -282,9 +374,13 @@ after 计数。
 - Modify: `src/rquant/growth_board_surge_strategy.py`
 - Modify: `src/rquant/presets.py`
 - Create: `tests/unit/test_backfill_manifest.py`
+- Modify: `tests/unit/test_growth_board_surge_strategy.py`
+- Modify: `tests/unit/test_presets.py`
 
-实现 `StrategyBackfillSpec`、`EligibilityRecord` 和窗口需求。科创/创业资格查询必须在读取分钟表
-前完成；N 字按日重建，不依赖历史 `screen_result`；竞价策略标记为 `daily+auction`。
+实现 frozen `StrategyBackfillSpec`、`EligibilityRecord` 和窗口需求，稳定 ID 不受资格行顺序影响。
+科创/创业资格查询必须通过 Task 11 的受控 PIT 入口并在读取分钟表前完成，manifest 与 replay
+共用同一个日级候选解析器；N 字按权威交易日运行现有筛选规则重建，不依赖历史
+`screen_result`；竞价策略标记为 `daily+auction`，不得把分钟是否存在当作资格条件。
 
 ### Task 13：窗口合并、覆盖计算与 ETA
 
@@ -292,17 +388,25 @@ after 计数。
 - Modify: `src/rquant/backfill_manifest.py`
 - Create: `tests/unit/test_backfill_planner.py`
 
-按交易日展开 90 日基准、B 日和最多 10 日退出窗口；同股票重叠窗口合并，再按 8000 行上限
-切块。只生成缺失任务，ETA 同时展示请求数、预计行数、磁盘、限频时间和置信度。
+只按权威开市日展开 90 日基准、B 日和最多 10 日退出窗口；日历有缺口或边界不足时显式失败。
+同股票相交或相邻窗口合并，但保留 baseline/B/S 各自期望分母。覆盖必须按 Task 9 配置的
+`tushare/1min` 完整交易时段判断，不能把“当天有任意分钟行”当成已覆盖；先扣除完整覆盖日，
+再按单次返回上限切块，恰好达到 8000 行视为可能截断。ETA 同时展示请求数、预计行数、磁盘、
+限频时间、总耗时、置信度和置信度原因；阶段门分别采用 B/S 99% 与历史基准 95%。
 
 ### Task 14：SQLite 回补状态
 
 **Files:**
 - Create: `src/rquant/backfill_state.py`
+- Modify: `src/rquant/config.py`
+- Modify: `.env.example`
 - Create: `tests/unit/test_backfill_state.py`
+- Modify: `tests/unit/test_config.py`
 
-实现 manifest/task/eligibility 持久化、原子 claim、崩溃 running 恢复、重试上限、失败原因、
-EWMA ETA。状态库使用配置中的独立 SQLite 路径，不放 DuckDB。
+实现 manifest/task/eligibility 同事务持久化、`BEGIN IMMEDIATE` 原子 claim、重试上限、结构化
+失败原因和 EWMA ETA。running 使用 `claimed_at` + lease，只回收超时任务；成功任务不可重领，
+同 ID 不同内容必须拒绝。状态库使用配置中的独立 SQLite 路径，启用 WAL、busy timeout 和短
+事务，不放 DuckDB，使 `backfill-status` 能在 DuckDB 写入期间查询。
 
 ### Task 15：回补执行器
 
@@ -310,9 +414,12 @@ EWMA ETA。状态库使用配置中的独立 SQLite 路径，不放 DuckDB。
 - Modify: `src/rquant/intraday_backfill.py`
 - Modify: `src/rquant/adapter/tushare.py`
 - Create: `tests/unit/test_backfill_runner.py`
+- Modify: `tests/unit/test_intraday_adapter.py`
 
 分钟接口复用统一退避/限频；成功任务不再请求；空返回必须分类为允许缺失或 `source_empty`；
-中断后只领取 pending/可重试 failed。写入后更新真实请求、行数、耗时和覆盖率。
+中断后只领取 pending/可重试 failed。每次请求前重新检查完整时段覆盖，避免 DuckDB 已写成功但
+SQLite 尚未标记时重复下载；写入后再计算完整覆盖并更新真实请求、返回/写入行数、耗时、
+scope 覆盖率和 EWMA。单任务失败不终止整个 manifest，执行器不得与盘中 monitor 并发写主库。
 
 ### Task 16：四条 CLI
 
@@ -329,8 +436,10 @@ rquant backfill-status --manifest-id ... [--json]
 rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 ```
 
-未知 manifest、失败任务和覆盖未达标返回非零 exit code。`dataset-snapshot` 文案明确不是
-`DatasetSpec.mode=snapshot` 的整表刷新。
+`backfill-plan` 只读副本并持久化计划，`backfill-status` 只读 SQLite 且 `--json` 输出稳定单个
+对象。未知 manifest、terminal failed 和覆盖未达标返回非零 exit code；覆盖不足本身是正常
+规划结果。`dataset-snapshot` 仅在 manifest 完成且 B/S 99%、历史基准 95% 阶段门通过后写入
+并 finalize 研究覆盖元数据，文案明确不是 `DatasetSpec.mode=snapshot` 的整表刷新。
 
 ## PR-D：preflight、真实数据审计与阶段验收
 

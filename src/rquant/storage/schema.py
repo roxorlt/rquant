@@ -847,6 +847,38 @@ CREATE TABLE IF NOT EXISTS data_quality_issue (
 );
 """
 
+DATA_REPAIR_AUDIT_DDL = """
+CREATE TABLE IF NOT EXISTS data_repair_audit (
+    audit_id       VARCHAR     PRIMARY KEY,
+    plan_id        VARCHAR     NOT NULL,
+    action_id      VARCHAR     NOT NULL,
+    dataset_id     VARCHAR     NOT NULL,
+    target_table   VARCHAR     NOT NULL,
+    key_columns    JSON        NOT NULL,
+    candidate_keys JSON        NOT NULL,
+    before_count   BIGINT      NOT NULL CHECK (before_count >= 0),
+    deleted_count  BIGINT      NOT NULL CHECK (deleted_count >= 0),
+    after_count    BIGINT      NOT NULL CHECK (after_count >= 0),
+    applied_at     TIMESTAMPTZ NOT NULL,
+    CHECK (after_count <= before_count),
+    CHECK (deleted_count = before_count - after_count)
+);
+"""
+
+LIMIT_UP_POOL_WRITE_GUARD_DDL = """
+CREATE TABLE IF NOT EXISTS limit_up_pool_write_guard (
+    guard_id   VARCHAR PRIMARY KEY,
+    generation BIGINT  NOT NULL CHECK (generation >= 0),
+    CHECK (guard_id = 'limit_up_pool_daily')
+);
+"""
+
+LIMIT_UP_POOL_WRITE_GUARD_SEED_DML = """
+INSERT INTO limit_up_pool_write_guard (guard_id, generation)
+VALUES ('limit_up_pool_daily', 0)
+ON CONFLICT (guard_id) DO NOTHING;
+"""
+
 TRADE_CALENDAR_DDL = """
 CREATE TABLE IF NOT EXISTS trade_calendar (
     exchange      VARCHAR     NOT NULL,
@@ -856,6 +888,34 @@ CREATE TABLE IF NOT EXISTS trade_calendar (
     source        VARCHAR     NOT NULL,
     updated_at    TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (exchange, cal_date)
+);
+"""
+
+STOCK_STATUS_DAILY_DDL = """
+CREATE TABLE IF NOT EXISTS stock_status_daily (
+    ts_code         VARCHAR     NOT NULL,
+    trade_date      DATE        NOT NULL,
+    name            VARCHAR,
+    is_st           BOOLEAN,
+    name_source     VARCHAR     NOT NULL,
+    st_source       VARCHAR,
+    available_at    TIMESTAMPTZ,
+    ingested_at     TIMESTAMPTZ NOT NULL,
+    conflict_reason VARCHAR,
+    PRIMARY KEY (ts_code, trade_date),
+    CHECK (length(trim(name_source)) > 0),
+    CHECK (name IS NULL OR length(trim(name)) > 0),
+    CHECK (st_source IS NULL OR length(trim(st_source)) > 0),
+    CHECK (conflict_reason IS NULL OR (name IS NULL AND is_st IS NULL)),
+    CHECK (
+        is_st IS NULL OR (
+            name IS NOT NULL
+            AND available_at IS NOT NULL
+            AND lower(trim(name_source)) NOT IN ('unknown', 'conflict')
+            AND st_source IS NOT NULL
+            AND lower(trim(st_source)) NOT IN ('unknown', 'conflict')
+        )
+    )
 );
 """
 
@@ -900,6 +960,10 @@ VERSIONED_COMPATIBILITY_DDL = [
     *LEGACY_MIGRATION_DDL,
     *DATA_METADATA_TABLE_DDLS,
     TRADE_CALENDAR_DDL,
+    STOCK_STATUS_DAILY_DDL,
+    DATA_REPAIR_AUDIT_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

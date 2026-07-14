@@ -14,6 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rquant.storage.schema import (
     BASE_DDL,
     DATA_METADATA_TABLE_DDLS,
+    DATA_REPAIR_AUDIT_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
     MARKET_SENTIMENT_MA20_MIGRATION_DDL,
     MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
@@ -23,6 +26,7 @@ from rquant.storage.schema import (
     PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+    STOCK_STATUS_DAILY_DDL,
     TRADE_CALENDAR_DDL,
 )
 
@@ -112,6 +116,24 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=3,
         name="authoritative trade calendar",
         statements=(TRADE_CALENDAR_DDL,),
+    ),
+    Migration(
+        version=4,
+        name="historical stock status facts",
+        statements=(STOCK_STATUS_DAILY_DDL,),
+    ),
+    Migration(
+        version=5,
+        name="local data repair audit",
+        statements=(DATA_REPAIR_AUDIT_DDL,),
+    ),
+    Migration(
+        version=6,
+        name="limit-up-pool write serialization guard",
+        statements=(
+            LIMIT_UP_POOL_WRITE_GUARD_DDL,
+            LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
+        ),
     ),
 )
 

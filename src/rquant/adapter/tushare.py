@@ -216,6 +216,70 @@ class TushareAdapter:
         logger.info(f"Tushare trade_cal 返回 {len(dates)} 个交易日")
         return sorted(dates)
 
+    def namechange_raw(
+        self,
+        start_date: date,
+        end_date: date,
+        ts_code: str | None = None,
+    ) -> pd.DataFrame:
+        """Fetch one bounded namechange window without inferring status facts."""
+        columns = [
+            "ts_code",
+            "name",
+            "start_date",
+            "end_date",
+            "ann_date",
+            "change_reason",
+        ]
+        if start_date > end_date:
+            return pd.DataFrame(columns=columns)
+        fields = ",".join(columns)
+        kwargs: dict[str, str] = {
+            "start_date": start_date.strftime("%Y%m%d"),
+            "end_date": end_date.strftime("%Y%m%d"),
+            "fields": fields,
+        }
+        if ts_code is not None:
+            kwargs["ts_code"] = ts_code
+        logger.info(
+            "Tushare namechange 请求："
+            f"start={kwargs['start_date']} end={kwargs['end_date']} "
+            f"ts_code={ts_code or 'ALL'}"
+        )
+        frame = self._call_with_backoff(
+            "namechange",
+            lambda: self._pro.namechange(**kwargs),
+        )
+        if frame is None or frame.empty:
+            logger.warning(
+                "Tushare namechange 返回空："
+                f"{kwargs['start_date']}-{kwargs['end_date']}"
+            )
+            return pd.DataFrame(columns=columns)
+        normalized = frame.reindex(columns=columns).reset_index(drop=True)
+        logger.info(f"Tushare namechange 返回 {len(normalized)} 行")
+        return normalized
+
+    def stock_st_raw(self, trade_date: date) -> pd.DataFrame:
+        """Fetch stock_st positives for one date; absence never means non-ST."""
+        columns = ["ts_code", "name", "trade_date", "type", "type_name"]
+        date_string = trade_date.strftime("%Y%m%d")
+        fields = ",".join(columns)
+        logger.info(f"Tushare stock_st 请求：trade_date={date_string}")
+        frame = self._call_with_backoff(
+            "stock_st",
+            lambda: self._pro.stock_st(
+                trade_date=date_string,
+                fields=fields,
+            ),
+        )
+        if frame is None or frame.empty:
+            logger.warning(f"Tushare stock_st 返回空：trade_date={date_string}")
+            return pd.DataFrame(columns=columns)
+        normalized = frame.reindex(columns=columns).reset_index(drop=True)
+        logger.info(f"Tushare stock_st 返回 {len(normalized)} 行")
+        return normalized
+
     def daily_by_date(self, trade_date: date) -> pd.DataFrame:
         """按交易日拉全市场日线（历史回补用，字段对齐 daily_bar 表）。"""
         ds = trade_date.strftime("%Y%m%d")

@@ -41,6 +41,14 @@ def test_build_daily_stock_features_price_position_and_accumulation(
             "amount": amounts[idx - 19],
         })
     store.upsert_daily(pd.DataFrame(rows))
+    store.upsert_adj_factor(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_date": row["trade_date"],
+            "adj_factor": 1.0,
+        }
+        for row in rows
+    ]))
 
     features = build_daily_stock_features(
         store,
@@ -85,6 +93,14 @@ def _seed_trend_history(
         for trade_date, close in zip(dates, closes, strict=True)
     ]
     store.upsert_daily(pd.DataFrame(rows))
+    store.upsert_adj_factor(pd.DataFrame([
+        {
+            "ts_code": ts_code,
+            "trade_date": trade_date,
+            "adj_factor": 1.0,
+        }
+        for trade_date in dates
+    ]))
     return dates[-1]
 
 

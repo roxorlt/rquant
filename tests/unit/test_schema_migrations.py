@@ -123,7 +123,7 @@ def test_v2_creates_metadata_tables_only_through_versioned_migration() -> None:
 def test_v3_creates_trade_calendar_only_through_versioned_migration() -> None:
     from rquant.storage.schema import ALL_DDL, TRADE_CALENDAR_DDL
 
-    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3]
+    assert [migration.version for migration in MIGRATIONS[:3]] == [1, 2, 3]
     assert MIGRATIONS[2].statements == (TRADE_CALENDAR_DDL,)
     assert TRADE_CALENDAR_DDL in ALL_DDL
 
@@ -137,7 +137,7 @@ def test_v3_creates_trade_calendar_only_through_versioned_migration() -> None:
     }
     assert "trade_calendar" not in before_v3
 
-    initialize_schema(conn)
+    initialize_schema(conn, migrations=MIGRATIONS[:3])
     columns = conn.execute(
         "SELECT column_name, is_nullable, data_type "
         "FROM information_schema.columns "
@@ -163,6 +163,67 @@ def test_v3_creates_trade_calendar_only_through_versioned_migration() -> None:
     assert primary_key == (["exchange", "cal_date"],)
     assert foreign_keys == []
     assert [row[0] for row in _migration_rows(conn)] == [1, 2, 3]
+    conn.close()
+
+
+def test_v4_creates_historical_stock_status_only_through_versioned_migration() -> None:
+    from rquant.storage.schema import ALL_DDL, STOCK_STATUS_DAILY_DDL
+
+    assert [migration.version for migration in MIGRATIONS[:4]] == [1, 2, 3, 4]
+    assert MIGRATIONS[3].statements == (STOCK_STATUS_DAILY_DDL,)
+    assert (
+        MIGRATIONS[3].checksum
+        == "1c788707a322f16dfaf24d34b36a1e8d4d4dc1880e5d61a4d3d3dc38d640ff77"
+    )
+    assert STOCK_STATUS_DAILY_DDL in ALL_DDL
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:3])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'stock_status_daily'"
+    ).fetchone()[0] == 0
+
+    initialize_schema(conn)
+    columns = conn.execute(
+        "SELECT column_name, is_nullable, data_type "
+        "FROM information_schema.columns "
+        "WHERE table_name = 'stock_status_daily' ORDER BY ordinal_position"
+    ).fetchall()
+    primary_key = conn.execute(
+        "SELECT constraint_column_names FROM duckdb_constraints() "
+        "WHERE table_name = 'stock_status_daily' "
+        "AND constraint_type = 'PRIMARY KEY'"
+    ).fetchone()
+
+    assert columns == [
+        ("ts_code", "NO", "VARCHAR"),
+        ("trade_date", "NO", "DATE"),
+        ("name", "YES", "VARCHAR"),
+        ("is_st", "YES", "BOOLEAN"),
+        ("name_source", "NO", "VARCHAR"),
+        ("st_source", "YES", "VARCHAR"),
+        ("available_at", "YES", "TIMESTAMP WITH TIME ZONE"),
+        ("ingested_at", "NO", "TIMESTAMP WITH TIME ZONE"),
+        ("conflict_reason", "YES", "VARCHAR"),
+    ]
+    assert primary_key == (["ts_code", "trade_date"],)
+    assert [row[0] for row in _migration_rows(conn)][:4] == [1, 2, 3, 4]
+    with pytest.raises(duckdb.ConstraintException):
+        conn.execute(
+            "INSERT INTO stock_status_daily VALUES ("
+            "'600000.SH', DATE '2020-01-02', NULL, FALSE, "
+            "'tushare.namechange', 'tushare.namechange', "
+            "TIMESTAMPTZ '2020-01-02 01:25:00+00', "
+            "TIMESTAMPTZ '2026-07-14 00:00:00+00', NULL)"
+        )
+    with pytest.raises(duckdb.ConstraintException):
+        conn.execute(
+            "INSERT INTO stock_status_daily VALUES ("
+            "'600000.SH', DATE '2020-01-02', '浦发银行', FALSE, "
+            "'conflict', NULL, NULL, "
+            "TIMESTAMPTZ '2026-07-14 00:00:00+00', 'overlap')"
+        )
     conn.close()
 
 

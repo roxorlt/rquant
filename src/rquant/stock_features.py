@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import date, datetime, time
 from math import isfinite
+from typing import Literal, Self
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
+from rquant.price_adjustment import PriceFactorBasis, resolve_price_factor_basis
 from rquant.storage.duckdb import DuckDBStore
 
 _MA_ALIGNMENT_WINDOWS = (5, 10, 20, 60)
@@ -23,6 +25,53 @@ class StockFeatureSnapshot(BaseModel):
     ts_code: str
     reference_date: date
     payload: dict[str, float | int | None]
+
+
+class PriceBasisDiagnostic(BaseModel):
+    """一个特征窗口的复权基准可用性。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    feature_family: str
+    window_days: int
+    available: bool
+    reason: str | None = None
+    basis: PriceFactorBasis | None = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if self.available:
+            if self.reason is not None:
+                raise ValueError("available diagnostic cannot carry reason")
+            if self.basis is not None and not self.basis.available:
+                raise ValueError("available diagnostic cannot carry unavailable basis")
+            return self
+        if self.reason is None:
+            raise ValueError("unavailable diagnostic requires reason")
+        if self.basis is not None and self.basis.available:
+            raise ValueError("unavailable diagnostic cannot carry available basis")
+        return self
+
+
+class DailyStockFeatureResult(BaseModel):
+    """日线候选特征及各价格窗口的可用性诊断。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    ts_code: str
+    reference_date: date
+    status: Literal["available", "partial", "no_data"]
+    reason: str | None = None
+    features: dict[str, float | int | None]
+    diagnostics: dict[str, PriceBasisDiagnostic]
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if self.status == "available" and self.reason is not None:
+            raise ValueError("available feature result cannot carry reason")
+        if self.status != "available" and self.reason is None:
+            raise ValueError("non-available feature result requires reason")
+        return self
 
 
 def _as_date(value: object) -> date:
@@ -70,16 +119,12 @@ def _query_daily_window(
     return df.sort_values("trade_date").reset_index(drop=True)
 
 
-def _apply_reference_price_basis(
+def _query_factor_map(
     store: DuckDBStore,
     ts_code: str,
-    df: pd.DataFrame,
+    start_date: date,
     reference_date: date,
-) -> pd.DataFrame:
-    """有复权因子时把历史价统一到 reference_date 价格基准。"""
-    if df.empty:
-        return df
-    start_date = _as_date(df.iloc[0]["trade_date"])
+) -> dict[date, float | None]:
     factor_df = store._conn.execute(
         """
         SELECT trade_date, adj_factor
@@ -91,28 +136,75 @@ def _apply_reference_price_basis(
         """,
         [ts_code, start_date, reference_date],
     ).fetchdf()
-    if factor_df.empty:
-        return df
-
-    ref_rows = factor_df[factor_df["trade_date"].apply(_as_date) == reference_date]
-    if ref_rows.empty or pd.isna(ref_rows.iloc[0]["adj_factor"]):
-        return df
-    ref_factor = float(ref_rows.iloc[0]["adj_factor"])
-    if ref_factor <= 0:
-        return df
-
-    out = df.copy()
-    factor_map = {
-        _as_date(row["trade_date"]): float(row["adj_factor"])
+    return {
+        _as_date(row["trade_date"]): (
+            None if pd.isna(row["adj_factor"]) else float(row["adj_factor"])
+        )
         for _, row in factor_df.iterrows()
-        if pd.notna(row["adj_factor"]) and float(row["adj_factor"]) > 0
     }
+
+
+def _resolve_window_basis(
+    df: pd.DataFrame,
+    factor_map: dict[date, float | None],
+    reference_date: date,
+) -> PriceFactorBasis:
+    return resolve_price_factor_basis(
+        required_dates=tuple(df["trade_date"].apply(_as_date).tolist()),
+        factor_by_date=factor_map,
+        reference_date=reference_date,
+    )
+
+
+def _apply_price_basis(df: pd.DataFrame, basis: PriceFactorBasis) -> pd.DataFrame:
+    if not basis.available:
+        raise ValueError("cannot adjust prices with an unavailable basis")
+    out = df.copy()
     out["trade_date_obj"] = out["trade_date"].apply(_as_date)
-    out["basis_ratio"] = out["trade_date_obj"].map(factor_map).fillna(ref_factor)
-    out["basis_ratio"] = out["basis_ratio"] / ref_factor
+    out["basis_ratio"] = out["trade_date_obj"].map(basis.ratio_by_date())
     for col in ["open", "high", "low", "close", "pre_close"]:
         out[col] = pd.to_numeric(out[col], errors="coerce") * out["basis_ratio"]
     return out.drop(columns=["trade_date_obj", "basis_ratio"])
+
+
+def _basis_diagnostic(
+    feature_family: str,
+    window_days: int,
+    basis: PriceFactorBasis,
+) -> PriceBasisDiagnostic:
+    return PriceBasisDiagnostic(
+        feature_family=feature_family,
+        window_days=window_days,
+        available=basis.available,
+        reason=basis.unavailable_reason,
+        basis=basis,
+    )
+
+
+def _insufficient_history_diagnostic(
+    feature_family: str,
+    window_days: int,
+) -> PriceBasisDiagnostic:
+    return PriceBasisDiagnostic(
+        feature_family=feature_family,
+        window_days=window_days,
+        available=False,
+        reason="insufficient_history",
+    )
+
+
+def _unavailable_price_position_features(
+    lookback: int,
+    actual_days: int,
+) -> dict[str, float | int | None]:
+    prefix = f"{lookback}d"
+    return {
+        f"price_window_days_{prefix}": actual_days,
+        f"price_position_{prefix}_pct": None,
+        f"price_rank_{prefix}_pct": None,
+        f"distance_to_high_{prefix}_pct": None,
+        f"distance_to_low_{prefix}_pct": None,
+    }
 
 
 def _price_position_features(
@@ -163,6 +255,8 @@ def _price_position_features(
 def _accumulation_features(
     df: pd.DataFrame,
     lookback: int,
+    *,
+    obv_close: pd.Series | None,
 ) -> dict[str, float | int | None]:
     prefix = f"{lookback}d"
     if df.empty:
@@ -183,16 +277,18 @@ def _accumulation_features(
     amount = pd.to_numeric(payload["amount"], errors="coerce").fillna(0.0)
     pct_chg = pd.to_numeric(payload["pct_chg"], errors="coerce").fillna(0.0)
 
-    direction = close.diff().fillna(0.0).map(
-        lambda value: 1 if value > 0 else -1 if value < 0 else 0
-    )
-    obv = (direction * vol).cumsum()
     total_vol = float(vol.abs().sum())
-    obv_change = (
-        (float(obv.iloc[-1]) - float(obv.iloc[0])) / total_vol * 100
-        if total_vol > 0 and len(obv) > 1
-        else None
-    )
+    obv_change: float | None = None
+    if obv_close is not None:
+        adjusted_close = pd.to_numeric(obv_close, errors="coerce")
+        direction = adjusted_close.diff().fillna(0.0).map(
+            lambda value: 1 if value > 0 else -1 if value < 0 else 0
+        )
+        obv = (direction * vol).cumsum()
+        if total_vol > 0 and len(obv) > 1:
+            obv_change = (
+                float(obv.iloc[-1]) - float(obv.iloc[0])
+            ) / total_vol * 100
 
     price_range = (high - low).replace(0, pd.NA)
     close_position = ((close - low) / price_range).clip(lower=0, upper=1)
@@ -222,11 +318,7 @@ def _accumulation_features(
 
 
 def _trend_features(df: pd.DataFrame) -> dict[str, float | int | None]:
-    """均线多头排列与 250 日收盘百分位，价格基准与其他价格特征一致。
-
-    无复权因子数据时退化为原始价：除权除息日的价格跳变会扭曲均线比较，
-    与模块内其他价格特征的局限相同。窗口行数不足时返回 None 不报错。
-    """
+    """均线多头排列与 250 日收盘百分位。"""
     out: dict[str, float | int | None] = {
         "ma_alignment": None,
         "price_percentile_250d": None,
@@ -245,15 +337,15 @@ def _trend_features(df: pd.DataFrame) -> dict[str, float | int | None]:
     return out
 
 
-def build_daily_stock_features(
+def build_daily_stock_feature_result(
     store: DuckDBStore,
     ts_code: str,
     reference_date: date,
     *,
     price_lookbacks: tuple[int, ...] = (90, 120, 250),
     accumulation_lookback: int = 20,
-) -> dict[str, float | int | None]:
-    """生成 T 日收盘后已知的价格位置、趋势与首板前吸筹代理特征。"""
+) -> DailyStockFeatureResult:
+    """生成 T 日特征，并保留每个实际价格窗口的复权诊断。"""
     trend_rows = max(max(_MA_ALIGNMENT_WINDOWS), _PRICE_PERCENTILE_LOOKBACK)
     max_rows = max(max(price_lookbacks), accumulation_lookback + 1, trend_rows)
     daily = _query_daily_window(
@@ -264,13 +356,172 @@ def build_daily_stock_features(
         include_reference=True,
     )
     if daily.empty:
-        return {}
-    adjusted = _apply_reference_price_basis(store, ts_code, daily, reference_date)
-    features = _price_position_features(adjusted, price_lookbacks)
-    features.update(_trend_features(adjusted))
-    before_reference = adjusted[adjusted["trade_date"].apply(_as_date) < reference_date]
-    features.update(_accumulation_features(before_reference, accumulation_lookback))
-    return features
+        return DailyStockFeatureResult(
+            ts_code=ts_code,
+            reference_date=reference_date,
+            status="no_data",
+            reason="missing_daily_data",
+            features={},
+            diagnostics={},
+        )
+
+    factor_map = _query_factor_map(
+        store,
+        ts_code,
+        _as_date(daily.iloc[0]["trade_date"]),
+        reference_date,
+    )
+    features: dict[str, float | int | None] = {}
+    diagnostics: dict[str, PriceBasisDiagnostic] = {}
+
+    for lookback in price_lookbacks:
+        window = daily.tail(lookback).copy()
+        basis = _resolve_window_basis(window, factor_map, reference_date)
+        key = f"price_position_{lookback}d"
+        diagnostics[key] = _basis_diagnostic(key, lookback, basis)
+        if basis.available:
+            features.update(
+                _price_position_features(
+                    _apply_price_basis(window, basis),
+                    (lookback,),
+                )
+            )
+        else:
+            features.update(
+                _unavailable_price_position_features(lookback, len(window))
+            )
+
+    ma_window_days = max(_MA_ALIGNMENT_WINDOWS)
+    ma_key = f"ma_alignment_{ma_window_days}d"
+    features["ma_alignment"] = None
+    ma_window = daily.tail(ma_window_days).copy()
+    if len(ma_window) < ma_window_days:
+        diagnostics[ma_key] = _insufficient_history_diagnostic(
+            ma_key,
+            ma_window_days,
+        )
+    else:
+        ma_basis = _resolve_window_basis(ma_window, factor_map, reference_date)
+        diagnostics[ma_key] = _basis_diagnostic(
+            ma_key,
+            ma_window_days,
+            ma_basis,
+        )
+        if ma_basis.available:
+            features["ma_alignment"] = _trend_features(
+                _apply_price_basis(ma_window, ma_basis)
+            )["ma_alignment"]
+
+    percentile_key = f"price_percentile_{_PRICE_PERCENTILE_LOOKBACK}d"
+    features["price_percentile_250d"] = None
+    percentile_window = daily.tail(_PRICE_PERCENTILE_LOOKBACK).copy()
+    if len(percentile_window) < _PRICE_PERCENTILE_LOOKBACK:
+        diagnostics[percentile_key] = _insufficient_history_diagnostic(
+            percentile_key,
+            _PRICE_PERCENTILE_LOOKBACK,
+        )
+    else:
+        percentile_basis = _resolve_window_basis(
+            percentile_window,
+            factor_map,
+            reference_date,
+        )
+        diagnostics[percentile_key] = _basis_diagnostic(
+            percentile_key,
+            _PRICE_PERCENTILE_LOOKBACK,
+            percentile_basis,
+        )
+        if percentile_basis.available:
+            features["price_percentile_250d"] = _trend_features(
+                _apply_price_basis(percentile_window, percentile_basis)
+            )["price_percentile_250d"]
+
+    before_reference = daily[
+        daily["trade_date"].apply(_as_date) < reference_date
+    ].tail(accumulation_lookback).copy()
+    accumulation_key = f"accumulation_obv_{accumulation_lookback}d"
+    scale_invariant_key = f"accumulation_scale_invariant_{accumulation_lookback}d"
+    adjusted_obv_close: pd.Series | None = None
+    if before_reference.empty:
+        diagnostics[accumulation_key] = _insufficient_history_diagnostic(
+            accumulation_key,
+            accumulation_lookback,
+        )
+        diagnostics[scale_invariant_key] = _insufficient_history_diagnostic(
+            scale_invariant_key,
+            accumulation_lookback,
+        )
+    else:
+        diagnostics[scale_invariant_key] = PriceBasisDiagnostic(
+            feature_family=scale_invariant_key,
+            window_days=accumulation_lookback,
+            available=True,
+        )
+        accumulation_basis = _resolve_window_basis(
+            before_reference,
+            factor_map,
+            reference_date,
+        )
+        diagnostics[accumulation_key] = _basis_diagnostic(
+            accumulation_key,
+            accumulation_lookback,
+            accumulation_basis,
+        )
+        if accumulation_basis.available:
+            adjusted_obv_close = _apply_price_basis(
+                before_reference,
+                accumulation_basis,
+            )["close"]
+    features.update(
+        _accumulation_features(
+            before_reference,
+            accumulation_lookback,
+            obv_close=adjusted_obv_close,
+        )
+    )
+
+    has_unavailable_basis = any(
+        diagnostic.basis is not None and not diagnostic.basis.available
+        for diagnostic in diagnostics.values()
+    )
+    has_unavailable_diagnostic = any(
+        not diagnostic.available for diagnostic in diagnostics.values()
+    )
+    if has_unavailable_basis:
+        status = "partial"
+        reason = "price_basis_unavailable"
+    elif has_unavailable_diagnostic:
+        status = "partial"
+        reason = "insufficient_history"
+    else:
+        status = "available"
+        reason = None
+    return DailyStockFeatureResult(
+        ts_code=ts_code,
+        reference_date=reference_date,
+        status=status,
+        reason=reason,
+        features=features,
+        diagnostics=diagnostics,
+    )
+
+
+def build_daily_stock_features(
+    store: DuckDBStore,
+    ts_code: str,
+    reference_date: date,
+    *,
+    price_lookbacks: tuple[int, ...] = (90, 120, 250),
+    accumulation_lookback: int = 20,
+) -> dict[str, float | int | None]:
+    """兼容接口：仅返回数值特征，不把诊断字符串混入下游。"""
+    return build_daily_stock_feature_result(
+        store,
+        ts_code,
+        reference_date,
+        price_lookbacks=price_lookbacks,
+        accumulation_lookback=accumulation_lookback,
+    ).features
 
 
 def build_intraday_relative_volume_features(

@@ -1,10 +1,12 @@
 """load_universe() 单测：用临时 DuckDB 实例塞数据。"""
 
-from datetime import date
+from datetime import UTC, date, datetime, time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
+import rquant.screen.loader as screen_loader
 from rquant.screen.loader import load_universe
 from rquant.screen.rules import (
     AggregateRequest,
@@ -12,12 +14,49 @@ from rquant.screen.rules import (
     no_consec_ups_in_window,
     no_limit_down_in_window,
 )
+from rquant.security_status import SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
+from rquant.trade_calendar import TradeCalendarDay
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _status(
+    ts_code: str,
+    trade_date: date,
+    name: str,
+    is_st: bool,
+    *,
+    available_time: time = time(9, 25),
+    ingested_at: datetime = datetime(2026, 4, 16, tzinfo=UTC),
+) -> SecurityStatusDaily:
+    return SecurityStatusDaily(
+        ts_code=ts_code,
+        trade_date=trade_date,
+        name=name,
+        is_st=is_st,
+        name_source="namechange",
+        st_source="namechange+stock_st",
+        available_at=datetime.combine(trade_date, available_time, SHANGHAI),
+        ingested_at=ingested_at,
+    )
 
 
 @pytest.fixture
 def store(tmp_path) -> DuckDBStore:
     s = DuckDBStore(path=tmp_path / "test.duckdb")
+
+    calendar_dates = [date(2026, 4, day) for day in range(6, 16)]
+    s.upsert_trade_calendar([
+        TradeCalendarDay(
+            exchange="SSE",
+            cal_date=cal_date,
+            is_open=cal_date.weekday() < 5,
+            source="tushare",
+            updated_at=datetime(2026, 4, 16, tzinfo=UTC),
+        )
+        for cal_date in calendar_dates
+    ])
 
     daily = pd.DataFrame([
         # 300001.SZ：3 天数据
@@ -67,7 +106,7 @@ def store(tmp_path) -> DuckDBStore:
 
     state = pd.DataFrame([
         {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 14),
-         "is_st": False, "is_bj": False, "board_type": "gem",
+         "is_st": True, "is_bj": False, "board_type": "gem",
          "limit_pct": 0.20, "limit_up_price": 12.60, "limit_down_price": 8.40,
          "is_limit_up": False, "is_limit_down": False, "is_first_limit_up": False,
          "is_yiziban": False, "consecutive_limit_ups": 0,
@@ -102,6 +141,9 @@ def store(tmp_path) -> DuckDBStore:
 
     # Extra state data for aggregate testing (older dates need daily_bar too)
     extra_daily = pd.DataFrame([
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 6), "open": 7.5,
+         "high": 8.5, "low": 7.0, "close": 8.0, "pre_close": 7.5,
+         "change": 0.5, "pct_chg": 6.67, "vol": 750.0, "amount": 6000.0},
         {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 7), "open": 8.0,
          "high": 9.0, "low": 7.5, "close": 8.5, "pre_close": 8.0,
          "change": 0.5, "pct_chg": 6.25, "vol": 800.0, "amount": 6800.0},
@@ -117,10 +159,31 @@ def store(tmp_path) -> DuckDBStore:
         {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 11), "open": 10.0,
          "high": 11.0, "low": 9.5, "close": 10.5, "pre_close": 10.0,
          "change": 0.5, "pct_chg": 5.0, "vol": 1050.0, "amount": 11025.0},
+        {"ts_code": "000001.SZ", "trade_date": date(2026, 4, 6), "open": 18.0,
+         "high": 18.5, "low": 17.5, "close": 18.2, "pre_close": 18.0,
+         "change": 0.2, "pct_chg": 1.11, "vol": 400.0, "amount": 7280.0},
+        {"ts_code": "000001.SZ", "trade_date": date(2026, 4, 7), "open": 18.2,
+         "high": 18.8, "low": 18.0, "close": 18.5, "pre_close": 18.2,
+         "change": 0.3, "pct_chg": 1.65, "vol": 410.0, "amount": 7585.0},
+        {"ts_code": "000001.SZ", "trade_date": date(2026, 4, 8), "open": 18.5,
+         "high": 19.0, "low": 18.3, "close": 18.8, "pre_close": 18.5,
+         "change": 0.3, "pct_chg": 1.62, "vol": 420.0, "amount": 7896.0},
+        {"ts_code": "000001.SZ", "trade_date": date(2026, 4, 9), "open": 18.8,
+         "high": 19.5, "low": 18.6, "close": 19.2, "pre_close": 18.8,
+         "change": 0.4, "pct_chg": 2.13, "vol": 430.0, "amount": 8256.0},
+        {"ts_code": "000001.SZ", "trade_date": date(2026, 4, 10), "open": 19.2,
+         "high": 20.0, "low": 19.0, "close": 19.7, "pre_close": 19.2,
+         "change": 0.5, "pct_chg": 2.60, "vol": 440.0, "amount": 8668.0},
     ])
     s.upsert_daily(extra_daily)
 
     extra_state = pd.DataFrame([
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 6),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 9.00, "limit_down_price": 6.00,
+         "is_limit_up": False, "is_limit_down": False, "is_first_limit_up": False,
+         "is_yiziban": False, "consecutive_limit_ups": 0,
+         "body_upper": 8.0, "body_lower": 7.5},
         {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 7),
          "is_st": False, "is_bj": False, "board_type": "gem",
          "limit_pct": 0.20, "limit_up_price": 9.60, "limit_down_price": 6.40,
@@ -151,8 +214,55 @@ def store(tmp_path) -> DuckDBStore:
          "is_limit_up": False, "is_limit_down": False, "is_first_limit_up": False,
          "is_yiziban": False, "consecutive_limit_ups": 0,
          "body_upper": 10.5, "body_lower": 10.0},
+        {"ts_code": "300001.SZ", "trade_date": date(2026, 4, 13),
+         "is_st": False, "is_bj": False, "board_type": "gem",
+         "limit_pct": 0.20, "limit_up_price": 12.00, "limit_down_price": 8.00,
+         "is_limit_up": False, "is_limit_down": False, "is_first_limit_up": False,
+         "is_yiziban": False, "consecutive_limit_ups": 0,
+         "body_upper": 10.5, "body_lower": 10.0},
     ])
+    for trade_day in [
+        date(2026, 4, 6), date(2026, 4, 7), date(2026, 4, 8),
+        date(2026, 4, 9), date(2026, 4, 10), date(2026, 4, 13),
+        date(2026, 4, 14),
+    ]:
+        extra_state.loc[len(extra_state)] = {
+            "ts_code": "000001.SZ",
+            "trade_date": trade_day,
+            "is_st": False,
+            "is_bj": False,
+            "board_type": "main",
+            "limit_pct": 0.10,
+            "limit_up_price": 22.0,
+            "limit_down_price": 18.0,
+            "is_limit_up": False,
+            "is_limit_down": False,
+            "is_first_limit_up": False,
+            "is_yiziban": False,
+            "consecutive_limit_ups": 0,
+            "body_upper": 20.0,
+            "body_lower": 19.5,
+        }
     s.upsert_state(extra_state)
+
+    open_dates = [cal_date for cal_date in calendar_dates if cal_date.weekday() < 5]
+    statuses: list[SecurityStatusDaily] = []
+    for trade_day in open_dates:
+        gem_name = {
+            date(2026, 4, 13): "戴帽前",
+            date(2026, 4, 14): "*ST戴帽期",
+            date(2026, 4, 15): "摘帽后",
+        }.get(trade_day, "历史特锐德")
+        statuses.append(
+            _status(
+                "300001.SZ",
+                trade_day,
+                gem_name,
+                trade_day == date(2026, 4, 14),
+            )
+        )
+        statuses.append(_status("000001.SZ", trade_day, "历史平安", False))
+    s.upsert_stock_status(statuses)
 
     yield s
     s.close()
@@ -182,7 +292,7 @@ class TestLoadUniverse:
         assert row["MA20[0]"] == pytest.approx(10.5)
         assert row["IS_FIRST_LIMIT_UP[0]"]
         assert row["board_type"] == "gem"
-        assert row["name"] == "特锐德"
+        assert row["name"] == "摘帽后"
 
     def test_values_at_t1(self, store: DuckDBStore) -> None:
         df = load_universe("2026-04-15", lookback=2, store=store)
@@ -205,6 +315,162 @@ class TestLoadUniverse:
         store.upsert_daily(extra)
         df = load_universe("2026-04-15", lookback=2, store=store)
         assert "900001.SH" not in set(df["ts_code"])
+
+    @pytest.mark.parametrize(
+        ("trade_date", "expected_name", "expected_is_st"),
+        [
+            ("2026-04-13", "戴帽前", False),
+            ("2026-04-14", "*ST戴帽期", True),
+            ("2026-04-15", "摘帽后", False),
+        ],
+    )
+    def test_uses_exact_date_historical_status(
+        self,
+        store: DuckDBStore,
+        trade_date: str,
+        expected_name: str,
+        expected_is_st: bool,
+    ) -> None:
+        df = load_universe(trade_date, lookback=0, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+        assert row["name"] == expected_name
+        assert row["is_st"] == expected_is_st
+        assert str(df["name"].dtype) == "string"
+        assert str(df["is_st"].dtype) == "boolean"
+
+    def test_default_decision_at_is_shanghai_1700(
+        self, store: DuckDBStore
+    ) -> None:
+        store.upsert_stock_status([
+            _status(
+                "300001.SZ",
+                date(2026, 4, 15),
+                "收盘前可见",
+                False,
+                available_time=time(16, 59),
+                ingested_at=datetime(2026, 4, 17, tzinfo=UTC),
+            )
+        ])
+
+        df = load_universe("2026-04-15", lookback=0, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+        assert row["name"] == "收盘前可见"
+        assert not row["is_st"]
+
+    def test_future_visible_status_remains_unknown(
+        self, store: DuckDBStore
+    ) -> None:
+        store.upsert_stock_status([
+            _status(
+                "300001.SZ",
+                date(2026, 4, 15),
+                "未来名称",
+                False,
+                available_time=time(17, 1),
+                ingested_at=datetime(2026, 4, 17, tzinfo=UTC),
+            )
+        ])
+
+        df = load_universe("2026-04-15", lookback=0, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+        assert pd.isna(row["name"])
+        assert pd.isna(row["is_st"])
+        assert pd.isna(row["IS_LIMIT_UP[0]"])
+
+    def test_close_fields_are_unavailable_before_daily_screen_time(
+        self, store: DuckDBStore
+    ) -> None:
+        decision_at = datetime(2026, 4, 15, 9, 24, tzinfo=SHANGHAI)
+
+        with pytest.raises(ValueError, match="at or after.*17:00"):
+            load_universe(
+                "2026-04-15",
+                lookback=0,
+                store=store,
+                decision_at=decision_at,
+            )
+
+    def test_explicit_post_close_replay_time_is_allowed(
+        self, store: DuckDBStore
+    ) -> None:
+        df = load_universe(
+            "2026-04-15",
+            lookback=0,
+            store=store,
+            decision_at=datetime(2026, 4, 15, 18, 30, tzinfo=SHANGHAI),
+        )
+
+        assert "CLOSE[0]" in df.columns
+        assert len(df) == 2
+
+    def test_conflicted_status_remains_unknown(self, store: DuckDBStore) -> None:
+        store.upsert_stock_status([
+            SecurityStatusDaily(
+                ts_code="300001.SZ",
+                trade_date=date(2026, 4, 15),
+                name=None,
+                is_st=None,
+                name_source="conflict",
+                st_source=None,
+                available_at=None,
+                ingested_at=datetime(2026, 4, 17, tzinfo=UTC),
+                conflict_reason="overlapping_namechange_intervals",
+            )
+        ])
+
+        df = load_universe("2026-04-15", lookback=0, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+        assert pd.isna(row["name"])
+        assert pd.isna(row["is_st"])
+        assert pd.isna(row["IS_LIMIT_UP[0]"])
+
+    def test_missing_status_does_not_fallback(self, store: DuckDBStore) -> None:
+        store._conn.execute(
+            "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+            ["300001.SZ", "2026-04-15"],
+        )
+
+        df = load_universe("2026-04-15", lookback=0, store=store)
+        row = df.loc[df["ts_code"] == "300001.SZ"].iloc[0]
+
+        assert pd.isna(row["name"])
+        assert pd.isna(row["is_st"])
+        assert pd.isna(row["IS_LIMIT_UP[0]"])
+
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            ("empty", "missing anchor 2026-04-15"),
+            ("internal_gap", "incomplete.*2026-04-14"),
+            ("closed_anchor", "2026-04-15.*closed"),
+        ],
+    )
+    def test_authoritative_calendar_errors_are_explicit(
+        self,
+        store: DuckDBStore,
+        mutation: str,
+        message: str,
+    ) -> None:
+        if mutation == "empty":
+            store._conn.execute("DELETE FROM trade_calendar")
+        elif mutation == "internal_gap":
+            store._conn.execute(
+                "DELETE FROM trade_calendar WHERE exchange = ? AND cal_date = ?",
+                ["SSE", "2026-04-14"],
+            )
+        else:
+            store._conn.execute(
+                "UPDATE trade_calendar SET is_open = FALSE "
+                "WHERE exchange = ? AND cal_date = ?",
+                ["SSE", "2026-04-15"],
+            )
+
+        with pytest.raises(screen_loader.ScreeningCalendarError, match=message):
+            load_universe("2026-04-15", lookback=2, store=store)
 
 
 class TestLoadUniverseBodyAndBasic:
@@ -354,6 +620,158 @@ class TestLoadUniverseAggregates:
         df = load_universe("2026-04-15", lookback=1, store=store)
         assert "CLOSE[0]" in df.columns
 
+    @pytest.mark.parametrize(
+        "mutation",
+        ["missing_state", "null_source", "missing_status", "missing_calendar"],
+    )
+    def test_negative_aggregate_is_unknown_when_window_fact_is_unknown(
+        self, store: DuckDBStore, mutation: str
+    ) -> None:
+        if mutation == "missing_state":
+            store._conn.execute(
+                "DELETE FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+                ["000001.SZ", "2026-04-09"],
+            )
+        elif mutation == "null_source":
+            store._conn.execute(
+                "UPDATE daily_state SET is_limit_down = NULL "
+                "WHERE ts_code = ? AND trade_date = ?",
+                ["000001.SZ", "2026-04-09"],
+            )
+        elif mutation == "missing_status":
+            store._conn.execute(
+                "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+                ["000001.SZ", "2026-04-09"],
+            )
+        else:
+            store._conn.execute(
+                "DELETE FROM trade_calendar WHERE exchange = ? AND cal_date = ?",
+                ["SSE", "2026-04-12"],
+            )
+        req = AggregateRequest(
+            name="has_limit_down_8d",
+            source_table="daily_state",
+            source_col="is_limit_down",
+            agg_func="any",
+            window=8,
+        )
+
+        df = load_universe(
+            "2026-04-15", lookback=0, store=store, aggregate_requests=[req]
+        )
+        value = df.loc[df["ts_code"] == "000001.SZ", req.name].iloc[0]
+
+        assert pd.isna(value)
+
+    def test_negative_aggregate_is_unknown_for_incomplete_window(
+        self, store: DuckDBStore
+    ) -> None:
+        req = AggregateRequest(
+            name="has_limit_down_9d",
+            source_table="daily_state",
+            source_col="is_limit_down",
+            agg_func="any",
+            window=9,
+        )
+
+        df = load_universe(
+            "2026-04-15", lookback=0, store=store, aggregate_requests=[req]
+        )
+        value = df.loc[df["ts_code"] == "000001.SZ", req.name].iloc[0]
+
+        assert pd.isna(value)
+
+    def test_known_violation_decides_false_amid_unknowns(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute(
+            "DELETE FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+            ["300001.SZ", "2026-04-09"],
+        )
+        rule = no_limit_down_in_window(window=8)
+
+        df = load_universe(
+            "2026-04-15",
+            lookback=0,
+            store=store,
+            aggregate_requests=rule.aggregate_requests,
+        )
+        row_index = df.index[df["ts_code"] == "300001.SZ"][0]
+
+        assert df.loc[row_index, "has_limit_down_8d"]
+        assert not rule(df).loc[row_index]
+
+    def test_known_violation_is_unknown_when_calendar_is_incomplete(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute(
+            "DELETE FROM trade_calendar WHERE exchange = ? AND cal_date = ?",
+            ["SSE", "2026-04-12"],
+        )
+        rule = no_limit_down_in_window(window=8)
+
+        df = load_universe(
+            "2026-04-15",
+            lookback=0,
+            store=store,
+            aggregate_requests=rule.aggregate_requests,
+        )
+        row_index = df.index[df["ts_code"] == "300001.SZ"][0]
+
+        assert pd.isna(df.loc[row_index, "has_limit_down_8d"])
+        assert not rule(df).loc[row_index]
+
+    @pytest.mark.parametrize("mutation", ["missing_state", "missing_calendar"])
+    def test_count_nonzero_requires_an_exact_complete_window(
+        self, store: DuckDBStore, mutation: str
+    ) -> None:
+        if mutation == "missing_state":
+            store._conn.execute(
+                "DELETE FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+                ["300001.SZ", "2026-04-09"],
+            )
+        else:
+            store._conn.execute(
+                "DELETE FROM trade_calendar WHERE exchange = ? AND cal_date = ?",
+                ["SSE", "2026-04-12"],
+            )
+        req = AggregateRequest(
+            name="count_limit_up_8d",
+            source_table="daily_state",
+            source_col="is_limit_up",
+            agg_func="count_nonzero",
+            window=8,
+        )
+
+        df = load_universe(
+            "2026-04-15", lookback=0, store=store, aggregate_requests=[req]
+        )
+        value = df.loc[df["ts_code"] == "300001.SZ", req.name].iloc[0]
+
+        assert pd.isna(value)
+
+    def test_nonviolating_max_is_unknown_when_window_is_incomplete(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute(
+            "DELETE FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+            ["300001.SZ", "2026-04-09"],
+        )
+        req = AggregateRequest(
+            name="max_consec_ups_8d",
+            source_table="daily_state",
+            source_col="consecutive_limit_ups",
+            agg_func="max",
+            window=8,
+        )
+
+        df = load_universe(
+            "2026-04-15", lookback=0, store=store, aggregate_requests=[req]
+        )
+        value = df.loc[df["ts_code"] == "300001.SZ", req.name].iloc[0]
+
+        assert pd.isna(value)
+
 
 class TestWindowRulesIntegration:
     """End-to-end test: rule declares aggregate → loader generates SQL → rule evaluates."""
@@ -413,11 +831,12 @@ class TestLoadUniverseStateResilience:
     ) -> None:
         store._conn.execute("DELETE FROM daily_state")
         df = load_universe("2026-04-15", lookback=1, store=store)
-        # 标量属性列补默认
+        # is_st 独立来自 PIT status；daily_state 缺失只影响派生/板块事实。
         assert "is_st" in df.columns
         assert "is_bj" in df.columns
         assert "board_type" in df.columns
         assert df["is_st"].eq(False).all()
+        assert df["is_bj"].isna().all()
         # STATE offset 列补全（含历史 offset [1]）
         assert "BODY_UPPER[0]" in df.columns
         assert "BODY_UPPER[1]" in df.columns
@@ -438,3 +857,18 @@ class TestLoadUniverseStateResilience:
         )
         # 不抛异常即通过（board_type 全 "" 不在白名单 → 全排除）
         assert result.empty
+
+    def test_missing_historical_daily_bar_keeps_price_offset_columns(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute(
+            "DELETE FROM daily_bar WHERE trade_date = ?",
+            ["2026-04-14"],
+        )
+
+        df = load_universe("2026-04-15", lookback=1, store=store)
+
+        assert "CLOSE[1]" in df.columns
+        assert "VOL[1]" in df.columns
+        assert df["CLOSE[1]"].isna().all()
+        assert df["VOL[1]"].isna().all()

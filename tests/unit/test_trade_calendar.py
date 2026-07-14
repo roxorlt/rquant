@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+import rquant.trade_calendar as trade_calendar
 from rquant.adapter.tushare import TushareAdapter
 from rquant.storage.duckdb import DuckDBStore
 from rquant.trade_calendar import (
@@ -709,3 +710,213 @@ def test_refresh_incomplete_provider_range_writes_zero_rows(
 
     assert gap.value.missing_dates == (date(2026, 1, 5),)
     assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_fetch_trade_calendar_rows_returns_validated_authoritative_days() -> None:
+    adapter = _RefreshAdapter(_provider_calendar())
+
+    rows = trade_calendar.fetch_trade_calendar_rows(
+        adapter,
+        exchange="SSE",
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 5),
+        updated_at=UPDATED_AT,
+    )
+
+    assert [row.cal_date for row in rows] == [date(2026, 1, day) for day in range(1, 6)]
+    assert adapter.calls == [(date(2026, 1, 1), date(2026, 1, 5), "SSE")]
+
+
+def test_fetch_trade_calendar_rows_requires_pretrade_date_column() -> None:
+    provider = _provider_calendar().drop(columns=["pretrade_date"])
+
+    with pytest.raises(ValueError, match="missing columns: pretrade_date"):
+        trade_calendar.fetch_trade_calendar_rows(
+            _RefreshAdapter(provider),
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+
+def test_fetch_trade_calendar_rows_rejects_null_pretrade_date() -> None:
+    provider = _provider_calendar()
+    provider.loc[2, "pretrade_date"] = None
+
+    with pytest.raises(ValueError, match="pretrade_date.*required"):
+        trade_calendar.fetch_trade_calendar_rows(
+            _RefreshAdapter(provider),
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+
+def test_fetch_trade_calendar_rows_rejects_incorrect_pretrade_chain() -> None:
+    provider = _provider_calendar()
+    provider.loc[1, "pretrade_date"] = "20251231"
+
+    with pytest.raises(ValueError, match="pretrade_date chain"):
+        trade_calendar.fetch_trade_calendar_rows(
+            _RefreshAdapter(provider),
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+            updated_at=UPDATED_AT,
+        )
+
+
+class _DropLastCalendarWriteConnection:
+    def __init__(self, connection: object) -> None:
+        self.connection = connection
+
+    def execute(self, query: str, parameters: object | None = None) -> object:
+        if parameters is None:
+            return self.connection.execute(query)  # type: ignore[attr-defined]
+        return self.connection.execute(query, parameters)  # type: ignore[attr-defined]
+
+    def executemany(self, query: str, parameters: object) -> object:
+        rows = list(parameters)  # type: ignore[arg-type]
+        return self.connection.executemany(query, rows[:-1])  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self.connection.close()  # type: ignore[attr-defined]
+
+
+class _FailAfterCalendarWriteConnection(_DropLastCalendarWriteConnection):
+    def __init__(self, connection: object) -> None:
+        super().__init__(connection)
+        self.has_written = False
+
+    def execute(self, query: str, parameters: object | None = None) -> object:
+        if self.has_written and query.lstrip().upper().startswith("SELECT"):
+            raise RuntimeError("verify query failed")
+        return super().execute(query, parameters)
+
+    def executemany(self, query: str, parameters: object) -> object:
+        self.has_written = True
+        return self.connection.executemany(query, parameters)  # type: ignore[attr-defined]
+
+
+def test_persist_verified_trade_calendar_detects_post_write_gap(
+    store: DuckDBStore,
+) -> None:
+    rows = normalize_trade_calendar(_provider_calendar(), updated_at=UPDATED_AT)
+    raw_connection = store._conn
+    store._conn = _DropLastCalendarWriteConnection(raw_connection)  # type: ignore[assignment]
+
+    with pytest.raises(TradeCalendarGapError) as gap:
+        trade_calendar.persist_verified_trade_calendar(
+            store,
+            rows,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+        )
+
+    assert gap.value.missing_dates == (date(2026, 1, 5),)
+    assert raw_connection.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_persist_verified_trade_calendar_rolls_back_verify_exception(
+    store: DuckDBStore,
+) -> None:
+    rows = normalize_trade_calendar(_provider_calendar(), updated_at=UPDATED_AT)
+    raw_connection = store._conn
+    store._conn = _FailAfterCalendarWriteConnection(raw_connection)  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="verify query failed"):
+        trade_calendar.persist_verified_trade_calendar(
+            store,
+            rows,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+        )
+
+    assert raw_connection.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 0
+
+
+def test_persist_verified_trade_calendar_detects_newer_stored_fact_conflict(
+    store: DuckDBStore,
+) -> None:
+    rows = normalize_trade_calendar(_provider_calendar(), updated_at=UPDATED_AT)
+    newer_conflict = _day(
+        date(2026, 1, 3),
+        True,
+        pretrade_date=date(2026, 1, 2),
+        source="newer-local",
+        updated_at=UPDATED_AT + timedelta(hours=1),
+    )
+    store.upsert_trade_calendar([newer_conflict])
+
+    with pytest.raises(ValueError, match="post-write verification mismatch"):
+        trade_calendar.persist_verified_trade_calendar(
+            store,
+            rows,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+        )
+
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 3)) == newer_conflict
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 1
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 1)) is None
+
+
+def test_persist_verified_trade_calendar_keeps_equal_time_conflict_atomic(
+    store: DuckDBStore,
+) -> None:
+    rows = normalize_trade_calendar(_provider_calendar(), updated_at=UPDATED_AT)
+    equal_time_conflict = _day(
+        date(2026, 1, 3),
+        True,
+        pretrade_date=date(2026, 1, 2),
+        source="equal-time-local",
+    )
+    store.upsert_trade_calendar([equal_time_conflict])
+
+    with pytest.raises(TradeCalendarConflictError, match="equal updated_at"):
+        trade_calendar.persist_verified_trade_calendar(
+            store,
+            rows,
+            exchange="SSE",
+            start=date(2026, 1, 1),
+            end=date(2026, 1, 5),
+        )
+
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 1
+    assert store.get_trade_calendar_day("SSE", date(2026, 1, 1)) is None
+
+
+def test_persist_verified_trade_calendar_is_idempotent_and_keeps_outside_rows(
+    store: DuckDBStore,
+) -> None:
+    outside = _day(
+        date(2025, 12, 31),
+        True,
+        pretrade_date=date(2025, 12, 30),
+    )
+    rows = normalize_trade_calendar(_provider_calendar(), updated_at=UPDATED_AT)
+    store.upsert_trade_calendar([outside])
+
+    first = trade_calendar.persist_verified_trade_calendar(
+        store,
+        rows,
+        exchange="SSE",
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 5),
+    )
+    second = trade_calendar.persist_verified_trade_calendar(
+        store,
+        rows,
+        exchange="SSE",
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 5),
+    )
+
+    assert first.upserted_days == second.upserted_days == 5
+    assert store._conn.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0] == 6
+    assert store.get_trade_calendar_day("SSE", date(2025, 12, 31)) == outside

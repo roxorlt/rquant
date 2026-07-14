@@ -1,13 +1,20 @@
 """screen() 端到端测试：复刻用户原始场景。"""
 
-from datetime import date
+from datetime import UTC, date, datetime
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
+from rquant.presets import ScreenPreset
 from rquant.screen import screen
 from rquant.screen.rules import first_limit_up, gt, not_bj, not_limit_up, not_st
+from rquant.security_status import SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
+from rquant.trade_calendar import TradeCalendarDay
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 @pytest.mark.integration
@@ -37,7 +44,18 @@ class TestUserScenario:
             c_today,
             limit_up_yesterday,
         ) in [
-            ("300001.SZ", "特锐德", False, "gem", 10.0, 11.0, 13.0, 11.0, 12.0, True),
+            (
+                "300001.SZ",
+                "当前特锐德",
+                False,
+                "gem",
+                10.0,
+                11.0,
+                13.0,
+                11.0,
+                12.0,
+                True,
+            ),
             (
                 "000001.SZ",
                 "平安银行",
@@ -134,6 +152,42 @@ class TestUserScenario:
         s.upsert_daily(pd.DataFrame(daily_rows))
         s.upsert_stock_basic(pd.DataFrame(basic_rows))
         s.upsert_state(pd.DataFrame(state_rows))
+        s.upsert_trade_calendar([
+            TradeCalendarDay(
+                exchange="SSE",
+                cal_date=trade_day,
+                is_open=True,
+                source="tushare",
+                updated_at=datetime(2026, 4, 16, tzinfo=UTC),
+            )
+            for trade_day in (date(2026, 4, 14), date(2026, 4, 15))
+        ])
+        historical_names = {
+            "300001.SZ": "历史特锐德",
+            "000001.SZ": "历史平安银行",
+            "833001.BJ": "历史北交所",
+        }
+        s.upsert_stock_status([
+            SecurityStatusDaily(
+                ts_code=code,
+                trade_date=trade_day,
+                name=historical_names[code],
+                is_st=False,
+                name_source="namechange",
+                st_source="namechange+stock_st",
+                available_at=datetime(
+                    trade_day.year,
+                    trade_day.month,
+                    trade_day.day,
+                    9,
+                    25,
+                    tzinfo=SHANGHAI,
+                ),
+                ingested_at=datetime(2026, 4, 16, tzinfo=UTC),
+            )
+            for code in historical_names
+            for trade_day in (date(2026, 4, 14), date(2026, 4, 15))
+        ])
         yield s
         s.close()
 
@@ -150,4 +204,36 @@ class TestUserScenario:
             store=store,
         )
         assert list(result["ts_code"]) == ["300001.SZ"]
-        assert result.loc[0, "name"] == "特锐德"
+        assert result.loc[0, "name"] == "历史特锐德"
+
+    def test_daily_pipeline_persists_historical_status_name(
+        self, store: DuckDBStore
+    ) -> None:
+        from rquant.pipeline import run_daily_pipeline
+
+        preset = ScreenPreset(
+            name="pit-name",
+            description="test",
+            rules=[
+                not_st(),
+                not_bj(),
+                first_limit_up(offset=1),
+                not_limit_up(offset=0),
+                gt("HIGH[0]", "CLOSE[1]"),
+            ],
+        )
+        with (
+            patch("rquant.pipeline.PRESET_SCREENS", {"pit-name": preset}),
+            patch("rquant.pipeline._sync_pool2_watch"),
+            patch("rquant.pipeline._push_daily_summary"),
+            patch("rquant.monitor.check_exits"),
+        ):
+            summary = run_daily_pipeline(
+                "2026-04-15",
+                store=store,
+                minute_backfill=False,
+            )
+
+        assert summary == {"pit-name": 1}
+        stored = store.query_screen_result("2026-04-15", "pit-name")
+        assert stored.loc[0, "name"] == "历史特锐德"

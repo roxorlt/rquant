@@ -9,12 +9,16 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
+from typing import Literal
 
+import duckdb
 import pandas as pd
 from loguru import logger
 
-from rquant.storage.duckdb import DuckDBStore
+from rquant.data_metadata import DataQualityIssue, stable_sha256, utc_now
+from rquant.storage.duckdb import DuckDBStore, _duckdb_transaction_is_active
 
 # akshare stock_zt_pool_em 中文列 → limit_up_pool_daily 列
 _COLUMN_MAP: dict[str, str] = {
@@ -36,6 +40,102 @@ _COLUMN_MAP: dict[str, str] = {
 
 _INT_COLUMNS = ("break_count", "consecutive_boards")
 _SEAL_TIME_COLUMNS = ("first_seal_time", "last_seal_time")
+_CALENDAR_EXCHANGE = "SSE"
+_DATASET_ID = "limit_up_pool_daily"
+_RULE_CLOSED_DAY = "limit_up_pool.closed_day_capture"
+_RULE_CALENDAR_UNKNOWN = "limit_up_pool.calendar_unknown"
+_RULE_CALENDAR_CHANGED = "limit_up_pool.calendar_changed_during_capture"
+_RULE_BUSINESS_WRITE = "limit_up_pool.concurrent_business_write"
+
+
+class LimitUpPoolCaptureError(RuntimeError):
+    """Base class for a capture that must return a non-zero CLI status."""
+
+
+class LimitUpPoolCalendarGuardError(LimitUpPoolCaptureError):
+    """Authoritative calendar cannot prove that this capture may write."""
+
+    trade_date: date
+    stage: Literal["pre_fetch", "pre_write"]
+
+    def __init__(
+        self,
+        trade_date: date,
+        *,
+        stage: Literal["pre_fetch", "pre_write"],
+        detail: str,
+    ) -> None:
+        self.trade_date = trade_date
+        self.stage = stage
+        super().__init__(detail)
+
+
+class LimitUpPoolWriteConflictError(LimitUpPoolCaptureError):
+    trade_date: date
+
+    def __init__(self, trade_date: date) -> None:
+        self.trade_date = trade_date
+        super().__init__(
+            "limit-up-pool concurrent business write blocked capture: "
+            f"{trade_date.isoformat()}"
+        )
+
+
+def _record_data_quality_issue(
+    store: DuckDBStore,
+    issue: DataQualityIssue,
+) -> None:
+    if not _duckdb_transaction_is_active(store._conn):  # noqa: SLF001
+        store.record_data_quality_issue(issue)
+        return
+
+    existing = store.get_data_quality_issue(issue.issue_id)
+    if existing is not None and (
+        existing.rule_id,
+        existing.dataset_id,
+        existing.scope_key,
+    ) != (issue.rule_id, issue.dataset_id, issue.scope_key):
+        raise ValueError(f"data quality issue id conflict: {issue.issue_id}")
+    if existing is not None:
+        effective_time = existing.resolved_at or existing.last_seen_at
+        if issue.last_seen_at <= effective_time:
+            return
+        store._conn.execute(  # noqa: SLF001
+            """
+            UPDATE data_quality_issue
+            SET severity = ?, status = 'open', message = ?,
+                evidence = CAST(? AS JSON), last_seen_at = ?,
+                resolved_at = NULL
+            WHERE issue_id = ?
+            """,
+            [
+                issue.severity,
+                issue.message,
+                json.dumps(issue.evidence, sort_keys=True),
+                issue.last_seen_at,
+                issue.issue_id,
+            ],
+        )
+        return
+    store._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO data_quality_issue
+        (issue_id, rule_id, dataset_id, severity, status, scope_key,
+         message, evidence, first_seen_at, last_seen_at, resolved_at)
+        VALUES (?, ?, ?, ?, 'open', ?, ?, CAST(? AS JSON), ?, ?, NULL)
+        """,
+        [
+            issue.issue_id,
+            issue.rule_id,
+            issue.dataset_id,
+            issue.severity,
+            issue.scope_key,
+            issue.message,
+            json.dumps(issue.evidence, sort_keys=True),
+            issue.first_seen_at,
+            issue.last_seen_at,
+        ],
+    )
 
 
 def to_ts_code(symbol: str) -> str | None:
@@ -107,16 +207,308 @@ def _fetch_zt_pool(ds: str) -> pd.DataFrame:
     return ak.stock_zt_pool_em(date=ds)
 
 
+def _record_calendar_issue(
+    store: DuckDBStore,
+    trading_date: date,
+    *,
+    stage: Literal["pre_fetch", "pre_write"],
+    state: Literal["closed", "unknown", "concurrent_change"],
+) -> None:
+    if stage == "pre_fetch" and state == "closed":
+        rule_id = _RULE_CLOSED_DAY
+        severity: Literal["P0", "P1"] = "P1"
+        message = "limit-up-pool capture was scheduled for a known closed day"
+    elif state == "unknown":
+        rule_id = _RULE_CALENDAR_UNKNOWN
+        severity = "P0"
+        message = "limit-up-pool capture blocked because calendar is unknown"
+    else:
+        rule_id = _RULE_CALENDAR_CHANGED
+        severity = "P0"
+        message = "limit-up-pool calendar changed before the final write"
+    _record_data_quality_issue(
+        store,
+        DataQualityIssue.detected(
+            rule_id=rule_id,
+            dataset_id=_DATASET_ID,
+            severity=severity,
+            scope_key=trading_date.isoformat(),
+            message=message,
+            evidence={
+                "exchange": _CALENDAR_EXCHANGE,
+                "trade_date": trading_date.isoformat(),
+                "stage": stage,
+                "calendar_state": state,
+            },
+        ),
+    )
+
+
+def _record_business_write_issue(
+    store: DuckDBStore,
+    trading_date: date,
+) -> None:
+    _record_data_quality_issue(
+        store,
+        DataQualityIssue.detected(
+            rule_id=_RULE_BUSINESS_WRITE,
+            dataset_id=_DATASET_ID,
+            severity="P0",
+            scope_key=trading_date.isoformat(),
+            message="concurrent limit-up-pool business write blocked capture",
+            evidence={
+                "trade_date": trading_date.isoformat(),
+                "stage": "pre_write",
+            },
+        ),
+    )
+
+
+def _record_conflict_issue(
+    store: DuckDBStore,
+    trading_date: date,
+    *,
+    conflict_domain: Literal["calendar", "business_write"],
+    use_fresh_connection: bool,
+) -> None:
+    issue_store = DuckDBStore(store.path) if use_fresh_connection else None
+    target = issue_store or store
+    try:
+        if conflict_domain == "calendar":
+            _record_calendar_issue(
+                target,
+                trading_date,
+                stage="pre_write",
+                state="concurrent_change",
+            )
+        else:
+            _record_business_write_issue(target, trading_date)
+    finally:
+        if issue_store is not None:
+            issue_store.close()
+
+
+def _resolve_open_issues(
+    store: DuckDBStore,
+    trading_date: date,
+    rule_ids: tuple[str, ...],
+) -> None:
+    for rule_id in rule_ids:
+        issue_id = stable_sha256(
+            "data_quality_issue",
+            {
+                "rule_id": rule_id,
+                "dataset_id": _DATASET_ID,
+                "scope_key": trading_date.isoformat(),
+            },
+        )
+        existing = store.get_data_quality_issue(issue_id)
+        if existing is not None and existing.status == "open":
+            if not _duckdb_transaction_is_active(store._conn):  # noqa: SLF001
+                store.resolve_data_quality_issue(issue_id)
+                continue
+            resolved_at = utc_now()
+            if resolved_at < existing.last_seen_at:
+                raise ValueError(
+                    "data quality issue resolved_at cannot be earlier than "
+                    f"last_seen_at: {issue_id}"
+                )
+            updated = store._conn.execute(  # noqa: SLF001
+                """
+                UPDATE data_quality_issue
+                SET status = 'resolved', resolved_at = ?
+                WHERE issue_id = ? AND status = 'open'
+                RETURNING issue_id
+                """,
+                [resolved_at, issue_id],
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError(
+                    f"data quality issue resolution lost concurrent update: {issue_id}"
+                )
+
+
+def _allow_remote_fetch(store: DuckDBStore, trading_date: date) -> bool:
+    calendar_day = store.get_trade_calendar_day(_CALENDAR_EXCHANGE, trading_date)
+    if calendar_day is None:
+        _record_calendar_issue(
+            store,
+            trading_date,
+            stage="pre_fetch",
+            state="unknown",
+        )
+        raise LimitUpPoolCalendarGuardError(
+            trading_date,
+            stage="pre_fetch",
+            detail=(
+                "limit-up-pool calendar unknown before fetch: "
+                f"{trading_date.isoformat()}"
+            ),
+        )
+    if not calendar_day.is_open:
+        _record_calendar_issue(
+            store,
+            trading_date,
+            stage="pre_fetch",
+            state="closed",
+        )
+        logger.warning(
+            "涨停池拒绝休市日采集: "
+            f"date={trading_date.isoformat()} exchange={_CALENDAR_EXCHANGE}"
+        )
+        return False
+    _resolve_open_issues(
+        store,
+        trading_date,
+        (_RULE_CLOSED_DAY, _RULE_CALENDAR_UNKNOWN),
+    )
+    return True
+
+
+def _write_with_final_calendar_check(
+    store: DuckDBStore,
+    df: pd.DataFrame,
+    trading_date: date,
+) -> int:
+    owns_transaction = not _duckdb_transaction_is_active(  # noqa: SLF001
+        store._conn  # noqa: SLF001
+    )
+    transaction_open = False
+    blocked_state: Literal["closed", "unknown"] | None = None
+    conflict_domain: Literal["calendar", "business_write"] = "calendar"
+    rows: int
+    try:
+        if owns_transaction:
+            store._conn.execute("BEGIN")  # noqa: SLF001
+            transaction_open = True
+        # DuckDB optimizes `SET is_open = is_open` away. Two real writes restore
+        # the fact before reading it while fencing same-row calendar corrections.
+        store._conn.execute(  # noqa: SLF001
+            """
+            UPDATE trade_calendar
+            SET is_open = NOT is_open
+            WHERE exchange = ? AND cal_date = ?
+            """,
+            [_CALENDAR_EXCHANGE, trading_date],
+        )
+        store._conn.execute(  # noqa: SLF001
+            """
+            UPDATE trade_calendar
+            SET is_open = NOT is_open
+            WHERE exchange = ? AND cal_date = ?
+            """,
+            [_CALENDAR_EXCHANGE, trading_date],
+        )
+        calendar_day = store.get_trade_calendar_day(
+            _CALENDAR_EXCHANGE,
+            trading_date,
+        )
+        if calendar_day is None:
+            blocked_state = "unknown"
+        elif not calendar_day.is_open:
+            blocked_state = "closed"
+        if blocked_state is not None:
+            if owns_transaction:
+                store._conn.execute("ROLLBACK")  # noqa: SLF001
+                transaction_open = False
+            _record_calendar_issue(
+                store,
+                trading_date,
+                stage="pre_write",
+                state=blocked_state,
+            )
+            raise LimitUpPoolCalendarGuardError(
+                trading_date,
+                stage="pre_write",
+                detail=(
+                    "limit-up-pool calendar changed before write: "
+                    f"{trading_date.isoformat()} state={blocked_state}"
+                ),
+            )
+        conflict_domain = "business_write"
+        rows = store.upsert_limit_up_pool(df, transaction_mode="existing")
+        if owns_transaction:
+            store._conn.execute("COMMIT")  # noqa: SLF001
+            transaction_open = False
+    except duckdb.TransactionException as original_error:
+        if transaction_open:
+            try:
+                store._conn.execute("ROLLBACK")  # noqa: SLF001
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "calendar fence failed and rollback failed",
+                    [original_error, rollback_error],
+                ) from None
+            transaction_open = False
+        try:
+            _record_conflict_issue(
+                store,
+                trading_date,
+                conflict_domain=conflict_domain,
+                use_fresh_connection=not owns_transaction,
+            )
+        except BaseException as issue_error:
+            original_error.add_note(
+                "failed to persist the capture conflict quality issue: "
+                f"{type(issue_error).__name__}: {issue_error}"
+            )
+            logger.exception(
+                "涨停池冲突已阻断，但 P0 质量问题落库失败: "
+                f"date={trading_date.isoformat()} domain={conflict_domain}"
+            )
+        if conflict_domain == "business_write":
+            raise LimitUpPoolWriteConflictError(trading_date) from original_error
+        raise LimitUpPoolCalendarGuardError(
+            trading_date,
+            stage="pre_write",
+            detail=(
+                "limit-up-pool concurrent write blocked final calendar check: "
+                f"{trading_date.isoformat()}"
+            ),
+        ) from original_error
+    except BaseException as original_error:
+        if transaction_open:
+            try:
+                store._conn.execute("ROLLBACK")  # noqa: SLF001
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "limit-up-pool write failed and rollback failed",
+                    [original_error, rollback_error],
+                ) from None
+        raise
+    try:
+        _resolve_open_issues(
+            store,
+            trading_date,
+            (_RULE_CALENDAR_CHANGED, _RULE_BUSINESS_WRITE),
+        )
+    except Exception as exc:
+        logger.warning(
+            "涨停池已写入，但旧质量问题暂未关闭，后续重跑会重试: "
+            f"date={trading_date.isoformat()} err={exc}"
+        )
+    return rows
+
+
 def capture_zt_pool(
     trade_date: date | None = None, store: DuckDBStore | None = None
 ) -> int:
     """抓当日涨停池并落库，返回写入行数。
 
-    东财源失败 / 空返回 / 列名变更都不炸（warning + return 0）：日终链路
-    容忍缺采，缺一天就少一天样本，不值得触发运维告警。
+    权威日历明确休市时记录 P1 并跳过；日历未知或抓取期间发生变化时
+    记录 P0 并抛出 ``LimitUpPoolCalendarGuardError``。东财源失败、空返回和
+    列名变更仍保持原有的 warning + return 0 兼容行为。
     """
     trading_date = trade_date or date.today()
     ds = trading_date.strftime("%Y%m%d")
+
+    owns_store = store is None
+    if owns_store:
+        with DuckDBStore() as calendar_store:
+            if not _allow_remote_fetch(calendar_store, trading_date):
+                return 0
+    elif not _allow_remote_fetch(store, trading_date):
+        return 0
 
     try:
         raw = _fetch_zt_pool(ds)
@@ -138,12 +530,14 @@ def capture_zt_pool(
         logger.warning(f"涨停池归一化后为空: date={ds}")
         return 0
 
-    owns_store = store is None
-    store = store or DuckDBStore()
-    try:
-        rows = store.upsert_limit_up_pool(df)
-    finally:
-        if owns_store:
-            store.close()
+    if owns_store:
+        with DuckDBStore() as write_store:
+            rows = _write_with_final_calendar_check(
+                write_store,
+                df,
+                trading_date,
+            )
+    else:
+        rows = _write_with_final_calendar_check(store, df, trading_date)
     logger.info(f"limit_up_pool_daily 写入 {rows} 行: date={ds}")
     return rows

@@ -37,6 +37,7 @@ from rquant.dashboard.strategy_lab_data import (
     load_tushare_activity_packages,
     load_tushare_interface_catalog,
     load_tushare_purchase_goods,
+    query_growth_board_candidates,
     safe_replay_end_date,
 )
 from rquant.dashboard.strategy_lab_runs import (
@@ -389,7 +390,13 @@ def auction_gap_minute_cached(
         max_hold_days=max_hold_days,
     )
     with open_readonly_store(
-        required_tables=["auction_bar", "daily_bar", "daily_state", "minute_bar"]
+        required_tables=[
+            "auction_bar",
+            "daily_bar",
+            "daily_state",
+            "minute_bar",
+            "stock_status_daily",
+        ]
     ) as store:
         baseline = run_auction_gap_replay(store, config.auction_config())
         minute_trades = run_auction_gap_minute_replay(store, config)
@@ -427,7 +434,7 @@ def growth_board_surge_cached(
         use_accel_surge=use_accel_surge,
     )
     with open_readonly_store(
-        required_tables=["daily_bar", "daily_state", "stock_basic", "minute_bar"]
+        required_tables=["daily_bar", "daily_state", "minute_bar", "stock_status_daily"]
     ) as store:
         trades = run_growth_board_surge_replay(
             store,
@@ -505,29 +512,15 @@ def growth_board_candidate_count_cached(
     start_date: str,
     end_date: str,
 ) -> int:
-    df = query_duckdb(
-        """
-        SELECT COUNT(*) AS candidates
-        FROM daily_bar db
-        LEFT JOIN stock_basic sb ON db.ts_code = sb.ts_code
-        LEFT JOIN daily_state ds
-          ON db.ts_code = ds.ts_code AND db.trade_date = ds.trade_date
-        WHERE db.trade_date >= ?
-          AND db.trade_date <= ?
-          AND (
-              db.ts_code LIKE '300%.SZ'
-              OR db.ts_code LIKE '301%.SZ'
-              OR db.ts_code LIKE '688%.SH'
-          )
-          AND COALESCE(ds.is_st, FALSE) = FALSE
-          AND lower(COALESCE(sb.name, '')) NOT LIKE '%st%'
-          AND db.pre_close > 0
-        """,
-        (date.fromisoformat(start_date), date.fromisoformat(end_date)),
-    )
-    if df is None or df.empty:
-        return 0
-    return int(df.iloc[0]["candidates"])
+    with open_readonly_store(
+        required_tables=["daily_bar", "stock_status_daily"]
+    ) as store:
+        candidates = query_growth_board_candidates(
+            store._conn,
+            start_date=date.fromisoformat(start_date),
+            end_date=date.fromisoformat(end_date),
+        )
+    return len(candidates)
 
 
 @st.cache_data(ttl=300)

@@ -1,5 +1,6 @@
 """ScreenPlan → screen() 端到端测试（不调 LLM）。"""
 
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -69,10 +70,20 @@ class TestScreenWithPlanDiagnostic:
         from rquant.llm.dispatch import screen_with_plan_diagnostic
         from rquant.llm.schemas import ScreenPlan
         from rquant.storage.duckdb import DuckDBStore
+        from rquant.trade_calendar import TradeCalendarDay
 
         plan = ScreenPlan(trade_date="2026-04-30", stages=[])
         store = DuckDBStore(tmp_path / "dispatch.duckdb")
         try:
+            store.upsert_trade_calendar([
+                TradeCalendarDay(
+                    exchange="SSE",
+                    cal_date=date(2026, 4, 30),
+                    is_open=True,
+                    source="test",
+                    updated_at=datetime(2026, 5, 1, tzinfo=UTC),
+                )
+            ])
             df, diag = screen_with_plan_diagnostic(plan, store=store)
         finally:
             store.close()

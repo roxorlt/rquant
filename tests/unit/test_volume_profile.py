@@ -34,6 +34,14 @@ def _seed_profile_data(store: DuckDBStore) -> None:
         }
         for day in [1, 2, 3, 4]
     ]))
+    store.upsert_adj_factor(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_date": date(2026, 6, day),
+            "adj_factor": 1.0,
+        }
+        for day in [1, 2, 3, 4]
+    ]))
     store.upsert_minute_bars(pd.DataFrame([
         {
             "ts_code": "600000.SH",
@@ -90,6 +98,8 @@ def test_calculate_volume_profile_uses_previous_trading_days(
 
     assert profile is not None
     assert profile.rows_count == 3
+    assert profile.weight_basis == "adjusted_share_volume"
+    assert profile.total_vol == 450.0
     assert profile.total_amount == 4750.0
     assert profile.vwap == pytest.approx(4750.0 / 450.0)
     assert profile.poc_price == 11.0
@@ -253,6 +263,8 @@ def test_build_volume_profile_risk_plan_rejects_close_overhead_supply() -> None:
         concentration_top5_pct=60,
         below_reference_amount_pct=55,
         above_reference_amount_pct=45,
+        below_reference_volume_pct=55,
+        above_reference_volume_pct=45,
     )
 
     plan = build_volume_profile_risk_plan(
@@ -263,3 +275,83 @@ def test_build_volume_profile_risk_plan_rejects_close_overhead_supply() -> None:
 
     assert plan.entry_allowed is False
     assert plan.reject_reason == "overhead_resistance_too_close"
+
+
+def _sample_volume_profile():
+    from rquant.volume_profile import VolumeProfile
+
+    return VolumeProfile(
+        ts_code="600000.SH",
+        reference_date=date(2026, 6, 24),
+        lookback_days=30,
+        start_date=date(2026, 5, 1),
+        end_date=date(2026, 6, 23),
+        rows_count=100,
+        total_vol=1000.0,
+        total_amount=10000.0,
+        vwap=10.0,
+        poc_price=9.8,
+        value_area_low=9.5,
+        value_area_high=10.5,
+        concentration_top5_pct=60.0,
+        below_reference_amount_pct=55.0,
+        above_reference_amount_pct=45.0,
+        below_reference_volume_pct=65.0,
+        above_reference_volume_pct=35.0,
+    )
+
+
+@pytest.mark.parametrize("ratio", [0.5, 2.0])
+def test_scale_volume_profile_scales_price_and_share_basis_inversely(
+    ratio: float,
+) -> None:
+    from rquant.volume_profile import scale_volume_profile
+
+    profile = _sample_volume_profile()
+    target_date = date(2026, 6, 25)
+
+    scaled = scale_volume_profile(
+        profile,
+        ratio,
+        target_reference_date=target_date,
+    )
+
+    assert scaled.reference_date == target_date
+    assert scaled.vwap == pytest.approx(profile.vwap * ratio)
+    assert scaled.poc_price == pytest.approx(profile.poc_price * ratio)
+    assert scaled.value_area_low == pytest.approx(profile.value_area_low * ratio)
+    assert scaled.value_area_high == pytest.approx(profile.value_area_high * ratio)
+    assert scaled.total_vol == pytest.approx(profile.total_vol / ratio)
+    assert scaled.vwap * scaled.total_vol == pytest.approx(
+        profile.vwap * profile.total_vol
+    )
+    assert scaled.total_amount == profile.total_amount
+    assert scaled.concentration_top5_pct == profile.concentration_top5_pct
+    assert scaled.below_reference_amount_pct == profile.below_reference_amount_pct
+    assert scaled.above_reference_amount_pct == profile.above_reference_amount_pct
+    assert scaled.below_reference_volume_pct == profile.below_reference_volume_pct
+    assert scaled.above_reference_volume_pct == profile.above_reference_volume_pct
+
+
+def test_scale_volume_profile_ratio_one_can_update_reference_date() -> None:
+    from rquant.volume_profile import scale_volume_profile
+
+    profile = _sample_volume_profile()
+
+    scaled = scale_volume_profile(
+        profile,
+        1.0,
+        target_reference_date=date(2026, 6, 25),
+    )
+
+    assert scaled.reference_date == date(2026, 6, 25)
+    assert scaled.total_vol == profile.total_vol
+    assert scaled.vwap == profile.vwap
+
+
+@pytest.mark.parametrize("ratio", [0.0, -0.5])
+def test_scale_volume_profile_rejects_non_positive_ratio(ratio: float) -> None:
+    from rquant.volume_profile import scale_volume_profile
+
+    with pytest.raises(ValueError, match="ratio"):
+        scale_volume_profile(_sample_volume_profile(), ratio)

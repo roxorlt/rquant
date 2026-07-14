@@ -9,12 +9,12 @@ from collections.abc import Sequence
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 
 import duckdb
 import pandas as pd
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from rquant.config import settings
 from rquant.data_metadata import (
@@ -26,6 +26,16 @@ from rquant.data_metadata import (
     normalize_utc_datetime,
     utc_now,
 )
+from rquant.price_adjustment import resolve_price_factor_basis
+from rquant.security_status import (
+    DailySecurityKey,
+    SecurityStatusConcurrentWriteError,
+    SecurityStatusCoverage,
+    SecurityStatusDaily,
+    SecurityStatusEligibilityChangedError,
+    SecurityStatusWriteConflictError,
+    deduplicate_security_status_rows,
+)
 from rquant.storage.migrations import initialize_schema
 from rquant.trade_calendar import (
     TradeCalendarConflictError,
@@ -35,7 +45,50 @@ from rquant.trade_calendar import (
     trade_calendar_business_facts,
 )
 
+_INVALID_STOCK_STATUS_PREDICATE = """
+(
+    status.name_source IS NULL
+    OR length(trim(status.name_source)) = 0
+    OR (status.name IS NOT NULL AND length(trim(status.name)) = 0)
+    OR (status.st_source IS NOT NULL AND length(trim(status.st_source)) = 0)
+    OR (
+        status.conflict_reason IS NOT NULL
+        AND (status.name IS NOT NULL OR status.is_st IS NOT NULL)
+    )
+    OR (
+        status.is_st IS NOT NULL
+        AND (
+            status.name IS NULL
+            OR status.available_at IS NULL
+            OR lower(trim(status.name_source)) IN ('unknown', 'conflict')
+            OR status.st_source IS NULL
+            OR lower(trim(status.st_source)) IN ('unknown', 'conflict')
+        )
+    )
+)
+"""
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
+_SECURITY_STATUS_ROWS_ADAPTER = TypeAdapter(list[SecurityStatusDaily])
+
+
+def _is_retryable_stock_status_upsert_error(error: BaseException) -> bool:
+    if not isinstance(error, duckdb.Error):
+        return False
+    message = str(error).lower()
+    duplicate_or_unique = any(
+        marker in message
+        for marker in (
+            "duplicate key",
+            "primary key constraint",
+            "unique constraint",
+        )
+    )
+    transaction_conflict = (
+        isinstance(error, duckdb.TransactionException)
+        and "conflict" in message
+    )
+    return duplicate_or_unique or transaction_conflict
 
 
 def _revalidate_for_write(model: ModelT) -> ModelT:
@@ -56,6 +109,58 @@ def _revalidate_for_write(model: ModelT) -> ModelT:
         raise ValueError(
             f"{type(model).__name__} failed write-boundary validation: {exc}"
         ) from exc
+
+
+def _validate_security_status_rows(
+    rows: Sequence[SecurityStatusDaily],
+) -> list[SecurityStatusDaily]:
+    try:
+        return _SECURITY_STATUS_ROWS_ADAPTER.validate_python(list(rows))
+    except ValueError as exc:
+        raise ValueError(
+            f"SecurityStatusDaily failed write-boundary validation: {exc}"
+        ) from exc
+
+
+def _duckdb_transaction_is_active(
+    conn: duckdb.DuckDBPyConnection,
+) -> bool:
+    # Autocommit assigns a fresh id per statement; an explicit transaction reuses it.
+    first = conn.execute("SELECT current_transaction_id()").fetchone()
+    second = conn.execute("SELECT current_transaction_id()").fetchone()
+    if first is None or second is None:
+        raise RuntimeError("cannot inspect DuckDB transaction state")
+    return first[0] == second[0]
+
+
+def _security_status_frame(rows: Sequence[SecurityStatusDaily]) -> pd.DataFrame:
+    return pd.DataFrame.from_records(
+        (
+            {
+                "ts_code": row.ts_code,
+                "trade_date": row.trade_date,
+                "name": row.name,
+                "is_st": row.is_st,
+                "name_source": row.name_source,
+                "st_source": row.st_source,
+                "available_at": row.available_at,
+                "ingested_at": row.ingested_at,
+                "conflict_reason": row.conflict_reason,
+            }
+            for row in rows
+        ),
+        columns=(
+            "ts_code",
+            "trade_date",
+            "name",
+            "is_st",
+            "name_source",
+            "st_source",
+            "available_at",
+            "ingested_at",
+            "conflict_reason",
+        ),
+    )
 
 
 def _utc_datetime_from_db(value: object) -> datetime:
@@ -192,6 +297,22 @@ def _trade_calendar_from_row(row: tuple[object, ...]) -> TradeCalendarDay:
     )
 
 
+def _security_status_from_row(row: tuple[object, ...]) -> SecurityStatusDaily:
+    return SecurityStatusDaily(
+        ts_code=str(row[0]),
+        trade_date=cast(date, row[1]),
+        name=None if row[2] is None else str(row[2]),
+        is_st=cast(bool | None, row[3]),
+        name_source=str(row[4]),
+        st_source=None if row[5] is None else str(row[5]),
+        available_at=(
+            None if row[6] is None else _utc_datetime_from_db(row[6])
+        ),
+        ingested_at=_utc_datetime_from_db(row[7]),
+        conflict_reason=None if row[8] is None else str(row[8]),
+    )
+
+
 class DuckDBStore:
     def __init__(self, path: Path | None = None, *, read_only: bool = False) -> None:
         self.path = path or settings.duckdb_path
@@ -201,6 +322,450 @@ class DuckDBStore:
 
     def _init_schema(self) -> None:
         initialize_schema(self._conn)
+
+    def list_daily_security_keys(
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
+    ) -> list[DailySecurityKey]:
+        if start > end:
+            raise ValueError("daily security key start must not be after end")
+        code_scope = tuple(sorted(set(ts_codes or ())))
+        if ts_codes is not None and not code_scope:
+            return []
+        code_predicate = "AND ts_code = ANY(?)" if code_scope else ""
+        parameters: list[object] = [start, end]
+        if code_scope:
+            parameters.append(list(code_scope))
+        rows = self._conn.execute(
+            f"""
+            SELECT ts_code, trade_date
+            FROM daily_bar
+            WHERE trade_date BETWEEN ? AND ?
+              {code_predicate}
+            ORDER BY ts_code, trade_date
+            """,
+            parameters,
+        ).fetchall()
+        return [
+            DailySecurityKey(ts_code=str(ts_code), trade_date=cast(date, trade_date))
+            for ts_code, trade_date in rows
+        ]
+
+    def list_daily_security_dates(
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
+    ) -> list[date]:
+        if start > end:
+            raise ValueError("daily security date start must not be after end")
+        code_scope = tuple(sorted(set(ts_codes or ())))
+        if ts_codes is not None and not code_scope:
+            return []
+        code_predicate = "AND ts_code = ANY(?)" if code_scope else ""
+        parameters: list[object] = [start, end]
+        if code_scope:
+            parameters.append(list(code_scope))
+        rows = self._conn.execute(
+            f"""
+            SELECT DISTINCT trade_date
+            FROM daily_bar
+            WHERE trade_date BETWEEN ? AND ?
+              {code_predicate}
+            ORDER BY trade_date
+            """,
+            parameters,
+        ).fetchall()
+        return [cast(date, row[0]) for row in rows]
+
+    def list_incomplete_stock_status_dates(
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_codes: Sequence[str] | None = None,
+    ) -> list[date]:
+        if start > end:
+            raise ValueError("stock status date start must not be after end")
+        code_scope = tuple(sorted(set(ts_codes or ())))
+        if ts_codes is not None and not code_scope:
+            return []
+        code_predicate = "AND daily.ts_code = ANY(?)" if code_scope else ""
+        parameters: list[object] = [start, end]
+        if code_scope:
+            parameters.append(list(code_scope))
+        rows = self._conn.execute(
+            f"""
+            SELECT DISTINCT daily.trade_date
+            FROM daily_bar AS daily
+            LEFT JOIN stock_status_daily AS status USING (ts_code, trade_date)
+            WHERE daily.trade_date BETWEEN ? AND ?
+              {code_predicate}
+              AND (
+                  status.ts_code IS NULL
+                  OR status.is_st IS NULL
+                  OR {_INVALID_STOCK_STATUS_PREDICATE}
+              )
+            ORDER BY daily.trade_date
+            """,
+            parameters,
+        ).fetchall()
+        return [cast(date, row[0]) for row in rows]
+
+    def list_incomplete_stock_status_keys(
+        self, keys: Sequence[DailySecurityKey]
+    ) -> list[DailySecurityKey]:
+        ordered = sorted(set(keys), key=lambda key: (key.ts_code, key.trade_date))
+        if not ordered:
+            return []
+        stage_name = "_rquant_status_key_scope"
+        frame = pd.DataFrame(
+            [(key.ts_code, key.trade_date) for key in ordered],
+            columns=["ts_code", "trade_date"],
+        )
+        try:
+            self._conn.register(stage_name, frame)
+            rows = self._conn.execute(
+                f"""
+                SELECT daily.ts_code, daily.trade_date
+                FROM {stage_name} AS scope
+                INNER JOIN daily_bar AS daily USING (ts_code, trade_date)
+                LEFT JOIN stock_status_daily AS status USING (ts_code, trade_date)
+                WHERE status.ts_code IS NULL
+                   OR status.is_st IS NULL
+                   OR {_INVALID_STOCK_STATUS_PREDICATE}
+                ORDER BY daily.ts_code, daily.trade_date
+                """
+            ).fetchall()
+        finally:
+            self._conn.unregister(stage_name)
+        return [
+            DailySecurityKey(ts_code=str(ts_code), trade_date=cast(date, trade_date))
+            for ts_code, trade_date in rows
+        ]
+
+    def upsert_stock_status(
+        self,
+        rows: Sequence[SecurityStatusDaily],
+        *,
+        transaction_mode: Literal["standalone", "existing"] = "standalone",
+        require_daily_keys: bool = False,
+    ) -> int:
+        if transaction_mode not in {"standalone", "existing"}:
+            raise ValueError(
+                "stock status transaction_mode must be 'standalone' or 'existing'"
+            )
+        observations = _validate_security_status_rows(rows)
+        if not observations:
+            return 0
+        ordered = deduplicate_security_status_rows(observations)
+        stage_name = "_rquant_stock_status_stage"
+        stage = _security_status_frame(observations)
+        stage_registered = False
+        transaction_open = False
+        try:
+            self._conn.register(stage_name, stage)
+            stage_registered = True
+            if transaction_mode == "standalone":
+                self._conn.execute("BEGIN")
+                transaction_open = True
+            if require_daily_keys:
+                # Writers are serialized by contract; revalidate exact keys in
+                # this writer transaction instead of adding FK or broad locks.
+                missing_rows = self._conn.execute(
+                    f"""
+                    SELECT DISTINCT stage.ts_code, stage.trade_date
+                    FROM {stage_name} AS stage
+                    LEFT JOIN daily_bar AS daily USING (ts_code, trade_date)
+                    WHERE daily.ts_code IS NULL
+                    ORDER BY stage.trade_date, stage.ts_code
+                    """
+                ).fetchall()
+                if missing_rows:
+                    raise SecurityStatusEligibilityChangedError(
+                        [
+                            DailySecurityKey(
+                                ts_code=str(ts_code),
+                                trade_date=cast(date, trade_date),
+                            )
+                            for ts_code, trade_date in missing_rows
+                        ]
+                    )
+            conflict = self._conn.execute(
+                f"""
+                SELECT stage.ts_code, stage.trade_date,
+                       strftime(stage.ingested_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                FROM {stage_name} AS stage
+                JOIN stock_status_daily AS target USING (ts_code, trade_date)
+                WHERE stage.ingested_at = target.ingested_at
+                  AND (
+                      stage.name IS DISTINCT FROM target.name
+                      OR stage.is_st IS DISTINCT FROM target.is_st
+                      OR stage.name_source IS DISTINCT FROM target.name_source
+                      OR stage.st_source IS DISTINCT FROM target.st_source
+                      OR stage.available_at IS DISTINCT FROM target.available_at
+                      OR stage.conflict_reason
+                         IS DISTINCT FROM target.conflict_reason
+                  )
+                ORDER BY stage.trade_date DESC, stage.ts_code
+                LIMIT 1
+                """
+            ).fetchone()
+            if conflict is not None:
+                raise SecurityStatusWriteConflictError(
+                    str(conflict[0]),
+                    cast(date, conflict[1]),
+                    _utc_datetime_from_db(conflict[2]),
+                )
+            self._conn.execute(
+                f"""
+                INSERT INTO stock_status_daily
+                (ts_code, trade_date, name, is_st, name_source, st_source,
+                 available_at, ingested_at, conflict_reason)
+                SELECT ts_code, trade_date, name, is_st, name_source, st_source,
+                       available_at, ingested_at, conflict_reason
+                FROM (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY ts_code, trade_date
+                        ORDER BY ingested_at DESC
+                    ) AS observation_rank
+                    FROM {stage_name}
+                ) AS selected
+                WHERE observation_rank = 1
+                ON CONFLICT (ts_code, trade_date) DO UPDATE SET
+                    name = excluded.name,
+                    is_st = excluded.is_st,
+                    name_source = excluded.name_source,
+                    st_source = excluded.st_source,
+                    available_at = excluded.available_at,
+                    ingested_at = excluded.ingested_at,
+                    conflict_reason = excluded.conflict_reason
+                WHERE excluded.ingested_at > stock_status_daily.ingested_at
+                """
+            )
+            if transaction_mode == "standalone":
+                self._conn.execute("COMMIT")
+                transaction_open = False
+        except BaseException as primary:
+            retryable_conflict = _is_retryable_stock_status_upsert_error(primary)
+            rollback_error: BaseException | None = None
+            if transaction_open:
+                try:
+                    self._conn.execute("ROLLBACK")
+                    transaction_open = False
+                except BaseException as error:
+                    rollback_auto_ended = (
+                        retryable_conflict
+                        and isinstance(error, duckdb.TransactionException)
+                        and "no transaction is active" in str(error).lower()
+                    )
+                    if rollback_auto_ended:
+                        transaction_open = False
+                    else:
+                        rollback_error = error
+            if rollback_error is not None:
+                raise BaseExceptionGroup(
+                    "stock status upsert and rollback both failed",
+                    [primary, rollback_error],
+                ) from None
+            if retryable_conflict:
+                raise SecurityStatusConcurrentWriteError(
+                    "retry stock status upsert after concurrent transaction conflict"
+                ) from primary
+            raise
+        finally:
+            if stage_registered:
+                try:
+                    self._conn.unregister(stage_name)
+                except duckdb.Error:
+                    logger.exception("stock status staging view cleanup failed")
+        return len(ordered)
+
+    def list_stock_status(
+        self,
+        start: date,
+        end: date,
+        *,
+        ts_code: str | None = None,
+    ) -> list[SecurityStatusDaily]:
+        if start > end:
+            raise ValueError("stock status start must not be after end")
+        filters = "trade_date BETWEEN ? AND ?"
+        params: list[object] = [start, end]
+        if ts_code is not None:
+            filters += " AND ts_code = ?"
+            params.append(ts_code)
+        rows = self._conn.execute(
+            f"""
+            SELECT ts_code, trade_date, name, is_st, name_source, st_source,
+                   CASE WHEN available_at IS NULL THEN NULL ELSE
+                       strftime(available_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END,
+                   strftime(ingested_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ'),
+                   conflict_reason
+            FROM stock_status_daily
+            WHERE {filters}
+            ORDER BY ts_code, trade_date
+            """,
+            params,
+        ).fetchall()
+        return [_security_status_from_row(row) for row in rows]
+
+    def missing_stock_status_keys(
+        self, start: date, end: date
+    ) -> list[DailySecurityKey]:
+        if start > end:
+            raise ValueError("stock status gap start must not be after end")
+        rows = self._conn.execute(
+            """
+            SELECT daily.ts_code, daily.trade_date
+            FROM daily_bar AS daily
+            LEFT JOIN stock_status_daily AS status
+              USING (ts_code, trade_date)
+            WHERE daily.trade_date BETWEEN ? AND ?
+              AND status.ts_code IS NULL
+            ORDER BY daily.ts_code, daily.trade_date
+            """,
+            [start, end],
+        ).fetchall()
+        return [
+            DailySecurityKey(ts_code=str(ts_code), trade_date=cast(date, trade_date))
+            for ts_code, trade_date in rows
+        ]
+
+    def stock_status_coverage(
+        self,
+        start: date,
+        end: date,
+        *,
+        sample_limit: int = 20,
+    ) -> SecurityStatusCoverage:
+        if start > end:
+            raise ValueError("stock status coverage start must not be after end")
+        if sample_limit < 1:
+            raise ValueError("sample_limit must be positive")
+        missing_rows = self._conn.execute(
+            """
+            SELECT counts.expected_count, counts.persisted_count,
+                   counts.category_count, samples.ts_code, samples.trade_date
+            FROM (
+                SELECT COUNT(*) AS expected_count,
+                       COUNT(status.ts_code) AS persisted_count,
+                       COUNT(*) FILTER (WHERE status.ts_code IS NULL)
+                           AS category_count
+                FROM daily_bar AS daily
+                LEFT JOIN stock_status_daily AS status
+                  USING (ts_code, trade_date)
+                WHERE daily.trade_date BETWEEN ? AND ?
+            ) AS counts
+            LEFT JOIN (
+                SELECT daily.ts_code, daily.trade_date
+                FROM daily_bar AS daily
+                LEFT JOIN stock_status_daily AS status
+                  USING (ts_code, trade_date)
+                WHERE daily.trade_date BETWEEN ? AND ?
+                  AND status.ts_code IS NULL
+                ORDER BY daily.trade_date DESC, daily.ts_code
+                LIMIT ?
+            ) AS samples ON TRUE
+            ORDER BY samples.trade_date DESC, samples.ts_code
+            """,
+            [start, end, start, end, sample_limit],
+        ).fetchall()
+        assert missing_rows
+        expected_count = int(missing_rows[0][0])
+        persisted_count = int(missing_rows[0][1])
+        missing_count = int(missing_rows[0][2])
+        missing_samples = tuple(
+            DailySecurityKey(ts_code=str(row[3]), trade_date=cast(date, row[4]))
+            for row in missing_rows
+            if row[3] is not None
+        )
+        unknown_count, unknown_samples = self._stock_status_category_summary(
+            start,
+            end,
+            predicate="status.is_st IS NULL",
+            sample_limit=sample_limit,
+        )
+        conflict_count, conflict_samples = self._stock_status_category_summary(
+            start,
+            end,
+            predicate="status.conflict_reason IS NOT NULL",
+            sample_limit=sample_limit,
+        )
+        invalid_count, invalid_samples = self._stock_status_category_summary(
+            start,
+            end,
+            predicate=_INVALID_STOCK_STATUS_PREDICATE,
+            sample_limit=sample_limit,
+        )
+        return SecurityStatusCoverage(
+            start=start,
+            end=end,
+            expected_count=expected_count,
+            persisted_count=persisted_count,
+            missing_count=missing_count,
+            unknown_count=unknown_count,
+            conflict_count=conflict_count,
+            invalid_count=invalid_count,
+            missing_samples=missing_samples,
+            unknown_samples=unknown_samples,
+            conflict_samples=conflict_samples,
+            invalid_samples=invalid_samples,
+        )
+
+    def _stock_status_category_summary(
+        self,
+        start: date,
+        end: date,
+        *,
+        predicate: str,
+        sample_limit: int,
+    ) -> tuple[int, tuple[DailySecurityKey, ...]]:
+        allowed_predicates = {
+            "status.is_st IS NULL",
+            "status.conflict_reason IS NOT NULL",
+            _INVALID_STOCK_STATUS_PREDICATE,
+        }
+        if predicate not in allowed_predicates:
+            raise ValueError(f"unsupported stock status predicate: {predicate}")
+        rows = self._conn.execute(
+            f"""
+            SELECT counts.category_count, samples.ts_code, samples.trade_date
+            FROM (
+                SELECT COUNT(*) AS category_count
+                FROM stock_status_daily AS status
+                INNER JOIN daily_bar AS daily USING (ts_code, trade_date)
+                WHERE daily.trade_date BETWEEN ? AND ?
+                  AND {predicate}
+            ) AS counts
+            LEFT JOIN (
+                SELECT status.ts_code, status.trade_date
+                FROM stock_status_daily AS status
+                INNER JOIN daily_bar AS daily USING (ts_code, trade_date)
+                WHERE daily.trade_date BETWEEN ? AND ?
+                  AND {predicate}
+                ORDER BY status.trade_date DESC, status.ts_code
+                LIMIT ?
+            ) AS samples ON TRUE
+            ORDER BY samples.trade_date DESC, samples.ts_code
+            """,
+            [start, end, start, end, sample_limit],
+        ).fetchall()
+        assert rows
+        samples = tuple(
+            DailySecurityKey(ts_code=str(row[1]), trade_date=cast(date, row[2]))
+            for row in rows
+            if row[1] is not None
+        )
+        return int(rows[0][0]), samples
 
     def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int:
         observations = [_revalidate_for_write(row) for row in rows]
@@ -1036,8 +1601,9 @@ class DuckDBStore:
     ) -> pd.DataFrame:
         """返回某只股票的前复权日线。
 
-        前复权公式：qfq[t] = raw[t] * adj_factor[t] / adj_factor[latest]
-        参考因子 = 该股票 adj_factor 表中最大 trade_date 对应的因子。
+        前复权公式：qfq[t] = raw[t] * adj_factor[t] / adj_factor[reference]。
+        指定 end 时 reference 是不晚于 end 的最新因子；未指定时才使用全表最新
+        因子。窗口内任一因子不可用时，整段 qfq 列为空并返回稳定状态字段。
 
         同时返回原始价和 qfq 价，方便对比核验。
         """
@@ -1051,36 +1617,117 @@ class DuckDBStore:
             params.append(end)
 
         sql = f"""
-        WITH ref AS (
-            SELECT ts_code, adj_factor AS ref_factor
-            FROM adj_factor
-            WHERE ts_code = ?
-              AND trade_date = (
-                  SELECT MAX(trade_date) FROM adj_factor WHERE ts_code = ?
-              )
-        )
         SELECT
             db.ts_code,
-            strftime(db.trade_date, '%Y-%m-%d') AS trade_date,
+            db.trade_date,
             db.open  AS raw_open,
+            db.high  AS raw_high,
+            db.low   AS raw_low,
             db.close AS raw_close,
-            db.open  * af.adj_factor / r.ref_factor AS qfq_open,
-            db.high  * af.adj_factor / r.ref_factor AS qfq_high,
-            db.low   * af.adj_factor / r.ref_factor AS qfq_low,
-            db.close * af.adj_factor / r.ref_factor AS qfq_close,
+            db.pre_close AS raw_pre_close,
             db.vol,
-            af.adj_factor,
-            r.ref_factor
+            af.adj_factor
         FROM daily_bar db
-        INNER JOIN adj_factor af
+        LEFT JOIN adj_factor af
             ON db.ts_code = af.ts_code AND db.trade_date = af.trade_date
-        INNER JOIN ref r
-            ON db.ts_code = r.ts_code
         WHERE {where}
         ORDER BY db.trade_date
         """
-        ref_params = [ts_code, ts_code]
-        return self._conn.execute(sql, ref_params + params).fetchdf()
+        daily = self._conn.execute(sql, params).fetchdf()
+        qfq_columns = [
+            "qfq_open",
+            "qfq_high",
+            "qfq_low",
+            "qfq_close",
+        ]
+        if daily.empty:
+            for column in qfq_columns:
+                daily[column] = pd.Series(dtype="float64")
+            daily["ref_factor"] = pd.Series(dtype="float64")
+            daily["ref_trade_date"] = pd.Series(dtype="object")
+            daily["price_basis_available"] = pd.Series(dtype="bool")
+            daily["price_basis_reason"] = pd.Series(dtype="object")
+            return daily
+
+        reference_sql = """
+            SELECT trade_date, adj_factor
+            FROM adj_factor
+            WHERE ts_code = ?
+        """
+        reference_params: list[str] = [ts_code]
+        if end:
+            reference_sql += " AND trade_date <= ?"
+            reference_params.append(end)
+        reference_sql += " ORDER BY trade_date DESC LIMIT 1"
+        reference_row = self._conn.execute(
+            reference_sql,
+            reference_params,
+        ).fetchone()
+
+        daily_dates = [
+            value.date() if isinstance(value, pd.Timestamp) else value
+            for value in daily["trade_date"].tolist()
+        ]
+        factor_by_date = {
+            trade_date: None if pd.isna(factor) else float(factor)
+            for trade_date, factor in zip(
+                daily_dates,
+                daily["adj_factor"].tolist(),
+                strict=True,
+            )
+        }
+        if reference_row is None:
+            basis_available = False
+            unavailable_reason = "missing_reference_factor"
+            reference_date_value: date | None = None
+            reference_factor: float | None = None
+            ratios: dict[date, float] = {}
+        else:
+            raw_reference_date, raw_reference_factor = reference_row
+            reference_date_value = (
+                raw_reference_date.date()
+                if isinstance(raw_reference_date, pd.Timestamp)
+                else raw_reference_date
+            )
+            reference_factor = (
+                None
+                if raw_reference_factor is None
+                else float(raw_reference_factor)
+            )
+            factor_by_date[reference_date_value] = reference_factor
+            basis = resolve_price_factor_basis(
+                required_dates=daily_dates,
+                factor_by_date=factor_by_date,
+                reference_date=reference_date_value,
+            )
+            basis_available = basis.available
+            unavailable_reason = basis.unavailable_reason
+            reference_factor = basis.reference_factor
+            ratios = basis.ratio_by_date()
+
+        daily["ref_factor"] = reference_factor
+        daily["ref_trade_date"] = (
+            reference_date_value.isoformat()
+            if reference_date_value is not None
+            else None
+        )
+        daily["price_basis_available"] = basis_available
+        daily["price_basis_reason"] = unavailable_reason
+        ratio_series = pd.Series(
+            [ratios.get(trade_date) for trade_date in daily_dates],
+            index=daily.index,
+            dtype="float64",
+        )
+        for raw_column, qfq_column in zip(
+            ["raw_open", "raw_high", "raw_low", "raw_close"],
+            qfq_columns,
+            strict=True,
+        ):
+            daily[qfq_column] = (
+                pd.to_numeric(daily[raw_column], errors="coerce") * ratio_series
+            )
+        daily["trade_date"] = [trade_date.isoformat() for trade_date in daily_dates]
+        return daily
 
     def count_adj_factor(self, ts_code: str | None = None) -> int:
         if ts_code:
@@ -1749,28 +2396,85 @@ class DuckDBStore:
 
     # ── limit_up_pool_daily ──
 
-    def upsert_limit_up_pool(self, df: pd.DataFrame) -> int:
+    def upsert_limit_up_pool(
+        self,
+        df: pd.DataFrame,
+        *,
+        transaction_mode: Literal["auto", "standalone", "existing"] = "auto",
+    ) -> int:
         if df.empty:
             return 0
+        if transaction_mode not in {"auto", "standalone", "existing"}:
+            raise ValueError(
+                "limit-up-pool transaction_mode must be auto, standalone, or existing"
+            )
+        active_transaction = _duckdb_transaction_is_active(self._conn)
+        if transaction_mode == "standalone" and active_transaction:
+            raise ValueError(
+                "standalone limit-up-pool upsert cannot join an existing transaction"
+            )
+        if transaction_mode == "existing" and not active_transaction:
+            raise ValueError(
+                "existing limit-up-pool upsert requires an active transaction"
+            )
+        owns_transaction = transaction_mode == "standalone" or (
+            transaction_mode == "auto" and not active_transaction
+        )
         payload = df.copy()
         if "source" not in payload.columns:
             payload["source"] = "eastmoney"
-        self._conn.register("zt_pool_tmp", payload)
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO limit_up_pool_daily
-            (ts_code, trade_date, name, pct_chg, close, amount,
-             circ_mv, total_mv, turnover_rate, seal_amount,
-             first_seal_time, last_seal_time, break_count,
-             limit_up_stat, consecutive_boards, industry, source)
-            SELECT ts_code, trade_date, name, pct_chg, close, amount,
-                   circ_mv, total_mv, turnover_rate, seal_amount,
-                   first_seal_time, last_seal_time, break_count,
-                   limit_up_stat, consecutive_boards, industry, source
-            FROM zt_pool_tmp
-            """
-        )
-        self._conn.unregister("zt_pool_tmp")
+        stage_name = "zt_pool_tmp"
+        stage_registered = False
+        transaction_open = False
+        try:
+            if owns_transaction:
+                self._conn.execute("BEGIN")
+                transaction_open = True
+            self._conn.register(stage_name, payload)
+            stage_registered = True
+            guard = self._conn.execute(
+                """
+                UPDATE limit_up_pool_write_guard
+                SET generation = generation + 1
+                WHERE guard_id = 'limit_up_pool_daily'
+                RETURNING generation
+                """
+            ).fetchone()
+            if guard is None:
+                raise RuntimeError("limit-up-pool write guard row is missing")
+            self._conn.execute(
+                f"""
+                INSERT OR REPLACE INTO limit_up_pool_daily
+                (ts_code, trade_date, name, pct_chg, close, amount,
+                 circ_mv, total_mv, turnover_rate, seal_amount,
+                 first_seal_time, last_seal_time, break_count,
+                 limit_up_stat, consecutive_boards, industry, source)
+                SELECT ts_code, trade_date, name, pct_chg, close, amount,
+                       circ_mv, total_mv, turnover_rate, seal_amount,
+                       first_seal_time, last_seal_time, break_count,
+                       limit_up_stat, consecutive_boards, industry, source
+                FROM {stage_name}
+                """
+            )
+            if owns_transaction:
+                self._conn.execute("COMMIT")
+                transaction_open = False
+        except BaseException as primary:
+            if transaction_open:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except BaseException as rollback_error:
+                    raise BaseExceptionGroup(
+                        "limit-up-pool upsert failed and rollback failed",
+                        [primary, rollback_error],
+                    ) from None
+            raise
+        finally:
+            if stage_registered:
+                try:
+                    self._conn.unregister(stage_name)
+                except duckdb.Error:
+                    logger.exception("limit-up-pool staging view cleanup failed")
         count = len(df)
         logger.info(f"DuckDB upsert limit_up_pool_daily: {count} 行")
         return count

@@ -109,8 +109,36 @@ class TradeCalendarAdapter(Protocol):
     ) -> pd.DataFrame: ...
 
 
+class TradeCalendarConnection(Protocol):
+    def execute(
+        self,
+        query: str,
+        parameters: Sequence[object] | None = None,
+    ) -> TradeCalendarConnection: ...
+
+    def executemany(
+        self,
+        query: str,
+        parameters: Sequence[Sequence[object]],
+    ) -> TradeCalendarConnection: ...
+
+    def fetchone(self) -> tuple[object, ...] | None: ...
+
+    def fetchall(self) -> list[tuple[object, ...]]: ...
+
+
 class TradeCalendarStore(Protocol):
+    _conn: TradeCalendarConnection
+
     def upsert_trade_calendar(self, rows: Sequence[TradeCalendarDay]) -> int: ...
+
+    def list_trade_calendar(
+        self, exchange: str, start: date, end: date
+    ) -> list[TradeCalendarDay]: ...
+
+    def missing_trade_calendar_dates(
+        self, exchange: str, start: date, end: date
+    ) -> list[date]: ...
 
 
 def trade_calendar_business_facts(
@@ -232,16 +260,72 @@ def _civil_dates(start: date, end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
 
 
-def refresh_trade_calendar(
+def _validate_authoritative_rows(
+    rows: Sequence[TradeCalendarDay],
+    *,
+    exchange: str,
+    start: date,
+    end: date,
+) -> list[TradeCalendarDay]:
+    if start > end:
+        raise ValueError("trade calendar refresh start must not be after end")
+    selected = deduplicate_trade_calendar_rows(rows)
+    wrong_exchange = sorted({row.exchange for row in selected if row.exchange != exchange})
+    if wrong_exchange:
+        raise ValueError(
+            f"trade calendar provider returned unexpected exchanges: {wrong_exchange}"
+        )
+    outside_dates = sorted(
+        {row.cal_date for row in selected if row.cal_date < start or row.cal_date > end}
+    )
+    if outside_dates:
+        rendered = ", ".join(day.isoformat() for day in outside_dates)
+        raise ValueError(
+            "trade calendar provider returned dates outside requested range: "
+            f"{rendered}"
+        )
+    expected_dates = _civil_dates(start, end)
+    fetched_dates = {row.cal_date for row in selected}
+    missing_dates = [day for day in expected_dates if day not in fetched_dates]
+    if missing_dates:
+        raise TradeCalendarGapError(exchange, missing_dates)
+
+    first_pretrade_date = selected[0].pretrade_date
+    if first_pretrade_date is None:
+        raise ValueError(
+            f"trade calendar pretrade_date is required for {selected[0].cal_date}"
+        )
+    if first_pretrade_date >= start:
+        raise ValueError(
+            "trade calendar first pretrade_date must be before requested range: "
+            f"{first_pretrade_date} >= {start}"
+        )
+
+    last_open = first_pretrade_date
+    for row in selected:
+        if row.pretrade_date is None:
+            raise ValueError(
+                f"trade calendar pretrade_date is required for {row.cal_date}"
+            )
+        if row.pretrade_date != last_open:
+            raise ValueError(
+                "trade calendar pretrade_date chain mismatch for "
+                f"{row.cal_date}: expected {last_open}, got {row.pretrade_date}"
+            )
+        if row.is_open:
+            last_open = row.cal_date
+    return selected
+
+
+def fetch_trade_calendar_rows(
     adapter: TradeCalendarAdapter,
-    store: TradeCalendarStore,
     *,
     exchange: str,
     start: date,
     end: date,
     updated_at: datetime | None = None,
-) -> TradeCalendarRefreshResult:
-    """Fetch and persist a complete requested civil range or raise a typed gap."""
+) -> list[TradeCalendarDay]:
+    """Fetch, normalize, and validate a complete authoritative civil range."""
     if start > end:
         raise ValueError("trade calendar refresh start must not be after end")
     frame = adapter.trade_cal_raw(start, end, exchange=exchange)
@@ -254,36 +338,155 @@ def refresh_trade_calendar(
                 f"{exchange} {start.isoformat()}..{end.isoformat()}"
             ),
         )
+    required_columns = {"exchange", "cal_date", "is_open", "pretrade_date"}
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(
+            "trade calendar provider data missing columns: "
+            + ", ".join(missing_columns)
+        )
     rows = normalize_trade_calendar(
         frame,
         source="tushare",
         updated_at=updated_at,
     )
-    wrong_exchange = sorted({row.exchange for row in rows if row.exchange != exchange})
-    if wrong_exchange:
-        raise ValueError(
-            f"trade calendar provider returned unexpected exchanges: {wrong_exchange}"
-        )
-    outside_dates = sorted(
-        {row.cal_date for row in rows if row.cal_date < start or row.cal_date > end}
-    )
-    if outside_dates:
-        rendered = ", ".join(day.isoformat() for day in outside_dates)
-        raise ValueError(
-            "trade calendar provider returned dates outside requested range: "
-            f"{rendered}"
-        )
-    expected_dates = _civil_dates(start, end)
-    fetched_dates = {row.cal_date for row in rows}
-    missing_dates = [day for day in expected_dates if day not in fetched_dates]
-    if missing_dates:
-        raise TradeCalendarGapError(exchange, missing_dates)
-    upserted = store.upsert_trade_calendar(rows)
-    return TradeCalendarRefreshResult(
+    return _validate_authoritative_rows(
+        rows,
         exchange=exchange,
         start=start,
         end=end,
-        requested_days=len(expected_dates),
-        fetched_days=len(rows),
-        upserted_days=upserted,
+    )
+
+
+def persist_verified_trade_calendar(
+    store: TradeCalendarStore,
+    rows: Sequence[TradeCalendarDay],
+    *,
+    exchange: str,
+    start: date,
+    end: date,
+) -> TradeCalendarRefreshResult:
+    """Persist validated rows and verify stored business facts day by day."""
+    authoritative_rows = _validate_authoritative_rows(
+        rows,
+        exchange=exchange,
+        start=start,
+        end=end,
+    )
+    connection = store._conn
+    connection.execute("BEGIN")
+    try:
+        for incoming in authoritative_rows:
+            existing = connection.execute(
+                """
+                SELECT is_open, pretrade_date
+                FROM trade_calendar
+                WHERE exchange = ? AND cal_date = ? AND updated_at = ?
+                """,
+                [incoming.exchange, incoming.cal_date, incoming.updated_at],
+            ).fetchone()
+            if existing is not None and (
+                bool(existing[0]), existing[1]
+            ) != trade_calendar_business_facts(incoming):
+                raise TradeCalendarConflictError(
+                    incoming.exchange,
+                    incoming.cal_date,
+                    incoming.updated_at,
+                )
+
+        connection.executemany(
+            """
+            INSERT INTO trade_calendar
+            (exchange, cal_date, is_open, pretrade_date, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (exchange, cal_date) DO UPDATE SET
+                is_open = excluded.is_open,
+                pretrade_date = excluded.pretrade_date,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            WHERE excluded.updated_at > trade_calendar.updated_at
+            """,
+            [
+                [
+                    row.exchange,
+                    row.cal_date,
+                    row.is_open,
+                    row.pretrade_date,
+                    row.source,
+                    row.updated_at,
+                ]
+                for row in authoritative_rows
+            ],
+        )
+
+        stored_rows = connection.execute(
+            """
+            SELECT cal_date, is_open, pretrade_date
+            FROM trade_calendar
+            WHERE exchange = ? AND cal_date BETWEEN ? AND ?
+            ORDER BY cal_date
+            """,
+            [exchange, start, end],
+        ).fetchall()
+        stored_by_date = {
+            row[0]: (bool(row[1]), row[2])
+            for row in stored_rows
+        }
+        missing_dates = [
+            row.cal_date
+            for row in authoritative_rows
+            if row.cal_date not in stored_by_date
+        ]
+        if missing_dates:
+            raise TradeCalendarGapError(exchange, missing_dates)
+
+        mismatches = [
+            row.cal_date
+            for row in authoritative_rows
+            if stored_by_date[row.cal_date] != trade_calendar_business_facts(row)
+        ]
+        if mismatches:
+            rendered = ", ".join(day.isoformat() for day in mismatches)
+            raise ValueError(
+                "trade calendar post-write verification mismatch for "
+                f"{exchange}: {rendered}"
+            )
+        result = TradeCalendarRefreshResult(
+            exchange=exchange,
+            start=start,
+            end=end,
+            requested_days=len(_civil_dates(start, end)),
+            fetched_days=len(authoritative_rows),
+            upserted_days=len(authoritative_rows),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    return result
+
+
+def refresh_trade_calendar(
+    adapter: TradeCalendarAdapter,
+    store: TradeCalendarStore,
+    *,
+    exchange: str,
+    start: date,
+    end: date,
+    updated_at: datetime | None = None,
+) -> TradeCalendarRefreshResult:
+    """Compatibility wrapper for fetch then persist with post-write verification."""
+    rows = fetch_trade_calendar_rows(
+        adapter,
+        exchange=exchange,
+        start=start,
+        end=end,
+        updated_at=updated_at,
+    )
+    return persist_verified_trade_calendar(
+        store,
+        rows,
+        exchange=exchange,
+        start=start,
+        end=end,
     )
