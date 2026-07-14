@@ -374,9 +374,13 @@ dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则
 - Modify: `src/rquant/growth_board_surge_strategy.py`
 - Modify: `src/rquant/presets.py`
 - Create: `tests/unit/test_backfill_manifest.py`
+- Modify: `tests/unit/test_growth_board_surge_strategy.py`
+- Modify: `tests/unit/test_presets.py`
 
-实现 `StrategyBackfillSpec`、`EligibilityRecord` 和窗口需求。科创/创业资格查询必须在读取分钟表
-前完成；N 字按日重建，不依赖历史 `screen_result`；竞价策略标记为 `daily+auction`。
+实现 frozen `StrategyBackfillSpec`、`EligibilityRecord` 和窗口需求，稳定 ID 不受资格行顺序影响。
+科创/创业资格查询必须通过 Task 11 的受控 PIT 入口并在读取分钟表前完成，manifest 与 replay
+共用同一个日级候选解析器；N 字按权威交易日运行现有筛选规则重建，不依赖历史
+`screen_result`；竞价策略标记为 `daily+auction`，不得把分钟是否存在当作资格条件。
 
 ### Task 13：窗口合并、覆盖计算与 ETA
 
@@ -384,17 +388,25 @@ dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则
 - Modify: `src/rquant/backfill_manifest.py`
 - Create: `tests/unit/test_backfill_planner.py`
 
-按交易日展开 90 日基准、B 日和最多 10 日退出窗口；同股票重叠窗口合并，再按 8000 行上限
-切块。只生成缺失任务，ETA 同时展示请求数、预计行数、磁盘、限频时间和置信度。
+只按权威开市日展开 90 日基准、B 日和最多 10 日退出窗口；日历有缺口或边界不足时显式失败。
+同股票相交或相邻窗口合并，但保留 baseline/B/S 各自期望分母。覆盖必须按 Task 9 配置的
+`tushare/1min` 完整交易时段判断，不能把“当天有任意分钟行”当成已覆盖；先扣除完整覆盖日，
+再按单次返回上限切块，恰好达到 8000 行视为可能截断。ETA 同时展示请求数、预计行数、磁盘、
+限频时间、总耗时、置信度和置信度原因；阶段门分别采用 B/S 99% 与历史基准 95%。
 
 ### Task 14：SQLite 回补状态
 
 **Files:**
 - Create: `src/rquant/backfill_state.py`
+- Modify: `src/rquant/config.py`
+- Modify: `.env.example`
 - Create: `tests/unit/test_backfill_state.py`
+- Modify: `tests/unit/test_config.py`
 
-实现 manifest/task/eligibility 持久化、原子 claim、崩溃 running 恢复、重试上限、失败原因、
-EWMA ETA。状态库使用配置中的独立 SQLite 路径，不放 DuckDB。
+实现 manifest/task/eligibility 同事务持久化、`BEGIN IMMEDIATE` 原子 claim、重试上限、结构化
+失败原因和 EWMA ETA。running 使用 `claimed_at` + lease，只回收超时任务；成功任务不可重领，
+同 ID 不同内容必须拒绝。状态库使用配置中的独立 SQLite 路径，启用 WAL、busy timeout 和短
+事务，不放 DuckDB，使 `backfill-status` 能在 DuckDB 写入期间查询。
 
 ### Task 15：回补执行器
 
@@ -402,9 +414,12 @@ EWMA ETA。状态库使用配置中的独立 SQLite 路径，不放 DuckDB。
 - Modify: `src/rquant/intraday_backfill.py`
 - Modify: `src/rquant/adapter/tushare.py`
 - Create: `tests/unit/test_backfill_runner.py`
+- Modify: `tests/unit/test_intraday_adapter.py`
 
 分钟接口复用统一退避/限频；成功任务不再请求；空返回必须分类为允许缺失或 `source_empty`；
-中断后只领取 pending/可重试 failed。写入后更新真实请求、行数、耗时和覆盖率。
+中断后只领取 pending/可重试 failed。每次请求前重新检查完整时段覆盖，避免 DuckDB 已写成功但
+SQLite 尚未标记时重复下载；写入后再计算完整覆盖并更新真实请求、返回/写入行数、耗时、
+scope 覆盖率和 EWMA。单任务失败不终止整个 manifest，执行器不得与盘中 monitor 并发写主库。
 
 ### Task 16：四条 CLI
 
@@ -421,8 +436,10 @@ rquant backfill-status --manifest-id ... [--json]
 rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 ```
 
-未知 manifest、失败任务和覆盖未达标返回非零 exit code。`dataset-snapshot` 文案明确不是
-`DatasetSpec.mode=snapshot` 的整表刷新。
+`backfill-plan` 只读副本并持久化计划，`backfill-status` 只读 SQLite 且 `--json` 输出稳定单个
+对象。未知 manifest、terminal failed 和覆盖未达标返回非零 exit code；覆盖不足本身是正常
+规划结果。`dataset-snapshot` 仅在 manifest 完成且 B/S 99%、历史基准 95% 阶段门通过后写入
+并 finalize 研究覆盖元数据，文案明确不是 `DatasetSpec.mode=snapshot` 的整表刷新。
 
 ## PR-D：preflight、真实数据审计与阶段验收
 
