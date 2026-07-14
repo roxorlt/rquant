@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 from pydantic import (
@@ -43,6 +43,166 @@ class QualityModel(BaseModel):
         frozen=True,
         str_strip_whitespace=True,
     )
+
+
+class MinuteSessionWindow(QualityModel):
+    start: time
+    end: time
+    step_minutes: StrictInt = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> MinuteSessionWindow:
+        if self.start.tzinfo is not None or self.end.tzinfo is not None:
+            raise ValueError("minute session windows must use local naive times")
+        if any(
+            value != 0
+            for value in (
+                self.start.second,
+                self.start.microsecond,
+                self.end.second,
+                self.end.microsecond,
+            )
+        ):
+            raise ValueError("minute session windows must align to whole minutes")
+        start_at = datetime.combine(date.min, self.start)
+        end_at = datetime.combine(date.min, self.end)
+        if start_at > end_at:
+            raise ValueError("minute session window start must not be after end")
+        duration_minutes = int((end_at - start_at).total_seconds() // 60)
+        if duration_minutes % self.step_minutes != 0:
+            raise ValueError("minute session window end must align to step_minutes")
+        return self
+
+    def expected_times(self) -> tuple[time, ...]:
+        current = datetime.combine(date.min, self.start)
+        end_at = datetime.combine(date.min, self.end)
+        values: list[time] = []
+        while current <= end_at:
+            values.append(current.time())
+            current += timedelta(minutes=self.step_minutes)
+        return tuple(values)
+
+
+class MinuteSourceSessionSpec(QualityModel):
+    source: str = Field(min_length=1)
+    freq: str = Field(min_length=1)
+    timestamp_semantics: Literal["bar_start", "bar_end", "provider_snapshot"]
+    windows: tuple[MinuteSessionWindow, ...] = Field(min_length=1)
+    authoritative: bool
+    required_for_daily_coverage: bool
+    require_full_session: bool
+
+    @model_validator(mode="after")
+    def validate_spec(self) -> MinuteSourceSessionSpec:
+        if self.required_for_daily_coverage and not self.authoritative:
+            raise ValueError(
+                "required_for_daily_coverage requires an authoritative source"
+            )
+        starts = tuple(window.start for window in self.windows)
+        if starts != tuple(sorted(starts)):
+            raise ValueError("minute session windows must be in chronological order")
+        expected = tuple(
+            value
+            for window in self.windows
+            for value in window.expected_times()
+        )
+        if len(expected) != len(set(expected)):
+            raise ValueError("minute session windows must not overlap")
+        return self
+
+    def expected_times(self) -> tuple[time, ...]:
+        return tuple(
+            value
+            for window in self.windows
+            for value in window.expected_times()
+        )
+
+
+class MinuteSessionGapSample(QualityModel):
+    ts_code: str = Field(min_length=1)
+    trade_date: date
+    source: str = Field(min_length=1)
+    freq: str = Field(min_length=1)
+    timestamp_semantics: Literal["bar_start", "bar_end", "provider_snapshot"]
+    missing_count: StrictInt = Field(ge=0)
+    missing_times: tuple[str, ...]
+    extra_count: StrictInt = Field(ge=0)
+    extra_times: tuple[str, ...]
+
+
+class DailyMinuteDateSample(QualityModel):
+    ts_code: str = Field(min_length=1)
+    trade_date: date
+
+
+class MinuteWithoutDailySample(DailyMinuteDateSample):
+    source: str = Field(min_length=1)
+    freq: str = Field(min_length=1)
+    minute_count: StrictInt = Field(gt=0)
+
+
+class MinuteOverlapSample(QualityModel):
+    ts_code: str = Field(min_length=1)
+    trade_time: datetime
+    freq: str = Field(min_length=1)
+    sources: tuple[str, ...] = Field(min_length=2)
+    distinct_payload_count: StrictInt = Field(gt=0)
+
+
+def _display_minute_time(value: str) -> str:
+    return value[:-3] if value.endswith(":00") else value
+
+
+DEFAULT_MINUTE_SOURCE_SESSION_SPECS = (
+    MinuteSourceSessionSpec(
+        source="tushare",
+        freq="1min",
+        timestamp_semantics="bar_end",
+        windows=(
+            MinuteSessionWindow(
+                start=time(9, 30), end=time(11, 30), step_minutes=1
+            ),
+            MinuteSessionWindow(
+                start=time(13, 1), end=time(15, 0), step_minutes=1
+            ),
+        ),
+        authoritative=True,
+        required_for_daily_coverage=True,
+        require_full_session=True,
+    ),
+    MinuteSourceSessionSpec(
+        source="tushare_rt",
+        freq="1min",
+        timestamp_semantics="provider_snapshot",
+        windows=(
+            MinuteSessionWindow(
+                start=time(9, 30), end=time(11, 30), step_minutes=1
+            ),
+            MinuteSessionWindow(
+                start=time(13, 0), end=time(15, 0), step_minutes=1
+            ),
+        ),
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    ),
+    MinuteSourceSessionSpec(
+        source="tushare_rt_daily",
+        freq="1min",
+        timestamp_semantics="provider_snapshot",
+        windows=(
+            MinuteSessionWindow(
+                start=time(9, 30), end=time(11, 30), step_minutes=1
+            ),
+            MinuteSessionWindow(
+                start=time(13, 0), end=time(15, 0), step_minutes=1
+            ),
+        ),
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    ),
+)
 
 
 class LimitUpPoolRepairKey(QualityModel):
@@ -585,6 +745,515 @@ def historical_security_status_audit_rules(
             description="Aggregate blocking historical status coverage gaps",
             check=coverage_check,
         ),
+    )
+
+
+def daily_minute_consistency_audit_rules(
+    start: date,
+    end: date,
+    *,
+    source_specs: Sequence[MinuteSourceSessionSpec] = (
+        DEFAULT_MINUTE_SOURCE_SESSION_SPECS
+    ),
+    sample_limit: int = 20,
+) -> tuple[AuditRule, ...]:
+    """Build daily/minute consistency rules for explicitly declared sources."""
+    if start > end:
+        raise ValueError("daily/minute audit start must not be after end")
+    if sample_limit < 1:
+        raise ValueError("sample_limit must be positive")
+    specs = tuple(source_specs)
+    if not specs:
+        raise ValueError("daily/minute audit requires source specs")
+    identities = tuple((spec.source, spec.freq) for spec in specs)
+    if len(identities) != len(set(identities)):
+        raise ValueError("duplicate minute source/freq spec")
+    if not any(spec.authoritative for spec in specs):
+        raise ValueError("daily/minute audit requires an authoritative spec")
+
+    coverage_specs = tuple(
+        spec
+        for spec in specs
+        if spec.authoritative and spec.required_for_daily_coverage
+    )
+    if not coverage_specs:
+        raise ValueError(
+            "daily/minute audit requires an authoritative coverage spec"
+        )
+
+    def minute_without_daily_check(
+        store: DuckDBStore,
+    ) -> tuple[AuditFinding, ...]:
+        rows = store._conn.execute(  # noqa: SLF001
+            """
+            WITH missing_daily AS (
+                SELECT
+                    m.ts_code,
+                    CAST(m.trade_time AS DATE) AS trade_date,
+                    m.source,
+                    m.freq,
+                    count(*) AS minute_count
+                FROM minute_bar AS m
+                LEFT JOIN daily_bar AS d
+                  ON d.ts_code = m.ts_code
+                 AND d.trade_date = CAST(m.trade_time AS DATE)
+                WHERE CAST(m.trade_time AS DATE) BETWEEN ? AND ?
+                  AND d.ts_code IS NULL
+                GROUP BY
+                    m.ts_code,
+                    CAST(m.trade_time AS DATE),
+                    m.source,
+                    m.freq
+            )
+            SELECT *, count(*) OVER () AS finding_count
+            FROM missing_daily
+            ORDER BY trade_date, ts_code, source, freq
+            LIMIT ?
+            """,
+            [start, end, sample_limit],
+        ).fetchall()
+        if not rows:
+            return ()
+        samples = tuple(
+            MinuteWithoutDailySample(
+                ts_code=ts_code,
+                trade_date=trade_date_value,
+                source=source,
+                freq=freq,
+                minute_count=minute_count,
+            )
+            for (
+                ts_code,
+                trade_date_value,
+                source,
+                freq,
+                minute_count,
+                _finding_count,
+            ) in rows
+        )
+        return (
+            AuditFinding(
+                rule_id="minute-without-daily",
+                dataset_id="minute_bar",
+                severity="P1",
+                scope_key=f"{start.isoformat()}/{end.isoformat()}",
+                message="Minute bars exist without a matching daily bar",
+                evidence={
+                    "count": rows[0][-1],
+                    "samples": [
+                        sample.model_dump(mode="json") for sample in samples
+                    ],
+                },
+            ),
+        )
+
+    def eligible_daily_without_minute_check(
+        store: DuckDBStore,
+    ) -> tuple[AuditFinding, ...]:
+        coverage_values = ", ".join("(?, ?)" for _spec in coverage_specs)
+        parameters: list[object] = [
+            value
+            for spec in coverage_specs
+            for value in (spec.source, spec.freq)
+        ]
+        parameters.extend((start, end))
+        rows = store._conn.execute(  # noqa: SLF001
+            f"""
+            WITH coverage_source(source, freq) AS (
+                VALUES {coverage_values}
+            ),
+            missing_minutes AS (
+                SELECT d.ts_code, d.trade_date
+                FROM daily_bar AS d
+                WHERE d.trade_date BETWEEN ? AND ?
+                  AND (
+                        coalesce(d.vol, 0) > 0
+                     OR coalesce(d.amount, 0) > 0
+                  )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM minute_bar AS m
+                        JOIN coverage_source AS c
+                          ON c.source = m.source
+                         AND c.freq = m.freq
+                        WHERE m.ts_code = d.ts_code
+                          AND CAST(m.trade_time AS DATE) = d.trade_date
+                  )
+            )
+            SELECT *, count(*) OVER () AS finding_count
+            FROM missing_minutes
+            ORDER BY trade_date, ts_code
+            LIMIT ?
+            """,
+            [*parameters, sample_limit],
+        ).fetchall()
+        if not rows:
+            return ()
+        samples = tuple(
+            DailyMinuteDateSample(
+                ts_code=ts_code,
+                trade_date=trade_date_value,
+            )
+            for ts_code, trade_date_value, _finding_count in rows
+        )
+        return (
+            AuditFinding(
+                rule_id="eligible-daily-without-authoritative-minute",
+                dataset_id="minute_bar",
+                severity="P1",
+                scope_key=f"{start.isoformat()}/{end.isoformat()}",
+                message="Eligible daily bars have no authoritative minute bars",
+                evidence={
+                    "count": rows[0][-1],
+                    "samples": [
+                        sample.model_dump(mode="json") for sample in samples
+                    ],
+                },
+            ),
+        )
+
+    declared_values = ", ".join("(?, ?)" for _spec in specs)
+    declared_parameters: list[object] = [
+        value for spec in specs for value in (spec.source, spec.freq)
+    ]
+
+    def unknown_semantics_check(
+        store: DuckDBStore,
+    ) -> tuple[AuditFinding, ...]:
+        parameters = [*declared_parameters, start, end]
+        rows = store._conn.execute(  # noqa: SLF001
+            f"""
+            WITH declared(source, freq) AS (
+                VALUES {declared_values}
+            ),
+            unknown_rows AS (
+                SELECT
+                    m.ts_code,
+                    CAST(m.trade_time AS DATE) AS trade_date,
+                    m.source,
+                    m.freq,
+                    count(*) AS minute_count
+                FROM minute_bar AS m
+                LEFT JOIN declared AS d
+                  ON d.source = m.source
+                 AND d.freq = m.freq
+                WHERE CAST(m.trade_time AS DATE) BETWEEN ? AND ?
+                  AND d.source IS NULL
+                GROUP BY
+                    m.ts_code,
+                    CAST(m.trade_time AS DATE),
+                    m.source,
+                    m.freq
+            )
+            SELECT *, count(*) OVER () AS finding_count
+            FROM unknown_rows
+            ORDER BY trade_date, ts_code, source, freq
+            LIMIT ?
+            """,
+            [*parameters, sample_limit],
+        ).fetchall()
+        if not rows:
+            return ()
+        samples = tuple(
+            MinuteWithoutDailySample(
+                ts_code=ts_code,
+                trade_date=trade_date_value,
+                source=source,
+                freq=freq,
+                minute_count=minute_count,
+            )
+            for (
+                ts_code,
+                trade_date_value,
+                source,
+                freq,
+                minute_count,
+                _finding_count,
+            ) in rows
+        )
+        return (
+            AuditFinding(
+                rule_id="unknown-source-or-freq-semantics",
+                dataset_id="minute_bar",
+                severity="P0",
+                scope_key=f"{start.isoformat()}/{end.isoformat()}",
+                message=(
+                    "Minute bars use a source/frequency pair with undeclared "
+                    "timestamp semantics"
+                ),
+                evidence={
+                    "count": rows[0][-1],
+                    "samples": [
+                        sample.model_dump(mode="json") for sample in samples
+                    ],
+                },
+            ),
+        )
+
+    def make_overlap_check(
+        *,
+        rule_id: Literal[
+            "cross-source-exact-overlap",
+            "cross-source-conflicting-overlap",
+        ],
+        severity: Literal["P2", "P3"],
+        exact: bool,
+    ) -> AuditCheck:
+        def check(store: DuckDBStore) -> tuple[AuditFinding, ...]:
+            comparator = "= 1" if exact else "> 1"
+            parameters = [*declared_parameters, start, end]
+            rows = store._conn.execute(  # noqa: SLF001
+                f"""
+                WITH declared(source, freq) AS (
+                    VALUES {declared_values}
+                ),
+                overlap_rows AS (
+                    SELECT
+                        m.ts_code,
+                        m.trade_time,
+                        m.freq,
+                        list(DISTINCT m.source ORDER BY m.source) AS sources,
+                        count(DISTINCT struct_pack(
+                            open_value := m.open,
+                            high_value := m.high,
+                            low_value := m.low,
+                            close_value := m.close,
+                            vol_value := m.vol,
+                            amount_value := m.amount
+                        )) AS distinct_payload_count
+                    FROM minute_bar AS m
+                    JOIN declared AS d
+                      ON d.source = m.source
+                     AND d.freq = m.freq
+                    WHERE CAST(m.trade_time AS DATE) BETWEEN ? AND ?
+                    GROUP BY m.ts_code, m.trade_time, m.freq
+                    HAVING count(DISTINCT m.source) > 1
+                )
+                SELECT
+                    ts_code,
+                    trade_time,
+                    freq,
+                    sources,
+                    distinct_payload_count,
+                    count(*) OVER () AS finding_count
+                FROM overlap_rows
+                WHERE distinct_payload_count {comparator}
+                ORDER BY trade_time, ts_code, freq
+                LIMIT ?
+                """,
+                [*parameters, sample_limit],
+            ).fetchall()
+            if not rows:
+                return ()
+            samples = tuple(
+                MinuteOverlapSample(
+                    ts_code=ts_code,
+                    trade_time=trade_time_value,
+                    freq=freq,
+                    sources=tuple(sources),
+                    distinct_payload_count=distinct_payload_count,
+                )
+                for (
+                    ts_code,
+                    trade_time_value,
+                    freq,
+                    sources,
+                    distinct_payload_count,
+                    _finding_count,
+                ) in rows
+            )
+            return (
+                AuditFinding(
+                    rule_id=rule_id,
+                    dataset_id="minute_bar",
+                    severity=severity,
+                    scope_key=f"{start.isoformat()}/{end.isoformat()}",
+                    message=(
+                        "Multiple sources contain identical logical minute bars"
+                        if exact
+                        else (
+                            "Multiple sources disagree on OHLCV for the same "
+                            "logical minute bar"
+                        )
+                    ),
+                    evidence={
+                        "count": rows[0][-1],
+                        "samples": [
+                            sample.model_dump(mode="json") for sample in samples
+                        ],
+                    },
+                ),
+            )
+
+        return check
+
+    def no_findings(_store: DuckDBStore) -> tuple[AuditFinding, ...]:
+        return ()
+
+    def make_session_check(spec: MinuteSourceSessionSpec) -> AuditCheck:
+        def check(store: DuckDBStore) -> tuple[AuditFinding, ...]:
+            expected_values = tuple(
+                value.isoformat(timespec="seconds")
+                for value in spec.expected_times()
+            )
+            rows = store._conn.execute(  # noqa: SLF001
+                """
+                WITH sessions AS (
+                    SELECT
+                        ts_code,
+                        CAST(trade_time AS DATE) AS trade_date,
+                        list(
+                            DISTINCT strftime(trade_time, '%H:%M:%S')
+                            ORDER BY strftime(trade_time, '%H:%M:%S')
+                        ) AS actual_times
+                    FROM minute_bar
+                    WHERE CAST(trade_time AS DATE) BETWEEN ? AND ?
+                      AND source = ?
+                      AND freq = ?
+                    GROUP BY ts_code, CAST(trade_time AS DATE)
+                )
+                SELECT *, count(*) OVER () AS finding_count
+                FROM sessions
+                WHERE actual_times IS DISTINCT FROM ?
+                ORDER BY trade_date, ts_code
+                LIMIT ?
+                """,
+                [
+                    start,
+                    end,
+                    spec.source,
+                    spec.freq,
+                    list(expected_values),
+                    sample_limit,
+                ],
+            ).fetchall()
+            expected = set(expected_values)
+            samples: list[MinuteSessionGapSample] = []
+            for (
+                ts_code,
+                trade_date_value,
+                actual_values,
+                _finding_count,
+            ) in rows:
+                actual = set(actual_values)
+                missing = sorted(expected - actual)
+                extra = sorted(actual - expected)
+                samples.append(
+                    MinuteSessionGapSample(
+                        ts_code=ts_code,
+                        trade_date=trade_date_value,
+                        source=spec.source,
+                        freq=spec.freq,
+                        timestamp_semantics=spec.timestamp_semantics,
+                        missing_count=len(missing),
+                        missing_times=tuple(
+                            _display_minute_time(value) for value in missing
+                        ),
+                        extra_count=len(extra),
+                        extra_times=tuple(
+                            _display_minute_time(value) for value in extra
+                        ),
+                    )
+                )
+            if not rows:
+                return ()
+            return (
+                AuditFinding(
+                    rule_id="incomplete-authoritative-session",
+                    dataset_id="minute_bar",
+                    severity="P1",
+                    scope_key=(
+                        f"{start.isoformat()}/{end.isoformat()}/"
+                        f"{spec.source}/{spec.freq}"
+                    ),
+                    message=(
+                        "Authoritative minute sessions do not match their "
+                        "configured timestamp grid"
+                    ),
+                    evidence={
+                        "count": rows[0][-1],
+                        "expected_count": len(expected),
+                        "samples": [
+                            sample.model_dump(mode="json") for sample in samples
+                        ],
+                    },
+                ),
+            )
+
+        return check
+
+    full_session_specs = tuple(
+        spec
+        for spec in specs
+        if spec.authoritative and spec.require_full_session
+    )
+
+    def session_check(store: DuckDBStore) -> tuple[AuditFinding, ...]:
+        return tuple(
+            finding
+            for spec in full_session_specs
+            for finding in make_session_check(spec)(store)
+        )
+
+    definitions = (
+        (
+            "minute-without-daily",
+            "P1",
+            "Minute bars exist without a matching daily bar",
+        ),
+        (
+            "eligible-daily-without-authoritative-minute",
+            "P1",
+            "Eligible daily bars have no authoritative minute bars",
+        ),
+        (
+            "incomplete-authoritative-session",
+            "P1",
+            "Authoritative minute sessions do not match their configured grid",
+        ),
+        (
+            "unknown-source-or-freq-semantics",
+            "P0",
+            "Minute bars use an undeclared source/frequency semantic",
+        ),
+        (
+            "cross-source-exact-overlap",
+            "P3",
+            "Multiple sources contain the same logical minute bar",
+        ),
+        (
+            "cross-source-conflicting-overlap",
+            "P2",
+            "Multiple sources disagree on the same logical minute bar",
+        ),
+    )
+    checks: dict[str, AuditCheck] = {
+        "minute-without-daily": minute_without_daily_check,
+        "eligible-daily-without-authoritative-minute": (
+            eligible_daily_without_minute_check
+        ),
+        "incomplete-authoritative-session": session_check,
+        "unknown-source-or-freq-semantics": unknown_semantics_check,
+        "cross-source-exact-overlap": make_overlap_check(
+            rule_id="cross-source-exact-overlap",
+            severity="P3",
+            exact=True,
+        ),
+        "cross-source-conflicting-overlap": make_overlap_check(
+            rule_id="cross-source-conflicting-overlap",
+            severity="P2",
+            exact=False,
+        ),
+    }
+    return tuple(
+        AuditRule(
+            rule_id=rule_id,
+            dataset_id="minute_bar",
+            severity=severity,
+            description=description,
+            check=checks.get(rule_id, no_findings),
+        )
+        for rule_id, severity, description in definitions
     )
 
 
