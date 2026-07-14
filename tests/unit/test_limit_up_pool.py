@@ -3,20 +3,35 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import pytest
 
 import rquant.limit_up_pool as limit_up_pool
 from rquant.limit_up_pool import capture_zt_pool, normalize_zt_pool, to_ts_code
 from rquant.storage.duckdb import DuckDBStore
+from rquant.trade_calendar import TradeCalendarDay
+
+_CALENDAR_UPDATED_AT = datetime(2026, 7, 1, 16, 0, tzinfo=UTC)
 
 
 @pytest.fixture()
 def store(tmp_path: Path) -> Iterator[DuckDBStore]:
     s = DuckDBStore(tmp_path / "test.duckdb")
+    calendar_dates = {date(2026, 7, 2), date.today()}
+    s.upsert_trade_calendar([
+        TradeCalendarDay(
+            exchange="SSE",
+            cal_date=cal_date,
+            is_open=True,
+            source="test",
+            updated_at=_CALENDAR_UPDATED_AT,
+        )
+        for cal_date in calendar_dates
+    ])
     yield s
     s.close()
 
@@ -124,6 +139,162 @@ class TestNormalizeZtPool:
 
 
 class TestCaptureZtPool:
+    def test_known_closed_day_records_p1_without_remote_fetch(
+        self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed_date = date(2026, 7, 4)
+        store.upsert_trade_calendar([
+            TradeCalendarDay(
+                exchange="SSE",
+                cal_date=closed_date,
+                is_open=False,
+                source="test",
+                updated_at=_CALENDAR_UPDATED_AT,
+            )
+        ])
+
+        def unexpected_fetch(ds: str) -> pd.DataFrame:
+            pytest.fail(f"closed-day capture must not fetch: {ds}")
+
+        monkeypatch.setattr(limit_up_pool, "_fetch_zt_pool", unexpected_fetch)
+
+        assert capture_zt_pool(closed_date, store) == 0
+        issue = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT severity, scope_key
+            FROM data_quality_issue
+            WHERE dataset_id = 'limit_up_pool_daily'
+            """
+        ).fetchone()
+        assert issue == ("P1", closed_date.isoformat())
+        assert store.query_limit_up_pool(closed_date).empty
+
+    def test_unknown_calendar_records_p0_and_fails_before_remote_fetch(
+        self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unknown_date = date(2026, 7, 3)
+
+        def unexpected_fetch(ds: str) -> pd.DataFrame:
+            pytest.fail(f"unknown-calendar capture must not fetch: {ds}")
+
+        monkeypatch.setattr(limit_up_pool, "_fetch_zt_pool", unexpected_fetch)
+
+        with pytest.raises(RuntimeError, match="calendar.*unknown"):
+            capture_zt_pool(unknown_date, store)
+
+        issue = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT severity, scope_key
+            FROM data_quality_issue
+            WHERE dataset_id = 'limit_up_pool_daily'
+            """
+        ).fetchone()
+        assert issue == ("P0", unknown_date.isoformat())
+        assert store.query_limit_up_pool(unknown_date).empty
+
+    def test_calendar_is_rechecked_after_fetch_before_business_write(
+        self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trading_date = date(2026, 7, 2)
+
+        def fetch_then_close(ds: str) -> pd.DataFrame:
+            store.upsert_trade_calendar([
+                TradeCalendarDay(
+                    exchange="SSE",
+                    cal_date=trading_date,
+                    is_open=False,
+                    source="test-correction",
+                    updated_at=datetime(2026, 7, 2, 16, 30, tzinfo=UTC),
+                )
+            ])
+            return _raw_zt_pool()
+
+        monkeypatch.setattr(limit_up_pool, "_fetch_zt_pool", fetch_then_close)
+
+        with pytest.raises(RuntimeError, match="calendar.*changed"):
+            capture_zt_pool(trading_date, store)
+
+        issue = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT severity, scope_key
+            FROM data_quality_issue
+            WHERE dataset_id = 'limit_up_pool_daily'
+            """
+        ).fetchone()
+        assert issue == ("P0", trading_date.isoformat())
+        assert store.query_limit_up_pool(trading_date).empty
+
+    def test_final_check_fences_concurrent_calendar_correction(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "capture-calendar-concurrency.duckdb"
+        trading_date = date(2026, 7, 2)
+        with DuckDBStore(db_path) as setup:
+            setup.upsert_trade_calendar([
+                TradeCalendarDay(
+                    exchange="SSE",
+                    cal_date=trading_date,
+                    is_open=True,
+                    source="test",
+                    updated_at=_CALENDAR_UPDATED_AT,
+                )
+            ])
+
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            lambda ds: _raw_zt_pool(),
+        )
+        writer_outcomes: list[str] = []
+        with (
+            DuckDBStore(db_path) as capture_store,
+            DuckDBStore(db_path) as calendar_writer,
+        ):
+            original_get = capture_store.get_trade_calendar_day
+            reads = 0
+
+            def read_then_correct(
+                exchange: str,
+                cal_date: date,
+            ) -> TradeCalendarDay | None:
+                nonlocal reads
+                calendar_day = original_get(exchange, cal_date)
+                reads += 1
+                if reads == 2:
+                    try:
+                        calendar_writer._conn.execute(  # noqa: SLF001
+                            """
+                            UPDATE trade_calendar
+                            SET is_open = FALSE
+                            WHERE exchange = 'SSE' AND cal_date = ?
+                            """,
+                            [trading_date],
+                        )
+                    except duckdb.TransactionException:
+                        writer_outcomes.append("conflicted")
+                    else:
+                        writer_outcomes.append("committed")
+                return calendar_day
+
+            monkeypatch.setattr(
+                capture_store,
+                "get_trade_calendar_day",
+                read_then_correct,
+            )
+            assert capture_zt_pool(trading_date, capture_store) == 3
+
+        with DuckDBStore(db_path, read_only=True) as check:
+            calendar = check.get_trade_calendar_day("SSE", trading_date)
+            pool_count = check._conn.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM limit_up_pool_daily"
+            ).fetchone()
+
+        assert writer_outcomes == ["conflicted"]
+        assert calendar is not None and calendar.is_open is True
+        assert pool_count == (3,)
+
     def test_capture_writes_to_store(
         self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -99,6 +99,32 @@ def _parse_iso_date(value: str) -> date:
     return parsed
 
 
+def _parse_sha256(value: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) != 64:
+        raise argparse.ArgumentTypeError("plan id 必须是 64 位 SHA256")
+    try:
+        int(normalized, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("plan id 必须是 64 位 SHA256") from exc
+    return normalized
+
+
+class _RQuantArgumentParser(argparse.ArgumentParser):
+    def parse_args(
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        if getattr(parsed, "command", None) == "zt-pool-repair":
+            apply_requested = bool(getattr(parsed, "apply", False))
+            plan_supplied = getattr(parsed, "plan_id", None) is not None
+            if apply_requested != plan_supplied:
+                self.error("真正执行修复必须同时传 --apply 和 --plan-id")
+        return parsed
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """启动 APScheduler 常驻进程。"""
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -375,12 +401,51 @@ def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
 
 def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
     """采集当日东财涨停池到 limit_up_pool_daily。"""
-    from rquant.limit_up_pool import capture_zt_pool
+    from rquant.limit_up_pool import (
+        LimitUpPoolCalendarGuardError,
+        capture_zt_pool,
+    )
 
     setup_logging()
     trade_date = date.fromisoformat(args.date) if args.date else None
-    rows = capture_zt_pool(trade_date)
+    try:
+        rows = capture_zt_pool(trade_date)
+    except LimitUpPoolCalendarGuardError as exc:
+        logger.error(f"zt-pool-capture 被权威交易日历阻断: {exc}")
+        return 1
     logger.info(f"zt-pool-capture 完成: rows={rows}")
+    return 0
+
+
+def cmd_zt_pool_repair(args: argparse.Namespace) -> int:
+    """Dry-run or CAS-apply the closed-day limit-up-pool repair."""
+    from rquant.data_quality import (
+        LimitUpPoolRepairBlockedError,
+        LimitUpPoolRepairNoOpError,
+        LimitUpPoolRepairPlanMismatchError,
+        apply_limit_up_pool_closed_day_repair,
+        build_limit_up_pool_closed_day_repair_plan,
+    )
+
+    setup_logging()
+    with DuckDBStore() as store:
+        if not args.apply:
+            plan = build_limit_up_pool_closed_day_repair_plan(store)
+            logger.info(f"zt-pool-repair dry-run:\n{plan.model_dump_json(indent=2)}")
+            return 1 if plan.status == "blocked" else 0
+        try:
+            result = apply_limit_up_pool_closed_day_repair(
+                store,
+                args.plan_id,
+            )
+        except (
+            LimitUpPoolRepairBlockedError,
+            LimitUpPoolRepairNoOpError,
+            LimitUpPoolRepairPlanMismatchError,
+        ) as exc:
+            logger.error(f"zt-pool-repair 拒绝执行: {exc}")
+            return 1
+    logger.info(f"zt-pool-repair applied:\n{result.model_dump_json(indent=2)}")
     return 0
 
 
@@ -1306,7 +1371,7 @@ def cmd_panorama_user_list(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
-    parser = argparse.ArgumentParser(
+    parser = _RQuantArgumentParser(
         prog="rquant", description="rQuant 量化选股平台"
     )
     sub = parser.add_subparsers(dest="command")
@@ -1471,6 +1536,22 @@ def build_parser() -> argparse.ArgumentParser:
     zt_pool_p.add_argument(
         "--date", type=str, default=None,
         help="交易日期 YYYY-MM-DD (默认今天)",
+    )
+
+    zt_repair_p = sub.add_parser(
+        "zt-pool-repair",
+        help="生成休市日污染修复计划；显式确认 plan id 后原子执行",
+    )
+    zt_repair_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="执行已确认的修复计划（必须同时传 --plan-id）",
+    )
+    zt_repair_p.add_argument(
+        "--plan-id",
+        type=_parse_sha256,
+        default=None,
+        help="dry-run 输出的 64 位 plan id（必须同时传 --apply）",
     )
 
     limit_list_p = sub.add_parser(
@@ -2133,6 +2214,7 @@ def main() -> int:
         "moneyflow-backfill": cmd_moneyflow_backfill,
         "market-daily-backfill": cmd_market_daily_backfill,
         "zt-pool-capture": cmd_zt_pool_capture,
+        "zt-pool-repair": cmd_zt_pool_repair,
         "limit-list-backfill": cmd_limit_list_backfill,
         "data-backfill": cmd_data_backfill,
         "minute-backfill": cmd_minute_backfill,

@@ -274,6 +274,190 @@ class TestTradeCalendarBootstrap:
         store_factory.assert_not_called()
 
 
+class TestLimitUpPoolCommands:
+    def test_repair_defaults_to_dry_run(self) -> None:
+        args = build_parser().parse_args(["zt-pool-repair"])
+
+        assert args.command == "zt-pool-repair"
+        assert args.apply is False
+        assert args.plan_id is None
+
+    def test_repair_apply_requires_both_explicit_flags(self) -> None:
+        plan_id = "a" * 64
+
+        accepted = build_parser().parse_args(
+            ["zt-pool-repair", "--apply", "--plan-id", plan_id]
+        )
+        assert accepted.apply is True
+        assert accepted.plan_id == plan_id
+
+        for incomplete in (
+            ["zt-pool-repair", "--apply"],
+            ["zt-pool-repair", "--plan-id", plan_id],
+        ):
+            with pytest.raises(SystemExit) as caught:
+                build_parser().parse_args(incomplete)
+            assert caught.value.code == 2
+
+    def test_repair_rejects_non_sha256_plan_id(self) -> None:
+        with pytest.raises(SystemExit) as caught:
+            build_parser().parse_args(
+                ["zt-pool-repair", "--apply", "--plan-id", "not-a-plan"]
+            )
+
+        assert caught.value.code == 2
+
+    def test_repair_dry_run_then_explicit_apply(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        from rquant.data_quality import (
+            build_limit_up_pool_closed_day_repair_plan,
+        )
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore(tmp_path / "repair-cli.duckdb")
+        closed_date = date(2026, 7, 12)
+        store._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO trade_calendar
+            (exchange, cal_date, is_open, source, updated_at)
+            VALUES ('SSE', ?, FALSE, 'test', now())
+            """,
+            [closed_date],
+        )
+        store._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO limit_up_pool_daily (ts_code, trade_date, source)
+            VALUES ('600001.SH', ?, 'eastmoney')
+            """,
+            [closed_date],
+        )
+
+        class _StoreContext:
+            def __enter__(self) -> DuckDBStore:
+                return store
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        monkeypatch.setattr(cli, "DuckDBStore", _StoreContext)
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+
+        assert cli.cmd_zt_pool_repair(
+            SimpleNamespace(apply=False, plan_id=None)
+        ) == 0
+        assert store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM limit_up_pool_daily"
+        ).fetchone() == (1,)
+        plan = build_limit_up_pool_closed_day_repair_plan(store)
+        assert plan.plan_id is not None
+
+        assert cli.cmd_zt_pool_repair(
+            SimpleNamespace(apply=True, plan_id=plan.plan_id)
+        ) == 0
+        assert store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM limit_up_pool_daily"
+        ).fetchone() == (0,)
+        assert store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM data_repair_audit"
+        ).fetchone() == (1,)
+        store.close()
+
+    def test_repair_dry_run_returns_nonzero_when_calendar_is_unknown(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore(tmp_path / "repair-cli-unknown.duckdb")
+        store._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO limit_up_pool_daily (ts_code, trade_date, source)
+            VALUES ('600001.SH', DATE '2026-07-12', 'eastmoney')
+            """
+        )
+
+        class _StoreContext:
+            def __enter__(self) -> DuckDBStore:
+                return store
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        monkeypatch.setattr(cli, "DuckDBStore", _StoreContext)
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+
+        assert cli.cmd_zt_pool_repair(
+            SimpleNamespace(apply=False, plan_id=None)
+        ) == 1
+        assert store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM limit_up_pool_daily"
+        ).fetchone() == (1,)
+        assert store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM data_repair_audit"
+        ).fetchone() == (0,)
+        store.close()
+
+    def test_repair_apply_returns_nonzero_for_empty_plan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        from rquant.data_quality import (
+            build_limit_up_pool_closed_day_repair_plan,
+        )
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore(tmp_path / "repair-cli-empty.duckdb")
+        plan = build_limit_up_pool_closed_day_repair_plan(store)
+        assert plan.plan_id is not None and plan.before_count == 0
+
+        class _StoreContext:
+            def __enter__(self) -> DuckDBStore:
+                return store
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        monkeypatch.setattr(cli, "DuckDBStore", _StoreContext)
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+
+        assert cli.cmd_zt_pool_repair(
+            SimpleNamespace(apply=True, plan_id=plan.plan_id)
+        ) == 1
+        assert store._conn.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM data_repair_audit"
+        ).fetchone() == (0,)
+        store.close()
+
+    def test_capture_calendar_guard_returns_nonzero(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        import rquant.limit_up_pool as limit_up_pool
+
+        def blocked_capture(trade_date: date | None) -> int:
+            assert trade_date == date(2026, 7, 3)
+            raise limit_up_pool.LimitUpPoolCalendarGuardError(
+                date(2026, 7, 3),
+                stage="pre_fetch",
+                detail="calendar unknown",
+            )
+
+        monkeypatch.setattr(limit_up_pool, "capture_zt_pool", blocked_capture)
+
+        result = cli.cmd_zt_pool_capture(SimpleNamespace(date="2026-07-03"))
+
+        assert result == 1
+
+
 def _write_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
