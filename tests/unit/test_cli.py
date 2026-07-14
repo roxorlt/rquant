@@ -311,6 +311,7 @@ class TestLimitUpPoolCommands:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
     ) -> None:
         import rquant.cli as cli
         from rquant.data_quality import (
@@ -319,6 +320,7 @@ class TestLimitUpPoolCommands:
         from rquant.storage.duckdb import DuckDBStore
 
         store = DuckDBStore(tmp_path / "repair-cli.duckdb")
+        request.addfinalizer(store.close)
         closed_date = date(2026, 7, 12)
         store._conn.execute(  # noqa: SLF001
             """
@@ -364,17 +366,18 @@ class TestLimitUpPoolCommands:
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM data_repair_audit"
         ).fetchone() == (1,)
-        store.close()
 
     def test_repair_dry_run_returns_nonzero_when_calendar_is_unknown(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
     ) -> None:
         import rquant.cli as cli
         from rquant.storage.duckdb import DuckDBStore
 
         store = DuckDBStore(tmp_path / "repair-cli-unknown.duckdb")
+        request.addfinalizer(store.close)
         store._conn.execute(  # noqa: SLF001
             """
             INSERT INTO limit_up_pool_daily (ts_code, trade_date, source)
@@ -401,12 +404,12 @@ class TestLimitUpPoolCommands:
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM data_repair_audit"
         ).fetchone() == (0,)
-        store.close()
 
     def test_repair_apply_returns_nonzero_for_empty_plan(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
     ) -> None:
         import rquant.cli as cli
         from rquant.data_quality import (
@@ -415,6 +418,7 @@ class TestLimitUpPoolCommands:
         from rquant.storage.duckdb import DuckDBStore
 
         store = DuckDBStore(tmp_path / "repair-cli-empty.duckdb")
+        request.addfinalizer(store.close)
         plan = build_limit_up_pool_closed_day_repair_plan(store)
         assert plan.plan_id is not None and plan.before_count == 0
 
@@ -434,7 +438,6 @@ class TestLimitUpPoolCommands:
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM data_repair_audit"
         ).fetchone() == (0,)
-        store.close()
 
     def test_capture_calendar_guard_returns_nonzero(
         self,

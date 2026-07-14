@@ -192,6 +192,40 @@ class TestCaptureZtPool:
         assert issue == ("P0", unknown_date.isoformat())
         assert store.query_limit_up_pool(unknown_date).empty
 
+    def test_successful_retry_resolves_previous_unknown_calendar_issue(
+        self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trading_date = date(2026, 7, 3)
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            lambda ds: _raw_zt_pool(),
+        )
+        with pytest.raises(limit_up_pool.LimitUpPoolCalendarGuardError):
+            capture_zt_pool(trading_date, store)
+
+        store.upsert_trade_calendar([
+            TradeCalendarDay(
+                exchange="SSE",
+                cal_date=trading_date,
+                is_open=True,
+                source="test-correction",
+                updated_at=datetime(2026, 7, 3, 9, 0, tzinfo=UTC),
+            )
+        ])
+
+        assert capture_zt_pool(trading_date, store) == 3
+        issue = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT status, resolved_at IS NOT NULL
+            FROM data_quality_issue
+            WHERE rule_id = 'limit_up_pool.calendar_unknown'
+              AND scope_key = ?
+            """,
+            [trading_date.isoformat()],
+        ).fetchone()
+        assert issue == ("resolved", True)
+
     def test_calendar_is_rechecked_after_fetch_before_business_write(
         self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -360,6 +394,65 @@ class TestCaptureZtPool:
         assert calendar is not None and calendar.is_open is False
         assert pool_count == (0,)
         assert issue == ("P0", trading_date.isoformat())
+
+    def test_pool_writer_conflict_is_not_mislabeled_as_calendar_change(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "capture-pool-writer-conflict.duckdb"
+        trading_date = date(2026, 7, 2)
+        with DuckDBStore(db_path) as setup:
+            setup.upsert_trade_calendar([
+                TradeCalendarDay(
+                    exchange="SSE",
+                    cal_date=trading_date,
+                    is_open=True,
+                    source="test",
+                    updated_at=_CALENDAR_UPDATED_AT,
+                )
+            ])
+
+        capture_store = DuckDBStore(db_path)
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            lambda ds: _raw_zt_pool(),
+        )
+
+        def conflicting_pool_write(df: pd.DataFrame) -> int:
+            raise duckdb.TransactionException("pool guard conflict")
+
+        monkeypatch.setattr(
+            capture_store,
+            "upsert_limit_up_pool",
+            conflicting_pool_write,
+        )
+        try:
+            with pytest.raises(
+                limit_up_pool.LimitUpPoolWriteConflictError,
+                match="business write",
+            ):
+                capture_zt_pool(trading_date, capture_store)
+        finally:
+            capture_store.close()
+
+        with DuckDBStore(db_path, read_only=True) as check:
+            pool_count = check._conn.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM limit_up_pool_daily"
+            ).fetchone()
+            issues = check._conn.execute(  # noqa: SLF001
+                """
+                SELECT rule_id, severity
+                FROM data_quality_issue
+                WHERE scope_key = ?
+                ORDER BY rule_id
+                """,
+                [trading_date.isoformat()],
+            ).fetchall()
+
+        assert pool_count == (0,)
+        assert issues == [("limit_up_pool.concurrent_business_write", "P0")]
 
     def test_capture_writes_to_store(
         self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch

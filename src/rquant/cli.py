@@ -402,7 +402,7 @@ def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
 def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
     """采集当日东财涨停池到 limit_up_pool_daily。"""
     from rquant.limit_up_pool import (
-        LimitUpPoolCalendarGuardError,
+        LimitUpPoolCaptureError,
         capture_zt_pool,
     )
 
@@ -410,7 +410,7 @@ def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
     trade_date = date.fromisoformat(args.date) if args.date else None
     try:
         rows = capture_zt_pool(trade_date)
-    except LimitUpPoolCalendarGuardError as exc:
+    except LimitUpPoolCaptureError as exc:
         logger.error(f"zt-pool-capture 被权威交易日历阻断: {exc}")
         return 1
     logger.info(f"zt-pool-capture 完成: rows={rows}")

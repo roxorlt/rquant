@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from loguru import logger
 
-from rquant.data_metadata import DataQualityIssue
+from rquant.data_metadata import DataQualityIssue, stable_sha256
 from rquant.storage.duckdb import DuckDBStore
 
 # akshare stock_zt_pool_em 中文列 → limit_up_pool_daily 列
@@ -41,9 +41,17 @@ _INT_COLUMNS = ("break_count", "consecutive_boards")
 _SEAL_TIME_COLUMNS = ("first_seal_time", "last_seal_time")
 _CALENDAR_EXCHANGE = "SSE"
 _DATASET_ID = "limit_up_pool_daily"
+_RULE_CLOSED_DAY = "limit_up_pool.closed_day_capture"
+_RULE_CALENDAR_UNKNOWN = "limit_up_pool.calendar_unknown"
+_RULE_CALENDAR_CHANGED = "limit_up_pool.calendar_changed_during_capture"
+_RULE_BUSINESS_WRITE = "limit_up_pool.concurrent_business_write"
 
 
-class LimitUpPoolCalendarGuardError(RuntimeError):
+class LimitUpPoolCaptureError(RuntimeError):
+    """Base class for a capture that must return a non-zero CLI status."""
+
+
+class LimitUpPoolCalendarGuardError(LimitUpPoolCaptureError):
     """Authoritative calendar cannot prove that this capture may write."""
 
     trade_date: date
@@ -59,6 +67,17 @@ class LimitUpPoolCalendarGuardError(RuntimeError):
         self.trade_date = trade_date
         self.stage = stage
         super().__init__(detail)
+
+
+class LimitUpPoolWriteConflictError(LimitUpPoolCaptureError):
+    trade_date: date
+
+    def __init__(self, trade_date: date) -> None:
+        self.trade_date = trade_date
+        super().__init__(
+            "limit-up-pool concurrent business write blocked capture: "
+            f"{trade_date.isoformat()}"
+        )
 
 
 def to_ts_code(symbol: str) -> str | None:
@@ -138,15 +157,15 @@ def _record_calendar_issue(
     state: Literal["closed", "unknown", "concurrent_change"],
 ) -> None:
     if stage == "pre_fetch" and state == "closed":
-        rule_id = "limit_up_pool.closed_day_capture"
+        rule_id = _RULE_CLOSED_DAY
         severity: Literal["P0", "P1"] = "P1"
         message = "limit-up-pool capture was scheduled for a known closed day"
     elif state == "unknown":
-        rule_id = "limit_up_pool.calendar_unknown"
+        rule_id = _RULE_CALENDAR_UNKNOWN
         severity = "P0"
         message = "limit-up-pool capture blocked because calendar is unknown"
     else:
-        rule_id = "limit_up_pool.calendar_changed_during_capture"
+        rule_id = _RULE_CALENDAR_CHANGED
         severity = "P0"
         message = "limit-up-pool calendar changed before the final write"
     store.record_data_quality_issue(
@@ -164,6 +183,44 @@ def _record_calendar_issue(
             },
         )
     )
+
+
+def _record_business_write_issue(
+    store: DuckDBStore,
+    trading_date: date,
+) -> None:
+    store.record_data_quality_issue(
+        DataQualityIssue.detected(
+            rule_id=_RULE_BUSINESS_WRITE,
+            dataset_id=_DATASET_ID,
+            severity="P0",
+            scope_key=trading_date.isoformat(),
+            message="concurrent limit-up-pool business write blocked capture",
+            evidence={
+                "trade_date": trading_date.isoformat(),
+                "stage": "pre_write",
+            },
+        )
+    )
+
+
+def _resolve_open_issues(
+    store: DuckDBStore,
+    trading_date: date,
+    rule_ids: tuple[str, ...],
+) -> None:
+    for rule_id in rule_ids:
+        issue_id = stable_sha256(
+            "data_quality_issue",
+            {
+                "rule_id": rule_id,
+                "dataset_id": _DATASET_ID,
+                "scope_key": trading_date.isoformat(),
+            },
+        )
+        existing = store.get_data_quality_issue(issue_id)
+        if existing is not None and existing.status == "open":
+            store.resolve_data_quality_issue(issue_id)
 
 
 def _allow_remote_fetch(store: DuckDBStore, trading_date: date) -> bool:
@@ -195,6 +252,11 @@ def _allow_remote_fetch(store: DuckDBStore, trading_date: date) -> bool:
             f"date={trading_date.isoformat()} exchange={_CALENDAR_EXCHANGE}"
         )
         return False
+    _resolve_open_issues(
+        store,
+        trading_date,
+        (_RULE_CLOSED_DAY, _RULE_CALENDAR_UNKNOWN),
+    )
     return True
 
 
@@ -205,6 +267,7 @@ def _write_with_final_calendar_check(
 ) -> int:
     transaction_open = False
     blocked_state: Literal["closed", "unknown"] | None = None
+    conflict_domain: Literal["calendar", "business_write"] = "calendar"
     try:
         store._conn.execute("BEGIN")  # noqa: SLF001
         transaction_open = True
@@ -251,9 +314,15 @@ def _write_with_final_calendar_check(
                     f"{trading_date.isoformat()} state={blocked_state}"
                 ),
             )
+        conflict_domain = "business_write"
         rows = store.upsert_limit_up_pool(df)
         store._conn.execute("COMMIT")  # noqa: SLF001
         transaction_open = False
+        _resolve_open_issues(
+            store,
+            trading_date,
+            (_RULE_CALENDAR_CHANGED, _RULE_BUSINESS_WRITE),
+        )
         return rows
     except duckdb.TransactionException as original_error:
         if transaction_open:
@@ -266,17 +335,22 @@ def _write_with_final_calendar_check(
                 ) from None
             transaction_open = False
         try:
-            _record_calendar_issue(
-                store,
-                trading_date,
-                stage="pre_write",
-                state="concurrent_change",
-            )
+            if conflict_domain == "calendar":
+                _record_calendar_issue(
+                    store,
+                    trading_date,
+                    stage="pre_write",
+                    state="concurrent_change",
+                )
+            else:
+                _record_business_write_issue(store, trading_date)
         except BaseException as issue_error:
             raise BaseExceptionGroup(
-                "calendar fence failed and P0 issue recording failed",
+                "capture conflict and P0 issue recording both failed",
                 [original_error, issue_error],
             ) from None
+        if conflict_domain == "business_write":
+            raise LimitUpPoolWriteConflictError(trading_date) from original_error
         raise LimitUpPoolCalendarGuardError(
             trading_date,
             stage="pre_write",
