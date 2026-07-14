@@ -137,6 +137,14 @@ def test_run_entry_mode_comparison_can_compare_profile_variants(
         }
         for day in [21, 22, 23]
     ]))
+    store.upsert_adj_factor(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_date": datetime(2026, 6, day).date(),
+            "adj_factor": 1.0,
+        }
+        for day in [21, 22, 23, 24]
+    ]))
 
     result = run_entry_mode_comparison(
         store,
