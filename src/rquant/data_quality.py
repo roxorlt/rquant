@@ -165,6 +165,14 @@ def _display_minute_time(value: str) -> str:
     return value[:-3] if value.endswith(":00") else value
 
 
+def _minute_frequency_minutes(freq: str) -> int:
+    suffix = "min"
+    magnitude = freq[: -len(suffix)] if freq.endswith(suffix) else ""
+    if not magnitude.isdecimal() or int(magnitude) < 1:
+        raise ValueError(f"minute frequency cannot be normalized: {freq}")
+    return int(magnitude)
+
+
 DEFAULT_MINUTE_SOURCE_SESSION_SPECS = (
     MinuteSourceSessionSpec(
         source="tushare",
@@ -927,7 +935,6 @@ def daily_minute_consistency_audit_rules(
             if (spec.source, spec.freq) in grouped
         )
 
-    declared_values = ", ".join("(?, ?)" for _spec in specs)
     declared_parameters: list[object] = [
         value for spec in specs for value in (spec.source, spec.freq)
     ]
@@ -1006,6 +1013,17 @@ def daily_minute_consistency_audit_rules(
 
     overlap_cache_store: DuckDBStore | None = None
     overlap_cache: tuple[MinuteOverlapAuditSummary, ...] = ()
+    overlap_declared_values = ", ".join("(?, ?, ?, ?)" for _spec in specs)
+    overlap_declared_parameters: list[object] = [
+        value
+        for spec in specs
+        for value in (
+            spec.source,
+            spec.freq,
+            spec.timestamp_semantics,
+            _minute_frequency_minutes(spec.freq),
+        )
+    ]
 
     def load_overlap_summaries(
         store: DuckDBStore,
@@ -1015,13 +1033,28 @@ def daily_minute_consistency_audit_rules(
             return overlap_cache
         rows = store._conn.execute(  # noqa: SLF001
             f"""
-            WITH declared(source, freq) AS (
-                VALUES {declared_values}
+            WITH declared(source, freq, timestamp_semantics, bar_minutes) AS (
+                VALUES {overlap_declared_values}
+            ),
+            normalized_rows AS (
+                SELECT
+                    m.*,
+                    CASE
+                        WHEN d.timestamp_semantics = 'bar_end'
+                            THEN m.trade_time - d.bar_minutes * INTERVAL 1 MINUTE
+                        ELSE m.trade_time
+                    END AS logical_bar_start
+                FROM minute_bar AS m
+                JOIN declared AS d
+                  ON d.source = m.source
+                 AND d.freq = m.freq
+                WHERE m.trade_time >= ?
+                  AND m.trade_time < ?
             ),
             overlap_rows AS (
                 SELECT
                     m.ts_code,
-                    m.trade_time,
+                    m.logical_bar_start AS trade_time,
                     m.freq,
                     list(DISTINCT m.source ORDER BY m.source) AS sources,
                     count(DISTINCT struct_pack(
@@ -1032,13 +1065,8 @@ def daily_minute_consistency_audit_rules(
                         vol_value := m.vol,
                         amount_value := m.amount
                     )) AS distinct_payload_count
-                FROM minute_bar AS m
-                JOIN declared AS d
-                  ON d.source = m.source
-                 AND d.freq = m.freq
-                WHERE m.trade_time >= ?
-                  AND m.trade_time < ?
-                GROUP BY m.ts_code, m.trade_time, m.freq
+                FROM normalized_rows AS m
+                GROUP BY m.ts_code, m.logical_bar_start, m.freq
                 HAVING count(DISTINCT m.source) > 1
             ),
             classified AS (
@@ -1075,7 +1103,7 @@ def daily_minute_consistency_audit_rules(
             ORDER BY category, trade_time, ts_code, freq
             """,
             [
-                *declared_parameters,
+                *overlap_declared_parameters,
                 range_start,
                 range_end,
                 sample_limit,

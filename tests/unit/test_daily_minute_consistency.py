@@ -1,6 +1,6 @@
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import duckdb
 import pytest
@@ -104,6 +104,7 @@ def _insert_minutes(
 def _single_minute_spec(
     *,
     source: str = "feed",
+    timestamp_semantics: Literal["bar_start", "bar_end", "provider_snapshot"] = ("bar_start"),
     authoritative: bool = True,
     required_for_daily_coverage: bool = True,
     require_full_session: bool = True,
@@ -111,7 +112,7 @@ def _single_minute_spec(
     return MinuteSourceSessionSpec(
         source=source,
         freq="1min",
-        timestamp_semantics="bar_start",
+        timestamp_semantics=timestamp_semantics,
         windows=(MinuteSessionWindow(start=time(9, 30), end=time(9, 30), step_minutes=1),),
         authoritative=authoritative,
         required_for_daily_coverage=required_for_daily_coverage,
@@ -785,6 +786,212 @@ def test_cross_source_exact_and_conflicting_overlaps_are_separate_and_null_safe(
                 "freq": "1min",
                 "sources": ["feed", "mirror"],
                 "distinct_payload_count": 2,
+            }
+        ],
+    }
+
+
+def test_overlap_normalizes_mixed_timestamp_semantics_to_same_logical_bar(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "mixed-overlap-semantics.duckdb"
+    trade_date = date(2026, 6, 26)
+    start_feed = _single_minute_spec(require_full_session=False)
+    end_feed = _single_minute_spec(
+        source="end_feed",
+        timestamp_semantics="bar_end",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    snapshot_feed = _single_minute_spec(
+        source="snapshot_feed",
+        timestamp_semantics="provider_snapshot",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+        for source, trade_time in (
+            (start_feed.source, time(9, 30)),
+            (end_feed.source, time(9, 31)),
+            (snapshot_feed.source, time(9, 30)),
+        ):
+            _insert_minute_row(
+                store,
+                ts_code="600000.SH",
+                trade_time=datetime.combine(trade_date, trade_time),
+                source=source,
+            )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(start_feed, end_feed, snapshot_feed),
+    )
+
+    exact = next(item for item in report.findings if item.rule_id == "cross-source-exact-overlap")
+    assert exact.evidence == {
+        "count": 1,
+        "samples": [
+            {
+                "ts_code": "600000.SH",
+                "trade_time": "2026-06-26T09:30:00",
+                "freq": "1min",
+                "sources": ["end_feed", "feed", "snapshot_feed"],
+                "distinct_payload_count": 1,
+            }
+        ],
+    }
+    assert all(item.rule_id != "cross-source-conflicting-overlap" for item in report.findings)
+
+
+def test_overlap_normalization_does_not_merge_adjacent_logical_bars(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "adjacent-overlap-semantics.duckdb"
+    trade_date = date(2026, 6, 26)
+    start_feed = _single_minute_spec(require_full_session=False)
+    end_feed = _single_minute_spec(
+        source="end_feed",
+        timestamp_semantics="bar_end",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+        for source in (start_feed.source, end_feed.source):
+            _insert_minute_row(
+                store,
+                ts_code="600000.SH",
+                trade_time=datetime.combine(trade_date, time(9, 31)),
+                source=source,
+            )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(start_feed, end_feed),
+    )
+
+    assert all(not item.rule_id.startswith("cross-source-") for item in report.findings)
+
+
+def test_overlap_normalization_detects_shifted_conflict_without_exact_false_positive(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "shifted-conflict-semantics.duckdb"
+    trade_date = date(2026, 6, 26)
+    start_feed = _single_minute_spec(require_full_session=False)
+    end_feed = _single_minute_spec(
+        source="end_feed",
+        timestamp_semantics="bar_end",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    snapshot_feed = _single_minute_spec(
+        source="snapshot_feed",
+        timestamp_semantics="provider_snapshot",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+        for source in (start_feed.source, snapshot_feed.source):
+            _insert_minute_row(
+                store,
+                ts_code="600000.SH",
+                trade_time=datetime.combine(trade_date, time(9, 30)),
+                source=source,
+            )
+        _insert_minute_row(
+            store,
+            ts_code="600000.SH",
+            trade_time=datetime.combine(trade_date, time(9, 31)),
+            source=end_feed.source,
+            high=10.2,
+        )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(start_feed, end_feed, snapshot_feed),
+    )
+
+    conflict = next(
+        item for item in report.findings if item.rule_id == "cross-source-conflicting-overlap"
+    )
+    assert conflict.evidence == {
+        "count": 1,
+        "samples": [
+            {
+                "ts_code": "600000.SH",
+                "trade_time": "2026-06-26T09:30:00",
+                "freq": "1min",
+                "sources": ["end_feed", "feed", "snapshot_feed"],
+                "distinct_payload_count": 2,
+            }
+        ],
+    }
+    assert all(item.rule_id != "cross-source-exact-overlap" for item in report.findings)
+
+
+def test_unknown_semantics_fails_closed_without_joining_known_overlap(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "unknown-mixed-overlap-semantics.duckdb"
+    trade_date = date(2026, 6, 26)
+    start_feed = _single_minute_spec(require_full_session=False)
+    end_feed = _single_minute_spec(
+        source="end_feed",
+        timestamp_semantics="bar_end",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+        for source, trade_time in (
+            (start_feed.source, time(9, 30)),
+            (end_feed.source, time(9, 31)),
+            ("mystery", time(9, 30)),
+        ):
+            _insert_minute_row(
+                store,
+                ts_code="600000.SH",
+                trade_time=datetime.combine(trade_date, trade_time),
+                source=source,
+            )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(start_feed, end_feed),
+    )
+
+    unknown = next(
+        item for item in report.findings if item.rule_id == "unknown-source-or-freq-semantics"
+    )
+    exact = next(item for item in report.findings if item.rule_id == "cross-source-exact-overlap")
+    assert report.is_blocked is True
+    assert unknown.severity == "P0"
+    assert exact.evidence == {
+        "count": 1,
+        "samples": [
+            {
+                "ts_code": "600000.SH",
+                "trade_time": "2026-06-26T09:30:00",
+                "freq": "1min",
+                "sources": ["end_feed", "feed"],
+                "distinct_payload_count": 1,
             }
         ],
     }
