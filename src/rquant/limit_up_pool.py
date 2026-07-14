@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
+import duckdb
 import pandas as pd
 from loguru import logger
 
@@ -134,7 +135,7 @@ def _record_calendar_issue(
     trading_date: date,
     *,
     stage: Literal["pre_fetch", "pre_write"],
-    state: Literal["closed", "unknown"],
+    state: Literal["closed", "unknown", "concurrent_change"],
 ) -> None:
     if stage == "pre_fetch" and state == "closed":
         rule_id = "limit_up_pool.closed_day_capture"
@@ -254,9 +255,45 @@ def _write_with_final_calendar_check(
         store._conn.execute("COMMIT")  # noqa: SLF001
         transaction_open = False
         return rows
-    except BaseException:
+    except duckdb.TransactionException as original_error:
         if transaction_open:
-            store._conn.execute("ROLLBACK")  # noqa: SLF001
+            try:
+                store._conn.execute("ROLLBACK")  # noqa: SLF001
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "calendar fence failed and rollback failed",
+                    [original_error, rollback_error],
+                ) from None
+            transaction_open = False
+        try:
+            _record_calendar_issue(
+                store,
+                trading_date,
+                stage="pre_write",
+                state="concurrent_change",
+            )
+        except BaseException as issue_error:
+            raise BaseExceptionGroup(
+                "calendar fence failed and P0 issue recording failed",
+                [original_error, issue_error],
+            ) from None
+        raise LimitUpPoolCalendarGuardError(
+            trading_date,
+            stage="pre_write",
+            detail=(
+                "limit-up-pool concurrent write blocked final calendar check: "
+                f"{trading_date.isoformat()}"
+            ),
+        ) from original_error
+    except BaseException as original_error:
+        if transaction_open:
+            try:
+                store._conn.execute("ROLLBACK")  # noqa: SLF001
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "limit-up-pool write failed and rollback failed",
+                    [original_error, rollback_error],
+                ) from None
         raise
 
 

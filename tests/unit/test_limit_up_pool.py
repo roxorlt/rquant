@@ -295,6 +295,72 @@ class TestCaptureZtPool:
         assert calendar is not None and calendar.is_open is True
         assert pool_count == (3,)
 
+    def test_final_check_records_p0_when_calendar_writer_wins_fence(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "capture-calendar-writer-wins.duckdb"
+        trading_date = date(2026, 7, 2)
+        with DuckDBStore(db_path) as setup:
+            setup.upsert_trade_calendar([
+                TradeCalendarDay(
+                    exchange="SSE",
+                    cal_date=trading_date,
+                    is_open=True,
+                    source="test",
+                    updated_at=_CALENDAR_UPDATED_AT,
+                )
+            ])
+
+        capture_store = DuckDBStore(db_path)
+        calendar_writer = DuckDBStore(db_path)
+
+        def fetch_after_writer_takes_fence(ds: str) -> pd.DataFrame:
+            calendar_writer._conn.execute("BEGIN")  # noqa: SLF001
+            calendar_writer._conn.execute(  # noqa: SLF001
+                """
+                UPDATE trade_calendar
+                SET is_open = FALSE
+                WHERE exchange = 'SSE' AND cal_date = ?
+                """,
+                [trading_date],
+            )
+            return _raw_zt_pool()
+
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            fetch_after_writer_takes_fence,
+        )
+        try:
+            with pytest.raises(
+                limit_up_pool.LimitUpPoolCalendarGuardError,
+                match="concurrent",
+            ):
+                capture_zt_pool(trading_date, capture_store)
+            calendar_writer._conn.execute("COMMIT")  # noqa: SLF001
+        finally:
+            capture_store.close()
+            calendar_writer.close()
+
+        with DuckDBStore(db_path, read_only=True) as check:
+            calendar = check.get_trade_calendar_day("SSE", trading_date)
+            pool_count = check._conn.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM limit_up_pool_daily"
+            ).fetchone()
+            issue = check._conn.execute(  # noqa: SLF001
+                """
+                SELECT severity, scope_key
+                FROM data_quality_issue
+                WHERE rule_id = 'limit_up_pool.calendar_changed_during_capture'
+                """
+            ).fetchone()
+
+        assert calendar is not None and calendar.is_open is False
+        assert pool_count == (0,)
+        assert issue == ("P0", trading_date.isoformat())
+
     def test_capture_writes_to_store(
         self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
