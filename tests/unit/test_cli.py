@@ -666,7 +666,14 @@ class TestCmdAuctionGapReplay:
         rc = cmd_auction_gap_replay(args)
 
         assert rc == 0
-        assert calls == [{"required_tables": ["auction_bar", "daily_bar", "daily_state"]}]
+        assert calls == [{
+            "required_tables": [
+                "auction_bar",
+                "daily_bar",
+                "daily_state",
+                "stock_status_daily",
+            ]
+        }]
         replay_mock.assert_called_once()
         assert replay_mock.call_args.args[0] is store
 
@@ -722,6 +729,7 @@ class TestCmdAuctionGapMinuteReplay:
                 "daily_bar",
                 "daily_state",
                 "minute_bar",
+                "stock_status_daily",
             ]
         }]
         candidate_mock.assert_called_once()
@@ -994,8 +1002,8 @@ class TestCmdGrowthBoardSurgeReplay:
                 "daily_bar",
                 "daily_indicator",
                 "daily_state",
-                "stock_basic",
                 "minute_bar",
+                "stock_status_daily",
             ]
         )
         replay.assert_called_once()

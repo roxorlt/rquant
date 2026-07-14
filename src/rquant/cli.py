@@ -490,7 +490,12 @@ def cmd_auction_gap_replay(args: argparse.Namespace) -> int:
         st_filter=args.st_filter,
     )
     with open_readonly_store(
-        required_tables=["auction_bar", "daily_bar", "daily_state"]
+        required_tables=[
+            "auction_bar",
+            "daily_bar",
+            "daily_state",
+            "stock_status_daily",
+        ]
     ) as store:
         trades = run_auction_gap_replay(store, config)
 
@@ -542,7 +547,13 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         seal_hold_max_open_times=args.seal_hold_max_open_times,
         factor_score_threshold=args.factor_score_threshold,
     )
-    required_tables = ["auction_bar", "daily_bar", "daily_state", "minute_bar"]
+    required_tables = [
+        "auction_bar",
+        "daily_bar",
+        "daily_state",
+        "minute_bar",
+        "stock_status_daily",
+    ]
     if seal_hold_enabled:
         required_tables.append("limit_list_daily")
     if args.persist_positions:
@@ -705,8 +716,8 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         "daily_bar",
         "daily_indicator",
         "daily_state",
-        "stock_basic",
         "minute_bar",
+        "stock_status_daily",
     ]
     if config.factor_layer_enabled:
         required_tables += ["moneyflow_daily", "market_sentiment_daily"]

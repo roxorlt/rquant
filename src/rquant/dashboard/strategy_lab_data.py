@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
@@ -35,6 +36,7 @@ TUSHARE_STATUS_LABELS: dict[str, str] = {
 }
 
 _POINTS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*积分")
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class StrategyOptimizationWorkloadEstimate(BaseModel):
@@ -74,6 +76,63 @@ class GrowthBoardAblationSpec(BaseModel):
     require_vwap_strength: bool = True
     use_same_minute_surge: bool = True
     use_accel_surge: bool = True
+
+
+def query_growth_board_candidates(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    start_date: date,
+    end_date: date,
+    min_signal_time: time = time(9, 30),
+) -> pd.DataFrame:
+    """批量读取 Lab 工作量分母，并按盘中决策时点校验历史证券状态。"""
+    raw = conn.execute(
+        """
+        SELECT daily.ts_code,
+               daily.trade_date,
+               status.name,
+               status.is_st,
+               status.available_at,
+               status.conflict_reason
+        FROM daily_bar AS daily
+        LEFT JOIN stock_status_daily AS status
+          ON daily.ts_code = status.ts_code
+         AND daily.trade_date = status.trade_date
+        WHERE daily.trade_date >= ?
+          AND daily.trade_date <= ?
+          AND (
+              daily.ts_code LIKE '300%.SZ'
+              OR daily.ts_code LIKE '301%.SZ'
+              OR daily.ts_code LIKE '688%.SH'
+          )
+          AND daily.pre_close > 0
+        ORDER BY daily.trade_date, daily.ts_code
+        """,
+        [start_date, end_date],
+    ).fetchdf()
+    if raw.empty:
+        return raw[["ts_code", "trade_date", "name"]]
+
+    signal_dates = pd.to_datetime(raw["trade_date"])
+    decision_at = signal_dates.dt.tz_localize(SHANGHAI) + timedelta(
+        hours=min_signal_time.hour,
+        minutes=min_signal_time.minute,
+        seconds=min_signal_time.second,
+        microseconds=min_signal_time.microsecond,
+    )
+    available_at = pd.to_datetime(raw["available_at"], utc=True)
+    known_non_st = (
+        raw["conflict_reason"].isna()
+        & raw["name"].notna()
+        & raw["name"].astype("string").str.strip().ne("")
+        & raw["is_st"].notna()
+        & raw["is_st"].eq(False)
+        & available_at.notna()
+        & available_at.le(decision_at)
+    ).fillna(False)
+    candidates = raw.loc[known_non_st, ["ts_code", "trade_date", "name"]].copy()
+    candidates["name"] = candidates["name"].astype("string").str.strip()
+    return candidates.reset_index(drop=True)
 
 
 def _duration_label(seconds: float) -> str:

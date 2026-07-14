@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 import pandas as pd
 import pytest
 
+from rquant.security_status import SHANGHAI, SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -105,6 +106,27 @@ def _seed_base(
         "list_date": "19991110",
         "market": "主板",
     }]))
+    status_dates = sorted({row["trade_date"] for row in daily_rows})
+    store.upsert_stock_status(tuple(
+        SecurityStatusDaily(
+            ts_code="600000.SH",
+            trade_date=trade_date,
+            name="历史浦发",
+            is_st=False,
+            name_source="test_name",
+            st_source="test_st",
+            available_at=datetime(
+                trade_date.year,
+                trade_date.month,
+                trade_date.day,
+                9,
+                25,
+                tzinfo=SHANGHAI,
+            ),
+            ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
+        )
+        for trade_date in status_dates
+    ))
     store.upsert_state(pd.DataFrame([
         {
             "ts_code": "600000.SH",

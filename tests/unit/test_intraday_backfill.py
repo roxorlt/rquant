@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
+from rquant.security_status import SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -181,6 +183,20 @@ def _seed_auction_gap_candidate(store: DuckDBStore) -> None:
         "list_date": "19991110",
         "market": "主板",
     }]))
+    store.upsert_stock_status([
+        SecurityStatusDaily(
+            ts_code="600000.SH",
+            trade_date=date(2026, 6, 25),
+            name="浦发银行",
+            is_st=False,
+            name_source="namechange",
+            st_source="namechange",
+            available_at=datetime(
+                2026, 6, 25, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai")
+            ),
+            ingested_at=datetime(2026, 6, 27, tzinfo=UTC),
+        )
+    ])
     store.upsert_state(pd.DataFrame([
         {
             "ts_code": "600000.SH",
@@ -344,6 +360,32 @@ def test_backfill_auction_gap_minute_replay_window_fetches_signal_to_exit_window
         datetime(2026, 6, 25, 9, 30),
         datetime(2026, 6, 26, 15, 0),
     )]
+
+
+def test_backfill_auction_gap_ts_code_handles_missing_status_candidate(
+    store: DuckDBStore,
+) -> None:
+    from rquant.intraday_backfill import backfill_auction_gap_minute_replay_window
+
+    _seed_auction_gap_candidate(store)
+    store._conn.execute("DELETE FROM stock_status_daily")
+    adapter = _FakeIntradayAdapter()
+
+    summary = backfill_auction_gap_minute_replay_window(
+        store,
+        adapter,
+        start_date="2026-06-25",
+        end_date="2026-06-25",
+        max_hold_days=1,
+        freq="1min",
+        ts_code="600000.SH",
+    )
+
+    assert summary.candidates_count == 0
+    assert summary.planned_requests == 0
+    assert summary.executed_requests == 0
+    assert summary.rows_written == 0
+    assert adapter.calls == []
 
 
 def test_backfill_minute_replay_window_fetches_buy_to_exit_window(
