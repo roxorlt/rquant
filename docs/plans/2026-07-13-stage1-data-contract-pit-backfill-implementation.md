@@ -8,6 +8,10 @@
 
 **技术栈：** Python 3.11+、Pydantic、DuckDB、SQLite、pandas、argparse、pytest、ruff。
 
+**执行状态（2026-07-14）：** PR-A 已随 v0.14.0 部署；PR-B Tasks 6-11 已完成实现和审查，
+全量 1682 项测试通过，待合并为 v0.15.0 并按受控顺序完成云端/本地交易日历 bootstrap；
+PR-C、PR-D 尚未完成。
+
 ---
 
 ## 交付批次
