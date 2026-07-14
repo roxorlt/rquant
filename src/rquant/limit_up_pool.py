@@ -268,6 +268,7 @@ def _write_with_final_calendar_check(
     transaction_open = False
     blocked_state: Literal["closed", "unknown"] | None = None
     conflict_domain: Literal["calendar", "business_write"] = "calendar"
+    rows: int
     try:
         store._conn.execute("BEGIN")  # noqa: SLF001
         transaction_open = True
@@ -318,12 +319,6 @@ def _write_with_final_calendar_check(
         rows = store.upsert_limit_up_pool(df)
         store._conn.execute("COMMIT")  # noqa: SLF001
         transaction_open = False
-        _resolve_open_issues(
-            store,
-            trading_date,
-            (_RULE_CALENDAR_CHANGED, _RULE_BUSINESS_WRITE),
-        )
-        return rows
     except duckdb.TransactionException as original_error:
         if transaction_open:
             try:
@@ -369,6 +364,18 @@ def _write_with_final_calendar_check(
                     [original_error, rollback_error],
                 ) from None
         raise
+    try:
+        _resolve_open_issues(
+            store,
+            trading_date,
+            (_RULE_CALENDAR_CHANGED, _RULE_BUSINESS_WRITE),
+        )
+    except Exception as exc:
+        logger.warning(
+            "涨停池已写入，但旧质量问题暂未关闭，后续重跑会重试: "
+            f"date={trading_date.isoformat()} err={exc}"
+        )
+    return rows
 
 
 def capture_zt_pool(

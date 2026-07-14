@@ -460,6 +460,33 @@ class TestLimitUpPoolCommands:
 
         assert result == 1
 
+    def test_capture_business_conflict_uses_neutral_blocked_message(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        import rquant.limit_up_pool as limit_up_pool
+
+        def blocked_capture(trade_date: date | None) -> int:
+            assert trade_date == date(2026, 7, 3)
+            raise limit_up_pool.LimitUpPoolWriteConflictError(date(2026, 7, 3))
+
+        errors: list[str] = []
+        monkeypatch.setattr(limit_up_pool, "capture_zt_pool", blocked_capture)
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+        monkeypatch.setattr(
+            cli,
+            "logger",
+            SimpleNamespace(error=errors.append),
+        )
+
+        result = cli.cmd_zt_pool_capture(SimpleNamespace(date="2026-07-03"))
+
+        assert result == 1
+        assert len(errors) == 1
+        assert "zt-pool-capture 被阻断" in errors[0]
+        assert "交易日历" not in errors[0]
+
 
 def _write_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")

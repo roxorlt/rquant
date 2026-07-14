@@ -454,6 +454,45 @@ class TestCaptureZtPool:
         assert pool_count == (0,)
         assert issues == [("limit_up_pool.concurrent_business_write", "P0")]
 
+    def test_post_commit_issue_resolution_conflict_does_not_misreport_write(
+        self,
+        store: DuckDBStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            lambda ds: _raw_zt_pool(),
+        )
+        resolve_calls = 0
+
+        def fail_post_commit_resolution(
+            current_store: DuckDBStore,
+            trading_date: date,
+            rule_ids: tuple[str, ...],
+        ) -> None:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            if resolve_calls == 2:
+                raise duckdb.TransactionException("issue resolution conflict")
+
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_resolve_open_issues",
+            fail_post_commit_resolution,
+        )
+
+        assert capture_zt_pool(date(2026, 7, 2), store) == 3
+        assert resolve_calls == 2
+        assert store.query_limit_up_pool(date(2026, 7, 2)).shape[0] == 3
+        assert store._conn.execute(  # noqa: SLF001
+            """
+            SELECT COUNT(*)
+            FROM data_quality_issue
+            WHERE rule_id = 'limit_up_pool.concurrent_business_write'
+            """
+        ).fetchone() == (0,)
+
     def test_capture_writes_to_store(
         self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -411,7 +411,7 @@ def cmd_zt_pool_capture(args: argparse.Namespace) -> int:
     try:
         rows = capture_zt_pool(trade_date)
     except LimitUpPoolCaptureError as exc:
-        logger.error(f"zt-pool-capture 被权威交易日历阻断: {exc}")
+        logger.error(f"zt-pool-capture 被阻断: {exc}")
         return 1
     logger.info(f"zt-pool-capture 完成: rows={rows}")
     return 0
