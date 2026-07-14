@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -27,6 +30,10 @@ from rquant.storage.duckdb import DuckDBStore
 
 _READ_ONLY_ACCESS_MODE = "read_only"
 _WRITABLE_ACCESS_MODES = frozenset({"automatic", "read_write"})
+_LIMIT_UP_POOL_REPAIR_ACTION_ID = "limit-up-pool-closed-day-cleanup/v1"
+_LIMIT_UP_POOL_DATASET_ID = "limit_up_pool_daily"
+_LIMIT_UP_POOL_TARGET_TABLE = "limit_up_pool_daily"
+_LIMIT_UP_POOL_KEY_COLUMNS = ("ts_code", "trade_date", "source")
 
 
 class QualityModel(BaseModel):
@@ -36,6 +43,355 @@ class QualityModel(BaseModel):
         frozen=True,
         str_strip_whitespace=True,
     )
+
+
+class LimitUpPoolRepairKey(QualityModel):
+    ts_code: str = Field(min_length=1)
+    trade_date: date
+    source: str = Field(min_length=1)
+
+
+class LimitUpPoolRepairPlanPayload(QualityModel):
+    action_id: str = Field(min_length=1)
+    dataset_id: str = Field(min_length=1)
+    target_table: str = Field(min_length=1)
+    key_columns: tuple[str, ...] = Field(min_length=1)
+    candidate_keys: tuple[LimitUpPoolRepairKey, ...]
+    before_count: StrictInt = Field(ge=0)
+
+
+class LimitUpPoolRepairPlan(QualityModel):
+    status: Literal["ready", "blocked"]
+    severity: QualitySeverity | None = None
+    action_id: str = _LIMIT_UP_POOL_REPAIR_ACTION_ID
+    dataset_id: str = _LIMIT_UP_POOL_DATASET_ID
+    target_table: str = _LIMIT_UP_POOL_TARGET_TABLE
+    key_columns: tuple[str, ...] = _LIMIT_UP_POOL_KEY_COLUMNS
+    candidate_keys: tuple[LimitUpPoolRepairKey, ...] = ()
+    unknown_dates: tuple[date, ...] = ()
+    plan_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @computed_field
+    @property
+    def before_count(self) -> int:
+        return len(self.candidate_keys)
+
+    @model_validator(mode="after")
+    def validate_status(self) -> LimitUpPoolRepairPlan:
+        if self.status == "ready":
+            if self.plan_id is None:
+                raise ValueError("ready repair plan requires plan_id")
+            if self.severity is not None or self.unknown_dates:
+                raise ValueError("ready repair plan cannot be blocked")
+        else:
+            if self.plan_id is not None or self.candidate_keys:
+                raise ValueError("blocked repair plan cannot be executable")
+            if self.severity != "P0" or not self.unknown_dates:
+                raise ValueError("blocked repair plan requires P0 unknown dates")
+        return self
+
+
+class LimitUpPoolRepairApplyRequest(QualityModel):
+    expected_plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DataRepairAudit(QualityModel):
+    audit_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    action_id: str = Field(min_length=1)
+    dataset_id: str = Field(min_length=1)
+    target_table: str = Field(min_length=1)
+    key_columns: tuple[str, ...] = Field(min_length=1)
+    candidate_keys: tuple[LimitUpPoolRepairKey, ...]
+    before_count: StrictInt = Field(ge=0)
+    deleted_count: StrictInt = Field(ge=0)
+    after_count: StrictInt = Field(ge=0)
+    applied_at: datetime
+
+    @field_validator("applied_at")
+    @classmethod
+    def validate_applied_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> DataRepairAudit:
+        if self.after_count > self.before_count:
+            raise ValueError("after_count cannot exceed before_count")
+        if self.deleted_count != self.before_count - self.after_count:
+            raise ValueError("deleted_count must equal before_count - after_count")
+        if self.before_count != len(self.candidate_keys):
+            raise ValueError("before_count must match candidate_keys")
+        return self
+
+
+class LimitUpPoolRepairApplyResult(QualityModel):
+    audit_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    action_id: str = Field(min_length=1)
+    before_count: StrictInt = Field(ge=0)
+    deleted_count: StrictInt = Field(ge=0)
+    after_count: StrictInt = Field(ge=0)
+    applied_at: datetime
+
+    @field_validator("applied_at")
+    @classmethod
+    def validate_applied_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+
+class LimitUpPoolRepairBlockedError(RuntimeError):
+    plan: LimitUpPoolRepairPlan
+
+    def __init__(self, plan: LimitUpPoolRepairPlan) -> None:
+        self.plan = plan
+        rendered = ", ".join(day.isoformat() for day in plan.unknown_dates)
+        super().__init__(f"unknown trade calendar dates block repair: {rendered}")
+
+
+class LimitUpPoolRepairPlanMismatchError(RuntimeError):
+    expected_plan_id: str
+    current_plan_id: str
+
+    def __init__(self, expected_plan_id: str, current_plan_id: str) -> None:
+        self.expected_plan_id = expected_plan_id
+        self.current_plan_id = current_plan_id
+        super().__init__(
+            "repair plan id mismatch: "
+            f"expected={expected_plan_id}, current={current_plan_id}"
+        )
+
+
+def _load_limit_up_pool_repair_plan(
+    store: DuckDBStore,
+) -> LimitUpPoolRepairPlan:
+    rows = store._conn.execute(  # noqa: SLF001
+        """
+        SELECT pool.ts_code, pool.trade_date, pool.source, calendar.is_open
+        FROM limit_up_pool_daily AS pool
+        LEFT JOIN trade_calendar AS calendar
+          ON calendar.exchange = 'SSE'
+         AND calendar.cal_date = pool.trade_date
+        ORDER BY pool.trade_date, pool.ts_code, pool.source
+        """
+    ).fetchall()
+    unknown_dates = tuple(
+        sorted({row[1] for row in rows if row[3] is None})
+    )
+    if unknown_dates:
+        return LimitUpPoolRepairPlan(
+            status="blocked",
+            severity="P0",
+            unknown_dates=unknown_dates,
+        )
+
+    candidate_keys = tuple(
+        sorted(
+            {
+                LimitUpPoolRepairKey(
+                    ts_code=str(row[0]),
+                    trade_date=row[1],
+                    source=str(row[2]),
+                )
+                for row in rows
+                if row[3] is False
+            },
+            key=lambda key: (key.ts_code, key.trade_date, key.source),
+        )
+    )
+    payload = LimitUpPoolRepairPlanPayload(
+        action_id=_LIMIT_UP_POOL_REPAIR_ACTION_ID,
+        dataset_id=_LIMIT_UP_POOL_DATASET_ID,
+        target_table=_LIMIT_UP_POOL_TARGET_TABLE,
+        key_columns=_LIMIT_UP_POOL_KEY_COLUMNS,
+        candidate_keys=candidate_keys,
+        before_count=len(candidate_keys),
+    )
+    canonical = json.dumps(
+        payload.model_dump(mode="json"),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    plan_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return LimitUpPoolRepairPlan(
+        status="ready",
+        candidate_keys=candidate_keys,
+        plan_id=plan_id,
+    )
+
+
+def build_limit_up_pool_closed_day_repair_plan(
+    store: DuckDBStore,
+) -> LimitUpPoolRepairPlan:
+    """Build an executable plan from the writable target database itself."""
+    _require_writable_store(store, operation="build repair plan")
+    return _load_limit_up_pool_repair_plan(store)
+
+
+def _delete_limit_up_pool_repair_candidates(
+    store: DuckDBStore,
+    candidate_keys: tuple[LimitUpPoolRepairKey, ...],
+) -> tuple[LimitUpPoolRepairKey, ...]:
+    if not candidate_keys:
+        return ()
+    placeholders = ", ".join("(?, ?, ?)" for _ in candidate_keys)
+    parameters = [
+        value
+        for key in candidate_keys
+        for value in (key.ts_code, key.trade_date, key.source)
+    ]
+    rows = store._conn.execute(  # noqa: SLF001
+        f"""
+        DELETE FROM limit_up_pool_daily
+        WHERE (ts_code, trade_date, source) IN (VALUES {placeholders})
+          AND EXISTS (
+              SELECT 1
+              FROM trade_calendar AS calendar
+              WHERE calendar.exchange = 'SSE'
+                AND calendar.cal_date = limit_up_pool_daily.trade_date
+                AND calendar.is_open = FALSE
+          )
+        RETURNING ts_code, trade_date, source
+        """,
+        parameters,
+    ).fetchall()
+    return tuple(
+        sorted(
+            (
+                LimitUpPoolRepairKey(
+                    ts_code=str(row[0]),
+                    trade_date=row[1],
+                    source=str(row[2]),
+                )
+                for row in rows
+            ),
+            key=lambda key: (key.ts_code, key.trade_date, key.source),
+        )
+    )
+
+
+def _insert_data_repair_audit(
+    store: DuckDBStore,
+    audit: DataRepairAudit,
+) -> None:
+    store._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO data_repair_audit
+        (audit_id, plan_id, action_id, dataset_id, target_table,
+         key_columns, candidate_keys, before_count, deleted_count,
+         after_count, applied_at)
+        VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, ?, ?, ?)
+        """,
+        [
+            audit.audit_id,
+            audit.plan_id,
+            audit.action_id,
+            audit.dataset_id,
+            audit.target_table,
+            json.dumps(audit.key_columns, ensure_ascii=True),
+            json.dumps(
+                [key.model_dump(mode="json") for key in audit.candidate_keys],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            audit.before_count,
+            audit.deleted_count,
+            audit.after_count,
+            audit.applied_at,
+        ],
+    )
+
+
+def apply_limit_up_pool_closed_day_repair(
+    store: DuckDBStore,
+    expected_plan_id: str,
+    *,
+    applied_at: datetime | None = None,
+) -> LimitUpPoolRepairApplyResult:
+    """CAS-apply a closed-day cleanup and its audit in one transaction."""
+    _require_writable_store(store, operation="apply repair plan")
+    request = LimitUpPoolRepairApplyRequest(
+        expected_plan_id=expected_plan_id,
+    )
+    applied_time = normalize_utc_datetime(
+        utc_now() if applied_at is None else applied_at
+    )
+    transaction_open = False
+    try:
+        store._conn.execute("BEGIN")  # noqa: SLF001
+        transaction_open = True
+        current = _load_limit_up_pool_repair_plan(store)
+        if current.status == "blocked":
+            raise LimitUpPoolRepairBlockedError(current)
+        if current.plan_id != request.expected_plan_id:
+            assert current.plan_id is not None
+            raise LimitUpPoolRepairPlanMismatchError(
+                request.expected_plan_id,
+                current.plan_id,
+            )
+
+        deleted_keys = _delete_limit_up_pool_repair_candidates(
+            store,
+            current.candidate_keys,
+        )
+        if deleted_keys != current.candidate_keys:
+            raise RuntimeError(
+                "deleted repair keys do not match the approved candidate keys"
+            )
+        after = _load_limit_up_pool_repair_plan(store)
+        if after.status == "blocked":
+            raise LimitUpPoolRepairBlockedError(after)
+        if after.before_count != 0:
+            raise RuntimeError(
+                "closed-day repair after_count must be zero: "
+                f"after_count={after.before_count}"
+            )
+
+        audit_id = stable_sha256(
+            "data_repair_audit",
+            {
+                "plan_id": request.expected_plan_id,
+                "action_id": current.action_id,
+                "applied_at": applied_time,
+            },
+        )
+        audit = DataRepairAudit(
+            audit_id=audit_id,
+            plan_id=request.expected_plan_id,
+            action_id=current.action_id,
+            dataset_id=current.dataset_id,
+            target_table=current.target_table,
+            key_columns=current.key_columns,
+            candidate_keys=current.candidate_keys,
+            before_count=current.before_count,
+            deleted_count=len(deleted_keys),
+            after_count=after.before_count,
+            applied_at=applied_time,
+        )
+        _insert_data_repair_audit(store, audit)
+        result = LimitUpPoolRepairApplyResult(
+            audit_id=audit.audit_id,
+            plan_id=audit.plan_id,
+            action_id=audit.action_id,
+            before_count=audit.before_count,
+            deleted_count=audit.deleted_count,
+            after_count=audit.after_count,
+            applied_at=audit.applied_at,
+        )
+        store._conn.execute("COMMIT")  # noqa: SLF001
+        transaction_open = False
+        return result
+    except BaseException as original_error:
+        if transaction_open:
+            try:
+                store._conn.execute("ROLLBACK")  # noqa: SLF001
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "repair failed and rollback failed; database state uncertain",
+                    [original_error, rollback_error],
+                ) from None
+        raise
 
 
 class AuditFinding(QualityModel):

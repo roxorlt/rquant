@@ -112,7 +112,10 @@ MERGE_TABLES: tuple[str, ...] = (
     "data_quality_issue",
 )
 
-LOCAL_ONLY_TABLES: tuple[str, ...] = ("schema_migration",)
+LOCAL_ONLY_TABLES: tuple[str, ...] = (
+    "schema_migration",
+    "data_repair_audit",
+)
 
 DATA_METADATA_TABLES: tuple[str, ...] = (
     "dataset_snapshot",

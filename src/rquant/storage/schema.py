@@ -847,6 +847,24 @@ CREATE TABLE IF NOT EXISTS data_quality_issue (
 );
 """
 
+DATA_REPAIR_AUDIT_DDL = """
+CREATE TABLE IF NOT EXISTS data_repair_audit (
+    audit_id       VARCHAR     PRIMARY KEY,
+    plan_id        VARCHAR     NOT NULL,
+    action_id      VARCHAR     NOT NULL,
+    dataset_id     VARCHAR     NOT NULL,
+    target_table   VARCHAR     NOT NULL,
+    key_columns    JSON        NOT NULL,
+    candidate_keys JSON        NOT NULL,
+    before_count   BIGINT      NOT NULL CHECK (before_count >= 0),
+    deleted_count  BIGINT      NOT NULL CHECK (deleted_count >= 0),
+    after_count    BIGINT      NOT NULL CHECK (after_count >= 0),
+    applied_at     TIMESTAMPTZ NOT NULL,
+    CHECK (after_count <= before_count),
+    CHECK (deleted_count = before_count - after_count)
+);
+"""
+
 TRADE_CALENDAR_DDL = """
 CREATE TABLE IF NOT EXISTS trade_calendar (
     exchange      VARCHAR     NOT NULL,
@@ -929,6 +947,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     *DATA_METADATA_TABLE_DDLS,
     TRADE_CALENDAR_DDL,
     STOCK_STATUS_DAILY_DDL,
+    DATA_REPAIR_AUDIT_DDL,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

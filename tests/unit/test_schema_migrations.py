@@ -169,7 +169,7 @@ def test_v3_creates_trade_calendar_only_through_versioned_migration() -> None:
 def test_v4_creates_historical_stock_status_only_through_versioned_migration() -> None:
     from rquant.storage.schema import ALL_DDL, STOCK_STATUS_DAILY_DDL
 
-    assert [migration.version for migration in MIGRATIONS] == [1, 2, 3, 4]
+    assert [migration.version for migration in MIGRATIONS[:4]] == [1, 2, 3, 4]
     assert MIGRATIONS[3].statements == (STOCK_STATUS_DAILY_DDL,)
     assert (
         MIGRATIONS[3].checksum
@@ -208,7 +208,7 @@ def test_v4_creates_historical_stock_status_only_through_versioned_migration() -
         ("conflict_reason", "YES", "VARCHAR"),
     ]
     assert primary_key == (["ts_code", "trade_date"],)
-    assert [row[0] for row in _migration_rows(conn)] == [1, 2, 3, 4]
+    assert [row[0] for row in _migration_rows(conn)][:4] == [1, 2, 3, 4]
     with pytest.raises(duckdb.ConstraintException):
         conn.execute(
             "INSERT INTO stock_status_daily VALUES ("
