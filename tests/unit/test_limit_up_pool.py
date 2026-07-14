@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
 import pandas as pd
@@ -64,6 +65,21 @@ def _raw_zt_pool() -> pd.DataFrame:
             "所属行业": "生物制品",
         },
     ])
+
+
+class _RecordingConnection:
+    def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+        self.inner = inner
+        self.transaction_commands: list[str] = []
+
+    def execute(self, query: str, *args: object, **kwargs: object) -> Any:
+        normalized = " ".join(query.split()).upper()
+        if normalized in {"BEGIN", "COMMIT", "ROLLBACK"}:
+            self.transaction_commands.append(normalized)
+        return self.inner.execute(query, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
 
 
 class TestToTsCode:
@@ -139,6 +155,176 @@ class TestNormalizeZtPool:
 
 
 class TestCaptureZtPool:
+    def test_capture_joins_outer_transaction_without_managing_it(
+        self,
+        store: DuckDBStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        trading_date = date(2026, 7, 2)
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            lambda ds: _raw_zt_pool(),
+        )
+        store._conn.execute("BEGIN")  # noqa: SLF001
+        recording = _RecordingConnection(store._conn)  # noqa: SLF001
+        store._conn = cast(Any, recording)  # noqa: SLF001
+
+        assert capture_zt_pool(trading_date, store) == 3
+        assert recording.transaction_commands == []
+        assert store.query_limit_up_pool(trading_date).shape[0] == 3
+
+        store._conn.execute("ROLLBACK")  # noqa: SLF001
+        assert store.query_limit_up_pool(trading_date).empty
+        guard = store._conn.execute(  # noqa: SLF001
+            "SELECT generation FROM limit_up_pool_write_guard "
+            "WHERE guard_id = 'limit_up_pool_daily'"
+        ).fetchone()
+        assert guard == (0,)
+
+    def test_final_calendar_rejection_does_not_roll_back_outer_transaction(
+        self,
+        store: DuckDBStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        trading_date = date(2026, 7, 2)
+
+        def fetch_then_close(ds: str) -> pd.DataFrame:
+            store._conn.execute(  # noqa: SLF001
+                "UPDATE trade_calendar SET is_open = FALSE, source = 'outer' "
+                "WHERE exchange = 'SSE' AND cal_date = ?",
+                [trading_date],
+            )
+            return _raw_zt_pool()
+
+        monkeypatch.setattr(limit_up_pool, "_fetch_zt_pool", fetch_then_close)
+        store._conn.execute("BEGIN")  # noqa: SLF001
+        recording = _RecordingConnection(store._conn)  # noqa: SLF001
+        store._conn = cast(Any, recording)  # noqa: SLF001
+
+        with pytest.raises(
+            limit_up_pool.LimitUpPoolCalendarGuardError,
+            match="calendar.*changed",
+        ):
+            capture_zt_pool(trading_date, store)
+
+        assert recording.transaction_commands == []
+        store._conn.execute("COMMIT")  # noqa: SLF001
+        calendar = store.get_trade_calendar_day("SSE", trading_date)
+        issue = store._conn.execute(  # noqa: SLF001
+            "SELECT rule_id, severity FROM data_quality_issue WHERE scope_key = ?",
+            [trading_date.isoformat()],
+        ).fetchone()
+        assert calendar is not None
+        assert calendar.is_open is False
+        assert calendar.source == "outer"
+        assert issue == ("limit_up_pool.calendar_changed_during_capture", "P0")
+        assert store.query_limit_up_pool(trading_date).empty
+
+    def test_outer_transaction_preserves_business_write_conflict_classification(
+        self,
+        store: DuckDBStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        trading_date = date(2026, 7, 2)
+        transaction_modes: list[str] = []
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            lambda ds: _raw_zt_pool(),
+        )
+
+        def conflicting_pool_write(
+            df: pd.DataFrame,
+            *,
+            transaction_mode: str = "auto",
+        ) -> int:
+            transaction_modes.append(transaction_mode)
+            raise duckdb.TransactionException("pool guard conflict")
+
+        monkeypatch.setattr(
+            store,
+            "upsert_limit_up_pool",
+            conflicting_pool_write,
+        )
+        store._conn.execute("BEGIN")  # noqa: SLF001
+        recording = _RecordingConnection(store._conn)  # noqa: SLF001
+        store._conn = cast(Any, recording)  # noqa: SLF001
+
+        with pytest.raises(
+            limit_up_pool.LimitUpPoolWriteConflictError,
+            match="business write",
+        ):
+            capture_zt_pool(trading_date, store)
+
+        assert recording.transaction_commands == []
+        assert transaction_modes == ["existing"]
+        store._conn.execute("COMMIT")  # noqa: SLF001
+        issues = store._conn.execute(  # noqa: SLF001
+            "SELECT rule_id, severity FROM data_quality_issue WHERE scope_key = ? ORDER BY rule_id",
+            [trading_date.isoformat()],
+        ).fetchall()
+        assert issues == [("limit_up_pool.concurrent_business_write", "P0")]
+        assert store.query_limit_up_pool(trading_date).empty
+
+    def test_real_outer_transaction_conflict_persists_issue_independently(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "outer-calendar-conflict.duckdb"
+        trading_date = date(2026, 7, 2)
+        with DuckDBStore(db_path) as setup:
+            setup.upsert_trade_calendar([
+                TradeCalendarDay(
+                    exchange="SSE",
+                    cal_date=trading_date,
+                    is_open=True,
+                    source="test",
+                    updated_at=_CALENDAR_UPDATED_AT,
+                )
+            ])
+
+        capture_store = DuckDBStore(db_path)
+        calendar_writer = DuckDBStore(db_path)
+
+        def fetch_after_calendar_commit(ds: str) -> pd.DataFrame:
+            calendar_writer._conn.execute(  # noqa: SLF001
+                "UPDATE trade_calendar SET is_open = FALSE "
+                "WHERE exchange = 'SSE' AND cal_date = ?",
+                [trading_date],
+            )
+            return _raw_zt_pool()
+
+        monkeypatch.setattr(
+            limit_up_pool,
+            "_fetch_zt_pool",
+            fetch_after_calendar_commit,
+        )
+        capture_store._conn.execute("BEGIN")  # noqa: SLF001
+        try:
+            with pytest.raises(
+                limit_up_pool.LimitUpPoolCalendarGuardError,
+                match="concurrent",
+            ):
+                capture_zt_pool(trading_date, capture_store)
+            with pytest.raises(duckdb.TransactionException, match="aborted"):
+                capture_store._conn.execute("SELECT 1")  # noqa: SLF001
+            with DuckDBStore(db_path) as check:
+                issue = check._conn.execute(  # noqa: SLF001
+                    "SELECT rule_id, severity FROM data_quality_issue "
+                    "WHERE scope_key = ?",
+                    [trading_date.isoformat()],
+                ).fetchone()
+            assert issue == (
+                "limit_up_pool.calendar_changed_during_capture",
+                "P0",
+            )
+        finally:
+            capture_store._conn.execute("ROLLBACK")  # noqa: SLF001
+            capture_store.close()
+            calendar_writer.close()
+
     def test_known_closed_day_records_p1_without_remote_fetch(
         self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -420,7 +606,11 @@ class TestCaptureZtPool:
             lambda ds: _raw_zt_pool(),
         )
 
-        def conflicting_pool_write(df: pd.DataFrame) -> int:
+        def conflicting_pool_write(
+            df: pd.DataFrame,
+            *,
+            transaction_mode: str = "auto",
+        ) -> int:
             raise duckdb.TransactionException("pool guard conflict")
 
         monkeypatch.setattr(
