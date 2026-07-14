@@ -113,12 +113,25 @@ class TestDeriveState:
         is_st: bool = False,
         name: str | None = None,
     ) -> pd.DataFrame:
-        dates = bars["trade_date"].tolist()
+        bars_with_listing = self._with_listing_window(bars)
+        dates = bars_with_listing["trade_date"].tolist()
         return derive_state(
-            bars,
+            bars_with_listing,
             ts_code,
             self._status(ts_code, dates, is_st=is_st, name=name),
         )
+
+    def _with_listing_window(
+        self,
+        bars: pd.DataFrame,
+        *,
+        list_date: date = date(1990, 1, 2),
+        fifth_trading_date: date | None = date(1990, 1, 8),
+    ) -> pd.DataFrame:
+        result = bars.copy()
+        result["list_date"] = list_date
+        result["fifth_listing_trade_date"] = fifth_trading_date
+        return result
 
     def _with_pretrade_dates(
         self,
@@ -142,6 +155,140 @@ class TestDeriveState:
         assert out.iloc[0]["limit_down_price"] == 9.00
         assert bool(out.iloc[0]["is_limit_up"])
         assert out.iloc[0]["board_type"] == "main"
+
+    def test_nonempty_derivation_requires_authoritative_listing_columns(self) -> None:
+        bars = pd.DataFrame([self._mkbar("2024-01-02", 10.2, 11.0, 10.0, 11.0, 10.0)])
+
+        with pytest.raises(ValueError, match="listing eligibility"):
+            derive_state(
+                bars,
+                "600519.SH",
+                self._status("600519.SH", [date(2024, 1, 2)]),
+            )
+
+    @pytest.mark.parametrize(
+        "ts_code",
+        [
+            "600519.SH",
+            "300750.SZ",
+            "688981.SH",
+        ],
+    )
+    def test_first_five_listing_days_are_explicitly_unsupported(
+        self,
+        ts_code: str,
+    ) -> None:
+        dates = [date(2024, 1, day) for day in range(2, 8)]
+        sixth_close = 12.0 if ts_code.startswith(("300", "688")) else 11.0
+        bars = self._with_pretrade_dates(
+            pd.DataFrame(
+                [
+                    self._mkbar(
+                        day.isoformat(),
+                        10.0,
+                        sixth_close if index == 5 else 11.0,
+                        10.0,
+                        sixth_close if index == 5 else 11.0,
+                        10.0,
+                    )
+                    for index, day in enumerate(dates)
+                ]
+            ),
+            [date(2023, 12, 29), *dates[:-1]],
+        )
+        bars = self._with_listing_window(
+            bars,
+            list_date=dates[0],
+            fifth_trading_date=dates[4],
+        )
+
+        out = derive_state(bars, ts_code, self._status(ts_code, dates))
+
+        assert out.iloc[:5]["limit_pct"].isna().all()
+        assert out.iloc[:5]["is_limit_up"].isna().all()
+        assert out.iloc[5]["limit_pct"] in {0.10, 0.20}
+        assert out.iloc[5]["is_limit_up"] == True  # noqa: E712
+        assert pd.isna(out.iloc[5]["consecutive_limit_ups"])
+
+    @pytest.mark.parametrize(
+        ("ts_code", "list_date", "next_date", "expected"),
+        [
+            ("600519.SH", date(2020, 1, 2), date(2020, 1, 3), 0.10),
+            ("300750.SZ", date(2020, 8, 20), date(2020, 8, 21), 0.10),
+            ("833533.BJ", date(2024, 1, 2), date(2024, 1, 3), 0.30),
+        ],
+    )
+    def test_legacy_and_bj_listing_day_is_unsupported_then_limit_applies(
+        self,
+        ts_code: str,
+        list_date: date,
+        next_date: date,
+        expected: float,
+    ) -> None:
+        bars = self._with_listing_window(
+            pd.DataFrame(
+                [
+                    self._mkbar(list_date.isoformat(), 10.0, 11.0, 10.0, 11.0, 10.0),
+                    self._mkbar(next_date.isoformat(), 10.0, 11.0, 10.0, 11.0, 10.0),
+                ]
+            ),
+            list_date=list_date,
+            fifth_trading_date=None,
+        )
+        status_dates = bars["trade_date"].tolist()
+
+        out = derive_state(bars, ts_code, self._status(ts_code, status_dates))
+
+        assert pd.isna(out.iloc[0]["limit_pct"])
+        assert out.iloc[1]["limit_pct"] == expected
+
+    @pytest.mark.parametrize(
+        ("ts_code", "list_date", "fifth_date", "sixth_date", "expected"),
+        [
+            (
+                "300750.SZ",
+                date(2020, 8, 24),
+                date(2020, 8, 28),
+                date(2020, 8, 31),
+                0.20,
+            ),
+            (
+                "600519.SH",
+                date(2023, 4, 10),
+                date(2023, 4, 14),
+                date(2023, 4, 17),
+                0.10,
+            ),
+        ],
+    )
+    def test_five_day_no_limit_rules_apply_at_exact_reform_boundaries(
+        self,
+        ts_code: str,
+        list_date: date,
+        fifth_date: date,
+        sixth_date: date,
+        expected: float,
+    ) -> None:
+        bars = self._with_listing_window(
+            pd.DataFrame(
+                [
+                    self._mkbar(list_date.isoformat(), 10.0, 11.0, 10.0, 11.0, 10.0),
+                    self._mkbar(fifth_date.isoformat(), 10.0, 11.0, 10.0, 11.0, 10.0),
+                    self._mkbar(sixth_date.isoformat(), 10.0, 12.0, 10.0, 12.0, 10.0),
+                ]
+            ),
+            list_date=list_date,
+            fifth_trading_date=fifth_date,
+        )
+
+        out = derive_state(
+            bars,
+            ts_code,
+            self._status(ts_code, [list_date, fifth_date, sixth_date]),
+        )
+
+        assert out.iloc[:2]["limit_pct"].isna().all()
+        assert out.iloc[2]["limit_pct"] == expected
 
     def test_gem_20pct_limit(self) -> None:
         df = pd.DataFrame(
@@ -193,7 +340,7 @@ class TestDeriveState:
             }
         )
 
-        out = derive_state(bars, "600000.SH", status)
+        out = derive_state(self._with_listing_window(bars), "600000.SH", status)
 
         assert out["is_st"].tolist() == [False, True, False]
         assert out["limit_pct"].tolist() == [0.10, 0.05, 0.10]
@@ -324,7 +471,7 @@ class TestDeriveState:
         )
 
         out = derive_state(
-            bars,
+            self._with_listing_window(bars),
             "600519.SH",
             self._status("600519.SH", [trade_date]),
             seed=seed,
@@ -348,7 +495,7 @@ class TestDeriveState:
         )
 
         out = derive_state(
-            bars,
+            self._with_listing_window(bars),
             "600519.SH",
             self._status("600519.SH", [trade_date]),
             seed=seed,
@@ -372,7 +519,7 @@ class TestDeriveState:
         )
 
         out = derive_state(
-            bars,
+            self._with_listing_window(bars),
             "600519.SH",
             self._status("600519.SH", [trade_date]),
             seed=seed,
@@ -412,7 +559,11 @@ class TestDeriveState:
             [self._mkbar("2024-01-02", 10.0, 11.0, 9.9, 11.0, 10.0)]
         )
 
-        out = derive_state(bars, "600519.SH", pd.DataFrame()).iloc[0]
+        out = derive_state(
+            self._with_listing_window(bars),
+            "600519.SH",
+            pd.DataFrame(),
+        ).iloc[0]
 
         nullable = [
             "is_st",
@@ -447,7 +598,11 @@ class TestDeriveState:
             }
         )
 
-        out = derive_state(bars, "600000.SH", status).iloc[0]
+        out = derive_state(
+            self._with_listing_window(bars),
+            "600000.SH",
+            status,
+        ).iloc[0]
 
         assert pd.isna(out["is_st"])
         assert pd.isna(out["limit_pct"])
@@ -474,7 +629,7 @@ class TestDeriveState:
             }
         )
 
-        out = derive_state(bars, "600000.SH", status)
+        out = derive_state(self._with_listing_window(bars), "600000.SH", status)
 
         assert pd.isna(out.iloc[0]["is_st"])
         assert out.iloc[1]["is_st"] == True  # noqa: E712
@@ -493,7 +648,7 @@ class TestDeriveState:
         )
         status = self._status("600000.SH", [dates[0], *dates[2:]])
 
-        out = derive_state(bars, "600000.SH", status)
+        out = derive_state(self._with_listing_window(bars), "600000.SH", status)
 
         limit_up = out["is_limit_up"].tolist()
         first = out["is_first_limit_up"].tolist()

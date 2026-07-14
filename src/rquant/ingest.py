@@ -56,9 +56,27 @@ def _load_daily_state_inputs(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     joined = store._conn.execute(
         """
+        WITH listing_facts AS (
+            SELECT basic.ts_code, basic.list_date,
+                   (
+                       SELECT CASE WHEN count(*) = 5 THEN max(cal_date) END
+                       FROM (
+                           SELECT calendar.cal_date
+                           FROM trade_calendar AS calendar
+                           WHERE calendar.exchange = 'SSE'
+                             AND calendar.is_open = TRUE
+                             AND calendar.cal_date >= basic.list_date
+                           ORDER BY calendar.cal_date
+                           LIMIT 5
+                       ) AS first_five_open_days
+                   ) AS fifth_listing_trade_date
+            FROM stock_basic AS basic
+        )
         SELECT daily.trade_date, daily.open, daily.high, daily.low,
                daily.close, daily.pre_close,
                calendar.pretrade_date AS expected_pretrade_date,
+               listing.list_date,
+               listing.fifth_listing_trade_date,
                status.ts_code AS status_ts_code,
                status.trade_date AS status_trade_date,
                status.name AS status_name,
@@ -73,6 +91,8 @@ def _load_daily_state_inputs(
           ON calendar.exchange = 'SSE'
          AND calendar.cal_date = daily.trade_date
          AND calendar.is_open = TRUE
+        LEFT JOIN listing_facts AS listing
+          ON listing.ts_code = daily.ts_code
         WHERE daily.ts_code = ?
         ORDER BY daily.trade_date
         """,
@@ -86,6 +106,8 @@ def _load_daily_state_inputs(
         "close",
         "pre_close",
         "expected_pretrade_date",
+        "list_date",
+        "fifth_listing_trade_date",
     ]
     if joined.empty:
         return joined.reindex(columns=daily_columns), pd.DataFrame()
@@ -130,7 +152,23 @@ def _load_target_daily_state_inputs(
         return pd.DataFrame(), {}
     joined = store._conn.execute(
         """
-        WITH first_target AS (
+        WITH listing_facts AS (
+            SELECT basic.ts_code, basic.list_date,
+                   (
+                       SELECT CASE WHEN count(*) = 5 THEN max(cal_date) END
+                       FROM (
+                           SELECT calendar.cal_date
+                           FROM trade_calendar AS calendar
+                           WHERE calendar.exchange = 'SSE'
+                             AND calendar.is_open = TRUE
+                             AND calendar.cal_date >= basic.list_date
+                           ORDER BY calendar.cal_date
+                           LIMIT 5
+                       ) AS first_five_open_days
+                   ) AS fifth_listing_trade_date
+            FROM stock_basic AS basic
+        ),
+        first_target AS (
             SELECT ts_code, min(trade_date) AS first_trade_date
             FROM daily_bar
             WHERE trade_date >= ?
@@ -153,6 +191,8 @@ def _load_target_daily_state_inputs(
         SELECT daily.ts_code, daily.trade_date,
                daily.open, daily.high, daily.low, daily.close, daily.pre_close,
                calendar.pretrade_date AS expected_pretrade_date,
+               listing.list_date,
+               listing.fifth_listing_trade_date,
                status.ts_code AS status_ts_code,
                status.name AS status_name,
                status.is_st AS status_is_st,
@@ -169,6 +209,8 @@ def _load_target_daily_state_inputs(
         LEFT JOIN stock_status_daily AS status
           ON status.ts_code = daily.ts_code
          AND status.trade_date = daily.trade_date
+        LEFT JOIN listing_facts AS listing
+          ON listing.ts_code = daily.ts_code
         INNER JOIN first_target AS first
           ON first.ts_code = daily.ts_code
         LEFT JOIN predecessor
@@ -216,6 +258,8 @@ def _derive_target_daily_states(
                 "close",
                 "pre_close",
                 "expected_pretrade_date",
+                "list_date",
+                "fifth_listing_trade_date",
             ]
         ].copy()
         status = code_rows.loc[

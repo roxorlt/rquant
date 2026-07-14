@@ -693,6 +693,115 @@ def test_target_state_input_query_is_bounded_to_one_row_per_5000_codes(
     assert all(seed.trade_date == date(2023, 12, 29) for seed in seeds.values())
 
 
+def test_target_state_derivation_uses_listing_date_and_authoritative_fifth_day(
+    db_path: Path,
+) -> None:
+    trading_dates = [
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+        date(2024, 1, 5),
+        date(2024, 1, 8),
+        date(2024, 1, 9),
+    ]
+    with DuckDBStore(db_path) as store:
+        store.upsert_stock_basic(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "symbol": "600000",
+                        "name": "新股样本",
+                        "area": "上海",
+                        "industry": "测试",
+                        "list_date": "20240102",
+                        "market": "主板",
+                    }
+                ]
+            )
+        )
+        store.upsert_daily(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": trading_date,
+                        "open": 10.0,
+                        "high": 11.0,
+                        "low": 10.0,
+                        "close": 11.0,
+                        "pre_close": 10.0,
+                        "change": 1.0,
+                        "pct_chg": 10.0,
+                        "vol": 1000.0,
+                        "amount": 10000.0,
+                    }
+                    for trading_date in trading_dates
+                ]
+            )
+        )
+        store.upsert_stock_status(
+            tuple(
+                SecurityStatusDaily(
+                    ts_code="600000.SH",
+                    trade_date=trading_date,
+                    name="新股样本",
+                    is_st=False,
+                    name_source="test",
+                    st_source="test",
+                    available_at=datetime(
+                        trading_date.year,
+                        trading_date.month,
+                        trading_date.day,
+                        9,
+                        25,
+                        tzinfo=SHANGHAI,
+                    ),
+                    ingested_at=datetime(2024, 1, 10, 8, 0, tzinfo=UTC),
+                )
+                for trading_date in trading_dates
+            )
+        )
+        calendar = pd.DataFrame(
+            {
+                "cal_date": trading_dates,
+                "pretrade_date": [
+                    date(2023, 12, 29),
+                    *trading_dates[:-1],
+                ],
+            }
+        )
+        store._conn.register("calendar_fixture", calendar)
+        store._conn.execute(
+            """
+            INSERT INTO trade_calendar (
+                exchange, cal_date, is_open, pretrade_date, source, updated_at
+            )
+            SELECT 'SSE', cal_date, TRUE, pretrade_date, 'test', now()
+            FROM calendar_fixture
+            """
+        )
+        store._conn.unregister("calendar_fixture")
+
+        target_rows, seeds = ingest_module._load_target_daily_state_inputs(
+            store,
+            trading_dates[0],
+            ["600000.SH"],
+        )
+
+    assert target_rows["fifth_listing_trade_date"].nunique() == 1
+    assert pd.Timestamp(target_rows["fifth_listing_trade_date"].iloc[0]).date() == date(
+        2024,
+        1,
+        8,
+    )
+    state = ingest_module._derive_target_daily_states(target_rows, seeds)
+    assert state["limit_pct"].iloc[:5].isna().all()
+    assert state["is_limit_up"].iloc[:5].isna().all()
+    assert state["limit_pct"].iloc[5] == pytest.approx(0.10)
+    assert bool(state["is_limit_up"].iloc[5]) is True
+
+
 def test_target_state_seed_uses_each_codes_first_actual_bar_after_start(
     db_path: Path,
 ) -> None:

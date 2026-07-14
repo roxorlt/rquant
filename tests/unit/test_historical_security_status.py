@@ -66,7 +66,7 @@ def _interval(
         start_date=start,
         end_date=end,
         ann_date=ann_date,
-        change_reason="test",
+        change_reason="更名",
     )
 
 
@@ -196,6 +196,78 @@ def test_materialize_uses_inclusive_intervals_open_end_and_pit_visibility() -> N
     assert by_day[date(2020, 1, 6)].is_st is True
 
 
+@pytest.mark.parametrize("change_reason", ["重新上市", "恢复上市"])
+def test_materialize_marks_relisting_first_day_unsupported(
+    change_reason: str,
+) -> None:
+    relisting_date = date(2020, 1, 2)
+    names = NameChangeHistory(
+        intervals=(
+            NameChangeInterval(
+                ts_code="600000.SH",
+                name="浦发银行",
+                start_date=relisting_date,
+                end_date=None,
+                ann_date=relisting_date,
+                change_reason=change_reason,
+            ),
+        )
+    )
+
+    rows = materialize_security_status(
+        [_key(relisting_date), _key(date(2020, 1, 3))],
+        names,
+        StockSTHistory(),
+        ingested_at=INGESTED_AT,
+    )
+
+    assert rows[0].name is None
+    assert rows[0].is_st is None
+    assert rows[0].conflict_reason == "unsupported_relisting_price_limit"
+    assert rows[1].name == "浦发银行"
+    assert rows[1].is_st is False
+
+
+@pytest.mark.parametrize(
+    ("change_reason", "expected_conflict"),
+    [
+        (None, "unknown_namechange_boundary"),
+        ("重返上市", "unsupported_listing_transition"),
+        ("无法分类", "unknown_namechange_reason"),
+    ],
+)
+def test_materialize_fails_closed_on_ambiguous_listing_boundary(
+    change_reason: str | None,
+    expected_conflict: str,
+) -> None:
+    boundary_date = date(2020, 1, 2)
+    names = NameChangeHistory(
+        intervals=(
+            NameChangeInterval(
+                ts_code="600000.SH",
+                name="浦发银行",
+                start_date=boundary_date,
+                end_date=None,
+                ann_date=boundary_date,
+                change_reason=change_reason,
+            ),
+        )
+    )
+
+    rows = materialize_security_status(
+        [_key(boundary_date), _key(date(2020, 1, 3))],
+        names,
+        StockSTHistory(),
+        ingested_at=INGESTED_AT,
+    )
+
+    assert rows[0].name is None
+    assert rows[0].is_st is None
+    assert rows[0].conflict_reason == expected_conflict
+    assert rows[1].name == "浦发银行"
+    assert rows[1].is_st is False
+
+
 def test_materialize_conflicts_and_invalid_source_rows_fail_to_unknown() -> None:
     raw = pd.DataFrame(
         [
@@ -205,7 +277,7 @@ def test_materialize_conflicts_and_invalid_source_rows_fail_to_unknown() -> None
                 "start_date": "20200101",
                 "end_date": "20200103",
                 "ann_date": "20200101",
-                "change_reason": "normal",
+                "change_reason": "更名",
             },
             {
                 "ts_code": "600000.SH",
@@ -213,7 +285,7 @@ def test_materialize_conflicts_and_invalid_source_rows_fail_to_unknown() -> None
                 "start_date": "20200102",
                 "end_date": "20200104",
                 "ann_date": "20200102",
-                "change_reason": "overlap",
+                "change_reason": "更名",
             },
             {
                 "ts_code": "000001.SZ",
@@ -448,7 +520,7 @@ class _LateAnnouncementAdapter:
                     "start_date": "20200102",
                     "end_date": None,
                     "ann_date": "20200105",
-                    "change_reason": "late announcement",
+                    "change_reason": "更名",
                 }
             ]
         )
@@ -679,7 +751,7 @@ class _ScopedAdapter:
                     "start_date": "20200101",
                     "end_date": None,
                     "ann_date": "20200101",
-                    "change_reason": "normal",
+                    "change_reason": "更名",
                 }
                 for code in codes
             ]
@@ -1758,7 +1830,7 @@ class _StreamingAdapter:
                     "start_date": "20200101",
                     "end_date": None,
                     "ann_date": "20200101",
-                    "change_reason": "normal",
+                    "change_reason": "更名",
                 }
             ]
         )

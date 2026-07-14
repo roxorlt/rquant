@@ -90,6 +90,7 @@ def _state_row(
     *,
     board_type: str,
     limit_up_price: float,
+    limit_pct: float = 0.20,
     is_yiziban: bool = False,
 ) -> dict[str, object]:
     return {
@@ -98,7 +99,7 @@ def _state_row(
         "is_st": False,
         "is_bj": False,
         "board_type": board_type,
-        "limit_pct": 0.20,
+        "limit_pct": limit_pct,
         "limit_up_price": limit_up_price,
         "limit_down_price": limit_up_price / 1.5,
         "is_limit_up": False,
@@ -261,16 +262,17 @@ def test_growth_board_surge_replay_uses_intraday_volume_signal(store: DuckDBStor
         "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
         ["300001.SZ", signal_date],
     )
-    store.upsert_stock_status((
-        _known_status(
-            "300001.SZ",
-            signal_date,
-            name="历史创业",
-            hour=9,
-            minute=33,
-        ),
-    ))
-
+    store.upsert_stock_status(
+        (
+            _known_status(
+                "300001.SZ",
+                signal_date,
+                name="历史创业",
+                hour=9,
+                minute=33,
+            ),
+        )
+    )
     trades = run_growth_board_surge_replay(
         store,
         start_date=date(2026, 6, 25),
@@ -394,18 +396,37 @@ def test_growth_board_candidates_use_historical_gem_limit_pct_before_2020_reform
     daily = _daily_row("300001.SZ", signal_date, 10.1)
     daily["pre_close"] = 10.0
     store.upsert_daily(pd.DataFrame([daily]))
-    store.upsert_indicators(pd.DataFrame([
-        _indicator_row("300001.SZ", previous_date, bull=True),
-    ]))
-    store.upsert_stock_status((
-        _known_status(
-            "300001.SZ",
-            signal_date,
-            name="历史创业板",
-            hour=9,
-            minute=30,
-        ),
-    ))
+    store.upsert_indicators(
+        pd.DataFrame(
+            [
+                _indicator_row("300001.SZ", previous_date, bull=True),
+            ]
+        )
+    )
+    store.upsert_stock_status(
+        (
+            _known_status(
+                "300001.SZ",
+                signal_date,
+                name="历史创业板",
+                hour=9,
+                minute=30,
+            ),
+        )
+    )
+    store.upsert_state(
+        pd.DataFrame(
+            [
+                _state_row(
+                    "300001.SZ",
+                    signal_date,
+                    board_type="gem",
+                    limit_pct=0.10,
+                    limit_up_price=11.0,
+                ),
+            ]
+        )
+    )
 
     candidates = _query_candidates(
         store,
@@ -416,6 +437,52 @@ def test_growth_board_candidates_use_historical_gem_limit_pct_before_2020_reform
 
     assert len(candidates) == 1
     assert candidates[0].limit_up_price == pytest.approx(11.00)
+
+
+def test_growth_board_candidates_exclude_unsupported_price_limit_state(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import _query_candidates
+
+    signal_date = date(2026, 6, 25)
+    previous_date = date(2026, 6, 24)
+    store.upsert_daily(
+        pd.DataFrame(
+            [
+                _daily_row("300001.SZ", signal_date, 10.1),
+            ]
+        )
+    )
+    store.upsert_indicators(
+        pd.DataFrame(
+            [
+                _indicator_row("300001.SZ", previous_date, bull=True),
+            ]
+        )
+    )
+    store.upsert_stock_status((_known_status("300001.SZ", signal_date, name="上市初期样本"),))
+    unsupported = _state_row(
+        "300001.SZ",
+        signal_date,
+        board_type="gem",
+        limit_up_price=12.0,
+    )
+    unsupported["limit_pct"] = None
+    unsupported["limit_up_price"] = None
+    unsupported["is_limit_up"] = None
+    unsupported["is_first_limit_up"] = None
+    unsupported["is_yiziban"] = None
+    unsupported["consecutive_limit_ups"] = None
+    store.upsert_state(pd.DataFrame([unsupported]))
+
+    candidates = _query_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+
+    assert candidates == []
 
 
 def test_growth_board_surge_replay_uses_default_config_when_omitted(

@@ -417,7 +417,7 @@ def test_auction_gap_replay_empty_result_keeps_minimum_columns(
     assert {"signal_date", "ts_code", "name"}.issubset(trades.columns)
 
 
-def test_auction_gap_replay_uses_pit_status_when_daily_state_disagrees(
+def test_auction_gap_replay_excludes_daily_state_that_disagrees_with_pit_status(
     store: DuckDBStore,
 ) -> None:
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
@@ -445,14 +445,7 @@ def test_auction_gap_replay_uses_pit_status_when_daily_state_disagrees(
         ),
     )
 
-    assert trades["ts_code"].tolist() == ["600000.SH"]
-    row = trades.iloc[0]
-    assert row["name"] == "历史浦发"
-    assert not bool(row["is_st"])
-    assert row["limit_pct"] == pytest.approx(0.10)
-    assert row["limit_up_price"] == pytest.approx(11.44)
-    assert not bool(row["hit_limit_up_today"])
-    assert pd.isna(row["hit_yiziban_today"])
+    assert "600000.SH" not in trades["ts_code"].tolist()
 
 
 def test_auction_gap_replay_calculates_limit_price_from_final_state_pct(
@@ -516,26 +509,57 @@ def test_auction_gap_replay_uses_historical_gem_limit_pct_before_2020_reform(
         for trade_date in dates
     ]))
     signal_date = date(2020, 8, 21)
-    store.upsert_stock_status((
-        _status_row(
-            "300001.SZ",
-            signal_date,
-            name="历史创业板",
-            is_st=False,
-            available_at=datetime(2020, 8, 21, 9, 25, tzinfo=SHANGHAI),
-        ),
-    ))
-    store.upsert_auction_bars(pd.DataFrame([{
-        "ts_code": "300001.SZ",
-        "trade_date": signal_date,
-        "auction_type": "open_realtime",
-        "price": 10.5,
-        "vol": 18000.0,
-        "amount": 189000.0,
-        "turnover_rate": 0.1,
-        "volume_ratio": 1.0,
-        "source": "tushare",
-    }]))
+    store.upsert_stock_status(
+        (
+            _status_row(
+                "300001.SZ",
+                signal_date,
+                name="历史创业板",
+                is_st=False,
+                available_at=datetime(2020, 8, 21, 9, 25, tzinfo=SHANGHAI),
+            ),
+        )
+    )
+    store.upsert_state(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "trade_date": signal_date,
+                    "is_st": False,
+                    "is_bj": False,
+                    "board_type": "gem",
+                    "limit_pct": 0.10,
+                    "limit_up_price": 11.0,
+                    "limit_down_price": 9.0,
+                    "is_limit_up": False,
+                    "is_limit_down": False,
+                    "is_first_limit_up": False,
+                    "is_yiziban": False,
+                    "consecutive_limit_ups": 0,
+                    "body_upper": 10.0,
+                    "body_lower": 10.0,
+                }
+            ]
+        )
+    )
+    store.upsert_auction_bars(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "trade_date": signal_date,
+                    "auction_type": "open_realtime",
+                    "price": 10.5,
+                    "vol": 18000.0,
+                    "amount": 189000.0,
+                    "turnover_rate": 0.1,
+                    "volume_ratio": 1.0,
+                    "source": "tushare",
+                }
+            ]
+        )
+    )
 
     trades = run_auction_gap_replay(
         store,
@@ -549,6 +573,37 @@ def test_auction_gap_replay_uses_historical_gem_limit_pct_before_2020_reform(
     row = trades.iloc[0]
     assert row["limit_pct"] == pytest.approx(0.10)
     assert row["limit_up_price"] == pytest.approx(11.00)
+
+
+def test_auction_gap_replay_excludes_unsupported_price_limit_state(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
+
+    _seed_auction_gap_case(store)
+    store._conn.execute(
+        """
+        UPDATE daily_state
+        SET limit_pct = NULL,
+            is_limit_up = NULL,
+            is_first_limit_up = NULL,
+            is_yiziban = NULL,
+            consecutive_limit_ups = NULL
+        WHERE ts_code = '600000.SH'
+          AND trade_date = DATE '2026-06-25'
+        """
+    )
+
+    trades = run_auction_gap_replay(
+        store,
+        AuctionGapConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            st_filter="case_insensitive",
+        ),
+    )
+
+    assert "600000.SH" not in trades["ts_code"].tolist()
 
 
 def test_auction_gap_replay_prefers_tushare_auction_over_minute_fallback(
@@ -602,7 +657,7 @@ def test_auction_gap_replay_strict_high_gap_mode_requires_gap_above_prior_high(
     assert trades.empty
 
 
-def test_auction_gap_replay_can_generate_live_candidate_without_signal_day_daily(
+def test_auction_gap_replay_excludes_candidate_without_signal_day_state(
     store: DuckDBStore,
 ) -> None:
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
@@ -625,11 +680,46 @@ def test_auction_gap_replay_can_generate_live_candidate_without_signal_day_daily
         ),
     )
 
-    assert trades["ts_code"].tolist() == ["600000.SH"]
-    row = trades.iloc[0]
-    assert row["prev_trade_date"] == pd.Timestamp("2026-06-24")
-    assert row["pre_close"] == pytest.approx(10.4)
-    assert row["auction_vol_ratio_5d"] == pytest.approx(0.18)
-    assert row["limit_up_price"] == pytest.approx(11.44)
-    assert pd.isna(row["day_high"])
-    assert pd.isna(row["next_open"])
+    assert "600000.SH" not in trades["ts_code"].tolist()
+
+
+def test_auction_gap_replay_does_not_fill_state_gap_from_listing_facts(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
+
+    _seed_auction_gap_case(store)
+    store._conn.execute(
+        """
+        UPDATE stock_basic
+        SET list_date = DATE '2026-06-22'
+        WHERE ts_code = '600000.SH'
+        """
+    )
+    store._conn.execute(
+        """
+        INSERT INTO trade_calendar
+            (exchange, cal_date, is_open, pretrade_date, source, updated_at)
+        VALUES
+            ('SSE', DATE '2026-06-22', TRUE, DATE '2026-06-19', 'test', now()),
+            ('SSE', DATE '2026-06-23', TRUE, DATE '2026-06-22', 'test', now()),
+            ('SSE', DATE '2026-06-24', TRUE, DATE '2026-06-23', 'test', now()),
+            ('SSE', DATE '2026-06-25', TRUE, DATE '2026-06-24', 'test', now()),
+            ('SSE', DATE '2026-06-26', TRUE, DATE '2026-06-25', 'test', now())
+        """
+    )
+    store._conn.execute(
+        "DELETE FROM daily_state WHERE ts_code = '600000.SH' AND trade_date = DATE '2026-06-25'"
+    )
+
+    trades = run_auction_gap_replay(
+        store,
+        AuctionGapConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            st_filter="case_insensitive",
+            require_next_day=False,
+        ),
+    )
+
+    assert "600000.SH" not in trades["ts_code"].tolist()

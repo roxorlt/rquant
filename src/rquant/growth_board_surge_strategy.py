@@ -20,7 +20,7 @@ from rquant.paper import (
     open_position_from_signal,
 )
 from rquant.signal_provenance import GROWTH_SURGE_V1, build_signal_factors
-from rquant.state.derive import _classify_board, _historical_limit_pct, _round_half_up
+from rquant.state.derive import _classify_board
 from rquant.stock_features import (
     build_daily_stock_features,
     build_intraday_relative_volume_features,
@@ -390,20 +390,14 @@ def _query_candidates(
             continue
         if pd.isna(row["pre_close"]) or float(row["pre_close"]) <= 0:
             continue
-        state_matches_status = (
-            pd.notna(row["state_is_st"]) and not bool(row["state_is_st"])
-        )
-        limit_pct = _historical_limit_pct(False, board_type, trading_date)
-        if state_matches_status and pd.notna(row["state_limit_pct"]):
-            limit_pct = float(row["state_limit_pct"])
-        if state_matches_status and pd.notna(row["state_limit_up_price"]):
-            limit_up_price = float(row["state_limit_up_price"])
-        else:
-            limit_up_price = float(
-                _round_half_up(
-                    pd.Series([float(row["pre_close"]) * (1 + limit_pct)])
-                ).iloc[0]
-            )
+        state_matches_status = pd.notna(row["state_is_st"]) and not bool(row["state_is_st"])
+        if (
+            not state_matches_status
+            or pd.isna(row["state_limit_pct"])
+            or pd.isna(row["state_limit_up_price"])
+        ):
+            continue
+        limit_up_price = float(row["state_limit_up_price"])
         candidates.append(
             _GrowthBoardCandidate(
                 ts_code=ts_code,

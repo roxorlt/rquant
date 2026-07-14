@@ -31,6 +31,16 @@ _NAMECHANGE_COLUMNS = (
 )
 _STOCK_ST_COLUMNS = ("ts_code", "name", "trade_date", "type", "type_name")
 _ST_PREFIX = re.compile(r"^(?:S\*ST|\*ST|SST|ST)", re.IGNORECASE)
+_RELISTING_REASON_MARKERS = ("重新上市", "恢复上市")
+_ORDINARY_NAMECHANGE_REASON_MARKERS = (
+    "更名",
+    "改名",
+    "ST",
+    "风险警示",
+    "摘帽",
+    "戴帽",
+    "股改",
+)
 
 
 class SecurityStatusModel(BaseModel):
@@ -389,6 +399,26 @@ def normalize_name(value: object) -> tuple[str | None, bool | None]:
     return compact, bool(_ST_PREFIX.match(compact))
 
 
+def _namechange_boundary_conflict(
+    interval: NameChangeInterval,
+    trade_date: date,
+) -> str | None:
+    if interval.start_date != trade_date:
+        return None
+    reason = (interval.change_reason or "").strip()
+    if not reason:
+        return "unknown_namechange_boundary"
+    if any(marker in reason for marker in _RELISTING_REASON_MARKERS):
+        return "unsupported_relisting_price_limit"
+    if "上市" in reason and reason != "上市":
+        return "unsupported_listing_transition"
+    if reason == "上市" or any(
+        marker in reason for marker in _ORDINARY_NAMECHANGE_REASON_MARKERS
+    ):
+        return None
+    return "unknown_namechange_reason"
+
+
 def _parse_date(value: object, *, field_name: str, optional: bool = False) -> date | None:
     if value is None:
         if optional:
@@ -688,6 +718,27 @@ def materialize_security_status(
                     key,
                     ingested_at=ingested_at,
                     conflict_reason="invalid_stock_st_fields",
+                )
+            )
+            continue
+
+        boundary_conflicts = {
+            conflict
+            for interval in intervals_by_code.get(key.ts_code, ())
+            if (
+                conflict := _namechange_boundary_conflict(
+                    interval,
+                    key.trade_date,
+                )
+            )
+            is not None
+        }
+        if boundary_conflicts:
+            rows.append(
+                _unknown_status(
+                    key,
+                    ingested_at=ingested_at,
+                    conflict_reason=sorted(boundary_conflicts)[0],
                 )
             )
             continue

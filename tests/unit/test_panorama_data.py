@@ -288,6 +288,8 @@ class TestLimitPrices:
                     "low": [row["low"]],
                     "close": [row["price"]],
                     "pre_close": [row["pre_close"]],
+                    "list_date": [date(1990, 1, 2)],
+                    "fifth_listing_trade_date": [date(1990, 1, 8)],
                 }
             )
             compact_name = str(row["name"]).upper().replace(" ", "")

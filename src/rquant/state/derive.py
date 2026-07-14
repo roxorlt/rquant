@@ -19,12 +19,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_STATE_DECISION_TIME = time(15, 0)
 CHINEXT_20_PERCENT_START = date(2020, 8, 24)
+MAIN_BOARD_FIVE_DAY_NO_LIMIT_START = date(2023, 4, 10)
 _STATUS_REQUIRED_COLUMNS = {
     "ts_code",
     "trade_date",
     "name",
     "is_st",
     "available_at",
+}
+_LISTING_ELIGIBILITY_COLUMNS = {
+    "list_date",
+    "fifth_listing_trade_date",
 }
 
 
@@ -45,6 +50,24 @@ class DailyStateSeed(BaseModel):
             raise ValueError("non-limit predecessor must have consecutive count zero")
         if self.is_limit_up is True and self.consecutive_limit_ups == 0:
             raise ValueError("limit-up predecessor count must be positive or unknown")
+        return self
+
+
+class ListingPriceLimitFact(BaseModel):
+    """Authoritative listing window needed before applying exchange limits."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    list_date: date
+    fifth_listing_trade_date: date | None = None
+
+    @model_validator(mode="after")
+    def validate_window(self) -> ListingPriceLimitFact:
+        if (
+            self.fifth_listing_trade_date is not None
+            and self.fifth_listing_trade_date < self.list_date
+        ):
+            raise ValueError("fifth listing trade date cannot precede list date")
         return self
 
 
@@ -97,6 +120,19 @@ def _historical_limit_pct(
     return _limit_pct(is_st, board_type)
 
 
+def _requires_five_day_listing_window(
+    board_type: str,
+    list_date: date,
+) -> bool:
+    if board_type == "star":
+        return True
+    if board_type == "gem":
+        return list_date >= CHINEXT_20_PERCENT_START
+    if board_type == "main":
+        return list_date >= MAIN_BOARD_FIVE_DAY_NO_LIMIT_START
+    return False
+
+
 def _civil_date(value: object) -> date | None:
     if value is None:
         return None
@@ -115,6 +151,49 @@ def _civil_date(value: object) -> date | None:
         return pd.Timestamp(value).date()
     except (TypeError, ValueError):
         return None
+
+
+def _single_fact_date(values: pd.Series) -> date | None:
+    resolved = {value for raw in values.tolist() if (value := _civil_date(raw)) is not None}
+    return next(iter(resolved)) if len(resolved) == 1 else None
+
+
+def _listing_price_limit_fact(df: pd.DataFrame) -> ListingPriceLimitFact | None:
+    list_date = _single_fact_date(df["list_date"])
+    if list_date is None:
+        return None
+    fifth_date = _single_fact_date(df["fifth_listing_trade_date"])
+    try:
+        return ListingPriceLimitFact(
+            list_date=list_date,
+            fifth_listing_trade_date=fifth_date,
+        )
+    except ValueError:
+        return None
+
+
+def _price_limit_eligibility(
+    trade_dates: list[date | None],
+    *,
+    board_type: str,
+    fact: ListingPriceLimitFact | None,
+) -> pd.Series:
+    values: list[object] = []
+    for trade_date in trade_dates:
+        if trade_date is None or fact is None or trade_date < fact.list_date:
+            values.append(pd.NA)
+            continue
+        if trade_date == fact.list_date:
+            values.append(False)
+            continue
+        if _requires_five_day_listing_window(board_type, fact.list_date):
+            if fact.fifth_listing_trade_date is None:
+                values.append(pd.NA)
+            else:
+                values.append(trade_date > fact.fifth_listing_trade_date)
+            continue
+        values.append(True)
+    return pd.Series(values, dtype="boolean")
 
 
 def _aware_datetime(value: object) -> datetime | None:
@@ -259,6 +338,10 @@ def derive_state(
     if df_daily.empty:
         return pd.DataFrame()
 
+    missing_listing_columns = _LISTING_ELIGIBILITY_COLUMNS - set(df_daily.columns)
+    if missing_listing_columns:
+        raise ValueError(f"listing eligibility requires columns: {sorted(missing_listing_columns)}")
+
     df = df_daily.sort_values("trade_date").reset_index(drop=True)
     status_by_date = _status_by_trade_date(status_daily, ts_code=ts_code)
     trade_dates = [_civil_date(value) for value in df["trade_date"]]
@@ -275,12 +358,23 @@ def derive_state(
 
     is_bj = ts_code.endswith(".BJ")
     board_type = _classify_board(ts_code)
+    listing_fact = _listing_price_limit_fact(df)
+    price_limit_eligible = _price_limit_eligibility(
+        trade_dates,
+        board_type=board_type,
+        fact=listing_fact,
+    )
     limit_pct = pd.Series(
         [
             pd.NA
-            if pd.isna(value) or trade_date is None
+            if (pd.isna(value) or trade_date is None or pd.isna(eligible) or not bool(eligible))
             else _historical_limit_pct(bool(value), board_type, trade_date)
-            for value, trade_date in zip(is_st, trade_dates, strict=True)
+            for value, trade_date, eligible in zip(
+                is_st,
+                trade_dates,
+                price_limit_eligible,
+                strict=True,
+            )
         ],
         dtype="Float64",
     )
@@ -298,7 +392,7 @@ def derive_state(
     valid_price = close.notna() & pre_close.notna() & (pre_close > 0)
     is_limit_up = pd.Series(pd.NA, index=df.index, dtype="boolean")
     is_limit_down = pd.Series(pd.NA, index=df.index, dtype="boolean")
-    comparable = known_status & valid_price
+    comparable = known_status & valid_price & price_limit_eligible.fillna(False)
     is_limit_up.loc[comparable] = (
         close.loc[comparable] >= limit_up_price.loc[comparable] - price_tol
     )

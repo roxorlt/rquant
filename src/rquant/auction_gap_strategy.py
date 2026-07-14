@@ -24,7 +24,10 @@ from rquant.signal_provenance import (
     build_signal_factors,
     persist_position_with_provenance,
 )
-from rquant.state.derive import _classify_board, _historical_limit_pct, _round_half_up
+from rquant.state.derive import (
+    _classify_board,
+    _round_half_up,
+)
 from rquant.stock_features import build_intraday_relative_volume_features
 from rquant.storage.duckdb import DuckDBStore
 from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
@@ -1222,34 +1225,17 @@ def run_auction_gap_replay(
     )
     computed_board_type = out["ts_code"].apply(_classify_board)
     out["board_type"] = out["state_board_type"].combine_first(computed_board_type)
-    fallback_limit_pct = pd.Series(
-        [
-            _historical_limit_pct(
-                bool(is_st),
-                str(board_type),
-                _as_date(signal_date),
-            )
-            for is_st, board_type, signal_date in zip(
-                out["is_st"],
-                out["board_type"],
-                out["signal_date"],
-                strict=False,
-            )
-        ],
-        index=out.index,
-    )
     state_matches_status = (
         out["state_is_st"].notna()
         & out["state_is_st"].astype("boolean").eq(out["is_st"].astype("boolean"))
     ).fillna(False)
-    out["limit_pct"] = (
-        out["state_limit_pct"].where(state_matches_status).combine_first(fallback_limit_pct)
-    )
-    fallback_limit_up = _round_half_up(out["pre_close"] * (1 + out["limit_pct"]))
+    out["limit_pct"] = out["state_limit_pct"].where(state_matches_status)
+    calculated_limit_up = _round_half_up(out["pre_close"] * (1 + out["limit_pct"]))
     out["limit_up_price"] = (
         out["state_limit_up_price"]
         .where(state_matches_status)
-        .combine_first(fallback_limit_up)
+        .combine_first(calculated_limit_up.where(out["limit_pct"].notna()))
+        .where(out["limit_pct"].notna())
     )
     if "hit_limit_up_today" in out.columns:
         calc_hit_limit = pd.Series(pd.NA, index=out.index, dtype="boolean")
