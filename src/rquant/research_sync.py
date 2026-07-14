@@ -1042,6 +1042,17 @@ def _sync_table(
         if manage_transaction:
             conn.execute("BEGIN")
             transaction_started = True
+        if table == "limit_up_pool_daily":
+            guard = conn.execute(
+                """
+                UPDATE limit_up_pool_write_guard
+                SET generation = generation + 1
+                WHERE guard_id = 'limit_up_pool_daily'
+                RETURNING generation
+                """
+            ).fetchone()
+            if guard is None:
+                raise RuntimeError("limit-up-pool write guard row is missing")
         if mode == "replace":
             conn.execute(f'DELETE FROM "{table}"')
             conn.execute(

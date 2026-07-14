@@ -9,6 +9,7 @@ from typing import Any
 import duckdb
 import pytest
 
+import rquant.data_quality as data_quality
 import rquant.research_sync as research_sync
 from rquant.data_metadata import (
     DataQualityIssue,
@@ -2485,3 +2486,76 @@ def test_backfilled_history_tables_are_merge() -> None:
     for table in must_merge:
         assert table in MERGE_TABLES, f"{table} 必须是 merge 语义"
         assert table not in REPLACE_TABLES, f"{table} 不允许整表替换"
+
+
+@pytest.mark.parametrize("mode", ["merge", "restore"])
+def test_limit_up_pool_research_sync_writer_blocks_concurrent_repair(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    target_path = tmp_path / f"target-{mode}.duckdb"
+    source_path = tmp_path / f"source-{mode}.duckdb"
+    closed = date(2026, 7, 12)
+
+    with DuckDBStore(target_path) as target:
+        target._conn.execute(
+            "INSERT INTO trade_calendar "
+            "(exchange, cal_date, is_open, pretrade_date, source, updated_at) "
+            "VALUES ('SSE', ?, FALSE, NULL, 'test', ?)",
+            [closed, datetime(2026, 7, 14, tzinfo=UTC)],
+        )
+        target._conn.execute(
+            "INSERT INTO limit_up_pool_daily (ts_code, trade_date, source) "
+            "VALUES ('600001.SH', ?, 'eastmoney')",
+            [closed],
+        )
+    with DuckDBStore(source_path) as source:
+        source._conn.execute(
+            "INSERT INTO limit_up_pool_daily (ts_code, trade_date, source) "
+            "VALUES ('000001.SZ', ?, 'eastmoney')",
+            [closed],
+        )
+
+    with DuckDBStore(target_path) as repair_store:
+        plan = data_quality.build_limit_up_pool_closed_day_repair_plan(
+            repair_store
+        )
+        assert plan.plan_id is not None
+        sync_conn = duckdb.connect(str(target_path))
+        research_sync._attach_readonly(sync_conn, source_path, "sync_source")
+        transaction_open = False
+        try:
+            sync_conn.execute("BEGIN")
+            transaction_open = True
+            result = research_sync._sync_table(
+                sync_conn,
+                "limit_up_pool_daily",
+                "sync_source",
+                mode,
+                manage_transaction=False,
+            )
+            assert result.mode == "merge"
+
+            with pytest.raises(duckdb.TransactionException, match="Conflict on"):
+                data_quality.apply_limit_up_pool_closed_day_repair(
+                    repair_store,
+                    plan.plan_id,
+                )
+
+            sync_conn.execute("COMMIT")
+            transaction_open = False
+        finally:
+            if transaction_open:
+                sync_conn.execute("ROLLBACK")
+            sync_conn.close()
+
+    with DuckDBStore(target_path, read_only=True) as check:
+        pool_rows = check._conn.execute(
+            "SELECT ts_code FROM limit_up_pool_daily ORDER BY ts_code"
+        ).fetchall()
+        audit_count = check._conn.execute(
+            "SELECT COUNT(*) FROM data_repair_audit"
+        ).fetchone()
+
+    assert pool_rows == [("000001.SZ",), ("600001.SH",)]
+    assert audit_count == (0,)
