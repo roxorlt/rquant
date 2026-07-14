@@ -115,6 +115,7 @@ MERGE_TABLES: tuple[str, ...] = (
 LOCAL_ONLY_TABLES: tuple[str, ...] = (
     "schema_migration",
     "data_repair_audit",
+    "limit_up_pool_write_guard",
 )
 
 DATA_METADATA_TABLES: tuple[str, ...] = (

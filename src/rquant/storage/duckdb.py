@@ -121,6 +121,17 @@ def _validate_security_status_rows(
         ) from exc
 
 
+def _duckdb_transaction_is_active(
+    conn: duckdb.DuckDBPyConnection,
+) -> bool:
+    # Autocommit assigns a fresh id per statement; an explicit transaction reuses it.
+    first = conn.execute("SELECT current_transaction_id()").fetchone()
+    second = conn.execute("SELECT current_transaction_id()").fetchone()
+    if first is None or second is None:
+        raise RuntimeError("cannot inspect DuckDB transaction state")
+    return first[0] == second[0]
+
+
 def _security_status_frame(rows: Sequence[SecurityStatusDaily]) -> pd.DataFrame:
     return pd.DataFrame.from_records(
         (
@@ -2302,28 +2313,85 @@ class DuckDBStore:
 
     # ── limit_up_pool_daily ──
 
-    def upsert_limit_up_pool(self, df: pd.DataFrame) -> int:
+    def upsert_limit_up_pool(
+        self,
+        df: pd.DataFrame,
+        *,
+        transaction_mode: Literal["auto", "standalone", "existing"] = "auto",
+    ) -> int:
         if df.empty:
             return 0
+        if transaction_mode not in {"auto", "standalone", "existing"}:
+            raise ValueError(
+                "limit-up-pool transaction_mode must be auto, standalone, or existing"
+            )
+        active_transaction = _duckdb_transaction_is_active(self._conn)
+        if transaction_mode == "standalone" and active_transaction:
+            raise ValueError(
+                "standalone limit-up-pool upsert cannot join an existing transaction"
+            )
+        if transaction_mode == "existing" and not active_transaction:
+            raise ValueError(
+                "existing limit-up-pool upsert requires an active transaction"
+            )
+        owns_transaction = transaction_mode == "standalone" or (
+            transaction_mode == "auto" and not active_transaction
+        )
         payload = df.copy()
         if "source" not in payload.columns:
             payload["source"] = "eastmoney"
-        self._conn.register("zt_pool_tmp", payload)
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO limit_up_pool_daily
-            (ts_code, trade_date, name, pct_chg, close, amount,
-             circ_mv, total_mv, turnover_rate, seal_amount,
-             first_seal_time, last_seal_time, break_count,
-             limit_up_stat, consecutive_boards, industry, source)
-            SELECT ts_code, trade_date, name, pct_chg, close, amount,
-                   circ_mv, total_mv, turnover_rate, seal_amount,
-                   first_seal_time, last_seal_time, break_count,
-                   limit_up_stat, consecutive_boards, industry, source
-            FROM zt_pool_tmp
-            """
-        )
-        self._conn.unregister("zt_pool_tmp")
+        stage_name = "zt_pool_tmp"
+        stage_registered = False
+        transaction_open = False
+        try:
+            if owns_transaction:
+                self._conn.execute("BEGIN")
+                transaction_open = True
+            self._conn.register(stage_name, payload)
+            stage_registered = True
+            guard = self._conn.execute(
+                """
+                UPDATE limit_up_pool_write_guard
+                SET generation = generation + 1
+                WHERE guard_id = 'limit_up_pool_daily'
+                RETURNING generation
+                """
+            ).fetchone()
+            if guard is None:
+                raise RuntimeError("limit-up-pool write guard row is missing")
+            self._conn.execute(
+                f"""
+                INSERT OR REPLACE INTO limit_up_pool_daily
+                (ts_code, trade_date, name, pct_chg, close, amount,
+                 circ_mv, total_mv, turnover_rate, seal_amount,
+                 first_seal_time, last_seal_time, break_count,
+                 limit_up_stat, consecutive_boards, industry, source)
+                SELECT ts_code, trade_date, name, pct_chg, close, amount,
+                       circ_mv, total_mv, turnover_rate, seal_amount,
+                       first_seal_time, last_seal_time, break_count,
+                       limit_up_stat, consecutive_boards, industry, source
+                FROM {stage_name}
+                """
+            )
+            if owns_transaction:
+                self._conn.execute("COMMIT")
+                transaction_open = False
+        except BaseException as primary:
+            if transaction_open:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except BaseException as rollback_error:
+                    raise BaseExceptionGroup(
+                        "limit-up-pool upsert failed and rollback failed",
+                        [primary, rollback_error],
+                    ) from None
+            raise
+        finally:
+            if stage_registered:
+                try:
+                    self._conn.unregister(stage_name)
+                except duckdb.Error:
+                    logger.exception("limit-up-pool staging view cleanup failed")
         count = len(df)
         logger.info(f"DuckDB upsert limit_up_pool_daily: {count} 行")
         return count

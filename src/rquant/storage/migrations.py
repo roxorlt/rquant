@@ -15,6 +15,8 @@ from rquant.storage.schema import (
     BASE_DDL,
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
     MARKET_SENTIMENT_MA20_MIGRATION_DDL,
     MONEYFLOW_DAILY_FULL_MIGRATION_DDLS,
@@ -124,6 +126,14 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=5,
         name="local data repair audit",
         statements=(DATA_REPAIR_AUDIT_DDL,),
+    ),
+    Migration(
+        version=6,
+        name="limit-up-pool write serialization guard",
+        statements=(
+            LIMIT_UP_POOL_WRITE_GUARD_DDL,
+            LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
+        ),
     ),
 )
 

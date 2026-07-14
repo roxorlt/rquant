@@ -161,6 +161,14 @@ class LimitUpPoolRepairPlanMismatchError(RuntimeError):
         )
 
 
+class LimitUpPoolRepairNoOpError(RuntimeError):
+    plan: LimitUpPoolRepairPlan
+
+    def __init__(self, plan: LimitUpPoolRepairPlan) -> None:
+        self.plan = plan
+        super().__init__("limit-up-pool repair plan has no candidates")
+
+
 def _load_limit_up_pool_repair_plan(
     store: DuckDBStore,
 ) -> LimitUpPoolRepairPlan:
@@ -303,6 +311,27 @@ def _insert_data_repair_audit(
     )
 
 
+def _acquire_limit_up_pool_repair_write_fence(store: DuckDBStore) -> None:
+    # DuckDB 1.5 optimizes `SET is_open = is_open` and takes no write conflict.
+    # Two real writes restore the fact before it is read while fencing that column.
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE trade_calendar SET is_open = NOT is_open WHERE exchange = 'SSE'"
+    )
+    store._conn.execute(  # noqa: SLF001
+        "UPDATE trade_calendar SET is_open = NOT is_open WHERE exchange = 'SSE'"
+    )
+    guard = store._conn.execute(  # noqa: SLF001
+        """
+        UPDATE limit_up_pool_write_guard
+        SET generation = generation + 1
+        WHERE guard_id = 'limit_up_pool_daily'
+        RETURNING generation
+        """
+    ).fetchone()
+    if guard is None:
+        raise RuntimeError("limit-up-pool write guard row is missing")
+
+
 def apply_limit_up_pool_closed_day_repair(
     store: DuckDBStore,
     expected_plan_id: str,
@@ -321,6 +350,7 @@ def apply_limit_up_pool_closed_day_repair(
     try:
         store._conn.execute("BEGIN")  # noqa: SLF001
         transaction_open = True
+        _acquire_limit_up_pool_repair_write_fence(store)
         current = _load_limit_up_pool_repair_plan(store)
         if current.status == "blocked":
             raise LimitUpPoolRepairBlockedError(current)
@@ -330,6 +360,8 @@ def apply_limit_up_pool_closed_day_repair(
                 request.expected_plan_id,
                 current.plan_id,
             )
+        if current.before_count == 0:
+            raise LimitUpPoolRepairNoOpError(current)
 
         deleted_keys = _delete_limit_up_pool_repair_candidates(
             store,

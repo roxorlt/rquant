@@ -865,6 +865,20 @@ CREATE TABLE IF NOT EXISTS data_repair_audit (
 );
 """
 
+LIMIT_UP_POOL_WRITE_GUARD_DDL = """
+CREATE TABLE IF NOT EXISTS limit_up_pool_write_guard (
+    guard_id   VARCHAR PRIMARY KEY,
+    generation BIGINT  NOT NULL CHECK (generation >= 0),
+    CHECK (guard_id = 'limit_up_pool_daily')
+);
+"""
+
+LIMIT_UP_POOL_WRITE_GUARD_SEED_DML = """
+INSERT INTO limit_up_pool_write_guard (guard_id, generation)
+VALUES ('limit_up_pool_daily', 0)
+ON CONFLICT (guard_id) DO NOTHING;
+"""
+
 TRADE_CALENDAR_DDL = """
 CREATE TABLE IF NOT EXISTS trade_calendar (
     exchange      VARCHAR     NOT NULL,
@@ -948,6 +962,8 @@ VERSIONED_COMPATIBILITY_DDL = [
     TRADE_CALENDAR_DDL,
     STOCK_STATUS_DAILY_DDL,
     DATA_REPAIR_AUDIT_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_DDL,
+    LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses
