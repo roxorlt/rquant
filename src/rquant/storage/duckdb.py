@@ -26,6 +26,7 @@ from rquant.data_metadata import (
     normalize_utc_datetime,
     utc_now,
 )
+from rquant.price_adjustment import resolve_price_factor_basis
 from rquant.security_status import (
     DailySecurityKey,
     SecurityStatusConcurrentWriteError,
@@ -1600,8 +1601,9 @@ class DuckDBStore:
     ) -> pd.DataFrame:
         """返回某只股票的前复权日线。
 
-        前复权公式：qfq[t] = raw[t] * adj_factor[t] / adj_factor[latest]
-        参考因子 = 该股票 adj_factor 表中最大 trade_date 对应的因子。
+        前复权公式：qfq[t] = raw[t] * adj_factor[t] / adj_factor[reference]。
+        指定 end 时 reference 是不晚于 end 的最新因子；未指定时才使用全表最新
+        因子。窗口内任一因子不可用时，整段 qfq 列为空并返回稳定状态字段。
 
         同时返回原始价和 qfq 价，方便对比核验。
         """
@@ -1615,36 +1617,117 @@ class DuckDBStore:
             params.append(end)
 
         sql = f"""
-        WITH ref AS (
-            SELECT ts_code, adj_factor AS ref_factor
-            FROM adj_factor
-            WHERE ts_code = ?
-              AND trade_date = (
-                  SELECT MAX(trade_date) FROM adj_factor WHERE ts_code = ?
-              )
-        )
         SELECT
             db.ts_code,
-            strftime(db.trade_date, '%Y-%m-%d') AS trade_date,
+            db.trade_date,
             db.open  AS raw_open,
+            db.high  AS raw_high,
+            db.low   AS raw_low,
             db.close AS raw_close,
-            db.open  * af.adj_factor / r.ref_factor AS qfq_open,
-            db.high  * af.adj_factor / r.ref_factor AS qfq_high,
-            db.low   * af.adj_factor / r.ref_factor AS qfq_low,
-            db.close * af.adj_factor / r.ref_factor AS qfq_close,
+            db.pre_close AS raw_pre_close,
             db.vol,
-            af.adj_factor,
-            r.ref_factor
+            af.adj_factor
         FROM daily_bar db
-        INNER JOIN adj_factor af
+        LEFT JOIN adj_factor af
             ON db.ts_code = af.ts_code AND db.trade_date = af.trade_date
-        INNER JOIN ref r
-            ON db.ts_code = r.ts_code
         WHERE {where}
         ORDER BY db.trade_date
         """
-        ref_params = [ts_code, ts_code]
-        return self._conn.execute(sql, ref_params + params).fetchdf()
+        daily = self._conn.execute(sql, params).fetchdf()
+        qfq_columns = [
+            "qfq_open",
+            "qfq_high",
+            "qfq_low",
+            "qfq_close",
+        ]
+        if daily.empty:
+            for column in qfq_columns:
+                daily[column] = pd.Series(dtype="float64")
+            daily["ref_factor"] = pd.Series(dtype="float64")
+            daily["ref_trade_date"] = pd.Series(dtype="object")
+            daily["price_basis_available"] = pd.Series(dtype="bool")
+            daily["price_basis_reason"] = pd.Series(dtype="object")
+            return daily
+
+        reference_sql = """
+            SELECT trade_date, adj_factor
+            FROM adj_factor
+            WHERE ts_code = ?
+        """
+        reference_params: list[str] = [ts_code]
+        if end:
+            reference_sql += " AND trade_date <= ?"
+            reference_params.append(end)
+        reference_sql += " ORDER BY trade_date DESC LIMIT 1"
+        reference_row = self._conn.execute(
+            reference_sql,
+            reference_params,
+        ).fetchone()
+
+        daily_dates = [
+            value.date() if isinstance(value, pd.Timestamp) else value
+            for value in daily["trade_date"].tolist()
+        ]
+        factor_by_date = {
+            trade_date: None if pd.isna(factor) else float(factor)
+            for trade_date, factor in zip(
+                daily_dates,
+                daily["adj_factor"].tolist(),
+                strict=True,
+            )
+        }
+        if reference_row is None:
+            basis_available = False
+            unavailable_reason = "missing_reference_factor"
+            reference_date_value: date | None = None
+            reference_factor: float | None = None
+            ratios: dict[date, float] = {}
+        else:
+            raw_reference_date, raw_reference_factor = reference_row
+            reference_date_value = (
+                raw_reference_date.date()
+                if isinstance(raw_reference_date, pd.Timestamp)
+                else raw_reference_date
+            )
+            reference_factor = (
+                None
+                if raw_reference_factor is None
+                else float(raw_reference_factor)
+            )
+            factor_by_date[reference_date_value] = reference_factor
+            basis = resolve_price_factor_basis(
+                required_dates=daily_dates,
+                factor_by_date=factor_by_date,
+                reference_date=reference_date_value,
+            )
+            basis_available = basis.available
+            unavailable_reason = basis.unavailable_reason
+            reference_factor = basis.reference_factor
+            ratios = basis.ratio_by_date()
+
+        daily["ref_factor"] = reference_factor
+        daily["ref_trade_date"] = (
+            reference_date_value.isoformat()
+            if reference_date_value is not None
+            else None
+        )
+        daily["price_basis_available"] = basis_available
+        daily["price_basis_reason"] = unavailable_reason
+        ratio_series = pd.Series(
+            [ratios.get(trade_date) for trade_date in daily_dates],
+            index=daily.index,
+            dtype="float64",
+        )
+        for raw_column, qfq_column in zip(
+            ["raw_open", "raw_high", "raw_low", "raw_close"],
+            qfq_columns,
+            strict=True,
+        ):
+            daily[qfq_column] = (
+                pd.to_numeric(daily[raw_column], errors="coerce") * ratio_series
+            )
+        daily["trade_date"] = [trade_date.isoformat() for trade_date in daily_dates]
+        return daily
 
     def count_adj_factor(self, ts_code: str | None = None) -> int:
         if ts_code:

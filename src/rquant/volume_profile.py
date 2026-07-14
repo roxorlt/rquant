@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from typing import Literal, Self
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.paper import PaperRiskPlan
+from rquant.price_adjustment import PriceFactorBasis, resolve_price_factor_basis
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -23,16 +25,54 @@ class VolumeProfile(BaseModel):
     start_date: date
     end_date: date
     rows_count: int
-    total_vol: float
-    total_amount: float
+    total_vol: float = Field(description="reference_date 基准的可比股数")
+    total_amount: float = Field(description="未经复权的原始成交额")
     vwap: float
     poc_price: float
     value_area_low: float
     value_area_high: float
     concentration_top5_pct: float
-    below_reference_amount_pct: float
-    above_reference_amount_pct: float
+    below_reference_amount_pct: float = Field(description="原始成交额口径")
+    above_reference_amount_pct: float = Field(description="原始成交额口径")
+    below_reference_volume_pct: float = Field(description="可比股数口径")
+    above_reference_volume_pct: float = Field(description="可比股数口径")
+    weight_basis: Literal["adjusted_share_volume"] = "adjusted_share_volume"
     source: str = "minute_bar"
+
+
+VolumeProfileCalculationStatus = Literal[
+    "available",
+    "no_data",
+    "invalid_data",
+    "price_basis_unavailable",
+]
+
+
+class VolumeProfileCalculation(BaseModel):
+    """价量分布计算结果及不可用诊断。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: VolumeProfileCalculationStatus
+    reason: str | None = None
+    profile: VolumeProfile | None = None
+    price_basis: PriceFactorBasis | None = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if self.status == "available":
+            if self.profile is None or self.reason is not None:
+                raise ValueError("available calculation requires profile without reason")
+            if self.price_basis is None or not self.price_basis.available:
+                raise ValueError("available calculation requires available price basis")
+            return self
+        if self.profile is not None or self.reason is None:
+            raise ValueError("unavailable calculation requires reason without profile")
+        if self.status == "price_basis_unavailable" and (
+            self.price_basis is None or self.price_basis.available
+        ):
+            raise ValueError("price_basis_unavailable requires unavailable price basis")
+        return self
 
 
 class VolumeProfileRuleConfig(BaseModel):
@@ -104,14 +144,13 @@ def _reference_price(
     return float(row[0])
 
 
-def _adj_factor_ratios(
+def _adj_factor_basis(
     store: DuckDBStore,
     ts_code: str,
     *,
-    start_date: date,
-    end_date: date,
+    required_dates: set[date],
     reference_date: date,
-) -> dict[date, float]:
+) -> PriceFactorBasis:
     df = store._conn.execute(
         """
         SELECT trade_date, adj_factor
@@ -121,27 +160,19 @@ def _adj_factor_ratios(
           AND trade_date <= ?
         ORDER BY trade_date
         """,
-        [ts_code, start_date, reference_date],
+        [ts_code, min(required_dates), reference_date],
     ).fetchdf()
-    if df.empty:
-        return {}
-
-    ref_rows = df[df["trade_date"].apply(_as_date) == reference_date]
-    if ref_rows.empty or pd.isna(ref_rows.iloc[0]["adj_factor"]):
-        return {}
-    ref_factor = float(ref_rows.iloc[0]["adj_factor"])
-    if ref_factor <= 0:
-        return {}
-
-    ratios: dict[date, float] = {}
-    for _, row in df.iterrows():
-        trade_date = _as_date(row["trade_date"])
-        if trade_date < start_date or trade_date > end_date:
-            continue
-        factor = float(row["adj_factor"]) if pd.notna(row["adj_factor"]) else 0.0
-        if factor > 0:
-            ratios[trade_date] = factor / ref_factor
-    return ratios
+    factor_by_date = {
+        _as_date(row["trade_date"]): (
+            None if pd.isna(row["adj_factor"]) else float(row["adj_factor"])
+        )
+        for _, row in df.iterrows()
+    }
+    return resolve_price_factor_basis(
+        required_dates=required_dates,
+        factor_by_date=factor_by_date,
+        reference_date=reference_date,
+    )
 
 
 def _minute_trade_price(row: pd.Series) -> float:
@@ -160,17 +191,154 @@ def _floor_price(value: float) -> float:
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR))
 
 
-def _value_area(bins: pd.DataFrame, ratio: float = 0.70) -> tuple[float, float]:
-    ranked = bins.sort_values("amount", ascending=False).reset_index(drop=True)
-    threshold = bins["amount"].sum() * ratio
+def _value_area(
+    bins: pd.DataFrame,
+    *,
+    weight_column: str,
+    ratio: float = 0.70,
+) -> tuple[float, float]:
+    ranked = bins.sort_values(weight_column, ascending=False).reset_index(drop=True)
+    threshold = bins[weight_column].sum() * ratio
     selected: list[float] = []
-    amount_sum = 0.0
+    weight_sum = 0.0
     for _, row in ranked.iterrows():
         selected.append(float(row["price_bin"]))
-        amount_sum += float(row["amount"])
-        if amount_sum >= threshold:
+        weight_sum += float(row[weight_column])
+        if weight_sum >= threshold:
             break
     return min(selected), max(selected)
+
+
+def calculate_volume_profile_outcome(
+    store: DuckDBStore,
+    ts_code: str,
+    *,
+    reference_date: date,
+    lookback_days: int,
+    freq: str = "1min",
+    bin_pct: float = 0.005,
+) -> VolumeProfileCalculation:
+    """计算参考日前 N 个交易日的价量分布，并保留失败诊断。"""
+    dates = _lookback_dates(store, reference_date, lookback_days)
+    if not dates:
+        return VolumeProfileCalculation(status="no_data", reason="no_trading_dates")
+
+    ref_price = _reference_price(store, ts_code, reference_date)
+    if ref_price is None or ref_price <= 0:
+        return VolumeProfileCalculation(
+            status="invalid_data",
+            reason="missing_or_invalid_reference_price",
+        )
+
+    start = datetime.combine(dates[0], time(9, 30))
+    end = datetime.combine(dates[-1], time(15, 0))
+    minutes = store.query_minute_bars(ts_code, start, end, freq=freq)
+    if minutes.empty:
+        return VolumeProfileCalculation(status="no_data", reason="missing_minute_data")
+
+    payload = minutes.copy()
+    vol = pd.to_numeric(payload["vol"], errors="coerce").fillna(0.0)
+    amount = pd.to_numeric(payload["amount"], errors="coerce").fillna(0.0)
+    close = pd.to_numeric(payload["close"], errors="coerce")
+    payload["raw_trade_price"] = close
+    valid_trade_amount = (vol > 0) & (amount > 0)
+    payload.loc[valid_trade_amount, "raw_trade_price"] = (
+        amount.loc[valid_trade_amount] / vol.loc[valid_trade_amount]
+    )
+    payload["trade_date"] = pd.to_datetime(payload["trade_time"]).dt.date
+    minute_dates = set(payload["trade_date"].tolist())
+    price_basis = _adj_factor_basis(
+        store,
+        ts_code,
+        required_dates=minute_dates,
+        reference_date=reference_date,
+    )
+    if not price_basis.available:
+        return VolumeProfileCalculation(
+            status="price_basis_unavailable",
+            reason=price_basis.unavailable_reason,
+            price_basis=price_basis,
+        )
+    payload["basis_ratio"] = payload["trade_date"].map(
+        price_basis.ratio_by_date()
+    )
+    if payload["basis_ratio"].isna().any():
+        return VolumeProfileCalculation(
+            status="invalid_data",
+            reason="unmapped_price_basis_ratio",
+            price_basis=price_basis,
+        )
+    payload["qfq_price"] = payload["raw_trade_price"] * payload["basis_ratio"]
+    payload["comparable_volume"] = vol / payload["basis_ratio"]
+    bin_size = max(round(ref_price * bin_pct, 4), 0.01)
+    payload["price_bin"] = (
+        (payload["qfq_price"] / bin_size).round() * bin_size
+    ).round(2)
+    bins = (
+        payload.groupby("price_bin", as_index=False)
+        .agg(
+            amount=("amount", "sum"),
+            comparable_volume=("comparable_volume", "sum"),
+        )
+        .sort_values("price_bin")
+    )
+    if bins.empty:
+        return VolumeProfileCalculation(status="no_data", reason="empty_price_bins")
+
+    total_amount = float(payload["amount"].sum())
+    total_vol = float(payload["comparable_volume"].sum())
+    if total_amount <= 0 or total_vol <= 0:
+        return VolumeProfileCalculation(
+            status="invalid_data",
+            reason="non_positive_profile_totals",
+            price_basis=price_basis,
+        )
+    adjusted_vwap = float(
+        (payload["qfq_price"] * payload["comparable_volume"]).sum()
+    ) / total_vol
+
+    poc_row = bins.sort_values("comparable_volume", ascending=False).iloc[0]
+    value_low, value_high = _value_area(
+        bins,
+        weight_column="comparable_volume",
+    )
+    top5_volume = float(
+        bins.sort_values("comparable_volume", ascending=False)
+        .head(5)["comparable_volume"]
+        .sum()
+    )
+    below_amount = float(bins.loc[bins["price_bin"] < ref_price, "amount"].sum())
+    above_amount = float(bins.loc[bins["price_bin"] > ref_price, "amount"].sum())
+    below_volume = float(
+        bins.loc[bins["price_bin"] < ref_price, "comparable_volume"].sum()
+    )
+    above_volume = float(
+        bins.loc[bins["price_bin"] > ref_price, "comparable_volume"].sum()
+    )
+
+    return VolumeProfileCalculation(
+        status="available",
+        price_basis=price_basis,
+        profile=VolumeProfile(
+            ts_code=ts_code,
+            reference_date=reference_date,
+            lookback_days=lookback_days,
+            start_date=dates[0],
+            end_date=dates[-1],
+            rows_count=len(payload),
+            total_vol=total_vol,
+            total_amount=total_amount,
+            vwap=adjusted_vwap,
+            poc_price=float(poc_row["price_bin"]),
+            value_area_low=value_low,
+            value_area_high=value_high,
+            concentration_top5_pct=top5_volume / total_vol * 100,
+            below_reference_amount_pct=below_amount / total_amount * 100,
+            above_reference_amount_pct=above_amount / total_amount * 100,
+            below_reference_volume_pct=below_volume / total_vol * 100,
+            above_reference_volume_pct=above_volume / total_vol * 100,
+        ),
+    )
 
 
 def calculate_volume_profile(
@@ -182,93 +350,43 @@ def calculate_volume_profile(
     freq: str = "1min",
     bin_pct: float = 0.005,
 ) -> VolumeProfile | None:
-    """计算参考日前 N 个交易日的近似价量分布。"""
-    dates = _lookback_dates(store, reference_date, lookback_days)
-    if not dates:
-        return None
-
-    ref_price = _reference_price(store, ts_code, reference_date)
-    if ref_price is None or ref_price <= 0:
-        return None
-
-    start = datetime.combine(dates[0], time(9, 30))
-    end = datetime.combine(dates[-1], time(15, 0))
-    minutes = store.query_minute_bars(ts_code, start, end, freq=freq)
-    if minutes.empty:
-        return None
-
-    payload = minutes.copy()
-    vol = pd.to_numeric(payload["vol"], errors="coerce").fillna(0.0)
-    amount = pd.to_numeric(payload["amount"], errors="coerce").fillna(0.0)
-    close = pd.to_numeric(payload["close"], errors="coerce")
-    payload["trade_price"] = close
-    valid_trade_amount = (vol > 0) & (amount > 0)
-    payload.loc[valid_trade_amount, "trade_price"] = (
-        amount.loc[valid_trade_amount] / vol.loc[valid_trade_amount]
-    )
-    ratios = _adj_factor_ratios(
+    """兼容接口：仅返回 profile，不把诊断字符串混入策略输入。"""
+    return calculate_volume_profile_outcome(
         store,
         ts_code,
-        start_date=dates[0],
-        end_date=dates[-1],
-        reference_date=reference_date,
-    )
-    if ratios:
-        payload["trade_date"] = pd.to_datetime(payload["trade_time"]).dt.date
-        payload["basis_ratio"] = payload["trade_date"].map(ratios).fillna(1.0)
-        payload["trade_price"] = payload["trade_price"] * payload["basis_ratio"]
-    bin_size = max(round(ref_price * bin_pct, 4), 0.01)
-    payload["price_bin"] = (
-        (payload["trade_price"] / bin_size).round() * bin_size
-    ).round(2)
-    bins = (
-        payload.groupby("price_bin", as_index=False)
-        .agg(amount=("amount", "sum"), vol=("vol", "sum"))
-        .sort_values("price_bin")
-    )
-    if bins.empty:
-        return None
-
-    total_amount = float(payload["amount"].sum())
-    total_vol = float(payload["vol"].sum())
-    if total_amount <= 0 or total_vol <= 0:
-        return None
-
-    poc_row = bins.sort_values("amount", ascending=False).iloc[0]
-    value_low, value_high = _value_area(bins)
-    top5_amount = float(bins.sort_values("amount", ascending=False).head(5)["amount"].sum())
-    below_amount = float(bins.loc[bins["price_bin"] < ref_price, "amount"].sum())
-    above_amount = float(bins.loc[bins["price_bin"] > ref_price, "amount"].sum())
-
-    return VolumeProfile(
-        ts_code=ts_code,
         reference_date=reference_date,
         lookback_days=lookback_days,
-        start_date=dates[0],
-        end_date=dates[-1],
-        rows_count=len(payload),
-        total_vol=total_vol,
-        total_amount=total_amount,
-        vwap=total_amount / total_vol,
-        poc_price=float(poc_row["price_bin"]),
-        value_area_low=value_low,
-        value_area_high=value_high,
-        concentration_top5_pct=top5_amount / total_amount * 100,
-        below_reference_amount_pct=below_amount / total_amount * 100,
-        above_reference_amount_pct=above_amount / total_amount * 100,
-    )
+        freq=freq,
+        bin_pct=bin_pct,
+    ).profile
 
 
-def scale_volume_profile(profile: VolumeProfile, ratio: float) -> VolumeProfile:
-    """把价量分布价格字段缩放到新的价格基准。"""
-    if ratio <= 0 or ratio == 1:
+def scale_volume_profile(
+    profile: VolumeProfile,
+    ratio: float,
+    *,
+    target_reference_date: date | None = None,
+) -> VolumeProfile:
+    """把价量分布统一到新的价格与可比股数基准。"""
+    if ratio <= 0:
+        raise ValueError("ratio must be positive")
+
+    updates: dict[str, object] = {}
+    if target_reference_date is not None:
+        updates["reference_date"] = target_reference_date
+    if ratio != 1:
+        updates.update(
+            {
+                "vwap": profile.vwap * ratio,
+                "poc_price": profile.poc_price * ratio,
+                "value_area_low": profile.value_area_low * ratio,
+                "value_area_high": profile.value_area_high * ratio,
+                "total_vol": profile.total_vol / ratio,
+            }
+        )
+    if not updates:
         return profile
-    return profile.model_copy(update={
-        "vwap": profile.vwap * ratio,
-        "poc_price": profile.poc_price * ratio,
-        "value_area_low": profile.value_area_low * ratio,
-        "value_area_high": profile.value_area_high * ratio,
-    })
+    return profile.model_copy(update=updates)
 
 
 def _support_candidates(

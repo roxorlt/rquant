@@ -904,6 +904,7 @@ def _volume_profiles_for_item(
     item: _ReplayItem,
     config: MinuteReplayConfig,
     price_basis_ratio: float,
+    buy_date: date,
 ) -> list[VolumeProfile]:
     if not config.volume_profile.enabled:
         return []
@@ -921,7 +922,13 @@ def _volume_profiles_for_item(
         )
         if profile is None:
             continue
-        profiles.append(scale_volume_profile(profile, price_basis_ratio))
+        profiles.append(
+            scale_volume_profile(
+                profile,
+                price_basis_ratio,
+                target_reference_date=buy_date,
+            )
+        )
     return profiles
 
 
@@ -1200,6 +1207,7 @@ def build_minute_replay_entry_snapshots(
             raw_item,
             config,
             float(price_basis_ratio),
+            buy_date,
         )
         static_factors: dict[str, float | int | None] | None = None
         if config.entry_mode == "factor_confirm":

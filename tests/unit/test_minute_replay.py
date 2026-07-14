@@ -147,6 +147,57 @@ def _seed_minutes(store: DuckDBStore) -> None:
     ]))
 
 
+def _seed_volume_profile_history(
+    store: DuckDBStore,
+    *,
+    include_factors: bool,
+) -> None:
+    history_dates = [date(2026, 6, day) for day in [21, 22, 23]]
+    store.upsert_daily(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_date": trade_date,
+            "open": 10.0,
+            "high": 10.1,
+            "low": 9.9,
+            "close": 10.0,
+            "pre_close": 10.0,
+            "change": 0.0,
+            "pct_chg": 0.0,
+            "vol": 1,
+            "amount": 1,
+        }
+        for trade_date in history_dates
+    ]))
+    store.upsert_minute_bars(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_time": datetime.combine(trade_date, datetime.min.time()).replace(
+                hour=9,
+                minute=30,
+            ),
+            "freq": "1min",
+            "open": 10.0,
+            "high": 10.0,
+            "low": 10.0,
+            "close": 10.0,
+            "vol": 10000,
+            "amount": 100000,
+            "source": "tushare",
+        }
+        for trade_date in history_dates
+    ]))
+    if include_factors:
+        store.upsert_adj_factor(pd.DataFrame([
+            {
+                "ts_code": "600000.SH",
+                "trade_date": trade_date,
+                "adj_factor": 1.0,
+            }
+            for trade_date in [*history_dates, date(2026, 6, 24)]
+        ]))
+
+
 def test_replay_enters_when_strong_carry_breaks_t_high_and_exits_next_day(
     store: DuckDBStore,
 ) -> None:
@@ -266,37 +317,7 @@ def test_replay_can_use_volume_profile_dynamic_risk(
 
     _seed_daily_and_screen(store)
     _seed_minutes(store)
-    store.upsert_daily(pd.DataFrame([
-        {
-            "ts_code": "600000.SH",
-            "trade_date": date(2026, 6, day),
-            "open": 10.0,
-            "high": 10.1,
-            "low": 9.9,
-            "close": 10.0,
-            "pre_close": 10.0,
-            "change": 0.0,
-            "pct_chg": 0.0,
-            "vol": 1,
-            "amount": 1,
-        }
-        for day in [21, 22, 23]
-    ]))
-    store.upsert_minute_bars(pd.DataFrame([
-        {
-            "ts_code": "600000.SH",
-            "trade_time": datetime(2026, 6, day, 9, 30),
-            "freq": "1min",
-            "open": 10.0,
-            "high": 10.0,
-            "low": 10.0,
-            "close": 10.0,
-            "vol": 10000,
-            "amount": 100000,
-            "source": "tushare",
-        }
-        for day in [21, 22, 23]
-    ]))
+    _seed_volume_profile_history(store, include_factors=True)
 
     trades = run_minute_strong_carry_replay(
         store,
@@ -316,6 +337,83 @@ def test_replay_can_use_volume_profile_dynamic_risk(
     assert row["volume_profile_rr"] > 1.2
     assert row["stop_loss_basis"] == "t_close"
     assert row["take_profit_basis"] == "profile_fallback_pct"
+
+
+def test_replay_volume_profile_scaling_targets_buy_date(
+    store: DuckDBStore,
+) -> None:
+    from rquant.minute_replay import (
+        MinuteReplayConfig,
+        _ReplayItem,
+        _volume_profiles_for_item,
+    )
+    from rquant.volume_profile import VolumeProfileRuleConfig
+
+    _seed_daily_and_screen(store)
+    _seed_volume_profile_history(store, include_factors=True)
+    buy_date = date(2026, 6, 25)
+    item = _ReplayItem(
+        ts_code="600000.SH",
+        pool="pool1",
+        name="浦发银行",
+        entry_date=buy_date,
+        reference_date=date(2026, 6, 24),
+        limit_up_date=date(2026, 6, 23),
+        t_close=10.0,
+        t_high=10.2,
+        limit_up_price_next=11.0,
+        stop_weak=9.5,
+    )
+    config = MinuteReplayConfig(
+        volume_profile=VolumeProfileRuleConfig(
+            enabled=True,
+            lookback_days=(3,),
+        )
+    )
+
+    profiles = _volume_profiles_for_item(
+        store,
+        item,
+        config,
+        price_basis_ratio=2.0,
+        buy_date=buy_date,
+    )
+
+    assert len(profiles) == 1
+    assert profiles[0].reference_date == buy_date
+    assert profiles[0].vwap == pytest.approx(20.0)
+    assert profiles[0].total_vol == pytest.approx(15000.0)
+
+
+def test_replay_does_not_raw_fallback_when_adjustment_factors_are_missing(
+    store: DuckDBStore,
+) -> None:
+    from rquant.minute_replay import run_minute_strong_carry_replay
+    from rquant.volume_profile import VolumeProfileRuleConfig
+
+    _seed_daily_and_screen(store)
+    _seed_minutes(store)
+    _seed_volume_profile_history(store, include_factors=False)
+
+    trades = run_minute_strong_carry_replay(
+        store,
+        start_date="2026-06-24",
+        end_date="2026-06-24",
+        max_hold_days=1,
+        volume_profile_config=VolumeProfileRuleConfig(
+            enabled=True,
+            require_profile=False,
+            lookback_days=(3,),
+        ),
+    )
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["volume_profile_lookbacks"] == ""
+    assert row["volume_profile_rr"] is None
+    assert row["price_position_90d_pct"] is None
+    assert row["ma_alignment"] is None
+    assert row["accum_obv_change_20d_pct"] is None
 
 
 def test_replay_skips_when_buy_day_minutes_missing(store: DuckDBStore) -> None:
@@ -599,6 +697,14 @@ def test_replay_attaches_candidate_stock_features(store: DuckDBStore) -> None:
             "amount": 100000 + idx * 20000,
         }
         for idx, day in enumerate([19, 20, 21, 22, 23], start=1)
+    ]))
+    store.upsert_adj_factor(pd.DataFrame([
+        {
+            "ts_code": "600000.SH",
+            "trade_date": date(2026, 6, day),
+            "adj_factor": 1.0,
+        }
+        for day in [19, 20, 21, 22, 23, 24]
     ]))
     store.upsert_minute_bars(pd.DataFrame([
         {
