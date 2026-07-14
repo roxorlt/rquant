@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from rquant.cli import build_parser
 
@@ -65,6 +71,689 @@ class TestCLISmoke:
         )
         assert result.returncode == 0
         assert "--date" in result.stdout
+
+
+class TestTradeCalendarBootstrap:
+    def test_parser_defaults_to_2020_through_current_year(self) -> None:
+        args = build_parser().parse_args(["trade-calendar-bootstrap"])
+
+        assert args.command == "trade-calendar-bootstrap"
+        assert args.start_date == date(2020, 1, 1)
+        assert args.end_date == date(date.today().year, 12, 31)
+
+    def test_parser_accepts_custom_iso_dates(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "trade-calendar-bootstrap",
+                "--start-date",
+                "2024-02-01",
+                "--end-date",
+                "2024-02-29",
+            ]
+        )
+
+        assert args.start_date == date(2024, 2, 1)
+        assert args.end_date == date(2024, 2, 29)
+
+    def test_parser_rejects_non_iso_date_with_argparse_exit_2(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            build_parser().parse_args(
+                ["trade-calendar-bootstrap", "--start-date", "20240201"]
+            )
+
+        assert exc.value.code == 2
+        assert "--start-date" in capsys.readouterr().err
+
+    def test_start_after_end_fails_without_fetch_or_writer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        import rquant.cli as cli
+
+        adapter_factory = MagicMock()
+        store_factory = MagicMock()
+        monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter_factory)
+        monkeypatch.setattr(cli, "DuckDBStore", store_factory)
+
+        result = cli.cmd_trade_calendar_bootstrap(
+            SimpleNamespace(
+                start_date=date(2026, 1, 2),
+                end_date=date(2026, 1, 1),
+            )
+        )
+
+        assert result != 0
+        adapter_factory.assert_not_called()
+        store_factory.assert_not_called()
+
+    def test_fetch_and_validation_finish_before_writer_enters(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        import rquant.cli as cli
+
+        writer_active = False
+        events: list[str] = []
+        authoritative_rows = [object()]
+
+        class _Store:
+            def __enter__(self) -> _Store:
+                nonlocal writer_active
+                assert writer_active is False
+                writer_active = True
+                events.append("writer_enter")
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                nonlocal writer_active
+                writer_active = False
+                events.append("writer_exit")
+
+        def fake_fetch(
+            adapter: object,
+            *,
+            exchange: str,
+            start: date,
+            end: date,
+        ) -> list[object]:
+            assert writer_active is False
+            assert adapter is adapter_instance
+            assert (exchange, start, end) == (
+                "SSE",
+                date(2026, 1, 1),
+                date(2026, 1, 5),
+            )
+            events.append("fetch")
+            return authoritative_rows
+
+        def fake_persist(
+            store: _Store,
+            rows: list[object],
+            *,
+            exchange: str,
+            start: date,
+            end: date,
+        ) -> SimpleNamespace:
+            assert writer_active is True
+            assert isinstance(store, _Store)
+            assert rows is authoritative_rows
+            assert (exchange, start, end) == (
+                "SSE",
+                date(2026, 1, 1),
+                date(2026, 1, 5),
+            )
+            events.append("persist")
+            return SimpleNamespace(
+                requested_days=5,
+                fetched_days=5,
+                upserted_days=5,
+            )
+
+        adapter_instance = object()
+        info = MagicMock()
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            MagicMock(return_value=adapter_instance),
+        )
+        monkeypatch.setattr("rquant.trade_calendar.fetch_trade_calendar_rows", fake_fetch)
+        monkeypatch.setattr("rquant.trade_calendar.persist_verified_trade_calendar", fake_persist)
+        monkeypatch.setattr(cli, "DuckDBStore", MagicMock(side_effect=_Store))
+        monkeypatch.setattr(cli, "setup_logging", MagicMock())
+        monkeypatch.setattr(cli.logger, "info", info)
+
+        result = cli.cmd_trade_calendar_bootstrap(
+            SimpleNamespace(
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 1, 5),
+            )
+        )
+
+        assert result == 0
+        assert events == ["fetch", "writer_enter", "persist", "writer_exit"]
+        message = str(info.call_args.args[0])
+        assert "processed=5" in message
+        assert "changed" not in message
+
+    def test_invalid_pretrade_chain_fails_before_writer_opens(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        import pandas as pd
+
+        import rquant.cli as cli
+
+        class _Adapter:
+            def trade_cal_raw(
+                self,
+                start: date,
+                end: date,
+                exchange: str = "SSE",
+            ) -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "exchange": exchange,
+                            "cal_date": start,
+                            "is_open": True,
+                            "pretrade_date": date(2025, 12, 31),
+                        },
+                        {
+                            "exchange": exchange,
+                            "cal_date": end,
+                            "is_open": False,
+                            "pretrade_date": date(2025, 12, 31),
+                        },
+                    ]
+                )
+
+        store_factory = MagicMock(side_effect=AssertionError("writer opened"))
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            MagicMock(return_value=_Adapter()),
+        )
+        monkeypatch.setattr(cli, "DuckDBStore", store_factory)
+        monkeypatch.setattr(cli, "setup_logging", MagicMock())
+
+        with pytest.raises(ValueError, match="pretrade_date chain"):
+            cli.cmd_trade_calendar_bootstrap(
+                SimpleNamespace(
+                    start_date=date(2026, 1, 1),
+                    end_date=date(2026, 1, 2),
+                )
+            )
+
+        store_factory.assert_not_called()
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _prepare_sync_script(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
+    project = tmp_path / "project"
+    scripts_dir = project / "scripts"
+    fake_bin = project / "fake-bin"
+    scripts_dir.mkdir(parents=True)
+    fake_bin.mkdir()
+    (project / ".venv" / "bin").mkdir(parents=True)
+
+    source = Path(__file__).resolve().parents[2] / "scripts" / "sync-from-cloud.sh"
+    script = scripts_dir / "sync-from-cloud.sh"
+    script.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    script.chmod(0o755)
+    (project / ".env").write_text(
+        "RQUANT_BACKUP_USER=test\n"
+        "RQUANT_BACKUP_TOKEN=test-token\n"
+        "RQUANT_BACKUP_URL=https://backup.invalid\n"
+        "PUSHDEER_KEYS=test-key\n",
+        encoding="utf-8",
+    )
+
+    calls = project / "calls.log"
+    curl_calls = project / "curl-calls.log"
+    _write_executable(
+        project / ".venv" / "bin" / "rquant",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${SYNC_TEST_CALLS}"
+if [[ -f "${SYNC_TEST_LOCK_PID_FILE}" ]]; then
+    printf 'lock-pid:%s\\n' "$(cat "${SYNC_TEST_LOCK_PID_FILE}")" >> "${SYNC_TEST_CALLS}"
+fi
+if [[ -f "${SYNC_TEST_COMPLETION_FILE}" ]]; then
+    printf 'marker-before:%s\\n' "$*" >> "${SYNC_TEST_CALLS}"
+fi
+case "${1:-}" in
+    research-sync) exit "${RESEARCH_SYNC_EXIT:-0}" ;;
+    zt-pool-capture) exit "${ZT_POOL_EXIT:-0}" ;;
+    limit-list-backfill) exit "${LIMIT_LIST_EXIT:-0}" ;;
+    data-backfill) exit "${DATA_BACKFILL_EXIT:-0}" ;;
+    *) exit 0 ;;
+esac
+""",
+    )
+    _write_executable(
+        fake_bin / "curl",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${SYNC_TEST_CURL_CALLS}"
+args="$*"
+output=""
+while (( $# > 0 )); do
+    if [[ "$1" == "-o" ]]; then
+        output="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+if [[ -n "${output}" ]]; then
+    if [[ "${args}" == *"latest.json"* ]]; then
+        printf '{"snapshot_at":"2026-07-14T09:00:00Z"}\\n' > "${output}"
+    else
+        printf 'compressed-placeholder\\n' > "${output}"
+    fi
+fi
+if [[ "${args}" == *"-w %{http_code}"* ]]; then
+    printf '200'
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "gzip",
+        """#!/usr/bin/env bash
+printf 'duckdb-placeholder\\n'
+""",
+    )
+    _write_executable(
+        fake_bin / "mkdir",
+        """#!/usr/bin/env bash
+if [[ "${SYNC_TEST_MKDIR_FAIL_DATA:-0}" == "1" && "${1:-}" == "-p" ]]; then
+    exit 1
+fi
+if [[ "${SYNC_TEST_MKDIR_FAIL_LOCK:-0}" == "1" && "${1:-}" == *".sync-from-cloud.lock" ]]; then
+    exit 1
+fi
+exec /bin/mkdir "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "sleep",
+        """#!/usr/bin/env bash
+if [[ -n "${SYNC_TEST_PUBLISH_LOCK_PID_ON_SLEEP:-}" ]]; then
+    publish_tmp="${SYNC_TEST_LOCK_PID_FILE}.fake-publisher"
+    printf '%s\n' "${SYNC_TEST_PUBLISH_LOCK_PID_ON_SLEEP}" > "${publish_tmp}"
+    /bin/mv "${publish_tmp}" "${SYNC_TEST_LOCK_PID_FILE}"
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "mv",
+        """#!/usr/bin/env bash
+if [[ "${2:-}" == "${SYNC_TEST_LOCK_PID_FILE}" ]]; then
+    destination_before="missing"
+    if [[ -e "${SYNC_TEST_LOCK_PID_FILE}" ]]; then
+        destination_before=$(cat "${SYNC_TEST_LOCK_PID_FILE}")
+    fi
+    printf 'destination-before:%s\n' "${destination_before}" \
+        >> "${SYNC_TEST_LOCK_PUBLISH_CALLS}"
+    printf 'source:%s\n' "$(cat "${1}")" \
+        >> "${SYNC_TEST_LOCK_PUBLISH_CALLS}"
+fi
+exec /bin/mv "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "date",
+        """#!/usr/bin/env bash
+if [[ "${SYNC_TEST_DAILY_WINDOW:-0}" != "1" ]]; then
+    exec /bin/date "$@"
+fi
+case "${1:-}" in
+    +%H) printf '17\\n' ;;
+    +%M) printf '20\\n' ;;
+    +%u) printf '2\\n' ;;
+    '+%Y-%m-%d') printf '2026-07-14\\n' ;;
+    +%s) printf '1784011200\\n' ;;
+    '+%Y-%m-%d %H:%M:%S') printf '2026-07-14 17:20:00\\n' ;;
+    *) exec /bin/date "$@" ;;
+esac
+""",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["SYNC_TEST_CALLS"] = str(calls)
+    env["SYNC_TEST_CURL_CALLS"] = str(curl_calls)
+    env["SYNC_TEST_COMPLETION_FILE"] = str(
+        project / "data" / ".last-research-sync-date"
+    )
+    env["SYNC_TEST_LOCK_PID_FILE"] = str(
+        project / "data" / ".sync-from-cloud.lock" / "pid"
+    )
+    env["SYNC_TEST_LOCK_PUBLISH_CALLS"] = str(project / "lock-publish.log")
+    return script, env, calls
+
+
+def _rquant_command_calls(path: Path) -> list[str]:
+    return [
+        call
+        for call in path.read_text(encoding="utf-8").splitlines()
+        if not call.startswith(("lock-pid:", "marker-before:"))
+    ]
+
+
+class TestSyncFromCloudFlags:
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["--force", "--skip-post-sync-captures"],
+            ["--skip-post-sync-captures", "--force"],
+        ],
+    )
+    def test_skip_post_sync_captures_accepts_either_order(
+        self,
+        tmp_path: Path,
+        args: list[str],
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        env["SYNC_TEST_DAILY_WINDOW"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = _rquant_command_calls(calls_path)
+        assert calls == [
+            f"research-sync --backup {script.parents[1] / 'data' / 'cloud_backup.duckdb'}"
+        ]
+        assert "baseline snapshot_at=" in result.stdout
+        assert Path(env["SYNC_TEST_COMPLETION_FILE"]).read_text().strip() == "2026-07-14"
+
+    def test_force_without_skip_runs_all_post_sync_captures(self, tmp_path: Path) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        env["SYNC_TEST_DAILY_WINDOW"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), "--force"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        raw_calls = calls_path.read_text(encoding="utf-8").splitlines()
+        assert _rquant_command_calls(calls_path) == [
+            f"research-sync --backup {script.parents[1] / 'data' / 'cloud_backup.duckdb'}",
+            "zt-pool-capture",
+            "limit-list-backfill --today",
+            "data-backfill --dataset kpl_concept --today",
+        ]
+        assert not any(call.startswith("marker-before:") for call in raw_calls)
+        assert Path(env["SYNC_TEST_COMPLETION_FILE"]).read_text().strip() == "2026-07-14"
+
+    def test_zt_pool_failure_alerts_stays_nonzero_and_does_not_mark_complete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        env["SYNC_TEST_DAILY_WINDOW"] = "1"
+        env["ZT_POOL_EXIT"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), "--force"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode != 0
+        assert _rquant_command_calls(calls_path) == [
+            f"research-sync --backup {script.parents[1] / 'data' / 'cloud_backup.duckdb'}",
+            "zt-pool-capture",
+            "limit-list-backfill --today",
+            "data-backfill --dataset kpl_concept --today",
+        ]
+        assert not Path(env["SYNC_TEST_COMPLETION_FILE"]).exists()
+        curl_calls = Path(env["SYNC_TEST_CURL_CALLS"]).read_text(encoding="utf-8")
+        assert "-X POST" in curl_calls
+
+    def test_unknown_argument_exits_2(self, tmp_path: Path) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+
+        result = subprocess.run(
+            ["bash", str(script), "--unknown"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 2
+        assert not calls_path.exists()
+
+    @pytest.mark.parametrize(
+        ("args", "expected_code"),
+        [([], 0), (["--force"], 75)],
+    )
+    def test_active_lock_uses_normal_or_force_contention_code(
+        self,
+        tmp_path: Path,
+        args: list[str],
+        expected_code: int,
+    ) -> None:
+        script, env, _ = _prepare_sync_script(tmp_path)
+        lock_dir = script.parents[1] / "data" / ".sync-from-cloud.lock"
+        lock_dir.mkdir(parents=True)
+        pid_file = lock_dir / "pid"
+        pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            ["bash", str(script), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == expected_code
+        assert pid_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    @pytest.mark.parametrize(
+        ("args", "expected_code"),
+        [([], 0), (["--force"], 75)],
+    )
+    def test_pending_pid_publication_becomes_active_lock_without_removal(
+        self,
+        tmp_path: Path,
+        args: list[str],
+        expected_code: int,
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        lock_dir = script.parents[1] / "data" / ".sync-from-cloud.lock"
+        lock_dir.mkdir(parents=True)
+        pid_file = lock_dir / "pid"
+        env["SYNC_TEST_DAILY_WINDOW"] = "1"
+        env["SYNC_TEST_PUBLISH_LOCK_PID_ON_SLEEP"] = str(os.getpid())
+
+        result = subprocess.run(
+            ["bash", str(script), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == expected_code, result.stdout + result.stderr
+        assert pid_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert not calls_path.exists()
+
+    @pytest.mark.parametrize(
+        ("args", "expected_code"),
+        [([], 0), (["--force"], 75)],
+    )
+    def test_empty_pid_is_waited_for_then_atomically_replaced_by_active_owner(
+        self,
+        tmp_path: Path,
+        args: list[str],
+        expected_code: int,
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        lock_dir = script.parents[1] / "data" / ".sync-from-cloud.lock"
+        lock_dir.mkdir(parents=True)
+        pid_file = lock_dir / "pid"
+        pid_file.write_text("", encoding="utf-8")
+        env["SYNC_TEST_DAILY_WINDOW"] = "1"
+        env["SYNC_TEST_PUBLISH_LOCK_PID_ON_SLEEP"] = str(os.getpid())
+
+        result = subprocess.run(
+            ["bash", str(script), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == expected_code, result.stdout + result.stderr
+        assert pid_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert not calls_path.exists()
+
+    @pytest.mark.parametrize(
+        ("args", "expected_code"),
+        [([], 0), (["--force"], 75)],
+    )
+    def test_live_interrupted_pid_publication_is_preserved_as_active_lock(
+        self,
+        tmp_path: Path,
+        args: list[str],
+        expected_code: int,
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        lock_dir = script.parents[1] / "data" / ".sync-from-cloud.lock"
+        lock_dir.mkdir(parents=True)
+        interrupted_pid = lock_dir / "pid.tmp.interrupted"
+        interrupted_pid.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        env["SYNC_TEST_DAILY_WINDOW"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == expected_code, result.stdout + result.stderr
+        assert interrupted_pid.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert not calls_path.exists()
+
+    def test_dead_interrupted_pid_publication_is_recovered_once(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        lock_dir = script.parents[1] / "data" / ".sync-from-cloud.lock"
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "pid.tmp.interrupted").write_text(
+            "99999999\n",
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            ["bash", str(script), "--force", "--skip-post-sync-captures"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _rquant_command_calls(calls_path) == [
+            f"research-sync --backup {script.parents[1] / 'data' / 'cloud_backup.duckdb'}"
+        ]
+        assert not lock_dir.exists()
+
+    @pytest.mark.parametrize("stale_pid", ["invalid", "99999999"])
+    def test_stale_or_invalid_pid_lock_is_recovered(
+        self,
+        tmp_path: Path,
+        stale_pid: str,
+    ) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+        lock_dir = script.parents[1] / "data" / ".sync-from-cloud.lock"
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "pid").write_text(f"{stale_pid}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            ["bash", str(script), "--force", "--skip-post-sync-captures"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "stale lock" in result.stdout
+        assert calls_path.read_text(encoding="utf-8").splitlines()[0].startswith(
+            "research-sync --backup"
+        )
+        assert not lock_dir.exists()
+
+    def test_data_directory_creation_failure_exits_1(self, tmp_path: Path) -> None:
+        script, env, _ = _prepare_sync_script(tmp_path)
+        env["SYNC_TEST_MKDIR_FAIL_DATA"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), "--force"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "failed to create data/log directories" in result.stderr
+
+    def test_lock_mkdir_permission_error_exits_1(self, tmp_path: Path) -> None:
+        script, env, _ = _prepare_sync_script(tmp_path)
+        env["SYNC_TEST_MKDIR_FAIL_LOCK"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), "--force"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "failed to create sync lock" in result.stdout
+
+    def test_owned_lock_writes_pid_and_is_removed_on_exit(self, tmp_path: Path) -> None:
+        script, env, calls_path = _prepare_sync_script(tmp_path)
+
+        result = subprocess.run(
+            ["bash", str(script), "--force", "--skip-post-sync-captures"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        lock_observations = [
+            call
+            for call in calls_path.read_text(encoding="utf-8").splitlines()
+            if call.startswith("lock-pid:")
+        ]
+        assert len(lock_observations) == 1
+        assert lock_observations[0].removeprefix("lock-pid:").isdigit()
+        publish_observations = Path(
+            env["SYNC_TEST_LOCK_PUBLISH_CALLS"]
+        ).read_text(encoding="utf-8").splitlines()
+        assert publish_observations == [
+            "destination-before:missing",
+            f"source:{lock_observations[0].removeprefix('lock-pid:')}",
+        ]
+        assert not Path(env["SYNC_TEST_LOCK_PID_FILE"]).parent.exists()
+
+    def test_research_sync_failure_remains_nonzero_after_stale_check(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        script, env, _ = _prepare_sync_script(tmp_path)
+        env["RESEARCH_SYNC_EXIT"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(script), "--force", "--skip-post-sync-captures"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode != 0
+        assert "merge FAILED" in result.stdout
 
 
 class TestCmdMarketDailyBackfill:

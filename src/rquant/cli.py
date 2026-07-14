@@ -6,7 +6,7 @@ import argparse
 import signal
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from datetime import time as dtime
 from pathlib import Path
 
@@ -86,6 +86,17 @@ def _parse_hhmm(value: str) -> dtime:
     except ValueError as e:
         msg = f"时间格式应为 HH:MM: {value}"
         raise argparse.ArgumentTypeError(msg) from e
+
+
+def _parse_iso_date(value: str) -> date:
+    """Parse the exact YYYY-MM-DD CLI form."""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"日期格式应为 YYYY-MM-DD: {value}") from e
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError(f"日期格式应为 YYYY-MM-DD: {value}")
+    return parsed
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -269,6 +280,41 @@ def cmd_research_sync(args: argparse.Namespace) -> int:
         f"replica: {'已刷新' if report.replica_refreshed else report.replica_detail}"
     )
     return 1 if report.has_errors else 0
+
+
+def cmd_trade_calendar_bootstrap(args: argparse.Namespace) -> int:
+    """Bootstrap a complete authoritative SSE civil-date calendar."""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.trade_calendar import (
+        fetch_trade_calendar_rows,
+        persist_verified_trade_calendar,
+    )
+
+    setup_logging()
+    if args.start_date > args.end_date:
+        logger.error("trade calendar start date must not be after end date")
+        return 2
+
+    rows = fetch_trade_calendar_rows(
+        TushareAdapter(),
+        exchange="SSE",
+        start=args.start_date,
+        end=args.end_date,
+    )
+    with DuckDBStore() as store:
+        result = persist_verified_trade_calendar(
+            store,
+            rows,
+            exchange="SSE",
+            start=args.start_date,
+            end=args.end_date,
+        )
+    logger.info(
+        "trade calendar bootstrap complete: "
+        f"exchange=SSE, range={args.start_date}..{args.end_date}, "
+        f"processed={result.upserted_days}, verified={result.requested_days}"
+    )
+    return 0
 
 
 def cmd_sentiment_recompute(args: argparse.Namespace) -> int:
@@ -1361,6 +1407,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="跳过只读副本刷新",
     )
 
+    calendar_p = sub.add_parser(
+        "trade-calendar-bootstrap",
+        help="从 Tushare 初始化权威 SSE 交易日历",
+    )
+    calendar_p.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        default=date(2020, 1, 1),
+        help="开始日期 YYYY-MM-DD (默认 2020-01-01)",
+    )
+    calendar_p.add_argument(
+        "--end-date",
+        type=_parse_iso_date,
+        default=date(date.today().year, 12, 31),
+        help="结束日期 YYYY-MM-DD (默认运行当年 12-31)",
+    )
+
     moneyflow_p = sub.add_parser(
         "moneyflow-backfill",
         help="拉取 Tushare 日级个股资金流并写入 moneyflow_daily",
@@ -2065,6 +2128,7 @@ def main() -> int:
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
         "research-sync": cmd_research_sync,
+        "trade-calendar-bootstrap": cmd_trade_calendar_bootstrap,
         "sentiment-recompute": cmd_sentiment_recompute,
         "moneyflow-backfill": cmd_moneyflow_backfill,
         "market-daily-backfill": cmd_market_daily_backfill,
