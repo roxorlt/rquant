@@ -212,6 +212,8 @@ DEFAULT_MINUTE_SOURCE_SESSION_SPECS = (
     ),
 )
 
+STAGE1_AUDIT_RULE_SET_VERSION = "stage1-v2"
+
 
 class LimitUpPoolRepairKey(QualityModel):
     ts_code: str = Field(min_length=1)
@@ -741,6 +743,77 @@ def historical_security_status_audit_rules(
     )
 
 
+def limit_up_pool_calendar_audit_rules(
+    start: date,
+    end: date,
+    *,
+    sample_limit: int = 20,
+) -> tuple[AuditRule, ...]:
+    """Block pool rows whose session is closed or absent from the calendar."""
+    if start > end:
+        raise ValueError("limit-up-pool audit start must not be after end")
+    if sample_limit < 1:
+        raise ValueError("sample_limit must be positive")
+
+    def calendar_check(store: DuckDBStore) -> tuple[AuditFinding, ...]:
+        rows = store._conn.execute(  # noqa: SLF001
+            """
+            WITH contaminated AS (
+                SELECT pool.ts_code, pool.trade_date, pool.source,
+                       calendar.is_open
+                FROM limit_up_pool_daily AS pool
+                LEFT JOIN trade_calendar AS calendar
+                  ON calendar.exchange = 'SSE'
+                 AND calendar.cal_date = pool.trade_date
+                WHERE pool.trade_date BETWEEN ? AND ?
+                  AND (calendar.is_open IS NULL OR calendar.is_open = FALSE)
+            )
+            SELECT ts_code, trade_date, source, is_open,
+                   count(*) OVER () AS finding_count
+            FROM contaminated
+            ORDER BY trade_date DESC, ts_code, source
+            LIMIT ?
+            """,
+            [start, end, sample_limit],
+        ).fetchall()
+        if not rows:
+            return ()
+        unknown_count = sum(1 for row in rows if row[3] is None)
+        return (
+            AuditFinding(
+                rule_id="limit-up-pool-calendar-coverage",
+                dataset_id="limit_up_pool_daily",
+                severity="P0",
+                scope_key=f"{start.isoformat()}/{end.isoformat()}",
+                message=(
+                    "Limit-up pool contains rows from closed or unknown sessions"
+                ),
+                evidence={
+                    "count": rows[0][4],
+                    "sample_unknown_calendar_count": unknown_count,
+                    "samples": [
+                        {
+                            "ts_code": str(ts_code),
+                            "trade_date": trade_date_value.isoformat(),
+                            "source": str(source),
+                        }
+                        for ts_code, trade_date_value, source, _is_open, _count in rows
+                    ],
+                },
+            ),
+        )
+
+    return (
+        AuditRule(
+            rule_id="limit-up-pool-calendar-coverage",
+            dataset_id="limit_up_pool_daily",
+            severity="P0",
+            description="Detect limit-up-pool rows outside open SSE sessions",
+            check=calendar_check,
+        ),
+    )
+
+
 def daily_minute_consistency_audit_rules(
     start: date,
     end: date,
@@ -852,10 +925,6 @@ def daily_minute_consistency_audit_rules(
                 SELECT d.ts_code, d.trade_date
                 FROM daily_bar AS d
                 WHERE d.trade_date BETWEEN ? AND ?
-                  AND (
-                        coalesce(d.vol, 0) > 0
-                     OR coalesce(d.amount, 0) > 0
-                  )
             ),
             missing_required AS (
                 SELECT
@@ -875,6 +944,26 @@ def daily_minute_consistency_audit_rules(
                       AND m.trade_time < CAST(d.trade_date AS TIMESTAMP)
                                          + INTERVAL 1 DAY
                 )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM stock_suspend_event AS suspension
+                    JOIN stock_suspend_coverage AS coverage
+                      ON coverage.source = suspension.source
+                     AND coverage.trade_date = suspension.trade_date
+                     AND coverage.coverage_state = 'complete'
+                    WHERE suspension.source = 'tushare'
+                      AND suspension.ts_code = d.ts_code
+                      AND suspension.trade_date = d.trade_date
+                    GROUP BY suspension.ts_code, suspension.trade_date
+                    HAVING count(*) FILTER (
+                               WHERE suspension.suspend_type = 'S'
+                                 AND suspension.session_scope = 'full_day'
+                           ) > 0
+                       AND count(*) FILTER (
+                               WHERE suspension.suspend_type <> 'S'
+                                  OR suspension.session_scope <> 'full_day'
+                           ) = 0
+                  )
             ),
             ranked AS (
                 SELECT
@@ -1439,6 +1528,15 @@ def run_audit(
         observed_at=audit_time,
         rule_ids=rule_ids,
         findings=tuple(findings),
+    )
+
+
+def build_stage1_audit_rules(start: date, end: date) -> tuple[AuditRule, ...]:
+    """Build the immutable Stage-1 research audit rule set for one date range."""
+    return (
+        *historical_security_status_audit_rules(start, end),
+        *limit_up_pool_calendar_audit_rules(start, end),
+        *daily_minute_consistency_audit_rules(start, end),
     )
 
 

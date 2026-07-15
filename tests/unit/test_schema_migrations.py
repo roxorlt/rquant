@@ -227,6 +227,74 @@ def test_v4_creates_historical_stock_status_only_through_versioned_migration() -
     conn.close()
 
 
+def test_v7_creates_data_audit_run_only_through_versioned_migration() -> None:
+    from rquant.storage.schema import ALL_DDL, DATA_AUDIT_RUN_DDL
+
+    assert [migration.version for migration in MIGRATIONS[:7]] == list(range(1, 8))
+    assert MIGRATIONS[6].statements == (DATA_AUDIT_RUN_DDL,)
+    assert DATA_AUDIT_RUN_DDL in ALL_DDL
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:6])
+    before = conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'data_audit_run'"
+    ).fetchone()
+    assert before == (0,)
+
+    initialize_schema(conn, migrations=MIGRATIONS[:7])
+    columns = conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'data_audit_run' ORDER BY ordinal_position"
+    ).fetchall()
+    assert [row[0] for row in columns] == [
+        "audit_run_id",
+        "as_of_date",
+        "range_start",
+        "range_end",
+        "rule_set_version",
+        "status",
+        "finding_issue_ids",
+        "p0_count",
+        "observed_at",
+        "completed_at",
+        "error_message",
+    ]
+    conn.close()
+
+
+def test_v8_creates_suspension_tables_only_through_versioned_migration() -> None:
+    from rquant.storage.schema import (
+        ALL_DDL,
+        STOCK_SUSPEND_COVERAGE_DDL,
+        STOCK_SUSPEND_EVENT_DDL,
+    )
+
+    statements = (STOCK_SUSPEND_EVENT_DDL, STOCK_SUSPEND_COVERAGE_DDL)
+    assert [migration.version for migration in MIGRATIONS[:8]] == list(range(1, 9))
+    assert MIGRATIONS[7].statements == statements
+    assert all(statement in ALL_DDL for statement in statements)
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:7])
+    before = conn.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_name LIKE 'stock_suspend_%'"
+    ).fetchall()
+    assert before == []
+
+    initialize_schema(conn, migrations=MIGRATIONS[:8])
+    tables = conn.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_name LIKE 'stock_suspend_%' ORDER BY table_name"
+    ).fetchall()
+    assert tables == [
+        ("stock_suspend_coverage",),
+        ("stock_suspend_event",),
+    ]
+    conn.close()
+
+
 def test_v3_failure_rolls_back_table_and_ledger() -> None:
     from rquant.storage.schema import TRADE_CALENDAR_DDL
 

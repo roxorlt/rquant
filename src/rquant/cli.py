@@ -702,6 +702,62 @@ def cmd_backfill_status(args: argparse.Namespace) -> int:
     return 2 if status.terminal else 1
 
 
+def cmd_suspension_backfill(args: argparse.Namespace) -> int:
+    """Backfill exact Tushare suspend_d snapshots for open sessions."""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.suspension import backfill_suspension_facts
+
+    setup_logging()
+    result = backfill_suspension_facts(
+        TushareAdapter(),
+        store_factory=DuckDBStore,
+        start=args.start_date,
+        end=args.end_date,
+        queried_at=datetime.now(UTC),
+        missing_only=not args.full_refresh,
+    )
+    _print_json(result.model_dump(mode="json"))
+    return 0
+
+
+def cmd_security_status_backfill(args: argparse.Namespace) -> int:
+    """Plan or backfill historical name/ST facts for daily eligibility keys."""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.security_status import (
+        backfill_historical_security_status,
+        plan_historical_security_status_backfill,
+    )
+
+    setup_logging()
+    source_as_of = args.source_as_of or datetime.now(_SHANGHAI).date()
+    if args.dry_run:
+        plan = plan_historical_security_status_backfill(
+            store_factory=open_readonly_store,
+            start=args.start_date,
+            end=args.end_date,
+            source_as_of=source_as_of,
+            missing_only=not args.full_refresh,
+        )
+        payload = plan.model_dump(mode="json")
+        payload["total_logical_api_operations"] = (
+            plan.total_logical_api_operations
+        )
+        _print_json(payload)
+        return 0
+
+    result = backfill_historical_security_status(
+        TushareAdapter(),
+        store_factory=DuckDBStore,
+        start=args.start_date,
+        end=args.end_date,
+        source_as_of=source_as_of,
+        ingested_at=datetime.now(UTC),
+        missing_only=not args.full_refresh,
+    )
+    _print_json(result.model_dump(mode="json"))
+    return 0
+
+
 def _watermark_text(value: object) -> str:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
@@ -769,16 +825,37 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         if begun.status == "ready":
             finalized = begun
         else:
+            eligibility_count = len(current.manifest.eligibilities)
+            store.upsert_dataset_coverage(
+                DatasetCoverage(
+                    snapshot_id=begun.snapshot_id,
+                    dataset_id="strategy_eligibility",
+                    coverage_scope="eligibility",
+                    table_name="backfill_manifest",
+                    expected_count=eligibility_count,
+                    available_count=eligibility_count,
+                    missing_reasons=(),
+                )
+            )
             phases = {
                 "baseline": coverage.baseline,
                 "entry": coverage.entry,
                 "exit": coverage.exit,
             }
             for scope, phase in phases.items():
-                missing_reasons = (
-                    ()
-                    if phase.complete_sessions == phase.expected_sessions
-                    else ("incomplete_full_session",)
+                missing_reasons = tuple(
+                    reason
+                    for reason, applies in (
+                        (
+                            "known_full_day_suspension",
+                            phase.accepted_missing_sessions > 0,
+                        ),
+                        (
+                            "incomplete_full_session",
+                            phase.satisfied_sessions < phase.expected_sessions,
+                        ),
+                    )
+                    if applies
                 )
                 store.upsert_dataset_coverage(
                     DatasetCoverage(
@@ -787,7 +864,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                         coverage_scope=scope,
                         table_name="minute_bar",
                         expected_count=phase.expected_sessions,
-                        available_count=phase.complete_sessions,
+                        available_count=phase.satisfied_sessions,
                         missing_reasons=missing_reasons,
                     )
                 )
@@ -803,6 +880,10 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 [as_of_shanghai.date()],
             ).fetchone()
             watermarks: dict[str, str] = {}
+            watermarks["manifest_start_date"] = (
+                current.manifest.start_date.isoformat()
+            )
+            watermarks["manifest_end_date"] = current.manifest.end_date.isoformat()
             if minute_row and minute_row[0] is not None:
                 watermarks["minute_bar"] = _watermark_text(minute_row[0])
             if calendar_row and calendar_row[0] is not None:
@@ -822,6 +903,117 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         }
     )
     return 0
+
+
+def cmd_data_audit(args: argparse.Namespace) -> int:
+    """Run and persist the Stage-1 research data audit as positive evidence."""
+    from rquant.data_metadata import DataAuditRun, DataAuditRunFinalization
+    from rquant.data_quality import (
+        STAGE1_AUDIT_RULE_SET_VERSION,
+        build_stage1_audit_rules,
+        record_audit_report,
+        resolve_audit_issues,
+        run_audit,
+    )
+
+    setup_logging()
+    range_start = args.start_date or (args.as_of - timedelta(days=120))
+    if range_start > args.as_of:
+        _print_json(
+            {
+                "status": "failed",
+                "error": "start_date cannot be after as_of",
+            }
+        )
+        return 2
+    observed_at = datetime.now(UTC)
+    audit_run = DataAuditRun.create(
+        as_of_date=args.as_of,
+        range_start=range_start,
+        range_end=args.as_of,
+        rule_set_version=STAGE1_AUDIT_RULE_SET_VERSION,
+        observed_at=observed_at,
+    )
+    try:
+        with DuckDBStore() as writable:
+            writable.begin_data_audit_run(audit_run)
+        rules = build_stage1_audit_rules(range_start, args.as_of)
+        # Positive research evidence must observe the primary generation, not a
+        # replica that may legitimately trail it by several minutes.
+        with DuckDBStore(read_only=True) as readonly:
+            report = run_audit(readonly, rules, observed_at=observed_at)
+        current_issue_ids = set(report.issue_ids)
+        with DuckDBStore() as writable:
+            previously_open = writable.list_open_data_quality_issues(
+                rule_ids=report.rule_ids
+            )
+            record_audit_report(writable, report)
+            resolve_audit_issues(
+                writable,
+                [
+                    issue.issue_id
+                    for issue in previously_open
+                    if issue.issue_id not in current_issue_ids
+                    and _quality_issue_matches_audit_range(
+                        issue.scope_key,
+                        range_start,
+                        args.as_of,
+                    )
+                ],
+                resolved_at=observed_at,
+            )
+            finalized = writable.finalize_data_audit_run(
+                audit_run.audit_run_id,
+                DataAuditRunFinalization(
+                    finding_issue_ids=report.issue_ids,
+                    p0_count=sum(
+                        1 for finding in report.findings if finding.severity == "P0"
+                    ),
+                    completed_at=datetime.now(UTC),
+                ),
+            )
+    except Exception as exc:
+        try:
+            with DuckDBStore() as writable:
+                writable.fail_data_audit_run(
+                    audit_run.audit_run_id,
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+        except Exception:
+            logger.exception("failed to persist failed data audit evidence")
+        _print_json(
+            {
+                "audit_run_id": audit_run.audit_run_id,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return 2
+
+    _print_json(
+        {
+            "audit_run_id": finalized.audit_run_id,
+            "status": finalized.status,
+            "as_of_date": finalized.as_of_date.isoformat(),
+            "range_start": finalized.range_start.isoformat(),
+            "range_end": finalized.range_end.isoformat(),
+            "rule_set_version": finalized.rule_set_version,
+            "finding_count": len(finalized.finding_issue_ids),
+            "p0_count": finalized.p0_count,
+        }
+    )
+    return 1 if finalized.p0_count else 0
+
+
+def _quality_issue_matches_audit_range(
+    scope_key: str,
+    range_start: date,
+    range_end: date,
+) -> bool:
+    """Only let a clean rerun resolve findings owned by the exact same range."""
+    parts = scope_key.split("/")
+    expected = (range_start.isoformat(), range_end.isoformat())
+    return any(tuple(parts[index : index + 2]) == expected for index in range(len(parts) - 1))
 
 
 def cmd_minute_backfill(args: argparse.Namespace) -> int:
@@ -1342,7 +1534,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     from rquant.preflight import format_pushdeer_summary, format_report, run_all_checks
 
     setup_logging()
-    results = run_all_checks()
+    results = run_all_checks(freshness_profile=args.profile)
     print(format_report(results))
 
     if args.notify:
@@ -1979,6 +2171,61 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出稳定的单个 JSON 对象",
     )
 
+    suspension_backfill_p = sub.add_parser(
+        "suspension-backfill",
+        help="按权威交易日历回补 Tushare 停复牌事实与查询覆盖",
+    )
+    suspension_backfill_p.add_argument(
+        "--start-date",
+        required=True,
+        type=_parse_iso_date,
+        help="开始日期 YYYY-MM-DD",
+    )
+    suspension_backfill_p.add_argument(
+        "--end-date",
+        required=True,
+        type=_parse_iso_date,
+        help="结束日期 YYYY-MM-DD",
+    )
+    suspension_backfill_p.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="重拉已有 complete 覆盖；默认只补缺失日期",
+    )
+
+    security_status_backfill_p = sub.add_parser(
+        "security-status-backfill",
+        help="预估或回补历史股票简称与 ST 状态事实",
+    )
+    security_status_backfill_p.add_argument(
+        "--start-date",
+        required=True,
+        type=_parse_iso_date,
+        help="开始日期 YYYY-MM-DD",
+    )
+    security_status_backfill_p.add_argument(
+        "--end-date",
+        required=True,
+        type=_parse_iso_date,
+        help="结束日期 YYYY-MM-DD",
+    )
+    security_status_backfill_p.add_argument(
+        "--source-as-of",
+        type=_parse_iso_date,
+        default=None,
+        help="数据源认知截止日（默认今天）",
+    )
+    security_status_backfill_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只计算标的数、交易日数和逻辑 API 调用数，不联网、不写库",
+    )
+    security_status_backfill_p.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="重算已有状态；默认只补缺失或未知状态",
+    )
+
     dataset_snapshot_p = sub.add_parser(
         "dataset-snapshot",
         help="覆盖率验收通过后固化研究数据元信息快照",
@@ -1988,6 +2235,23 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=strategy_choices,
         help="策略标识，必须与 manifest 一致",
+    )
+
+    data_audit_p = sub.add_parser(
+        "data-audit",
+        help="运行 Stage-1 研究数据审计并保存正式研究门凭证",
+    )
+    data_audit_p.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        required=True,
+        help="审计截止交易日 YYYY-MM-DD",
+    )
+    data_audit_p.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        default=None,
+        help="审计开始日期（默认向前 120 个自然日）",
     )
     dataset_snapshot_p.add_argument(
         "--as-of",
@@ -2502,6 +2766,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--notify", action="store_true",
         help="跑完推一条摘要到 PushDeer（默认只 stdout）",
     )
+    pf_p.add_argument(
+        "--profile",
+        choices=("production", "research"),
+        default="production",
+        help="数据新鲜度契约范围（默认 production）",
+    )
 
     from rquant.surge_watch import SurgeConfig
 
@@ -2619,7 +2889,10 @@ def main() -> int:
         "backfill-plan": cmd_backfill_plan,
         "backfill-run": cmd_backfill_run,
         "backfill-status": cmd_backfill_status,
+        "suspension-backfill": cmd_suspension_backfill,
+        "security-status-backfill": cmd_security_status_backfill,
         "dataset-snapshot": cmd_dataset_snapshot,
+        "data-audit": cmd_data_audit,
         "minute-backfill": cmd_minute_backfill,
         "minute-replay-backfill": cmd_minute_replay_backfill,
         "auction-backfill": cmd_auction_backfill,
@@ -2657,7 +2930,7 @@ def main() -> int:
     # （非 Exception，本就不被下方 except 捕获），不该再包一层运维告警。
     if args.command in (
         "serve", "notify-test", "alert",
-        "daily-report", "pre-market-check", "preflight", "lab-run",
+        "daily-report", "pre-market-check", "preflight", "data-audit", "lab-run",
         "panorama-auth-serve", "panorama-user-add",
         "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
     ):

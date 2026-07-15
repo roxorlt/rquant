@@ -206,6 +206,28 @@ def test_derive_interface_catalog_rows_converts_all_a_share_rows() -> None:
     assert row.history_coverage_type == "unknown"
 
 
+def test_suspend_d_catalog_reflects_authoritative_integration() -> None:
+    from rquant.tushare_docs import TushareDocPage
+
+    page = TushareDocPage(
+        doc_id=214,
+        title="每日停复牌信息",
+        category_path=["股票数据", "行情数据", "每日停复牌信息"],
+        is_section=False,
+        doc_url="https://tushare.pro/document/2?doc_id=214",
+        api_name="suspend_d",
+        description="按日期获取股票停复牌信息",
+    )
+
+    rows = derive_interface_catalog_rows([classify_tushare_interface(page)])
+
+    assert rows[0].integration_status == "already_integrated"
+    assert rows[0].target_table_hint == (
+        "stock_suspend_event + stock_suspend_coverage"
+    )
+    assert rows[0].history_coverage_type == "unknown"
+
+
 def test_parse_tushare_purchase_goods_keeps_api_permission_coverage() -> None:
     payload = {
         "code": 0,

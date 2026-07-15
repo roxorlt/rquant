@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from rquant.data_quality import DEFAULT_MINUTE_SOURCE_SESSION_SPECS
@@ -191,6 +192,48 @@ def test_only_exact_full_session_counts_as_covered(store: DuckDBStore) -> None:
     assert plan.requested_session_count == 4
     assert plan.coverage.baseline_gate_passed is False
     assert plan.coverage.entry_exit_gate_passed is False
+
+
+def test_known_full_day_suspension_satisfies_coverage_without_task(
+    store: DuckDBStore,
+) -> None:
+    from rquant.backfill_manifest import plan_minute_backfill
+    from rquant.suspension import (
+        normalize_suspend_d_snapshot,
+        persist_suspension_snapshot,
+    )
+
+    opens = _weekday_opens(date(2026, 6, 1), 10)
+    _seed_calendar(store, opens)
+    manifest = _manifest(
+        entries=[("300001.SZ", opens[5])],
+        baseline_days=2,
+        exit_days=2,
+    )
+    snapshot = normalize_suspend_d_snapshot(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "trade_date": opens[5].strftime("%Y%m%d"),
+                    "suspend_timing": "全天",
+                    "suspend_type": "S",
+                }
+            ]
+        ),
+        trade_date=opens[5],
+        queried_at=datetime(2026, 7, 15, tzinfo=UTC),
+    )
+    persist_suspension_snapshot(store, snapshot)
+
+    plan = plan_minute_backfill(store, manifest)
+
+    assert plan.coverage.entry.complete_sessions == 0
+    assert plan.coverage.entry.accepted_missing_sessions == 1
+    assert plan.coverage.entry.coverage_ratio == 1.0
+    assert opens[5] not in {
+        trading_date for task in plan.tasks for trading_date in task.open_dates
+    }
 
 
 def test_calendar_civil_gap_blocks_planning(store: DuckDBStore) -> None:

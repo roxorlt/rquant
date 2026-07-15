@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import pandas as pd
 import tushare as ts
@@ -25,6 +25,11 @@ from rquant.security_status import (
 from rquant.state import derive_state
 from rquant.state.derive import DailyStateSeed
 from rquant.storage import DuckDBStore
+from rquant.suspension import (
+    SuspensionAdapter,
+    normalize_suspend_d_snapshot,
+    persist_suspension_snapshot,
+)
 
 # Tushare 接口限流：~120ms 间隔
 _API_SLEEP = 0.15
@@ -301,6 +306,7 @@ def ingest_daily(
     *,
     pro: DailyIngestClient | None = None,
     status_adapter: SecurityStatusAdapter | None = None,
+    suspension_adapter: SuspensionAdapter | None = None,
     writer_factory: Callable[[], DuckDBStore] = DuckDBStore,
     ingested_at: datetime | None = None,
     api_sleep: float = _API_SLEEP,
@@ -350,6 +356,13 @@ def ingest_daily(
         from rquant.adapter.tushare import TushareAdapter
 
         status_adapter = TushareAdapter()
+    if suspension_adapter is None:
+        if not hasattr(status_adapter, "suspend_d_raw"):
+            raise TypeError(
+                "status_adapter must implement suspend_d_raw or "
+                "suspension_adapter must be provided"
+            )
+        suspension_adapter = cast(SuspensionAdapter, status_adapter)
     status_keys = [
         DailySecurityKey(ts_code=str(row.ts_code), trade_date=row.trade_date)
         for row in df_daily[["ts_code", "trade_date"]].itertuples(index=False)
@@ -360,6 +373,11 @@ def ingest_daily(
         ingested_at=resolved_ingested_at,
         request_interval_seconds=api_sleep,
         sleep=sleep,
+    )
+    suspension_snapshot = normalize_suspend_d_snapshot(
+        suspension_adapter.suspend_d_raw(target_date),
+        trade_date=target_date,
+        queried_at=resolved_ingested_at,
     )
 
     logger.info(f"拉取 index_daily {trade_date}...")
@@ -442,6 +460,16 @@ def ingest_daily(
                 f"stock_status_daily: {len(status_batch.rows)} 行 "
                 f"(unknown={sum(row.is_st is None for row in status_batch.rows)}, "
                 f"conflict={sum(row.conflict_reason is not None for row in status_batch.rows)})"
+            )
+            persist_suspension_snapshot(
+                writer,
+                suspension_snapshot,
+                transaction_mode="existing",
+            )
+            logger.info(
+                "stock_suspend_coverage: "
+                f"{suspension_snapshot.coverage.coverage_state}, "
+                f"events={len(suspension_snapshot.events)}"
             )
             if not df_index.empty:
                 writer.upsert_index_daily(df_index)

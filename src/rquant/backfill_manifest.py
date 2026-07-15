@@ -249,19 +249,25 @@ class BackfillPhaseCoverage(BaseModel):
 
     expected_sessions: int = Field(ge=0)
     complete_sessions: int = Field(ge=0)
+    accepted_missing_sessions: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_counts(self) -> BackfillPhaseCoverage:
-        if self.complete_sessions > self.expected_sessions:
-            raise ValueError("complete sessions cannot exceed expected sessions")
+        if self.satisfied_sessions > self.expected_sessions:
+            raise ValueError("satisfied sessions cannot exceed expected sessions")
         return self
+
+    @computed_field
+    @property
+    def satisfied_sessions(self) -> int:
+        return self.complete_sessions + self.accepted_missing_sessions
 
     @computed_field
     @property
     def coverage_ratio(self) -> float:
         if self.expected_sessions == 0:
             return 0.0
-        return self.complete_sessions / self.expected_sessions
+        return self.satisfied_sessions / self.expected_sessions
 
 
 class BackfillCoverage(BaseModel):
@@ -272,11 +278,15 @@ class BackfillCoverage(BaseModel):
     exit: BackfillPhaseCoverage
     expected_unique_sessions: int = Field(ge=0)
     complete_unique_sessions: int = Field(ge=0)
+    accepted_missing_unique_sessions: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_unique_counts(self) -> BackfillCoverage:
-        if self.complete_unique_sessions > self.expected_unique_sessions:
-            raise ValueError("complete unique sessions cannot exceed expected sessions")
+        if (
+            self.complete_unique_sessions + self.accepted_missing_unique_sessions
+            > self.expected_unique_sessions
+        ):
+            raise ValueError("satisfied unique sessions cannot exceed expected sessions")
         return self
 
     @computed_field
@@ -285,8 +295,8 @@ class BackfillCoverage(BaseModel):
         expected = self.entry.expected_sessions + self.exit.expected_sessions
         if expected == 0:
             return 0.0
-        complete = self.entry.complete_sessions + self.exit.complete_sessions
-        return complete / expected
+        satisfied = self.entry.satisfied_sessions + self.exit.satisfied_sessions
+        return satisfied / expected
 
     @computed_field
     @property
@@ -296,7 +306,17 @@ class BackfillCoverage(BaseModel):
     @computed_field
     @property
     def entry_exit_gate_passed(self) -> bool:
-        return self.entry_exit_coverage_ratio >= 0.99
+        return self.entry_gate_passed and self.exit_gate_passed
+
+    @computed_field
+    @property
+    def entry_gate_passed(self) -> bool:
+        return self.entry.coverage_ratio >= 0.99
+
+    @computed_field
+    @property
+    def exit_gate_passed(self) -> bool:
+        return self.exit.coverage_ratio >= 0.99
 
 
 class BackfillEstimate(BaseModel):
@@ -764,36 +784,45 @@ def _complete_minute_sessions(
 def _coverage_from_demands(
     demands: list[tuple[str, str, BackfillPhase, date]],
     complete: set[tuple[str, date]],
+    accepted_missing: set[tuple[str, date]],
 ) -> BackfillCoverage:
     expected_counts = {phase: 0 for phase in ("baseline", "entry", "exit")}
     complete_counts = {phase: 0 for phase in ("baseline", "entry", "exit")}
+    accepted_counts = {phase: 0 for phase in ("baseline", "entry", "exit")}
     unique_sessions: set[tuple[str, date]] = set()
     for _eligibility_id, ts_code, phase, trading_date in demands:
         expected_counts[phase] += 1
         unique_sessions.add((ts_code, trading_date))
         if (ts_code, trading_date) in complete:
             complete_counts[phase] += 1
+        elif (ts_code, trading_date) in accepted_missing:
+            accepted_counts[phase] += 1
     return BackfillCoverage(
         baseline=BackfillPhaseCoverage(
             expected_sessions=expected_counts["baseline"],
             complete_sessions=complete_counts["baseline"],
+            accepted_missing_sessions=accepted_counts["baseline"],
         ),
         entry=BackfillPhaseCoverage(
             expected_sessions=expected_counts["entry"],
             complete_sessions=complete_counts["entry"],
+            accepted_missing_sessions=accepted_counts["entry"],
         ),
         exit=BackfillPhaseCoverage(
             expected_sessions=expected_counts["exit"],
             complete_sessions=complete_counts["exit"],
+            accepted_missing_sessions=accepted_counts["exit"],
         ),
         expected_unique_sessions=len(unique_sessions),
         complete_unique_sessions=len(unique_sessions & complete),
+        accepted_missing_unique_sessions=len(unique_sessions & accepted_missing),
     )
 
 
 def _missing_task_chunks(
     windows: tuple[MergedBackfillWindow, ...],
     complete: set[tuple[str, date]],
+    accepted_missing: set[tuple[str, date]],
     open_dates: list[date],
     session_spec: MinuteSourceSessionSpec,
     response_row_limit: int,
@@ -809,6 +838,7 @@ def _missing_task_chunks(
             value
             for value in window.open_dates
             if (window.ts_code, value) not in complete
+            and (window.ts_code, value) not in accepted_missing
         ]
         groups: list[list[date]] = []
         for trading_date in missing:
@@ -913,10 +943,17 @@ def plan_minute_backfill(
     demands = _calendar_scope_demands(manifest, open_dates, civil_dates)
     windows = _merge_windows(demands, open_dates)
     complete = _complete_minute_sessions(store, windows, selected_spec)
-    coverage = _coverage_from_demands(demands, complete)
+    accepted_missing = store.known_full_day_suspensions(
+        tuple(sorted({window.ts_code for window in windows})),
+        min((window.start_date for window in windows), default=manifest.start_date),
+        max((window.end_date for window in windows), default=manifest.end_date),
+    )
+    accepted_missing -= complete
+    coverage = _coverage_from_demands(demands, complete, accepted_missing)
     tasks = _missing_task_chunks(
         windows,
         complete,
+        accepted_missing,
         open_dates,
         selected_spec,
         response_row_limit,

@@ -1,7 +1,7 @@
 ---
 title: rQuant - 个人版 A 股量化选股与监控平台
 created_at: 2026-04-15
-updated_at: 2026-07-13
+updated_at: 2026-07-15
 status: active
 owner: roxor
 tags: [quant, a-shares, personal-tool, python, macOS]
@@ -20,6 +20,8 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - Strategy Lab 支持 N 字、集合竞价和科创/创业放量的 replay、消融与研究记录。
 - 20 个首批策略数据集已有 Point-in-Time 契约；历史名称/ST、复权价格、竞价/分钟/盘后数据
   可见性均按决策时点 fail closed，研究快照、覆盖率、质量问题和权威交易日历可追溯。
+- 正式研究由持久化数据审计与覆盖率门禁保护；Tushare 停复牌事实按交易日保存，不再用零成交量
+  猜测停牌。
 - DuckDB 保存生产和研究数据，Parquet/JSONL 保存共享快照与任务结果。
 - 云端承担生产调度，本地 Mac 承担研究、分钟数据和热备。
 
@@ -44,7 +46,14 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
+2026-07-15 的阶段 1 真实数据审计发现 2 个 P0：379,658 个日线资格键缺历史名称/ST，涨停池
+含 400 行休市日数据。PR-D 的代码能力已经完成，但数据准入尚未通过；正式回测继续阻断，且
+尚未启动大规模分钟下载。现有数据快照只冻结覆盖元数据，正式模式还会要求不可变计算快照，
+不会让底层数据已变化的结果冒充可复现研究。
+
 - [研究可信度基线](docs/analysis/2026-07-13-research-trust-baseline.md)
+- [阶段 1 真实数据验收](docs/analysis/2026-07-15-stage1-data-contract-acceptance.md)
+- [v0.17.0 首次部署前数据初始化](docs/deploy/2026-07-15-v0.17.0-stage1-bootstrap.md)
 - [可信策略研究与盘中监控路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)
 - [Strategy Lab 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
 
@@ -99,6 +108,20 @@ bash scripts/check-core-quality.sh
 
 # 日度链路预检
 .venv/bin/rquant preflight
+.venv/bin/rquant preflight --profile research
+
+# 运行并保存阶段 1 数据审计（P0 时返回非零）
+.venv/bin/rquant data-audit --start-date 2026-04-01 --as-of 2026-07-14
+
+# 先估算历史名称/ST 回补规模，再在盘外安全窗口执行
+.venv/bin/rquant security-status-backfill \
+  --start-date 2026-04-01 --end-date 2026-07-14 --dry-run
+.venv/bin/rquant security-status-backfill \
+  --start-date 2026-04-01 --end-date 2026-07-14
+
+# 回补权威停复牌逐日快照
+.venv/bin/rquant suspension-backfill \
+  --start-date 2026-04-01 --end-date 2026-07-14
 
 # 健康看板
 .venv/bin/streamlit run src/rquant/dashboard/app.py --server.port 8501
@@ -159,7 +182,7 @@ data/                 本地数据与运行状态，不进 Git
 
 1. 冻结研究基线和工程护栏。
 2. 建数据契约、PIT 状态与回补清单（迁移内核、历史状态、质量审计、PIT 复权和可见性门禁
-   已完成；资格全集、可恢复回补清单、覆盖率阶段门和四条 CLI 已完成，进入真实数据验收）。
+   已完成；真实数据审计已运行，当前先修复 2 个 P0，再验收三类策略覆盖率）。
 3. 统一无未来函数分钟特征和 StrategySpec。
 4. 完善可成交性、费用和 10 万本金账户模拟。
 5. 修正优化器后重评现有策略。

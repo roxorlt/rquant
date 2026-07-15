@@ -146,6 +146,11 @@ class _StatusAdapter:
             columns=["ts_code", "name", "trade_date", "type", "type_name"]
         )
 
+    def suspend_d_raw(self, trade_date: date) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["ts_code", "trade_date", "suspend_timing", "suspend_type"]
+        )
+
 
 class _WriterFactory:
     def __init__(
@@ -206,11 +211,19 @@ def test_ingest_prefetches_status_and_ignores_current_stock_name(
     with DuckDBStore(db_path, read_only=True) as store:
         status = store.list_stock_status(date(2024, 1, 2), date(2024, 1, 2))
         state = store.get_state("600000.SH").iloc[0]
+        suspension_coverage = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT coverage_state, row_count
+            FROM stock_suspend_coverage
+            WHERE source = 'tushare' AND trade_date = DATE '2024-01-02'
+            """
+        ).fetchone()
     assert len(status) == 1
     assert status[0].is_st is False
     assert state["is_st"] == False  # noqa: E712
     assert state["limit_pct"] == pytest.approx(0.10)
     assert state["is_limit_up"] == False  # noqa: E712
+    assert suspension_coverage == ("complete", 0)
 
 
 def test_ingest_source_failure_happens_before_any_database_mutation(
@@ -418,6 +431,20 @@ def test_ingest_opens_production_writer_only_after_all_remote_fetches(
                 pass
             return pd.DataFrame(
                 columns=["ts_code", "name", "trade_date", "type", "type_name"]
+            )
+
+        def suspend_d_raw(self, trade_date: date) -> pd.DataFrame:
+            del trade_date
+            assert writer_factory.calls == 0
+            with DuckDBStore(db_path, read_only=True):
+                pass
+            return pd.DataFrame(
+                columns=[
+                    "ts_code",
+                    "trade_date",
+                    "suspend_timing",
+                    "suspend_type",
+                ]
             )
 
     rows = ingest_daily(

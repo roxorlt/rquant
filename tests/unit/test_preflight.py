@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import subprocess
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from rquant.data_contracts import CONTRACTS_BY_ID, EXCHANGE_TIMEZONE
 from rquant.preflight import (
     check_data_freshness,
     detail_duckdb_lock,
@@ -46,13 +47,31 @@ class _ReadonlyStore:
     def __exit__(self, *_: object) -> None:
         self.closed = True
 
+    def latest_trading_day(self, anchor: date, *, exchange: str = "SSE") -> date:
+        del exchange
+        return anchor
+
+    def previous_trading_day(self, anchor: date, *, exchange: str = "SSE") -> date:
+        del anchor, exchange
+        return date(2026, 7, 10)
+
+    def is_trading_day(self, exchange: str, cal_date: date) -> bool:
+        del exchange, cal_date
+        return True
+
+    def list_trade_calendar(
+        self, exchange: str, start: date, end: date
+    ) -> list[object]:
+        del exchange, start, end
+        return []
+
 
 def _forbid_primary_store(*_: object, **__: object) -> None:
     raise AssertionError("preflight must not construct DuckDBStore directly")
 
 
 def test_data_freshness_uses_readonly_store_helper(monkeypatch: Any) -> None:
-    store = _ReadonlyStore((date.today(), 123))
+    store = _ReadonlyStore((date(2026, 7, 10), 123))
     seen_required_tables: list[tuple[str, ...]] = []
 
     def open_readonly_store(
@@ -64,10 +83,18 @@ def test_data_freshness_uses_readonly_store_helper(monkeypatch: Any) -> None:
     monkeypatch.setattr(duckdb_module, "open_readonly_store", open_readonly_store)
     monkeypatch.setattr(duckdb_module, "DuckDBStore", _forbid_primary_store)
 
-    result = check_data_freshness({"daily_bar": 5})
+    result = check_data_freshness(
+        (CONTRACTS_BY_ID["daily_bar"],),
+        as_of=datetime.combine(
+            date(2026, 7, 13),
+            datetime.min.time(),
+            tzinfo=EXCHANGE_TIMEZONE,
+        ),
+        replica_path=None,
+    )
 
     assert result.status == "ok"
-    assert seen_required_tables == [("daily_bar",)]
+    assert seen_required_tables == [()]
     assert store.entered is True
     assert store.closed is True
 

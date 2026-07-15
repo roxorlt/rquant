@@ -269,6 +269,38 @@ class TestCancelBackgroundRun:
 
 
 class TestExecuteSpec:
+    def test_formal_gate_runs_before_builder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        builder_called = False
+
+        def fake_builder(params: dict[str, Any]) -> Any:
+            nonlocal builder_called
+            builder_called = True
+            return _fake_run()
+
+        def block(*_: object, **__: object) -> None:
+            raise PermissionError("正式研究门未通过")
+
+        monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", fake_builder)
+        monkeypatch.setattr(worker, "_enforce_spec_research_gate", block)
+
+        with pytest.raises(PermissionError, match="正式研究门未通过"):
+            worker.execute_spec(
+                {
+                    "run_type": "n_shape_optimize",
+                    "run_id": "run-gate-blocked",
+                    "params": {"research_gate": {"mode": "formal"}},
+                },
+                base_dir=tmp_path,
+            )
+
+        assert builder_called is False
+        status = worker.read_run_status("run-gate-blocked", base_dir=tmp_path)
+        assert status is not None and status.state == "error"
+
     def test_success_saves_run_and_marks_done(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

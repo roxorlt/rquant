@@ -260,6 +260,26 @@ class TushareAdapter:
         logger.info(f"Tushare namechange 返回 {len(normalized)} 行")
         return normalized
 
+    def suspend_d_raw(self, trade_date: date) -> pd.DataFrame:
+        """Fetch the full-market suspend/resume event snapshot for one date."""
+        columns = ["ts_code", "trade_date", "suspend_timing", "suspend_type"]
+        date_string = trade_date.strftime("%Y%m%d")
+        fields = ",".join(columns)
+        logger.info(f"Tushare suspend_d 请求：trade_date={date_string}")
+        frame = self._call_with_backoff(
+            "suspend_d",
+            lambda: self._pro.suspend_d(
+                trade_date=date_string,
+                fields=fields,
+            ),
+        )
+        if frame is None or frame.empty:
+            logger.info(f"Tushare suspend_d 成功返回空：trade_date={date_string}")
+            return pd.DataFrame(columns=columns)
+        normalized = frame.reindex(columns=columns).reset_index(drop=True)
+        logger.info(f"Tushare suspend_d 返回 {len(normalized)} 行")
+        return normalized
+
     def stock_st_raw(self, trade_date: date) -> pd.DataFrame:
         """Fetch stock_st positives for one date; absence never means non-ST."""
         columns = ["ts_code", "name", "trade_date", "type", "type_name"]

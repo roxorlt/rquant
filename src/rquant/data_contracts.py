@@ -44,6 +44,7 @@ class FreshnessRule(ContractModel):
     watermark_column: str = Field(min_length=1)
     max_trading_session_lag: int | None = Field(default=None, ge=0)
     max_wall_clock_lag: timedelta | None = None
+    event_driven: bool = False
     required_on_open_day: bool
 
     @field_validator("max_wall_clock_lag")
@@ -55,13 +56,24 @@ class FreshnessRule(ContractModel):
 
     @model_validator(mode="after")
     def validate_lag_kind(self) -> FreshnessRule:
-        if self.max_trading_session_lag is not None and self.max_wall_clock_lag is not None:
+        declared = sum(
+            (
+                self.max_trading_session_lag is not None,
+                self.max_wall_clock_lag is not None,
+                self.event_driven,
+            )
+        )
+        if declared > 1:
             raise ValueError("freshness rule must use exactly one known lag kind")
         return self
 
     @property
     def has_known_lag(self) -> bool:
         return self.max_trading_session_lag is not None or self.max_wall_clock_lag is not None
+
+    @property
+    def has_declared_policy(self) -> bool:
+        return self.has_known_lag or self.event_driven
 
 
 class SourceAvailability(ContractModel):
@@ -141,7 +153,7 @@ class DatasetContract(ContractModel):
         elif self.source_availability:
             raise ValueError("source availability is only valid for AUCTION_0925 contracts")
 
-        if self.visibility is not VisibilityRule.UNKNOWN and not self.freshness.has_known_lag:
+        if self.visibility is not VisibilityRule.UNKNOWN and not self.freshness.has_declared_policy:
             raise ValueError("known visibility requires a known freshness lag")
         return self
 
@@ -296,7 +308,7 @@ DATASET_CONTRACTS: tuple[DatasetContract, ...] = (
         ),
         historized=True,
         earliest_date=None,
-        allowed_missing_reasons=(),
+        allowed_missing_reasons=("known_full_day_suspension",),
     ),
     DatasetContract(
         dataset_id="auction_bar",
@@ -318,6 +330,46 @@ DATASET_CONTRACTS: tuple[DatasetContract, ...] = (
         freshness=_session_freshness("trade_date", lag=0),
         historized=True,
         earliest_date=date(2025, 1, 1),
+        allowed_missing_reasons=(),
+    ),
+    DatasetContract(
+        dataset_id="stock_suspend_event",
+        table_name="stock_suspend_event",
+        sources=("tushare",),
+        physical_primary_key=(
+            "source",
+            "ts_code",
+            "trade_date",
+            "suspend_type",
+            "suspend_timing",
+        ),
+        logical_key=("ts_code", "trade_date", "suspend_type", "suspend_timing"),
+        event_date_column="trade_date",
+        ingested_at_column="ingested_at",
+        price_basis=PriceBasis.NOT_APPLICABLE,
+        visibility=VisibilityRule.PANEL_CLOSE_NEXT_SESSION,
+        freshness=FreshnessRule(
+            watermark_column="ingested_at",
+            event_driven=True,
+            required_on_open_day=False,
+        ),
+        historized=True,
+        earliest_date=None,
+        allowed_missing_reasons=(),
+    ),
+    DatasetContract(
+        dataset_id="stock_suspend_coverage",
+        table_name="stock_suspend_coverage",
+        sources=("tushare",),
+        physical_primary_key=("source", "trade_date"),
+        logical_key=("trade_date",),
+        event_date_column="trade_date",
+        ingested_at_column="queried_at",
+        price_basis=PriceBasis.NOT_APPLICABLE,
+        visibility=VisibilityRule.PANEL_CLOSE_NEXT_SESSION,
+        freshness=_session_freshness("trade_date", lag=0),
+        historized=True,
+        earliest_date=None,
         allowed_missing_reasons=(),
     ),
     DatasetContract(

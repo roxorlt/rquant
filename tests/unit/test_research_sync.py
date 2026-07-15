@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pandas as pd
 import pytest
 
 import rquant.data_quality as data_quality
@@ -28,6 +29,10 @@ from rquant.research_sync import (
     sync_from_backup,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.suspension import (
+    normalize_suspend_d_snapshot,
+    persist_suspension_snapshot,
+)
 
 
 def _make_local_db(path: Path) -> None:
@@ -1823,6 +1828,57 @@ class TestRestoreResearchTables:
         # 冲突行保留本地新值（closed），本地缺失的 pos-2 被补入
         assert rows == {"pos-1": "closed", "pos-2": "open"}
 
+    def test_restore_suspension_snapshot_is_an_atomic_newer_wins_bundle(
+        self,
+        tmp_path: Path,
+        local_db: Path,
+    ) -> None:
+        source = tmp_path / "suspension-source.duckdb"
+        _write_suspension_snapshot(
+            local_db,
+            queried_at=datetime(2026, 7, 14, 8, tzinfo=UTC),
+            suspended=True,
+        )
+        _write_suspension_snapshot(
+            source,
+            queried_at=datetime(2026, 7, 14, 9, tzinfo=UTC),
+            suspended=False,
+        )
+
+        report = restore_research_tables(
+            source,
+            local_db,
+            tables=["stock_suspend_event", "stock_suspend_coverage"],
+            refresh_replica=False,
+        )
+
+        assert not report.has_errors
+        with DuckDBStore(local_db, read_only=True) as store:
+            coverage = store._conn.execute(  # noqa: SLF001
+                "SELECT row_count, snapshot_hash FROM stock_suspend_coverage"
+            ).fetchone()
+            event_count = store._conn.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM stock_suspend_event"
+            ).fetchone()[0]
+        assert coverage is not None and coverage[0] == 0
+        assert event_count == 0
+
+    def test_restore_rejects_partial_suspension_snapshot_bundle(
+        self,
+        tmp_path: Path,
+        local_db: Path,
+    ) -> None:
+        source = tmp_path / "partial-suspension-source.duckdb"
+        DuckDBStore(source).close()
+
+        with pytest.raises(ValueError, match="suspension.*bundle"):
+            restore_research_tables(
+                source,
+                local_db,
+                tables=["stock_suspend_event"],
+                refresh_replica=False,
+            )
+
     def test_restore_source_path_with_single_quote(
         self, tmp_path: Path, local_db: Path
     ) -> None:
@@ -2124,6 +2180,122 @@ def test_data_metadata_tables_use_merge_semantics() -> None:
     assert metadata_tables <= set(MERGE_TABLES)
     assert not metadata_tables & set(REPLACE_TABLES)
     assert not metadata_tables & set(LOCAL_ONLY_TABLES)
+
+
+def test_suspension_facts_merge_but_audit_runs_stay_local() -> None:
+    suspension_tables = {
+        "stock_suspend_event",
+        "stock_suspend_coverage",
+    }
+
+    assert suspension_tables <= set(MERGE_TABLES)
+    assert not suspension_tables & set(REPLACE_TABLES)
+    assert "data_audit_run" in LOCAL_ONLY_TABLES
+    assert "data_audit_run" not in MERGE_TABLES
+    assert "data_audit_run" not in REPLACE_TABLES
+
+
+def _write_suspension_snapshot(
+    db_path: Path,
+    *,
+    queried_at: datetime,
+    suspended: bool,
+) -> None:
+    trade_date = date(2026, 7, 14)
+    frame = (
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": "20260714",
+                    "suspend_timing": "全天",
+                    "suspend_type": "S",
+                }
+            ]
+        )
+        if suspended
+        else pd.DataFrame()
+    )
+    with DuckDBStore(db_path) as store:
+        persist_suspension_snapshot(
+            store,
+            normalize_suspend_d_snapshot(
+                frame,
+                trade_date=trade_date,
+                queried_at=queried_at,
+            ),
+        )
+
+
+def test_newer_cloud_suspension_snapshot_replaces_events_atomically(
+    local_db: Path,
+    backup_db: Path,
+) -> None:
+    _write_suspension_snapshot(
+        local_db,
+        queried_at=datetime(2026, 7, 14, 8, tzinfo=UTC),
+        suspended=True,
+    )
+    _write_suspension_snapshot(
+        backup_db,
+        queried_at=datetime(2026, 7, 14, 9, tzinfo=UTC),
+        suspended=False,
+    )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    assert not report.has_errors
+    with DuckDBStore(local_db, read_only=True) as store:
+        known = store.known_full_day_suspensions(
+            ("600000.SH",),
+            date(2026, 7, 14),
+            date(2026, 7, 14),
+        )
+        coverage = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT row_count,
+                   strftime(queried_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ')
+            FROM stock_suspend_coverage
+            """
+        ).fetchone()
+    assert known == set()
+    assert coverage == (0, "2026-07-14T09:00:00Z")
+
+
+def test_older_cloud_suspension_snapshot_cannot_overwrite_local(
+    local_db: Path,
+    backup_db: Path,
+) -> None:
+    _write_suspension_snapshot(
+        local_db,
+        queried_at=datetime(2026, 7, 14, 10, tzinfo=UTC),
+        suspended=True,
+    )
+    _write_suspension_snapshot(
+        backup_db,
+        queried_at=datetime(2026, 7, 14, 9, tzinfo=UTC),
+        suspended=False,
+    )
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    assert not report.has_errors
+    with DuckDBStore(local_db, read_only=True) as store:
+        known = store.known_full_day_suspensions(
+            ("600000.SH",),
+            date(2026, 7, 14),
+            date(2026, 7, 14),
+        )
+        queried_at = store._conn.execute(  # noqa: SLF001
+            """
+            SELECT strftime(
+                queried_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ'
+            )
+            FROM stock_suspend_coverage
+            """
+        ).fetchone()[0]
+    assert known == {("600000.SH", date(2026, 7, 14))}
+    assert queried_at == "2026-07-14T10:00:00Z"
 
 
 def test_trade_calendar_uses_merge_semantics() -> None:

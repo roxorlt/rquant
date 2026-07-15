@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Literal, Self, TypeAlias
 
 from pydantic import (
@@ -22,6 +22,7 @@ from pydantic import (
 SnapshotStatus: TypeAlias = Literal["building", "ready"]
 QualitySeverity: TypeAlias = Literal["P0", "P1", "P2", "P3"]
 QualityIssueStatus: TypeAlias = Literal["open", "resolved"]
+DataAuditRunStatus: TypeAlias = Literal["running", "completed", "failed"]
 StableIdValue: TypeAlias = str | datetime | None
 QualityEvidence: TypeAlias = dict[str, JsonValue]
 TableWatermarks: TypeAlias = dict[str, str]
@@ -153,6 +154,18 @@ class DatasetSnapshot(MetadataModel):
             values["created_at"] = created_at
         return cls.model_validate(values)
 
+    def finalize(self, finalization: DatasetSnapshotFinalization) -> Self:
+        if self.status != "building":
+            raise ValueError("only a building snapshot can be finalized")
+        return self.model_copy(
+            update={
+                "status": "ready",
+                "table_watermarks": finalization.table_watermarks,
+                "quality_issue_ids": finalization.quality_issue_ids,
+                "completed_at": finalization.completed_at,
+            }
+        )
+
 
 class DatasetSnapshotFinalization(MetadataModel):
     table_watermarks: TableWatermarks = Field(default_factory=dict)
@@ -163,6 +176,111 @@ class DatasetSnapshotFinalization(MetadataModel):
     @classmethod
     def validate_completed_at(cls, value: datetime) -> datetime:
         return normalize_utc_datetime(value)
+
+
+class DataAuditRunFinalization(MetadataModel):
+    finding_issue_ids: tuple[str, ...] = ()
+    p0_count: int = Field(ge=0)
+    completed_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("completed_at")
+    @classmethod
+    def validate_completed_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> DataAuditRunFinalization:
+        if len(self.finding_issue_ids) != len(set(self.finding_issue_ids)):
+            raise ValueError("finding_issue_ids cannot contain duplicates")
+        if self.p0_count > len(self.finding_issue_ids):
+            raise ValueError("p0_count cannot exceed finding count")
+        return self
+
+
+class DataAuditRun(MetadataModel):
+    as_of_date: date
+    range_start: date
+    range_end: date
+    rule_set_version: str = Field(min_length=1)
+    status: DataAuditRunStatus = "running"
+    finding_issue_ids: tuple[str, ...] = ()
+    p0_count: int = Field(default=0, ge=0)
+    observed_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+    error_message: str | None = None
+
+    @field_validator("observed_at", "completed_at")
+    @classmethod
+    def validate_business_time(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> DataAuditRun:
+        if not (self.range_start <= self.range_end <= self.as_of_date):
+            raise ValueError("audit range must end on or before as_of_date")
+        if len(self.finding_issue_ids) != len(set(self.finding_issue_ids)):
+            raise ValueError("finding_issue_ids cannot contain duplicates")
+        if self.p0_count > len(self.finding_issue_ids):
+            raise ValueError("p0_count cannot exceed finding count")
+        if self.status == "running":
+            if self.completed_at is not None or self.error_message is not None:
+                raise ValueError("running audit cannot contain terminal fields")
+            if self.finding_issue_ids or self.p0_count:
+                raise ValueError("running audit cannot contain findings")
+        elif self.status == "completed":
+            if self.completed_at is None or self.error_message is not None:
+                raise ValueError("completed audit requires completed_at and no error")
+        elif self.completed_at is None or not self.error_message:
+            raise ValueError("failed audit requires completed_at and error_message")
+        if self.completed_at is not None and self.completed_at < self.observed_at:
+            raise ValueError("completed_at cannot be earlier than observed_at")
+        return self
+
+    @computed_field
+    @property
+    def audit_run_id(self) -> str:
+        return stable_sha256(
+            "data_audit_run",
+            {
+                "as_of_date": self.as_of_date.isoformat(),
+                "range_start": self.range_start.isoformat(),
+                "range_end": self.range_end.isoformat(),
+                "rule_set_version": self.rule_set_version,
+                "observed_at": self.observed_at,
+            },
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        as_of_date: date,
+        range_start: date,
+        range_end: date,
+        rule_set_version: str,
+        observed_at: datetime | None = None,
+    ) -> Self:
+        values: dict[str, object] = {
+            "as_of_date": as_of_date,
+            "range_start": range_start,
+            "range_end": range_end,
+            "rule_set_version": rule_set_version,
+        }
+        if observed_at is not None:
+            values["observed_at"] = observed_at
+        return cls.model_validate(values)
+
+    def finalize(self, finalization: DataAuditRunFinalization) -> Self:
+        if self.status != "running":
+            raise ValueError("only a running audit can be finalized")
+        return self.model_copy(
+            update={
+                "status": "completed",
+                "finding_issue_ids": finalization.finding_issue_ids,
+                "p0_count": finalization.p0_count,
+                "completed_at": finalization.completed_at,
+            }
+        )
 
 
 class DatasetCoverage(MetadataModel):

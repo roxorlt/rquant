@@ -9,8 +9,9 @@
 **技术栈：** Python 3.11+、Pydantic、DuckDB、SQLite、pandas、argparse、pytest、ruff。
 
 **执行状态（2026-07-15）：** PR-A 已随 v0.14.0 部署；PR-B Tasks 6-11 已随 v0.15.0
-部署并完成云端/本地交易日历 bootstrap；PR-C 已完成实现、双重审查和全量回归，待合并发布为 v0.16.0；
-PR-D 尚未完成。
+部署并完成云端/本地交易日历 bootstrap；PR-C 已合并并标记 v0.16.0；PR-D Tasks 17-19
+已实现并运行真实数据审计。代码验收通过，但历史名称/ST 与休市日涨停池两个 P0 尚未修复，
+Task 20 的生产数据与覆盖率验收未通过。
 
 ---
 
@@ -453,6 +454,8 @@ rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 
 ### Task 17：契约驱动 preflight freshness
 
+**状态：已实现并通过相关测试。**
+
 **Files:**
 - Modify: `src/rquant/preflight.py`
 - Modify: `tests/unit/test_preflight.py`
@@ -462,6 +465,8 @@ rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 `minute_bar`、`auction_bar`、`adj_factor`、`limit_list_daily`、资金流和板块关键表。
 
 ### Task 18：data-audit 与正式研究阻断
+
+**状态：已实现并通过相关测试。**
 
 **Files:**
 - Modify: `src/rquant/cli.py`
@@ -474,10 +479,16 @@ rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 
 ### Task 19：真实数据只读核验与回补计划
 
+**状态：已完成只读核验；发现 2 个 P0，未执行大规模分钟下载。**
+
 对本地只读副本运行审计，从最新日期向旧查找人工样本，记录回退天数。生成但不执行 P0/P1/P2
 回补 manifest，输出请求数、预计行数、磁盘和 ETA；大规模下载必须另行确认。
 
 ### Task 20：阶段 1 验收
+
+**状态：阻断。** 代码、测试和可操作回补入口已具备；仍需部署 v0.17.0、修复生产数据、
+重新生成三类 manifest、实现不可变快照绑定执行并通过 99%/95% 覆盖率门。详细证据见
+`docs/analysis/2026-07-15-stage1-data-contract-acceptance.md`。
 
 **Files:**
 - Modify: `CHANGELOG.md`

@@ -312,7 +312,7 @@ def test_dataset_snapshot_records_metadata_without_refreshing_tables(
     )
 
     assert rc == 0
-    assert writable_store.upsert_dataset_coverage.call_count == 3
+    assert writable_store.upsert_dataset_coverage.call_count == 4
     writable_store.finalize_dataset_snapshot.assert_called_once()
     assert "metadata-only" in capsys.readouterr().out
 
@@ -391,6 +391,13 @@ def test_dataset_snapshot_watermarks_are_bounded_by_as_of(
     assert calls[0].args[1] == [datetime(2026, 6, 30, 15)]
     assert "cal_date <= ?" in calls[1].args[0]
     assert calls[1].args[1] == [date(2026, 6, 30)]
+    finalization = writable_store.finalize_dataset_snapshot.call_args.args[1]
+    assert finalization.table_watermarks["manifest_start_date"] == (
+        plan.manifest.start_date.isoformat()
+    )
+    assert finalization.table_watermarks["manifest_end_date"] == (
+        plan.manifest.end_date.isoformat()
+    )
 
 
 def test_dataset_snapshot_ready_retry_is_idempotent(

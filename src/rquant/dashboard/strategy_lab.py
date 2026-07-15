@@ -51,7 +51,18 @@ from rquant.dashboard.strategy_lab_worker import (
     launch_background_run,
     list_run_statuses,
 )
-from rquant.research_manifest import CURRENT_RESEARCH_NOTICES, RESEARCH_STATUS_LABELS
+from rquant.research_gate import (
+    ResearchGateDecision,
+    ResearchGateFailure,
+    ResearchGateRequest,
+    build_gate_research_manifest,
+    evaluate_store_research_gate,
+)
+from rquant.research_manifest import (
+    CURRENT_RESEARCH_NOTICES,
+    RESEARCH_STATUS_LABELS,
+    detect_code_commit,
+)
 from rquant.storage.duckdb import open_readonly_connection, open_readonly_store
 from rquant.topn_selection import default_score_profiles
 from rquant.volume_profile import calculate_volume_profile
@@ -130,6 +141,50 @@ def query_duckdb(sql: str, params: tuple[object, ...] = ()) -> pd.DataFrame | No
         return conn.execute(sql, list(params)).fetchdf()
     finally:
         conn.close()
+
+
+@st.cache_data(ttl=60)
+def current_research_gate(
+    mode: str,
+    strategy_name: str,
+    start_date: date,
+    end_date: date,
+) -> tuple[ResearchGateRequest, ResearchGateDecision]:
+    request = ResearchGateRequest(
+        mode=mode,
+        strategy_name=strategy_name,
+        start_date=start_date,
+        end_date=end_date,
+        code_commit=detect_code_commit(),
+    )
+    try:
+        with open_readonly_store() as store:
+            decision = evaluate_store_research_gate(store, request)
+    except Exception as exc:
+        failure = ResearchGateFailure(
+            code="metadata_unavailable",
+            message=f"研究门元数据不可用: {type(exc).__name__}: {exc}",
+        )
+        decision = ResearchGateDecision(
+            allowed=mode == "exploratory",
+            research_status="exploratory",
+            audit_run_id=None,
+            dataset_snapshot_id=None,
+            coverage_ratios={},
+            coverage_counts={},
+            failures=(failure,),
+        )
+    return request, decision
+
+
+def _render_research_gate(decision: ResearchGateDecision) -> None:
+    if decision.allowed and decision.research_status == "comparable":
+        st.success("正式研究门已通过")
+        return
+    if not decision.failures:
+        st.info("当前为探索性试跑")
+        return
+    st.warning("；".join(failure.message for failure in decision.failures))
 
 
 @st.cache_data(ttl=300)
@@ -972,6 +1027,14 @@ with st.expander("研究可信度警示", expanded=True):
         else:
             st.info(message)
 
+research_mode_label = st.sidebar.radio(
+    "研究用途",
+    ["探索性试跑", "正式回测"],
+    horizontal=True,
+    key="research_mode",
+)
+research_mode = "formal" if research_mode_label == "正式回测" else "exploratory"
+
 PRESET_OPTIONS = ["n-shape-combined", "n-shape-pool1", "n-shape-pool2"]
 
 # 收益对比结果落盘时每张表最多保留的行数；超出部分只存在于当前会话内存
@@ -1055,7 +1118,27 @@ with st.sidebar.form("compare_form"):
         ],
         key="compare_variants",
     )
-    run_clicked = st.form_submit_button("运行对比", type="primary", width="stretch")
+    n_gate_request, n_gate_decision = current_research_gate(
+        research_mode,
+        "n_shape",
+        start_value,
+        end_value,
+    )
+    run_clicked = st.form_submit_button(
+        "运行对比",
+        type="primary",
+        width="stretch",
+        disabled=research_mode == "formal" and not n_gate_decision.allowed,
+    )
+
+n_gate_request = n_gate_request.model_copy(
+    update={
+        "audit_run_id": n_gate_decision.audit_run_id,
+        "dataset_snapshot_id": n_gate_decision.dataset_snapshot_id,
+    }
+)
+with st.sidebar.expander("正式研究门", expanded=research_mode == "formal"):
+    _render_research_gate(n_gate_decision)
 
 # 日期被重置时不静默执行：让用户看清新区间后再点一次，避免以为跑的是自己选的区间
 if _dates_were_reset:
@@ -1166,6 +1249,7 @@ if run_clicked:
                 "交易明细": trades,
             },
             max_rows_per_table=COMPARE_SAVE_MAX_ROWS,
+            manifest=build_gate_research_manifest(n_gate_request, n_gate_decision),
         )
     )
     # 结果进 session_state：切 tab / 改控件触发 rerun 不再丢结果
@@ -1347,10 +1431,12 @@ with tab_optimize:
             "生成排行榜",
             type="primary",
             width="stretch",
+            disabled=research_mode == "formal" and not n_gate_decision.allowed,
         )
         optimize_background_clicked = ob2.form_submit_button(
             "后台运行",
             width="stretch",
+            disabled=research_mode == "formal" and not n_gate_decision.allowed,
         )
 
     opt_candidate_count = screen_candidate_count(
@@ -1415,6 +1501,7 @@ with tab_optimize:
                     "walk_forward_folds": int(walk_forward_folds),
                     "validation_ratio": float(validation_ratio),
                     "min_trades": int(min_trades),
+                    "research_gate": n_gate_request.model_dump(mode="json"),
                 },
             })
             st.success(
@@ -1484,6 +1571,10 @@ with tab_optimize:
                     "Walk-forward排行": walk_forward_rankings,
                     "Walk-forward入选样本": walk_forward_trades,
                 },
+                manifest=build_gate_research_manifest(
+                    n_gate_request,
+                    n_gate_decision,
+                ),
             )
         )
         st.session_state["optimize_result"] = {
@@ -1676,11 +1767,29 @@ with tab_auction:
             step=1,
             key="auction_hold_days",
         )
+        auction_gate_request, auction_gate_decision = current_research_gate(
+            research_mode,
+            "auction_gap",
+            start_value,
+            end_value,
+        )
         run_auction_clicked = st.form_submit_button(
             "运行集合竞价策略",
             type="primary",
             width="stretch",
+            disabled=(
+                research_mode == "formal" and not auction_gate_decision.allowed
+            ),
         )
+
+    auction_gate_request = auction_gate_request.model_copy(
+        update={
+            "audit_run_id": auction_gate_decision.audit_run_id,
+            "dataset_snapshot_id": auction_gate_decision.dataset_snapshot_id,
+        }
+    )
+    if research_mode == "formal":
+        _render_research_gate(auction_gate_decision)
 
     auction_candidate_count = auction_candidate_count_cached(
         start_value.isoformat(),
@@ -1748,6 +1857,10 @@ with tab_auction:
                     "分钟B/S明细": auction_minute_trades,
                     "竞价基准明细": auction_baseline,
                 },
+                manifest=build_gate_research_manifest(
+                    auction_gate_request,
+                    auction_gate_decision,
+                ),
             )
         )
         st.session_state["auction_result"] = {
@@ -1977,12 +2090,30 @@ with tab_growth:
                 default=spec_labels,
                 key="growth_ablation_labels",
             )
+            growth_gate_request, growth_gate_decision = current_research_gate(
+                research_mode,
+                "growth_board_surge",
+                growth_start,
+                growth_end,
+            )
             st.caption("单策略回测只使用上方参数；消融对比会按所选版本自动改写过滤条件。")
             run_growth_clicked = st.form_submit_button(
                 "运行科创/创业放量策略",
                 type="primary",
                 width="stretch",
+                disabled=(
+                    research_mode == "formal" and not growth_gate_decision.allowed
+                ),
             )
+
+        growth_gate_request = growth_gate_request.model_copy(
+            update={
+                "audit_run_id": growth_gate_decision.audit_run_id,
+                "dataset_snapshot_id": growth_gate_decision.dataset_snapshot_id,
+            }
+        )
+        if research_mode == "formal":
+            _render_research_gate(growth_gate_decision)
 
         st.caption(
             "当前可回测部分：过滤 ST/一字板、科创/创业板、均线多头排列、分钟级爆量 B、"
@@ -2090,6 +2221,10 @@ with tab_growth:
                         "策略汇总": growth_metrics,
                         "交易明细": growth_trades,
                     },
+                    manifest=build_gate_research_manifest(
+                        growth_gate_request,
+                        growth_gate_decision,
+                    ),
                 )
             )
             st.session_state["growth_result"] = {

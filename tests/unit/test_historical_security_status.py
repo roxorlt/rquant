@@ -40,6 +40,7 @@ from rquant.security_status import (
     normalize_name,
     normalize_namechange_history,
     normalize_stock_st_history,
+    plan_historical_security_status_backfill,
     prefetch_security_status,
 )
 from rquant.storage.duckdb import DuckDBStore
@@ -628,6 +629,52 @@ def test_backfill_closes_planning_store_before_provider_calls(
     )
 
     assert result.upserted_count == 1
+
+
+def test_security_status_backfill_plan_counts_missing_keys_and_api_operations(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "status-plan.duckdb"
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close)
+            VALUES
+                ('600000.SH', DATE '2020-01-02', 10),
+                ('000001.SZ', DATE '2020-01-02', 11),
+                ('600000.SH', DATE '2020-01-03', 12)
+            """
+        )
+        store.upsert_stock_status(
+            [
+                SecurityStatusDaily(
+                    ts_code="000001.SZ",
+                    trade_date=date(2020, 1, 2),
+                    name="平安银行",
+                    is_st=False,
+                    name_source="namechange",
+                    st_source="stock_st",
+                    available_at=datetime(2020, 1, 2, 9, 25, tzinfo=SHANGHAI),
+                    ingested_at=INGESTED_AT,
+                )
+            ],
+            require_daily_keys=True,
+        )
+
+    plan = plan_historical_security_status_backfill(
+        store_factory=lambda: DuckDBStore(db_path),
+        start=date(2020, 1, 2),
+        end=date(2020, 1, 3),
+        source_as_of=date(2026, 7, 15),
+        namechange_start=date(1990, 1, 1),
+        missing_only=True,
+    )
+
+    assert plan.eligible_count == 2
+    assert plan.trade_date_count == 2
+    assert plan.namechange_logical_api_operations == 13
+    assert plan.stock_st_logical_api_operations == 2
+    assert plan.total_logical_api_operations == 15
 
 
 def test_backfill_rejects_key_deleted_between_plan_and_apply(

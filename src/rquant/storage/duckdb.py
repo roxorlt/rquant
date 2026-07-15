@@ -18,6 +18,8 @@ from pydantic import BaseModel, TypeAdapter
 
 from rquant.config import settings
 from rquant.data_metadata import (
+    DataAuditRun,
+    DataAuditRunFinalization,
     DataQualityIssue,
     DatasetCoverage,
     DatasetSnapshot,
@@ -243,6 +245,28 @@ def _quality_issue_from_row(row: tuple[object, ...]) -> DataQualityIssue:
             f"stored={stored_id}, derived={issue.issue_id}"
         )
     return issue
+
+
+def _data_audit_run_from_row(row: tuple[object, ...]) -> DataAuditRun:
+    run = DataAuditRun(
+        as_of_date=cast(date, row[1]),
+        range_start=cast(date, row[2]),
+        range_end=cast(date, row[3]),
+        rule_set_version=str(row[4]),
+        status=cast(str, row[5]),
+        finding_issue_ids=tuple(json.loads(str(row[6]))),
+        p0_count=int(cast(int, row[7])),
+        observed_at=_utc_datetime_from_db(row[8]),
+        completed_at=None if row[9] is None else _utc_datetime_from_db(row[9]),
+        error_message=None if row[10] is None else str(row[10]),
+    )
+    stored_id = str(row[0])
+    if run.audit_run_id != stored_id:
+        raise ValueError(
+            "data_audit_run stable id mismatch: "
+            f"stored={stored_id}, derived={run.audit_run_id}"
+        )
+    return run
 
 
 def _snapshot_finalization_matches(
@@ -938,6 +962,200 @@ class DuckDBStore:
         self._require_calendar_range(exchange, candidate, anchor)
         return candidate
 
+    def begin_data_audit_run(self, run: DataAuditRun) -> DataAuditRun:
+        run = _revalidate_for_write(run)
+        if run.status != "running":
+            raise ValueError("begin_data_audit_run requires a running audit")
+        self._conn.execute(
+            """
+            INSERT INTO data_audit_run
+            (audit_run_id, as_of_date, range_start, range_end, rule_set_version,
+             status, finding_issue_ids, p0_count, observed_at, completed_at,
+             error_message)
+            VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?)
+            ON CONFLICT (audit_run_id) DO NOTHING
+            """,
+            [
+                run.audit_run_id,
+                run.as_of_date,
+                run.range_start,
+                run.range_end,
+                run.rule_set_version,
+                run.status,
+                json.dumps(run.finding_issue_ids),
+                run.p0_count,
+                run.observed_at,
+                run.completed_at,
+                run.error_message,
+            ],
+        )
+        stored = self.get_data_audit_run(run.audit_run_id)
+        if stored is None:
+            raise RuntimeError(f"data audit run was not persisted: {run.audit_run_id}")
+        if stored != run:
+            raise ValueError(f"data audit run identity conflict: {run.audit_run_id}")
+        return stored
+
+    def get_data_audit_run(self, audit_run_id: str) -> DataAuditRun | None:
+        row = self._conn.execute(
+            """
+            SELECT audit_run_id, as_of_date, range_start, range_end,
+                   rule_set_version, status, finding_issue_ids, p0_count,
+                   strftime(observed_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ'),
+                   CASE WHEN completed_at IS NULL THEN NULL ELSE
+                       strftime(completed_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ') END,
+                   error_message
+            FROM data_audit_run
+            WHERE audit_run_id = ?
+            """,
+            [audit_run_id],
+        ).fetchone()
+        return None if row is None else _data_audit_run_from_row(row)
+
+    def finalize_data_audit_run(
+        self,
+        audit_run_id: str,
+        finalization: DataAuditRunFinalization,
+    ) -> DataAuditRun:
+        finalization = _revalidate_for_write(finalization)
+        current = self.get_data_audit_run(audit_run_id)
+        if current is None:
+            raise KeyError(f"data audit run not found: {audit_run_id}")
+        if current.status == "completed":
+            expected = current.model_copy(
+                update={
+                    "finding_issue_ids": finalization.finding_issue_ids,
+                    "p0_count": finalization.p0_count,
+                    "completed_at": finalization.completed_at,
+                }
+            )
+            if current != expected:
+                raise ValueError(f"completed data audit run is immutable: {audit_run_id}")
+            return current
+        if current.status != "running":
+            raise ValueError(f"failed data audit run cannot be finalized: {audit_run_id}")
+        finalized = _revalidate_for_write(current.finalize(finalization))
+        self._conn.execute(
+            """
+            UPDATE data_audit_run
+            SET status = 'completed', finding_issue_ids = CAST(? AS JSON),
+                p0_count = ?, completed_at = ?, error_message = NULL
+            WHERE audit_run_id = ? AND status = 'running'
+            """,
+            [
+                json.dumps(finalized.finding_issue_ids),
+                finalized.p0_count,
+                finalized.completed_at,
+                audit_run_id,
+            ],
+        )
+        stored = self.get_data_audit_run(audit_run_id)
+        if stored != finalized:
+            raise RuntimeError(f"data audit finalization lost update: {audit_run_id}")
+        return stored
+
+    def fail_data_audit_run(
+        self,
+        audit_run_id: str,
+        *,
+        error_message: str,
+        completed_at: datetime | None = None,
+    ) -> DataAuditRun:
+        current = self.get_data_audit_run(audit_run_id)
+        if current is None:
+            raise KeyError(f"data audit run not found: {audit_run_id}")
+        if current.status != "running":
+            return current
+        failed = DataAuditRun.model_validate(
+            {
+                **current.model_dump(exclude_computed_fields=True),
+                "status": "failed",
+                "completed_at": completed_at or utc_now(),
+                "error_message": error_message,
+            }
+        )
+        self._conn.execute(
+            """
+            UPDATE data_audit_run
+            SET status = 'failed', completed_at = ?, error_message = ?
+            WHERE audit_run_id = ? AND status = 'running'
+            """,
+            [failed.completed_at, failed.error_message, audit_run_id],
+        )
+        stored = self.get_data_audit_run(audit_run_id)
+        if stored != failed:
+            raise RuntimeError(f"data audit failure update lost: {audit_run_id}")
+        return stored
+
+    def latest_completed_data_audit_run(
+        self,
+        *,
+        as_of_date: date,
+        range_start: date | None = None,
+        range_end: date | None = None,
+    ) -> DataAuditRun | None:
+        requested_start = range_start or as_of_date
+        requested_end = range_end or as_of_date
+        row = self._conn.execute(
+            """
+            SELECT audit_run_id, as_of_date, range_start, range_end,
+                   rule_set_version, status, finding_issue_ids, p0_count,
+                   strftime(observed_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ'),
+                   strftime(completed_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ'),
+                   error_message
+            FROM data_audit_run
+            WHERE status = 'completed'
+              AND as_of_date >= ?
+              AND range_start <= ?
+              AND range_end >= ?
+            ORDER BY as_of_date DESC, completed_at DESC
+            LIMIT 1
+            """,
+            [requested_end, requested_start, requested_end],
+        ).fetchone()
+        return None if row is None else _data_audit_run_from_row(row)
+
+    def known_full_day_suspensions(
+        self,
+        ts_codes: Sequence[str],
+        start: date,
+        end: date,
+        *,
+        source: str = "tushare",
+    ) -> set[tuple[str, date]]:
+        codes = tuple(sorted(set(ts_codes)))
+        if not codes or start > end:
+            return set()
+        placeholders = ",".join("?" for _ in codes)
+        rows = self._conn.execute(
+            f"""
+            SELECT event.ts_code, event.trade_date
+            FROM stock_suspend_event AS event
+            JOIN stock_suspend_coverage AS coverage
+              ON coverage.source = event.source
+             AND coverage.trade_date = event.trade_date
+             AND coverage.coverage_state = 'complete'
+            WHERE event.source = ?
+              AND event.trade_date BETWEEN ? AND ?
+              AND event.ts_code IN ({placeholders})
+            GROUP BY event.ts_code, event.trade_date
+            HAVING count(*) FILTER (
+                       WHERE event.suspend_type = 'S'
+                         AND event.session_scope = 'full_day'
+                   ) > 0
+               AND count(*) FILTER (
+                       WHERE event.suspend_type <> 'S'
+                          OR event.session_scope <> 'full_day'
+                   ) = 0
+            """,
+            [source, start, end, *codes],
+        ).fetchall()
+        return {(str(ts_code), cast(date, trade_date)) for ts_code, trade_date in rows}
+
     def begin_dataset_snapshot(
         self, snapshot: DatasetSnapshot
     ) -> DatasetSnapshot:
@@ -1518,6 +1736,78 @@ class DuckDBStore:
             issues_by_id[issue_id]
             for issue_id in snapshot.quality_issue_ids
         ]
+
+    def list_open_data_quality_issues(
+        self,
+        *,
+        severities: Sequence[str] | None = None,
+        rule_ids: Sequence[str] | None = None,
+    ) -> list[DataQualityIssue]:
+        predicates = ["status = 'open'"]
+        parameters: list[object] = []
+        if severities is not None:
+            selected_severities = tuple(dict.fromkeys(severities))
+            if not selected_severities:
+                return []
+            predicates.append(
+                "severity IN (" + ",".join("?" for _ in selected_severities) + ")"
+            )
+            parameters.extend(selected_severities)
+        if rule_ids is not None:
+            selected_rule_ids = tuple(dict.fromkeys(rule_ids))
+            if not selected_rule_ids:
+                return []
+            predicates.append(
+                "rule_id IN (" + ",".join("?" for _ in selected_rule_ids) + ")"
+            )
+            parameters.extend(selected_rule_ids)
+        rows = self._conn.execute(
+            "SELECT issue_id, rule_id, dataset_id, severity, status, scope_key, "
+            "message, evidence, "
+            "strftime(first_seen_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ'), "
+            "strftime(last_seen_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ'), "
+            "CASE WHEN resolved_at IS NULL THEN NULL ELSE "
+            "strftime(resolved_at AT TIME ZONE 'UTC', "
+            "'%Y-%m-%dT%H:%M:%S.%fZ') END "
+            "FROM data_quality_issue WHERE "
+            + " AND ".join(predicates)
+            + " ORDER BY severity, rule_id, scope_key",
+            parameters,
+        ).fetchall()
+        return [_quality_issue_from_row(row) for row in rows]
+
+    def latest_ready_dataset_snapshot(
+        self,
+        *,
+        strategy_name: str,
+        as_of_date: date,
+        range_start: date | None = None,
+        range_end: date | None = None,
+    ) -> DatasetSnapshot | None:
+        requested_start = range_start or as_of_date
+        requested_end = range_end or as_of_date
+        row = self._conn.execute(
+            """
+            SELECT snapshot_id
+            FROM dataset_snapshot
+            WHERE strategy_name = ? AND status = 'ready'
+              AND CAST(as_of_time AT TIME ZONE 'Asia/Shanghai' AS DATE) >= ?
+              AND TRY_CAST(
+                    json_extract_string(table_watermarks, '$.manifest_start_date')
+                    AS DATE
+                  ) <= ?
+              AND TRY_CAST(
+                    json_extract_string(table_watermarks, '$.manifest_end_date')
+                    AS DATE
+                  ) >= ?
+            ORDER BY as_of_time ASC, completed_at DESC
+            LIMIT 1
+            """,
+            [strategy_name, requested_end, requested_start, requested_end],
+        ).fetchone()
+        return None if row is None else self.get_dataset_snapshot(str(row[0]))
 
     def upsert_daily(self, df: pd.DataFrame) -> int:
         if df.empty:
