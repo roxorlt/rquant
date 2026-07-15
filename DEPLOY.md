@@ -5,6 +5,39 @@
 
 ---
 
+## 2026-07-15 · v0.15.0 · 阶段 1 PR-B PIT 质量守卫
+
+**状态**：PR #78 已 squash merge 为
+`22618768aaf6bf507eaeb7ed4c8c42813b19fe4b`。权威交易日历于 7 月 14 日完成初始化，
+代码于 7 月 15 日 08:37 部署；云端与本地核验完成后恢复盘中调度。
+
+**部署内容**：
+
+- 历史证券名称/ST 状态、上市/重新上市边界改为 nullable、PIT 且 fail closed。
+- 日线/分钟语义审计、分钟时间戳语义归一、复权价格可见性守卫与质量问题落库。
+- 涨停池修复采用权威交易日历、稳定 plan id、CAS 重算和调用方事务所有权保护。
+- 竞价与科创/创业策略回放必须使用匹配的历史状态，禁止回退当前证券快照。
+
+**生产初始化与验证**：
+
+- 首次部署在 preflight smoke 阶段因 `trade_calendar` 缺少 `2026-07-13` anchor 自动回滚到
+  `v0.14.0`；根因是目标版本的 fail-closed 筛选先于部署后的日历 bootstrap 执行。
+- 使用同一 `v0.15.0` 临时 worktree 执行幂等 bootstrap，Tushare 返回并验证
+  `2020-01-01..2026-12-31` 共 2,557 个自然日、1,697 个交易日；随后正式发布成功。
+- 发布后云端 preflight 为 `ok=5 warn=0 fail=0 skip=0`；主库和只读副本日历范围、行数、
+  交易日计数完全一致。
+- 09:05 重新生成 252M HTTP 生产快照，本地 `cloud_backup.duckdb`、主库和只读副本均完成
+  合并并核验为 2,557/1,697；本地 preflight 为 `ok=3 warn=0 fail=0 skip=2`。
+- 同时恢复多个 timer 时，monitor 首次启动与一次性备份任务争夺 DuckDB 写锁；backup 与
+  replica 成功结束后 monitor 按 `RestartSec=30s` 自动恢复，`NRestarts=1`、10 只 watchlist
+  进入盘前阶段。后续恢复顺序应先跑完一次性写任务，再启动 monitor/surge-watch。
+
+**回滚基线**：`bb6141982d65f5ed78ed59c24c6c694d11cbd0c1`（`v0.14.0`）。
+代码和依赖仍使用受控发布器自动回滚；已写入的交易日历和新增 schema 向后兼容，代码回滚时
+可保留，不得在服务运行期间整文件覆盖 DuckDB。
+
+---
+
 ## 2026-07-14 · v0.14.0 · 阶段 1 PR-A 数据可信底座
 
 **状态**：PR #76 已 squash merge 为
