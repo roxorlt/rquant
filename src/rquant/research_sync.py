@@ -77,6 +77,8 @@ MERGE_TABLES: tuple[str, ...] = (
     "monitor_event",
     "minute_bar",
     "auction_bar",
+    "stock_suspend_event",
+    "stock_suspend_coverage",
     "index_daily_bar",
     "moneyflow_daily",
     "market_sentiment_daily",
@@ -114,6 +116,7 @@ MERGE_TABLES: tuple[str, ...] = (
 
 LOCAL_ONLY_TABLES: tuple[str, ...] = (
     "schema_migration",
+    "data_audit_run",
     "data_repair_audit",
     "limit_up_pool_write_guard",
 )
@@ -984,6 +987,13 @@ def _sync_table(
             )
         return TableSyncResult(table=table, mode="skipped", detail="备份中无此表")
 
+    if table == "stock_suspend_event" and mode in {"merge", "restore"}:
+        return TableSyncResult(
+            table=table,
+            mode="skipped",
+            detail="由 stock_suspend_coverage 原子快照 bundle 协调",
+        )
+
     cols, pk_cols = _common_columns(conn, table, alias)
     if not cols:
         return TableSyncResult(table=table, mode="skipped", detail="无共同列")
@@ -1036,6 +1046,18 @@ def _sync_table(
             mode="error",
             detail=f"stock_status_daily merge missing columns: {missing}",
         )
+    if table == "stock_suspend_coverage" and mode in {"merge", "restore"}:
+        event_source_exists = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            f"WHERE table_catalog = '{alias}' "
+            "AND table_name = 'stock_suspend_event'"
+        ).fetchone()[0]
+        if not event_source_exists:
+            return TableSyncResult(
+                table=table,
+                mode="error",
+                detail="suspension coverage source is missing event table",
+            )
 
     transaction_started = False
     try:
@@ -1059,6 +1081,102 @@ def _sync_table(
                 f'INSERT INTO "{table}" ({col_list}) '
                 f'SELECT {col_list} FROM {alias}."{table}"'
             )
+        elif table == "stock_suspend_coverage":
+            conflict = conn.execute(
+                f"""
+                SELECT incoming.source, incoming.trade_date
+                FROM {alias}.stock_suspend_coverage AS incoming
+                JOIN stock_suspend_coverage AS target
+                  USING (source, trade_date)
+                WHERE incoming.queried_at = target.queried_at
+                  AND (
+                      incoming.coverage_state
+                          IS DISTINCT FROM target.coverage_state
+                      OR incoming.row_count IS DISTINCT FROM target.row_count
+                      OR incoming.snapshot_hash
+                          IS DISTINCT FROM target.snapshot_hash
+                  )
+                ORDER BY incoming.trade_date, incoming.source
+                LIMIT 1
+                """
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError(
+                    "conflicting suspension snapshots at equal queried_at: "
+                    f"{conflict[0]}/{conflict[1]}"
+                )
+            invalid = conn.execute(
+                f"""
+                SELECT coverage.source, coverage.trade_date,
+                       coverage.row_count, count(event.ts_code) AS event_count
+                FROM {alias}.stock_suspend_coverage AS coverage
+                LEFT JOIN {alias}.stock_suspend_event AS event
+                  USING (source, trade_date)
+                GROUP BY coverage.source, coverage.trade_date,
+                         coverage.row_count
+                HAVING coverage.row_count <> count(event.ts_code)
+                ORDER BY coverage.trade_date, coverage.source
+                LIMIT 1
+                """
+            ).fetchone()
+            if invalid is not None:
+                raise ValueError(
+                    "suspension snapshot row_count mismatch: "
+                    f"{invalid[0]}/{invalid[1]} "
+                    f"declared={invalid[2]} actual={invalid[3]}"
+                )
+            conn.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE suspension_incoming_keys AS
+                SELECT incoming.source, incoming.trade_date
+                FROM {alias}.stock_suspend_coverage AS incoming
+                LEFT JOIN stock_suspend_coverage AS target
+                  USING (source, trade_date)
+                WHERE target.source IS NULL
+                   OR incoming.queried_at > target.queried_at
+                """
+            )
+            conn.execute(
+                """
+                DELETE FROM stock_suspend_event AS target
+                USING suspension_incoming_keys AS incoming
+                WHERE target.source = incoming.source
+                  AND target.trade_date = incoming.trade_date
+                """
+            )
+            conn.execute(
+                f"""
+                INSERT INTO stock_suspend_event
+                (source, ts_code, trade_date, suspend_type, suspend_timing,
+                 session_scope, available_at, ingested_at)
+                SELECT event.source, event.ts_code, event.trade_date,
+                       event.suspend_type, event.suspend_timing,
+                       event.session_scope, event.available_at,
+                       event.ingested_at
+                FROM {alias}.stock_suspend_event AS event
+                JOIN suspension_incoming_keys AS incoming
+                  USING (source, trade_date)
+                """
+            )
+            conn.execute(
+                f"""
+                INSERT INTO stock_suspend_coverage
+                (source, trade_date, coverage_state, row_count,
+                 snapshot_hash, queried_at)
+                SELECT coverage.source, coverage.trade_date,
+                       coverage.coverage_state, coverage.row_count,
+                       coverage.snapshot_hash, coverage.queried_at
+                FROM {alias}.stock_suspend_coverage AS coverage
+                JOIN suspension_incoming_keys AS incoming
+                  USING (source, trade_date)
+                ON CONFLICT (source, trade_date) DO UPDATE SET
+                    coverage_state = excluded.coverage_state,
+                    row_count = excluded.row_count,
+                    snapshot_hash = excluded.snapshot_hash,
+                    queried_at = excluded.queried_at
+                """
+            )
+            conn.execute("DROP TABLE suspension_incoming_keys")
         elif mode == "restore":
             conn.execute(
                 f'INSERT OR IGNORE INTO "{table}" ({col_list}) '
@@ -1170,6 +1288,13 @@ def _sync_table(
         return TableSyncResult(table=table, mode="error", detail=str(e)[:200])
 
     if mode == "restore":
+        if table == "stock_suspend_coverage":
+            return TableSyncResult(
+                table=table,
+                mode="merge",
+                rows=src_rows,
+                detail="restore：停复牌事件与 coverage 原子协调，较新快照胜出",
+            )
         return TableSyncResult(
             table=table,
             mode="merge",
@@ -1387,6 +1512,12 @@ def restore_research_tables(
         raise ValueError(
             f"只允许恢复 MERGE_TABLES 中的研究表，非法表：{unknown}"
         )
+    suspension_bundle = {"stock_suspend_event", "stock_suspend_coverage"}
+    selected_suspension_tables = suspension_bundle.intersection(tables)
+    if selected_suspension_tables and selected_suspension_tables != suspension_bundle:
+        raise ValueError(
+            "suspension snapshot bundle must restore event and coverage together"
+        )
     if not source_path.exists():
         return _failure_report(
             source_path, db_path, f"恢复源不存在：{source_path}"
@@ -1399,15 +1530,35 @@ def restore_research_tables(
         return _failure_report(source_path, db_path, f"打开主库失败：{e}")
 
     results: list[TableSyncResult] = []
+    transaction_started = False
     try:
         initialize_schema(conn)
         _attach_readonly(conn, source_path, "restore_src")
+        conn.execute("BEGIN")
+        transaction_started = True
         for table in tables:
-            results.append(_sync_table(conn, table, "restore_src", "restore"))
+            result = _sync_table(
+                conn,
+                table,
+                "restore_src",
+                "restore",
+                manage_transaction=False,
+            )
+            results.append(result)
+            if result.mode == "error":
+                raise RuntimeError(result.detail)
+        conn.execute("COMMIT")
+        transaction_started = False
         conn.execute("DETACH restore_src")
         conn.execute("CHECKPOINT")
     except Exception as e:
         logger.exception("research-restore 顶层失败")
+        if transaction_started:
+            try:
+                conn.execute("ROLLBACK")
+                transaction_started = False
+            except Exception:
+                logger.exception("research-restore 跨表事务回滚失败")
         results.append(
             TableSyncResult(table="<sync>", mode="error", detail=str(e)[:200])
         )

@@ -847,6 +847,58 @@ CREATE TABLE IF NOT EXISTS data_quality_issue (
 );
 """
 
+DATA_AUDIT_RUN_DDL = """
+CREATE TABLE IF NOT EXISTS data_audit_run (
+    audit_run_id      VARCHAR     PRIMARY KEY,
+    as_of_date        DATE        NOT NULL,
+    range_start       DATE        NOT NULL,
+    range_end         DATE        NOT NULL,
+    rule_set_version  VARCHAR     NOT NULL,
+    status            VARCHAR     NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    finding_issue_ids JSON        NOT NULL,
+    p0_count          BIGINT      NOT NULL CHECK (p0_count >= 0),
+    observed_at       TIMESTAMPTZ NOT NULL,
+    completed_at      TIMESTAMPTZ,
+    error_message     VARCHAR,
+    CHECK (range_start <= range_end AND range_end <= as_of_date),
+    CHECK (
+        (status = 'running' AND completed_at IS NULL AND error_message IS NULL)
+        OR (status = 'completed' AND completed_at IS NOT NULL AND error_message IS NULL)
+        OR (status = 'failed' AND completed_at IS NOT NULL AND error_message IS NOT NULL)
+    )
+);
+"""
+
+STOCK_SUSPEND_EVENT_DDL = """
+CREATE TABLE IF NOT EXISTS stock_suspend_event (
+    source          VARCHAR     NOT NULL,
+    ts_code         VARCHAR     NOT NULL,
+    trade_date      DATE        NOT NULL,
+    suspend_type    VARCHAR     NOT NULL CHECK (suspend_type IN ('S', 'R')),
+    suspend_timing  VARCHAR     NOT NULL,
+    session_scope   VARCHAR     NOT NULL CHECK (
+        session_scope IN ('full_day', 'partial', 'unknown')
+    ),
+    available_at    TIMESTAMPTZ NOT NULL,
+    ingested_at     TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source, ts_code, trade_date, suspend_type, suspend_timing)
+);
+"""
+
+STOCK_SUSPEND_COVERAGE_DDL = """
+CREATE TABLE IF NOT EXISTS stock_suspend_coverage (
+    source          VARCHAR     NOT NULL,
+    trade_date      DATE        NOT NULL,
+    coverage_state  VARCHAR     NOT NULL CHECK (
+        coverage_state IN ('complete', 'unverified_empty', 'unsupported')
+    ),
+    row_count        BIGINT      NOT NULL CHECK (row_count >= 0),
+    snapshot_hash    VARCHAR     NOT NULL,
+    queried_at       TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source, trade_date)
+);
+"""
+
 DATA_REPAIR_AUDIT_DDL = """
 CREATE TABLE IF NOT EXISTS data_repair_audit (
     audit_id       VARCHAR     PRIMARY KEY,
@@ -964,6 +1016,9 @@ VERSIONED_COMPATIBILITY_DDL = [
     DATA_REPAIR_AUDIT_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
+    DATA_AUDIT_RUN_DDL,
+    STOCK_SUSPEND_EVENT_DDL,
+    STOCK_SUSPEND_COVERAGE_DDL,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

@@ -646,18 +646,31 @@ def _allowed_missing_dates(
 ) -> dict[date, str]:
     if not missing_dates:
         return {}
+    known_suspended = store.known_full_day_suspensions(
+        (task.ts_code,),
+        min(missing_dates),
+        max(missing_dates),
+    )
+    allowed = {
+        trading_date: "known_full_day_suspension"
+        for ts_code, trading_date in known_suspended
+        if ts_code == task.ts_code and trading_date in missing_dates
+    }
     row = store._conn.execute(
         "SELECT list_date FROM stock_basic WHERE ts_code = ?",
         [task.ts_code],
     ).fetchone()
     if row is None or row[0] is None:
-        return {}
+        return allowed
     list_date = _parse_date(row[0])
-    return {
-        trading_date: "not_listed"
-        for trading_date in missing_dates
-        if trading_date < list_date
-    }
+    allowed.update(
+        {
+            trading_date: "not_listed"
+            for trading_date in missing_dates
+            if trading_date < list_date
+        }
+    )
+    return allowed
 
 
 def run_backfill_manifest(

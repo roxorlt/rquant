@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 import duckdb
+import pandas as pd
 import pytest
 from pydantic import ValidationError
 
@@ -431,7 +432,7 @@ def test_full_session_requirement_requires_authoritative_source() -> None:
         )
 
 
-def test_only_trading_daily_rows_require_authoritative_minutes(
+def test_all_daily_rows_require_minutes_without_authoritative_suspension(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "eligibility.duckdb"
@@ -458,8 +459,14 @@ def test_only_trading_daily_rows_require_authoritative_minutes(
         "eligible-daily-without-authoritative-minute",
     )
     assert report.findings[0].evidence == {
-        "count": 1,
+        "count": 2,
         "samples": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "2026-06-26",
+                "source": "feed",
+                "freq": "1min",
+            },
             {
                 "ts_code": "600000.SH",
                 "trade_date": "2026-06-26",
@@ -555,7 +562,7 @@ def test_minute_without_daily_is_reported_separately(tmp_path: Path) -> None:
     }
 
 
-def test_zero_volume_daily_and_no_rows_do_not_create_missing_findings(
+def test_zero_volume_daily_needs_authoritative_suspension_fact(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "allowed-missing.duckdb"
@@ -569,6 +576,54 @@ def test_zero_volume_daily_and_no_rows_do_not_create_missing_findings(
             """,
             [trade_date],
         )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(spec,),
+    )
+
+    assert report.findings[0].rule_id == (
+        "eligible-daily-without-authoritative-minute"
+    )
+    assert report.findings[0].evidence["count"] == 1
+
+
+def test_authoritative_full_day_suspension_allows_missing_minutes(
+    tmp_path: Path,
+) -> None:
+    from rquant.suspension import (
+        normalize_suspend_d_snapshot,
+        persist_suspension_snapshot,
+    )
+
+    database_path = tmp_path / "suspended.duckdb"
+    trade_date = date(2026, 6, 26)
+    spec = _single_minute_spec()
+    snapshot = normalize_suspend_d_snapshot(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260626",
+                    "suspend_timing": "全天",
+                    "suspend_type": "S",
+                }
+            ]
+        ),
+        trade_date=trade_date,
+        queried_at=datetime(2026, 6, 27, tzinfo=UTC),
+    )
+    with DuckDBStore(database_path) as store:
+        store._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close, vol, amount)
+            VALUES ('000001.SZ', ?, 10.0, 0.0, 0.0)
+            """,
+            [trade_date],
+        )
+        persist_suspension_snapshot(store, snapshot)
 
     report = _run_consistency_audit(
         database_path,

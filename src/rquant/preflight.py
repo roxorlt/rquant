@@ -20,12 +20,19 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
 
 from rquant.config import settings
+from rquant.data_contracts import (
+    CONTRACTS_BY_ID,
+    EXCHANGE_TIMEZONE,
+    DatasetContract,
+    VisibilityRule,
+)
 
 CheckStatus = Literal["ok", "warn", "fail", "skip"]
 
@@ -51,12 +58,17 @@ SERVICES_TO_CHECK = [
     "rquant-pre-market-check.timer",
 ]
 
-# 业务表 → 期望最新数据「不该比今天落后超过 N 天」（节假日除外）
-TABLE_FRESHNESS_DAYS = {
-    "daily_bar": 5,        # 含周末/节假日缓冲
-    "screen_result": 5,
-    "monitor_event": 30,   # monitor_event 只有交易日有，宽松一点
-}
+PRODUCTION_FRESHNESS_DATASET_IDS = (
+    "daily_bar",
+    "stock_status_daily",
+    "minute_bar",
+    "auction_bar",
+    "adj_factor",
+    "stock_suspend_coverage",
+)
+RESEARCH_FRESHNESS_DATASET_IDS = tuple(CONTRACTS_BY_ID)
+READONLY_REPLICA_MAX_SOURCE_LAG = timedelta(minutes=12)
+FreshnessProfile = Literal["production", "research"]
 
 SMOKE_SCREEN_TABLES = (
     "screen_result",
@@ -269,61 +281,264 @@ def detail_duckdb_lock(path: Path) -> CheckResult:
 # ---------- 4. 数据新鲜度 ----------
 
 
+def _normalize_watermark_datetime(value: object) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=EXCHANGE_TIMEZONE)
+    return parsed.astimezone(EXCHANGE_TIMEZONE)
+
+
+def _normalize_watermark_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.fromisoformat(str(value)).date()
+
+
+def _latest_expected_session(
+    store: object,
+    contract: DatasetContract,
+    as_of: datetime,
+) -> date:
+    anchor = store.latest_trading_day(as_of.date())
+    if (
+        contract.visibility is VisibilityRule.PANEL_CLOSE_NEXT_SESSION
+        and anchor == as_of.date()
+    ):
+        return store.previous_trading_day(as_of.date())
+    if (
+        contract.visibility is VisibilityRule.AUCTION_0925
+        and anchor == as_of.date()
+    ):
+        source_cutoff = min(item.available_at for item in contract.source_availability)
+        if as_of.timetz().replace(tzinfo=None) < source_cutoff:
+            return store.previous_trading_day(as_of.date())
+    return anchor
+
+
+def _trading_session_lag(
+    store: object,
+    watermark: date,
+    expected: date,
+) -> int:
+    if not store.is_trading_day("SSE", watermark):
+        raise ValueError(f"watermark {watermark.isoformat()} 落在非交易日")
+    if watermark > expected:
+        raise ValueError(
+            f"watermark {watermark.isoformat()} 晚于可见交易日 {expected.isoformat()}"
+        )
+    if watermark == expected:
+        return 0
+    rows = store.list_trade_calendar("SSE", watermark + timedelta(days=1), expected)
+    return sum(1 for row in rows if row.is_open)
+
+
+def _expected_intraday_time(store: object, as_of: datetime) -> datetime:
+    local_time = as_of.timetz().replace(tzinfo=None)
+    if not store.is_trading_day("SSE", as_of.date()) or local_time < time(9, 30):
+        session = store.latest_trading_day(as_of.date())
+        if session == as_of.date():
+            session = store.previous_trading_day(as_of.date())
+        return datetime.combine(session, time(15), tzinfo=EXCHANGE_TIMEZONE)
+    if local_time <= time(11, 30):
+        return as_of
+    if local_time < time(13):
+        return datetime.combine(as_of.date(), time(11, 30), tzinfo=EXCHANGE_TIMEZONE)
+    if local_time <= time(15):
+        return as_of
+    return datetime.combine(as_of.date(), time(15), tzinfo=EXCHANGE_TIMEZONE)
+
+
+def _replica_freshness_detail(
+    replica_path: Path | None,
+    *,
+    primary_path: Path | None,
+    as_of: datetime,
+    max_source_lag: timedelta,
+) -> tuple[str | None, bool]:
+    if replica_path is None:
+        return None, False
+    if not replica_path.exists():
+        return f"  ⚠ 只读副本不存在: {replica_path}", True
+    replica_modified = datetime.fromtimestamp(
+        replica_path.stat().st_mtime, tz=EXCHANGE_TIMEZONE
+    )
+    wall_age = max(as_of - replica_modified, timedelta(0))
+    wall_age_minutes = int(wall_age.total_seconds() // 60)
+    source_paths = () if primary_path is None else (
+        primary_path,
+        primary_path.with_name(primary_path.name + ".wal"),
+    )
+    source_mtimes = [path.stat().st_mtime for path in source_paths if path.exists()]
+    if not source_mtimes:
+        return f"  ✓ 只读副本文件年龄 {wall_age_minutes} 分钟（主库工件不可比较）", False
+    source_modified = datetime.fromtimestamp(max(source_mtimes), tz=EXCHANGE_TIMEZONE)
+    source_lag = max(source_modified - replica_modified, timedelta(0))
+    source_lag_minutes = int(source_lag.total_seconds() // 60)
+    threshold_minutes = int(max_source_lag.total_seconds() // 60)
+    if source_lag > max_source_lag:
+        return (
+            f"  ⚠ 只读副本落后主库工件 {source_lag_minutes} 分钟"
+            f"（阈值 {threshold_minutes} 分钟；文件年龄 {wall_age_minutes} 分钟）",
+            True,
+        )
+    return (
+        f"  ✓ 只读副本落后主库工件 {source_lag_minutes} 分钟"
+        f"（文件年龄 {wall_age_minutes} 分钟）",
+        False,
+    )
+
+
 def check_data_freshness(
-    table_max_age: dict[str, int] = None,
+    contracts: Sequence[DatasetContract] | None = None,
+    *,
+    profile: FreshnessProfile = "production",
+    as_of: datetime | None = None,
+    replica_path: Path | None = settings.duckdb_readonly_path_resolved,
+    primary_path: Path | None = settings.duckdb_path,
+    replica_max_source_lag: timedelta = READONLY_REPLICA_MAX_SOURCE_LAG,
 ) -> CheckResult:
-    """各核心表的最新 trade_date / row count / 距今天数。"""
-    table_max_age = table_max_age or TABLE_FRESHNESS_DAYS
+    """按数据契约检查交易日/分钟水位、空表和只读副本年龄。"""
+    profile_ids = (
+        PRODUCTION_FRESHNESS_DATASET_IDS
+        if profile == "production"
+        else RESEARCH_FRESHNESS_DATASET_IDS
+    )
+    selected = tuple(contracts or (CONTRACTS_BY_ID[item] for item in profile_ids))
+    local_as_of = as_of or datetime.now(EXCHANGE_TIMEZONE)
+    if local_as_of.tzinfo is None or local_as_of.utcoffset() is None:
+        raise ValueError("as_of must be timezone-aware")
+    local_as_of = local_as_of.astimezone(EXCHANGE_TIMEZONE)
     try:
         from rquant.storage.duckdb import open_readonly_store
 
-        store = open_readonly_store(required_tables=tuple(table_max_age))
+        store = open_readonly_store()
     except Exception as e:
         return CheckResult(
             "data_freshness", "fail",
             f"只读副本/主库打开失败: {type(e).__name__}: {e}",
         )
 
-    today = date.today()
     details: list[str] = []
     has_warn = False
     has_fail = False
 
+    replica_detail, replica_warn = _replica_freshness_detail(
+        replica_path,
+        primary_path=primary_path,
+        as_of=local_as_of,
+        max_source_lag=replica_max_source_lag,
+    )
+    if replica_detail is not None:
+        details.append(replica_detail)
+        has_fail = replica_warn
+
     with store:
-        for table, max_days in table_max_age.items():
+        for contract in selected:
+            table = contract.table_name
+            watermark_column = contract.freshness.watermark_column
             try:
-                row = store._conn.execute(
-                    f"SELECT MAX(trade_date), COUNT(*) FROM {table}"
-                ).fetchone()
+                if contract.visibility is VisibilityRule.PANEL_CLOSE_NEXT_SESSION:
+                    event_date_column = contract.event_date_column
+                    assert event_date_column is not None
+                    row = store._conn.execute(
+                        f"SELECT MAX({watermark_column}), COUNT(*) FROM {table} "
+                        f"WHERE {event_date_column} < ?",
+                        [local_as_of.date()],
+                    ).fetchone()
+                else:
+                    row = store._conn.execute(
+                        f"SELECT MAX({watermark_column}), COUNT(*) FROM {table}"
+                    ).fetchone()
             except Exception as e:
-                details.append(f"  ✗ {table}: 查询失败 {type(e).__name__}")
+                details.append(
+                    f"  ✗ {contract.dataset_id}/{table}: 查询失败 "
+                    f"{type(e).__name__}: {e}"
+                )
                 has_fail = True
                 continue
             latest, total = row
             if latest is None:
-                details.append(f"  ⚠ {table}: 空表")
+                if contract.freshness.required_on_open_day:
+                    details.append(f"  ✗ {contract.dataset_id}/{table}: 必需数据为空")
+                    has_fail = True
+                else:
+                    details.append(f"  ⚠ {contract.dataset_id}/{table}: 可选数据为空")
+                    has_warn = True
+                continue
+
+            rule = contract.freshness
+            if rule.event_driven:
+                details.append(
+                    f"  — {contract.dataset_id}/{table}: latest={latest}, total={total:,} 行；"
+                    "事件驱动数据不声明固定时效阈值"
+                )
+                continue
+            if not rule.has_known_lag:
+                details.append(
+                    f"  ⚠ {contract.dataset_id}/{table}: latest={latest}, total={total:,} 行；"
+                    "契约未声明时效阈值"
+                )
                 has_warn = True
                 continue
-            # latest 可能是 date 或 str 视 DuckDB 版本而定
-            latest_date = (
-                latest
-                if isinstance(latest, date)
-                else datetime.fromisoformat(str(latest)).date()
-            )
-            age_days = (today - latest_date).days
+
+            try:
+                if rule.max_trading_session_lag is not None:
+                    watermark_date = _normalize_watermark_date(latest)
+                    expected = _latest_expected_session(store, contract, local_as_of)
+                    lag = _trading_session_lag(store, watermark_date, expected)
+                    threshold = rule.max_trading_session_lag
+                    lag_text = f"{lag} 个交易日"
+                    threshold_text = f"{threshold} 个交易日"
+                else:
+                    assert rule.max_wall_clock_lag is not None
+                    watermark_time = _normalize_watermark_datetime(latest)
+                    if (
+                        time(9, 30) <= local_as_of.time() < time(9, 35)
+                        and watermark_time.date() < local_as_of.date()
+                    ):
+                        expected_time = datetime.combine(
+                            store.previous_trading_day(local_as_of.date()),
+                            time(15),
+                            tzinfo=EXCHANGE_TIMEZONE,
+                        )
+                    else:
+                        expected_time = _expected_intraday_time(store, local_as_of)
+                    if watermark_time > expected_time:
+                        raise ValueError(
+                            f"watermark {watermark_time.isoformat()} 晚于应有时点 "
+                            f"{expected_time.isoformat()}"
+                        )
+                    lag_delta = expected_time - watermark_time
+                    lag = int(lag_delta.total_seconds() // 60)
+                    threshold = int(rule.max_wall_clock_lag.total_seconds() // 60)
+                    lag_text = f"{lag} 分钟"
+                    threshold_text = f"{threshold} 分钟"
+            except Exception as e:
+                details.append(
+                    f"  ✗ {contract.dataset_id}/{table}: freshness 无法判定 "
+                    f"{type(e).__name__}: {e}"
+                )
+                has_fail = True
+                continue
+
             line = (
-                f"  {table}: latest={latest_date} ({age_days}d ago), "
-                f"total={total:,} 行"
+                f"{contract.dataset_id}/{table}: latest={latest}, {lag_text}，"
+                f"阈值 {threshold_text}，total={total:,} 行"
             )
-            if age_days > max_days:
-                details.append(f"  ⚠ {line}")
-                details.append(f"    阈值 {max_days}d，落后 {age_days - max_days}d")
-                has_warn = True
+            if lag > threshold:
+                if rule.required_on_open_day:
+                    details.append(f"  ✗ {line}")
+                    has_fail = True
+                else:
+                    details.append(f"  ⚠ {line}")
+                    has_warn = True
             else:
                 details.append(f"  ✓ {line}")
 
     status = "fail" if has_fail else ("warn" if has_warn else "ok")
-    n = len(table_max_age)
+    n = len(selected)
     if status == "ok":
         summary = f"{n} 表新鲜"
     elif status == "warn":
@@ -412,7 +627,11 @@ def smoke_screen() -> CheckResult:
 # ---------- 聚合 + 输出 ----------
 
 
-def run_all_checks(systemd_dir: Path | None = None) -> list[CheckResult]:
+def run_all_checks(
+    systemd_dir: Path | None = None,
+    *,
+    freshness_profile: FreshnessProfile = "production",
+) -> list[CheckResult]:
     """跑全部体检。systemd_dir 默认从项目根推断。"""
     project_root = Path(__file__).resolve().parents[2]
     systemd_dir = systemd_dir or (project_root / "deploy" / "systemd")
@@ -421,7 +640,7 @@ def run_all_checks(systemd_dir: Path | None = None) -> list[CheckResult]:
     results.append(verify_unit_files(systemd_dir))
     results.append(detail_systemd_state(SERVICES_TO_CHECK))
     results.append(detail_duckdb_lock(settings.duckdb_path))
-    results.append(check_data_freshness())
+    results.append(check_data_freshness(profile=freshness_profile))
     results.append(smoke_screen())
     return results
 

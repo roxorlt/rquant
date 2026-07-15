@@ -96,7 +96,7 @@ tags: [quant, data-source, a-shares, research]
 | ETF 申赎清单 | Tushare Pro | 日更 |
 | 北向资金 | Tushare Pro `hsgt_top10` | T+1（盘中估算无 L2） |
 
-## rQuant 当前接入状态（2026-07-01）
+## rQuant 当前接入状态（2026-07-15）
 
 | 场景 | 当前接入 | 数据表/命令 | 回测是否可无未来函数使用 | 备注 |
 |---|---|---|---|---|
@@ -105,6 +105,8 @@ tags: [quant, data-source, a-shares, research]
 | 实时分钟日累计 | Tushare `rt_min_daily` | `minute_bar` / `rquant rt-minute-daily-fetch` | 只用于当天已发生分钟补齐 | 适合盘中服务重启、漏轮询后补齐单只股票当天 9:30 至当前分钟。 |
 | 集合竞价 | Tushare `stk_auction` | `auction_bar` / `rquant auction-backfill` | 可以 | 2025-01-01 起有历史数据；缺失行可用 09:30 分钟 K 做保守 fallback。 |
 | 集合竞价 fallback | 09:30 `minute_bar` 合成 | `rquant auction-minute-fallback` | 可以 | 只补 Tushare 集合竞价缺行，不覆盖原始集合竞价。 |
+| 停复牌事实 | Tushare `suspend_d` | `stock_suspend_event` + `stock_suspend_coverage` / `rquant suspension-backfill` | 可以 | 逐交易日保存完整查询快照；只有权威全天停牌事实才能解释分钟缺失。 |
+| 历史名称/ST | Tushare `namechange` + `stock_st` | `stock_status_daily` / `rquant security-status-backfill` | 可以 | nullable unknown、按 09:25 可见性 fail closed；支持 dry-run 预估逻辑 API 次数。 |
 | 日级资金流 | Tushare `moneyflow` | `moneyflow_daily` / `rquant moneyflow-backfill` | 只能做盘后复盘/次日过滤 | 它是日级盘后数据，不能用于当日盘中 B 信号。 |
 | 外盘/内盘 | AKShare 腾讯分笔可查当前历史分笔 | 暂未落表 | 大样本历史回测不足 | 当前 `stock_zh_a_tick_tx_js` 无日期参数，不适合作为多年历史回测主源。 |
 | 盘中大单净量 | 待定 | 暂无 | 暂不可用 | 需要可靠的盘中订单流/资金流历史源；不能用盘后 `moneyflow` 冒充。 |
@@ -117,7 +119,7 @@ tags: [quant, data-source, a-shares, research]
 | 爬虫源站改版（Ashare/AKShare/adata） | 多源容灾，适配层抽象 |
 | 盘中轮询被反爬限流 | 池子 ≤ 50 只，轮询间隔 ≥ 3s |
 | 不同源数据对不齐（前复权/后复权） | 统一在适配层做标准化 |
-| 停牌/除权/特殊交易日 | 初期手动处理，积累经验后自动化 |
+| 停牌/除权/特殊交易日 | 停复牌读 `suspend_d` 权威事实；复权因子按 PIT 锚定；未知状态 fail closed，不人工猜测 |
 | Mac 生态缺失（QMT / 掘金客户端） | 明确放弃，不做实盘 |
 
 ## 原始调研对话

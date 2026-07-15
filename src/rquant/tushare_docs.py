@@ -764,7 +764,14 @@ def _priority(is_a_share_related: bool, tags: list[str], is_section: bool) -> in
 
 
 def _integration_status(api_name: str | None, priority: int) -> str:
-    integrated = {"stock_basic", "daily", "adj_factor", "stk_mins", "daily_basic"}
+    integrated = {
+        "stock_basic",
+        "daily",
+        "adj_factor",
+        "stk_mins",
+        "daily_basic",
+        "suspend_d",
+    }
     if api_name in integrated:
         return "already_integrated"
     if priority <= 2:
@@ -850,6 +857,8 @@ def _update_cadence(row: TushareAuditRow) -> str:
 
 def _target_table_hint(row: TushareAuditRow) -> str:
     tags = set(row.capability_tags)
+    if row.api_name == "suspend_d":
+        return "stock_suspend_event + stock_suspend_coverage"
     if "opening_auction" in tags:
         return "auction_bar"
     if "intraday_realtime" in tags or "historical_minute" in tags:

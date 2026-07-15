@@ -274,6 +274,54 @@ class TestTradeCalendarBootstrap:
         store_factory.assert_not_called()
 
 
+class TestSuspensionBackfillParser:
+    def test_parser_accepts_range_and_full_refresh(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "suspension-backfill",
+                "--start-date",
+                "2026-07-01",
+                "--end-date",
+                "2026-07-15",
+                "--full-refresh",
+            ]
+        )
+
+        assert args.command == "suspension-backfill"
+        assert args.start_date == date(2026, 7, 1)
+        assert args.end_date == date(2026, 7, 15)
+        assert args.full_refresh is True
+
+
+class TestSecurityStatusBackfillParser:
+    def test_parser_accepts_dry_run_and_full_refresh(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "security-status-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-15",
+                "--dry-run",
+                "--full-refresh",
+            ]
+        )
+
+        assert args.command == "security-status-backfill"
+        assert args.start_date == date(2026, 4, 1)
+        assert args.end_date == date(2026, 7, 15)
+        assert args.dry_run is True
+        assert args.full_refresh is True
+
+
+class TestPreflightParser:
+    def test_research_profile_is_explicitly_selectable(self) -> None:
+        args = build_parser().parse_args(["preflight", "--profile", "research"])
+
+        assert args.command == "preflight"
+        assert args.profile == "research"
+
+
 class TestLimitUpPoolCommands:
     def test_repair_defaults_to_dry_run(self) -> None:
         args = build_parser().parse_args(["zt-pool-repair"])

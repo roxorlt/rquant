@@ -206,6 +206,24 @@ class SecurityStatusBackfillResult(SecurityStatusModel):
         return self.stock_st_logical_api_operations
 
 
+class SecurityStatusBackfillPlan(SecurityStatusModel):
+    start: date
+    end: date
+    source_as_of: date
+    missing_only: bool
+    eligible_count: int = Field(ge=0)
+    trade_date_count: int = Field(ge=0)
+    namechange_logical_api_operations: int = Field(ge=0)
+    stock_st_logical_api_operations: int = Field(ge=0)
+
+    @property
+    def total_logical_api_operations(self) -> int:
+        return (
+            self.namechange_logical_api_operations
+            + self.stock_st_logical_api_operations
+        )
+
+
 class SecurityStatusPrefetchBatch(SecurityStatusModel):
     rows: tuple[SecurityStatusDaily, ...] = ()
     source_as_of: date
@@ -1098,46 +1116,20 @@ def prefetch_security_status(
     )
 
 
-def backfill_historical_security_status(
-    adapter: SecurityStatusAdapter,
+def _scope_security_status_backfill_keys(
     *,
     store_factory: Callable[[], SecurityStatusStore],
     start: date,
     end: date,
-    ingested_at: datetime,
-    source_as_of: date | None = None,
-    namechange_start: date = NAMECHANGE_EARLIEST_DATE,
-    window_years: int = 3,
-    missing_only: bool = True,
-    eligible_keys: Sequence[DailySecurityKey] | None = None,
-    ts_codes: Sequence[str] | None = None,
-    strict_stock_st_crosscheck: bool = False,
-    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
-    sleep: Callable[[float], None] = time_module.sleep,
-) -> SecurityStatusBackfillResult:
-    """Plan exact keys, fetch remotely with no store open, then apply once."""
-    if start > end:
-        raise ValueError("security-status backfill start must not be after end")
+    missing_only: bool,
+    eligible_keys: Sequence[DailySecurityKey] | None,
+    ts_codes: Sequence[str] | None,
+) -> tuple[DailySecurityKey, ...]:
     if eligible_keys is not None and ts_codes is not None:
         raise ValueError("eligible_keys and ts_codes are mutually exclusive scopes")
-    _require_aware(ingested_at, field_name="ingested_at")
-    resolved_source_as_of = source_as_of or ingested_at.astimezone(SHANGHAI).date()
-    if resolved_source_as_of < end:
-        raise ValueError("source_as_of must not be before eligibility end")
-    normalized_codes = (
-        None if ts_codes is None else tuple(sorted(set(ts_codes)))
-    )
+    normalized_codes = None if ts_codes is None else tuple(sorted(set(ts_codes)))
     if normalized_codes == ():
-        return SecurityStatusBackfillResult(
-            start=start,
-            end=end,
-            source_as_of=resolved_source_as_of,
-            eligible_count=0,
-            upserted_count=0,
-            unknown_count=0,
-            conflict_count=0,
-            source_issue_count=0,
-        )
+        return ()
 
     with store_factory() as planning_store:
         if eligible_keys is not None:
@@ -1174,6 +1166,92 @@ def backfill_historical_security_status(
                 if missing_only
                 else daily_keys
             )
+    return tuple(
+        sorted(
+            set(scoped_keys),
+            key=lambda item: (item.trade_date, item.ts_code),
+        )
+    )
+
+
+def plan_historical_security_status_backfill(
+    *,
+    store_factory: Callable[[], SecurityStatusStore],
+    start: date,
+    end: date,
+    source_as_of: date | None = None,
+    namechange_start: date = NAMECHANGE_EARLIEST_DATE,
+    window_years: int = 3,
+    missing_only: bool = True,
+    eligible_keys: Sequence[DailySecurityKey] | None = None,
+    ts_codes: Sequence[str] | None = None,
+) -> SecurityStatusBackfillPlan:
+    """Count exact eligibility and provider operations without remote calls."""
+    if start > end:
+        raise ValueError("security-status backfill start must not be after end")
+    resolved_source_as_of = source_as_of or datetime.now(SHANGHAI).date()
+    if resolved_source_as_of < end:
+        raise ValueError("source_as_of must not be before eligibility end")
+    scoped_keys = _scope_security_status_backfill_keys(
+        store_factory=store_factory,
+        start=start,
+        end=end,
+        missing_only=missing_only,
+        eligible_keys=eligible_keys,
+        ts_codes=ts_codes,
+    )
+    trade_dates = {key.trade_date for key in scoped_keys}
+    namechange_operations = 0
+    if scoped_keys:
+        namechange_operations = count_namechange_windows(
+            min(namechange_start, start),
+            resolved_source_as_of,
+            window_years=window_years,
+        )
+    return SecurityStatusBackfillPlan(
+        start=start,
+        end=end,
+        source_as_of=resolved_source_as_of,
+        missing_only=missing_only,
+        eligible_count=len(scoped_keys),
+        trade_date_count=len(trade_dates),
+        namechange_logical_api_operations=namechange_operations,
+        stock_st_logical_api_operations=len(trade_dates),
+    )
+
+
+def backfill_historical_security_status(
+    adapter: SecurityStatusAdapter,
+    *,
+    store_factory: Callable[[], SecurityStatusStore],
+    start: date,
+    end: date,
+    ingested_at: datetime,
+    source_as_of: date | None = None,
+    namechange_start: date = NAMECHANGE_EARLIEST_DATE,
+    window_years: int = 3,
+    missing_only: bool = True,
+    eligible_keys: Sequence[DailySecurityKey] | None = None,
+    ts_codes: Sequence[str] | None = None,
+    strict_stock_st_crosscheck: bool = False,
+    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time_module.sleep,
+) -> SecurityStatusBackfillResult:
+    """Plan exact keys, fetch remotely with no store open, then apply once."""
+    if start > end:
+        raise ValueError("security-status backfill start must not be after end")
+    _require_aware(ingested_at, field_name="ingested_at")
+    resolved_source_as_of = source_as_of or ingested_at.astimezone(SHANGHAI).date()
+    if resolved_source_as_of < end:
+        raise ValueError("source_as_of must not be before eligibility end")
+    scoped_keys = _scope_security_status_backfill_keys(
+        store_factory=store_factory,
+        start=start,
+        end=end,
+        missing_only=missing_only,
+        eligible_keys=eligible_keys,
+        ts_codes=ts_codes,
+    )
 
     if not scoped_keys:
         return SecurityStatusBackfillResult(

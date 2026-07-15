@@ -39,6 +39,8 @@ EXPECTED_DATASET_IDS = (
     "stock_status_daily",
     "minute_bar",
     "auction_bar",
+    "stock_suspend_event",
+    "stock_suspend_coverage",
     "adj_factor",
     "limit_list_daily",
     "ths_daily",
@@ -91,7 +93,7 @@ def _contract(**overrides: object) -> DatasetContract:
     return DatasetContract.model_validate(values)
 
 
-def test_registry_contains_exact_initial_twenty_contracts() -> None:
+def test_registry_contains_exact_stage1_contracts() -> None:
     assert isinstance(DATASET_CONTRACTS, tuple)
     assert tuple(contract.dataset_id for contract in DATASET_CONTRACTS) == (EXPECTED_DATASET_IDS)
     assert tuple(CONTRACTS_BY_ID) == EXPECTED_DATASET_IDS
@@ -180,6 +182,8 @@ def test_source_availability_must_exactly_cover_contract_sources(
 def test_board_and_moneyflow_daily_contracts_are_never_same_day_intraday() -> None:
     panel_ids = {
         "daily_bar",
+        "stock_suspend_event",
+        "stock_suspend_coverage",
         "adj_factor",
         "limit_list_daily",
         "ths_daily",
@@ -242,11 +246,17 @@ def test_freshness_rule_accepts_one_known_lag_kind_or_unknown() -> None:
         watermark_column="updated_at",
         required_on_open_day=False,
     )
+    event_rule = FreshnessRule(
+        watermark_column="queried_at",
+        event_driven=True,
+        required_on_open_day=False,
+    )
 
     assert session_rule.max_trading_session_lag == 0
     assert wall_clock_rule.max_wall_clock_lag == timedelta(minutes=1)
     assert unknown_rule.max_trading_session_lag is None
     assert unknown_rule.max_wall_clock_lag is None
+    assert event_rule.has_declared_policy is True
     assert (
         _contract(
             visibility=VisibilityRule.UNKNOWN,
@@ -267,6 +277,7 @@ def test_freshness_rule_accepts_one_known_lag_kind_or_unknown() -> None:
             "max_trading_session_lag": 1,
             "max_wall_clock_lag": timedelta(minutes=1),
         },
+        {"max_trading_session_lag": 1, "event_driven": True},
     ],
 )
 def test_freshness_rule_rejects_invalid_lags(values: dict[str, object]) -> None:
@@ -470,7 +481,7 @@ def test_opted_in_backfill_contracts_map_to_the_same_physical_table() -> None:
         for contract in DATASET_CONTRACTS
         if contract.backfill_dataset_id is not None
     }
-    assert opted_in == set(EXPECTED_DATASET_IDS[6:])
+    assert opted_in == set(EXPECTED_DATASET_IDS[8:])
     assert opted_in < set(DATASETS)
 
     for contract in DATASET_CONTRACTS:

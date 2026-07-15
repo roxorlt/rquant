@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.storage.schema import (
     BASE_DDL,
+    DATA_AUDIT_RUN_DDL,
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_DDL,
@@ -27,6 +28,8 @@ from rquant.storage.schema import (
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
     STOCK_STATUS_DAILY_DDL,
+    STOCK_SUSPEND_COVERAGE_DDL,
+    STOCK_SUSPEND_EVENT_DDL,
     TRADE_CALENDAR_DDL,
 )
 
@@ -134,6 +137,16 @@ MIGRATIONS: tuple[Migration, ...] = (
             LIMIT_UP_POOL_WRITE_GUARD_DDL,
             LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
         ),
+    ),
+    Migration(
+        version=7,
+        name="data audit run evidence",
+        statements=(DATA_AUDIT_RUN_DDL,),
+    ),
+    Migration(
+        version=8,
+        name="authoritative suspension facts",
+        statements=(STOCK_SUSPEND_EVENT_DDL, STOCK_SUSPEND_COVERAGE_DDL),
     ),
 )
 
