@@ -1,6 +1,22 @@
 """Config 层单测：确保 .env 能正确加载、字段校验生效。"""
 
-from rquant.config import settings
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from rquant.config import Settings, settings
+
+
+def _settings_values(tmp_path: Path) -> dict[str, object]:
+    return {
+        "_env_file": None,
+        "tushare_token_main": "x" * 32,
+        "data_dir": tmp_path / "data",
+        "duckdb_path": tmp_path / "data" / "rquant.duckdb",
+        "parquet_dir": tmp_path / "data" / "parquet",
+        "log_dir": tmp_path / "logs",
+    }
 
 
 class TestSettings:
@@ -16,3 +32,48 @@ class TestSettings:
 
     def test_app_env_valid(self) -> None:
         assert settings.app_env in ("dev", "prod")
+
+    def test_backfill_state_uses_configurable_separate_sqlite_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "state" / "backfill.sqlite3"
+        configured = Settings(
+            **_settings_values(tmp_path),
+            backfill_state_path=state_path,
+            backfill_state_busy_timeout_ms=1_234,
+        )
+
+        assert configured.backfill_state_path_resolved == state_path
+        assert configured.backfill_state_path_resolved != configured.duckdb_path
+        assert state_path.parent.is_dir()
+        assert configured.backfill_state_busy_timeout_ms == 1_234
+
+    def test_backfill_state_path_defaults_under_data_dir(self, tmp_path: Path) -> None:
+        configured = Settings(
+            **_settings_values(tmp_path),
+            backfill_state_path="",
+        )
+
+        assert configured.backfill_state_path_resolved == (
+            tmp_path / "data" / "backfill_state.sqlite3"
+        )
+
+    def test_backfill_state_rejects_duckdb_path(self, tmp_path: Path) -> None:
+        duckdb_path = tmp_path / "data" / "rquant.duckdb"
+
+        with pytest.raises(ValidationError, match="backfill state path must differ"):
+            Settings(
+                **_settings_values(tmp_path),
+                backfill_state_path=duckdb_path,
+            )
+
+    def test_backfill_state_rejects_readonly_duckdb_path(self, tmp_path: Path) -> None:
+        readonly_path = tmp_path / "data" / "rquant_ro.duckdb"
+
+        with pytest.raises(ValidationError, match="backfill state path must differ"):
+            Settings(
+                **_settings_values(tmp_path),
+                duckdb_readonly_path=readonly_path,
+                backfill_state_path=readonly_path,
+            )

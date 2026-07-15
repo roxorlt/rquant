@@ -1,7 +1,7 @@
 # rQuant 可信策略研究与盘中监控完整迭代计划
 
 > 日期：2026-07-13  
-> 状态：执行中；阶段 0 已完成，阶段 1 PR-A 已随 v0.14.0 部署，PR-B 代码已完成待发布
+> 状态：执行中；阶段 0 已完成，阶段 1 PR-A/v0.14.0、PR-B/v0.15.0 已部署，PR-C 已通过审查待发布
 > 适用范围：数据、历史回放、策略研究、模拟盘、盘中监控、Strategy Lab、生产运维  
 > 取代关系：本文件统一后续优先级；此前各专项计划仍保留为设计输入，不再各自决定开发顺序。
 
@@ -88,14 +88,14 @@ rQuant 已经有日线、历史分钟、实时分钟、集合竞价、资金流�
 
 ## 5. 总体时间与阶段门
 
-### 5.1 当前进度（2026-07-14）
+### 5.1 当前进度（2026-07-15）
 
 | 里程碑 | 状态 | 已完成内容 |
 |---|---|---|
 | 阶段 0 | 已完成 | 研究基线、四级状态、最小 CI、受控发布 |
 | 阶段 1 PR-A | 已部署 v0.14.0 | migration v1-v3、研究元数据、20 个 PIT 数据契约、权威交易日历 |
-| 阶段 1 PR-B | 代码已完成，待发布 | 历史 ST/名称、质量审计、周末污染、复权与 PIT 门禁；全量 1682 项测试通过 |
-| 阶段 1 PR-C | 待开始 | 资格分母、可恢复回补 manifest、ETA、CLI |
+| 阶段 1 PR-B | 已部署 v0.15.0 | 历史 ST/名称、质量审计、周末污染、复权与 PIT 门禁 |
+| 阶段 1 PR-C | 审查与回归完成，待发布 | 资格分母、可恢复回补 manifest、精确覆盖、ETA、四条 CLI |
 | 阶段 1 PR-D | 待开始 | preflight、真实数据审计、覆盖率阶段门 |
 
 PR-A 没有改变现有策略触发、回放选股或收益计算。它只把后续研究所依赖的版本、时间可见性、
@@ -210,10 +210,10 @@ PR-A 没有改变现有策略触发、回放选股或收益计算。它只把后
 
 ```bash
 rquant data-audit --as-of YYYY-MM-DD
-rquant backfill-plan --strategy growth_board_surge --start YYYY-MM-DD --end YYYY-MM-DD
+rquant backfill-plan --strategy growth_board_surge --start-date YYYY-MM-DD --end-date YYYY-MM-DD
 rquant backfill-run --manifest-id <id>
 rquant backfill-status --manifest-id <id>
-rquant dataset-snapshot --strategy growth_board_surge --as-of YYYY-MM-DD
+rquant dataset-snapshot --strategy growth_board_surge --as-of YYYY-MM-DDTHH:MM:SS+08:00 --manifest-id <id>
 ```
 
 ### 7.6 阶段门

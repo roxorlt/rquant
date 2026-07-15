@@ -9,6 +9,7 @@ from typing import Literal
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.data_contracts import EXCHANGE_TIMEZONE
 from rquant.paper import (
     PaperPosition,
     PaperRiskPlan,
@@ -18,6 +19,11 @@ from rquant.paper import (
     mark_position_to_quote,
     open_position_from_signal,
 )
+from rquant.pit_visibility import (
+    VisibilityQueryScope,
+    query_visible_rows,
+    visible_sources_at,
+)
 from rquant.signal_provenance import (
     AUCTION_GAP_MINUTE_STRATEGY,
     SignalProvenance,
@@ -25,7 +31,10 @@ from rquant.signal_provenance import (
     persist_position_with_provenance,
 )
 from rquant.state.derive import (
+    ListingPriceLimitFact,
     _classify_board,
+    _historical_limit_pct,
+    _price_limit_eligibility,
     _round_half_up,
 )
 from rquant.stock_features import build_intraday_relative_volume_features
@@ -85,6 +94,7 @@ class AuctionGapConfig(BaseModel):
     min_auction_vol_ratio_5d: float = 0.15
     max_auction_vol_ratio_5d: float = 5.0
     st_filter: StFilterMode = "case_insensitive"
+    decision_time: time = time(9, 27)
     exit_mode: ExitMode = "next_open"
     daily_vol_unit_factor: float = 100.0
     price_tol: float = 0.01
@@ -632,16 +642,41 @@ def _query_next_auction(
     ts_code: str,
     trading_date: date,
 ) -> pd.Series | None:
-    df = store._conn.execute(
-        """
-        SELECT ts_code, trade_date, price, vol, amount, turnover_rate, volume_ratio
-        FROM auction_bar
-        WHERE ts_code = ?
-          AND trade_date = ?
-          AND auction_type = 'open_realtime'
-        """,
-        [ts_code, trading_date],
-    ).fetchdf()
+    decision_at = datetime.combine(
+        trading_date,
+        time(9, 30),
+        tzinfo=EXCHANGE_TIMEZONE,
+    )
+    sources = visible_sources_at(
+        "auction_bar",
+        event_date=trading_date,
+        as_of_time=decision_at,
+    )
+    if not sources:
+        return None
+    df = query_visible_rows(
+        store,
+        "auction_bar",
+        decision_at,
+        scope=VisibilityQueryScope(
+            ts_codes=(ts_code,),
+            start_date=trading_date,
+            end_date=trading_date,
+            sources=sources,
+            columns=(
+                "ts_code",
+                "trade_date",
+                "auction_type",
+                "price",
+                "vol",
+                "amount",
+                "turnover_rate",
+                "volume_ratio",
+                "source",
+            ),
+        ),
+    )
+    df = df.loc[df["auction_type"] == "open_realtime"]
     if df.empty:
         return None
     return df.iloc[0]
@@ -1031,49 +1066,73 @@ def run_auction_gap_replay(
     选股特征只使用信号日集合竞价和信号日前历史日线；结果列使用信号日收盘后
     与次一交易日数据，用于回测评估。
     """
-    auction = store._conn.execute(
+    start_date = _as_date(config.start_date)
+    end_date = _as_date(config.end_date)
+    decision_at_end = datetime.combine(
+        end_date,
+        config.decision_time,
+        tzinfo=EXCHANGE_TIMEZONE,
+    )
+    visible_sources = visible_sources_at(
+        "auction_bar",
+        event_date=end_date,
+        as_of_time=decision_at_end,
+    )
+    if not visible_sources:
+        return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
+    auction = query_visible_rows(
+        store,
+        "auction_bar",
+        decision_at_end,
+        scope=VisibilityQueryScope(
+            start_date=start_date,
+            end_date=end_date,
+            sources=visible_sources,
+            columns=(
+                "ts_code",
+                "trade_date",
+                "auction_type",
+                "price",
+                "vol",
+                "amount",
+                "turnover_rate",
+                "volume_ratio",
+                "source",
+            ),
+        ),
+    )
+    auction = auction.loc[
+        (auction["auction_type"] == "open_realtime")
+        & auction["price"].notna()
+        & auction["vol"].gt(0)
+    ].copy()
+    if auction.empty:
+        return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
+    status = store._conn.execute(
         """
-        SELECT auction.ts_code,
-               auction.trade_date,
-               auction.price,
-               auction.vol,
-               auction.amount,
-               auction.turnover_rate,
-               auction.volume_ratio,
-               auction.source,
+        SELECT status.ts_code,
+               status.trade_date,
                status.name AS status_name,
                status.is_st AS status_is_st,
                status.available_at AS status_available_at,
                status.conflict_reason AS status_conflict_reason
-        FROM auction_bar AS auction
-        LEFT JOIN stock_status_daily AS status
-          ON auction.ts_code = status.ts_code
-         AND auction.trade_date = status.trade_date
-        WHERE auction.trade_date >= ?
-          AND auction.trade_date <= ?
-          AND auction.auction_type = 'open_realtime'
-          AND auction.price IS NOT NULL
-          AND auction.vol > 0
+        FROM stock_status_daily AS status
+        WHERE status.trade_date >= ? AND status.trade_date <= ?
         """,
-        [config.start_date, config.end_date],
+        [start_date, end_date],
     ).fetchdf()
-    if auction.empty:
-        return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
-    source_priority = auction["source"].map({
-        "tushare": 0,
-        "minute_0930_fallback": 1,
-    }).fillna(9)
-    auction = (
-        auction.assign(_source_priority=source_priority)
-        .sort_values(["ts_code", "trade_date", "_source_priority"])
-        .drop_duplicates(["ts_code", "trade_date"], keep="first")
-        .drop(columns=["_source_priority"])
-        .reset_index(drop=True)
+    auction = auction.merge(
+        status,
+        on=["ts_code", "trade_date"],
+        how="left",
     )
     signal_dates = pd.to_datetime(auction["trade_date"])
     decision_at = (
         signal_dates.dt.tz_localize("Asia/Shanghai")
-        + pd.Timedelta(hours=9, minutes=25)
+        + pd.to_timedelta(
+            config.decision_time.hour * 60 + config.decision_time.minute,
+            unit="minutes",
+        )
     )
     available_at = pd.to_datetime(auction["status_available_at"], utc=True)
     status_known = (
@@ -1107,8 +1166,7 @@ def run_auction_gap_replay(
     ).fetchdf()
     state = store._conn.execute(
         """
-        SELECT ts_code, trade_date, is_st, board_type, limit_pct, limit_up_price,
-               is_limit_up, is_yiziban, is_limit_down
+        SELECT ts_code, trade_date, is_st, is_limit_up, is_yiziban, is_limit_down
         FROM daily_state
         """
     ).fetchdf()
@@ -1161,12 +1219,55 @@ def run_auction_gap_replay(
     )
     calendar["next_trade_date"] = calendar["trade_date"].shift(-1)
 
+    requested_codes = sorted(auction["ts_code"].astype(str).unique().tolist())
+    listing = store._conn.execute(
+        """
+        WITH requested AS (
+            SELECT UNNEST(?) AS ts_code
+        ),
+        first_daily AS (
+            SELECT ts_code, MIN(trade_date) AS first_trade_date
+            FROM daily_bar
+            WHERE ts_code IN (SELECT ts_code FROM requested)
+            GROUP BY ts_code
+        )
+        SELECT requested.ts_code,
+               COALESCE(basic.list_date, first_daily.first_trade_date) AS list_date
+        FROM requested
+        LEFT JOIN stock_basic AS basic USING (ts_code)
+        LEFT JOIN first_daily USING (ts_code)
+        """,
+        [requested_codes],
+    ).fetchdf()
+    listing_calendar = store._conn.execute(
+        """
+        SELECT cal_date
+        FROM trade_calendar
+        WHERE exchange = 'SSE' AND is_open = TRUE
+        ORDER BY cal_date
+        """
+    ).fetchdf()
+    open_calendar = [
+        pd.Timestamp(value).date()
+        for value in listing_calendar.get("cal_date", pd.Series(dtype="object"))
+    ]
+    listing_facts: dict[str, ListingPriceLimitFact] = {}
+    for listing_row in listing.itertuples(index=False):
+        if pd.isna(listing_row.list_date):
+            continue
+        list_date = pd.Timestamp(listing_row.list_date).date()
+        listing_sessions = [day for day in open_calendar if day >= list_date]
+        fifth_listing_trade_date = (
+            listing_sessions[4] if len(listing_sessions) >= 5 else None
+        )
+        listing_facts[str(listing_row.ts_code)] = ListingPriceLimitFact(
+            list_date=list_date,
+            fifth_listing_trade_date=fifth_listing_trade_date,
+        )
+
     current_state = state.rename(
         columns={
             "is_st": "state_is_st",
-            "board_type": "state_board_type",
-            "limit_pct": "state_limit_pct",
-            "limit_up_price": "state_limit_up_price",
             "is_limit_up": "hit_limit_up_today",
             "is_yiziban": "hit_yiziban_today",
         }
@@ -1223,20 +1324,31 @@ def run_auction_gap_replay(
         .merge(next_daily, on=["ts_code", "next_trade_date"], how="left")
         .merge(next_state, on=["ts_code", "next_trade_date"], how="left")
     )
-    computed_board_type = out["ts_code"].apply(_classify_board)
-    out["board_type"] = out["state_board_type"].combine_first(computed_board_type)
+    out["board_type"] = out["ts_code"].apply(_classify_board)
     state_matches_status = (
         out["state_is_st"].notna()
         & out["state_is_st"].astype("boolean").eq(out["is_st"].astype("boolean"))
     ).fillna(False)
-    out["limit_pct"] = out["state_limit_pct"].where(state_matches_status)
-    calculated_limit_up = _round_half_up(out["pre_close"] * (1 + out["limit_pct"]))
-    out["limit_up_price"] = (
-        out["state_limit_up_price"]
-        .where(state_matches_status)
-        .combine_first(calculated_limit_up.where(out["limit_pct"].notna()))
-        .where(out["limit_pct"].notna())
-    )
+    limit_pcts: list[float | None] = []
+    for row in out.itertuples(index=False):
+        signal_date = pd.Timestamp(row.signal_date).date()
+        board_type = str(row.board_type)
+        fact = listing_facts.get(str(row.ts_code))
+        eligible = _price_limit_eligibility(
+            [signal_date],
+            board_type=board_type,
+            fact=fact,
+        ).iloc[0]
+        if pd.isna(eligible) or not bool(eligible):
+            limit_pcts.append(None)
+            continue
+        limit_pcts.append(
+            _historical_limit_pct(bool(row.is_st), board_type, signal_date)
+        )
+    out["limit_pct"] = pd.Series(limit_pcts, index=out.index, dtype="Float64")
+    out["limit_up_price"] = _round_half_up(
+        out["pre_close"] * (1 + out["limit_pct"])
+    ).where(out["limit_pct"].notna())
     if "hit_limit_up_today" in out.columns:
         calc_hit_limit = pd.Series(pd.NA, index=out.index, dtype="boolean")
         has_day_close = out["day_close"].notna() & out["limit_up_price"].notna()

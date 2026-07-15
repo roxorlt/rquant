@@ -40,7 +40,12 @@ def _daily(ts_code: str, trade_date: date, close: float) -> dict[str, object]:
 
 
 def _auction(
-    ts_code: str, trade_date: date, price: float, amount: float
+    ts_code: str,
+    trade_date: date,
+    price: float,
+    amount: float,
+    *,
+    source: str = "tushare",
 ) -> dict[str, object]:
     return {
         "ts_code": ts_code,
@@ -51,7 +56,7 @@ def _auction(
         "amount": amount,
         "turnover_rate": 1.0,
         "volume_ratio": 1.0,
-        "source": "tushare",
+        "source": source,
     }
 
 
@@ -130,6 +135,21 @@ def test_board_auction_strength_uses_latest_membership_stamp(
     assert result is not None
     # 2/2 的题材 A 成分数 3（旧打点 2/1 的 300099.SZ 不计入）
     assert result["board_member_count"] == 3
+
+
+def test_board_auction_strength_hides_signal_day_membership_snapshot(
+    store: DuckDBStore,
+) -> None:
+    _seed_two_boards(store)
+    store.upsert_dataset("kpl_concept_member_daily", pd.DataFrame([
+        _member("999999.KP", "300001.SZ", _SIGNAL),
+        _member("999999.KP", "300099.SZ", _SIGNAL),
+    ]))
+
+    result = board_auction_strength(store, "300001.SZ", _SIGNAL)
+
+    assert result is not None
+    assert result["board_code"] == "000100.KP"
 
 
 def test_board_auction_strength_no_membership_returns_none(
@@ -227,3 +247,62 @@ def test_board_auction_strength_hist_days_truncates_window(
     assert near is not None and far is not None
     assert near["board_auction_amount_ratio"] == pytest.approx(0.8)
     assert far["board_auction_amount_ratio"] == pytest.approx(4000 / 3000, abs=1e-4)
+
+
+def test_board_auction_strength_hides_fallback_before_0931(
+    store: DuckDBStore,
+) -> None:
+    ts = "300088.SZ"
+    store.upsert_dataset("kpl_concept_member_daily", pd.DataFrame([
+        _member("000600.KP", ts, _MEMBER_DATE),
+    ]))
+    store.upsert_daily(pd.DataFrame([{
+        **_daily(ts, _PREV, 10.0), "open": 10.0, "high": 10.0, "low": 10.0,
+        "pre_close": 10.0, "change": 0.0, "pct_chg": 0.0, "vol": 1.0,
+        "amount": 1.0,
+    }]))
+    store.upsert_auction_bars(pd.DataFrame([
+        _auction(
+            ts,
+            _SIGNAL,
+            11.0,
+            4000.0,
+            source="minute_0930_fallback",
+        ),
+        _auction(ts, _HIST[1], 10.0, 2000.0),
+    ]))
+
+    result = board_auction_strength(store, ts, _SIGNAL)
+
+    assert result is not None
+    assert result["board_gap_up_ratio"] is None
+    assert result["board_auction_amount_ratio"] is None
+
+
+def test_board_auction_strength_uses_historical_fallback_visible_by_signal_day(
+    store: DuckDBStore,
+) -> None:
+    ts = "300089.SZ"
+    store.upsert_dataset("kpl_concept_member_daily", pd.DataFrame([
+        _member("000601.KP", ts, _MEMBER_DATE),
+    ]))
+    store.upsert_daily(pd.DataFrame([{
+        **_daily(ts, _PREV, 10.0), "open": 10.0, "high": 10.0, "low": 10.0,
+        "pre_close": 10.0, "change": 0.0, "pct_chg": 0.0, "vol": 1.0,
+        "amount": 1.0,
+    }]))
+    store.upsert_auction_bars(pd.DataFrame([
+        _auction(ts, _SIGNAL, 11.0, 4000.0, source="tushare"),
+        _auction(
+            ts,
+            _HIST[1],
+            10.0,
+            2000.0,
+            source="minute_0930_fallback",
+        ),
+    ]))
+
+    result = board_auction_strength(store, ts, _SIGNAL)
+
+    assert result is not None
+    assert result["board_auction_amount_ratio"] == pytest.approx(2.0)

@@ -8,9 +8,9 @@
 
 **技术栈：** Python 3.11+、Pydantic、DuckDB、SQLite、pandas、argparse、pytest、ruff。
 
-**执行状态（2026-07-14）：** PR-A 已随 v0.14.0 部署；PR-B Tasks 6-11 已完成实现和审查，
-全量 1682 项测试通过，待合并为 v0.15.0 并按受控顺序完成云端/本地交易日历 bootstrap；
-PR-C、PR-D 尚未完成。
+**执行状态（2026-07-15）：** PR-A 已随 v0.14.0 部署；PR-B Tasks 6-11 已随 v0.15.0
+部署并完成云端/本地交易日历 bootstrap；PR-C 已完成实现、双重审查和全量回归，待合并发布为 v0.16.0；
+PR-D 尚未完成。
 
 ---
 
@@ -361,7 +361,7 @@ dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则
 - Create: `src/rquant/pit_visibility.py`
 - Create: `tests/unit/test_pit_visibility.py`
 
-实现纯函数与受控查询入口：同日盘后资金流在盘中不可见、T-1 可见、竞价 09:25 后可见、
+实现纯函数与受控查询入口：同日盘后资金流在盘中不可见、T-1 可见、竞价按来源最早可见时刻、
 分钟只到当前时刻、派生字段的 `available_at` 为输入最大值。先不重写全部策略，PR-C 的资格解析
 器必须使用该入口。
 
@@ -380,7 +380,8 @@ dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则
 实现 frozen `StrategyBackfillSpec`、`EligibilityRecord` 和窗口需求，稳定 ID 不受资格行顺序影响。
 科创/创业资格查询必须通过 Task 11 的受控 PIT 入口并在读取分钟表前完成，manifest 与 replay
 共用同一个日级候选解析器；N 字按权威交易日运行现有筛选规则重建，不依赖历史
-`screen_result`；竞价策略标记为 `daily+auction`，不得把分钟是否存在当作资格条件。
+`screen_result`；竞价策略标记为 `daily+auction`，不得把分钟是否存在当作资格条件，并以
+`量比 > 0 + 含 ST` 的参数宽口径候选作为分母，避免 Lab 参数放宽后出现 manifest 外候选。
 
 ### Task 13：窗口合并、覆盖计算与 ETA
 
@@ -406,7 +407,9 @@ dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则
 实现 manifest/task/eligibility 同事务持久化、`BEGIN IMMEDIATE` 原子 claim、重试上限、结构化
 失败原因和 EWMA ETA。running 使用 `claimed_at` + lease，只回收超时任务；成功任务不可重领，
 同 ID 不同内容必须拒绝。状态库使用配置中的独立 SQLite 路径，启用 WAL、busy timeout 和短
-事务，不放 DuckDB，使 `backfill-status` 能在 DuckDB 写入期间查询。
+事务，不放 DuckDB，使 `backfill-status` 能在 DuckDB 写入期间查询。最终尝试租约过期时仅允许
+一次 recovery-only 核验，完整则补记成功，不完整则终止，避免“已写 DuckDB、未写 SQLite”被
+误判永久失败或无限重试。大清单通过 ordinal 游标单向认领，避免逐任务反复扫描全部剩余任务。
 
 ### Task 15：回补执行器
 
@@ -419,7 +422,11 @@ dry-run 的 plan id，并在单事务内重算候选集做 CAS，集合变化则
 分钟接口复用统一退避/限频；成功任务不再请求；空返回必须分类为允许缺失或 `source_empty`；
 中断后只领取 pending/可重试 failed。每次请求前重新检查完整时段覆盖，避免 DuckDB 已写成功但
 SQLite 尚未标记时重复下载；写入后再计算完整覆盖并更新真实请求、返回/写入行数、耗时、
-scope 覆盖率和 EWMA。单任务失败不终止整个 manifest，执行器不得与盘中 monitor 并发写主库。
+scope 覆盖率和 EWMA。单任务失败不终止整个 manifest，未知异常也落结构化失败后继续；执行器
+不得与盘中 monitor 并发写主库，生产模式在网络请求期间释放 DuckDB，只在覆盖检查和幂等写入
+时使用短连接，并在保护窗口前五分钟停止领取新任务。
+API 返回后必须原子续租成功才可进入 DuckDB 写入；租约已被 recovery worker 接管时丢弃迟到
+结果并记录真实请求量，防止旧 worker 污染已终止任务。
 
 ### Task 16：四条 CLI
 
@@ -439,7 +446,8 @@ rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 `backfill-plan` 只读副本并持久化计划，`backfill-status` 只读 SQLite 且 `--json` 输出稳定单个
 对象。未知 manifest、terminal failed 和覆盖未达标返回非零 exit code；覆盖不足本身是正常
 规划结果。`dataset-snapshot` 仅在 manifest 完成且 B/S 99%、历史基准 95% 阶段门通过后写入
-并 finalize 研究覆盖元数据，文案明确不是 `DatasetSpec.mode=snapshot` 的整表刷新。
+并 finalize 研究覆盖元数据；零资格分母为 0% 而不是 100%，`as-of` 不得早于最后一个所需分钟
+窗口，表水位只统计该时点以前。文案明确不是 `DatasetSpec.mode=snapshot` 的整表刷新。
 
 ## PR-D：preflight、真实数据审计与阶段验收
 

@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import signal
+import socket
 import sys
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
+from rquant.backfill_state import BackfillStateStore, UnknownManifestError
 from rquant.logging import setup_logging
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
@@ -99,6 +104,19 @@ def _parse_iso_date(value: str) -> date:
     return parsed
 
 
+def _parse_iso_datetime(value: str) -> datetime:
+    """Parse an ISO-8601 instant and normalize it to UTC."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"时间格式应为带时区 ISO-8601: {value}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError(f"时间必须显式包含时区: {value}")
+    return parsed.astimezone(UTC)
+
+
 def _parse_sha256(value: str) -> str:
     normalized = value.strip().lower()
     if len(normalized) != 64:
@@ -108,6 +126,40 @@ def _parse_sha256(value: str) -> str:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("plan id 必须是 64 位 SHA256") from exc
     return normalized
+
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_BACKFILL_PROTECTED_START = dtime(9, 15)
+_BACKFILL_PROTECTED_END = dtime(15, 10)
+
+
+def _next_backfill_protected_start(now: datetime) -> datetime:
+    local = now.astimezone(_SHANGHAI)
+    candidate_date = local.date()
+    if local.weekday() >= 5 or local.time() >= _BACKFILL_PROTECTED_START:
+        candidate_date += timedelta(days=1)
+    while candidate_date.weekday() >= 5:
+        candidate_date += timedelta(days=1)
+    return datetime.combine(
+        candidate_date,
+        _BACKFILL_PROTECTED_START,
+        tzinfo=_SHANGHAI,
+    )
+
+
+def _backfill_write_window_safe(now: datetime, estimated_seconds: float) -> bool:
+    """Keep a conservative long DuckDB writer away from monitor hours."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("backfill write-window time must be timezone-aware")
+    local = now.astimezone(_SHANGHAI)
+    if (
+        local.weekday() < 5
+        and _BACKFILL_PROTECTED_START <= local.time() <= _BACKFILL_PROTECTED_END
+    ):
+        return False
+    conservative_seconds = max(0.0, estimated_seconds) * 2 + 1_800
+    expected_finish = local + timedelta(seconds=conservative_seconds)
+    return expected_finish < _next_backfill_protected_start(local)
 
 
 class _RQuantArgumentParser(argparse.ArgumentParser):
@@ -502,6 +554,274 @@ def cmd_data_backfill(args: argparse.Namespace) -> int:
             logger.info(summary)
             has_failure = has_failure or bool(summary["failed_dates"])
     return 1 if has_failure else 0
+
+
+def _print_json(payload: object) -> None:
+    print(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _valid_clean_commit(value: str | None) -> bool:
+    if value is None or len(value) != 40:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def cmd_backfill_plan(args: argparse.Namespace) -> int:
+    """Resolve PIT eligibility, plan exact minute coverage, and persist it."""
+    from rquant.backfill_manifest import (
+        STRATEGY_BACKFILL_SPECS,
+        BackfillManifest,
+        backfill_state_input,
+        plan_minute_backfill,
+        resolve_strategy_eligibility,
+    )
+    from rquant.research_manifest import detect_code_commit
+
+    setup_logging()
+    code_commit = detect_code_commit()
+    if not _valid_clean_commit(code_commit):
+        logger.error("backfill plan requires a clean 40-character git commit")
+        return 2
+    spec = STRATEGY_BACKFILL_SPECS[args.strategy]
+    as_of_time = datetime.now(UTC)
+    with open_readonly_store() as store:
+        eligibility = resolve_strategy_eligibility(
+            store,
+            strategy_id=args.strategy,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        manifest = BackfillManifest.build(
+            spec=spec,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            as_of_time=as_of_time,
+            code_commit=code_commit,
+            eligibilities=eligibility,
+        )
+        plan = plan_minute_backfill(store, manifest)
+    BackfillStateStore().persist_manifest(backfill_state_input(plan))
+    _print_json(
+        {
+            "manifest_id": plan.manifest.manifest_id,
+            "strategy": plan.manifest.spec.strategy_id,
+            "eligibility_count": len(plan.manifest.eligibilities),
+            "task_count": len(plan.tasks),
+            "requested_session_count": plan.requested_session_count,
+            "coverage": plan.coverage.model_dump(mode="json"),
+            "estimate": plan.estimate.model_dump(mode="json"),
+        }
+    )
+    return 0
+
+
+def cmd_backfill_run(args: argparse.Namespace) -> int:
+    """Execute one persisted manifest without crossing monitor hours."""
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.backfill_manifest import MinuteBackfillPlan
+    from rquant.intraday_backfill import run_backfill_manifest
+
+    setup_logging()
+    state = BackfillStateStore()
+    persisted = state.load_manifest(args.manifest_id)
+    if persisted is None:
+        logger.error(f"unknown backfill manifest: {args.manifest_id}")
+        return 2
+    status_before = state.get_manifest_status(args.manifest_id)
+    if status_before.status == "completed":
+        _print_json(status_before.model_dump(mode="json"))
+        return 0
+    if status_before.status == "failed" and not args.retry_failed:
+        logger.error("manifest has failed tasks; pass --retry-failed after inspection")
+        return 2
+
+    plan = MinuteBackfillPlan.model_validate(persisted.payload)
+    estimated_seconds = (
+        status_before.eta_seconds
+        if status_before.eta_seconds is not None
+        else plan.estimate.total_seconds
+    )
+    now = datetime.now(UTC)
+    if not _backfill_write_window_safe(now, estimated_seconds):
+        logger.error(
+            "backfill run would overlap the protected 09:15-15:10 monitor window"
+        )
+        return 2
+
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
+    summary = run_backfill_manifest(
+        None,
+        state,
+        TushareAdapter(),
+        manifest_id=args.manifest_id,
+        worker_id=worker_id,
+        retry_failed=args.retry_failed,
+        stop_before=_next_backfill_protected_start(now) - timedelta(minutes=5),
+        store_factory=DuckDBStore,
+    )
+    status_after = state.get_manifest_status(args.manifest_id)
+    _print_json(
+        {
+            "run": summary.model_dump(mode="json"),
+            "status": status_after.model_dump(mode="json"),
+        }
+    )
+    return 0 if status_after.status == "completed" else 1
+
+
+def cmd_backfill_status(args: argparse.Namespace) -> int:
+    """Read manifest progress from SQLite without opening DuckDB."""
+    setup_logging()
+    try:
+        status = BackfillStateStore().get_manifest_status(args.manifest_id)
+    except UnknownManifestError:
+        logger.error(f"unknown backfill manifest: {args.manifest_id}")
+        return 2
+    payload = status.model_dump(mode="json")
+    if args.json:
+        _print_json(payload)
+    else:
+        logger.info(
+            f"manifest={status.manifest_id} status={status.status} "
+            f"tasks={status.succeeded}/{status.task_count} "
+            f"failed={status.failed} eta={status.eta_seconds}"
+        )
+    if status.status != "failed":
+        return 0
+    return 2 if status.terminal else 1
+
+
+def _watermark_text(value: object) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
+    """Finalize research metadata after recomputing exact minute coverage."""
+    from rquant.backfill_manifest import MinuteBackfillPlan, plan_minute_backfill
+    from rquant.data_metadata import (
+        DatasetCoverage,
+        DatasetSnapshot,
+        DatasetSnapshotFinalization,
+    )
+
+    setup_logging()
+    state = BackfillStateStore()
+    persisted = state.load_manifest(args.manifest_id)
+    if persisted is None:
+        logger.error(f"unknown backfill manifest: {args.manifest_id}")
+        return 2
+    status = state.get_manifest_status(args.manifest_id)
+    if status.status != "completed":
+        logger.error(
+            f"manifest must be completed before snapshot finalization: {status.status}"
+        )
+        return 2
+    original = MinuteBackfillPlan.model_validate(persisted.payload)
+    if original.manifest.spec.strategy_id != args.strategy:
+        logger.error("snapshot strategy does not match the persisted manifest")
+        return 2
+
+    with DuckDBStore() as store:
+        current = plan_minute_backfill(store, original.manifest)
+        coverage = current.coverage
+        if not coverage.baseline_gate_passed or not coverage.entry_exit_gate_passed:
+            logger.error(
+                "dataset coverage gate failed: baseline must be >=95% and B/S >=99%"
+            )
+            return 2
+
+        as_of_shanghai = args.as_of.astimezone(ZoneInfo("Asia/Shanghai"))
+        if current.windows:
+            required_through = datetime.combine(
+                max(window.end_date for window in current.windows),
+                dtime(15, 0),
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            )
+            if as_of_shanghai < required_through:
+                logger.error(
+                    "snapshot as-of precedes the final required minute window: "
+                    f"as_of={as_of_shanghai.isoformat()} "
+                    f"required_through={required_through.isoformat()}"
+                )
+                return 2
+
+        snapshot = DatasetSnapshot.create(
+            strategy_name=args.strategy,
+            manifest_id=args.manifest_id,
+            as_of_time=args.as_of,
+            code_commit=original.manifest.code_commit,
+            origin="rquant.backfill_manifest.metadata_only",
+        )
+        begun = store.begin_dataset_snapshot(snapshot)
+        if begun.status == "ready":
+            finalized = begun
+        else:
+            phases = {
+                "baseline": coverage.baseline,
+                "entry": coverage.entry,
+                "exit": coverage.exit,
+            }
+            for scope, phase in phases.items():
+                missing_reasons = (
+                    ()
+                    if phase.complete_sessions == phase.expected_sessions
+                    else ("incomplete_full_session",)
+                )
+                store.upsert_dataset_coverage(
+                    DatasetCoverage(
+                        snapshot_id=begun.snapshot_id,
+                        dataset_id="minute_bar:tushare:1min",
+                        coverage_scope=scope,
+                        table_name="minute_bar",
+                        expected_count=phase.expected_sessions,
+                        available_count=phase.complete_sessions,
+                        missing_reasons=missing_reasons,
+                    )
+                )
+            minute_row = store._conn.execute(
+                "SELECT MAX(trade_time) FROM minute_bar "
+                "WHERE source = 'tushare' AND freq = '1min' "
+                "AND trade_time <= ?",
+                [as_of_shanghai.replace(tzinfo=None)],
+            ).fetchone()
+            calendar_row = store._conn.execute(
+                "SELECT MAX(cal_date) FROM trade_calendar "
+                "WHERE exchange = 'SSE' AND cal_date <= ?",
+                [as_of_shanghai.date()],
+            ).fetchone()
+            watermarks: dict[str, str] = {}
+            if minute_row and minute_row[0] is not None:
+                watermarks["minute_bar"] = _watermark_text(minute_row[0])
+            if calendar_row and calendar_row[0] is not None:
+                watermarks["trade_calendar"] = _watermark_text(calendar_row[0])
+            finalized = store.finalize_dataset_snapshot(
+                begun.snapshot_id,
+                DatasetSnapshotFinalization(
+                    table_watermarks=watermarks,
+                    completed_at=datetime.now(UTC),
+                ),
+            )
+    _print_json(
+        {
+            "snapshot_id": finalized.snapshot_id,
+            "status": finalized.status,
+            "scope": "metadata-only; no whole-table snapshot refresh was performed",
+        }
+    )
+    return 0
 
 
 def cmd_minute_backfill(args: argparse.Namespace) -> int:
@@ -1603,6 +1923,85 @@ def build_parser() -> argparse.ArgumentParser:
         help="日终增量：start=end=今天（snapshot 数据集即刷新快照）",
     )
 
+    strategy_choices = ["auction_gap", "growth_board_surge", "n_shape"]
+    backfill_plan_p = sub.add_parser(
+        "backfill-plan",
+        help="按策略和 PIT 候选生成可恢复的历史分钟回补计划",
+    )
+    backfill_plan_p.add_argument(
+        "--strategy",
+        required=True,
+        choices=strategy_choices,
+        help="策略标识",
+    )
+    backfill_plan_p.add_argument(
+        "--start-date",
+        required=True,
+        type=_parse_iso_date,
+        help="候选开始日期 YYYY-MM-DD",
+    )
+    backfill_plan_p.add_argument(
+        "--end-date",
+        required=True,
+        type=_parse_iso_date,
+        help="候选结束日期 YYYY-MM-DD",
+    )
+
+    backfill_run_p = sub.add_parser(
+        "backfill-run",
+        help="在安全写入窗口执行已持久化的分钟回补计划",
+    )
+    backfill_run_p.add_argument(
+        "--manifest-id",
+        required=True,
+        type=_parse_sha256,
+        help="backfill-plan 输出的 64 位 manifest id",
+    )
+    backfill_run_p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="重试尚未耗尽次数的可重试失败任务",
+    )
+
+    backfill_status_p = sub.add_parser(
+        "backfill-status",
+        help="仅从独立 SQLite 查询回补进度与 ETA",
+    )
+    backfill_status_p.add_argument(
+        "--manifest-id",
+        required=True,
+        type=_parse_sha256,
+        help="64 位 manifest id",
+    )
+    backfill_status_p.add_argument(
+        "--json",
+        action="store_true",
+        help="输出稳定的单个 JSON 对象",
+    )
+
+    dataset_snapshot_p = sub.add_parser(
+        "dataset-snapshot",
+        help="覆盖率验收通过后固化研究数据元信息快照",
+    )
+    dataset_snapshot_p.add_argument(
+        "--strategy",
+        required=True,
+        choices=strategy_choices,
+        help="策略标识，必须与 manifest 一致",
+    )
+    dataset_snapshot_p.add_argument(
+        "--as-of",
+        required=True,
+        type=_parse_iso_datetime,
+        help="带时区 ISO-8601 数据截止时刻",
+    )
+    dataset_snapshot_p.add_argument(
+        "--manifest-id",
+        required=True,
+        type=_parse_sha256,
+        help="已完成的 64 位 manifest id",
+    )
+
     minute_p = sub.add_parser(
         "minute-backfill", help="回补 Pool 命中标的历史分钟线"
     )
@@ -2217,6 +2616,10 @@ def main() -> int:
         "zt-pool-repair": cmd_zt_pool_repair,
         "limit-list-backfill": cmd_limit_list_backfill,
         "data-backfill": cmd_data_backfill,
+        "backfill-plan": cmd_backfill_plan,
+        "backfill-run": cmd_backfill_run,
+        "backfill-status": cmd_backfill_status,
+        "dataset-snapshot": cmd_dataset_snapshot,
         "minute-backfill": cmd_minute_backfill,
         "minute-replay-backfill": cmd_minute_replay_backfill,
         "auction-backfill": cmd_auction_backfill,

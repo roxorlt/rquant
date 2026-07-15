@@ -8,7 +8,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     data_dir: Path
     duckdb_path: Path
     duckdb_readonly_path: Path | None = None
+    backfill_state_path: Path | None = None
+    backfill_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
     parquet_dir: Path
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -117,12 +119,43 @@ class Settings(BaseSettings):
         v.parent.mkdir(parents=True, exist_ok=True)
         return v
 
+    @field_validator("backfill_state_path", mode="before")
+    @classmethod
+    def normalize_empty_backfill_state_path(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("backfill_state_path", mode="after")
+    @classmethod
+    def ensure_backfill_state_parent_exists(cls, v: Path | None) -> Path | None:
+        if v is not None:
+            v.parent.mkdir(parents=True, exist_ok=True)
+        return v
+
+    @model_validator(mode="after")
+    def validate_backfill_state_is_separate(self) -> "Settings":
+        state_path = self.backfill_state_path_resolved.resolve()
+        if state_path in {
+            self.duckdb_path.resolve(),
+            self.duckdb_readonly_path_resolved.resolve(),
+        }:
+            raise ValueError(
+                "backfill state path must differ from DuckDB main and readonly paths"
+            )
+        return self
+
     @property
     def duckdb_readonly_path_resolved(self) -> Path:
         """副本路径未显式配置时，从主库路径派生（同目录、_ro 后缀）。"""
         if self.duckdb_readonly_path is not None:
             return self.duckdb_readonly_path
         return self.duckdb_path.with_name(self.duckdb_path.stem + "_ro.duckdb")
+
+    @property
+    def backfill_state_path_resolved(self) -> Path:
+        """回补状态库独立于 DuckDB；未配置时放在 data_dir。"""
+        path = self.backfill_state_path or self.data_dir / "backfill_state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def panorama_users_path_resolved(self) -> Path:

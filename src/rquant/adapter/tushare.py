@@ -366,15 +366,15 @@ class TushareAdapter:
             f"start={start_str} end={end_str}"
         )
 
-        try:
-            df = self._pro.stk_mins(
+        df = self._call_with_backoff(
+            "stk_mins",
+            lambda: self._pro.stk_mins(
                 ts_code=ts_code,
                 freq=freq,
                 start_date=start_str,
                 end_date=end_str,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Tushare stk_mins 调用失败：{e}") from e
+            ),
+        )
 
         if df is None or df.empty:
             logger.warning(

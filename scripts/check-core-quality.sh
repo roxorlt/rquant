@@ -5,6 +5,14 @@ PYTHON_BIN="${RQUANT_PYTHON:-.venv/bin/python}"
 
 "${PYTHON_BIN}" -m ruff check \
   src/rquant/research_manifest.py \
+  src/rquant/backfill_manifest.py \
+  src/rquant/backfill_state.py \
+  src/rquant/intraday_backfill.py \
+  src/rquant/adapter/tushare.py \
+  src/rquant/auction_gap_strategy.py \
+  src/rquant/board_auction_strength.py \
+  src/rquant/pit_visibility.py \
+  src/rquant/cli.py \
   src/rquant/dashboard/strategy_lab_runs.py \
   src/rquant/dashboard/strategy_lab_worker.py \
   src/rquant/minute_replay.py \
@@ -12,6 +20,14 @@ PYTHON_BIN="${RQUANT_PYTHON:-.venv/bin/python}"
   src/rquant/monitor.py \
   src/rquant/growth_board_surge_strategy.py \
   tests/unit/test_research_manifest.py \
+  tests/unit/test_backfill_manifest.py \
+  tests/unit/test_backfill_planner.py \
+  tests/unit/test_backfill_state.py \
+  tests/unit/test_backfill_runner.py \
+  tests/unit/test_backfill_cli.py \
+  tests/unit/test_intraday_adapter.py \
+  tests/unit/test_auction_gap_strategy.py \
+  tests/unit/test_board_auction_strength.py \
   tests/unit/test_strategy_lab_runs.py \
   tests/unit/test_minute_replay.py \
   tests/unit/test_paper.py \

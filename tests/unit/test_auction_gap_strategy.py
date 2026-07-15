@@ -377,7 +377,7 @@ def test_auction_gap_replay_rejects_unknown_point_in_time_status(
                     signal_date,
                     name="历史浦发",
                     is_st=False,
-                    available_at=datetime(2026, 6, 25, 9, 25, 1, tzinfo=SHANGHAI),
+                    available_at=datetime(2026, 6, 25, 9, 27, 1, tzinfo=SHANGHAI),
                 ),
             ))
 
@@ -417,7 +417,7 @@ def test_auction_gap_replay_empty_result_keeps_minimum_columns(
     assert {"signal_date", "ts_code", "name"}.issubset(trades.columns)
 
 
-def test_auction_gap_replay_excludes_daily_state_that_disagrees_with_pit_status(
+def test_auction_gap_replay_ignores_daily_state_limits_that_disagree_with_pit_status(
     store: DuckDBStore,
 ) -> None:
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
@@ -445,10 +445,13 @@ def test_auction_gap_replay_excludes_daily_state_that_disagrees_with_pit_status(
         ),
     )
 
-    assert "600000.SH" not in trades["ts_code"].tolist()
+    row = trades.set_index("ts_code").loc["600000.SH"]
+    assert row["limit_pct"] == pytest.approx(0.10)
+    assert row["limit_up_price"] == pytest.approx(11.44)
+    assert not bool(row["hit_limit_up_today"])
 
 
-def test_auction_gap_replay_calculates_limit_price_from_final_state_pct(
+def test_auction_gap_replay_does_not_use_final_state_pct_for_pit_selection(
     store: DuckDBStore,
 ) -> None:
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
@@ -474,8 +477,8 @@ def test_auction_gap_replay_calculates_limit_price_from_final_state_pct(
     )
 
     row = trades.set_index("ts_code").loc["600000.SH"]
-    assert row["limit_pct"] == pytest.approx(0.07)
-    assert row["limit_up_price"] == pytest.approx(11.13)
+    assert row["limit_pct"] == pytest.approx(0.10)
+    assert row["limit_up_price"] == pytest.approx(11.44)
 
 
 def test_auction_gap_replay_uses_historical_gem_limit_pct_before_2020_reform(
@@ -575,7 +578,7 @@ def test_auction_gap_replay_uses_historical_gem_limit_pct_before_2020_reform(
     assert row["limit_up_price"] == pytest.approx(11.00)
 
 
-def test_auction_gap_replay_excludes_unsupported_price_limit_state(
+def test_auction_gap_replay_derives_limit_when_daily_state_limit_is_missing(
     store: DuckDBStore,
 ) -> None:
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
@@ -603,7 +606,9 @@ def test_auction_gap_replay_excludes_unsupported_price_limit_state(
         ),
     )
 
-    assert "600000.SH" not in trades["ts_code"].tolist()
+    row = trades.set_index("ts_code").loc["600000.SH"]
+    assert row["limit_pct"] == pytest.approx(0.10)
+    assert row["limit_up_price"] == pytest.approx(11.44)
 
 
 def test_auction_gap_replay_prefers_tushare_auction_over_minute_fallback(
@@ -637,6 +642,39 @@ def test_auction_gap_replay_prefers_tushare_auction_over_minute_fallback(
     assert trades.iloc[0]["entry_price"] == pytest.approx(10.7)
 
 
+def test_auction_gap_replay_hides_0930_fallback_at_0927_decision(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
+
+    _seed_auction_gap_case(store)
+    store._conn.execute(
+        "DELETE FROM auction_bar WHERE ts_code = '600000.SH'"
+    )
+    store.upsert_auction_bars(pd.DataFrame([{
+        "ts_code": "600000.SH",
+        "trade_date": date(2026, 6, 25),
+        "auction_type": "open_realtime",
+        "price": 10.8,
+        "vol": 20000.0,
+        "amount": 216000.0,
+        "turnover_rate": None,
+        "volume_ratio": None,
+        "source": "minute_0930_fallback",
+    }]))
+
+    trades = run_auction_gap_replay(
+        store,
+        AuctionGapConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            st_filter="case_insensitive",
+        ),
+    )
+
+    assert trades.empty
+
+
 def test_auction_gap_replay_strict_high_gap_mode_requires_gap_above_prior_high(
     store: DuckDBStore,
 ) -> None:
@@ -657,7 +695,7 @@ def test_auction_gap_replay_strict_high_gap_mode_requires_gap_above_prior_high(
     assert trades.empty
 
 
-def test_auction_gap_replay_excludes_candidate_without_signal_day_state(
+def test_auction_gap_replay_keeps_candidate_without_signal_day_state(
     store: DuckDBStore,
 ) -> None:
     from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
@@ -680,7 +718,7 @@ def test_auction_gap_replay_excludes_candidate_without_signal_day_state(
         ),
     )
 
-    assert "600000.SH" not in trades["ts_code"].tolist()
+    assert "600000.SH" in trades["ts_code"].tolist()
 
 
 def test_auction_gap_replay_does_not_fill_state_gap_from_listing_facts(
