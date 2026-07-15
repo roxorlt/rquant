@@ -53,7 +53,7 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 
 - [研究可信度基线](docs/analysis/2026-07-13-research-trust-baseline.md)
 - [阶段 1 真实数据验收](docs/analysis/2026-07-15-stage1-data-contract-acceptance.md)
-- [v0.17.0 首次部署前数据初始化](docs/deploy/2026-07-15-v0.17.0-stage1-bootstrap.md)
+- [v0.17.1 Stage 1 状态修复与首次部署](docs/deploy/2026-07-15-v0.17.1-stage1-bootstrap.md)
 - [可信策略研究与盘中监控路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)
 - [Strategy Lab 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
 

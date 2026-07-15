@@ -603,6 +603,41 @@ def test_growth_board_candidates_keep_historical_code_missing_from_current_basic
     assert [candidate.ts_code for candidate in candidates] == ["300001.SZ"]
 
 
+def test_growth_board_candidates_use_known_st_fact_without_name(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
+
+    _seed_base_market(store)
+    signal_date = date(2026, 6, 25)
+    store._conn.execute(
+        "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+        ["300001.SZ", signal_date],
+    )
+    store.upsert_stock_status((
+        SecurityStatusDaily(
+            ts_code="300001.SZ",
+            trade_date=signal_date,
+            name=None,
+            is_st=False,
+            name_source="unknown",
+            st_source="tushare.stock_st_absence",
+            available_at=datetime(2026, 6, 25, 9, 25, tzinfo=SHANGHAI),
+            ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ),
+    ))
+
+    candidates = resolve_growth_board_candidates(
+        store,
+        signal_date,
+        date(2026, 6, 24),
+        time(9, 30),
+    )
+
+    assert [candidate.ts_code for candidate in candidates] == ["300001.SZ"]
+    assert candidates[0].name == "300001.SZ"
+
+
 def test_growth_board_surge_replay_uses_default_config_when_omitted(
     store: DuckDBStore,
 ) -> None:

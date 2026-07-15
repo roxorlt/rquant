@@ -343,7 +343,13 @@ def test_query_growth_board_candidates_uses_exact_point_in_time_status(
             trade_date=trade_date,
             name=name,
             is_st=is_st,
-            name_source="test_name" if conflict_reason is None else "conflict",
+            name_source=(
+                "conflict"
+                if conflict_reason is not None
+                else "unknown"
+                if name is None and is_st is not None
+                else "test_name"
+            ),
             st_source="test_st" if is_st is not None else None,
             available_at=available_at,
             ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
@@ -354,6 +360,7 @@ def test_query_growth_board_candidates_uses_exact_point_in_time_status(
     store.upsert_stock_status((
         status(codes[0], signal_date, name="历史一号", is_st=False, available_at=boundary),
         status(codes[1], signal_date, name="*ST历史二号", is_st=True, available_at=boundary),
+        status(codes[2], signal_date, name=None, is_st=False, available_at=boundary),
         status(
             codes[3],
             date(2026, 6, 24),
@@ -392,6 +399,6 @@ def test_query_growth_board_candidates_uses_exact_point_in_time_status(
         end_date=signal_date,
     )
 
-    assert candidates["ts_code"].tolist() == [codes[0], codes[6]]
-    assert candidates["name"].tolist() == ["历史一号", "历史七号"]
+    assert candidates["ts_code"].tolist() == [codes[0], codes[2], codes[6]]
+    assert candidates["name"].tolist() == ["历史一号", codes[2], "历史七号"]
     store.close()

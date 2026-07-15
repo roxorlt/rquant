@@ -310,8 +310,6 @@ def resolve_growth_board_candidates(
         return []
     status = status[
         status["conflict_reason"].isna()
-        & status["name"].notna()
-        & status["name"].astype("string").str.strip().ne("")
         & status["is_st"].notna()
         & ~status["is_st"].astype(bool)
     ].copy()
@@ -462,7 +460,11 @@ def resolve_growth_board_candidates(
         candidates.append(
             GrowthBoardCandidate(
                 ts_code=ts_code,
-                name=str(status_row["name"]).strip(),
+                name=(
+                    ts_code
+                    if pd.isna(status_row["name"])
+                    else str(status_row["name"]).strip()
+                ),
                 trade_date=trading_date,
                 previous_date=previous_date,
                 board_type=board_type,

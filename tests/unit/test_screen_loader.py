@@ -428,6 +428,35 @@ class TestLoadUniverse:
         assert pd.isna(row["is_st"])
         assert pd.isna(row["IS_LIMIT_UP[0]"])
 
+    def test_known_st_fact_without_name_remains_usable(
+        self,
+        store: DuckDBStore,
+    ) -> None:
+        trade_date = date(2026, 4, 15)
+        store.upsert_stock_status([
+            SecurityStatusDaily(
+                ts_code="000001.SZ",
+                trade_date=trade_date,
+                name=None,
+                is_st=False,
+                name_source="unknown",
+                st_source="tushare.stock_st_absence",
+                available_at=datetime.combine(
+                    trade_date,
+                    time(9, 25),
+                    SHANGHAI,
+                ),
+                ingested_at=datetime(2026, 4, 17, tzinfo=UTC),
+            )
+        ])
+
+        df = load_universe("2026-04-15", lookback=0, store=store)
+        row = df.loc[df["ts_code"] == "000001.SZ"].iloc[0]
+
+        assert pd.isna(row["name"])
+        assert row["is_st"] == False  # noqa: E712
+        assert row["IS_LIMIT_UP[0]"] == False  # noqa: E712
+
     def test_missing_status_does_not_fallback(self, store: DuckDBStore) -> None:
         store._conn.execute(
             "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",

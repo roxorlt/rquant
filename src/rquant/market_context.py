@@ -80,8 +80,6 @@ WITH eligible AS (
         status.ts_code IS NOT NULL
             AND status.conflict_reason IS NULL
             AND status.is_st IS NOT NULL
-            AND status.name IS NOT NULL
-            AND length(trim(status.name)) > 0
             AND status.available_at IS NOT NULL
             AND status.available_at <= (
                 CAST(db.trade_date AS TIMESTAMP) + INTERVAL '17 hours'

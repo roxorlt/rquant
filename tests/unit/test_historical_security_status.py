@@ -118,7 +118,7 @@ def test_security_status_coverage_rejects_conflicts_exceeding_unknowns() -> None
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
-        ({"name": None}, "name"),
+        ({"name": None}, "name_source"),
         ({"available_at": None}, "available_at"),
         ({"name_source": "unknown"}, "name_source"),
         ({"name_source": "conflict"}, "name_source"),
@@ -145,6 +145,22 @@ def test_known_security_status_requires_complete_valid_fact_sources(
 
     with pytest.raises(ValidationError, match=error):
         SecurityStatusDaily.model_validate(payload)
+
+
+def test_known_st_status_does_not_require_a_historical_display_name() -> None:
+    status = SecurityStatusDaily(
+        ts_code="689009.SH",
+        trade_date=date(2026, 7, 14),
+        name=None,
+        is_st=False,
+        name_source="unknown",
+        st_source="tushare.stock_st_absence",
+        available_at=datetime(2026, 7, 14, 9, 25, tzinfo=SHANGHAI),
+        ingested_at=INGESTED_AT,
+    )
+
+    assert status.name is None
+    assert status.is_st is False
 
 
 def test_conflicted_security_status_must_keep_fact_unknown() -> None:
@@ -269,6 +285,32 @@ def test_materialize_fails_closed_on_ambiguous_listing_boundary(
     assert rows[1].is_st is False
 
 
+def test_materialize_accepts_provider_other_reason_as_a_known_name_interval() -> None:
+    listing_date = date(2026, 7, 10)
+    names = NameChangeHistory(
+        intervals=(
+            NameChangeInterval(
+                ts_code="301583.SZ",
+                name="托伦斯",
+                start_date=listing_date,
+                ann_date=listing_date,
+                change_reason="其他",
+            ),
+        )
+    )
+
+    row = materialize_security_status(
+        [_key(listing_date, "301583.SZ")],
+        names,
+        StockSTHistory(),
+        ingested_at=INGESTED_AT,
+    )[0]
+
+    assert row.name == "托伦斯"
+    assert row.is_st is False
+    assert row.conflict_reason is None
+
+
 def test_materialize_conflicts_and_invalid_source_rows_fail_to_unknown() -> None:
     raw = pd.DataFrame(
         [
@@ -312,7 +354,7 @@ def test_materialize_conflicts_and_invalid_source_rows_fail_to_unknown() -> None
     assert all(row.conflict_reason is not None for row in rows)
 
 
-def test_stock_st_only_confirms_true_and_name_conflict_is_unknown() -> None:
+def test_stock_st_positive_confirms_true_without_requiring_display_name_match() -> None:
     keys = [
         _key(date(2020, 1, 2)),
         _key(date(2020, 1, 3)),
@@ -365,16 +407,66 @@ def test_stock_st_only_confirms_true_and_name_conflict_is_unknown() -> None:
     assert by_day[date(2020, 1, 2)].available_at == datetime(
         2020, 1, 2, 9, 25, tzinfo=SHANGHAI
     )
-    assert by_day[date(2020, 1, 3)].name is None
-    assert by_day[date(2020, 1, 3)].is_st is None
-    assert "stock_st_name_conflict" in cast(
-        str, by_day[date(2020, 1, 3)].conflict_reason
+    assert by_day[date(2020, 1, 3)].name == "浦发银行"
+    assert by_day[date(2020, 1, 3)].is_st is True
+    assert by_day[date(2020, 1, 3)].conflict_reason is None
+    assert by_day[date(2020, 1, 3)].st_source == (
+        "tushare.namechange+tushare.stock_st"
     )
     assert by_day[date(2020, 1, 4)].name == "*ST浦发"
     assert by_day[date(2020, 1, 4)].is_st is True
     assert by_day[date(2020, 1, 4)].st_source == (
         "tushare.namechange+tushare.stock_st"
     )
+
+
+def test_complete_stock_st_list_absence_confirms_non_st_without_name() -> None:
+    trade_date = date(2026, 7, 14)
+    rows = materialize_security_status(
+        [_key(trade_date, "689009.SH")],
+        NameChangeHistory(),
+        StockSTHistory(is_complete=True),
+        ingested_at=INGESTED_AT,
+    )
+
+    assert rows[0].name is None
+    assert rows[0].is_st is False
+    assert rows[0].name_source == "unknown"
+    assert rows[0].st_source == "tushare.stock_st_absence"
+    assert rows[0].available_at == datetime(
+        2026, 7, 14, 9, 25, tzinfo=SHANGHAI
+    )
+
+
+def test_status_coverage_accepts_known_st_fact_without_name(tmp_path: Path) -> None:
+    trade_date = date(2026, 7, 14)
+    with DuckDBStore(tmp_path / "status-without-name.duckdb") as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, 10)",
+            ["689009.SH", trade_date],
+        )
+        store.upsert_stock_status(
+            (
+                SecurityStatusDaily(
+                    ts_code="689009.SH",
+                    trade_date=trade_date,
+                    name=None,
+                    is_st=False,
+                    name_source="unknown",
+                    st_source="tushare.stock_st_absence",
+                    available_at=datetime(
+                        2026, 7, 14, 9, 25, tzinfo=SHANGHAI
+                    ),
+                    ingested_at=INGESTED_AT,
+                ),
+            )
+        )
+
+        coverage = store.stock_status_coverage(trade_date, trade_date)
+
+    assert coverage.unknown_count == 0
+    assert coverage.conflict_count == 0
+    assert coverage.invalid_count == 0
 
 
 class _StubSecurityStatusPro:
@@ -1198,6 +1290,78 @@ def test_normalize_stock_st_rejects_invalid_positive_without_inventing_false() -
     assert history.is_complete is False
     assert rows[0].is_st is None
     assert rows[0].conflict_reason is not None
+
+
+@pytest.mark.parametrize(
+    "response_dates",
+    [
+        ["20260711"],
+        ["20260714", "20260711"],
+    ],
+)
+def test_stock_st_response_dates_must_match_requested_trade_date(
+    response_dates: list[str],
+) -> None:
+    requested = date(2026, 7, 14)
+    history = normalize_stock_st_history(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": f"60000{index}.SH",
+                    "name": "*ST错日样本",
+                    "trade_date": response_date,
+                    "type": "S",
+                    "type_name": "ST",
+                }
+                for index, response_date in enumerate(response_dates)
+            ]
+        ),
+        requested_trade_date=requested,
+    )
+
+    rows = materialize_security_status(
+        [_key(requested)],
+        NameChangeHistory(),
+        history,
+        ingested_at=INGESTED_AT,
+    )
+
+    assert history.is_complete is False
+    assert {item.trade_date for item in history.observations} <= {requested}
+    assert any(
+        issue.trade_date == requested
+        and issue.reason == "stock_st_response_trade_date_mismatch"
+        for issue in history.issues
+    )
+    assert rows[0].is_st is None
+    assert rows[0].conflict_reason == "invalid_stock_st_fields"
+
+
+def test_stock_st_without_requested_date_cannot_claim_complete_list() -> None:
+    history = normalize_stock_st_history(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "name": "*ST样本",
+                    "trade_date": "20260714",
+                    "type": "S",
+                    "type_name": "ST",
+                }
+            ]
+        )
+    )
+
+    row = materialize_security_status(
+        [_key(date(2026, 7, 14), "689009.SH")],
+        NameChangeHistory(),
+        history,
+        ingested_at=INGESTED_AT,
+    )[0]
+
+    assert history.is_complete is False
+    assert row.is_st is None
+    assert row.st_source is None
 
 
 def test_unscoped_invalid_namechange_row_fails_closed_for_all_eligible_keys() -> None:

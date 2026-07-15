@@ -167,10 +167,14 @@ def test_v3_creates_trade_calendar_only_through_versioned_migration() -> None:
 
 
 def test_v4_creates_historical_stock_status_only_through_versioned_migration() -> None:
-    from rquant.storage.schema import ALL_DDL, STOCK_STATUS_DAILY_DDL
+    from rquant.storage.schema import (
+        ALL_DDL,
+        STOCK_STATUS_DAILY_DDL,
+        STOCK_STATUS_DAILY_V4_DDL,
+    )
 
     assert [migration.version for migration in MIGRATIONS[:4]] == [1, 2, 3, 4]
-    assert MIGRATIONS[3].statements == (STOCK_STATUS_DAILY_DDL,)
+    assert MIGRATIONS[3].statements == (STOCK_STATUS_DAILY_V4_DDL,)
     assert (
         MIGRATIONS[3].checksum
         == "1c788707a322f16dfaf24d34b36a1e8d4d4dc1880e5d61a4d3d3dc38d640ff77"
@@ -292,6 +296,40 @@ def test_v8_creates_suspension_tables_only_through_versioned_migration() -> None
         ("stock_suspend_coverage",),
         ("stock_suspend_event",),
     ]
+    conn.close()
+
+
+def test_v9_decouples_historical_name_from_known_st_status() -> None:
+    assert [migration.version for migration in MIGRATIONS] == list(range(1, 10))
+
+    from rquant.storage.schema import STOCK_STATUS_DAILY_V4_DDL
+
+    conn = duckdb.connect(":memory:")
+    conn.execute(STOCK_STATUS_DAILY_V4_DDL)
+    conn.execute(
+        "INSERT INTO stock_status_daily VALUES ("
+        "'600000.SH', DATE '2020-01-02', '浦发银行', FALSE, "
+        "'tushare.namechange', 'tushare.namechange', "
+        "TIMESTAMPTZ '2020-01-02 01:25:00+00', "
+        "TIMESTAMPTZ '2026-07-14 00:00:00+00', NULL)"
+    )
+
+    initialize_schema(conn)
+
+    assert conn.execute(
+        "SELECT name, is_st FROM stock_status_daily WHERE ts_code = '600000.SH'"
+    ).fetchone() == ("浦发银行", False)
+    conn.execute(
+        "INSERT INTO stock_status_daily VALUES ("
+        "'689009.SH', DATE '2026-07-14', NULL, FALSE, "
+        "'unknown', 'tushare.stock_st_absence', "
+        "TIMESTAMPTZ '2026-07-14 01:25:00+00', "
+        "TIMESTAMPTZ '2026-07-15 00:00:00+00', NULL)"
+    )
+    assert conn.execute(
+        "SELECT name, is_st, st_source FROM stock_status_daily "
+        "WHERE ts_code = '689009.SH'"
+    ).fetchone() == (None, False, "tushare.stock_st_absence")
     conn.close()
 
 

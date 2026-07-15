@@ -60,11 +60,17 @@ _INVALID_STOCK_STATUS_PREDICATE = """
     OR (
         status.is_st IS NOT NULL
         AND (
-            status.name IS NULL
-            OR status.available_at IS NULL
-            OR lower(trim(status.name_source)) IN ('unknown', 'conflict')
+            status.available_at IS NULL
             OR status.st_source IS NULL
             OR lower(trim(status.st_source)) IN ('unknown', 'conflict')
+            OR (
+                status.name IS NULL
+                AND lower(trim(status.name_source)) <> 'unknown'
+            )
+            OR (
+                status.name IS NOT NULL
+                AND lower(trim(status.name_source)) IN ('unknown', 'conflict')
+            )
         )
     )
 )
