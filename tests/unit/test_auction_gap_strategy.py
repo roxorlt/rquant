@@ -338,6 +338,43 @@ def test_auction_gap_replay_none_rejects_exact_nullable_unknown_status(
     assert trades["ts_code"].tolist() == ["000001.SZ"]
 
 
+def test_auction_gap_replay_uses_known_st_fact_without_name(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
+
+    _seed_auction_gap_case(store)
+    signal_date = date(2026, 6, 25)
+    store._conn.execute(
+        "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+        ["600000.SH", signal_date],
+    )
+    store.upsert_stock_status((
+        SecurityStatusDaily(
+            ts_code="600000.SH",
+            trade_date=signal_date,
+            name=None,
+            is_st=False,
+            name_source="unknown",
+            st_source="tushare.stock_st_absence",
+            available_at=datetime(2026, 6, 25, 9, 25, tzinfo=SHANGHAI),
+            ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ),
+    ))
+
+    trades = run_auction_gap_replay(
+        store,
+        AuctionGapConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            st_filter="case_insensitive",
+        ),
+    )
+
+    assert trades["ts_code"].tolist() == ["600000.SH"]
+    assert trades.iloc[0]["name"] == "600000.SH"
+
+
 @pytest.mark.parametrize("status_case", ["missing", "adjacent_only", "conflict", "future"])
 def test_auction_gap_replay_rejects_unknown_point_in_time_status(
     store: DuckDBStore,

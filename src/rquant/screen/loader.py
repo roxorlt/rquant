@@ -325,8 +325,6 @@ def _compute_aggregate(
                 AND status.ts_code IS NOT NULL
                 AND status.conflict_reason IS NULL
                 AND status.is_st IS NOT NULL
-                AND status.name IS NOT NULL
-                AND length(trim(status.name)) > 0
                 AND status.available_at IS NOT NULL
                 AND status.available_at <= ?
                 {state_matches_status}
@@ -383,7 +381,6 @@ def load_universe(
             daily.ts_code,
             CASE
                 WHEN status.conflict_reason IS NULL
-                 AND status.is_st IS NOT NULL
                  AND status.name IS NOT NULL
                  AND length(trim(status.name)) > 0
                  AND status.available_at IS NOT NULL
@@ -394,8 +391,6 @@ def load_universe(
             CASE
                 WHEN status.conflict_reason IS NULL
                  AND status.is_st IS NOT NULL
-                 AND status.name IS NOT NULL
-                 AND length(trim(status.name)) > 0
                  AND status.available_at IS NOT NULL
                  AND status.available_at <= ?
                 THEN status.is_st
@@ -452,8 +447,6 @@ def load_universe(
                 status.ts_code IS NOT NULL
                     AND status.conflict_reason IS NULL
                     AND status.is_st IS NOT NULL
-                    AND status.name IS NOT NULL
-                    AND length(trim(status.name)) > 0
                     AND status.available_at IS NOT NULL
                     AND status.available_at <= ?
                     AND state.is_st IS NOT DISTINCT FROM status.is_st

@@ -8,8 +8,10 @@ mac 通过 HTTP（未来 HTTPS）+ basic auth 拉云端 DuckDB 快照。绕开 S
 云端服务器：
   systemd-timer (每 5 分钟)
     → backup-snapshot.sh
-    → cp data/rquant.duckdb → backup/.tmp → gzip → atomic mv → backup/latest.duckdb.gz
-    → 写 backup/latest.json 元数据
+    → cp 已验证的 rquant_ro.duckdb（含 WAL）到私有临时代际
+    → 副本较主库/WAL 落后超过 12 分钟时等待本轮同步，60 秒后仍落后则失败
+    → 临时库 checkpoint + 只读校验 → gzip 校验 → atomic mv
+    → 写带 source/source_lag_seconds/verified/table_count 的元数据
 
   nginx :8081
     /backup/ → static serve backup/ + basic auth
@@ -42,7 +44,22 @@ ls -la ~/rquant/backup/
 cat ~/rquant/backup/latest.json
 ```
 
-预期：`backup/latest.duckdb.gz` 和 `backup/latest.json` 都存在。
+预期：`backup/latest.duckdb.gz` 和 `backup/latest.json` 都存在，JSON 中
+`source=replica`、`verified=true` 且 `table_count > 0`。部署迁移前已经停止全部写者时，
+可用 `RQUANT_BACKUP_SOURCE=main scripts/backup-snapshot.sh` 生成主库精确恢复点；主库仍被
+写者锁定时该命令会失败，不会覆盖上一份好快照。主库模式会在同一个 DuckDB 写锁内完成
+checkpoint 和复制，不留“刚 checkpoint 完又被新 writer 写入”的时间窗。
+
+发布前需要运行目标 tag 的新脚本、但数据仍位于当前生产目录时，显式指定生产根目录：
+
+```bash
+RQUANT_BACKUP_SOURCE=main \
+  RQUANT_BACKUP_PROJECT_DIR=/home/lighthouse/rquant \
+  /tmp/rquant-release/scripts/backup-snapshot.sh
+```
+
+脚本、Python 环境、数据库、日志和备份输出均会按该生产根目录解析；不要让发布
+worktree 自己的空 `data/` 目录参与备份。
 
 ### 2. 装 nginx + htpasswd 工具
 
@@ -90,7 +107,7 @@ curl -sI -u "rquant:${TOKEN}" http://localhost:8081/backup/latest.duckdb.gz | he
 
 # 元数据
 curl -s -u "rquant:${TOKEN}" http://localhost:8081/backup/latest.json | python3 -m json.tool
-# 期望：{"snapshot_at": "...", "src_bytes": ..., "compressed_bytes": ...}
+# 期望包含：{"snapshot_at": "...", "source": "replica", "source_lag_seconds": ..., "verified": true, ...}
 ```
 
 ## mac 侧
@@ -130,7 +147,7 @@ tail -10 logs/sync-from-cloud.log
 | `curl 404 Not Found` | snapshot 还没生成 → `sudo systemctl start rquant-backup.service` 手动触发 |
 | `nginx -t` 报 user 错 | OpenCloudOS 默认 nginx user 是 `nginx`，跟 htpasswd `chown` 一致 |
 | `nginx -t` 报 port 占用 | `sudo ss -tlnp \| grep :8080` 看谁在占；改 nginx config listen 别的端口 |
-| 本地 sync 拉成功但 DuckDB 打开报错 | partial state，下次 sync 自动覆盖修复；或 `--force` 重拉 |
+| 本地 sync 拉成功但 DuckDB 打开报错 | 云端快照校验不应放行坏库；检查 backup service 日志并保留样本 |
 | timer 不触发 | `systemctl list-timers \| grep rquant-backup` 看 NEXT 时间；`journalctl -u rquant-backup.service -n 30` 看错误 |
 
 ## 未来：HTTPS 升级

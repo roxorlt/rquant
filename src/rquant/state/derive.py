@@ -23,7 +23,6 @@ MAIN_BOARD_FIVE_DAY_NO_LIMIT_START = date(2023, 4, 10)
 _STATUS_REQUIRED_COLUMNS = {
     "ts_code",
     "trade_date",
-    "name",
     "is_st",
     "available_at",
 }
@@ -256,9 +255,6 @@ def _status_by_trade_date(
             continue
         is_st = row["is_st"]
         if not is_bool(is_st):
-            continue
-        name = row["name"]
-        if not isinstance(name, str) or not name.strip():
             continue
         available_at = _aware_datetime(row["available_at"])
         decision_at = datetime.combine(

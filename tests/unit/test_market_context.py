@@ -26,7 +26,7 @@ def _status_row(
     ts_code: str,
     trade_date: date,
     *,
-    name: str = "历史名称",
+    name: str | None = "历史名称",
     is_st: bool = False,
     available_time: time = time(9, 25),
 ) -> SecurityStatusDaily:
@@ -35,7 +35,7 @@ def _status_row(
         trade_date=trade_date,
         name=name,
         is_st=is_st,
-        name_source="namechange",
+        name_source="unknown" if name is None else "namechange",
         st_source="namechange+stock_st",
         available_at=datetime.combine(trade_date, available_time, SHANGHAI),
         ingested_at=datetime(2026, 7, 1, tzinfo=UTC),
@@ -145,7 +145,7 @@ def test_build_market_sentiment_from_daily_state_and_bar(
     store.upsert_stock_status([
         _status_row("000001.SZ", trade_date),
         _status_row("000002.SZ", trade_date),
-        _status_row("300001.SZ", trade_date),
+        _status_row("300001.SZ", trade_date, name=None),
     ])
 
     sentiment = build_market_sentiment(store, trade_date)

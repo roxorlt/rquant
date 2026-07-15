@@ -27,7 +27,8 @@ from rquant.storage.schema import (
     PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
-    STOCK_STATUS_DAILY_DDL,
+    STOCK_STATUS_DAILY_V4_DDL,
+    STOCK_STATUS_NAME_OPTIONAL_MIGRATION_DDLS,
     STOCK_SUSPEND_COVERAGE_DDL,
     STOCK_SUSPEND_EVENT_DDL,
     TRADE_CALENDAR_DDL,
@@ -123,7 +124,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=4,
         name="historical stock status facts",
-        statements=(STOCK_STATUS_DAILY_DDL,),
+        statements=(STOCK_STATUS_DAILY_V4_DDL,),
     ),
     Migration(
         version=5,
@@ -147,6 +148,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=8,
         name="authoritative suspension facts",
         statements=(STOCK_SUSPEND_EVENT_DDL, STOCK_SUSPEND_COVERAGE_DDL),
+    ),
+    Migration(
+        version=9,
+        name="decouple historical name from ST status",
+        statements=STOCK_STATUS_NAME_OPTIONAL_MIGRATION_DDLS,
     ),
 )
 

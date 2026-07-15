@@ -123,15 +123,18 @@ def query_growth_board_candidates(
     available_at = pd.to_datetime(raw["available_at"], utc=True)
     known_non_st = (
         raw["conflict_reason"].isna()
-        & raw["name"].notna()
-        & raw["name"].astype("string").str.strip().ne("")
         & raw["is_st"].notna()
         & raw["is_st"].eq(False)
         & available_at.notna()
         & available_at.le(decision_at)
     ).fillna(False)
     candidates = raw.loc[known_non_st, ["ts_code", "trade_date", "name"]].copy()
-    candidates["name"] = candidates["name"].astype("string").str.strip()
+    candidates["name"] = (
+        candidates["name"]
+        .astype("string")
+        .str.strip()
+        .fillna(candidates["ts_code"].astype("string"))
+    )
     return candidates.reset_index(drop=True)
 
 

@@ -1137,8 +1137,6 @@ def run_auction_gap_replay(
     available_at = pd.to_datetime(auction["status_available_at"], utc=True)
     status_known = (
         auction["status_conflict_reason"].isna()
-        & auction["status_name"].notna()
-        & auction["status_name"].astype("string").str.strip().ne("")
         & auction["status_is_st"].notna()
         & available_at.notna()
         & available_at.le(decision_at)
@@ -1146,7 +1144,12 @@ def run_auction_gap_replay(
     auction = auction.loc[status_known].copy()
     if auction.empty:
         return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
-    auction["name"] = auction["status_name"].astype("string").str.strip()
+    auction["name"] = (
+        auction["status_name"]
+        .astype("string")
+        .str.strip()
+        .fillna(auction["ts_code"].astype("string"))
+    )
     auction["is_st"] = auction["status_is_st"].astype(bool)
     auction = auction.drop(columns=[
         "status_name",

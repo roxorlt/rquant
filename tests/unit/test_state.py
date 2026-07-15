@@ -318,6 +318,38 @@ class TestDeriveState:
         assert bool(out.iloc[0]["is_st"])
         assert bool(out.iloc[0]["is_limit_up"])
 
+    def test_known_st_fact_does_not_require_historical_display_name(self) -> None:
+        trade_date = date(2024, 1, 2)
+        bars = pd.DataFrame(
+            [self._mkbar("2024-01-02", 10.2, 11.0, 10.0, 11.0, 10.0)]
+        )
+        status = pd.DataFrame(
+            {
+                "ts_code": ["600519.SH"],
+                "trade_date": [trade_date],
+                "name": [None],
+                "is_st": pd.Series([False], dtype="boolean"),
+                "available_at": [
+                    datetime.combine(
+                        trade_date,
+                        time(9, 25),
+                        tzinfo=SHANGHAI,
+                    )
+                ],
+                "conflict_reason": [None],
+            }
+        )
+
+        out = derive_state(
+            self._with_listing_window(bars),
+            "600519.SH",
+            status,
+        ).iloc[0]
+
+        assert out["is_st"] == False  # noqa: E712
+        assert out["limit_pct"] == pytest.approx(0.10)
+        assert out["is_limit_up"] == True  # noqa: E712
+
     def test_status_changes_before_during_and_after_st(self) -> None:
         dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
         bars = pd.DataFrame(

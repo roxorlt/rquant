@@ -32,9 +32,12 @@ _NAMECHANGE_COLUMNS = (
 _STOCK_ST_COLUMNS = ("ts_code", "name", "trade_date", "type", "type_name")
 _ST_PREFIX = re.compile(r"^(?:S\*ST|\*ST|SST|ST)", re.IGNORECASE)
 _RELISTING_REASON_MARKERS = ("重新上市", "恢复上市")
+# Tushare uses "其他" for most ordinary name intervals, including both IPO
+# names and later renames; unrecognized values still fail closed below.
 _ORDINARY_NAMECHANGE_REASON_MARKERS = (
     "更名",
     "改名",
+    "其他",
     "ST",
     "风险警示",
     "摘帽",
@@ -102,7 +105,7 @@ class NameChangeHistory(SecurityStatusModel):
 class StockSTHistory(SecurityStatusModel):
     observations: tuple[StockSTObservation, ...] = ()
     issues: tuple[SecurityStatusSourceIssue, ...] = ()
-    is_complete: bool = True
+    is_complete: bool = False
 
 
 class SecurityStatusDaily(SecurityStatusModel):
@@ -136,11 +139,15 @@ class SecurityStatusDaily(SecurityStatusModel):
             raise ValueError("conflicted status must keep name and is_st unknown")
         if self.is_st is not None:
             invalid_fields: list[str] = []
-            if self.name is None:
-                invalid_fields.append("name")
             if self.available_at is None:
                 invalid_fields.append("available_at")
-            if self.name_source.casefold() in {"unknown", "conflict"}:
+            normalized_name_source = self.name_source.casefold()
+            if self.name is None and normalized_name_source != "unknown":
+                invalid_fields.append("name_source")
+            if self.name is not None and normalized_name_source in {
+                "unknown",
+                "conflict",
+            }:
                 invalid_fields.append("name_source")
             if self.st_source is None or self.st_source.casefold() in {
                 "unknown",
@@ -558,6 +565,7 @@ def normalize_stock_st_history(
     """Normalize stock_st positive observations without inferring negative rows."""
     observations: dict[tuple[object, ...], StockSTObservation] = {}
     issues: list[SecurityStatusSourceIssue] = []
+    response_date_mismatch = False
     for raw in frame.to_dict(orient="records"):
         ts_code = _source_code(raw.get("ts_code"))
         trade_date: date | None = None
@@ -567,6 +575,12 @@ def normalize_stock_st_history(
             )
             assert parsed_date is not None
             trade_date = parsed_date
+            if (
+                requested_trade_date is not None
+                and trade_date != requested_trade_date
+            ):
+                response_date_mismatch = True
+                continue
             if ts_code is None:
                 raise ValueError("ts_code is required")
             name, _ = normalize_name(raw.get("name"))
@@ -597,6 +611,14 @@ def normalize_stock_st_history(
             observation.type_name,
         )
         observations[key] = observation
+    if response_date_mismatch and requested_trade_date is not None:
+        issues.append(
+            SecurityStatusSourceIssue(
+                source="tushare.stock_st",
+                reason="stock_st_response_trade_date_mismatch",
+                trade_date=requested_trade_date,
+            )
+        )
     if frame.empty and requested_trade_date is not None:
         reason = (
             "stock_st_unavailable_before_2016"
@@ -626,7 +648,11 @@ def normalize_stock_st_history(
     return StockSTHistory(
         observations=selected,
         issues=tuple(issues),
-        is_complete=not issues,
+        is_complete=(
+            requested_trade_date is not None
+            and requested_trade_date >= STOCK_ST_AVAILABLE_FROM
+            and not issues
+        ),
     )
 
 
@@ -820,20 +846,15 @@ def materialize_security_status(
                 name_source = "tushare.stock_st"
                 st_source = "tushare.stock_st"
                 available_at = _visible_at(key.trade_date)
-            elif stock_name != row_name or row_is_st is not True:
-                rows.append(
-                    _unknown_status(
-                        key,
-                        ingested_at=ingested_at,
-                        conflict_reason="stock_st_name_conflict",
-                    )
-                )
-                continue
             else:
                 row_is_st = True
                 st_source = "tushare.namechange+tushare.stock_st"
                 stock_available_at = _visible_at(key.trade_date)
                 available_at = max(available_at, stock_available_at)
+        elif row_is_st is None and stock_st.is_complete:
+            row_is_st = False
+            st_source = "tushare.stock_st_absence"
+            available_at = _visible_at(key.trade_date)
 
         rows.append(
             SecurityStatusDaily(
