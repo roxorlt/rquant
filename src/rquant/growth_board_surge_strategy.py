@@ -19,8 +19,15 @@ from rquant.paper import (
     mark_position_to_quote,
     open_position_from_signal,
 )
+from rquant.pit_visibility import VisibilityQueryScope, query_visible_rows
 from rquant.signal_provenance import GROWTH_SURGE_V1, build_signal_factors
-from rquant.state.derive import _classify_board
+from rquant.state.derive import (
+    ListingPriceLimitFact,
+    _classify_board,
+    _historical_limit_pct,
+    _price_limit_eligibility,
+    _round_half_up,
+)
 from rquant.stock_features import (
     build_daily_stock_features,
     build_intraday_relative_volume_features,
@@ -157,7 +164,7 @@ class GrowthBoardSurgeConfig(BaseModel):
 
 
 @dataclass(frozen=True)
-class _GrowthBoardCandidate:
+class GrowthBoardCandidate:
     ts_code: str
     name: str
     trade_date: date
@@ -216,12 +223,13 @@ def _as_datetime(value: object) -> datetime:
 def _trading_dates(store: DuckDBStore) -> list[date]:
     df = store._conn.execute(
         """
-        SELECT DISTINCT trade_date
-        FROM daily_bar
-        ORDER BY trade_date
+        SELECT cal_date
+        FROM trade_calendar
+        WHERE exchange = 'SSE' AND is_open = TRUE
+        ORDER BY cal_date
         """
     ).fetchdf()
-    return [_as_date(value) for value in df["trade_date"].tolist()]
+    return [_as_date(value) for value in df["cal_date"].tolist()]
 
 
 def _window_trading_dates(
@@ -267,149 +275,217 @@ def _query_daily_bar(
     return df.iloc[0]
 
 
-def _query_candidates(
+def resolve_growth_board_candidates(
     store: DuckDBStore,
     trading_date: date,
     previous_date: date,
     min_signal_time: time = time(9, 30),
-) -> list[_GrowthBoardCandidate]:
+) -> list[GrowthBoardCandidate]:
+    """Resolve the opening candidate universe from PIT-visible inputs only."""
     decision_at = datetime.combine(trading_date, min_signal_time, tzinfo=SHANGHAI)
-    raw = store._conn.execute(
-        """
-        WITH ma_base AS (
-            SELECT ts_code,
-                   trade_date,
-                   AVG(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                   ) AS ma5_calc,
-                   COUNT(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                   ) AS ma5_count,
-                   AVG(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
-                   ) AS ma10_calc,
-                   COUNT(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
-                   ) AS ma10_count,
-                   AVG(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                   ) AS ma20_calc,
-                   COUNT(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                   ) AS ma20_count,
-                   AVG(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
-                   ) AS ma60_calc,
-                   COUNT(close) OVER (
-                       PARTITION BY ts_code
-                       ORDER BY trade_date
-                       ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
-                   ) AS ma60_count
-            FROM daily_bar
+    status = query_visible_rows(
+        store,
+        "stock_status_daily",
+        decision_at,
+        scope=VisibilityQueryScope(
+            start_date=trading_date,
+            end_date=trading_date,
+            start_time=datetime.combine(
+                trading_date,
+                time.min,
+                tzinfo=SHANGHAI,
+            ),
+            end_time=decision_at,
+            columns=(
+                "ts_code",
+                "trade_date",
+                "name",
+                "is_st",
+                "available_at",
+                "conflict_reason",
+            ),
         ),
-        daily_ma AS (
-            SELECT ts_code,
-                   trade_date,
-                   CASE WHEN ma5_count >= 5 THEN ma5_calc END AS ma5_calc,
-                   CASE WHEN ma10_count >= 10 THEN ma10_calc END AS ma10_calc,
-                   CASE WHEN ma20_count >= 20 THEN ma20_calc END AS ma20_calc,
-                   CASE WHEN ma60_count >= 60 THEN ma60_calc END AS ma60_calc
-            FROM ma_base
-        )
-        SELECT db.ts_code,
-               db.pre_close,
-               status.name,
-               status.is_st AS status_is_st,
-               CASE
-                   WHEN status.ts_code IS NOT NULL
-                    AND status.conflict_reason IS NULL
-                    AND status.name IS NOT NULL
-                    AND length(trim(status.name)) > 0
-                    AND status.is_st IS NOT NULL
-                    AND status.available_at IS NOT NULL
-                    AND status.available_at <= ?
-                   THEN TRUE
-                   ELSE FALSE
-               END AS status_known,
-               ds.is_st AS state_is_st,
-               ds.board_type AS state_board_type,
-               ds.limit_pct AS state_limit_pct,
-               ds.limit_up_price AS state_limit_up_price,
-               COALESCE(di.ma5, dma.ma5_calc) AS ma5,
-               COALESCE(di.ma10, dma.ma10_calc) AS ma10,
-               COALESCE(di.ma20, dma.ma20_calc) AS ma20,
-               COALESCE(di.ma60, dma.ma60_calc) AS ma60
-        FROM daily_bar db
-        LEFT JOIN stock_status_daily status
-          ON db.ts_code = status.ts_code AND db.trade_date = status.trade_date
-        LEFT JOIN daily_state ds
-          ON db.ts_code = ds.ts_code AND db.trade_date = ds.trade_date
-        LEFT JOIN daily_indicator di
-          ON db.ts_code = di.ts_code AND di.trade_date = ?
-        LEFT JOIN daily_ma dma
-          ON db.ts_code = dma.ts_code AND dma.trade_date = ?
-        WHERE db.trade_date = ?
-        """,
-        [decision_at, previous_date, previous_date, trading_date],
-    ).fetchdf()
-    if raw.empty:
+    )
+    if status.empty:
+        return []
+    status = status[
+        status["conflict_reason"].isna()
+        & status["name"].notna()
+        & status["name"].astype("string").str.strip().ne("")
+        & status["is_st"].notna()
+        & ~status["is_st"].astype(bool)
+    ].copy()
+    status["board_type"] = status["ts_code"].astype(str).map(_classify_board)
+    status = status[status["board_type"].isin(("gem", "star"))]
+    if status.empty:
         return []
 
-    candidates: list[_GrowthBoardCandidate] = []
-    for _, row in raw.iterrows():
-        ts_code = str(row["ts_code"])
-        if not bool(row["status_known"]) or bool(row["status_is_st"]):
-            continue
-        name = str(row["name"]).strip()
-        board_type = (
-            str(row["state_board_type"])
-            if pd.notna(row["state_board_type"]) and str(row["state_board_type"])
-            else _classify_board(ts_code)
+    codes = tuple(sorted(status["ts_code"].astype(str).unique()))
+    calendar_rows = store._conn.execute(
+        """
+        SELECT cal_date
+        FROM trade_calendar
+        WHERE exchange = 'SSE'
+          AND is_open = TRUE
+          AND cal_date <= ?
+        ORDER BY cal_date DESC
+        LIMIT 60
+        """,
+        [previous_date],
+    ).fetchall()
+    if not calendar_rows:
+        return []
+    window_start = min(_as_date(row[0]) for row in calendar_rows)
+    daily = query_visible_rows(
+        store,
+        "daily_bar",
+        decision_at,
+        scope=VisibilityQueryScope(
+            ts_codes=codes,
+            start_date=window_start,
+            end_date=previous_date,
+            columns=("ts_code", "trade_date", "close"),
+        ),
+    )
+    if daily.empty:
+        return []
+    daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
+
+    indicators = store._conn.execute(
+        """
+        SELECT ts_code, ma5, ma10, ma20, ma60
+        FROM daily_indicator
+        WHERE trade_date = ?
+        """,
+        [previous_date],
+    ).fetchdf()
+    indicator_by_code = {
+        str(row["ts_code"]): row
+        for _, row in indicators.iterrows()
+        if str(row["ts_code"]) in codes
+    }
+
+    placeholders = ", ".join("?" for _ in codes)
+    listing = store._conn.execute(
+        f"""
+        WITH first_daily AS (
+            SELECT ts_code, MIN(trade_date) AS first_trade_date
+            FROM daily_bar
+            WHERE ts_code IN ({placeholders})
+            GROUP BY ts_code
+        ),
+        listing_dates AS (
+            SELECT first_daily.ts_code,
+                   COALESCE(basic.list_date, first_daily.first_trade_date) AS list_date
+            FROM first_daily
+            LEFT JOIN stock_basic AS basic USING (ts_code)
         )
-        if board_type not in {"gem", "star"}:
+        SELECT listing_dates.ts_code,
+               listing_dates.list_date,
+               (
+                   SELECT CASE WHEN count(*) = 5 THEN max(cal_date) END
+                   FROM (
+                       SELECT calendar.cal_date
+                       FROM trade_calendar AS calendar
+                       WHERE calendar.exchange = 'SSE'
+                         AND calendar.is_open = TRUE
+                         AND calendar.cal_date >= listing_dates.list_date
+                       ORDER BY calendar.cal_date
+                       LIMIT 5
+                   )
+               ) AS fifth_listing_trade_date
+        FROM listing_dates
+        """,
+        list(codes),
+    ).fetchdf()
+    listing_by_code = {
+        str(row["ts_code"]): row for _, row in listing.iterrows()
+    }
+
+    candidates: list[GrowthBoardCandidate] = []
+    for _, status_row in status.iterrows():
+        ts_code = str(status_row["ts_code"])
+        history = daily[daily["ts_code"].astype(str) == ts_code].sort_values(
+            "trade_date"
+        )
+        previous = history[history["trade_date"] == previous_date]
+        if previous.empty:
             continue
-        ma_values = [row["ma5"], row["ma10"], row["ma20"], row["ma60"]]
+        pre_close = float(previous.iloc[-1]["close"])
+        if pre_close <= 0:
+            continue
+
+        indicator = indicator_by_code.get(ts_code)
+        if indicator is None or any(
+            pd.isna(indicator[column])
+            for column in ("ma5", "ma10", "ma20", "ma60")
+        ):
+            closes = pd.to_numeric(history["close"], errors="coerce").dropna()
+            ma_values = [
+                closes.tail(window).mean() if len(closes) >= window else pd.NA
+                for window in (5, 10, 20, 60)
+            ]
+        else:
+            ma_values = [
+                indicator[column]
+                for column in ("ma5", "ma10", "ma20", "ma60")
+            ]
         if any(pd.isna(value) for value in ma_values):
             continue
         ma5, ma10, ma20, ma60 = [float(value) for value in ma_values]
         if not (ma5 > ma10 > ma20 > ma60):
             continue
-        if pd.isna(row["pre_close"]) or float(row["pre_close"]) <= 0:
+
+        board_type = str(status_row["board_type"])
+        listing_row = listing_by_code.get(ts_code)
+        if listing_row is None or pd.isna(listing_row["list_date"]):
             continue
-        state_matches_status = pd.notna(row["state_is_st"]) and not bool(row["state_is_st"])
-        if (
-            not state_matches_status
-            or pd.isna(row["state_limit_pct"])
-            or pd.isna(row["state_limit_up_price"])
-        ):
+        fact = ListingPriceLimitFact(
+            list_date=_as_date(listing_row["list_date"]),
+            fifth_listing_trade_date=(
+                None
+                if pd.isna(listing_row["fifth_listing_trade_date"])
+                else _as_date(listing_row["fifth_listing_trade_date"])
+            ),
+        )
+        limit_eligible = _price_limit_eligibility(
+            [trading_date],
+            board_type=board_type,
+            fact=fact,
+        ).iloc[0]
+        if pd.isna(limit_eligible) or not bool(limit_eligible):
             continue
-        limit_up_price = float(row["state_limit_up_price"])
+        limit_pct = _historical_limit_pct(False, board_type, trading_date)
+        limit_up_price = float(
+            _round_half_up(pd.Series([pre_close * (1 + limit_pct)])).iloc[0]
+        )
         candidates.append(
-            _GrowthBoardCandidate(
+            GrowthBoardCandidate(
                 ts_code=ts_code,
-                name=name,
+                name=str(status_row["name"]).strip(),
                 trade_date=trading_date,
                 previous_date=previous_date,
                 board_type=board_type,
-                pre_close=float(row["pre_close"]),
+                pre_close=pre_close,
                 limit_up_price=limit_up_price,
             )
         )
     return candidates
+
+
+def _query_candidates(
+    store: DuckDBStore,
+    trading_date: date,
+    previous_date: date,
+    min_signal_time: time = time(9, 30),
+) -> list[GrowthBoardCandidate]:
+    """Compatibility wrapper for older tests and private callers."""
+    return resolve_growth_board_candidates(
+        store,
+        trading_date,
+        previous_date,
+        min_signal_time,
+    )
 
 
 def _quote_from_close(row: pd.Series) -> _Quote:
@@ -735,7 +811,7 @@ def _run_exit_scan(
 
 def _position_to_row(
     position: PaperPosition,
-    candidate: _GrowthBoardCandidate,
+    candidate: GrowthBoardCandidate,
     day_minutes: pd.DataFrame,
 ) -> dict[str, object]:
     payload = position.risk_payload or {}
@@ -804,7 +880,7 @@ def _position_to_row(
 
 def _find_entry_position(
     store: DuckDBStore,
-    candidate: _GrowthBoardCandidate,
+    candidate: GrowthBoardCandidate,
     minutes: pd.DataFrame,
     window_dates: list[date],
     config: GrowthBoardSurgeConfig,
@@ -1088,7 +1164,7 @@ def run_growth_board_surge_replay(
         if len(window_dates) <= cfg.max_hold_days:
             continue
         _, window_end = _day_bounds(window_dates[-1])
-        for candidate in _query_candidates(
+        for candidate in resolve_growth_board_candidates(
             store,
             trading_date,
             previous_date,
@@ -1120,6 +1196,11 @@ def run_growth_board_surge_replay(
                     candidate.ts_code,
                     trading_date,
                     hist_days=cfg.board_hist_days,
+                    decision_at=datetime.combine(
+                        trading_date,
+                        cfg.min_signal_time,
+                        tzinfo=SHANGHAI,
+                    ),
                 )
                 if board_strength is None:
                     continue

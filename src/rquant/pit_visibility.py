@@ -209,6 +209,28 @@ def is_input_visible(value: VisibilityInput, *, as_of_time: datetime) -> bool:
     return evaluate_visibility(value, as_of_time=as_of_time).visible
 
 
+def visible_sources_at(
+    dataset_id: str,
+    *,
+    event_date: date,
+    as_of_time: datetime,
+) -> tuple[str, ...]:
+    """Return registered sources usable at a same-session decision instant."""
+    contract = _contract_for(dataset_id)
+    return tuple(
+        source
+        for source in contract.sources
+        if is_input_visible(
+            VisibilityInput(
+                dataset_id=dataset_id,
+                event_date=event_date,
+                source=source,
+            ),
+            as_of_time=as_of_time,
+        )
+    )
+
+
 def derive_available_at(inputs: Sequence[datetime | None]) -> datetime:
     """Return the latest availability among all required derived-field inputs."""
 
@@ -499,4 +521,5 @@ __all__ = [
     "evaluate_visibility",
     "is_input_visible",
     "query_visible_rows",
+    "visible_sources_at",
 ]

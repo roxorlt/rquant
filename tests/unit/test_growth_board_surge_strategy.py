@@ -10,6 +10,7 @@ import pytest
 
 from rquant.security_status import SHANGHAI, SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
+from rquant.trade_calendar import TradeCalendarDay
 
 
 @pytest.fixture()
@@ -160,6 +161,24 @@ def _minute_row(
     }
 
 
+def _seed_open_calendar(store: DuckDBStore, dates: list[date]) -> None:
+    previous = dates[0] - timedelta(days=1)
+    rows: list[TradeCalendarDay] = []
+    for trade_date in dates:
+        rows.append(
+            TradeCalendarDay(
+                exchange="SSE",
+                cal_date=trade_date,
+                is_open=True,
+                pretrade_date=previous,
+                source="test",
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+            )
+        )
+        previous = trade_date
+    store.upsert_trade_calendar(rows)
+
+
 def _seed_base_market(store: DuckDBStore) -> None:
     dates = [
         date(2026, 6, 22),
@@ -168,6 +187,7 @@ def _seed_base_market(store: DuckDBStore) -> None:
         date(2026, 6, 25),
         date(2026, 6, 26),
     ]
+    _seed_open_calendar(store, dates)
     rows: list[dict[str, object]] = []
     for i, trade_date in enumerate(dates):
         rows.append(_daily_row("300001.SZ", trade_date, 10.0 + i * 0.2))
@@ -393,9 +413,30 @@ def test_growth_board_candidates_use_historical_gem_limit_pct_before_2020_reform
 
     signal_date = date(2020, 8, 21)
     previous_date = date(2020, 8, 20)
-    daily = _daily_row("300001.SZ", signal_date, 10.1)
-    daily["pre_close"] = 10.0
-    store.upsert_daily(pd.DataFrame([daily]))
+    _seed_open_calendar(store, [previous_date, signal_date])
+    store.upsert_daily(
+        pd.DataFrame(
+            [
+                _daily_row("300001.SZ", previous_date, 10.0),
+                _daily_row("300001.SZ", signal_date, 10.1),
+            ]
+        )
+    )
+    store.upsert_stock_basic(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "symbol": "300001",
+                    "name": "历史创业板",
+                    "area": "深圳",
+                    "industry": "测试",
+                    "list_date": "20100101",
+                    "market": "创业板",
+                }
+            ]
+        )
+    )
     store.upsert_indicators(
         pd.DataFrame(
             [
@@ -446,10 +487,27 @@ def test_growth_board_candidates_exclude_unsupported_price_limit_state(
 
     signal_date = date(2026, 6, 25)
     previous_date = date(2026, 6, 24)
+    _seed_open_calendar(store, [previous_date, signal_date])
     store.upsert_daily(
         pd.DataFrame(
             [
+                _daily_row("300001.SZ", previous_date, 10.0),
                 _daily_row("300001.SZ", signal_date, 10.1),
+            ]
+        )
+    )
+    store.upsert_stock_basic(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "symbol": "300001",
+                    "name": "上市初期样本",
+                    "area": "深圳",
+                    "industry": "测试",
+                    "list_date": signal_date.strftime("%Y%m%d"),
+                    "market": "创业板",
+                }
             ]
         )
     )
@@ -483,6 +541,66 @@ def test_growth_board_candidates_exclude_unsupported_price_limit_state(
     )
 
     assert candidates == []
+
+
+def test_growth_board_candidates_ignore_signal_day_close_and_state(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
+
+    _seed_base_market(store)
+    signal_date = date(2026, 6, 25)
+    previous_date = date(2026, 6, 24)
+
+    before = resolve_growth_board_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+    store._conn.execute(
+        "UPDATE daily_bar SET close = 999, pre_close = 888 "
+        "WHERE ts_code = ? AND trade_date = ?",
+        ["300001.SZ", signal_date],
+    )
+    store._conn.execute(
+        "DELETE FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+        ["300001.SZ", signal_date],
+    )
+    after = resolve_growth_board_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+
+    assert before == after
+    assert len(after) == 1
+    assert after[0].pre_close == pytest.approx(10.4)
+    assert after[0].limit_up_price == pytest.approx(12.48)
+
+
+def test_growth_board_candidates_keep_historical_code_missing_from_current_basic(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
+
+    _seed_base_market(store)
+    store.upsert_daily(
+        pd.DataFrame([_daily_row("300001.SZ", date(2020, 1, 2), 5.0)])
+    )
+    store._conn.execute(
+        "DELETE FROM stock_basic WHERE ts_code = '300001.SZ'"
+    )
+
+    candidates = resolve_growth_board_candidates(
+        store,
+        date(2026, 6, 25),
+        date(2026, 6, 24),
+        time(9, 30),
+    )
+
+    assert [candidate.ts_code for candidate in candidates] == ["300001.SZ"]
 
 
 def test_growth_board_surge_replay_uses_default_config_when_omitted(
@@ -591,6 +709,7 @@ def test_growth_board_surge_replay_calculates_ma_from_daily_bar(
     )
 
     dates = [date(2026, 3, 1) + timedelta(days=i) for i in range(63)]
+    _seed_open_calendar(store, dates)
     ts_code = "300002.SZ"
     daily_rows = [
         _daily_row(ts_code, trade_date, 10.0 + idx * 0.1)

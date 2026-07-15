@@ -108,6 +108,20 @@ bash scripts/check-core-quality.sh
 
 # 盘中全景
 .venv/bin/streamlit run src/rquant/dashboard/market_panorama.py --server.port 8506
+
+# 生成可恢复的策略分钟回补计划（只读副本）
+.venv/bin/rquant backfill-plan \
+  --strategy growth_board_surge \
+  --start-date 2025-01-01 \
+  --end-date 2026-06-30
+
+# 盘外执行、查询进度并在覆盖率达标后固化研究元数据
+.venv/bin/rquant backfill-run --manifest-id <64位ID>
+.venv/bin/rquant backfill-status --manifest-id <64位ID> --json
+.venv/bin/rquant dataset-snapshot \
+  --strategy growth_board_surge \
+  --as-of 2026-06-30T15:00:00+08:00 \
+  --manifest-id <64位ID>
 ```
 
 本地页面默认分别访问 `http://127.0.0.1:8501`、`http://127.0.0.1:8504` 和
@@ -145,7 +159,7 @@ data/                 本地数据与运行状态，不进 Git
 
 1. 冻结研究基线和工程护栏。
 2. 建数据契约、PIT 状态与回补清单（迁移内核、历史状态、质量审计、PIT 复权和可见性门禁
-   已完成；资格全集与可恢复回补清单进行中）。
+   已完成；资格全集、可恢复回补清单、覆盖率阶段门和四条 CLI 已完成，进入真实数据验收）。
 3. 统一无未来函数分钟特征和 StrategySpec。
 4. 完善可成交性、费用和 10 万本金账户模拟。
 5. 修正优化器后重评现有策略。

@@ -183,6 +183,66 @@ def test_stk_mins_normalizes_tushare_rows(monkeypatch) -> None:
     assert df.iloc[1]["amount"] == 5649956.0
 
 
+def test_stk_mins_retries_transient_failures_and_normalizes(monkeypatch) -> None:
+    from rquant.adapter import tushare as tushare_module
+    from rquant.adapter.tushare import TushareAdapter
+
+    class _FlakyPro(_FakePro):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def stk_mins(
+            self,
+            *,
+            ts_code: str,
+            freq: str,
+            start_date: str,
+            end_date: str,
+        ) -> pd.DataFrame:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise Exception("频率超限")
+            if self.attempts == 2:
+                raise Exception("temporary network error")
+            return super().stk_mins(
+                ts_code=ts_code,
+                freq=freq,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+    fake = _FlakyPro()
+    tokens: list[str] = []
+    sleeps: list[float] = []
+
+    def fake_pro_api(token: str) -> _FlakyPro:
+        tokens.append(token)
+        return fake
+
+    monkeypatch.setattr(tushare_module.settings, "tushare_token_backup", "backup")
+    monkeypatch.setattr(tushare_module.ts, "pro_api", fake_pro_api)
+    monkeypatch.setattr(tushare_module.time, "sleep", sleeps.append)
+
+    adapter = TushareAdapter(token="primary")
+    df = adapter.stk_mins(
+        "600000.SH",
+        "1min",
+        datetime(2023, 8, 25, 9, 30),
+        datetime(2023, 8, 25, 15, 0),
+    )
+
+    assert fake.attempts == 3
+    assert tokens == ["primary"]
+    assert sleeps == [25.0, 5.0]
+    assert df["trade_time"].tolist() == [
+        pd.Timestamp("2023-08-25 09:30:00"),
+        pd.Timestamp("2023-08-25 09:31:00"),
+    ]
+    assert df["freq"].tolist() == ["1min", "1min"]
+    assert df["source"].tolist() == ["tushare", "tushare"]
+
+
 def test_stk_mins_rejects_unsupported_freq(monkeypatch) -> None:
     import pytest
 
@@ -311,6 +371,8 @@ def test_stk_mins_does_not_switch_to_backup_token(monkeypatch) -> None:
 
     monkeypatch.setattr(tushare_module.settings, "tushare_token_backup", "backup")
     monkeypatch.setattr(tushare_module.ts, "pro_api", fake_pro_api)
+    sleeps: list[float] = []
+    monkeypatch.setattr(tushare_module.time, "sleep", sleeps.append)
 
     adapter = TushareAdapter(token="primary")
     with pytest.raises(RuntimeError, match="stk_mins"):
@@ -322,6 +384,7 @@ def test_stk_mins_does_not_switch_to_backup_token(monkeypatch) -> None:
         )
 
     assert tokens == ["primary"]
+    assert sleeps == [5.0] * 5
 
 
 def test_stk_auction_normalizes_tushare_rows(monkeypatch) -> None:
