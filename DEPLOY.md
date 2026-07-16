@@ -5,6 +5,58 @@
 
 ---
 
+## 2026-07-17 · v0.19.0 · 首次研究数据迁云候选发布
+
+**状态**：用户明确授权首次迁云后，05:58-06:23 完成 Mac 冻结快照、迁移包、云端 staging
+上传、candidate 发布和独立验收。snapshot ID 为
+`research-20260716T215935Z-4e713ead`，全链路绑定代码
+`4e713eada6596228f81f455a12fde3cca1111b30`。本次发布的是**研究权威候选**，没有切换现有
+Dashboard/Lab/回测消费者，也没有删除 Mac 数据。
+
+**迁移证据**：
+
+- WAL-free 恢复快照 5,157,957,632 字节、51 张表，SHA-256
+  `c5863c8e73606b84632eae336282df74315a1d816f5d084ac2f3c05f5a5cc6a2`；绑定 37 个
+  Strategy Lab 文件，artifact inventory hash 为
+  `990f0af8a675fe7627be88fc6aed9620e826f5ea41bc9cb99c12b3ad20332393`。
+- 迁移包 1,392 个内容文件、317,323,241 字节、670 个分区、21,065,728 行；固定样本
+  `200/200` 匹配，所有物理主键重复数为 0。bundle manifest SHA-256 为
+  `db276d943b8810439c63dcd7e611eb21c5823db40955c8d2c0e57d25a4ac12d0`。
+- 分钟线为 316 个分区、19,114,853 行，覆盖 `2025-03-28..2026-07-16`；集合竞价为
+  354 个分区、1,950,875 行，覆盖 `2025-01-16..2026-07-16`。云端逐项核对 manifest 与
+  version Parquet 数量均为 `316/316` 和 `354/354`。
+- 7 张辅助研究表全部发布：`monitor_event=2434`、`data_quality_issue=9`，其余五张当前为
+  0 行；物理 data/manifest 均为 7 个，Lab artifact 为 37 个。
+
+**发布过程与安全门**：
+
+- 原计划 15:12 发布；用户在 06:19 明确要求盘前立即执行后，先取消下午 timer，再使用
+  “08:15 后拒绝启动 + CLI 30 分钟硬超时 + systemd 31 分 40 秒外层上限”执行，确保最迟
+  08:45 结束，与 09:15 交易保护窗口保留 30 分钟。实际发布于 06:21:13 开始，06:23:28
+  完成。
+- 发布前 monitor inactive，远端空间门通过；发布只写独立 `data/lake/`、
+  `data/research.duckdb`、`data/research_artifacts/` 和 candidate 标记。生产
+  `data/rquant.duckdb` 发布前后 SHA-256 均为
+  `53a76b354c838d6345aeadb345ad90573601b29219b4dd61b6b3bf712c73d73b`。
+- candidate 的 catalog SHA-256 为
+  `7700f28cc25aa6486d14391cb262cfa7bb9c3721963d61cb2e11cd55adce8b43`，与实际
+  `research.duckdb` 一致。发布后再次执行 verify 通过，幂等重跑返回 `unchanged`。
+
+**生产验收**：最终 preflight 为 `ok=5 warn=0 fail=0 skip=0`，无 DuckDB 读写锁；
+dashboard active，monitor/surge-watch 按盘前日程保持 inactive，原有 10 个 rQuant timers
+均有下一次触发。立即发布 transient service 为 `Result=success`、`ExecMainStatus=0`，下午
+timer 已取消。
+
+**保留与后续门**：candidate 要求 Mac 主库、恢复快照、迁移包和 staging 全部继续保留。
+完成云端每日分钟/竞价/模拟盘增量、消费者候选验证入口、异机备份和至少 10 个交易日观察前，
+不得删除本地研究库或把 candidate 提升为唯一权威。
+
+**回滚**：生产 DuckDB 未变化，现有消费者尚未切换，因此不需要业务数据回滚。若候选后续
+验收失败，应停止晋级并保留快照、staging、candidate 和日志作为证据，禁止手工覆盖生产库或
+删除本地原始研究数据。
+
+---
+
 ## 2026-07-17 · v0.19.0 · 研究数据迁云工具上线
 
 **状态**：PR #90 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.19.0`
