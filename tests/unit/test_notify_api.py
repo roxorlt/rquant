@@ -8,7 +8,7 @@ import pytest
 
 
 @pytest.fixture()
-def mock_settings():
+def mock_settings(tmp_path):
     """提供可调整的 settings mock；同时 stub 日志写入避免污染真实 JSONL。"""
     with patch("rquant.notify.api.settings") as m, patch("rquant.notify.api._log_notification"):
         m.notify_enabled = True
@@ -21,6 +21,9 @@ def mock_settings():
         m.pushdeer_endpoint = "https://api2.pushdeer.com/message/push"
         m.pushplus_token_list = ["pp1"]
         m.pushplus_endpoint = "http://www.pushplus.plus/send"
+        m.notification_state_path_resolved = tmp_path / "notification-state.sqlite3"
+        m.notification_state_busy_timeout_ms = 5_000
+        m.notify_error_cooldown_seconds = 1_800
         yield m
 
 
@@ -108,3 +111,51 @@ class TestNotifyDispatch:
             pool2_count=0,
         )
         MockPushPlus.return_value.push.assert_called_once()
+
+    @patch("rquant.notify.api.PushPlusClient")
+    @patch("rquant.notify.api.PushDeerClient")
+    def test_repeated_error_is_suppressed_across_calls(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
+        from rquant.notify.api import notify
+
+        MockPushDeer.return_value.push.return_value = [(True, None)]
+        MockPushPlus.return_value.push.return_value = [(True, None)]
+
+        notify("error", component="cli:monitor", exc=RuntimeError("schema mismatch"))
+        notify("error", component="cli:monitor", exc=RuntimeError("schema mismatch"))
+
+        MockPushDeer.return_value.push.assert_called_once()
+        MockPushPlus.return_value.push.assert_called_once()
+
+    @patch("rquant.notify.api.PushPlusClient")
+    @patch("rquant.notify.api.PushDeerClient")
+    def test_failed_error_delivery_releases_suppression_gate(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
+        from rquant.notify.api import notify
+
+        MockPushDeer.return_value.push.return_value = [(False, "down")]
+        MockPushPlus.return_value.push.return_value = [(False, "down")]
+
+        notify("error", component="cli:monitor", exc=RuntimeError("schema mismatch"))
+        notify("error", component="cli:monitor", exc=RuntimeError("schema mismatch"))
+
+        assert MockPushDeer.return_value.push.call_count == 2
+        assert MockPushPlus.return_value.push.call_count == 2
+
+    @patch("rquant.notify.api.PushPlusClient")
+    @patch("rquant.notify.api.PushDeerClient")
+    def test_gate_failure_suppresses_error_instead_of_failing_open(
+        self, MockPushDeer, MockPushPlus, mock_settings
+    ) -> None:
+        from rquant.notify.api import notify
+
+        with patch(
+            "rquant.notify.api.NotificationGate.claim",
+            side_effect=OSError("all gates unavailable"),
+        ):
+            notify("error", component="cli:monitor", exc=RuntimeError("schema mismatch"))
+
+        MockPushDeer.return_value.push.assert_not_called()
+        MockPushPlus.return_value.push.assert_not_called()

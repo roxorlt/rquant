@@ -5,6 +5,7 @@
 #
 # 每次调用追加一行到 logs/watchdog-YYYY-MM-DD.log，供 daily-report 统计：
 #   <ISO ts> active           monitor 活，正常路径
+#   <ISO ts> active-warming   monitor 活，但连续运行不足 5 分钟，暂不关闭事故
 #   <ISO ts> skip-clean-exit  今天已 exit 0 过（节假日 / 收盘后），静默
 #   <ISO ts> alert-restart    告警 + systemctl start 成功
 #   <ISO ts> restart-failed   告警 + systemctl start 失败 + 升级告警
@@ -19,12 +20,30 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
 UNIT="rquant-monitor.service"
 LOG_FILE="${PROJECT_DIR}/logs/watchdog-$(date +%Y-%m-%d).log"
+STABLE_SECONDS=300
 
 mkdir -p "${PROJECT_DIR}/logs"
 
 log_event() {
     # $1 = tag
     printf "%s %s\n" "$(date -Iseconds)" "$1" >> "${LOG_FILE}"
+}
+
+is_stably_active() {
+    local unit="$1"
+    local active_since active_epoch now_epoch
+    systemctl is-active --quiet "${unit}" || return 1
+    active_since=$(systemctl show "${unit}" -p ActiveEnterTimestamp --value 2>/dev/null || true)
+    [[ -n "${active_since}" ]] || return 1
+    active_epoch=$(date -d "${active_since}" +%s 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    (( active_epoch > 0 && now_epoch - active_epoch >= STABLE_SECONDS ))
+}
+
+resolve_incident() {
+    local unit="$1"
+    "${RQUANT_BIN}" alert-resolve --dedup-key "service:${unit}" || true
+    "${RQUANT_BIN}" alert-resolve --dedup-key "service-critical:${unit}" || true
 }
 
 # 交易时段自检（09:30-15:00）：timer 范围 `09..14:*/2` 包含 09:00-09:28
@@ -36,9 +55,19 @@ if (( NOW_HM_INT < 930 || NOW_HM_INT > 1500 )); then
     exit 0
 fi
 
-# 已 active：正常路径，直接退
+# surge-watch 没有独立 watchdog；复用本检查器关闭其稳定运行后的历史事故。
+if is_stably_active "rquant-surge-watch.service"; then
+    resolve_incident "rquant-surge-watch.service"
+fi
+
+# monitor 已 active：连续稳定 5 分钟后才关闭事故，短暂拉起仍视为同一次 flapping。
 if systemctl is-active --quiet "${UNIT}"; then
-    log_event "active"
+    if is_stably_active "${UNIT}"; then
+        log_event "active"
+        resolve_incident "${UNIT}"
+    else
+        log_event "active-warming"
+    fi
     exit 0
 fi
 
@@ -65,7 +94,9 @@ fi
 # 真不活：告警 + 拉起（用 sudo；详见 header 注释 5/13 复盘）
 "${RQUANT_BIN}" alert \
     --subject "[RQ] ${UNIT} 不在跑（盘中）" \
-    --body "watchdog 自动尝试 sudo systemctl start" || true
+    --body "watchdog 自动尝试 sudo systemctl start" \
+    --dedup-key "service:${UNIT}" \
+    --cooldown-seconds 1800 || true
 
 if sudo systemctl start "${UNIT}"; then
     log_event "alert-restart"
@@ -74,5 +105,7 @@ else
     log_event "restart-failed"
     "${RQUANT_BIN}" alert \
         --subject "[RQ][CRITICAL] ${UNIT} 重启失败，需人工介入" \
-        --body "watchdog 调用 sudo systemctl start ${UNIT} 失败。可能原因：sudoers 配置漏 / polkit 拒 / unit 自身错。立刻 ssh 上服务器排查。" || true
+        --body "watchdog 调用 sudo systemctl start ${UNIT} 失败。可能原因：sudoers 配置漏 / polkit 拒 / unit 自身错。立刻 ssh 上服务器排查。" \
+        --dedup-key "service-critical:${UNIT}" \
+        --cooldown-seconds 1800 || true
 fi

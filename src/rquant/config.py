@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     pushplus_tokens: str = Field(default="")
     pushplus_endpoint: str = Field(default="http://www.pushplus.plus/send")
     notify_enabled: bool = True
+    notification_state_path: Path | None = None
+    notification_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
+    notify_error_cooldown_seconds: int = Field(default=1_800, ge=0)
+    notify_ops_cooldown_seconds: int = Field(default=1_800, ge=0)
     notify_price_level: bool = True
     notify_pool2_exit: bool = True
     notify_daily_summary: bool = True
@@ -154,6 +158,12 @@ class Settings(BaseSettings):
     def backfill_state_path_resolved(self) -> Path:
         """回补状态库独立于 DuckDB；未配置时放在 data_dir。"""
         path = self.backfill_state_path or self.data_dir / "backfill_state.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def notification_state_path_resolved(self) -> Path:
+        path = self.notification_state_path or self.data_dir / "notification_state.sqlite3"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 

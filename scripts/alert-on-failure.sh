@@ -51,7 +51,11 @@ sudo systemctl restart rquant-canvas.service
 # 都汇到这里，若 PushDeer/PushPlus 全挂（网络抖动 / token 失效），告警会静默消失。
 # 落盘到 logs/alert-failures.jsonl，由 daily-report 扫描带出 + dashboard 可见，
 # 保证原始故障"至少在服务器上有记录"。
-if ! "${RQUANT_BIN}" alert --subject "${SUBJECT}" --body "${BODY}"; then
+if ! "${RQUANT_BIN}" alert \
+    --subject "${SUBJECT}" \
+    --body "${BODY}" \
+    --dedup-key "service:${UNIT}" \
+    --cooldown-seconds 1800; then
     FAIL_LOG="${PROJECT_DIR}/logs/alert-failures.jsonl"
     mkdir -p "${PROJECT_DIR}/logs"
     # 用 python 写 json，避免 subject 含特殊字符破坏格式
