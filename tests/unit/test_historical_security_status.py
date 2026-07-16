@@ -311,6 +311,32 @@ def test_materialize_accepts_provider_other_reason_as_a_known_name_interval() ->
     assert row.conflict_reason is None
 
 
+def test_materialize_marks_delisting_period_as_an_intentional_exclusion() -> None:
+    boundary_date = date(2026, 6, 1)
+    names = NameChangeHistory(
+        intervals=(
+            NameChangeInterval(
+                ts_code="600421.SH",
+                name="退市华嵘",
+                start_date=boundary_date,
+                ann_date=date(2026, 5, 25),
+                change_reason="退市整理期",
+            ),
+        )
+    )
+
+    row = materialize_security_status(
+        [_key(boundary_date, "600421.SH")],
+        names,
+        StockSTHistory(is_complete=True),
+        ingested_at=INGESTED_AT,
+    )[0]
+
+    assert row.name is None
+    assert row.is_st is None
+    assert row.conflict_reason == "unsupported_delisting_price_limit"
+
+
 def test_materialize_conflicts_and_invalid_source_rows_fail_to_unknown() -> None:
     raw = pd.DataFrame(
         [
@@ -1072,7 +1098,7 @@ def test_security_status_audit_rules_emit_p0_for_missing_unknown_and_conflict(
 
     assert report.is_blocked is True
     assert {finding.severity for finding in report.findings} == {"P0"}
-    assert len(rules) == 1
+    assert len(rules) == 2
     findings = {finding.scope_key: finding for finding in report.findings}
     scopes = {
         category: f"{category}/2020-01-02/2020-01-02"
@@ -1090,6 +1116,62 @@ def test_security_status_audit_rules_emit_p0_for_missing_unknown_and_conflict(
     assert findings[scopes["conflict"]].evidence["samples"] == [
         "000002.SZ/2020-01-02"
     ]
+
+
+def test_intentional_status_exclusion_is_observable_but_not_blocking(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_quality import historical_security_status_audit_rules, run_audit
+
+    db_path = tmp_path / "excluded-status.duckdb"
+    trade_date = date(2026, 6, 1)
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, ?)",
+            ["600421.SH", trade_date, 1.23],
+        )
+        store.upsert_stock_status(
+            (
+                SecurityStatusDaily(
+                    ts_code="600421.SH",
+                    trade_date=trade_date,
+                    name=None,
+                    is_st=None,
+                    name_source="conflict",
+                    st_source=None,
+                    available_at=None,
+                    ingested_at=INGESTED_AT,
+                    conflict_reason="unsupported_delisting_price_limit",
+                ),
+            )
+        )
+        coverage = store.stock_status_coverage(trade_date, trade_date)
+        incomplete = store.list_incomplete_stock_status_keys(
+            [_key(trade_date, "600421.SH")]
+        )
+
+    assert coverage.unknown_count == 0
+    assert coverage.conflict_count == 0
+    assert coverage.excluded_count == 1
+    assert coverage.excluded_samples == (_key(trade_date, "600421.SH"),)
+    assert incomplete == []
+
+    with DuckDBStore(db_path, read_only=True) as readonly:
+        report = run_audit(
+            readonly,
+            historical_security_status_audit_rules(trade_date, trade_date),
+            observed_at=INGESTED_AT,
+        )
+
+    assert report.is_blocked is False
+    assert report.finding_count == 1
+    finding = report.findings[0]
+    assert finding.rule_id == "stock-status-intentional-exclusion"
+    assert finding.severity == "P2"
+    assert finding.evidence == {
+        "count": 1,
+        "samples": ["600421.SH/2026-06-01"],
+    }
 
 
 def test_million_row_audit_aggregates_counts_with_bounded_stable_samples(

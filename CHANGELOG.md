@@ -6,6 +6,12 @@
 
 ### Fixed
 
+- **退市整理期误报历史状态 P0**：Tushare `namechange.change_reason=退市整理期` 现在归类为
+  已知但主动排除的上市状态边界，继续 fail closed，不伪装为普通非 ST，也不参与任何策略或
+  涨跌停派生；`security-status-backfill --missing-only` 不再反复下载这些已确认排除的股票日。
+  Stage 1 审计升级为 `stage1-v3`：真正缺失、未知和冲突仍保持 P0，主动安全排除单列为可追溯
+  的 P2 证据。项目版本从 `0.17.1` 更新到 `0.17.2`。
+
 - **历史 ST 状态回补误报 P0**：Tushare `namechange.change_reason=其他` 视为有效名称区间，
   不再把新股首日误判为未知边界；`stock_st` 正例按 `ts_code + trade_date` 确认 ST，展示名
   被截断或带 `XD` 前缀时不再与历史名称制造伪冲突。完整且未触及 1000 行上限的逐日 ST

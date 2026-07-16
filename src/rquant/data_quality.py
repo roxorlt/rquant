@@ -212,7 +212,7 @@ DEFAULT_MINUTE_SOURCE_SESSION_SPECS = (
     ),
 )
 
-STAGE1_AUDIT_RULE_SET_VERSION = "stage1-v2"
+STAGE1_AUDIT_RULE_SET_VERSION = "stage1-v3"
 
 
 class LimitUpPoolRepairKey(QualityModel):
@@ -732,6 +732,36 @@ def historical_security_status_audit_rules(
             if count > 0
         )
 
+    def intentional_exclusion_check(
+        store: DuckDBStore,
+    ) -> tuple[AuditFinding, ...]:
+        coverage = store.stock_status_coverage(
+            start,
+            end,
+            sample_limit=sample_limit,
+        )
+        if coverage.excluded_count == 0:
+            return ()
+        return (
+            AuditFinding(
+                rule_id="stock-status-intentional-exclusion",
+                dataset_id="stock_status_daily",
+                severity="P2",
+                scope_key=f"unsupported/{start.isoformat()}/{end.isoformat()}",
+                message=(
+                    "known listing-status transitions are intentionally excluded "
+                    "from strategy eligibility"
+                ),
+                evidence={
+                    "count": coverage.excluded_count,
+                    "samples": [
+                        f"{sample.ts_code}/{sample.trade_date.isoformat()}"
+                        for sample in coverage.excluded_samples
+                    ],
+                },
+            ),
+        )
+
     return (
         AuditRule(
             rule_id="stock-status-coverage",
@@ -739,6 +769,13 @@ def historical_security_status_audit_rules(
             severity="P0",
             description="Aggregate blocking historical status coverage gaps",
             check=coverage_check,
+        ),
+        AuditRule(
+            rule_id="stock-status-intentional-exclusion",
+            dataset_id="stock_status_daily",
+            severity="P2",
+            description="Report known fail-closed listing-status transitions",
+            check=intentional_exclusion_check,
         ),
     )
 
