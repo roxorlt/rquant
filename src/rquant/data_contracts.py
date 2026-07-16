@@ -794,3 +794,48 @@ def validate_contract_registry(
 
 CONTRACTS_BY_ID: Mapping[str, DatasetContract] = build_contract_registry(DATASET_CONTRACTS)
 validate_contract_registry_shape(DATASET_CONTRACTS, CONTRACTS_BY_ID)
+
+RESEARCH_DATASET_IDS = ("minute_bar", "auction_bar")
+
+RESEARCH_EXPORT_SCHEMAS: Mapping[str, tuple[tuple[str, str], ...]] = MappingProxyType(
+    {
+        "minute_bar": (
+            ("ts_code", "VARCHAR"),
+            ("trade_time", "TIMESTAMP"),
+            ("freq", "VARCHAR"),
+            ("open", "DOUBLE"),
+            ("high", "DOUBLE"),
+            ("low", "DOUBLE"),
+            ("close", "DOUBLE"),
+            ("vol", "DOUBLE"),
+            ("amount", "DOUBLE"),
+            ("source", "VARCHAR"),
+            ("created_at", "TIMESTAMP"),
+        ),
+        "auction_bar": (
+            ("ts_code", "VARCHAR"),
+            ("trade_date", "DATE"),
+            ("auction_type", "VARCHAR"),
+            ("price", "DOUBLE"),
+            ("vol", "DOUBLE"),
+            ("amount", "DOUBLE"),
+            ("turnover_rate", "DOUBLE"),
+            ("volume_ratio", "DOUBLE"),
+            ("source", "VARCHAR"),
+            ("created_at", "TIMESTAMP"),
+        ),
+    }
+)
+
+
+def research_dataset_contract(dataset_id: str) -> DatasetContract:
+    """Return the canonical contract for datasets admitted to the research lake."""
+    if dataset_id not in RESEARCH_DATASET_IDS:
+        raise ValueError(f"unsupported research dataset: {dataset_id}")
+    return CONTRACTS_BY_ID[dataset_id]
+
+
+def research_export_schema(dataset_id: str) -> tuple[tuple[str, str], ...]:
+    """Return the exact physical schema admitted to one research Parquet dataset."""
+    research_dataset_contract(dataset_id)
+    return RESEARCH_EXPORT_SCHEMAS[dataset_id]

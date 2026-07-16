@@ -410,6 +410,45 @@ class TestReadonlyHelpers:
             conn.close()
         assert name == "replica"
 
+    def test_open_readonly_connection_can_require_replica(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.storage import duckdb as duckdb_mod
+
+        primary = tmp_path / "main.duckdb"
+        replica = tmp_path / "main_ro.duckdb"
+        self._make_db(primary, "primary")
+
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_path", primary)
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_readonly_path", replica)
+
+        with pytest.raises(FileNotFoundError, match="read-only replica"):
+            duckdb_mod.open_readonly_connection(require_replica=True)
+
+        self._make_db(replica, "replica")
+        conn = duckdb_mod.open_readonly_connection(require_replica=True)
+        try:
+            name = conn.execute("SELECT name FROM marker").fetchone()[0]
+        finally:
+            conn.close()
+        assert name == "replica"
+
+    def test_required_replica_rejects_main_path_alias(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.storage import duckdb as duckdb_mod
+
+        primary = tmp_path / "main.duckdb"
+        self._make_db(primary, "primary")
+        replica = tmp_path / "main_ro.duckdb"
+        replica.symlink_to(primary)
+
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_path", primary)
+        monkeypatch.setattr(duckdb_mod.settings, "duckdb_readonly_path", replica)
+
+        with pytest.raises(ValueError, match="must not resolve to the primary"):
+            duckdb_mod.open_readonly_connection(require_replica=True)
+
     def test_readonly_path_resolved_default(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

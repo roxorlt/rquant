@@ -360,6 +360,34 @@ def cmd_research_sync(args: argparse.Namespace) -> int:
     return 1 if report.has_errors else 0
 
 
+def cmd_research_export(args: argparse.Namespace) -> int:
+    """Export validated research partitions from the local read-only replica."""
+    from rquant.config import settings
+    from rquant.research_catalog import ResearchCatalog
+    from rquant.research_lake import export_research_dataset
+    from rquant.research_manifest import detect_code_commit
+    from rquant.storage.duckdb import open_readonly_connection
+
+    catalog_path = settings.research_db_path or settings.data_dir / "research.duckdb"
+    lake_root = settings.research_lake_dir or settings.data_dir / "lake"
+    connection = open_readonly_connection(require_replica=True)
+    try:
+        summary = export_research_dataset(
+            connection,
+            catalog=ResearchCatalog(catalog_path),
+            lake_root=lake_root,
+            dataset=args.dataset,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            code_commit=detect_code_commit() or "unknown",
+            dry_run=args.dry_run,
+        )
+    finally:
+        connection.close()
+    print(summary.model_dump_json(indent=2))
+    return 0
+
+
 def cmd_trade_calendar_bootstrap(args: argparse.Namespace) -> int:
     """Bootstrap a complete authoritative SSE civil-date calendar."""
     from rquant.adapter.tushare import TushareAdapter
@@ -2035,6 +2063,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="跳过只读副本刷新",
     )
 
+    research_export_p = sub.add_parser(
+        "research-export",
+        help="从只读副本导出校验过的分钟/竞价研究湖分区",
+    )
+    research_export_p.add_argument(
+        "--dataset",
+        required=True,
+        choices=["minute_bar", "auction_bar"],
+        help="研究数据集",
+    )
+    research_export_p.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        required=True,
+        help="开始日期 YYYY-MM-DD（含）",
+    )
+    research_export_p.add_argument(
+        "--end-date",
+        type=_parse_iso_date,
+        required=True,
+        help="结束日期 YYYY-MM-DD（含）",
+    )
+    research_export_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只报告分区和行数，不创建目录、Parquet 或 catalog",
+    )
+
     calendar_p = sub.add_parser(
         "trade-calendar-bootstrap",
         help="从 Tushare 初始化权威 SSE 交易日历",
@@ -2940,6 +2996,7 @@ def main() -> int:
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
         "research-sync": cmd_research_sync,
+        "research-export": cmd_research_export,
         "trade-calendar-bootstrap": cmd_trade_calendar_bootstrap,
         "sentiment-recompute": cmd_sentiment_recompute,
         "moneyflow-backfill": cmd_moneyflow_backfill,
