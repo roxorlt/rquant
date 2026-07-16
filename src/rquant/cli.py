@@ -388,6 +388,46 @@ def cmd_research_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_research_migration(args: argparse.Namespace) -> int:
+    """Run one explicit, resumable phase of the research cloud bootstrap."""
+    from rquant.research_migration import (
+        create_recovery_snapshot,
+        prepare_research_migration_bundle,
+        publish_research_migration_bundle,
+        verify_research_migration_bundle,
+    )
+
+    if args.migration_command == "snapshot":
+        result = create_recovery_snapshot(
+            args.source_database,
+            recovery_dir=args.recovery_dir,
+            artifact_dir=args.artifact_dir,
+            snapshot_id=args.snapshot_id,
+            code_commit=args.code_commit,
+        )
+    elif args.migration_command == "prepare":
+        result = prepare_research_migration_bundle(
+            args.source_snapshot,
+            bundle_dir=args.bundle_dir,
+            artifact_dir=args.artifact_dir,
+            snapshot_id=args.snapshot_id,
+            code_commit=args.code_commit,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+    elif args.migration_command == "verify":
+        result = verify_research_migration_bundle(args.bundle_path)
+    elif args.migration_command == "publish":
+        result = publish_research_migration_bundle(
+            args.bundle_path,
+            target_data_dir=args.target_data_dir,
+        )
+    else:  # pragma: no cover - argparse requires one supported subcommand
+        raise ValueError(f"unsupported research migration phase: {args.migration_command}")
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
 def cmd_trade_calendar_bootstrap(args: argparse.Namespace) -> int:
     """Bootstrap a complete authoritative SSE civil-date calendar."""
     from rquant.adapter.tushare import TushareAdapter
@@ -2091,6 +2131,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="只报告分区和行数，不创建目录、Parquet 或 catalog",
     )
 
+    migration_p = sub.add_parser(
+        "research-migration",
+        help="创建恢复快照、迁移包并在云端校验发布研究数据",
+    )
+    migration_sub = migration_p.add_subparsers(
+        dest="migration_command",
+        required=True,
+    )
+    migration_snapshot_p = migration_sub.add_parser(
+        "snapshot",
+        help="checkpoint 后创建只读、不可变恢复快照",
+    )
+    migration_snapshot_p.add_argument(
+        "--source-database",
+        type=Path,
+        required=True,
+        help="本地研究主库绝对路径",
+    )
+    migration_snapshot_p.add_argument(
+        "--recovery-dir",
+        type=Path,
+        required=True,
+        help="恢复快照父目录",
+    )
+    migration_snapshot_p.add_argument(
+        "--artifact-dir",
+        type=Path,
+        required=True,
+        help="需要与 DuckDB 快照绑定的 Strategy Lab artifact 目录",
+    )
+    migration_snapshot_p.add_argument("--snapshot-id", required=True)
+    migration_snapshot_p.add_argument("--code-commit", required=True)
+
+    migration_prepare_p = migration_sub.add_parser(
+        "prepare",
+        help="从不可变恢复快照生成自校验迁移包",
+    )
+    migration_prepare_p.add_argument("--source-snapshot", type=Path, required=True)
+    migration_prepare_p.add_argument("--bundle-dir", type=Path, required=True)
+    migration_prepare_p.add_argument("--artifact-dir", type=Path, required=True)
+    migration_prepare_p.add_argument("--snapshot-id", required=True)
+    migration_prepare_p.add_argument("--code-commit", required=True)
+    migration_prepare_p.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        required=True,
+    )
+    migration_prepare_p.add_argument(
+        "--end-date",
+        type=_parse_iso_date,
+        required=True,
+    )
+
+    migration_verify_p = migration_sub.add_parser(
+        "verify",
+        help="重新计算迁移包文件与数据语义证据",
+    )
+    migration_verify_p.add_argument("--bundle-path", type=Path, required=True)
+
+    migration_publish_p = migration_sub.add_parser(
+        "publish",
+        help="逐分区发布到研究目录并最后写候选权威标记",
+    )
+    migration_publish_p.add_argument("--bundle-path", type=Path, required=True)
+    migration_publish_p.add_argument("--target-data-dir", type=Path, required=True)
+    migration_publish_p.add_argument(
+        "--apply",
+        action="store_true",
+        required=True,
+        help="确认执行云端研究目录写入",
+    )
+
     calendar_p = sub.add_parser(
         "trade-calendar-bootstrap",
         help="从 Tushare 初始化权威 SSE 交易日历",
@@ -2997,6 +3109,7 @@ def main() -> int:
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
         "research-sync": cmd_research_sync,
         "research-export": cmd_research_export,
+        "research-migration": cmd_research_migration,
         "trade-calendar-bootstrap": cmd_trade_calendar_bootstrap,
         "sentiment-recompute": cmd_sentiment_recompute,
         "moneyflow-backfill": cmd_moneyflow_backfill,

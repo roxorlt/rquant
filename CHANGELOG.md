@@ -55,6 +55,18 @@
 
 ### Added
 
+- **存量研究数据可恢复迁云**：新增 `research-migration snapshot/prepare/verify/publish` 和
+  `scripts/migrate-research-to-cloud.sh`。迁移从同一个 WAL-free 只读恢复快照导出分钟、竞价、
+  7 张辅助研究表和完整 Strategy Lab artifact；逐分区保存行数、日期、主键、金额/成交量、
+  固定样本及文件/内容哈希。上传使用快照专属 staging 与可续传 checksum rsync，云端重新校验
+  后逐文件原子发布并由 manifest 重建 catalog，最后才标记“候选权威”；生产 DuckDB 不进入
+  写路径，中断后按原快照幂等续跑，本地主库至少保留 10 个交易日。辅助表按结束日限制业务
+  及结果时间，Lab artifact 清单通过预写 pending 证据与恢复快照绑定；publish 拒绝额外 lake
+  分区/孤儿文件、catalog 哈希漂移、非盘后或 monitor 活跃状态，并在发布前重新检查远端空间，
+  以 6 小时硬超时阻止跨入下一交易窗口；硬中断后只在同一 publish state 绑定通过、相关分区
+  export lock 均空闲时，清理本发布器精确命名的残留临时文件。该版本只发布迁移工具和验收
+  流程，不代表存量数据已经上传或切换权威；项目版本从 `0.18.0` 更新到 `0.19.0`。
+
 - **研究数据湖导出契约**：新增 `research-export`，从本地只读副本按交易日（分钟数据额外按
   频率）导出 `minute_bar` / `auction_bar`。每个分区先写临时 Parquet，再校验 schema、物理
   主键、source、行数和时间范围，发布为不可变版本文件并原子切换 manifest；manifest 同时保存
