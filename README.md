@@ -17,6 +17,8 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - 收盘后更新日线、指标、市场状态，生成 Pool1/Pool2 等候选池。
 - 接入 Tushare 历史 1 分钟、实时分钟、实时分钟日累计和集合竞价。
 - 对候选池运行盘中分钟监控，通过 PushDeer/PushPlus 告警。
+- 云端是盘中 monitor 与系统异常的唯一告警权威；同一事故跨进程/重启默认只通知一次，
+  服务恢复后才关闭事故。本地 monitor 只采集；尚未迁云的晨间脉搏/午间战报仍是独立业务报告。
 - Strategy Lab 支持 N 字、集合竞价和科创/创业放量的 replay、消融与研究记录。
 - 20 个首批策略数据集已有 Point-in-Time 契约；历史名称/ST、复权价格、竞价/分钟/盘后数据
   可见性均按决策时点 fail closed，研究快照、覆盖率、质量问题和权威交易日历可追溯。
@@ -55,6 +57,7 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - [阶段 1 真实数据验收](docs/analysis/2026-07-15-stage1-data-contract-acceptance.md)
 - [v0.17.1 Stage 1 状态修复与首次部署](docs/deploy/2026-07-15-v0.17.1-stage1-bootstrap.md)
 - [可信策略研究与盘中监控路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)
+- [研究数据云化、告警治理与 Strategy Lab 重构计划](docs/plans/2026-07-16-research-cloud-alert-lab-implementation.md)
 - [Strategy Lab 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
 
 ## 运行架构
@@ -72,6 +75,8 @@ systemd timers                        Strategy Lab / panorama / launchd
 
 DuckDB 是单文件锁。盘中唯一写入者是 monitor；Dashboard、Lab 和临时查询必须读
 `rquant_ro.duckdb` 副本。云端快照下载到 `cloud_backup.duckdb`，禁止整文件覆盖本地主库。
+研究数据将按上方云化计划迁入独立 `research.duckdb` 与交易日分区 Parquet；迁移验收完成前，
+本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。
 
 ## 技术栈
 

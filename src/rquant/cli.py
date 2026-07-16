@@ -1493,6 +1493,7 @@ def cmd_alert(args: argparse.Namespace) -> int:
     """
     from rquant.config import settings
     from rquant.notify.client import PushDeerClient, PushPlusClient
+    from rquant.notify.gate import NotificationGate
 
     setup_logging()
     keys = settings.pushdeer_key_list
@@ -1500,6 +1501,29 @@ def cmd_alert(args: argparse.Namespace) -> int:
     if not keys and not tokens:
         logger.error("PUSHDEER_KEYS 和 PUSHPLUS_TOKENS 都未配置，alert 无处可发")
         return 1
+
+    gate = None
+    lease = None
+    cooldown_seconds = (
+        settings.notify_ops_cooldown_seconds
+        if args.cooldown_seconds is None
+        else args.cooldown_seconds
+    )
+    if not args.force and cooldown_seconds > 0:
+        try:
+            gate = NotificationGate(
+                settings.notification_state_path_resolved,
+                busy_timeout_ms=settings.notification_state_busy_timeout_ms,
+            )
+            event_key = args.dedup_key or f"ops:{args.subject.strip().lower()}"
+            lease = gate.claim(event_key, cooldown_seconds)
+        except Exception as e:
+            logger.error(f"alert 去重状态完全不可用，已抑制 Push: {e}")
+            return 1
+        else:
+            if lease is None:
+                logger.warning(f"alert 同类事件仍在冷却期，已抑制: {args.subject!r}")
+                return 0
 
     body = args.body or ""
     success = 0
@@ -1518,7 +1542,34 @@ def cmd_alert(args: argparse.Namespace) -> int:
                 logger.error(f"PushPlus 失败: {err}")
 
     logger.info(f"alert 发送: {success}/{total} 成功 (subject={args.subject!r})")
+    if gate is not None and lease is not None:
+        try:
+            if success > 0:
+                gate.complete(lease, cooldown_seconds)
+            else:
+                gate.release(lease)
+        except Exception as e:
+            logger.error(f"alert 更新投递去重状态失败: {e}")
     return 0 if success > 0 else 1
+
+
+def cmd_alert_resolve(args: argparse.Namespace) -> int:
+    """关闭已恢复的运维事故，让之后的新故障可以再次告警。"""
+    from rquant.config import settings
+    from rquant.notify.gate import NotificationGate
+
+    setup_logging()
+    try:
+        gate = NotificationGate(
+            settings.notification_state_path_resolved,
+            busy_timeout_ms=settings.notification_state_busy_timeout_ms,
+        )
+        gate.clear(args.dedup_key)
+    except Exception as e:
+        logger.error(f"alert 事故关闭失败 ({args.dedup_key!r}): {e}")
+        return 1
+    logger.info(f"alert 事故已关闭: {args.dedup_key!r}")
+    return 0
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -2822,6 +2873,17 @@ def build_parser() -> argparse.ArgumentParser:
     alert_p = sub.add_parser("alert", help="发运维告警（systemd OnFailure / watchdog 用）")
     alert_p.add_argument("--subject", required=True, help="告警主题")
     alert_p.add_argument("--body", default="", help="告警正文（可选）")
+    alert_p.add_argument("--dedup-key", default=None, help="跨进程去重事件键（默认按主题）")
+    alert_p.add_argument(
+        "--cooldown-seconds",
+        type=int,
+        default=None,
+        help="同类事件冷却秒数（默认读取 NOTIFY_OPS_COOLDOWN_SECONDS；0 表示关闭）",
+    )
+    alert_p.add_argument("--force", action="store_true", help="忽略冷却期强制发送")
+
+    alert_resolve_p = sub.add_parser("alert-resolve", help="服务恢复后关闭运维告警事故")
+    alert_resolve_p.add_argument("--dedup-key", required=True, help="要关闭的事故事件键")
 
     lab_run_p = sub.add_parser(
         "lab-run", help="执行 Strategy Lab 后台任务 spec（UI「后台运行」派生，内部命令）",
@@ -2906,6 +2968,7 @@ def main() -> int:
         "blacklist": cmd_blacklist,
         "notify-test": cmd_notify_test,
         "alert": cmd_alert,
+        "alert-resolve": cmd_alert_resolve,
         "daily-report": cmd_daily_report,
         "morning-pulse": cmd_morning_pulse,
         "midday-report": cmd_midday_report,
@@ -2929,7 +2992,7 @@ def main() -> int:
     # panorama-auth-* 是独立登录网关，不依赖 notify 体系，SECRET 缺失走 SystemExit
     # （非 Exception，本就不被下方 except 捕获），不该再包一层运维告警。
     if args.command in (
-        "serve", "notify-test", "alert",
+        "serve", "notify-test", "alert", "alert-resolve",
         "daily-report", "pre-market-check", "preflight", "data-audit", "lab-run",
         "panorama-auth-serve", "panorama-user-add",
         "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
@@ -2941,7 +3004,8 @@ def main() -> int:
     except Exception as e:
         logger.exception(f"=== {args.command} 异常 ===")
         from rquant.notify import notify
-        notify("error", component=f"cli:{args.command}", exc=e)
+        if args.command not in {"monitor", "surge-watch"}:
+            notify("error", component=f"cli:{args.command}", exc=e)
         return 1
 
 

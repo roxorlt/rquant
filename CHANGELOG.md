@@ -10,6 +10,14 @@
   超限后交由 watchdog 和人工诊断；Mac monitor LaunchAgent 显式关闭通知，只保留研究分钟采集。
   基础设施独立于 v0.17.3 代码 tag 发布，并提供预验证、失败自动恢复和回滚 runbook。
 
+- **盘中异常重启导致 Push 风暴**：错误通知和 systemd/watchdog 运维告警新增独立于
+  DuckDB 的持久事故状态（SQLite 索引 + 文件锁降级门）。发送前只占 60 秒租约，至少一个
+  通道成功后才进入 30 分钟冷却；全部通道失败时立即释放，两个状态存储都不可用时 fail
+  closed 并保留本地故障日志。`monitor` / `surge-watch` 的进程异常统一交由 systemd
+  `OnFailure` 告警；monitor 30 分钟最多自动拉起 3 次，watchdog 与 `OnFailure` 共用事故键，
+  服务恢复后关闭事故。Mac monitor 保留分钟采集但显式关闭通知，云端成为 monitor 与系统
+  异常的唯一告警权威。项目版本从 `0.17.2` 更新到 `0.17.3`。
+
 - **退市整理期误报历史状态 P0**：Tushare `namechange.change_reason=退市整理期` 现在归类为
   已知但主动排除的上市状态边界，继续 fail closed，不伪装为普通非 ST，也不参与任何策略或
   涨跌停派生；`security-status-backfill --missing-only` 不再反复下载这些已确认排除的股票日。
@@ -46,6 +54,10 @@
   `runner.temp`，改用该位置允许的 `github.workspace` 作为测试数据目录。
 
 ### Added
+
+- **研究数据云化与 Strategy Lab 重构实施计划**：明确生产库、研究元数据库和分区 Parquet
+  数据湖的职责，给出存量迁移、每日增量、服务迁云、Mac 退役阶段门，以及 Lab 按需路由、
+  统一运行规格、任务中心、结果驾驶舱、实验对比和模拟盘晋级六项迭代顺序。
 
 - **阶段 1 真实数据审计与正式研究门（PR-D）**：preflight 改为按数据契约、权威交易日和
   当前可见分区检查生产/研究水位，区分必需空表、可选空表、午休/开盘宽限及只读副本滞后；

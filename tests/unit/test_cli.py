@@ -2086,6 +2086,24 @@ class TestMainErrorReporting:
                 main()
             mock_notify.assert_not_called()
 
+    def test_monitor_failure_relies_on_systemd_alert_only(self, monkeypatch) -> None:
+        """Long-running monitor must not duplicate its systemd OnFailure alert."""
+        from unittest.mock import patch
+
+        from rquant.cli import main
+
+        def boom(_args):
+            raise RuntimeError("schema mismatch")
+
+        monkeypatch.setattr("rquant.cli.cmd_monitor", boom)
+        with (
+            patch("sys.argv", ["rquant", "monitor"]),
+            patch("rquant.notify.notify") as mock_notify,
+        ):
+            assert main() == 1
+
+        mock_notify.assert_not_called()
+
 
 class TestIngestWithRetry:
     """_ingest_with_retry 的网络异常重试（6/4 真实事故：tushare ReadTimeout）。"""

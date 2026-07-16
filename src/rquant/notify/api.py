@@ -8,6 +8,7 @@ from loguru import logger
 
 from rquant.config import settings
 from rquant.notify.client import PushDeerClient, PushPlusClient
+from rquant.notify.gate import NotificationGate, NotificationLease, error_event_key
 from rquant.notify.log import append as _log_notification
 from rquant.notify.messages import build_message
 
@@ -47,6 +48,27 @@ def notify(scene: Scene, **kwargs) -> None:
         logger.error(f"通知 [{scene}] 消息构造失败: {e}")
         return
 
+    gate: NotificationGate | None = None
+    lease: NotificationLease | None = None
+    if scene == "error":
+        try:
+            gate = NotificationGate(
+                settings.notification_state_path_resolved,
+                busy_timeout_ms=settings.notification_state_busy_timeout_ms,
+            )
+            lease = gate.claim(
+                error_event_key(kwargs["component"], kwargs["exc"]),
+                settings.notify_error_cooldown_seconds,
+            )
+        except Exception as e:
+            logger.error(f"通知 [{scene}] 去重状态完全不可用，已抑制 Push 并保留本地日志: {e}")
+            return
+        else:
+            if lease is None:
+                logger.warning(f"通知 [{scene}] 同类故障仍在冷却期，已抑制: {title}")
+                return
+
+    delivered = False
     pushdeer = PushDeerClient(
         keys=settings.pushdeer_key_list,
         endpoint=settings.pushdeer_endpoint,
@@ -54,6 +76,7 @@ def notify(scene: Scene, **kwargs) -> None:
     try:
         results = pushdeer.push(title, body)
         for key, (success, err) in zip(settings.pushdeer_key_list, results, strict=False):
+            delivered = delivered or success
             _log_notification(scene, "pushdeer", key[:8], success, err, title)
     except Exception as e:
         logger.error(f"通知 [{scene}] PushDeer 推送失败: {e}")
@@ -68,6 +91,16 @@ def notify(scene: Scene, **kwargs) -> None:
     try:
         results = pushplus.push(title, body)
         for token, (success, err) in zip(settings.pushplus_token_list, results, strict=False):
+            delivered = delivered or success
             _log_notification(scene, "pushplus", token[:8], success, err, title)
     except Exception as e:
         logger.error(f"通知 [{scene}] PushPlus 推送失败: {e}")
+
+    if gate is not None and lease is not None:
+        try:
+            if delivered:
+                gate.complete(lease, settings.notify_error_cooldown_seconds)
+            else:
+                gate.release(lease)
+        except Exception as e:
+            logger.error(f"通知 [{scene}] 更新投递去重状态失败: {e}")
