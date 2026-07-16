@@ -5,6 +5,46 @@
 
 ---
 
+## 2026-07-17 · v0.19.0 · 研究数据迁云工具上线
+
+**状态**：PR #90 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.19.0`
+精确指向 `4e713eada6596228f81f455a12fde3cca1111b30`。01:03 在交易保护窗口外由受控发布器从
+`v0.17.3` 快进部署，状态 `deployed`。本次只上线代码与操作手册，**没有上传、发布或切换
+研究数据权威，也没有写生产 DuckDB**。
+
+**部署内容**：
+
+- 一并上线 v0.18.0 的研究湖导出契约：分钟/竞价按交易日导出校验过的不可变 Parquet，独立
+  `research.duckdb` 保存 manifest、覆盖度和替换审计。
+- 新增 `research-migration snapshot/prepare/verify/publish`：从同一个 WAL-free 恢复快照
+  打包分钟、竞价、7 张辅助研究表和 Strategy Lab artifact，保存 PIT 截止、主键、聚合、
+  固定样本与文件/内容哈希证据。
+- 新增 `scripts/migrate-research-to-cloud.sh` 与中文操作手册，支持本地准备、checksum rsync
+  续传、云端重验和 candidate-last 发布。中断恢复会校验 publish state、分区 export lock、
+  inode 和 symlink 边界；生产 `rquant.duckdb` 不进入迁移写路径。
+
+**发布与验收**：
+
+- dry-run 识别前序 SHA `06c4eb0bc3a35a4749212b5b1c1e8960bde8d288`、目标 SHA
+  `4e713ea`，changed files 不含 `deploy/systemd/`、nginx、sudoers 或生产数据修复路径。
+- 发布器只重启部署前 active 的 canvas、dashboard、NL screen、panorama-auth、panorama；
+  monitor 和 surge-watch 保持按日程 `inactive/dead`。五个 UI 服务均为 `active/running`、
+  `Result=success`、`NRestarts=0`，10 个 rQuant timers 均有下一次触发。
+- 最终 preflight 为 `ok=5 warn=0 fail=0 skip=0`：主副本工件延迟 0 分钟，日线最新
+  `2026-07-16`，分钟最新 `2026-07-16 15:00`（87,709 行），竞价最新 `2026-07-16`
+  （11,047 行），无 DuckDB 读写锁；Dashboard 健康端点返回 `ok`，新 CLI help 正常。
+- 本地最终为 1,922 项全量测试和 134 项聚焦测试通过；独立审查未发现剩余 Critical、High、
+  Medium 问题。GitHub Actions Python 3.11/3.12 分别通过。
+
+**后续数据门**：真实迁移属于单独的生产数据写入变更，仍需明确授权后按操作手册执行。完成
+云端逐表/逐分区验收、每日增量验证和至少 10 个交易日观察前，本地研究主库不得删除。
+
+**回滚**：本版本没有 schema 或生产业务数据变更。部署中失败由受控发布器自动回滚；成功后
+如需撤回，必须对 `4e713ea` 创建 revert PR、合并并打新 SemVer tag 后向前发布，禁止在生产
+机向旧 tag 非快进回退或直接覆盖 DuckDB。
+
+---
+
 ## 2026-07-16 · v0.17.3 · 通知事故治理与研究云化计划
 
 **状态**：基础设施 PR #85 先行 squash merge 为
