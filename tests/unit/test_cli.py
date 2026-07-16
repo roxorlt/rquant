@@ -90,6 +90,46 @@ class TestBuildParser:
 
         assert exc.value.code == 2
 
+    def test_research_migration_snapshot_uses_explicit_identity_and_paths(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "research-migration",
+                "snapshot",
+                "--source-database",
+                "/data/rquant.duckdb",
+                "--recovery-dir",
+                "/data/recovery",
+                "--artifact-dir",
+                "/data/strategy_lab_runs",
+                "--snapshot-id",
+                "research-20260716T160000Z-a1b2c3d4",
+                "--code-commit",
+                "a" * 40,
+            ]
+        )
+
+        assert args.command == "research-migration"
+        assert args.migration_command == "snapshot"
+        assert args.source_database == Path("/data/rquant.duckdb")
+        assert args.recovery_dir == Path("/data/recovery")
+        assert args.artifact_dir == Path("/data/strategy_lab_runs")
+        assert args.code_commit == "a" * 40
+
+    def test_research_migration_publish_requires_explicit_apply(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            build_parser().parse_args(
+                [
+                    "research-migration",
+                    "publish",
+                    "--bundle-path",
+                    "/staging/research-20260716T160000Z-a1b2c3d4",
+                    "--target-data-dir",
+                    "/srv/rquant/data",
+                ]
+            )
+
+        assert exc.value.code == 2
+
 
 class TestCLISmoke:
     def test_help_exits_0(self) -> None:
@@ -167,6 +207,70 @@ class TestResearchExport:
         assert observed["code_commit"] == "a" * 40
         connection.close.assert_called_once_with()
         assert capsys.readouterr().out.strip() == '{"status":"planned"}'
+
+
+class TestResearchMigration:
+    def test_verify_command_prints_machine_readable_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import research_migration as migration_module
+
+        result = MagicMock()
+        result.model_dump_json.return_value = '{"status":"verified"}'
+        verify = MagicMock(return_value=result)
+        monkeypatch.setattr(migration_module, "verify_research_migration_bundle", verify)
+        args = build_parser().parse_args(
+            [
+                "research-migration",
+                "verify",
+                "--bundle-path",
+                "/staging/research-20260716T160000Z-a1b2c3d4",
+            ]
+        )
+
+        assert cli.cmd_research_migration(args) == 0
+        verify.assert_called_once_with(
+            Path("/staging/research-20260716T160000Z-a1b2c3d4")
+        )
+        assert capsys.readouterr().out.strip() == '{"status":"verified"}'
+
+    def test_publish_command_delegates_only_with_apply(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import research_migration as migration_module
+
+        result = MagicMock()
+        result.model_dump_json.return_value = '{"status":"published"}'
+        publish = MagicMock(return_value=result)
+        monkeypatch.setattr(migration_module, "publish_research_migration_bundle", publish)
+        args = build_parser().parse_args(
+            [
+                "research-migration",
+                "publish",
+                "--bundle-path",
+                "/staging/research-20260716T160000Z-a1b2c3d4",
+                "--target-data-dir",
+                "/srv/rquant/data",
+                "--apply",
+            ]
+        )
+
+        assert cli.cmd_research_migration(args) == 0
+        publish.assert_called_once_with(
+            Path("/staging/research-20260716T160000Z-a1b2c3d4"),
+            target_data_dir=Path("/srv/rquant/data"),
+        )
+        assert capsys.readouterr().out.strip() == '{"status":"published"}'
 
 
 class TestTradeCalendarBootstrap:

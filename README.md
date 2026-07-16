@@ -26,6 +26,8 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
   猜测停牌。
 - `research-export` 可从只读副本把分钟/竞价数据发布为校验过的交易日 Parquet 分区，并在独立
   `research.duckdb` 保存 manifest、覆盖度和替换审计；支持零落盘 dry-run。
+- `research-migration` 与分阶段迁移脚本可从同一不可变恢复快照打包、校验、断点上传并在云端
+  原子发布研究候选；生产 `rquant.duckdb` 不进入迁移写路径。
 - 云端承担生产调度，本地 Mac 承担研究、分钟数据和热备。
 
 ## 明确边界
@@ -76,9 +78,10 @@ systemd timers                        Strategy Lab / panorama / launchd
 
 DuckDB 是单文件锁。盘中唯一写入者是 monitor；Dashboard、Lab 和临时查询必须读
 `rquant_ro.duckdb` 副本。云端快照下载到 `cloud_backup.duckdb`，禁止整文件覆盖本地主库。
-研究湖导出契约现已落地，存量数据将在下一阶段按上方云化计划迁入独立 `research.duckdb` 与
-交易日分区 Parquet；迁移验收完成前，本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，
-不得删除。可先用以下命令只读估算分区与行数：
+研究湖导出和首次迁移工具已落地，存量数据按恢复快照、迁移包、staging、候选发布四阶段进入
+独立 `research.duckdb` 与交易日分区 Parquet。迁移、每日增量和 10 个交易日观察期全部验收前，
+本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。完整步骤见
+[研究数据首次迁云操作手册](docs/deploy/research-cloud-bootstrap.md)。可先用以下命令只读估算：
 
 ```bash
 rquant research-export --dataset minute_bar \
