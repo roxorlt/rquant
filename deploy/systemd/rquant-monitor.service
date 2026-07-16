@@ -6,6 +6,10 @@ Wants=network-online.target
 # 失败时触发 alert relay 推 PushDeer（v0.10.1+）
 OnFailure=rquant-alert@%n.service
 
+# 30 分钟最多 3 次自动拉起；超限后交给 watchdog 和人工诊断，不允许无限刷屏。
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
 [Service]
 Type=simple
 User=lighthouse
