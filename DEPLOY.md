@@ -5,6 +5,51 @@
 
 ---
 
+## 2026-07-16 · v0.17.3 · 通知事故治理与研究云化计划
+
+**状态**：基础设施 PR #85 先行 squash merge 为
+`03cb96468ef8983f4ea88f17b47704069ea36158`；通知代码与研究/Lab 计划 PR #86 squash merge
+并以 annotated tag `v0.17.3` 精确指向
+`06c4eb0bc3a35a4749212b5b1c1e8960bde8d288`。21:29-21:47 在交易保护窗口外完成两段发布。
+
+**部署内容**：
+
+- systemd monitor 自动重启限制为 30 分钟最多 3 次；Mac monitor LaunchAgent 显式设置
+  `NOTIFY_ENABLED=false`，本地只保留研究分钟采集。
+- 错误与运维告警使用 60 秒 pending 租约，至少一个通道成功后才进入 30 分钟冷却；文件锁
+  状态为跨进程权威，SQLite 保存可查询镜像并作为降级。两种状态存储均不可用时 fail closed，
+  不退回无状态重复发送。
+- monitor/surge-watch 进程异常只交给 systemd `OnFailure`；watchdog 复用事故键，并在服务
+  连续稳定 5 分钟后才关闭事故，避免短暂拉起重新打开 Push 风暴窗口。
+- 新增研究数据云化、服务迁移和 Strategy Lab 六项改造实施计划；本次未迁移或删除研究主库。
+
+**发布与验收**：
+
+- 基础设施先在腾讯云 `/tmp` 通过 `systemd-analyze verify`，安装前后均复验；实际参数为
+  `StartLimitIntervalUSec=30min`、`StartLimitBurst=3`、`RestartUSec=30s`。
+- v0.17.3 dry-run 明确以 `03cb964` 为前序，changed files 不含 `deploy/systemd/` 等受保护
+  路径。实际发布由 transient `rquant-v0173-code-rollout2.service` 托管，结果
+  `success`、`ExecMainStatus=0`；只重启发布前 active 的五个 UI 服务，monitor/surge 保持
+  inactive。
+- 无 Push 的事故门 smoke 通过：claim、complete、冷却抑制、clear 和重新 claim 全部符合
+  预期。发布前本地 160 项聚焦测试通过，GitHub Actions Python 3.11/3.12 全量 CI 通过。
+- 副本同步与备份均 `Result=success`、`ExecMainStatus=0`；只读副本文件年龄归零。最终
+  preflight 为 `ok=5 warn=0 fail=0 skip=0`，分钟最新 `2026-07-16 15:00`、竞价最新
+  `2026-07-16`。
+- 云端 tag、HEAD 和包版本均为 v0.17.3；dashboard/panorama active，monitor/surge
+  inactive，10 个 rQuant timers 均有下一次触发。Mac 主运行时也已快进到相同 SHA，editable
+  包重新绑定主 checkout，版本为 0.17.3。
+
+**运行环境说明**：发布期间 sshd 多次返回 `Exceeded MaxStartups`，属于未认证连接队列限流，
+不是 rQuant 故障。改用 systemd transient oneshot 后发布不再依赖 SSH 会话；未修改 sshd
+配置。
+
+**回滚**：本版本无 schema 和业务数据变更。部署过程中失败由受控发布器自动回滚；成功发布
+后的回退必须对 `06c4eb0` 创建 revert PR、合并为新的 main 提交、打新 SemVer tag 后向前发布。
+受控发布器会拒绝向旧 tag 非快进倒退，禁止在生产机使用 `git reset` 或直接覆盖 DuckDB。
+
+---
+
 ## 2026-07-16 · v0.17.2 · Stage 1 生产数据修复验收
 
 **状态**：PR #82、#83 已依次 squash merge；`v0.17.2` 精确指向
