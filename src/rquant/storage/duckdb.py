@@ -3116,8 +3116,18 @@ def open_readonly_store(
     return store
 
 
-def open_readonly_connection() -> duckdb.DuckDBPyConnection:
-    """裸 duckdb.connect 版本，给 dashboard/app.py 用（它不走 DuckDBStore）。"""
+def open_readonly_connection(
+    *,
+    require_replica: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    """裸 read-only 连接；大批量导出可要求副本并禁止回退主库。"""
+    if require_replica:
+        replica = settings.duckdb_readonly_path_resolved
+        if not replica.is_file():
+            raise FileNotFoundError(f"read-only replica does not exist: {replica}")
+        if replica.resolve() == settings.duckdb_path.resolve():
+            raise ValueError("read-only replica must not resolve to the primary DuckDB")
+        return duckdb.connect(str(replica), read_only=True)
     paths = _readonly_candidate_paths()
     for p in paths[:-1]:
         try:

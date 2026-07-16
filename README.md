@@ -24,7 +24,8 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
   可见性均按决策时点 fail closed，研究快照、覆盖率、质量问题和权威交易日历可追溯。
 - 正式研究由持久化数据审计与覆盖率门禁保护；Tushare 停复牌事实按交易日保存，不再用零成交量
   猜测停牌。
-- DuckDB 保存生产和研究数据，Parquet/JSONL 保存共享快照与任务结果。
+- `research-export` 可从只读副本把分钟/竞价数据发布为校验过的交易日 Parquet 分区，并在独立
+  `research.duckdb` 保存 manifest、覆盖度和替换审计；支持零落盘 dry-run。
 - 云端承担生产调度，本地 Mac 承担研究、分钟数据和热备。
 
 ## 明确边界
@@ -48,7 +49,7 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
-2026-07-16 已部署 `v0.17.2` 并完成 Stage 1 生产数据修复。`stage1-v3` 审计区间
+2026-07-16 已部署 `v0.17.3` 并完成 Stage 1 生产数据修复与重复告警治理。`stage1-v3` 审计区间
 `2026-04-01..2026-07-15` 的 P0 为 0；历史状态覆盖 385,183/385,183，13 个退市整理期
 股票日作为主动安全排除的 P2 证据保留，主库与只读副本一致。正式回测仍受策略级分钟覆盖率
 和不可变计算快照约束；在这些门槛完成前，现有策略不会从 `exploratory` 晋级。
@@ -75,8 +76,14 @@ systemd timers                        Strategy Lab / panorama / launchd
 
 DuckDB 是单文件锁。盘中唯一写入者是 monitor；Dashboard、Lab 和临时查询必须读
 `rquant_ro.duckdb` 副本。云端快照下载到 `cloud_backup.duckdb`，禁止整文件覆盖本地主库。
-研究数据将按上方云化计划迁入独立 `research.duckdb` 与交易日分区 Parquet；迁移验收完成前，
-本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。
+研究湖导出契约现已落地，存量数据将在下一阶段按上方云化计划迁入独立 `research.duckdb` 与
+交易日分区 Parquet；迁移验收完成前，本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，
+不得删除。可先用以下命令只读估算分区与行数：
+
+```bash
+rquant research-export --dataset minute_bar \
+  --start-date 2025-03-28 --end-date 2026-07-16 --dry-run
+```
 
 ## 技术栈
 

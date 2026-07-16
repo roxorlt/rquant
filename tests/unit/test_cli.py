@@ -54,6 +54,42 @@ class TestBuildParser:
         args = parser.parse_args([])
         assert args.command is None
 
+    def test_research_export_requires_typed_dataset_and_dates(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "research-export",
+                "--dataset",
+                "minute_bar",
+                "--start-date",
+                "2026-07-14",
+                "--end-date",
+                "2026-07-15",
+                "--dry-run",
+            ]
+        )
+
+        assert args.command == "research-export"
+        assert args.dataset == "minute_bar"
+        assert args.start_date == date(2026, 7, 14)
+        assert args.end_date == date(2026, 7, 15)
+        assert args.dry_run is True
+
+    def test_research_export_rejects_unsupported_dataset(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            build_parser().parse_args(
+                [
+                    "research-export",
+                    "--dataset",
+                    "daily_bar",
+                    "--start-date",
+                    "2026-07-14",
+                    "--end-date",
+                    "2026-07-15",
+                ]
+            )
+
+        assert exc.value.code == 2
+
 
 class TestCLISmoke:
     def test_help_exits_0(self) -> None:
@@ -71,6 +107,66 @@ class TestCLISmoke:
         )
         assert result.returncode == 0
         assert "--date" in result.stdout
+
+
+class TestResearchExport:
+    def test_command_requires_replica_and_passes_typed_plan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_lake as lake_module
+        from rquant import research_manifest as manifest_module
+        from rquant.storage import duckdb as duckdb_module
+
+        connection = MagicMock()
+        summary = MagicMock()
+        summary.model_dump_json.return_value = '{"status":"planned"}'
+        observed: dict[str, object] = {}
+
+        def open_replica(*, require_replica: bool = False) -> MagicMock:
+            observed["require_replica"] = require_replica
+            return connection
+
+        def export_dataset(source: object, **kwargs: object) -> MagicMock:
+            observed["source"] = source
+            observed.update(kwargs)
+            return summary
+
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(config_module.settings, "research_db_path", None)
+        monkeypatch.setattr(config_module.settings, "research_lake_dir", None)
+        monkeypatch.setattr(duckdb_module, "open_readonly_connection", open_replica)
+        monkeypatch.setattr(lake_module, "export_research_dataset", export_dataset)
+        monkeypatch.setattr(manifest_module, "detect_code_commit", lambda: "a" * 40)
+        args = build_parser().parse_args(
+            [
+                "research-export",
+                "--dataset",
+                "auction_bar",
+                "--start-date",
+                "2026-07-14",
+                "--end-date",
+                "2026-07-15",
+                "--dry-run",
+            ]
+        )
+
+        assert cli.cmd_research_export(args) == 0
+        assert observed["require_replica"] is True
+        assert observed["source"] is connection
+        assert observed["dataset"] == "auction_bar"
+        assert observed["start_date"] == date(2026, 7, 14)
+        assert observed["end_date"] == date(2026, 7, 15)
+        assert observed["dry_run"] is True
+        assert observed["code_commit"] == "a" * 40
+        connection.close.assert_called_once_with()
+        assert capsys.readouterr().out.strip() == '{"status":"planned"}'
 
 
 class TestTradeCalendarBootstrap:

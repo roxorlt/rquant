@@ -77,3 +77,41 @@ class TestSettings:
                 duckdb_readonly_path=readonly_path,
                 backfill_state_path=readonly_path,
             )
+
+    def test_research_paths_default_under_data_dir(self, tmp_path: Path) -> None:
+        configured = Settings(
+            **_settings_values(tmp_path),
+            research_db_path="",
+            research_lake_dir="",
+        )
+
+        assert configured.research_db_path_resolved == tmp_path / "data" / "research.duckdb"
+        assert configured.research_lake_dir_resolved == tmp_path / "data" / "lake"
+        assert configured.research_lake_dir_resolved.is_dir()
+
+    @pytest.mark.parametrize("field", ["research_db_path", "research_lake_dir"])
+    def test_research_paths_must_not_alias_operational_duckdb(
+        self,
+        tmp_path: Path,
+        field: str,
+    ) -> None:
+        duckdb_path = tmp_path / "data" / "rquant.duckdb"
+
+        with pytest.raises(ValidationError, match="research paths must differ"):
+            Settings(
+                **_settings_values(tmp_path),
+                **{field: duckdb_path},
+            )
+
+    def test_readonly_duckdb_must_not_alias_main_by_symlink(self, tmp_path: Path) -> None:
+        main = tmp_path / "data" / "rquant.duckdb"
+        main.parent.mkdir(parents=True)
+        main.touch()
+        replica = tmp_path / "data" / "rquant_ro.duckdb"
+        replica.symlink_to(main)
+
+        with pytest.raises(ValidationError, match="readonly DuckDB path must differ"):
+            Settings(
+                **_settings_values(tmp_path),
+                duckdb_readonly_path=replica,
+            )
