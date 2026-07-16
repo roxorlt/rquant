@@ -32,6 +32,12 @@ _NAMECHANGE_COLUMNS = (
 _STOCK_ST_COLUMNS = ("ts_code", "name", "trade_date", "type", "type_name")
 _ST_PREFIX = re.compile(r"^(?:S\*ST|\*ST|SST|ST)", re.IGNORECASE)
 _RELISTING_REASON_MARKERS = ("重新上市", "恢复上市")
+_DELISTING_REASON_MARKERS = ("退市整理期",)
+INTENTIONAL_STATUS_EXCLUSION_REASONS = (
+    "unsupported_delisting_price_limit",
+    "unsupported_listing_transition",
+    "unsupported_relisting_price_limit",
+)
 # Tushare uses "其他" for most ordinary name intervals, including both IPO
 # names and later renames; unrecognized values still fail closed below.
 _ORDINARY_NAMECHANGE_REASON_MARKERS = (
@@ -170,10 +176,12 @@ class SecurityStatusCoverage(SecurityStatusModel):
     missing_count: int = Field(ge=0)
     unknown_count: int = Field(ge=0)
     conflict_count: int = Field(ge=0)
+    excluded_count: int = Field(default=0, ge=0)
     invalid_count: int = Field(ge=0)
     missing_samples: tuple[DailySecurityKey, ...] = ()
     unknown_samples: tuple[DailySecurityKey, ...] = ()
     conflict_samples: tuple[DailySecurityKey, ...] = ()
+    excluded_samples: tuple[DailySecurityKey, ...] = ()
     invalid_samples: tuple[DailySecurityKey, ...] = ()
 
     @model_validator(mode="after")
@@ -184,6 +192,8 @@ class SecurityStatusCoverage(SecurityStatusModel):
             raise ValueError("unknown_count cannot exceed persisted_count")
         if self.conflict_count > self.unknown_count:
             raise ValueError("conflict_count cannot exceed unknown_count")
+        if self.unknown_count + self.excluded_count > self.persisted_count:
+            raise ValueError("unknown_count + excluded_count cannot exceed persisted_count")
         if self.invalid_count > self.persisted_count:
             raise ValueError("invalid_count cannot exceed persisted_count")
         return self
@@ -435,6 +445,8 @@ def _namechange_boundary_conflict(
         return "unknown_namechange_boundary"
     if any(marker in reason for marker in _RELISTING_REASON_MARKERS):
         return "unsupported_relisting_price_limit"
+    if any(marker in reason for marker in _DELISTING_REASON_MARKERS):
+        return "unsupported_delisting_price_limit"
     if "上市" in reason and reason != "上市":
         return "unsupported_listing_transition"
     if reason == "上市" or any(

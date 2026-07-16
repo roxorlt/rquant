@@ -30,6 +30,7 @@ from rquant.data_metadata import (
 )
 from rquant.price_adjustment import resolve_price_factor_basis
 from rquant.security_status import (
+    INTENTIONAL_STATUS_EXCLUSION_REASONS,
     DailySecurityKey,
     SecurityStatusConcurrentWriteError,
     SecurityStatusCoverage,
@@ -75,6 +76,21 @@ _INVALID_STOCK_STATUS_PREDICATE = """
     )
 )
 """
+
+_INTENTIONAL_STATUS_EXCLUSION_SQL = ", ".join(
+    f"'{reason}'" for reason in INTENTIONAL_STATUS_EXCLUSION_REASONS
+)
+_INTENTIONAL_STATUS_EXCLUSION_PREDICATE = (
+    f"status.conflict_reason IN ({_INTENTIONAL_STATUS_EXCLUSION_SQL})"
+)
+_ACTIONABLE_UNKNOWN_STATUS_PREDICATE = (
+    "status.is_st IS NULL AND NOT coalesce("
+    f"{_INTENTIONAL_STATUS_EXCLUSION_PREDICATE}, FALSE)"
+)
+_ACTIONABLE_CONFLICT_STATUS_PREDICATE = (
+    "status.conflict_reason IS NOT NULL AND NOT coalesce("
+    f"{_INTENTIONAL_STATUS_EXCLUSION_PREDICATE}, FALSE)"
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 _SECURITY_STATUS_ROWS_ADAPTER = TypeAdapter(list[SecurityStatusDaily])
@@ -437,7 +453,7 @@ class DuckDBStore:
               {code_predicate}
               AND (
                   status.ts_code IS NULL
-                  OR status.is_st IS NULL
+                  OR ({_ACTIONABLE_UNKNOWN_STATUS_PREDICATE})
                   OR {_INVALID_STOCK_STATUS_PREDICATE}
               )
             ORDER BY daily.trade_date
@@ -466,7 +482,7 @@ class DuckDBStore:
                 INNER JOIN daily_bar AS daily USING (ts_code, trade_date)
                 LEFT JOIN stock_status_daily AS status USING (ts_code, trade_date)
                 WHERE status.ts_code IS NULL
-                   OR status.is_st IS NULL
+                   OR ({_ACTIONABLE_UNKNOWN_STATUS_PREDICATE})
                    OR {_INVALID_STOCK_STATUS_PREDICATE}
                 ORDER BY daily.ts_code, daily.trade_date
                 """
@@ -721,13 +737,19 @@ class DuckDBStore:
         unknown_count, unknown_samples = self._stock_status_category_summary(
             start,
             end,
-            predicate="status.is_st IS NULL",
+            predicate=_ACTIONABLE_UNKNOWN_STATUS_PREDICATE,
             sample_limit=sample_limit,
         )
         conflict_count, conflict_samples = self._stock_status_category_summary(
             start,
             end,
-            predicate="status.conflict_reason IS NOT NULL",
+            predicate=_ACTIONABLE_CONFLICT_STATUS_PREDICATE,
+            sample_limit=sample_limit,
+        )
+        excluded_count, excluded_samples = self._stock_status_category_summary(
+            start,
+            end,
+            predicate=_INTENTIONAL_STATUS_EXCLUSION_PREDICATE,
             sample_limit=sample_limit,
         )
         invalid_count, invalid_samples = self._stock_status_category_summary(
@@ -744,10 +766,12 @@ class DuckDBStore:
             missing_count=missing_count,
             unknown_count=unknown_count,
             conflict_count=conflict_count,
+            excluded_count=excluded_count,
             invalid_count=invalid_count,
             missing_samples=missing_samples,
             unknown_samples=unknown_samples,
             conflict_samples=conflict_samples,
+            excluded_samples=excluded_samples,
             invalid_samples=invalid_samples,
         )
 
@@ -760,8 +784,9 @@ class DuckDBStore:
         sample_limit: int,
     ) -> tuple[int, tuple[DailySecurityKey, ...]]:
         allowed_predicates = {
-            "status.is_st IS NULL",
-            "status.conflict_reason IS NOT NULL",
+            _ACTIONABLE_UNKNOWN_STATUS_PREDICATE,
+            _ACTIONABLE_CONFLICT_STATUS_PREDICATE,
+            _INTENTIONAL_STATUS_EXCLUSION_PREDICATE,
             _INVALID_STOCK_STATUS_PREDICATE,
         }
         if predicate not in allowed_predicates:
