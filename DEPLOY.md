@@ -5,6 +5,48 @@
 
 ---
 
+## 2026-07-16 · v0.17.2 · Stage 1 生产数据修复验收
+
+**状态**：PR #82、#83 已依次 squash merge；`v0.17.2` 精确指向
+`aa3d4e378d2867303681a7a553bba752f6744a07`。16:12-16:17 在交易保护窗口外通过受控发布器
+部署，Stage 1 生产数据 P0 已清零，调度已恢复。
+
+**部署与修复内容**：
+
+- 上线 v0.17.1 的历史状态对账、PIT 竞价修复和备份/副本原子发布加固，再以 v0.17.2
+  识别 Tushare `namechange.change_reason=退市整理期`。
+- 13 个退市整理期股票日继续 fail closed，不伪装为普通非 ST，也不进入策略；审计从真正的
+  unknown/conflict 中分离，作为 `stock-status-intentional-exclusion` P2 证据保留。
+- Stage 1 审计规则升级为 `stage1-v3`；真正缺失、未知、冲突和非法状态仍保持 P0。
+
+**生产验收**：
+
+- `data-audit`：区间 `2026-04-01..2026-07-15`，审计 ID
+  `62485722f2daa4591189f88ac3d65db327ae9cef4d437f638ea9ce19cee55782`，
+  `finding_count=4`、`p0_count=0`、状态 `completed`。
+- `stock_status_daily`：资格分母与持久化均为 385,183，missing/unknown/conflict/invalid 均为 0，
+  主动安全排除 13；schema migration 保持 v9。
+- 主库与 `rquant_ro.duckdb` 摘要完全一致：日线最新 `2026-07-15`、1,628,806 行；
+  状态覆盖、审计凭证、13 条排除和 migration 版本均一致。
+- preflight 为 `ok=5 warn=0 fail=0 skip=0`；分钟最新 `2026-07-16 15:00`，竞价最新
+  `2026-07-16`，停复牌覆盖最新 `2026-07-15`。dashboard、NL screen 等长驻服务完成重启，
+  daily/monitor/surge-watch 按日程保持 inactive，全部 rQuant timers 已恢复下一次触发。
+- 修复前恢复点：
+  `/home/lighthouse/rquant/backup/v0.17.2-pre-apply-20260716T081302Z.duckdb.gz`；
+  修复后恢复点：
+  `/home/lighthouse/rquant/backup/v0.17.2-post-repair-20260716T081750Z.duckdb.gz`。
+
+**剩余研究门**：生产数据 P0 清零不等于策略可晋级。全市场历史分钟缺口、策略 manifest 的
+B/S 与基准覆盖率、不可变计算快照仍需完成；N 字、集合竞价和科创/创业放量继续保持
+`exploratory`。
+
+**回滚**：代码回滚使用
+`bash scripts/deploy-production.sh --target v0.17.1`。v0.17.2 未新增 schema，13 条安全排除可
+保留；只有确认必须回滚数据时，才在停止全部写服务后使用上述 pre-apply 恢复点，禁止运行期间
+直接覆盖 DuckDB。
+
+---
+
 ## 2026-07-15 · v0.15.0 · 阶段 1 PR-B PIT 质量守卫
 
 **状态**：PR #78 已 squash merge 为
