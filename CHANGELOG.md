@@ -6,6 +6,10 @@
 
 ### Fixed
 
+- **monitor 异常重启基础设施熔断**：systemd 在 30 分钟内最多自动拉起 monitor 3 次，
+  超限后交由 watchdog 和人工诊断；Mac monitor LaunchAgent 显式关闭通知，只保留研究分钟采集。
+  基础设施独立于 v0.17.3 代码 tag 发布，并提供预验证、失败自动恢复和回滚 runbook。
+
 - **退市整理期误报历史状态 P0**：Tushare `namechange.change_reason=退市整理期` 现在归类为
   已知但主动排除的上市状态边界，继续 fail closed，不伪装为普通非 ST，也不参与任何策略或
   涨跌停派生；`security-status-backfill --missing-only` 不再反复下载这些已确认排除的股票日。
