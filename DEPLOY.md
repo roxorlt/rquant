@@ -30,8 +30,8 @@ systemd timer，也没有写生产 DuckDB 或研究 lake。
 
 **启用前门槛**：部署目录存在长期未跟踪的 `backup/`，导致提交探测器在包含未跟踪文件时
 返回 `dc48656-dirty`；tracked worktree 实际干净，tag 与 HEAD 准确。dry-run 允许该标记，
-正式采集会 fail closed。启用研究日增量前必须先把运行时备份目录排除出 Git 状态或由受控
-部署注入精确 `RQUANT_CODE_COMMIT`，并完成独立基础设施授权与发布。
+正式采集会 fail closed。该目录误判由后续 `v0.20.2` 修复；研究日增量仍须完成独立基础设施
+授权与发布后才能启用。
 
 **回滚**：本版本没有 schema 或数据写入。部署失败由受控发布器自动回滚；成功后的撤回必须
 对 `dc48656` 创建 revert PR、合并并打新 SemVer tag 后向前发布，禁止生产机非快进退回旧 tag。
