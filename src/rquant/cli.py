@@ -410,21 +410,40 @@ def cmd_research_export(args: argparse.Namespace) -> int:
 def cmd_research_ingest(args: argparse.Namespace) -> int:
     """Seal one cloud research day and publish a fail-closed observation."""
     from rquant.config import settings
-    from rquant.research_ingest import ResearchIngestPaths, run_daily_research_ingest
+    from rquant.research_ingest import (
+        ResearchIngestPaths,
+        ResearchIngestSkipResult,
+        research_trade_date_is_open,
+        run_daily_research_ingest,
+    )
     from rquant.research_manifest import detect_code_commit
 
+    if args.recover and args.date is None:
+        raise ValueError("research-ingest --recover requires --date")
+    if args.scheduled and args.date is None:
+        raise ValueError("research-ingest --scheduled requires --date")
+    if args.recover and args.scheduled:
+        raise ValueError("research-ingest --recover and --scheduled are mutually exclusive")
     if not args.dry_run and not settings.research_cloud_ingest_enabled:
         logger.error(
             "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
         )
         return 3
+    trade_date = args.date or datetime.now(_SHANGHAI).date()
+    source_database = settings.duckdb_readonly_path_resolved
+    if (args.date is None or args.scheduled) and not research_trade_date_is_open(
+        source_database,
+        trade_date,
+    ):
+        print(ResearchIngestSkipResult(trade_date=trade_date).model_dump_json())
+        return 0
     adapter = None
     if not args.dry_run:
         from rquant.adapter.tushare import TushareAdapter
 
         adapter = TushareAdapter()
     result = run_daily_research_ingest(
-        source_database=settings.duckdb_readonly_path_resolved,
+        source_database=source_database,
         paths=ResearchIngestPaths(
             state_dir=settings.data_dir,
             catalog_path=settings.research_db_path_resolved,
@@ -432,13 +451,28 @@ def cmd_research_ingest(args: argparse.Namespace) -> int:
             lake_root=settings.research_lake_dir_resolved,
             staging_root=settings.research_staging_dir_resolved,
         ),
-        trade_date=args.date,
+        trade_date=trade_date,
         adapter=adapter,
         code_commit=detect_code_commit() or "unknown",
         dry_run=args.dry_run,
+        recovery=args.recover,
     )
     print(result.model_dump_json(indent=2))
     return 2 if result.status == "degraded" else 0
+
+
+def cmd_research_ingest_readiness(args: argparse.Namespace) -> int:
+    """Check that the refreshed operational replica is ready for research ingest."""
+    from rquant.config import settings
+    from rquant.research_ingest import assess_research_ingest_readiness
+
+    trade_date = args.date or datetime.now(_SHANGHAI).date()
+    result = assess_research_ingest_readiness(
+        settings.duckdb_readonly_path_resolved,
+        trade_date,
+    )
+    print(result.model_dump_json(indent=2))
+    return 1 if result.status == "not_ready" else 0
 
 
 def cmd_research_authority_status(args: argparse.Namespace) -> int:
@@ -2212,13 +2246,34 @@ def build_parser() -> argparse.ArgumentParser:
     research_ingest_p.add_argument(
         "--date",
         type=_parse_iso_date,
-        default=date.today(),
+        default=None,
         help="目标交易日 YYYY-MM-DD（默认今天）",
     )
     research_ingest_p.add_argument(
         "--dry-run",
         action="store_true",
         help="只检查本地副本已有数据，不请求接口或发布研究目录",
+    )
+    research_ingest_p.add_argument(
+        "--recover",
+        action="store_true",
+        help="按交易日顺序使用 stk_mins 恢复遗漏的历史分区（必须同时传 --date）",
+    )
+    research_ingest_p.add_argument(
+        "--scheduled",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+
+    research_readiness_p = sub.add_parser(
+        "research-ingest-readiness",
+        help="检查日线副本是否已具备研究日增量所需的当日完整数据",
+    )
+    research_readiness_p.add_argument(
+        "--date",
+        type=_parse_iso_date,
+        default=None,
+        help="目标交易日 YYYY-MM-DD（默认上海时区今天）",
     )
 
     research_status_p = sub.add_parser(
@@ -3211,6 +3266,7 @@ def main() -> int:
         "research-sync": cmd_research_sync,
         "research-export": cmd_research_export,
         "research-ingest": cmd_research_ingest,
+        "research-ingest-readiness": cmd_research_ingest_readiness,
         "research-authority-status": cmd_research_authority_status,
         "research-migration": cmd_research_migration,
         "trade-calendar-bootstrap": cmd_trade_calendar_bootstrap,
