@@ -491,7 +491,7 @@ def ingest_daily(
             )
             writer._conn.execute(
                 "DELETE FROM daily_indicator "
-                "WHERE trade_date = ? AND ts_code = ANY(?)",
+                "WHERE trade_date >= ? AND ts_code = ANY(?)",
                 [target_date, codes],
             )
             indicator_rows = writer.upsert_indicators(target_indicators)

@@ -694,6 +694,47 @@ def test_ingest_indicator_failure_rolls_back_entire_daily_transaction(
         ) == []
 
 
+def test_ingest_invalidates_future_indicators_for_affected_codes_only(
+    db_path: Path,
+) -> None:
+    sentinel_rows = pd.DataFrame(
+        [
+            {
+                "ts_code": ts_code,
+                "trade_date": date(2024, 1, 3),
+                "ma5": 999.0,
+                "ma10": 999.0,
+                "ma20": 999.0,
+                "ma60": 999.0,
+                "rsi6": 999.0,
+                "rsi14": 999.0,
+                "macd": 999.0,
+                "macd_signal": 999.0,
+                "macd_hist": 999.0,
+                "kdj_k": 999.0,
+                "kdj_d": 999.0,
+                "kdj_j": 999.0,
+            }
+            for ts_code in ("600000.SH", "000001.SZ")
+        ]
+    )
+    with DuckDBStore(db_path) as store:
+        store.upsert_indicators(sentinel_rows)
+
+    _run_ingest(db_path, _StatusAdapter(db_path))
+
+    with DuckDBStore(db_path, read_only=True) as store:
+        future_rows = store._conn.execute(
+            """
+            SELECT ts_code, ma5
+            FROM daily_indicator
+            WHERE trade_date = DATE '2024-01-03'
+            ORDER BY ts_code
+            """
+        ).fetchall()
+    assert future_rows == [("000001.SZ", 999.0)]
+
+
 def test_ingest_older_date_recomputes_existing_future_state_tail(
     db_path: Path,
 ) -> None:
