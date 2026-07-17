@@ -83,13 +83,31 @@ class TestSettings:
             **_settings_values(tmp_path),
             research_db_path="",
             research_lake_dir="",
+            research_readonly_db_path="",
+            research_staging_dir="",
         )
 
         assert configured.research_db_path_resolved == tmp_path / "data" / "research.duckdb"
+        assert configured.research_readonly_db_path_resolved == (
+            tmp_path / "data" / "research_ro.duckdb"
+        )
         assert configured.research_lake_dir_resolved == tmp_path / "data" / "lake"
+        assert configured.research_staging_dir_resolved == (
+            tmp_path / "data" / "research_staging"
+        )
         assert configured.research_lake_dir_resolved.is_dir()
+        assert configured.research_staging_dir_resolved.is_dir()
+        assert configured.research_cloud_ingest_enabled is False
 
-    @pytest.mark.parametrize("field", ["research_db_path", "research_lake_dir"])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "research_db_path",
+            "research_readonly_db_path",
+            "research_lake_dir",
+            "research_staging_dir",
+        ],
+    )
     def test_research_paths_must_not_alias_operational_duckdb(
         self,
         tmp_path: Path,
@@ -101,6 +119,18 @@ class TestSettings:
             Settings(
                 **_settings_values(tmp_path),
                 **{field: duckdb_path},
+            )
+
+    def test_research_readonly_catalog_must_not_alias_writable_catalog(
+        self, tmp_path: Path
+    ) -> None:
+        catalog = tmp_path / "data" / "research.duckdb"
+
+        with pytest.raises(ValidationError, match="research paths must differ"):
+            Settings(
+                **_settings_values(tmp_path),
+                research_db_path=catalog,
+                research_readonly_db_path=catalog,
             )
 
     def test_readonly_duckdb_must_not_alias_main_by_symlink(self, tmp_path: Path) -> None:

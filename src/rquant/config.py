@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     backfill_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
     parquet_dir: Path
     research_db_path: Path | None = None
+    research_readonly_db_path: Path | None = None
     research_lake_dir: Path | None = None
+    research_staging_dir: Path | None = None
+    research_cloud_ingest_enabled: bool = False
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_dir: Path
@@ -130,7 +133,13 @@ class Settings(BaseSettings):
     def normalize_empty_backfill_state_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("research_db_path", "research_lake_dir", mode="before")
+    @field_validator(
+        "research_db_path",
+        "research_readonly_db_path",
+        "research_lake_dir",
+        "research_staging_dir",
+        mode="before",
+    )
     @classmethod
     def normalize_empty_research_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
@@ -157,13 +166,23 @@ class Settings(BaseSettings):
             raise ValueError(
                 "backfill state path must differ from DuckDB main and readonly paths"
             )
-        research_db = (self.research_db_path or self.data_dir / "research.duckdb").resolve()
-        research_lake = (self.research_lake_dir or self.data_dir / "lake").resolve()
-        if research_db in operational_paths or research_lake in operational_paths:
+        research_paths = {
+            (self.research_db_path or self.data_dir / "research.duckdb").resolve(),
+            (
+                self.research_readonly_db_path
+                or self.data_dir / "research_ro.duckdb"
+            ).resolve(),
+            (self.research_lake_dir or self.data_dir / "lake").resolve(),
+            (
+                self.research_staging_dir
+                or self.data_dir / "research_staging"
+            ).resolve(),
+        }
+        if research_paths & operational_paths:
             raise ValueError(
                 "research paths must differ from DuckDB main and readonly paths"
             )
-        if research_db == research_lake:
+        if len(research_paths) != 4:
             raise ValueError("research paths must differ from each other")
         return self
 
@@ -189,9 +208,23 @@ class Settings(BaseSettings):
         return path
 
     @property
+    def research_readonly_db_path_resolved(self) -> Path:
+        """Read-only research catalog atomically refreshed after daily sealing."""
+        path = self.research_readonly_db_path or self.data_dir / "research_ro.duckdb"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
     def research_lake_dir_resolved(self) -> Path:
         """Partitioned Parquet root for immutable-at-publish research data."""
         path = self.research_lake_dir or self.data_dir / "lake"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def research_staging_dir_resolved(self) -> Path:
+        """Daily monitor evidence used to validate the expected minute universe."""
+        path = self.research_staging_dir or self.data_dir / "research_staging"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

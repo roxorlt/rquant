@@ -55,6 +55,22 @@
 
 ### Added
 
+- **云端研究数据每日增量候选链路**：新增 `research-ingest`，在不写生产 DuckDB 的前提下，
+  日终用 `rt_min_daily` 补齐 monitor 盘前固化清单、独立拉取全市场集合竞价，并将分钟/竞价
+  同日分区写入隔离 lake/catalog 代际；两张数据集全部导出和审计通过后才进入带持久 journal
+  的可回滚发布事务，任一步失败即时恢复，进程硬中断则在下次运行前自动回滚。盘前清单首次
+  写入后不可变且绑定代码提交，分钟要求清单内每只完整覆盖 09:30-11:30、13:01-15:00
+  共 241 个分钟格，竞价要求覆盖当日 `daily_bar` 股票日的 98%；缺清单、分母或覆盖不足只发布
+  `degraded` 观察证据，不可成为权威。`research-authority-status` 可只读核验 bootstrap 血缘、
+  主副 catalog、Parquet/manifest 绑定、连续 observation 哈希链和 10 日晋级门；修改 current
+  或任一历史证据都会 fail closed，晋级时会对全 catalog 做一次物理文件哈希扫描。竞价分母
+  同时受近日 `daily_bar` 全市场覆盖与观测集合反向覆盖保护，避免部分日线把胜率虚高。正式
+  存量迁移与日增量共用发布锁；权威候选建立后，旧 `research-export` 仅允许 dry-run。
+  回滚在写入前一次性校验写前、写后哈希、全部备份、不可变版本和 observation，不覆盖
+  第三方代际；新建事务与证据目录逐级 fsync。研究
+  catalog/lake/staging 自定义路径已贯通 CLI。生产开关
+  默认关闭，systemd 调度另走独立基础设施发布。项目版本从 `0.19.0` 更新到 `0.20.0`。
+
 - **存量研究数据可恢复迁云**：新增 `research-migration snapshot/prepare/verify/publish` 和
   `scripts/migrate-research-to-cloud.sh`。迁移从同一个 WAL-free 只读恢复快照导出分钟、竞价、
   7 张辅助研究表和完整 Strategy Lab artifact；逐分区保存行数、日期、主键、金额/成交量、

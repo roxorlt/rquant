@@ -1,7 +1,7 @@
 ---
 title: rQuant - 个人版 A 股量化选股与监控平台
 created_at: 2026-04-15
-updated_at: 2026-07-16
+updated_at: 2026-07-17
 status: active
 owner: roxor
 tags: [quant, a-shares, personal-tool, python, macOS]
@@ -28,7 +28,10 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
   `research.duckdb` 保存 manifest、覆盖度和替换审计；支持零落盘 dry-run。
 - `research-migration` 与分阶段迁移脚本可从同一不可变恢复快照打包、校验、断点上传并在云端
   原子发布研究候选；生产 `rquant.duckdb` 不进入迁移写路径。
-- 云端承担生产调度，本地 Mac 承担研究、分钟数据和热备。
+- `research-ingest` 可在日终补齐不可变 monitor 清单分钟、拉取集合竞价，并通过可自动回滚的
+  发布 journal 一致切换 Parquet manifest、研究主/只读目录和观察证据；开关默认关闭，须经
+  独立调度发布后才运行。
+- 云端承担生产调度和研究候选存储；Mac 主库在 10 个交易日观察完成前继续保留为恢复依据。
 
 ## 明确边界
 
@@ -78,14 +81,20 @@ systemd timers                        Strategy Lab / panorama / launchd
 
 DuckDB 是单文件锁。盘中唯一写入者是 monitor；Dashboard、Lab 和临时查询必须读
 `rquant_ro.duckdb` 副本。云端快照下载到 `cloud_backup.duckdb`，禁止整文件覆盖本地主库。
-研究湖导出和首次迁移工具已落地，存量数据按恢复快照、迁移包、staging、候选发布四阶段进入
-独立 `research.duckdb` 与交易日分区 Parquet。迁移、每日增量和 10 个交易日观察期全部验收前，
-本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。完整步骤见
+研究湖导出和首次迁移已落地，存量数据按恢复快照、迁移包、staging、候选发布四阶段进入
+独立 `research.duckdb` 与交易日分区 Parquet。每日增量代码使用隔离代际和持久 journal 完成
+分钟、竞价双数据集可恢复发布，`research-authority-status` 同时验证 catalog、manifest、文件
+哈希与连续 observation 证据链。每日调度和 10 个交易日观察
+期全部验收前，本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。完整步骤见
 [研究数据首次迁云操作手册](docs/deploy/research-cloud-bootstrap.md)。可先用以下命令只读估算：
 
 ```bash
 rquant research-export --dataset minute_bar \
   --start-date 2025-03-28 --end-date 2026-07-16 --dry-run
+
+# 日终只读预演与候选状态核验
+rquant research-ingest --date 2026-07-17 --dry-run
+rquant research-authority-status
 ```
 
 ## 技术栈

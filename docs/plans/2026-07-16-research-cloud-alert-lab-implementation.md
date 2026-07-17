@@ -152,6 +152,12 @@ pending 租约，成功后才进入 1800 秒冷却；全部通道失败时释放
 
 ## 6. Task 4: 每日增量与服务迁云
 
+> 2026-07-17 进度：应用层已实现不可变 monitor 盘前清单证据、日终 `rt_min_daily`/竞价补齐、
+> 分钟 241 格与竞价 98% 覆盖门、带 journal 自动回滚的 lake/catalog 双数据集事务发布、
+> 全局 publisher 锁与回滚 CAS、`research_ro` 刷新和可验证 observation/Parquet 哈希链的
+> 10 日观察入口；晋级时全量复核 bootstrap catalog。生产开关默认为关闭；systemd 18:10 调度、
+> 首次启用和连续 5/10 个交易日观察仍是独立基础设施/运营阶段门，Mac 采集尚未卸载。
+
 **Files:**
 - Create: `src/rquant/research_ingest.py`
 - Create: `deploy/systemd/rquant-research-ingest.service`
@@ -170,7 +176,8 @@ pending 租约，成功后才进入 1800 秒冷却；全部通道失败时释放
 
 **Step 4:** 09:26 后采集集合竞价，记录 source 与 available_at；09:30 分钟 fallback 单独分区。
 
-**Step 5:** systemd timer 在 15:15 后做补齐、校验、封分区和 research_ro 原子刷新。
+**Step 5:** systemd timer 在 18:10（等待 17:00 daily 与最新副本）做补齐、校验、封分区和
+research_ro 原子刷新；15:15 仅作为手工历史补跑的最早安全门。
 
 **Step 6:** 连续 5 个交易日比较 Mac/云端资格股票日、分钟覆盖率和竞价覆盖率。
 

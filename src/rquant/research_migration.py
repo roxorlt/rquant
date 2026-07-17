@@ -1568,7 +1568,10 @@ def publish_research_migration_bundle(
         if protected_path.is_symlink():
             raise RuntimeError(f"research publish path must not be a symlink: {protected_path}")
 
-    with exclusive_file_lock(target_data_dir / ".research-migration.lock"):
+    with (
+        exclusive_file_lock(target_data_dir / "research-publish.lock"),
+        exclusive_file_lock(target_data_dir / ".research-migration.lock"),
+    ):
         if candidate_path.exists():
             if not candidate_path.is_file():
                 raise RuntimeError("research authority candidate must be a regular file")
