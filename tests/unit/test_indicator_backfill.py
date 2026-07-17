@@ -452,6 +452,100 @@ def test_apply_rejects_source_change_between_snapshot_and_writer(
     assert row == (999.0,)
 
 
+def test_apply_rejects_incomplete_a_share_coverage_before_writer(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "indicator-incomplete-coverage.duckdb"
+    with DuckDBStore(db_path) as seed:
+        trade_dates = _seed_many_codes(
+            seed,
+            ["600000.SH", "000001.SZ"],
+            periods=65,
+        )
+        seed._conn.execute(
+            """
+            DELETE FROM adj_factor
+            WHERE ts_code = '000001.SZ'
+              AND trade_date = ?
+            """,
+            [trade_dates[-2]],
+        )
+        seed.upsert_daily(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "200001.SZ",
+                        "trade_date": trade_date,
+                        "open": 9.8,
+                        "high": 10.5,
+                        "low": 9.5,
+                        "close": 10.0,
+                        "pre_close": 10.0,
+                        "change": 0.0,
+                        "pct_chg": 0.0,
+                        "vol": 1000.0,
+                        "amount": 10000.0,
+                    }
+                    for trade_date in trade_dates[-2:]
+                ]
+            )
+        )
+        seed.upsert_indicators(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": trade_dates[-1],
+                        "ma5": 999.0,
+                        "ma10": 999.0,
+                        "ma20": 999.0,
+                        "ma60": 999.0,
+                        "rsi6": 999.0,
+                        "rsi14": 999.0,
+                        "macd": 999.0,
+                        "macd_signal": 999.0,
+                        "macd_hist": 999.0,
+                        "kdj_k": 999.0,
+                        "kdj_d": 999.0,
+                        "kdj_j": 999.0,
+                    }
+                ]
+            )
+        )
+
+    writer_opened = False
+
+    def writer_factory() -> DuckDBStore:
+        nonlocal writer_opened
+        writer_opened = True
+        return DuckDBStore(db_path)
+
+    with pytest.raises(
+        backfill_module.DailyIndicatorBackfillCoverageError,
+        match=r"coverage 50\.00% is below 99\.00%.*2/4",
+    ):
+        backfill_module.run_daily_indicator_backfill(
+            reader_factory=lambda: DuckDBStore(db_path, read_only=True),
+            writer_factory=writer_factory,
+            start_date=trade_dates[-2],
+            end_date=trade_dates[-1],
+            apply=True,
+            now=datetime(2024, 3, 30, 10, 0, tzinfo=SHANGHAI),
+        )
+
+    assert writer_opened is False
+    with DuckDBStore(db_path, read_only=True) as verify:
+        row = verify._conn.execute(
+            """
+            SELECT ma5
+            FROM daily_indicator
+            WHERE ts_code = '600000.SH' AND trade_date = ?
+            """,
+            [trade_dates[-1]],
+        ).fetchone()
+    assert row == (999.0,)
+
+
 @pytest.mark.parametrize(
     "now",
     [

@@ -25,6 +25,21 @@ _PROTECTED_START = dtime(9, 15)
 _PROTECTED_END = dtime(15, 10)
 _WRITE_MARGIN = timedelta(seconds=60)
 _DEFAULT_CODE_BATCH_SIZE = 300
+_MIN_OUTPUT_COVERAGE = 0.99
+_A_SHARE_TS_CODE_PATTERNS = (
+    "000%.SZ",
+    "001%.SZ",
+    "002%.SZ",
+    "003%.SZ",
+    "300%.SZ",
+    "301%.SZ",
+    "600%.SH",
+    "601%.SH",
+    "603%.SH",
+    "605%.SH",
+    "688%.SH",
+    "689%.SH",
+)
 _INDICATOR_COLUMNS = [
     "ts_code",
     "trade_date",
@@ -73,6 +88,10 @@ class DailyIndicatorBackfillProtectedWindowError(RuntimeError):
 
 
 class DailyIndicatorBackfillSourceChangedError(RuntimeError):
+    pass
+
+
+class DailyIndicatorBackfillCoverageError(RuntimeError):
     pass
 
 
@@ -150,6 +169,17 @@ def _normalize_codes(ts_codes: Sequence[str]) -> list[str]:
     return sorted({str(ts_code) for ts_code in ts_codes})
 
 
+def _a_share_code_predicate(column: str) -> str:
+    return (
+        "("
+        + " OR ".join(
+            f"{column} LIKE '{pattern}'"
+            for pattern in _A_SHARE_TS_CODE_PATTERNS
+        )
+        + ")"
+    )
+
+
 def _list_indicator_codes(
     store: DuckDBStore,
     *,
@@ -158,11 +188,13 @@ def _list_indicator_codes(
 ) -> list[str]:
     if ts_codes is not None:
         return _normalize_codes(ts_codes)
+    a_share = _a_share_code_predicate("ts_code")
     rows = store._conn.execute(
-        """
+        f"""
         SELECT DISTINCT ts_code
         FROM daily_bar
         WHERE trade_date <= ?
+          AND {a_share}
         ORDER BY ts_code
         """,
         [end_date],
@@ -415,17 +447,35 @@ def _scope_counts(
     start_date: date,
     end_date: date,
 ) -> tuple[int, int]:
+    a_share = _a_share_code_predicate("ts_code")
     row = store._conn.execute(
-        """
+        f"""
         SELECT count(DISTINCT ts_code), count(*)
         FROM daily_bar
         WHERE trade_date BETWEEN ? AND ?
+          AND {a_share}
         """,
         [start_date, end_date],
     ).fetchone()
     if row is None:
         return 0, 0
     return int(row[0]), int(row[1])
+
+
+def _require_prepared_coverage(
+    *,
+    estimated_rows: int,
+    actual_rows: int,
+) -> None:
+    if estimated_rows == 0:
+        return
+    coverage = actual_rows / estimated_rows
+    if coverage < _MIN_OUTPUT_COVERAGE:
+        raise DailyIndicatorBackfillCoverageError(
+            f"daily_indicator coverage {coverage:.2%} is below "
+            f"{_MIN_OUTPUT_COVERAGE:.2%} "
+            f"({actual_rows}/{estimated_rows} rows)"
+        )
 
 
 def _indicator_source_fingerprint(
@@ -553,7 +603,7 @@ def prepare_daily_indicator_backfill(
         if transaction_open:
             reader._conn.execute("ROLLBACK")
         raise
-    return PreparedDailyIndicatorBackfill(
+    plan = PreparedDailyIndicatorBackfill(
         start_date=start_date,
         end_date=end_date,
         code_count=code_count,
@@ -561,6 +611,11 @@ def prepare_daily_indicator_backfill(
         source_fingerprint=source_fingerprint,
         indicators=indicators,
     )
+    _require_prepared_coverage(
+        estimated_rows=plan.estimated_rows,
+        actual_rows=len(plan.indicators),
+    )
+    return plan
 
 
 def apply_prepared_daily_indicator_backfill(

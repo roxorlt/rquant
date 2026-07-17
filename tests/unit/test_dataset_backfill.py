@@ -51,7 +51,7 @@ def test_registry_covers_expected_datasets() -> None:
         "moneyflow_ind_dc", "moneyflow_cnt_ths", "moneyflow_mkt_dc",
         "top_list", "top_inst",
         "kpl_list", "kpl_concept", "kpl_concept_daily",
-        "daily_info", "hm_list", "index_daily",
+        "daily_info", "hm_list", "index_daily", "adj_factor",
     }
     assert set(DATASETS) == expected
 
@@ -128,6 +128,64 @@ class _FailingDayAdapter(_FakeByDateAdapter):
         if trade_date == date(2024, 1, 3):
             raise RuntimeError("rate limit")
         return super().moneyflow_dc_by_date(trade_date)
+
+
+class _FakeAdjFactorAdapter(_FakeByDateAdapter):
+    def adj_factor_by_date(self, trade_date: date) -> pd.DataFrame:
+        self.fetch_calls.append(trade_date)
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": trade_date,
+                    "adj_factor": 1.25,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": trade_date,
+                    "adj_factor": 2.5,
+                },
+            ]
+        )
+
+
+def test_adj_factor_backfill_is_targeted_and_idempotent(
+    store: DuckDBStore,
+) -> None:
+    adapter = _FakeAdjFactorAdapter()
+
+    preview = backfill_dataset(
+        "adj_factor",
+        "2024-01-01",
+        "2024-01-05",
+        store,
+        adapter,
+        dry_run=True,
+    )
+    first = backfill_dataset(
+        "adj_factor",
+        "2024-01-01",
+        "2024-01-05",
+        store,
+        adapter,
+        api_sleep=0.0,
+    )
+    second = backfill_dataset(
+        "adj_factor",
+        "2024-01-01",
+        "2024-01-05",
+        store,
+        adapter,
+        api_sleep=0.0,
+    )
+
+    assert preview["table"] == "adj_factor"
+    assert preview["planned_requests"] == 2
+    assert preview["rows"] == 0
+    assert first["rows"] == 4
+    assert second["rows"] == 4
+    assert store.count_adj_factor() == 4
+    assert store.query("SELECT count(*) AS n FROM daily_bar").iloc[0]["n"] == 0
 
 
 def test_by_date_writes_rows(store: DuckDBStore) -> None:
