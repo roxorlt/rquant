@@ -69,7 +69,8 @@ systemd-analyze verify \
     case "${path}" in
       deploy/systemd/rquant-research-ingest.service|\
       deploy/systemd/rquant-research-ingest.timer|\
-      deploy/systemd/README.md|scripts/deploy.sh) ;;
+      deploy/systemd/README.md|scripts/deploy.sh|\
+      tests/unit/test_research_ingest_systemd.py) ;;
       *) echo "unexpected infrastructure path: ${path}" >&2; exit 1 ;;
     esac
   done <<< "${CHANGED_FILES}"
