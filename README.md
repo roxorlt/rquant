@@ -152,7 +152,13 @@ bash scripts/check-core-quality.sh
 .venv/bin/rquant suspension-backfill \
   --start-date 2026-04-01 --end-date 2026-07-14
 
-# 先预演，再在盘外窗口从本地日线与复权因子重建日指标
+# 复权因子历史不完整时，先仅回补 adj_factor（不会改日线/状态表）
+.venv/bin/rquant data-backfill --dataset adj_factor \
+  --start-date 2024-09-02 --end-date 2026-07-16 --dry-run
+.venv/bin/rquant data-backfill --dataset adj_factor \
+  --start-date 2024-09-02 --end-date 2026-07-16
+
+# 再预演，并在盘外窗口从本地日线与复权因子重建日指标
 .venv/bin/rquant daily-indicator-backfill \
   --start-date 2026-03-31 --end-date 2026-07-16
 .venv/bin/rquant daily-indicator-backfill \

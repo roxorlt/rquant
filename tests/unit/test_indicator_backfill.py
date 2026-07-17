@@ -145,7 +145,7 @@ def test_apply_replaces_only_requested_range(tmp_path: Path) -> None:
         sentinel_rows = pd.DataFrame(
             [
                 {
-                    "ts_code": "600000.SH",
+                    "ts_code": ts_code,
                     "trade_date": indicator_date,
                     "ma5": 999.0,
                     "ma10": 999.0,
@@ -160,7 +160,11 @@ def test_apply_replaces_only_requested_range(tmp_path: Path) -> None:
                     "kdj_d": 999.0,
                     "kdj_j": 999.0,
                 }
-                for indicator_date in (preserved_date, start_date)
+                for ts_code, indicator_date in (
+                    ("600000.SH", preserved_date),
+                    ("600000.SH", start_date),
+                    ("200001.SZ", start_date),
+                )
             ]
         )
         seed.upsert_indicators(sentinel_rows)
@@ -177,10 +181,9 @@ def test_apply_replaces_only_requested_range(tmp_path: Path) -> None:
     with DuckDBStore(db_path, read_only=True) as verify:
         rows = verify._conn.execute(
             """
-            SELECT trade_date, ma5
+            SELECT ts_code, trade_date, ma5
             FROM daily_indicator
-            WHERE ts_code = '600000.SH'
-            ORDER BY trade_date
+            ORDER BY ts_code, trade_date
             """
         ).fetchall()
     assert result.model_dump(mode="json") == {
@@ -193,9 +196,10 @@ def test_apply_replaces_only_requested_range(tmp_path: Path) -> None:
         "consistency_mode": "detached_snapshot_plus_source_fingerprint",
         "toctou_status": "source_fingerprint_verified",
     }
-    assert rows[0] == (preserved_date, 999.0)
-    assert [row[0] for row in rows[1:]] == [start_date, end_date]
-    assert all(row[1] != 999.0 for row in rows[1:])
+    assert rows[0] == ("200001.SZ", start_date, 999.0)
+    assert rows[1] == ("600000.SH", preserved_date, 999.0)
+    assert [row[1] for row in rows[2:]] == [start_date, end_date]
+    assert all(row[2] != 999.0 for row in rows[2:])
 
 
 def test_batch_derivation_keeps_each_output_on_its_own_factor_basis(
@@ -450,6 +454,165 @@ def test_apply_rejects_source_change_between_snapshot_and_writer(
             [trade_dates[-1]],
         ).fetchone()
     assert row == (999.0,)
+
+
+def test_apply_rejects_incomplete_a_share_coverage_before_writer(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "indicator-incomplete-coverage.duckdb"
+    with DuckDBStore(db_path) as seed:
+        trade_dates = _seed_many_codes(
+            seed,
+            ["600000.SH", "000001.SZ"],
+            periods=65,
+        )
+        seed._conn.execute(
+            """
+            DELETE FROM adj_factor
+            WHERE ts_code = '000001.SZ'
+              AND trade_date = ?
+            """,
+            [trade_dates[-2]],
+        )
+        seed.upsert_daily(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "200001.SZ",
+                        "trade_date": trade_date,
+                        "open": 9.8,
+                        "high": 10.5,
+                        "low": 9.5,
+                        "close": 10.0,
+                        "pre_close": 10.0,
+                        "change": 0.0,
+                        "pct_chg": 0.0,
+                        "vol": 1000.0,
+                        "amount": 10000.0,
+                    }
+                    for trade_date in trade_dates[-2:]
+                ]
+            )
+        )
+        seed.upsert_indicators(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": trade_dates[-1],
+                        "ma5": 999.0,
+                        "ma10": 999.0,
+                        "ma20": 999.0,
+                        "ma60": 999.0,
+                        "rsi6": 999.0,
+                        "rsi14": 999.0,
+                        "macd": 999.0,
+                        "macd_signal": 999.0,
+                        "macd_hist": 999.0,
+                        "kdj_k": 999.0,
+                        "kdj_d": 999.0,
+                        "kdj_j": 999.0,
+                    }
+                ]
+            )
+        )
+
+    writer_opened = False
+
+    def writer_factory() -> DuckDBStore:
+        nonlocal writer_opened
+        writer_opened = True
+        return DuckDBStore(db_path)
+
+    with pytest.raises(
+        backfill_module.DailyIndicatorBackfillCoverageError,
+        match=r"coverage 50\.00% is below 99\.00%.*2/4",
+    ):
+        backfill_module.run_daily_indicator_backfill(
+            reader_factory=lambda: DuckDBStore(db_path, read_only=True),
+            writer_factory=writer_factory,
+            start_date=trade_dates[-2],
+            end_date=trade_dates[-1],
+            apply=True,
+            now=datetime(2024, 3, 30, 10, 0, tzinfo=SHANGHAI),
+        )
+
+    assert writer_opened is False
+    with DuckDBStore(db_path, read_only=True) as verify:
+        row = verify._conn.execute(
+            """
+            SELECT ma5
+            FROM daily_indicator
+            WHERE ts_code = '600000.SH' AND trade_date = ?
+            """,
+            [trade_dates[-1]],
+        ).fetchone()
+    assert row == (999.0,)
+
+
+def test_direct_apply_rechecks_coverage_before_transaction(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "indicator-direct-apply-coverage.duckdb"
+    with DuckDBStore(db_path) as seed:
+        trade_dates = _seed_history(seed)
+        target_dates = trade_dates[-2:]
+        seed.upsert_indicators(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": trade_date,
+                        "ma5": 999.0,
+                        "ma10": 999.0,
+                        "ma20": 999.0,
+                        "ma60": 999.0,
+                        "rsi6": 999.0,
+                        "rsi14": 999.0,
+                        "macd": 999.0,
+                        "macd_signal": 999.0,
+                        "macd_hist": 999.0,
+                        "kdj_k": 999.0,
+                        "kdj_d": 999.0,
+                        "kdj_j": 999.0,
+                    }
+                    for trade_date in target_dates
+                ]
+            )
+        )
+
+    with DuckDBStore(db_path, read_only=True) as reader:
+        plan = backfill_module.prepare_daily_indicator_backfill(
+            reader,
+            start_date=target_dates[0],
+            end_date=target_dates[1],
+        )
+    plan.indicators = plan.indicators.iloc[:1].copy()
+
+    with DuckDBStore(db_path) as writer:
+        with pytest.raises(
+            backfill_module.DailyIndicatorBackfillCoverageError,
+            match=r"coverage 50\.00% is below 99\.00%.*1/2",
+        ):
+            backfill_module.apply_prepared_daily_indicator_backfill(
+                writer,
+                plan,
+            )
+        rows = writer._conn.execute(
+            """
+            SELECT trade_date, ma5
+            FROM daily_indicator
+            WHERE ts_code = '600000.SH'
+              AND trade_date BETWEEN ? AND ?
+            ORDER BY trade_date
+            """,
+            target_dates,
+        ).fetchall()
+
+    assert rows == [
+        (target_dates[0], 999.0),
+        (target_dates[1], 999.0),
+    ]
 
 
 @pytest.mark.parametrize(

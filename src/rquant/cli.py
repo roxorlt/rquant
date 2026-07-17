@@ -459,6 +459,7 @@ def cmd_daily_indicator_backfill(args: argparse.Namespace) -> int:
     """Preview or rebuild daily indicators from local daily facts."""
     from rquant import indicator_backfill as indicator_backfill_module
     from rquant.indicator_backfill import (
+        DailyIndicatorBackfillCoverageError,
         DailyIndicatorBackfillProtectedWindowError,
     )
 
@@ -475,7 +476,10 @@ def cmd_daily_indicator_backfill(args: argparse.Namespace) -> int:
             end_date=args.end_date,
             apply=args.apply,
         )
-    except DailyIndicatorBackfillProtectedWindowError as error:
+    except (
+        DailyIndicatorBackfillCoverageError,
+        DailyIndicatorBackfillProtectedWindowError,
+    ) as error:
         logger.error(str(error))
         return 2
     print(result.model_dump_json(indent=2))

@@ -332,6 +332,37 @@ class TestDailyIndicatorBackfill:
         assert cli.cmd_daily_indicator_backfill(args) == 2
         writer.assert_not_called()
 
+    def test_apply_returns_two_when_indicator_coverage_is_incomplete(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        import rquant.indicator_backfill as backfill_module
+
+        def reject(**_: object) -> None:
+            raise backfill_module.DailyIndicatorBackfillCoverageError(
+                "daily_indicator coverage 1.00% is below 99.00% (1/100 rows)"
+            )
+
+        monkeypatch.setattr(
+            backfill_module,
+            "run_daily_indicator_backfill",
+            reject,
+        )
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+        args = build_parser().parse_args(
+            [
+                "daily-indicator-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-14",
+                "--apply",
+            ]
+        )
+
+        assert cli.cmd_daily_indicator_backfill(args) == 2
+
 
 class TestResearchExport:
     def test_command_requires_replica_and_passes_typed_plan(

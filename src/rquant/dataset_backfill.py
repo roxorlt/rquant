@@ -243,6 +243,10 @@ DATASETS: dict[str, DatasetSpec] = {
             name="dc_daily", table="dc_index_daily", mode="by_date",
             fetch=lambda a, d: a.dc_daily_by_date(d),
         ),
+        DatasetSpec(
+            name="adj_factor", table="adj_factor", mode="by_date",
+            fetch=lambda a, d: a.adj_factor_by_date(d),
+        ),
         # 板块静态 / 成分（低频快照）
         DatasetSpec(
             name="ths_index", table="ths_board", mode="snapshot",
