@@ -66,6 +66,16 @@ class TestComputeIndicators:
         assert (out["kdj_k"] >= 0).all() and (out["kdj_k"] <= 100).all()
         assert (out["kdj_d"] >= 0).all() and (out["kdj_d"] <= 100).all()
 
+    def test_kdj_flat_price_range_carries_initial_values(self) -> None:
+        df = _make_df(10)
+        df[["qfq_open", "qfq_high", "qfq_low", "qfq_close"]] = 10.0
+
+        out = compute_indicators(df)
+
+        assert out["kdj_k"].tolist() == [50.0] * 10
+        assert out["kdj_d"].tolist() == [50.0] * 10
+        assert out["kdj_j"].tolist() == [50.0] * 10
+
     def test_macd_hist_equals_macd_minus_signal(self) -> None:
         out = compute_indicators(_make_df(100))
         diff = out["macd"] - out["macd_signal"]
