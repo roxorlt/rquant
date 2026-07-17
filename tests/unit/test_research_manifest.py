@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from datetime import date
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -173,6 +174,47 @@ def test_detect_code_commit_marks_dirty_worktree(tmp_path) -> None:
 
     assert clean_commit is not None and not clean_commit.endswith("-dirty")
     assert dirty_commit == f"{clean_commit}-dirty"
+
+
+def test_detect_code_commit_ignores_project_runtime_backup_directory(
+    tmp_path: Path,
+) -> None:
+    from rquant.research_manifest import detect_code_commit
+
+    project_root = Path(__file__).resolve().parents[2]
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text(
+        (project_root / ".gitignore").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    tracked = repo / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    clean_commit = detect_code_commit(repo)
+    backup_dir = repo / "backup"
+    backup_dir.mkdir()
+    (backup_dir / "snapshot.duckdb.gz").write_bytes(b"runtime backup")
+
+    observed_commit = detect_code_commit(repo)
+
+    assert clean_commit is not None
+    assert observed_commit == clean_commit
 
 
 def test_manifest_rejects_covered_count_above_denominator() -> None:

@@ -6,6 +6,10 @@
 
 ### Fixed
 
+- **运行时备份目录误标研究提交为 dirty**：根目录 `backup/` 明确作为云端定时恢复快照目录
+  排除出 Git 状态；研究提交探测仍会拒绝其他未提交或未跟踪文件，但不会再因受控备份工件让
+  正式 `research-ingest` fail closed。项目版本从 `0.20.1` 更新到 `0.20.2`。
+
 - **研究日增量 dry-run 混合日期类型崩溃**：研究 Parquet 中的 `datetime.date` 与运营 DuckDB
   返回的 pandas `Timestamp` 在合并后统一规范化，再进入主键分组与排序；修复云端
   `research-ingest --dry-run` 的类型比较异常。项目版本从 `0.20.0` 更新到 `0.20.1`。

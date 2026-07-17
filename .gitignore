@@ -72,6 +72,8 @@ Thumbs.db
 
 # 项目本地数据（不进 git）
 data/
+# 云端定时恢复快照（运行时工件，不参与代码提交纯净度判断）
+backup/
 # 盘中脉搏 / 午间战报自产数据（已被上面的 data/ 覆盖，显式列出便于检索）
 data/midday/
 data/reports/
