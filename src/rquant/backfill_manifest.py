@@ -771,6 +771,30 @@ def resolve_auction_gap_eligibility(
 
 _ELIGIBILITY_INPUT_COVERAGE_THRESHOLD = 0.99
 _N_SHAPE_PANEL_OPEN_DAYS = 121
+_A_SHARE_TS_CODE_PATTERNS = (
+    "000%.SZ",
+    "001%.SZ",
+    "002%.SZ",
+    "003%.SZ",
+    "300%.SZ",
+    "301%.SZ",
+    "600%.SH",
+    "601%.SH",
+    "603%.SH",
+    "605%.SH",
+    "688%.SH",
+    "689%.SH",
+)
+
+
+def _a_share_code_predicate(column: str) -> str:
+    return (
+        "("
+        + " OR ".join(
+            f"{column} LIKE '{pattern}'" for pattern in _A_SHARE_TS_CODE_PATTERNS
+        )
+        + ")"
+    )
 
 
 def _coverage_passes(expected: int, available: int) -> bool:
@@ -808,6 +832,9 @@ def _opening_panel_counts(
         for target, previous in previous_by_target.items()
         for value in (target, previous)
     ]
+    basic_is_a_share = _a_share_code_predicate("basic.ts_code")
+    status_is_a_share = _a_share_code_predicate("status.ts_code")
+    bar_is_a_share = _a_share_code_predicate("bar.ts_code")
     board_filter = (
         """
         AND (
@@ -891,10 +918,7 @@ def _opening_panel_counts(
             JOIN stock_basic AS basic
               ON basic.list_date IS NOT NULL
              AND basic.list_date <= requested.previous_date
-             AND (
-                 basic.ts_code LIKE '%.SH'
-                 OR basic.ts_code LIKE '%.SZ'
-             )
+             AND {basic_is_a_share}
             UNION
             SELECT requested.target_date,
                    requested.previous_date,
@@ -902,10 +926,7 @@ def _opening_panel_counts(
             FROM requested
             JOIN stock_status_daily AS status
               ON status.trade_date = requested.previous_date
-             AND (
-                 status.ts_code LIKE '%.SH'
-                 OR status.ts_code LIKE '%.SZ'
-             )
+             AND {status_is_a_share}
             UNION
             SELECT requested.target_date,
                    requested.previous_date,
@@ -913,10 +934,7 @@ def _opening_panel_counts(
             FROM requested
             JOIN daily_bar AS bar
               ON bar.trade_date = requested.previous_date
-             AND (
-                 bar.ts_code LIKE '%.SH'
-                 OR bar.ts_code LIKE '%.SZ'
-             )
+             AND {bar_is_a_share}
         ),
         expected AS (
             SELECT universe.target_date,
@@ -969,8 +987,11 @@ def _n_shape_complete_dates(
     )
     last_index = max(index_by_date[target] for target in supported)
     source_dates = calendar[first_index : last_index + 1]
+    basic_is_a_share = _a_share_code_predicate("basic.ts_code")
+    status_is_a_share = _a_share_code_predicate("status.ts_code")
+    bar_is_a_share = _a_share_code_predicate("bar.ts_code")
     rows = store._conn.execute(
-        """
+        f"""
         WITH universe AS (
             SELECT calendar.cal_date AS trade_date,
                    basic.ts_code
@@ -978,10 +999,7 @@ def _n_shape_complete_dates(
             JOIN stock_basic AS basic
               ON basic.list_date IS NOT NULL
              AND basic.list_date <= calendar.cal_date
-             AND (
-                 basic.ts_code LIKE '%.SH'
-                 OR basic.ts_code LIKE '%.SZ'
-             )
+             AND {basic_is_a_share}
             WHERE calendar.exchange = 'SSE'
               AND calendar.is_open = TRUE
               AND calendar.cal_date BETWEEN ? AND ?
@@ -990,19 +1008,13 @@ def _n_shape_complete_dates(
                    status.ts_code
             FROM stock_status_daily AS status
             WHERE status.trade_date BETWEEN ? AND ?
-              AND (
-                  status.ts_code LIKE '%.SH'
-                  OR status.ts_code LIKE '%.SZ'
-              )
+              AND {status_is_a_share}
             UNION
             SELECT bar.trade_date,
                    bar.ts_code
             FROM daily_bar AS bar
             WHERE bar.trade_date BETWEEN ? AND ?
-              AND (
-                  bar.ts_code LIKE '%.SH'
-                  OR bar.ts_code LIKE '%.SZ'
-              )
+              AND {bar_is_a_share}
         )
         SELECT universe.trade_date,
                COUNT(*) AS expected_count,

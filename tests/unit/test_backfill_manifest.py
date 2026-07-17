@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 
 import pandas as pd
 import pytest
@@ -552,6 +552,129 @@ def test_listing_universe_detects_stock_missing_from_daily_bar(
 
     assert resolution.complete_dates == ()
     assert resolution.incomplete[0].reason == "daily_input_panel_below_99pct"
+
+
+def test_auction_panel_excludes_b_shares_from_a_share_denominator(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.auction_gap_strategy as auction
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        auction,
+        "run_auction_gap_replay",
+        lambda *_args, **_kwargs: pd.DataFrame(),
+    )
+    with DuckDBStore(tmp_path / "auction-a-share-universe.duckdb") as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('300001.SZ', DATE '2020-01-01', '创业板'),
+                ('200001.SZ', DATE '2020-01-01', '主板'),
+                ('900901.SH', DATE '2020-01-01', '主板')
+            """
+        )
+        store._conn.execute(
+            """
+            INSERT INTO auction_bar
+            (ts_code, trade_date, auction_type, price, vol, source)
+            VALUES
+            ('300001.SZ', ?, 'open_realtime', 10.2, 1000, 'tushare')
+            """,
+            [signal_date],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="auction_gap",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+
+    assert resolution.complete_dates == (signal_date,)
+    assert resolution.incomplete == ()
+
+
+def test_n_shape_panel_excludes_b_shares_from_a_share_denominator(
+    tmp_path,
+) -> None:
+    from rquant.backfill_manifest import _n_shape_complete_dates
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(121)]
+    target = days[-1]
+    with DuckDBStore(tmp_path / "n-shape-a-share-universe.duckdb") as store:
+        _seed_open_calendar(store, days)
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('000001.SZ', DATE '1991-04-03', '主板'),
+                ('200001.SZ', DATE '1992-02-28', '主板'),
+                ('900901.SH', DATE '1992-02-21', '主板')
+            """
+        )
+        for trading_date in days:
+            store._conn.execute(
+                """
+                INSERT INTO daily_bar
+                (ts_code, trade_date, open, high, low, close)
+                VALUES ('000001.SZ', ?, 10, 11, 9, 10)
+                """,
+                [trading_date],
+            )
+            store._conn.execute(
+                """
+                INSERT INTO daily_state
+                (ts_code, trade_date, is_st, is_limit_up, is_limit_down,
+                 is_first_limit_up, is_yiziban, consecutive_limit_ups,
+                 body_upper, body_lower)
+                VALUES
+                ('000001.SZ', ?, FALSE, FALSE, FALSE, FALSE, FALSE, 0, 10, 10)
+                """,
+                [trading_date],
+            )
+            store._conn.execute(
+                """
+                INSERT INTO stock_status_daily
+                (ts_code, trade_date, name, is_st, name_source, st_source,
+                 available_at, ingested_at, conflict_reason)
+                VALUES
+                ('000001.SZ', ?, '平安银行', FALSE, 'test', 'test', ?, ?, NULL)
+                """,
+                [
+                    trading_date,
+                    datetime.combine(trading_date, time(8, 0), tzinfo=UTC),
+                    datetime.combine(trading_date, time(8, 0), tzinfo=UTC),
+                ],
+            )
+        store._conn.execute(
+            """
+            INSERT INTO daily_basic (ts_code, trade_date, circ_mv)
+            VALUES ('000001.SZ', ?, 1000000)
+            """,
+            [target],
+        )
+
+        complete_dates = _n_shape_complete_dates(
+            store,
+            requested_dates=(target,),
+            calendar=days,
+        )
+
+    assert complete_dates == (target,)
 
 
 def test_auction_eligibility_is_daily_plus_auction_and_never_checks_minutes(
