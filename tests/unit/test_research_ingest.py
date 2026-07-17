@@ -414,6 +414,95 @@ def test_missing_watchlist_never_becomes_candidate_even_with_observed_minutes(
     assert adapter.minute_calls == [("000001.SZ",)]
 
 
+def test_merge_frames_normalizes_mixed_business_date_types() -> None:
+    import rquant.research_ingest as ingest_module
+
+    base = {
+        "ts_code": "000001.SZ",
+        "auction_type": "open",
+        "price": 10.0,
+        "vol": 1_000.0,
+        "amount": 10_000.0,
+        "turnover_rate": 0.1,
+        "volume_ratio": 1.5,
+        "source": "tushare",
+    }
+    existing = pd.DataFrame(
+        [
+            {
+                **base,
+                "trade_date": date(2026, 7, 16),
+                "created_at": datetime(2026, 7, 16, 9, 26),
+            }
+        ]
+    )
+    fetched = pd.DataFrame(
+        [
+            {
+                **base,
+                "trade_date": pd.Timestamp("2026-07-16"),
+                "price": 10.1,
+                "created_at": pd.Timestamp("2026-07-16 15:50:00"),
+            }
+        ]
+    )
+
+    merged = ingest_module._merge_frames(
+        existing,
+        fetched,
+        columns=ingest_module._AUCTION_COLUMNS,
+        primary_key=("ts_code", "trade_date", "auction_type", "source"),
+    )
+
+    assert len(merged) == 1
+    assert merged.iloc[0]["trade_date"] == date(2026, 7, 16)
+    assert merged.iloc[0]["price"] == 10.1
+    assert merged.iloc[0]["created_at"] == pd.Timestamp("2026-07-16 09:26:00")
+
+
+def test_dry_run_merges_parquet_dates_with_operational_duckdb_timestamps(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 17)
+    paths = _paths(tmp_path)
+    source = tmp_path / "source.duckdb"
+    _seed_source(source, trade_date)
+    with duckdb.connect(str(source)) as connection:
+        connection.execute(
+            """
+            INSERT INTO auction_bar VALUES (
+                '000001.SZ', ?, 'open_realtime', 10.1, 1000, 10000,
+                0.1, 1.5, 'tushare', ?
+            )
+            """,
+            [trade_date, datetime(2026, 7, 17, 15, 50)],
+        )
+
+    _seed_bootstrap_partition(paths, trade_date)
+    candidate_path = _seed_bootstrap_candidate(tmp_path, paths=paths)
+    _write_watchlist(tmp_path, trade_date, paths=paths)
+    catalog_before = _sha256(paths.catalog_path)
+    candidate_before = _sha256(candidate_path)
+    adapter = _Adapter(trade_date)
+
+    result = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=adapter,
+        code_commit=_COMMIT,
+        dry_run=True,
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=_CST),
+    )
+
+    assert result.status == "planned"
+    assert adapter.minute_calls == []
+    assert adapter.auction_calls == []
+    assert _sha256(paths.catalog_path) == catalog_before
+    assert _sha256(candidate_path) == candidate_before
+    assert not paths.readonly_catalog_path.exists()
+
+
 def test_dry_run_does_not_call_network_or_mutate_candidate(tmp_path: Path) -> None:
     trade_date = date(2026, 7, 17)
     source = tmp_path / "source.duckdb"
