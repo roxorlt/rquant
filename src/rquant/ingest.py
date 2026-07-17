@@ -15,7 +15,7 @@ import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
-from rquant.indicator_backfill import derive_daily_indicators
+from rquant.indicator_backfill import derive_target_daily_indicators
 from rquant.market_context import sync_market_sentiment
 from rquant.security_status import (
     DailySecurityKey,
@@ -53,6 +53,10 @@ class DailyIngestClient(Protocol):
     def adj_factor(self, **kwargs: object) -> pd.DataFrame: ...
 
     def daily_basic(self, **kwargs: object) -> pd.DataFrame: ...
+
+
+def _open_primary_indicator_reader() -> DuckDBStore:
+    return DuckDBStore(settings.duckdb_path, read_only=True)
 
 
 def _load_daily_state_inputs(
@@ -307,6 +311,9 @@ def ingest_daily(
     pro: DailyIngestClient | None = None,
     status_adapter: SecurityStatusAdapter | None = None,
     suspension_adapter: SuspensionAdapter | None = None,
+    indicator_reader_factory: Callable[[], DuckDBStore] = (
+        _open_primary_indicator_reader
+    ),
     writer_factory: Callable[[], DuckDBStore] = DuckDBStore,
     ingested_at: datetime | None = None,
     api_sleep: float = _API_SLEEP,
@@ -442,8 +449,16 @@ def ingest_daily(
             df_basic_mkt["trade_date"], format="%Y%m%d"
         ).dt.date
 
+    codes = sorted(df_daily["ts_code"].astype(str).unique().tolist())
+    with indicator_reader_factory() as indicator_reader:
+        target_indicators = derive_target_daily_indicators(
+            indicator_reader,
+            target_date=target_date,
+            daily_rows=df_daily,
+            factor_rows=df_factor,
+        )
+
     with writer_factory() as writer:
-        codes = sorted(df_daily["ts_code"].astype(str).unique().tolist())
         transaction_open = False
         try:
             writer._conn.execute("BEGIN")
@@ -483,12 +498,6 @@ def ingest_daily(
                 logger.warning(
                     f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子"
                 )
-            target_indicators = derive_daily_indicators(
-                writer,
-                start_date=target_date,
-                end_date=target_date,
-                ts_codes=codes,
-            )
             writer._conn.execute(
                 "DELETE FROM daily_indicator "
                 "WHERE trade_date >= ? AND ts_code = ANY(?)",

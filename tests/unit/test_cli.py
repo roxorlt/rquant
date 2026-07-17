@@ -218,6 +218,8 @@ class TestDailyIndicatorBackfill:
             "start_date": "2026-04-01",
             "end_date": "2026-07-14",
             "dry_run": True,
+            "consistency_mode": "detached_snapshot_plus_source_fingerprint",
+            "toctou_status": "not_applicable",
         }
         writer.assert_not_called()
 
@@ -233,15 +235,43 @@ class TestDailyIndicatorBackfill:
         import rquant.indicator_backfill as backfill_module
         from rquant.storage.duckdb import DuckDBStore
 
-        store = DuckDBStore(tmp_path / "indicator-apply.duckdb")
-        context = MagicMock()
-        context.__enter__.return_value = store
-        context.__exit__.side_effect = lambda *_: store.close()
-        writer = MagicMock(return_value=context)
-        readonly = MagicMock(side_effect=AssertionError("readonly opened"))
+        db_path = tmp_path / "indicator-apply.duckdb"
+        with DuckDBStore(db_path):
+            pass
+        events: list[str] = []
+
+        class _Context:
+            def __init__(self, store: DuckDBStore, role: str) -> None:
+                self.store = store
+                self.role = role
+
+            def __enter__(self) -> DuckDBStore:
+                events.append(f"{self.role}_enter")
+                return self.store
+
+            def __exit__(self, *args: object) -> None:
+                del args
+                events.append(f"{self.role}_exit")
+                self.store.close()
+
+        def readonly() -> _Context:
+            events.append("readonly_construct")
+            return _Context(DuckDBStore(db_path, read_only=True), "readonly")
+
+        def writable() -> _Context:
+            events.append("writer_construct")
+            return _Context(DuckDBStore(db_path), "writer")
+
+        writer = MagicMock(side_effect=writable)
+        replica = MagicMock(side_effect=AssertionError("replica opened"))
         monkeypatch.setattr(cli, "DuckDBStore", writer)
-        monkeypatch.setattr(cli, "open_readonly_store", readonly)
+        monkeypatch.setattr(cli, "open_readonly_store", replica)
         monkeypatch.setattr(cli, "setup_logging", lambda: None)
+        monkeypatch.setattr(
+            backfill_module,
+            "open_detached_daily_indicator_store",
+            readonly,
+        )
         monkeypatch.setattr(
             backfill_module,
             "_now",
@@ -261,7 +291,15 @@ class TestDailyIndicatorBackfill:
         assert cli.cmd_daily_indicator_backfill(args) == 0
         assert json.loads(capsys.readouterr().out)["dry_run"] is False
         writer.assert_called_once_with()
-        readonly.assert_not_called()
+        replica.assert_not_called()
+        assert events == [
+            "readonly_construct",
+            "readonly_enter",
+            "readonly_exit",
+            "writer_construct",
+            "writer_enter",
+            "writer_exit",
+        ]
 
     def test_apply_returns_two_inside_protected_window(
         self,

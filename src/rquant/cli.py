@@ -457,28 +457,24 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 def cmd_daily_indicator_backfill(args: argparse.Namespace) -> int:
     """Preview or rebuild daily indicators from local daily facts."""
+    from rquant import indicator_backfill as indicator_backfill_module
     from rquant.indicator_backfill import (
         DailyIndicatorBackfillProtectedWindowError,
-        backfill_daily_indicators,
-        require_daily_indicator_write_window,
     )
 
     setup_logging()
-    if args.apply:
-        try:
-            require_daily_indicator_write_window()
-        except DailyIndicatorBackfillProtectedWindowError as error:
-            logger.error(str(error))
-            return 2
-    context = DuckDBStore() if args.apply else open_readonly_store()
     try:
-        with context as store:
-            result = backfill_daily_indicators(
-                store,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                apply=args.apply,
-            )
+        result = indicator_backfill_module.run_daily_indicator_backfill(
+            reader_factory=(
+                indicator_backfill_module.open_detached_daily_indicator_store
+                if args.apply
+                else open_readonly_store
+            ),
+            writer_factory=DuckDBStore,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            apply=args.apply,
+        )
     except DailyIndicatorBackfillProtectedWindowError as error:
         logger.error(str(error))
         return 2
