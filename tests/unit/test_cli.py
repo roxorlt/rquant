@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -267,6 +269,77 @@ class TestResearchExport:
 
 
 class TestResearchIngest:
+    def test_default_date_skips_authoritative_closed_day_before_adapter(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_ingest as ingest_module
+
+        source = tmp_path / "rquant_ro.duckdb"
+        is_open = MagicMock(return_value=False)
+        adapter_factory = MagicMock()
+        monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", True
+        )
+        monkeypatch.setattr(ingest_module, "research_trade_date_is_open", is_open)
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter", adapter_factory
+        )
+        args = build_parser().parse_args(["research-ingest"])
+        expected_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+        assert args.date is None
+        assert cli.cmd_research_ingest(args) == 0
+        is_open.assert_called_once_with(source, expected_date)
+        adapter_factory.assert_not_called()
+        assert json.loads(capsys.readouterr().out) == {
+            "status": "skipped",
+            "trade_date": expected_date.isoformat(),
+            "reason": "closed_trade_date",
+        }
+
+    def test_scheduled_explicit_closed_day_skips_before_adapter(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_ingest as ingest_module
+
+        source = tmp_path / "rquant_ro.duckdb"
+        is_open = MagicMock(return_value=False)
+        adapter_factory = MagicMock()
+        monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", True
+        )
+        monkeypatch.setattr(ingest_module, "research_trade_date_is_open", is_open)
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter", adapter_factory
+        )
+        args = build_parser().parse_args(
+            [
+                "research-ingest",
+                "--date",
+                "2026-07-17",
+                "--scheduled",
+            ]
+        )
+
+        assert cli.cmd_research_ingest(args) == 0
+        is_open.assert_called_once_with(source, date(2026, 7, 17))
+        adapter_factory.assert_not_called()
+
     def test_command_is_disabled_by_default_before_adapter_or_writes(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -333,6 +406,7 @@ class TestResearchIngest:
             adapter=adapter,
             code_commit="a" * 40,
             dry_run=False,
+            recovery=False,
         )
         assert capsys.readouterr().out.strip() == '{"status":"degraded"}'
 
@@ -368,6 +442,76 @@ class TestResearchIngest:
 
         assert cli.cmd_research_ingest(args) == 0
         assert run_ingest.call_args.kwargs["dry_run"] is True
+
+    def test_recover_uses_explicit_historical_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_ingest as ingest_module
+        from rquant import research_manifest as manifest_module
+
+        result = MagicMock(status="candidate")
+        result.model_dump_json.return_value = '{"status":"candidate"}'
+        run_ingest = MagicMock(return_value=result)
+        source = tmp_path / "rquant_ro.duckdb"
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", True
+        )
+        monkeypatch.setattr(ingest_module, "run_daily_research_ingest", run_ingest)
+        monkeypatch.setattr(manifest_module, "detect_code_commit", lambda: "a" * 40)
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter", MagicMock(return_value=MagicMock())
+        )
+        args = build_parser().parse_args(
+            ["research-ingest", "--date", "2026-07-16", "--recover"]
+        )
+
+        assert cli.cmd_research_ingest(args) == 0
+        assert run_ingest.call_args.kwargs["trade_date"] == date(2026, 7, 16)
+        assert run_ingest.call_args.kwargs["recovery"] is True
+
+    def test_recover_requires_explicit_date(self) -> None:
+        args = build_parser().parse_args(["research-ingest", "--recover"])
+
+        with pytest.raises(ValueError, match="requires --date"):
+            from rquant.cli import cmd_research_ingest
+
+            cmd_research_ingest(args)
+
+    def test_readiness_command_returns_one_for_stale_replica(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_ingest as ingest_module
+
+        result = MagicMock(status="not_ready")
+        result.model_dump_json.return_value = '{"status":"not_ready"}'
+        assess = MagicMock(return_value=result)
+        source = tmp_path / "rquant_ro.duckdb"
+        monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
+        monkeypatch.setattr(
+            ingest_module, "assess_research_ingest_readiness", assess
+        )
+        args = build_parser().parse_args(
+            ["research-ingest-readiness", "--date", "2026-07-17"]
+        )
+
+        assert cli.cmd_research_ingest_readiness(args) == 1
+        assess.assert_called_once_with(source, date(2026, 7, 17))
+        assert capsys.readouterr().out.strip() == '{"status":"not_ready"}'
 
     def test_authority_status_is_read_only_and_machine_readable(
         self,

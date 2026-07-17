@@ -63,6 +63,15 @@
 
 ### Added
 
+- **云端研究日增量可靠性与恢复入口**：新增日终 runner 和机器可读 readiness 检查；只有
+  当日 daily 成功结束、主动刷新的只读副本包含完整当日日线后，才允许补齐并封存分钟/竞价。
+  runner 固定目标交易日并最多尝试 4 次，普通日增量和历史恢复都强制 observation 连续，不能
+  越过漏日；bootstrap catalog 的最后完整交易日可作为首次恢复锚点。
+  默认日期统一使用上海时区，权威日历明确休市时返回 typed `skipped`，日历缺口仍 fail
+  closed；`research-ingest --recover --date ...` 使用历史 `stk_mins` 按现有 observation 链顺序
+  恢复漏日，不使用未来分钟数据。systemd 调度另走独立基础设施发布。项目版本从 `0.20.2`
+  更新到 `0.21.0`。
+
 - **云端研究数据每日增量候选链路**：新增 `research-ingest`，在不写生产 DuckDB 的前提下，
   日终用 `rt_min_daily` 补齐 monitor 盘前固化清单、独立拉取全市场集合竞价，并将分钟/竞价
   同日分区写入隔离 lake/catalog 代际；两张数据集全部导出和审计通过后才进入带持久 journal

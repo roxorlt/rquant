@@ -16,6 +16,7 @@ from rquant.research_catalog import ResearchCatalog
 from rquant.research_ingest import (
     ResearchIngestPaths,
     ResearchWatchlistItem,
+    assess_research_ingest_readiness,
     inspect_research_authority,
     run_daily_research_ingest,
     write_research_watchlist_snapshot,
@@ -177,6 +178,24 @@ class _Adapter:
         )
 
 
+class _HistoricalAdapter(_Adapter):
+    def __init__(self, trade_date: date) -> None:
+        super().__init__(trade_date)
+        self.historical_minute_calls: list[tuple[str, str, datetime, datetime]] = []
+
+    def stk_mins(
+        self,
+        ts_code: str,
+        freq: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        self.historical_minute_calls.append((ts_code, freq, start, end))
+        frame = _minute_frame(self.trade_date, (ts_code,))
+        frame["source"] = "tushare"
+        return frame
+
+
 def _seed_bootstrap_candidate(data_dir: Path, *, paths: ResearchIngestPaths | None = None) -> Path:
     resolved = paths or _paths(data_dir)
     catalog_path = resolved.catalog_path
@@ -259,6 +278,203 @@ def _seed_bootstrap_partition(paths: ResearchIngestPaths, trade_date: date) -> P
     return paths.lake_root / payload["relative_path"]
 
 
+def test_readiness_requires_complete_current_daily_universe(tmp_path: Path) -> None:
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    _seed_source(source, trade_date)
+
+    ready = assess_research_ingest_readiness(source, trade_date)
+
+    assert ready.status == "ready"
+    assert ready.trade_date == trade_date
+    assert ready.daily_bar_code_count == 2
+    assert ready.latest_daily_bar_date == trade_date
+
+    with duckdb.connect(str(source)) as connection:
+        connection.execute(
+            "DELETE FROM daily_bar WHERE trade_date = ? AND ts_code = '600000.SH'",
+            [trade_date],
+        )
+
+    stale = assess_research_ingest_readiness(source, trade_date)
+
+    assert stale.status == "not_ready"
+    assert stale.daily_bar_code_count == 1
+    assert "daily_bar_universe_incomplete" in stale.issues
+
+
+def test_readiness_treats_authoritative_closed_day_as_ready_skip(tmp_path: Path) -> None:
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    _seed_source(source, trade_date)
+    with duckdb.connect(str(source)) as connection:
+        connection.execute(
+            "UPDATE trade_calendar SET is_open = FALSE WHERE cal_date = ?",
+            [trade_date],
+        )
+        connection.execute("DELETE FROM daily_bar WHERE trade_date = ?", [trade_date])
+
+    result = assess_research_ingest_readiness(source, trade_date)
+
+    assert result.status == "closed"
+    assert result.daily_bar_code_count == 0
+    assert result.issues == ()
+
+
+def test_historical_recovery_uses_stk_mins_in_sequence(tmp_path: Path) -> None:
+    trade_date = date(2026, 7, 17)
+    previous = date(2026, 7, 16)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, previous)
+    _write_watchlist(tmp_path, trade_date)
+    run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=previous,
+        adapter=_Adapter(previous),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 16, 15, 30, tzinfo=_CST),
+    )
+    adapter = _HistoricalAdapter(trade_date)
+
+    result = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=adapter,
+        code_commit=_COMMIT,
+        recovery=True,
+        now=lambda: datetime(2026, 7, 18, 8, 0, tzinfo=_CST),
+    )
+
+    assert result.status == "candidate"
+    assert adapter.minute_calls == []
+    assert [call[0] for call in adapter.historical_minute_calls] == [
+        "000001.SZ",
+        "600000.SH",
+    ]
+    assert all(call[1] == "1min" for call in adapter.historical_minute_calls)
+    assert all(call[2].date() == trade_date for call in adapter.historical_minute_calls)
+    assert all(call[3].date() == trade_date for call in adapter.historical_minute_calls)
+
+
+def test_first_historical_recovery_uses_bootstrap_catalog_anchor(tmp_path: Path) -> None:
+    trade_date = date(2026, 7, 17)
+    previous = date(2026, 7, 16)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_partition(paths, previous)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    adapter = _HistoricalAdapter(trade_date)
+
+    result = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=adapter,
+        code_commit=_COMMIT,
+        recovery=True,
+        now=lambda: datetime(2026, 7, 18, 8, 0, tzinfo=_CST),
+    )
+
+    assert result.status == "candidate"
+    assert len(adapter.historical_minute_calls) == 2
+
+
+def test_first_historical_recovery_rejects_gap_from_bootstrap_anchor(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 18)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_partition(paths, date(2026, 7, 16))
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    adapter = _HistoricalAdapter(trade_date)
+
+    with pytest.raises(RuntimeError, match="observation gap"):
+        run_daily_research_ingest(
+            source_database=source,
+            paths=paths,
+            trade_date=trade_date,
+            adapter=adapter,
+            code_commit=_COMMIT,
+            recovery=True,
+            now=lambda: datetime(2026, 7, 19, 8, 0, tzinfo=_CST),
+        )
+
+    assert adapter.historical_minute_calls == []
+    assert adapter.auction_calls == []
+
+
+def test_normal_ingest_cannot_skip_a_missing_observation_day(tmp_path: Path) -> None:
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, date(2026, 7, 17))
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, date(2026, 7, 16))
+    run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=date(2026, 7, 16),
+        adapter=_Adapter(date(2026, 7, 16)),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 16, 15, 30, tzinfo=_CST),
+    )
+    with duckdb.connect(str(source)) as connection:
+        connection.execute(
+            "INSERT INTO trade_calendar VALUES ('SSE', DATE '2026-07-18', TRUE)"
+        )
+        connection.executemany(
+            """
+            INSERT INTO daily_bar VALUES
+                (?, DATE '2026-07-18', 10, 10.2, 9.9, 10.1, 10, 1, 1000, 10000, 'tushare')
+            """,
+            [("000001.SZ",), ("600000.SH",)],
+        )
+    _write_watchlist(tmp_path, date(2026, 7, 18))
+    adapter = _Adapter(date(2026, 7, 18))
+
+    with pytest.raises(RuntimeError, match="observation gap"):
+        run_daily_research_ingest(
+            source_database=source,
+            paths=paths,
+            trade_date=date(2026, 7, 18),
+            adapter=adapter,
+            code_commit=_COMMIT,
+            now=lambda: datetime(2026, 7, 18, 15, 30, tzinfo=_CST),
+        )
+
+    assert adapter.minute_calls == []
+    assert adapter.auction_calls == []
+
+
+def test_historical_recovery_is_forbidden_during_market_protection_window(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 16)
+    adapter = _HistoricalAdapter(trade_date)
+
+    with pytest.raises(ValueError, match="market protection window"):
+        run_daily_research_ingest(
+            source_database=tmp_path / "not-opened.duckdb",
+            paths=_paths(tmp_path),
+            trade_date=trade_date,
+            adapter=adapter,
+            code_commit=_COMMIT,
+            recovery=True,
+            now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=_CST),
+        )
+
+    assert adapter.historical_minute_calls == []
+
+
 def test_watchlist_snapshot_is_atomic_typed_and_idempotent(tmp_path: Path) -> None:
     trade_date = date(2026, 7, 17)
 
@@ -269,6 +485,31 @@ def test_watchlist_snapshot_is_atomic_typed_and_idempotent(tmp_path: Path) -> No
     assert first.is_file()
     assert not list(first.parent.glob("*.tmp-*"))
     assert '"ts_code": "000001.SZ"' in first.read_text(encoding="utf-8")
+
+
+def test_trade_date_probe_distinguishes_closed_day_from_calendar_gap(
+    tmp_path: Path,
+) -> None:
+    from rquant.research_ingest import research_trade_date_is_open
+
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    _seed_source(source, trade_date)
+    with duckdb.connect(str(source)) as connection:
+        connection.execute(
+            "UPDATE trade_calendar SET is_open = FALSE WHERE cal_date = ?",
+            [trade_date],
+        )
+
+    assert research_trade_date_is_open(source, trade_date) is False
+
+    with duckdb.connect(str(source)) as connection:
+        connection.execute(
+            "DELETE FROM trade_calendar WHERE cal_date = ?",
+            [trade_date],
+        )
+    with pytest.raises(ValueError, match="missing SSE trade date"):
+        research_trade_date_is_open(source, trade_date)
 
 
 def test_watchlist_snapshot_cannot_be_created_or_replaced_after_open(tmp_path: Path) -> None:
@@ -457,6 +698,25 @@ def test_merge_frames_normalizes_mixed_business_date_types() -> None:
     assert len(merged) == 1
     assert merged.iloc[0]["trade_date"] == date(2026, 7, 16)
     assert merged.iloc[0]["price"] == 10.1
+    assert merged.iloc[0]["created_at"] == pd.Timestamp("2026-07-16 15:50:00")
+
+
+def test_merge_frames_keeps_first_observation_when_business_values_match() -> None:
+    import rquant.research_ingest as ingest_module
+
+    existing = _Adapter(date(2026, 7, 16)).stk_auction(date(2026, 7, 16)).iloc[[0]]
+    existing["created_at"] = pd.Timestamp("2026-07-16 09:26:00")
+    fetched = existing.copy()
+    fetched["created_at"] = pd.Timestamp("2026-07-16 15:50:00")
+
+    merged = ingest_module._merge_frames(
+        existing,
+        fetched,
+        columns=ingest_module._AUCTION_COLUMNS,
+        primary_key=("ts_code", "trade_date", "auction_type", "source"),
+    )
+
+    assert len(merged) == 1
     assert merged.iloc[0]["created_at"] == pd.Timestamp("2026-07-16 09:26:00")
 
 

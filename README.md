@@ -29,8 +29,8 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - `research-migration` 与分阶段迁移脚本可从同一不可变恢复快照打包、校验、断点上传并在云端
   原子发布研究候选；生产 `rquant.duckdb` 不进入迁移写路径。
 - `research-ingest` 可在日终补齐不可变 monitor 清单分钟、拉取集合竞价，并通过可自动回滚的
-  发布 journal 一致切换 Parquet manifest、研究主/只读目录和观察证据；开关默认关闭，须经
-  独立调度发布后才运行。
+  发布 journal 一致切换 Parquet manifest、研究主/只读目录和观察证据；日终 runner 会先确认
+  daily 成功、主动刷新副本并检查当日日线完整性，漏日可按证据链顺序用 `stk_mins` 恢复。
 - 云端承担生产调度和研究候选存储；Mac 主库在 10 个交易日观察完成前继续保留为恢复依据。
 
 ## 明确边界
@@ -93,7 +93,9 @@ rquant research-export --dataset minute_bar \
   --start-date 2025-03-28 --end-date 2026-07-16 --dry-run
 
 # 日终只读预演与候选状态核验
+rquant research-ingest-readiness --date 2026-07-17
 rquant research-ingest --date 2026-07-17 --dry-run
+rquant research-ingest --date 2026-07-16 --recover
 rquant research-authority-status
 ```
 

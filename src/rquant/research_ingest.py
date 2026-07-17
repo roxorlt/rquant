@@ -32,6 +32,8 @@ from rquant.research_migration import ResearchAuthorityCandidate
 _CST = ZoneInfo("Asia/Shanghai")
 _CLEAN_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _MINIMUM_SAFE_TIME = time(15, 15)
+_MARKET_PROTECTION_START = time(9, 15)
+_MARKET_PROTECTION_END = time(15, 10)
 _MINIMUM_AUCTION_COVERAGE = 0.98
 
 _MINUTE_COLUMNS = (
@@ -63,6 +65,14 @@ _AUCTION_COLUMNS = (
 
 class ResearchIngestAdapter(Protocol):
     def rt_min_daily(self, ts_codes: list[str], freq: str = "1min") -> pd.DataFrame: ...
+
+    def stk_mins(
+        self,
+        ts_code: str,
+        freq: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame: ...
 
     def stk_auction(self, trade_date: date) -> pd.DataFrame: ...
 
@@ -110,6 +120,20 @@ class ResearchIngestPaths(_ResearchModel):
     @property
     def transactions_root(self) -> Path:
         return self.state_dir / "research_transactions"
+
+
+class ResearchIngestSkipResult(_ResearchModel):
+    status: Literal["skipped"] = "skipped"
+    trade_date: date
+    reason: Literal["closed_trade_date"] = "closed_trade_date"
+
+
+class ResearchIngestReadinessResult(_ResearchModel):
+    status: Literal["ready", "closed", "not_ready"]
+    trade_date: date
+    latest_daily_bar_date: date | None
+    daily_bar_code_count: int = Field(ge=0)
+    issues: tuple[str, ...]
 
 
 class ResearchWatchlistItem(_ResearchModel):
@@ -388,7 +412,10 @@ def _table_exists(connection: duckdb.DuckDBPyConnection, table: str) -> bool:
     return row is not None and int(row[0]) == 1
 
 
-def _require_open_trade_date(connection: duckdb.DuckDBPyConnection, trade_date: date) -> None:
+def _trade_date_is_open(
+    connection: duckdb.DuckDBPyConnection,
+    trade_date: date,
+) -> bool:
     if not _table_exists(connection, "trade_calendar"):
         raise ValueError("authoritative SSE trade calendar is required")
     row = connection.execute(
@@ -399,8 +426,23 @@ def _require_open_trade_date(connection: duckdb.DuckDBPyConnection, trade_date: 
         """,
         [trade_date],
     ).fetchone()
-    if row is None or not bool(row[0]):
-        raise ValueError(f"closed or missing SSE trade date: {trade_date}")
+    if row is None:
+        raise ValueError(f"missing SSE trade date: {trade_date}")
+    return bool(row[0])
+
+
+def research_trade_date_is_open(source_database: Path, trade_date: date) -> bool:
+    """Resolve a stored SSE calendar fact without treating missing data as closed."""
+    source_database = Path(source_database)
+    if not source_database.is_file() or source_database.is_symlink():
+        raise ValueError(f"source read-only database is invalid: {source_database}")
+    with duckdb.connect(str(source_database), read_only=True) as connection:
+        return _trade_date_is_open(connection, trade_date)
+
+
+def _require_open_trade_date(connection: duckdb.DuckDBPyConnection, trade_date: date) -> None:
+    if not _trade_date_is_open(connection, trade_date):
+        raise ValueError(f"closed SSE trade date: {trade_date}")
 
 
 def _query_existing_frame(
@@ -501,6 +543,64 @@ def _daily_bar_universe_is_complete(
     return intersection / len(current_codes) >= 0.98 and intersection / len(status_codes) >= 0.98
 
 
+def assess_research_ingest_readiness(
+    source_database: Path,
+    trade_date: date,
+) -> ResearchIngestReadinessResult:
+    """Verify that the refreshed replica can support a trustworthy daily ingest."""
+    source_database = Path(source_database)
+    if not source_database.is_file() or source_database.is_symlink():
+        raise ValueError(f"source read-only database is invalid: {source_database}")
+    with duckdb.connect(str(source_database), read_only=True) as connection:
+        if not _trade_date_is_open(connection, trade_date):
+            return ResearchIngestReadinessResult(
+                status="closed",
+                trade_date=trade_date,
+                latest_daily_bar_date=None,
+                daily_bar_code_count=0,
+                issues=(),
+            )
+        if not _table_exists(connection, "daily_bar"):
+            return ResearchIngestReadinessResult(
+                status="not_ready",
+                trade_date=trade_date,
+                latest_daily_bar_date=None,
+                daily_bar_code_count=0,
+                issues=("daily_bar_missing",),
+            )
+        latest_row = connection.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
+        latest_daily_bar_date = None if latest_row is None else latest_row[0]
+        current_codes = _expected_auction_codes(connection, trade_date)
+        issues: list[str] = []
+        if latest_daily_bar_date != trade_date:
+            issues.append("daily_bar_not_current")
+        if not _daily_bar_universe_is_complete(connection, trade_date, current_codes):
+            issues.append("daily_bar_universe_incomplete")
+        return ResearchIngestReadinessResult(
+            status="ready" if not issues else "not_ready",
+            trade_date=trade_date,
+            latest_daily_bar_date=latest_daily_bar_date,
+            daily_bar_code_count=len(current_codes),
+            issues=tuple(issues),
+        )
+
+
+def _fetch_historical_minutes(
+    adapter: ResearchIngestAdapter,
+    *,
+    ts_codes: set[str],
+    trade_date: date,
+) -> pd.DataFrame:
+    start = datetime.combine(trade_date, time(9, 0))
+    end = datetime.combine(trade_date, time(15, 30))
+    frames = [
+        adapter.stk_mins(ts_code, "1min", start, end)
+        for ts_code in sorted(ts_codes)
+    ]
+    populated = [frame for frame in frames if frame is not None and not frame.empty]
+    return pd.concat(populated, ignore_index=True) if populated else pd.DataFrame()
+
+
 def _normalize_fetched_frame(
     frame: pd.DataFrame,
     *,
@@ -551,11 +651,23 @@ def _merge_frames(
         combined["created_at"] = pd.to_datetime(
             combined["created_at"], errors="raise"
         )
-        combined["created_at"] = combined.groupby(list(primary_key), dropna=False)[
-            "created_at"
-        ].transform("min")
+    business_columns = [column for column in columns if column != "created_at"]
+    combined["_business_hash"] = pd.util.hash_pandas_object(
+        combined[business_columns],
+        index=False,
+    )
+    business_versions = combined.groupby(list(primary_key), dropna=False)[
+        "_business_hash"
+    ].transform("nunique")
+    ordered = combined.sort_values("created_at")
+    unchanged = ordered.loc[business_versions.loc[ordered.index] == 1].drop_duplicates(
+        list(primary_key), keep="first"
+    )
+    revised = ordered.loc[business_versions.loc[ordered.index] > 1].drop_duplicates(
+        list(primary_key), keep="last"
+    )
     return (
-        combined.drop_duplicates(list(primary_key), keep="last")
+        pd.concat([unchanged, revised], ignore_index=True)[list(columns)]
         .sort_values(list(primary_key))
         .reset_index(drop=True)
     )
@@ -1421,6 +1533,47 @@ def _previous_open_date(connection: duckdb.DuckDBPyConnection, trade_date: date)
     return None if row is None else row[0]
 
 
+def _latest_complete_research_date(catalog_path: Path) -> date | None:
+    with duckdb.connect(str(catalog_path), read_only=True) as connection:
+        row = connection.execute(
+            """
+            SELECT MAX(trade_date)
+            FROM (
+                SELECT trade_date
+                FROM research_partition
+                WHERE dataset IN ('minute_bar', 'auction_bar')
+                GROUP BY trade_date
+                HAVING SUM(
+                    CASE WHEN dataset = 'minute_bar' AND freq = '1min' THEN 1 ELSE 0 END
+                ) > 0
+                AND SUM(CASE WHEN dataset = 'auction_bar' THEN 1 ELSE 0 END) > 0
+            )
+            """
+        ).fetchone()
+    return None if row is None else row[0]
+
+
+def _require_observation_continuity(
+    paths: ResearchIngestPaths,
+    *,
+    trade_date: date,
+    previous_open_date: date | None,
+    previous: ResearchDailyIngestResult | None,
+) -> None:
+    if previous is not None:
+        if previous.trade_date in {trade_date, previous_open_date}:
+            return
+        raise RuntimeError(
+            "research observation gap: recover the earliest missing trade date first"
+        )
+    bootstrap_anchor = _latest_complete_research_date(paths.catalog_path)
+    if bootstrap_anchor is not None and bootstrap_anchor != previous_open_date:
+        raise RuntimeError(
+            "research observation gap from bootstrap catalog: "
+            "recover the earliest missing trade date first"
+        )
+
+
 def _stability_evidence(
     *,
     status: Literal["candidate", "degraded"],
@@ -1457,6 +1610,7 @@ def run_daily_research_ingest(
     adapter: ResearchIngestAdapter | None,
     code_commit: str,
     dry_run: bool = False,
+    recovery: bool = False,
     now: Callable[[], datetime] | None = None,
 ) -> ResearchDailyIngestResult:
     """Seal one trading day's minute/auction partitions without writing production DB."""
@@ -1467,9 +1621,18 @@ def run_daily_research_ingest(
     generated_at = generated_at.astimezone(_CST)
     if trade_date > generated_at.date():
         raise ValueError("research ingest cannot target a future trade date")
-    if not dry_run and trade_date != generated_at.date():
+    if recovery and trade_date >= generated_at.date():
+        raise ValueError("historical recovery requires a past trade date")
+    if (
+        recovery
+        and not dry_run
+        and generated_at.weekday() < 5
+        and _MARKET_PROTECTION_START <= generated_at.time() <= _MARKET_PROTECTION_END
+    ):
+        raise ValueError("historical recovery is forbidden during market protection window")
+    if not recovery and not dry_run and trade_date != generated_at.date():
         raise ValueError("rt_min_daily ingest only supports the current trade date")
-    if not dry_run and generated_at.time() < _MINIMUM_SAFE_TIME:
+    if not recovery and not dry_run and generated_at.time() < _MINIMUM_SAFE_TIME:
         raise ValueError("current trading day research ingest is forbidden before 15:15 CST")
     if not dry_run and _CLEAN_COMMIT_PATTERN.fullmatch(code_commit) is None:
         raise ValueError("research ingest requires a clean 40-character code commit")
@@ -1485,6 +1648,7 @@ def run_daily_research_ingest(
             adapter=adapter,
             code_commit=code_commit,
             dry_run=True,
+            recovery=recovery,
             generated_at=generated_at,
         )
     _mkdir_durable(paths.state_dir)
@@ -1497,6 +1661,7 @@ def run_daily_research_ingest(
             adapter=adapter,
             code_commit=code_commit,
             dry_run=False,
+            recovery=recovery,
             generated_at=generated_at,
         )
 
@@ -1509,6 +1674,7 @@ def _run_daily_research_ingest_locked(
     adapter: ResearchIngestAdapter | None,
     code_commit: str,
     dry_run: bool,
+    recovery: bool,
     generated_at: datetime,
 ) -> ResearchDailyIngestResult:
     watchlist = _load_watchlist_snapshot(paths.staging_root, trade_date)
@@ -1571,7 +1737,22 @@ def _run_daily_research_ingest_locked(
             previous_marker_hash,
             previous_catalog_hash,
         ) = _validate_prior_authority(paths)
-        minute_raw = adapter.rt_min_daily(sorted(expected_minute_codes), freq="1min")
+        _require_observation_continuity(
+            paths,
+            trade_date=trade_date,
+            previous_open_date=previous_open_date,
+            previous=previous,
+        )
+        if recovery:
+            minute_raw = _fetch_historical_minutes(
+                adapter,
+                ts_codes=expected_minute_codes,
+                trade_date=trade_date,
+            )
+        else:
+            minute_raw = adapter.rt_min_daily(
+                sorted(expected_minute_codes), freq="1min"
+            )
         auction_raw = adapter.stk_auction(trade_date)
         fetched_minutes = _normalize_fetched_frame(
             minute_raw,
