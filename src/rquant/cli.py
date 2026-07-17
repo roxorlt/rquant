@@ -455,6 +455,33 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_daily_indicator_backfill(args: argparse.Namespace) -> int:
+    """Preview or rebuild daily indicators from local daily facts."""
+    from rquant import indicator_backfill as indicator_backfill_module
+    from rquant.indicator_backfill import (
+        DailyIndicatorBackfillProtectedWindowError,
+    )
+
+    setup_logging()
+    try:
+        result = indicator_backfill_module.run_daily_indicator_backfill(
+            reader_factory=(
+                indicator_backfill_module.open_detached_daily_indicator_store
+                if args.apply
+                else open_readonly_store
+            ),
+            writer_factory=DuckDBStore,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            apply=args.apply,
+        )
+    except DailyIndicatorBackfillProtectedWindowError as error:
+        logger.error(str(error))
+        return 2
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     """启动盘中实时监控。"""
     from rquant.monitor import run_monitor
@@ -2591,6 +2618,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="交易日期 YYYY-MM-DD (默认今天)",
     )
 
+    indicator_backfill_p = sub.add_parser(
+        "daily-indicator-backfill",
+        help="从本地日线与复权因子预演或重建 daily_indicator",
+    )
+    indicator_backfill_p.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        required=True,
+        help="开始日期 YYYY-MM-DD（含）",
+    )
+    indicator_backfill_p.add_argument(
+        "--end-date",
+        type=_parse_iso_date,
+        required=True,
+        help="结束日期 YYYY-MM-DD（含）",
+    )
+    indicator_backfill_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="显式执行写入；默认只预演",
+    )
+
     monitor_p = sub.add_parser("monitor", help="启动盘中实时监控")
     monitor_p.add_argument(
         "--interval", type=int, default=5,
@@ -3719,6 +3768,7 @@ def main() -> int:
         "serve": cmd_serve,
         "run-daily": cmd_run_daily,
         "ingest": cmd_ingest,
+        "daily-indicator-backfill": cmd_daily_indicator_backfill,
         "monitor": cmd_monitor,
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,

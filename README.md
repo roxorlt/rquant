@@ -54,13 +54,12 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
-2026-07-17 生产当前运行 `v0.21.1`；Stage 1 的生产数据修复仍保持 `stage1-v3` P0=0，
-历史状态、权威日历、停复牌和研究数据迁云链路已建立。`v0.22.0` 候选进一步实现不可变执行
-绑定：正式门禁和策略计算使用同一组内容寻址 Parquet，保存 snapshot/binding/策略参数/完整
-结果四层指纹，并把精确资格候选固化为 `strategy_eligibility` 工件，源库变化不再改变旧
-回测或候选全集。代码能力完成不等于策略结论已可信；N 字、科创/创业放量和集合竞价仍需分别
-生成真实资格 manifest，达到 baseline 95%、eligibility/B/S 99% 并完成生产固定回放后，
-才能从 `exploratory` 晋级。
+2026-07-17 生产当前运行 `v0.22.0`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
+snapshot/binding 执行链已上线。`v0.22.1` 候选修复首次生产 manifest 暴露的资格分母混入
+B 股、日终未持续生成 `daily_indicator` 两个阻断，并提供受控历史补算入口。代码能力完成
+不等于策略结论已可信；N 字、科创/创业放量和集合竞价仍需分别补齐真实资格 manifest，
+达到 baseline 95%、eligibility/B/S 99% 并完成生产固定回放后，才能从 `exploratory`
+晋级。
 
 - [研究可信度基线](docs/analysis/2026-07-13-research-trust-baseline.md)
 - [阶段 1 真实数据验收](docs/analysis/2026-07-15-stage1-data-contract-acceptance.md)
@@ -152,6 +151,12 @@ bash scripts/check-core-quality.sh
 # 回补权威停复牌逐日快照
 .venv/bin/rquant suspension-backfill \
   --start-date 2026-04-01 --end-date 2026-07-14
+
+# 先预演，再在盘外窗口从本地日线与复权因子重建日指标
+.venv/bin/rquant daily-indicator-backfill \
+  --start-date 2026-03-31 --end-date 2026-07-16
+.venv/bin/rquant daily-indicator-backfill \
+  --start-date 2026-03-31 --end-date 2026-07-16 --apply
 
 # 健康看板
 .venv/bin/streamlit run src/rquant/dashboard/app.py --server.port 8501

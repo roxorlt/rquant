@@ -28,10 +28,12 @@ class _FakeDailyPro:
         close: float = 10.5,
         high: float | None = None,
         include_daily_basic: bool = False,
+        adj_factor_value: float | None = None,
     ) -> None:
         self.close = close
         self.high = high if high is not None else max(close, 10.5)
         self.include_daily_basic = include_daily_basic
+        self.adj_factor_value = adj_factor_value
 
     def stock_basic(self, **kwargs: object) -> pd.DataFrame:
         del kwargs
@@ -74,8 +76,18 @@ class _FakeDailyPro:
         return pd.DataFrame()
 
     def adj_factor(self, **kwargs: object) -> pd.DataFrame:
-        del kwargs
-        return pd.DataFrame()
+        assert kwargs == {"trade_date": "20240102"}
+        if self.adj_factor_value is None:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": "20240102",
+                    "adj_factor": self.adj_factor_value,
+                }
+            ]
+        )
 
     def daily_basic(self, **kwargs: object) -> pd.DataFrame:
         del kwargs
@@ -167,6 +179,16 @@ class _WriterFactory:
         return self.store_type(self.db_path)
 
 
+class _ReaderFactory:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self.calls = 0
+
+    def __call__(self) -> DuckDBStore:
+        self.calls += 1
+        return DuckDBStore(self.db_path, read_only=True)
+
+
 @pytest.fixture()
 def db_path(tmp_path: Path) -> Path:
     path = tmp_path / "ingest.duckdb"
@@ -185,12 +207,14 @@ def _run_ingest(
     *,
     sleeper: Callable[[float], None] = _no_sleep,
     pro: _FakeDailyPro | None = None,
+    indicator_reader_factory: Callable[[], DuckDBStore] | None = None,
     writer_factory: Callable[[], DuckDBStore] | None = None,
 ) -> int:
     return ingest_daily(
         "2024-01-02",
         pro=pro or _FakeDailyPro(),
         status_adapter=status_adapter,
+        indicator_reader_factory=indicator_reader_factory or _ReaderFactory(db_path),
         writer_factory=writer_factory or _WriterFactory(db_path),
         ingested_at=INGESTED_AT,
         api_sleep=0,
@@ -451,6 +475,7 @@ def test_ingest_opens_production_writer_only_after_all_remote_fetches(
         "2024-01-02",
         pro=_AssertingPro(),
         status_adapter=_AssertingStatusAdapter(),
+        indicator_reader_factory=_ReaderFactory(db_path),
         writer_factory=writer_factory,
         ingested_at=INGESTED_AT,
         api_sleep=0,
@@ -459,6 +484,67 @@ def test_ingest_opens_production_writer_only_after_all_remote_fetches(
 
     assert rows == 1
     assert writer_factory.calls == 1
+
+
+def test_ingest_derives_indicators_before_constructing_writer(
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class _RecordingReaderStore(DuckDBStore):
+        def __enter__(self) -> DuckDBStore:
+            events.append("reader_enter")
+            return super().__enter__()
+
+        def __exit__(self, *args: object) -> None:
+            events.append("reader_exit")
+            super().__exit__(*args)
+
+    class _RecordingWriterFactory(_WriterFactory):
+        def __call__(self) -> DuckDBStore:
+            events.append("writer")
+            return super().__call__()
+
+    writer_factory = _RecordingWriterFactory(db_path)
+
+    def derive_before_writer(*args: object, **kwargs: object) -> pd.DataFrame:
+        del args, kwargs
+        assert writer_factory.calls == 0
+        assert events == ["reader_construct", "reader_enter"]
+        events.append("derive")
+        return pd.DataFrame()
+
+    def reader_factory() -> DuckDBStore:
+        events.append("reader_construct")
+        return _RecordingReaderStore(db_path, read_only=True)
+
+    monkeypatch.setattr(
+        ingest_module,
+        "derive_target_daily_indicators",
+        derive_before_writer,
+        raising=False,
+    )
+
+    rows = ingest_daily(
+        "2024-01-02",
+        pro=_FakeDailyPro(adj_factor_value=2.0),
+        status_adapter=_StatusAdapter(db_path),
+        indicator_reader_factory=reader_factory,
+        writer_factory=writer_factory,
+        ingested_at=INGESTED_AT,
+        api_sleep=0,
+        sleep=_no_sleep,
+    )
+
+    assert rows == 1
+    assert events == [
+        "reader_construct",
+        "reader_enter",
+        "derive",
+        "reader_exit",
+        "writer",
+    ]
 
 
 def _seed_target_bar_and_state(db_path: Path) -> tuple[object, object]:
@@ -586,6 +672,141 @@ def test_ingest_rolls_back_bar_and_state_when_atomic_apply_fails(
     assert bar == old_bar
     assert state == old_state
     assert status == [old_status]
+
+
+def test_ingest_generates_target_indicator_without_future_factor_leakage(
+    db_path: Path,
+) -> None:
+    history_dates = pd.bdate_range(end="2024-01-01", periods=59).date
+    with DuckDBStore(db_path) as store:
+        store.upsert_daily(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": history_date,
+                        "open": 10.0,
+                        "high": 11.0,
+                        "low": 9.0,
+                        "close": 10.0,
+                        "pre_close": 10.0,
+                        "change": 0.0,
+                        "pct_chg": 0.0,
+                        "vol": 1000.0,
+                        "amount": 10000.0,
+                    }
+                    for history_date in history_dates
+                ]
+            )
+        )
+        store.upsert_adj_factor(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": history_date,
+                        "adj_factor": 1.0,
+                    }
+                    for history_date in history_dates
+                ]
+                + [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": date(2024, 1, 3),
+                        "adj_factor": 10.0,
+                    }
+                ]
+            )
+        )
+
+    rows = _run_ingest(
+        db_path,
+        _StatusAdapter(db_path, expected_daily_count=59),
+        pro=_FakeDailyPro(close=10.0, adj_factor_value=2.0),
+    )
+
+    assert rows == 1
+    with DuckDBStore(db_path, read_only=True) as store:
+        indicator = store._conn.execute(
+            """
+            SELECT trade_date, ma5, ma60
+            FROM daily_indicator
+            WHERE ts_code = '600000.SH'
+              AND trade_date = DATE '2024-01-02'
+            """
+        ).fetchone()
+    assert indicator is not None
+    assert indicator[0] == date(2024, 1, 2)
+    assert indicator[1] == pytest.approx(6.0)
+    assert indicator[2] == pytest.approx(5.0 + 5.0 / 60.0)
+
+
+def test_ingest_indicator_failure_rolls_back_entire_daily_transaction(
+    db_path: Path,
+) -> None:
+    class _FailingIndicatorStore(DuckDBStore):
+        def upsert_indicators(self, df: pd.DataFrame) -> int:
+            super().upsert_indicators(df)
+            raise RuntimeError("indicator write failed")
+
+    with pytest.raises(RuntimeError, match="indicator write failed"):
+        _run_ingest(
+            db_path,
+            _StatusAdapter(db_path),
+            pro=_FakeDailyPro(adj_factor_value=2.0),
+            writer_factory=_WriterFactory(db_path, _FailingIndicatorStore),
+        )
+
+    with DuckDBStore(db_path, read_only=True) as store:
+        assert store.count_daily("600000.SH") == 0
+        assert store.count_adj_factor("600000.SH") == 0
+        assert store.count_indicators("600000.SH") == 0
+        assert store.count_state("600000.SH") == 0
+        assert store.list_stock_status(
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+        ) == []
+
+
+def test_ingest_invalidates_future_indicators_for_affected_codes_only(
+    db_path: Path,
+) -> None:
+    sentinel_rows = pd.DataFrame(
+        [
+            {
+                "ts_code": ts_code,
+                "trade_date": date(2024, 1, 3),
+                "ma5": 999.0,
+                "ma10": 999.0,
+                "ma20": 999.0,
+                "ma60": 999.0,
+                "rsi6": 999.0,
+                "rsi14": 999.0,
+                "macd": 999.0,
+                "macd_signal": 999.0,
+                "macd_hist": 999.0,
+                "kdj_k": 999.0,
+                "kdj_d": 999.0,
+                "kdj_j": 999.0,
+            }
+            for ts_code in ("600000.SH", "000001.SZ")
+        ]
+    )
+    with DuckDBStore(db_path) as store:
+        store.upsert_indicators(sentinel_rows)
+
+    _run_ingest(db_path, _StatusAdapter(db_path))
+
+    with DuckDBStore(db_path, read_only=True) as store:
+        future_rows = store._conn.execute(
+            """
+            SELECT ts_code, ma5
+            FROM daily_indicator
+            WHERE trade_date = DATE '2024-01-03'
+            ORDER BY ts_code
+            """
+        ).fetchall()
+    assert future_rows == [("000001.SZ", 999.0)]
 
 
 def test_ingest_older_date_recomputes_existing_future_state_tail(
@@ -923,6 +1144,7 @@ def test_ingest_invalidate_tail_mode_skips_state_and_sentiment(
             expected_daily_count=2,
             expected_state_count=2,
         ),
+        indicator_reader_factory=_ReaderFactory(db_path),
         writer_factory=_WriterFactory(db_path),
         ingested_at=INGESTED_AT,
         api_sleep=0,
