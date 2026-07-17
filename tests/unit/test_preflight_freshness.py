@@ -15,7 +15,11 @@ from rquant.data_contracts import (
     PriceBasis,
     VisibilityRule,
 )
-from rquant.preflight import PRODUCTION_FRESHNESS_DATASET_IDS, check_data_freshness
+from rquant.preflight import (
+    PRODUCTION_FRESHNESS_DATASET_IDS,
+    RESEARCH_FRESHNESS_DATASET_IDS,
+    check_data_freshness,
+)
 from rquant.trade_calendar import TradeCalendarDay
 
 
@@ -130,6 +134,11 @@ def test_suspension_coverage_is_a_required_production_daily_contract() -> None:
     assert contract.freshness.watermark_column == "trade_date"
     assert contract.freshness.max_trading_session_lag == 0
     assert contract.freshness.required_on_open_day is True
+
+
+def test_auction_freshness_belongs_to_research_not_production() -> None:
+    assert "auction_bar" not in PRODUCTION_FRESHNESS_DATASET_IDS
+    assert "auction_bar" in RESEARCH_FRESHNESS_DATASET_IDS
 
 
 def test_trading_session_lag_ignores_weekend_calendar_days(monkeypatch: Any) -> None:

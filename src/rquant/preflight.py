@@ -62,7 +62,6 @@ PRODUCTION_FRESHNESS_DATASET_IDS = (
     "daily_bar",
     "stock_status_daily",
     "minute_bar",
-    "auction_bar",
     "adj_factor",
     "stock_suspend_coverage",
 )
