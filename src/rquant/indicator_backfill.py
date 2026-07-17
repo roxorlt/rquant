@@ -623,6 +623,10 @@ def apply_prepared_daily_indicator_backfill(
     plan: PreparedDailyIndicatorBackfill,
 ) -> DailyIndicatorBackfillResult:
     """Apply a prepared plan under the production serial-writer contract."""
+    _require_prepared_coverage(
+        estimated_rows=plan.estimated_rows,
+        actual_rows=len(plan.indicators),
+    )
     # The aggregate source scan is deliberately much shorter than indicator
     # derivation and prevents a stale detached replica from overwriting main.
     transaction_open = False
@@ -637,8 +641,13 @@ def apply_prepared_daily_indicator_backfill(
             raise DailyIndicatorBackfillSourceChangedError(
                 "daily_indicator source facts changed after detached snapshot"
             )
+        a_share = _a_share_code_predicate("ts_code")
         writer._conn.execute(
-            "DELETE FROM daily_indicator WHERE trade_date BETWEEN ? AND ?",
+            f"""
+            DELETE FROM daily_indicator
+            WHERE trade_date BETWEEN ? AND ?
+              AND {a_share}
+            """,
             [plan.start_date, plan.end_date],
         )
         actual_rows = writer.upsert_indicators(plan.indicators)
