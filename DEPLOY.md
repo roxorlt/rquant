@@ -5,6 +5,49 @@
 
 ---
 
+## 2026-07-17 · v0.21.1 · 云端研究日增量首次上线
+
+**状态**：应用代码 PR #97 与 preflight 热修 PR #98 经 Python 3.11/3.12 CI 全绿后
+squash merge；annotated tag `v0.21.1` 精确指向
+`530bb8c489fb481da9a934220813c5ec02a65909`。15:19-15:20 由受控发布器从 `v0.20.2`
+快进部署，状态 `deployed`。基础设施 PR #99 随后合并为精确 SHA
+`39341f8145caa33c7355ca01983de9f65ab9f883`；生产 `main` 仅按白名单快进这 5 个文件，
+安装 `rquant-research-ingest.service/.timer` 后保持 timer `disabled/inactive`。
+
+**上线内容**：日终 runner 只在当日 daily 成功、主动刷新的只读副本包含完整日线后运行；
+默认日期使用上海时区，普通增量和历史恢复都强制 observation 连续。分钟、竞价、catalog
+和只读 catalog 先写隔离事务，完整审计后再原子发布。runner 固定交易日，最多尝试 4 次；
+`degraded` 和开关关闭不重试。`auction_bar` 仍由研究 authority 验收，不再误列为没有每日
+writer 的生产 DuckDB freshness 必选表。
+
+**验证与生产验收**：
+
+- 本地组合分支 `1981 passed`，核心质量检查和 `git diff --check` 通过；PR #97、#98、#99
+  的 Python 3.11/3.12 CI 均通过。
+- 云端原样 `systemd-analyze calendar` 将触发式规范为工作日 `18:10:00`，连续 5 次迭代
+  正确；两个 unit `systemd-analyze verify` 退出码为 0。安装后 28 个 unit 全部通过
+  preflight，timer 明确为 `disabled/inactive`。
+- 生产代码 tag、包版本和应用 SHA 分别为 `v0.21.1`、`0.21.1`、`530bb8c`；安装基础设施后
+  生产 `main` 为 `39341f8`。部署只重启当时 active 的 5 个 Web 服务，monitor 与
+  surge-watch 保持正常收盘退出；备份与只读副本同步均为 `status=0/SUCCESS`。
+- 17:00 daily 于 17:02 成功，写入 `daily_bar=5,522`、`stock_status_daily=5,522`，
+  副本主动刷新后 readiness 返回 `ready`、`issues=[]`。
+
+**首次 observation**：17:11 手工运行写入 2026-07-17 分钟 4,329 行（9/9 标的完整，
+覆盖率 100%）和竞价 5,523 行（预期 5,522，覆盖率 99.9819%），catalog 与只读 catalog
+哈希一致。结果按设计为 `degraded`、退出码 2，唯一问题是
+`watchlist_snapshot_missing`：当天 09:25 monitor 启动时研究开关尚未启用，不能在盘后
+伪造 09:30 前不可变清单。开关现保持 `true`，让下个交易日 monitor 留下真实清单；timer
+继续禁用，待下个交易日收盘后手工得到 `candidate` 且退出码 0 才能启用。
+
+**回滚**：发现异常时先执行
+`sudo systemctl disable --now rquant-research-ingest.timer`，并将
+`RESEARCH_CLOUD_INGEST_ENABLED=false`。已发布的 degraded observation、Parquet 和 catalog
+必须保留作审计证据，不得手工删除或改写。代码或 unit 撤回必须创建 revert PR、合并后向前
+发布新 SemVer / 精确基础设施 SHA；禁止生产机非快进回退。
+
+---
+
 ## 2026-07-17 · v0.20.2 · 研究提交纯净度门修复
 
 **状态**：PR #95 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.20.2`
