@@ -5,6 +5,39 @@
 
 ---
 
+## 2026-07-17 · v0.20.2 · 研究提交纯净度门修复
+
+**状态**：PR #95 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.20.2`
+精确指向 `0c1755e15b2f1a78f09ef18171010d0cf32e4f1f`。09:05 在交易保护窗口前由受控发布器从
+`v0.20.1` 快进部署，状态 `deployed`。研究采集开关继续关闭，没有新增 systemd timer，
+没有写生产 DuckDB 或研究 lake。
+
+**修复内容**：根目录 `backup/` 明确作为云端定时恢复快照目录加入 `.gitignore`，避免受控
+运行时工件让研究提交探测误报 `-dirty`；其他未提交或未跟踪文件仍会使可信度门 fail closed。
+同时补齐 `v0.20.0` 和 `v0.20.1` 的生产部署审计记录。
+
+**验证与生产验收**：
+
+- 新回归测试先复现 `backup/snapshot.duckdb.gz` 导致 `-dirty`，修复后通过；本地聚焦测试
+  `11 passed`、全量测试 `1958 passed`，核心质量检查与 `git diff --check` 通过。
+- 部署后 tag、HEAD 和包版本均为 `v0.20.2` / `0c1755e` / `0.20.2`；包含未跟踪文件的
+  `git status` 为空，`detect_code_commit()` 返回精确 40 位 SHA
+  `0c1755e15b2f1a78f09ef18171010d0cf32e4f1f`。
+- 原失败日期的 `research-ingest --date 2026-07-16 --dry-run` 返回 `status=planned`，结果内
+  `code_commit` 为同一精确 SHA、`issues=[]`，且没有发布分区或调用网络补拉。
+- 09:06 preflight 为 `ok=5 warn=0 fail=0 skip=0`，主副本工件延迟 0 分钟；五个前台服务
+  `active/running`、`Result=success`、`NRestarts=0`。09:00 盘前检查已完成，monitor 与
+  surge-watch 保持 inactive 等待 09:25 timer，原有 10 个 timers 全部正常。
+
+**保留门**：本版本只消除正式研究增量的提交纯净度阻断。生产开关仍为 false/missing；安装
+研究日增量 systemd 调度、打开开关并开始 10 个交易日 observation，仍属于独立基础设施与
+生产研究数据写入变更，必须另行明确授权。
+
+**回滚**：本版本没有 schema 或数据写入。部署失败由受控发布器自动回滚；成功后的撤回必须
+对 `0c1755e` 创建 revert PR、合并并打新 SemVer tag 后向前发布，禁止生产机非快进回退旧 tag。
+
+---
+
 ## 2026-07-17 · v0.20.1 · 研究日增量日期类型热修
 
 **状态**：PR #94 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.20.1`
