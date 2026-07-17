@@ -6,6 +6,11 @@
 
 ### Fixed
 
+- **生产 preflight 被研究竞价表永久阻塞**：`auction_bar` 由研究回补/日增量链路维护，
+  不再误列为生产 DuckDB 的盘中 freshness 必选表；竞价覆盖仍由研究 catalog 的
+  authority/candidate 验收，避免在没有生产每日 writer 的情况下于 09:31 后必然失败。
+  项目版本从 `0.21.0` 更新到 `0.21.1`。
+
 - **运行时备份目录误标研究提交为 dirty**：根目录 `backup/` 明确作为云端定时恢复快照目录
   排除出 Git 状态；研究提交探测仍会拒绝其他未提交或未跟踪文件，但不会再因受控备份工件让
   正式 `research-ingest` fail closed。项目版本从 `0.20.1` 更新到 `0.20.2`。
