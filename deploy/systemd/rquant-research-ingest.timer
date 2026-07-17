@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger rQuant cloud research ingest at 18:10 Mon-Fri
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 18:10:00
+AccuracySec=1s
+Unit=rquant-research-ingest.service
+
+[Install]
+WantedBy=timers.target
