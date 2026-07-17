@@ -56,6 +56,35 @@ class TestBuildParser:
         args = parser.parse_args([])
         assert args.command is None
 
+    def test_daily_indicator_backfill_defaults_to_preview_and_requires_apply(
+        self,
+    ) -> None:
+        preview = build_parser().parse_args(
+            [
+                "daily-indicator-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-14",
+            ]
+        )
+        apply = build_parser().parse_args(
+            [
+                "daily-indicator-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-14",
+                "--apply",
+            ]
+        )
+
+        assert preview.command == "daily-indicator-backfill"
+        assert preview.start_date == date(2026, 4, 1)
+        assert preview.end_date == date(2026, 7, 14)
+        assert preview.apply is False
+        assert apply.apply is True
+
     def test_research_export_requires_typed_dataset_and_dates(self) -> None:
         args = build_parser().parse_args(
             [
@@ -149,6 +178,125 @@ class TestCLISmoke:
         )
         assert result.returncode == 0
         assert "--date" in result.stdout
+
+
+class TestDailyIndicatorBackfill:
+    def test_preview_uses_readonly_store_and_prints_json(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        import rquant.cli as cli
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore(tmp_path / "indicator-preview.duckdb")
+        context = MagicMock()
+        context.__enter__.return_value = store
+        context.__exit__.side_effect = lambda *_: store.close()
+        writer = MagicMock(side_effect=AssertionError("writer opened"))
+        monkeypatch.setattr(cli, "open_readonly_store", lambda: context)
+        monkeypatch.setattr(cli, "DuckDBStore", writer)
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+        args = build_parser().parse_args(
+            [
+                "daily-indicator-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-14",
+            ]
+        )
+
+        assert cli.cmd_daily_indicator_backfill(args) == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "code_count": 0,
+            "estimated_rows": 0,
+            "actual_rows": 0,
+            "start_date": "2026-04-01",
+            "end_date": "2026-07-14",
+            "dry_run": True,
+        }
+        writer.assert_not_called()
+
+    def test_explicit_apply_uses_writer(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        import rquant.cli as cli
+        import rquant.indicator_backfill as backfill_module
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore(tmp_path / "indicator-apply.duckdb")
+        context = MagicMock()
+        context.__enter__.return_value = store
+        context.__exit__.side_effect = lambda *_: store.close()
+        writer = MagicMock(return_value=context)
+        readonly = MagicMock(side_effect=AssertionError("readonly opened"))
+        monkeypatch.setattr(cli, "DuckDBStore", writer)
+        monkeypatch.setattr(cli, "open_readonly_store", readonly)
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+        monkeypatch.setattr(
+            backfill_module,
+            "_now",
+            lambda: datetime(2026, 7, 18, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        args = build_parser().parse_args(
+            [
+                "daily-indicator-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-14",
+                "--apply",
+            ]
+        )
+
+        assert cli.cmd_daily_indicator_backfill(args) == 0
+        assert json.loads(capsys.readouterr().out)["dry_run"] is False
+        writer.assert_called_once_with()
+        readonly.assert_not_called()
+
+    def test_apply_returns_two_inside_protected_window(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        import rquant.cli as cli
+        import rquant.indicator_backfill as backfill_module
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore(tmp_path / "indicator-protected.duckdb")
+        context = MagicMock()
+        context.__enter__.return_value = store
+        context.__exit__.side_effect = lambda *_: store.close()
+        monkeypatch.setattr(cli, "DuckDBStore", MagicMock(return_value=context))
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+        monkeypatch.setattr(
+            backfill_module,
+            "_now",
+            lambda: datetime(2026, 7, 17, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        args = build_parser().parse_args(
+            [
+                "daily-indicator-backfill",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-14",
+                "--apply",
+            ]
+        )
+
+        assert cli.cmd_daily_indicator_backfill(args) == 2
 
 
 class TestResearchExport:

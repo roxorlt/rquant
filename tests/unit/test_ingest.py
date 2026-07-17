@@ -28,10 +28,12 @@ class _FakeDailyPro:
         close: float = 10.5,
         high: float | None = None,
         include_daily_basic: bool = False,
+        adj_factor_value: float | None = None,
     ) -> None:
         self.close = close
         self.high = high if high is not None else max(close, 10.5)
         self.include_daily_basic = include_daily_basic
+        self.adj_factor_value = adj_factor_value
 
     def stock_basic(self, **kwargs: object) -> pd.DataFrame:
         del kwargs
@@ -74,8 +76,18 @@ class _FakeDailyPro:
         return pd.DataFrame()
 
     def adj_factor(self, **kwargs: object) -> pd.DataFrame:
-        del kwargs
-        return pd.DataFrame()
+        assert kwargs == {"trade_date": "20240102"}
+        if self.adj_factor_value is None:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": "20240102",
+                    "adj_factor": self.adj_factor_value,
+                }
+            ]
+        )
 
     def daily_basic(self, **kwargs: object) -> pd.DataFrame:
         del kwargs
@@ -586,6 +598,100 @@ def test_ingest_rolls_back_bar_and_state_when_atomic_apply_fails(
     assert bar == old_bar
     assert state == old_state
     assert status == [old_status]
+
+
+def test_ingest_generates_target_indicator_without_future_factor_leakage(
+    db_path: Path,
+) -> None:
+    history_dates = pd.bdate_range(end="2024-01-01", periods=59).date
+    with DuckDBStore(db_path) as store:
+        store.upsert_daily(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": history_date,
+                        "open": 10.0,
+                        "high": 11.0,
+                        "low": 9.0,
+                        "close": 10.0,
+                        "pre_close": 10.0,
+                        "change": 0.0,
+                        "pct_chg": 0.0,
+                        "vol": 1000.0,
+                        "amount": 10000.0,
+                    }
+                    for history_date in history_dates
+                ]
+            )
+        )
+        store.upsert_adj_factor(
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": history_date,
+                        "adj_factor": 1.0,
+                    }
+                    for history_date in history_dates
+                ]
+                + [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": date(2024, 1, 3),
+                        "adj_factor": 10.0,
+                    }
+                ]
+            )
+        )
+
+    rows = _run_ingest(
+        db_path,
+        _StatusAdapter(db_path, expected_daily_count=59),
+        pro=_FakeDailyPro(close=10.0, adj_factor_value=2.0),
+    )
+
+    assert rows == 1
+    with DuckDBStore(db_path, read_only=True) as store:
+        indicator = store._conn.execute(
+            """
+            SELECT trade_date, ma5, ma60
+            FROM daily_indicator
+            WHERE ts_code = '600000.SH'
+              AND trade_date = DATE '2024-01-02'
+            """
+        ).fetchone()
+    assert indicator is not None
+    assert indicator[0] == date(2024, 1, 2)
+    assert indicator[1] == pytest.approx(6.0)
+    assert indicator[2] == pytest.approx(5.0 + 5.0 / 60.0)
+
+
+def test_ingest_indicator_failure_rolls_back_entire_daily_transaction(
+    db_path: Path,
+) -> None:
+    class _FailingIndicatorStore(DuckDBStore):
+        def upsert_indicators(self, df: pd.DataFrame) -> int:
+            super().upsert_indicators(df)
+            raise RuntimeError("indicator write failed")
+
+    with pytest.raises(RuntimeError, match="indicator write failed"):
+        _run_ingest(
+            db_path,
+            _StatusAdapter(db_path),
+            pro=_FakeDailyPro(adj_factor_value=2.0),
+            writer_factory=_WriterFactory(db_path, _FailingIndicatorStore),
+        )
+
+    with DuckDBStore(db_path, read_only=True) as store:
+        assert store.count_daily("600000.SH") == 0
+        assert store.count_adj_factor("600000.SH") == 0
+        assert store.count_indicators("600000.SH") == 0
+        assert store.count_state("600000.SH") == 0
+        assert store.list_stock_status(
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+        ) == []
 
 
 def test_ingest_older_date_recomputes_existing_future_state_tail(

@@ -1,7 +1,6 @@
-"""每日数据拉取：stock_basic → daily_bar → adj_factor → daily_basic → derive_state。
+"""每日数据拉取：stock_basic → daily_bar → adj_factor → indicators → state。
 
 按 trade_date 模式拉全市场，适合每日自动化。
-跳过 indicators（当前筛选预设不依赖）。
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
+from rquant.indicator_backfill import derive_daily_indicators
 from rquant.market_context import sync_market_sentiment
 from rquant.security_status import (
     DailySecurityKey,
@@ -483,6 +483,21 @@ def ingest_daily(
                 logger.warning(
                     f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子"
                 )
+            target_indicators = derive_daily_indicators(
+                writer,
+                start_date=target_date,
+                end_date=target_date,
+                ts_codes=codes,
+            )
+            writer._conn.execute(
+                "DELETE FROM daily_indicator "
+                "WHERE trade_date = ? AND ts_code = ANY(?)",
+                [target_date, codes],
+            )
+            indicator_rows = writer.upsert_indicators(target_indicators)
+            logger.info(
+                f"daily_indicator: {indicator_rows} 行, {len(codes)} 只"
+            )
             if df_basic_mkt is not None and not df_basic_mkt.empty:
                 writer.upsert_daily_basic(df_basic_mkt)
                 logger.info(f"daily_basic: {len(df_basic_mkt)} 行")
