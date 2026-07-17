@@ -265,20 +265,15 @@ class TestDailyIndicatorBackfill:
 
     def test_apply_returns_two_inside_protected_window(
         self,
-        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from unittest.mock import MagicMock
 
         import rquant.cli as cli
         import rquant.indicator_backfill as backfill_module
-        from rquant.storage.duckdb import DuckDBStore
 
-        store = DuckDBStore(tmp_path / "indicator-protected.duckdb")
-        context = MagicMock()
-        context.__enter__.return_value = store
-        context.__exit__.side_effect = lambda *_: store.close()
-        monkeypatch.setattr(cli, "DuckDBStore", MagicMock(return_value=context))
+        writer = MagicMock(side_effect=AssertionError("writer opened"))
+        monkeypatch.setattr(cli, "DuckDBStore", writer)
         monkeypatch.setattr(cli, "setup_logging", lambda: None)
         monkeypatch.setattr(
             backfill_module,
@@ -297,6 +292,7 @@ class TestDailyIndicatorBackfill:
         )
 
         assert cli.cmd_daily_indicator_backfill(args) == 2
+        writer.assert_not_called()
 
 
 class TestResearchExport:

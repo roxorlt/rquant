@@ -460,9 +460,16 @@ def cmd_daily_indicator_backfill(args: argparse.Namespace) -> int:
     from rquant.indicator_backfill import (
         DailyIndicatorBackfillProtectedWindowError,
         backfill_daily_indicators,
+        require_daily_indicator_write_window,
     )
 
     setup_logging()
+    if args.apply:
+        try:
+            require_daily_indicator_write_window()
+        except DailyIndicatorBackfillProtectedWindowError as error:
+            logger.error(str(error))
+            return 2
     context = DuckDBStore() if args.apply else open_readonly_store()
     try:
         with context as store:
