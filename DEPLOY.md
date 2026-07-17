@@ -5,6 +5,61 @@
 
 ---
 
+## 2026-07-17 · v0.20.1 · 研究日增量日期类型热修
+
+**状态**：PR #94 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.20.1`
+精确指向 `dc486566e356178596c7d917f0bf8fb42c38b055`。08:50 由受控发布器从
+`v0.20.0` 快进部署，状态 `deployed`。研究采集开关继续保持关闭，没有安装或启用新的
+systemd timer，也没有写生产 DuckDB 或研究 lake。
+
+**修复内容**：研究 Parquet 返回的 `datetime.date` 与运营 DuckDB 返回的 pandas
+`Timestamp` 在合并前统一规范化，再进入主键分组和排序；保留同主键最新业务值与最早
+`created_at` 的既有语义。新增函数级测试和真实 Parquet + DuckDB dry-run 全链路回归测试。
+
+**验证与生产验收**：
+
+- 本地研究采集测试 `25 passed`、全量测试 `1957 passed`，核心质量检查与
+  `git diff --check` 通过；GitHub Actions Python 3.11/3.12 分别通过。
+- 部署后 tag、HEAD 和包版本均为 `v0.20.1` / `dc48656` / `0.20.1`；preflight 为
+  `ok=5 warn=0 fail=0 skip=0`，无 DuckDB 锁，五个前台服务均为 `active/running`、
+  `Result=success`、`NRestarts=0`，原有 10 个 timers 均有下一次触发。
+- 对原失败日期重新执行 `research-ingest --date 2026-07-16 --dry-run` 成功返回
+  `status=planned`：分钟计划 3,561 行、竞价计划 5,523 行，没有网络补拉或文件发布，日期类型
+  异常未再出现。`research-authority-status` 仍为 `bootstrap_candidate`，bootstrap catalog
+  哈希一致，尚无日增量 observation，符合开关未启用时的预期。
+
+**启用前门槛**：部署目录存在长期未跟踪的 `backup/`，导致提交探测器在包含未跟踪文件时
+返回 `dc48656-dirty`；tracked worktree 实际干净，tag 与 HEAD 准确。dry-run 允许该标记，
+正式采集会 fail closed。启用研究日增量前必须先把运行时备份目录排除出 Git 状态或由受控
+部署注入精确 `RQUANT_CODE_COMMIT`，并完成独立基础设施授权与发布。
+
+**回滚**：本版本没有 schema 或数据写入。部署失败由受控发布器自动回滚；成功后的撤回必须
+对 `dc48656` 创建 revert PR、合并并打新 SemVer tag 后向前发布，禁止生产机非快进退回旧 tag。
+
+---
+
+## 2026-07-17 · v0.20.0 · 云端研究日增量候选代码上线
+
+**状态**：PR #93 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.20.0`
+精确指向 `03d04c8acf8d9c3fc377432b4977d768506d87e9`。08:33-08:34 由受控发布器从
+`v0.19.0` 快进部署，状态 `deployed`。本次只上线候选链路代码，生产开关
+`RESEARCH_CLOUD_INGEST_ENABLED` 保持关闭，systemd 配置未发布。
+
+**部署内容**：新增盘前不可变清单、日终分钟补齐、全市场竞价增量、隔离 lake/catalog 发布
+事务、完整覆盖率审计、连续 observation 哈希链、只读权威状态检查和 10 个交易日晋级门。
+正式增量与存量迁移共用发布锁，任一分区或证据失败都会回滚；生产 DuckDB 不进入写路径。
+
+**验证与生产验收**：本地全量 `1956 passed`，PR 双版本 CI 通过；部署后 preflight 5/5、
+五个前台服务和 10 个既有 timers 正常。`research-authority-status` 返回
+`bootstrap_candidate`、bootstrap catalog 哈希一致、`stable_trading_days=0`，没有提前提升
+研究权威。首次对 `2026-07-16` 执行只读 dry-run 暴露 Parquet 日期与 DuckDB 时间戳混合比较
+异常；由于是 dry-run 且开关关闭，没有产生数据写入，随后由 `v0.20.1` 修复并复验。
+
+**回滚**：本版本未启用调度且未改数据。部署失败由受控发布器自动回滚；成功后的撤回必须
+对 `03d04c8` 创建 revert PR、合并并打新 SemVer tag 后向前发布。
+
+---
+
 ## 2026-07-17 · v0.19.0 · 首次研究数据迁云候选发布
 
 **状态**：用户明确授权首次迁云后，05:58-06:23 完成 Mac 冻结快照、迁移包、云端 staging
