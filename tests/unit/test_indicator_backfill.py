@@ -169,6 +169,7 @@ def test_batch_derivation_keeps_each_output_on_its_own_factor_basis(
 @pytest.mark.parametrize(
     "now",
     [
+        datetime(2024, 4, 1, 9, 14, tzinfo=SHANGHAI),
         datetime(2024, 4, 1, 9, 15, tzinfo=SHANGHAI),
         datetime(2024, 4, 1, 12, 0, tzinfo=SHANGHAI),
         datetime(2024, 4, 1, 15, 10, tzinfo=SHANGHAI),
@@ -187,6 +188,30 @@ def test_apply_rejects_protected_window_without_writing(
             end_date=trade_dates[-1],
             apply=True,
             now=now,
+        )
+
+    assert store.count_indicators() == 0
+
+
+def test_apply_rechecks_window_after_readonly_derivation(
+    store: DuckDBStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trade_dates = _seed_history(store)
+    times = iter(
+        [
+            datetime(2024, 4, 1, 8, 0, tzinfo=SHANGHAI),
+            datetime(2024, 4, 1, 9, 15, tzinfo=SHANGHAI),
+        ]
+    )
+    monkeypatch.setattr(backfill_module, "_now", lambda: next(times))
+
+    with pytest.raises(RuntimeError, match="09:15-15:10"):
+        backfill_module.backfill_daily_indicators(
+            store,
+            start_date=trade_dates[-2],
+            end_date=trade_dates[-1],
+            apply=True,
         )
 
     assert store.count_indicators() == 0

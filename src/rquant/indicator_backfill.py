@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,7 @@ from rquant.storage.duckdb import DuckDBStore
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _PROTECTED_START = dtime(9, 15)
 _PROTECTED_END = dtime(15, 10)
+_WRITE_MARGIN = timedelta(seconds=60)
 _INDICATOR_COLUMNS = [
     "ts_code",
     "trade_date",
@@ -59,14 +60,31 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _in_protected_window(now: datetime) -> bool:
+def _write_window_blocked(now: datetime) -> bool:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("protected-window time must be timezone-aware")
     local = now.astimezone(_SHANGHAI)
-    return (
-        local.weekday() < 5
-        and _PROTECTED_START <= local.time() <= _PROTECTED_END
+    if local.weekday() >= 5:
+        return False
+    protected_start = datetime.combine(
+        local.date(),
+        _PROTECTED_START,
+        tzinfo=_SHANGHAI,
     )
+    protected_end = datetime.combine(
+        local.date(),
+        _PROTECTED_END,
+        tzinfo=_SHANGHAI,
+    ) + timedelta(minutes=1)
+    return protected_start - _WRITE_MARGIN <= local < protected_end
+
+
+def _require_write_window(now: datetime) -> None:
+    if _write_window_blocked(now):
+        raise DailyIndicatorBackfillProtectedWindowError(
+            "daily_indicator apply is blocked during weekdays 09:15-15:10 "
+            "Asia/Shanghai (including a 60-second write margin)"
+        )
 
 
 def derive_daily_indicators(
@@ -183,11 +201,8 @@ def backfill_daily_indicators(
     if start_date > end_date:
         raise ValueError("start_date must not be after end_date")
     resolved_now = now or _now()
-    if apply and _in_protected_window(resolved_now):
-        raise DailyIndicatorBackfillProtectedWindowError(
-            "daily_indicator apply is blocked during weekdays 09:15-15:10 "
-            "Asia/Shanghai"
-        )
+    if apply:
+        _require_write_window(resolved_now)
 
     code_count, estimated_rows = _scope_counts(
         store,
@@ -209,6 +224,7 @@ def backfill_daily_indicators(
         start_date=start_date,
         end_date=end_date,
     )
+    _require_write_window(now or _now())
     transaction_open = False
     try:
         store._conn.execute("BEGIN")
