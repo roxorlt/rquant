@@ -6,6 +6,10 @@
 
 ### Fixed
 
+- **研究日增量 dry-run 混合日期类型崩溃**：研究 Parquet 中的 `datetime.date` 与运营 DuckDB
+  返回的 pandas `Timestamp` 在合并后统一规范化，再进入主键分组与排序；修复云端
+  `research-ingest --dry-run` 的类型比较异常。项目版本从 `0.20.0` 更新到 `0.20.1`。
+
 - **monitor 异常重启基础设施熔断**：systemd 在 30 分钟内最多自动拉起 monitor 3 次，
   超限后交由 watchdog 和人工诊断；Mac monitor LaunchAgent 显式关闭通知，只保留研究分钟采集。
   基础设施独立于 v0.17.3 代码 tag 发布，并提供预验证、失败自动恢复和回滚 runbook。

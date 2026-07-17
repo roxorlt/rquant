@@ -539,7 +539,18 @@ def _merge_frames(
     if not frames:
         return pd.DataFrame(columns=columns)
     combined = pd.concat(frames, ignore_index=True)
+    if "trade_date" in combined.columns:
+        combined["trade_date"] = pd.to_datetime(
+            combined["trade_date"], errors="raise"
+        ).dt.date
+    if "trade_time" in combined.columns:
+        combined["trade_time"] = pd.to_datetime(
+            combined["trade_time"], errors="raise"
+        )
     if "created_at" in combined.columns:
+        combined["created_at"] = pd.to_datetime(
+            combined["created_at"], errors="raise"
+        )
         combined["created_at"] = combined.groupby(list(primary_key), dropna=False)[
             "created_at"
         ].transform("min")
