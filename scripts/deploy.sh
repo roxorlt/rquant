@@ -118,6 +118,10 @@ CHANGED_TIMER_FILES=$(echo "${SYSTEMD_CHANGED}" | grep "\.timer$" || true)
 TIMER_HANDLED=0
 for f in ${CHANGED_TIMER_FILES}; do
     t=$(basename "${f}")
+    if [[ "${t}" == "rquant-research-ingest.timer" ]] && ! systemctl is-enabled "${t}" &>/dev/null; then
+        warn "${t}: 研究日增量须按独立上线手册手工启用，跳过自动 enable"
+        continue
+    fi
     if systemctl is-enabled "${t}" 2>/dev/null | grep -qE "^enabled"; then
         run "sudo systemctl restart '${t}'"
         ok "↻ ${t} (restarted, 应用新 OnCalendar)"
@@ -206,6 +210,10 @@ else
     sleep 1
     for f in ${CHANGED_TIMER_FILES}; do
         t=$(basename "${f}")
+        if [[ "${t}" == "rquant-research-ingest.timer" ]] && ! systemctl is-enabled "${t}" &>/dev/null; then
+            warn "${t}: 尚未手工启用，跳过 NEXT trigger 验证"
+            continue
+        fi
         # systemd 252 (OpenCloudOS 9 / RHEL 9) 上 `show -p NextElapseUSecRealtime --value`
         # 返回的是**人类可读时间戳**（如 "Wed 2026-05-20 11:50:00 CST"），不是微秒数字。
         # 5/20 翻车：原版做 `next_s=$((next_us / 1000000))` 时，算术展开把 "Wed" 当

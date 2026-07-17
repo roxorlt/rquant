@@ -1,0 +1,24 @@
+[Unit]
+Description=rQuant Cloud Research Daily Ingest
+After=network-online.target rquant-daily.service rquant-replica-sync.service
+Wants=network-online.target
+
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+Environment=TZ=Asia/Shanghai
+
+ExecStart=/home/lighthouse/rquant/scripts/run-research-ingest-daily.sh
+
+Restart=no
+TimeoutStartSec=7200
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
