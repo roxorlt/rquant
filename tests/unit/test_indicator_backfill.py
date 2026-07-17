@@ -15,8 +15,14 @@ from rquant.storage.duckdb import DuckDBStore
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-def _seed_history(store: DuckDBStore) -> list[date]:
-    trade_dates = list(pd.bdate_range(end="2024-04-01", periods=65).date)
+def _seed_history(
+    store: DuckDBStore,
+    *,
+    periods: int = 65,
+) -> list[date]:
+    trade_dates = list(
+        pd.bdate_range(end="2024-04-01", periods=periods).date
+    )
     store.upsert_daily(
         pd.DataFrame(
             [
@@ -167,6 +173,59 @@ def test_batch_derivation_keeps_each_output_on_its_own_factor_basis(
 
 
 @pytest.mark.parametrize(
+    "invalid_factor",
+    [None, float("nan"), float("inf"), 0.0, -1.0],
+    ids=["missing", "nan", "inf", "zero", "negative"],
+)
+def test_derivation_fails_closed_after_invalid_historical_factor(
+    store: DuckDBStore,
+    invalid_factor: float | None,
+) -> None:
+    trade_dates = _seed_history(store)
+    invalid_date = trade_dates[-2]
+    if invalid_factor is None:
+        store._conn.execute(
+            """
+            DELETE FROM adj_factor
+            WHERE ts_code = '600000.SH' AND trade_date = ?
+            """,
+            [invalid_date],
+        )
+    else:
+        store._conn.execute(
+            """
+            UPDATE adj_factor
+            SET adj_factor = ?
+            WHERE ts_code = '600000.SH' AND trade_date = ?
+            """,
+            [invalid_factor, invalid_date],
+        )
+
+    result = backfill_module.derive_daily_indicators(
+        store,
+        start_date=trade_dates[-1],
+        end_date=trade_dates[-1],
+    )
+
+    assert result.empty
+
+
+def test_short_valid_listing_keeps_output_with_normal_ma60_nan(
+    store: DuckDBStore,
+) -> None:
+    trade_dates = _seed_history(store, periods=10)
+
+    result = backfill_module.derive_daily_indicators(
+        store,
+        start_date=trade_dates[-1],
+        end_date=trade_dates[-1],
+    )
+
+    assert len(result) == 1
+    assert pd.isna(result.iloc[0]["ma60"])
+
+
+@pytest.mark.parametrize(
     "now",
     [
         datetime(2024, 4, 1, 9, 14, tzinfo=SHANGHAI),
@@ -191,6 +250,65 @@ def test_apply_rejects_protected_window_without_writing(
         )
 
     assert store.count_indicators() == 0
+
+
+def test_apply_rolls_back_deleted_rows_when_indicator_upsert_fails(
+    tmp_path: Path,
+) -> None:
+    class _FailingStore(DuckDBStore):
+        def upsert_indicators(self, df: pd.DataFrame) -> int:
+            super().upsert_indicators(df)
+            raise RuntimeError("indicator upsert failed")
+
+    store = _FailingStore(tmp_path / "indicator-rollback.duckdb")
+    try:
+        trade_dates = _seed_history(store)
+        start_date, end_date = trade_dates[-2], trade_dates[-1]
+        sentinel_rows = pd.DataFrame(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": indicator_date,
+                    "ma5": 999.0,
+                    "ma10": 999.0,
+                    "ma20": 999.0,
+                    "ma60": 999.0,
+                    "rsi6": 999.0,
+                    "rsi14": 999.0,
+                    "macd": 999.0,
+                    "macd_signal": 999.0,
+                    "macd_hist": 999.0,
+                    "kdj_k": 999.0,
+                    "kdj_d": 999.0,
+                    "kdj_j": 999.0,
+                }
+                for indicator_date in (start_date, end_date)
+            ]
+        )
+        DuckDBStore.upsert_indicators(store, sentinel_rows)
+
+        with pytest.raises(RuntimeError, match="indicator upsert failed"):
+            backfill_module.backfill_daily_indicators(
+                store,
+                start_date=start_date,
+                end_date=end_date,
+                apply=True,
+                now=datetime(2024, 3, 30, 10, 0, tzinfo=SHANGHAI),
+            )
+
+        rows = store._conn.execute(
+            """
+            SELECT trade_date, ma5
+            FROM daily_indicator
+            WHERE ts_code = '600000.SH'
+              AND trade_date BETWEEN ? AND ?
+            ORDER BY trade_date
+            """,
+            [start_date, end_date],
+        ).fetchall()
+        assert rows == [(start_date, 999.0), (end_date, 999.0)]
+    finally:
+        store.close()
 
 
 def test_apply_rechecks_window_after_readonly_derivation(

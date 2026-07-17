@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
+from math import isfinite
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -79,8 +80,11 @@ def _write_window_blocked(now: datetime) -> bool:
     return protected_start - _WRITE_MARGIN <= local < protected_end
 
 
-def _require_write_window(now: datetime) -> None:
-    if _write_window_blocked(now):
+def require_daily_indicator_write_window(
+    now: datetime | None = None,
+) -> None:
+    """Fail before opening a writer when the production write window is closed."""
+    if _write_window_blocked(now or _now()):
         raise DailyIndicatorBackfillProtectedWindowError(
             "daily_indicator apply is blocked during weekdays 09:15-15:10 "
             "Asia/Shanghai (including a 60-second write margin)"
@@ -129,6 +133,25 @@ def derive_daily_indicators(
             code_rows["adj_factor"],
             errors="coerce",
         )
+        factor_is_valid = factors.map(
+            lambda factor: pd.notna(factor)
+            and isfinite(float(factor))
+            and float(factor) > 0
+        )
+        first_invalid = next(
+            (
+                position
+                for position, valid in enumerate(factor_is_valid)
+                if not valid
+            ),
+            len(code_rows),
+        )
+        # Match the price-basis contract: an invalid required factor poisons
+        # that date and every later output until the source history is repaired.
+        code_rows = code_rows.iloc[:first_invalid].reset_index(drop=True)
+        factors = factors.iloc[:first_invalid].reset_index(drop=True)
+        if code_rows.empty:
+            continue
         adjusted = pd.DataFrame(
             {
                 "ts_code": code_rows["ts_code"],
@@ -152,15 +175,13 @@ def derive_daily_indicators(
             }
         )
         indicators = compute_indicators(adjusted)
-        positive_factors = factors.where(factors > 0)
         indicators[_PRICE_INDICATOR_COLUMNS] = indicators[
             _PRICE_INDICATOR_COLUMNS
-        ].div(positive_factors, axis=0)
+        ].div(factors, axis=0)
         indicator_dates = pd.to_datetime(indicators["trade_date"]).dt.date
         target = indicators.loc[
             (indicator_dates >= start_date)
             & (indicator_dates <= end_date)
-            & positive_factors.notna()
         ].copy()
         if not target.empty:
             frames.append(target[_INDICATOR_COLUMNS])
@@ -200,9 +221,8 @@ def backfill_daily_indicators(
     """Preview or atomically rebuild one local daily_indicator date range."""
     if start_date > end_date:
         raise ValueError("start_date must not be after end_date")
-    resolved_now = now or _now()
     if apply:
-        _require_write_window(resolved_now)
+        require_daily_indicator_write_window(now)
 
     code_count, estimated_rows = _scope_counts(
         store,
@@ -224,7 +244,7 @@ def backfill_daily_indicators(
         start_date=start_date,
         end_date=end_date,
     )
-    _require_write_window(now or _now())
+    require_daily_indicator_write_window(now)
     transaction_open = False
     try:
         store._conn.execute("BEGIN")
