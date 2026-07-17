@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from datetime import date
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -13,6 +15,7 @@ from rquant.data_metadata import (
     DataQualityIssue,
     DatasetCoverage,
     DatasetSnapshot,
+    DatasetSnapshotBinding,
 )
 from rquant.data_quality import STAGE1_AUDIT_RULE_SET_VERSION
 from rquant.research_manifest import ResearchManifest, ResearchStatus
@@ -38,6 +41,7 @@ class ResearchGateRequest(GateModel):
     end_date: date
     audit_run_id: str | None = None
     dataset_snapshot_id: str | None = None
+    dataset_binding_hash: str | None = None
     code_commit: str | None = None
 
     @model_validator(mode="after")
@@ -57,6 +61,7 @@ class ResearchGateDecision(GateModel):
     research_status: ResearchStatus
     audit_run_id: str | None
     dataset_snapshot_id: str | None
+    dataset_binding_hash: str | None = None
     coverage_ratios: dict[str, float | None]
     coverage_counts: dict[str, tuple[int, int]]
     failures: tuple[ResearchGateFailure, ...]
@@ -66,11 +71,23 @@ def _failure(code: str, message: str) -> ResearchGateFailure:
     return ResearchGateFailure(code=code, message=message)
 
 
+def research_gate_metadata_ready(
+    decision: ResearchGateDecision,
+) -> bool:
+    """Return whether only execution-time artifact verification remains."""
+    return not any(
+        failure.code != "snapshot_artifacts_unverified"
+        for failure in decision.failures
+    )
+
+
 def evaluate_research_gate(
     request: ResearchGateRequest,
     *,
     audit_run: DataAuditRun | None,
     snapshot: DatasetSnapshot | None,
+    binding: DatasetSnapshotBinding | None = None,
+    binding_verified: bool = False,
     coverages: Sequence[DatasetCoverage],
     open_p0_issues: Sequence[DataQualityIssue],
 ) -> ResearchGateDecision:
@@ -116,6 +133,13 @@ def evaluate_research_gate(
 
     if snapshot is None:
         failures.append(_failure("snapshot_missing", "没有可用的 ready 数据快照"))
+        if binding is not None:
+            failures.append(
+                _failure(
+                    "snapshot_binding_orphan",
+                    "执行数据绑定没有对应的数据快照",
+                )
+            )
     else:
         if request.dataset_snapshot_id and snapshot.snapshot_id != request.dataset_snapshot_id:
             failures.append(_failure("snapshot_mismatch", "数据快照 ID 与提交请求不一致"))
@@ -134,12 +158,96 @@ def evaluate_research_gate(
             or manifest_end < request.end_date.isoformat()
         ):
             failures.append(_failure("snapshot_range", "数据快照未覆盖完整回测日期区间"))
-        failures.append(
-            _failure(
-                "snapshot_execution_unbound",
-                "正式回测尚未绑定不可变计算数据，当前只能探索性试跑",
-            )
+        eligibility_resolution_hash = snapshot.table_watermarks.get(
+            "eligibility_resolution_hash"
         )
+        if eligibility_resolution_hash is None:
+            failures.append(
+                _failure(
+                    "snapshot_eligibility_resolution_missing",
+                    "数据快照没有记录资格解析 hash",
+                )
+            )
+        if binding is None:
+            failures.append(
+                _failure(
+                    "snapshot_execution_unbound",
+                    "正式回测尚未绑定不可变计算数据，当前只能探索性试跑",
+                )
+            )
+        else:
+            if request.dataset_binding_hash and (
+                binding.binding_hash != request.dataset_binding_hash
+            ):
+                failures.append(
+                    _failure(
+                        "snapshot_binding_hash_mismatch",
+                        "执行数据绑定 hash 与提交请求不一致",
+                    )
+                )
+            if binding.snapshot_id != snapshot.snapshot_id:
+                failures.append(
+                    _failure(
+                        "snapshot_binding_mismatch",
+                        "执行数据绑定不属于所选数据快照",
+                    )
+                )
+            if binding.status != "ready":
+                failures.append(
+                    _failure(
+                        "snapshot_binding_not_ready",
+                        "执行数据绑定尚未完成",
+                    )
+                )
+            manifest = binding.manifest
+            if (
+                manifest.strategy_name != snapshot.strategy_name
+                or manifest.code_commit != snapshot.code_commit
+                or manifest.as_of_time != snapshot.as_of_time
+            ):
+                failures.append(
+                    _failure(
+                        "snapshot_binding_identity",
+                        "执行数据绑定与快照身份不一致",
+                    )
+                )
+            eligibility_artifacts = tuple(
+                artifact
+                for artifact in manifest.artifacts
+                if artifact.dataset_id == "strategy_eligibility"
+                and artifact.table_name == "strategy_eligibility"
+            )
+            if (
+                eligibility_resolution_hash is None
+                or manifest.eligibility_resolution_hash
+                != eligibility_resolution_hash
+                or len(eligibility_artifacts) != 1
+                or eligibility_artifacts[0].artifact_key
+                != f"strategy_eligibility:{eligibility_resolution_hash}"
+            ):
+                failures.append(
+                    _failure(
+                        "snapshot_binding_eligibility",
+                        "执行数据绑定与快照资格解析不是同一数据代际",
+                    )
+                )
+            if (
+                manifest.start_date > request.start_date
+                or manifest.end_date < request.end_date
+            ):
+                failures.append(
+                    _failure(
+                        "snapshot_binding_range",
+                        "执行数据绑定未覆盖完整回测日期区间",
+                    )
+                )
+            if not binding_verified:
+                failures.append(
+                    _failure(
+                        "snapshot_artifacts_unverified",
+                        "执行数据工件尚未在本次会话中完成哈希校验",
+                    )
+                )
         if not snapshot.manifest_id:
             failures.append(_failure("manifest_missing", "数据快照未绑定不可变回补清单"))
         if request.code_commit and snapshot.code_commit != request.code_commit:
@@ -189,6 +297,23 @@ def evaluate_research_gate(
                     f"{scope} 覆盖率 {ratio:.2%}，要求至少 {threshold:.0%}",
                 )
             )
+    eligibility_coverage = by_scope.get("eligibility")
+    if (
+        binding is not None
+        and eligibility_coverage is not None
+        and (
+            binding.manifest.eligibility_expected_dates
+            != eligibility_coverage.expected_count
+            or binding.manifest.eligibility_complete_dates
+            != eligibility_coverage.available_count
+        )
+    ):
+        failures.append(
+            _failure(
+                "snapshot_binding_eligibility_counts",
+                "执行数据绑定的资格日期计数与覆盖凭证不一致",
+            )
+        )
 
     formal_passed = not failures
     allowed = request.mode == "exploratory" or formal_passed
@@ -201,6 +326,9 @@ def evaluate_research_gate(
         ),
         audit_run_id=None if audit_run is None else audit_run.audit_run_id,
         dataset_snapshot_id=None if snapshot is None else snapshot.snapshot_id,
+        dataset_binding_hash=(
+            None if binding is None else binding.binding_hash
+        ),
         coverage_ratios=coverage_ratios,
         coverage_counts=coverage_counts,
         failures=tuple(failures),
@@ -210,6 +338,8 @@ def evaluate_research_gate(
 def evaluate_store_research_gate(
     store: object,
     request: ResearchGateRequest,
+    *,
+    binding_verified: bool = False,
 ) -> ResearchGateDecision:
     audit_run = (
         store.get_data_audit_run(request.audit_run_id)
@@ -231,14 +361,104 @@ def evaluate_store_research_gate(
         )
     )
     coverages = () if snapshot is None else store.list_dataset_coverages(snapshot.snapshot_id)
+    binding = (
+        None
+        if snapshot is None
+        else store.get_dataset_snapshot_binding(snapshot.snapshot_id)
+    )
     open_p0 = store.list_open_data_quality_issues(severities=("P0",))
     return evaluate_research_gate(
         request,
         audit_run=audit_run,
         snapshot=snapshot,
+        binding=binding,
+        binding_verified=binding_verified,
         coverages=coverages,
         open_p0_issues=open_p0,
     )
+
+
+@contextmanager
+def open_gated_research_store(
+    request: ResearchGateRequest,
+    *,
+    metadata_store_factory: (
+        Callable[[], AbstractContextManager[object]] | None
+    ) = None,
+    execution_session_factory: (
+        Callable[
+            [DatasetSnapshotBinding, Path],
+            AbstractContextManager[object],
+        ]
+        | None
+    ) = None,
+    lake_root: Path | None = None,
+) -> Iterator[tuple[object, ResearchGateDecision]]:
+    """Evaluate the gate and run formal compute on its exact verified binding."""
+    if metadata_store_factory is None:
+        from rquant.storage.duckdb import open_readonly_store
+
+        metadata_store_factory = open_readonly_store
+    with metadata_store_factory() as metadata_store:
+        decision = evaluate_store_research_gate(metadata_store, request)
+        blocking_failures = tuple(
+            failure
+            for failure in decision.failures
+            if failure.code != "snapshot_artifacts_unverified"
+        )
+        if request.mode == "formal" and blocking_failures:
+            reasons = "; ".join(
+                failure.message for failure in blocking_failures
+            )
+            raise PermissionError(f"正式研究门未通过: {reasons}")
+        if request.mode == "exploratory":
+            yield metadata_store, decision
+            return
+
+        snapshot_id = decision.dataset_snapshot_id
+        if snapshot_id is None:
+            raise PermissionError("正式研究门没有解析出数据快照")
+        binding = metadata_store.get_dataset_snapshot_binding(snapshot_id)
+        if binding is None or binding.status != "ready":
+            raise PermissionError("正式研究门没有可用的执行数据绑定")
+        if (
+            decision.dataset_binding_hash is None
+            or binding.binding_hash != decision.dataset_binding_hash
+        ):
+            raise PermissionError("正式研究门执行数据绑定发生变化")
+
+        if lake_root is None:
+            from rquant.config import settings
+
+            lake_root = settings.research_lake_dir_resolved
+        if execution_session_factory is None:
+            from rquant.research_snapshot import ResearchExecutionSession
+
+            def open_execution_session(
+                selected: DatasetSnapshotBinding,
+                root: Path,
+            ) -> AbstractContextManager[object]:
+                return ResearchExecutionSession(
+                    binding=selected,
+                    lake_root=root,
+                )
+
+            execution_session_factory = open_execution_session
+        with execution_session_factory(binding, lake_root) as execution_store:
+            verified_decision = evaluate_store_research_gate(
+                metadata_store,
+                request,
+                binding_verified=True,
+            )
+            if not verified_decision.allowed:
+                reasons = "; ".join(
+                    failure.message
+                    for failure in verified_decision.failures
+                )
+                raise PermissionError(f"正式研究门未通过: {reasons}")
+            if verified_decision.dataset_binding_hash != binding.binding_hash:
+                raise PermissionError("正式研究门执行数据绑定发生变化")
+            yield execution_store, verified_decision
 
 
 def build_gate_research_manifest(
@@ -246,8 +466,11 @@ def build_gate_research_manifest(
     decision: ResearchGateDecision,
 ) -> ResearchManifest:
     warnings = [failure.message for failure in decision.failures]
+    numerator = sum(item[0] for item in decision.coverage_counts.values())
+    denominator = sum(item[1] for item in decision.coverage_counts.values())
     if decision.research_status == "exploratory":
         return ResearchManifest(
+            schema_version=2,
             research_status="exploratory",
             status_reason=(
                 "探索性试跑；正式研究门未通过"
@@ -255,16 +478,23 @@ def build_gate_research_manifest(
                 else "用户选择探索性试跑"
             ),
             code_commit=request.code_commit,
+            dataset_snapshot_id=decision.dataset_snapshot_id,
+            dataset_binding_hash=decision.dataset_binding_hash,
+            coverage_numerator=(numerator if denominator else None),
+            coverage_denominator=(denominator if denominator else None),
+            data_start_date=request.start_date,
+            data_end_date=request.end_date,
+            universe_definition=request.strategy_name,
             warnings=warnings
             or ["当前结果只能形成研究假设，不能用于本金增长推算或自动发布到 live。"],
         )
-    numerator = sum(item[0] for item in decision.coverage_counts.values())
-    denominator = sum(item[1] for item in decision.coverage_counts.values())
     return ResearchManifest(
+        schema_version=1,
         research_status="comparable",
         status_reason="已通过 Stage-1 数据审计、PIT 与覆盖率正式研究门",
         code_commit=request.code_commit,
         dataset_snapshot_id=decision.dataset_snapshot_id,
+        dataset_binding_hash=decision.dataset_binding_hash,
         coverage_numerator=numerator,
         coverage_denominator=denominator,
         data_start_date=request.start_date,

@@ -54,15 +54,19 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
-2026-07-16 已部署 `v0.17.3` 并完成 Stage 1 生产数据修复与重复告警治理。`stage1-v3` 审计区间
-`2026-04-01..2026-07-15` 的 P0 为 0；历史状态覆盖 385,183/385,183，13 个退市整理期
-股票日作为主动安全排除的 P2 证据保留，主库与只读副本一致。正式回测仍受策略级分钟覆盖率
-和不可变计算快照约束；在这些门槛完成前，现有策略不会从 `exploratory` 晋级。
+2026-07-17 生产当前运行 `v0.21.1`；Stage 1 的生产数据修复仍保持 `stage1-v3` P0=0，
+历史状态、权威日历、停复牌和研究数据迁云链路已建立。`v0.22.0` 候选进一步实现不可变执行
+绑定：正式门禁和策略计算使用同一组内容寻址 Parquet，保存 snapshot/binding/策略参数/完整
+结果四层指纹，并把精确资格候选固化为 `strategy_eligibility` 工件，源库变化不再改变旧
+回测或候选全集。代码能力完成不等于策略结论已可信；N 字、科创/创业放量和集合竞价仍需分别
+生成真实资格 manifest，达到 baseline 95%、eligibility/B/S 99% 并完成生产固定回放后，
+才能从 `exploratory` 晋级。
 
 - [研究可信度基线](docs/analysis/2026-07-13-research-trust-baseline.md)
 - [阶段 1 真实数据验收](docs/analysis/2026-07-15-stage1-data-contract-acceptance.md)
 - [v0.17.1 Stage 1 状态修复与首次部署](docs/deploy/2026-07-15-v0.17.1-stage1-bootstrap.md)
 - [可信策略研究与盘中监控路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)
+- [不可变执行快照设计](docs/plans/2026-07-17-stage1-execution-snapshot-design.md)
 - [研究数据云化、告警治理与 Strategy Lab 重构计划](docs/plans/2026-07-16-research-cloud-alert-lab-implementation.md)
 - [Strategy Lab 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
 
@@ -170,7 +174,15 @@ bash scripts/check-core-quality.sh
 .venv/bin/rquant dataset-snapshot \
   --strategy growth_board_surge \
   --as-of 2026-06-30T15:00:00+08:00 \
-  --manifest-id <64位ID>
+  --manifest-id <64位ID> \
+  --dry-run
+
+# 核对预演后在不会跨入交易保护窗口的时段生成元数据快照与不可变执行绑定
+.venv/bin/rquant dataset-snapshot \
+  --strategy growth_board_surge \
+  --as-of 2026-06-30T15:00:00+08:00 \
+  --manifest-id <64位ID> \
+  --apply
 ```
 
 本地页面默认分别访问 `http://127.0.0.1:8501`、`http://127.0.0.1:8504` 和
@@ -187,6 +199,12 @@ bash scripts/check-core-quality.sh
 7. 研究数据必须声明最早可见时刻；集合竞价 Tushare 行最早按 09:26、09:30 分钟 fallback
    最早按 09:31 使用，缺失来源信息时失败关闭。
 8. 交易日只认持久化权威日历；已知周末/节假日是休市，缺行是数据问题，不能用日线反推。
+9. 历史回放的 `as-of` 是事件时间截止，不假装分钟回补文件在历史当时已存在；正式绑定另存
+   分区发布时间、catalog 观察时间和 binding 生成时间，明确本次研究所用的数据版本。
+10. 资格完整性分母来自上市股票、历史状态和日线键的并集；正式回放只读取 binding 内精确
+    `strategy_eligibility` 候选，不能用当前 `screen_result` 重算或补充候选。
+11. 集合竞价资格解析直接读取 manifest 固定的 `auction_bar` 研究湖版本；catalog 换头不能
+    改写旧候选或正式回放输入。写入型 snapshot 有保守启动门禁和运行中硬 deadline。
 
 ## 目录
 
@@ -207,8 +225,8 @@ data/                 本地数据与运行状态，不进 Git
 当前执行 [2026-07-13 总路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)：
 
 1. 冻结研究基线和工程护栏。
-2. 建数据契约、PIT 状态与回补清单（迁移内核、历史状态、质量审计、PIT 复权和可见性门禁
-   已完成；真实数据审计已运行，当前先修复 2 个 P0，再验收三类策略覆盖率）。
+2. 建数据契约、PIT 状态、回补清单和不可变执行绑定（代码能力已完成；当前逐策略生成真实
+   manifest、补齐覆盖并做生产固定回放验收）。
 3. 统一无未来函数分钟特征和 StrategySpec。
 4. 完善可成交性、费用和 10 万本金账户模拟。
 5. 修正优化器后重评现有策略。

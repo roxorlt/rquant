@@ -314,6 +314,192 @@ def test_metadata_queries_and_transitions_explain_missing_ids(tmp_path: Path) ->
             store.resolve_data_quality_issue("missing")
 
 
+def _execution_manifest(
+    snapshot_id: str,
+    *,
+    reverse_artifacts: bool = False,
+) -> object:
+    from rquant.data_metadata import (
+        DatasetSnapshotArtifact,
+        DatasetSnapshotBindingManifest,
+    )
+
+    artifacts = [
+        DatasetSnapshotArtifact(
+            artifact_type="lake_partition",
+            dataset_id="minute_bar",
+            table_name="minute_bar",
+            artifact_key="minute_bar:2026-07-14:1min",
+            relative_path=(
+                "minute/freq=1min/year=2026/month=07/"
+                "trade_date=2026-07-14/versions/" + "a" * 64 + ".parquet"
+            ),
+            row_count=241,
+            schema_hash="b" * 64,
+            content_hash="c" * 64,
+            file_hash="a" * 64,
+        ),
+        DatasetSnapshotArtifact(
+            artifact_type="materialized_table",
+            dataset_id="daily_bar",
+            table_name="daily_bar",
+            artifact_key="daily_bar:2026-04-01:2026-07-14",
+            relative_path="tables/daily_bar.parquet",
+            row_count=42,
+            schema_hash="d" * 64,
+            content_hash="e" * 64,
+            file_hash="f" * 64,
+        ),
+    ]
+    if reverse_artifacts:
+        artifacts.reverse()
+    return DatasetSnapshotBindingManifest(
+        snapshot_id=snapshot_id,
+        strategy_name="growth_board_surge",
+        start_date=datetime(2026, 4, 1, tzinfo=UTC).date(),
+        end_date=datetime(2026, 7, 14, tzinfo=UTC).date(),
+        as_of_time=datetime(2026, 7, 15, 8, tzinfo=UTC),
+        code_commit="1" * 40,
+        dependency_contract_version="stage1-v1",
+        builder_version="snapshot-builder-v1",
+        artifacts=tuple(artifacts),
+    )
+
+
+def test_execution_binding_hash_is_canonical_and_path_independent() -> None:
+    from rquant.data_metadata import DatasetSnapshotBinding
+
+    manifest = _execution_manifest("9" * 64)
+    reordered = _execution_manifest("9" * 64, reverse_artifacts=True)
+    left = DatasetSnapshotBinding.create(
+        manifest=manifest,
+        artifact_root="/srv/rquant/research-lake",
+        manifest_relative_path="snapshots/9/manifest.json",
+        created_at=datetime(2026, 7, 15, 8, tzinfo=UTC),
+    )
+    right = DatasetSnapshotBinding.create(
+        manifest=reordered,
+        artifact_root="/Users/test/rquant/research-lake",
+        manifest_relative_path="relocated/snapshots/9/manifest.json",
+        created_at=datetime(2026, 7, 15, 8, tzinfo=UTC),
+    )
+
+    assert manifest.manifest_hash == reordered.manifest_hash
+    assert left.binding_hash == right.binding_hash
+    assert left.artifact_root != right.artifact_root
+    assert len(left.binding_hash) == 64
+    assert len(manifest.manifest_hash) == 64
+
+
+def test_execution_binding_requires_ready_parent_and_is_immutable(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_metadata import (
+        DatasetSnapshot,
+        DatasetSnapshotBinding,
+        DatasetSnapshotBindingFinalization,
+        DatasetSnapshotFinalization,
+    )
+
+    t0 = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    parent = DatasetSnapshot.create(
+        strategy_name="growth_board_surge",
+        manifest_id="m" * 64,
+        as_of_time=t0,
+        code_commit="1" * 40,
+        origin="test",
+        created_at=t0,
+    )
+    manifest = _execution_manifest(parent.snapshot_id)
+    binding = DatasetSnapshotBinding.create(
+        manifest=manifest,
+        artifact_root="/srv/rquant/research-lake",
+        manifest_relative_path=(
+            f"snapshots/{parent.snapshot_id}/{manifest.manifest_hash}/manifest.json"
+        ),
+        created_at=t0,
+    )
+    finalization = DatasetSnapshotBindingFinalization(
+        completed_at=t0 + timedelta(minutes=2)
+    )
+
+    with DuckDBStore(tmp_path / "binding.duckdb") as store:
+        store.begin_dataset_snapshot(parent)
+        with pytest.raises(ValueError, match="ready dataset snapshot"):
+            store.begin_dataset_snapshot_binding(binding)
+
+        store.finalize_dataset_snapshot(
+            parent.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+        )
+        begun = store.begin_dataset_snapshot_binding(binding)
+        begun_again = store.begin_dataset_snapshot_binding(
+            binding.model_copy(update={"created_at": t0 + timedelta(seconds=30)})
+        )
+        assert begun.status == "building"
+        assert begun_again.created_at == t0
+
+        ready = store.finalize_dataset_snapshot_binding(
+            parent.snapshot_id,
+            finalization,
+        )
+        assert ready.status == "ready"
+        assert ready.completed_at == t0 + timedelta(minutes=2)
+        assert store.get_dataset_snapshot_binding(parent.snapshot_id) == ready
+        assert (
+            store.finalize_dataset_snapshot_binding(parent.snapshot_id, finalization)
+            == ready
+        )
+
+        different_manifest = manifest.model_copy(
+            update={"builder_version": "snapshot-builder-v2"}
+        )
+        conflicting = DatasetSnapshotBinding.create(
+            manifest=different_manifest,
+            artifact_root=binding.artifact_root,
+            manifest_relative_path=binding.manifest_relative_path,
+            created_at=t0,
+        )
+        with pytest.raises(ValueError, match="already bound|immutable|conflict"):
+            store.begin_dataset_snapshot_binding(conflicting)
+
+
+def test_execution_binding_detects_caller_tampering_at_write_boundary(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_metadata import (
+        DatasetSnapshot,
+        DatasetSnapshotBinding,
+        DatasetSnapshotFinalization,
+    )
+
+    t0 = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    parent = DatasetSnapshot.create(
+        strategy_name="growth_board_surge",
+        manifest_id="m" * 64,
+        as_of_time=t0,
+        code_commit="1" * 40,
+        origin="test",
+        created_at=t0,
+    )
+    binding = DatasetSnapshotBinding.create(
+        manifest=_execution_manifest(parent.snapshot_id),
+        artifact_root="/srv/rquant/research-lake",
+        manifest_relative_path=f"snapshots/{parent.snapshot_id}/manifest.json",
+        created_at=t0,
+    )
+    object.__setattr__(binding, "manifest_hash", "0" * 64)
+
+    with DuckDBStore(tmp_path / "tampered-binding.duckdb") as store:
+        store.begin_dataset_snapshot(parent)
+        store.finalize_dataset_snapshot(
+            parent.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+        )
+        with pytest.raises(ValueError, match="write-boundary|manifest_hash"):
+            store.begin_dataset_snapshot_binding(binding)
+
+
 def test_finalized_snapshot_allows_exact_coverage_retry(tmp_path: Path) -> None:
     from rquant.data_metadata import (
         DatasetCoverage,

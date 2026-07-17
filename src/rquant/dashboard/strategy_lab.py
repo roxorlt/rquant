@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import time as time_module
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -57,6 +59,8 @@ from rquant.research_gate import (
     ResearchGateRequest,
     build_gate_research_manifest,
     evaluate_store_research_gate,
+    open_gated_research_store,
+    research_gate_metadata_ready,
 )
 from rquant.research_manifest import (
     CURRENT_RESEARCH_NOTICES,
@@ -184,7 +188,34 @@ def _render_research_gate(decision: ResearchGateDecision) -> None:
     if not decision.failures:
         st.info("当前为探索性试跑")
         return
+    if research_gate_metadata_ready(decision):
+        st.info("元数据门已通过；点击运行后会校验全部绑定文件再开始正式回测")
+        return
     st.warning("；".join(failure.message for failure in decision.failures))
+
+
+@contextmanager
+def _open_strategy_compute_store(
+    research_gate_json: str | None,
+) -> Iterator[tuple[object, ResearchGateDecision | None]]:
+    if research_gate_json is None:
+        with open_readonly_store() as store:
+            yield store, None
+        return
+    request = ResearchGateRequest.model_validate_json(research_gate_json)
+    with open_gated_research_store(request) as (store, decision):
+        yield store, decision
+
+
+def _execution_gate_decision(
+    payload: str | None,
+    fallback: ResearchGateDecision,
+) -> ResearchGateDecision:
+    return (
+        fallback
+        if payload is None
+        else ResearchGateDecision.model_validate_json(payload)
+    )
 
 
 @st.cache_data(ttl=300)
@@ -361,10 +392,13 @@ def strategy_compare_cached(
     max_hold_days: int,
     preset_name: str,
     factor_score_threshold: float = 35.0,
-) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    research_gate_json: str | None = None,
+    execution_nonce: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, int, str | None]:
     from rquant.strategy_compare import run_entry_mode_comparison
 
-    with open_readonly_store() as store:
+    del execution_nonce
+    with _open_strategy_compute_store(research_gate_json) as (store, decision):
         result = run_entry_mode_comparison(
             store,
             start_date=start_date,
@@ -375,7 +409,12 @@ def strategy_compare_cached(
             preset_name=preset_name,
             factor_score_threshold=factor_score_threshold,
         )
-    return result.summary, result.trades, result.candidates_count
+    return (
+        result.summary,
+        result.trades,
+        result.candidates_count,
+        None if decision is None else decision.model_dump_json(),
+    )
 
 
 @st.cache_data(ttl=1800)
@@ -391,10 +430,21 @@ def strategy_optimize_cached(
     preset_name: str,
     validation_ratio: float,
     min_trades: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    research_gate_json: str | None = None,
+    execution_nonce: str = "",
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    str | None,
+]:
     from rquant.strategy_optimizer import run_strategy_optimization
 
-    with open_readonly_store() as store:
+    del execution_nonce
+    with _open_strategy_compute_store(research_gate_json) as (store, decision):
         result = run_strategy_optimization(
             store,
             start_date=start_date,
@@ -416,6 +466,7 @@ def strategy_optimize_cached(
         result.topn_trades,
         result.walk_forward_rankings,
         result.walk_forward_trades,
+        None if decision is None else decision.model_dump_json(),
     )
 
 
@@ -428,7 +479,9 @@ def auction_gap_minute_cached(
     min_ratio: float,
     max_ratio: float,
     max_hold_days: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    research_gate_json: str | None = None,
+    execution_nonce: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str | None]:
     from rquant.auction_gap_strategy import (
         AuctionGapMinuteReplayConfig,
         run_auction_gap_minute_replay,
@@ -444,18 +497,16 @@ def auction_gap_minute_cached(
         max_auction_vol_ratio_5d=max_ratio,
         max_hold_days=max_hold_days,
     )
-    with open_readonly_store(
-        required_tables=[
-            "auction_bar",
-            "daily_bar",
-            "daily_state",
-            "minute_bar",
-            "stock_status_daily",
-        ]
-    ) as store:
+    del execution_nonce
+    with _open_strategy_compute_store(research_gate_json) as (store, decision):
         baseline = run_auction_gap_replay(store, config.auction_config())
         minute_trades = run_auction_gap_minute_replay(store, config)
-    return auction_gap_metric_rows(baseline, minute_trades), baseline, minute_trades
+    return (
+        auction_gap_metric_rows(baseline, minute_trades),
+        baseline,
+        minute_trades,
+        None if decision is None else decision.model_dump_json(),
+    )
 
 
 @st.cache_data(ttl=1800)
@@ -471,7 +522,9 @@ def growth_board_surge_cached(
     require_vwap_strength: bool,
     use_same_minute_surge: bool = True,
     use_accel_surge: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    research_gate_json: str | None = None,
+    execution_nonce: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
     from rquant.growth_board_surge_strategy import (
         GrowthBoardSurgeConfig,
         run_growth_board_surge_replay,
@@ -488,16 +541,19 @@ def growth_board_surge_cached(
         use_same_minute_surge=use_same_minute_surge,
         use_accel_surge=use_accel_surge,
     )
-    with open_readonly_store(
-        required_tables=["daily_bar", "daily_state", "minute_bar", "stock_status_daily"]
-    ) as store:
+    del execution_nonce
+    with _open_strategy_compute_store(research_gate_json) as (store, decision):
         trades = run_growth_board_surge_replay(
             store,
             start_date=start_date,
             end_date=end_date,
             config=config,
         )
-    return growth_board_metric_rows(trades), trades
+    return (
+        growth_board_metric_rows(trades),
+        trades,
+        None if decision is None else decision.model_dump_json(),
+    )
 
 
 @st.cache_data(ttl=1800)
@@ -511,13 +567,16 @@ def growth_board_ablation_cached(
     min_amount_accel_5m: float,
     max_hold_days: int,
     spec_keys: tuple[str, ...],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    research_gate_json: str | None = None,
+    execution_nonce: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
     all_specs = {spec.key: spec for spec in growth_board_ablation_specs()}
     metric_frames: list[pd.DataFrame] = []
     trade_frames: list[pd.DataFrame] = []
+    verified_decision_json: str | None = None
     for key in spec_keys:
         spec = all_specs[key]
-        metrics, trades = growth_board_surge_cached(
+        metrics, trades, decision_json = growth_board_surge_cached(
             start_date,
             end_date,
             lookback_days,
@@ -529,7 +588,10 @@ def growth_board_ablation_cached(
             spec.require_vwap_strength,
             spec.use_same_minute_surge,
             spec.use_accel_surge,
+            research_gate_json,
+            execution_nonce,
         )
+        verified_decision_json = decision_json or verified_decision_json
         metrics = growth_board_metric_rows(trades, strategy_name=spec.label)
         metrics["说明"] = spec.description
         metric_frames.append(metrics)
@@ -559,7 +621,7 @@ def growth_board_ablation_cached(
                     else None
                 )
             )
-    return metric_df, trade_df
+    return metric_df, trade_df, verified_decision_json
 
 
 @st.cache_data(ttl=300)
@@ -1128,15 +1190,20 @@ with st.sidebar.form("compare_form"):
         "运行对比",
         type="primary",
         width="stretch",
-        disabled=research_mode == "formal" and not n_gate_decision.allowed,
+        disabled=(
+            research_mode == "formal"
+            and not research_gate_metadata_ready(n_gate_decision)
+        ),
     )
 
 n_gate_request = n_gate_request.model_copy(
     update={
         "audit_run_id": n_gate_decision.audit_run_id,
         "dataset_snapshot_id": n_gate_decision.dataset_snapshot_id,
+        "dataset_binding_hash": n_gate_decision.dataset_binding_hash,
     }
 )
+n_gate_json = n_gate_request.model_dump_json()
 with st.sidebar.expander("正式研究门", expanded=research_mode == "formal"):
     _render_research_gate(n_gate_decision)
 
@@ -1206,7 +1273,12 @@ if run_clicked:
     compare_variants = max(1, len(selected_modes) * len(selected_variants))
     compare_estimated_seconds = max(2.0, compare_candidate_count * compare_variants * 0.012)
     with st.spinner("正在回放分钟策略..."):
-        summary, trades, candidates_count = _run_with_countdown(
+        (
+            summary,
+            trades,
+            candidates_count,
+            compare_gate_decision_json,
+        ) = _run_with_countdown(
             "N字分钟回放",
             compare_estimated_seconds,
             lambda: strategy_compare_cached(
@@ -1217,8 +1289,14 @@ if run_clicked:
                 int(hold_days),
                 preset_name,
                 float(factor_score_threshold),
+                n_gate_json,
+                uuid.uuid4().hex if research_mode == "formal" else "",
             ),
         )
+    compare_gate_decision = _execution_gate_decision(
+        compare_gate_decision_json,
+        n_gate_decision,
+    )
     compare_saved = save_strategy_lab_run(
         build_strategy_lab_run(
             run_type="n_shape_compare",
@@ -1249,7 +1327,10 @@ if run_clicked:
                 "交易明细": trades,
             },
             max_rows_per_table=COMPARE_SAVE_MAX_ROWS,
-            manifest=build_gate_research_manifest(n_gate_request, n_gate_decision),
+            manifest=build_gate_research_manifest(
+                n_gate_request,
+                compare_gate_decision,
+            ),
         )
     )
     # 结果进 session_state：切 tab / 改控件触发 rerun 不再丢结果
@@ -1431,12 +1512,18 @@ with tab_optimize:
             "生成排行榜",
             type="primary",
             width="stretch",
-            disabled=research_mode == "formal" and not n_gate_decision.allowed,
+            disabled=(
+                research_mode == "formal"
+                and not research_gate_metadata_ready(n_gate_decision)
+            ),
         )
         optimize_background_clicked = ob2.form_submit_button(
             "后台运行",
             width="stretch",
-            disabled=research_mode == "formal" and not n_gate_decision.allowed,
+            disabled=(
+                research_mode == "formal"
+                and not research_gate_metadata_ready(n_gate_decision)
+            ),
         )
 
     opt_candidate_count = screen_candidate_count(
@@ -1517,6 +1604,7 @@ with tab_optimize:
                 topn_trades,
                 walk_forward_rankings,
                 walk_forward_trades,
+                optimize_gate_decision_json,
             ) = _run_with_countdown(
                 "自动优化",
                 workload.estimated_seconds,
@@ -1532,8 +1620,14 @@ with tab_optimize:
                     preset_name,
                     float(validation_ratio),
                     int(min_trades),
+                    n_gate_json,
+                    uuid.uuid4().hex if research_mode == "formal" else "",
                 ),
             )
+        optimize_gate_decision = _execution_gate_decision(
+            optimize_gate_decision_json,
+            n_gate_decision,
+        )
         saved_run = save_strategy_lab_run(
             build_strategy_lab_run(
                 run_type="n_shape_optimize",
@@ -1573,7 +1667,7 @@ with tab_optimize:
                 },
                 manifest=build_gate_research_manifest(
                     n_gate_request,
-                    n_gate_decision,
+                    optimize_gate_decision,
                 ),
             )
         )
@@ -1778,7 +1872,8 @@ with tab_auction:
             type="primary",
             width="stretch",
             disabled=(
-                research_mode == "formal" and not auction_gate_decision.allowed
+                research_mode == "formal"
+                and not research_gate_metadata_ready(auction_gate_decision)
             ),
         )
 
@@ -1786,8 +1881,10 @@ with tab_auction:
         update={
             "audit_run_id": auction_gate_decision.audit_run_id,
             "dataset_snapshot_id": auction_gate_decision.dataset_snapshot_id,
+            "dataset_binding_hash": auction_gate_decision.dataset_binding_hash,
         }
     )
+    auction_gate_json = auction_gate_request.model_dump_json()
     if research_mode == "formal":
         _render_research_gate(auction_gate_decision)
 
@@ -1808,7 +1905,12 @@ with tab_auction:
 
     if run_auction_clicked:
         with st.spinner("正在回放集合竞价跳空策略..."):
-            auction_metrics, auction_baseline, auction_minute_trades = (
+            (
+                auction_metrics,
+                auction_baseline,
+                auction_minute_trades,
+                auction_gate_decision_json,
+            ) = (
                 _run_with_countdown(
                     "集合竞价回放",
                     auction_workload.estimated_seconds,
@@ -1820,9 +1922,15 @@ with tab_auction:
                         float(auction_min_ratio),
                         float(auction_max_ratio),
                         int(auction_hold_days),
+                        auction_gate_json,
+                        uuid.uuid4().hex if research_mode == "formal" else "",
                     ),
                 )
             )
+        auction_execution_decision = _execution_gate_decision(
+            auction_gate_decision_json,
+            auction_gate_decision,
+        )
         baseline_row = auction_metrics.iloc[0]
         minute_row = auction_metrics.iloc[1]
         saved_run = save_strategy_lab_run(
@@ -1859,7 +1967,7 @@ with tab_auction:
                 },
                 manifest=build_gate_research_manifest(
                     auction_gate_request,
-                    auction_gate_decision,
+                    auction_execution_decision,
                 ),
             )
         )
@@ -2102,7 +2210,8 @@ with tab_growth:
                 type="primary",
                 width="stretch",
                 disabled=(
-                    research_mode == "formal" and not growth_gate_decision.allowed
+                    research_mode == "formal"
+                    and not research_gate_metadata_ready(growth_gate_decision)
                 ),
             )
 
@@ -2110,8 +2219,10 @@ with tab_growth:
             update={
                 "audit_run_id": growth_gate_decision.audit_run_id,
                 "dataset_snapshot_id": growth_gate_decision.dataset_snapshot_id,
+                "dataset_binding_hash": growth_gate_decision.dataset_binding_hash,
             }
         )
+        growth_gate_json = growth_gate_request.model_dump_json()
         if research_mode == "formal":
             _render_research_gate(growth_gate_decision)
 
@@ -2158,7 +2269,11 @@ with tab_growth:
         elif run_growth_clicked:
             with st.spinner("正在回放科创/创业板分钟放量策略..."):
                 if growth_run_mode == "消融对比":
-                    growth_metrics, growth_trades = _run_with_countdown(
+                    (
+                        growth_metrics,
+                        growth_trades,
+                        growth_gate_decision_json,
+                    ) = _run_with_countdown(
                         "科创/创业放量消融",
                         growth_workload.estimated_seconds,
                         lambda: growth_board_ablation_cached(
@@ -2171,10 +2286,16 @@ with tab_growth:
                             float(growth_min_accel),
                             int(growth_hold_days),
                             growth_spec_keys,
+                            growth_gate_json,
+                            uuid.uuid4().hex if research_mode == "formal" else "",
                         ),
                     )
                 else:
-                    growth_metrics, growth_trades = _run_with_countdown(
+                    (
+                        growth_metrics,
+                        growth_trades,
+                        growth_gate_decision_json,
+                    ) = _run_with_countdown(
                         "科创/创业放量回放",
                         growth_workload.estimated_seconds,
                         lambda: growth_board_surge_cached(
@@ -2189,9 +2310,15 @@ with tab_growth:
                             bool(growth_require_vwap),
                             True,
                             True,
+                            growth_gate_json,
+                            uuid.uuid4().hex if research_mode == "formal" else "",
                         ),
                     )
 
+            growth_execution_decision = _execution_gate_decision(
+                growth_gate_decision_json,
+                growth_gate_decision,
+            )
             row = growth_metrics.iloc[0]
             saved_run = save_strategy_lab_run(
                 build_strategy_lab_run(
@@ -2223,7 +2350,7 @@ with tab_growth:
                     },
                     manifest=build_gate_research_manifest(
                         growth_gate_request,
-                        growth_gate_decision,
+                        growth_execution_decision,
                     ),
                 )
             )

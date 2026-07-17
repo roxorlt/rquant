@@ -522,6 +522,85 @@ def _validate_existing_manifest(
     return expected_path
 
 
+def _event_is_after_as_of(
+    value: datetime | date,
+    as_of_time: datetime,
+) -> bool:
+    if as_of_time.tzinfo is None or as_of_time.utcoffset() is None:
+        raise ValueError("as_of_time must be timezone-aware")
+    market_zone = ZoneInfo("Asia/Shanghai")
+    if isinstance(value, datetime):
+        event_time = (
+            value.replace(tzinfo=market_zone)
+            if value.tzinfo is None or value.utcoffset() is None
+            else value
+        )
+        return event_time.astimezone(UTC) > as_of_time.astimezone(UTC)
+    return value > as_of_time.astimezone(market_zone).date()
+
+
+def verify_research_partition(
+    *,
+    lake_root: Path,
+    manifest: ResearchPartitionManifest,
+    as_of_time: datetime,
+) -> Path:
+    """Verify an immutable partition version without consulting the catalog head."""
+    contract = research_dataset_contract(manifest.dataset)
+    columns = research_export_schema(manifest.dataset)
+    expected_schema_hash = _schema_hash(columns)
+    relative_path = _validate_existing_manifest(
+        manifest,
+        key=manifest.partition,
+        contract=contract,
+        schema_hash=expected_schema_hash,
+    )
+    root = lake_root.resolve()
+    path = (root / relative_path).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(
+            f"partition path escapes lake root: {manifest.partition.partition_id}"
+        )
+    if not path.is_file():
+        raise ValueError(
+            f"partition file missing: {manifest.partition.partition_id}"
+        )
+    if path.stat().st_size != manifest.file_size:
+        raise ValueError(
+            f"partition file size mismatch: {manifest.partition.partition_id}"
+        )
+    if _file_sha256(path) != manifest.file_hash:
+        raise ValueError(
+            f"partition file hash mismatch: {manifest.partition.partition_id}"
+        )
+    earliest, latest = _validate_temp_partition(
+        path,
+        key=manifest.partition,
+        expected_rows=manifest.row_count,
+        expected_columns=columns,
+        contract=contract,
+    )
+    if earliest != manifest.earliest_time or latest != manifest.latest_time:
+        raise ValueError(
+            f"partition event bounds mismatch: {manifest.partition.partition_id}"
+        )
+    observed_content_hash = _logical_content_hash(
+        path,
+        columns=columns,
+        primary_key=contract.physical_primary_key,
+    )
+    if observed_content_hash != manifest.content_hash:
+        raise ValueError(
+            f"partition content hash mismatch: {manifest.partition.partition_id}"
+        )
+    if _event_is_after_as_of(latest, as_of_time):
+        raise ValueError(
+            "partition contains future data after as_of_time: "
+            f"{manifest.partition.partition_id}"
+        )
+    return path
+
+
 def _export_partition(
     connection: duckdb.DuckDBPyConnection,
     *,

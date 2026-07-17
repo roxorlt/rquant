@@ -39,6 +39,7 @@ from rquant.state.derive import (
 )
 from rquant.stock_features import build_intraday_relative_volume_features
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strategy_dependencies import query_bound_strategy_eligibility
 from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
 
 GapMode = Literal["close", "strict_high"]
@@ -1068,6 +1069,20 @@ def run_auction_gap_replay(
     """
     start_date = _as_date(config.start_date)
     end_date = _as_date(config.end_date)
+    bound_eligibility = query_bound_strategy_eligibility(
+        store,
+        strategy_id="auction_gap",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    bound_keys = (
+        None
+        if bound_eligibility is None
+        else {
+            (row.eligibility_date, row.ts_code)
+            for row in bound_eligibility
+        }
+    )
     decision_at_end = datetime.combine(
         end_date,
         config.decision_time,
@@ -1106,6 +1121,21 @@ def run_auction_gap_replay(
         & auction["price"].notna()
         & auction["vol"].gt(0)
     ].copy()
+    if bound_keys is not None:
+        observed_keys = {
+            (_as_date(row.trade_date), str(row.ts_code))
+            for row in auction.itertuples(index=False)
+        }
+        if bound_keys - observed_keys:
+            raise ValueError(
+                "bound auction eligibility has no matching valid auction rows"
+            )
+        auction = auction[
+            [
+                (_as_date(row.trade_date), str(row.ts_code)) in bound_keys
+                for row in auction.itertuples(index=False)
+            ]
+        ].copy()
     if auction.empty:
         return pd.DataFrame(columns=_AUCTION_GAP_MINIMUM_COLUMNS)
     status = store._conn.execute(

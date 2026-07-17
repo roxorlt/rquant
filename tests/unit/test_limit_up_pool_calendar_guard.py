@@ -140,7 +140,7 @@ def test_data_repair_audit_is_local_only() -> None:
 def test_v6_creates_local_limit_up_pool_write_guard() -> None:
     assert hasattr(schema, "LIMIT_UP_POOL_WRITE_GUARD_DDL")
     assert hasattr(schema, "LIMIT_UP_POOL_WRITE_GUARD_SEED_DML")
-    assert [migration.version for migration in MIGRATIONS] == list(range(1, 10))
+    assert [migration.version for migration in MIGRATIONS] == list(range(1, 11))
     assert MIGRATIONS[5].statements == (
         schema.LIMIT_UP_POOL_WRITE_GUARD_DDL,
         schema.LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,

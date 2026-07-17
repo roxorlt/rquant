@@ -119,7 +119,7 @@ def _build_n_shape_optimize_run(params: dict[str, Any]) -> StrategyLabSavedRun:
     from rquant.research_gate import (
         ResearchGateRequest,
         build_gate_research_manifest,
-        evaluate_store_research_gate,
+        open_gated_research_store,
     )
     from rquant.storage.duckdb import open_readonly_store
     from rquant.strategy_optimizer import run_strategy_optimization
@@ -140,28 +140,43 @@ def _build_n_shape_optimize_run(params: dict[str, Any]) -> StrategyLabSavedRun:
     manifest = None
     if gate_payload is not None:
         gate_request = ResearchGateRequest.model_validate(gate_payload)
-        with open_readonly_store() as gate_store:
-            gate_decision = evaluate_store_research_gate(gate_store, gate_request)
-        if gate_request.mode == "formal" and not gate_decision.allowed:
-            reasons = "; ".join(failure.message for failure in gate_decision.failures)
-            raise PermissionError(f"正式研究门未通过: {reasons}")
-        manifest = build_gate_research_manifest(gate_request, gate_decision)
-
-    with open_readonly_store() as store:
-        result = run_strategy_optimization(
-            store,
-            start_date=start_date,
-            end_date=end_date,
-            entry_modes=entry_modes,  # type: ignore[arg-type]
-            profile_variants=profile_variants,  # type: ignore[arg-type]
-            max_hold_days_options=hold_options,
-            top_n_options=topn_options,
-            score_profile_names=score_profile_names,
-            walk_forward_folds=walk_forward_folds,
-            preset_name=preset_name,
-            validation_ratio=validation_ratio,
-            min_trades=min_trades,
+        with open_gated_research_store(
+            gate_request
+        ) as (store, gate_decision):
+            result = run_strategy_optimization(
+                store,
+                start_date=start_date,
+                end_date=end_date,
+                entry_modes=entry_modes,  # type: ignore[arg-type]
+                profile_variants=profile_variants,  # type: ignore[arg-type]
+                max_hold_days_options=hold_options,
+                top_n_options=topn_options,
+                score_profile_names=score_profile_names,
+                walk_forward_folds=walk_forward_folds,
+                preset_name=preset_name,
+                validation_ratio=validation_ratio,
+                min_trades=min_trades,
+            )
+        manifest = build_gate_research_manifest(
+            gate_request,
+            gate_decision,
         )
+    else:
+        with open_readonly_store() as store:
+            result = run_strategy_optimization(
+                store,
+                start_date=start_date,
+                end_date=end_date,
+                entry_modes=entry_modes,  # type: ignore[arg-type]
+                profile_variants=profile_variants,  # type: ignore[arg-type]
+                max_hold_days_options=hold_options,
+                top_n_options=topn_options,
+                score_profile_names=score_profile_names,
+                walk_forward_folds=walk_forward_folds,
+                preset_name=preset_name,
+                validation_ratio=validation_ratio,
+                min_trades=min_trades,
+            )
     return build_strategy_lab_run(
         run_type="n_shape_optimize",
         title=f"N字自动优化 {start_date} 至 {end_date}（后台）",
@@ -207,7 +222,11 @@ def _enforce_spec_research_gate(run_type: str, params: dict[str, Any]) -> None:
     payload = params.get("research_gate")
     if payload is None:
         return
-    from rquant.research_gate import ResearchGateRequest, evaluate_store_research_gate
+    from rquant.research_gate import (
+        ResearchGateRequest,
+        evaluate_store_research_gate,
+        research_gate_metadata_ready,
+    )
     from rquant.storage.duckdb import open_readonly_store
 
     request = ResearchGateRequest.model_validate(payload)
@@ -216,7 +235,7 @@ def _enforce_spec_research_gate(run_type: str, params: dict[str, Any]) -> None:
         raise PermissionError("后台任务的正式研究门策略标识不匹配")
     with open_readonly_store() as store:
         decision = evaluate_store_research_gate(store, request)
-    if request.mode == "formal" and not decision.allowed:
+    if request.mode == "formal" and not research_gate_metadata_ready(decision):
         reasons = "; ".join(failure.message for failure in decision.failures)
         raise PermissionError(f"正式研究门未通过: {reasons}")
 

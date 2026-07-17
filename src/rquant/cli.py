@@ -7,12 +7,15 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 import time
-from contextlib import nullcontext
+from collections.abc import Sequence
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
+from types import FrameType, TracebackType
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -132,6 +135,28 @@ def _parse_sha256(value: str) -> str:
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _BACKFILL_PROTECTED_START = dtime(9, 15)
 _BACKFILL_PROTECTED_END = dtime(15, 10)
+_SNAPSHOT_BINDING_ESTIMATED_SECONDS = 1_800.0
+_SNAPSHOT_DEADLINE_MARGIN_SECONDS = 60
+
+
+class _SnapshotWriteDeadlineError(RuntimeError):
+    pass
+
+
+def _snapshot_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _in_backfill_protected_window(now: datetime) -> bool:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("protected-window time must be timezone-aware")
+    local = now.astimezone(_SHANGHAI)
+    return (
+        local.weekday() < 5
+        and _BACKFILL_PROTECTED_START
+        <= local.time()
+        <= _BACKFILL_PROTECTED_END
+    )
 
 
 def _next_backfill_protected_start(now: datetime) -> datetime:
@@ -153,14 +178,172 @@ def _backfill_write_window_safe(now: datetime, estimated_seconds: float) -> bool
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("backfill write-window time must be timezone-aware")
     local = now.astimezone(_SHANGHAI)
-    if (
-        local.weekday() < 5
-        and _BACKFILL_PROTECTED_START <= local.time() <= _BACKFILL_PROTECTED_END
-    ):
+    if _in_backfill_protected_window(local):
         return False
     conservative_seconds = max(0.0, estimated_seconds) * 2 + 1_800
     expected_finish = local + timedelta(seconds=conservative_seconds)
     return expected_finish < _next_backfill_protected_start(local)
+
+
+def _dataset_snapshot_write_window_safe(
+    now: datetime,
+    estimated_seconds: float,
+) -> bool:
+    """Keep snapshot publication out of monitor hours on every environment."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("snapshot write-window time must be timezone-aware")
+    local = now.astimezone(_SHANGHAI)
+    if local.weekday() >= 5:
+        return True
+    return _backfill_write_window_safe(
+        local,
+        max(_SNAPSHOT_BINDING_ESTIMATED_SECONDS, estimated_seconds),
+    )
+
+
+def _dataset_snapshot_apply_deadline(now: datetime) -> datetime:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("snapshot deadline time must be timezone-aware")
+    local = now.astimezone(_SHANGHAI)
+    return _next_backfill_protected_start(local) - timedelta(
+        seconds=_SNAPSHOT_DEADLINE_MARGIN_SECONDS
+    )
+
+
+def _require_snapshot_before_deadline(deadline: datetime | None) -> None:
+    if deadline is not None and _snapshot_now().astimezone(_SHANGHAI) >= deadline:
+        raise _SnapshotWriteDeadlineError(
+            "dataset snapshot execution reached the protected-window deadline"
+        )
+
+
+class _SnapshotDeadlineStoreContext:
+    def __init__(
+        self,
+        context: AbstractContextManager[DuckDBStore],
+        *,
+        deadline: datetime | None,
+    ) -> None:
+        self._context = context
+        self.deadline = deadline
+        self.expired = False
+        self._previous_handler: object | None = None
+        self._previous_timer: tuple[float, float] | None = None
+
+    def _handle_deadline(
+        self,
+        _signum: int,
+        _frame: FrameType | None,
+    ) -> None:
+        raise _SnapshotWriteDeadlineError(
+            "dataset snapshot execution reached the protected-window deadline"
+        )
+
+    def _arm(self) -> None:
+        if self.deadline is None:
+            return
+        remaining = (
+            self.deadline
+            - _snapshot_now().astimezone(_SHANGHAI)
+        ).total_seconds()
+        if remaining <= 0:
+            raise _SnapshotWriteDeadlineError(
+                "dataset snapshot execution reached the protected-window deadline"
+            )
+        self._previous_handler = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, self._handle_deadline)
+        self._previous_timer = signal.setitimer(signal.ITIMER_REAL, remaining)
+
+    def _disarm(self) -> None:
+        if self.deadline is None or self._previous_handler is None:
+            return
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, self._previous_handler)
+        if self._previous_timer is not None and self._previous_timer[0] > 0:
+            signal.setitimer(
+                signal.ITIMER_REAL,
+                self._previous_timer[0],
+                self._previous_timer[1],
+            )
+        self._previous_handler = None
+        self._previous_timer = None
+
+    def __enter__(self) -> DuckDBStore:
+        self._arm()
+        try:
+            return self._context.__enter__()
+        except Exception:
+            self._disarm()
+            raise
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        try:
+            suppressed = self._context.__exit__(exc_type, exc, traceback)
+        finally:
+            self._disarm()
+        if exc_type is not None and issubclass(
+            exc_type,
+            _SnapshotWriteDeadlineError,
+        ):
+            self.expired = True
+            return True
+        return bool(suppressed)
+
+
+def _run_deadline_supervised_process(
+    command: Sequence[str],
+    *,
+    deadline: datetime,
+) -> int:
+    remaining = (
+        deadline
+        - _snapshot_now().astimezone(_SHANGHAI)
+    ).total_seconds()
+    if remaining <= 0:
+        logger.error("dataset snapshot worker deadline already elapsed")
+        return 2
+    try:
+        result = subprocess.run(
+            list(command),
+            check=False,
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "dataset snapshot worker was killed at the protected-window deadline"
+        )
+        return 2
+    return int(result.returncode)
+
+
+def _run_dataset_snapshot_supervised_worker(
+    args: argparse.Namespace,
+    *,
+    deadline: datetime,
+) -> int:
+    command = (
+        sys.executable,
+        "-m",
+        "rquant.cli",
+        "dataset-snapshot",
+        "--strategy",
+        str(args.strategy),
+        "--as-of",
+        args.as_of.isoformat(),
+        "--manifest-id",
+        str(args.manifest_id),
+        "--apply",
+        "--deadline-worker",
+    )
+    return _run_deadline_supervised_process(
+        command,
+        deadline=deadline,
+    )
 
 
 class _RQuantArgumentParser(argparse.ArgumentParser):
@@ -762,7 +945,13 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
         plan_minute_backfill,
         resolve_strategy_eligibility,
     )
+    from rquant.config import settings
+    from rquant.research_catalog import ResearchCatalog
     from rquant.research_manifest import detect_code_commit
+    from rquant.research_snapshot import (
+        SnapshotArtifactResolver,
+        resolve_strategy_eligibility_from_artifacts,
+    )
 
     setup_logging()
     code_commit = detect_code_commit()
@@ -771,28 +960,69 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
         return 2
     spec = STRATEGY_BACKFILL_SPECS[args.strategy]
     as_of_time = datetime.now(UTC)
+    catalog = ResearchCatalog(settings.research_db_path_resolved)
     with open_readonly_store() as store:
-        eligibility = resolve_strategy_eligibility(
-            store,
-            strategy_id=args.strategy,
-            start_date=args.start_date,
-            end_date=args.end_date,
-        )
+        if args.strategy == "auction_gap":
+            eligibility_artifacts = SnapshotArtifactResolver(
+                catalog=catalog,
+                lake_root=settings.research_lake_dir_resolved,
+            ).resolve_lake_partitions(
+                dataset="auction_bar",
+                start_date=args.start_date,
+                end_date=args.end_date,
+                as_of_time=as_of_time,
+            )
+            if not eligibility_artifacts:
+                logger.error(
+                    "auction eligibility requires immutable auction_bar "
+                    "research-lake partitions"
+                )
+                return 2
+            eligibility_resolution = (
+                resolve_strategy_eligibility_from_artifacts(
+                    store,
+                    strategy_id=args.strategy,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
+                    input_artifacts=eligibility_artifacts,
+                    lake_root=settings.research_lake_dir_resolved,
+                    as_of_time=as_of_time,
+                )
+            )
+        else:
+            eligibility_resolution = resolve_strategy_eligibility(
+                store,
+                strategy_id=args.strategy,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
         manifest = BackfillManifest.build(
             spec=spec,
             start_date=args.start_date,
             end_date=args.end_date,
             as_of_time=as_of_time,
             code_commit=code_commit,
-            eligibilities=eligibility,
+            eligibilities=eligibility_resolution.records,
+            eligibility_resolution=eligibility_resolution,
         )
-        plan = plan_minute_backfill(store, manifest)
+        plan = plan_minute_backfill(
+            store,
+            manifest,
+            coverage_authority="combined",
+            research_catalog=catalog,
+            research_lake_root=settings.research_lake_dir_resolved,
+        )
     BackfillStateStore().persist_manifest(backfill_state_input(plan))
     _print_json(
         {
             "manifest_id": plan.manifest.manifest_id,
             "strategy": plan.manifest.spec.strategy_id,
             "eligibility_count": len(plan.manifest.eligibilities),
+            "eligibility_resolution_hash": (
+                eligibility_resolution.resolution_hash
+            ),
+            "eligibility_expected_dates": eligibility_resolution.expected_count,
+            "eligibility_complete_dates": eligibility_resolution.available_count,
             "task_count": len(plan.tasks),
             "requested_session_count": plan.requested_session_count,
             "coverage": plan.coverage.model_dump(mode="json"),
@@ -942,14 +1172,27 @@ def _watermark_text(value: object) -> str:
 
 def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
     """Finalize research metadata after recomputing exact minute coverage."""
-    from rquant.backfill_manifest import MinuteBackfillPlan, plan_minute_backfill
+    from rquant.backfill_manifest import (
+        MinuteBackfillPlan,
+        plan_minute_backfill,
+        resolve_strategy_eligibility,
+    )
+    from rquant.config import settings
     from rquant.data_metadata import (
         DatasetCoverage,
         DatasetSnapshot,
         DatasetSnapshotFinalization,
     )
+    from rquant.research_catalog import ResearchCatalog
+    from rquant.research_snapshot import (
+        SnapshotArtifactResolver,
+        build_dataset_snapshot_binding,
+        resolve_strategy_eligibility_from_artifacts,
+    )
+    from rquant.strategy_dependencies import strategy_execution_dependencies
 
     setup_logging()
+    dry_run = not bool(getattr(args, "apply", False))
     state = BackfillStateStore()
     persisted = state.load_manifest(args.manifest_id)
     if persisted is None:
@@ -965,10 +1208,85 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
     if original.manifest.spec.strategy_id != args.strategy:
         logger.error("snapshot strategy does not match the persisted manifest")
         return 2
+    started_at = _snapshot_now()
+    if not dry_run and not _dataset_snapshot_write_window_safe(
+        started_at,
+        original.estimate.total_seconds,
+    ):
+        logger.error(
+            "dataset snapshot apply would overlap the protected "
+            "09:15-15:10 market window"
+        )
+        return 2
+    deadline = (
+        None
+        if dry_run
+        else _dataset_snapshot_apply_deadline(started_at)
+    )
+    deadline_worker = bool(getattr(args, "deadline_worker", True))
+    if not dry_run and not deadline_worker:
+        if deadline is None:
+            logger.error("weekday snapshot apply requires a worker deadline")
+            return 2
+        return _run_dataset_snapshot_supervised_worker(
+            args,
+            deadline=deadline,
+        )
 
-    with DuckDBStore() as store:
-        current = plan_minute_backfill(store, original.manifest)
+    store_context = open_readonly_store() if dry_run else DuckDBStore()
+    guarded_store = _SnapshotDeadlineStoreContext(
+        store_context,
+        deadline=deadline,
+    )
+    catalog = ResearchCatalog(settings.research_db_path_resolved)
+    with guarded_store as store:
+        _require_snapshot_before_deadline(deadline)
+        planned_resolution = original.manifest.eligibility_resolution
+        if planned_resolution is None:
+            logger.error(
+                "dataset snapshot requires an independently verified "
+                "eligibility resolution"
+            )
+            return 2
+        if (
+            args.strategy == "auction_gap"
+            and not planned_resolution.input_artifacts
+        ):
+            logger.error(
+                "auction snapshot requires immutable eligibility input artifacts; "
+                "generate a new backfill manifest"
+            )
+            return 2
+        if args.strategy != "auction_gap":
+            live_resolution = resolve_strategy_eligibility(
+                store,
+                strategy_id=args.strategy,
+                start_date=original.manifest.start_date,
+                end_date=original.manifest.end_date,
+            )
+            if live_resolution.resolution_hash != planned_resolution.resolution_hash:
+                logger.error(
+                    "strategy eligibility changed after manifest planning; "
+                    "generate a new backfill manifest before snapshot publication"
+                )
+                return 2
+        current = plan_minute_backfill(
+            store,
+            original.manifest,
+            coverage_authority="research_lake",
+            research_catalog=catalog,
+            research_lake_root=settings.research_lake_dir_resolved,
+            coverage_as_of_time=args.as_of,
+        )
+        _require_snapshot_before_deadline(deadline)
         coverage = current.coverage
+        resolution = planned_resolution
+        if resolution.expected_count == 0 or resolution.coverage_ratio < 0.99:
+            logger.error(
+                "eligibility coverage gate failed: requested trading dates "
+                "must be non-empty and >=99% complete"
+            )
+            return 2
         if not coverage.baseline_gate_passed or not coverage.entry_exit_gate_passed:
             logger.error(
                 "dataset coverage gate failed: baseline must be >=95% and B/S >=99%"
@@ -990,6 +1308,97 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 )
                 return 2
 
+        binding_start = min(
+            (window.start_date for window in current.windows),
+            default=current.manifest.start_date,
+        )
+        binding_end = max(
+            (window.end_date for window in current.windows),
+            default=current.manifest.end_date,
+        )
+        ts_codes = tuple(
+            sorted(
+                {
+                    row.ts_code
+                    for row in current.manifest.eligibilities
+                }
+            )
+        )
+        dependencies = strategy_execution_dependencies(args.strategy)
+        pinned_lake_artifacts = list(current.minute_coverage_artifacts)
+        resolver = SnapshotArtifactResolver(
+            catalog=catalog,
+            lake_root=settings.research_lake_dir_resolved,
+        )
+        for dataset in dependencies.lake_datasets:
+            if dataset == "minute_bar":
+                continue
+            resolved = resolver.resolve_lake_partitions(
+                dataset=dataset,
+                start_date=binding_start,
+                end_date=binding_end,
+                as_of_time=args.as_of,
+            )
+            if not resolved:
+                logger.error(
+                    f"research lake has no {dataset} partitions in binding range"
+                )
+                return 2
+            if dataset == "auction_bar" and resolution.input_artifacts:
+                by_key = {
+                    artifact.artifact_key: artifact
+                    for artifact in resolved
+                }
+                by_key.update(
+                    {
+                        artifact.artifact_key: artifact
+                        for artifact in resolution.input_artifacts
+                    }
+                )
+                resolved = tuple(
+                    by_key[key] for key in sorted(by_key)
+                )
+            pinned_lake_artifacts.extend(resolved)
+        if args.strategy == "auction_gap":
+            live_resolution = resolve_strategy_eligibility_from_artifacts(
+                store,
+                strategy_id=args.strategy,
+                start_date=original.manifest.start_date,
+                end_date=original.manifest.end_date,
+                input_artifacts=resolution.input_artifacts,
+                lake_root=settings.research_lake_dir_resolved,
+                as_of_time=args.as_of,
+            )
+            _require_snapshot_before_deadline(deadline)
+            if live_resolution.resolution_hash != resolution.resolution_hash:
+                logger.error(
+                    "strategy eligibility changed after manifest planning; "
+                    "generate a new backfill manifest before snapshot publication"
+                )
+                return 2
+        if dry_run:
+            _print_json(
+                {
+                    "status": "dry_run",
+                    "strategy": args.strategy,
+                    "manifest_id": args.manifest_id,
+                    "as_of": args.as_of.isoformat(),
+                    "binding_start": binding_start.isoformat(),
+                    "binding_end": binding_end.isoformat(),
+                    "candidate_count": len(ts_codes),
+                    "coverage": coverage.model_dump(mode="json"),
+                    "lake_datasets": dependencies.lake_datasets,
+                    "lake_artifact_count": len(pinned_lake_artifacts),
+                    "materialized_tables": tuple(
+                        dependency.table_name
+                        for dependency in dependencies.materialized_tables
+                    ),
+                    "apply_required": True,
+                }
+            )
+            return 0
+
+        _require_snapshot_before_deadline(deadline)
         snapshot = DatasetSnapshot.create(
             strategy_name=args.strategy,
             manifest_id=args.manifest_id,
@@ -1001,16 +1410,17 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         if begun.status == "ready":
             finalized = begun
         else:
-            eligibility_count = len(current.manifest.eligibilities)
             store.upsert_dataset_coverage(
                 DatasetCoverage(
                     snapshot_id=begun.snapshot_id,
                     dataset_id="strategy_eligibility",
                     coverage_scope="eligibility",
                     table_name="backfill_manifest",
-                    expected_count=eligibility_count,
-                    available_count=eligibility_count,
-                    missing_reasons=(),
+                    expected_count=resolution.expected_count,
+                    available_count=resolution.available_count,
+                    missing_reasons=tuple(
+                        sorted({row.reason for row in resolution.incomplete})
+                    ),
                 )
             )
             phases = {
@@ -1018,13 +1428,21 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 "entry": coverage.entry,
                 "exit": coverage.exit,
             }
+            accepted_missing_reasons = tuple(
+                sorted(
+                    {
+                        row.reason
+                        for row in current.unavailable_sessions
+                    }
+                )
+            )
             for scope, phase in phases.items():
                 missing_reasons = tuple(
                     reason
                     for reason, applies in (
-                        (
-                            "known_full_day_suspension",
-                            phase.accepted_missing_sessions > 0,
+                        *(
+                            (reason, phase.accepted_missing_sessions > 0)
+                            for reason in accepted_missing_reasons
                         ),
                         (
                             "incomplete_full_session",
@@ -1060,6 +1478,9 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 current.manifest.start_date.isoformat()
             )
             watermarks["manifest_end_date"] = current.manifest.end_date.isoformat()
+            watermarks["eligibility_resolution_hash"] = (
+                resolution.resolution_hash
+            )
             if minute_row and minute_row[0] is not None:
                 watermarks["minute_bar"] = _watermark_text(minute_row[0])
             if calendar_row and calendar_row[0] is not None:
@@ -1071,11 +1492,33 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                     completed_at=datetime.now(UTC),
                 ),
             )
+        _require_snapshot_before_deadline(deadline)
+        binding = build_dataset_snapshot_binding(
+            metadata_store=store,
+            source_connection=store._conn,
+            catalog=ResearchCatalog(settings.research_db_path_resolved),
+            lake_root=settings.research_lake_dir_resolved,
+            snapshot_id=finalized.snapshot_id,
+            start_date=binding_start,
+            end_date=binding_end,
+            ts_codes=ts_codes,
+            dependencies=dependencies,
+            lake_artifacts=tuple(pinned_lake_artifacts),
+            eligibility_resolution=resolution,
+        )
+        _require_snapshot_before_deadline(deadline)
+    if guarded_store.expired:
+        logger.error(
+            "dataset snapshot apply stopped before the protected "
+            "09:15-15:10 market window"
+        )
+        return 2
     _print_json(
         {
             "snapshot_id": finalized.snapshot_id,
             "status": finalized.status,
-            "scope": "metadata-only; no whole-table snapshot refresh was performed",
+            "binding_hash": binding.binding_hash,
+            "scope": "immutable execution binding",
         }
     )
     return 0
@@ -2639,6 +3082,22 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=_parse_sha256,
         help="已完成的 64 位 manifest id",
+    )
+    snapshot_mode = dataset_snapshot_p.add_mutually_exclusive_group()
+    snapshot_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只验证覆盖并展示执行绑定计划（默认行为）",
+    )
+    snapshot_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="在非交易保护窗口写入快照元数据和不可变执行绑定",
+    )
+    dataset_snapshot_p.add_argument(
+        "--deadline-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     minute_p = sub.add_parser(

@@ -63,6 +63,67 @@ def test_manifest_computes_coverage_ratio_from_counts() -> None:
     assert manifest.missing_evidence == []
 
 
+def test_manifest_v2_requires_and_preserves_execution_hashes() -> None:
+    from rquant.research_manifest import ResearchManifest
+
+    with pytest.raises(ValidationError, match="dataset_binding_hash"):
+        ResearchManifest(
+            schema_version=2,
+            research_status="comparable",
+            status_reason="绑定执行数据",
+            code_commit="abc123",
+            dataset_snapshot_id="snapshot-20260713",
+            coverage_numerator=100,
+            coverage_denominator=100,
+            data_start_date=date(2025, 1, 1),
+            data_end_date=date(2026, 6, 30),
+            universe_definition="资格全集 v1",
+            execution_model_version="execution-v1",
+            cost_model_version="cost-v1",
+        )
+
+    with pytest.raises(ValidationError, match="strategy_spec_hash, result_hash"):
+        ResearchManifest(
+            schema_version=2,
+            research_status="comparable",
+            status_reason="绑定执行数据",
+            code_commit="abc123",
+            dataset_snapshot_id="snapshot-20260713",
+            dataset_binding_hash="b" * 64,
+            coverage_numerator=100,
+            coverage_denominator=100,
+            data_start_date=date(2025, 1, 1),
+            data_end_date=date(2026, 6, 30),
+            universe_definition="资格全集 v1",
+            execution_model_version="execution-v1",
+            cost_model_version="cost-v1",
+        )
+
+    manifest = ResearchManifest(
+        schema_version=2,
+        research_status="comparable",
+        status_reason="绑定执行数据",
+        code_commit="abc123",
+        dataset_snapshot_id="snapshot-20260713",
+        dataset_binding_hash="b" * 64,
+        coverage_numerator=100,
+        coverage_denominator=100,
+        data_start_date=date(2025, 1, 1),
+        data_end_date=date(2026, 6, 30),
+        universe_definition="资格全集 v1",
+        execution_model_version="execution-v1",
+        cost_model_version="cost-v1",
+        strategy_spec_hash="c" * 64,
+        result_hash="d" * 64,
+    )
+
+    assert manifest.schema_version == 2
+    assert manifest.dataset_binding_hash == "b" * 64
+    assert manifest.strategy_spec_hash == "c" * 64
+    assert manifest.result_hash == "d" * 64
+    assert manifest.missing_evidence == []
+
+
 def test_comparable_manifest_does_not_accept_ratio_without_counts() -> None:
     from rquant.research_manifest import ResearchManifest
 

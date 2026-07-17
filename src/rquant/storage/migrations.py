@@ -16,6 +16,7 @@ from rquant.storage.schema import (
     DATA_AUDIT_RUN_DDL,
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
+    DATASET_SNAPSHOT_BINDING_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
@@ -153,6 +154,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=9,
         name="decouple historical name from ST status",
         statements=STOCK_STATUS_NAME_OPTIONAL_MIGRATION_DDLS,
+    ),
+    Migration(
+        version=10,
+        name="immutable dataset snapshot execution binding",
+        statements=(DATASET_SNAPSHOT_BINDING_DDL,),
     ),
 )
 

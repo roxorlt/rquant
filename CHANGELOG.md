@@ -68,6 +68,38 @@
 
 ### Added
 
+- **Stage 1 不可变正式研究执行链**：新增 migration v10 与
+  `dataset_snapshot_binding`，把分钟/竞价研究湖精确内容寻址版本和策略所需日级小表物化为
+  不可改写的执行 manifest；文件、schema、逻辑内容、行数、主键、时间范围和 PIT 截止时点在
+  计算前逐项验证。formal gate 与策略计算共用同一个内存 DuckDB
+  `ResearchExecutionSession`，不再在门禁通过后重新读取滚动主库或副本；源库和 catalog head
+  后续变化不会改变旧结果，绑定文件缺失或篡改则在策略查询前 fail closed。三类现有策略建立
+  typed 数据依赖合同，Strategy Lab 缓存绑定 snapshot/binding，保存记录新增策略参数 hash 与
+  完整结果 hash。
+- **资格与分钟覆盖证据闭环**：回补 manifest 新增可复现的
+  `EligibilityResolution`，请求、已评估、已完成和未知交易日独立记录，日历自然日缺口不再被
+  零候选掩盖；输入完整性分母由上市股票、历史状态和日线键的并集独立构造，缺失日线的股票
+  不会从分母中消失。日级策略按依赖面板、竞价策略按前一交易日股票全集验证至少 99% 输入
+  完备，单条竞价记录不再把整日自证为完成。精确 eligibility 记录作为
+  `strategy_eligibility` 工件写入 binding，三类正式回放只允许消费这组候选键，源
+  `screen_result` 或日级表变化不能偷换候选全集。集合竞价 eligibility 还会保存用于解析的
+  精确 `auction_bar` artifact 身份；即使规划后 catalog head 更新，发布与正式回放仍复用
+  同一代竞价文件。分钟完整性以研究湖不可变版本为正式权威，运营 DuckDB 仅能作为规划辅助；
+  覆盖计算实际读取的内容寻址分区直接传给 binding builder，消除二次查询 catalog head 的
+  竞态。
+  上市日前和权威全日停牌在生成任务与 ETA 前分类，不再浪费 API 请求。
+  `dataset-snapshot` 默认只读预演，只有显式 `--apply` 才发布；所有环境的工作日 apply
+  不仅在 `09:15-15:10` 内拒绝，也会按保守 ETA 拒绝可能跨入保护窗口的任务；运行中另设
+  不持有 DuckDB 的父进程监督器，提前 60 秒用 OS 级 timeout 终止并回收整个 worker；worker
+  内部仍用 signal 与阶段检查优雅释放连接。覆盖通过后会同时生成不可变执行绑定。项目版本从
+  `0.21.1` 更新到 `0.22.0`。
+- **正式执行 TOCTOU 加固**：执行会话对每个已校验 Parquet 建立同文件系统私有硬链接，
+  原路径被原子替换也不会改变已打开会话；正式研究门只有在本次执行会话完成全部工件校验后
+  才返回 `comparable`。Strategy Lab 正式运行使用唯一执行 nonce，缓存不能跳过校验；旧 v9
+  备份缺少 `dataset_snapshot_binding` 时仍可同步其余 metadata，并明确标为 legacy skip。
+  研究湖 artifact 另存 revision 创建时间与 catalog 更新时间，区分事件 `as-of` 和研究数据
+  版本，避免把历史回补发布时间误当成当时可见的市场事件。
+
 - **云端研究日增量可靠性与恢复入口**：新增日终 runner 和机器可读 readiness 检查；只有
   当日 daily 成功结束、主动刷新的只读副本包含完整当日日线后，才允许补齐并封存分钟/竞价。
   runner 固定目标交易日并最多尝试 4 次，普通日增量和历史恢复都强制 observation 连续，不能

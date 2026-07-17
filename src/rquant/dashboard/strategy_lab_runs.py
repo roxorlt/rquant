@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -106,6 +107,72 @@ def _records(df: pd.DataFrame, *, limit: int) -> list[dict[str, Any]]:
     ]
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _hash_json_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime | date | time):
+        return value.isoformat()
+    if isinstance(value, pd.Timedelta):
+        return str(value)
+    if hasattr(value, "item"):
+        return _hash_json_value(value.item())
+    if isinstance(value, float):
+        return None if math.isnan(value) or math.isinf(value) else value
+    if isinstance(value, dict):
+        return {str(key): _hash_json_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_hash_json_value(item) for item in value]
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _strategy_spec_hash(run_type: str, params: dict[str, Any]) -> str:
+    payload = {
+        "run_type": run_type,
+        "params": _hash_json_value(params),
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _result_hash(
+    metrics: dict[str, Any],
+    tables: dict[str, pd.DataFrame],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        _canonical_json_bytes({"metrics": _hash_json_value(metrics)})
+    )
+    for name in sorted(tables):
+        df = tables[name]
+        digest.update(
+            _canonical_json_bytes({
+                "table": name,
+                "columns": [str(column) for column in df.columns],
+                "dtypes": [str(dtype) for dtype in df.dtypes],
+                "row_count": len(df),
+            })
+        )
+        for row in df.itertuples(index=False, name=None):
+            digest.update(_canonical_json_bytes(_hash_json_value(row)))
+    return digest.hexdigest()
+
+
 def _markdown_value(value: Any) -> str:
     clean = _json_value(value)
     if clean is None:
@@ -151,6 +218,9 @@ def _research_manifest_markdown_lines(manifest: ResearchManifest) -> list[str]:
         f"- 原因：{manifest.status_reason}",
         f"- 代码提交：`{manifest.code_commit or '未知'}`",
         f"- 数据快照：`{manifest.dataset_snapshot_id or '未知'}`",
+        f"- 执行数据绑定：`{manifest.dataset_binding_hash or '未知'}`",
+        f"- 策略参数哈希：`{manifest.strategy_spec_hash or '未知'}`",
+        f"- 完整结果哈希：`{manifest.result_hash or '未知'}`",
         f"- 数据覆盖：{coverage}",
         f"- 数据区间：{data_range}",
         f"- 资格全集：{manifest.universe_definition or '未知'}",
@@ -230,6 +300,15 @@ def build_strategy_lab_run(
     manifest: ResearchManifest | None = None,
 ) -> StrategyLabSavedRun:
     created_at = datetime.now(CST)
+    normalized_params = _json_value(params)
+    normalized_metrics = _json_value(metrics)
+    base_manifest = manifest or new_exploratory_manifest(run_type)
+    enriched_manifest = ResearchManifest.model_validate({
+        **base_manifest.model_dump(exclude={"missing_evidence"}),
+        "schema_version": 2,
+        "strategy_spec_hash": _strategy_spec_hash(run_type, params),
+        "result_hash": _result_hash(metrics, tables),
+    })
     saved_tables: list[StrategyLabRunTable] = []
     for name, df in tables.items():
         total_rows = len(df)
@@ -246,10 +325,10 @@ def build_strategy_lab_run(
         run_type=run_type,
         title=title,
         created_at=created_at,
-        params=_json_value(params),
-        metrics=_json_value(metrics),
+        params=normalized_params,
+        metrics=normalized_metrics,
         tables=saved_tables,
-        manifest=manifest or new_exploratory_manifest(run_type),
+        manifest=enriched_manifest,
         markdown="",
     )
     run.markdown = render_strategy_lab_markdown(run)

@@ -23,6 +23,9 @@ from rquant.data_metadata import (
     DataQualityIssue,
     DatasetCoverage,
     DatasetSnapshot,
+    DatasetSnapshotBinding,
+    DatasetSnapshotBindingFinalization,
+    DatasetSnapshotBindingManifest,
     DatasetSnapshotFinalization,
     DatasetSnapshotWriteConflictError,
     normalize_utc_datetime,
@@ -217,6 +220,30 @@ def _snapshot_from_row(row: tuple[object, ...]) -> DatasetSnapshot:
     return snapshot
 
 
+def _snapshot_binding_from_row(
+    row: tuple[object, ...],
+) -> DatasetSnapshotBinding:
+    manifest = DatasetSnapshotBindingManifest.model_validate_json(str(row[4]))
+    binding = DatasetSnapshotBinding(
+        binding_version=int(cast(int, row[1])),
+        snapshot_id=str(row[0]),
+        manifest_hash=str(row[3]),
+        manifest=manifest,
+        artifact_root=str(row[5]),
+        manifest_relative_path=str(row[6]),
+        status=cast(str, row[7]),
+        created_at=_utc_datetime_from_db(row[8]),
+        completed_at=None if row[9] is None else _utc_datetime_from_db(row[9]),
+    )
+    stored_hash = str(row[2])
+    if binding.binding_hash != stored_hash:
+        raise ValueError(
+            "dataset_snapshot_binding stable hash mismatch: "
+            f"stored={stored_hash}, derived={binding.binding_hash}"
+        )
+    return binding
+
+
 def _coverage_from_row(row: tuple[object, ...]) -> DatasetCoverage:
     coverage = DatasetCoverage(
         snapshot_id=str(row[0]),
@@ -300,6 +327,20 @@ def _snapshot_finalization_matches(
         and snapshot.table_watermarks == finalization.table_watermarks
         and snapshot.quality_issue_ids == finalization.quality_issue_ids
         and snapshot.completed_at == finalization.completed_at
+    )
+
+
+def _snapshot_binding_identity(
+    binding: DatasetSnapshotBinding,
+) -> tuple[object, ...]:
+    return (
+        binding.binding_version,
+        binding.snapshot_id,
+        binding.binding_hash,
+        binding.manifest_hash,
+        binding.manifest,
+        binding.artifact_root,
+        binding.manifest_relative_path,
     )
 
 
@@ -1387,6 +1428,165 @@ class DuckDBStore:
             [snapshot_id],
         ).fetchone()
         return None if row is None else _snapshot_from_row(row)
+
+    def begin_dataset_snapshot_binding(
+        self,
+        binding: DatasetSnapshotBinding,
+    ) -> DatasetSnapshotBinding:
+        binding = _revalidate_for_write(binding)
+        if binding.status != "building":
+            raise ValueError(
+                "begin_dataset_snapshot_binding requires a building binding"
+            )
+        self._conn.execute("BEGIN")
+        try:
+            touched = self._conn.execute(
+                "UPDATE dataset_snapshot SET status = status "
+                "WHERE snapshot_id = ? RETURNING snapshot_id",
+                [binding.snapshot_id],
+            ).fetchone()
+            if touched is None:
+                raise KeyError(
+                    f"dataset snapshot not found: {binding.snapshot_id}"
+                )
+            snapshot = self.get_dataset_snapshot(binding.snapshot_id)
+            if snapshot is None or snapshot.status != "ready":
+                raise ValueError(
+                    "execution binding requires a ready dataset snapshot: "
+                    f"{binding.snapshot_id}"
+                )
+            manifest = binding.manifest
+            if (
+                manifest.strategy_name != snapshot.strategy_name
+                or manifest.code_commit != snapshot.code_commit
+                or manifest.as_of_time != snapshot.as_of_time
+            ):
+                raise ValueError(
+                    "execution binding manifest disagrees with dataset snapshot "
+                    f"identity: {binding.snapshot_id}"
+                )
+
+            existing = self.get_dataset_snapshot_binding(binding.snapshot_id)
+            if existing is not None:
+                if _snapshot_binding_identity(existing) != _snapshot_binding_identity(
+                    binding
+                ):
+                    raise ValueError(
+                        "dataset snapshot already bound to different immutable "
+                        f"execution data: {binding.snapshot_id}"
+                    )
+                self._conn.execute("COMMIT")
+                return existing
+
+            self._conn.execute(
+                """
+                INSERT INTO dataset_snapshot_binding
+                (snapshot_id, binding_version, binding_hash, manifest_hash,
+                 manifest_json, artifact_root, manifest_relative_path, status,
+                 created_at, completed_at)
+                VALUES (?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?)
+                """,
+                [
+                    binding.snapshot_id,
+                    binding.binding_version,
+                    binding.binding_hash,
+                    binding.manifest_hash,
+                    binding.manifest.model_dump_json(
+                        exclude_computed_fields=True
+                    ),
+                    binding.artifact_root,
+                    binding.manifest_relative_path,
+                    binding.status,
+                    binding.created_at,
+                    binding.completed_at,
+                ],
+            )
+            stored = self.get_dataset_snapshot_binding(binding.snapshot_id)
+            if stored is None:
+                raise RuntimeError(
+                    "dataset snapshot binding insert was not persisted: "
+                    f"{binding.snapshot_id}"
+                )
+            self._conn.execute("COMMIT")
+            return stored
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def finalize_dataset_snapshot_binding(
+        self,
+        snapshot_id: str,
+        finalization: DatasetSnapshotBindingFinalization,
+    ) -> DatasetSnapshotBinding:
+        finalization = _revalidate_for_write(finalization)
+        self._conn.execute("BEGIN")
+        try:
+            existing = self.get_dataset_snapshot_binding(snapshot_id)
+            if existing is None:
+                raise KeyError(
+                    f"dataset snapshot binding not found: {snapshot_id}"
+                )
+            if finalization.completed_at < existing.created_at:
+                raise ValueError(
+                    "binding completed_at cannot precede created_at: "
+                    f"{snapshot_id}"
+                )
+            if existing.status == "ready":
+                if existing.completed_at != finalization.completed_at:
+                    raise ValueError(
+                        "dataset snapshot binding is immutable after ready: "
+                        f"{snapshot_id}"
+                    )
+                self._conn.execute("COMMIT")
+                return existing
+
+            finalized = _revalidate_for_write(existing.finalize(finalization))
+            updated = self._conn.execute(
+                """
+                UPDATE dataset_snapshot_binding
+                SET status = 'ready', completed_at = ?
+                WHERE snapshot_id = ? AND status = 'building'
+                RETURNING snapshot_id
+                """,
+                [finalized.completed_at, snapshot_id],
+            ).fetchone()
+            if updated is None:
+                raise DatasetSnapshotWriteConflictError(
+                    "dataset snapshot binding write conflict; retry finalization: "
+                    f"{snapshot_id}"
+                )
+            stored = self.get_dataset_snapshot_binding(snapshot_id)
+            if stored is None:
+                raise RuntimeError(
+                    "dataset snapshot binding finalize was not persisted: "
+                    f"{snapshot_id}"
+                )
+            self._conn.execute("COMMIT")
+            return stored
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def get_dataset_snapshot_binding(
+        self,
+        snapshot_id: str,
+    ) -> DatasetSnapshotBinding | None:
+        row = self._conn.execute(
+            """
+            SELECT snapshot_id, binding_version, binding_hash, manifest_hash,
+                   manifest_json, artifact_root, manifest_relative_path, status,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ') AS created_at,
+                   CASE WHEN completed_at IS NULL THEN NULL ELSE
+                       strftime(completed_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END AS completed_at
+            FROM dataset_snapshot_binding
+            WHERE snapshot_id = ?
+            """,
+            [snapshot_id],
+        ).fetchone()
+        return None if row is None else _snapshot_binding_from_row(row)
 
     def upsert_dataset_coverage(
         self, coverage: DatasetCoverage
