@@ -805,6 +805,26 @@ CREATE TABLE IF NOT EXISTS dataset_snapshot (
 );
 """
 
+DATASET_SNAPSHOT_BINDING_DDL = """
+CREATE TABLE IF NOT EXISTS dataset_snapshot_binding (
+    snapshot_id            VARCHAR     PRIMARY KEY,
+    binding_version        INTEGER     NOT NULL,
+    binding_hash           VARCHAR     NOT NULL UNIQUE,
+    manifest_hash          VARCHAR     NOT NULL,
+    manifest_json          JSON        NOT NULL,
+    artifact_root          VARCHAR     NOT NULL,
+    manifest_relative_path VARCHAR     NOT NULL,
+    status                 VARCHAR     NOT NULL CHECK (status IN ('building', 'ready')),
+    created_at             TIMESTAMPTZ NOT NULL,
+    completed_at           TIMESTAMPTZ,
+    CHECK (binding_version > 0),
+    CHECK (
+        (status = 'building' AND completed_at IS NULL)
+        OR (status = 'ready' AND completed_at IS NOT NULL)
+    )
+);
+"""
+
 DATASET_COVERAGE_DDL = """
 CREATE TABLE IF NOT EXISTS dataset_coverage (
     snapshot_id     VARCHAR     NOT NULL,
@@ -1095,6 +1115,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     DATA_AUDIT_RUN_DDL,
     STOCK_SUSPEND_EVENT_DDL,
     STOCK_SUSPEND_COVERAGE_DDL,
+    DATASET_SNAPSHOT_BINDING_DDL,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

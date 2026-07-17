@@ -241,6 +241,45 @@ def test_auction_gap_replay_uses_share_volume_and_next_open_exit(
     assert row["name"] == "历史浦发"
 
 
+def test_auction_gap_replay_uses_only_bound_eligibility_keys(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
+
+    _seed_auction_gap_case(store)
+    store._conn.execute(
+        """
+        CREATE TABLE strategy_eligibility (
+            eligibility_id VARCHAR PRIMARY KEY,
+            strategy_id VARCHAR NOT NULL,
+            strategy_version VARCHAR NOT NULL,
+            ts_code VARCHAR NOT NULL,
+            eligibility_date DATE NOT NULL,
+            entry_date DATE NOT NULL,
+            decision_at TIMESTAMPTZ NOT NULL,
+            variant VARCHAR NOT NULL,
+            resolution_hash VARCHAR NOT NULL
+        );
+        INSERT INTO strategy_eligibility VALUES (
+            'eligibility-1', 'auction_gap', 'v1', '600000.SH',
+            DATE '2026-06-25', DATE '2026-06-25',
+            TIMESTAMPTZ '2026-06-25 01:27:00+00', 'auction_gap', 'hash'
+        );
+        """
+    )
+
+    trades = run_auction_gap_replay(
+        store,
+        AuctionGapConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            st_filter="none",
+        ),
+    )
+
+    assert trades["ts_code"].tolist() == ["600000.SH"]
+
+
 def test_auction_gap_replay_literal_lower_only_filters_lowercase_historical_name(
     store: DuckDBStore,
 ) -> None:

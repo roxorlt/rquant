@@ -46,11 +46,18 @@ from loguru import logger
 from pydantic import BaseModel
 
 from rquant.config import settings
-from rquant.data_metadata import DataQualityIssue, DatasetCoverage, DatasetSnapshot
+from rquant.data_metadata import (
+    DataQualityIssue,
+    DatasetCoverage,
+    DatasetSnapshot,
+    DatasetSnapshotBinding,
+)
 from rquant.security_status import SecurityStatusWriteConflictError
 from rquant.storage.duckdb import (
     _coverage_from_row,
     _quality_issue_from_row,
+    _snapshot_binding_from_row,
+    _snapshot_binding_identity,
     _snapshot_from_row,
 )
 from rquant.storage.migrations import initialize_schema
@@ -110,6 +117,7 @@ MERGE_TABLES: tuple[str, ...] = (
     "market_daily_info",
     "hm_list",
     "dataset_snapshot",
+    "dataset_snapshot_binding",
     "dataset_coverage",
     "data_quality_issue",
 )
@@ -123,8 +131,16 @@ LOCAL_ONLY_TABLES: tuple[str, ...] = (
 
 DATA_METADATA_TABLES: tuple[str, ...] = (
     "dataset_snapshot",
+    "dataset_snapshot_binding",
     "dataset_coverage",
     "data_quality_issue",
+)
+LEGACY_REQUIRED_DATA_METADATA_TABLES = frozenset(
+    {
+        "dataset_snapshot",
+        "dataset_coverage",
+        "data_quality_issue",
+    }
 )
 
 
@@ -396,6 +412,35 @@ def _load_source_coverages(
     return coverages
 
 
+def _load_source_snapshot_bindings(
+    conn: duckdb.DuckDBPyConnection,
+    alias: str,
+) -> dict[str, DatasetSnapshotBinding]:
+    rows = conn.execute(
+        f"""
+        SELECT snapshot_id, binding_version, binding_hash, manifest_hash,
+               manifest_json, artifact_root, manifest_relative_path, status,
+               strftime(created_at AT TIME ZONE 'UTC',
+                        '%Y-%m-%dT%H:%M:%S.%fZ'),
+               CASE WHEN completed_at IS NULL THEN NULL ELSE
+                   strftime(completed_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ')
+               END
+        FROM {alias}.dataset_snapshot_binding
+        """
+    ).fetchall()
+    bindings: dict[str, DatasetSnapshotBinding] = {}
+    for row in rows:
+        try:
+            binding = _snapshot_binding_from_row(row)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid source dataset_snapshot_binding {row[0]}: {exc}"
+            ) from exc
+        bindings[binding.snapshot_id] = binding
+    return bindings
+
+
 def _load_source_quality_issues(
     conn: duckdb.DuckDBPyConnection, alias: str
 ) -> dict[str, DataQualityIssue]:
@@ -435,6 +480,33 @@ def _validate_source_coverage_references(
             raise ValueError(
                 "source dataset_coverage references missing dataset_snapshot: "
                 f"{coverage.snapshot_id}"
+            )
+
+
+def _validate_source_binding_references(
+    snapshots: dict[str, DatasetSnapshot],
+    bindings: dict[str, DatasetSnapshotBinding],
+) -> None:
+    for binding in bindings.values():
+        snapshot = snapshots.get(binding.snapshot_id)
+        if snapshot is None:
+            raise ValueError(
+                "source dataset_snapshot_binding references missing "
+                f"dataset_snapshot: {binding.snapshot_id}"
+            )
+        if snapshot.status != "ready":
+            raise ValueError(
+                "source dataset_snapshot_binding requires ready "
+                f"dataset_snapshot: {binding.snapshot_id}"
+            )
+        if (
+            binding.manifest.strategy_name != snapshot.strategy_name
+            or binding.manifest.code_commit != snapshot.code_commit
+            or binding.manifest.as_of_time != snapshot.as_of_time
+        ):
+            raise ValueError(
+                "source dataset_snapshot_binding manifest disagrees with "
+                f"dataset_snapshot: {binding.snapshot_id}"
             )
 
 
@@ -562,6 +634,96 @@ def _promote_dataset_snapshots(
           AND source.status = 'ready'
         """
     )
+
+
+def _merge_dataset_snapshot_bindings(
+    conn: duckdb.DuckDBPyConnection,
+    bindings: dict[str, DatasetSnapshotBinding],
+) -> int:
+    changed = 0
+    for source in bindings.values():
+        row = conn.execute(
+            """
+            SELECT snapshot_id, binding_version, binding_hash, manifest_hash,
+                   manifest_json, artifact_root, manifest_relative_path, status,
+                   strftime(created_at AT TIME ZONE 'UTC',
+                            '%Y-%m-%dT%H:%M:%S.%fZ'),
+                   CASE WHEN completed_at IS NULL THEN NULL ELSE
+                       strftime(completed_at AT TIME ZONE 'UTC',
+                                '%Y-%m-%dT%H:%M:%S.%fZ')
+                   END
+            FROM dataset_snapshot_binding
+            WHERE snapshot_id = ?
+            """,
+            [source.snapshot_id],
+        ).fetchone()
+        target = None if row is None else _snapshot_binding_from_row(row)
+        if target is not None:
+            if _snapshot_binding_identity(target) != _snapshot_binding_identity(
+                source
+            ):
+                raise ValueError(
+                    "immutable dataset_snapshot_binding conflict: "
+                    f"{source.snapshot_id}"
+                )
+            if target.status == "ready":
+                if (
+                    source.status == "ready"
+                    and target.completed_at != source.completed_at
+                ):
+                    raise ValueError(
+                        "immutable dataset_snapshot_binding finalization "
+                        f"conflict: {source.snapshot_id}"
+                    )
+                continue
+            if source.status == "ready":
+                conn.execute(
+                    """
+                    UPDATE dataset_snapshot_binding
+                    SET status = 'ready',
+                        created_at = least(created_at, ?),
+                        completed_at = ?
+                    WHERE snapshot_id = ? AND status = 'building'
+                    """,
+                    [source.created_at, source.completed_at, source.snapshot_id],
+                )
+                changed += 1
+            continue
+
+        parent = conn.execute(
+            "SELECT status FROM dataset_snapshot WHERE snapshot_id = ?",
+            [source.snapshot_id],
+        ).fetchone()
+        if parent is None or str(parent[0]) != "ready":
+            raise ValueError(
+                "target dataset_snapshot_binding requires ready "
+                f"dataset_snapshot: {source.snapshot_id}"
+            )
+        conn.execute(
+            """
+            INSERT INTO dataset_snapshot_binding
+            (snapshot_id, binding_version, binding_hash, manifest_hash,
+             manifest_json, artifact_root, manifest_relative_path, status,
+             created_at, completed_at)
+            VALUES (?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?)
+            """,
+            [
+                source.snapshot_id,
+                source.binding_version,
+                source.binding_hash,
+                source.manifest_hash,
+                source.manifest.model_dump_json(
+                    exclude_computed_fields=True
+                ),
+                source.artifact_root,
+                source.manifest_relative_path,
+                source.status,
+                source.created_at,
+                source.completed_at,
+            ],
+        )
+        changed += 1
+    return changed
 
 
 def _merge_dataset_coverages(
@@ -868,7 +1030,9 @@ def _sync_data_metadata_bundle(
             for row in conn.execute(
                 "SELECT table_name FROM information_schema.tables "
                 f"WHERE table_catalog = '{alias}' "
-                "AND table_name IN (?, ?, ?)",
+                "AND table_name IN ("
+                + ",".join("?" for _ in DATA_METADATA_TABLES)
+                + ")",
                 list(DATA_METADATA_TABLES),
             ).fetchall()
         }
@@ -884,18 +1048,30 @@ def _sync_data_metadata_bundle(
                 )
                 for table in DATA_METADATA_TABLES
             ]
-        missing_tables = set(DATA_METADATA_TABLES) - present_tables
-        if missing_tables:
+        missing_required = (
+            LEGACY_REQUIRED_DATA_METADATA_TABLES - present_tables
+        )
+        if missing_required:
             current_table = next(
-                table for table in DATA_METADATA_TABLES if table in missing_tables
+                table
+                for table in DATA_METADATA_TABLES
+                if table in missing_required
             )
             raise ValueError(
                 "incomplete linked metadata bundle; missing source tables: "
-                f"{', '.join(sorted(missing_tables))}"
+                f"{', '.join(sorted(missing_required))}"
             )
 
         current_table = "dataset_snapshot"
         source_snapshots = _load_source_snapshots(conn, alias)
+        source_bindings: dict[str, DatasetSnapshotBinding] = {}
+        binding_table_present = (
+            "dataset_snapshot_binding" in present_tables
+        )
+        if binding_table_present:
+            current_table = "dataset_snapshot_binding"
+            source_bindings = _load_source_snapshot_bindings(conn, alias)
+        _validate_source_binding_references(source_snapshots, source_bindings)
         current_table = "dataset_coverage"
         source_coverages = _load_source_coverages(conn, alias)
         _validate_source_coverage_references(
@@ -926,6 +1102,10 @@ def _sync_data_metadata_bundle(
         )
         current_table = "dataset_snapshot"
         _promote_dataset_snapshots(conn, alias)
+        current_table = "dataset_snapshot_binding"
+        accepted_counts["dataset_snapshot_binding"] = (
+            _merge_dataset_snapshot_bindings(conn, source_bindings)
+        )
         if manage_transaction:
             conn.execute("COMMIT")
             transaction_started = False
@@ -945,7 +1125,22 @@ def _sync_data_metadata_bundle(
         )
 
     return [
-        TableSyncResult(table=table, mode="merge", rows=accepted_counts[table])
+        TableSyncResult(
+            table=table,
+            mode=(
+                "skipped"
+                if table == "dataset_snapshot_binding"
+                and not binding_table_present
+                else "merge"
+            ),
+            rows=accepted_counts[table],
+            detail=(
+                "legacy metadata source predates execution bindings"
+                if table == "dataset_snapshot_binding"
+                and not binding_table_present
+                else ""
+            ),
+        )
         for table in DATA_METADATA_TABLES
     ]
 

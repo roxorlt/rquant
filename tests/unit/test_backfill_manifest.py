@@ -125,6 +125,46 @@ def test_manifest_rejects_records_from_another_strategy() -> None:
         )
 
 
+def test_eligibility_resolution_distinguishes_zero_hits_from_unresolved_dates() -> None:
+    from rquant.backfill_manifest import (
+        EligibilityResolution,
+        EligibilityResolutionGap,
+    )
+
+    resolved_empty = date(2026, 6, 25)
+    resolved_with_hit = date(2026, 6, 26)
+    unresolved = date(2026, 6, 29)
+    record = _eligibility(
+        "300001.SZ",
+        eligibility_date=resolved_with_hit,
+        entry_date=resolved_with_hit,
+    )
+
+    resolution = EligibilityResolution(
+        strategy_id="growth_board_surge",
+        strategy_version="v1",
+        requested_dates=(resolved_empty, resolved_with_hit, unresolved),
+        evaluated_dates=(resolved_empty, resolved_with_hit, unresolved),
+        complete_dates=(resolved_empty, resolved_with_hit),
+        incomplete=(
+            EligibilityResolutionGap(
+                eligibility_date=unresolved,
+                reason="daily_inputs_incomplete",
+            ),
+        ),
+        records=(record,),
+    )
+
+    assert resolution.expected_count == 3
+    assert resolution.available_count == 2
+    assert resolution.coverage_ratio == pytest.approx(2 / 3)
+    assert resolved_empty in resolution.complete_dates
+    assert not any(
+        row.eligibility_date == resolved_empty for row in resolution.records
+    )
+    assert len(resolution.resolution_hash) == 64
+
+
 def test_auction_eligibility_uses_parameter_superset(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -181,6 +221,48 @@ def _seed_open_calendar(store, days: list[date]) -> None:
         )
         previous = day
     store.upsert_trade_calendar(rows)
+
+
+def _seed_growth_input_panel(
+    store,
+    *,
+    previous_date: date,
+    signal_date: date,
+    codes: tuple[str, ...] = ("300001.SZ",),
+) -> None:
+    for index, code in enumerate(codes):
+        close = 10.0 + index
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar
+            (ts_code, trade_date, close)
+            VALUES (?, ?, ?)
+            """,
+            [code, previous_date, close],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_indicator
+            (ts_code, trade_date, ma5, ma10, ma20, ma60)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [code, previous_date, close, close, close, close],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_status_daily
+            (ts_code, trade_date, name, is_st, name_source, st_source,
+             available_at, ingested_at, conflict_reason)
+            VALUES (?, ?, ?, FALSE, 'test', 'test', ?, ?, NULL)
+            """,
+            [
+                code,
+                signal_date,
+                f"样本{index}",
+                datetime.combine(signal_date, time(1, 0), tzinfo=UTC),
+                datetime.combine(signal_date, time(1, 0), tzinfo=UTC),
+            ],
+        )
 
 
 def test_n_shape_eligibility_rebuilds_dependencies_from_authoritative_calendar(
@@ -287,6 +369,189 @@ def test_growth_eligibility_uses_shared_daily_resolver_before_minute_reads(
     assert [(row.ts_code, row.variant, row.entry_date) for row in records] == [
         ("300001.SZ", "gem", days[1])
     ]
+
+
+def test_daily_zero_hit_date_is_complete_eligibility_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24), date(2026, 6, 25)]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-empty.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_growth_input_panel(
+            store,
+            previous_date=days[0],
+            signal_date=days[1],
+        )
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=days[1],
+            end_date=days[1],
+        )
+
+    assert resolution.requested_dates == (days[1],)
+    assert resolution.complete_dates == (days[1],)
+    assert resolution.records == ()
+    assert resolution.coverage_ratio == 1.0
+
+
+def test_daily_zero_hits_are_incomplete_when_input_panel_is_missing(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24), date(2026, 6, 25)]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-missing-panel.duckdb") as store:
+        _seed_open_calendar(store, days)
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=days[1],
+            end_date=days[1],
+        )
+
+    assert resolution.complete_dates == ()
+    assert resolution.incomplete[0].reason == "daily_input_panel_below_99pct"
+
+
+def test_missing_auction_snapshot_is_not_self_certified_as_zero_hits(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.auction_gap_strategy as auction
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        auction,
+        "run_auction_gap_replay",
+        lambda *_args, **_kwargs: pd.DataFrame(),
+    )
+    with DuckDBStore(tmp_path / "auction-empty.duckdb") as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+        )
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="auction_gap",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+
+    assert resolution.requested_dates == (signal_date,)
+    assert resolution.complete_dates == ()
+    assert resolution.coverage_ratio == 0.0
+    assert resolution.incomplete[0].reason == "auction_input_panel_below_99pct"
+
+
+def test_one_auction_row_does_not_certify_a_partially_missing_universe(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.auction_gap_strategy as auction
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        auction,
+        "run_auction_gap_replay",
+        lambda *_args, **_kwargs: pd.DataFrame(),
+    )
+    with DuckDBStore(tmp_path / "auction-partial.duckdb") as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ", "300002.SZ"),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO auction_bar
+            (ts_code, trade_date, auction_type, price, vol, source)
+            VALUES (
+                '300001.SZ', ?, 'open_realtime', 10.2, 1000, 'tushare'
+            )
+            """,
+            [signal_date],
+        )
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="auction_gap",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+
+    assert resolution.complete_dates == ()
+    assert resolution.incomplete[0].reason == "auction_input_panel_below_99pct"
+
+
+def test_listing_universe_detects_stock_missing_from_daily_bar(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-independent-universe.duckdb") as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('300001.SZ', DATE '2020-01-01', '创业板'),
+                ('300002.SZ', DATE '2020-01-01', '创业板')
+            """
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+
+    assert resolution.complete_dates == ()
+    assert resolution.incomplete[0].reason == "daily_input_panel_below_99pct"
 
 
 def test_auction_eligibility_is_daily_plus_auction_and_never_checks_minutes(

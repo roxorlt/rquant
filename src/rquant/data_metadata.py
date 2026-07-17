@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
+from pathlib import PurePosixPath
 from typing import Literal, Self, TypeAlias
 
 from pydantic import (
@@ -20,6 +21,7 @@ from pydantic import (
 )
 
 SnapshotStatus: TypeAlias = Literal["building", "ready"]
+SnapshotArtifactType: TypeAlias = Literal["lake_partition", "materialized_table"]
 QualitySeverity: TypeAlias = Literal["P0", "P1", "P2", "P3"]
 QualityIssueStatus: TypeAlias = Literal["open", "resolved"]
 DataAuditRunStatus: TypeAlias = Literal["running", "completed", "failed"]
@@ -77,6 +79,18 @@ def stable_sha256(
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def canonical_json_sha256(namespace: str, payload: JsonValue) -> str:
+    """Hash a JSON payload after canonical key ordering and compact encoding."""
+    _validate_finite_json(payload)
+    encoded = json.dumps(
+        {"namespace": namespace.strip(), "payload": payload},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class MetadataModel(BaseModel):
@@ -170,6 +184,200 @@ class DatasetSnapshot(MetadataModel):
 class DatasetSnapshotFinalization(MetadataModel):
     table_watermarks: TableWatermarks = Field(default_factory=dict)
     quality_issue_ids: tuple[str, ...] = ()
+    completed_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("completed_at")
+    @classmethod
+    def validate_completed_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+
+class DatasetSnapshotArtifact(MetadataModel):
+    artifact_type: SnapshotArtifactType
+    dataset_id: str = Field(min_length=1)
+    table_name: str = Field(min_length=1)
+    artifact_key: str = Field(min_length=1)
+    partition_id: str | None = None
+    relative_path: str = Field(min_length=1)
+    row_count: int = Field(ge=0)
+    schema_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    file_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    file_size: int | None = Field(default=None, gt=0)
+    earliest_time: str | None = None
+    latest_time: str | None = None
+    event_column: str | None = None
+    source: str | None = None
+    primary_key: tuple[str, ...] = ()
+    revision_created_at: datetime | None = None
+    catalog_updated_at: datetime | None = None
+
+    @field_validator("relative_path")
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("artifact relative_path must stay within its root")
+        return path.as_posix()
+
+    @field_validator("revision_created_at", "catalog_updated_at")
+    @classmethod
+    def validate_revision_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        return None if value is None else normalize_utc_datetime(value)
+
+
+class DatasetSnapshotBindingManifest(MetadataModel):
+    manifest_version: Literal[1] = 1
+    snapshot_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    strategy_name: str = Field(min_length=1)
+    start_date: date
+    end_date: date
+    as_of_time: datetime
+    code_commit: str = Field(min_length=1)
+    dependency_contract_version: str = Field(min_length=1)
+    builder_version: str = Field(min_length=1)
+    eligibility_resolution_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    eligibility_expected_dates: int | None = Field(default=None, ge=0)
+    eligibility_complete_dates: int | None = Field(default=None, ge=0)
+    artifacts: tuple[DatasetSnapshotArtifact, ...] = Field(min_length=1)
+
+    @field_validator("as_of_time")
+    @classmethod
+    def validate_as_of_time(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> DatasetSnapshotBindingManifest:
+        if self.start_date > self.end_date:
+            raise ValueError("binding manifest start_date cannot follow end_date")
+        keys = [artifact.artifact_key for artifact in self.artifacts]
+        if len(keys) != len(set(keys)):
+            raise ValueError("binding manifest artifact_key values must be unique")
+        counts = (
+            self.eligibility_expected_dates,
+            self.eligibility_complete_dates,
+        )
+        if (self.eligibility_resolution_hash is None) != all(
+            value is None for value in counts
+        ):
+            raise ValueError(
+                "eligibility resolution hash and counts must be provided together"
+            )
+        if (
+            self.eligibility_expected_dates is not None
+            and self.eligibility_complete_dates is not None
+            and self.eligibility_complete_dates > self.eligibility_expected_dates
+        ):
+            raise ValueError(
+                "eligibility complete dates cannot exceed expected dates"
+            )
+        return self
+
+    @computed_field
+    @property
+    def manifest_hash(self) -> str:
+        payload = self.model_dump(
+            mode="json",
+            exclude_computed_fields=True,
+        )
+        payload["artifacts"] = sorted(
+            payload["artifacts"],
+            key=lambda artifact: str(artifact["artifact_key"]),
+        )
+        return canonical_json_sha256("dataset_snapshot_binding_manifest", payload)
+
+
+class DatasetSnapshotBinding(MetadataModel):
+    binding_version: Literal[1] = 1
+    snapshot_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest: DatasetSnapshotBindingManifest
+    artifact_root: str = Field(min_length=1)
+    manifest_relative_path: str = Field(min_length=1)
+    status: SnapshotStatus = "building"
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+    @field_validator("manifest_relative_path")
+    @classmethod
+    def validate_manifest_relative_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("manifest_relative_path must stay within artifact_root")
+        return path.as_posix()
+
+    @field_validator("created_at", "completed_at")
+    @classmethod
+    def validate_business_time(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> DatasetSnapshotBinding:
+        if self.snapshot_id != self.manifest.snapshot_id:
+            raise ValueError("binding snapshot_id must match manifest snapshot_id")
+        if self.manifest_hash != self.manifest.manifest_hash:
+            raise ValueError("binding manifest_hash must match canonical manifest")
+        if self.status == "building" and self.completed_at is not None:
+            raise ValueError("building binding cannot contain completed_at")
+        if self.status == "ready" and self.completed_at is None:
+            raise ValueError("ready binding requires completed_at")
+        if self.completed_at is not None and self.completed_at < self.created_at:
+            raise ValueError("binding completed_at cannot precede created_at")
+        return self
+
+    @computed_field
+    @property
+    def binding_hash(self) -> str:
+        return stable_sha256(
+            "dataset_snapshot_binding",
+            {
+                "binding_version": str(self.binding_version),
+                "snapshot_id": self.snapshot_id,
+                "manifest_hash": self.manifest_hash,
+            },
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        manifest: DatasetSnapshotBindingManifest,
+        artifact_root: str,
+        manifest_relative_path: str,
+        created_at: datetime | None = None,
+    ) -> Self:
+        values: dict[str, object] = {
+            "snapshot_id": manifest.snapshot_id,
+            "manifest_hash": manifest.manifest_hash,
+            "manifest": manifest,
+            "artifact_root": artifact_root,
+            "manifest_relative_path": manifest_relative_path,
+        }
+        if created_at is not None:
+            values["created_at"] = created_at
+        return cls.model_validate(values)
+
+    def finalize(
+        self,
+        finalization: DatasetSnapshotBindingFinalization,
+    ) -> Self:
+        if self.status != "building":
+            raise ValueError("only a building binding can be finalized")
+        return self.model_copy(
+            update={
+                "status": "ready",
+                "completed_at": finalization.completed_at,
+            }
+        )
+
+
+class DatasetSnapshotBindingFinalization(MetadataModel):
     completed_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("completed_at")

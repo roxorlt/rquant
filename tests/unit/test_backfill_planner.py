@@ -194,6 +194,101 @@ def test_only_exact_full_session_counts_as_covered(store: DuckDBStore) -> None:
     assert plan.coverage.entry_exit_gate_passed is False
 
 
+def test_research_lake_coverage_survives_operational_minute_cleanup(
+    store: DuckDBStore,
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_manifest import plan_minute_backfill
+    from rquant.research_catalog import ResearchCatalog
+    from rquant.research_lake import export_research_dataset
+
+    opens = _weekday_opens(date(2026, 6, 1), 7)
+    _seed_calendar(store, opens)
+    manifest = _manifest(
+        entries=[("300001.SZ", opens[3])],
+        baseline_days=1,
+        exit_days=1,
+    )
+    expected_times = next(
+        spec
+        for spec in DEFAULT_MINUTE_SOURCE_SESSION_SPECS
+        if spec.source == "tushare" and spec.freq == "1min"
+    ).expected_times()
+    _insert_session(
+        store,
+        ts_code="300001.SZ",
+        trade_date=opens[2],
+        times=expected_times,
+    )
+    catalog = ResearchCatalog(tmp_path / "research.duckdb")
+    lake_root = tmp_path / "lake"
+    export_research_dataset(
+        store._conn,
+        catalog=catalog,
+        lake_root=lake_root,
+        dataset="minute_bar",
+        start_date=opens[2],
+        end_date=opens[2],
+        code_commit="a" * 40,
+    )
+    store._conn.execute("DELETE FROM minute_bar")
+
+    plan = plan_minute_backfill(
+        store,
+        manifest,
+        coverage_authority="research_lake",
+        research_catalog=catalog,
+        research_lake_root=lake_root,
+    )
+
+    assert plan.coverage.baseline.complete_sessions == 1
+    assert len(plan.minute_coverage_artifacts) == 1
+    assert plan.minute_coverage_artifacts[0].dataset_id == "minute_bar"
+    assert opens[2] not in {
+        trading_date for task in plan.tasks for trading_date in task.open_dates
+    }
+
+
+def test_research_lake_authority_does_not_accept_unpublished_operational_rows(
+    store: DuckDBStore,
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_manifest import plan_minute_backfill
+    from rquant.research_catalog import ResearchCatalog
+
+    opens = _weekday_opens(date(2026, 6, 1), 7)
+    _seed_calendar(store, opens)
+    manifest = _manifest(
+        entries=[("300001.SZ", opens[3])],
+        baseline_days=1,
+        exit_days=1,
+    )
+    expected_times = next(
+        spec
+        for spec in DEFAULT_MINUTE_SOURCE_SESSION_SPECS
+        if spec.source == "tushare" and spec.freq == "1min"
+    ).expected_times()
+    _insert_session(
+        store,
+        ts_code="300001.SZ",
+        trade_date=opens[2],
+        times=expected_times,
+    )
+
+    plan = plan_minute_backfill(
+        store,
+        manifest,
+        coverage_authority="research_lake",
+        research_catalog=ResearchCatalog(tmp_path / "research.duckdb"),
+        research_lake_root=tmp_path / "lake",
+    )
+
+    assert plan.coverage.baseline.complete_sessions == 0
+    assert opens[2] in {
+        trading_date for task in plan.tasks for trading_date in task.open_dates
+    }
+
+
 def test_known_full_day_suspension_satisfies_coverage_without_task(
     store: DuckDBStore,
 ) -> None:
@@ -234,6 +329,42 @@ def test_known_full_day_suspension_satisfies_coverage_without_task(
     assert opens[5] not in {
         trading_date for task in plan.tasks for trading_date in task.open_dates
     }
+
+
+def test_pre_listing_sessions_are_classified_before_tasks_and_eta(
+    store: DuckDBStore,
+) -> None:
+    from rquant.backfill_manifest import plan_minute_backfill
+
+    opens = _weekday_opens(date(2026, 6, 1), 10)
+    _seed_calendar(store, opens)
+    store._conn.execute(
+        "INSERT INTO stock_basic (ts_code, list_date) VALUES (?, ?)",
+        ["300001.SZ", opens[5]],
+    )
+    manifest = _manifest(
+        entries=[("300001.SZ", opens[5])],
+        baseline_days=2,
+        exit_days=1,
+    )
+
+    plan = plan_minute_backfill(store, manifest)
+
+    assert plan.coverage.baseline.accepted_missing_sessions == 2
+    assert plan.coverage.baseline.coverage_ratio == 1.0
+    assert {
+        (row.ts_code, row.trade_date, row.reason)
+        for row in plan.unavailable_sessions
+    } == {
+        ("300001.SZ", opens[3], "not_listed"),
+        ("300001.SZ", opens[4], "not_listed"),
+    }
+    task_dates = {
+        trading_date for task in plan.tasks for trading_date in task.open_dates
+    }
+    assert opens[3] not in task_dates
+    assert opens[4] not in task_dates
+    assert plan.requested_session_count == 2
 
 
 def test_calendar_civil_gap_blocks_planning(store: DuckDBStore) -> None:
@@ -295,3 +426,28 @@ def test_empty_eligibility_never_becomes_full_coverage(store: DuckDBStore) -> No
     assert plan.coverage.entry_exit_coverage_ratio == 0.0
     assert plan.coverage.baseline_gate_passed is False
     assert plan.coverage.entry_exit_gate_passed is False
+
+
+def test_manifest_range_outside_authoritative_calendar_fails_even_when_empty(
+    store: DuckDBStore,
+) -> None:
+    from rquant.backfill_manifest import (
+        STRATEGY_BACKFILL_SPECS,
+        BackfillCalendarError,
+        BackfillManifest,
+        plan_minute_backfill,
+    )
+
+    opens = _weekday_opens(date(2026, 6, 1), 5)
+    _seed_calendar(store, opens)
+    manifest = BackfillManifest.build(
+        spec=STRATEGY_BACKFILL_SPECS["growth_board_surge"],
+        start_date=date(2026, 7, 1),
+        end_date=date(2026, 7, 3),
+        as_of_time=datetime(2026, 7, 15, tzinfo=UTC),
+        code_commit="d" * 40,
+        eligibilities=(),
+    )
+
+    with pytest.raises(BackfillCalendarError, match="does not cover manifest range"):
+        plan_minute_backfill(store, manifest)

@@ -8,10 +8,10 @@
 
 **技术栈：** Python 3.11+、Pydantic、DuckDB、SQLite、pandas、argparse、pytest、ruff。
 
-**执行状态（2026-07-15）：** PR-A 已随 v0.14.0 部署；PR-B Tasks 6-11 已随 v0.15.0
-部署并完成云端/本地交易日历 bootstrap；PR-C 已合并并标记 v0.16.0；PR-D Tasks 17-19
-已实现并运行真实数据审计。代码验收通过，但历史名称/ST 与休市日涨停池两个 P0 尚未修复，
-Task 20 的生产数据与覆盖率验收未通过。
+**执行状态（2026-07-17）：** PR-A 至 PR-D 已部署，历史名称/ST 与休市日涨停池 P0 已修复，
+`stage1-v3` 审计 P0=0。后续 PR-E 已实现 eligibility 完成证据、研究湖分钟覆盖权威、不可变
+执行绑定和 Strategy Lab 同会话正式计算。Task 20 仍需三类策略的真实 manifest、覆盖回补与
+固定 replay 生产验收；代码完成不会自动晋级策略状态。
 
 ---
 
@@ -441,7 +441,7 @@ API 返回后必须原子续租成功才可进入 DuckDB 写入；租约已被 r
 rquant backfill-plan --strategy ... --start-date ... --end-date ...
 rquant backfill-run --manifest-id ... [--retry-failed]
 rquant backfill-status --manifest-id ... [--json]
-rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
+rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ... --apply
 ```
 
 `backfill-plan` 只读副本并持久化计划，`backfill-status` 只读 SQLite 且 `--json` 输出稳定单个
@@ -486,8 +486,8 @@ rquant dataset-snapshot --strategy ... --as-of ... --manifest-id ...
 
 ### Task 20：阶段 1 验收
 
-**状态：阻断。** 代码、测试和可操作回补入口已具备；仍需部署 v0.17.0、修复生产数据、
-重新生成三类 manifest、实现不可变快照绑定执行并通过 99%/95% 覆盖率门。详细证据见
+**状态：生产策略验收待执行。** 数据 P0 已修复，不可变快照绑定与正式同会话执行已实现；
+仍需重新生成三类 manifest，并通过 99%/95% 覆盖率门与固定 replay。详细证据见
 `docs/analysis/2026-07-15-stage1-data-contract-acceptance.md`。
 
 **Files:**

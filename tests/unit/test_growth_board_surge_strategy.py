@@ -580,6 +580,42 @@ def test_growth_board_candidates_ignore_signal_day_close_and_state(
     assert after[0].limit_up_price == pytest.approx(12.48)
 
 
+def test_growth_board_candidates_fail_closed_when_bound_keys_disagree(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
+
+    _seed_base_market(store)
+    store._conn.execute(
+        """
+        CREATE TABLE strategy_eligibility (
+            eligibility_id VARCHAR PRIMARY KEY,
+            strategy_id VARCHAR NOT NULL,
+            strategy_version VARCHAR NOT NULL,
+            ts_code VARCHAR NOT NULL,
+            eligibility_date DATE NOT NULL,
+            entry_date DATE NOT NULL,
+            decision_at TIMESTAMPTZ NOT NULL,
+            variant VARCHAR NOT NULL,
+            resolution_hash VARCHAR NOT NULL
+        );
+        INSERT INTO strategy_eligibility VALUES (
+            'eligibility-1', 'growth_board_surge', 'v1', '300002.SZ',
+            DATE '2026-06-25', DATE '2026-06-25',
+            TIMESTAMPTZ '2026-06-25 01:30:00+00', 'gem', 'hash'
+        );
+        """
+    )
+
+    with pytest.raises(ValueError, match="bound growth-board eligibility"):
+        resolve_growth_board_candidates(
+            store,
+            date(2026, 6, 25),
+            date(2026, 6, 24),
+            time(9, 30),
+        )
+
+
 def test_growth_board_candidates_keep_historical_code_missing_from_current_basic(
     store: DuckDBStore,
 ) -> None:

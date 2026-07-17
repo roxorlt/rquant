@@ -306,6 +306,54 @@ class ResearchCatalog:
             updated_at=cast(datetime, row[11]),
         )
 
+    def list_partitions(
+        self,
+        *,
+        dataset: str,
+        start_date: date,
+        end_date: date,
+        freq: str | None = None,
+    ) -> list[ResearchPartitionRecord]:
+        if start_date > end_date:
+            raise ValueError("start_date cannot be after end_date")
+        parameters: list[object] = [dataset, start_date, end_date]
+        freq_predicate = ""
+        if freq is not None:
+            freq_predicate = " AND freq = ?"
+            parameters.append(freq)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT partition_id, dataset, trade_date, freq, relative_path,
+                       row_count, content_hash, file_hash, schema_hash,
+                       manifest_json, created_at, updated_at
+                FROM research_partition
+                WHERE dataset = ? AND trade_date BETWEEN ? AND ?
+                """
+                + freq_predicate
+                + " ORDER BY trade_date, freq, partition_id",
+                parameters,
+            ).fetchall()
+        return [
+            ResearchPartitionRecord(
+                partition_id=str(row[0]),
+                dataset=str(row[1]),
+                trade_date=cast(date, row[2]),
+                freq=None if row[3] is None else str(row[3]),
+                relative_path=str(row[4]),
+                row_count=int(row[5]),
+                content_hash=str(row[6]),
+                file_hash=str(row[7]),
+                schema_hash=str(row[8]),
+                manifest_json=(
+                    json.dumps(row[9]) if not isinstance(row[9], str) else row[9]
+                ),
+                created_at=cast(datetime, row[10]),
+                updated_at=cast(datetime, row[11]),
+            )
+            for row in rows
+        ]
+
     def get_coverage(self, dataset: str) -> ResearchDatasetCoverage | None:
         with self._connection() as connection:
             row = connection.execute(

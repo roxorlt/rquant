@@ -88,7 +88,7 @@ rQuant 已经有日线、历史分钟、实时分钟、集合竞价、资金流�
 
 ## 5. 总体时间与阶段门
 
-### 5.1 当前进度（2026-07-15）
+### 5.1 当前进度（2026-07-17）
 
 | 里程碑 | 状态 | 已完成内容 |
 |---|---|---|
@@ -96,7 +96,8 @@ rQuant 已经有日线、历史分钟、实时分钟、集合竞价、资金流�
 | 阶段 1 PR-A | 已部署 v0.14.0 | migration v1-v3、研究元数据、20 个 PIT 数据契约、权威交易日历 |
 | 阶段 1 PR-B | 已部署 v0.15.0 | 历史 ST/名称、质量审计、周末污染、复权与 PIT 门禁 |
 | 阶段 1 PR-C | 已合并并标记 v0.16.0 | 资格分母、可恢复回补 manifest、精确覆盖、ETA、四条 CLI |
-| 阶段 1 PR-D | 实现完成，数据验收阻断 | 契约 preflight、停复牌事实、正式研究门；待修复历史状态与休市日污染 |
+| 阶段 1 PR-D | 已部署并完成生产修复 | 契约 preflight、停复牌事实、正式研究门；`stage1-v3` P0=0 |
+| 阶段 1 PR-E | v0.22.0 候选 | 资格解析证据、研究湖覆盖权威、不可变执行绑定、同会话正式计算、结果指纹 |
 
 PR-A 没有改变现有策略触发、回放选股或收益计算。它只把后续研究所依赖的版本、时间可见性、
 覆盖率和交易日语义固化下来；现有策略仍保持 `exploratory`，不能因底层能力完成而自动晋级。
@@ -213,7 +214,7 @@ rquant data-audit --as-of YYYY-MM-DD
 rquant backfill-plan --strategy growth_board_surge --start-date YYYY-MM-DD --end-date YYYY-MM-DD
 rquant backfill-run --manifest-id <id>
 rquant backfill-status --manifest-id <id>
-rquant dataset-snapshot --strategy growth_board_surge --as-of YYYY-MM-DDTHH:MM:SS+08:00 --manifest-id <id>
+rquant dataset-snapshot --strategy growth_board_surge --as-of YYYY-MM-DDTHH:MM:SS+08:00 --manifest-id <id> --apply
 ```
 
 ### 7.6 阶段门
@@ -224,10 +225,10 @@ rquant dataset-snapshot --strategy growth_board_surge --as-of YYYY-MM-DDTHH:MM:S
 - 周末污染为零；历史 ST 抽样核验通过。
 - `data-audit` 发现 P0 问题时，Lab 禁止开始正式回测。
 
-2026-07-15 已对只读副本运行 `stage1-v2` 审计：历史名称/ST 缺 379,658 个股票日，涨停池含
-400 行休市日数据，共 2 个 P0。当前按设计保持 fail closed，三类分钟回补 manifest 的资格数
-均为 0；现有 metadata-only snapshot 也不得晋级正式研究。先完成数据修复，再生成和确认下载
-计划，并补上不可变计算快照。详见
+2026-07-16 已完成生产状态与休市日污染修复，`stage1-v3` 审计 P0=0。2026-07-17 的
+v0.22.0 候选已补上不可变执行绑定和正式同会话计算，metadata-only snapshot 仍不得晋级。
+阶段 1 剩余出口是分别为三类策略生成真实资格 manifest、补齐覆盖并运行固定正式回放；在
+真实 baseline/eligibility/B/S 覆盖达到门槛前，状态继续保持 `exploratory`。详见
 [阶段 1 真实数据验收](../analysis/2026-07-15-stage1-data-contract-acceptance.md)。
 
 ## 8. 阶段 2：无未来函数分钟特征引擎

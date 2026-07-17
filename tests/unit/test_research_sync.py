@@ -16,6 +16,10 @@ from rquant.data_metadata import (
     DataQualityIssue,
     DatasetCoverage,
     DatasetSnapshot,
+    DatasetSnapshotArtifact,
+    DatasetSnapshotBinding,
+    DatasetSnapshotBindingFinalization,
+    DatasetSnapshotBindingManifest,
     DatasetSnapshotFinalization,
 )
 from rquant.research_sync import (
@@ -2173,6 +2177,7 @@ def test_schema_migration_is_local_only() -> None:
 def test_data_metadata_tables_use_merge_semantics() -> None:
     metadata_tables = {
         "dataset_snapshot",
+        "dataset_snapshot_binding",
         "dataset_coverage",
         "data_quality_issue",
     }
@@ -2180,6 +2185,129 @@ def test_data_metadata_tables_use_merge_semantics() -> None:
     assert metadata_tables <= set(MERGE_TABLES)
     assert not metadata_tables & set(REPLACE_TABLES)
     assert not metadata_tables & set(LOCAL_ONLY_TABLES)
+
+
+def test_ready_snapshot_binding_syncs_atomically_and_idempotently(
+    tmp_path: Path,
+) -> None:
+    local_path = tmp_path / "local-binding.duckdb"
+    backup_path = tmp_path / "backup-binding.duckdb"
+    t0 = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    snapshot = DatasetSnapshot.create(
+        strategy_name="growth_board_surge",
+        manifest_id="m" * 64,
+        as_of_time=t0,
+        code_commit="1" * 40,
+        origin="test",
+        created_at=t0,
+    )
+    manifest = DatasetSnapshotBindingManifest(
+        snapshot_id=snapshot.snapshot_id,
+        strategy_name=snapshot.strategy_name,
+        start_date=date(2026, 7, 14),
+        end_date=date(2026, 7, 14),
+        as_of_time=snapshot.as_of_time,
+        code_commit=snapshot.code_commit,
+        dependency_contract_version="stage1-v1",
+        builder_version="snapshot-builder-v1",
+        artifacts=(
+            DatasetSnapshotArtifact(
+                artifact_type="lake_partition",
+                dataset_id="minute_bar",
+                table_name="minute_bar",
+                artifact_key="minute_bar:2026-07-14:1min",
+                relative_path="minute/versions/" + "a" * 64 + ".parquet",
+                row_count=241,
+                schema_hash="b" * 64,
+                content_hash="c" * 64,
+                file_hash="a" * 64,
+            ),
+        ),
+    )
+    binding = DatasetSnapshotBinding.create(
+        manifest=manifest,
+        artifact_root="research_lake",
+        manifest_relative_path=(
+            f"snapshots/{snapshot.snapshot_id}/{manifest.manifest_hash}/manifest.json"
+        ),
+        created_at=t0,
+    )
+
+    with DuckDBStore(local_path):
+        pass
+    with DuckDBStore(backup_path) as backup:
+        backup.begin_dataset_snapshot(snapshot)
+        backup.finalize_dataset_snapshot(
+            snapshot.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+        )
+        backup.begin_dataset_snapshot_binding(binding)
+        ready = backup.finalize_dataset_snapshot_binding(
+            snapshot.snapshot_id,
+            DatasetSnapshotBindingFinalization(
+                completed_at=t0 + timedelta(minutes=2)
+            ),
+        )
+
+    first = sync_from_backup(backup_path, local_path, refresh_replica=False)
+    second = sync_from_backup(backup_path, local_path, refresh_replica=False)
+
+    with DuckDBStore(local_path) as local:
+        stored = local.get_dataset_snapshot_binding(snapshot.snapshot_id)
+    assert not first.has_errors
+    assert not second.has_errors
+    assert stored == ready
+    assert next(
+        item for item in first.tables if item.table == "dataset_snapshot_binding"
+    ).rows == 1
+    assert next(
+        item for item in second.tables if item.table == "dataset_snapshot_binding"
+    ).rows == 0
+
+
+def test_legacy_metadata_bundle_without_binding_table_still_syncs(
+    tmp_path: Path,
+) -> None:
+    local_path = tmp_path / "local-legacy-metadata.duckdb"
+    backup_path = tmp_path / "backup-legacy-metadata.duckdb"
+    t0 = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    snapshot = DatasetSnapshot.create(
+        strategy_name="growth_board_surge",
+        manifest_id="m" * 64,
+        as_of_time=t0,
+        code_commit="1" * 40,
+        origin="legacy-test",
+        created_at=t0,
+    )
+
+    with DuckDBStore(local_path):
+        pass
+    with DuckDBStore(backup_path) as backup:
+        backup.begin_dataset_snapshot(snapshot)
+        backup.finalize_dataset_snapshot(
+            snapshot.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1)),
+        )
+        backup._conn.execute("DROP TABLE dataset_snapshot_binding")
+
+    report = sync_from_backup(
+        backup_path,
+        local_path,
+        refresh_replica=False,
+    )
+
+    with DuckDBStore(local_path) as local:
+        stored = local.get_dataset_snapshot(snapshot.snapshot_id)
+    binding_result = next(
+        item for item in report.tables
+        if item.table == "dataset_snapshot_binding"
+    )
+    assert not report.has_errors
+    assert stored is not None
+    assert stored.status == "ready"
+    assert binding_result.mode == "skipped"
+    assert binding_result.rows == 0
+    assert "legacy" in binding_result.detail
 
 
 def test_suspension_facts_merge_but_audit_runs_stay_local() -> None:

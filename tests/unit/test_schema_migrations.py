@@ -300,7 +300,7 @@ def test_v8_creates_suspension_tables_only_through_versioned_migration() -> None
 
 
 def test_v9_decouples_historical_name_from_known_st_status() -> None:
-    assert [migration.version for migration in MIGRATIONS] == list(range(1, 10))
+    assert [migration.version for migration in MIGRATIONS[:9]] == list(range(1, 10))
 
     from rquant.storage.schema import STOCK_STATUS_DAILY_V4_DDL
 
@@ -330,6 +330,55 @@ def test_v9_decouples_historical_name_from_known_st_status() -> None:
         "SELECT name, is_st, st_source FROM stock_status_daily "
         "WHERE ts_code = '689009.SH'"
     ).fetchone() == (None, False, "tushare.stock_st_absence")
+    conn.close()
+
+
+def test_v10_creates_dataset_snapshot_binding_only_through_migration() -> None:
+    from rquant.storage.schema import (
+        ALL_DDL,
+        DATASET_SNAPSHOT_BINDING_DDL,
+    )
+
+    assert [migration.version for migration in MIGRATIONS] == list(range(1, 11))
+    assert MIGRATIONS[9].statements == (DATASET_SNAPSHOT_BINDING_DDL,)
+    assert DATASET_SNAPSHOT_BINDING_DDL in ALL_DDL
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:9])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'dataset_snapshot_binding'"
+    ).fetchone() == (0,)
+
+    initialize_schema(conn)
+    columns = conn.execute(
+        "SELECT column_name, is_nullable, data_type "
+        "FROM information_schema.columns "
+        "WHERE table_name = 'dataset_snapshot_binding' "
+        "ORDER BY ordinal_position"
+    ).fetchall()
+    assert columns == [
+        ("snapshot_id", "NO", "VARCHAR"),
+        ("binding_version", "NO", "INTEGER"),
+        ("binding_hash", "NO", "VARCHAR"),
+        ("manifest_hash", "NO", "VARCHAR"),
+        ("manifest_json", "NO", "JSON"),
+        ("artifact_root", "NO", "VARCHAR"),
+        ("manifest_relative_path", "NO", "VARCHAR"),
+        ("status", "NO", "VARCHAR"),
+        ("created_at", "NO", "TIMESTAMP WITH TIME ZONE"),
+        ("completed_at", "YES", "TIMESTAMP WITH TIME ZONE"),
+    ]
+    assert conn.execute(
+        "SELECT constraint_column_names FROM duckdb_constraints() "
+        "WHERE table_name = 'dataset_snapshot_binding' "
+        "AND constraint_type = 'PRIMARY KEY'"
+    ).fetchone() == (["snapshot_id"],)
+    assert conn.execute(
+        "SELECT * FROM duckdb_constraints() "
+        "WHERE table_name = 'dataset_snapshot_binding' "
+        "AND constraint_type = 'FOREIGN KEY'"
+    ).fetchall() == []
     conn.close()
 
 

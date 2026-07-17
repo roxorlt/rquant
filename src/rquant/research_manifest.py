@@ -65,11 +65,23 @@ CURRENT_RESEARCH_NOTICES: tuple[ResearchNotice, ...] = (
 class ResearchManifest(BaseModel):
     """一条研究结果可复现、可晋级所需的最小证据。"""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     research_status: ResearchStatus = "exploratory"
     status_reason: str = Field(min_length=1)
     code_commit: str | None = None
     dataset_snapshot_id: str | None = None
+    dataset_binding_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    strategy_spec_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    result_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     coverage_numerator: int | None = Field(default=None, ge=0)
     coverage_denominator: int | None = Field(default=None, gt=0)
     coverage_ratio: float | None = Field(default=None, ge=0, le=1)
@@ -92,6 +104,12 @@ class ResearchManifest(BaseModel):
             missing.append("code_commit")
         if not self.dataset_snapshot_id:
             missing.append("dataset_snapshot_id")
+        if self.schema_version >= 2 and not self.dataset_binding_hash:
+            missing.append("dataset_binding_hash")
+        if self.schema_version >= 2 and not self.strategy_spec_hash:
+            missing.append("strategy_spec_hash")
+        if self.schema_version >= 2 and not self.result_hash:
+            missing.append("result_hash")
         if self.coverage_numerator is None or self.coverage_denominator is None:
             missing.append("coverage_counts")
         if self.data_start_date is None or self.data_end_date is None:

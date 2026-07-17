@@ -198,6 +198,52 @@ def _seed_volume_profile_history(
         ]))
 
 
+def test_bound_eligibility_replaces_mutable_screen_result(
+    store: DuckDBStore,
+) -> None:
+    from rquant.minute_replay import _query_candidates
+
+    _seed_daily_and_screen(store)
+    store._conn.execute(
+        """
+        CREATE TABLE strategy_eligibility (
+            eligibility_id VARCHAR PRIMARY KEY,
+            strategy_id VARCHAR NOT NULL,
+            strategy_version VARCHAR NOT NULL,
+            ts_code VARCHAR NOT NULL,
+            eligibility_date DATE NOT NULL,
+            entry_date DATE NOT NULL,
+            decision_at TIMESTAMPTZ NOT NULL,
+            variant VARCHAR NOT NULL,
+            resolution_hash VARCHAR NOT NULL
+        );
+        INSERT INTO strategy_eligibility VALUES (
+            'eligibility-1', 'n_shape', 'v1', '600000.SH',
+            DATE '2026-06-24', DATE '2026-06-25',
+            TIMESTAMPTZ '2026-06-24 09:00:00+00', 'pool2', 'hash'
+        );
+        """
+    )
+
+    pool1 = _query_candidates(
+        store,
+        date(2026, 6, 24),
+        date(2026, 6, 24),
+        "n-shape-pool1",
+    )
+    combined = _query_candidates(
+        store,
+        date(2026, 6, 24),
+        date(2026, 6, 24),
+        "n-shape-combined",
+    )
+
+    assert pool1.empty
+    assert combined[["ts_code", "preset_name"]].to_records(index=False).tolist() == [
+        ("600000.SH", "n-shape-pool2")
+    ]
+
+
 def test_replay_enters_when_strong_carry_breaks_t_high_and_exits_next_day(
     store: DuckDBStore,
 ) -> None:

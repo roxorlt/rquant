@@ -30,6 +30,7 @@ from rquant.stock_features import (
     build_intraday_relative_volume_features,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strategy_dependencies import query_bound_strategy_eligibility
 from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
 from rquant.volume_profile import (
     VolumeProfile,
@@ -222,6 +223,68 @@ def _query_candidates(
     end: date,
     preset_name: str,
 ) -> pd.DataFrame:
+    bound = query_bound_strategy_eligibility(
+        store,
+        strategy_id="n_shape",
+        start_date=start,
+        end_date=end,
+    )
+    if bound is not None:
+        variants = (
+            ("pool1", "pool2")
+            if preset_name == "n-shape-combined"
+            else (
+                "pool2"
+                if preset_name == "n-shape-pool2"
+                else "pool1",
+            )
+        )
+        return store._conn.execute(
+            """
+            WITH ranked AS (
+                SELECT eligibility.eligibility_date AS trade_date,
+                       CASE eligibility.variant
+                           WHEN 'pool2' THEN 'n-shape-pool2'
+                           ELSE 'n-shape-pool1'
+                       END AS preset_name,
+                       eligibility.ts_code,
+                       COALESCE(status.name, basic.name, eligibility.ts_code)
+                           AS name,
+                       daily.close,
+                       daily.pct_chg,
+                       CASE eligibility.variant
+                           WHEN 'pool2' THEN 2
+                           ELSE 1
+                       END AS pool_priority,
+                       row_number() OVER (
+                           PARTITION BY eligibility.eligibility_date,
+                                        eligibility.ts_code
+                           ORDER BY
+                               CASE eligibility.variant
+                                   WHEN 'pool2' THEN 2
+                                   ELSE 1
+                               END DESC
+                       ) AS rn
+                FROM strategy_eligibility AS eligibility
+                LEFT JOIN daily_bar AS daily
+                  ON daily.ts_code = eligibility.ts_code
+                 AND daily.trade_date = eligibility.eligibility_date
+                LEFT JOIN stock_status_daily AS status
+                  ON status.ts_code = eligibility.ts_code
+                 AND status.trade_date = eligibility.eligibility_date
+                LEFT JOIN stock_basic AS basic
+                  ON basic.ts_code = eligibility.ts_code
+                WHERE eligibility.strategy_id = 'n_shape'
+                  AND eligibility.eligibility_date BETWEEN ? AND ?
+                  AND eligibility.variant = ANY(?)
+            )
+            SELECT trade_date, preset_name, ts_code, name, close, pct_chg
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY trade_date, pool_priority DESC, ts_code
+            """,
+            [start, end, list(variants)],
+        ).fetchdf()
     if preset_name == "n-shape-combined":
         return store._conn.execute(
             """

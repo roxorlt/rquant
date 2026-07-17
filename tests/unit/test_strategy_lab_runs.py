@@ -87,6 +87,7 @@ def test_strategy_lab_run_roundtrips_explicit_research_manifest(tmp_path) -> Non
         status_reason="完整资格全集上的横向比较",
         code_commit="abc123",
         dataset_snapshot_id="snapshot-1",
+        dataset_binding_hash="b" * 64,
         coverage_numerator=100,
         coverage_denominator=100,
         data_start_date=date(2025, 1, 1),
@@ -111,6 +112,78 @@ def test_strategy_lab_run_roundtrips_explicit_research_manifest(tmp_path) -> Non
     assert loaded.manifest.coverage_ratio == 1.0
     assert "可比较" in loaded.markdown
     assert "snapshot-1" in loaded.markdown
+    assert len(loaded.manifest.strategy_spec_hash or "") == 64
+    assert len(loaded.manifest.result_hash or "") == 64
+    assert loaded.manifest.strategy_spec_hash in loaded.markdown
+    assert loaded.manifest.result_hash in loaded.markdown
+
+
+def test_strategy_and_result_hashes_change_only_with_their_own_payloads() -> None:
+    from rquant.dashboard.strategy_lab_runs import build_strategy_lab_run
+
+    base = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="hash",
+        params={"hold_days": 1},
+        metrics={"mean_ret": 1.0},
+        tables={"trades": pd.DataFrame({"ts_code": ["000001.SZ"]})},
+    )
+    changed_result = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="hash",
+        params={"hold_days": 1},
+        metrics={"mean_ret": 2.0},
+        tables={"trades": pd.DataFrame({"ts_code": ["000001.SZ"]})},
+    )
+    changed_spec = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="hash",
+        params={"hold_days": 2},
+        metrics={"mean_ret": 1.0},
+        tables={"trades": pd.DataFrame({"ts_code": ["000001.SZ"]})},
+    )
+
+    assert base.manifest.strategy_spec_hash == changed_result.manifest.strategy_spec_hash
+    assert base.manifest.result_hash != changed_result.manifest.result_hash
+    assert base.manifest.strategy_spec_hash != changed_spec.manifest.strategy_spec_hash
+    assert base.manifest.result_hash == changed_spec.manifest.result_hash
+
+
+def test_strategy_and_result_hashes_preserve_sub_six_decimal_precision() -> None:
+    from rquant.dashboard.strategy_lab_runs import build_strategy_lab_run
+
+    first = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="precision",
+        params={"threshold": 1.0000001},
+        metrics={"mean_ret": 2.0000001},
+        tables={"trades": pd.DataFrame({"ret": [3.0000001]})},
+    )
+    changed_spec = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="precision",
+        params={"threshold": 1.0000002},
+        metrics={"mean_ret": 2.0000001},
+        tables={"trades": pd.DataFrame({"ret": [3.0000001]})},
+    )
+    changed_metric = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="precision",
+        params={"threshold": 1.0000001},
+        metrics={"mean_ret": 2.0000002},
+        tables={"trades": pd.DataFrame({"ret": [3.0000001]})},
+    )
+    changed_table = build_strategy_lab_run(
+        run_type="auction_gap",
+        title="precision",
+        params={"threshold": 1.0000001},
+        metrics={"mean_ret": 2.0000001},
+        tables={"trades": pd.DataFrame({"ret": [3.0000002]})},
+    )
+
+    assert first.manifest.strategy_spec_hash != changed_spec.manifest.strategy_spec_hash
+    assert first.manifest.result_hash != changed_metric.manifest.result_hash
+    assert first.manifest.result_hash != changed_table.manifest.result_hash
 
 
 def test_legacy_run_without_manifest_loads_as_exploratory(tmp_path) -> None:

@@ -6,9 +6,11 @@ import hashlib
 import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pandas as pd
 from pydantic import (
     BaseModel,
@@ -19,6 +21,7 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.data_metadata import DatasetSnapshotArtifact
 from rquant.data_quality import (
     DEFAULT_MINUTE_SOURCE_SESSION_SPECS,
     MinuteSourceSessionSpec,
@@ -27,10 +30,16 @@ from rquant.data_quality import (
 EligibilityBasis = Literal["daily", "daily+auction"]
 BackfillPhase = Literal["baseline", "entry", "exit"]
 EstimateConfidence = Literal["low", "medium", "high"]
+MinuteCoverageAuthority = Literal["operational", "research_lake", "combined"]
+UnavailableSessionReason = Literal[
+    "known_full_day_suspension",
+    "not_listed",
+]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 if TYPE_CHECKING:
     from rquant.backfill_state import BackfillManifestInput
+    from rquant.research_catalog import ResearchCatalog
     from rquant.screen.rules import Rule
     from rquant.storage.duckdb import DuckDBStore
 
@@ -122,6 +131,143 @@ class EligibilityRecord(BaseModel):
         return self
 
 
+class EligibilityResolutionGap(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    eligibility_date: date
+    reason: str = Field(min_length=1)
+
+
+class EligibilityResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    resolution_hash: str = ""
+    strategy_id: str = Field(min_length=1)
+    strategy_version: str = Field(min_length=1)
+    requested_dates: tuple[date, ...]
+    evaluated_dates: tuple[date, ...]
+    complete_dates: tuple[date, ...]
+    incomplete: tuple[EligibilityResolutionGap, ...] = ()
+    records: tuple[EligibilityRecord, ...] = ()
+    input_artifacts: tuple[DatasetSnapshotArtifact, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_and_derive_hash(self) -> EligibilityResolution:
+        requested = tuple(sorted(set(self.requested_dates)))
+        evaluated = tuple(sorted(set(self.evaluated_dates)))
+        complete = tuple(sorted(set(self.complete_dates)))
+        incomplete = tuple(
+            sorted(self.incomplete, key=lambda row: row.eligibility_date)
+        )
+        records = tuple(
+            sorted(
+                {row.eligibility_id: row for row in self.records}.values(),
+                key=lambda row: (
+                    row.entry_date,
+                    row.ts_code,
+                    row.variant,
+                    row.eligibility_id,
+                ),
+            )
+        )
+        input_artifacts = tuple(
+            sorted(self.input_artifacts, key=lambda row: row.artifact_key)
+        )
+        artifact_keys = [row.artifact_key for row in input_artifacts]
+        if len(artifact_keys) != len(set(artifact_keys)):
+            raise ValueError("eligibility input artifacts must be unique")
+        if input_artifacts and self.strategy_id != "auction_gap":
+            raise ValueError(
+                "only auction_gap eligibility may declare lake input artifacts"
+            )
+        if any(
+            row.artifact_type != "lake_partition"
+            or row.dataset_id != "auction_bar"
+            or row.table_name != "auction_bar"
+            for row in input_artifacts
+        ):
+            raise ValueError(
+                "eligibility input artifacts must be auction_bar lake partitions"
+            )
+        requested_set = set(requested)
+        evaluated_set = set(evaluated)
+        complete_set = set(complete)
+        if not evaluated_set <= requested_set:
+            raise ValueError("evaluated dates must be requested")
+        if not complete_set <= evaluated_set:
+            raise ValueError("complete dates must be evaluated")
+        incomplete_dates = [row.eligibility_date for row in incomplete]
+        if len(incomplete_dates) != len(set(incomplete_dates)):
+            raise ValueError("incomplete eligibility dates must be unique")
+        if set(incomplete_dates) != requested_set - complete_set:
+            raise ValueError(
+                "incomplete evidence must explain every requested date "
+                "that is not complete"
+            )
+        for row in records:
+            if (
+                row.strategy_id != self.strategy_id
+                or row.strategy_version != self.strategy_version
+            ):
+                raise ValueError("eligibility record strategy does not match resolution")
+            if row.eligibility_date not in complete_set:
+                raise ValueError(
+                    "eligibility records may only come from complete resolution dates"
+                )
+        object.__setattr__(self, "requested_dates", requested)
+        object.__setattr__(self, "evaluated_dates", evaluated)
+        object.__setattr__(self, "complete_dates", complete)
+        object.__setattr__(self, "incomplete", incomplete)
+        object.__setattr__(self, "records", records)
+        object.__setattr__(self, "input_artifacts", input_artifacts)
+        expected = _canonical_hash(
+            {
+                "strategy_id": self.strategy_id,
+                "strategy_version": self.strategy_version,
+                "requested_dates": requested,
+                "evaluated_dates": evaluated,
+                "complete_dates": complete,
+                "incomplete": [
+                    row.model_dump(mode="json") for row in incomplete
+                ],
+                "eligibility_ids": [row.eligibility_id for row in records],
+                "input_artifacts": [
+                    {
+                        "artifact_key": row.artifact_key,
+                        "partition_id": row.partition_id,
+                        "relative_path": row.relative_path,
+                        "row_count": row.row_count,
+                        "schema_hash": row.schema_hash,
+                        "content_hash": row.content_hash,
+                        "file_hash": row.file_hash,
+                    }
+                    for row in input_artifacts
+                ],
+            }
+        )
+        if self.resolution_hash and self.resolution_hash != expected:
+            raise ValueError("resolution_hash does not match resolution content")
+        object.__setattr__(self, "resolution_hash", expected)
+        return self
+
+    @computed_field
+    @property
+    def expected_count(self) -> int:
+        return len(self.requested_dates)
+
+    @computed_field
+    @property
+    def available_count(self) -> int:
+        return len(self.complete_dates)
+
+    @computed_field
+    @property
+    def coverage_ratio(self) -> float:
+        if self.expected_count == 0:
+            return 0.0
+        return self.available_count / self.expected_count
+
+
 class BackfillManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -132,6 +278,7 @@ class BackfillManifest(BaseModel):
     as_of_time: datetime
     code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     eligibilities: tuple[EligibilityRecord, ...]
+    eligibility_resolution: EligibilityResolution | None = None
 
     @field_validator("as_of_time")
     @classmethod
@@ -161,17 +308,36 @@ class BackfillManifest(BaseModel):
                 raise ValueError("eligibility strategy does not match manifest spec")
             if not self.start_date <= row.eligibility_date <= self.end_date:
                 raise ValueError("eligibility date is outside manifest range")
+        resolution = self.eligibility_resolution
+        if resolution is not None:
+            if (
+                resolution.strategy_id != self.spec.strategy_id
+                or resolution.strategy_version != self.spec.strategy_version
+            ):
+                raise ValueError("eligibility resolution strategy does not match spec")
+            if tuple(row.eligibility_id for row in resolution.records) != tuple(
+                row.eligibility_id for row in ordered
+            ):
+                raise ValueError(
+                    "manifest eligibilities must match eligibility resolution records"
+                )
+            if resolution.requested_dates and (
+                resolution.requested_dates[0] < self.start_date
+                or resolution.requested_dates[-1] > self.end_date
+            ):
+                raise ValueError("eligibility resolution is outside manifest range")
         object.__setattr__(self, "eligibilities", ordered)
-        expected = _canonical_hash(
-            {
-                "spec": self.spec.model_dump(mode="json"),
-                "start_date": self.start_date,
-                "end_date": self.end_date,
-                "as_of_time": self.as_of_time,
-                "code_commit": self.code_commit,
-                "eligibility_ids": [row.eligibility_id for row in ordered],
-            }
-        )
+        identity = {
+            "spec": self.spec.model_dump(mode="json"),
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "as_of_time": self.as_of_time,
+            "code_commit": self.code_commit,
+            "eligibility_ids": [row.eligibility_id for row in ordered],
+        }
+        if resolution is not None:
+            identity["eligibility_resolution_hash"] = resolution.resolution_hash
+        expected = _canonical_hash(identity)
         if self.manifest_id and self.manifest_id != expected:
             raise ValueError("manifest_id does not match manifest content")
         object.__setattr__(self, "manifest_id", expected)
@@ -187,6 +353,7 @@ class BackfillManifest(BaseModel):
         as_of_time: datetime,
         code_commit: str,
         eligibilities: Iterable[EligibilityRecord],
+        eligibility_resolution: EligibilityResolution | None = None,
     ) -> BackfillManifest:
         return cls(
             spec=spec,
@@ -195,6 +362,7 @@ class BackfillManifest(BaseModel):
             as_of_time=as_of_time,
             code_commit=code_commit,
             eligibilities=tuple(eligibilities),
+            eligibility_resolution=eligibility_resolution,
         )
 
 
@@ -242,6 +410,14 @@ class MinuteBackfillTask(BaseModel):
         if self.possible_truncation != (self.expected_rows == self.response_row_limit):
             raise ValueError("possible_truncation must mark an exact response limit")
         return self
+
+
+class UnavailableMinuteSession(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ts_code: str = Field(min_length=1)
+    trade_date: date
+    reason: UnavailableSessionReason
 
 
 class BackfillPhaseCoverage(BaseModel):
@@ -342,6 +518,8 @@ class MinuteBackfillPlan(BaseModel):
     coverage: BackfillCoverage
     requested_session_count: int = Field(ge=0)
     estimate: BackfillEstimate
+    unavailable_sessions: tuple[UnavailableMinuteSession, ...] = ()
+    minute_coverage_artifacts: tuple[DatasetSnapshotArtifact, ...] = ()
 
 
 _DEFAULT_WINDOW = StrategyWindowRequirement()
@@ -380,16 +558,18 @@ def _as_date(value: object) -> date:
     raise ValueError(f"cannot convert value to date: {value!r}")
 
 
-def _authoritative_open_dates(store: DuckDBStore) -> list[date]:
-    rows = store._conn.execute(
-        """
-        SELECT cal_date
-        FROM trade_calendar
-        WHERE exchange = 'SSE' AND is_open = TRUE
-        ORDER BY cal_date
-        """
-    ).fetchall()
-    return [_as_date(row[0]) for row in rows]
+def _authoritative_open_dates(
+    store: DuckDBStore,
+    *,
+    required_start: date,
+    required_end: date,
+) -> list[date]:
+    open_dates, _civil_dates = _authoritative_calendar_facts(
+        store,
+        required_start=required_start,
+        required_end=required_end,
+    )
+    return open_dates
 
 
 def _target_open_dates(
@@ -415,7 +595,11 @@ def resolve_n_shape_eligibility(
 
     runner = screen_runner or screen
     spec = STRATEGY_BACKFILL_SPECS["n_shape"]
-    calendar = _authoritative_open_dates(store)
+    calendar = _authoritative_open_dates(
+        store,
+        required_start=start_date,
+        required_end=end_date,
+    )
     targets = _target_open_dates(calendar, start_date, end_date)
     if not targets:
         return ()
@@ -509,7 +693,11 @@ def resolve_growth_board_eligibility(
 
     spec = STRATEGY_BACKFILL_SPECS["growth_board_surge"]
     config = growth.GrowthBoardSurgeConfig()
-    calendar = _authoritative_open_dates(store)
+    calendar = _authoritative_open_dates(
+        store,
+        required_start=start_date,
+        required_end=end_date,
+    )
     targets = _target_open_dates(calendar, start_date, end_date)
     index_by_date = {day: index for index, day in enumerate(calendar)}
     records: list[EligibilityRecord] = []
@@ -581,36 +769,426 @@ def resolve_auction_gap_eligibility(
     return tuple(sorted(records, key=lambda row: row.eligibility_id))
 
 
+_ELIGIBILITY_INPUT_COVERAGE_THRESHOLD = 0.99
+_N_SHAPE_PANEL_OPEN_DAYS = 121
+
+
+def _coverage_passes(expected: int, available: int) -> bool:
+    return (
+        expected > 0
+        and available / expected >= _ELIGIBILITY_INPUT_COVERAGE_THRESHOLD
+    )
+
+
+def _previous_open_dates(
+    requested_dates: tuple[date, ...],
+    calendar: list[date],
+) -> dict[date, date]:
+    index_by_date = {value: index for index, value in enumerate(calendar)}
+    return {
+        target: calendar[index_by_date[target] - 1]
+        for target in requested_dates
+        if index_by_date[target] > 0
+    }
+
+
+def _opening_panel_counts(
+    store: DuckDBStore,
+    *,
+    requested_dates: tuple[date, ...],
+    calendar: list[date],
+    strategy_id: Literal["growth_board_surge", "auction_gap"],
+) -> dict[date, tuple[int, int]]:
+    previous_by_target = _previous_open_dates(requested_dates, calendar)
+    if not previous_by_target:
+        return {}
+    values = ", ".join("(?, ?)" for _ in previous_by_target)
+    parameters: list[object] = [
+        value
+        for target, previous in previous_by_target.items()
+        for value in (target, previous)
+    ]
+    board_filter = (
+        """
+        AND (
+            universe.ts_code LIKE '300%'
+            OR universe.ts_code LIKE '301%'
+            OR universe.ts_code LIKE '688%'
+            OR universe.ts_code LIKE '689%'
+        )
+        """
+        if strategy_id == "growth_board_surge"
+        else ""
+    )
+    if strategy_id == "growth_board_surge":
+        availability = """
+            status.ts_code IS NOT NULL
+            AND status.conflict_reason IS NULL
+            AND status.is_st IS NOT NULL
+            AND status.available_at IS NOT NULL
+            AND status.available_at <= (
+                CAST(expected.target_date AS TIMESTAMP)
+                + INTERVAL '9 hours 30 minutes'
+            ) AT TIME ZONE 'Asia/Shanghai'
+            AND indicator.ts_code IS NOT NULL
+            AND indicator.ma5 IS NOT NULL
+            AND indicator.ma10 IS NOT NULL
+            AND indicator.ma20 IS NOT NULL
+            AND indicator.ma60 IS NOT NULL
+            AND expected.daily_ts_code IS NOT NULL
+            AND expected.close IS NOT NULL
+            AND expected.close > 0
+        """
+        joins = """
+        LEFT JOIN stock_status_daily AS status
+          ON status.ts_code = expected.ts_code
+         AND status.trade_date = expected.target_date
+        LEFT JOIN daily_indicator AS indicator
+          ON indicator.ts_code = expected.ts_code
+         AND indicator.trade_date = expected.previous_date
+        """
+    else:
+        availability = """
+            status.ts_code IS NOT NULL
+            AND status.conflict_reason IS NULL
+            AND status.is_st IS NOT NULL
+            AND status.available_at IS NOT NULL
+            AND status.available_at <= (
+                CAST(expected.target_date AS TIMESTAMP)
+                + INTERVAL '9 hours 27 minutes'
+            ) AT TIME ZONE 'Asia/Shanghai'
+            AND auction.ts_code IS NOT NULL
+            AND expected.daily_ts_code IS NOT NULL
+            AND expected.close IS NOT NULL
+            AND expected.close > 0
+        """
+        joins = """
+        LEFT JOIN stock_status_daily AS status
+          ON status.ts_code = expected.ts_code
+         AND status.trade_date = expected.target_date
+        LEFT JOIN (
+            SELECT DISTINCT ts_code, trade_date
+            FROM auction_bar
+            WHERE auction_type = 'open_realtime'
+              AND price IS NOT NULL
+              AND price > 0
+              AND vol IS NOT NULL
+              AND vol > 0
+        ) AS auction
+          ON auction.ts_code = expected.ts_code
+         AND auction.trade_date = expected.target_date
+        """
+    rows = store._conn.execute(
+        f"""
+        WITH requested(target_date, previous_date) AS (
+            VALUES {values}
+        ),
+        universe AS (
+            SELECT requested.target_date,
+                   requested.previous_date,
+                   basic.ts_code
+            FROM requested
+            JOIN stock_basic AS basic
+              ON basic.list_date IS NOT NULL
+             AND basic.list_date <= requested.previous_date
+             AND (
+                 basic.ts_code LIKE '%.SH'
+                 OR basic.ts_code LIKE '%.SZ'
+             )
+            UNION
+            SELECT requested.target_date,
+                   requested.previous_date,
+                   status.ts_code
+            FROM requested
+            JOIN stock_status_daily AS status
+              ON status.trade_date = requested.previous_date
+             AND (
+                 status.ts_code LIKE '%.SH'
+                 OR status.ts_code LIKE '%.SZ'
+             )
+            UNION
+            SELECT requested.target_date,
+                   requested.previous_date,
+                   bar.ts_code
+            FROM requested
+            JOIN daily_bar AS bar
+              ON bar.trade_date = requested.previous_date
+             AND (
+                 bar.ts_code LIKE '%.SH'
+                 OR bar.ts_code LIKE '%.SZ'
+             )
+        ),
+        expected AS (
+            SELECT universe.target_date,
+                   universe.previous_date,
+                   universe.ts_code,
+                   bar.ts_code AS daily_ts_code,
+                   bar.close
+            FROM universe
+            LEFT JOIN daily_bar AS bar
+              ON bar.trade_date = universe.previous_date
+             AND bar.ts_code = universe.ts_code
+            WHERE TRUE
+              {board_filter}
+        )
+        SELECT expected.target_date,
+               COUNT(*) AS expected_count,
+               COUNT(*) FILTER (WHERE {availability}) AS available_count
+        FROM expected
+        {joins}
+        GROUP BY expected.target_date
+        ORDER BY expected.target_date
+        """,
+        parameters,
+    ).fetchall()
+    return {
+        _as_date(target): (int(expected), int(available))
+        for target, expected, available in rows
+    }
+
+
+def _n_shape_complete_dates(
+    store: DuckDBStore,
+    *,
+    requested_dates: tuple[date, ...],
+    calendar: list[date],
+) -> tuple[date, ...]:
+    if not requested_dates:
+        return ()
+    index_by_date = {value: index for index, value in enumerate(calendar)}
+    supported = [
+        target
+        for target in requested_dates
+        if index_by_date[target] >= _N_SHAPE_PANEL_OPEN_DAYS - 1
+    ]
+    if not supported:
+        return ()
+    first_index = min(
+        index_by_date[target] - (_N_SHAPE_PANEL_OPEN_DAYS - 1)
+        for target in supported
+    )
+    last_index = max(index_by_date[target] for target in supported)
+    source_dates = calendar[first_index : last_index + 1]
+    rows = store._conn.execute(
+        """
+        WITH universe AS (
+            SELECT calendar.cal_date AS trade_date,
+                   basic.ts_code
+            FROM trade_calendar AS calendar
+            JOIN stock_basic AS basic
+              ON basic.list_date IS NOT NULL
+             AND basic.list_date <= calendar.cal_date
+             AND (
+                 basic.ts_code LIKE '%.SH'
+                 OR basic.ts_code LIKE '%.SZ'
+             )
+            WHERE calendar.exchange = 'SSE'
+              AND calendar.is_open = TRUE
+              AND calendar.cal_date BETWEEN ? AND ?
+            UNION
+            SELECT status.trade_date,
+                   status.ts_code
+            FROM stock_status_daily AS status
+            WHERE status.trade_date BETWEEN ? AND ?
+              AND (
+                  status.ts_code LIKE '%.SH'
+                  OR status.ts_code LIKE '%.SZ'
+              )
+            UNION
+            SELECT bar.trade_date,
+                   bar.ts_code
+            FROM daily_bar AS bar
+            WHERE bar.trade_date BETWEEN ? AND ?
+              AND (
+                  bar.ts_code LIKE '%.SH'
+                  OR bar.ts_code LIKE '%.SZ'
+              )
+        )
+        SELECT universe.trade_date,
+               COUNT(*) AS expected_count,
+               COUNT(*) FILTER (
+                   WHERE bar.ts_code IS NOT NULL
+                     AND bar.open IS NOT NULL
+                     AND bar.high IS NOT NULL
+                     AND bar.low IS NOT NULL
+                     AND bar.close IS NOT NULL
+                     AND state.ts_code IS NOT NULL
+                     AND state.is_limit_up IS NOT NULL
+                     AND state.is_limit_down IS NOT NULL
+                     AND state.is_first_limit_up IS NOT NULL
+                     AND state.is_yiziban IS NOT NULL
+                     AND state.consecutive_limit_ups IS NOT NULL
+                     AND state.body_upper IS NOT NULL
+                     AND state.body_lower IS NOT NULL
+                     AND status.ts_code IS NOT NULL
+                     AND status.conflict_reason IS NULL
+                     AND status.is_st IS NOT NULL
+                     AND status.available_at IS NOT NULL
+                     AND status.available_at <= (
+                         CAST(universe.trade_date AS TIMESTAMP)
+                         + INTERVAL '17 hours'
+                     ) AT TIME ZONE 'Asia/Shanghai'
+                     AND state.is_st IS NOT DISTINCT FROM status.is_st
+               ) AS available_count,
+               COUNT(*) FILTER (
+                   WHERE basic.ts_code IS NOT NULL
+                     AND basic.circ_mv IS NOT NULL
+               ) AS basic_available_count
+        FROM universe
+        LEFT JOIN daily_bar AS bar
+          ON bar.ts_code = universe.ts_code
+         AND bar.trade_date = universe.trade_date
+        LEFT JOIN daily_state AS state
+          ON state.ts_code = universe.ts_code
+         AND state.trade_date = universe.trade_date
+        LEFT JOIN stock_status_daily AS status
+          ON status.ts_code = universe.ts_code
+         AND status.trade_date = universe.trade_date
+        LEFT JOIN daily_basic AS basic
+          ON basic.ts_code = universe.ts_code
+         AND basic.trade_date = universe.trade_date
+        GROUP BY universe.trade_date
+        ORDER BY universe.trade_date
+        """,
+        [
+            source_dates[0],
+            source_dates[-1],
+            source_dates[0],
+            source_dates[-1],
+            source_dates[0],
+            source_dates[-1],
+        ],
+    ).fetchall()
+    panel = {
+        _as_date(trade_date): (
+            int(expected),
+            int(available),
+            int(basic_available),
+        )
+        for trade_date, expected, available, basic_available in rows
+    }
+
+    complete: list[date] = []
+    for target in supported:
+        target_index = index_by_date[target]
+        window = calendar[
+            target_index - (_N_SHAPE_PANEL_OPEN_DAYS - 1) : target_index + 1
+        ]
+        facts = [panel.get(source_date, (0, 0, 0)) for source_date in window]
+        if any(expected == 0 for expected, _available, _basic in facts):
+            continue
+        expected = sum(item[0] for item in facts)
+        available = sum(item[1] for item in facts)
+        current_expected, _current_available, current_basic = facts[-1]
+        if _coverage_passes(expected, available) and _coverage_passes(
+            current_expected,
+            current_basic,
+        ):
+            complete.append(target)
+    return tuple(complete)
+
+
+def _eligibility_input_complete_dates(
+    store: DuckDBStore,
+    *,
+    strategy_id: str,
+    requested_dates: tuple[date, ...],
+    calendar: list[date],
+) -> tuple[date, ...]:
+    if strategy_id == "n_shape":
+        return _n_shape_complete_dates(
+            store,
+            requested_dates=requested_dates,
+            calendar=calendar,
+        )
+    counts = _opening_panel_counts(
+        store,
+        requested_dates=requested_dates,
+        calendar=calendar,
+        strategy_id=(
+            "growth_board_surge"
+            if strategy_id == "growth_board_surge"
+            else "auction_gap"
+        ),
+    )
+    return tuple(
+        target
+        for target in requested_dates
+        if _coverage_passes(*counts.get(target, (0, 0)))
+    )
+
+
 def resolve_strategy_eligibility(
     store: DuckDBStore,
     *,
     strategy_id: str,
     start_date: date,
     end_date: date,
-) -> tuple[EligibilityRecord, ...]:
+) -> EligibilityResolution:
+    spec = STRATEGY_BACKFILL_SPECS.get(strategy_id)
+    if spec is None:
+        raise KeyError(f"unknown strategy backfill spec: {strategy_id}")
+    calendar = _authoritative_open_dates(
+        store,
+        required_start=start_date,
+        required_end=end_date,
+    )
+    requested_dates = tuple(_target_open_dates(calendar, start_date, end_date))
     if strategy_id == "n_shape":
-        return resolve_n_shape_eligibility(
+        records = resolve_n_shape_eligibility(
             store,
             start_date=start_date,
             end_date=end_date,
         )
-    if strategy_id == "growth_board_surge":
-        return resolve_growth_board_eligibility(
+    elif strategy_id == "growth_board_surge":
+        records = resolve_growth_board_eligibility(
             store,
             start_date=start_date,
             end_date=end_date,
         )
-    if strategy_id == "auction_gap":
-        return resolve_auction_gap_eligibility(
+    else:
+        records = resolve_auction_gap_eligibility(
             store,
             start_date=start_date,
             end_date=end_date,
         )
-    raise KeyError(f"unknown strategy backfill spec: {strategy_id}")
+    complete_dates = _eligibility_input_complete_dates(
+        store,
+        strategy_id=strategy_id,
+        requested_dates=requested_dates,
+        calendar=calendar,
+    )
+    records = tuple(
+        row for row in records if row.eligibility_date in set(complete_dates)
+    )
+    complete_set = set(complete_dates)
+    return EligibilityResolution(
+        strategy_id=spec.strategy_id,
+        strategy_version=spec.strategy_version,
+        requested_dates=requested_dates,
+        evaluated_dates=requested_dates,
+        complete_dates=complete_dates,
+        incomplete=tuple(
+            EligibilityResolutionGap(
+                eligibility_date=value,
+                reason=(
+                    "auction_input_panel_below_99pct"
+                    if strategy_id == "auction_gap"
+                    else "daily_input_panel_below_99pct"
+                ),
+            )
+            for value in requested_dates
+            if value not in complete_set
+        ),
+        records=records,
+    )
 
 
 def _authoritative_calendar_facts(
     store: DuckDBStore,
+    *,
+    required_start: date | None = None,
+    required_end: date | None = None,
 ) -> tuple[list[date], set[date]]:
     rows = store._conn.execute(
         """
@@ -626,6 +1204,22 @@ def _authoritative_calendar_facts(
     open_dates = [_as_date(row[0]) for row in rows if bool(row[1])]
     if not open_dates:
         raise BackfillCalendarError("authoritative SSE trade calendar has no open sessions")
+    if (required_start is None) != (required_end is None):
+        raise ValueError("required calendar range must include both boundaries")
+    if required_start is not None and required_end is not None:
+        if required_start > required_end:
+            raise ValueError("required calendar start must not be after end")
+        required = {
+            required_start + timedelta(days=offset)
+            for offset in range((required_end - required_start).days + 1)
+        }
+        missing = sorted(required - civil_dates)
+        if missing:
+            rendered = ", ".join(value.isoformat() for value in missing[:5])
+            raise BackfillCalendarError(
+                "authoritative trade calendar does not cover manifest range: "
+                f"{rendered}"
+            )
     return open_dates, civil_dates
 
 
@@ -781,6 +1375,75 @@ def _complete_minute_sessions(
     }
 
 
+def _complete_minute_sessions_from_lake(
+    windows: tuple[MergedBackfillWindow, ...],
+    session_spec: MinuteSourceSessionSpec,
+    *,
+    catalog: ResearchCatalog,
+    lake_root: Path,
+    as_of_time: datetime,
+) -> tuple[
+    set[tuple[str, date]],
+    tuple[DatasetSnapshotArtifact, ...],
+]:
+    if not windows:
+        return set(), ()
+    from rquant.research_snapshot import SnapshotArtifactResolver
+
+    codes = tuple(sorted({window.ts_code for window in windows}))
+    start_date = min(window.start_date for window in windows)
+    end_date = max(window.end_date for window in windows)
+    artifacts = SnapshotArtifactResolver(
+        catalog=catalog,
+        lake_root=lake_root,
+    ).resolve_lake_partitions(
+        dataset="minute_bar",
+        start_date=start_date,
+        end_date=end_date,
+        freq=session_spec.freq,
+        as_of_time=as_of_time,
+    )
+    if not artifacts:
+        return set(), ()
+    paths = [str(Path(lake_root) / artifact.relative_path) for artifact in artifacts]
+    placeholders = ", ".join("?" for _ in codes)
+    with duckdb.connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT ts_code,
+                   CAST(trade_time AS DATE) AS trade_date,
+                   list(
+                       DISTINCT strftime(trade_time, '%H:%M:%S')
+                       ORDER BY strftime(trade_time, '%H:%M:%S')
+                   ) AS actual_times
+            FROM read_parquet(?, hive_partitioning = false)
+            WHERE source = ?
+              AND freq = ?
+              AND ts_code IN ({placeholders})
+            GROUP BY ts_code, CAST(trade_time AS DATE)
+            """,
+            [paths, session_spec.source, session_spec.freq, *codes],
+        ).fetchall()
+    expected = tuple(
+        value.isoformat(timespec="seconds")
+        for value in session_spec.expected_times()
+    )
+    desired = {
+        (window.ts_code, trading_date)
+        for window in windows
+        for trading_date in window.open_dates
+    }
+    return (
+        {
+            (str(ts_code), _as_date(trading_date))
+            for ts_code, trading_date, actual_times in rows
+            if tuple(actual_times) == expected
+            and (str(ts_code), _as_date(trading_date)) in desired
+        },
+        artifacts,
+    )
+
+
 def _coverage_from_demands(
     demands: list[tuple[str, str, BackfillPhase, date]],
     complete: set[tuple[str, date]],
@@ -816,6 +1479,57 @@ def _coverage_from_demands(
         expected_unique_sessions=len(unique_sessions),
         complete_unique_sessions=len(unique_sessions & complete),
         accepted_missing_unique_sessions=len(unique_sessions & accepted_missing),
+    )
+
+
+def _unavailable_minute_sessions(
+    store: DuckDBStore,
+    windows: tuple[MergedBackfillWindow, ...],
+) -> tuple[UnavailableMinuteSession, ...]:
+    if not windows:
+        return ()
+    codes = tuple(sorted({window.ts_code for window in windows}))
+    start_date = min(window.start_date for window in windows)
+    end_date = max(window.end_date for window in windows)
+    desired = {
+        (window.ts_code, trading_date)
+        for window in windows
+        for trading_date in window.open_dates
+    }
+    reasons: dict[tuple[str, date], UnavailableSessionReason] = {
+        key: "known_full_day_suspension"
+        for key in store.known_full_day_suspensions(
+            codes,
+            start_date,
+            end_date,
+        )
+        if key in desired
+    }
+    placeholders = ", ".join("?" for _ in codes)
+    listing_rows = store._conn.execute(
+        f"""
+        SELECT ts_code, list_date
+        FROM stock_basic
+        WHERE ts_code IN ({placeholders})
+          AND list_date IS NOT NULL
+        """,
+        list(codes),
+    ).fetchall()
+    listing_dates = {
+        str(ts_code): _as_date(list_date)
+        for ts_code, list_date in listing_rows
+    }
+    for ts_code, trading_date in desired:
+        list_date = listing_dates.get(ts_code)
+        if list_date is not None and trading_date < list_date:
+            reasons[(ts_code, trading_date)] = "not_listed"
+    return tuple(
+        UnavailableMinuteSession(
+            ts_code=ts_code,
+            trade_date=trading_date,
+            reason=reason,
+        )
+        for (ts_code, trading_date), reason in sorted(reasons.items())
     )
 
 
@@ -927,6 +1641,10 @@ def plan_minute_backfill(
     requests_per_minute: int = 500,
     observed_request_seconds: float | None = None,
     observed_bytes_per_row: float | None = None,
+    coverage_authority: MinuteCoverageAuthority = "operational",
+    research_catalog: ResearchCatalog | None = None,
+    research_lake_root: Path | None = None,
+    coverage_as_of_time: datetime | None = None,
 ) -> MinuteBackfillPlan:
     """Expand eligibility windows, deduct exact coverage, and estimate work."""
     if response_row_limit < 1 or requests_per_minute < 1:
@@ -938,17 +1656,45 @@ def plan_minute_backfill(
     )
     if not selected_spec.authoritative or not selected_spec.require_full_session:
         raise ValueError("backfill planning requires an authoritative full-session spec")
+    if coverage_authority not in {"operational", "research_lake", "combined"}:
+        raise ValueError(f"unknown minute coverage authority: {coverage_authority}")
+    if coverage_authority in {"research_lake", "combined"} and (
+        research_catalog is None or research_lake_root is None
+    ):
+        raise ValueError(
+            "research lake coverage requires both catalog and lake root"
+        )
 
-    open_dates, civil_dates = _authoritative_calendar_facts(store)
+    open_dates, civil_dates = _authoritative_calendar_facts(
+        store,
+        required_start=manifest.start_date,
+        required_end=manifest.end_date,
+    )
     demands = _calendar_scope_demands(manifest, open_dates, civil_dates)
     windows = _merge_windows(demands, open_dates)
-    complete = _complete_minute_sessions(store, windows, selected_spec)
-    accepted_missing = store.known_full_day_suspensions(
-        tuple(sorted({window.ts_code for window in windows})),
-        min((window.start_date for window in windows), default=manifest.start_date),
-        max((window.end_date for window in windows), default=manifest.end_date),
+    complete: set[tuple[str, date]] = set()
+    minute_coverage_artifacts: tuple[DatasetSnapshotArtifact, ...] = ()
+    if coverage_authority in {"operational", "combined"}:
+        complete |= _complete_minute_sessions(store, windows, selected_spec)
+    if coverage_authority in {"research_lake", "combined"}:
+        lake_complete, minute_coverage_artifacts = (
+            _complete_minute_sessions_from_lake(
+            windows,
+            selected_spec,
+            catalog=research_catalog,
+            lake_root=research_lake_root,
+            as_of_time=coverage_as_of_time or manifest.as_of_time,
+            )
+        )
+        complete |= lake_complete
+    unavailable_sessions = tuple(
+        row
+        for row in _unavailable_minute_sessions(store, windows)
+        if (row.ts_code, row.trade_date) not in complete
     )
-    accepted_missing -= complete
+    accepted_missing = {
+        (row.ts_code, row.trade_date) for row in unavailable_sessions
+    }
     coverage = _coverage_from_demands(demands, complete, accepted_missing)
     tasks = _missing_task_chunks(
         windows,
@@ -965,6 +1711,8 @@ def plan_minute_backfill(
         tasks=tasks,
         coverage=coverage,
         requested_session_count=requested_session_count,
+        unavailable_sessions=unavailable_sessions,
+        minute_coverage_artifacts=minute_coverage_artifacts,
         estimate=_backfill_estimate(
             tasks,
             requests_per_minute=requests_per_minute,

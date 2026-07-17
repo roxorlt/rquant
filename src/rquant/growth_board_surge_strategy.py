@@ -33,6 +33,7 @@ from rquant.stock_features import (
     build_intraday_relative_volume_features,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strategy_dependencies import query_bound_strategy_eligibility
 from rquant.topn_selection import FeatureScoreTerm, score_feature_terms
 
 UNSUPPORTED_ORDER_FLOW_CONDITIONS = (
@@ -283,6 +284,19 @@ def resolve_growth_board_candidates(
 ) -> list[GrowthBoardCandidate]:
     """Resolve the opening candidate universe from PIT-visible inputs only."""
     decision_at = datetime.combine(trading_date, min_signal_time, tzinfo=SHANGHAI)
+    bound_eligibility = query_bound_strategy_eligibility(
+        store,
+        strategy_id="growth_board_surge",
+        start_date=trading_date,
+        end_date=trading_date,
+    )
+    bound_codes = (
+        None
+        if bound_eligibility is None
+        else {row.ts_code for row in bound_eligibility}
+    )
+    if bound_codes == set():
+        return []
     status = query_visible_rows(
         store,
         "stock_status_daily",
@@ -315,7 +329,13 @@ def resolve_growth_board_candidates(
     ].copy()
     status["board_type"] = status["ts_code"].astype(str).map(_classify_board)
     status = status[status["board_type"].isin(("gem", "star"))]
+    if bound_codes is not None:
+        status = status[status["ts_code"].astype(str).isin(bound_codes)]
     if status.empty:
+        if bound_codes:
+            raise ValueError(
+                "bound growth-board eligibility has no matching PIT status rows"
+            )
         return []
 
     codes = tuple(sorted(status["ts_code"].astype(str).unique()))
@@ -346,6 +366,10 @@ def resolve_growth_board_candidates(
         ),
     )
     if daily.empty:
+        if bound_codes:
+            raise ValueError(
+                "bound growth-board eligibility has no matching daily history"
+            )
         return []
     daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
 
@@ -471,6 +495,12 @@ def resolve_growth_board_candidates(
                 pre_close=pre_close,
                 limit_up_price=limit_up_price,
             )
+        )
+    if bound_codes is not None and {
+        candidate.ts_code for candidate in candidates
+    } != bound_codes:
+        raise ValueError(
+            "bound growth-board eligibility disagrees with execution inputs"
         )
     return candidates
 
