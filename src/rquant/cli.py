@@ -9,6 +9,7 @@ import signal
 import socket
 import sys
 import time
+from contextlib import nullcontext
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
@@ -363,29 +364,102 @@ def cmd_research_sync(args: argparse.Namespace) -> int:
 def cmd_research_export(args: argparse.Namespace) -> int:
     """Export validated research partitions from the local read-only replica."""
     from rquant.config import settings
-    from rquant.research_catalog import ResearchCatalog
+    from rquant.research_catalog import ResearchCatalog, exclusive_file_lock
     from rquant.research_lake import export_research_dataset
     from rquant.research_manifest import detect_code_commit
     from rquant.storage.duckdb import open_readonly_connection
 
-    catalog_path = settings.research_db_path or settings.data_dir / "research.duckdb"
-    lake_root = settings.research_lake_dir or settings.data_dir / "lake"
+    catalog_path = settings.research_db_path_resolved
+    lake_root = settings.research_lake_dir_resolved
     connection = open_readonly_connection(require_replica=True)
     try:
-        summary = export_research_dataset(
-            connection,
-            catalog=ResearchCatalog(catalog_path),
-            lake_root=lake_root,
-            dataset=args.dataset,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            code_commit=detect_code_commit() or "unknown",
-            dry_run=args.dry_run,
+        publish_guard = (
+            nullcontext()
+            if args.dry_run
+            else exclusive_file_lock(settings.data_dir / "research-publish.lock")
         )
+        with publish_guard:
+            authority_markers = (
+                settings.data_dir / "research-authority-candidate.json",
+                settings.data_dir / "research-authority-current.json",
+            )
+            if not args.dry_run and any(
+                marker.exists() or marker.is_symlink() for marker in authority_markers
+            ):
+                logger.error(
+                    "研究 authority 已建立；正式目录禁止直接 research-export，"
+                    "请使用 research-ingest 维护每日证据链"
+                )
+                return 3
+            summary = export_research_dataset(
+                connection,
+                catalog=ResearchCatalog(catalog_path),
+                lake_root=lake_root,
+                dataset=args.dataset,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                code_commit=detect_code_commit() or "unknown",
+                dry_run=args.dry_run,
+            )
     finally:
         connection.close()
     print(summary.model_dump_json(indent=2))
     return 0
+
+
+def cmd_research_ingest(args: argparse.Namespace) -> int:
+    """Seal one cloud research day and publish a fail-closed observation."""
+    from rquant.config import settings
+    from rquant.research_ingest import ResearchIngestPaths, run_daily_research_ingest
+    from rquant.research_manifest import detect_code_commit
+
+    if not args.dry_run and not settings.research_cloud_ingest_enabled:
+        logger.error(
+            "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
+        )
+        return 3
+    adapter = None
+    if not args.dry_run:
+        from rquant.adapter.tushare import TushareAdapter
+
+        adapter = TushareAdapter()
+    result = run_daily_research_ingest(
+        source_database=settings.duckdb_readonly_path_resolved,
+        paths=ResearchIngestPaths(
+            state_dir=settings.data_dir,
+            catalog_path=settings.research_db_path_resolved,
+            readonly_catalog_path=settings.research_readonly_db_path_resolved,
+            lake_root=settings.research_lake_dir_resolved,
+            staging_root=settings.research_staging_dir_resolved,
+        ),
+        trade_date=args.date,
+        adapter=adapter,
+        code_commit=detect_code_commit() or "unknown",
+        dry_run=args.dry_run,
+    )
+    print(result.model_dump_json(indent=2))
+    return 2 if result.status == "degraded" else 0
+
+
+def cmd_research_authority_status(args: argparse.Namespace) -> int:
+    """Verify the rolling research candidate without opening production DuckDB."""
+    from rquant.config import settings
+    from rquant.research_ingest import ResearchIngestPaths, inspect_research_authority
+
+    paths = (
+        ResearchIngestPaths.from_data_dir(args.data_dir)
+        if args.data_dir is not None
+        else ResearchIngestPaths(
+            state_dir=settings.data_dir,
+            catalog_path=settings.research_db_path_resolved,
+            readonly_catalog_path=settings.research_readonly_db_path_resolved,
+            lake_root=settings.research_lake_dir_resolved,
+            staging_root=settings.research_staging_dir_resolved,
+        )
+    )
+    status = inspect_research_authority(paths)
+    print(status.model_dump_json(indent=2))
+    return 1 if status.status in {"missing", "invalid"} else 0
 
 
 def cmd_research_migration(args: argparse.Namespace) -> int:
@@ -2131,6 +2205,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="只报告分区和行数，不创建目录、Parquet 或 catalog",
     )
 
+    research_ingest_p = sub.add_parser(
+        "research-ingest",
+        help="日终补齐并封存云端分钟/竞价研究分区",
+    )
+    research_ingest_p.add_argument(
+        "--date",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="目标交易日 YYYY-MM-DD（默认今天）",
+    )
+    research_ingest_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只检查本地副本已有数据，不请求接口或发布研究目录",
+    )
+
+    research_status_p = sub.add_parser(
+        "research-authority-status",
+        help="只读核验研究候选、主副目录哈希和连续观察天数",
+    )
+    research_status_p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="研究数据根目录（默认 DATA_DIR）",
+    )
+
     migration_p = sub.add_parser(
         "research-migration",
         help="创建恢复快照、迁移包并在云端校验发布研究数据",
@@ -3109,6 +3210,8 @@ def main() -> int:
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
         "research-sync": cmd_research_sync,
         "research-export": cmd_research_export,
+        "research-ingest": cmd_research_ingest,
+        "research-authority-status": cmd_research_authority_status,
         "research-migration": cmd_research_migration,
         "trade-calendar-bootstrap": cmd_trade_calendar_bootstrap,
         "sentiment-recompute": cmd_sentiment_recompute,

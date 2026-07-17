@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
@@ -378,6 +381,36 @@ def build_watchlist(
         f"pool1={sum(1 for i in items.values() if i.pool == 'pool1')})"
     )
     return list(items.values())
+
+
+def _publish_research_watchlist(
+    items: Sequence[WatchItem], trade_date: date
+) -> Path | None:
+    """Persist the pre-open expected universe when cloud research shadowing is on."""
+    if not settings.research_cloud_ingest_enabled:
+        return None
+    from rquant.research_ingest import (
+        ResearchWatchlistItem,
+        write_research_watchlist_snapshot,
+    )
+    from rquant.research_manifest import detect_code_commit
+
+    commit = detect_code_commit()
+    if commit is None or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("cannot publish research watchlist without a clean code commit")
+    captured_at = _now()
+    if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+        captured_at = captured_at.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return write_research_watchlist_snapshot(
+        settings.research_staging_dir_resolved,
+        trade_date=trade_date,
+        items=tuple(
+            ResearchWatchlistItem(ts_code=item.ts_code, pool=item.pool)
+            for item in items
+        ),
+        captured_at=captured_at,
+        code_commit=commit,
+    )
 
 
 def _as_date(value: object) -> date | None:
@@ -821,6 +854,14 @@ def run_monitor(interval: int = 5) -> int:
         if not watchlist:
             logger.warning("Watchlist 为空，退出")
             return 0
+
+        try:
+            snapshot_path = _publish_research_watchlist(watchlist, today)
+            if snapshot_path is not None:
+                logger.info(f"研究分钟预期清单已固化: {snapshot_path}")
+        except Exception:
+            # 监控继续运行；日终 research-ingest 会因缺少清单 fail closed。
+            logger.exception("研究分钟预期清单固化失败")
 
         logger.info(f"开始监控 {len(watchlist)} 只，间隔 {interval} 秒")
 

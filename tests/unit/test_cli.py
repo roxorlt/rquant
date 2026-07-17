@@ -160,6 +160,7 @@ class TestResearchExport:
 
         from rquant import cli
         from rquant import config as config_module
+        from rquant import research_catalog as catalog_module
         from rquant import research_lake as lake_module
         from rquant import research_manifest as manifest_module
         from rquant.storage import duckdb as duckdb_module
@@ -168,6 +169,8 @@ class TestResearchExport:
         summary = MagicMock()
         summary.model_dump_json.return_value = '{"status":"planned"}'
         observed: dict[str, object] = {}
+        publish_lock = MagicMock()
+        publish_lock_factory = MagicMock(return_value=publish_lock)
 
         def open_replica(*, require_replica: bool = False) -> MagicMock:
             observed["require_replica"] = require_replica
@@ -182,6 +185,9 @@ class TestResearchExport:
         monkeypatch.setattr(config_module.settings, "research_db_path", None)
         monkeypatch.setattr(config_module.settings, "research_lake_dir", None)
         monkeypatch.setattr(duckdb_module, "open_readonly_connection", open_replica)
+        monkeypatch.setattr(
+            catalog_module, "exclusive_file_lock", publish_lock_factory
+        )
         monkeypatch.setattr(lake_module, "export_research_dataset", export_dataset)
         monkeypatch.setattr(manifest_module, "detect_code_commit", lambda: "a" * 40)
         args = build_parser().parse_args(
@@ -193,7 +199,6 @@ class TestResearchExport:
                 "2026-07-14",
                 "--end-date",
                 "2026-07-15",
-                "--dry-run",
             ]
         )
 
@@ -203,10 +208,193 @@ class TestResearchExport:
         assert observed["dataset"] == "auction_bar"
         assert observed["start_date"] == date(2026, 7, 14)
         assert observed["end_date"] == date(2026, 7, 15)
-        assert observed["dry_run"] is True
+        assert observed["dry_run"] is False
         assert observed["code_commit"] == "a" * 40
+        publish_lock_factory.assert_called_once_with(
+            tmp_path / "research-publish.lock"
+        )
         connection.close.assert_called_once_with()
         assert capsys.readouterr().out.strip() == '{"status":"planned"}'
+
+    def test_command_refuses_formal_publish_after_authority_exists(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_catalog as catalog_module
+        from rquant import research_lake as lake_module
+        from rquant.storage import duckdb as duckdb_module
+
+        connection = MagicMock()
+        export_dataset = MagicMock()
+        publish_lock = MagicMock()
+        (tmp_path / "research-authority-candidate.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(config_module.settings, "research_db_path", None)
+        monkeypatch.setattr(config_module.settings, "research_lake_dir", None)
+        monkeypatch.setattr(
+            duckdb_module,
+            "open_readonly_connection",
+            MagicMock(return_value=connection),
+        )
+        monkeypatch.setattr(
+            catalog_module,
+            "exclusive_file_lock",
+            MagicMock(return_value=publish_lock),
+        )
+        monkeypatch.setattr(lake_module, "export_research_dataset", export_dataset)
+        args = build_parser().parse_args(
+            [
+                "research-export",
+                "--dataset",
+                "auction_bar",
+                "--start-date",
+                "2026-07-14",
+                "--end-date",
+                "2026-07-15",
+            ]
+        )
+
+        assert cli.cmd_research_export(args) == 3
+        export_dataset.assert_not_called()
+        connection.close.assert_called_once_with()
+
+
+class TestResearchIngest:
+    def test_command_is_disabled_by_default_before_adapter_or_writes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+
+        adapter = MagicMock()
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", False
+        )
+        monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter)
+        args = build_parser().parse_args(
+            ["research-ingest", "--date", "2026-07-17"]
+        )
+
+        assert cli.cmd_research_ingest(args) == 3
+        adapter.assert_not_called()
+
+    def test_command_delegates_paths_and_returns_degraded_exit_two(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_ingest as ingest_module
+        from rquant import research_manifest as manifest_module
+
+        adapter = MagicMock()
+        adapter_factory = MagicMock(return_value=adapter)
+        result = MagicMock(status="degraded")
+        result.model_dump_json.return_value = '{"status":"degraded"}'
+        run_ingest = MagicMock(return_value=result)
+        source = tmp_path / "rquant_ro.duckdb"
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", True
+        )
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter", adapter_factory
+        )
+        monkeypatch.setattr(
+            ingest_module, "run_daily_research_ingest", run_ingest
+        )
+        monkeypatch.setattr(
+            manifest_module, "detect_code_commit", lambda: "a" * 40
+        )
+        args = build_parser().parse_args(
+            ["research-ingest", "--date", "2026-07-17"]
+        )
+
+        assert cli.cmd_research_ingest(args) == 2
+        run_ingest.assert_called_once_with(
+            source_database=source,
+            paths=ingest_module.ResearchIngestPaths.from_data_dir(tmp_path),
+            trade_date=date(2026, 7, 17),
+            adapter=adapter,
+            code_commit="a" * 40,
+            dry_run=False,
+        )
+        assert capsys.readouterr().out.strip() == '{"status":"degraded"}'
+
+    def test_dry_run_is_allowed_while_production_switch_is_off(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_ingest as ingest_module
+
+        result = MagicMock(status="planned")
+        result.model_dump_json.return_value = '{"status":"planned"}'
+        run_ingest = MagicMock(return_value=result)
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", False
+        )
+        monkeypatch.setattr(
+            ingest_module, "run_daily_research_ingest", run_ingest
+        )
+        args = build_parser().parse_args(
+            [
+                "research-ingest",
+                "--date",
+                "2026-07-17",
+                "--dry-run",
+            ]
+        )
+
+        assert cli.cmd_research_ingest(args) == 0
+        assert run_ingest.call_args.kwargs["dry_run"] is True
+
+    def test_authority_status_is_read_only_and_machine_readable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import research_ingest as ingest_module
+
+        status = MagicMock()
+        status.model_dump_json.return_value = '{"status":"candidate"}'
+        inspect = MagicMock(return_value=status)
+        monkeypatch.setattr(
+            ingest_module, "inspect_research_authority", inspect
+        )
+        args = build_parser().parse_args(
+            ["research-authority-status", "--data-dir", str(tmp_path)]
+        )
+
+        assert cli.cmd_research_authority_status(args) == 0
+        inspect.assert_called_once_with(
+            ingest_module.ResearchIngestPaths.from_data_dir(tmp_path)
+        )
+        assert capsys.readouterr().out.strip() == '{"status":"candidate"}'
 
 
 class TestResearchMigration:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -700,6 +701,28 @@ def test_publish_bundle_rebuilds_catalog_and_never_touches_production(
     assert marker.status == "candidate"
     assert marker.local_retention_min_trading_days == 10
     assert not list(target.rglob("*.tmp-*"))
+
+
+def test_publish_bundle_acquires_global_publish_lock_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, bundle_path = _prepared_bundle(tmp_path)
+    target = tmp_path / "cloud-data"
+    observed: list[Path] = []
+
+    def observe_lock(path: Path) -> AbstractContextManager[None]:
+        observed.append(path)
+        return exclusive_file_lock(path)
+
+    monkeypatch.setattr(migration_module, "exclusive_file_lock", observe_lock)
+
+    publish_research_migration_bundle(bundle_path, target_data_dir=target)
+
+    assert observed[:2] == [
+        target / "research-publish.lock",
+        target / ".research-migration.lock",
+    ]
 
 
 def test_publish_semantically_scans_each_raw_partition_only_once(

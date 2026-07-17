@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -826,6 +827,54 @@ class TestRunMonitor:
 
         assert result == 0
         mock_store_cls.assert_called_once()
+
+    def test_monitor_watchlist_snapshot_is_opt_in_and_keeps_pool_evidence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant import config as config_module
+        from rquant.monitor import WatchItem, _publish_research_watchlist
+
+        items = [
+            WatchItem(
+                ts_code="000001.SZ",
+                pool="pool1",
+                limit_up_date=date(2026, 7, 16),
+                body_upper=10.0,
+                body_lower=9.0,
+                body=1.0,
+                level_40=9.4,
+                level_30=9.3,
+                level_20=9.2,
+                stop_strong=9.0,
+                stop_weak=8.8,
+            )
+        ]
+        monkeypatch.setattr(
+            config_module.settings, "research_staging_dir", tmp_path / "staging"
+        )
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", False
+        )
+
+        assert _publish_research_watchlist(items, date(2026, 7, 17)) is None
+        assert not (tmp_path / "staging").exists()
+
+        monkeypatch.setattr(
+            config_module.settings, "research_cloud_ingest_enabled", True
+        )
+        monkeypatch.setattr(
+            "rquant.research_manifest.detect_code_commit", lambda: "a" * 40
+        )
+        monkeypatch.setattr(
+            "rquant.monitor._now", lambda: datetime(2026, 7, 17, 9, 25)
+        )
+
+        path = _publish_research_watchlist(items, date(2026, 7, 17))
+
+        assert path is not None
+        payload = path.read_text(encoding="utf-8")
+        assert '"ts_code": "000001.SZ"' in payload
+        assert '"pool": "pool1"' in payload
 
     @patch("rquant.monitor._count_trading_days_since", return_value=4)
     @patch("rquant.monitor.check_exits", return_value=0)
