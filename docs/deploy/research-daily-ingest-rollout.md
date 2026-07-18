@@ -146,6 +146,36 @@ authority、主副 catalog 或任一目标 manifest 发生变化都会令旧 pla
 低于双侧 98% 门或任一发布步骤失败时，全部日期保持修复前状态。成功修复不会删除旧内容寻址
 版本，但会把稳定观察天数重置为 0。
 
+已经位于 observation 链中间、且生产只读副本有完整分钟会话、研究湖历史分区缺失时，
+不能用 `research-ingest --recover`，也不能恢复旧 `research-export` 写权限。先用已完成的
+策略分钟回补 manifest 做只读预演：
+
+```bash
+.venv/bin/rquant research-repair-minute \
+  --manifest-id <已完成的manifest_id>
+```
+
+重点核对 `required_session_count`、`lake_complete_session_count`、
+`missing_session_count`、逐日 `target_session_count` 和 `plan_id`。预演不会请求
+Tushare，也不会创建 transaction 或改写研究湖。确认后原样复用 manifest 和 plan：
+
+```bash
+.venv/bin/rquant research-repair-minute \
+  --manifest-id <同一个manifest_id> \
+  --apply \
+  --plan-id <预演输出的plan_id>
+```
+
+apply 会重建计划并核对生产分钟行、authority、主副 catalog 和每个旧 manifest 的内容；
+任何输入变化都会令旧 plan 失效。整批按不可变版本、manifests、主 catalog、只读 catalog、
+observation/current 的顺序发布，任一步失败都回到批次前状态。成功后
+`stable_trading_days=0`，下一次相邻交易日 daily 才重新累计为 1。
+
+这里有两个不同的“时间边界”：新建 `backfill-plan` 时，可观测候选截止日会随最新已收盘
+交易日持续向前移动；一旦 manifest completed，它的资格、窗口和 unavailable 声明就是
+不可变审计快照。历史修复只补这个冻结范围，不能借修复命令扩大到后来新增的交易日。
+要研究更晚样本，应重新生成新的 manifest。
+
 ## 每日验收
 
 ```bash

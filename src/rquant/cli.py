@@ -367,6 +367,11 @@ class _RQuantArgumentParser(argparse.ArgumentParser):
             plan_supplied = getattr(parsed, "plan_id", None) is not None
             if apply_requested != plan_supplied:
                 self.error("竞价历史修复必须同时传 --apply 和 --plan-id")
+        if getattr(parsed, "command", None) == "research-repair-minute":
+            apply_requested = bool(getattr(parsed, "apply", False))
+            plan_supplied = getattr(parsed, "plan_id", None) is not None
+            if apply_requested != plan_supplied:
+                self.error("分钟历史修复必须同时传 --apply 和 --plan-id")
         return parsed
 
 
@@ -708,6 +713,45 @@ def cmd_research_repair_auction(args: argparse.Namespace) -> int:
         ),
         trade_dates=tuple(args.date),
         adapter=TushareAdapter(),
+        code_commit=detect_code_commit() or "unknown",
+        apply=args.apply,
+        plan_id=args.plan_id,
+    )
+    payload = result.model_dump(mode="json")
+    payload["plan_id"] = result.plan_id
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_research_repair_minute(args: argparse.Namespace) -> int:
+    """Plan or atomically publish a manifest-bound minute-lake repair."""
+    from rquant.config import settings
+    from rquant.research_manifest import detect_code_commit
+    from rquant.research_minute_repair import (
+        ResearchIngestPaths,
+        run_research_minute_repair,
+    )
+
+    if args.apply and not settings.research_cloud_ingest_enabled:
+        logger.error(
+            "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
+        )
+        return 3
+    state = BackfillStateStore(
+        settings.backfill_state_path_resolved,
+        busy_timeout_ms=settings.backfill_state_busy_timeout_ms,
+    )
+    result = run_research_minute_repair(
+        source_database=settings.duckdb_readonly_path_resolved,
+        paths=ResearchIngestPaths(
+            state_dir=settings.data_dir,
+            catalog_path=settings.research_db_path_resolved,
+            readonly_catalog_path=settings.research_readonly_db_path_resolved,
+            lake_root=settings.research_lake_dir_resolved,
+            staging_root=settings.research_staging_dir_resolved,
+        ),
+        state=state,
+        manifest_id=args.manifest_id,
         code_commit=detect_code_commit() or "unknown",
         apply=args.apply,
         plan_id=args.plan_id,
@@ -2869,6 +2913,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="预演输出的 64 位 plan id（必须同时传 --apply）",
     )
 
+    research_repair_minute_p = sub.add_parser(
+        "research-repair-minute",
+        help="按已完成回补 manifest 预演或原子修复历史分钟研究分区",
+    )
+    research_repair_minute_p.add_argument(
+        "--manifest-id",
+        type=_parse_sha256,
+        required=True,
+        help="已完成的分钟回补 manifest id",
+    )
+    research_repair_minute_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="执行已确认的批次修复（必须同时传 --plan-id）",
+    )
+    research_repair_minute_p.add_argument(
+        "--plan-id",
+        type=_parse_sha256,
+        default=None,
+        help="预演输出的 64 位 plan id（必须同时传 --apply）",
+    )
+
     research_readiness_p = sub.add_parser(
         "research-ingest-readiness",
         help="检查日线副本是否已具备研究日增量所需的当日完整数据",
@@ -3891,6 +3957,7 @@ def main() -> int:
         "research-export": cmd_research_export,
         "research-ingest": cmd_research_ingest,
         "research-repair-auction": cmd_research_repair_auction,
+        "research-repair-minute": cmd_research_repair_minute,
         "research-ingest-readiness": cmd_research_ingest_readiness,
         "research-authority-status": cmd_research_authority_status,
         "research-migration": cmd_research_migration,

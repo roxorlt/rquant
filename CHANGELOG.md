@@ -131,6 +131,17 @@
 
 ### Added
 
+- **历史分钟研究湖受控修复**：新增 `research-repair-minute` 双阶段命令。范围真相来自
+  已完成且通过内容、子任务和资格校验的分钟回补 manifest；计划直接比较生产只读副本与
+  研究湖当前 head，只修复 manifest 窗口内生产已完整、研究湖尚缺的 241 分钟会话，不重新
+  请求 Tushare，也不按最新规则重算历史资格。预演绑定 authority、主副 catalog、旧
+  manifests、源行和合并结果的 SHA256；正式执行必须复用同一 `plan_id`，在交易保护窗口外
+  一次发布全部不可变版本、manifests、主副 catalog 和 minute-repair observation。任一边界
+  失败会先完整 CAS 预检再整批回滚，硬中断由下一次研究写入自动恢复；符号链接、来源漂移、
+  多 journal 或第三方代际均 fail closed。新建回补计划的可观测候选上限继续随最新已收盘
+  交易日移动，而单个 completed manifest 作为审计快照保持冻结。项目版本从 `0.23.3`
+  更新到 `0.24.0`。
+
 - **集合竞价历史缺口受控修复**：新增 `research-repair-auction` 双阶段命令。预演会真实请求
   Tushare，对指定交易日逐日验证权威日线分母、Tushare 开盘竞价来源/类型/主键，以及有效
   覆盖率和观测精确率双侧 98% 门，再生成绑定代码、authority、主副 catalog、旧 manifest、
