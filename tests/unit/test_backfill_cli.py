@@ -24,6 +24,7 @@ from rquant.backfill_manifest import (
     EligibilityResolution,
     MergedBackfillWindow,
     MinuteBackfillPlan,
+    MinuteBackfillTask,
     backfill_state_input,
 )
 from rquant.backfill_state import BackfillStateStore
@@ -153,6 +154,28 @@ def _plan_with_window() -> MinuteBackfillPlan:
     return plan.model_copy(update={"windows": (window,)})
 
 
+def _plan_with_task() -> MinuteBackfillPlan:
+    plan = _plan()
+    task = MinuteBackfillTask(
+        task_id="d" * 64,
+        ts_code="300001.SZ",
+        source="tushare",
+        freq="1min",
+        start_date=date(2026, 6, 26),
+        end_date=date(2026, 6, 26),
+        open_dates=(date(2026, 6, 26),),
+        expected_rows=241,
+        response_row_limit=8_000,
+        possible_truncation=False,
+    )
+    return plan.model_copy(
+        update={
+            "tasks": (task,),
+            "requested_session_count": 1,
+        }
+    )
+
+
 def _auction_plan(
     input_artifact: DatasetSnapshotArtifact,
 ) -> MinuteBackfillPlan:
@@ -201,6 +224,15 @@ def test_backfill_cli_parser_contracts() -> None:
             "2026-06-30",
         ]
     )
+    automatic_plan = parser.parse_args(
+        [
+            "backfill-plan",
+            "--strategy",
+            "n_shape",
+            "--start-date",
+            "2026-01-01",
+        ]
+    )
     run = parser.parse_args(["backfill-run", "--manifest-id", "b" * 64])
     status = parser.parse_args(
         ["backfill-status", "--manifest-id", "c" * 64, "--json"]
@@ -242,6 +274,7 @@ def test_backfill_cli_parser_contracts() -> None:
     )
 
     assert plan.start_date == date(2026, 1, 1)
+    assert automatic_plan.end_date is None
     assert run.retry_failed is False
     assert status.json is True
     assert snapshot.as_of == datetime(2026, 6, 30, 7, tzinfo=UTC)
@@ -474,6 +507,101 @@ def test_backfill_status_retryable_failure_is_nonzero(
     assert rc == 1
 
 
+def test_backfill_run_revalidates_persisted_plan_before_claiming_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.backfill_manifest import BackfillCalendarError
+
+    plan = _plan_with_task()
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(backfill_state_input(plan))
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    readonly_store = MagicMock()
+    context = MagicMock()
+    context.__enter__.return_value = readonly_store
+    context.__exit__.return_value = False
+    monkeypatch.setattr(cli, "open_readonly_store", MagicMock(return_value=context))
+    validator = MagicMock(
+        side_effect=BackfillCalendarError(
+            "required minute session 2026-07-20 is later than "
+            "latest closed session 2026-07-17"
+        )
+    )
+    monkeypatch.setattr(
+        "rquant.backfill_manifest.validate_executable_backfill_plan",
+        validator,
+    )
+    adapter = MagicMock()
+    runner = MagicMock()
+    monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter)
+    monkeypatch.setattr(
+        "rquant.intraday_backfill.run_backfill_manifest",
+        runner,
+    )
+
+    rc = cli.cmd_backfill_run(
+        Namespace(manifest_id=plan.manifest.manifest_id, retry_failed=False)
+    )
+
+    assert rc == 2
+    validator.assert_called_once_with(readonly_store, plan)
+    adapter.assert_not_called()
+    runner.assert_not_called()
+    assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"
+
+
+def test_backfill_run_rejects_divergent_claim_task_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan_with_task()
+    persisted = backfill_state_input(plan)
+    changed_task = persisted.tasks[0].model_copy(
+        update={
+            "payload": {
+                **persisted.tasks[0].payload,
+                "end_date": "2026-07-20",
+                "open_dates": ["2026-07-20"],
+            }
+        }
+    )
+    divergent = persisted.model_copy(update={"tasks": (changed_task,)})
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(persisted)
+    monkeypatch.setattr(
+        state,
+        "load_manifest",
+        MagicMock(return_value=divergent),
+    )
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    readonly_factory = MagicMock()
+    monkeypatch.setattr(cli, "open_readonly_store", readonly_factory)
+    calendar_validator = MagicMock()
+    monkeypatch.setattr(
+        "rquant.backfill_manifest.validate_executable_backfill_plan",
+        calendar_validator,
+    )
+    adapter = MagicMock()
+    runner = MagicMock()
+    monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter)
+    monkeypatch.setattr(
+        "rquant.intraday_backfill.run_backfill_manifest",
+        runner,
+    )
+
+    rc = cli.cmd_backfill_run(
+        Namespace(manifest_id=plan.manifest.manifest_id, retry_failed=False)
+    )
+
+    assert rc == 2
+    readonly_factory.assert_not_called()
+    calendar_validator.assert_not_called()
+    adapter.assert_not_called()
+    runner.assert_not_called()
+    assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"
+
+
 def test_backfill_plan_persists_immutable_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -494,6 +622,10 @@ def test_backfill_plan_persists_immutable_plan(
     monkeypatch.setattr(
         "rquant.backfill_manifest.plan_minute_backfill",
         MagicMock(return_value=planned),
+    )
+    monkeypatch.setattr(
+        "rquant.backfill_manifest.latest_observable_eligibility_date",
+        MagicMock(return_value=date(2026, 6, 30)),
     )
     monkeypatch.setattr(
         "rquant.research_manifest.detect_code_commit",

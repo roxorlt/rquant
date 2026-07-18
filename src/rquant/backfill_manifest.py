@@ -37,6 +37,7 @@ UnavailableSessionReason = Literal[
     "not_listed",
 ]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+MINUTE_SESSION_AVAILABLE_AT = time(15, 10)
 
 if TYPE_CHECKING:
     from rquant.backfill_state import BackfillManifestInput
@@ -88,10 +89,18 @@ class StrategyBackfillSpec(BaseModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
     eligibility_basis: EligibilityBasis
+    eligibility_entry_delay_trading_days: int = Field(default=0, ge=0, le=10)
     minute_frequency: Literal["1min"] = "1min"
     window: StrategyWindowRequirement = Field(
         default_factory=StrategyWindowRequirement
     )
+
+
+def _strategy_spec_identity(spec: StrategyBackfillSpec) -> dict[str, object]:
+    payload = spec.model_dump(mode="json")
+    if spec.eligibility_entry_delay_trading_days == 0:
+        payload.pop("eligibility_entry_delay_trading_days")
+    return payload
 
 
 class EligibilityRecord(BaseModel):
@@ -329,7 +338,7 @@ class BackfillManifest(BaseModel):
                 raise ValueError("eligibility resolution is outside manifest range")
         object.__setattr__(self, "eligibilities", ordered)
         identity = {
-            "spec": self.spec.model_dump(mode="json"),
+            "spec": _strategy_spec_identity(self.spec),
             "start_date": self.start_date,
             "end_date": self.end_date,
             "as_of_time": self.as_of_time,
@@ -369,6 +378,10 @@ class BackfillManifest(BaseModel):
 
 class BackfillCalendarError(RuntimeError):
     """The authoritative calendar cannot support an exact backfill window."""
+
+
+class BackfillPlanIntegrityError(RuntimeError):
+    """Persisted runner tasks disagree with the immutable embedded plan."""
 
 
 class MergedBackfillWindow(BaseModel):
@@ -542,6 +555,7 @@ STRATEGY_BACKFILL_SPECS: dict[str, StrategyBackfillSpec] = {
         strategy_id="n_shape",
         strategy_version="v1",
         eligibility_basis="daily",
+        eligibility_entry_delay_trading_days=1,
         window=_DEFAULT_WINDOW,
     ),
 }
@@ -1323,6 +1337,76 @@ def _authoritative_calendar_facts(
     return open_dates, civil_dates
 
 
+def _latest_closed_open_session(
+    open_dates: list[date],
+    *,
+    as_of_time: datetime,
+) -> date:
+    local_as_of = _aware_utc(as_of_time, field_name="as_of_time").astimezone(
+        SHANGHAI
+    )
+    closed_dates = [
+        value
+        for value in open_dates
+        if value < local_as_of.date()
+        or (
+            value == local_as_of.date()
+            and local_as_of.time() > MINUTE_SESSION_AVAILABLE_AT
+        )
+    ]
+    if not closed_dates:
+        raise BackfillCalendarError("no closed market session is observable as of time")
+    return closed_dates[-1]
+
+
+def latest_observable_eligibility_date(
+    store: DuckDBStore,
+    *,
+    spec: StrategyBackfillSpec,
+    as_of_time: datetime,
+) -> date:
+    """Return the newest candidate date with its full entry/exit window closed."""
+    open_dates, _civil_dates = _authoritative_calendar_facts(store)
+    latest_closed = _latest_closed_open_session(
+        open_dates,
+        as_of_time=as_of_time,
+    )
+    latest_index = open_dates.index(latest_closed)
+    forward_sessions = (
+        spec.eligibility_entry_delay_trading_days
+        + spec.window.entry_trading_days
+        - 1
+        + spec.window.exit_trading_days
+    )
+    candidate_index = latest_index - forward_sessions
+    if candidate_index < 0:
+        raise BackfillCalendarError(
+            f"{spec.strategy_id} requires {forward_sessions} closed sessions "
+            "after eligibility"
+        )
+    return open_dates[candidate_index]
+
+
+def resolve_requested_eligibility_end(
+    *,
+    requested_end: date | None,
+    observable_end: date,
+    start_date: date,
+) -> date:
+    selected = requested_end or observable_end
+    if selected > observable_end:
+        raise BackfillCalendarError(
+            f"requested eligibility end {selected.isoformat()} exceeds "
+            f"observable end {observable_end.isoformat()}"
+        )
+    if selected < start_date:
+        raise BackfillCalendarError(
+            f"eligibility start {start_date.isoformat()} exceeds "
+            f"observable end {selected.isoformat()}"
+        )
+    return selected
+
+
 def _calendar_scope_demands(
     manifest: BackfillManifest,
     open_dates: list[date],
@@ -1381,7 +1465,82 @@ def _calendar_scope_demands(
     if missing:
         rendered = ", ".join(value.isoformat() for value in missing[:5])
         raise BackfillCalendarError(f"authoritative trade calendar gap: {rendered}")
+    latest_closed = _latest_closed_open_session(
+        open_dates,
+        as_of_time=manifest.as_of_time,
+    )
+    if required_end > latest_closed:
+        raise BackfillCalendarError(
+            f"required minute session {required_end.isoformat()} is later than "
+            f"latest closed session {latest_closed.isoformat()}"
+        )
     return demands
+
+
+def validate_executable_backfill_plan(
+    store: DuckDBStore,
+    plan: MinuteBackfillPlan,
+) -> None:
+    """Revalidate a persisted plan before any task can be claimed."""
+    open_dates, civil_dates = _authoritative_calendar_facts(
+        store,
+        required_start=plan.manifest.start_date,
+        required_end=plan.manifest.end_date,
+    )
+    demands = _calendar_scope_demands(
+        plan.manifest,
+        open_dates,
+        civil_dates,
+    )
+    authoritative_open_dates = set(open_dates)
+    demanded_sessions = {
+        (ts_code, trading_date)
+        for _eligibility_id, ts_code, _phase, trading_date in demands
+    }
+    for task in plan.tasks:
+        for trading_date in task.open_dates:
+            if trading_date not in authoritative_open_dates:
+                raise BackfillCalendarError(
+                    "persisted task contains a non-open session: "
+                    f"{task.ts_code} {trading_date.isoformat()}"
+                )
+            if (task.ts_code, trading_date) not in demanded_sessions:
+                raise BackfillCalendarError(
+                    "persisted task is outside the manifest demand: "
+                    f"{task.ts_code} {trading_date.isoformat()}"
+                )
+
+
+def validate_persisted_backfill_tasks(
+    persisted: BackfillManifestInput,
+    plan: MinuteBackfillPlan,
+) -> None:
+    """Ensure the runner will claim the exact tasks embedded in the plan."""
+    if persisted.manifest_id != plan.manifest.manifest_id:
+        raise BackfillPlanIntegrityError(
+            "persisted manifest ID disagrees with the embedded plan"
+        )
+    embedded_tasks = {
+        task.task_id: task.model_dump(mode="json") for task in plan.tasks
+    }
+    claim_tasks = {
+        task.task_id: task.payload for task in persisted.tasks
+    }
+    if embedded_tasks.keys() != claim_tasks.keys():
+        raise BackfillPlanIntegrityError(
+            "persisted claim task IDs disagree with the embedded plan"
+        )
+    changed_task_ids = sorted(
+        task_id
+        for task_id, payload in embedded_tasks.items()
+        if claim_tasks[task_id] != payload
+    )
+    if changed_task_ids:
+        rendered = ", ".join(changed_task_ids[:5])
+        raise BackfillPlanIntegrityError(
+            "persisted claim task payload disagrees with the embedded plan: "
+            f"{rendered}"
+        )
 
 
 def _merge_windows(

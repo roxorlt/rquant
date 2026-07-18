@@ -51,6 +51,7 @@ def _manifest(
     entries: list[tuple[str, date]],
     baseline_days: int = 90,
     exit_days: int = 10,
+    as_of_time: datetime = datetime(2026, 7, 15, tzinfo=UTC),
 ):
     from rquant.backfill_manifest import (
         BackfillManifest,
@@ -85,7 +86,7 @@ def _manifest(
         spec=spec,
         start_date=min(day for _, day in entries),
         end_date=max(day for _, day in entries),
-        as_of_time=datetime(2026, 7, 15, tzinfo=UTC),
+        as_of_time=as_of_time,
         code_commit="c" * 40,
         eligibilities=records,
     )
@@ -451,3 +452,150 @@ def test_manifest_range_outside_authoritative_calendar_fails_even_when_empty(
 
     with pytest.raises(BackfillCalendarError, match="does not cover manifest range"):
         plan_minute_backfill(store, manifest)
+
+
+def test_plan_rejects_exit_session_after_latest_closed_market_session(
+    store: DuckDBStore,
+) -> None:
+    from rquant.backfill_manifest import (
+        BackfillCalendarError,
+        BackfillManifest,
+        EligibilityRecord,
+        StrategyBackfillSpec,
+        StrategyWindowRequirement,
+        plan_minute_backfill,
+    )
+
+    opens = _weekday_opens(date(2026, 6, 1), 36)
+    assert opens[-1] == date(2026, 7, 20)
+    _seed_calendar(store, opens)
+    spec = StrategyBackfillSpec(
+        strategy_id="n_shape",
+        strategy_version="planner-test-v1",
+        eligibility_basis="daily",
+        window=StrategyWindowRequirement(
+            baseline_trading_days=2,
+            entry_trading_days=1,
+            exit_trading_days=10,
+        ),
+    )
+    eligibility = EligibilityRecord(
+        strategy_id=spec.strategy_id,
+        strategy_version=spec.strategy_version,
+        ts_code="603416.SH",
+        eligibility_date=date(2026, 7, 3),
+        entry_date=date(2026, 7, 6),
+        decision_at=datetime(2026, 7, 3, 9, tzinfo=UTC),
+        variant="pool1",
+    )
+    manifest = BackfillManifest.build(
+        spec=spec,
+        start_date=eligibility.eligibility_date,
+        end_date=eligibility.eligibility_date,
+        as_of_time=datetime(2026, 7, 18, 10, tzinfo=UTC),
+        code_commit="e" * 40,
+        eligibilities=(eligibility,),
+    )
+
+    with pytest.raises(
+        BackfillCalendarError,
+        match=(
+            "required minute session 2026-07-20 is later than "
+            "latest closed session 2026-07-17"
+        ),
+    ):
+        plan_minute_backfill(store, manifest)
+
+
+def test_execution_rejects_persisted_plan_with_unobservable_future_sessions(
+    store: DuckDBStore,
+) -> None:
+    from rquant.backfill_manifest import (
+        BackfillCalendarError,
+        BackfillManifest,
+        plan_minute_backfill,
+        validate_executable_backfill_plan,
+    )
+
+    opens = _weekday_opens(date(2026, 6, 1), 36)
+    _seed_calendar(store, opens)
+    safe_manifest = _manifest(
+        entries=[("603416.SH", date(2026, 7, 6))],
+        baseline_days=2,
+        exit_days=10,
+        as_of_time=datetime(2026, 7, 21, 10, tzinfo=UTC),
+    )
+    legacy_plan = plan_minute_backfill(store, safe_manifest)
+    unsafe_manifest = BackfillManifest.build(
+        spec=safe_manifest.spec,
+        start_date=safe_manifest.start_date,
+        end_date=safe_manifest.end_date,
+        as_of_time=datetime(2026, 7, 18, 10, tzinfo=UTC),
+        code_commit=safe_manifest.code_commit,
+        eligibilities=safe_manifest.eligibilities,
+    )
+    legacy_plan = legacy_plan.model_copy(update={"manifest": unsafe_manifest})
+
+    with pytest.raises(
+        BackfillCalendarError,
+        match=(
+            "required minute session 2026-07-20 is later than "
+            "latest closed session 2026-07-17"
+        ),
+    ):
+        validate_executable_backfill_plan(store, legacy_plan)
+
+
+def test_latest_observable_eligibility_date_moves_with_strategy_window(
+    store: DuckDBStore,
+) -> None:
+    from rquant.backfill_manifest import (
+        STRATEGY_BACKFILL_SPECS,
+        BackfillCalendarError,
+        latest_observable_eligibility_date,
+        resolve_requested_eligibility_end,
+    )
+
+    opens = _weekday_opens(date(2026, 6, 1), 36)
+    _seed_calendar(store, opens)
+    weekend_as_of = datetime(2026, 7, 18, 10, tzinfo=UTC)
+
+    assert latest_observable_eligibility_date(
+        store,
+        spec=STRATEGY_BACKFILL_SPECS["n_shape"],
+        as_of_time=weekend_as_of,
+    ) == date(2026, 7, 2)
+    assert latest_observable_eligibility_date(
+        store,
+        spec=STRATEGY_BACKFILL_SPECS["growth_board_surge"],
+        as_of_time=weekend_as_of,
+    ) == date(2026, 7, 3)
+    assert latest_observable_eligibility_date(
+        store,
+        spec=STRATEGY_BACKFILL_SPECS["n_shape"],
+        as_of_time=datetime(2026, 7, 20, 7, 10, tzinfo=UTC),
+    ) == date(2026, 7, 2)
+    assert latest_observable_eligibility_date(
+        store,
+        spec=STRATEGY_BACKFILL_SPECS["n_shape"],
+        as_of_time=datetime(2026, 7, 20, 7, 10, 1, tzinfo=UTC),
+    ) == date(2026, 7, 3)
+    assert resolve_requested_eligibility_end(
+        requested_end=None,
+        observable_end=date(2026, 7, 2),
+        start_date=date(2026, 4, 1),
+    ) == date(2026, 7, 2)
+    assert resolve_requested_eligibility_end(
+        requested_end=date(2026, 7, 1),
+        observable_end=date(2026, 7, 2),
+        start_date=date(2026, 4, 1),
+    ) == date(2026, 7, 1)
+    with pytest.raises(
+        BackfillCalendarError,
+        match="requested eligibility end 2026-07-03 exceeds observable end 2026-07-02",
+    ):
+        resolve_requested_eligibility_end(
+            requested_end=date(2026, 7, 3),
+            observable_end=date(2026, 7, 2),
+            start_date=date(2026, 4, 1),
+        )
