@@ -26,6 +26,7 @@ from rquant.research_lake import (
 from rquant.research_repair import (
     ResearchAuctionRepairDayPlan,
     ResearchAuctionRepairPlan,
+    ResearchAuctionRepairQuality,
     assess_tushare_auction_rows,
     build_auction_repair_day_plan,
     hash_auction_business_rows,
@@ -98,11 +99,30 @@ def _day_plan(trade_date: date) -> ResearchAuctionRepairDayPlan:
         merged_row_count=100,
         observed_code_count=100,
         valid_code_count=100,
+        traded_code_count=98,
+        explicit_no_trade_code_count=2,
+        malformed_code_count=0,
         expected_valid_code_count=100,
         expected_observed_code_count=100,
         unexpected_code_count=0,
         changed=True,
     )
+
+
+def _quality_payload() -> dict[str, object]:
+    return {
+        "expected_code_count": 100,
+        "observed_code_count": 100,
+        "valid_code_count": 100,
+        "traded_code_count": 98,
+        "explicit_no_trade_code_count": 2,
+        "malformed_code_count": 0,
+        "expected_valid_code_count": 100,
+        "expected_observed_code_count": 100,
+        "unexpected_code_count": 0,
+        "passed": True,
+        "issues": (),
+    }
 
 
 def test_normalize_repair_dates_sorts_deduplicates_and_rejects_empty() -> None:
@@ -203,6 +223,203 @@ def test_tushare_quality_accepts_exact_98_percent_boundary() -> None:
     assert audit.issues == ()
 
 
+def test_tushare_quality_accepts_explicit_no_trade_observations() -> None:
+    expected = set(_codes(100))
+    frame = _auction_frame(_codes(100))
+    frame.loc[:2, "price"] = float("nan")
+    frame.loc[:2, ["vol", "amount"]] = 0
+    normalized = normalize_tushare_auction_rows(
+        frame,
+        trade_date=_TRADE_DATE,
+        generated_at=_GENERATED_AT,
+    )
+
+    audit = assess_tushare_auction_rows(normalized, expected_codes=expected)
+
+    assert audit.passed is True
+    assert audit.valid_code_count == 100
+    assert audit.expected_valid_code_count == 100
+    assert audit.traded_code_count == 97
+    assert audit.explicit_no_trade_code_count == 3
+    assert audit.malformed_code_count == 0
+    assert audit.issues == ()
+
+
+def test_tushare_quality_rejects_malformed_partial_auction_rows() -> None:
+    expected = set(_codes(100))
+    frame = _auction_frame(_codes(100))
+    frame.loc[0, "price"] = float("nan")
+    normalized = normalize_tushare_auction_rows(
+        frame,
+        trade_date=_TRADE_DATE,
+        generated_at=_GENERATED_AT,
+    )
+
+    audit = assess_tushare_auction_rows(normalized, expected_codes=expected)
+
+    assert audit.passed is False
+    assert audit.valid_code_count == 99
+    assert audit.traded_code_count == 99
+    assert audit.explicit_no_trade_code_count == 0
+    assert audit.malformed_code_count == 1
+    assert audit.issues == ("tushare_malformed_rows_present",)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        pytest.param("price", float("nan"), id="price-null-with-trades"),
+        pytest.param("price", 0.0, id="price-zero"),
+        pytest.param("price", -1.0, id="price-negative"),
+        pytest.param("price", float("inf"), id="price-positive-infinity"),
+        pytest.param("price", float("-inf"), id="price-negative-infinity"),
+        pytest.param("vol", float("nan"), id="volume-null"),
+        pytest.param("vol", 0.0, id="volume-zero"),
+        pytest.param("vol", -1.0, id="volume-negative"),
+        pytest.param("vol", float("inf"), id="volume-positive-infinity"),
+        pytest.param("vol", float("-inf"), id="volume-negative-infinity"),
+        pytest.param("amount", float("nan"), id="amount-null"),
+        pytest.param("amount", 0.0, id="amount-zero"),
+        pytest.param("amount", -1.0, id="amount-negative"),
+        pytest.param("amount", float("inf"), id="amount-positive-infinity"),
+        pytest.param("amount", float("-inf"), id="amount-negative-infinity"),
+    ],
+)
+def test_tushare_quality_rejects_every_malformed_numeric_boundary(
+    column: str,
+    value: float,
+) -> None:
+    frame = _auction_frame(["000001.SZ"])
+    frame.loc[0, column] = value
+    normalized = normalize_tushare_auction_rows(
+        frame,
+        trade_date=_TRADE_DATE,
+        generated_at=_GENERATED_AT,
+    )
+
+    audit = assess_tushare_auction_rows(
+        normalized,
+        expected_codes={"000001.SZ"},
+    )
+
+    assert audit.passed is False
+    assert audit.traded_code_count == 0
+    assert audit.explicit_no_trade_code_count == 0
+    assert audit.malformed_code_count == 1
+    assert audit.issues == (
+        "tushare_valid_coverage_below_98pct",
+        "tushare_malformed_rows_present",
+    )
+
+
+def test_tushare_quality_still_rejects_three_percent_genuine_missing_rows() -> None:
+    expected = set(_codes(100))
+    normalized = normalize_tushare_auction_rows(
+        _auction_frame(_codes(97)),
+        trade_date=_TRADE_DATE,
+        generated_at=_GENERATED_AT,
+    )
+
+    audit = assess_tushare_auction_rows(normalized, expected_codes=expected)
+
+    assert audit.passed is False
+    assert audit.expected_valid_code_count == 97
+    assert audit.expected_observed_code_count == 97
+    assert audit.issues == ("tushare_valid_coverage_below_98pct",)
+
+
+def test_quality_model_rejects_fail_open_issue_evidence() -> None:
+    payload = _quality_payload()
+    payload.update(
+        {
+            "valid_code_count": 99,
+            "traded_code_count": 99,
+            "explicit_no_trade_code_count": 0,
+            "malformed_code_count": 1,
+            "expected_valid_code_count": 99,
+        }
+    )
+
+    with pytest.raises(ValueError, match="quality issues"):
+        ResearchAuctionRepairQuality.model_validate(payload)
+
+
+def test_quality_model_rejects_expected_valid_outside_observed_universe() -> None:
+    payload = _quality_payload()
+    payload.update(
+        {
+            "expected_observed_code_count": 99,
+            "unexpected_code_count": 1,
+        }
+    )
+
+    with pytest.raises(ValueError, match="expected observed"):
+        ResearchAuctionRepairQuality.model_validate(payload)
+
+
+def test_quality_model_rejects_impossible_expected_set_relationship() -> None:
+    payload = _quality_payload()
+    payload.update(
+        {
+            "expected_valid_code_count": 98,
+            "expected_observed_code_count": 100,
+        }
+    )
+
+    with pytest.raises(ValueError, match="set relationship"):
+        ResearchAuctionRepairQuality.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "observed_code_count": 100,
+            "valid_code_count": 99,
+            "traded_code_count": 99,
+            "explicit_no_trade_code_count": 0,
+            "malformed_code_count": 1,
+            "expected_valid_code_count": 99,
+        },
+        {
+            "observed_code_count": 97,
+            "valid_code_count": 97,
+            "traded_code_count": 95,
+            "explicit_no_trade_code_count": 2,
+            "expected_valid_code_count": 97,
+            "expected_observed_code_count": 97,
+            "unexpected_code_count": 0,
+        },
+        {
+            "expected_valid_code_count": 97,
+            "expected_observed_code_count": 97,
+            "unexpected_code_count": 3,
+        },
+    ],
+)
+def test_day_plan_rejects_any_quality_gate_failure(
+    updates: dict[str, int],
+) -> None:
+    payload = _day_plan(_TRADE_DATE).model_dump()
+    payload.update(updates)
+
+    with pytest.raises(ValueError, match="quality gate"):
+        ResearchAuctionRepairDayPlan.model_validate(payload)
+
+
+def test_day_plan_rejects_impossible_expected_set_relationship() -> None:
+    payload = _day_plan(_TRADE_DATE).model_dump()
+    payload.update(
+        {
+            "expected_valid_code_count": 98,
+            "expected_observed_code_count": 100,
+        }
+    )
+
+    with pytest.raises(ValueError, match="set relationship"):
+        ResearchAuctionRepairDayPlan.model_validate(payload)
+
+
 def test_tushare_quality_rejects_97_percent_and_nonpositive_values() -> None:
     expected = set(_codes(100))
     observed = _codes(97) + _codes(3, prefix="9")
@@ -223,6 +440,7 @@ def test_tushare_quality_rejects_97_percent_and_nonpositive_values() -> None:
     assert set(audit.issues) == {
         "tushare_valid_coverage_below_98pct",
         "tushare_observed_precision_below_98pct",
+        "tushare_malformed_rows_present",
     }
 
 
@@ -274,6 +492,8 @@ def test_plan_id_is_canonical_and_binds_authority_and_day_content() -> None:
 
     assert first.plan_id == second.plan_id
     assert len(first.plan_id) == 64
+    assert first.schema_version == 2
+    assert first.action_id == "research-auction-history-repair/v2"
     assert first.trade_dates == (date(2026, 4, 20), date(2026, 7, 14))
 
     changed = ResearchAuctionRepairPlan(
@@ -284,6 +504,34 @@ def test_plan_id_is_canonical_and_binds_authority_and_day_content() -> None:
         days=days,
     )
     assert changed.plan_id != first.plan_id
+
+
+def test_plan_id_binds_traded_and_explicit_no_trade_counts() -> None:
+    original_day = _day_plan(_TRADE_DATE)
+    changed_payload = original_day.model_dump()
+    changed_payload.update(
+        {
+            "traded_code_count": 97,
+            "explicit_no_trade_code_count": 3,
+        }
+    )
+    changed_day = ResearchAuctionRepairDayPlan.model_validate(changed_payload)
+    baseline = ResearchAuctionRepairPlan(
+        code_commit=_COMMIT,
+        authority_current_sha256=_HASH_A,
+        catalog_sha256=_HASH_B,
+        readonly_catalog_sha256=_HASH_C,
+        days=(original_day,),
+    )
+    changed = ResearchAuctionRepairPlan(
+        code_commit=_COMMIT,
+        authority_current_sha256=_HASH_A,
+        catalog_sha256=_HASH_B,
+        readonly_catalog_sha256=_HASH_C,
+        days=(changed_day,),
+    )
+
+    assert baseline.plan_id != changed.plan_id
 
 
 def test_plan_rejects_unsorted_or_duplicate_days() -> None:
@@ -530,6 +778,68 @@ def test_repair_preview_fetches_real_data_without_writing_files(tmp_path: Path) 
     assert result.observation is None
     assert adapter.calls == [target]
     assert _tree_fingerprint(tmp_path) == before
+
+
+def test_repair_preview_and_apply_publish_explicit_no_trade_observation(
+    tmp_path: Path,
+) -> None:
+    paths = _seed_current_authority(tmp_path)
+    target = date(2026, 7, 14)
+    source = tmp_path / "repair-source.duckdb"
+    codes = _seed_repair_source(source, (target,))
+    frame = _auction_frame(sorted(codes), trade_date=target)
+    no_trade_code = sorted(codes)[0]
+    no_trade = frame["ts_code"] == no_trade_code
+    frame.loc[no_trade, "price"] = float("nan")
+    frame.loc[no_trade, ["vol", "amount"]] = 0
+    adapter = _RepairAdapter({target: frame})
+
+    preview = run_research_auction_repair(
+        source_database=source,
+        paths=paths,
+        trade_dates=(target,),
+        adapter=adapter,
+        code_commit=_COMMIT,
+        now=lambda: _GENERATED_AT,
+    )
+    day = preview.plan.days[0]
+    assert day.traded_code_count == 99
+    assert day.explicit_no_trade_code_count == 1
+    assert day.malformed_code_count == 0
+
+    applied = run_research_auction_repair(
+        source_database=source,
+        paths=paths,
+        trade_dates=(target,),
+        adapter=adapter,
+        code_commit=_COMMIT,
+        apply=True,
+        plan_id=preview.plan_id,
+        now=lambda: _GENERATED_AT,
+    )
+
+    assert applied.status == "candidate"
+    manifest_path = paths.lake_root / partition_manifest_relative_path(
+        ResearchPartitionKey(dataset="auction_bar", trade_date=target)
+    )
+    manifest = ResearchPartitionManifest.model_validate_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    version_path = verify_research_partition(
+        lake_root=paths.lake_root,
+        manifest=manifest,
+        as_of_time=datetime(2026, 7, 18, 8, 0, tzinfo=UTC),
+    )
+    with duckdb.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT price, vol, amount
+            FROM read_parquet(?)
+            WHERE ts_code = ?
+            """,
+            [str(version_path), no_trade_code],
+        ).fetchone()
+    assert row == (None, 0.0, 0.0)
 
 
 def test_repair_apply_rejects_stale_plan_before_any_publish(tmp_path: Path) -> None:

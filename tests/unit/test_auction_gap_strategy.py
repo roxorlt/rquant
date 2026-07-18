@@ -751,6 +751,36 @@ def test_auction_gap_replay_hides_0930_fallback_at_0927_decision(
     assert trades.empty
 
 
+def test_auction_gap_replay_excludes_explicit_no_trade_auction_row(
+    store: DuckDBStore,
+) -> None:
+    from rquant.auction_gap_strategy import AuctionGapConfig, run_auction_gap_replay
+
+    _seed_auction_gap_case(store)
+    store._conn.execute(
+        """
+        UPDATE auction_bar
+        SET price = NULL,
+            vol = 0,
+            amount = 0
+        WHERE ts_code = '600000.SH'
+          AND trade_date = DATE '2026-06-25'
+          AND source = 'tushare'
+        """
+    )
+
+    trades = run_auction_gap_replay(
+        store,
+        AuctionGapConfig(
+            start_date="2026-06-25",
+            end_date="2026-06-25",
+            st_filter="case_insensitive",
+        ),
+    )
+
+    assert trades.empty
+
+
 def test_auction_gap_replay_strict_high_gap_mode_requires_gap_above_prior_high(
     store: DuckDBStore,
 ) -> None:

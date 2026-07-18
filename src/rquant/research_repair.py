@@ -49,7 +49,7 @@ from rquant.research_lake import (
 )
 
 _CST = ZoneInfo("Asia/Shanghai")
-_ACTION_ID = "research-auction-history-repair/v1"
+_ACTION_ID = "research-auction-history-repair/v2"
 _CLEAN_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _TS_CODE_PATTERN = re.compile(r"^\d{6}\.(?:SZ|SH|BJ)$")
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -87,11 +87,14 @@ class _ResearchRepairModel(BaseModel):
 
 
 class ResearchAuctionRepairQuality(_ResearchRepairModel):
-    """Strict Tushare coverage evidence for one historical trade date."""
+    """Strict Tushare completeness evidence for one historical trade date."""
 
     expected_code_count: int = Field(gt=0)
     observed_code_count: int = Field(gt=0)
     valid_code_count: int = Field(ge=0)
+    traded_code_count: int = Field(ge=0)
+    explicit_no_trade_code_count: int = Field(ge=0)
+    malformed_code_count: int = Field(ge=0)
     expected_valid_code_count: int = Field(ge=0)
     expected_observed_code_count: int = Field(ge=0)
     unexpected_code_count: int = Field(ge=0)
@@ -102,8 +105,25 @@ class ResearchAuctionRepairQuality(_ResearchRepairModel):
     def validate_quality(self) -> ResearchAuctionRepairQuality:
         if self.observed_code_count < self.valid_code_count:
             raise ValueError("valid code count cannot exceed observed code count")
+        if self.valid_code_count != (
+            self.traded_code_count + self.explicit_no_trade_code_count
+        ):
+            raise ValueError("valid code count must equal traded plus explicit no-trade")
+        if self.observed_code_count != (
+            self.valid_code_count + self.malformed_code_count
+        ):
+            raise ValueError("observed code count must equal valid plus malformed")
         if self.expected_code_count < self.expected_valid_code_count:
             raise ValueError("expected valid count cannot exceed expected code count")
+        if self.valid_code_count < self.expected_valid_code_count:
+            raise ValueError("expected valid count cannot exceed valid code count")
+        if self.expected_valid_code_count > self.expected_observed_code_count:
+            raise ValueError("expected valid count cannot exceed expected observed count")
+        if (
+            self.expected_observed_code_count - self.expected_valid_code_count
+            > self.malformed_code_count
+        ):
+            raise ValueError("expected valid/observed counts violate set relationship")
         if self.expected_code_count < self.expected_observed_code_count:
             raise ValueError("expected observed count cannot exceed expected code count")
         if self.observed_code_count < self.expected_observed_code_count:
@@ -112,8 +132,17 @@ class ResearchAuctionRepairQuality(_ResearchRepairModel):
             self.observed_code_count - self.expected_observed_code_count
         ):
             raise ValueError("unexpected code count is inconsistent")
-        if self.passed != (not self.issues):
-            raise ValueError("quality passed flag must agree with issues")
+        expected_issues = _auction_quality_issues(
+            expected_code_count=self.expected_code_count,
+            observed_code_count=self.observed_code_count,
+            expected_valid_code_count=self.expected_valid_code_count,
+            expected_observed_code_count=self.expected_observed_code_count,
+            malformed_code_count=self.malformed_code_count,
+        )
+        if self.issues != expected_issues:
+            raise ValueError("quality issues do not match quality counts")
+        if self.passed != (not expected_issues):
+            raise ValueError("quality passed flag must agree with derived issues")
         return self
 
 
@@ -131,17 +160,64 @@ class ResearchAuctionRepairDayPlan(_ResearchRepairModel):
     merged_row_count: int = Field(gt=0)
     observed_code_count: int = Field(gt=0)
     valid_code_count: int = Field(ge=0)
+    traded_code_count: int = Field(ge=0)
+    explicit_no_trade_code_count: int = Field(ge=0)
+    malformed_code_count: int = Field(ge=0)
     expected_valid_code_count: int = Field(ge=0)
     expected_observed_code_count: int = Field(ge=0)
     unexpected_code_count: int = Field(ge=0)
     changed: bool
 
+    @model_validator(mode="after")
+    def validate_quality_counts(self) -> ResearchAuctionRepairDayPlan:
+        if self.valid_code_count != (
+            self.traded_code_count + self.explicit_no_trade_code_count
+        ):
+            raise ValueError("valid code count must equal traded plus explicit no-trade")
+        if self.observed_code_count != (
+            self.valid_code_count + self.malformed_code_count
+        ):
+            raise ValueError("observed code count must equal valid plus malformed")
+        if self.expected_valid_code_count > min(
+            self.expected_code_count,
+            self.valid_code_count,
+        ):
+            raise ValueError("expected valid count is inconsistent")
+        if self.expected_observed_code_count > min(
+            self.expected_code_count,
+            self.observed_code_count,
+        ):
+            raise ValueError("expected observed count is inconsistent")
+        if self.expected_valid_code_count > self.expected_observed_code_count:
+            raise ValueError("expected valid count cannot exceed expected observed count")
+        if (
+            self.expected_observed_code_count - self.expected_valid_code_count
+            > self.malformed_code_count
+        ):
+            raise ValueError("expected valid/observed counts violate set relationship")
+        if self.unexpected_code_count != (
+            self.observed_code_count - self.expected_observed_code_count
+        ):
+            raise ValueError("unexpected code count is inconsistent")
+        issues = _auction_quality_issues(
+            expected_code_count=self.expected_code_count,
+            observed_code_count=self.observed_code_count,
+            expected_valid_code_count=self.expected_valid_code_count,
+            expected_observed_code_count=self.expected_observed_code_count,
+            malformed_code_count=self.malformed_code_count,
+        )
+        if issues:
+            raise ValueError(
+                "auction repair day plan quality gate failed: " + ", ".join(issues)
+            )
+        return self
+
 
 class ResearchAuctionRepairPlan(_ResearchRepairModel):
     """Canonical plan whose SHA256 must survive a fresh apply-time rebuild."""
 
-    schema_version: Literal[1] = 1
-    action_id: Literal["research-auction-history-repair/v1"] = _ACTION_ID
+    schema_version: Literal[2] = 2
+    action_id: Literal["research-auction-history-repair/v2"] = _ACTION_ID
     code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     authority_current_sha256: str = Field(pattern=_HASH_PATTERN)
     catalog_sha256: str = Field(pattern=_HASH_PATTERN)
@@ -308,12 +384,38 @@ def _meets_percentage(numerator: int, denominator: int, percentage: int) -> bool
     return numerator * 100 >= denominator * percentage
 
 
+def _auction_quality_issues(
+    *,
+    expected_code_count: int,
+    observed_code_count: int,
+    expected_valid_code_count: int,
+    expected_observed_code_count: int,
+    malformed_code_count: int,
+) -> tuple[str, ...]:
+    issues: list[str] = []
+    if not _meets_percentage(
+        expected_valid_code_count,
+        expected_code_count,
+        _MINIMUM_COVERAGE_PERCENT,
+    ):
+        issues.append("tushare_valid_coverage_below_98pct")
+    if not _meets_percentage(
+        expected_observed_code_count,
+        observed_code_count,
+        _MINIMUM_COVERAGE_PERCENT,
+    ):
+        issues.append("tushare_observed_precision_below_98pct")
+    if malformed_code_count:
+        issues.append("tushare_malformed_rows_present")
+    return tuple(issues)
+
+
 def assess_tushare_auction_rows(
     frame: pd.DataFrame,
     *,
     expected_codes: set[str],
 ) -> ResearchAuctionRepairQuality:
-    """Apply the two-sided 98% gate using integer cross multiplication."""
+    """Apply structural row validation plus a two-sided 98% completeness gate."""
     if not expected_codes:
         raise ValueError("auction repair expected universe is empty")
     invalid_expected = sorted(
@@ -328,32 +430,53 @@ def assess_tushare_auction_rows(
         raise ValueError("normalized Tushare auction rows are empty")
 
     observed_codes = set(frame["ts_code"].astype(str))
-    valid_mask = frame["price"].gt(0) & frame["vol"].gt(0)
+    finite_price = frame["price"].notna() & frame["price"].abs().lt(float("inf"))
+    finite_vol = frame["vol"].notna() & frame["vol"].abs().lt(float("inf"))
+    finite_amount = frame["amount"].notna() & frame["amount"].abs().lt(float("inf"))
+    traded_mask = (
+        finite_price
+        & frame["price"].gt(0)
+        & finite_vol
+        & frame["vol"].gt(0)
+        & finite_amount
+        & frame["amount"].gt(0)
+    )
+    explicit_no_trade_mask = (
+        frame["price"].isna()
+        & finite_vol
+        & frame["vol"].eq(0)
+        & finite_amount
+        & frame["amount"].eq(0)
+    )
+    valid_mask = traded_mask | explicit_no_trade_mask
+    malformed_mask = ~valid_mask
     valid_codes = set(frame.loc[valid_mask, "ts_code"].astype(str))
+    traded_codes = set(frame.loc[traded_mask, "ts_code"].astype(str))
+    explicit_no_trade_codes = set(
+        frame.loc[explicit_no_trade_mask, "ts_code"].astype(str)
+    )
+    malformed_codes = set(frame.loc[malformed_mask, "ts_code"].astype(str))
     expected_valid_codes = expected_codes & valid_codes
     expected_observed_codes = expected_codes & observed_codes
-    issues: list[str] = []
-    if not _meets_percentage(
-        len(expected_valid_codes),
-        len(expected_codes),
-        _MINIMUM_COVERAGE_PERCENT,
-    ):
-        issues.append("tushare_valid_coverage_below_98pct")
-    if not _meets_percentage(
-        len(expected_observed_codes),
-        len(observed_codes),
-        _MINIMUM_COVERAGE_PERCENT,
-    ):
-        issues.append("tushare_observed_precision_below_98pct")
+    issues = _auction_quality_issues(
+        expected_code_count=len(expected_codes),
+        observed_code_count=len(observed_codes),
+        expected_valid_code_count=len(expected_valid_codes),
+        expected_observed_code_count=len(expected_observed_codes),
+        malformed_code_count=len(malformed_codes),
+    )
     return ResearchAuctionRepairQuality(
         expected_code_count=len(expected_codes),
         observed_code_count=len(observed_codes),
         valid_code_count=len(valid_codes),
+        traded_code_count=len(traded_codes),
+        explicit_no_trade_code_count=len(explicit_no_trade_codes),
+        malformed_code_count=len(malformed_codes),
         expected_valid_code_count=len(expected_valid_codes),
         expected_observed_code_count=len(expected_observed_codes),
         unexpected_code_count=len(observed_codes - expected_codes),
         passed=not issues,
-        issues=tuple(issues),
+        issues=issues,
     )
 
 
@@ -497,6 +620,9 @@ def build_auction_repair_day_plan(
         merged_row_count=len(merged),
         observed_code_count=quality.observed_code_count,
         valid_code_count=quality.valid_code_count,
+        traded_code_count=quality.traded_code_count,
+        explicit_no_trade_code_count=quality.explicit_no_trade_code_count,
+        malformed_code_count=quality.malformed_code_count,
         expected_valid_code_count=quality.expected_valid_code_count,
         expected_observed_code_count=quality.expected_observed_code_count,
         unexpected_code_count=quality.unexpected_code_count,

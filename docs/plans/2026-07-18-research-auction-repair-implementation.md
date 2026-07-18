@@ -21,7 +21,9 @@
 - Create: `tests/unit/test_research_repair.py`
 
 1. 写失败测试，覆盖目标日期排序去重、缺字段、错误日期、错误来源/类型、重复物理主键、
-   非正价格/成交量、两侧 98% 整数边界、日线全市场不完整、规范哈希稳定性。
+   实际成交与明确无成交分类、price/vol/amount 的空值/零值/负值/无穷值矩阵、两侧 98%
+   整数边界、日线全市场不完整、规范哈希稳定性。只有
+   `price=NULL, vol=0, amount=0` 是合法无成交观测，其他非正或半截组合均属畸形。
 2. 运行：
 
    ```bash
@@ -108,7 +110,8 @@
    plan 不写文件、apply 退出码和 JSON 输出。
 2. 实现 `research-repair-auction` parser/dispatch/handler。
 3. plan 阶段真实请求接口但不持久化；apply 阶段要求开关、干净提交和 `--plan-id`。
-4. 更新中文使用说明、Changelog 与版本为 `0.23.0`。
+4. 初始能力版本为 `0.23.0`；生产七日修复前将无成交质量语义热修并更新中文说明、
+   Changelog 与版本为 `0.23.1`。
 5. 运行：
 
    ```bash
@@ -131,13 +134,13 @@
 2. 运行独立代码审查，修复所有 P0/P1/P2。
 3. 检查 git diff 仅包含本功能，提交 feature 分支并推送。
 4. 创建 PR，等待 Python 3.11/3.12 CI 全绿后 squash merge。
-5. 创建 annotated `v0.23.0`，确认 tag 精确指向合并后的 `origin/main`。
+5. 创建 annotated `v0.23.1`，确认 tag 精确指向合并后的 `origin/main`。
 
 ## Task 7: 生产七日修复
 
 1. 周末或工作日 15:10 后只读核对现状。
 2. 备份研究 catalog、只读 catalog、authority 状态和 lake manifests。
-3. 通过 `scripts/deploy-production.sh --target v0.23.0 --dry-run` 预演，再部署精确 tag。
+3. 通过 `scripts/deploy-production.sh --target v0.23.1 --dry-run` 预演，再部署精确 tag。
 4. 执行七日期 plan，保存 JSON 与 `plan_id`。
 5. 人工/程序核对每一天预期 universe、Tushare 有效覆盖、精确率和变更统计。
 6. 使用同一日期集与 `plan_id` apply。
