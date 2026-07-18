@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -215,6 +216,100 @@ class ResearchDailyIngestResult(_ResearchModel):
         ):
             raise ValueError("multi-day candidate requires a stability parent")
         return self
+
+
+def _model_payload_sha256(model: BaseModel) -> str:
+    payload = (model.model_dump_json(indent=2) + "\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+class ResearchAuctionRepairPartitionChange(_ResearchModel):
+    trade_date: date
+    before_manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    after_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    before_content_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    before_manifest: ResearchPartitionManifest | None = None
+    after_manifest: ResearchPartitionManifest
+
+    @model_validator(mode="after")
+    def validate_change(self) -> ResearchAuctionRepairPartitionChange:
+        if (
+            self.after_manifest.dataset != "auction_bar"
+            or self.after_manifest.partition.trade_date != self.trade_date
+        ):
+            raise ValueError("auction repair manifest must bind its trade date")
+        if _model_payload_sha256(self.after_manifest) != self.after_manifest_sha256:
+            raise ValueError("repaired auction manifest physical hash is inconsistent")
+        if self.before_manifest is None:
+            if (
+                self.before_manifest_sha256 is not None
+                or self.before_content_hash is not None
+                or self.after_manifest.parent_content_hash is not None
+            ):
+                raise ValueError("new auction partition cannot claim prior manifest evidence")
+        else:
+            if (
+                self.before_manifest.dataset != "auction_bar"
+                or self.before_manifest.partition.trade_date != self.trade_date
+            ):
+                raise ValueError("prior auction manifest must bind its trade date")
+            if self.before_manifest_sha256 is None:
+                raise ValueError("prior auction manifest requires its physical hash")
+            if (
+                _model_payload_sha256(self.before_manifest)
+                != self.before_manifest_sha256
+            ):
+                raise ValueError("prior auction manifest physical hash is inconsistent")
+            if self.before_content_hash != self.before_manifest.content_hash:
+                raise ValueError("prior auction content hash does not match its manifest")
+            if (
+                self.after_manifest.parent_content_hash
+                != self.before_manifest.content_hash
+            ):
+                raise ValueError("repaired auction manifest must link to prior content")
+        return self
+
+
+class ResearchAuctionRepairObservation(_ResearchModel):
+    schema_version: Literal[1] = 1
+    observation_kind: Literal["auction_repair"] = "auction_repair"
+    status: Literal["candidate"] = "candidate"
+    observation_id: str
+    bootstrap_snapshot_id: str
+    trade_date: date
+    generated_at: datetime
+    code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    previous_observation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_before_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    readonly_catalog_before_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    readonly_catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stable_trading_days: Literal[0] = 0
+    repairs: tuple[ResearchAuctionRepairPartitionChange, ...] = Field(min_length=1)
+    issues: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> ResearchAuctionRepairObservation:
+        if self.generated_at.tzinfo is None or self.generated_at.utcoffset() is None:
+            raise ValueError("auction repair generated_at must be timezone-aware")
+        repair_dates = tuple(change.trade_date for change in self.repairs)
+        if repair_dates != tuple(sorted(set(repair_dates))):
+            raise ValueError("auction repair dates must be strictly ordered and unique")
+        if any(repair_date > self.trade_date for repair_date in repair_dates):
+            raise ValueError("auction repair cannot move authority trade date backwards")
+        if self.issues:
+            raise ValueError("auction repair authority observation cannot contain issues")
+        return self
+
+
+ResearchAuthorityObservation = ResearchDailyIngestResult | ResearchAuctionRepairObservation
 
 
 class _ResearchPublishJournal(_ResearchModel):
@@ -813,7 +908,23 @@ def _auction_audit(
     )
 
 
-def _observation_path(paths: ResearchIngestPaths, result: ResearchDailyIngestResult) -> Path:
+def _parse_research_observation(payload: bytes | str) -> ResearchAuthorityObservation:
+    decoded = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+    document = json.loads(decoded)
+    if not isinstance(document, dict):
+        raise ValueError("research observation must be a JSON object")
+    kind = document.get("observation_kind", "daily_ingest")
+    if kind == "daily_ingest":
+        return ResearchDailyIngestResult.model_validate_json(decoded)
+    if kind == "auction_repair":
+        return ResearchAuctionRepairObservation.model_validate_json(decoded)
+    raise ValueError(f"unsupported research observation kind: {kind}")
+
+
+def _observation_path(
+    paths: ResearchIngestPaths,
+    result: ResearchAuthorityObservation,
+) -> Path:
     return (
         paths.state_dir
         / "research_observations"
@@ -824,8 +935,8 @@ def _observation_path(paths: ResearchIngestPaths, result: ResearchDailyIngestRes
 
 def _observation_index(
     paths: ResearchIngestPaths,
-) -> tuple[dict[str, tuple[ResearchDailyIngestResult, bytes]], int]:
-    index: dict[str, tuple[ResearchDailyIngestResult, bytes]] = {}
+) -> tuple[dict[str, tuple[ResearchAuthorityObservation, bytes]], int]:
+    index: dict[str, tuple[ResearchAuthorityObservation, bytes]] = {}
     files = tuple(sorted((paths.state_dir / "research_observations").glob("**/*.json")))
     for path in files:
         if not path.is_file() or path.is_symlink():
@@ -835,7 +946,7 @@ def _observation_index(
         if digest in index:
             raise RuntimeError("duplicate research observation content hash")
         index[digest] = (
-            ResearchDailyIngestResult.model_validate_json(payload),
+            _parse_research_observation(payload),
             payload,
         )
     return index, len(files)
@@ -843,7 +954,7 @@ def _observation_index(
 
 def _observation_chain_issues(
     paths: ResearchIngestPaths,
-    current: ResearchDailyIngestResult,
+    current: ResearchAuthorityObservation,
     current_payload: bytes,
 ) -> tuple[str, ...]:
     issues: list[str] = []
@@ -860,9 +971,19 @@ def _observation_chain_issues(
         issues.append("current_observation_mismatch")
         return tuple(issues)
 
+    latest_repair_bindings: dict[
+        date,
+        tuple[ResearchPartitionManifest, str],
+    ] = {}
     seen: set[str] = set()
     node = current
     while node.previous_observation_sha256 is not None:
+        if isinstance(node, ResearchAuctionRepairObservation):
+            for change in node.repairs:
+                latest_repair_bindings.setdefault(
+                    change.trade_date,
+                    (change.after_manifest, change.after_manifest_sha256),
+                )
         parent_hash = node.previous_observation_sha256
         if parent_hash in seen or parent_hash not in index:
             issues.append("observation_lineage_broken")
@@ -872,16 +993,38 @@ def _observation_chain_issues(
         if (
             parent.bootstrap_snapshot_id != current.bootstrap_snapshot_id
             or parent.trade_date > node.trade_date
+            or (
+                isinstance(node, ResearchAuctionRepairObservation)
+                and parent.trade_date != node.trade_date
+            )
         ):
             issues.append("observation_lineage_broken")
             break
         node = parent
+    if (
+        not issues
+        and latest_repair_bindings
+        and (
+            isinstance(current, ResearchAuctionRepairObservation)
+            or current.stable_trading_days < 10
+        )
+    ):
+        repair_issues = _manifest_binding_issues(
+            paths,
+            tuple(latest_repair_bindings.values()),
+        )
+        if repair_issues:
+            issues.extend(repair_issues)
 
-    if current.status == "candidate":
+    if isinstance(current, ResearchDailyIngestResult) and current.status == "candidate":
         node = current
         expected_days = current.stable_trading_days
         while expected_days > 0:
-            if node.status != "candidate" or node.stable_trading_days != expected_days:
+            if (
+                not isinstance(node, ResearchDailyIngestResult)
+                or node.status != "candidate"
+                or node.stable_trading_days != expected_days
+            ):
                 issues.append("stability_chain_broken")
                 break
             node_lake_issues = _lake_binding_issues(paths, node)
@@ -896,7 +1039,8 @@ def _observation_chain_issues(
                 break
             parent = index[parent_hash][0]
             if (
-                node.previous_stable_trade_date != parent.trade_date
+                not isinstance(parent, ResearchDailyIngestResult)
+                or node.previous_stable_trade_date != parent.trade_date
                 or parent.trade_date >= node.trade_date
                 or parent.bootstrap_snapshot_id != current.bootstrap_snapshot_id
             ):
@@ -908,55 +1052,80 @@ def _observation_chain_issues(
 
 
 def _lake_binding_issues(
-    paths: ResearchIngestPaths, current: ResearchDailyIngestResult
+    paths: ResearchIngestPaths,
+    current: ResearchAuthorityObservation,
+) -> tuple[str, ...]:
+    if isinstance(current, ResearchDailyIngestResult):
+        bindings: tuple[tuple[ResearchPartitionManifest | None, str | None], ...] = tuple(
+            (partition.manifest, None)
+            for audit in (current.minute, current.auction)
+            for partition in audit.export.partitions
+        )
+    else:
+        bindings = tuple(
+            (change.after_manifest, change.after_manifest_sha256)
+            for change in current.repairs
+        )
+    return _manifest_binding_issues(paths, bindings)
+
+
+def _manifest_binding_issues(
+    paths: ResearchIngestPaths,
+    bindings: tuple[
+        tuple[ResearchPartitionManifest | None, str | None],
+        ...,
+    ],
 ) -> tuple[str, ...]:
     try:
         catalog_connection = duckdb.connect(str(paths.catalog_path), read_only=True)
     except Exception:
         return ("research_catalog_unreadable",)
     try:
-        for audit in (current.minute, current.auction):
-            for partition in audit.export.partitions:
-                manifest = partition.manifest
-                if manifest is None:
-                    return ("lake_manifest_missing_from_observation",)
-                manifest_path = paths.lake_root / partition_manifest_relative_path(
-                    manifest.partition
+        for manifest, expected_manifest_hash in bindings:
+            if manifest is None:
+                return ("lake_manifest_missing_from_observation",)
+            manifest_path = paths.lake_root / partition_manifest_relative_path(
+                manifest.partition
+            )
+            data_path = paths.lake_root / manifest.relative_path
+            try:
+                observed_manifest = ResearchPartitionManifest.model_validate_json(
+                    manifest_path.read_text(encoding="utf-8")
                 )
-                data_path = paths.lake_root / manifest.relative_path
-                try:
-                    observed_manifest = ResearchPartitionManifest.model_validate_json(
-                        manifest_path.read_text(encoding="utf-8")
-                    )
-                except Exception:
-                    return ("lake_manifest_invalid",)
-                if observed_manifest != manifest:
-                    return ("lake_manifest_mismatch",)
-                if (
-                    not data_path.is_file()
-                    or data_path.is_symlink()
-                    or data_path.stat().st_size != manifest.file_size
-                    or _file_sha256(data_path) != manifest.file_hash
-                ):
-                    return ("lake_partition_hash_mismatch",)
-                catalog_row = catalog_connection.execute(
-                    """
-                    SELECT relative_path, content_hash, file_hash, manifest_json
-                    FROM research_partition
-                    WHERE partition_id = ?
-                    """,
-                    [manifest.partition.partition_id],
-                ).fetchone()
-                if catalog_row is None:
-                    return ("catalog_partition_missing",)
-                catalog_manifest = ResearchPartitionManifest.model_validate_json(catalog_row[3])
-                if (
-                    str(catalog_row[0]) != manifest.relative_path
-                    or str(catalog_row[1]) != manifest.content_hash
-                    or str(catalog_row[2]) != manifest.file_hash
-                    or catalog_manifest != manifest
-                ):
-                    return ("catalog_partition_mismatch",)
+            except Exception:
+                return ("lake_manifest_invalid",)
+            if (
+                expected_manifest_hash is not None
+                and _file_sha256(manifest_path) != expected_manifest_hash
+            ):
+                return ("lake_manifest_hash_mismatch",)
+            if observed_manifest != manifest:
+                return ("lake_manifest_mismatch",)
+            if (
+                not data_path.is_file()
+                or data_path.is_symlink()
+                or data_path.stat().st_size != manifest.file_size
+                or _file_sha256(data_path) != manifest.file_hash
+            ):
+                return ("lake_partition_hash_mismatch",)
+            catalog_row = catalog_connection.execute(
+                """
+                SELECT relative_path, content_hash, file_hash, manifest_json
+                FROM research_partition
+                WHERE partition_id = ?
+                """,
+                [manifest.partition.partition_id],
+            ).fetchone()
+            if catalog_row is None:
+                return ("catalog_partition_missing",)
+            catalog_manifest = ResearchPartitionManifest.model_validate_json(catalog_row[3])
+            if (
+                str(catalog_row[0]) != manifest.relative_path
+                or str(catalog_row[1]) != manifest.content_hash
+                or str(catalog_row[2]) != manifest.file_hash
+                or catalog_manifest != manifest
+            ):
+                return ("catalog_partition_mismatch",)
     finally:
         catalog_connection.close()
     return ()
@@ -1005,7 +1174,7 @@ def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...
 
 def _validate_prior_authority(
     paths: ResearchIngestPaths,
-) -> tuple[str, ResearchDailyIngestResult | None, str | None, str]:
+) -> tuple[str, ResearchAuthorityObservation | None, str | None, str]:
     candidate_path = paths.state_dir / "research-authority-candidate.json"
     catalog_path = paths.catalog_path
     current_path = paths.state_dir / "research-authority-current.json"
@@ -1020,7 +1189,7 @@ def _validate_prior_authority(
         if not current_path.is_file() or current_path.is_symlink():
             raise RuntimeError("research authority current marker is invalid")
         current_payload = current_path.read_bytes()
-        current = ResearchDailyIngestResult.model_validate_json(current_payload)
+        current = _parse_research_observation(current_payload)
         if current.status == "planned":
             raise RuntimeError("planned research ingest cannot be an authority marker")
         if current.bootstrap_snapshot_id != candidate.snapshot_id:
@@ -1038,6 +1207,17 @@ def _validate_prior_authority(
         lake_issues = _lake_binding_issues(paths, current)
         if lake_issues:
             raise RuntimeError(f"research lake binding invalid: {', '.join(lake_issues)}")
+        if (
+            isinstance(current, ResearchDailyIngestResult)
+            and current.status == "candidate"
+            and current.stable_trading_days >= 10
+        ):
+            catalog_issues = _catalog_lake_integrity_issues(paths)
+            if catalog_issues:
+                raise RuntimeError(
+                    "research catalog/lake integrity invalid: "
+                    f"{', '.join(catalog_issues)}"
+                )
         catalog_hash = _file_sha256(catalog_path)
         return (
             candidate.snapshot_id,
@@ -1440,8 +1620,17 @@ def _recover_interrupted_publish(paths: ResearchIngestPaths) -> None:
         if not transaction_root.is_dir() or transaction_root.is_symlink():
             raise RuntimeError(f"invalid research transaction path: {transaction_root}")
         journal_path = _journal_path(transaction_root)
+        repair_journal_path = transaction_root / "auction-repair-journal.json"
+        if journal_path.exists() and repair_journal_path.exists():
+            raise RuntimeError("research transaction contains multiple publish journals")
         if journal_path.exists():
             _rollback_publish_transaction(paths, transaction_root)
+        elif repair_journal_path.exists():
+            from rquant.research_repair import (
+                rollback_research_auction_repair_publish,
+            )
+
+            rollback_research_auction_repair_publish(paths, transaction_root)
         else:
             _remove_transaction_root(transaction_root)
 
@@ -1558,7 +1747,7 @@ def _require_observation_continuity(
     *,
     trade_date: date,
     previous_open_date: date | None,
-    previous: ResearchDailyIngestResult | None,
+    previous: ResearchAuthorityObservation | None,
 ) -> None:
     if previous is not None:
         if previous.trade_date in {trade_date, previous_open_date}:
@@ -1579,12 +1768,16 @@ def _stability_evidence(
     status: Literal["candidate", "degraded"],
     trade_date: date,
     previous_open_date: date | None,
-    previous: ResearchDailyIngestResult | None,
+    previous: ResearchAuthorityObservation | None,
     previous_marker_hash: str | None,
 ) -> tuple[int, str | None, date | None]:
     if status != "candidate":
         return 0, None, None
-    if previous is None or previous.status != "candidate":
+    if (
+        previous is None
+        or not isinstance(previous, ResearchDailyIngestResult)
+        or previous.status != "candidate"
+    ):
         return 1, None, None
     if previous.trade_date == trade_date:
         return (
@@ -1936,7 +2129,10 @@ def inspect_research_authority(paths: ResearchIngestPaths) -> ResearchAuthorityS
     readonly_path = paths.readonly_catalog_path
     current_path = paths.state_dir / "research-authority-current.json"
     observation_count = len(tuple((paths.state_dir / "research_observations").glob("**/*.json")))
-    pending_journals = tuple(paths.transactions_root.glob("*/publish-journal.json"))
+    pending_journals = (
+        *paths.transactions_root.glob("*/publish-journal.json"),
+        *paths.transactions_root.glob("*/auction-repair-journal.json"),
+    )
     if pending_journals:
         return ResearchAuthorityStatus(
             status="invalid",
@@ -2005,7 +2201,7 @@ def inspect_research_authority(paths: ResearchIngestPaths) -> ResearchAuthorityS
         if not current_path.is_file() or current_path.is_symlink():
             raise ValueError("current marker is not a regular file")
         current_payload = current_path.read_bytes()
-        current = ResearchDailyIngestResult.model_validate_json(current_payload)
+        current = _parse_research_observation(current_payload)
     except Exception:
         return ResearchAuthorityStatus(
             status="invalid",
@@ -2037,7 +2233,12 @@ def inspect_research_authority(paths: ResearchIngestPaths) -> ResearchAuthorityS
     issues.extend(_lake_binding_issues(paths, current))
     if current.status == "planned":
         issues.append("planned_marker_cannot_be_authoritative")
-    if not issues and current.status == "candidate" and current.stable_trading_days >= 10:
+    if (
+        not issues
+        and isinstance(current, ResearchDailyIngestResult)
+        and current.status == "candidate"
+        and current.stable_trading_days >= 10
+    ):
         issues.extend(_catalog_lake_integrity_issues(paths))
     status: Literal["candidate", "degraded", "invalid"]
     if issues:
@@ -2046,7 +2247,11 @@ def inspect_research_authority(paths: ResearchIngestPaths) -> ResearchAuthorityS
         status = "candidate"
     else:
         status = "degraded"
-    eligible = status == "candidate" and current.stable_trading_days >= 10
+    eligible = (
+        status == "candidate"
+        and isinstance(current, ResearchDailyIngestResult)
+        and current.stable_trading_days >= 10
+    )
     return ResearchAuthorityStatus(
         status=status,
         bootstrap_snapshot_id=candidate.snapshot_id,

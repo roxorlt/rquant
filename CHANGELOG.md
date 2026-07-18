@@ -104,6 +104,16 @@
 
 ### Added
 
+- **集合竞价历史缺口受控修复**：新增 `research-repair-auction` 双阶段命令。预演会真实请求
+  Tushare，对指定交易日逐日验证权威日线分母、Tushare 开盘竞价来源/类型/主键，以及有效
+  覆盖率和观测精确率双侧 98% 门，再生成绑定代码、authority、主副 catalog、旧 manifest、
+  接口业务内容与合并后内容的 SHA256 plan id；正式执行必须用同一日期集和新鲜 plan id，
+  并在交易保护窗口外一次原子发布全部日期。修复沿用内容寻址 Parquet，保留 fallback、
+  未变化行的原始 `created_at` 和所有旧版本；批次 journal 在任何发布边界失败时先做完整
+  CAS 预检再恢复 manifests、主副 catalog 与 authority。新的修复观察认证新旧 manifest
+  血缘且不推进最新交易日，并把 10 日稳定观察归零；后续 daily 在重新累计期间持续校验被
+  修复的历史分区。项目版本从 `0.22.5` 更新到 `0.23.0`。
+
 - **Stage 1 不可变正式研究执行链**：新增 migration v10 与
   `dataset_snapshot_binding`，把分钟/竞价研究湖精确内容寻址版本和策略所需日级小表物化为
   不可改写的执行 manifest；文件、schema、逻辑内容、行数、主键、时间范围和 PIT 截止时点在

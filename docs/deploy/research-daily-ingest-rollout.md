@@ -122,6 +122,30 @@ timer 不设置 `Persistent=true`，避免服务器隔日恢复后用错误日�
 恢复模式逐只调用历史 `stk_mins`，只允许接在当前 observation 的下一个交易日，拒绝倒序修补
 或跨越缺口，避免重写已发布证据链。
 
+已经位于 observation 链中间、且只缺集合竞价的数据不能使用 `--recover`。在交易保护窗口外
+先用同一组重复 `--date` 真实请求接口并生成计划：
+
+```bash
+.venv/bin/rquant research-repair-auction \
+  --date 2026-04-20 \
+  --date 2026-07-07
+```
+
+核对每一天的预期代码数、有效代码数、反向精确率和 `changed` 后，再原样复用日期集执行：
+
+```bash
+.venv/bin/rquant research-repair-auction \
+  --date 2026-04-20 \
+  --date 2026-07-07 \
+  --apply \
+  --plan-id <预演输出的plan_id>
+```
+
+预演会真实访问 Tushare，但不创建或改写本地文件。apply 会重新取数；接口业务内容、
+authority、主副 catalog 或任一目标 manifest 发生变化都会令旧 plan 失效。批次中任意日期
+低于双侧 98% 门或任一发布步骤失败时，全部日期保持修复前状态。成功修复不会删除旧内容寻址
+版本，但会把稳定观察天数重置为 0。
+
 ## 每日验收
 
 ```bash
