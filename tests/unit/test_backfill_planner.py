@@ -195,6 +195,120 @@ def test_only_exact_full_session_counts_as_covered(store: DuckDBStore) -> None:
     assert plan.coverage.entry_exit_gate_passed is False
 
 
+def test_minute_completion_uses_bounded_exact_target_aggregates(
+    store: DuckDBStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.backfill_manifest as manifest_module
+    from rquant.backfill_manifest import (
+        MergedBackfillWindow,
+        _complete_minute_sessions,
+    )
+
+    spec = next(
+        value
+        for value in DEFAULT_MINUTE_SOURCE_SESSION_SPECS
+        if value.source == "tushare" and value.freq == "1min"
+    )
+    first_date = date(2026, 6, 1)
+    second_date = date(2026, 6, 2)
+    expected_times = spec.expected_times()
+    _insert_session(
+        store,
+        ts_code="300001.SZ",
+        trade_date=first_date,
+        times=expected_times,
+    )
+    _insert_session(
+        store,
+        ts_code="300001.SZ",
+        trade_date=second_date,
+        times=expected_times[:-1],
+    )
+    _insert_session(
+        store,
+        ts_code="300002.SZ",
+        trade_date=first_date,
+        times=(*expected_times[:-1], time(12, 0)),
+    )
+    _insert_session(
+        store,
+        ts_code="300002.SZ",
+        trade_date=second_date,
+        times=(*expected_times, time(12, 0)),
+    )
+    store._conn.executemany(
+        """
+        INSERT INTO minute_bar (
+            ts_code, trade_time, freq, open, high, low, close,
+            vol, amount, source
+        ) VALUES (?, ?, '1min', 10, 10, 10, 10, 100, 1000, 'other')
+        """,
+        [
+            ("300003.SZ", datetime.combine(first_date, minute_time))
+            for minute_time in expected_times
+        ],
+    )
+    _insert_session(
+        store,
+        ts_code="999999.SZ",
+        trade_date=first_date,
+        times=expected_times,
+    )
+    windows = (
+        MergedBackfillWindow(
+            ts_code="300001.SZ",
+            start_date=first_date,
+            end_date=second_date,
+            open_dates=(first_date, second_date),
+        ),
+        MergedBackfillWindow(
+            ts_code="300002.SZ",
+            start_date=first_date,
+            end_date=second_date,
+            open_dates=(first_date, second_date),
+        ),
+        MergedBackfillWindow(
+            ts_code="300003.SZ",
+            start_date=first_date,
+            end_date=second_date,
+            open_dates=(first_date, second_date),
+        ),
+    )
+
+    class RecordingConnection:
+        def __init__(self, connection: object) -> None:
+            self.connection = connection
+            self.statements: list[str] = []
+
+        def execute(
+            self,
+            statement: str,
+            parameters: list[object] | None = None,
+        ) -> object:
+            self.statements.append(statement)
+            return self.connection.execute(statement, parameters or [])
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.connection, name)
+
+    recording = RecordingConnection(store._conn)
+    monkeypatch.setattr(manifest_module, "_MINUTE_COMPLETION_BATCH_SIZE", 2)
+    monkeypatch.setattr(store, "_conn", recording)
+
+    complete = _complete_minute_sessions(store, windows, spec)
+
+    assert complete == {("300001.SZ", first_date)}
+    completion_sql = [
+        statement.lower()
+        for statement in recording.statements
+        if "from minute_bar" in statement.lower()
+    ]
+    assert len(completion_sql) == 3
+    assert all("list(" not in statement for statement in completion_sql)
+    assert all("values" in statement for statement in completion_sql)
+
+
 def test_research_lake_coverage_survives_operational_minute_cleanup(
     store: DuckDBStore,
     tmp_path: Path,

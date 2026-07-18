@@ -38,6 +38,7 @@ UnavailableSessionReason = Literal[
 ]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MINUTE_SESSION_AVAILABLE_AT = time(15, 10)
+_MINUTE_COMPLETION_BATCH_SIZE = 512
 
 if TYPE_CHECKING:
     from rquant.backfill_state import BackfillManifestInput
@@ -1589,49 +1590,93 @@ def _complete_minute_sessions(
 ) -> set[tuple[str, date]]:
     if not windows:
         return set()
-    codes = tuple(sorted({window.ts_code for window in windows}))
-    start_date = min(window.start_date for window in windows)
-    end_date = max(window.end_date for window in windows)
-    placeholders = ", ".join("?" for _ in codes)
-    rows = store._conn.execute(
-        f"""
-        SELECT ts_code,
-               CAST(trade_time AS DATE) AS trade_date,
-               list(
-                   DISTINCT strftime(trade_time, '%H:%M:%S')
-                   ORDER BY strftime(trade_time, '%H:%M:%S')
-               ) AS actual_times
-        FROM minute_bar
-        WHERE source = ?
-          AND freq = ?
-          AND CAST(trade_time AS DATE) >= ?
-          AND CAST(trade_time AS DATE) <= ?
-          AND ts_code IN ({placeholders})
-        GROUP BY ts_code, CAST(trade_time AS DATE)
-        """,
-        [
-            session_spec.source,
-            session_spec.freq,
-            start_date,
-            end_date,
-            *codes,
-        ],
-    ).fetchall()
-    expected = tuple(
+    return _complete_minute_sessions_from_relation(
+        store._conn,
+        relation_sql="minute_bar",
+        relation_parameters=(),
+        desired=_desired_minute_sessions(windows),
+        session_spec=session_spec,
+    )
+
+
+def _complete_minute_sessions_from_relation(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    relation_sql: str,
+    relation_parameters: tuple[object, ...],
+    desired: tuple[tuple[str, date], ...],
+    session_spec: MinuteSourceSessionSpec,
+) -> set[tuple[str, date]]:
+    expected_times = tuple(
         value.isoformat(timespec="seconds")
         for value in session_spec.expected_times()
     )
-    desired = {
-        (window.ts_code, trading_date)
-        for window in windows
-        for trading_date in window.open_dates
-    }
-    return {
-        (str(ts_code), _as_date(trading_date))
-        for ts_code, trading_date, actual_times in rows
-        if tuple(actual_times) == expected
-        and (str(ts_code), _as_date(trading_date)) in desired
-    }
+    expected_placeholders = ", ".join("?" for _ in expected_times)
+    complete: set[tuple[str, date]] = set()
+    for offset in range(0, len(desired), _MINUTE_COMPLETION_BATCH_SIZE):
+        batch = desired[offset : offset + _MINUTE_COMPLETION_BATCH_SIZE]
+        target_placeholders = ", ".join("(?, ?)" for _ in batch)
+        target_parameters = [
+            value
+            for ts_code, trade_date in batch
+            for value in (ts_code, trade_date)
+        ]
+        rows = connection.execute(
+            f"""
+            WITH desired_sessions(ts_code, trade_date) AS (
+                VALUES {target_placeholders}
+            )
+            SELECT minute.ts_code,
+                   CAST(minute.trade_time AS DATE) AS trade_date
+            FROM {relation_sql} AS minute
+            INNER JOIN desired_sessions AS desired
+              ON desired.ts_code = minute.ts_code
+             AND desired.trade_date = CAST(minute.trade_time AS DATE)
+            WHERE minute.source = ?
+              AND minute.freq = ?
+            GROUP BY minute.ts_code, CAST(minute.trade_time AS DATE)
+            HAVING COUNT(
+                       DISTINCT strftime(minute.trade_time, '%H:%M:%S')
+                   ) = ?
+               AND COUNT(
+                       DISTINCT CASE
+                           WHEN strftime(
+                               minute.trade_time,
+                               '%H:%M:%S'
+                           ) IN ({expected_placeholders})
+                           THEN strftime(minute.trade_time, '%H:%M:%S')
+                       END
+                   ) = ?
+            """,
+            [
+                *target_parameters,
+                *relation_parameters,
+                session_spec.source,
+                session_spec.freq,
+                len(expected_times),
+                *expected_times,
+                len(expected_times),
+            ],
+        ).fetchall()
+        complete.update(
+            (str(ts_code), _as_date(trading_date))
+            for ts_code, trading_date in rows
+        )
+    return complete
+
+
+def _desired_minute_sessions(
+    windows: tuple[MergedBackfillWindow, ...],
+) -> tuple[tuple[str, date], ...]:
+    return tuple(
+        sorted(
+            {
+                (window.ts_code, trading_date)
+                for window in windows
+                for trading_date in window.open_dates
+            }
+        )
+    )
 
 
 def _complete_minute_sessions_from_lake(
@@ -1650,7 +1695,6 @@ def _complete_minute_sessions_from_lake(
         return set(), ()
     from rquant.research_snapshot import SnapshotArtifactResolver
 
-    codes = tuple(sorted({window.ts_code for window in windows}))
     start_date = min(window.start_date for window in windows)
     end_date = max(window.end_date for window in windows)
     artifacts = SnapshotArtifactResolver(
@@ -1666,43 +1710,16 @@ def _complete_minute_sessions_from_lake(
     if not artifacts:
         return set(), ()
     paths = [str(Path(lake_root) / artifact.relative_path) for artifact in artifacts]
-    placeholders = ", ".join("?" for _ in codes)
     connect_config = {"temp_directory": ""} if memory_only else {}
     with duckdb.connect(config=connect_config) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT ts_code,
-                   CAST(trade_time AS DATE) AS trade_date,
-                   list(
-                       DISTINCT strftime(trade_time, '%H:%M:%S')
-                       ORDER BY strftime(trade_time, '%H:%M:%S')
-                   ) AS actual_times
-            FROM read_parquet(?, hive_partitioning = false)
-            WHERE source = ?
-              AND freq = ?
-              AND ts_code IN ({placeholders})
-            GROUP BY ts_code, CAST(trade_time AS DATE)
-            """,
-            [paths, session_spec.source, session_spec.freq, *codes],
-        ).fetchall()
-    expected = tuple(
-        value.isoformat(timespec="seconds")
-        for value in session_spec.expected_times()
-    )
-    desired = {
-        (window.ts_code, trading_date)
-        for window in windows
-        for trading_date in window.open_dates
-    }
-    return (
-        {
-            (str(ts_code), _as_date(trading_date))
-            for ts_code, trading_date, actual_times in rows
-            if tuple(actual_times) == expected
-            and (str(ts_code), _as_date(trading_date)) in desired
-        },
-        artifacts,
-    )
+        complete = _complete_minute_sessions_from_relation(
+            connection,
+            relation_sql="read_parquet(?, hive_partitioning = false)",
+            relation_parameters=(paths,),
+            desired=_desired_minute_sessions(windows),
+            session_spec=session_spec,
+        )
+    return complete, artifacts
 
 
 def _coverage_from_demands(
