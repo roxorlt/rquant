@@ -665,18 +665,19 @@ def test_finalize_market_backfill_recomputes_state_and_sentiment_once(
                 ('000001.SZ', DATE '2024-01-03', 5)
             """
         )
-    state_calls: list[tuple[list[str], str]] = []
+    state_calls: list[tuple[list[str], date, str]] = []
     sentiment_calls: list[tuple[date, date]] = []
 
     def recompute(
         store: DuckDBStore,
         codes: list[str] | None,
         *,
+        start_date: date,
         status_mode: str,
     ) -> int:
         del store
         assert codes is not None
-        state_calls.append((codes, status_mode))
+        state_calls.append((codes, start_date, status_mode))
         return 3
 
     def recompute_sentiment(
@@ -698,6 +699,10 @@ def test_finalize_market_backfill_recomputes_state_and_sentiment_once(
 
     assert result == (3, 2)
     assert state_calls == [
-        (["000001.SZ", "600000.SH"], "verified_no_fetch")
+        (
+            ["000001.SZ", "600000.SH"],
+            date(2024, 1, 2),
+            "verified_no_fetch",
+        )
     ]
     assert sentiment_calls == [(date(2024, 1, 2), date(2024, 1, 3))]

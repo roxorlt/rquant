@@ -1796,12 +1796,17 @@ class TestCmdMarketDailyBackfill:
             assert args == ("2020-01-01", "2020-01-02", adapter)
             assert kwargs["store_factory"] is store_factory
             events.append("remote_backfill")
-            return {"failed_dates": [], "affected_codes": ["600000.SH"]}
+            return {
+                "failed_dates": [],
+                "affected_codes": ["600000.SH"],
+                "state_tail_start_date": "2020-01-01",
+            }
 
-        def fake_recompute(store, *, codes, status_mode):
+        def fake_recompute(store, *, codes, start_date, status_mode):
             assert writer_active is True
             assert isinstance(store, _Store)
             assert codes == ["600000.SH"]
+            assert start_date == date(2020, 1, 1)
             assert status_mode == "verified_no_fetch"
             events.append("recompute")
             return 1
@@ -1836,7 +1841,7 @@ class TestCmdMarketDailyBackfill:
             "writer_exit",
         ]
 
-    def test_skip_state_recompute_keeps_invalidated_tails_without_rebuild(
+    def test_skip_state_recompute_leaves_invalidated_state_without_rebuild(
         self,
         monkeypatch,
     ) -> None:
@@ -1911,7 +1916,7 @@ class TestCmdMarketDailyBackfill:
 
         assert result.returncode == 0
         assert "--skip-state-recompute" in result.stdout
-        assert "陈旧状态尾部" in result.stdout
+        assert "原子尾段重算" in result.stdout
 
 
 class TestMonitorParser:

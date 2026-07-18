@@ -335,8 +335,16 @@ def test_growth_eligibility_uses_shared_daily_resolver_before_minute_reads(
     days = [date(2026, 6, 24), date(2026, 6, 25)]
     calls: list[tuple[date, date]] = []
 
-    def fake_candidates(store, trading_date, previous_date, min_signal_time):
+    def fake_candidates(
+        store,
+        trading_date,
+        previous_date,
+        min_signal_time,
+        *,
+        structural_excluded_codes,
+    ):
         del store, min_signal_time
+        assert structural_excluded_codes == set()
         calls.append((trading_date, previous_date))
         return [
             growth.GrowthBoardCandidate(
@@ -391,6 +399,12 @@ def test_daily_zero_hit_date_is_complete_eligibility_evidence(
             store,
             previous_date=days[0],
             signal_date=days[1],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300001.SZ', DATE '2020-01-01', '创业板')
+            """
         )
         resolution = resolve_strategy_eligibility(
             store,
@@ -552,6 +566,630 @@ def test_listing_universe_detects_stock_missing_from_daily_bar(
 
     assert resolution.complete_dates == ()
     assert resolution.incomplete[0].reason == "daily_input_panel_below_99pct"
+
+
+def test_growth_panel_excludes_listing_without_60_prior_open_sessions(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(62)]
+    previous_date = days[-2]
+    signal_date = days[-1]
+
+    def stale_candidate(*_args, **_kwargs):
+        return [
+            growth.GrowthBoardCandidate(
+                ts_code="300002.SZ",
+                name="短上市脏指标",
+                trade_date=signal_date,
+                previous_date=previous_date,
+                board_type="gem",
+                pre_close=10.0,
+                limit_up_price=12.0,
+            )
+        ]
+
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        stale_candidate,
+    )
+    with DuckDBStore(tmp_path / "growth-new-listing.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('300001.SZ', ?, '创业板'),
+                ('300002.SZ', ?, '创业板')
+            """,
+            [days[0], days[-10]],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=days,
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (2, 2)
+    assert resolution.complete_dates == (signal_date,)
+    assert resolution.incomplete == ()
+    assert resolution.records == ()
+
+
+def test_growth_panel_excludes_verified_previous_full_day_suspension(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-suspended.duckdb") as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('300001.SZ', DATE '2020-01-01', '创业板'),
+                ('300002.SZ', DATE '2020-01-01', '创业板')
+            """
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_coverage
+            (source, trade_date, coverage_state, row_count, snapshot_hash, queried_at)
+            VALUES ('tushare', ?, 'complete', 1, 'snapshot', ?)
+            """,
+            [previous_date, datetime(2026, 6, 25, 16, tzinfo=UTC)],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_event
+            (source, ts_code, trade_date, suspend_type, suspend_timing,
+             session_scope, available_at, ingested_at)
+            VALUES
+            ('tushare', '300002.SZ', ?, 'S', '09:30-15:00',
+             'full_day', ?, ?)
+            """,
+            [
+                previous_date,
+                datetime(2026, 6, 25, 8, tzinfo=UTC),
+                datetime(2026, 6, 25, 16, tzinfo=UTC),
+            ],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=[previous_date, signal_date],
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (2, 2)
+    assert resolution.complete_dates == (signal_date,)
+    assert resolution.incomplete == ()
+
+
+@pytest.mark.parametrize(
+    ("coverage_state", "session_scope", "has_resume"),
+    [
+        ("unverified_empty", "full_day", False),
+        ("unsupported", "full_day", False),
+        ("complete", "partial", False),
+        ("complete", "full_day", True),
+    ],
+)
+def test_growth_panel_keeps_unproven_suspension_in_denominator(
+    monkeypatch,
+    tmp_path,
+    coverage_state: str,
+    session_scope: str,
+    has_resume: bool,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import resolve_strategy_eligibility
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    suffix = "resume" if has_resume else "no-resume"
+    with DuckDBStore(
+        tmp_path / f"growth-{coverage_state}-{session_scope}-{suffix}.duckdb"
+    ) as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('300001.SZ', DATE '2020-01-01', '创业板'),
+                ('300002.SZ', DATE '2020-01-01', '创业板')
+            """
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_coverage
+            (source, trade_date, coverage_state, row_count, snapshot_hash, queried_at)
+            VALUES ('tushare', ?, ?, 1, 'snapshot', ?)
+            """,
+            [
+                previous_date,
+                coverage_state,
+                datetime(2026, 6, 25, 16, tzinfo=UTC),
+            ],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_event
+            (source, ts_code, trade_date, suspend_type, suspend_timing,
+             session_scope, available_at, ingested_at)
+            VALUES
+            ('tushare', '300002.SZ', ?, 'S', '09:30-15:00', ?, ?, ?)
+            """,
+            [
+                previous_date,
+                session_scope,
+                datetime(2026, 6, 25, 8, tzinfo=UTC),
+                datetime(2026, 6, 25, 16, tzinfo=UTC),
+            ],
+        )
+        if has_resume:
+            store._conn.execute(
+                """
+                INSERT INTO stock_suspend_event
+                (source, ts_code, trade_date, suspend_type, suspend_timing,
+                 session_scope, available_at, ingested_at)
+                VALUES
+                ('tushare', '300002.SZ', ?, 'R', '09:30', 'partial', ?, ?)
+                """,
+                [
+                    previous_date,
+                    datetime(2026, 6, 25, 8, tzinfo=UTC),
+                    datetime(2026, 6, 25, 16, tzinfo=UTC),
+                ],
+            )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+
+    assert resolution.complete_dates == ()
+    assert resolution.incomplete[0].reason == "daily_input_panel_below_99pct"
+
+
+def test_growth_panel_keeps_missing_authoritative_listing_date_fail_closed(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(62)]
+    previous_date = days[-2]
+    signal_date = days[-1]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-missing-list-date.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300001.SZ', ?, '创业板')
+            """,
+            [days[0]],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close)
+            VALUES ('300002.SZ', ?, 10)
+            """,
+            [previous_date],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_status_daily
+            (ts_code, trade_date, name, is_st, name_source, st_source,
+             available_at, ingested_at, conflict_reason)
+            VALUES ('300002.SZ', ?, '缺上市日期', FALSE, 'test', 'test',
+                    ?, ?, NULL)
+            """,
+            [
+                signal_date,
+                datetime.combine(signal_date, time(1), tzinfo=UTC),
+                datetime.combine(signal_date, time(1), tzinfo=UTC),
+            ],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=days,
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (2, 1)
+    assert resolution.complete_dates == ()
+
+
+def test_growth_panel_all_short_listings_keep_observable_nonzero_denominator(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(12)]
+    signal_date = days[-1]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-all-new.duckdb") as store:
+        _seed_open_calendar(store, days)
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300002.SZ', ?, '创业板')
+            """,
+            [days[2]],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=days,
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (1, 1)
+    assert resolution.complete_dates == (signal_date,)
+    assert resolution.records == ()
+
+
+def test_growth_panel_60_session_listing_missing_ma60_is_not_structural(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(61)]
+    previous_date = days[-2]
+    signal_date = days[-1]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-60-session-boundary.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+            codes=("300001.SZ",),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES
+                ('300001.SZ', ?, '创业板'),
+                ('300002.SZ', ?, '创业板')
+            """,
+            [days[0], days[0]],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close)
+            VALUES ('300002.SZ', ?, 10)
+            """,
+            [previous_date],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_status_daily
+            (ts_code, trade_date, name, is_st, name_source, st_source,
+             available_at, ingested_at, conflict_reason)
+            VALUES ('300002.SZ', ?, '第60日', FALSE, 'test', 'test',
+                    ?, ?, NULL)
+            """,
+            [
+                signal_date,
+                datetime.combine(signal_date, time(1), tzinfo=UTC),
+                datetime.combine(signal_date, time(1), tzinfo=UTC),
+            ],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=days,
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (2, 1)
+    assert resolution.complete_dates == ()
+
+
+def test_growth_panel_rejects_historical_suspension_with_residual_bar(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(61)]
+    historical_suspension = days[10]
+    previous_date = days[-2]
+    signal_date = days[-1]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-suspension-conflict.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300001.SZ', ?, '创业板')
+            """,
+            [days[0]],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close)
+            VALUES ('300001.SZ', ?, 9)
+            """,
+            [historical_suspension],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_coverage
+            (source, trade_date, coverage_state, row_count, snapshot_hash, queried_at)
+            VALUES ('tushare', ?, 'complete', 1, 'snapshot', ?)
+            """,
+            [
+                historical_suspension,
+                datetime(2026, 8, 24, 16, tzinfo=UTC),
+            ],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_event
+            (source, ts_code, trade_date, suspend_type, suspend_timing,
+             session_scope, available_at, ingested_at)
+            VALUES
+            ('tushare', '300001.SZ', ?, 'S', '09:30-15:00',
+             'full_day', ?, ?)
+            """,
+            [
+                historical_suspension,
+                datetime(2026, 7, 4, 8, tzinfo=UTC),
+                datetime(2026, 8, 24, 16, tzinfo=UTC),
+            ],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=days,
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (1, 0)
+    assert resolution.complete_dates == ()
+
+
+def test_growth_panel_rejects_future_listing_fact(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    previous_date = date(2026, 6, 25)
+    signal_date = date(2026, 6, 26)
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-future-listing.duckdb") as store:
+        _seed_open_calendar(store, [previous_date, signal_date])
+        _seed_growth_input_panel(
+            store,
+            previous_date=previous_date,
+            signal_date=signal_date,
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300001.SZ', DATE '2026-07-01', '创业板')
+            """
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=[previous_date, signal_date],
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (1, 0)
+    assert resolution.complete_dates == ()
+
+
+def test_growth_panel_calendar_gap_cannot_prove_short_listing(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.backfill_manifest import (
+        _opening_panel_counts,
+        resolve_strategy_eligibility,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+
+    civil_days = [
+        date(2026, 6, 24) + timedelta(days=index)
+        for index in range(61)
+    ]
+    missing_day = civil_days[20]
+    known_days = [day for day in civil_days if day != missing_day]
+    signal_date = civil_days[-1]
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-calendar-gap.duckdb") as store:
+        _seed_open_calendar(store, known_days)
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300002.SZ', ?, '创业板')
+            """,
+            [civil_days[0]],
+        )
+
+        resolution = resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=signal_date,
+            end_date=signal_date,
+        )
+        counts = _opening_panel_counts(
+            store,
+            requested_dates=(signal_date,),
+            calendar=known_days,
+            strategy_id="growth_board_surge",
+        )
+
+    assert counts[signal_date] == (1, 0)
+    assert resolution.complete_dates == ()
 
 
 def test_auction_panel_excludes_b_shares_from_a_share_denominator(

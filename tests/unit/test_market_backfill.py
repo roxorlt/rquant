@@ -491,10 +491,98 @@ def test_historical_apply_failure_rolls_back_status_bar_and_state(
     assert state == old_state
 
 
-def test_historical_successful_update_invalidates_state_tail_without_rewrite(
+def test_missing_immediate_predecessor_state_blocks_historical_apply(
+    db_path: Path,
+) -> None:
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (
+                ts_code, trade_date, open, high, low, close, pre_close
+            ) VALUES
+                ('600000.SH', DATE '2019-12-31', 8, 8, 8, 8, 8),
+                ('600000.SH', DATE '2020-01-02', 9, 9, 9, 9, 9)
+            """
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_state (
+                ts_code, trade_date, is_limit_up, is_first_limit_up,
+                consecutive_limit_ups
+            ) VALUES
+                ('600000.SH', DATE '2020-01-02', FALSE, FALSE, 0)
+            """
+        )
+        old_bar = store._conn.execute(
+            "SELECT * FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
+            ["600000.SH", date(2020, 1, 2)],
+        ).fetchone()
+        old_state = store._conn.execute(
+            "SELECT * FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+            ["600000.SH", date(2020, 1, 2)],
+        ).fetchone()
+
+    summary = _backfill(db_path, _OneDayAdapter())
+
+    assert summary["failed_dates"] == ["2020-01-02"]
+    with DuckDBStore(db_path, read_only=True) as store:
+        bar = store._conn.execute(
+            "SELECT * FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
+            ["600000.SH", date(2020, 1, 2)],
+        ).fetchone()
+        state = store._conn.execute(
+            "SELECT * FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+            ["600000.SH", date(2020, 1, 2)],
+        ).fetchone()
+        target_status = store.list_stock_status(
+            date(2020, 1, 2),
+            date(2020, 1, 2),
+        )
+    assert bar == old_bar
+    assert state == old_state
+    assert target_status == []
+
+
+def test_older_status_gap_does_not_block_apply_when_predecessor_state_exists(
+    db_path: Path,
+) -> None:
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (
+                ts_code, trade_date, open, high, low, close, pre_close
+            ) VALUES
+                ('600000.SH', DATE '2019-12-30', 7, 7, 7, 7, 7),
+                ('600000.SH', DATE '2019-12-31', 8, 8, 8, 8, 7)
+            """
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_state (
+                ts_code, trade_date, is_limit_up, is_first_limit_up,
+                consecutive_limit_ups
+            ) VALUES ('600000.SH', DATE '2019-12-31', FALSE, FALSE, 0)
+            """
+        )
+
+    summary = _backfill(db_path, _OneDayAdapter())
+
+    assert summary["failed_dates"] == []
+    assert summary["affected_codes"] == ["600000.SH"]
+
+
+def test_historical_update_invalidates_state_and_indicators_before_rebuild(
     db_path: Path,
 ) -> None:
     _seed_market_bar_and_state_tail(db_path)
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_indicator (ts_code, trade_date, ma5) VALUES
+                ('600000.SH', DATE '2020-01-02', 9),
+                ('600000.SH', DATE '2020-01-03', 9)
+            """
+        )
 
     class _RejectStateWriteStore(DuckDBStore):
         def upsert_state(self, frame: pd.DataFrame) -> int:
@@ -515,7 +603,15 @@ def test_historical_successful_update_invalidates_state_tail_without_rewrite(
         ).fetchone()[0]
         states = store._conn.execute(
             """
-            SELECT trade_date, is_limit_up FROM daily_state
+            SELECT * FROM daily_state
+            WHERE ts_code = ?
+            ORDER BY trade_date
+            """,
+            ["600000.SH"],
+        ).fetchall()
+        indicators = store._conn.execute(
+            """
+            SELECT trade_date FROM daily_indicator
             WHERE ts_code = ? AND trade_date >= ?
             ORDER BY trade_date
             """,
@@ -523,6 +619,7 @@ def test_historical_successful_update_invalidates_state_tail_without_rewrite(
         ).fetchall()
     assert close == pytest.approx(10.2)
     assert states == []
+    assert indicators == []
 
 
 def test_basic_and_factor_only_rows_do_not_invalidate_state_tail(
@@ -552,6 +649,12 @@ def test_basic_and_factor_only_rows_do_not_invalidate_state_tail(
             ) VALUES ('600000.SH', DATE '2020-01-02', FALSE, 0)
             """
         )
+        store._conn.execute(
+            """
+            INSERT INTO daily_indicator (ts_code, trade_date, ma5)
+            VALUES ('600000.SH', DATE '2020-01-02', 9)
+            """
+        )
         store.upsert_stock_status((complete,))
 
     summary = _backfill(db_path, _FactOnlyAdapter())
@@ -565,7 +668,58 @@ def test_basic_and_factor_only_rows_do_not_invalidate_state_tail(
         state_dates = store._conn.execute(
             "SELECT trade_date FROM daily_state ORDER BY trade_date"
         ).fetchall()
+        indicator_dates = store._conn.execute(
+            "SELECT trade_date FROM daily_indicator ORDER BY trade_date"
+        ).fetchall()
     assert state_dates == [(date(2020, 1, 2),)]
+    assert indicator_dates == []
+
+
+def test_status_only_repair_invalidates_and_reports_affected_state_tail(
+    db_path: Path,
+) -> None:
+    unknown = SecurityStatusDaily(
+        ts_code="600000.SH",
+        trade_date=date(2020, 1, 2),
+        name=None,
+        is_st=None,
+        name_source="unknown",
+        st_source=None,
+        available_at=None,
+        ingested_at=INGESTED_AT - pd.Timedelta(seconds=1),
+    )
+    with DuckDBStore(db_path) as store:
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar (
+                ts_code, trade_date, open, high, low, close, pre_close
+            ) VALUES ('600000.SH', DATE '2020-01-02', 9, 9, 9, 9, 9)
+            """
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_state (
+                ts_code, trade_date, is_limit_up, consecutive_limit_ups
+            ) VALUES ('600000.SH', DATE '2020-01-02', FALSE, 0)
+            """
+        )
+        store.upsert_stock_status((unknown,))
+
+    summary = _backfill(db_path, _FactOnlyAdapter())
+
+    assert summary["failed_dates"] == []
+    assert summary["daily_rows"] == 0
+    assert summary["security_status_rows"] == 1
+    assert summary["affected_codes"] == ["600000.SH"]
+    assert summary["state_tail_start_date"] == "2020-01-02"
+    with DuckDBStore(db_path, read_only=True) as store:
+        assert store.count_state("600000.SH") == 0
+        repaired = store.list_stock_status(
+            date(2020, 1, 2),
+            date(2020, 1, 2),
+        )
+    assert len(repaired) == 1
+    assert repaired[0].is_st is False
 
 
 def test_request_plan_includes_existing_incomplete_date_when_calendar_empty(
@@ -877,6 +1031,115 @@ def test_recompute_daily_state_with_codes_subset_uses_exact_parameter(
             "600000.SH",
             "600000.SH",
         ]
+
+
+def test_recompute_daily_state_replaces_only_requested_tail_from_seed(
+    db_path: Path,
+) -> None:
+    with DuckDBStore(db_path) as store:
+        _seed_daily_history(store)
+        assert _recompute(store, codes=["600000.SH"]) == 2
+        predecessor_before = store._conn.execute(
+            """
+            SELECT * FROM daily_state
+            WHERE ts_code = ? AND trade_date = ?
+            """,
+            ["600000.SH", date(2020, 1, 2)],
+        ).fetchone()
+        store._conn.execute(
+            """
+            UPDATE daily_bar
+            SET high = 10.6, close = 10.5, change = 0.5, pct_chg = 5
+            WHERE ts_code = ? AND trade_date = ?
+            """,
+            ["600000.SH", date(2020, 1, 3)],
+        )
+        store._conn.execute(
+            """
+            DELETE FROM stock_status_daily
+            WHERE ts_code = ? AND trade_date = ?
+            """,
+            ["600000.SH", date(2020, 1, 2)],
+        )
+
+        total = recompute_daily_state(
+            store,
+            codes=["600000.SH"],
+            start_date=date(2020, 1, 3),
+            status_mode="verified_no_fetch",
+        )
+
+        predecessor_after = store._conn.execute(
+            """
+            SELECT * FROM daily_state
+            WHERE ts_code = ? AND trade_date = ?
+            """,
+            ["600000.SH", date(2020, 1, 2)],
+        ).fetchone()
+        tail = store._conn.execute(
+            """
+            SELECT is_limit_up, is_first_limit_up, consecutive_limit_ups
+            FROM daily_state
+            WHERE ts_code = ? AND trade_date = ?
+            """,
+            ["600000.SH", date(2020, 1, 3)],
+        ).fetchone()
+
+    assert total == 1
+    assert predecessor_after == predecessor_before
+    assert tail == (False, False, 0)
+
+
+def test_recompute_daily_state_rolls_back_tail_when_final_publish_fails(
+    db_path: Path,
+) -> None:
+    class _FailingPublishConnection:
+        def __init__(self, connection: object) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, *args: object, **kwargs: object) -> object:
+            normalized = " ".join(sql.split())
+            if (
+                normalized.startswith("INSERT INTO daily_state")
+                and "_rquant_state_tail_stage" in normalized
+            ):
+                raise RuntimeError("injected state-tail publish failure")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+    with DuckDBStore(db_path) as store:
+        _seed_daily_history(store)
+        assert _recompute(store) == 3
+        before = store._conn.execute(
+            "SELECT * FROM daily_state ORDER BY ts_code, trade_date"
+        ).fetchall()
+        store._conn.execute(
+            """
+            UPDATE daily_bar
+            SET high = close, close = pre_close
+            WHERE trade_date >= DATE '2020-01-02'
+            """
+        )
+        store._conn = _FailingPublishConnection(store._conn)  # type: ignore[assignment]
+
+        with pytest.raises(
+            RuntimeError,
+            match="injected state-tail publish failure",
+        ):
+            recompute_daily_state(
+                store,
+                start_date=date(2020, 1, 2),
+                status_mode="verified_no_fetch",
+                batch_size=1,
+            )
+
+        after = store._conn.execute(
+            "SELECT * FROM daily_state ORDER BY ts_code, trade_date"
+        ).fetchall()
+
+    assert after == before
 
 
 def test_recompute_does_not_interpolate_code_into_sql(db_path: Path) -> None:
