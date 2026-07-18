@@ -145,7 +145,11 @@ class ResearchCatalog:
     @contextmanager
     def _connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
         if self.read_only:
-            connection = duckdb.connect(str(self.path), read_only=True)
+            connection = duckdb.connect(
+                str(self.path),
+                read_only=True,
+                config={"temp_directory": ""},
+            )
             try:
                 yield connection
             finally:

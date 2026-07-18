@@ -1170,6 +1170,28 @@ def test_recovery_rejects_a_dangling_publish_journal_symlink(
     assert journal_path.is_symlink()
 
 
+def test_recovery_rejects_a_symlinked_transactions_root_without_deleting_target(
+    tmp_path: Path,
+) -> None:
+    import rquant.research_ingest as ingest_module
+
+    paths = _paths(tmp_path)
+    external_root = tmp_path / "external-transactions"
+    victim = external_root / "victim"
+    victim.mkdir(parents=True)
+    marker = victim / "keep.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+    paths.transactions_root.symlink_to(
+        external_root,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(RuntimeError, match="transactions root"):
+        ingest_module._recover_interrupted_publish(paths)
+
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_rollback_cas_never_overwrites_a_third_party_generation(tmp_path: Path) -> None:
     import rquant.research_ingest as ingest_module
 
@@ -1658,6 +1680,7 @@ def test_repair_partition_change_rejects_unbound_prior_evidence(
 def test_minute_repair_observation_is_parsed_and_resets_authority_stability(
     tmp_path: Path,
 ) -> None:
+    import rquant.research_ingest as ingest_module
     from rquant.research_ingest import (
         ResearchMinuteRepairObservation,
         ResearchMinuteRepairPartitionChange,
@@ -1751,6 +1774,64 @@ def test_minute_repair_observation_is_parsed_and_resets_authority_stability(
     ).hexdigest()
     assert next_result.stable_trading_days == 1
     assert next_result.stability_parent_sha256 is None
+
+    outside_manifest = tmp_path / "outside-minute-manifest.json"
+    outside_manifest.write_bytes(minute_manifest_path.read_bytes())
+    minute_manifest_path.unlink()
+    minute_manifest_path.symlink_to(outside_manifest)
+
+    tampered = inspect_research_authority(paths)
+
+    assert tampered.status == "invalid"
+    assert "lake_manifest_invalid" in tampered.issues
+    assert ingest_module._catalog_lake_integrity_issues(paths) == (
+        "catalog_lake_manifest_invalid",
+    )
+
+
+def test_existing_partition_reader_can_disable_disk_spill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_ingest as ingest_module
+    from rquant.research_lake import ResearchPartitionKey
+
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=_Adapter(trade_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    original_connect = ingest_module.duckdb.connect
+    configs: list[dict[str, str] | None] = []
+
+    def connect_spy(*args, **kwargs):
+        configs.append(kwargs.get("config"))
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_module.duckdb, "connect", connect_spy)
+
+    frame = ingest_module._query_existing_research_partition(
+        paths,
+        ResearchPartitionKey(
+            dataset="minute_bar",
+            trade_date=trade_date,
+            freq="1min",
+        ),
+        ("ts_code", "trade_time"),
+        memory_only=True,
+    )
+
+    assert not frame.empty
+    assert configs == [{"temp_directory": ""}]
 
 
 def test_same_date_auction_and_minute_repairs_keep_both_lake_bindings(

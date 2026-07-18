@@ -665,6 +665,8 @@ def _query_existing_research_partition(
     paths: ResearchIngestPaths,
     key: ResearchPartitionKey,
     columns: tuple[str, ...],
+    *,
+    memory_only: bool = False,
 ) -> pd.DataFrame:
     manifest_path = paths.lake_root / partition_manifest_relative_path(key)
     if not manifest_path.exists():
@@ -684,7 +686,8 @@ def _query_existing_research_partition(
     ):
         raise RuntimeError("research partition data hash mismatch")
     selected = ", ".join(columns)
-    with duckdb.connect() as connection:
+    connect_config = {"temp_directory": ""} if memory_only else {}
+    with duckdb.connect(config=connect_config) as connection:
         frame = connection.execute(
             f"SELECT {selected} FROM read_parquet(?)",
             [str(data_path)],
@@ -1200,8 +1203,17 @@ def _manifest_binding_issues(
         ...,
     ],
 ) -> tuple[str, ...]:
+    if (
+        not paths.catalog_path.is_file()
+        or paths.catalog_path.is_symlink()
+    ):
+        return ("research_catalog_unreadable",)
     try:
-        catalog_connection = duckdb.connect(str(paths.catalog_path), read_only=True)
+        catalog_connection = duckdb.connect(
+            str(paths.catalog_path),
+            read_only=True,
+            config={"temp_directory": ""},
+        )
     except Exception:
         return ("research_catalog_unreadable",)
     try:
@@ -1212,6 +1224,11 @@ def _manifest_binding_issues(
                 manifest.partition
             )
             data_path = paths.lake_root / manifest.relative_path
+            if not _is_regular_file_within(
+                paths.lake_root,
+                manifest_path,
+            ):
+                return ("lake_manifest_invalid",)
             try:
                 observed_manifest = ResearchPartitionManifest.model_validate_json(
                     manifest_path.read_text(encoding="utf-8")
@@ -1226,8 +1243,7 @@ def _manifest_binding_issues(
             if observed_manifest != manifest:
                 return ("lake_manifest_mismatch",)
             if (
-                not data_path.is_file()
-                or data_path.is_symlink()
+                not _is_regular_file_within(paths.lake_root, data_path)
                 or data_path.stat().st_size != manifest.file_size
                 or _file_sha256(data_path) != manifest.file_hash
             ):
@@ -1255,10 +1271,33 @@ def _manifest_binding_issues(
     return ()
 
 
+def _is_regular_file_within(root: Path, candidate: Path) -> bool:
+    if root.is_symlink() or not root.is_dir():
+        return False
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return False
+    if not candidate.is_file():
+        return False
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve()
+    return resolved_root in resolved_candidate.parents
+
+
 def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...]:
     """Hash every catalog partition; used at bootstrap and promotion boundaries."""
     try:
-        with duckdb.connect(str(paths.catalog_path), read_only=True) as connection:
+        with duckdb.connect(
+            str(paths.catalog_path),
+            read_only=True,
+            config={"temp_directory": ""},
+        ) as connection:
             rows = connection.execute(
                 """
                 SELECT relative_path, content_hash, file_hash, manifest_json
@@ -1273,6 +1312,11 @@ def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...
             manifest = ResearchPartitionManifest.model_validate_json(manifest_json)
             manifest_path = paths.lake_root / partition_manifest_relative_path(manifest.partition)
             data_path = paths.lake_root / manifest.relative_path
+            if not _is_regular_file_within(
+                paths.lake_root,
+                manifest_path,
+            ):
+                return ("catalog_lake_manifest_invalid",)
             observed_manifest = ResearchPartitionManifest.model_validate_json(
                 manifest_path.read_text(encoding="utf-8")
             )
@@ -1287,8 +1331,7 @@ def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...
         ):
             return ("catalog_lake_record_mismatch",)
         if (
-            not data_path.is_file()
-            or data_path.is_symlink()
+            not _is_regular_file_within(paths.lake_root, data_path)
             or data_path.stat().st_size != manifest.file_size
             or _file_sha256(data_path) != manifest.file_hash
         ):
@@ -1738,9 +1781,16 @@ def _remove_transaction_root(transaction_root: Path) -> None:
 
 
 def _recover_interrupted_publish(paths: ResearchIngestPaths) -> None:
-    if not paths.transactions_root.exists():
+    transactions_root = paths.transactions_root
+    if transactions_root.is_symlink() or (
+        transactions_root.exists() and not transactions_root.is_dir()
+    ):
+        raise RuntimeError(
+            f"invalid research transactions root: {transactions_root}"
+        )
+    if not transactions_root.exists():
         return
-    for transaction_root in sorted(paths.transactions_root.iterdir()):
+    for transaction_root in sorted(transactions_root.iterdir()):
         if not transaction_root.is_dir() or transaction_root.is_symlink():
             raise RuntimeError(f"invalid research transaction path: {transaction_root}")
         journal_paths = {

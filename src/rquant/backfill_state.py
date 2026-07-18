@@ -219,15 +219,29 @@ class BackfillStateStore:
                 raise ValueError(
                     f"read-only backfill state database is invalid: {self.path}"
                 )
+            self._require_checkpointed_snapshot()
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize()
+
+    def _require_checkpointed_snapshot(self) -> None:
+        sidecars = tuple(
+            self.path.with_name(f"{self.path.name}{suffix}")
+            for suffix in ("-wal", "-shm", "-journal")
+        )
+        if any(path.is_symlink() or path.exists() for path in sidecars):
+            raise ValueError(
+                "read-only backfill state database must be checkpointed"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         target: Path | str = self.path
         connect_kwargs: dict[str, object] = {}
         if self.read_only:
-            target = f"{self.path.resolve().as_uri()}?mode=ro"
+            self._require_checkpointed_snapshot()
+            target = (
+                f"{self.path.resolve().as_uri()}?mode=ro&immutable=1"
+            )
             connect_kwargs["uri"] = True
         connection = sqlite3.connect(
             target,
@@ -240,6 +254,7 @@ class BackfillStateStore:
         connection.execute("PRAGMA foreign_keys = ON")
         if self.read_only:
             connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA temp_store = MEMORY")
         return connection
 
     @contextmanager

@@ -575,9 +575,42 @@ def test_readonly_store_loads_state_but_rejects_writes(
     writable = BackfillStateStore(path)
     manifest = _manifest()
     writable.persist_manifest(manifest)
+    before_bytes = path.read_bytes()
+    before_entries = tuple(sorted(item.name for item in tmp_path.iterdir()))
 
     readonly = BackfillStateStore(path, read_only=True)
 
     assert readonly.load_manifest(manifest.manifest_id) is not None
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         readonly.persist_manifest(manifest)
+    assert path.read_bytes() == before_bytes
+    assert tuple(sorted(item.name for item in tmp_path.iterdir())) == before_entries
+
+
+def test_readonly_store_rejects_an_uncheckpointed_wal(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import BackfillStateStore
+
+    path = tmp_path / "backfill.sqlite3"
+    writable = BackfillStateStore(path)
+    manifest = _manifest()
+    writable.persist_manifest(manifest)
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute(
+            """
+            UPDATE backfill_manifest
+            SET updated_at = '2026-07-18T12:00:00.000000Z'
+            WHERE manifest_id = ?
+            """,
+            (manifest.manifest_id,),
+        )
+        writer.commit()
+        assert path.with_name(f"{path.name}-wal").is_file()
+
+        with pytest.raises(ValueError, match="checkpointed"):
+            BackfillStateStore(path, read_only=True)
+    finally:
+        writer.close()

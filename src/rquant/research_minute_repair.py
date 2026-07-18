@@ -570,10 +570,12 @@ def assess_minute_repair_scope(
         catalog=ResearchCatalog(paths.catalog_path, read_only=True),
         lake_root=paths.lake_root,
         as_of_time=as_of_time,
+        memory_only=True,
     )
     lake_required = required_keys & lake_complete
     missing_keys = required_keys - lake_required
     with DuckDBStore(source_database, read_only=True) as source:
+        source._conn.execute("SET temp_directory = ''")
         operational_complete = _complete_minute_sessions(
             source,
             plan.windows,
@@ -623,7 +625,11 @@ def _load_existing_minute_manifest(
 ) -> tuple[ResearchPartitionManifest | None, str | None]:
     key = _minute_partition_key(trade_date)
     manifest_path = paths.lake_root / partition_manifest_relative_path(key)
-    with duckdb.connect(str(paths.catalog_path), read_only=True) as catalog:
+    with duckdb.connect(
+        str(paths.catalog_path),
+        read_only=True,
+        config={"temp_directory": ""},
+    ) as catalog:
         row = catalog.execute(
             """
             SELECT relative_path, content_hash, file_hash, manifest_json
@@ -751,7 +757,11 @@ def _build_prepared_minute_repair(
     merged_by_date: dict[date, pd.DataFrame] = {}
     existing_manifests: dict[date, ResearchPartitionManifest | None] = {}
     source_database = Path(source_database)
-    with duckdb.connect(str(source_database), read_only=True) as source:
+    with duckdb.connect(
+        str(source_database),
+        read_only=True,
+        config={"temp_directory": ""},
+    ) as source:
         for trade_date in sorted(sessions_by_date):
             targets = tuple(
                 sorted(
@@ -766,6 +776,7 @@ def _build_prepared_minute_repair(
                 paths,
                 _minute_partition_key(trade_date),
                 _MINUTE_COLUMNS,
+                memory_only=True,
             )
             operational = _query_operational_minute_rows(
                 source,
@@ -1379,6 +1390,11 @@ def rollback_research_minute_repair_publish(
     )
     if journal.transaction_id != transaction_root.name:
         raise RuntimeError("minute repair journal transaction mismatch")
+    repair_dates = tuple(entry.trade_date for entry in journal.entries)
+    if repair_dates != tuple(sorted(set(repair_dates))):
+        raise RuntimeError(
+            "minute repair journal dates must be ordered and unique"
+        )
     catalog_targets = (
         (
             paths.catalog_path,
@@ -1403,7 +1419,22 @@ def rollback_research_minute_repair_publish(
     if observations_root not in journal.observation_path.resolve().parents:
         raise RuntimeError("minute repair observation path escaped state root")
 
-    with exclusive_file_lock(ResearchCatalog(paths.catalog_path).lock_path):
+    with ExitStack() as stack:
+        for trade_date in repair_dates:
+            stack.enter_context(
+                exclusive_file_lock(
+                    paths.lake_root
+                    / partition_directory(
+                        _minute_partition_key(trade_date)
+                    )
+                    / ".export.lock"
+                )
+            )
+        stack.enter_context(
+            exclusive_file_lock(
+                ResearchCatalog(paths.catalog_path).lock_path
+            )
+        )
         for target, backup, before_hash, after_hash in catalog_targets:
             if target.is_symlink() or (
                 target.exists() and not target.is_file()
@@ -1597,14 +1628,15 @@ def run_research_minute_repair(
             plan=prepared.plan,
         )
 
+    _require_outside_market_protection(generated_at)
     _mkdir_durable(paths.state_dir)
     with exclusive_file_lock(paths.publish_lock_path):
+        generated_at = _require_outside_market_protection(clock())
         _recover_interrupted_publish(paths)
 
         def publish_guard() -> None:
             _require_outside_market_protection(clock())
 
-        publish_guard()
         prepared = _build_prepared_minute_repair(
             source_database=source_database,
             paths=paths,

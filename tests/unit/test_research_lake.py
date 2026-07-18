@@ -169,6 +169,7 @@ def test_read_only_catalog_never_creates_or_mutates_files(tmp_path: Path) -> Non
 def test_export_writes_valid_parquet_manifest_and_catalog(
     source_connection: duckdb.DuckDBPyConnection,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lake_root = tmp_path / "lake"
     catalog = ResearchCatalog(tmp_path / "research.duckdb")
@@ -237,6 +238,31 @@ def test_export_writes_valid_parquet_manifest_and_catalog(
     assert coverage.row_count == 2
     assert coverage.earliest_date == date(2026, 7, 14)
     assert coverage.latest_date == date(2026, 7, 14)
+
+    original_connect = research_lake_module.duckdb.connect
+    configs: list[dict[str, str] | None] = []
+
+    def connect_spy(*args, **kwargs):
+        configs.append(kwargs.get("config"))
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        research_lake_module.duckdb,
+        "connect",
+        connect_spy,
+    )
+    research_lake_module.verify_research_partition(
+        lake_root=lake_root,
+        manifest=research_lake_module.ResearchPartitionManifest.model_validate_json(
+            manifest_path.read_text(encoding="utf-8")
+        ),
+        as_of_time=datetime(2026, 7, 15, tzinfo=UTC),
+    )
+
+    assert configs == [
+        {"temp_directory": ""},
+        {"temp_directory": ""},
+    ]
 
 
 def test_same_partition_is_idempotent_and_change_records_replacement(

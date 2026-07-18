@@ -98,14 +98,17 @@ manifest 无关的来源或代码。
 
 apply 共用 `research-publish.lock`，并在锁内：
 
-1. 恢复任何未完成的 daily、auction-repair 或 minute-repair 事务。
-2. 重新加载回补状态、权威链、catalog、研究湖与生产源并生成计划。
-3. 比对用户确认的 `plan_id`。
-4. 复制 catalog，在事务目录中生成全部受影响分区和只读 catalog。
-5. 写入包含所有 CAS 前后哈希的 minute-repair journal。
-6. 发布新 immutable versions、全部 manifests、主 catalog、只读 catalog、
+1. 在创建目录或获取发布锁前检查交易保护窗口；取得锁后再次检查，保护窗口内连 interrupted
+   recovery 也只延期、不写生产文件。
+2. 恢复任何未完成的 daily、auction-repair 或 minute-repair 事务；minute rollback 按
+   日期顺序持有全部分区锁，再持 catalog 锁。
+3. 重新加载回补状态、权威链、catalog、研究湖与生产源并生成计划。
+4. 比对用户确认的 `plan_id`。
+5. 复制 catalog，在事务目录中生成全部受影响分区和只读 catalog。
+6. 写入包含所有 CAS 前后哈希的 minute-repair journal。
+7. 发布新 immutable versions、全部 manifests、主 catalog、只读 catalog、
    repair observation 和 authority current。
-7. 全部完成后删除 journal 与事务目录。
+8. 全部完成后删除 journal 与事务目录。
 
 任一步失败都先完整预检全部 CAS 目标，再整体恢复旧 manifests、主副 catalog 和
 authority；只删除本事务新建且原先不存在的 immutable versions。不能出现逐日部分提交。

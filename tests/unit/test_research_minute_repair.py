@@ -423,7 +423,9 @@ def test_minute_repair_returns_unchanged_when_every_window_is_unavailable(
 
 def test_assess_scope_only_repairs_complete_operational_sessions_missing_from_lake(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import rquant.backfill_manifest as manifest_module
     from rquant.research_catalog import ResearchCatalog
     from rquant.research_lake import export_research_dataset
     from rquant.research_minute_repair import (
@@ -469,6 +471,14 @@ def test_assess_scope_only_repairs_complete_operational_sessions_missing_from_la
             now=lambda: datetime(2026, 7, 18, 8, 30, tzinfo=UTC),
             as_of_date=target_dates[-1],
         )
+    original_connect = manifest_module.duckdb.connect
+    connect_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def connect_spy(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(manifest_module.duckdb, "connect", connect_spy)
 
     scope = assess_minute_repair_scope(
         source_database=source_path,
@@ -477,6 +487,16 @@ def test_assess_scope_only_repairs_complete_operational_sessions_missing_from_la
         as_of_time=datetime(2026, 7, 18, 9, 0, tzinfo=UTC),
     )
 
+    in_memory_configs = [
+        kwargs.get("config")
+        for args, kwargs in connect_calls
+        if not args and "database" not in kwargs
+    ]
+    assert in_memory_configs
+    assert all(
+        config == {"temp_directory": ""}
+        for config in in_memory_configs
+    )
     assert scope.required_session_count == 3
     assert scope.lake_complete_session_count == 1
     assert scope.missing_sessions == (
@@ -749,7 +769,11 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
     before_current = current_path.read_bytes()
     before_catalog = hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest()
     original_catalog = repair_module.ResearchCatalog
+    original_existing_reader = (
+        repair_module._query_existing_research_partition
+    )
     catalog_modes: list[bool] = []
+    existing_reader_modes: list[bool] = []
 
     class CatalogSpy(original_catalog):
         def __init__(self, path: Path, *, read_only: bool = False) -> None:
@@ -757,6 +781,20 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
             super().__init__(path, read_only=read_only)
 
     monkeypatch.setattr(repair_module, "ResearchCatalog", CatalogSpy)
+
+    def existing_reader_spy(*args, memory_only: bool = False, **kwargs):
+        existing_reader_modes.append(memory_only)
+        return original_existing_reader(
+            *args,
+            memory_only=memory_only,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        repair_module,
+        "_query_existing_research_partition",
+        existing_reader_spy,
+    )
 
     first = build_research_minute_repair_plan(
         source_database=operational_path,
@@ -796,6 +834,8 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
     )
     assert all(day.source_row_count == 241 for day in first.days)
     assert catalog_modes == [True, True]
+    assert existing_reader_modes
+    assert all(existing_reader_modes)
     assert current_path.read_bytes() == before_current
     assert hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest() == before_catalog
 
@@ -1188,6 +1228,57 @@ def test_minute_repair_rechecks_protection_before_each_live_version(
     )
 
 
+def test_minute_repair_rejects_market_window_before_recovery_or_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    before_lock = paths.publish_lock_path.stat()
+    recovery_called = False
+
+    def recovery_spy(_paths) -> None:
+        nonlocal recovery_called
+        recovery_called = True
+
+    monkeypatch.setattr(
+        repair_module,
+        "_recover_interrupted_publish",
+        recovery_spy,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="forbidden during market protection window",
+    ):
+        repair_module.run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=lambda: datetime(2026, 7, 20, 10, 0, tzinfo=_CST),
+        )
+
+    assert recovery_called is False
+    after_lock = paths.publish_lock_path.stat()
+    assert after_lock.st_ino == before_lock.st_ino
+    assert after_lock.st_mtime_ns == before_lock.st_mtime_ns
+
+
 def test_next_apply_recovers_an_interrupted_minute_repair_journal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1239,6 +1330,38 @@ def test_next_apply_recovers_an_interrupted_minute_repair_journal(
         "rollback_research_minute_repair_publish",
         original_rollback,
     )
+    original_recovery = repair_module._recover_interrupted_publish
+    original_lock = repair_module.exclusive_file_lock
+    recovery_active = False
+    recovery_locks: list[Path] = []
+
+    def tracked_recovery(recovery_paths) -> None:
+        nonlocal recovery_active
+        recovery_active = True
+        try:
+            original_recovery(recovery_paths)
+        finally:
+            recovery_active = False
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def tracked_lock(lock_path: Path):
+        if recovery_active:
+            recovery_locks.append(lock_path)
+        with original_lock(lock_path):
+            yield
+
+    monkeypatch.setattr(
+        repair_module,
+        "_recover_interrupted_publish",
+        tracked_recovery,
+    )
+    monkeypatch.setattr(
+        repair_module,
+        "exclusive_file_lock",
+        tracked_lock,
+    )
 
     recovered = repair_module.run_research_minute_repair(
         source_database=operational_path,
@@ -1253,6 +1376,24 @@ def test_next_apply_recovers_an_interrupted_minute_repair_journal(
 
     assert recovered.status == "candidate"
     assert not tuple(paths.transactions_root.glob("**/*journal.json"))
+    expected_partition_locks = [
+        paths.lake_root
+        / "minute"
+        / "freq=1min"
+        / f"year={trade_date.year:04d}"
+        / f"month={trade_date.month:02d}"
+        / f"trade_date={trade_date.isoformat()}"
+        / ".export.lock"
+        for trade_date in (
+            date(2026, 7, 13),
+            date(2026, 7, 14),
+            date(2026, 7, 15),
+        )
+    ]
+    assert recovery_locks == [
+        *expected_partition_locks,
+        repair_module.ResearchCatalog(paths.catalog_path).lock_path,
+    ]
 
 
 def test_minute_repair_apply_rejects_source_drift_after_preview(
