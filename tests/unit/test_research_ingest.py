@@ -1635,3 +1635,226 @@ def test_repair_partition_change_rejects_unbound_prior_evidence(
             before_manifest=manifest,
             after_manifest=manifest,
         )
+
+
+def test_minute_repair_observation_is_parsed_and_resets_authority_stability(
+    tmp_path: Path,
+) -> None:
+    from rquant.research_ingest import (
+        ResearchMinuteRepairObservation,
+        ResearchMinuteRepairPartitionChange,
+    )
+
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    daily = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=_Adapter(trade_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    current_path = paths.state_dir / "research-authority-current.json"
+    parent_hash = hashlib.sha256(current_path.read_bytes()).hexdigest()
+    minute_manifest = daily.minute.export.partitions[0].manifest
+    assert minute_manifest is not None
+    minute_manifest_path = (
+        paths.lake_root
+        / "minute"
+        / "freq=1min"
+        / f"year={trade_date.year:04d}"
+        / f"month={trade_date.month:02d}"
+        / f"trade_date={trade_date.isoformat()}"
+        / "manifest.json"
+    )
+    repair = ResearchMinuteRepairObservation(
+        observation_id="research-minute-repair-20260718T080000Z-test",
+        bootstrap_snapshot_id=_SNAPSHOT_ID,
+        trade_date=trade_date,
+        generated_at=datetime(2026, 7, 18, 16, 0, tzinfo=_CST),
+        code_commit=_COMMIT,
+        manifest_id="e" * 64,
+        plan_id="f" * 64,
+        previous_observation_sha256=parent_hash,
+        catalog_before_sha256=daily.catalog_sha256,
+        catalog_sha256=daily.catalog_sha256,
+        readonly_catalog_before_sha256=daily.readonly_catalog_sha256,
+        readonly_catalog_sha256=daily.readonly_catalog_sha256,
+        repairs=(
+            ResearchMinuteRepairPartitionChange(
+                trade_date=trade_date,
+                before_manifest_sha256=None,
+                after_manifest_sha256=_sha256(minute_manifest_path),
+                before_content_hash=None,
+                before_manifest=None,
+                after_manifest=minute_manifest,
+            ),
+        ),
+    )
+    payload = (repair.model_dump_json(indent=2) + "\n").encode()
+    observation_path = (
+        paths.state_dir
+        / "research_observations"
+        / f"trade_date={trade_date.isoformat()}"
+        / f"{repair.observation_id}.json"
+    )
+    observation_path.parent.mkdir(parents=True, exist_ok=True)
+    observation_path.write_bytes(payload)
+    current_path.write_bytes(payload)
+
+    status = inspect_research_authority(paths)
+
+    assert status.status == "candidate"
+    assert status.latest_trade_date == trade_date
+    assert status.stable_trading_days == 0
+    assert status.eligible_for_promotion is False
+    assert status.issues == ()
+
+    next_date = date(2026, 7, 18)
+    next_source = tmp_path / "next-source.duckdb"
+    _seed_source(next_source, next_date)
+    _write_watchlist(tmp_path, next_date)
+    next_result = run_daily_research_ingest(
+        source_database=next_source,
+        paths=paths,
+        trade_date=next_date,
+        adapter=_Adapter(next_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 18, 16, 0, tzinfo=_CST),
+    )
+
+    assert next_result.previous_observation_sha256 == hashlib.sha256(
+        payload
+    ).hexdigest()
+    assert next_result.stable_trading_days == 1
+    assert next_result.stability_parent_sha256 is None
+
+
+def test_same_date_auction_and_minute_repairs_keep_both_lake_bindings(
+    tmp_path: Path,
+) -> None:
+    from rquant.research_ingest import (
+        ResearchMinuteRepairObservation,
+        ResearchMinuteRepairPartitionChange,
+    )
+
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    daily = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=_Adapter(trade_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    current_path = paths.state_dir / "research-authority-current.json"
+    daily_hash = hashlib.sha256(current_path.read_bytes()).hexdigest()
+    auction_manifest = daily.auction.export.partitions[0].manifest
+    minute_manifest = daily.minute.export.partitions[0].manifest
+    assert auction_manifest is not None
+    assert minute_manifest is not None
+    auction_manifest_path = (
+        paths.lake_root
+        / "auction"
+        / f"year={trade_date.year:04d}"
+        / f"month={trade_date.month:02d}"
+        / f"trade_date={trade_date.isoformat()}"
+        / "manifest.json"
+    )
+    minute_manifest_path = (
+        paths.lake_root
+        / "minute"
+        / "freq=1min"
+        / f"year={trade_date.year:04d}"
+        / f"month={trade_date.month:02d}"
+        / f"trade_date={trade_date.isoformat()}"
+        / "manifest.json"
+    )
+    auction_repair = ResearchAuctionRepairObservation(
+        observation_id="research-auction-repair-same-date-test",
+        bootstrap_snapshot_id=_SNAPSHOT_ID,
+        trade_date=trade_date,
+        generated_at=datetime(2026, 7, 18, 15, 30, tzinfo=_CST),
+        code_commit=_COMMIT,
+        plan_id="a" * 64,
+        previous_observation_sha256=daily_hash,
+        catalog_before_sha256=daily.catalog_sha256,
+        catalog_sha256=daily.catalog_sha256,
+        readonly_catalog_before_sha256=daily.readonly_catalog_sha256,
+        readonly_catalog_sha256=daily.readonly_catalog_sha256,
+        repairs=(
+            ResearchAuctionRepairPartitionChange(
+                trade_date=trade_date,
+                before_manifest_sha256=None,
+                after_manifest_sha256=_sha256(auction_manifest_path),
+                before_content_hash=None,
+                before_manifest=None,
+                after_manifest=auction_manifest,
+            ),
+        ),
+    )
+    auction_payload = (
+        auction_repair.model_dump_json(indent=2) + "\n"
+    ).encode()
+    auction_observation_path = (
+        paths.state_dir
+        / "research_observations"
+        / f"trade_date={trade_date.isoformat()}"
+        / f"{auction_repair.observation_id}.json"
+    )
+    auction_observation_path.write_bytes(auction_payload)
+    current_path.write_bytes(auction_payload)
+
+    minute_repair = ResearchMinuteRepairObservation(
+        observation_id="research-minute-repair-same-date-test",
+        bootstrap_snapshot_id=_SNAPSHOT_ID,
+        trade_date=trade_date,
+        generated_at=datetime(2026, 7, 18, 16, 0, tzinfo=_CST),
+        code_commit=_COMMIT,
+        manifest_id="b" * 64,
+        plan_id="c" * 64,
+        previous_observation_sha256=hashlib.sha256(auction_payload).hexdigest(),
+        catalog_before_sha256=daily.catalog_sha256,
+        catalog_sha256=daily.catalog_sha256,
+        readonly_catalog_before_sha256=daily.readonly_catalog_sha256,
+        readonly_catalog_sha256=daily.readonly_catalog_sha256,
+        repairs=(
+            ResearchMinuteRepairPartitionChange(
+                trade_date=trade_date,
+                before_manifest_sha256=None,
+                after_manifest_sha256=_sha256(minute_manifest_path),
+                before_content_hash=None,
+                before_manifest=None,
+                after_manifest=minute_manifest,
+            ),
+        ),
+    )
+    minute_payload = (
+        minute_repair.model_dump_json(indent=2) + "\n"
+    ).encode()
+    minute_observation_path = (
+        paths.state_dir
+        / "research_observations"
+        / f"trade_date={trade_date.isoformat()}"
+        / f"{minute_repair.observation_id}.json"
+    )
+    minute_observation_path.write_bytes(minute_payload)
+    current_path.write_bytes(minute_payload)
+
+    assert inspect_research_authority(paths).issues == ()
+
+    auction_manifest_path.write_text("{}\n", encoding="utf-8")
+    tampered = inspect_research_authority(paths)
+
+    assert tampered.status == "invalid"
+    assert "lake_manifest_invalid" in tampered.issues

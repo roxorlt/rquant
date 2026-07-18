@@ -8,9 +8,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-
 _COMMIT = "a" * 40
 _CST = ZoneInfo("Asia/Shanghai")
+
+
+def _repair_clock() -> datetime:
+    return datetime(2026, 7, 18, 16, 0, tzinfo=_CST)
 
 
 def _paths(tmp_path: Path):
@@ -172,6 +175,47 @@ def _minute_plan():
             confidence_reasons=("fixture",),
         ),
     )
+
+
+def _seed_minute_repair_case(tmp_path: Path):
+    from rquant.backfill_manifest import backfill_state_input
+    from rquant.backfill_state import BackfillStateStore
+    from rquant.research_ingest import run_daily_research_ingest
+    from rquant.storage.duckdb import DuckDBStore
+    from tests.unit.test_research_ingest import (
+        _Adapter,
+        _seed_bootstrap_candidate,
+        _seed_source,
+        _write_watchlist,
+    )
+
+    paths = _paths(tmp_path)
+    authority_date = date(2026, 7, 17)
+    daily_source = tmp_path / "daily-source.duckdb"
+    _seed_source(daily_source, authority_date)
+    _seed_bootstrap_candidate(tmp_path, paths=paths)
+    _write_watchlist(tmp_path, authority_date, paths=paths)
+    run_daily_research_ingest(
+        source_database=daily_source,
+        paths=paths,
+        trade_date=authority_date,
+        adapter=_Adapter(authority_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    operational_path = tmp_path / "operational-ro.duckdb"
+    backfill_plan = _minute_plan()
+    with DuckDBStore(operational_path) as source:
+        for window in backfill_plan.windows:
+            for trade_date in window.open_dates:
+                _insert_minute_session(
+                    source,
+                    ts_code=window.ts_code,
+                    trade_date=trade_date,
+                )
+    state = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    state.persist_manifest(backfill_state_input(backfill_plan))
+    return paths, state, operational_path, backfill_plan
 
 
 def test_load_completed_backfill_plan_reconstructs_exact_persisted_payload(
@@ -576,6 +620,10 @@ def test_minute_repair_plan_id_is_stable_and_changes_with_day_content() -> None:
 
     assert restored.plan_id == plan.plan_id
     assert changed.plan_id != plan.plan_id
+    invalid_action = plan.model_dump(mode="json")
+    invalid_action["action_id"] = "forged-action"
+    with pytest.raises(ValueError, match="action_id"):
+        ResearchMinuteRepairPlan.model_validate(invalid_action)
 
 
 def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bound(
@@ -658,3 +706,387 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
     assert all(day.source_row_count == 241 for day in first.days)
     assert current_path.read_bytes() == before_current
     assert hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest() == before_catalog
+
+
+def test_run_minute_repair_atomically_publishes_all_days_and_becomes_unchanged(
+    tmp_path: Path,
+) -> None:
+    import duckdb
+
+    from rquant.backfill_manifest import backfill_state_input
+    from rquant.backfill_state import BackfillStateStore
+    from rquant.research_ingest import (
+        inspect_research_authority,
+        run_daily_research_ingest,
+    )
+    from rquant.research_lake import (
+        ResearchPartitionKey,
+        ResearchPartitionManifest,
+        partition_manifest_relative_path,
+    )
+    from rquant.research_minute_repair import run_research_minute_repair
+    from rquant.storage.duckdb import DuckDBStore
+    from tests.unit.test_research_ingest import (
+        _Adapter,
+        _seed_bootstrap_candidate,
+        _seed_source,
+        _write_watchlist,
+    )
+
+    paths = _paths(tmp_path)
+    authority_date = date(2026, 7, 17)
+    daily_source = tmp_path / "daily-source.duckdb"
+    _seed_source(daily_source, authority_date)
+    _seed_bootstrap_candidate(tmp_path, paths=paths)
+    _write_watchlist(tmp_path, authority_date, paths=paths)
+    run_daily_research_ingest(
+        source_database=daily_source,
+        paths=paths,
+        trade_date=authority_date,
+        adapter=_Adapter(authority_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    operational_path = tmp_path / "operational-ro.duckdb"
+    backfill_plan = _minute_plan()
+    with DuckDBStore(operational_path) as source:
+        for window in backfill_plan.windows:
+            for trade_date in window.open_dates:
+                _insert_minute_session(
+                    source,
+                    ts_code=window.ts_code,
+                    trade_date=trade_date,
+                )
+    state = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    state.persist_manifest(backfill_state_input(backfill_plan))
+    preview = run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    applied = run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        apply=True,
+        plan_id=preview.plan_id,
+        now=_repair_clock,
+    )
+
+    assert preview.status == "planned"
+    assert applied.status == "candidate"
+    assert applied.observation is not None
+    assert applied.observation.manifest_id == backfill_plan.manifest.manifest_id
+    assert applied.observation.plan_id == preview.plan_id
+    assert len(applied.observation.repairs) == 3
+    assert inspect_research_authority(paths).stable_trading_days == 0
+    assert not tuple(paths.transactions_root.glob("**/*journal.json"))
+    for trade_date in (
+        date(2026, 7, 13),
+        date(2026, 7, 14),
+        date(2026, 7, 15),
+    ):
+        key = ResearchPartitionKey(
+            dataset="minute_bar",
+            trade_date=trade_date,
+            freq="1min",
+        )
+        manifest_path = paths.lake_root / partition_manifest_relative_path(key)
+        manifest = ResearchPartitionManifest.model_validate_json(
+            manifest_path.read_text(encoding="utf-8")
+        )
+        with duckdb.connect() as connection:
+            row_count = connection.execute(
+                "SELECT COUNT(*) FROM read_parquet(?)",
+                [str(paths.lake_root / manifest.relative_path)],
+            ).fetchone()[0]
+        assert row_count == 241
+
+    unchanged = run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+
+    assert unchanged.status == "unchanged"
+    assert unchanged.plan.missing_session_count == 0
+    assert unchanged.plan.days == ()
+
+
+def test_plan_baseline_rejects_a_symlinked_manifest_even_when_hash_matches(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    import rquant.research_minute_repair as repair_module
+    from rquant.research_lake import partition_manifest_relative_path
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    day = preview.plan.days[0]
+    target = tmp_path / "manifest-target.json"
+    target.write_text('{"fixture":true}\n', encoding="utf-8")
+    target_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    manifest_path = (
+        paths.lake_root
+        / partition_manifest_relative_path(
+            repair_module._minute_partition_key(day.trade_date)
+        )
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.symlink_to(target)
+    bound_plan = preview.plan.model_copy(
+        update={
+            "days": (
+                day.model_copy(
+                    update={"existing_manifest_sha256": target_hash}
+                ),
+                *preview.plan.days[1:],
+            )
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="invalid minute manifest path"):
+        repair_module._verify_plan_baseline(paths, bound_plan)
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    [
+        "versions_published",
+        "manifests_published",
+        "catalog_published",
+        "readonly_published",
+        "authority_published",
+    ],
+)
+def test_minute_repair_publish_failure_rolls_back_every_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_step: str,
+) -> None:
+    import hashlib
+
+    import rquant.research_minute_repair as repair_module
+    from rquant.research_lake import (
+        ResearchPartitionKey,
+        partition_directory,
+        partition_manifest_relative_path,
+    )
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    before = {
+        "catalog": hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest(),
+        "readonly": hashlib.sha256(
+            paths.readonly_catalog_path.read_bytes()
+        ).hexdigest(),
+        "current": (
+            paths.state_dir / "research-authority-current.json"
+        ).read_bytes(),
+        "observations": tuple(
+            sorted(
+                path.relative_to(paths.state_dir).as_posix()
+                for path in (
+                    paths.state_dir / "research_observations"
+                ).glob("**/*.json")
+            )
+        ),
+    }
+
+    def fail_at(step: str) -> None:
+        if step == failure_step:
+            raise RuntimeError(f"injected failure at {step}")
+
+    monkeypatch.setattr(repair_module, "_publish_step_hook", fail_at)
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        repair_module.run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=_repair_clock,
+        )
+
+    assert hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest() == before[
+        "catalog"
+    ]
+    assert hashlib.sha256(
+        paths.readonly_catalog_path.read_bytes()
+    ).hexdigest() == before["readonly"]
+    assert (
+        paths.state_dir / "research-authority-current.json"
+    ).read_bytes() == before["current"]
+    assert tuple(
+        sorted(
+            path.relative_to(paths.state_dir).as_posix()
+            for path in (
+                paths.state_dir / "research_observations"
+            ).glob("**/*.json")
+        )
+    ) == before["observations"]
+    assert not paths.transactions_root.exists() or not tuple(
+        paths.transactions_root.iterdir()
+    )
+    for trade_date in (
+        date(2026, 7, 13),
+        date(2026, 7, 14),
+        date(2026, 7, 15),
+    ):
+        key = ResearchPartitionKey(
+            dataset="minute_bar",
+            trade_date=trade_date,
+            freq="1min",
+        )
+        assert not (
+            paths.lake_root / partition_manifest_relative_path(key)
+        ).exists()
+        versions = (
+            paths.lake_root / partition_directory(key) / "versions"
+        )
+        assert not versions.exists() or not tuple(versions.iterdir())
+
+
+def test_next_apply_recovers_an_interrupted_minute_repair_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    original_rollback = repair_module.rollback_research_minute_repair_publish
+
+    def fail_after_catalog(step: str) -> None:
+        if step == "catalog_published":
+            raise RuntimeError("simulated process interruption")
+
+    def leave_journal(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated unavailable rollback")
+
+    monkeypatch.setattr(repair_module, "_publish_step_hook", fail_after_catalog)
+    monkeypatch.setattr(
+        repair_module,
+        "rollback_research_minute_repair_publish",
+        leave_journal,
+    )
+    with pytest.raises(RuntimeError, match="rollback is pending"):
+        repair_module.run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=_repair_clock,
+        )
+    assert tuple(paths.transactions_root.glob("**/minute-repair-journal.json"))
+
+    monkeypatch.setattr(repair_module, "_publish_step_hook", lambda _step: None)
+    monkeypatch.setattr(
+        repair_module,
+        "rollback_research_minute_repair_publish",
+        original_rollback,
+    )
+
+    recovered = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        apply=True,
+        plan_id=preview.plan_id,
+        now=_repair_clock,
+    )
+
+    assert recovered.status == "candidate"
+    assert not tuple(paths.transactions_root.glob("**/*journal.json"))
+
+
+def test_minute_repair_apply_rejects_source_drift_after_preview(
+    tmp_path: Path,
+) -> None:
+    import duckdb
+
+    from rquant.research_minute_repair import run_research_minute_repair
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    current_path = paths.state_dir / "research-authority-current.json"
+    before_current = current_path.read_bytes()
+    with duckdb.connect(str(operational_path)) as connection:
+        connection.execute(
+            """
+            UPDATE minute_bar
+            SET close = close + 0.01
+            WHERE ts_code = '000001.SZ'
+              AND trade_time = TIMESTAMP '2026-07-14 09:30:00'
+              AND freq = '1min'
+              AND source = 'tushare'
+            """
+        )
+
+    with pytest.raises(ValueError, match="stale minute repair plan"):
+        run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=_repair_clock,
+        )
+
+    assert current_path.read_bytes() == before_current
+    assert not tuple(paths.transactions_root.glob("**/*journal.json"))
