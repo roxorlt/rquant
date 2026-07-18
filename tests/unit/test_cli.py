@@ -1091,6 +1091,183 @@ class TestResearchMinuteRepair:
         assert output["plan_id"] == "f" * 64
 
 
+class TestFormalSmokeReplay:
+    def test_parser_requires_exact_formal_evidence(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "formal-smoke-replay",
+                "--strategy",
+                "n_shape",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-02",
+                "--audit-run-id",
+                "a" * 64,
+                "--snapshot-id",
+                "b" * 64,
+                "--binding-hash",
+                "c" * 64,
+                "--output-dir",
+                "/tmp/formal-smoke",
+            ]
+        )
+
+        assert args.command == "formal-smoke-replay"
+        assert args.strategy == "n_shape"
+        assert args.start_date == date(2026, 4, 1)
+        assert args.end_date == date(2026, 7, 2)
+        assert args.audit_run_id == "a" * 64
+        assert args.snapshot_id == "b" * 64
+        assert args.binding_hash == "c" * 64
+        assert args.output_dir == Path("/tmp/formal-smoke")
+
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "formal-smoke-replay",
+                    "--strategy",
+                    "n_shape",
+                    "--start-date",
+                    "2026-04-01",
+                    "--end-date",
+                    "2026-07-02",
+                    "--audit-run-id",
+                    "not-a-hash",
+                    "--snapshot-id",
+                    "b" * 64,
+                    "--binding-hash",
+                    "c" * 64,
+                ]
+            )
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "formal-smoke-replay",
+                    "--strategy",
+                    "n_shape",
+                    "--start-date",
+                    "2026-04-01",
+                    "--end-date",
+                    "2026-07-02",
+                    "--audit-run-id",
+                    "a" * 64,
+                    "--snapshot-id",
+                    "b" * 64,
+                    "--binding-hash",
+                    "c" * 64,
+                    "--mode",
+                    "exploratory",
+                ]
+            )
+
+    def test_command_detects_commit_runs_formal_replay_and_prints_json(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import formal_smoke_replay as smoke_module
+        from rquant import research_manifest as manifest_module
+
+        result = MagicMock()
+        result.model_dump.return_value = {
+            "status": "comparable",
+            "strategy": "n_shape",
+            "run_id": "formal-run-1",
+            "strategy_spec_hash": "e" * 64,
+            "result_hash": "f" * 64,
+        }
+        run = MagicMock(return_value=result)
+        monkeypatch.setattr(
+            manifest_module,
+            "detect_code_commit",
+            lambda: "d" * 40,
+        )
+        monkeypatch.setattr(
+            smoke_module,
+            "run_formal_smoke_replay",
+            run,
+        )
+        args = build_parser().parse_args(
+            [
+                "formal-smoke-replay",
+                "--strategy",
+                "n_shape",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-02",
+                "--audit-run-id",
+                "a" * 64,
+                "--snapshot-id",
+                "b" * 64,
+                "--binding-hash",
+                "c" * 64,
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+        assert cli.cmd_formal_smoke_replay(args) == 0
+
+        request = run.call_args.args[0]
+        assert request.strategy == "n_shape"
+        assert request.start_date == date(2026, 4, 1)
+        assert request.end_date == date(2026, 7, 2)
+        assert request.audit_run_id == "a" * 64
+        assert request.dataset_snapshot_id == "b" * 64
+        assert request.dataset_binding_hash == "c" * 64
+        assert request.code_commit == "d" * 40
+        assert run.call_args.kwargs == {"base_dir": tmp_path}
+        assert json.loads(capsys.readouterr().out) == result.model_dump.return_value
+
+    def test_command_rejects_dirty_or_missing_commit_before_compute(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import formal_smoke_replay as smoke_module
+        from rquant import research_manifest as manifest_module
+
+        run = MagicMock()
+        monkeypatch.setattr(
+            manifest_module,
+            "detect_code_commit",
+            lambda: "d" * 40 + "-dirty",
+        )
+        monkeypatch.setattr(
+            smoke_module,
+            "run_formal_smoke_replay",
+            run,
+        )
+        args = build_parser().parse_args(
+            [
+                "formal-smoke-replay",
+                "--strategy",
+                "n_shape",
+                "--start-date",
+                "2026-04-01",
+                "--end-date",
+                "2026-07-02",
+                "--audit-run-id",
+                "a" * 64,
+                "--snapshot-id",
+                "b" * 64,
+                "--binding-hash",
+                "c" * 64,
+            ]
+        )
+
+        assert cli.cmd_formal_smoke_replay(args) == 2
+        run.assert_not_called()
+
+
 class TestResearchMigration:
     def test_verify_command_prints_machine_readable_result(
         self,

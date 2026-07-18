@@ -763,6 +763,38 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
+    """Run one fixed strategy spec through the exact formal research binding."""
+    from rquant.formal_smoke_replay import (
+        FormalSmokeReplayRequest,
+        run_formal_smoke_replay,
+    )
+    from rquant.research_manifest import detect_code_commit
+
+    setup_logging()
+    code_commit = detect_code_commit()
+    if not _valid_clean_commit(code_commit):
+        logger.error(
+            "formal smoke replay requires a clean 40-character git commit"
+        )
+        return 2
+    request = FormalSmokeReplayRequest(
+        strategy=args.strategy,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        audit_run_id=args.audit_run_id,
+        dataset_snapshot_id=args.snapshot_id,
+        dataset_binding_hash=args.binding_hash,
+        code_commit=code_commit,
+    )
+    result = run_formal_smoke_replay(
+        request,
+        base_dir=args.output_dir,
+    )
+    _print_json(result.model_dump(mode="json"))
+    return 0
+
+
 def cmd_research_ingest_readiness(args: argparse.Namespace) -> int:
     """Check that the refreshed operational replica is ready for research ingest."""
     from rquant.config import settings
@@ -2936,6 +2968,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="预演输出的 64 位 plan id（必须同时传 --apply）",
     )
 
+    formal_smoke_p = sub.add_parser(
+        "formal-smoke-replay",
+        help="用精确审计、快照和绑定运行三策略固定正式冒烟回放",
+    )
+    formal_smoke_p.add_argument(
+        "--strategy",
+        required=True,
+        choices=("n_shape", "growth_board_surge", "auction_gap"),
+        help="固定策略标识",
+    )
+    formal_smoke_p.add_argument(
+        "--start-date",
+        required=True,
+        type=_parse_iso_date,
+        help="正式回放开始日期 YYYY-MM-DD",
+    )
+    formal_smoke_p.add_argument(
+        "--end-date",
+        required=True,
+        type=_parse_iso_date,
+        help="正式回放结束日期 YYYY-MM-DD",
+    )
+    formal_smoke_p.add_argument(
+        "--audit-run-id",
+        required=True,
+        type=_parse_sha256,
+        help="覆盖完整区间的数据审计 run id",
+    )
+    formal_smoke_p.add_argument(
+        "--snapshot-id",
+        required=True,
+        type=_parse_sha256,
+        help="ready dataset snapshot id",
+    )
+    formal_smoke_p.add_argument(
+        "--binding-hash",
+        required=True,
+        type=_parse_sha256,
+        help="ready immutable execution binding hash",
+    )
+    formal_smoke_p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Strategy Lab 记录根目录（默认使用配置 data_dir）",
+    )
+
     research_readiness_p = sub.add_parser(
         "research-ingest-readiness",
         help="检查日线副本是否已具备研究日增量所需的当日完整数据",
@@ -3959,6 +4038,7 @@ def main() -> int:
         "research-ingest": cmd_research_ingest,
         "research-repair-auction": cmd_research_repair_auction,
         "research-repair-minute": cmd_research_repair_minute,
+        "formal-smoke-replay": cmd_formal_smoke_replay,
         "research-ingest-readiness": cmd_research_ingest_readiness,
         "research-authority-status": cmd_research_authority_status,
         "research-migration": cmd_research_migration,
