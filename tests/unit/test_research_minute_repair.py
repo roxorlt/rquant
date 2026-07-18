@@ -550,7 +550,9 @@ def test_assess_scope_rejects_partial_operational_source_session(
         )
 
 
-def test_merge_minute_partition_upserts_only_target_sessions_and_preserves_evidence_time() -> None:
+def test_merge_minute_partition_upserts_only_target_sessions_and_preserves_evidence_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import pandas as pd
 
     from rquant.research_minute_repair import (
@@ -581,6 +583,15 @@ def test_merge_minute_partition_upserts_only_target_sessions_and_preserves_evide
     )
     operational.loc[1, "close"] = 10.15
 
+    def reject_row_object_iteration(self):
+        del self
+        raise AssertionError("minute merge must not materialize row Series objects")
+
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "iterrows",
+        reject_row_object_iteration,
+    )
     merged = merge_minute_partition(
         existing,
         operational,
@@ -607,15 +618,36 @@ def test_merge_minute_partition_upserts_only_target_sessions_and_preserves_evide
     )
 
 
-def test_minute_row_hash_binds_created_at_and_is_stable_under_input_order() -> None:
+def test_minute_row_hash_binds_created_at_and_is_stable_under_input_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pandas as pd
+
     from rquant.research_minute_repair import hash_minute_rows
 
     frame = _minute_rows().iloc[:3].copy()
     reordered = frame.iloc[::-1].reset_index(drop=True)
     changed_time = frame.copy()
     changed_time.loc[0, "created_at"] = datetime(2026, 7, 18, 9, 0)
+    original_to_csv = pd.DataFrame.to_csv
 
-    assert hash_minute_rows(frame) == hash_minute_rows(reordered)
+    def require_streaming_buffer(self, path_or_buf=None, *args, **kwargs):
+        assert path_or_buf is not None
+        return original_to_csv(self, path_or_buf, *args, **kwargs)
+
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "to_csv",
+        require_streaming_buffer,
+    )
+
+    frame_hash = hash_minute_rows(frame)
+
+    assert (
+        frame_hash
+        == "757fdee4008eb10995db0804a9a7b5925e6e64ea754c9ae4ddb201a5e2dda845"
+    )
+    assert frame_hash == hash_minute_rows(reordered)
     assert hash_minute_rows(frame) != hash_minute_rows(changed_time)
 
 
@@ -838,6 +870,193 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
     assert all(existing_reader_modes)
     assert current_path.read_bytes() == before_current
     assert hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest() == before_catalog
+
+
+def test_preview_does_not_retain_merged_day_frames(tmp_path: Path) -> None:
+    from dataclasses import fields
+
+    import pandas as pd
+
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+
+    prepared = repair_module._build_prepared_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        as_of_time=_repair_clock(),
+    )
+
+    assert "merged_by_date" not in {field.name for field in fields(prepared)}
+    assert not any(
+        isinstance(value, pd.DataFrame)
+        for value in vars(prepared).values()
+    )
+    assert len(prepared.plan.days) == 3
+    assert set(prepared.existing_manifests) == {
+        date(2026, 7, 13),
+        date(2026, 7, 14),
+        date(2026, 7, 15),
+    }
+
+
+def test_apply_stages_one_verified_trading_day_at_a_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    original_export = repair_module.export_research_dataset
+    exported_dates: list[date] = []
+
+    def export_one_day(source, **kwargs):
+        start_date = kwargs["start_date"]
+        end_date = kwargs["end_date"]
+        assert start_date == end_date
+        rows = source.execute(
+            """
+            SELECT DISTINCT CAST(trade_time AS DATE)
+            FROM minute_bar
+            ORDER BY 1
+            """
+        ).fetchall()
+        assert rows == [(start_date,)]
+        exported_dates.append(start_date)
+        return original_export(source, **kwargs)
+
+    monkeypatch.setattr(
+        repair_module,
+        "export_research_dataset",
+        export_one_day,
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+
+    result = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        apply=True,
+        plan_id=preview.plan_id,
+        now=_repair_clock,
+    )
+
+    assert result.status == "candidate"
+    assert exported_dates == [
+        date(2026, 7, 13),
+        date(2026, 7, 14),
+        date(2026, 7, 15),
+    ]
+
+
+def test_apply_rejects_source_drift_during_second_pass_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    import rquant.research_minute_repair as repair_module
+    from rquant.storage.duckdb import DuckDBStore
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    original_build = repair_module._build_prepared_minute_repair
+    build_count = 0
+
+    def build_then_drift(*args, **kwargs):
+        nonlocal build_count
+        prepared = original_build(*args, **kwargs)
+        build_count += 1
+        if build_count == 2:
+            with DuckDBStore(operational_path) as source:
+                source._conn.execute(
+                    """
+                    UPDATE minute_bar
+                    SET close = close + 0.01
+                    WHERE ts_code = '000001.SZ'
+                      AND CAST(trade_time AS DATE) = DATE '2026-07-14'
+                      AND CAST(trade_time AS TIME) = TIME '10:00:00'
+                      AND source = 'tushare'
+                      AND freq = '1min'
+                    """
+                )
+        return prepared
+
+    monkeypatch.setattr(
+        repair_module,
+        "_build_prepared_minute_repair",
+        build_then_drift,
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    before = {
+        "catalog": hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest(),
+        "readonly": hashlib.sha256(
+            paths.readonly_catalog_path.read_bytes()
+        ).hexdigest(),
+        "current": (
+            paths.state_dir / "research-authority-current.json"
+        ).read_bytes(),
+        "manifests": {
+            path.relative_to(paths.lake_root).as_posix(): path.read_bytes()
+            for path in paths.lake_root.glob("**/manifest.json")
+        },
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="minute repair day content changed after planning: 2026-07-14",
+    ):
+        repair_module.run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=_repair_clock,
+        )
+
+    assert hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest() == before[
+        "catalog"
+    ]
+    assert hashlib.sha256(
+        paths.readonly_catalog_path.read_bytes()
+    ).hexdigest() == before["readonly"]
+    assert (
+        paths.state_dir / "research-authority-current.json"
+    ).read_bytes() == before["current"]
+    assert {
+        path.relative_to(paths.lake_root).as_posix(): path.read_bytes()
+        for path in paths.lake_root.glob("**/manifest.json")
+    } == before["manifests"]
+    assert not paths.transactions_root.exists() or not tuple(
+        paths.transactions_root.iterdir()
+    )
 
 
 def test_run_minute_repair_atomically_publishes_all_days_and_becomes_unchanged(
