@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, time, timedelta
+from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from zoneinfo import ZoneInfo
@@ -1604,6 +1605,11 @@ def _complete_minute_sessions_from_relation(
     *,
     relation_sql: str,
     relation_parameters: tuple[object, ...],
+    relation_parameters_by_date: dict[
+        date,
+        tuple[object, ...],
+    ]
+    | None = None,
     desired: tuple[tuple[str, date], ...],
     session_spec: MinuteSourceSessionSpec,
 ) -> set[tuple[str, date]]:
@@ -1613,55 +1619,79 @@ def _complete_minute_sessions_from_relation(
     )
     expected_placeholders = ", ".join("?" for _ in expected_times)
     complete: set[tuple[str, date]] = set()
-    for offset in range(0, len(desired), _MINUTE_COMPLETION_BATCH_SIZE):
-        batch = desired[offset : offset + _MINUTE_COMPLETION_BATCH_SIZE]
-        target_placeholders = ", ".join("(?, ?)" for _ in batch)
-        target_parameters = [
-            value
-            for ts_code, trade_date in batch
-            for value in (ts_code, trade_date)
-        ]
-        rows = connection.execute(
-            f"""
-            WITH desired_sessions(ts_code, trade_date) AS (
-                VALUES {target_placeholders}
+    for trade_date, date_rows in groupby(
+        desired,
+        key=lambda row: row[1],
+    ):
+        date_desired = tuple(date_rows)
+        if relation_parameters_by_date is None:
+            current_relation_parameters = relation_parameters
+        else:
+            current_relation_parameters = relation_parameters_by_date.get(
+                trade_date
             )
-            SELECT minute.ts_code,
-                   CAST(minute.trade_time AS DATE) AS trade_date
-            FROM {relation_sql} AS minute
-            INNER JOIN desired_sessions AS desired
-              ON desired.ts_code = minute.ts_code
-             AND desired.trade_date = CAST(minute.trade_time AS DATE)
-            WHERE minute.source = ?
-              AND minute.freq = ?
-            GROUP BY minute.ts_code, CAST(minute.trade_time AS DATE)
-            HAVING COUNT(
-                       DISTINCT strftime(minute.trade_time, '%H:%M:%S')
-                   ) = ?
-               AND COUNT(
-                       DISTINCT CASE
-                           WHEN strftime(
-                               minute.trade_time,
-                               '%H:%M:%S'
-                           ) IN ({expected_placeholders})
-                           THEN strftime(minute.trade_time, '%H:%M:%S')
-                       END
-                   ) = ?
-            """,
-            [
-                *target_parameters,
-                *relation_parameters,
-                session_spec.source,
-                session_spec.freq,
-                len(expected_times),
-                *expected_times,
-                len(expected_times),
-            ],
-        ).fetchall()
-        complete.update(
-            (str(ts_code), _as_date(trading_date))
-            for ts_code, trading_date in rows
-        )
+            if current_relation_parameters is None:
+                continue
+        next_date = trade_date + timedelta(days=1)
+        for offset in range(
+            0,
+            len(date_desired),
+            _MINUTE_COMPLETION_BATCH_SIZE,
+        ):
+            batch = date_desired[
+                offset : offset + _MINUTE_COMPLETION_BATCH_SIZE
+            ]
+            target_placeholders = ", ".join("(?, ?)" for _ in batch)
+            target_parameters = [
+                value
+                for ts_code, target_date in batch
+                for value in (ts_code, target_date)
+            ]
+            rows = connection.execute(
+                f"""
+                WITH desired_sessions(ts_code, trade_date) AS (
+                    VALUES {target_placeholders}
+                )
+                SELECT minute.ts_code,
+                       CAST(minute.trade_time AS DATE) AS trade_date
+                FROM {relation_sql} AS minute
+                INNER JOIN desired_sessions AS desired
+                  ON desired.ts_code = minute.ts_code
+                 AND desired.trade_date = CAST(minute.trade_time AS DATE)
+                WHERE minute.source = ?
+                  AND minute.freq = ?
+                  AND minute.trade_time >= ?
+                  AND minute.trade_time < ?
+                GROUP BY minute.ts_code, CAST(minute.trade_time AS DATE)
+                HAVING COUNT(
+                           DISTINCT strftime(minute.trade_time, '%H:%M:%S')
+                       ) = ?
+                   AND COUNT(
+                           DISTINCT CASE
+                               WHEN strftime(
+                                   minute.trade_time,
+                                   '%H:%M:%S'
+                               ) IN ({expected_placeholders})
+                               THEN strftime(minute.trade_time, '%H:%M:%S')
+                           END
+                       ) = ?
+                """,
+                [
+                    *target_parameters,
+                    *current_relation_parameters,
+                    session_spec.source,
+                    session_spec.freq,
+                    trade_date,
+                    next_date,
+                    len(expected_times),
+                    *expected_times,
+                    len(expected_times),
+                ],
+            ).fetchall()
+            complete.update(
+                (str(ts_code), _as_date(trading_date))
+                for ts_code, trading_date in rows
+            )
     return complete
 
 
@@ -1674,9 +1704,39 @@ def _desired_minute_sessions(
                 (window.ts_code, trading_date)
                 for window in windows
                 for trading_date in window.open_dates
-            }
+            },
+            key=lambda row: (row[1], row[0]),
         )
     )
+
+
+def _minute_artifact_paths_by_date(
+    artifacts: tuple[DatasetSnapshotArtifact, ...],
+    *,
+    lake_root: Path,
+) -> dict[date, tuple[object, ...]]:
+    paths_by_date: dict[date, tuple[object, ...]] = {}
+    prefix = "minute_bar:"
+    suffix = ":1min"
+    for artifact in artifacts:
+        partition_id = artifact.partition_id
+        if (
+            partition_id is None
+            or not partition_id.startswith(prefix)
+            or not partition_id.endswith(suffix)
+        ):
+            raise ValueError("minute coverage artifact has an invalid partition id")
+        trade_date = date.fromisoformat(
+            partition_id[len(prefix) : -len(suffix)]
+        )
+        if trade_date in paths_by_date:
+            raise ValueError(
+                f"minute coverage has duplicate artifacts for {trade_date}"
+            )
+        paths_by_date[trade_date] = (
+            [str(Path(lake_root) / artifact.relative_path)],
+        )
+    return paths_by_date
 
 
 def _complete_minute_sessions_from_lake(
@@ -1709,13 +1769,17 @@ def _complete_minute_sessions_from_lake(
     )
     if not artifacts:
         return set(), ()
-    paths = [str(Path(lake_root) / artifact.relative_path) for artifact in artifacts]
+    parameters_by_date = _minute_artifact_paths_by_date(
+        artifacts,
+        lake_root=lake_root,
+    )
     connect_config = {"temp_directory": ""} if memory_only else {}
     with duckdb.connect(config=connect_config) as connection:
         complete = _complete_minute_sessions_from_relation(
             connection,
             relation_sql="read_parquet(?, hive_partitioning = false)",
-            relation_parameters=(paths,),
+            relation_parameters=(),
+            relation_parameters_by_date=parameters_by_date,
             desired=_desired_minute_sessions(windows),
             session_spec=session_spec,
         )

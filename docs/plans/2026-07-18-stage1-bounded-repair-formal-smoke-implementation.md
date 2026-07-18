@@ -30,7 +30,9 @@ result contract.
 **Step 3: Implement bounded scalar aggregation**
 
 Batch exact target keys, join rather than scan unrelated sessions, and compute count/min/max plus
-grid-validity aggregates in DuckDB. Keep `read_only=True` and `temp_directory=''`.
+grid-validity aggregates in DuckDB. Group batches by trading date, push an explicit half-open
+`trade_time` range into operational queries, and pass only that date's immutable Parquet artifact
+to lake queries. Keep `read_only=True` and `temp_directory=''`.
 
 **Step 4: Run GREEN**
 
@@ -139,8 +141,10 @@ PYTHONPATH=src /Users/roxor/brain/30-projects/rQuant/.venv/bin/pytest \
 
 Expected: all tests PASS, including journal rollback and zero-write preview cases.
 
-Also run a subprocess RSS test comparing one-day and ten-day fixtures with the same maximum day size;
-the allowed delta must be fixed overhead, not proportional to total rows.
+Also run the subprocess RSS probe with a common maximum-sized warm-up day followed by either one or
+ten measured days. Each day contains 512 complete sessions. Bound the one-to-ten-day delta as
+DuckDB/Parquet allocation overhead and separately require the day-five-to-day-ten peak range to stay
+within 48 MiB; a linear total-row slope fails even when the absolute process baseline is high.
 
 **Step 6: Commit**
 
@@ -251,7 +255,11 @@ Run the new CLI tests. Expected: unknown command/parser failure.
 **Step 3: Implement the command**
 
 Register `formal-smoke-replay`, validate exact evidence and clean commit, call the new executor, and
-print one JSON object suitable for deployment evidence capture.
+print one JSON object suitable for deployment evidence capture. Validate the real Git HEAD and dirty
+state; an injected deployment commit may confirm HEAD but cannot replace it.
+
+Before hashing or saving formal results, canonicalize every result table by normalized full-row key.
+The same rows in a different SQL/strategy return order must preserve the result hash.
 
 **Step 4: Run GREEN**
 

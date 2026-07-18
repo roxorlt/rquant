@@ -769,10 +769,10 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
         FormalSmokeReplayRequest,
         run_formal_smoke_replay,
     )
-    from rquant.research_manifest import detect_code_commit
+    from rquant.research_manifest import detect_verified_code_commit
 
     setup_logging()
-    code_commit = detect_code_commit()
+    code_commit = detect_verified_code_commit()
     if not _valid_clean_commit(code_commit):
         logger.error(
             "formal smoke replay requires a clean 40-character git commit"

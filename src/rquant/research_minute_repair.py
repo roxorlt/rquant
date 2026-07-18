@@ -967,6 +967,84 @@ def _build_minute_export_source(
     return connection
 
 
+def _stage_repair_day(
+    paths: ResearchIngestPaths,
+    *,
+    source: duckdb.DuckDBPyConnection,
+    prepared: _PreparedMinuteRepair,
+    day: ResearchMinuteRepairDayPlan,
+    staged_catalog: Path,
+    staged_lake: Path,
+    generated_at: datetime,
+    as_of_date: date,
+) -> ResearchPartitionManifest:
+    trade_date = day.trade_date
+    targets = prepared.target_sessions_by_date.get(trade_date)
+    if targets is None:
+        raise RuntimeError(
+            f"minute repair targets missing after planning: {trade_date}"
+        )
+    _existing_manifest, existing_manifest_sha256 = (
+        _load_existing_minute_manifest(paths, trade_date)
+    )
+    existing = _query_existing_research_partition(
+        paths,
+        _minute_partition_key(trade_date),
+        _MINUTE_COLUMNS,
+        memory_only=True,
+    )
+    operational = _query_operational_minute_rows(
+        source,
+        trade_date=trade_date,
+        ts_codes=tuple(row.ts_code for row in targets),
+    )
+    rebuilt_day, merged = build_minute_repair_day_plan(
+        trade_date=trade_date,
+        target_sessions=targets,
+        existing_manifest_sha256=existing_manifest_sha256,
+        existing=existing,
+        operational=operational,
+    )
+    if rebuilt_day != day:
+        raise RuntimeError(
+            "minute repair day content changed after planning: "
+            f"{trade_date}"
+        )
+    export_source = _build_minute_export_source(
+        trade_date,
+        merged,
+    )
+    try:
+        summary = export_research_dataset(
+            export_source,
+            catalog=ResearchCatalog(staged_catalog),
+            lake_root=staged_lake,
+            dataset="minute_bar",
+            start_date=trade_date,
+            end_date=trade_date,
+            code_commit=prepared.plan.code_commit,
+            now=lambda: generated_at.astimezone(UTC),
+            as_of_date=as_of_date,
+        )
+    finally:
+        export_source.close()
+    manifest = next(
+        (
+            partition.manifest
+            for partition in summary.partitions
+            if partition.trade_date == trade_date
+            and partition.manifest is not None
+        ),
+        None,
+    )
+    if manifest is None:
+        raise RuntimeError(
+            "minute repair staged export did not cover target date: "
+            f"{trade_date}"
+        )
+    return manifest
+
+
 def _prepare_repair_generation(
     paths: ResearchIngestPaths,
     *,
@@ -1009,71 +1087,16 @@ def _prepare_repair_generation(
         config={"temp_directory": ""},
     ) as source:
         for day in prepared.plan.days:
-            trade_date = day.trade_date
-            targets = prepared.target_sessions_by_date.get(trade_date)
-            if targets is None:
-                raise RuntimeError(
-                    f"minute repair targets missing after planning: {trade_date}"
-                )
-            _existing_manifest, existing_manifest_sha256 = (
-                _load_existing_minute_manifest(paths, trade_date)
-            )
-            existing = _query_existing_research_partition(
+            manifests[day.trade_date] = _stage_repair_day(
                 paths,
-                _minute_partition_key(trade_date),
-                _MINUTE_COLUMNS,
-                memory_only=True,
+                source=source,
+                prepared=prepared,
+                day=day,
+                staged_catalog=staged_catalog,
+                staged_lake=staged_lake,
+                generated_at=generated_at,
+                as_of_date=max(trade_dates),
             )
-            operational = _query_operational_minute_rows(
-                source,
-                trade_date=trade_date,
-                ts_codes=tuple(row.ts_code for row in targets),
-            )
-            rebuilt_day, merged = build_minute_repair_day_plan(
-                trade_date=trade_date,
-                target_sessions=targets,
-                existing_manifest_sha256=existing_manifest_sha256,
-                existing=existing,
-                operational=operational,
-            )
-            if rebuilt_day != day:
-                raise RuntimeError(
-                    "minute repair day content changed after planning: "
-                    f"{trade_date}"
-                )
-            export_source = _build_minute_export_source(
-                trade_date,
-                merged,
-            )
-            try:
-                summary = export_research_dataset(
-                    export_source,
-                    catalog=ResearchCatalog(staged_catalog),
-                    lake_root=staged_lake,
-                    dataset="minute_bar",
-                    start_date=trade_date,
-                    end_date=trade_date,
-                    code_commit=prepared.plan.code_commit,
-                    now=lambda: generated_at.astimezone(UTC),
-                    as_of_date=max(trade_dates),
-                )
-            finally:
-                export_source.close()
-            manifest = next(
-                (
-                    partition.manifest
-                    for partition in summary.partitions
-                    if partition.trade_date == trade_date
-                    and partition.manifest is not None
-                ),
-                None,
-            )
-            if manifest is None:
-                raise RuntimeError(
-                    "minute repair staged export did not cover target date: "
-                    f"{trade_date}"
-                )
-            manifests[trade_date] = manifest
     expected_dates = {day.trade_date for day in prepared.plan.days}
     if set(manifests) != expected_dates:
         raise RuntimeError(

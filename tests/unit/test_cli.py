@@ -1184,8 +1184,9 @@ class TestFormalSmokeReplay:
         run = MagicMock(return_value=result)
         monkeypatch.setattr(
             manifest_module,
-            "detect_code_commit",
+            "detect_verified_code_commit",
             lambda: "d" * 40,
+            raising=False,
         )
         monkeypatch.setattr(
             smoke_module,
@@ -1238,8 +1239,9 @@ class TestFormalSmokeReplay:
         run = MagicMock()
         monkeypatch.setattr(
             manifest_module,
-            "detect_code_commit",
+            "detect_verified_code_commit",
             lambda: "d" * 40 + "-dirty",
+            raising=False,
         )
         monkeypatch.setattr(
             smoke_module,

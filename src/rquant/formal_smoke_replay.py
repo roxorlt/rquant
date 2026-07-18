@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
 from rquant.auction_gap_strategy import AuctionGapMinuteReplayConfig
 from rquant.dashboard.strategy_lab_runs import (
+    _canonical_json_bytes,
+    _hash_json_value,
     _strategy_spec_hash,
     build_strategy_lab_run,
     save_strategy_lab_run,
@@ -237,6 +239,23 @@ def _return_metrics(
     )
 
 
+def _canonicalize_formal_tables(
+    tables: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    canonical: dict[str, pd.DataFrame] = {}
+    for name, frame in tables.items():
+        if len(frame) < 2:
+            canonical[name] = frame.reset_index(drop=True)
+            continue
+        row_keys = [
+            _canonical_json_bytes(_hash_json_value(row))
+            for row in frame.itertuples(index=False, name=None)
+        ]
+        order = sorted(range(len(frame)), key=row_keys.__getitem__)
+        canonical[name] = frame.iloc[order].reset_index(drop=True)
+    return canonical
+
+
 def _execute_n_shape(
     store: object,
     spec: FormalSmokeSpec,
@@ -402,10 +421,10 @@ def run_formal_smoke_replay(
             }
         ]
     )
-    tables = {
+    tables = _canonicalize_formal_tables({
         **computation.tables,
         "formal_evidence": evidence,
-    }
+    })
     manifest = build_gate_research_manifest(gate_request, decision)
     title = (
         f"Stage 1 {request.strategy} formal smoke "

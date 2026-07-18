@@ -200,8 +200,9 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
     )
 
     result = run_formal_smoke_replay(request, base_dir=tmp_path)
+    repeated = run_formal_smoke_replay(request, base_dir=tmp_path)
 
-    assert len(captured_requests) == 1
+    assert len(captured_requests) == 2
     gate_request = captured_requests[0]
     assert gate_request.mode == "formal"
     assert gate_request.strategy_name == "n_shape"
@@ -217,6 +218,9 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
     assert result.missing_evidence == ()
     assert len(result.strategy_spec_hash) == 64
     assert len(result.result_hash) == 64
+    assert repeated.run_id != result.run_id
+    assert repeated.strategy_spec_hash == result.strategy_spec_hash
+    assert repeated.result_hash == result.result_hash
 
     saved = load_strategy_lab_run(result.run_id, base_dir=tmp_path)
     assert saved.manifest.schema_version == 2
@@ -240,6 +244,86 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
             "code_commit": request.code_commit,
         }
     ]
+
+
+def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.formal_smoke_replay as smoke_module
+    from rquant.formal_smoke_replay import (
+        FormalSmokeComputation,
+        FormalSmokeReplayRequest,
+        run_formal_smoke_replay,
+    )
+
+    request = FormalSmokeReplayRequest(
+        strategy="growth_board_surge",
+        start_date=date(2026, 4, 1),
+        end_date=date(2026, 7, 2),
+        audit_run_id="a" * 64,
+        dataset_snapshot_id="b" * 64,
+        dataset_binding_hash="c" * 64,
+        code_commit="d" * 40,
+    )
+    execution_count = 0
+
+    @contextmanager
+    def open_exact_gate(_gate_request):
+        yield object(), _formal_decision()
+
+    def execute_with_unstable_order(_store, _spec):
+        nonlocal execution_count
+        execution_count += 1
+        rows = [
+            {
+                "ts_code": "300002.SZ",
+                "entry_time": pd.Timestamp("2026-05-06 09:37:00"),
+                "ret_pct": -1.25,
+            },
+            {
+                "ts_code": "300001.SZ",
+                "entry_time": pd.Timestamp("2026-05-05 09:36:00"),
+                "ret_pct": 3.5,
+            },
+        ]
+        if execution_count % 2 == 0:
+            rows.reverse()
+        trades = pd.DataFrame(rows)
+        return FormalSmokeComputation(
+            metrics={
+                "trade_count": 2,
+                "mean_ret_pct": 1.125,
+                "win_rate_pct": 50.0,
+            },
+            tables={
+                "strategy_summary": pd.DataFrame(
+                    [
+                        {"metric": "win_rate_pct", "value": 50.0},
+                        {"metric": "mean_ret_pct", "value": 1.125},
+                    ][:: 1 if execution_count % 2 else -1]
+                ),
+                "trades": trades,
+            },
+            sample_count=2,
+        )
+
+    monkeypatch.setattr(
+        smoke_module,
+        "open_gated_research_store",
+        open_exact_gate,
+    )
+    monkeypatch.setattr(
+        smoke_module,
+        "_execute_formal_smoke_spec",
+        execute_with_unstable_order,
+    )
+
+    first = run_formal_smoke_replay(request, base_dir=tmp_path)
+    second = run_formal_smoke_replay(request, base_dir=tmp_path)
+
+    assert first.run_id != second.run_id
+    assert first.result_hash == second.result_hash
 
 
 @pytest.mark.parametrize(

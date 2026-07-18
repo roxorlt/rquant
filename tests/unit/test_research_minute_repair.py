@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -216,6 +220,137 @@ def _seed_minute_repair_case(tmp_path: Path):
     state = BackfillStateStore(tmp_path / "backfill.sqlite3")
     state.persist_manifest(backfill_state_input(backfill_plan))
     return paths, state, operational_path, backfill_plan
+
+
+def _seed_minute_repair_rss_probe(
+    root: Path,
+    *,
+    day_count: int,
+    symbol_count: int = 512,
+) -> None:
+    import duckdb
+    import pandas as pd
+
+    from rquant.backfill_manifest import minute_session_spec
+    from rquant.research_minute_repair import (
+        _MINUTE_COLUMNS,
+        MinuteRepairSession,
+        ResearchMinuteRepairDayPlan,
+    )
+
+    root.mkdir(parents=True)
+    operational_path = root / "operational.duckdb"
+    warmup_date = date(2026, 6, 30)
+    trade_dates = tuple(
+        date(2026, 7, day)
+        for day in range(1, day_count + 1)
+    )
+    ts_codes = tuple(
+        f"{300000 + offset:06d}.SZ"
+        for offset in range(symbol_count)
+    )
+    expected_times = minute_session_spec().expected_times()
+    day_plans: dict[date, dict[str, object]] = {}
+    targets_by_date: dict[str, list[dict[str, object]]] = {}
+    rows_per_day = symbol_count * len(expected_times)
+    with duckdb.connect(str(operational_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR NOT NULL,
+                trade_time TIMESTAMP NOT NULL,
+                freq VARCHAR NOT NULL,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                vol DOUBLE,
+                amount DOUBLE,
+                source VARCHAR NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (ts_code, trade_time, freq, source)
+            )
+            """
+        )
+        for trade_date in (warmup_date, *trade_dates):
+            trade_times = tuple(
+                datetime.combine(trade_date, minute_time)
+                for minute_time in expected_times
+            )
+            frame = pd.MultiIndex.from_product(
+                (ts_codes, trade_times),
+                names=("ts_code", "trade_time"),
+            ).to_frame(index=False)
+            frame["freq"] = "1min"
+            frame["open"] = 10.0
+            frame["high"] = 10.2
+            frame["low"] = 9.9
+            frame["close"] = 10.1
+            frame["vol"] = 100.0
+            frame["amount"] = 1_010.0
+            frame["source"] = "tushare"
+            frame["created_at"] = datetime(2026, 7, 18, 8, 0)
+            connection.register("probe_day", frame)
+            connection.execute(
+                f"INSERT INTO minute_bar SELECT {', '.join(_MINUTE_COLUMNS)} "
+                "FROM probe_day"
+            )
+            connection.unregister("probe_day")
+            targets = tuple(
+                MinuteRepairSession(
+                    ts_code=ts_code,
+                    trade_date=trade_date,
+                )
+                for ts_code in ts_codes
+            )
+            day_plan = ResearchMinuteRepairDayPlan(
+                trade_date=trade_date,
+                target_session_count=symbol_count,
+                target_sessions_sha256="0" * 64,
+                existing_manifest_sha256=None,
+                source_rows_sha256="1" * 64,
+                merged_rows_sha256="2" * 64,
+                existing_row_count=0,
+                source_row_count=rows_per_day,
+                merged_row_count=rows_per_day,
+                changed=True,
+            )
+            day_plans[trade_date] = day_plan.model_dump(mode="json")
+            targets_by_date[trade_date.isoformat()] = [
+                target.model_dump(mode="json") for target in targets
+            ]
+            del frame
+    (root / "probe.json").write_text(
+        json.dumps(
+            {
+                "code_commit": _COMMIT,
+                "warmup_day": day_plans[warmup_date],
+                "days": [day_plans[trade_date] for trade_date in trade_dates],
+                "targets_by_date": targets_by_date,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _run_minute_repair_rss_probe(root: Path) -> dict[str, object]:
+    probe = Path(__file__).resolve().parents[1] / "support" / (
+        "research_minute_repair_rss_probe.py"
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+    }
+    result = subprocess.run(
+        [sys.executable, str(probe), str(root)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
 
 
 def test_load_completed_backfill_plan_reconstructs_exact_persisted_payload(
@@ -963,6 +1098,101 @@ def test_apply_stages_one_verified_trading_day_at_a_time(
         date(2026, 7, 14),
         date(2026, 7, 15),
     ]
+
+
+def test_apply_releases_previous_staged_day_before_rebuilding_next(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gc
+    import weakref
+
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    original_build = repair_module.build_minute_repair_day_plan
+    previous_merged: weakref.ReferenceType | None = None
+
+    def build_and_track(*args, **kwargs):
+        nonlocal previous_merged
+        gc.collect()
+        if previous_merged is not None:
+            assert previous_merged() is None
+        day, merged = original_build(*args, **kwargs)
+        previous_merged = weakref.ref(merged)
+        return day, merged
+
+    monkeypatch.setattr(
+        repair_module,
+        "build_minute_repair_day_plan",
+        build_and_track,
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+
+    result = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        apply=True,
+        plan_id=preview.plan_id,
+        now=_repair_clock,
+    )
+
+    assert result.status == "candidate"
+
+
+@pytest.mark.integration
+def test_apply_peak_rss_is_bounded_by_largest_staged_day(
+    tmp_path: Path,
+) -> None:
+    one_day = tmp_path / "one-day"
+    ten_days = tmp_path / "ten-days"
+    _seed_minute_repair_rss_probe(one_day, day_count=1)
+    _seed_minute_repair_rss_probe(ten_days, day_count=10)
+
+    one_day_result = _run_minute_repair_rss_probe(one_day)
+    ten_day_result = _run_minute_repair_rss_probe(ten_days)
+
+    one_day_count = int(one_day_result["day_count"])
+    ten_day_count = int(ten_day_result["day_count"])
+    one_day_rows = int(one_day_result["total_rows"])
+    ten_day_rows = int(ten_day_result["total_rows"])
+    one_day_max_rows = int(one_day_result["max_day_rows"])
+    ten_day_max_rows = int(ten_day_result["max_day_rows"])
+    one_day_peak = int(one_day_result["peak_rss_bytes"])
+    ten_day_peak = int(ten_day_result["peak_rss_bytes"])
+    ten_day_peaks = [
+        int(value) for value in ten_day_result["peak_rss_by_day"]
+    ]
+
+    assert ten_day_count == 10 * one_day_count
+    assert ten_day_rows == 10 * one_day_rows
+    assert ten_day_max_rows == one_day_max_rows
+    assert len(ten_day_peaks) == ten_day_count
+    diagnostic = {
+        "one_day_peak": one_day_peak,
+        "ten_day_peak": ten_day_peak,
+        "ten_day_peaks": ten_day_peaks,
+    }
+    assert ten_day_peak <= (
+        one_day_peak + 192 * 1024 * 1024
+    ), diagnostic
+    assert (
+        max(ten_day_peaks[4:]) - min(ten_day_peaks[4:])
+        <= 48 * 1024 * 1024
+    ), diagnostic
+    assert ten_day_peak < one_day_peak * 2, diagnostic
 
 
 def test_apply_rejects_source_drift_during_second_pass_before_publication(

@@ -210,6 +210,39 @@ def detect_code_commit(repo_root: Path | None = None) -> str | None:
     return commit
 
 
+def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
+    """Resolve a formal-run commit from the real clean Git checkout."""
+    cwd = repo_root or Path(__file__).resolve().parents[2]
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = head.stdout.strip()
+    if head.returncode != 0 or not commit or status.returncode != 0:
+        return None
+    injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
+    if injected and injected != commit:
+        return None
+    if status.stdout.strip():
+        return f"{commit}-dirty"
+    return commit
+
+
 def new_exploratory_manifest(run_type: str) -> ResearchManifest:
     return ResearchManifest(
         research_status="exploratory",

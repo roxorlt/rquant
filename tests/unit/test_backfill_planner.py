@@ -280,6 +280,7 @@ def test_minute_completion_uses_bounded_exact_target_aggregates(
         def __init__(self, connection: object) -> None:
             self.connection = connection
             self.statements: list[str] = []
+            self.parameters: list[list[object]] = []
 
         def execute(
             self,
@@ -287,6 +288,7 @@ def test_minute_completion_uses_bounded_exact_target_aggregates(
             parameters: list[object] | None = None,
         ) -> object:
             self.statements.append(statement)
+            self.parameters.append(parameters or [])
             return self.connection.execute(statement, parameters or [])
 
         def __getattr__(self, name: str) -> object:
@@ -300,13 +302,27 @@ def test_minute_completion_uses_bounded_exact_target_aggregates(
 
     assert complete == {("300001.SZ", first_date)}
     completion_sql = [
-        statement.lower()
-        for statement in recording.statements
+        (statement.lower(), parameters)
+        for statement, parameters in zip(
+            recording.statements,
+            recording.parameters,
+            strict=True,
+        )
         if "from minute_bar" in statement.lower()
     ]
-    assert len(completion_sql) == 3
-    assert all("list(" not in statement for statement in completion_sql)
-    assert all("values" in statement for statement in completion_sql)
+    assert len(completion_sql) == 4
+    assert all("list(" not in statement for statement, _ in completion_sql)
+    assert all("values" in statement for statement, _ in completion_sql)
+    assert all("minute.trade_time >= ?" in statement for statement, _ in completion_sql)
+    assert all("minute.trade_time < ?" in statement for statement, _ in completion_sql)
+    observed_bounds = {
+        (parameters[-245], parameters[-244])
+        for _, parameters in completion_sql
+    }
+    assert observed_bounds == {
+        (first_date, first_date + timedelta(days=1)),
+        (second_date, second_date + timedelta(days=1)),
+    }
 
 
 def test_research_lake_coverage_survives_operational_minute_cleanup(
@@ -362,6 +378,83 @@ def test_research_lake_coverage_survives_operational_minute_cleanup(
     assert opens[2] not in {
         trading_date for task in plan.tasks for trading_date in task.open_dates
     }
+
+
+def test_research_lake_completion_reads_only_each_target_date_artifact(
+    store: DuckDBStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.backfill_manifest as manifest_module
+    from rquant.backfill_manifest import (
+        MergedBackfillWindow,
+        _complete_minute_sessions_from_lake,
+    )
+    from rquant.research_catalog import ResearchCatalog
+    from rquant.research_lake import export_research_dataset
+
+    trade_dates = (date(2026, 6, 1), date(2026, 6, 2))
+    _seed_calendar(store, list(trade_dates))
+    spec = next(
+        value
+        for value in DEFAULT_MINUTE_SOURCE_SESSION_SPECS
+        if value.source == "tushare" and value.freq == "1min"
+    )
+    for trade_date in trade_dates:
+        _insert_session(
+            store,
+            ts_code="300001.SZ",
+            trade_date=trade_date,
+            times=spec.expected_times(),
+        )
+    catalog = ResearchCatalog(tmp_path / "research.duckdb")
+    lake_root = tmp_path / "lake"
+    export_research_dataset(
+        store._conn,
+        catalog=catalog,
+        lake_root=lake_root,
+        dataset="minute_bar",
+        start_date=trade_dates[0],
+        end_date=trade_dates[-1],
+        code_commit="a" * 40,
+    )
+    captured: dict[date, tuple[object, ...]] = {}
+
+    def capture_parameters(connection, **kwargs):
+        del connection
+        captured.update(kwargs["relation_parameters_by_date"])
+        return set()
+
+    monkeypatch.setattr(
+        manifest_module,
+        "_complete_minute_sessions_from_relation",
+        capture_parameters,
+    )
+    complete, artifacts = _complete_minute_sessions_from_lake(
+        (
+            MergedBackfillWindow(
+                ts_code="300001.SZ",
+                start_date=trade_dates[0],
+                end_date=trade_dates[-1],
+                open_dates=trade_dates,
+            ),
+        ),
+        spec,
+        catalog=catalog,
+        lake_root=lake_root,
+        as_of_time=datetime(2026, 6, 3, tzinfo=UTC),
+        memory_only=True,
+    )
+
+    assert complete == set()
+    assert len(artifacts) == 2
+    assert set(captured) == set(trade_dates)
+    for trade_date, parameters in captured.items():
+        assert len(parameters) == 1
+        paths = parameters[0]
+        assert isinstance(paths, list)
+        assert len(paths) == 1
+        assert f"trade_date={trade_date.isoformat()}" in paths[0]
 
 
 def test_research_lake_authority_does_not_accept_unpublished_operational_rows(

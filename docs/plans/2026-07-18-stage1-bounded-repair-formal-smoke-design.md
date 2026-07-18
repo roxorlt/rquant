@@ -34,7 +34,8 @@ latest eligibility
 
 1. 研究湖和生产源的完整性查询按精确 `(ts_code, trade_date)` 目标分批，只返回计数、
    最早/最晚时刻、唯一分钟数等标量和通过的会话键；不再为每个会话把 241 个时间字符串
-   聚合并物化到 Python。
+   聚合并物化到 Python。批次先按交易日分组，运营查询下推半开时间范围，研究湖每次只
+   打开目标日 Parquet，不能反复扫描整个数据库或全部历史分区。
 2. 计划遍逐日读取研究湖已有分区和生产分钟源，验证 241 分钟完整性，计算源行、合并行和
    目标 manifest 哈希，然后立即释放当日 `DataFrame`。
 3. apply 在取得发布锁并重新生成相同 plan ID 后，逐日再次读取同一来源，重建当日分区，
@@ -55,7 +56,8 @@ latest eligibility
 新增 `formal-smoke-replay`，只接受显式 `strategy`、日期区间、`audit_run_id`、
 `snapshot_id` 和 `binding_hash`。命令固定使用当前干净 40 位提交构造
 `ResearchGateRequest(mode="formal")`，通过 `open_gated_research_store()` 打开精确
-binding；不存在 exploratory 或滚动库 fallback。
+binding；提交身份必须来自真实 Git HEAD，可选部署环境变量只能与 HEAD 相等，不能覆盖
+dirty 或伪造提交。不存在 exploratory 或滚动库 fallback。
 
 三套 v1 固定规格为：
 
@@ -74,10 +76,14 @@ binding；不存在 exploratory 或滚动库 fallback。
 - 完整性判定对 exact、缺分钟、越界分钟、重复、无关代码和错误 source 的结果与旧算法
   一致，且不返回分钟字符串列表。
 - 预演不得保留跨日分钟帧，也不得创建事务目录或临时 spill。
-- 在子进程压力测试中，日期数扩大十倍时峰值 RSS 只随“最大单日行数”变化，不随总行数
-  线性增长。
+- 在独立子进程压力测试中，先用相同最大日做共同预热，再以 512 个会话、每会话 241 行
+  比较 1 日与 10 日：峰值 RSS 只允许一次性 DuckDB/Parquet 分配台阶，且第 5 至第
+  10 日波动不得超过 48 MiB，不能随总行数线性增长。
 - apply 每次最多导出一个交易日，并在第二遍验证所有计划哈希。
+- 下一交易日开始重建前，上一交易日的 existing/operational/merged 分钟帧均已释放。
 - 中途失败不改变 live manifest、catalog、readonly 或 authority。
+- 同秒重复正式回放不得覆盖旧记录；run ID 唯一，但相同输入的 spec/result hash 不变。
 - 三策略命令必须证明使用同一个 bound execution session，保存 comparable v2 结果。
-- 相同 snapshot/binding/spec 重跑得到相同 result hash；滚动库变化不影响旧结果。
+- 相同 snapshot/binding/spec 重跑得到相同 result hash；底层返回行顺序和滚动库变化均
+  不影响旧结果。
 - 生产按动态可观测截止日生成最终提交下的新 manifest，再依次修复、快照和固定回放。
