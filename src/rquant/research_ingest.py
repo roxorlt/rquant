@@ -1752,8 +1752,14 @@ def _recover_interrupted_publish(paths: ResearchIngestPaths) -> None:
                 transaction_root / "minute-repair-journal.json"
             ),
         }
+        if any(
+            path.is_symlink()
+            or (path.exists() and not path.is_file())
+            for path in journal_paths.values()
+        ):
+            raise RuntimeError("research publish journal path is invalid")
         present = tuple(
-            kind for kind, path in journal_paths.items() if path.exists()
+            kind for kind, path in journal_paths.items() if path.is_file()
         )
         if len(present) > 1:
             raise RuntimeError("research transaction contains multiple publish journals")

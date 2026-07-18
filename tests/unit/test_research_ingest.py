@@ -1152,6 +1152,24 @@ def test_next_run_recovers_interrupted_publish_before_validation(tmp_path: Path)
     assert (paths.state_dir / "research-authority-current.json").read_bytes() != current_before
 
 
+def test_recovery_rejects_a_dangling_publish_journal_symlink(
+    tmp_path: Path,
+) -> None:
+    import rquant.research_ingest as ingest_module
+
+    paths = _paths(tmp_path)
+    transaction_root = paths.transactions_root / "tx-dangling-journal"
+    transaction_root.mkdir(parents=True)
+    journal_path = transaction_root / "minute-repair-journal.json"
+    journal_path.symlink_to(tmp_path / "missing-journal.json")
+
+    with pytest.raises(RuntimeError, match="publish journal path is invalid"):
+        ingest_module._recover_interrupted_publish(paths)
+
+    assert transaction_root.is_dir()
+    assert journal_path.is_symlink()
+
+
 def test_rollback_cas_never_overwrites_a_third_party_generation(tmp_path: Path) -> None:
     import rquant.research_ingest as ingest_module
 

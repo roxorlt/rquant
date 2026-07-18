@@ -156,8 +156,12 @@ authority、主副 catalog 或任一目标 manifest 发生变化都会令旧 pla
 ```
 
 重点核对 `required_session_count`、`lake_complete_session_count`、
-`missing_session_count`、逐日 `target_session_count` 和 `plan_id`。预演不会请求
-Tushare，也不会创建 transaction 或改写研究湖。确认后原样复用 manifest 和 plan：
+`missing_session_count`、`affected_ts_codes`、逐日 `target_session_count` 和
+`plan_id`。`window_scope_sha256`、`unavailable_sessions_sha256`、
+`lake_complete_sessions_sha256` 与 `source_complete_sessions_sha256` 用于确认范围和
+两侧覆盖证据没有被摘要计数掩盖。预演不会请求 Tushare；状态库以 SQLite `mode=ro`、
+catalog 以 DuckDB `read_only=True` 打开，不创建 transaction、schema、目录、锁文件或改写
+研究湖。确认后原样复用 manifest 和 plan：
 
 ```bash
 .venv/bin/rquant research-repair-minute \

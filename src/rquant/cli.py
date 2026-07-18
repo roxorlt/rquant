@@ -740,6 +740,7 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
     state = BackfillStateStore(
         settings.backfill_state_path_resolved,
         busy_timeout_ms=settings.backfill_state_busy_timeout_ms,
+        read_only=True,
     )
     result = run_research_minute_repair(
         source_database=settings.duckdb_readonly_path_resolved,

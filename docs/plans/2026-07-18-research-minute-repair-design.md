@@ -136,4 +136,3 @@ JSON 输出包括：
 首次生产修复必须先备份，保存预演 JSON，核对 18,125 个缺失会话和 162 个分区，再用
 同一 `plan_id` apply。修复后重新执行 `n_shape` 的 dataset snapshot dry-run，覆盖门通过
 后才 apply 正式快照与固定回放。
-

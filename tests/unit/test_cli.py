@@ -1015,6 +1015,7 @@ class TestResearchMinuteRepair:
         state_factory.assert_called_once_with(
             state_path,
             busy_timeout_ms=config_module.settings.backfill_state_busy_timeout_ms,
+            read_only=True,
         )
         run_repair.assert_called_once_with(
             source_database=source,

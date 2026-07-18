@@ -126,10 +126,17 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
 
 
 class ResearchCatalog:
-    """A path-only handle; each operation takes one short cross-process lock."""
+    """A path-only catalog handle with explicit reader and publisher modes."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self.read_only = read_only
+        if read_only and (
+            not self.path.is_file() or self.path.is_symlink()
+        ):
+            raise ValueError(
+                f"read-only research catalog is invalid: {self.path}"
+            )
 
     @property
     def lock_path(self) -> Path:
@@ -137,6 +144,13 @@ class ResearchCatalog:
 
     @contextmanager
     def _connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        if self.read_only:
+            connection = duckdb.connect(str(self.path), read_only=True)
+            try:
+                yield connection
+            finally:
+                connection.close()
+            return
         with exclusive_file_lock(self.lock_path):
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = duckdb.connect(str(self.path))
@@ -146,6 +160,10 @@ class ResearchCatalog:
             finally:
                 connection.close()
 
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise RuntimeError("read-only research catalog cannot publish")
+
     def begin_run(
         self,
         *,
@@ -154,6 +172,7 @@ class ResearchCatalog:
         code_commit: str,
         started_at: datetime | None = None,
     ) -> str:
+        self._require_writable()
         run_id = uuid.uuid4().hex
         began_at = started_at or _utc_now()
         with self._connection() as connection:
@@ -191,6 +210,7 @@ class ResearchCatalog:
         error: str | None = None,
         finished_at: datetime | None = None,
     ) -> None:
+        self._require_writable()
         completed_at = finished_at or _utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN")

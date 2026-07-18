@@ -137,6 +137,35 @@ def test_partition_paths_are_stable_and_frequency_aware() -> None:
         ResearchPartitionKey(dataset="auction_bar", trade_date=date(2026, 7, 14), freq="1min")
 
 
+def test_read_only_catalog_never_creates_or_mutates_files(tmp_path: Path) -> None:
+    catalog_path = tmp_path / "catalog" / "research.duckdb"
+
+    with pytest.raises(ValueError, match="read-only research catalog"):
+        ResearchCatalog(catalog_path, read_only=True)
+    assert not catalog_path.parent.exists()
+
+    writable = ResearchCatalog(catalog_path)
+    with writable._connection():
+        pass
+    writable.lock_path.unlink()
+    before_catalog = catalog_path.read_bytes()
+    before_entries = tuple(sorted(path.name for path in catalog_path.parent.iterdir()))
+
+    read_only = ResearchCatalog(catalog_path, read_only=True)
+
+    assert read_only.list_partitions(
+        dataset="minute_bar",
+        start_date=date(2026, 7, 14),
+        end_date=date(2026, 7, 14),
+        freq="1min",
+    ) == []
+    assert read_only.get_coverage("minute_bar") is None
+    assert catalog_path.read_bytes() == before_catalog
+    assert tuple(
+        sorted(path.name for path in catalog_path.parent.iterdir())
+    ) == before_entries
+
+
 def test_export_writes_valid_parquet_manifest_and_catalog(
     source_connection: duckdb.DuckDBPyConnection,
     tmp_path: Path,

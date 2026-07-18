@@ -551,3 +551,33 @@ def test_success_duration_updates_ewma_eta(tmp_path: Path) -> None:
     assert status.written_rows == 723
     assert status.covered_sessions == 3
     assert status.allowed_missing_sessions == 1
+
+
+def test_readonly_store_requires_existing_database_without_creating_it(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import BackfillStateStore
+
+    path = tmp_path / "missing.sqlite3"
+
+    with pytest.raises(ValueError, match="read-only backfill state"):
+        BackfillStateStore(path, read_only=True)
+
+    assert not path.exists()
+
+
+def test_readonly_store_loads_state_but_rejects_writes(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import BackfillStateStore
+
+    path = tmp_path / "backfill.sqlite3"
+    writable = BackfillStateStore(path)
+    manifest = _manifest()
+    writable.persist_manifest(manifest)
+
+    readonly = BackfillStateStore(path, read_only=True)
+
+    assert readonly.load_manifest(manifest.manifest_id) is not None
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        readonly.persist_manifest(manifest)

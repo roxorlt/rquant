@@ -93,7 +93,7 @@ class MinuteRepairSession(_MinuteRepairModel):
 
 
 class MinuteRepairScope(_MinuteRepairModel):
-    required_session_count: int = Field(ge=1)
+    required_session_count: int = Field(ge=0)
     unavailable_session_count: int = Field(ge=0)
     lake_complete_session_count: int = Field(ge=0)
     missing_sessions: tuple[MinuteRepairSession, ...]
@@ -125,16 +125,21 @@ class ResearchMinuteRepairPlan(_MinuteRepairModel):
     manifest_content_sha256: str = Field(pattern=_HASH_PATTERN)
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
+    window_scope_sha256: str = Field(pattern=_HASH_PATTERN)
+    unavailable_sessions_sha256: str = Field(pattern=_HASH_PATTERN)
     authority_current_sha256: str = Field(pattern=_HASH_PATTERN)
     catalog_sha256: str = Field(pattern=_HASH_PATTERN)
     readonly_catalog_sha256: str = Field(pattern=_HASH_PATTERN)
-    required_session_count: int = Field(ge=1)
+    required_session_count: int = Field(ge=0)
     unavailable_session_count: int = Field(ge=0)
     lake_complete_session_count: int = Field(ge=0)
     missing_session_count: int = Field(ge=0)
     source_complete_session_count: int = Field(ge=0)
     required_sessions_sha256: str = Field(pattern=_HASH_PATTERN)
     missing_sessions_sha256: str = Field(pattern=_HASH_PATTERN)
+    lake_complete_sessions_sha256: str = Field(pattern=_HASH_PATTERN)
+    source_complete_sessions_sha256: str = Field(pattern=_HASH_PATTERN)
+    affected_ts_codes: tuple[str, ...] = ()
     days: tuple[ResearchMinuteRepairDayPlan, ...] = ()
 
     @model_validator(mode="after")
@@ -148,6 +153,10 @@ class ResearchMinuteRepairPlan(_MinuteRepairModel):
             raise ValueError("minute repair coverage counts are inconsistent")
         if self.source_complete_session_count != self.missing_session_count:
             raise ValueError("minute repair source coverage must equal missing coverage")
+        if self.source_complete_sessions_sha256 != self.missing_sessions_sha256:
+            raise ValueError("minute repair source session hash must equal missing hash")
+        if self.affected_ts_codes != tuple(sorted(set(self.affected_ts_codes))):
+            raise ValueError("minute repair affected codes must be sorted and unique")
         if sum(day.target_session_count for day in self.days) != (
             self.missing_session_count
         ):
@@ -558,7 +567,7 @@ def assess_minute_repair_scope(
     lake_complete, artifacts = _complete_minute_sessions_from_lake(
         plan.windows,
         session_spec,
-        catalog=ResearchCatalog(paths.catalog_path),
+        catalog=ResearchCatalog(paths.catalog_path, read_only=True),
         lake_root=paths.lake_root,
         as_of_time=as_of_time,
     )
@@ -775,12 +784,44 @@ def _build_prepared_minute_repair(
             existing_manifests[trade_date] = existing_manifest
 
     required = required_minute_sessions(plan)
+    missing_set = set(scope.missing_sessions)
+    lake_complete_sessions = tuple(
+        row for row in required if row not in missing_set
+    )
+    window_scope_sha256 = _canonical_sha256(
+        [
+            window.model_dump(mode="json")
+            for window in sorted(
+                plan.windows,
+                key=lambda row: (
+                    row.ts_code,
+                    row.start_date,
+                    row.end_date,
+                ),
+            )
+        ]
+    )
+    unavailable_sessions_sha256 = _canonical_sha256(
+        [
+            row.model_dump(mode="json")
+            for row in sorted(
+                plan.unavailable_sessions,
+                key=lambda item: (
+                    item.trade_date,
+                    item.ts_code,
+                    item.reason,
+                ),
+            )
+        ]
+    )
     repair_plan = ResearchMinuteRepairPlan(
         code_commit=code_commit,
         manifest_id=manifest_id,
         manifest_content_sha256=manifest_content_sha256,
         strategy_id=plan.manifest.spec.strategy_id,
         strategy_version=plan.manifest.spec.strategy_version,
+        window_scope_sha256=window_scope_sha256,
+        unavailable_sessions_sha256=unavailable_sessions_sha256,
         authority_current_sha256=previous_observation_sha256,
         catalog_sha256=catalog_sha256,
         readonly_catalog_sha256=previous.readonly_catalog_sha256,
@@ -791,6 +832,15 @@ def _build_prepared_minute_repair(
         source_complete_session_count=scope.source_complete_session_count,
         required_sessions_sha256=hash_minute_sessions(required),
         missing_sessions_sha256=hash_minute_sessions(scope.missing_sessions),
+        lake_complete_sessions_sha256=hash_minute_sessions(
+            lake_complete_sessions
+        ),
+        source_complete_sessions_sha256=hash_minute_sessions(
+            scope.missing_sessions
+        ),
+        affected_ts_codes=tuple(
+            sorted({row.ts_code for row in scope.missing_sessions})
+        ),
         days=tuple(day_plans),
     )
     return _PreparedMinuteRepair(
@@ -1124,10 +1174,12 @@ def _prepare_repair_journal(
             )
         manifest = change.after_manifest
         live_version = paths.lake_root / manifest.relative_path
-        if live_version.exists() and (
-            not live_version.is_file()
-            or live_version.is_symlink()
-            or _file_sha256(live_version) != manifest.file_hash
+        if live_version.is_symlink() or (
+            live_version.exists()
+            and (
+                not live_version.is_file()
+                or _file_sha256(live_version) != manifest.file_hash
+            )
         ):
             raise RuntimeError(
                 "existing immutable minute repair version hash mismatch"
@@ -1217,6 +1269,7 @@ def _publish_repair_generation(
             )
             publish_guard()
             for change in observation.repairs:
+                publish_guard()
                 staged_data = (
                     transaction_root
                     / "lake.next"
@@ -1225,22 +1278,24 @@ def _publish_repair_generation(
                 live_data = (
                     paths.lake_root / change.after_manifest.relative_path
                 )
-                if live_data.exists():
-                    if (
+                if live_data.is_symlink() or (
+                    live_data.exists()
+                    and (
                         not live_data.is_file()
-                        or live_data.is_symlink()
                         or _file_sha256(live_data)
                         != change.after_manifest.file_hash
-                    ):
-                        raise RuntimeError(
-                            "existing immutable minute repair version "
-                            "hash mismatch"
-                        )
-                else:
+                    )
+                ):
+                    raise RuntimeError(
+                        "existing immutable minute repair version "
+                        "hash mismatch"
+                    )
+                if not live_data.exists():
                     _copy_file_atomic(staged_data, live_data)
             _publish_step_hook("versions_published")
             publish_guard()
             for change in observation.repairs:
+                publish_guard()
                 relative_manifest = partition_manifest_relative_path(
                     _minute_partition_key(change.trade_date)
                 )
@@ -1263,6 +1318,7 @@ def _publish_repair_generation(
                 _repair_observation_path(paths, observation),
                 observation,
             )
+            publish_guard()
             _write_model_atomic(
                 paths.state_dir / "research-authority-current.json",
                 observation,

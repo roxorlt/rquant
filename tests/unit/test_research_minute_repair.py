@@ -353,6 +353,74 @@ def test_required_minute_sessions_use_persisted_windows_and_exclude_unavailable(
     )
 
 
+def test_minute_repair_returns_unchanged_when_every_window_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_manifest import (
+        BackfillCoverage,
+        BackfillPhaseCoverage,
+        UnavailableMinuteSession,
+        backfill_state_input,
+    )
+    from rquant.backfill_state import BackfillStateStore
+    from rquant.research_minute_repair import run_research_minute_repair
+
+    paths, _state, operational_path, base_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    unavailable = tuple(
+        UnavailableMinuteSession(
+            ts_code=window.ts_code,
+            trade_date=trade_date,
+            reason="known_full_day_suspension",
+        )
+        for window in base_plan.windows
+        for trade_date in window.open_dates
+    )
+    empty_plan = base_plan.model_copy(
+        update={
+            "unavailable_sessions": unavailable,
+            "coverage": BackfillCoverage(
+                baseline=BackfillPhaseCoverage(
+                    expected_sessions=1,
+                    complete_sessions=0,
+                    accepted_missing_sessions=1,
+                ),
+                entry=BackfillPhaseCoverage(
+                    expected_sessions=1,
+                    complete_sessions=0,
+                    accepted_missing_sessions=1,
+                ),
+                exit=BackfillPhaseCoverage(
+                    expected_sessions=1,
+                    complete_sessions=0,
+                    accepted_missing_sessions=1,
+                ),
+                expected_unique_sessions=3,
+                complete_unique_sessions=0,
+                accepted_missing_unique_sessions=3,
+            ),
+        }
+    )
+    state = BackfillStateStore(tmp_path / "empty-scope.sqlite3")
+    state.persist_manifest(backfill_state_input(empty_plan))
+
+    result = run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=empty_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+
+    assert result.status == "unchanged"
+    assert result.plan.required_session_count == 0
+    assert result.plan.unavailable_session_count == 3
+    assert result.plan.missing_session_count == 0
+    assert result.plan.days == ()
+
+
 def test_assess_scope_only_repairs_complete_operational_sessions_missing_from_lake(
     tmp_path: Path,
 ) -> None:
@@ -594,6 +662,8 @@ def test_minute_repair_plan_id_is_stable_and_changes_with_day_content() -> None:
         manifest_content_sha256="f" * 64,
         strategy_id="n_shape",
         strategy_version="v1",
+        window_scope_sha256="7" * 64,
+        unavailable_sessions_sha256="8" * 64,
         authority_current_sha256="1" * 64,
         catalog_sha256="2" * 64,
         readonly_catalog_sha256="3" * 64,
@@ -604,6 +674,9 @@ def test_minute_repair_plan_id_is_stable_and_changes_with_day_content() -> None:
         source_complete_session_count=1,
         required_sessions_sha256="4" * 64,
         missing_sessions_sha256="5" * 64,
+        lake_complete_sessions_sha256="6" * 64,
+        source_complete_sessions_sha256="5" * 64,
+        affected_ts_codes=("000001.SZ",),
         days=(day,),
     )
 
@@ -628,9 +701,11 @@ def test_minute_repair_plan_id_is_stable_and_changes_with_day_content() -> None:
 
 def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bound(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import hashlib
 
+    import rquant.research_minute_repair as repair_module
     from rquant.backfill_manifest import backfill_state_input
     from rquant.backfill_state import BackfillStateStore
     from rquant.research_ingest import run_daily_research_ingest
@@ -673,6 +748,15 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
     current_path = tmp_path / "research-authority-current.json"
     before_current = current_path.read_bytes()
     before_catalog = hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest()
+    original_catalog = repair_module.ResearchCatalog
+    catalog_modes: list[bool] = []
+
+    class CatalogSpy(original_catalog):
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            catalog_modes.append(read_only)
+            super().__init__(path, read_only=read_only)
+
+    monkeypatch.setattr(repair_module, "ResearchCatalog", CatalogSpy)
 
     first = build_research_minute_repair_plan(
         source_database=operational_path,
@@ -698,12 +782,20 @@ def test_build_minute_repair_plan_is_read_only_clock_independent_and_content_bou
     assert first.lake_complete_session_count == 0
     assert first.missing_session_count == 3
     assert first.source_complete_session_count == 3
+    assert first.affected_ts_codes == ("000001.SZ",)
+    assert first.window_scope_sha256 != first.unavailable_sessions_sha256
+    assert first.lake_complete_sessions_sha256 != first.missing_sessions_sha256
+    assert (
+        first.source_complete_sessions_sha256
+        == first.missing_sessions_sha256
+    )
     assert tuple(day.trade_date for day in first.days) == (
         date(2026, 7, 13),
         date(2026, 7, 14),
         date(2026, 7, 15),
     )
     assert all(day.source_row_count == 241 for day in first.days)
+    assert catalog_modes == [True, True]
     assert current_path.read_bytes() == before_current
     assert hashlib.sha256(paths.catalog_path.read_bytes()).hexdigest() == before_catalog
 
@@ -867,6 +959,69 @@ def test_plan_baseline_rejects_a_symlinked_manifest_even_when_hash_matches(
         repair_module._verify_plan_baseline(paths, bound_plan)
 
 
+def test_minute_repair_preserves_a_dangling_immutable_version_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    original_prepare_journal = repair_module._prepare_repair_journal
+    dangling_version: Path | None = None
+
+    def prepare_journal_with_dangling_version(*args, **kwargs):
+        nonlocal dangling_version
+        observation = kwargs["observation"]
+        dangling_version = (
+            paths.lake_root
+            / observation.repairs[0].after_manifest.relative_path
+        )
+        dangling_version.parent.mkdir(parents=True, exist_ok=True)
+        dangling_version.symlink_to(tmp_path / "missing-version.parquet")
+        return original_prepare_journal(*args, **kwargs)
+
+    def fail_after_versions(step: str) -> None:
+        if step == "versions_published":
+            raise RuntimeError("injected failure after versions")
+
+    monkeypatch.setattr(
+        repair_module,
+        "_prepare_repair_journal",
+        prepare_journal_with_dangling_version,
+    )
+    monkeypatch.setattr(
+        repair_module,
+        "_publish_step_hook",
+        fail_after_versions,
+    )
+
+    with pytest.raises(RuntimeError):
+        repair_module.run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=_repair_clock,
+        )
+
+    assert dangling_version is not None
+    assert dangling_version.is_symlink()
+    assert not dangling_version.exists()
+
+
 @pytest.mark.parametrize(
     "failure_step",
     [
@@ -975,6 +1130,62 @@ def test_minute_repair_publish_failure_rolls_back_every_target(
             paths.lake_root / partition_directory(key) / "versions"
         )
         assert not versions.exists() or not tuple(versions.iterdir())
+
+
+def test_minute_repair_rechecks_protection_before_each_live_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, operational_path, backfill_plan = (
+        _seed_minute_repair_case(tmp_path)
+    )
+    preview = repair_module.run_research_minute_repair(
+        source_database=operational_path,
+        paths=paths,
+        state=state,
+        manifest_id=backfill_plan.manifest.manifest_id,
+        code_commit=_COMMIT,
+        now=_repair_clock,
+    )
+    clock_calls = 0
+
+    def moving_clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        minute = 0 if clock_calls <= 5 else 15
+        return datetime(2026, 7, 20, 9, minute, tzinfo=_CST)
+
+    original_copy = repair_module._copy_file_atomic
+    published_versions: list[Path] = []
+
+    def track_copy(source: Path, target: Path) -> None:
+        if paths.lake_root in target.parents and target.suffix == ".parquet":
+            published_versions.append(target)
+        original_copy(source, target)
+
+    monkeypatch.setattr(repair_module, "_copy_file_atomic", track_copy)
+
+    with pytest.raises(
+        ValueError,
+        match="forbidden during market protection window",
+    ):
+        repair_module.run_research_minute_repair(
+            source_database=operational_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            apply=True,
+            plan_id=preview.plan_id,
+            now=moving_clock,
+        )
+
+    assert len(published_versions) == 1
+    assert not paths.transactions_root.exists() or not tuple(
+        paths.transactions_root.iterdir()
+    )
 
 
 def test_next_apply_recovers_an_interrupted_minute_repair_journal(
