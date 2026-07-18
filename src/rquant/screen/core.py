@@ -46,9 +46,13 @@ def screen(
 
     aggregates = _collect_aggregates(rules)
 
-    df = load_universe(
-        trade_date, lookback=lookback, store=store, aggregate_requests=aggregates
-    )
+    df = load_universe(trade_date, lookback=lookback, store=store, aggregate_requests=aggregates)
+
+    if df.empty:
+        cols = list(BASE_COLUMNS)
+        if include_columns:
+            cols += [c for c in include_columns if c not in cols]
+        return pd.DataFrame(columns=cols)
 
     if ts_code_whitelist is not None:
         df = df[df["ts_code"].isin(ts_code_whitelist)]

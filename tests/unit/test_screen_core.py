@@ -2,6 +2,9 @@
 
 from unittest.mock import patch
 
+import pandas as pd
+import pytest
+
 from rquant.screen import screen
 from rquant.screen.rules import (
     AggregateRequest,
@@ -98,17 +101,22 @@ class TestAggregateCollection:
         from rquant.screen.core import _collect_aggregates
 
         req = AggregateRequest(
-            name="same_name", source_table="daily_state",
-            source_col="x", agg_func="max", window=5,
+            name="same_name",
+            source_table="daily_state",
+            source_col="x",
+            agg_func="max",
+            window=5,
         )
 
         def r1(df):
             return df["ts_code"].notna()
+
         r1 = _tag_lookback(r1, 0)
         r1 = _tag_aggregates(r1, [req])
 
         def r2(df):
             return df["ts_code"].notna()
+
         r2 = _tag_lookback(r2, 0)
         r2 = _tag_aggregates(r2, [req])
 
@@ -135,6 +143,7 @@ class TestAggregateCollection:
 
         def rule_with_agg(df):
             return df["max_consec_ups_8d"] < 3
+
         rule_with_agg = _tag_lookback(rule_with_agg, 0)
         rule_with_agg = _tag_aggregates(rule_with_agg, [req])
 
@@ -148,6 +157,41 @@ class TestAggregateCollection:
 
 
 class TestWhitelist:
+    def test_whitelist_handles_loader_empty_frame_without_columns(self) -> None:
+        with patch(
+            "rquant.screen.core.load_universe",
+            return_value=pd.DataFrame(),
+        ):
+            result = screen(
+                trade_date="2026-04-15",
+                rules=[not_st()],
+                include_columns=["MA20[0]"],
+                ts_code_whitelist=["300001.SZ"],
+            )
+
+        assert result.empty
+        assert list(result.columns) == [
+            "ts_code",
+            "name",
+            "CLOSE[0]",
+            "PCT_CHG[0]",
+            "MA20[0]",
+        ]
+
+    def test_whitelist_rejects_nonempty_frame_without_ts_code(self) -> None:
+        with (
+            patch(
+                "rquant.screen.core.load_universe",
+                return_value=pd.DataFrame({"name": ["invalid"]}),
+            ),
+            pytest.raises(KeyError, match="ts_code"),
+        ):
+            screen(
+                trade_date="2026-04-15",
+                rules=[not_st()],
+                ts_code_whitelist=["300001.SZ"],
+            )
+
     def test_whitelist_filters_to_subset(self) -> None:
         df = make_wide_frame()
         with patch("rquant.screen.core.load_universe", return_value=df):
