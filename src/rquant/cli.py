@@ -832,10 +832,16 @@ def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
         and not args.skip_state_recompute
         and affected_codes
     ):
+        tail_start_value = summary.get("state_tail_start_date")
+        if not isinstance(tail_start_value, str):
+            raise RuntimeError(
+                "market backfill result is missing state_tail_start_date"
+            )
         with DuckDBStore() as store:
             recompute_daily_state(
                 store,
                 codes=affected_codes,
+                start_date=date.fromisoformat(tail_start_value),
                 status_mode="verified_no_fetch",
             )
     return 1 if summary["failed_dates"] else 0
@@ -2903,7 +2909,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-state-recompute",
         dest="skip_state_recompute",
         action="store_true",
-        help="跳过最终 daily_state 重算；逐日写入仍会删除受影响日期起的陈旧状态尾部",
+        help=(
+            "跳过最终 daily_state 原子尾段重算；受影响的状态和日指标"
+            "尾段仍会保持失效"
+        ),
     )
     market_backfill_p.add_argument(
         "--skip-state",

@@ -26,6 +26,7 @@ from rquant.data_quality import (
     DEFAULT_MINUTE_SOURCE_SESSION_SPECS,
     MinuteSourceSessionSpec,
 )
+from rquant.growth_eligibility import classify_growth_opening_structure
 
 EligibilityBasis = Literal["daily", "daily+auction"]
 BackfillPhase = Literal["baseline", "entry", "exit"]
@@ -700,19 +701,31 @@ def resolve_growth_board_eligibility(
     )
     targets = _target_open_dates(calendar, start_date, end_date)
     index_by_date = {day: index for index, day in enumerate(calendar)}
-    records: list[EligibilityRecord] = []
+    previous_by_target: dict[date, date] = {}
     for trading_date in targets:
         current_index = index_by_date[trading_date]
         if current_index == 0:
             raise ValueError("growth eligibility requires a prior open session")
-        previous_date = calendar[current_index - 1]
+        previous_by_target[trading_date] = calendar[current_index - 1]
+    excluded_by_target: dict[date, set[str]] = {}
+    for fact in classify_growth_opening_structure(store, previous_by_target):
+        excluded_by_target.setdefault(fact.target_date, set()).add(fact.ts_code)
+    records: list[EligibilityRecord] = []
+    for trading_date in targets:
+        previous_date = previous_by_target[trading_date]
         candidates = growth.resolve_growth_board_candidates(
             store,
             trading_date,
             previous_date,
             config.min_signal_time,
+            structural_excluded_codes=excluded_by_target.get(
+                trading_date,
+                set(),
+            ),
         )
         for candidate in candidates:
+            if candidate.ts_code in excluded_by_target.get(trading_date, set()):
+                continue
             records.append(
                 EligibilityRecord(
                     strategy_id=spec.strategy_id,
@@ -771,6 +784,7 @@ def resolve_auction_gap_eligibility(
 
 _ELIGIBILITY_INPUT_COVERAGE_THRESHOLD = 0.99
 _N_SHAPE_PANEL_OPEN_DAYS = 121
+_GROWTH_STRUCTURE_STAGE = "_rquant_growth_opening_structure"
 _A_SHARE_TS_CODE_PATTERNS = (
     "000%.SZ",
     "001%.SZ",
@@ -848,23 +862,51 @@ def _opening_panel_counts(
         else ""
     )
     if strategy_id == "growth_board_surge":
+        structural_facts = classify_growth_opening_structure(
+            store,
+            previous_by_target,
+        )
+        structure_frame = pd.DataFrame(
+            [
+                {
+                    "target_date": fact.target_date,
+                    "ts_code": fact.ts_code,
+                    "is_deterministic_non_candidate": (
+                        fact.is_deterministic_non_candidate
+                    ),
+                }
+                for fact in structural_facts
+            ],
+            columns=[
+                "target_date",
+                "ts_code",
+                "is_deterministic_non_candidate",
+            ],
+        )
+        store._conn.register(_GROWTH_STRUCTURE_STAGE, structure_frame)
         availability = """
-            status.ts_code IS NOT NULL
-            AND status.conflict_reason IS NULL
-            AND status.is_st IS NOT NULL
-            AND status.available_at IS NOT NULL
-            AND status.available_at <= (
-                CAST(expected.target_date AS TIMESTAMP)
-                + INTERVAL '9 hours 30 minutes'
-            ) AT TIME ZONE 'Asia/Shanghai'
-            AND indicator.ts_code IS NOT NULL
-            AND indicator.ma5 IS NOT NULL
-            AND indicator.ma10 IS NOT NULL
-            AND indicator.ma20 IS NOT NULL
-            AND indicator.ma60 IS NOT NULL
-            AND expected.daily_ts_code IS NOT NULL
-            AND expected.close IS NOT NULL
-            AND expected.close > 0
+            (
+                (
+                    structure.ts_code IS NULL
+                    AND status.ts_code IS NOT NULL
+                    AND status.conflict_reason IS NULL
+                    AND status.is_st IS NOT NULL
+                    AND status.available_at IS NOT NULL
+                    AND status.available_at <= (
+                        CAST(expected.target_date AS TIMESTAMP)
+                        + INTERVAL '9 hours 30 minutes'
+                    ) AT TIME ZONE 'Asia/Shanghai'
+                    AND indicator.ts_code IS NOT NULL
+                    AND indicator.ma5 IS NOT NULL
+                    AND indicator.ma10 IS NOT NULL
+                    AND indicator.ma20 IS NOT NULL
+                    AND indicator.ma60 IS NOT NULL
+                    AND expected.daily_ts_code IS NOT NULL
+                    AND expected.close IS NOT NULL
+                    AND expected.close > 0
+                )
+                OR structure.is_deterministic_non_candidate = TRUE
+            )
         """
         joins = """
         LEFT JOIN stock_status_daily AS status
@@ -873,6 +915,9 @@ def _opening_panel_counts(
         LEFT JOIN daily_indicator AS indicator
           ON indicator.ts_code = expected.ts_code
          AND indicator.trade_date = expected.previous_date
+        LEFT JOIN _rquant_growth_opening_structure AS structure
+          ON structure.target_date = expected.target_date
+         AND structure.ts_code = expected.ts_code
         """
     else:
         availability = """
@@ -905,12 +950,13 @@ def _opening_panel_counts(
           ON auction.ts_code = expected.ts_code
          AND auction.trade_date = expected.target_date
         """
-    rows = store._conn.execute(
-        f"""
-        WITH requested(target_date, previous_date) AS (
-            VALUES {values}
-        ),
-        universe AS (
+    try:
+        rows = store._conn.execute(
+            f"""
+            WITH requested(target_date, previous_date) AS (
+                VALUES {values}
+            ),
+            universe AS (
             SELECT requested.target_date,
                    requested.previous_date,
                    basic.ts_code
@@ -935,8 +981,8 @@ def _opening_panel_counts(
             JOIN daily_bar AS bar
               ON bar.trade_date = requested.previous_date
              AND {bar_is_a_share}
-        ),
-        expected AS (
+            ),
+            expected AS (
             SELECT universe.target_date,
                    universe.previous_date,
                    universe.ts_code,
@@ -948,17 +994,20 @@ def _opening_panel_counts(
              AND bar.ts_code = universe.ts_code
             WHERE TRUE
               {board_filter}
-        )
-        SELECT expected.target_date,
-               COUNT(*) AS expected_count,
-               COUNT(*) FILTER (WHERE {availability}) AS available_count
-        FROM expected
-        {joins}
-        GROUP BY expected.target_date
-        ORDER BY expected.target_date
-        """,
-        parameters,
-    ).fetchall()
+            )
+            SELECT expected.target_date,
+                   COUNT(*) AS expected_count,
+                   COUNT(*) FILTER (WHERE {availability}) AS available_count
+            FROM expected
+            {joins}
+            GROUP BY expected.target_date
+            ORDER BY expected.target_date
+            """,
+            parameters,
+        ).fetchall()
+    finally:
+        if strategy_id == "growth_board_surge":
+            store._conn.unregister(_GROWTH_STRUCTURE_STAGE)
     return {
         _as_date(target): (int(expected), int(available))
         for target, expected, available in rows

@@ -10,7 +10,10 @@ from typing import Literal, Protocol
 import pandas as pd
 from loguru import logger
 
-from rquant.ingest import _load_daily_state_inputs
+from rquant.ingest import (
+    _derive_target_daily_states,
+    _load_target_daily_state_inputs,
+)
 from rquant.security_status import (
     DEFAULT_REQUEST_INTERVAL_SECONDS,
     NAMECHANGE_EARLIEST_DATE,
@@ -27,6 +30,26 @@ from rquant.storage.duckdb import DuckDBStore
 _API_SLEEP = 0.35
 _REQUESTS_PER_DAY = 3
 _STATE_LOG_EVERY = 500
+_STATE_BATCH_SIZE = 250
+_STATE_STAGE = "_rquant_state_tail_stage"
+_STATE_BATCH_STAGE = "_rquant_state_tail_batch"
+_STATE_COLUMNS = (
+    "ts_code",
+    "trade_date",
+    "is_st",
+    "is_bj",
+    "board_type",
+    "limit_pct",
+    "limit_up_price",
+    "limit_down_price",
+    "is_limit_up",
+    "is_limit_down",
+    "is_first_limit_up",
+    "is_yiziban",
+    "consecutive_limit_ups",
+    "body_upper",
+    "body_lower",
+)
 _REQUEST_COUNT_SEMANTICS = (
     "logical_adapter_operations; internal retries are not observable or countable"
 )
@@ -119,22 +142,63 @@ def _existing_status_scope(
     return existing, incomplete
 
 
+def _require_state_predecessor_coverage(
+    store: DuckDBStore,
+    *,
+    trade_date: date,
+    affected_codes: set[str],
+) -> None:
+    if not affected_codes:
+        return
+    missing = store._conn.execute(
+        """
+        WITH predecessor AS (
+            SELECT ts_code, max(trade_date) AS trade_date
+            FROM daily_bar
+            WHERE ts_code = ANY(?)
+              AND trade_date < ?
+            GROUP BY ts_code
+        )
+        SELECT predecessor.ts_code, predecessor.trade_date
+        FROM predecessor
+        LEFT JOIN daily_state AS state USING (ts_code, trade_date)
+        WHERE state.ts_code IS NULL
+        ORDER BY predecessor.trade_date DESC, predecessor.ts_code
+        LIMIT 1
+        """,
+        [sorted(affected_codes), trade_date],
+    ).fetchone()
+    if missing is not None:
+        raise RuntimeError(
+            f"authoritative predecessor state is missing for {missing[0]} {missing[1]}"
+        )
+
+
 def _apply_prepared_date(
     store_factory: Callable[[], DuckDBStore],
     *,
     trade_date: date,
+    state_tail_start_date: date,
     daily: pd.DataFrame,
     daily_basic: pd.DataFrame,
     adj_factor: pd.DataFrame,
     status_rows: Sequence[SecurityStatusDaily],
 ) -> tuple[int, int, int, int, set[str]]:
-    """Atomically replace market facts and invalidate the derived state tail."""
+    """Atomically replace market facts and invalidate dependent indicators."""
     with store_factory() as store:
-        affected_codes = _frame_codes(daily)
+        affected_codes = _frame_codes(daily).union(
+            row.ts_code for row in status_rows
+        )
+        indicator_affected_codes = _frame_codes(daily, adj_factor)
         transaction_open = False
         try:
             store._conn.execute("BEGIN")
             transaction_open = True
+            _require_state_predecessor_coverage(
+                store,
+                trade_date=state_tail_start_date,
+                affected_codes=affected_codes,
+            )
             daily_count = store.upsert_daily(daily)
             basic_count = store.upsert_daily_basic(daily_basic)
             factor_count = store.upsert_adj_factor(adj_factor)
@@ -143,14 +207,22 @@ def _apply_prepared_date(
                 transaction_mode="existing",
                 require_daily_keys=True,
             )
+            if indicator_affected_codes:
+                ordered_codes = sorted(indicator_affected_codes)
+                store._conn.execute(
+                    """
+                    DELETE FROM daily_indicator
+                    WHERE ts_code = ANY(?) AND trade_date >= ?
+                    """,
+                    [ordered_codes, trade_date],
+                )
             if affected_codes:
-                ordered_codes = sorted(affected_codes)
                 store._conn.execute(
                     """
                     DELETE FROM daily_state
                     WHERE ts_code = ANY(?) AND trade_date >= ?
                     """,
-                    [ordered_codes, trade_date],
+                    [sorted(affected_codes), trade_date],
                 )
             store._conn.execute("COMMIT")
             transaction_open = False
@@ -278,6 +350,7 @@ def backfill_market_daily(
         "security_status_conflicts": 0,
         "failed_dates": [],
         "affected_codes": [],
+        "state_tail_start_date": None,
         "dry_run": dry_run,
     }
     if dry_run or not dates:
@@ -298,6 +371,7 @@ def backfill_market_daily(
         sleep=sleep,
     )
     affected_codes: set[str] = set()
+    state_tail_start_date: date | None = None
 
     for index, trading_date in enumerate(dates):
         summary["executed_dates"] += 1
@@ -353,6 +427,7 @@ def backfill_market_daily(
             ) = _apply_prepared_date(
                 store_factory,
                 trade_date=trading_date,
+                state_tail_start_date=state_tail_start_date or trading_date,
                 daily=df_daily,
                 daily_basic=df_basic,
                 adj_factor=df_factor,
@@ -377,6 +452,8 @@ def backfill_market_daily(
             row.conflict_reason is not None for row in status_rows
         )
         affected_codes.update(date_affected_codes)
+        if date_affected_codes and state_tail_start_date is None:
+            state_tail_start_date = trading_date
         logger.info(
             f"{trading_date} 回补完成 ({index + 1}/{len(dates)}): "
             f"daily={daily_rows} basic={basic_rows} factor={factor_rows} "
@@ -384,6 +461,11 @@ def backfill_market_daily(
         )
 
     summary["affected_codes"] = sorted(affected_codes)
+    summary["state_tail_start_date"] = (
+        state_tail_start_date.isoformat()
+        if state_tail_start_date is not None
+        else None
+    )
     _sync_request_counts(summary, counters)
     return summary
 
@@ -392,13 +474,15 @@ def recompute_daily_state(
     store: DuckDBStore,
     codes: list[str] | None = None,
     *,
+    start_date: date | None = None,
     status_mode: Literal["verified_no_fetch"],
+    batch_size: int = _STATE_BATCH_SIZE,
 ) -> int:
-    """Recompute only from already persisted, verified per-date status rows."""
-    from rquant.state import derive_state
-
+    """Atomically replace a state tail from persisted point-in-time facts."""
     if status_mode != "verified_no_fetch":
         raise ValueError("status_mode must be 'verified_no_fetch'")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     if codes is None:
         codes = [
             str(row[0])
@@ -410,17 +494,48 @@ def recompute_daily_state(
         codes = sorted(set(codes))
     if not codes:
         return 0
+    if start_date is None:
+        first_row = store._conn.execute(
+            """
+            SELECT min(trade_date)
+            FROM daily_bar
+            WHERE ts_code = ANY(?)
+            """,
+            [codes],
+        ).fetchone()
+        target_date = first_row[0] if first_row is not None else None
+        if target_date is None:
+            return 0
+    else:
+        target_date = start_date
+    codes = [
+        str(row[0])
+        for row in store._conn.execute(
+            """
+            SELECT DISTINCT ts_code
+            FROM daily_bar
+            WHERE ts_code = ANY(?)
+              AND trade_date >= ?
+            ORDER BY ts_code
+            """,
+            [codes, target_date],
+        ).fetchall()
+    ]
+    if not codes:
+        return 0
 
     missing_status = store._conn.execute(
         """
         SELECT daily.ts_code, daily.trade_date
         FROM daily_bar AS daily
         LEFT JOIN stock_status_daily AS status USING (ts_code, trade_date)
-        WHERE daily.ts_code = ANY(?) AND status.ts_code IS NULL
+        WHERE daily.ts_code = ANY(?)
+          AND daily.trade_date >= ?
+          AND status.ts_code IS NULL
         ORDER BY daily.trade_date DESC, daily.ts_code
         LIMIT 1
         """,
-        [codes],
+        [codes, target_date],
     ).fetchone()
     if missing_status is not None:
         raise RuntimeError(
@@ -428,16 +543,77 @@ def recompute_daily_state(
             f"{missing_status[0]} {missing_status[1]}"
         )
 
-    logger.info(f"daily_state 全量重算: {len(codes)} 只...")
+    column_sql = ", ".join(_STATE_COLUMNS)
+    logger.info(
+        f"daily_state 原子尾段重算: {len(codes)} 只, start={target_date}..."
+    )
     total = 0
-    for index, code in enumerate(codes):
-        raw, status = _load_daily_state_inputs(store, code)
-        if raw.empty:
-            continue
-        total += store.upsert_state(
-            derive_state(raw, ts_code=code, status_daily=status)
+    transaction_open = False
+    try:
+        store._conn.execute("BEGIN")
+        transaction_open = True
+        store._conn.execute(
+            f"""
+            CREATE TEMP TABLE {_STATE_STAGE} AS
+            SELECT {column_sql}
+            FROM daily_state
+            WHERE FALSE
+            """
         )
-        if (index + 1) % _STATE_LOG_EVERY == 0:
-            logger.info(f"  daily_state 重算进度: {index + 1}/{len(codes)}")
-    logger.info(f"daily_state 重算完成: {len(codes)} 只, {total:,} 行")
+        for offset in range(0, len(codes), batch_size):
+            batch = codes[offset : offset + batch_size]
+            target_rows, seeds = _load_target_daily_state_inputs(
+                store,
+                target_date,
+                batch,
+            )
+            target_state = _derive_target_daily_states(target_rows, seeds)
+            if not target_state.empty:
+                store._conn.register(_STATE_BATCH_STAGE, target_state)
+                try:
+                    store._conn.execute(
+                        f"""
+                        INSERT INTO {_STATE_STAGE} ({column_sql})
+                        SELECT {column_sql}
+                        FROM {_STATE_BATCH_STAGE}
+                        """
+                    )
+                finally:
+                    store._conn.unregister(_STATE_BATCH_STAGE)
+                total += len(target_state)
+            completed = min(offset + batch_size, len(codes))
+            if completed % _STATE_LOG_EVERY == 0 or completed == len(codes):
+                logger.info(
+                    f"  daily_state 尾段准备进度: {completed}/{len(codes)}"
+                )
+        store._conn.execute(
+            """
+            DELETE FROM daily_state
+            WHERE ts_code = ANY(?) AND trade_date >= ?
+            """,
+            [codes, target_date],
+        )
+        store._conn.execute(
+            f"""
+            INSERT INTO daily_state ({column_sql})
+            SELECT {column_sql}
+            FROM {_STATE_STAGE}
+            """
+        )
+        store._conn.execute(f"DROP TABLE {_STATE_STAGE}")
+        store._conn.execute("COMMIT")
+        transaction_open = False
+    except BaseException as primary:
+        if transaction_open:
+            try:
+                store._conn.execute("ROLLBACK")
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    "daily_state tail rebuild and rollback both failed",
+                    [primary, rollback_error],
+                ) from None
+        raise
+    logger.info(
+        f"daily_state 原子尾段重算完成: {len(codes)} 只, {total:,} 行"
+    )
     return total

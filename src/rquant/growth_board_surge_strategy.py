@@ -10,6 +10,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.board_auction_strength import board_auction_strength
+from rquant.growth_eligibility import classify_growth_opening_structure
 from rquant.paper import (
     PaperPosition,
     PaperRiskPlan,
@@ -281,6 +282,8 @@ def resolve_growth_board_candidates(
     trading_date: date,
     previous_date: date,
     min_signal_time: time = time(9, 30),
+    *,
+    structural_excluded_codes: set[str] | None = None,
 ) -> list[GrowthBoardCandidate]:
     """Resolve the opening candidate universe from PIT-visible inputs only."""
     decision_at = datetime.combine(trading_date, min_signal_time, tzinfo=SHANGHAI)
@@ -329,6 +332,16 @@ def resolve_growth_board_candidates(
     ].copy()
     status["board_type"] = status["ts_code"].astype(str).map(_classify_board)
     status = status[status["board_type"].isin(("gem", "star"))]
+    excluded_codes = structural_excluded_codes
+    if excluded_codes is None:
+        excluded_codes = {
+            fact.ts_code
+            for fact in classify_growth_opening_structure(
+                store,
+                {trading_date: previous_date},
+            )
+        }
+    status = status[~status["ts_code"].astype(str).isin(excluded_codes)]
     if bound_codes is not None:
         status = status[status["ts_code"].astype(str).isin(bound_codes)]
     if status.empty:
@@ -390,20 +403,8 @@ def resolve_growth_board_candidates(
     placeholders = ", ".join("?" for _ in codes)
     listing = store._conn.execute(
         f"""
-        WITH first_daily AS (
-            SELECT ts_code, MIN(trade_date) AS first_trade_date
-            FROM daily_bar
-            WHERE ts_code IN ({placeholders})
-            GROUP BY ts_code
-        ),
-        listing_dates AS (
-            SELECT first_daily.ts_code,
-                   COALESCE(basic.list_date, first_daily.first_trade_date) AS list_date
-            FROM first_daily
-            LEFT JOIN stock_basic AS basic USING (ts_code)
-        )
-        SELECT listing_dates.ts_code,
-               listing_dates.list_date,
+        SELECT basic.ts_code,
+               basic.list_date,
                (
                    SELECT CASE WHEN count(*) = 5 THEN max(cal_date) END
                    FROM (
@@ -411,12 +412,14 @@ def resolve_growth_board_candidates(
                        FROM trade_calendar AS calendar
                        WHERE calendar.exchange = 'SSE'
                          AND calendar.is_open = TRUE
-                         AND calendar.cal_date >= listing_dates.list_date
+                         AND calendar.cal_date >= basic.list_date
                        ORDER BY calendar.cal_date
                        LIMIT 5
                    )
                ) AS fifth_listing_trade_date
-        FROM listing_dates
+        FROM stock_basic AS basic
+        WHERE basic.ts_code IN ({placeholders})
+          AND basic.list_date IS NOT NULL
         """,
         list(codes),
     ).fetchdf()

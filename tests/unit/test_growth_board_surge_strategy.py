@@ -480,6 +480,110 @@ def test_growth_board_candidates_use_historical_gem_limit_pct_before_2020_reform
     assert candidates[0].limit_up_price == pytest.approx(11.00)
 
 
+def test_growth_board_candidates_reject_short_listing_with_stale_ma60(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
+
+    days = [
+        date(2026, 6, 15) + timedelta(days=index)
+        for index in range(11)
+    ]
+    previous_date = days[-2]
+    signal_date = days[-1]
+    _seed_open_calendar(store, days)
+    store.upsert_daily(
+        pd.DataFrame(
+            [
+                _daily_row("300001.SZ", trading_date, 10.0 + index * 0.1)
+                for index, trading_date in enumerate(days[:-1])
+            ]
+        )
+    )
+    store.upsert_stock_basic(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "symbol": "300001",
+                    "name": "短上市样本",
+                    "area": "深圳",
+                    "industry": "测试",
+                    "list_date": days[0].strftime("%Y%m%d"),
+                    "market": "创业板",
+                }
+            ]
+        )
+    )
+    store.upsert_indicators(
+        pd.DataFrame(
+            [_indicator_row("300001.SZ", previous_date, bull=True)]
+        )
+    )
+    store.upsert_stock_status(
+        (
+            _known_status(
+                "300001.SZ",
+                signal_date,
+                name="短上市样本",
+                hour=9,
+                minute=25,
+            ),
+        )
+    )
+
+    candidates = resolve_growth_board_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+
+    assert candidates == []
+
+
+def test_growth_board_candidates_reject_suspension_input_conflict(
+    store: DuckDBStore,
+) -> None:
+    from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
+
+    _seed_base_market(store)
+    signal_date = date(2026, 6, 25)
+    previous_date = date(2026, 6, 24)
+    store._conn.execute(
+        """
+        INSERT INTO stock_suspend_coverage
+        (source, trade_date, coverage_state, row_count, snapshot_hash, queried_at)
+        VALUES ('tushare', ?, 'complete', 1, 'snapshot', ?)
+        """,
+        [previous_date, datetime(2026, 6, 24, 16, tzinfo=UTC)],
+    )
+    store._conn.execute(
+        """
+        INSERT INTO stock_suspend_event
+        (source, ts_code, trade_date, suspend_type, suspend_timing,
+         session_scope, available_at, ingested_at)
+        VALUES
+        ('tushare', '300001.SZ', ?, 'S', '09:30-15:00',
+         'full_day', ?, ?)
+        """,
+        [
+            previous_date,
+            datetime(2026, 6, 24, 8, tzinfo=UTC),
+            datetime(2026, 6, 24, 16, tzinfo=UTC),
+        ],
+    )
+
+    candidates = resolve_growth_board_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+    )
+
+    assert candidates == []
+
+
 def test_growth_board_candidates_exclude_unsupported_price_limit_state(
     store: DuckDBStore,
 ) -> None:
@@ -616,7 +720,7 @@ def test_growth_board_candidates_fail_closed_when_bound_keys_disagree(
         )
 
 
-def test_growth_board_candidates_keep_historical_code_missing_from_current_basic(
+def test_growth_board_candidates_fail_closed_without_authoritative_listing_fact(
     store: DuckDBStore,
 ) -> None:
     from rquant.growth_board_surge_strategy import resolve_growth_board_candidates
@@ -636,7 +740,7 @@ def test_growth_board_candidates_keep_historical_code_missing_from_current_basic
         time(9, 30),
     )
 
-    assert [candidate.ts_code for candidate in candidates] == ["300001.SZ"]
+    assert candidates == []
 
 
 def test_growth_board_candidates_use_known_st_fact_without_name(

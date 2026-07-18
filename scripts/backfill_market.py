@@ -90,6 +90,7 @@ def finalize_backfill_state(
         state_rows = recompute(
             store,
             codes=codes,
+            start_date=parsed_dates[0],
             status_mode="verified_no_fetch",
         )
         last_date = store._conn.execute(

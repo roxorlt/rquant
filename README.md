@@ -158,6 +158,11 @@ bash scripts/check-core-quality.sh
 .venv/bin/rquant data-backfill --dataset adj_factor \
   --start-date 2024-09-02 --end-date 2026-07-16
 
+# 修复缺失日线时，市场事实先短事务写入；状态尾段最后原子重建
+# 受影响的日指标会明确失效，随后必须运行 daily-indicator-backfill
+.venv/bin/rquant market-daily-backfill \
+  --start-date 2026-04-20 --end-date 2026-04-20
+
 # 再预演，并在盘外窗口从本地日线与复权因子重建日指标
 .venv/bin/rquant daily-indicator-backfill \
   --start-date 2026-03-31 --end-date 2026-07-16
