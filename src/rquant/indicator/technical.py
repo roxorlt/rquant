@@ -29,7 +29,10 @@ def _kdj(
     """
     llv = low.rolling(window=n, min_periods=1).min()
     hhv = high.rolling(window=n, min_periods=1).max()
-    rsv = ((close - llv) / (hhv - llv).replace(0, pd.NA) * 100).astype("float64")
+    spread = hhv - llv
+    rsv = (
+        (close - llv) / spread.mask(spread.eq(0)) * 100
+    ).astype("float64")
 
     k = pd.Series(index=close.index, dtype="float64")
     d = pd.Series(index=close.index, dtype="float64")
