@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
+import pytest
 
 
 def test_save_and_load_strategy_lab_run_with_markdown_export(tmp_path) -> None:
@@ -51,6 +52,52 @@ def test_save_and_load_strategy_lab_run_with_markdown_export(tmp_path) -> None:
     assert loaded.manifest.research_status == "exploratory"
     assert "## 研究可信度" in loaded.markdown
     assert "探索性" in loaded.markdown
+
+
+def test_run_ids_are_unique_when_two_runs_finish_in_the_same_second(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import rquant.dashboard.strategy_lab_runs as runs_module
+
+    fixed_now = datetime(
+        2026,
+        7,
+        18,
+        22,
+        0,
+        0,
+        123456,
+        tzinfo=runs_module.CST,
+    )
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(runs_module, "datetime", FrozenDateTime)
+    first = runs_module.build_strategy_lab_run(
+        run_type="n_shape_compare",
+        title="same second",
+        params={},
+        metrics={},
+        tables={},
+    )
+    second = runs_module.build_strategy_lab_run(
+        run_type="n_shape_compare",
+        title="same second",
+        params={},
+        metrics={},
+        tables={},
+    )
+
+    assert first.created_at == second.created_at
+    assert first.run_id != second.run_id
+    runs_module.save_strategy_lab_run(first, base_dir=tmp_path)
+    runs_module.save_strategy_lab_run(second, base_dir=tmp_path)
+    with pytest.raises(FileExistsError):
+        runs_module.save_strategy_lab_run(first, base_dir=tmp_path)
 
 
 def test_build_strategy_lab_run_truncates_large_tables(tmp_path) -> None:

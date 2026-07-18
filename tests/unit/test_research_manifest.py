@@ -278,6 +278,50 @@ def test_detect_code_commit_ignores_project_runtime_backup_directory(
     assert observed_commit == clean_commit
 
 
+def test_detect_verified_code_commit_rejects_injected_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    monkeypatch.setenv("RQUANT_CODE_COMMIT", "f" * 40)
+    assert detect_verified_code_commit(repo) is None
+
+    monkeypatch.setenv("RQUANT_CODE_COMMIT", head)
+    assert detect_verified_code_commit(repo) == head
+
+    tracked.write_text("dirty\n", encoding="utf-8")
+    assert detect_verified_code_commit(repo) == f"{head}-dirty"
+
+
 def test_manifest_rejects_covered_count_above_denominator() -> None:
     from rquant.research_manifest import ResearchManifest
 

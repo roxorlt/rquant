@@ -228,7 +228,10 @@ class _PreparedMinuteRepair:
     plan: ResearchMinuteRepairPlan
     previous: ResearchAuthorityObservation
     previous_observation_sha256: str
-    merged_by_date: dict[date, pd.DataFrame]
+    target_sessions_by_date: dict[
+        date,
+        tuple[MinuteRepairSession, ...],
+    ]
     existing_manifests: dict[date, ResearchPartitionManifest | None]
 
 
@@ -302,33 +305,25 @@ def hash_minute_rows(frame: pd.DataFrame) -> str:
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
-    body = ordered.to_csv(
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\n")
+
+    class HashingTextWriter:
+        def write(self, value: str) -> int:
+            digest.update(value.encode("utf-8"))
+            return len(value)
+
+    ordered.to_csv(
+        HashingTextWriter(),
         index=False,
         columns=list(_MINUTE_COLUMNS),
         date_format="%Y-%m-%dT%H:%M:%S.%f",
         float_format="%.17g",
         na_rep="<NULL>",
         lineterminator="\n",
-    ).encode("utf-8")
-    digest = hashlib.sha256()
-    digest.update(header)
-    digest.update(b"\n")
-    digest.update(body)
+    )
     return digest.hexdigest()
-
-
-def _business_values(row: pd.Series) -> tuple[object, ...]:
-    values: list[object] = []
-    for column in _MINUTE_BUSINESS_COLUMNS:
-        value = row[column]
-        if value is None or pd.isna(value):
-            values.append(None)
-        elif isinstance(value, (pd.Timestamp, datetime)):
-            values.append(pd.Timestamp(value).to_pydatetime())
-        else:
-            item = getattr(value, "item", None)
-            values.append(item() if callable(item) else value)
-    return tuple(values)
 
 
 def _validate_operational_sessions(
@@ -388,21 +383,33 @@ def merge_minute_partition(
         trade_date=trade_date,
         target_sessions=target_sessions,
     )
-    keyed: dict[tuple[object, ...], pd.Series] = {}
-    for _, row in prior.iterrows():
-        key = tuple(row[column] for column in _MINUTE_PHYSICAL_KEY)
-        keyed[key] = row.copy()
-    for _, row in current.iterrows():
-        key = tuple(row[column] for column in _MINUTE_PHYSICAL_KEY)
-        previous = keyed.get(key)
-        if previous is None or _business_values(previous) != _business_values(row):
-            keyed[key] = row.copy()
-    merged = pd.DataFrame(
-        [row.to_dict() for row in keyed.values()],
-        columns=_MINUTE_COLUMNS,
+    key_columns = list(_MINUTE_PHYSICAL_KEY)
+    business_columns = list(_MINUTE_BUSINESS_COLUMNS)
+    prior_by_key = prior.set_index(key_columns, drop=False)
+    current_by_key = current.set_index(key_columns, drop=False)
+    overlap = current_by_key.index.intersection(
+        prior_by_key.index,
+        sort=False,
     )
-    merged["trade_time"] = pd.to_datetime(merged["trade_time"], errors="raise")
-    merged["created_at"] = pd.to_datetime(merged["created_at"], errors="raise")
+    if not overlap.empty:
+        prior_values = prior_by_key.loc[overlap, business_columns]
+        current_values = current_by_key.loc[overlap, business_columns]
+        unchanged = (
+            current_values.eq(prior_values)
+            | (current_values.isna() & prior_values.isna())
+        ).all(axis=1)
+        unchanged_keys = overlap[unchanged.to_numpy()]
+        if not unchanged_keys.empty:
+            current_by_key.loc[unchanged_keys, "created_at"] = (
+                prior_by_key.loc[unchanged_keys, "created_at"].to_numpy()
+            )
+    retained_prior = prior_by_key.loc[
+        ~prior_by_key.index.isin(current_by_key.index)
+    ].reset_index(drop=True)
+    merged = pd.concat(
+        [retained_prior, current_by_key.reset_index(drop=True)],
+        ignore_index=True,
+    )
     return (
         merged.sort_values(list(_MINUTE_PHYSICAL_KEY), kind="stable")
         .reset_index(drop=True)
@@ -754,7 +761,6 @@ def _build_prepared_minute_repair(
         sessions_by_date[session.trade_date].append(session)
 
     day_plans: list[ResearchMinuteRepairDayPlan] = []
-    merged_by_date: dict[date, pd.DataFrame] = {}
     existing_manifests: dict[date, ResearchPartitionManifest | None] = {}
     source_database = Path(source_database)
     with duckdb.connect(
@@ -791,8 +797,8 @@ def _build_prepared_minute_repair(
                 operational=operational,
             )
             day_plans.append(day_plan)
-            merged_by_date[trade_date] = merged
             existing_manifests[trade_date] = existing_manifest
+            del merged
 
     required = required_minute_sessions(plan)
     missing_set = set(scope.missing_sessions)
@@ -858,7 +864,15 @@ def _build_prepared_minute_repair(
         plan=repair_plan,
         previous=previous,
         previous_observation_sha256=previous_observation_sha256,
-        merged_by_date=merged_by_date,
+        target_sessions_by_date={
+            trade_date: tuple(
+                sorted(
+                    sessions,
+                    key=lambda row: row.ts_code,
+                )
+            )
+            for trade_date, sessions in sessions_by_date.items()
+        },
         existing_manifests=existing_manifests,
     )
 
@@ -911,7 +925,8 @@ def _verify_plan_baseline(
 
 
 def _build_minute_export_source(
-    merged_by_date: dict[date, pd.DataFrame],
+    trade_date: date,
+    merged: pd.DataFrame,
 ) -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect()
     connection.execute(
@@ -938,18 +953,11 @@ def _build_minute_export_source(
         );
         """
     )
-    connection.executemany(
+    connection.execute(
         "INSERT INTO trade_calendar VALUES ('SSE', ?, TRUE)",
-        [(trade_date,) for trade_date in sorted(merged_by_date)],
+        [trade_date],
     )
-    combined = pd.concat(
-        [
-            merged_by_date[trade_date]
-            for trade_date in sorted(merged_by_date)
-        ],
-        ignore_index=True,
-    )
-    connection.register("minute_repair_input", combined)
+    connection.register("minute_repair_input", merged)
     selected = ", ".join(_MINUTE_COLUMNS)
     connection.execute(
         f"INSERT INTO minute_bar ({selected}) "
@@ -959,9 +967,88 @@ def _build_minute_export_source(
     return connection
 
 
+def _stage_repair_day(
+    paths: ResearchIngestPaths,
+    *,
+    source: duckdb.DuckDBPyConnection,
+    prepared: _PreparedMinuteRepair,
+    day: ResearchMinuteRepairDayPlan,
+    staged_catalog: Path,
+    staged_lake: Path,
+    generated_at: datetime,
+    as_of_date: date,
+) -> ResearchPartitionManifest:
+    trade_date = day.trade_date
+    targets = prepared.target_sessions_by_date.get(trade_date)
+    if targets is None:
+        raise RuntimeError(
+            f"minute repair targets missing after planning: {trade_date}"
+        )
+    _existing_manifest, existing_manifest_sha256 = (
+        _load_existing_minute_manifest(paths, trade_date)
+    )
+    existing = _query_existing_research_partition(
+        paths,
+        _minute_partition_key(trade_date),
+        _MINUTE_COLUMNS,
+        memory_only=True,
+    )
+    operational = _query_operational_minute_rows(
+        source,
+        trade_date=trade_date,
+        ts_codes=tuple(row.ts_code for row in targets),
+    )
+    rebuilt_day, merged = build_minute_repair_day_plan(
+        trade_date=trade_date,
+        target_sessions=targets,
+        existing_manifest_sha256=existing_manifest_sha256,
+        existing=existing,
+        operational=operational,
+    )
+    if rebuilt_day != day:
+        raise RuntimeError(
+            "minute repair day content changed after planning: "
+            f"{trade_date}"
+        )
+    export_source = _build_minute_export_source(
+        trade_date,
+        merged,
+    )
+    try:
+        summary = export_research_dataset(
+            export_source,
+            catalog=ResearchCatalog(staged_catalog),
+            lake_root=staged_lake,
+            dataset="minute_bar",
+            start_date=trade_date,
+            end_date=trade_date,
+            code_commit=prepared.plan.code_commit,
+            now=lambda: generated_at.astimezone(UTC),
+            as_of_date=as_of_date,
+        )
+    finally:
+        export_source.close()
+    manifest = next(
+        (
+            partition.manifest
+            for partition in summary.partitions
+            if partition.trade_date == trade_date
+            and partition.manifest is not None
+        ),
+        None,
+    )
+    if manifest is None:
+        raise RuntimeError(
+            "minute repair staged export did not cover target date: "
+            f"{trade_date}"
+        )
+    return manifest
+
+
 def _prepare_repair_generation(
     paths: ResearchIngestPaths,
     *,
+    source_database: Path,
     prepared: _PreparedMinuteRepair,
     transaction_root: Path,
     generated_at: datetime,
@@ -992,27 +1079,24 @@ def _prepare_repair_generation(
             if live_partition.is_dir():
                 shutil.copytree(live_partition, staged_partition)
 
-    export_source = _build_minute_export_source(prepared.merged_by_date)
-    try:
-        trade_dates = tuple(day.trade_date for day in prepared.plan.days)
-        summary = export_research_dataset(
-            export_source,
-            catalog=ResearchCatalog(staged_catalog),
-            lake_root=staged_lake,
-            dataset="minute_bar",
-            start_date=min(trade_dates),
-            end_date=max(trade_dates),
-            code_commit=prepared.plan.code_commit,
-            now=lambda: generated_at.astimezone(UTC),
-            as_of_date=max(trade_dates),
-        )
-    finally:
-        export_source.close()
-    manifests = {
-        partition.trade_date: partition.manifest
-        for partition in summary.partitions
-        if partition.manifest is not None
-    }
+    manifests: dict[date, ResearchPartitionManifest] = {}
+    trade_dates = tuple(day.trade_date for day in prepared.plan.days)
+    with duckdb.connect(
+        str(source_database),
+        read_only=True,
+        config={"temp_directory": ""},
+    ) as source:
+        for day in prepared.plan.days:
+            manifests[day.trade_date] = _stage_repair_day(
+                paths,
+                source=source,
+                prepared=prepared,
+                day=day,
+                staged_catalog=staged_catalog,
+                staged_lake=staged_lake,
+                generated_at=generated_at,
+                as_of_date=max(trade_dates),
+            )
     expected_dates = {day.trade_date for day in prepared.plan.days}
     if set(manifests) != expected_dates:
         raise RuntimeError(
@@ -1665,6 +1749,7 @@ def run_research_minute_repair(
             staged_catalog, staged_readonly, manifests = (
                 _prepare_repair_generation(
                     paths,
+                    source_database=source_database,
                     prepared=prepared,
                     transaction_root=transaction_root,
                     generated_at=generated_at,

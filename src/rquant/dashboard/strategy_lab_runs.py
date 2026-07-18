@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -67,8 +68,9 @@ def _slug(value: str) -> str:
 
 
 def _run_id(run_type: str, title: str, created_at: datetime) -> str:
-    stamp = created_at.strftime("%Y%m%d-%H%M%S")
-    return f"{stamp}-{run_type}-{_slug(title)}"
+    stamp = created_at.strftime("%Y%m%d-%H%M%S-%f")
+    nonce = uuid.uuid4().hex[:8]
+    return f"{stamp}-{nonce}-{run_type}-{_slug(title)}"
 
 
 def _json_value(value: Any) -> Any:
@@ -347,15 +349,23 @@ def save_strategy_lab_run(
     payload = run.model_copy(
         update={"json_path": json_path, "markdown_path": markdown_path}
     )
-    json_path.write_text(
-        json.dumps(
-            payload.model_dump(mode="json"),
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    markdown_path.write_text(run.markdown, encoding="utf-8")
+    json_created = False
+    try:
+        with json_path.open("x", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    payload.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        json_created = True
+        with markdown_path.open("x", encoding="utf-8") as handle:
+            handle.write(run.markdown)
+    except BaseException:
+        if json_created and not markdown_path.exists():
+            json_path.unlink(missing_ok=True)
+        raise
     return payload
 
 

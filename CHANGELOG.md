@@ -6,6 +6,24 @@
 
 ### Fixed
 
+- **历史分钟完整性检查和研究湖修复内存随总样本线性增长**：生产源与研究湖的 241 分钟
+  会话完整性改为按精确 `(ts_code, trade_date)` 有界分批，只返回标量计数和通过的会话键，
+  不再为每个会话聚合整列分钟字符串。每批再按交易日分组，运营分钟查询显式下推
+  `[当日 00:00, 次日 00:00)`，研究湖只打开目标日内容寻址 Parquet，避免用有界内存换来
+  重复扫描全库。`research-repair-minute` 改为两遍式逐日处理：
+  预演只冻结每天的源行、合并行与目标 manifest 哈希并立即释放分钟帧；正式执行按日重建、
+  核对同一计划后写入共享 staging，每日重建封装在独立调用内，下一日开始前释放上一日
+  所有分钟帧；最后仍以一个 CAS journal 整批发布。任一来源漂移在
+  live publication 前失败关闭；行哈希采用流式编码，单日合并改为向量化主键覆盖，峰值
+  内存不再随整个历史区间增长。项目版本从 `0.24.0` 更新到 `0.25.0`。
+
+- **正式回放提交身份和同秒记录可被覆盖**：`formal-smoke-replay` 不再只验证环境变量形状，
+  而是要求真实 Git checkout 的 HEAD 与可选 `RQUANT_CODE_COMMIT` 完全一致，并重新检查
+  tracked/untracked dirty 状态；环境变量不能伪造正式结果的代码身份。Strategy Lab run ID
+  增加微秒与随机后缀，JSON/Markdown 使用独占创建；同秒重复运行保留两份证据，相同
+  snapshot/binding/spec 重跑仍产生相同 spec/result hash。正式回放保存前按规范化整行键
+  稳定排序所有结果表，底层 SQL 或策略返回顺序变化不再伪造 result hash 差异。
+
 - **策略分钟回补会规划尚未发生的退出交易日**：`backfill-plan` 不再要求人工猜测候选
   截止日；省略 `--end-date` 时，根据权威交易日历、当前上海时间、策略资格日至入场日
   的交易日偏移，以及 entry/exit 窗口，自动选择全部分钟会话已经收盘的最新候选日。
@@ -130,6 +148,13 @@
   `runner.temp`，改用该位置允许的 `github.workspace` 作为测试数据目录。
 
 ### Added
+
+- **三策略不可变正式冒烟回放**：新增 `formal-smoke-replay`，为 N 字、科创/创业放量和
+  集合竞价提供版本化固定参数。命令只接受显式 `audit_run_id`、`snapshot_id` 和
+  `binding_hash`，要求当前代码是干净的 40 位提交，只通过 formal gate 打开同一个
+  `ResearchExecutionSession`，不存在探索模式或滚动数据库降级。结果沿用 Strategy Lab
+  comparable v2 记录，输出并持久化 run ID、固定规格版本、spec/result hash、样本数、
+  收益指标及精确审计证据，便于 Stage 1 生产验收与复现。
 
 - **历史分钟研究湖受控修复**：新增 `research-repair-minute` 双阶段命令。范围真相来自
   已完成且通过内容、子任务和资格校验的分钟回补 manifest；计划直接比较生产只读副本与
