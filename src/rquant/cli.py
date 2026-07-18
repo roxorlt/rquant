@@ -20,7 +20,11 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from rquant.backfill_state import BackfillStateStore, UnknownManifestError
+from rquant.backfill_state import (
+    BackfillStateStore,
+    ManifestContentConflictError,
+    UnknownManifestError,
+)
 from rquant.logging import setup_logging
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
@@ -1016,9 +1020,12 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
     """Resolve PIT eligibility, plan exact minute coverage, and persist it."""
     from rquant.backfill_manifest import (
         STRATEGY_BACKFILL_SPECS,
+        BackfillCalendarError,
         BackfillManifest,
         backfill_state_input,
+        latest_observable_eligibility_date,
         plan_minute_backfill,
+        resolve_requested_eligibility_end,
         resolve_strategy_eligibility,
     )
     from rquant.config import settings
@@ -1038,6 +1045,20 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
     as_of_time = datetime.now(UTC)
     catalog = ResearchCatalog(settings.research_db_path_resolved)
     with open_readonly_store() as store:
+        try:
+            observable_end = latest_observable_eligibility_date(
+                store,
+                spec=spec,
+                as_of_time=as_of_time,
+            )
+            end_date = resolve_requested_eligibility_end(
+                requested_end=args.end_date,
+                observable_end=observable_end,
+                start_date=args.start_date,
+            )
+        except BackfillCalendarError as exc:
+            logger.error(str(exc))
+            return 2
         if args.strategy == "auction_gap":
             eligibility_artifacts = SnapshotArtifactResolver(
                 catalog=catalog,
@@ -1045,7 +1066,7 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
             ).resolve_lake_partitions(
                 dataset="auction_bar",
                 start_date=args.start_date,
-                end_date=args.end_date,
+                end_date=end_date,
                 as_of_time=as_of_time,
             )
             if not eligibility_artifacts:
@@ -1059,7 +1080,7 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
                     store,
                     strategy_id=args.strategy,
                     start_date=args.start_date,
-                    end_date=args.end_date,
+                    end_date=end_date,
                     input_artifacts=eligibility_artifacts,
                     lake_root=settings.research_lake_dir_resolved,
                     as_of_time=as_of_time,
@@ -1070,12 +1091,12 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
                 store,
                 strategy_id=args.strategy,
                 start_date=args.start_date,
-                end_date=args.end_date,
+                end_date=end_date,
             )
         manifest = BackfillManifest.build(
             spec=spec,
             start_date=args.start_date,
-            end_date=args.end_date,
+            end_date=end_date,
             as_of_time=as_of_time,
             code_commit=code_commit,
             eligibilities=eligibility_resolution.records,
@@ -1093,6 +1114,8 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
         {
             "manifest_id": plan.manifest.manifest_id,
             "strategy": plan.manifest.spec.strategy_id,
+            "observable_end_date": observable_end.isoformat(),
+            "effective_end_date": end_date.isoformat(),
             "eligibility_count": len(plan.manifest.eligibilities),
             "eligibility_resolution_hash": (
                 eligibility_resolution.resolution_hash
@@ -1111,12 +1134,22 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
 def cmd_backfill_run(args: argparse.Namespace) -> int:
     """Execute one persisted manifest without crossing monitor hours."""
     from rquant.adapter.tushare import TushareAdapter
-    from rquant.backfill_manifest import MinuteBackfillPlan
+    from rquant.backfill_manifest import (
+        BackfillCalendarError,
+        BackfillPlanIntegrityError,
+        MinuteBackfillPlan,
+        validate_executable_backfill_plan,
+        validate_persisted_backfill_tasks,
+    )
     from rquant.intraday_backfill import run_backfill_manifest
 
     setup_logging()
     state = BackfillStateStore()
-    persisted = state.load_manifest(args.manifest_id)
+    try:
+        persisted = state.load_manifest(args.manifest_id)
+    except ManifestContentConflictError as exc:
+        logger.error(f"persisted backfill state failed integrity check: {exc}")
+        return 2
     if persisted is None:
         logger.error(f"unknown backfill manifest: {args.manifest_id}")
         return 2
@@ -1129,6 +1162,13 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
         return 2
 
     plan = MinuteBackfillPlan.model_validate(persisted.payload)
+    try:
+        validate_persisted_backfill_tasks(persisted, plan)
+        with open_readonly_store() as store:
+            validate_executable_backfill_plan(store, plan)
+    except (BackfillCalendarError, BackfillPlanIntegrityError) as exc:
+        logger.error(f"persisted backfill plan is not executable: {exc}")
+        return 2
     estimated_seconds = (
         status_before.eta_seconds
         if status_before.eta_seconds is not None
@@ -3076,9 +3116,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill_plan_p.add_argument(
         "--end-date",
-        required=True,
         type=_parse_iso_date,
-        help="候选结束日期 YYYY-MM-DD",
+        default=None,
+        help="候选结束日期 YYYY-MM-DD；省略时自动取完整 B/S 窗口可观测上限",
     )
 
     backfill_run_p = sub.add_parser(

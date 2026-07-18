@@ -45,6 +45,20 @@ def test_strategy_backfill_specs_define_reproducible_windows() -> None:
     assert STRATEGY_BACKFILL_SPECS["auction_gap"].eligibility_basis == "daily+auction"
     assert STRATEGY_BACKFILL_SPECS["growth_board_surge"].eligibility_basis == "daily"
     assert STRATEGY_BACKFILL_SPECS["n_shape"].eligibility_basis == "daily"
+    assert (
+        STRATEGY_BACKFILL_SPECS["n_shape"].eligibility_entry_delay_trading_days
+        == 1
+    )
+    assert (
+        STRATEGY_BACKFILL_SPECS[
+            "growth_board_surge"
+        ].eligibility_entry_delay_trading_days
+        == 0
+    )
+    assert (
+        STRATEGY_BACKFILL_SPECS["auction_gap"].eligibility_entry_delay_trading_days
+        == 0
+    )
     for spec in STRATEGY_BACKFILL_SPECS.values():
         assert spec.minute_frequency == "1min"
         assert spec.window.baseline_trading_days == 90
@@ -104,6 +118,50 @@ def test_manifest_id_is_independent_of_eligibility_input_order() -> None:
         "300001.SZ",
         "688001.SH",
     ]
+
+
+def test_legacy_manifest_without_entry_delay_keeps_its_identity() -> None:
+    from rquant.backfill_manifest import (
+        BackfillManifest,
+        StrategyWindowRequirement,
+        _canonical_hash,
+    )
+
+    start_date = date(2026, 6, 1)
+    end_date = date(2026, 6, 30)
+    as_of_time = datetime(2026, 7, 1, tzinfo=UTC)
+    legacy_spec = {
+        "strategy_id": "n_shape",
+        "strategy_version": "v1",
+        "eligibility_basis": "daily",
+        "minute_frequency": "1min",
+        "window": StrategyWindowRequirement().model_dump(mode="json"),
+    }
+    legacy_id = _canonical_hash(
+        {
+            "spec": legacy_spec,
+            "start_date": start_date,
+            "end_date": end_date,
+            "as_of_time": as_of_time,
+            "code_commit": "a" * 40,
+            "eligibility_ids": [],
+        }
+    )
+
+    restored = BackfillManifest.model_validate(
+        {
+            "manifest_id": legacy_id,
+            "spec": legacy_spec,
+            "start_date": start_date,
+            "end_date": end_date,
+            "as_of_time": as_of_time,
+            "code_commit": "a" * 40,
+            "eligibilities": [],
+        }
+    )
+
+    assert restored.manifest_id == legacy_id
+    assert restored.spec.eligibility_entry_delay_trading_days == 0
 
 
 def test_manifest_rejects_records_from_another_strategy() -> None:

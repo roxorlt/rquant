@@ -80,6 +80,35 @@ def test_manifest_tasks_and_eligibility_persist_atomically_and_idempotently(
     assert store.get_manifest_status(manifest.manifest_id).task_count == 2
 
 
+def test_load_manifest_rejects_tampered_task_content(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import (
+        BackfillStateStore,
+        ManifestContentConflictError,
+    )
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    manifest = _manifest()
+    store.persist_manifest(manifest)
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            """
+            UPDATE backfill_task
+            SET payload_json = '{"trade_date":"2026-07-20","ts_code":"300001.SZ"}'
+            WHERE manifest_id = ? AND task_id = ?
+            """,
+            (manifest.manifest_id, manifest.tasks[0].task_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ManifestContentConflictError, match="content hash"):
+        store.load_manifest(manifest.manifest_id)
+
+
 def test_store_enables_wal_and_busy_timeout_on_every_connection(tmp_path: Path) -> None:
     from rquant.backfill_state import BackfillStateStore
 

@@ -56,8 +56,10 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
-2026-07-18 生产当前运行 `v0.23.1`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
-snapshot/binding 执行链已上线。`v0.23.2` 候选修正 N 字 121 交易日资格面板对
+2026-07-18 生产当前运行 `v0.23.2`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
+snapshot/binding 执行链已上线。`v0.23.3` 候选修正策略分钟回补的可观测截止日：
+系统按当前已收盘交易日、策略入场偏移与完整退出窗口自动移动候选上限，拒绝生成未来
+分钟任务，同时保留旧 manifest 身份。`v0.23.2` 已修正 N 字 121 交易日资格面板对
 “完整停牌快照、只有停牌无复牌、且无日线”这一确定性非交易日的完整性语义。代码能力完成
 不等于策略结论已可信；N 字、科创/创业放量和集合竞价仍需分别补齐真实资格 manifest，
 达到 baseline 95%、eligibility/B/S 99% 并完成生产固定回放后，才能从 `exploratory`
@@ -190,13 +192,18 @@ bash scripts/check-core-quality.sh
 # 盘中全景
 .venv/bin/streamlit run src/rquant/dashboard/market_panorama.py --server.port 8506
 
-# 生成可恢复的策略分钟回补计划（只读副本）
+# 生成可恢复的策略分钟回补计划（只读副本；截止日自动移动到完整 B/S 窗口可观测上限）
+.venv/bin/rquant backfill-plan \
+  --strategy growth_board_surge \
+  --start-date 2025-01-01
+
+# 需要固定历史区间时可显式指定更早日期；超过可观测上限会失败关闭
 .venv/bin/rquant backfill-plan \
   --strategy growth_board_surge \
   --start-date 2025-01-01 \
   --end-date 2026-06-30
 
-# 盘外执行、查询进度并在覆盖率达标后固化研究元数据
+# 盘外执行（领取任务前会重验 manifest 的可观测窗口）、查询进度并固化研究元数据
 .venv/bin/rquant backfill-run --manifest-id <64位ID>
 .venv/bin/rquant backfill-status --manifest-id <64位ID> --json
 .venv/bin/rquant dataset-snapshot \

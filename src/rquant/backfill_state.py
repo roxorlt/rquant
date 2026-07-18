@@ -421,14 +421,18 @@ class BackfillStateStore:
         connection = self._connect()
         try:
             manifest_row = connection.execute(
-                "SELECT payload_json FROM backfill_manifest WHERE manifest_id = ?",
+                """
+                SELECT payload_json, content_hash
+                FROM backfill_manifest
+                WHERE manifest_id = ?
+                """,
                 (manifest_id,),
             ).fetchone()
             if manifest_row is None:
                 return None
             task_rows = connection.execute(
                 """
-                SELECT task_id, payload_json, max_attempts
+                SELECT task_id, payload_json, max_attempts, content_hash
                 FROM backfill_task
                 WHERE manifest_id = ?
                 ORDER BY ordinal
@@ -437,7 +441,7 @@ class BackfillStateStore:
             ).fetchall()
             eligibility_rows = connection.execute(
                 """
-                SELECT eligibility_id, payload_json
+                SELECT eligibility_id, payload_json, content_hash
                 FROM backfill_eligibility
                 WHERE manifest_id = ?
                 ORDER BY ordinal
@@ -446,7 +450,7 @@ class BackfillStateStore:
             ).fetchall()
         finally:
             connection.close()
-        return BackfillManifestInput(
+        loaded = BackfillManifestInput(
             manifest_id=manifest_id,
             payload=_json_object(manifest_row["payload_json"]),
             tasks=tuple(
@@ -465,6 +469,34 @@ class BackfillStateStore:
                 for row in eligibility_rows
             ),
         )
+        for task, row in zip(loaded.tasks, task_rows, strict=True):
+            expected_hash = self._content_hash(task.model_dump(mode="json"))
+            if row["content_hash"] != expected_hash:
+                raise ManifestContentConflictError(
+                    f"manifest {manifest_id!r} task {task.task_id!r} "
+                    "content hash mismatch"
+                )
+        for eligibility, row in zip(
+            loaded.eligibility,
+            eligibility_rows,
+            strict=True,
+        ):
+            expected_hash = self._content_hash(
+                eligibility.model_dump(mode="json")
+            )
+            if row["content_hash"] != expected_hash:
+                raise ManifestContentConflictError(
+                    f"manifest {manifest_id!r} eligibility "
+                    f"{eligibility.eligibility_id!r} content hash mismatch"
+                )
+        expected_manifest_hash = self._content_hash(
+            self._canonical_manifest(loaded)
+        )
+        if manifest_row["content_hash"] != expected_manifest_hash:
+            raise ManifestContentConflictError(
+                f"manifest {manifest_id!r} content hash mismatch"
+            )
+        return loaded
 
     def _require_manifest(self, connection: sqlite3.Connection, manifest_id: str) -> None:
         row = connection.execute(
