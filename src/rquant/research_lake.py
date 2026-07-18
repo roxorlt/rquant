@@ -245,7 +245,9 @@ def _logical_content_hash(
     selected = ", ".join(_quoted_identifier(column) for column, _ in columns)
     ordered = ", ".join(_quoted_identifier(column) for column in primary_key)
     digest = hashlib.sha256()
-    with duckdb.connect() as connection:
+    with duckdb.connect(
+        config={"temp_directory": ""},
+    ) as connection:
         cursor = connection.execute(
             f"""
             SELECT {selected}
@@ -439,7 +441,9 @@ def _validate_temp_partition(
 ) -> tuple[datetime | date, datetime | date]:
     parquet = _quoted_literal(str(path))
     reader = f"read_parquet({parquet}, hive_partitioning = false)"
-    with duckdb.connect() as validation:
+    with duckdb.connect(
+        config={"temp_directory": ""},
+    ) as validation:
         described = validation.execute(f"DESCRIBE SELECT * FROM {reader}").fetchall()
         actual_columns = tuple((str(row[0]), str(row[1])) for row in described)
         if actual_columns != expected_columns:

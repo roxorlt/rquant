@@ -197,6 +197,7 @@ class BackfillStateStore:
         *,
         busy_timeout_ms: int | None = None,
         ewma_alpha: float = 0.3,
+        read_only: bool = False,
     ) -> None:
         if path is None or busy_timeout_ms is None:
             from rquant.config import settings
@@ -212,18 +213,48 @@ class BackfillStateStore:
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
         self.ewma_alpha = ewma_alpha
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self.read_only = read_only
+        if read_only:
+            if not self.path.is_file() or self.path.is_symlink():
+                raise ValueError(
+                    f"read-only backfill state database is invalid: {self.path}"
+                )
+            self._require_checkpointed_snapshot()
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize()
+
+    def _require_checkpointed_snapshot(self) -> None:
+        sidecars = tuple(
+            self.path.with_name(f"{self.path.name}{suffix}")
+            for suffix in ("-wal", "-shm", "-journal")
+        )
+        if any(path.is_symlink() or path.exists() for path in sidecars):
+            raise ValueError(
+                "read-only backfill state database must be checkpointed"
+            )
 
     def _connect(self) -> sqlite3.Connection:
+        target: Path | str = self.path
+        connect_kwargs: dict[str, object] = {}
+        if self.read_only:
+            self._require_checkpointed_snapshot()
+            target = (
+                f"{self.path.resolve().as_uri()}?mode=ro&immutable=1"
+            )
+            connect_kwargs["uri"] = True
         connection = sqlite3.connect(
-            self.path,
+            target,
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
+            **connect_kwargs,
         )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA foreign_keys = ON")
+        if self.read_only:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA temp_store = MEMORY")
         return connection
 
     @contextmanager

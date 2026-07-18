@@ -309,7 +309,109 @@ class ResearchAuctionRepairObservation(_ResearchModel):
         return self
 
 
-ResearchAuthorityObservation = ResearchDailyIngestResult | ResearchAuctionRepairObservation
+class ResearchMinuteRepairPartitionChange(_ResearchModel):
+    trade_date: date
+    before_manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    after_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    before_content_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    before_manifest: ResearchPartitionManifest | None = None
+    after_manifest: ResearchPartitionManifest
+
+    @model_validator(mode="after")
+    def validate_change(self) -> ResearchMinuteRepairPartitionChange:
+        if (
+            self.after_manifest.dataset != "minute_bar"
+            or self.after_manifest.partition.freq != "1min"
+            or self.after_manifest.partition.trade_date != self.trade_date
+        ):
+            raise ValueError(
+                "minute repair manifest must bind its trade date and 1min frequency"
+            )
+        if _model_payload_sha256(self.after_manifest) != self.after_manifest_sha256:
+            raise ValueError("repaired minute manifest physical hash is inconsistent")
+        if self.before_manifest is None:
+            if (
+                self.before_manifest_sha256 is not None
+                or self.before_content_hash is not None
+                or self.after_manifest.parent_content_hash is not None
+            ):
+                raise ValueError(
+                    "new minute partition cannot claim prior manifest evidence"
+                )
+        else:
+            if (
+                self.before_manifest.dataset != "minute_bar"
+                or self.before_manifest.partition.freq != "1min"
+                or self.before_manifest.partition.trade_date != self.trade_date
+            ):
+                raise ValueError(
+                    "prior minute manifest must bind its trade date and frequency"
+                )
+            if self.before_manifest_sha256 is None:
+                raise ValueError("prior minute manifest requires its physical hash")
+            if (
+                _model_payload_sha256(self.before_manifest)
+                != self.before_manifest_sha256
+            ):
+                raise ValueError("prior minute manifest physical hash is inconsistent")
+            if self.before_content_hash != self.before_manifest.content_hash:
+                raise ValueError(
+                    "prior minute content hash does not match its manifest"
+                )
+            if (
+                self.after_manifest.parent_content_hash
+                != self.before_manifest.content_hash
+            ):
+                raise ValueError("repaired minute manifest must link to prior content")
+        return self
+
+
+class ResearchMinuteRepairObservation(_ResearchModel):
+    schema_version: Literal[1] = 1
+    observation_kind: Literal["minute_repair"] = "minute_repair"
+    status: Literal["candidate"] = "candidate"
+    observation_id: str
+    bootstrap_snapshot_id: str
+    trade_date: date
+    generated_at: datetime
+    code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    manifest_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    previous_observation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_before_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    readonly_catalog_before_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    readonly_catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stable_trading_days: Literal[0] = 0
+    repairs: tuple[ResearchMinuteRepairPartitionChange, ...] = Field(
+        min_length=1
+    )
+    issues: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> ResearchMinuteRepairObservation:
+        if self.generated_at.tzinfo is None or self.generated_at.utcoffset() is None:
+            raise ValueError("minute repair generated_at must be timezone-aware")
+        repair_dates = tuple(change.trade_date for change in self.repairs)
+        if repair_dates != tuple(sorted(set(repair_dates))):
+            raise ValueError("minute repair dates must be strictly ordered and unique")
+        if any(repair_date > self.trade_date for repair_date in repair_dates):
+            raise ValueError("minute repair cannot move authority trade date backwards")
+        if self.issues:
+            raise ValueError("minute repair authority observation cannot contain issues")
+        return self
+
+
+ResearchRepairObservation = (
+    ResearchAuctionRepairObservation | ResearchMinuteRepairObservation
+)
+ResearchAuthorityObservation = ResearchDailyIngestResult | ResearchRepairObservation
 
 
 class _ResearchPublishJournal(_ResearchModel):
@@ -563,6 +665,8 @@ def _query_existing_research_partition(
     paths: ResearchIngestPaths,
     key: ResearchPartitionKey,
     columns: tuple[str, ...],
+    *,
+    memory_only: bool = False,
 ) -> pd.DataFrame:
     manifest_path = paths.lake_root / partition_manifest_relative_path(key)
     if not manifest_path.exists():
@@ -582,7 +686,8 @@ def _query_existing_research_partition(
     ):
         raise RuntimeError("research partition data hash mismatch")
     selected = ", ".join(columns)
-    with duckdb.connect() as connection:
+    connect_config = {"temp_directory": ""} if memory_only else {}
+    with duckdb.connect(config=connect_config) as connection:
         frame = connection.execute(
             f"SELECT {selected} FROM read_parquet(?)",
             [str(data_path)],
@@ -918,6 +1023,8 @@ def _parse_research_observation(payload: bytes | str) -> ResearchAuthorityObserv
         return ResearchDailyIngestResult.model_validate_json(decoded)
     if kind == "auction_repair":
         return ResearchAuctionRepairObservation.model_validate_json(decoded)
+    if kind == "minute_repair":
+        return ResearchMinuteRepairObservation.model_validate_json(decoded)
     raise ValueError(f"unsupported research observation kind: {kind}")
 
 
@@ -972,16 +1079,19 @@ def _observation_chain_issues(
         return tuple(issues)
 
     latest_repair_bindings: dict[
-        date,
+        str,
         tuple[ResearchPartitionManifest, str],
     ] = {}
     seen: set[str] = set()
     node = current
     while node.previous_observation_sha256 is not None:
-        if isinstance(node, ResearchAuctionRepairObservation):
+        if isinstance(
+            node,
+            (ResearchAuctionRepairObservation, ResearchMinuteRepairObservation),
+        ):
             for change in node.repairs:
                 latest_repair_bindings.setdefault(
-                    change.trade_date,
+                    change.after_manifest.partition.partition_id,
                     (change.after_manifest, change.after_manifest_sha256),
                 )
         parent_hash = node.previous_observation_sha256
@@ -994,8 +1104,19 @@ def _observation_chain_issues(
             parent.bootstrap_snapshot_id != current.bootstrap_snapshot_id
             or parent.trade_date > node.trade_date
             or (
-                isinstance(node, ResearchAuctionRepairObservation)
-                and parent.trade_date != node.trade_date
+                isinstance(
+                    node,
+                    (
+                        ResearchAuctionRepairObservation,
+                        ResearchMinuteRepairObservation,
+                    ),
+                )
+                and (
+                    parent.trade_date != node.trade_date
+                    or node.catalog_before_sha256 != parent.catalog_sha256
+                    or node.readonly_catalog_before_sha256
+                    != parent.readonly_catalog_sha256
+                )
             )
         ):
             issues.append("observation_lineage_broken")
@@ -1005,7 +1126,13 @@ def _observation_chain_issues(
         not issues
         and latest_repair_bindings
         and (
-            isinstance(current, ResearchAuctionRepairObservation)
+            isinstance(
+                current,
+                (
+                    ResearchAuctionRepairObservation,
+                    ResearchMinuteRepairObservation,
+                ),
+            )
             or current.stable_trading_days < 10
         )
     ):
@@ -1076,8 +1203,17 @@ def _manifest_binding_issues(
         ...,
     ],
 ) -> tuple[str, ...]:
+    if (
+        not paths.catalog_path.is_file()
+        or paths.catalog_path.is_symlink()
+    ):
+        return ("research_catalog_unreadable",)
     try:
-        catalog_connection = duckdb.connect(str(paths.catalog_path), read_only=True)
+        catalog_connection = duckdb.connect(
+            str(paths.catalog_path),
+            read_only=True,
+            config={"temp_directory": ""},
+        )
     except Exception:
         return ("research_catalog_unreadable",)
     try:
@@ -1088,6 +1224,11 @@ def _manifest_binding_issues(
                 manifest.partition
             )
             data_path = paths.lake_root / manifest.relative_path
+            if not _is_regular_file_within(
+                paths.lake_root,
+                manifest_path,
+            ):
+                return ("lake_manifest_invalid",)
             try:
                 observed_manifest = ResearchPartitionManifest.model_validate_json(
                     manifest_path.read_text(encoding="utf-8")
@@ -1102,8 +1243,7 @@ def _manifest_binding_issues(
             if observed_manifest != manifest:
                 return ("lake_manifest_mismatch",)
             if (
-                not data_path.is_file()
-                or data_path.is_symlink()
+                not _is_regular_file_within(paths.lake_root, data_path)
                 or data_path.stat().st_size != manifest.file_size
                 or _file_sha256(data_path) != manifest.file_hash
             ):
@@ -1131,10 +1271,33 @@ def _manifest_binding_issues(
     return ()
 
 
+def _is_regular_file_within(root: Path, candidate: Path) -> bool:
+    if root.is_symlink() or not root.is_dir():
+        return False
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return False
+    if not candidate.is_file():
+        return False
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve()
+    return resolved_root in resolved_candidate.parents
+
+
 def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...]:
     """Hash every catalog partition; used at bootstrap and promotion boundaries."""
     try:
-        with duckdb.connect(str(paths.catalog_path), read_only=True) as connection:
+        with duckdb.connect(
+            str(paths.catalog_path),
+            read_only=True,
+            config={"temp_directory": ""},
+        ) as connection:
             rows = connection.execute(
                 """
                 SELECT relative_path, content_hash, file_hash, manifest_json
@@ -1149,6 +1312,11 @@ def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...
             manifest = ResearchPartitionManifest.model_validate_json(manifest_json)
             manifest_path = paths.lake_root / partition_manifest_relative_path(manifest.partition)
             data_path = paths.lake_root / manifest.relative_path
+            if not _is_regular_file_within(
+                paths.lake_root,
+                manifest_path,
+            ):
+                return ("catalog_lake_manifest_invalid",)
             observed_manifest = ResearchPartitionManifest.model_validate_json(
                 manifest_path.read_text(encoding="utf-8")
             )
@@ -1163,8 +1331,7 @@ def _catalog_lake_integrity_issues(paths: ResearchIngestPaths) -> tuple[str, ...
         ):
             return ("catalog_lake_record_mismatch",)
         if (
-            not data_path.is_file()
-            or data_path.is_symlink()
+            not _is_regular_file_within(paths.lake_root, data_path)
             or data_path.stat().st_size != manifest.file_size
             or _file_sha256(data_path) != manifest.file_hash
         ):
@@ -1614,23 +1781,55 @@ def _remove_transaction_root(transaction_root: Path) -> None:
 
 
 def _recover_interrupted_publish(paths: ResearchIngestPaths) -> None:
-    if not paths.transactions_root.exists():
+    transactions_root = paths.transactions_root
+    if transactions_root.is_symlink() or (
+        transactions_root.exists() and not transactions_root.is_dir()
+    ):
+        raise RuntimeError(
+            f"invalid research transactions root: {transactions_root}"
+        )
+    if not transactions_root.exists():
         return
-    for transaction_root in sorted(paths.transactions_root.iterdir()):
+    for transaction_root in sorted(transactions_root.iterdir()):
         if not transaction_root.is_dir() or transaction_root.is_symlink():
             raise RuntimeError(f"invalid research transaction path: {transaction_root}")
-        journal_path = _journal_path(transaction_root)
-        repair_journal_path = transaction_root / "auction-repair-journal.json"
-        if journal_path.exists() and repair_journal_path.exists():
+        journal_paths = {
+            "daily": _journal_path(transaction_root),
+            "auction_repair": (
+                transaction_root / "auction-repair-journal.json"
+            ),
+            "minute_repair": (
+                transaction_root / "minute-repair-journal.json"
+            ),
+        }
+        if any(
+            path.is_symlink()
+            or (path.exists() and not path.is_file())
+            for path in journal_paths.values()
+        ):
+            raise RuntimeError("research publish journal path is invalid")
+        present = tuple(
+            kind for kind, path in journal_paths.items() if path.is_file()
+        )
+        if len(present) > 1:
             raise RuntimeError("research transaction contains multiple publish journals")
-        if journal_path.exists():
+        if present == ("daily",):
             _rollback_publish_transaction(paths, transaction_root)
-        elif repair_journal_path.exists():
+        elif present == ("auction_repair",):
             from rquant.research_repair import (
                 rollback_research_auction_repair_publish,
             )
 
             rollback_research_auction_repair_publish(paths, transaction_root)
+        elif present == ("minute_repair",):
+            from rquant.research_minute_repair import (
+                rollback_research_minute_repair_publish,
+            )
+
+            rollback_research_minute_repair_publish(
+                paths,
+                transaction_root,
+            )
         else:
             _remove_transaction_root(transaction_root)
 
@@ -2132,6 +2331,7 @@ def inspect_research_authority(paths: ResearchIngestPaths) -> ResearchAuthorityS
     pending_journals = (
         *paths.transactions_root.glob("*/publish-journal.json"),
         *paths.transactions_root.glob("*/auction-repair-journal.json"),
+        *paths.transactions_root.glob("*/minute-repair-journal.json"),
     )
     if pending_journals:
         return ResearchAuthorityStatus(

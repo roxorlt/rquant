@@ -880,6 +880,217 @@ class TestResearchAuctionRepair:
         assert output["plan_id"] == "f" * 64
 
 
+class TestResearchMinuteRepair:
+    def test_parser_requires_apply_and_plan_id_together(self) -> None:
+        parser = build_parser()
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "research-repair-minute",
+                    "--manifest-id",
+                    "b" * 64,
+                    "--apply",
+                ]
+            )
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "research-repair-minute",
+                    "--manifest-id",
+                    "b" * 64,
+                    "--plan-id",
+                    "a" * 64,
+                ]
+            )
+
+    def test_parser_rejects_non_sha_manifest_id(self) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "research-repair-minute",
+                    "--manifest-id",
+                    "not-a-sha",
+                ]
+            )
+
+    def test_apply_is_disabled_before_opening_backfill_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_minute_repair as repair_module
+
+        state_factory = MagicMock()
+        run_repair = MagicMock()
+        monkeypatch.setattr(
+            config_module.settings,
+            "research_cloud_ingest_enabled",
+            False,
+        )
+        monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
+        monkeypatch.setattr(
+            repair_module,
+            "run_research_minute_repair",
+            run_repair,
+        )
+        args = build_parser().parse_args(
+            [
+                "research-repair-minute",
+                "--manifest-id",
+                "b" * 64,
+                "--apply",
+                "--plan-id",
+                "a" * 64,
+            ]
+        )
+
+        assert cli.cmd_research_repair_minute(args) == 3
+        state_factory.assert_not_called()
+        run_repair.assert_not_called()
+
+    def test_preview_is_read_only_and_prints_content_bound_plan_id(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_manifest as manifest_module
+        from rquant import research_minute_repair as repair_module
+
+        source = tmp_path / "rquant_ro.duckdb"
+        state_path = tmp_path / "backfill.sqlite3"
+        state = MagicMock()
+        state_factory = MagicMock(return_value=state)
+        result = MagicMock(status="planned", plan_id="f" * 64)
+        result.model_dump.return_value = {
+            "status": "planned",
+            "plan": {"missing_session_count": 3},
+            "observation": None,
+        }
+        run_repair = MagicMock(return_value=result)
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(
+            config_module.settings,
+            "duckdb_readonly_path",
+            source,
+        )
+        monkeypatch.setattr(
+            config_module.settings,
+            "backfill_state_path",
+            state_path,
+        )
+        monkeypatch.setattr(
+            config_module.settings,
+            "research_cloud_ingest_enabled",
+            False,
+        )
+        monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
+        monkeypatch.setattr(
+            repair_module,
+            "run_research_minute_repair",
+            run_repair,
+        )
+        monkeypatch.setattr(
+            manifest_module,
+            "detect_code_commit",
+            lambda: "a" * 40,
+        )
+        args = build_parser().parse_args(
+            [
+                "research-repair-minute",
+                "--manifest-id",
+                "b" * 64,
+            ]
+        )
+
+        assert cli.cmd_research_repair_minute(args) == 0
+        state_factory.assert_called_once_with(
+            state_path,
+            busy_timeout_ms=config_module.settings.backfill_state_busy_timeout_ms,
+            read_only=True,
+        )
+        run_repair.assert_called_once_with(
+            source_database=source,
+            paths=repair_module.ResearchIngestPaths.from_data_dir(tmp_path),
+            state=state,
+            manifest_id="b" * 64,
+            code_commit="a" * 40,
+            apply=False,
+            plan_id=None,
+        )
+        output = json.loads(capsys.readouterr().out)
+        assert output["status"] == "planned"
+        assert output["plan_id"] == "f" * 64
+
+    def test_apply_delegates_confirmed_plan_and_prints_candidate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_manifest as manifest_module
+        from rquant import research_minute_repair as repair_module
+
+        state = MagicMock()
+        result = MagicMock(status="candidate", plan_id="f" * 64)
+        result.model_dump.return_value = {
+            "status": "candidate",
+            "plan": {"missing_session_count": 3},
+            "observation": {"observation_kind": "minute_repair"},
+        }
+        run_repair = MagicMock(return_value=result)
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(
+            config_module.settings,
+            "research_cloud_ingest_enabled",
+            True,
+        )
+        monkeypatch.setattr(
+            cli,
+            "BackfillStateStore",
+            MagicMock(return_value=state),
+        )
+        monkeypatch.setattr(
+            repair_module,
+            "run_research_minute_repair",
+            run_repair,
+        )
+        monkeypatch.setattr(
+            manifest_module,
+            "detect_code_commit",
+            lambda: "a" * 40,
+        )
+        args = build_parser().parse_args(
+            [
+                "research-repair-minute",
+                "--manifest-id",
+                "b" * 64,
+                "--apply",
+                "--plan-id",
+                "f" * 64,
+            ]
+        )
+
+        assert cli.cmd_research_repair_minute(args) == 0
+        assert run_repair.call_args.kwargs["apply"] is True
+        assert run_repair.call_args.kwargs["plan_id"] == "f" * 64
+        output = json.loads(capsys.readouterr().out)
+        assert output["status"] == "candidate"
+        assert output["plan_id"] == "f" * 64
+
+
 class TestResearchMigration:
     def test_verify_command_prints_machine_readable_result(
         self,
@@ -2979,6 +3190,38 @@ class TestMainErrorReporting:
             assert main() == 1
 
         mock_notify.assert_not_called()
+
+    def test_minute_repair_failure_is_caught_and_notified(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import patch
+
+        from rquant.cli import main
+
+        def boom(_args):
+            raise RuntimeError("repair failed")
+
+        monkeypatch.setattr("rquant.cli.cmd_research_repair_minute", boom)
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "rquant",
+                    "research-repair-minute",
+                    "--manifest-id",
+                    "b" * 64,
+                ],
+            ),
+            patch("rquant.notify.notify") as mock_notify,
+        ):
+            assert main() == 1
+
+        mock_notify.assert_called_once()
+        assert (
+            mock_notify.call_args.kwargs["component"]
+            == "cli:research-repair-minute"
+        )
 
 
 class TestIngestWithRetry:

@@ -33,6 +33,9 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
   daily 成功、主动刷新副本并检查当日日线完整性，漏日可按证据链顺序用 `stk_mins` 恢复。
 - `research-repair-auction` 可对位于证据链中间的集合竞价历史缺口做真实取数预演，再凭内容
   绑定的 plan id 批次原子发布；旧内容寻址版本继续可读，修复后 10 日稳定观察重新累计。
+- `research-repair-minute` 可按已完成的策略回补 manifest，把生产只读副本中已具备、研究湖
+  尚缺的完整 241 分钟会话受控合入历史分区；预演不请求行情接口，正式执行须复用同一个
+  内容绑定 plan id，并在任一发布边界失败时整批回滚。
 - 云端承担生产调度和研究候选存储；Mac 主库在 10 个交易日观察完成前继续保留为恢复依据。
 
 ## 明确边界
@@ -56,8 +59,12 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
-2026-07-18 生产当前运行 `v0.23.2`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
-snapshot/binding 执行链已上线。`v0.23.3` 候选修正策略分钟回补的可观测截止日：
+2026-07-18 生产当前运行 `v0.23.3`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
+snapshot/binding 执行链已上线。`v0.24.0` 候选增加受控历史分钟研究湖修复：
+它冻结一次已完成 manifest 的资格和窗口，只补该快照范围内的缺口，不重新解释历史。
+新建 manifest 的可观测截止日仍是移动的：系统按当前已收盘交易日、策略入场偏移与完整
+退出窗口自动推进候选上限，拒绝生成未来分钟任务，同时保留旧 manifest 身份。
+`v0.23.3` 已修正策略分钟回补的可观测截止日：
 系统按当前已收盘交易日、策略入场偏移与完整退出窗口自动移动候选上限，拒绝生成未来
 分钟任务，同时保留旧 manifest 身份。`v0.23.2` 已修正 N 字 121 交易日资格面板对
 “完整停牌快照、只有停牌无复牌、且无日线”这一确定性非交易日的完整性语义。代码能力完成
@@ -112,6 +119,13 @@ rquant research-repair-auction \
 rquant research-repair-auction \
   --date 2026-04-20 \
   --date 2026-07-07 \
+  --apply \
+  --plan-id <预演输出的plan_id>
+
+# 已完成的策略分钟回补 manifest：先只读核对研究湖缺口，再复用同一 plan_id 原子修复
+rquant research-repair-minute --manifest-id <已完成的manifest_id>
+rquant research-repair-minute \
+  --manifest-id <同一个manifest_id> \
   --apply \
   --plan-id <预演输出的plan_id>
 ```

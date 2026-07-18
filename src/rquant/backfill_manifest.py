@@ -1641,6 +1641,7 @@ def _complete_minute_sessions_from_lake(
     catalog: ResearchCatalog,
     lake_root: Path,
     as_of_time: datetime,
+    memory_only: bool = False,
 ) -> tuple[
     set[tuple[str, date]],
     tuple[DatasetSnapshotArtifact, ...],
@@ -1666,7 +1667,8 @@ def _complete_minute_sessions_from_lake(
         return set(), ()
     paths = [str(Path(lake_root) / artifact.relative_path) for artifact in artifacts]
     placeholders = ", ".join("?" for _ in codes)
-    with duckdb.connect() as connection:
+    connect_config = {"temp_directory": ""} if memory_only else {}
+    with duckdb.connect(config=connect_config) as connection:
         rows = connection.execute(
             f"""
             SELECT ts_code,
