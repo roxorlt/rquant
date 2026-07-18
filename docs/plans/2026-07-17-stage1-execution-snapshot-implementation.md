@@ -331,8 +331,13 @@ uv run pytest -q
 - 执行或确认已迁湖覆盖；
 - 重新计算 eligibility/baseline/entry/exit；
 - 构建 execution binding；
-- 运行固定 smoke research；
+- 使用 `formal-smoke-replay` 运行版本化固定 smoke research；显式传入同一次正式
+  `audit_run_id`、`snapshot_id` 和 `binding_hash`，禁止探索模式或滚动库 fallback；
 - 记录 snapshot ID、binding hash、coverage、result hash 和首个缺失原因。
+
+生成新的生产 manifest 时默认省略 `--end-date`，让权威交易日历按最新完整收盘日、
+策略入场偏移和 B/S 窗口计算移动的资格上限。持久化后的 manifest 是不可变审计快照；
+验收期间不得扩大其日期范围，要纳入新交易日必须另建 manifest。
 
 生产写入、发布与服务重启仍遵守工作日 `09:15-15:10` 保护窗口，不能以赶进度为由绕过。
 `dataset-snapshot --apply` 在所有环境采用保守 ETA 门禁：即使启动时尚未进入保护窗口，只要
