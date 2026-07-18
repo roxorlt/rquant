@@ -1041,7 +1041,25 @@ def _n_shape_complete_dates(
     bar_is_a_share = _a_share_code_predicate("bar.ts_code")
     rows = store._conn.execute(
         f"""
-        WITH universe AS (
+        WITH deterministic_nontrading AS (
+            SELECT suspension.ts_code,
+                   suspension.trade_date
+            FROM stock_suspend_event AS suspension
+            JOIN stock_suspend_coverage AS coverage
+              ON coverage.source = suspension.source
+             AND coverage.trade_date = suspension.trade_date
+             AND coverage.coverage_state = 'complete'
+            WHERE suspension.source = 'tushare'
+              AND suspension.trade_date BETWEEN ? AND ?
+            GROUP BY suspension.ts_code, suspension.trade_date
+            HAVING count(*) FILTER (
+                       WHERE suspension.suspend_type = 'S'
+                   ) > 0
+               AND count(*) FILTER (
+                       WHERE suspension.suspend_type = 'R'
+                   ) = 0
+        ),
+        universe AS (
             SELECT calendar.cal_date AS trade_date,
                    basic.ts_code
             FROM trade_calendar AS calendar
@@ -1068,32 +1086,48 @@ def _n_shape_complete_dates(
         SELECT universe.trade_date,
                COUNT(*) AS expected_count,
                COUNT(*) FILTER (
-                   WHERE bar.ts_code IS NOT NULL
-                     AND bar.open IS NOT NULL
-                     AND bar.high IS NOT NULL
-                     AND bar.low IS NOT NULL
-                     AND bar.close IS NOT NULL
-                     AND state.ts_code IS NOT NULL
-                     AND state.is_limit_up IS NOT NULL
-                     AND state.is_limit_down IS NOT NULL
-                     AND state.is_first_limit_up IS NOT NULL
-                     AND state.is_yiziban IS NOT NULL
-                     AND state.consecutive_limit_ups IS NOT NULL
-                     AND state.body_upper IS NOT NULL
-                     AND state.body_lower IS NOT NULL
-                     AND status.ts_code IS NOT NULL
-                     AND status.conflict_reason IS NULL
-                     AND status.is_st IS NOT NULL
-                     AND status.available_at IS NOT NULL
-                     AND status.available_at <= (
-                         CAST(universe.trade_date AS TIMESTAMP)
-                         + INTERVAL '17 hours'
-                     ) AT TIME ZONE 'Asia/Shanghai'
-                     AND state.is_st IS NOT DISTINCT FROM status.is_st
+                   WHERE (
+                       (
+                           bar.ts_code IS NOT NULL
+                           AND bar.open IS NOT NULL
+                           AND bar.high IS NOT NULL
+                           AND bar.low IS NOT NULL
+                           AND bar.close IS NOT NULL
+                           AND state.ts_code IS NOT NULL
+                           AND state.is_limit_up IS NOT NULL
+                           AND state.is_limit_down IS NOT NULL
+                           AND state.is_first_limit_up IS NOT NULL
+                           AND state.is_yiziban IS NOT NULL
+                           AND state.consecutive_limit_ups IS NOT NULL
+                           AND state.body_upper IS NOT NULL
+                           AND state.body_lower IS NOT NULL
+                           AND status.ts_code IS NOT NULL
+                           AND status.conflict_reason IS NULL
+                           AND status.is_st IS NOT NULL
+                           AND status.available_at IS NOT NULL
+                           AND status.available_at <= (
+                               CAST(universe.trade_date AS TIMESTAMP)
+                               + INTERVAL '17 hours'
+                           ) AT TIME ZONE 'Asia/Shanghai'
+                           AND state.is_st IS NOT DISTINCT FROM status.is_st
+                       )
+                       OR (
+                           bar.ts_code IS NULL
+                           AND nontrading.ts_code IS NOT NULL
+                       )
+                   )
                ) AS available_count,
                COUNT(*) FILTER (
-                   WHERE basic.ts_code IS NOT NULL
-                     AND basic.circ_mv IS NOT NULL
+                   WHERE (
+                       (
+                           basic.ts_code IS NOT NULL
+                           AND basic.circ_mv IS NOT NULL
+                       )
+                       OR (
+                           bar.ts_code IS NULL
+                           AND nontrading.ts_code IS NOT NULL
+                       )
+                   )
                ) AS basic_available_count
         FROM universe
         LEFT JOIN daily_bar AS bar
@@ -1108,10 +1142,15 @@ def _n_shape_complete_dates(
         LEFT JOIN daily_basic AS basic
           ON basic.ts_code = universe.ts_code
          AND basic.trade_date = universe.trade_date
+        LEFT JOIN deterministic_nontrading AS nontrading
+          ON nontrading.ts_code = universe.ts_code
+         AND nontrading.trade_date = universe.trade_date
         GROUP BY universe.trade_date
         ORDER BY universe.trade_date
         """,
         [
+            source_dates[0],
+            source_dates[-1],
             source_dates[0],
             source_dates[-1],
             source_dates[0],

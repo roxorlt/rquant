@@ -1315,6 +1315,202 @@ def test_n_shape_panel_excludes_b_shares_from_a_share_denominator(
     assert complete_dates == (target,)
 
 
+def _seed_n_shape_panel_with_missing_suspended_code(
+    store,
+    *,
+    days: list[date],
+    coverage_state: str,
+    has_resume: bool,
+) -> None:
+    store._conn.execute(
+        """
+        INSERT INTO stock_basic (ts_code, list_date, market)
+        VALUES
+            ('000001.SZ', DATE '1991-04-03', '主板'),
+            ('000002.SZ', DATE '1991-04-03', '主板')
+        """
+    )
+    for trading_date in days:
+        observed_at = datetime.combine(trading_date, time(8, 0), tzinfo=UTC)
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar
+            (ts_code, trade_date, open, high, low, close)
+            VALUES ('000001.SZ', ?, 10, 11, 9, 10)
+            """,
+            [trading_date],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO daily_state
+            (ts_code, trade_date, is_st, is_limit_up, is_limit_down,
+             is_first_limit_up, is_yiziban, consecutive_limit_ups,
+             body_upper, body_lower)
+            VALUES
+            ('000001.SZ', ?, FALSE, FALSE, FALSE, FALSE, FALSE, 0, 10, 10)
+            """,
+            [trading_date],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_status_daily
+            (ts_code, trade_date, name, is_st, name_source, st_source,
+             available_at, ingested_at, conflict_reason)
+            VALUES
+            ('000001.SZ', ?, '平安银行', FALSE, 'test', 'test', ?, ?, NULL)
+            """,
+            [trading_date, observed_at, observed_at],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_coverage
+            (source, trade_date, coverage_state, row_count, snapshot_hash, queried_at)
+            VALUES ('tushare', ?, ?, 1, 'snapshot', ?)
+            """,
+            [trading_date, coverage_state, observed_at],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_suspend_event
+            (source, ts_code, trade_date, suspend_type, suspend_timing,
+             session_scope, available_at, ingested_at)
+            VALUES
+            ('tushare', '000002.SZ', ?, 'S', '', 'unknown', ?, ?)
+            """,
+            [trading_date, observed_at, observed_at],
+        )
+        if has_resume:
+            store._conn.execute(
+                """
+                INSERT INTO stock_suspend_event
+                (source, ts_code, trade_date, suspend_type, suspend_timing,
+                 session_scope, available_at, ingested_at)
+                VALUES
+                ('tushare', '000002.SZ', ?, 'R', '', 'unknown', ?, ?)
+                """,
+                [trading_date, observed_at, observed_at],
+            )
+    store._conn.execute(
+        """
+        INSERT INTO daily_basic (ts_code, trade_date, circ_mv)
+        VALUES ('000001.SZ', ?, 1000000)
+        """,
+        [days[-1]],
+    )
+
+
+def test_n_shape_panel_accepts_complete_s_only_day_without_daily_bar(
+    tmp_path,
+) -> None:
+    from rquant.backfill_manifest import _n_shape_complete_dates
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(121)]
+    target = days[-1]
+    with DuckDBStore(tmp_path / "n-shape-s-only-suspension.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_n_shape_panel_with_missing_suspended_code(
+            store,
+            days=days,
+            coverage_state="complete",
+            has_resume=False,
+        )
+
+        complete_dates = _n_shape_complete_dates(
+            store,
+            requested_dates=(target,),
+            calendar=days,
+        )
+
+    assert complete_dates == (target,)
+
+
+def test_n_shape_panel_rejects_suspension_with_same_day_resume(
+    tmp_path,
+) -> None:
+    from rquant.backfill_manifest import _n_shape_complete_dates
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(121)]
+    target = days[-1]
+    with DuckDBStore(tmp_path / "n-shape-suspend-resume.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_n_shape_panel_with_missing_suspended_code(
+            store,
+            days=days,
+            coverage_state="complete",
+            has_resume=True,
+        )
+
+        complete_dates = _n_shape_complete_dates(
+            store,
+            requested_dates=(target,),
+            calendar=days,
+        )
+
+    assert complete_dates == ()
+
+
+def test_n_shape_panel_rejects_suspension_without_complete_coverage(
+    tmp_path,
+) -> None:
+    from rquant.backfill_manifest import _n_shape_complete_dates
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(121)]
+    target = days[-1]
+    with DuckDBStore(tmp_path / "n-shape-unverified-suspension.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_n_shape_panel_with_missing_suspended_code(
+            store,
+            days=days,
+            coverage_state="unverified_empty",
+            has_resume=False,
+        )
+
+        complete_dates = _n_shape_complete_dates(
+            store,
+            requested_dates=(target,),
+            calendar=days,
+        )
+
+    assert complete_dates == ()
+
+
+def test_n_shape_panel_rejects_s_only_suspension_with_residual_daily_bar(
+    tmp_path,
+) -> None:
+    from rquant.backfill_manifest import _n_shape_complete_dates
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24) + timedelta(days=index) for index in range(121)]
+    target = days[-1]
+    with DuckDBStore(tmp_path / "n-shape-suspension-bar-conflict.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_n_shape_panel_with_missing_suspended_code(
+            store,
+            days=days,
+            coverage_state="complete",
+            has_resume=False,
+        )
+        store._conn.executemany(
+            """
+            INSERT INTO daily_bar
+            (ts_code, trade_date, open, high, low, close)
+            VALUES ('000002.SZ', ?, 10, 11, 9, 10)
+            """,
+            [(trading_date,) for trading_date in days],
+        )
+
+        complete_dates = _n_shape_complete_dates(
+            store,
+            requested_dates=(target,),
+            calendar=days,
+        )
+
+    assert complete_dates == ()
+
+
 def test_auction_eligibility_is_daily_plus_auction_and_never_checks_minutes(
     monkeypatch,
     tmp_path,
