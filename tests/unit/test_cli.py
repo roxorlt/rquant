@@ -754,6 +754,132 @@ class TestResearchIngest:
         assert capsys.readouterr().out.strip() == '{"status":"candidate"}'
 
 
+class TestResearchAuctionRepair:
+    def test_parser_requires_apply_and_plan_id_together(self) -> None:
+        parser = build_parser()
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "research-repair-auction",
+                    "--date",
+                    "2026-07-14",
+                    "--apply",
+                ]
+            )
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "research-repair-auction",
+                    "--date",
+                    "2026-07-14",
+                    "--plan-id",
+                    "a" * 64,
+                ]
+            )
+
+    def test_apply_is_disabled_before_adapter_when_switch_is_off(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+
+        adapter_factory = MagicMock()
+        monkeypatch.setattr(
+            config_module.settings,
+            "research_cloud_ingest_enabled",
+            False,
+        )
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            adapter_factory,
+        )
+        args = build_parser().parse_args(
+            [
+                "research-repair-auction",
+                "--date",
+                "2026-07-14",
+                "--apply",
+                "--plan-id",
+                "a" * 64,
+            ]
+        )
+
+        assert cli.cmd_research_repair_auction(args) == 3
+        adapter_factory.assert_not_called()
+
+    def test_preview_delegates_all_dates_and_prints_plan_id(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from rquant import cli
+        from rquant import config as config_module
+        from rquant import research_manifest as manifest_module
+        from rquant import research_repair as repair_module
+
+        source = tmp_path / "rquant_ro.duckdb"
+        adapter = MagicMock()
+        adapter_factory = MagicMock(return_value=adapter)
+        result = MagicMock(status="planned", plan_id="f" * 64)
+        result.model_dump.return_value = {
+            "status": "planned",
+            "plan": {"trade_dates": ["2026-07-14", "2026-07-15"]},
+            "observation": None,
+        }
+        run_repair = MagicMock(return_value=result)
+        monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
+        monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
+        monkeypatch.setattr(
+            config_module.settings,
+            "research_cloud_ingest_enabled",
+            False,
+        )
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            adapter_factory,
+        )
+        monkeypatch.setattr(
+            repair_module,
+            "run_research_auction_repair",
+            run_repair,
+        )
+        monkeypatch.setattr(
+            manifest_module,
+            "detect_code_commit",
+            lambda: "a" * 40,
+        )
+        args = build_parser().parse_args(
+            [
+                "research-repair-auction",
+                "--date",
+                "2026-07-15",
+                "--date",
+                "2026-07-14",
+            ]
+        )
+
+        assert cli.cmd_research_repair_auction(args) == 0
+        run_repair.assert_called_once_with(
+            source_database=source,
+            paths=repair_module.ResearchIngestPaths.from_data_dir(tmp_path),
+            trade_dates=(date(2026, 7, 15), date(2026, 7, 14)),
+            adapter=adapter,
+            code_commit="a" * 40,
+            apply=False,
+            plan_id=None,
+        )
+        output = json.loads(capsys.readouterr().out)
+        assert output["status"] == "planned"
+        assert output["plan_id"] == "f" * 64
+
+
 class TestResearchMigration:
     def test_verify_command_prints_machine_readable_result(
         self,

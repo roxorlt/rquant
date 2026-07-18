@@ -14,6 +14,8 @@ import pytest
 
 from rquant.research_catalog import ResearchCatalog
 from rquant.research_ingest import (
+    ResearchAuctionRepairObservation,
+    ResearchAuctionRepairPartitionChange,
     ResearchIngestPaths,
     ResearchWatchlistItem,
     assess_research_ingest_readiness,
@@ -1442,3 +1444,194 @@ def test_promotion_requires_ten_intact_candidate_observations(tmp_path: Path) ->
     assert tampered.status == "invalid"
     assert tampered.eligible_for_promotion is False
     assert "observation_lineage_broken" in tampered.issues
+
+
+def test_legacy_daily_observation_without_kind_remains_authoritative(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    result = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=_Adapter(trade_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    observation_path = (
+        paths.state_dir
+        / "research_observations"
+        / f"trade_date={trade_date.isoformat()}"
+        / f"{result.observation_id}.json"
+    )
+    payload = result.model_dump(mode="json")
+    assert "observation_kind" not in payload
+    legacy = json.dumps(payload, ensure_ascii=False, indent=2).encode() + b"\n"
+    observation_path.write_bytes(legacy)
+    (paths.state_dir / "research-authority-current.json").write_bytes(legacy)
+
+    status = inspect_research_authority(paths)
+
+    assert status.status == "candidate"
+    assert status.latest_trade_date == trade_date
+    assert status.stable_trading_days == 1
+    assert status.issues == ()
+
+
+def test_repair_observation_resets_stability_and_next_daily_starts_at_one(
+    tmp_path: Path,
+) -> None:
+    first_date = date(2026, 7, 16)
+    first_source = tmp_path / "first.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(first_source, first_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, first_date)
+    first = run_daily_research_ingest(
+        source_database=first_source,
+        paths=paths,
+        trade_date=first_date,
+        adapter=_Adapter(first_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 16, 16, 0, tzinfo=_CST),
+    )
+    current_path = paths.state_dir / "research-authority-current.json"
+    parent_hash = hashlib.sha256(current_path.read_bytes()).hexdigest()
+    manifest = first.auction.export.partitions[0].manifest
+    assert manifest is not None
+    manifest_path = paths.lake_root / "auction" / (
+        f"year={first_date.year:04d}/month={first_date.month:02d}/"
+        f"trade_date={first_date.isoformat()}/manifest.json"
+    )
+    manifest_hash = _sha256(manifest_path)
+    repair = ResearchAuctionRepairObservation(
+        observation_id="research-auction-repair-20260718T080000Z-test",
+        bootstrap_snapshot_id=_SNAPSHOT_ID,
+        trade_date=first_date,
+        generated_at=datetime(2026, 7, 18, 16, 0, tzinfo=_CST),
+        code_commit=_COMMIT,
+        plan_id="f" * 64,
+        previous_observation_sha256=parent_hash,
+        catalog_before_sha256=first.catalog_sha256,
+        catalog_sha256=first.catalog_sha256,
+        readonly_catalog_before_sha256=first.readonly_catalog_sha256,
+        readonly_catalog_sha256=first.readonly_catalog_sha256,
+        repairs=(
+            ResearchAuctionRepairPartitionChange(
+                trade_date=first_date,
+                before_manifest_sha256=None,
+                after_manifest_sha256=manifest_hash,
+                before_content_hash=None,
+                before_manifest=None,
+                after_manifest=manifest,
+            ),
+        ),
+    )
+    repair_payload = (repair.model_dump_json(indent=2) + "\n").encode()
+    repair_path = (
+        paths.state_dir
+        / "research_observations"
+        / f"trade_date={first_date.isoformat()}"
+        / f"{repair.observation_id}.json"
+    )
+    repair_path.write_bytes(repair_payload)
+    current_path.write_bytes(repair_payload)
+
+    repaired_status = inspect_research_authority(paths)
+
+    assert repaired_status.status == "candidate"
+    assert repaired_status.latest_trade_date == first_date
+    assert repaired_status.stable_trading_days == 0
+    assert repaired_status.eligible_for_promotion is False
+    assert repaired_status.issues == ()
+
+    forged = repair.model_copy(
+        update={
+            "observation_id": "research-auction-repair-forged-future-date",
+            "trade_date": date(2026, 7, 17),
+        }
+    )
+    forged_payload = (forged.model_dump_json(indent=2) + "\n").encode()
+    forged_path = (
+        paths.state_dir
+        / "research_observations"
+        / "trade_date=2026-07-17"
+        / f"{forged.observation_id}.json"
+    )
+    forged_path.parent.mkdir(parents=True, exist_ok=True)
+    forged_path.write_bytes(forged_payload)
+    current_path.write_bytes(forged_payload)
+    forged_status = inspect_research_authority(paths)
+    assert forged_status.status == "invalid"
+    assert "observation_lineage_broken" in forged_status.issues
+    forged_path.unlink()
+    current_path.write_bytes(repair_payload)
+
+    next_date = date(2026, 7, 17)
+    next_source = tmp_path / "next.duckdb"
+    _seed_source(next_source, next_date)
+    _write_watchlist(tmp_path, next_date)
+    next_result = run_daily_research_ingest(
+        source_database=next_source,
+        paths=paths,
+        trade_date=next_date,
+        adapter=_Adapter(next_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+
+    assert next_result.status == "candidate"
+    assert next_result.previous_observation_sha256 == hashlib.sha256(
+        repair_payload
+    ).hexdigest()
+    assert next_result.stable_trading_days == 1
+    assert next_result.stability_parent_sha256 is None
+
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    tampered = inspect_research_authority(paths)
+    assert tampered.status == "invalid"
+    assert "lake_manifest_invalid" in tampered.issues
+
+
+def test_repair_partition_change_rejects_unbound_prior_evidence(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    paths = _paths(tmp_path)
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    result = run_daily_research_ingest(
+        source_database=source,
+        paths=paths,
+        trade_date=trade_date,
+        adapter=_Adapter(trade_date),
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 16, 0, tzinfo=_CST),
+    )
+    manifest = result.auction.export.partitions[0].manifest
+    assert manifest is not None
+    manifest_path = (
+        paths.lake_root
+        / "auction"
+        / f"year={trade_date.year:04d}"
+        / f"month={trade_date.month:02d}"
+        / f"trade_date={trade_date.isoformat()}"
+        / "manifest.json"
+    )
+
+    with pytest.raises(ValueError, match="content hash does not match"):
+        ResearchAuctionRepairPartitionChange(
+            trade_date=trade_date,
+            before_manifest_sha256=_sha256(manifest_path),
+            after_manifest_sha256=_sha256(manifest_path),
+            before_content_hash="f" * 64,
+            before_manifest=manifest,
+            after_manifest=manifest,
+        )

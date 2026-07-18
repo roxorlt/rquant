@@ -1,7 +1,7 @@
 ---
 title: rQuant - 个人版 A 股量化选股与监控平台
 created_at: 2026-04-15
-updated_at: 2026-07-17
+updated_at: 2026-07-18
 status: active
 owner: roxor
 tags: [quant, a-shares, personal-tool, python, macOS]
@@ -31,6 +31,8 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - `research-ingest` 可在日终补齐不可变 monitor 清单分钟、拉取集合竞价，并通过可自动回滚的
   发布 journal 一致切换 Parquet manifest、研究主/只读目录和观察证据；日终 runner 会先确认
   daily 成功、主动刷新副本并检查当日日线完整性，漏日可按证据链顺序用 `stk_mins` 恢复。
+- `research-repair-auction` 可对位于证据链中间的集合竞价历史缺口做真实取数预演，再凭内容
+  绑定的 plan id 批次原子发布；旧内容寻址版本继续可读，修复后 10 日稳定观察重新累计。
 - 云端承担生产调度和研究候选存储；Mac 主库在 10 个交易日观察完成前继续保留为恢复依据。
 
 ## 明确边界
@@ -54,9 +56,9 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 当前 N 字、科创/创业放量、集合竞价独立策略均为 `exploratory`。主要原因是分钟覆盖、
 成交可行性、live/replay 语义和严格样本外验证尚未全部闭环。
 
-2026-07-17 生产当前运行 `v0.22.0`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
-snapshot/binding 执行链已上线。`v0.22.1` 候选修复首次生产 manifest 暴露的资格分母混入
-B 股、日终未持续生成 `daily_indicator` 两个阻断，并提供受控历史补算入口。代码能力完成
+2026-07-18 生产当前运行 `v0.22.5`；Stage 1 数据审计保持 `stage1-v3` P0=0，不可变
+snapshot/binding 执行链已上线。`v0.23.0` 候选新增受控集合竞价历史修复，用于补齐正式
+策略验收暴露的七个竞价缺口。代码能力完成
 不等于策略结论已可信；N 字、科创/创业放量和集合竞价仍需分别补齐真实资格 manifest，
 达到 baseline 95%、eligibility/B/S 99% 并完成生产固定回放后，才能从 `exploratory`
 晋级。
@@ -100,6 +102,16 @@ rquant research-ingest-readiness --date 2026-07-17
 rquant research-ingest --date 2026-07-17 --dry-run
 rquant research-ingest --date 2026-07-16 --recover
 rquant research-authority-status
+
+# 历史竞价修复先真实取数预演，再原样复用日期集和输出的 plan_id 执行
+rquant research-repair-auction \
+  --date 2026-04-20 \
+  --date 2026-07-07
+rquant research-repair-auction \
+  --date 2026-04-20 \
+  --date 2026-07-07 \
+  --apply \
+  --plan-id <预演输出的plan_id>
 ```
 
 ## 技术栈
