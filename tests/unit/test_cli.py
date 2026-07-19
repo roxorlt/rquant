@@ -1577,7 +1577,7 @@ class TestSuspensionBackfillParser:
             end: date,
             missing_only: bool,
         ) -> Plan:
-            del store_factory
+            assert store_factory is cli.open_readonly_store
             calls.append((start, end, missing_only))
             return Plan()
 

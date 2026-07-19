@@ -1312,7 +1312,7 @@ def cmd_suspension_backfill(args: argparse.Namespace) -> int:
     setup_logging()
     if args.dry_run:
         plan = plan_suspension_backfill(
-            store_factory=DuckDBStore,
+            store_factory=open_readonly_store,
             start=args.start_date,
             end=args.end_date,
             missing_only=not args.full_refresh,

@@ -43,6 +43,7 @@ def test_rollout_script_restores_original_timers_and_backs_up_quiescent_main() -
     assert "trap on_exit EXIT" in content
     assert "rquant-research-ingest.timer" in content
     assert "rquant-research-ingest.service" in content
+    assert "refusing rollout while mutating service is active" in content
     stop_index = content.index("stop_mutating_units")
     backup_index = content.index("RQUANT_BACKUP_SOURCE=main", stop_index)
     assert stop_index < backup_index
@@ -96,4 +97,6 @@ def test_rollout_script_runs_complete_three_strategy_evidence_chain() -> None:
     ):
         assert required_value in content
     assert "p0_count" in content
+    assert 'require_json_value "${AUTHORITY_FILE}" status candidate' in content
+    assert 'payload["sample_count"] > 0' in content
     assert "sync-readonly-replica.sh" in content

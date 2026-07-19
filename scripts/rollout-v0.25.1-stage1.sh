@@ -108,14 +108,14 @@ capture_active_timers() {
 stop_mutating_units() {
     capture_active_timers
     sudo systemctl stop "${MUTATING_TIMERS[@]}"
-    sudo systemctl stop "${MUTATING_SERVICES[@]}"
     local service
     for service in "${MUTATING_SERVICES[@]}"; do
         if systemctl is-active --quiet "${service}"; then
-            echo "mutating service remained active after stop: ${service}" >&2
+            echo "refusing rollout while mutating service is active: ${service}" >&2
             return 1
         fi
     done
+    sudo systemctl stop "${MUTATING_SERVICES[@]}"
 }
 
 run_json() {
@@ -425,14 +425,16 @@ from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert payload["missing_evidence"] == []
-assert payload["sample_count"] >= 0
+assert payload["sample_count"] > 0
 PY
 done
 
 backup_main "v0.25.1-post-stage1"
 sync_operational_replica
 verify_main_replica
-"${RQUANT_BIN}" research-authority-status
+AUTHORITY_FILE="${RUN_DIR}/research-authority-status.json"
+run_json "${AUTHORITY_FILE}" "${RQUANT_BIN}" research-authority-status
+require_json_value "${AUTHORITY_FILE}" status candidate
 
 restore_original_timers
 "${RQUANT_BIN}" preflight
