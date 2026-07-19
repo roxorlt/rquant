@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
@@ -22,6 +23,7 @@ from loguru import logger
 
 from rquant.backfill_state import (
     BackfillStateStore,
+    BackfillWorkloadTelemetry,
     ManifestContentConflictError,
     UnknownManifestError,
 )
@@ -139,6 +141,12 @@ def _parse_sha256(value: str) -> str:
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _BACKFILL_PROTECTED_START = dtime(9, 15)
 _BACKFILL_PROTECTED_END = dtime(15, 10)
+_BACKFILL_DEADLINE_MARGIN_MINUTES = 10
+_BACKFILL_HARD_DEADLINE_GRACE_MINUTES = 5
+_BACKFILL_PARALLEL_OVERHEAD = 1.25
+_BACKFILL_MIN_TELEMETRY_SAMPLES = 32
+_BACKFILL_COLD_TASK_SECONDS = 10.416
+_BACKFILL_COLD_ROWS_PER_SECOND = 651.0
 _SNAPSHOT_BINDING_ESTIMATED_SECONDS = 1_800.0
 _SNAPSHOT_DEADLINE_MARGIN_SECONDS = 60
 
@@ -147,7 +155,132 @@ class _SnapshotWriteDeadlineError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _BackfillExecutionEstimate:
+    serial_seconds: float
+    point_seconds: float
+    guard_seconds: float
+    source: str
+
+
+def _estimate_parallel_backfill(
+    *,
+    static_total_seconds: float,
+    total_tasks: int,
+    worker_count: int,
+    telemetry: BackfillWorkloadTelemetry,
+    static_rate_limit_seconds: float = 0.0,
+) -> _BackfillExecutionEstimate:
+    if total_tasks < 0:
+        raise ValueError("total_tasks must not be negative")
+    if not 1 <= worker_count <= 16:
+        raise ValueError("worker_count must be between 1 and 16")
+    remaining_ratio = (
+        telemetry.remaining_tasks / total_tasks
+        if total_tasks
+        else 0.0
+    )
+    remaining_rate_limit_seconds = (
+        max(0.0, static_rate_limit_seconds) * remaining_ratio
+    )
+    task_floor_seconds = 0.0
+    candidates = [
+        (
+            max(0.0, static_total_seconds) * remaining_ratio,
+            "static",
+        )
+    ]
+    if telemetry.sample_task_count < _BACKFILL_MIN_TELEMETRY_SAMPLES:
+        task_floor_seconds = _BACKFILL_COLD_TASK_SECONDS
+        candidates.extend(
+            (
+                (
+                    telemetry.remaining_tasks * _BACKFILL_COLD_TASK_SECONDS,
+                    "production_cold_start",
+                ),
+                (
+                    telemetry.remaining_expected_rows
+                    / _BACKFILL_COLD_ROWS_PER_SECOND,
+                    "production_cold_start",
+                ),
+            )
+        )
+    if (
+        telemetry.sample_task_count
+        and telemetry.p75_task_seconds is not None
+        and telemetry.p75_seconds_per_row is not None
+    ):
+        task_floor_seconds = max(
+            task_floor_seconds,
+            telemetry.p75_task_seconds,
+        )
+        candidates.extend(
+            (
+                (
+                    telemetry.remaining_tasks * telemetry.p75_task_seconds,
+                    "historical_p75",
+                ),
+                (
+                    (
+                        telemetry.remaining_expected_rows
+                        * telemetry.p75_seconds_per_row
+                    ),
+                    "historical_p75",
+                ),
+            )
+        )
+    serial_seconds, source = max(candidates, key=lambda candidate: candidate[0])
+    effective_workers = max(
+        1,
+        min(worker_count, telemetry.remaining_tasks or 1),
+    )
+    point_seconds = max(
+        serial_seconds / effective_workers * _BACKFILL_PARALLEL_OVERHEAD,
+        task_floor_seconds,
+        remaining_rate_limit_seconds,
+    )
+    return _BackfillExecutionEstimate(
+        serial_seconds=serial_seconds,
+        point_seconds=point_seconds,
+        guard_seconds=point_seconds * 2 + 1_800,
+        source=source,
+    )
+
+
+def _resolve_backfill_stop_before(
+    now: datetime,
+    *,
+    max_runtime_minutes: int | None,
+) -> datetime:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("backfill deadline time must be timezone-aware")
+    local = now.astimezone(_SHANGHAI)
+    if _in_backfill_protected_window(local):
+        raise ValueError("backfill cannot start inside the protected window")
+    protected_deadline = _next_backfill_protected_start(local) - timedelta(
+        minutes=_BACKFILL_DEADLINE_MARGIN_MINUTES
+    )
+    if max_runtime_minutes is None:
+        return protected_deadline
+    if max_runtime_minutes < 1:
+        raise ValueError("max_runtime_minutes must be positive")
+    requested_deadline = local + timedelta(minutes=max_runtime_minutes)
+    return min(protected_deadline, requested_deadline)
+
+
+def _resolve_backfill_hard_deadline(stop_before: datetime) -> datetime:
+    if stop_before.tzinfo is None or stop_before.utcoffset() is None:
+        raise ValueError("backfill stop deadline must be timezone-aware")
+    return stop_before.astimezone(_SHANGHAI) + timedelta(
+        minutes=_BACKFILL_HARD_DEADLINE_GRACE_MINUTES
+    )
+
+
 def _snapshot_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _backfill_now() -> datetime:
     return datetime.now(UTC)
 
 
@@ -347,6 +480,37 @@ def _run_dataset_snapshot_supervised_worker(
     return _run_deadline_supervised_process(
         command,
         deadline=deadline,
+    )
+
+
+def _run_backfill_supervised_worker(
+    args: argparse.Namespace,
+    *,
+    stop_before: datetime,
+    hard_deadline: datetime,
+) -> int:
+    command = [
+        sys.executable,
+        "-m",
+        "rquant.cli",
+        "backfill-run",
+        "--manifest-id",
+        str(args.manifest_id),
+        "--workers",
+        str(args.workers),
+    ]
+    if bool(args.retry_failed):
+        command.append("--retry-failed")
+    command.extend(
+        (
+            "--stop-before",
+            stop_before.isoformat(),
+            "--deadline-worker",
+        )
+    )
+    return _run_deadline_supervised_process(
+        command,
+        deadline=hard_deadline,
     )
 
 
@@ -1218,7 +1382,7 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
         validate_executable_backfill_plan,
         validate_persisted_backfill_tasks,
     )
-    from rquant.intraday_backfill import run_backfill_manifest
+    from rquant.intraday_backfill import run_backfill_manifest_workers
 
     setup_logging()
     state = BackfillStateStore()
@@ -1246,27 +1410,74 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
     except (BackfillCalendarError, BackfillPlanIntegrityError) as exc:
         logger.error(f"persisted backfill plan is not executable: {exc}")
         return 2
-    estimated_seconds = (
-        status_before.eta_seconds
-        if status_before.eta_seconds is not None
-        else plan.estimate.total_seconds
+    worker_count = int(getattr(args, "workers", 8))
+    first_task = plan.tasks[0]
+    telemetry = state.get_workload_telemetry(
+        args.manifest_id,
+        source=first_task.source,
+        freq=first_task.freq,
+        response_row_limit=first_task.response_row_limit,
     )
-    now = datetime.now(UTC)
-    if not _backfill_write_window_safe(now, estimated_seconds):
+    execution_estimate = _estimate_parallel_backfill(
+        static_total_seconds=plan.estimate.total_seconds,
+        static_rate_limit_seconds=plan.estimate.rate_limit_seconds,
+        total_tasks=len(plan.tasks),
+        worker_count=worker_count,
+        telemetry=telemetry,
+    )
+    now = _backfill_now()
+    max_runtime_minutes = getattr(args, "max_runtime_minutes", None)
+    explicit_stop_before = getattr(args, "stop_before", None)
+    if explicit_stop_before is None:
+        try:
+            stop_before = _resolve_backfill_stop_before(
+                now,
+                max_runtime_minutes=max_runtime_minutes,
+            )
+        except ValueError as exc:
+            logger.error(str(exc))
+            return 2
+    else:
+        stop_before = explicit_stop_before.astimezone(_SHANGHAI)
+        if _in_backfill_protected_window(now) or now >= stop_before:
+            logger.error("backfill worker deadline already elapsed")
+            return 2
+    if (
+        max_runtime_minutes is None
+        and explicit_stop_before is None
+        and not _backfill_write_window_safe(
+            now,
+            execution_estimate.point_seconds,
+        )
+    ):
         logger.error(
             "backfill run would overlap the protected 09:15-15:10 monitor window"
         )
         return 2
 
+    logger.info(
+        "backfill execution estimate: "
+        f"workers={worker_count}, source={execution_estimate.source}, "
+        f"point={execution_estimate.point_seconds:.1f}s, "
+        f"guard={execution_estimate.guard_seconds:.1f}s, "
+        f"stop_before={stop_before.isoformat()}"
+    )
+    deadline_worker = bool(getattr(args, "deadline_worker", True))
+    if not deadline_worker:
+        return _run_backfill_supervised_worker(
+            args,
+            stop_before=stop_before,
+            hard_deadline=_resolve_backfill_hard_deadline(stop_before),
+        )
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
-    summary = run_backfill_manifest(
-        None,
+    summary = run_backfill_manifest_workers(
         state,
-        TushareAdapter(),
+        TushareAdapter,
         manifest_id=args.manifest_id,
         worker_id=worker_id,
+        worker_count=worker_count,
         retry_failed=args.retry_failed,
-        stop_before=_next_backfill_protected_start(now) - timedelta(minutes=5),
+        stop_before=stop_before,
         store_factory=DuckDBStore,
     )
     status_after = state.get_manifest_status(args.manifest_id)
@@ -1274,6 +1485,13 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
         {
             "run": summary.model_dump(mode="json"),
             "status": status_after.model_dump(mode="json"),
+            "estimate": {
+                "serial_seconds": execution_estimate.serial_seconds,
+                "point_seconds": execution_estimate.point_seconds,
+                "guard_seconds": execution_estimate.guard_seconds,
+                "source": execution_estimate.source,
+                "stop_before": stop_before.isoformat(),
+            },
         }
     )
     return 0 if status_after.status == "completed" else 1
@@ -3293,6 +3511,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--retry-failed",
         action="store_true",
         help="重试尚未耗尽次数的可重试失败任务",
+    )
+    backfill_run_p.add_argument(
+        "--workers",
+        type=int,
+        choices=range(1, 17),
+        default=8,
+        metavar="1..16",
+        help="并发 Tushare 拉取 worker 数；DuckDB 仍保持单写（默认 8）",
+    )
+    backfill_run_p.add_argument(
+        "--max-runtime-minutes",
+        type=int,
+        default=None,
+        help="本次最多运行分钟数；实际仍会在下一交易保护窗口前 10 分钟停止",
+    )
+    backfill_run_p.add_argument(
+        "--stop-before",
+        type=_parse_iso_datetime,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    backfill_run_p.add_argument(
+        "--deadline-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     backfill_status_p = sub.add_parser(

@@ -188,6 +188,30 @@ class BackfillManifestStatus(BackfillStateModel):
     failures: tuple[BackfillTaskFailureSummary, ...]
 
 
+class BackfillWorkloadTelemetry(BackfillStateModel):
+    remaining_tasks: int = Field(ge=0)
+    remaining_expected_rows: int = Field(ge=0)
+    sample_task_count: int = Field(ge=0)
+    sample_manifest_count: int = Field(ge=0)
+    p75_task_seconds: float | None = Field(default=None, ge=0)
+    p75_seconds_per_row: float | None = Field(default=None, ge=0)
+
+
+def _linear_quantile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    if not 0 <= quantile <= 1:
+        raise ValueError("quantile must be between zero and one")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
 class BackfillStateStore:
     """Keep backfill orchestration state outside the write-heavy DuckDB file."""
 
@@ -632,6 +656,7 @@ class BackfillStateStore:
                 max_attempts = int(row["max_attempts"])
                 if status == "pending":
                     candidate = row
+                    recovery_only = attempts >= max_attempts
                     break
                 if status == "running":
                     expiry = _decode_time(row["lease_expires_at"])
@@ -726,7 +751,7 @@ class BackfillStateStore:
     ) -> sqlite3.Row:
         row = connection.execute(
             """
-            SELECT status, claim_token, metrics_json
+            SELECT status, claim_token, metrics_json, recovery_attempted
             FROM backfill_task
             WHERE manifest_id = ? AND task_id = ?
             """,
@@ -772,6 +797,44 @@ class BackfillStateStore:
                 (_encode_time(renewed_at), claim.manifest_id),
             )
         return claim.model_copy(update={"lease_expires_at": lease_expires_at})
+
+    def release_task_claim(
+        self,
+        claim: ClaimedBackfillTask,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Return an interrupted claim to pending without spending an attempt."""
+        released_at = _normalize_time(now or _utc_now())
+        attempts = claim.attempt if claim.recovery_only else max(claim.attempt - 1, 0)
+        with self._write_transaction() as connection:
+            task_row = self._require_current_claim(connection, claim)
+            recovery_attempted = (
+                0
+                if claim.recovery_only
+                else int(task_row["recovery_attempted"])
+            )
+            connection.execute(
+                """
+                UPDATE backfill_task
+                SET status = 'pending', attempts = ?, recovery_attempted = ?,
+                    worker_id = NULL, claim_token = NULL, claimed_at = NULL,
+                    lease_seconds = NULL, lease_expires_at = NULL,
+                    failure_json = NULL, metrics_json = NULL,
+                    duration_seconds = NULL, finished_at = NULL
+                WHERE manifest_id = ? AND task_id = ?
+                """,
+                (
+                    attempts,
+                    recovery_attempted,
+                    claim.manifest_id,
+                    claim.task_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE backfill_manifest SET updated_at = ? WHERE manifest_id = ?",
+                (_encode_time(released_at), claim.manifest_id),
+            )
 
     def mark_task_succeeded(
         self,
@@ -997,4 +1060,98 @@ class BackfillStateStore:
             covered_sessions=metric_totals["covered_sessions"],
             allowed_missing_sessions=metric_totals["allowed_missing_sessions"],
             failures=tuple(failures),
+        )
+
+    def get_workload_telemetry(
+        self,
+        manifest_id: str,
+        *,
+        source: str,
+        freq: str,
+        response_row_limit: int,
+        sample_limit: int = 128,
+    ) -> BackfillWorkloadTelemetry:
+        if not source.strip() or not freq.strip():
+            raise ValueError("source and freq must not be blank")
+        if response_row_limit < 1 or sample_limit < 1:
+            raise ValueError("row and sample limits must be positive")
+        connection = self._connect()
+        try:
+            self._require_manifest(connection, manifest_id)
+            remaining = connection.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(
+                        CAST(json_extract(payload_json, '$.expected_rows') AS INTEGER)
+                    ), 0)
+                FROM backfill_task
+                WHERE manifest_id = ?
+                  AND (
+                      status IN ('pending', 'running')
+                      OR (
+                          status = 'failed'
+                          AND attempts < max_attempts
+                          AND COALESCE(
+                              json_extract(failure_json, '$.retryable'),
+                              0
+                          ) = 1
+                      )
+                  )
+                """,
+                (manifest_id,),
+            ).fetchone()
+            samples = connection.execute(
+                """
+                SELECT manifest_id,
+                       duration_seconds,
+                       CAST(
+                           json_extract(payload_json, '$.expected_rows')
+                           AS REAL
+                       ) AS expected_rows
+                FROM backfill_task
+                WHERE status = 'succeeded'
+                  AND duration_seconds IS NOT NULL
+                  AND duration_seconds >= 0
+                  AND CAST(
+                      json_extract(metrics_json, '$.request_count')
+                      AS INTEGER
+                  ) > 0
+                  AND json_extract(payload_json, '$.source') = ?
+                  AND json_extract(payload_json, '$.freq') = ?
+                  AND CAST(
+                      json_extract(payload_json, '$.response_row_limit')
+                      AS INTEGER
+                  ) = ?
+                  AND CAST(
+                      json_extract(payload_json, '$.expected_rows')
+                      AS INTEGER
+                  ) > 0
+                ORDER BY finished_at DESC, manifest_id, ordinal
+                LIMIT ?
+                """,
+                (
+                    source.strip(),
+                    freq.strip(),
+                    response_row_limit,
+                    sample_limit,
+                ),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        durations = [float(row["duration_seconds"]) for row in samples]
+        seconds_per_row = [
+            float(row["duration_seconds"]) / float(row["expected_rows"])
+            for row in samples
+        ]
+        return BackfillWorkloadTelemetry(
+            remaining_tasks=int(remaining[0]),
+            remaining_expected_rows=int(remaining[1]),
+            sample_task_count=len(samples),
+            sample_manifest_count=len(
+                {str(row["manifest_id"]) for row in samples}
+            ),
+            p75_task_seconds=_linear_quantile(durations, 0.75),
+            p75_seconds_per_row=_linear_quantile(seconds_per_row, 0.75),
         )

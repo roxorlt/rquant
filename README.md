@@ -66,7 +66,9 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 2026-07-18 Stage 1 数据审计保持 `stage1-v3` P0=0，不可变 snapshot/binding 执行链和
 受控历史分钟研究湖修复已上线。`v0.25.0` 将分钟修复改为有界内存两遍式，并为三策略增加
 只能通过 formal gate 的固定冒烟回放。`v0.25.1` 统一空时段全天停牌证据、整段原子刷新
-和可恢复三策略生产验收；新正式证据完成前，三策略仍保持 `exploratory`。
+和可恢复三策略生产验收。生产实测证明串行分钟回补 ETA 低估 17 到 27 倍；`v0.25.2`
+改为并发拉取、DuckDB 单写，以历史任务遥测生成保守 ETA，并允许在硬保护截止前分段续跑。
+新正式证据完成前，三策略仍保持 `exploratory`。
 
 **可用资格截止日是移动的，单份 manifest 是冻结的。** 每次执行 `backfill-plan` 且省略
 `--end-date` 时，系统按权威交易日历、当前已完整收盘交易日、策略入场偏移和完整 B/S 窗口
@@ -136,6 +138,12 @@ rquant research-repair-minute \
   --manifest-id <同一个manifest_id> \
   --apply \
   --plan-id <预演输出的plan_id>
+
+# 长分钟 manifest：网络并发、DuckDB 单写；09:05 停写、09:10 硬退出
+rquant backfill-run \
+  --manifest-id <manifest_id> \
+  --workers 8 \
+  --max-runtime-minutes 1050
 ```
 
 ## 技术栈

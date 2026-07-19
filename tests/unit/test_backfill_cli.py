@@ -276,6 +276,10 @@ def test_backfill_cli_parser_contracts() -> None:
     assert plan.start_date == date(2026, 1, 1)
     assert automatic_plan.end_date is None
     assert run.retry_failed is False
+    assert run.workers == 8
+    assert run.max_runtime_minutes is None
+    assert run.stop_before is None
+    assert run.deadline_worker is False
     assert status.json is True
     assert snapshot.as_of == datetime(2026, 6, 30, 7, tzinfo=UTC)
     assert snapshot.apply is False
@@ -318,6 +322,124 @@ def test_dataset_snapshot_protected_window(
     expected: bool,
 ) -> None:
     assert cli._in_backfill_protected_window(now) is expected
+
+
+def test_parallel_backfill_estimate_uses_slower_task_or_row_telemetry() -> None:
+    from rquant.backfill_state import BackfillWorkloadTelemetry
+
+    estimate = cli._estimate_parallel_backfill(
+        static_total_seconds=100.0,
+        total_tasks=20,
+        worker_count=4,
+        telemetry=BackfillWorkloadTelemetry(
+            remaining_tasks=10,
+            remaining_expected_rows=1_000,
+            sample_task_count=32,
+            sample_manifest_count=2,
+            p75_task_seconds=8.0,
+            p75_seconds_per_row=0.1,
+        ),
+    )
+
+    assert estimate.serial_seconds == pytest.approx(100.0)
+    assert estimate.point_seconds == pytest.approx(31.25)
+    assert estimate.guard_seconds == pytest.approx(1_862.5)
+    assert estimate.source == "historical_p75"
+
+
+def test_parallel_backfill_estimate_has_production_cold_start_floor() -> None:
+    from rquant.backfill_state import BackfillWorkloadTelemetry
+
+    estimate = cli._estimate_parallel_backfill(
+        static_total_seconds=10.0,
+        total_tasks=10,
+        worker_count=8,
+        telemetry=BackfillWorkloadTelemetry(
+            remaining_tasks=10,
+            remaining_expected_rows=1_000,
+            sample_task_count=0,
+            sample_manifest_count=0,
+        ),
+    )
+
+    assert estimate.serial_seconds == pytest.approx(104.16)
+    assert estimate.point_seconds == pytest.approx(16.275)
+    assert estimate.source == "production_cold_start"
+
+
+def test_parallel_backfill_estimate_keeps_single_task_and_rate_limit_floor() -> None:
+    from rquant.backfill_state import BackfillWorkloadTelemetry
+
+    estimate = cli._estimate_parallel_backfill(
+        static_total_seconds=4_000.0,
+        static_rate_limit_seconds=900.0,
+        total_tasks=100,
+        worker_count=8,
+        telemetry=BackfillWorkloadTelemetry(
+            remaining_tasks=1,
+            remaining_expected_rows=8_000,
+            sample_task_count=32,
+            sample_manifest_count=2,
+            p75_task_seconds=3_600.0,
+            p75_seconds_per_row=0.1,
+        ),
+    )
+
+    assert estimate.point_seconds == pytest.approx(4_500.0)
+    assert estimate.guard_seconds == pytest.approx(10_800.0)
+
+
+def test_backfill_runtime_deadline_is_capped_before_next_protected_window() -> None:
+    now = datetime(2026, 7, 20, 15, 11, tzinfo=SHANGHAI)
+
+    deadline = cli._resolve_backfill_stop_before(
+        now,
+        max_runtime_minutes=1_200,
+    )
+
+    assert deadline == datetime(2026, 7, 21, 9, 5, tzinfo=SHANGHAI)
+
+
+def test_backfill_hard_deadline_leaves_five_minutes_to_restore_timers() -> None:
+    soft_deadline = datetime(2026, 7, 21, 9, 5, tzinfo=SHANGHAI)
+
+    deadline = cli._resolve_backfill_hard_deadline(soft_deadline)
+
+    assert deadline == datetime(2026, 7, 21, 9, 10, tzinfo=SHANGHAI)
+
+
+def test_backfill_runtime_deadline_rejects_protected_window() -> None:
+    now = datetime(2026, 7, 20, 10, 0, tzinfo=SHANGHAI)
+
+    with pytest.raises(ValueError, match="protected"):
+        cli._resolve_backfill_stop_before(now, max_runtime_minutes=30)
+
+
+def test_backfill_supervisor_passes_exact_soft_deadline_to_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = MagicMock(return_value=0)
+    monkeypatch.setattr(cli, "_run_deadline_supervised_process", supervisor)
+    stop_before = datetime(2026, 7, 21, 9, 5, tzinfo=SHANGHAI)
+    hard_deadline = datetime(2026, 7, 21, 9, 10, tzinfo=SHANGHAI)
+
+    rc = cli._run_backfill_supervised_worker(
+        Namespace(
+            manifest_id="a" * 64,
+            workers=8,
+            retry_failed=True,
+        ),
+        stop_before=stop_before,
+        hard_deadline=hard_deadline,
+    )
+
+    assert rc == 0
+    command = supervisor.call_args.args[0]
+    assert command[-1] == "--deadline-worker"
+    assert "--stop-before" in command
+    assert stop_before.isoformat() in command
+    assert "--retry-failed" in command
+    assert supervisor.call_args.kwargs["deadline"] == hard_deadline
 
 
 @pytest.mark.parametrize(
@@ -600,6 +722,86 @@ def test_backfill_run_rejects_divergent_claim_task_payload(
     adapter.assert_not_called()
     runner.assert_not_called()
     assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"
+
+
+def test_backfill_run_uses_parallel_workers_and_bounded_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.backfill_state import BackfillWorkloadTelemetry
+    from rquant.intraday_backfill import BackfillRunSummary
+
+    plan = _plan_with_task()
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(backfill_state_input(plan))
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    readonly_store = MagicMock()
+    context = MagicMock()
+    context.__enter__.return_value = readonly_store
+    context.__exit__.return_value = False
+    monkeypatch.setattr(cli, "open_readonly_store", MagicMock(return_value=context))
+    monkeypatch.setattr(
+        "rquant.backfill_manifest.validate_executable_backfill_plan",
+        MagicMock(),
+    )
+    telemetry = BackfillWorkloadTelemetry(
+        remaining_tasks=1,
+        remaining_expected_rows=241,
+        sample_task_count=32,
+        sample_manifest_count=1,
+        p75_task_seconds=10.0,
+        p75_seconds_per_row=0.04,
+    )
+    monkeypatch.setattr(
+        state,
+        "get_workload_telemetry",
+        MagicMock(return_value=telemetry),
+    )
+    now = datetime(2026, 7, 20, 15, 11, tzinfo=SHANGHAI)
+    monkeypatch.setattr(cli, "_backfill_now", lambda: now)
+    full_window_guard = MagicMock(return_value=False)
+    monkeypatch.setattr(cli, "_backfill_write_window_safe", full_window_guard)
+    runner = MagicMock(
+        return_value=BackfillRunSummary(
+            manifest_id=plan.manifest.manifest_id,
+            worker_count=8,
+            claimed_tasks=0,
+            succeeded_tasks=0,
+            failed_tasks=0,
+            skipped_complete_tasks=0,
+            request_count=0,
+            returned_rows=0,
+            written_rows=0,
+            deadline_reached=True,
+        )
+    )
+    monkeypatch.setattr(
+        "rquant.intraday_backfill.run_backfill_manifest_workers",
+        runner,
+    )
+
+    rc = cli.cmd_backfill_run(
+        Namespace(
+            manifest_id=plan.manifest.manifest_id,
+            retry_failed=False,
+            workers=8,
+            max_runtime_minutes=60,
+        )
+    )
+
+    assert rc == 1
+    full_window_guard.assert_not_called()
+    runner.assert_called_once()
+    call = runner.call_args
+    assert call.kwargs["worker_count"] == 8
+    assert call.kwargs["stop_before"] == datetime(
+        2026,
+        7,
+        20,
+        16,
+        11,
+        tzinfo=SHANGHAI,
+    )
 
 
 def test_backfill_plan_persists_immutable_plan(

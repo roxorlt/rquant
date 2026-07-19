@@ -5,6 +5,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Barrier, Lock
+from time import sleep
 
 import pandas as pd
 
@@ -14,6 +16,7 @@ from rquant.backfill_state import (
     BackfillStateStore,
     BackfillTaskInput,
 )
+from rquant.intraday_backfill import run_backfill_manifest
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -247,6 +250,109 @@ def test_store_factory_releases_duckdb_during_source_request(tmp_path: Path) -> 
 
     assert summary.succeeded_tasks == 1
     assert active_stores == 0
+
+
+def test_parallel_workers_overlap_fetches_but_serialize_duckdb(
+    tmp_path: Path,
+) -> None:
+    from rquant.intraday_backfill import run_backfill_manifest_workers
+
+    day = date(2026, 6, 25)
+    tasks = tuple(
+        _task(str(index) * 64, f"30000{index}.SZ", (day,))
+        for index in range(1, 5)
+    )
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    _persist_tasks(state, tasks)
+
+    counter_lock = Lock()
+    first_fetches = Barrier(2)
+    fetch_calls = 0
+    active_fetches = 0
+    max_active_fetches = 0
+    active_stores = 0
+    max_active_stores = 0
+
+    @contextmanager
+    def store_factory():
+        nonlocal active_stores, max_active_stores
+        with counter_lock:
+            active_stores += 1
+            max_active_stores = max(max_active_stores, active_stores)
+        try:
+            with DuckDBStore(tmp_path / "market.duckdb") as current:
+                yield current
+        finally:
+            with counter_lock:
+                active_stores -= 1
+
+    class Adapter:
+        def stk_mins(self, ts_code, freq, start, end):
+            nonlocal fetch_calls, active_fetches, max_active_fetches
+            del freq, start, end
+            with counter_lock:
+                fetch_calls += 1
+                call_number = fetch_calls
+                active_fetches += 1
+                max_active_fetches = max(max_active_fetches, active_fetches)
+            try:
+                if call_number <= 2:
+                    first_fetches.wait(timeout=5)
+                sleep(0.01)
+                return _minute_frame(ts_code, (day,))
+            finally:
+                with counter_lock:
+                    active_fetches -= 1
+
+    summary = run_backfill_manifest_workers(
+        state,
+        Adapter,
+        manifest_id="manifest-runner",
+        worker_id="test-worker",
+        worker_count=2,
+        store_factory=store_factory,
+    )
+
+    assert summary.worker_count == 2
+    assert summary.claimed_tasks == 4
+    assert summary.succeeded_tasks == 4
+    assert summary.failed_tasks == 0
+    assert max_active_fetches == 2
+    assert max_active_stores == 1
+
+
+def test_runtime_deadline_discards_fetched_rows_and_releases_claim(
+    tmp_path: Path,
+) -> None:
+    from datetime import timedelta
+
+    day = date(2026, 6, 25)
+    task = _task("d" * 64, "300001.SZ", (day,))
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    _persist_tasks(state, (task,))
+
+    class SlowAdapter:
+        def stk_mins(self, ts_code, freq, start, end):
+            del freq, start, end
+            sleep(0.08)
+            return _minute_frame(ts_code, (day,))
+
+    summary = run_backfill_manifest(
+        None,
+        state,
+        SlowAdapter(),
+        manifest_id="manifest-runner",
+        worker_id="deadline-worker",
+        stop_before=datetime.now(UTC) + timedelta(milliseconds=20),
+        store_factory=lambda: DuckDBStore(tmp_path / "market.duckdb"),
+    )
+
+    assert summary.deadline_reached is True
+    assert summary.written_rows == 0
+    assert state.get_manifest_status("manifest-runner").status == "pending"
+    with DuckDBStore(tmp_path / "market.duckdb") as store:
+        row = store._conn.execute("SELECT count(*) FROM minute_bar").fetchone()
+        assert row[0] == 0
 
 
 def test_lost_lease_discards_late_source_rows_before_duckdb_write(

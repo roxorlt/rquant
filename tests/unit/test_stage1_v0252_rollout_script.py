@@ -1,4 +1,4 @@
-"""Safety contract for the v0.25.1 Stage 1 production rollout."""
+"""Safety contract for the v0.25.2 Stage 1 production rollout."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "scripts" / "rollout-v0.25.1-stage1.sh"
+SCRIPT = ROOT / "scripts" / "rollout-v0.25.2-stage1.sh"
 
 
 def test_rollout_script_is_valid_strict_bash() -> None:
@@ -25,7 +25,7 @@ def test_rollout_script_guards_exact_release_and_market_window() -> None:
     content = SCRIPT.read_text(encoding="utf-8")
 
     assert "set -Eeuo pipefail" in content
-    assert 'TARGET_TAG="v0.25.1"' in content
+    assert 'TARGET_TAG="v0.25.2"' in content
     assert "RQUANT_STAGE1_EXPECTED_SHA" in content
     assert 'git describe --tags --exact-match' in content
     assert 'git rev-parse HEAD' in content
@@ -49,6 +49,19 @@ def test_rollout_script_restores_original_timers_and_backs_up_quiescent_main() -
     assert stop_index < backup_index
     assert "verify_backup" in content
     assert "preserve_backup" in content
+    assert 'if ! sudo systemctl start "${ORIGINALLY_ACTIVE_TIMERS[@]}"; then' in content
+    assert "timeout --signal=TERM --kill-after=30s" in content
+    assert "ROLLOUT_HARD_DEADLINE_EPOCH" in content
+    assert 'run_guarded sudo systemctl stop "${MUTATING_TIMERS[@]}"' in content
+    assert "run_guarded cp --" in content
+    assert '"${PROJECT_DIR}/backup/latest.duckdb.gz"' in content
+    assert 'run_guarded "${PYTHON_BIN}" - "${replay_file}"' in content
+    restored_index = content.index("TIMERS_RESTORED=1")
+    verify_index = content.index(
+        'systemctl is-active --quiet "${timer}"',
+        content.index("restore_original_timers()"),
+    )
+    assert verify_index < restored_index
 
 
 def test_rollout_script_previews_then_refreshes_suspensions_atomically() -> None:
@@ -100,3 +113,27 @@ def test_rollout_script_runs_complete_three_strategy_evidence_chain() -> None:
     assert 'require_json_value "${AUTHORITY_FILE}" status candidate' in content
     assert 'payload["sample_count"] > 0' in content
     assert "sync-readonly-replica.sh" in content
+
+
+def test_rollout_script_resumes_large_manifest_or_pauses_cleanly() -> None:
+    content = SCRIPT.read_text(encoding="utf-8")
+
+    assert "RQUANT_STAGE1_RESUME_MANIFEST_ID" in content
+    assert "RQUANT_STAGE1_BACKFILL_WORKERS" in content
+    assert "RQUANT_STAGE1_BACKFILL_MAX_RUNTIME_MINUTES" in content
+    assert '--workers "${BACKFILL_WORKERS}"' in content
+    assert '--max-runtime-minutes "${BACKFILL_MAX_RUNTIME_MINUTES}"' in content
+    assert "ROLLOUT_RESULT=paused" in content
+    pause_index = content.index("ROLLOUT_RESULT=paused")
+    assert content.rfind("restore_original_timers", 0, pause_index) >= 0
+    assert content.rfind("backfill-status", 0, pause_index) >= 0
+    assert "pause_before_full_stage_window" in content
+    assert "assert_resume_start_window" in content
+    completed_index = content.index("RESUME_BACKFILL_COMPLETED")
+    full_stage_index = content.index("REFRESH_END=")
+    pause_guard_index = content.index(
+        "pause_before_full_stage_window",
+        completed_index,
+    )
+    assert completed_index < pause_guard_index < full_stage_index
+    assert content.count("pause_before_full_stage_window") >= 6
