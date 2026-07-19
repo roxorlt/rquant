@@ -27,6 +27,7 @@ from rquant.data_metadata import (
     utc_now,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.suspension_evidence import suspension_session_evidence_sql
 
 _READ_ONLY_ACCESS_MODE = "read_only"
 _WRITABLE_ACCESS_MODES = frozenset({"automatic", "read_write"})
@@ -952,11 +953,17 @@ def daily_minute_consistency_audit_rules(
         parameters: list[object] = [
             value for spec in coverage_specs for value in (spec.source, spec.freq)
         ]
-        parameters.extend((start, end))
+        parameters.extend((start, end, start, end))
         rows = store._conn.execute(  # noqa: SLF001
             f"""
             WITH required_source(source, freq) AS (
                 VALUES {coverage_values}
+            ),
+            suspension_evidence AS (
+                {suspension_session_evidence_sql(
+                    "suspension.source = 'tushare' "
+                    "AND suspension.trade_date BETWEEN ? AND ?"
+                )}
             ),
             eligible_daily AS (
                 SELECT d.ts_code, d.trade_date
@@ -983,23 +990,11 @@ def daily_minute_consistency_audit_rules(
                 )
                   AND NOT EXISTS (
                     SELECT 1
-                    FROM stock_suspend_event AS suspension
-                    JOIN stock_suspend_coverage AS coverage
-                      ON coverage.source = suspension.source
-                     AND coverage.trade_date = suspension.trade_date
-                     AND coverage.coverage_state = 'complete'
+                    FROM suspension_evidence AS suspension
                     WHERE suspension.source = 'tushare'
                       AND suspension.ts_code = d.ts_code
                       AND suspension.trade_date = d.trade_date
-                    GROUP BY suspension.ts_code, suspension.trade_date
-                    HAVING count(*) FILTER (
-                               WHERE suspension.suspend_type = 'S'
-                                 AND suspension.session_scope = 'full_day'
-                           ) > 0
-                       AND count(*) FILTER (
-                               WHERE suspension.suspend_type <> 'S'
-                                  OR suspension.session_scope <> 'full_day'
-                           ) = 0
+                      AND suspension.evidence_state = 'full_day'
                   )
             ),
             ranked AS (

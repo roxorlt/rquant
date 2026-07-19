@@ -524,3 +524,61 @@ def test_empty_known_suspended_session_is_allowed_missing(tmp_path: Path) -> Non
     assert summary.succeeded_tasks == 1
     assert persisted.status == "succeeded"
     assert persisted.metrics.allowed_missing_sessions == 1
+
+
+def test_positive_daily_evidence_prevents_runner_suspension_exemption(
+    tmp_path: Path,
+) -> None:
+    from rquant.intraday_backfill import run_backfill_manifest
+    from rquant.suspension import (
+        normalize_suspend_d_snapshot,
+        persist_suspension_snapshot,
+    )
+
+    day = date(2026, 6, 25)
+    task = _task("9" * 64, "300001.SZ", (day,))
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    _persist_tasks(state, (task,))
+
+    class Adapter:
+        def stk_mins(self, ts_code, freq, start, end):
+            del ts_code, freq, start, end
+            return pd.DataFrame()
+
+    snapshot = normalize_suspend_d_snapshot(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": task.ts_code,
+                    "trade_date": day.strftime("%Y%m%d"),
+                    "suspend_timing": None,
+                    "suspend_type": "S",
+                }
+            ]
+        ),
+        trade_date=day,
+        queried_at=datetime(2026, 7, 15, tzinfo=UTC),
+    )
+    with DuckDBStore(tmp_path / "market.duckdb") as store:
+        persist_suspension_snapshot(store, snapshot)
+        store._conn.execute(
+            """
+            INSERT INTO daily_bar
+            (ts_code, trade_date, close, vol, amount)
+            VALUES (?, ?, 10.0, 100.0, 1000.0)
+            """,
+            [task.ts_code, day],
+        )
+        summary = run_backfill_manifest(
+            store,
+            state,
+            Adapter(),
+            manifest_id="manifest-runner",
+            worker_id="test-worker",
+        )
+
+    persisted = state.get_task("manifest-runner", task.task_id)
+    assert summary.failed_tasks == 1
+    assert persisted.status == "failed"
+    assert persisted.failure.code == "source_empty"
+    assert persisted.metrics.allowed_missing_sessions == 0
