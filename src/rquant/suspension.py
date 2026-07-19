@@ -97,6 +97,66 @@ class SuspensionBackfillResult(SuspensionModel):
     event_count: int = Field(ge=0)
 
 
+class SuspensionBackfillPlan(SuspensionModel):
+    start: date
+    end: date
+    missing_only: bool
+    open_dates: tuple[date, ...]
+    requested_dates: tuple[date, ...]
+
+
+def plan_suspension_backfill(
+    *,
+    store_factory: Callable[[], DuckDBStore],
+    start: date,
+    end: date,
+    missing_only: bool = True,
+) -> SuspensionBackfillPlan:
+    """Resolve authoritative open dates and the exact read-only refresh target."""
+    if start > end:
+        raise ValueError("suspension backfill start must not be after end")
+    with store_factory() as planning_store:
+        missing_calendar = planning_store.missing_trade_calendar_dates(
+            "SSE",
+            start,
+            end,
+        )
+        if missing_calendar:
+            from rquant.trade_calendar import TradeCalendarGapError
+
+            raise TradeCalendarGapError("SSE", missing_calendar)
+        open_dates = tuple(
+            row.cal_date
+            for row in planning_store.list_trade_calendar("SSE", start, end)
+            if row.is_open
+        )
+        covered_dates = {
+            row[0]
+            for row in planning_store._conn.execute(  # noqa: SLF001
+                """
+                SELECT trade_date
+                FROM stock_suspend_coverage
+                WHERE source = 'tushare'
+                  AND coverage_state = 'complete'
+                  AND trade_date BETWEEN ? AND ?
+                """,
+                [start, end],
+            ).fetchall()
+        }
+    requested_dates = tuple(
+        trading_date
+        for trading_date in open_dates
+        if not missing_only or trading_date not in covered_dates
+    )
+    return SuspensionBackfillPlan(
+        start=start,
+        end=end,
+        missing_only=missing_only,
+        open_dates=open_dates,
+        requested_dates=requested_dates,
+    )
+
+
 def _parse_trade_date(value: object) -> date:
     if isinstance(value, pd.Timestamp):
         return value.date()
@@ -111,8 +171,10 @@ def _parse_trade_date(value: object) -> date:
 
 
 def _session_scope(suspend_type: str, timing: str) -> SessionScope:
-    if suspend_type != "S" or not timing:
+    if suspend_type != "S":
         return "unknown"
+    if not timing:
+        return "full_day"
     compact = timing.replace(" ", "")
     if compact in _FULL_DAY_TIMINGS:
         return "full_day"
@@ -296,49 +358,19 @@ def backfill_suspension_facts(
     sleep: Callable[[float], None] = time_module.sleep,
 ) -> SuspensionBackfillResult:
     """Fetch exact full-market snapshots without holding a DuckDB connection."""
-    if start > end:
-        raise ValueError("suspension backfill start must not be after end")
     if queried_at.tzinfo is None or queried_at.utcoffset() is None:
         raise ValueError("queried_at must be timezone-aware")
     if request_interval_seconds < 0:
         raise ValueError("request_interval_seconds must not be negative")
 
-    with store_factory() as planning_store:
-        missing_calendar = planning_store.missing_trade_calendar_dates(
-            "SSE",
-            start,
-            end,
-        )
-        if missing_calendar:
-            from rquant.trade_calendar import TradeCalendarGapError
-
-            raise TradeCalendarGapError("SSE", missing_calendar)
-        open_dates = tuple(
-            row.cal_date
-            for row in planning_store.list_trade_calendar("SSE", start, end)
-            if row.is_open
-        )
-        covered_dates = {
-            row[0]
-            for row in planning_store._conn.execute(  # noqa: SLF001
-                """
-                SELECT trade_date
-                FROM stock_suspend_coverage
-                WHERE source = 'tushare'
-                  AND coverage_state = 'complete'
-                  AND trade_date BETWEEN ? AND ?
-                """,
-                [start, end],
-            ).fetchall()
-        }
-
-    requested_dates = tuple(
-        trading_date
-        for trading_date in open_dates
-        if not missing_only or trading_date not in covered_dates
+    plan = plan_suspension_backfill(
+        store_factory=store_factory,
+        start=start,
+        end=end,
+        missing_only=missing_only,
     )
     snapshots: list[SuspensionSnapshot] = []
-    for index, trading_date in enumerate(requested_dates):
+    for index, trading_date in enumerate(plan.requested_dates):
         frame = adapter.suspend_d_raw(trading_date)
         snapshots.append(
             normalize_suspend_d_snapshot(
@@ -347,18 +379,28 @@ def backfill_suspension_facts(
                 queried_at=queried_at,
             )
         )
-        if index + 1 < len(requested_dates) and request_interval_seconds:
+        if index + 1 < len(plan.requested_dates) and request_interval_seconds:
             sleep(request_interval_seconds)
 
     if snapshots:
         with store_factory() as writer:
-            for snapshot in snapshots:
-                persist_suspension_snapshot(writer, snapshot)
+            writer._conn.execute("BEGIN")  # noqa: SLF001
+            try:
+                for snapshot in snapshots:
+                    persist_suspension_snapshot(
+                        writer,
+                        snapshot,
+                        transaction_mode="existing",
+                    )
+                writer._conn.execute("COMMIT")  # noqa: SLF001
+            except Exception:
+                writer._conn.execute("ROLLBACK")  # noqa: SLF001
+                raise
     return SuspensionBackfillResult(
         start=start,
         end=end,
-        open_date_count=len(open_dates),
-        requested_date_count=len(requested_dates),
+        open_date_count=len(plan.open_dates),
+        requested_date_count=len(plan.requested_dates),
         persisted_date_count=len(snapshots),
         event_count=sum(len(snapshot.events) for snapshot in snapshots),
     )

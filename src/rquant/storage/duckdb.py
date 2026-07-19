@@ -43,6 +43,7 @@ from rquant.security_status import (
     deduplicate_security_status_rows,
 )
 from rquant.storage.migrations import initialize_schema
+from rquant.suspension_evidence import suspension_session_evidence_sql
 from rquant.trade_calendar import (
     TradeCalendarConflictError,
     TradeCalendarDay,
@@ -1203,26 +1204,19 @@ class DuckDBStore:
         if not codes or start > end:
             return set()
         placeholders = ",".join("?" for _ in codes)
+        evidence_sql = suspension_session_evidence_sql(
+            "suspension.source = ? "
+            "AND suspension.trade_date BETWEEN ? AND ? "
+            f"AND suspension.ts_code IN ({placeholders})"
+        )
         rows = self._conn.execute(
             f"""
-            SELECT event.ts_code, event.trade_date
-            FROM stock_suspend_event AS event
-            JOIN stock_suspend_coverage AS coverage
-              ON coverage.source = event.source
-             AND coverage.trade_date = event.trade_date
-             AND coverage.coverage_state = 'complete'
-            WHERE event.source = ?
-              AND event.trade_date BETWEEN ? AND ?
-              AND event.ts_code IN ({placeholders})
-            GROUP BY event.ts_code, event.trade_date
-            HAVING count(*) FILTER (
-                       WHERE event.suspend_type = 'S'
-                         AND event.session_scope = 'full_day'
-                   ) > 0
-               AND count(*) FILTER (
-                       WHERE event.suspend_type <> 'S'
-                          OR event.session_scope <> 'full_day'
-                   ) = 0
+            WITH suspension_evidence AS (
+                {evidence_sql}
+            )
+            SELECT ts_code, trade_date
+            FROM suspension_evidence
+            WHERE evidence_state = 'full_day'
             """,
             [source, start, end, *codes],
         ).fetchall()

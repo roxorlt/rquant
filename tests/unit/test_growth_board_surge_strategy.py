@@ -321,6 +321,71 @@ def test_growth_board_surge_replay_uses_intraday_volume_signal(store: DuckDBStor
     assert row["ret_pct"] > 0
 
 
+def test_growth_board_replay_classifies_opening_structure_once(
+    monkeypatch: pytest.MonkeyPatch,
+    store: DuckDBStore,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+
+    dates = [
+        date(2026, 6, 22),
+        date(2026, 6, 23),
+        date(2026, 6, 24),
+        date(2026, 6, 25),
+    ]
+    _seed_open_calendar(store, dates)
+    classification_calls: list[dict[date, date]] = []
+    resolver_calls: list[tuple[date, set[str] | None]] = []
+
+    def classify_once(
+        _store: DuckDBStore,
+        date_pairs: dict[date, date],
+    ) -> tuple[object, ...]:
+        classification_calls.append(date_pairs)
+        return ()
+
+    def resolve_with_precomputed_structure(
+        _store: DuckDBStore,
+        trading_date: date,
+        _previous_date: date,
+        _min_signal_time: time,
+        *,
+        structural_excluded_codes: set[str] | None = None,
+    ) -> list[object]:
+        resolver_calls.append((trading_date, structural_excluded_codes))
+        return []
+
+    monkeypatch.setattr(
+        growth,
+        "classify_growth_opening_structure",
+        classify_once,
+    )
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        resolve_with_precomputed_structure,
+    )
+
+    result = growth.run_growth_board_surge_replay(
+        store,
+        start_date=dates[1],
+        end_date=dates[2],
+        config=growth.GrowthBoardSurgeConfig(max_hold_days=1),
+    )
+
+    assert result.empty
+    assert classification_calls == [
+        {
+            dates[1]: dates[0],
+            dates[2]: dates[1],
+        }
+    ]
+    assert resolver_calls == [
+        (dates[1], set()),
+        (dates[2], set()),
+    ]
+
+
 @pytest.mark.parametrize(
     "status_case",
     ["true", "missing", "adjacent_only", "conflict", "nullable", "future"],

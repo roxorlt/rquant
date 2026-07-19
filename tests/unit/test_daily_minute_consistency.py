@@ -590,7 +590,7 @@ def test_zero_volume_daily_needs_authoritative_suspension_fact(
     assert report.findings[0].evidence["count"] == 1
 
 
-def test_authoritative_full_day_suspension_allows_missing_minutes(
+def test_zero_volume_daily_row_conflicts_with_full_day_suspension(
     tmp_path: Path,
 ) -> None:
     from rquant.suspension import (
@@ -632,7 +632,62 @@ def test_authoritative_full_day_suspension_allows_missing_minutes(
         specs=(spec,),
     )
 
-    assert report.findings == ()
+    finding = next(
+        item
+        for item in report.findings
+        if item.rule_id == "eligible-daily-without-authoritative-minute"
+    )
+    assert finding.evidence["count"] == 1
+
+
+def test_positive_daily_evidence_blocks_full_day_suspension_exemption(
+    tmp_path: Path,
+) -> None:
+    from rquant.suspension import (
+        normalize_suspend_d_snapshot,
+        persist_suspension_snapshot,
+    )
+
+    database_path = tmp_path / "suspended-with-trading.duckdb"
+    trade_date = date(2026, 6, 26)
+    spec = _single_minute_spec()
+    snapshot = normalize_suspend_d_snapshot(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260626",
+                    "suspend_timing": None,
+                    "suspend_type": "S",
+                }
+            ]
+        ),
+        trade_date=trade_date,
+        queried_at=datetime(2026, 6, 27, tzinfo=UTC),
+    )
+    with DuckDBStore(database_path) as store:
+        store._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO daily_bar (ts_code, trade_date, close, vol, amount)
+            VALUES ('000001.SZ', ?, 10.0, 100.0, 1000.0)
+            """,
+            [trade_date],
+        )
+        persist_suspension_snapshot(store, snapshot)
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(spec,),
+    )
+
+    finding = next(
+        item
+        for item in report.findings
+        if item.rule_id == "eligible-daily-without-authoritative-minute"
+    )
+    assert finding.evidence["count"] == 1
 
 
 def test_unknown_source_or_frequency_semantics_is_blocking(

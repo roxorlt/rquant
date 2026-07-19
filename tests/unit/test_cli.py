@@ -1545,6 +1545,7 @@ class TestSuspensionBackfillParser:
                 "--end-date",
                 "2026-07-15",
                 "--full-refresh",
+                "--dry-run",
             ]
         )
 
@@ -1552,6 +1553,60 @@ class TestSuspensionBackfillParser:
         assert args.start_date == date(2026, 7, 1)
         assert args.end_date == date(2026, 7, 15)
         assert args.full_refresh is True
+        assert args.dry_run is True
+
+    def test_dry_run_does_not_construct_tushare_adapter(
+        self,
+        monkeypatch,
+        capsys,
+    ) -> None:
+        import rquant.cli as cli
+        import rquant.suspension as suspension_module
+
+        class Plan:
+            def model_dump(self, *, mode: str) -> dict[str, object]:
+                assert mode == "json"
+                return {"status": "ready"}
+
+        calls: list[tuple[date, date, bool]] = []
+
+        def plan(
+            *,
+            store_factory,
+            start: date,
+            end: date,
+            missing_only: bool,
+        ) -> Plan:
+            del store_factory
+            calls.append((start, end, missing_only))
+            return Plan()
+
+        monkeypatch.setattr(
+            suspension_module,
+            "plan_suspension_backfill",
+            plan,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "rquant.adapter.tushare.TushareAdapter",
+            lambda: pytest.fail("dry-run constructed TushareAdapter"),
+        )
+        monkeypatch.setattr(cli, "setup_logging", lambda: None)
+
+        result = cli.cmd_suspension_backfill(
+            SimpleNamespace(
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 15),
+                full_refresh=True,
+                dry_run=True,
+            )
+        )
+
+        assert result == 0
+        assert calls == [
+            (date(2026, 7, 1), date(2026, 7, 15), False)
+        ]
+        assert json.loads(capsys.readouterr().out) == {"status": "ready"}
 
 
 class TestSecurityStatusBackfillParser:

@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from rquant.storage.duckdb import DuckDBStore
+from rquant.suspension_evidence import suspension_session_evidence_sql
 
 
 class GrowthOpeningStructure(BaseModel):
@@ -48,28 +49,29 @@ def classify_growth_opening_structure(
         for target_date, previous_date in sorted(date_pairs.items())
         for value in (target_date, previous_date)
     ]
+    parameters.append(max(date_pairs.values()))
     rows = store._conn.execute(
         f"""
         WITH requested(target_date, previous_date) AS (
             VALUES {values}
         ),
+        suspension_evidence AS (
+            {suspension_session_evidence_sql(
+                "suspension.source = 'tushare' "
+                "AND suspension.trade_date <= ?"
+            )}
+        ),
         full_day_suspension AS (
             SELECT suspension.ts_code, suspension.trade_date
-            FROM stock_suspend_event AS suspension
-            JOIN stock_suspend_coverage AS coverage
-              ON coverage.source = suspension.source
-             AND coverage.trade_date = suspension.trade_date
-             AND coverage.coverage_state = 'complete'
+            FROM suspension_evidence AS suspension
             WHERE suspension.source = 'tushare'
-            GROUP BY suspension.ts_code, suspension.trade_date
-            HAVING count(*) FILTER (
-                       WHERE suspension.suspend_type = 'S'
-                         AND suspension.session_scope = 'full_day'
-                   ) > 0
-               AND count(*) FILTER (
-                       WHERE suspension.suspend_type <> 'S'
-                          OR suspension.session_scope <> 'full_day'
-                   ) = 0
+              AND suspension.evidence_state = 'full_day'
+        ),
+        suspension_conflict AS (
+            SELECT suspension.ts_code, suspension.trade_date
+            FROM suspension_evidence AS suspension
+            WHERE suspension.source = 'tushare'
+              AND suspension.evidence_state = 'conflict'
         ),
         universe AS (
             SELECT requested.target_date,
@@ -117,57 +119,31 @@ def classify_growth_opening_structure(
                    universe.previous_date,
                    universe.ts_code,
                    basic.list_date,
-                   bar.ts_code AS daily_ts_code,
-                   indicator.ts_code AS indicator_ts_code,
                    suspension.ts_code AS suspended_ts_code,
+                   conflict.ts_code AS suspension_conflict_ts_code,
                    EXISTS (
                        SELECT 1
-                       FROM full_day_suspension AS historical_suspension
+                       FROM suspension_conflict AS historical_suspension
                        WHERE historical_suspension.ts_code = universe.ts_code
                          AND historical_suspension.trade_date
                              BETWEEN basic.list_date AND universe.previous_date
-                         AND (
-                             EXISTS (
-                                 SELECT 1
-                                 FROM daily_bar AS conflicting_daily
-                                 WHERE conflicting_daily.ts_code =
-                                       historical_suspension.ts_code
-                                   AND conflicting_daily.trade_date =
-                                       historical_suspension.trade_date
-                             )
-                             OR EXISTS (
-                                 SELECT 1
-                                 FROM daily_indicator AS conflicting_indicator
-                                 WHERE conflicting_indicator.ts_code =
-                                       historical_suspension.ts_code
-                                   AND conflicting_indicator.trade_date =
-                                       historical_suspension.trade_date
-                             )
-                         )
                    ) AS has_historical_suspension_conflict
             FROM universe
             LEFT JOIN stock_basic AS basic
               ON basic.ts_code = universe.ts_code
-            LEFT JOIN daily_bar AS bar
-              ON bar.ts_code = universe.ts_code
-             AND bar.trade_date = universe.previous_date
-            LEFT JOIN daily_indicator AS indicator
-              ON indicator.ts_code = universe.ts_code
-             AND indicator.trade_date = universe.previous_date
             LEFT JOIN full_day_suspension AS suspension
               ON suspension.ts_code = universe.ts_code
              AND suspension.trade_date = universe.previous_date
+            LEFT JOIN suspension_conflict AS conflict
+              ON conflict.ts_code = universe.ts_code
+             AND conflict.trade_date = universe.previous_date
         ),
         classified AS (
             SELECT target_date,
                    previous_date,
                    ts_code,
                    CASE
-                       WHEN suspended_ts_code IS NOT NULL
-                        AND (
-                            daily_ts_code IS NOT NULL
-                            OR indicator_ts_code IS NOT NULL
-                        )
+                       WHEN suspension_conflict_ts_code IS NOT NULL
                        THEN 'suspension_input_conflict'
                        WHEN has_historical_suspension_conflict
                        THEN 'suspension_input_conflict'

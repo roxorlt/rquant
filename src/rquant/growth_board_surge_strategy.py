@@ -1190,20 +1190,39 @@ def run_growth_board_surge_replay(
     if not calendar:
         return pd.DataFrame()
 
-    rows: list[dict[str, object]] = []
+    replay_days: list[tuple[date, date, tuple[date, ...]]] = []
     for trading_date in [day for day in calendar if start <= day <= end]:
         previous_date = _previous_trading_date(calendar, trading_date)
         if previous_date is None:
             continue
-        window_dates = _window_trading_dates(calendar, trading_date, cfg.max_hold_days)
+        window_dates = _window_trading_dates(
+            calendar,
+            trading_date,
+            cfg.max_hold_days,
+        )
         if len(window_dates) <= cfg.max_hold_days:
             continue
+        replay_days.append((trading_date, previous_date, window_dates))
+
+    date_pairs = {
+        trading_date: previous_date
+        for trading_date, previous_date, _window_dates in replay_days
+    }
+    structural_exclusions = {
+        trading_date: set() for trading_date in date_pairs
+    }
+    for fact in classify_growth_opening_structure(store, date_pairs):
+        structural_exclusions[fact.target_date].add(fact.ts_code)
+
+    rows: list[dict[str, object]] = []
+    for trading_date, previous_date, window_dates in replay_days:
         _, window_end = _day_bounds(window_dates[-1])
         for candidate in resolve_growth_board_candidates(
             store,
             trading_date,
             previous_date,
             cfg.min_signal_time,
+            structural_excluded_codes=structural_exclusions[trading_date],
         ):
             # 不做新股（候选级）：上市不满 N 个交易日跳过
             if cfg.min_listing_trading_days > 0 and (

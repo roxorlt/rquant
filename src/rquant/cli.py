@@ -1304,9 +1304,21 @@ def cmd_backfill_status(args: argparse.Namespace) -> int:
 def cmd_suspension_backfill(args: argparse.Namespace) -> int:
     """Backfill exact Tushare suspend_d snapshots for open sessions."""
     from rquant.adapter.tushare import TushareAdapter
-    from rquant.suspension import backfill_suspension_facts
+    from rquant.suspension import (
+        backfill_suspension_facts,
+        plan_suspension_backfill,
+    )
 
     setup_logging()
+    if args.dry_run:
+        plan = plan_suspension_backfill(
+            store_factory=DuckDBStore,
+            start=args.start_date,
+            end=args.end_date,
+            missing_only=not args.full_refresh,
+        )
+        _print_json(plan.model_dump(mode="json"))
+        return 0
     result = backfill_suspension_facts(
         TushareAdapter(),
         store_factory=DuckDBStore,
@@ -3319,6 +3331,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-refresh",
         action="store_true",
         help="重拉已有 complete 覆盖；默认只补缺失日期",
+    )
+    suspension_backfill_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只输出权威开市日和精确刷新日期，不请求 Tushare 或写库",
     )
 
     security_status_backfill_p = sub.add_parser(
