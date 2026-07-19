@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Run the v0.25.1 suspension refresh and three-strategy Stage 1 acceptance.
+# Run the v0.25.2 resumable backfill and three-strategy Stage 1 acceptance.
 
 set -Eeuo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET_TAG="v0.25.1"
+TARGET_TAG="v0.25.2"
 EXPECTED_SHA="${RQUANT_STAGE1_EXPECTED_SHA:-}"
 START_DATE="${RQUANT_STAGE1_START_DATE:-2026-04-01}"
+RESUME_MANIFEST_ID="${RQUANT_STAGE1_RESUME_MANIFEST_ID:-}"
+BACKFILL_WORKERS="${RQUANT_STAGE1_BACKFILL_WORKERS:-8}"
+BACKFILL_MAX_RUNTIME_MINUTES="${RQUANT_STAGE1_BACKFILL_MAX_RUNTIME_MINUTES:-1050}"
 RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
 PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
 RUN_STAMP="$(TZ=Asia/Shanghai date +%Y%m%dT%H%M%S)"
-RUN_DIR="${PROJECT_DIR}/logs/stage1-v0.25.1-${RUN_STAMP}"
+RUN_DIR="${PROJECT_DIR}/logs/stage1-v0.25.2-${RUN_STAMP}"
 RUN_LOG="${RUN_DIR}/rollout.log"
 STRATEGIES=("n_shape" "growth_board_surge" "auction_gap")
 MUTATING_TIMERS=(
@@ -36,6 +39,7 @@ MUTATING_SERVICES=(
 ORIGINALLY_ACTIVE_TIMERS=()
 TIMERS_CAPTURED=0
 TIMERS_RESTORED=0
+ROLLOUT_HARD_DEADLINE_EPOCH=""
 
 declare -A MANIFEST_IDS
 declare -A EFFECTIVE_END_DATES
@@ -47,7 +51,16 @@ restore_original_timers() {
         return
     fi
     if (( ${#ORIGINALLY_ACTIVE_TIMERS[@]} )); then
-        sudo systemctl start "${ORIGINALLY_ACTIVE_TIMERS[@]}"
+        if ! sudo systemctl start "${ORIGINALLY_ACTIVE_TIMERS[@]}"; then
+            return 1
+        fi
+        local timer
+        for timer in "${ORIGINALLY_ACTIVE_TIMERS[@]}"; do
+            if ! systemctl is-active --quiet "${timer}"; then
+                echo "timer failed to become active: ${timer}" >&2
+                return 1
+            fi
+        done
     fi
     TIMERS_RESTORED=1
 }
@@ -62,7 +75,7 @@ on_exit() {
         rc=1
     fi
     if (( rc != 0 )); then
-        echo "v0.25.1 Stage 1 rollout failed (exit=${rc}); original timers restored" >&2
+        echo "v0.25.2 Stage 1 rollout failed (exit=${rc}); timer restoration attempted" >&2
         echo "ROLLOUT_LOG=${RUN_LOG}" >&2
     fi
     exit "${rc}"
@@ -76,6 +89,70 @@ assert_outside_market_window() {
         echo "refusing production mutation during 09:15-15:10 Asia/Shanghai" >&2
         return 1
     fi
+}
+
+assert_full_stage_start_window() {
+    local weekday hour_minute
+    weekday="$(TZ=Asia/Shanghai date +%u)"
+    hour_minute="$((10#$(TZ=Asia/Shanghai date +%H%M)))"
+    if (( weekday <= 5 && hour_minute <= 1510 )); then
+        echo "full Stage 1 chain may start only after 15:10 on weekdays" >&2
+        return 1
+    fi
+}
+
+assert_resume_start_window() {
+    local weekday hour_minute
+    weekday="$(TZ=Asia/Shanghai date +%u)"
+    hour_minute="$((10#$(TZ=Asia/Shanghai date +%H%M)))"
+    if (( weekday <= 5 && hour_minute >= 905 && hour_minute <= 1510 )); then
+        echo "resume may start only before 09:05 or after 15:10 on weekdays" >&2
+        return 1
+    fi
+}
+
+pause_before_full_stage_window() {
+    local weekday hour_minute
+    weekday="$(TZ=Asia/Shanghai date +%u)"
+    hour_minute="$((10#$(TZ=Asia/Shanghai date +%H%M)))"
+    if (( weekday <= 5 && hour_minute <= 1510 )); then
+        restore_original_timers
+        trap - EXIT HUP INT TERM
+        echo "ROLLOUT_RESULT=backfill_completed"
+        echo "ROLLOUT_NEXT=resume_after_15_10"
+        echo "ROLLOUT_LOG=${RUN_LOG}"
+        exit 0
+    fi
+}
+
+configure_rollout_hard_deadline() {
+    ROLLOUT_HARD_DEADLINE_EPOCH="$(
+        "${PYTHON_BIN}" - <<'PY'
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+zone = ZoneInfo("Asia/Shanghai")
+now = datetime.now(zone)
+candidate = now.date()
+if now.weekday() >= 5 or now.time() >= time(9, 10):
+    candidate += timedelta(days=1)
+while candidate.weekday() >= 5:
+    candidate += timedelta(days=1)
+deadline = datetime.combine(candidate, time(9, 10), tzinfo=zone)
+print(int(deadline.timestamp()))
+PY
+    )"
+    echo "ROLLOUT_HARD_DEADLINE_EPOCH=${ROLLOUT_HARD_DEADLINE_EPOCH}"
+}
+
+run_guarded() {
+    local remaining
+    remaining=$((ROLLOUT_HARD_DEADLINE_EPOCH - $(date +%s)))
+    if (( remaining <= 0 )); then
+        echo "rollout hard deadline already elapsed" >&2
+        return 124
+    fi
+    timeout --signal=TERM --kill-after=30s "${remaining}s" "$@"
 }
 
 assert_exact_release() {
@@ -94,10 +171,28 @@ assert_exact_release() {
     echo "TARGET_SHA=${actual_sha}"
 }
 
+validate_backfill_resume() {
+    if [[ -n "${RESUME_MANIFEST_ID}" ]] \
+        && [[ ! "${RESUME_MANIFEST_ID}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "RQUANT_STAGE1_RESUME_MANIFEST_ID must be a 64-character SHA256" >&2
+        return 1
+    fi
+    if [[ ! "${BACKFILL_WORKERS}" =~ ^[0-9]+$ ]] \
+        || (( BACKFILL_WORKERS < 1 || BACKFILL_WORKERS > 16 )); then
+        echo "RQUANT_STAGE1_BACKFILL_WORKERS must be between 1 and 16" >&2
+        return 1
+    fi
+    if [[ ! "${BACKFILL_MAX_RUNTIME_MINUTES}" =~ ^[0-9]+$ ]] \
+        || (( BACKFILL_MAX_RUNTIME_MINUTES < 1 )); then
+        echo "RQUANT_STAGE1_BACKFILL_MAX_RUNTIME_MINUTES must be positive" >&2
+        return 1
+    fi
+}
+
 capture_active_timers() {
     local timer
     for timer in "${MUTATING_TIMERS[@]}"; do
-        if systemctl is-active --quiet "${timer}"; then
+        if run_guarded systemctl is-active --quiet "${timer}"; then
             ORIGINALLY_ACTIVE_TIMERS+=("${timer}")
         fi
     done
@@ -107,29 +202,29 @@ capture_active_timers() {
 
 stop_mutating_units() {
     capture_active_timers
-    sudo systemctl stop "${MUTATING_TIMERS[@]}"
+    run_guarded sudo systemctl stop "${MUTATING_TIMERS[@]}"
     local service
     for service in "${MUTATING_SERVICES[@]}"; do
-        if systemctl is-active --quiet "${service}"; then
+        if run_guarded systemctl is-active --quiet "${service}"; then
             echo "refusing rollout while mutating service is active: ${service}" >&2
             return 1
         fi
     done
-    sudo systemctl stop "${MUTATING_SERVICES[@]}"
+    run_guarded sudo systemctl stop "${MUTATING_SERVICES[@]}"
 }
 
 run_json() {
     local output=$1
     shift
     echo "RUN_JSON=${output}"
-    "$@" > "${output}"
-    "${PYTHON_BIN}" -m json.tool "${output}"
+    run_guarded "$@" > "${output}"
+    run_guarded "${PYTHON_BIN}" -m json.tool "${output}"
 }
 
 json_value() {
     local input=$1
     local dotted_path=$2
-    "${PYTHON_BIN}" - "${input}" "${dotted_path}" <<'PY'
+    run_guarded "${PYTHON_BIN}" - "${input}" "${dotted_path}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -153,9 +248,50 @@ require_json_value() {
     fi
 }
 
+resume_backfill_or_pause() {
+    local run_file="${RUN_DIR}/resume-backfill-run.json"
+    local status_file="${RUN_DIR}/resume-backfill-status.json"
+    local run_exit status
+
+    echo "RESUME_MANIFEST_ID=${RESUME_MANIFEST_ID}"
+    echo "RUN_JSON=${run_file}"
+    set +e
+    run_guarded "${RQUANT_BIN}" backfill-run \
+        --manifest-id "${RESUME_MANIFEST_ID}" \
+        --workers "${BACKFILL_WORKERS}" \
+        --max-runtime-minutes "${BACKFILL_MAX_RUNTIME_MINUTES}" \
+        > "${run_file}"
+    run_exit=$?
+    set -e
+    if [[ -s "${run_file}" ]]; then
+        run_guarded "${PYTHON_BIN}" -m json.tool "${run_file}"
+    fi
+    run_json "${status_file}" \
+        "${RQUANT_BIN}" backfill-status \
+        --manifest-id "${RESUME_MANIFEST_ID}" \
+        --json
+    status="$(json_value "${status_file}" status)"
+    if [[ "${status}" == "completed" && "${run_exit}" == "0" ]]; then
+        echo "RESUME_BACKFILL_COMPLETED=${RESUME_MANIFEST_ID}"
+        return
+    fi
+    if [[ "${status}" =~ ^(pending|running)$ && "${run_exit}" == "1" ]]; then
+        restore_original_timers
+        trap - EXIT HUP INT TERM
+        echo "ROLLOUT_RESULT=paused"
+        echo "RESUME_BACKFILL_STATUS=${status}"
+        echo "ROLLOUT_LOG=${RUN_LOG}"
+        exit 0
+    fi
+    echo "resume backfill failed: exit=${run_exit}, status=${status}" >&2
+    return 1
+}
+
 verify_backup() {
     local started_epoch=$1
-    "${PYTHON_BIN}" - "${PROJECT_DIR}/backup/latest.json" "${started_epoch}" <<'PY'
+    run_guarded "${PYTHON_BIN}" - \
+        "${PROJECT_DIR}/backup/latest.json" \
+        "${started_epoch}" <<'PY'
 import json
 import sys
 from datetime import datetime
@@ -177,16 +313,21 @@ preserve_backup() {
     local label=$1
     local destination
     destination="${PROJECT_DIR}/backup/${label}-${RUN_STAMP}"
-    cp -- "${PROJECT_DIR}/backup/latest.duckdb.gz" "${destination}.duckdb.gz"
-    cp -- "${PROJECT_DIR}/backup/latest.json" "${destination}.json"
+    run_guarded cp -- \
+        "${PROJECT_DIR}/backup/latest.duckdb.gz" \
+        "${destination}.duckdb.gz"
+    run_guarded cp -- \
+        "${PROJECT_DIR}/backup/latest.json" \
+        "${destination}.json"
     echo "PRESERVED_BACKUP=${destination}"
 }
 
 backup_main() {
     local label=$1
     local started_epoch
-    started_epoch="$(date -u +%s)"
-    RQUANT_BACKUP_SOURCE=main \
+    started_epoch="$(run_guarded date -u +%s)"
+    run_guarded env \
+        RQUANT_BACKUP_SOURCE=main \
         RQUANT_BACKUP_PROJECT_DIR="${PROJECT_DIR}" \
         "${PROJECT_DIR}/scripts/backup-snapshot.sh"
     verify_backup "${started_epoch}"
@@ -194,7 +335,7 @@ backup_main() {
 }
 
 resolve_refresh_end() {
-    "${PYTHON_BIN}" - "${PROJECT_DIR}/data/rquant.duckdb" <<'PY'
+    run_guarded "${PYTHON_BIN}" - "${PROJECT_DIR}/data/rquant.duckdb" <<'PY'
 import sys
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -229,7 +370,7 @@ PY
 }
 
 verify_suspension_preview() {
-    "${PYTHON_BIN}" - "$1" <<'PY'
+    run_guarded "${PYTHON_BIN}" - "$1" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -243,7 +384,7 @@ PY
 }
 
 verify_suspension_apply() {
-    "${PYTHON_BIN}" - "$1" <<'PY'
+    run_guarded "${PYTHON_BIN}" - "$1" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -257,11 +398,11 @@ PY
 }
 
 sync_operational_replica() {
-    "${PROJECT_DIR}/scripts/sync-readonly-replica.sh"
+    run_guarded "${PROJECT_DIR}/scripts/sync-readonly-replica.sh"
 }
 
 verify_main_replica() {
-    "${PYTHON_BIN}" - \
+    run_guarded "${PYTHON_BIN}" - \
         "${PROJECT_DIR}/data/rquant.duckdb" \
         "${PROJECT_DIR}/data/rquant_ro.duckdb" \
         "${START_DATE}" \
@@ -327,15 +468,28 @@ trap 'exit 143' TERM
 assert_outside_market_window
 cd "${PROJECT_DIR}"
 assert_exact_release
+validate_backfill_resume
+if [[ -n "${RESUME_MANIFEST_ID}" ]]; then
+    assert_resume_start_window
+else
+    assert_full_stage_start_window
+fi
 [[ -x "${RQUANT_BIN}" ]]
 [[ -x "${PYTHON_BIN}" ]]
+command -v timeout >/dev/null
+configure_rollout_hard_deadline
 mkdir -p "${RUN_DIR}"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 echo "TARGET_TAG=${TARGET_TAG}"
 echo "TARGET_SHA=${EXPECTED_SHA}"
 
 stop_mutating_units
-backup_main "v0.25.1-pre-stage1"
+backup_main "v0.25.2-pre-stage1"
+
+if [[ -n "${RESUME_MANIFEST_ID}" ]]; then
+    resume_backfill_or_pause
+fi
+pause_before_full_stage_window
 
 REFRESH_END="$(
     resolve_refresh_end
@@ -350,6 +504,7 @@ verify_suspension_preview "${SUSPENSION_PREVIEW}"
 run_json "${SUSPENSION_APPLY}" "${RQUANT_BIN}" suspension-backfill --start-date "${START_DATE}" --end-date "${REFRESH_END}" --full-refresh
 verify_suspension_apply "${SUSPENSION_APPLY}"
 sync_operational_replica
+pause_before_full_stage_window
 
 for strategy in "${STRATEGIES[@]}"; do
     plan_file="${RUN_DIR}/${strategy}-backfill-plan.json"
@@ -361,9 +516,13 @@ for strategy in "${STRATEGIES[@]}"; do
     MANIFEST_IDS["${strategy}"]="$(json_value "${plan_file}" manifest_id)"
     EFFECTIVE_END_DATES["${strategy}"]="$(json_value "${plan_file}" effective_end_date)"
 
-    run_json "${run_file}" "${RQUANT_BIN}" backfill-run --manifest-id "${MANIFEST_IDS[${strategy}]}"
+    run_json "${run_file}" \
+        "${RQUANT_BIN}" backfill-run \
+        --manifest-id "${MANIFEST_IDS[${strategy}]}" \
+        --workers "${BACKFILL_WORKERS}"
     run_json "${status_file}" "${RQUANT_BIN}" backfill-status --manifest-id "${MANIFEST_IDS[${strategy}]}" --json
     require_json_value "${status_file}" status completed
+    pause_before_full_stage_window
 
     sync_operational_replica
     run_json "${repair_preview_file}" "${RQUANT_BIN}" research-repair-minute --manifest-id "${MANIFEST_IDS[${strategy}]}"
@@ -383,10 +542,11 @@ for strategy in "${STRATEGIES[@]}"; do
             exit 1
             ;;
     esac
+    pause_before_full_stage_window
 done
 
 SNAPSHOT_AS_OF="$(
-    "${PYTHON_BIN}" - <<'PY'
+    run_guarded "${PYTHON_BIN}" - <<'PY'
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -405,6 +565,7 @@ for strategy in "${STRATEGIES[@]}"; do
     require_json_value "${snapshot_apply_file}" status ready
     SNAPSHOT_IDS["${strategy}"]="$(json_value "${snapshot_apply_file}" snapshot_id)"
     BINDING_HASHES["${strategy}"]="$(json_value "${snapshot_apply_file}" binding_hash)"
+    pause_before_full_stage_window
 done
 
 AUDIT_FILE="${RUN_DIR}/data-audit.json"
@@ -412,13 +573,14 @@ run_json "${AUDIT_FILE}" "${RQUANT_BIN}" data-audit --start-date "${START_DATE}"
 require_json_value "${AUDIT_FILE}" status completed
 require_json_value "${AUDIT_FILE}" p0_count 0
 AUDIT_RUN_ID="$(json_value "${AUDIT_FILE}" audit_run_id)"
+pause_before_full_stage_window
 
 sync_operational_replica
 for strategy in "${STRATEGIES[@]}"; do
     replay_file="${RUN_DIR}/${strategy}-formal-smoke.json"
     run_json "${replay_file}" "${RQUANT_BIN}" formal-smoke-replay --strategy "${strategy}" --start-date "${START_DATE}" --end-date "${EFFECTIVE_END_DATES[${strategy}]}" --audit-run-id "${AUDIT_RUN_ID}" --snapshot-id "${SNAPSHOT_IDS[${strategy}]}" --binding-hash "${BINDING_HASHES[${strategy}]}"
     require_json_value "${replay_file}" status comparable
-    "${PYTHON_BIN}" - "${replay_file}" <<'PY'
+    run_guarded "${PYTHON_BIN}" - "${replay_file}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -427,9 +589,10 @@ payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert payload["missing_evidence"] == []
 assert payload["sample_count"] > 0
 PY
+    pause_before_full_stage_window
 done
 
-backup_main "v0.25.1-post-stage1"
+backup_main "v0.25.2-post-stage1"
 sync_operational_replica
 verify_main_replica
 AUTHORITY_FILE="${RUN_DIR}/research-authority-status.json"

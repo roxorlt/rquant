@@ -249,6 +249,74 @@ def test_running_task_is_reclaimed_only_after_its_lease_expires(
     )
 
 
+def test_release_task_claim_returns_it_to_pending_without_spending_attempt(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import BackfillStateStore, StaleTaskClaimError
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    store.persist_manifest(_manifest())
+    first = store.claim_task(
+        "manifest-1",
+        worker_id="worker-a",
+        lease_seconds=60,
+    )
+    assert first is not None
+
+    store.release_task_claim(first)
+
+    second = store.claim_task(
+        "manifest-1",
+        worker_id="worker-b",
+        lease_seconds=60,
+    )
+    assert second is not None
+    assert second.task_id == first.task_id
+    assert second.attempt == first.attempt
+    with pytest.raises(StaleTaskClaimError):
+        store.release_task_claim(first)
+
+
+def test_release_recovery_claim_reclaims_as_same_final_recovery(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import BackfillStateStore
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    store.persist_manifest(_manifest(max_attempts=1))
+    started_at = datetime(2026, 7, 13, 1, 0, tzinfo=UTC)
+    first = store.claim_task(
+        "manifest-1",
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=started_at,
+    )
+    assert first is not None
+    recovery = store.claim_task(
+        "manifest-1",
+        worker_id="worker-b",
+        lease_seconds=60,
+        now=started_at + timedelta(seconds=61),
+    )
+    assert recovery is not None
+    assert recovery.recovery_only is True
+
+    store.release_task_claim(
+        recovery,
+        now=started_at + timedelta(seconds=62),
+    )
+    reclaimed = store.claim_task(
+        "manifest-1",
+        worker_id="worker-c",
+        lease_seconds=60,
+        now=started_at + timedelta(seconds=63),
+    )
+
+    assert reclaimed is not None
+    assert reclaimed.attempt == 1
+    assert reclaimed.recovery_only is True
+
+
 def test_final_expired_attempt_gets_one_recovery_only_claim(tmp_path: Path) -> None:
     from rquant.backfill_state import BackfillStateStore
 
@@ -551,6 +619,109 @@ def test_success_duration_updates_ewma_eta(tmp_path: Path) -> None:
     assert status.written_rows == 723
     assert status.covered_sessions == 3
     assert status.allowed_missing_sessions == 1
+
+
+def test_workload_telemetry_uses_compatible_requested_tasks_and_exact_remaining_rows(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import (
+        BackfillManifestInput,
+        BackfillStateStore,
+        BackfillTaskInput,
+        BackfillTaskMetrics,
+    )
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    history_tasks = tuple(
+        BackfillTaskInput(
+            task_id=f"history-{index}",
+            payload={
+                "source": source,
+                "freq": "1min",
+                "response_row_limit": 8_000,
+                "expected_rows": expected_rows,
+            },
+        )
+        for index, (source, expected_rows) in enumerate(
+            (
+                ("tushare", 200),
+                ("tushare", 200),
+                ("tushare", 300),
+                ("tushare", 400),
+                ("tushare", 100),
+                ("other", 200),
+            )
+        )
+    )
+    store.persist_manifest(
+        BackfillManifestInput(
+            manifest_id="history",
+            payload={"strategy": "history"},
+            tasks=history_tasks,
+            eligibility=(),
+        )
+    )
+    durations = (2.0, 4.0, 6.0, 20.0, 100.0, 50.0)
+    request_counts = (1, 1, 1, 1, 0, 1)
+    now = datetime(2026, 7, 13, 1, 0, tzinfo=UTC)
+    for index, (duration, request_count) in enumerate(
+        zip(durations, request_counts, strict=True)
+    ):
+        claim = store.claim_task(
+            "history",
+            worker_id="worker",
+            lease_seconds=60,
+            now=now + timedelta(seconds=index),
+        )
+        assert claim is not None
+        store.mark_task_succeeded(
+            claim,
+            duration_seconds=duration,
+            metrics=BackfillTaskMetrics(request_count=request_count),
+            now=now + timedelta(seconds=index + duration),
+        )
+
+    store.persist_manifest(
+        BackfillManifestInput(
+            manifest_id="current",
+            payload={"strategy": "current"},
+            tasks=(
+                BackfillTaskInput(
+                    task_id="pending",
+                    payload={
+                        "source": "tushare",
+                        "freq": "1min",
+                        "response_row_limit": 8_000,
+                        "expected_rows": 1_000,
+                    },
+                ),
+                BackfillTaskInput(
+                    task_id="pending-other-limit",
+                    payload={
+                        "source": "tushare",
+                        "freq": "1min",
+                        "response_row_limit": 4_000,
+                        "expected_rows": 500,
+                    },
+                ),
+            ),
+            eligibility=(),
+        )
+    )
+
+    telemetry = store.get_workload_telemetry(
+        "current",
+        source="tushare",
+        freq="1min",
+        response_row_limit=8_000,
+    )
+
+    assert telemetry.remaining_tasks == 2
+    assert telemetry.remaining_expected_rows == 1_500
+    assert telemetry.sample_task_count == 4
+    assert telemetry.sample_manifest_count == 1
+    assert telemetry.p75_task_seconds == pytest.approx(9.5)
+    assert telemetry.p75_seconds_per_row == pytest.approx(0.0275)
 
 
 def test_readonly_store_requires_existing_database_without_creating_it(

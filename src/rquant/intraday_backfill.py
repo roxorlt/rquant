@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
+from threading import Lock
 from time import perf_counter
 from typing import Protocol
 
@@ -72,6 +74,7 @@ class BackfillRunSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     manifest_id: str
+    worker_count: int = Field(default=1, ge=1)
     claimed_tasks: int = Field(ge=0)
     succeeded_tasks: int = Field(ge=0)
     failed_tasks: int = Field(ge=0)
@@ -80,6 +83,12 @@ class BackfillRunSummary(BaseModel):
     request_count: int = Field(ge=0)
     returned_rows: int = Field(ge=0)
     written_rows: int = Field(ge=0)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0)
+    deadline_reached: bool = False
+
+
+class _BackfillDeadlineReachedError(RuntimeError):
+    pass
 
 
 def _parse_date(value: str | date) -> date:
@@ -686,19 +695,27 @@ def run_backfill_manifest(
     store_factory: Callable[[], AbstractContextManager[DuckDBStore]] | None = None,
 ) -> BackfillRunSummary:
     """Run every currently claimable task once, continuing after task failures."""
+    run_started = perf_counter()
     if (store is None) == (store_factory is None):
         raise ValueError("provide exactly one of store or store_factory")
-
-    def open_task_store() -> AbstractContextManager[DuckDBStore]:
-        if store_factory is not None:
-            return store_factory()
-        assert store is not None
-        return nullcontext(store)
 
     if stop_before is not None:
         if stop_before.tzinfo is None or stop_before.utcoffset() is None:
             raise ValueError("stop_before must be timezone-aware")
         stop_before = stop_before.astimezone(UTC)
+
+    def require_before_deadline() -> None:
+        if stop_before is not None and datetime.now(UTC) >= stop_before:
+            raise _BackfillDeadlineReachedError
+
+    @contextmanager
+    def open_task_store() -> Iterator[DuckDBStore]:
+        require_before_deadline()
+        context = store_factory() if store_factory is not None else nullcontext(store)
+        with context as current:
+            require_before_deadline()
+            assert current is not None
+            yield current
     last_ordinal = -1
     claimed_tasks = 0
     succeeded_tasks = 0
@@ -708,12 +725,14 @@ def run_backfill_manifest(
     request_count = 0
     returned_rows = 0
     written_rows = 0
+    deadline_reached = False
 
     while True:
         if stop_before is not None and datetime.now(UTC) >= stop_before:
             logger.info(
                 f"backfill manifest {manifest_id} paused before runtime deadline"
             )
+            deadline_reached = True
             break
         claim = state.claim_task(
             manifest_id,
@@ -778,20 +797,11 @@ def run_backfill_manifest(
                 task_requests += outcome.request_count
                 task_returned += outcome.returned_rows
             frames = [frame for outcome in outcomes for frame in outcome.frames]
-            try:
+            with open_task_store() as task_store:
                 claim = state.renew_task_claim(
                     claim,
                     lease_seconds=lease_seconds,
                 )
-            except StaleTaskClaimError:
-                lost_claim_tasks += 1
-                logger.warning(
-                    f"discarding late source rows after claim loss: {claim.task_id}"
-                )
-                request_count += task_requests
-                returned_rows += task_returned
-                continue
-            with open_task_store() as task_store:
                 complete_before_write = complete_minute_task_sessions(
                     task_store,
                     task,
@@ -846,6 +856,19 @@ def run_backfill_manifest(
                     metrics=metrics,
                 )
                 succeeded_tasks += 1
+        except _BackfillDeadlineReachedError:
+            try:
+                state.release_task_claim(claim)
+            except StaleTaskClaimError:
+                lost_claim_tasks += 1
+            request_count += task_requests
+            returned_rows += task_returned
+            written_rows += task_written
+            deadline_reached = True
+            logger.info(
+                f"backfill manifest {manifest_id} paused before DuckDB write deadline"
+            )
+            break
         except ValidationError as exc:
             state.mark_task_failed(
                 claim,
@@ -908,4 +931,70 @@ def run_backfill_manifest(
         request_count=request_count,
         returned_rows=returned_rows,
         written_rows=written_rows,
+        elapsed_seconds=perf_counter() - run_started,
+        deadline_reached=deadline_reached,
+    )
+
+
+def run_backfill_manifest_workers(
+    state: BackfillStateStore,
+    adapter_factory: Callable[[], IntradayAdapter],
+    *,
+    manifest_id: str,
+    worker_id: str,
+    worker_count: int,
+    store_factory: Callable[[], AbstractContextManager[DuckDBStore]],
+    retry_failed: bool = False,
+    lease_seconds: int = 1_800,
+    stop_before: datetime | None = None,
+) -> BackfillRunSummary:
+    """Run network-bound tasks concurrently while serializing every DuckDB access."""
+    if not 1 <= worker_count <= 16:
+        raise ValueError("worker_count must be between 1 and 16")
+
+    run_started = perf_counter()
+    store_lock = Lock()
+
+    @contextmanager
+    def locked_store() -> Iterator[DuckDBStore]:
+        with store_lock:
+            if stop_before is not None and datetime.now(UTC) >= stop_before:
+                raise _BackfillDeadlineReachedError
+            with store_factory() as current:
+                yield current
+
+    def run_worker(index: int) -> BackfillRunSummary:
+        return run_backfill_manifest(
+            None,
+            state,
+            adapter_factory(),
+            manifest_id=manifest_id,
+            worker_id=f"{worker_id}-{index + 1}",
+            retry_failed=retry_failed,
+            lease_seconds=lease_seconds,
+            stop_before=stop_before,
+            store_factory=locked_store,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="rquant-backfill",
+    ) as executor:
+        summaries = list(executor.map(run_worker, range(worker_count)))
+
+    return BackfillRunSummary(
+        manifest_id=manifest_id,
+        worker_count=worker_count,
+        claimed_tasks=sum(item.claimed_tasks for item in summaries),
+        succeeded_tasks=sum(item.succeeded_tasks for item in summaries),
+        failed_tasks=sum(item.failed_tasks for item in summaries),
+        lost_claim_tasks=sum(item.lost_claim_tasks for item in summaries),
+        skipped_complete_tasks=sum(
+            item.skipped_complete_tasks for item in summaries
+        ),
+        request_count=sum(item.request_count for item in summaries),
+        returned_rows=sum(item.returned_rows for item in summaries),
+        written_rows=sum(item.written_rows for item in summaries),
+        elapsed_seconds=perf_counter() - run_started,
+        deadline_reached=any(item.deadline_reached for item in summaries),
     )
