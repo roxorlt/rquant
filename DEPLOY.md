@@ -5,6 +5,65 @@
 
 ---
 
+## 2026-07-20 · v0.25.2 + PR #115 · 研究增量 candidate 与备份修复收尾
+
+**状态**：生产应用继续冻结在 tag `v0.25.2`、精确 SHA
+`f743fc46ece7c2677fd1bbbd6bdef47418ebf53b`，没有为基础设施修复重启应用服务。备份修复
+PR #115 经 Python 3.11/3.12 CI 全绿后 squash merge，精确 SHA 为
+`e4d14f06502c745101059f05382e401fd2dedf3b`。18:02 只从该 SHA 提取
+`rquant-backup.service`，云端 `systemd-analyze verify` 通过且文件 SHA-256 为
+`9a8bb5c92a479bccb076d992d8e2d478b2aff9a6f7c37595c8d35d6cae764003`，安装后
+`TimeoutStartUSec=10min`。
+
+**研究日增量首次 candidate**：
+
+- 09:25:06 的不可变 watchlist snapshot 绑定应用 SHA `f743fc4`，共 4 只
+  （pool1=2、pool2=2），与 monitor 运行清单一致；当天没有盘后补造或回填开盘前证据。
+- 17:00 daily 成功，主动刷新只读副本后 readiness 返回 `ready`、`issues=[]`。首次手工
+  ingest 退出码 0、状态 `candidate`：分钟 4/4 标的完整，覆盖率和观测精度均为 100%；
+  竞价 5,522/5,524，覆盖率 99.9638%，观测精度 100%；authority、catalog、只读 catalog
+  和 lake 全部验收通过。
+- `rquant-research-ingest.timer` 随后启用。18:10 首次定时运行于 12 秒内成功退出，
+  分钟与竞价分区均为 `unchanged`、`issues=[]`。最终 authority 仍为 `candidate`，
+  `stable_trading_days=1`、`observation_count=6`，catalog 与只读 catalog 哈希一致；
+  `eligible_for_promotion=false`，继续累计 10 个交易日证据，不提前晋级。
+
+**备份修复与清理**：
+
+- 生产 DuckDB 已增至 5,204,881,408 字节。旧 unit 的 `TimeoutStartSec=120` 会在复制、
+  压缩和校验即将完成时终止任务。新 unit 恢复 timer 后因 `Persistent=true` 补触发一次，
+  18:02:55 开始、18:06:07 成功，实测 192 秒，`Result=success`、
+  `ExecMainStatus=0`。产物来自只读副本、源延迟 0、52 张表，压缩后
+  1,529,612,162 字节，`gzip -t` 通过；timer 为 `enabled/active/waiting`，下一次触发
+  2026-07-21 09:00。
+- 删除前逐个核对 18 个 `.latest.duckdb.<pid>[.gz]` 私有代际文件：路径全部匹配固定格式，
+  9 个 PID 均不存在，最新有效备份完整，备份服务 inactive。随后按文件数量和总字节数双门
+  删除逻辑大小合计 57,077,510,144 字节；云盘可用空间由约 52 GiB 增至 63 GiB，实际
+  回收约 11 GiB，说明这些临时文件的逻辑大小不等于独占物理块。
+
+**最终验收**：
+
+- 从精确合并 SHA `e4d14f0` 的临时 worktree 运行 preflight：
+  `ok=5 warn=0 fail=0 skip=0`，28 个 unit 全部 verify，通过后临时 worktree 已删除。
+- 主库与只读副本摘要完全一致：`daily_bar=1,650,869`、
+  `daily_state=1,650,869`、`adj_factor=2,469,013`、
+  `stock_status_daily=1,061,544`、`screen_result=856`、
+  `minute_bar=46,992,269`；前五表最新日期均为 2026-07-20，分钟最新为
+  2026-07-20 14:59。
+- 修复分支本地全量 `2264 passed`，ruff、shell 语法和 `git diff --check` 通过；
+  独立审查无 P0/P1。PR #115 的 Python 3.11/3.12 CI 分别通过。
+
+**影响与回滚**：个人平台没有外部用户操作，管理员无需手工介入。若研究增量变为
+`degraded`、catalog 哈希失配或 service 非 0，应立即
+`sudo systemctl disable --now rquant-research-ingest.timer` 并保留 observation、catalog
+和 lake 作审计证据，禁止补造 09:30 前 snapshot。若备份超过 10 分钟、完整性失败或新 unit
+异常，应先停止 `rquant-backup.timer`，再用
+`/tmp/rquant-backup-rollback-20260720T180254.service` 恢复旧 unit 并
+`daemon-reload`；旧 unit 的 120 秒上限已知不适合当前库体积，因此回滚后 timer 必须保持
+inactive，改用受控的 replica 直接备份，直到新的向前修复上线。
+
+---
+
 ## 2026-07-17 · v0.21.1 · 云端研究日增量首次上线
 
 **状态**：应用代码 PR #97 与 preflight 热修 PR #98 经 Python 3.11/3.12 CI 全绿后
