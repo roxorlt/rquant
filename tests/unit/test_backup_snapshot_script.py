@@ -6,12 +6,17 @@ import gzip
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
+from configparser import ConfigParser
+from contextlib import suppress
 from pathlib import Path
 
 import duckdb
 
 ROOT = Path(__file__).resolve().parents[2]
+BACKUP_UNIT = ROOT / "deploy" / "systemd" / "rquant-backup.service"
 
 
 def _project(tmp_path: Path) -> Path:
@@ -160,4 +165,63 @@ def test_stale_replica_fails_without_replacing_last_good_snapshot(
     )
 
     assert result.returncode != 0
+    assert (project / "backup" / "latest.duckdb.gz").read_bytes() == previous
+
+
+def test_backup_unit_allows_large_snapshot_compression_to_finish() -> None:
+    unit = ConfigParser(interpolation=None, strict=True)
+    unit.read_string(BACKUP_UNIT.read_text(encoding="utf-8"))
+
+    assert unit.get("Service", "TimeoutStartSec") == "10min"
+
+
+def test_terminated_backup_cleans_private_generation(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    assert _run(project, source="main").returncode == 0
+    previous = (project / "backup" / "latest.duckdb.gz").read_bytes()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    entered = tmp_path / "gzip-entered"
+    fake_gzip = fake_bin / "gzip"
+    fake_gzip.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        "touch \"${RQUANT_TEST_GZIP_ENTERED}\"\n"
+        "sleep 60\n",
+        encoding="utf-8",
+    )
+    fake_gzip.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["RQUANT_BACKUP_SOURCE"] = "main"
+    env["RQUANT_TEST_GZIP_ENTERED"] = str(entered)
+    process = subprocess.Popen(
+        [str(project / "scripts" / "backup-snapshot.sh")],
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert entered.exists()
+
+        os.killpg(process.pid, signal.SIGTERM)
+        process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+
+    assert process.returncode != 0
+    assert not tuple((project / "backup").glob(".latest.*"))
     assert (project / "backup" / "latest.duckdb.gz").read_bytes() == previous

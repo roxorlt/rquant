@@ -11,7 +11,7 @@ Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 ExecStart=/home/lighthouse/rquant/scripts/backup-snapshot.sh
 
-TimeoutStartSec=120
+TimeoutStartSec=10min
 StandardOutput=journal
 StandardError=journal
 
