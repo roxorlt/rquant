@@ -206,6 +206,64 @@ def test_abandon_manifest_apply_rejects_stale_plan(
         )
 
 
+def test_abandonment_preview_reads_legacy_schema_without_migrating(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from rquant.backfill_state import BackfillStateStore
+
+    path = tmp_path / "backfill.sqlite3"
+    store = BackfillStateStore(path)
+    store.persist_manifest(_manifest(task_count=2))
+    with sqlite3.connect(path) as connection:
+        for column in (
+            "termination_plan_id",
+            "terminated_by_commit",
+            "terminated_at",
+            "termination_reason",
+            "terminal_status",
+        ):
+            connection.execute(
+                f"ALTER TABLE backfill_manifest DROP COLUMN {column}"
+            )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA journal_mode=DELETE")
+
+    legacy = BackfillStateStore(path, read_only=True)
+    status = legacy.get_manifest_status("manifest-1")
+    plan = legacy.plan_manifest_abandonment(
+        "manifest-1",
+        reason="strategy retired",
+        code_commit="a" * 40,
+    )
+
+    assert status.status == "pending"
+    assert plan.pending == 2
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(backfill_manifest)"
+            ).fetchall()
+        }
+    assert "terminal_status" not in columns
+
+    writable = BackfillStateStore(path)
+    applied = writable.apply_manifest_abandonment(plan)
+
+    assert applied.status == "abandoned"
+    with sqlite3.connect(path) as connection:
+        migrated_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(backfill_manifest)"
+            ).fetchall()
+        }
+    assert "terminal_status" in migrated_columns
+
+
 def test_load_manifest_rejects_tampered_task_content(
     tmp_path: Path,
 ) -> None:
