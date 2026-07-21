@@ -237,6 +237,17 @@ bash scripts/check-core-quality.sh
 # 盘外执行（领取任务前会重验 manifest 的可观测窗口）、查询进度并固化研究元数据
 .venv/bin/rquant backfill-run --manifest-id <64位ID>
 .venv/bin/rquant backfill-status --manifest-id <64位ID> --json
+
+# 策略退役时先预演；核对任务计数和原因后，复用输出的精确 plan_id 才能写入终态
+.venv/bin/rquant backfill-abandon \
+  --manifest-id <64位ID> \
+  --reason "策略研究线已退役"
+.venv/bin/rquant backfill-abandon \
+  --manifest-id <64位ID> \
+  --reason "策略研究线已退役" \
+  --plan-id <预演输出的plan_id> \
+  --apply
+
 .venv/bin/rquant dataset-snapshot \
   --strategy growth_board_surge \
   --as-of 2026-06-30T15:00:00+08:00 \

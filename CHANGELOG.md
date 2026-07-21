@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **策略分钟回补 manifest 可审计终止**：新增 `abandoned` 终态和
+  `rquant backfill-abandon`。命令默认只生成绑定 manifest 内容、任务计数、终止原因与干净
+  Git commit 的 SHA256 计划；只有显式传入同一 `plan_id` 和 `--apply` 才以短事务 CAS
+  落库。终止不会删除已完成任务、覆盖率、请求统计或已写分钟数据，`backfill-status` 会保留
+  剩余任务并展示原因、时间、代码提交和计划身份；`backfill-run` 与底层 claim 均拒绝继续
+  执行，若要恢复研究必须创建新 manifest。
+
 ### Fixed
 
 - **爆量粗筛累计额被上一交易日收盘 K 线冻结**：`surge-watch` 于 09:25 启动时，
