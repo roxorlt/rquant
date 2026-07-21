@@ -617,8 +617,18 @@ def test_backfill_abandon_requires_matching_preview_before_apply(
     plan = _plan_with_task()
     state = BackfillStateStore(tmp_path / "state.sqlite3")
     state.persist_manifest(backfill_state_input(plan))
-    state_factory = MagicMock(return_value=state)
+    state_factory = MagicMock(side_effect=AssertionError("live state opened"))
     monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
+    snapshot_context = MagicMock()
+    snapshot_context.__enter__.return_value = state
+    snapshot_context.__exit__.return_value = False
+    snapshot_factory = MagicMock(return_value=snapshot_context)
+    monkeypatch.setattr(
+        cli,
+        "open_backfill_state_snapshot",
+        snapshot_factory,
+        raising=False,
+    )
     monkeypatch.setattr(
         "rquant.research_manifest.detect_code_commit",
         lambda: _COMMIT,
@@ -634,11 +644,14 @@ def test_backfill_abandon_requires_matching_preview_before_apply(
     preview = json.loads(capsys.readouterr().out)
 
     assert preview_rc == 0
-    state_factory.assert_called_with(read_only=True)
+    snapshot_factory.assert_called_once_with()
+    state_factory.assert_not_called()
     assert preview["status"] == "dry_run"
     assert preview["apply_required"] is True
     assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"
 
+    state_factory.side_effect = None
+    state_factory.return_value = state
     apply_rc = cli.cmd_backfill_abandon(
         Namespace(
             manifest_id=plan.manifest.manifest_id,

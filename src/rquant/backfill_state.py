@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal, TypeAlias, cast
 from uuid import uuid4
 
@@ -264,6 +265,55 @@ def _linear_quantile(values: list[float], quantile: float) -> float | None:
         return ordered[lower]
     weight = position - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+@contextmanager
+def open_backfill_state_snapshot(
+    path: Path | str | None = None,
+    *,
+    busy_timeout_ms: int | None = None,
+) -> Iterator[BackfillStateStore]:
+    """Yield an immutable point-in-time copy of the live SQLite state."""
+    if path is None or busy_timeout_ms is None:
+        from rquant.config import settings
+
+        if path is None:
+            path = settings.backfill_state_path_resolved
+        if busy_timeout_ms is None:
+            busy_timeout_ms = settings.backfill_state_busy_timeout_ms
+    if busy_timeout_ms < 1:
+        raise ValueError("busy_timeout_ms must be positive")
+
+    source_path = Path(path)
+    if not source_path.is_file() or source_path.is_symlink():
+        raise ValueError(f"backfill state database is invalid: {source_path}")
+
+    with TemporaryDirectory(prefix="rquant-backfill-state-") as directory:
+        snapshot_path = Path(directory) / source_path.name
+        source = sqlite3.connect(
+            f"{source_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=busy_timeout_ms / 1_000,
+            isolation_level=None,
+        )
+        target = sqlite3.connect(
+            snapshot_path,
+            timeout=busy_timeout_ms / 1_000,
+            isolation_level=None,
+        )
+        try:
+            source.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+            target.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+
+        yield BackfillStateStore(
+            snapshot_path,
+            busy_timeout_ms=busy_timeout_ms,
+            read_only=True,
+        )
 
 
 class BackfillStateStore:

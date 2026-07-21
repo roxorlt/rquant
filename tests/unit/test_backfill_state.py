@@ -969,3 +969,55 @@ def test_readonly_store_rejects_an_uncheckpointed_wal(
             BackfillStateStore(path, read_only=True)
     finally:
         writer.close()
+
+
+def test_readonly_snapshot_includes_wal_without_mutating_live_state(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import (
+        BackfillStateStore,
+        open_backfill_state_snapshot,
+    )
+
+    path = tmp_path / "backfill.sqlite3"
+    writable = BackfillStateStore(path)
+    manifest = _manifest(task_count=2)
+    writable.persist_manifest(manifest)
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute(
+            """
+            UPDATE backfill_manifest
+            SET updated_at = '2026-07-22T03:00:00.000000Z'
+            WHERE manifest_id = ?
+            """,
+            (manifest.manifest_id,),
+        )
+        writer.commit()
+        wal_path = path.with_name(f"{path.name}-wal")
+        assert wal_path.is_file()
+        before_main = path.read_bytes()
+        before_wal = wal_path.read_bytes()
+
+        with open_backfill_state_snapshot(path) as snapshot:
+            snapshot_path = snapshot.path
+            status = snapshot.get_manifest_status(manifest.manifest_id)
+            plan = snapshot.plan_manifest_abandonment(
+                manifest.manifest_id,
+                reason="strategy retired",
+                code_commit="a" * 40,
+            )
+
+            assert snapshot.read_only is True
+            assert snapshot_path != path
+            assert status.pending == 2
+            assert plan.manifest_updated_at == datetime(
+                2026, 7, 22, 3, 0, tzinfo=UTC
+            )
+
+        assert not snapshot_path.exists()
+        assert path.read_bytes() == before_main
+        assert wal_path.read_bytes() == before_wal
+    finally:
+        writer.close()

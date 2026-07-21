@@ -320,7 +320,18 @@ def test_stage1_acceptance_cli_parser_and_ready_output(
     plan = _plan("n_shape")
     store = BackfillStateStore(tmp_path / "state.sqlite3")
     store.persist_manifest(backfill_state_input(plan))
-    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=store))
+    state_factory = MagicMock(side_effect=AssertionError("live state opened"))
+    monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
+    snapshot_context = MagicMock()
+    snapshot_context.__enter__.return_value = store
+    snapshot_context.__exit__.return_value = False
+    snapshot_factory = MagicMock(return_value=snapshot_context)
+    monkeypatch.setattr(
+        cli,
+        "open_backfill_state_snapshot",
+        snapshot_factory,
+        raising=False,
+    )
     monkeypatch.setattr(
         "rquant.research_manifest.detect_verified_code_commit",
         lambda: COMMIT,
@@ -347,6 +358,8 @@ def test_stage1_acceptance_cli_parser_and_ready_output(
     assert rc == 0
     assert payload["disposition"] == "ready"
     assert payload["spec"]["strategy"] == "n_shape"
+    snapshot_factory.assert_called_once_with()
+    state_factory.assert_not_called()
 
 
 def test_stage1_acceptance_cli_returns_nonzero_when_selected_strategy_blocked(
@@ -356,7 +369,14 @@ def test_stage1_acceptance_cli_returns_nonzero_when_selected_strategy_blocked(
     plan = _plan("growth_board_surge", with_task=True)
     store = BackfillStateStore(tmp_path / "state.sqlite3")
     store.persist_manifest(backfill_state_input(plan))
-    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=store))
+    snapshot_context = MagicMock()
+    snapshot_context.__enter__.return_value = store
+    snapshot_context.__exit__.return_value = False
+    monkeypatch.setattr(
+        cli,
+        "open_backfill_state_snapshot",
+        MagicMock(return_value=snapshot_context),
+    )
     monkeypatch.setattr(
         "rquant.research_manifest.detect_verified_code_commit",
         lambda: COMMIT,

@@ -28,6 +28,7 @@ from rquant.backfill_state import (
     ManifestContentConflictError,
     StaleManifestAbandonmentError,
     UnknownManifestError,
+    open_backfill_state_snapshot,
 )
 from rquant.logging import setup_logging
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
@@ -985,12 +986,13 @@ def cmd_stage1_acceptance(args: argparse.Namespace) -> int:
             end_date=args.end_date,
             expected_code_commit=args.expected_code_commit,
         )
-        plan = build_stage1_acceptance_plan(
-            BackfillStateStore(read_only=True),
-            spec,
-            observed_code_commit=code_commit,
-            now=datetime.now(_SHANGHAI),
-        )
+        with open_backfill_state_snapshot() as state:
+            plan = build_stage1_acceptance_plan(
+                state,
+                spec,
+                observed_code_commit=code_commit,
+                now=datetime.now(_SHANGHAI),
+            )
     except (
         ManifestContentConflictError,
         Stage1AcceptanceIdentityError,
@@ -1554,13 +1556,21 @@ def cmd_backfill_abandon(args: argparse.Namespace) -> int:
     if not _valid_clean_commit(code_commit):
         logger.error("manifest abandonment requires a clean 40-character git commit")
         return 2
-    state = BackfillStateStore(read_only=not args.apply)
     try:
-        plan = state.plan_manifest_abandonment(
-            args.manifest_id,
-            reason=args.reason,
-            code_commit=code_commit,
-        )
+        if args.apply:
+            state = BackfillStateStore()
+            plan = state.plan_manifest_abandonment(
+                args.manifest_id,
+                reason=args.reason,
+                code_commit=code_commit,
+            )
+        else:
+            with open_backfill_state_snapshot() as state:
+                plan = state.plan_manifest_abandonment(
+                    args.manifest_id,
+                    reason=args.reason,
+                    code_commit=code_commit,
+                )
     except (
         ManifestAbandonmentConflictError,
         UnknownManifestError,
