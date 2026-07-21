@@ -53,7 +53,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # growth_surge_b_v1 权重表：确认层评分（满分 100），与 GROWTH_SURGE_V1_FACTORS
 # 命中矩阵同键名。放量三件套沿用 log_ratio（BASE_SCORE_TERMS 同款口径）；
-# inner_outer_ratio 按用户口径「内盘越大越强」线性加分；large_net_vol_t1 只看
+# inner_outer_ratio 越低表示外盘相对越强，用反向线性加分；large_net_vol_t1 只看
 # 正负号（>0 即接近满分，linear low=0 high=1 手，实质二值化）；250 日低位为
 # 已验证方向（inverse_linear）。classic_volume_ratio 与市场温度只观察不计分。
 # 全部 skip_if_missing：缺数据按 0 贡献降级而非默认值路径。
@@ -72,7 +72,7 @@ GROWTH_SURGE_B_V1_SCORE_TERMS: tuple[FeatureScoreTerm, ...] = (
     ),
     FeatureScoreTerm(
         name="inner_outer_ratio", group="order_flow", weight=20.0,
-        transform="linear", low=1.0, high=2.0, skip_if_missing=True,
+        transform="inverse_linear", low=0.0, high=1.0, skip_if_missing=True,
     ),
     FeatureScoreTerm(
         name="large_net_vol_t1", group="order_flow", weight=15.0,
@@ -105,11 +105,11 @@ class GrowthBoardSurgeConfig(BaseModel):
     require_vwap_strength: bool = True
     vwap_buffer_pct: float = Field(default=0.0, ge=0, lt=0.05)
     # 用户三条件（2026-07-03）：量比宽门沿用 min_cum_amount_ratio（成交额口径）；
-    # 内盘>外盘为分钟 tick-rule 近似（升=外盘/降=内盘/平=均分，首分钟对比自身
+    # 外盘>内盘为分钟 tick-rule 近似（升=外盘/降=内盘/平=均分，首分钟对比自身
     # open）；大单净量用 T-1 moneyflow_daily.large_net_vol（T 日盘中不可知，防
     # 未来函数，与用户口径「今日大单净量」有 1 个交易日滞后）
     require_inner_outer: bool = False
-    min_inner_outer_ratio: float = Field(default=1.0, gt=0)
+    max_inner_outer_ratio: float = Field(default=1.0, gt=0)
     require_large_net_vol: bool = False
     min_large_net_vol: float = 0.0
     # 首爆过滤（用户 2026-07-03）：放量当天之前 N 个交易日没放量过 → 只打首次爆量。
@@ -995,7 +995,7 @@ def _find_entry_position(
         )
         if config.require_inner_outer and (
             inner_outer_ratio is None
-            or inner_outer_ratio <= config.min_inner_outer_ratio
+            or inner_outer_ratio >= config.max_inner_outer_ratio
         ):
             clocked_amount_history.append((quote_time.time(), minute_amount))
             continue
@@ -1084,7 +1084,7 @@ def _find_entry_position(
                     "rel_cum_amount_asof": config.min_cum_amount_ratio,
                     "rel_amount_same_minute": config.min_same_minute_amount_ratio,
                     "amount_accel_5m": config.min_amount_accel_5m,
-                    "inner_outer_ratio": config.min_inner_outer_ratio,
+                    "inner_outer_ratio": config.max_inner_outer_ratio,
                     "large_net_vol_t1": config.min_large_net_vol,
                     "board_gap_up_ratio": config.min_board_gap_up_ratio,
                     "board_auction_amount_ratio": (
@@ -1169,9 +1169,9 @@ def run_growth_board_surge_replay(
 
     - 量比：沿用 ``min_cum_amount_ratio`` 成交额口径宽门；另输出经典量比观察值
       ``classic_volume_ratio``（当日每分钟均量 / T-1 收盘可知的 5 日每分钟均量）
-    - 内盘>外盘：真实盘中内外盘无历史数据，用分钟 tick-rule 近似（close 对比前
+    - 外盘>内盘：真实盘中内外盘无历史数据，用分钟 tick-rule 近似（close 对比前
       一分钟 close：升=外盘、降=内盘、平=均分，首分钟对比自身 open），
-      ``require_inner_outer`` 开启时要求 inner/outer > ``min_inner_outer_ratio``
+      ``require_inner_outer`` 开启时要求 inner/outer < ``max_inner_outer_ratio``
     - 大单净量：T 日盘中不可知，用 T-1 ``moneyflow_daily.large_net_vol`` 防未来
       函数（与用户口径「今日大单净量」有 1 个交易日滞后），
       ``require_large_net_vol`` 开启时要求 > ``min_large_net_vol``

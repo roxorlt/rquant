@@ -733,7 +733,8 @@ def render_surge_log() -> None:
         return
     st.dataframe(_surge_log_display(df), hide_index=True, width="stretch", height=520)
     st.caption(
-        "口径 v3 纯累计：今日9:30累计÷前4日同刻累计≥2.5 · 每标的取当日最早识别时刻"
+        "口径 v4：累计放量 + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+        " · 每标的取当日最早识别时刻"
         f" · 观察提示非买入信号 · 共 {len(df)} 条"
     )
 
