@@ -1056,11 +1056,26 @@ class BackfillStateStore:
     def get_manifest_status(self, manifest_id: str) -> BackfillManifestStatus:
         connection = self._connect()
         try:
+            manifest_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(backfill_manifest)"
+                ).fetchall()
+            }
+            termination_projection = ", ".join(
+                column if column in manifest_columns else f"NULL AS {column}"
+                for column in (
+                    "terminal_status",
+                    "termination_reason",
+                    "terminated_at",
+                    "terminated_by_commit",
+                    "termination_plan_id",
+                )
+            )
             manifest = connection.execute(
-                """
+                f"""
                 SELECT content_hash, updated_at, ewma_duration_seconds,
-                       terminal_status, termination_reason, terminated_at,
-                       terminated_by_commit, termination_plan_id
+                       {termination_projection}
                 FROM backfill_manifest
                 WHERE manifest_id = ?
                 """,

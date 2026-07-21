@@ -248,6 +248,14 @@ bash scripts/check-core-quality.sh
   --plan-id <预演输出的plan_id> \
   --apply
 
+# 单个策略的 Stage 1 只读验收预演；正式链路见 docs/deploy/2026-07-22-stage1-strategy-closeout.md
+.venv/bin/rquant stage1-acceptance \
+  --strategy n_shape \
+  --manifest-id <64位ID> \
+  --start-date 2026-04-01 \
+  --end-date <manifest的effective_end_date> \
+  --expected-code-commit <40位Git SHA>
+
 .venv/bin/rquant dataset-snapshot \
   --strategy growth_board_surge \
   --as-of 2026-06-30T15:00:00+08:00 \

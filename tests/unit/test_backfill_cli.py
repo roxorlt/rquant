@@ -617,7 +617,8 @@ def test_backfill_abandon_requires_matching_preview_before_apply(
     plan = _plan_with_task()
     state = BackfillStateStore(tmp_path / "state.sqlite3")
     state.persist_manifest(backfill_state_input(plan))
-    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    state_factory = MagicMock(return_value=state)
+    monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
     monkeypatch.setattr(
         "rquant.research_manifest.detect_code_commit",
         lambda: _COMMIT,
@@ -633,6 +634,7 @@ def test_backfill_abandon_requires_matching_preview_before_apply(
     preview = json.loads(capsys.readouterr().out)
 
     assert preview_rc == 0
+    state_factory.assert_called_with(read_only=True)
     assert preview["status"] == "dry_run"
     assert preview["apply_required"] is True
     assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"

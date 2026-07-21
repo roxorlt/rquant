@@ -961,6 +961,49 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stage1_acceptance(args: argparse.Namespace) -> int:
+    """Build one no-write, manifest-bound Stage 1 acceptance plan."""
+    from pydantic import ValidationError
+
+    from rquant.research_manifest import detect_verified_code_commit
+    from rquant.stage1_acceptance import (
+        Stage1AcceptanceIdentityError,
+        Stage1AcceptanceSpec,
+        build_stage1_acceptance_plan,
+    )
+
+    setup_logging()
+    code_commit = detect_verified_code_commit()
+    if not _valid_clean_commit(code_commit):
+        logger.error("Stage 1 acceptance requires a clean 40-character git commit")
+        return 2
+    try:
+        spec = Stage1AcceptanceSpec(
+            strategy=args.strategy,
+            manifest_id=args.manifest_id,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            expected_code_commit=args.expected_code_commit,
+        )
+        plan = build_stage1_acceptance_plan(
+            BackfillStateStore(read_only=True),
+            spec,
+            observed_code_commit=code_commit,
+            now=datetime.now(_SHANGHAI),
+        )
+    except (
+        ManifestContentConflictError,
+        Stage1AcceptanceIdentityError,
+        UnknownManifestError,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        logger.error(f"cannot build Stage 1 acceptance plan: {exc}")
+        return 2
+    _print_json(plan.model_dump(mode="json"))
+    return 1 if plan.disposition == "blocked" else 0
+
+
 def cmd_research_ingest_readiness(args: argparse.Namespace) -> int:
     """Check that the refreshed operational replica is ready for research ingest."""
     from rquant.config import settings
@@ -1511,7 +1554,7 @@ def cmd_backfill_abandon(args: argparse.Namespace) -> int:
     if not _valid_clean_commit(code_commit):
         logger.error("manifest abandonment requires a clean 40-character git commit")
         return 2
-    state = BackfillStateStore()
+    state = BackfillStateStore(read_only=not args.apply)
     try:
         plan = state.plan_manifest_abandonment(
             args.manifest_id,
@@ -3310,6 +3353,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Strategy Lab 记录根目录（默认使用配置 data_dir）",
     )
 
+    stage1_acceptance_p = sub.add_parser(
+        "stage1-acceptance",
+        help="只读预演一个策略的 Stage 1 验收身份、状态与资源预算",
+    )
+    stage1_acceptance_p.add_argument(
+        "--strategy",
+        required=True,
+        choices=("n_shape", "growth_board_surge", "auction_gap"),
+        help="本次唯一验收的策略",
+    )
+    stage1_acceptance_p.add_argument(
+        "--manifest-id",
+        required=True,
+        type=_parse_sha256,
+        help="该策略精确的 completed 或 abandoned manifest id",
+    )
+    stage1_acceptance_p.add_argument(
+        "--start-date",
+        required=True,
+        type=_parse_iso_date,
+        help="必须与 manifest 一致的资格开始日期",
+    )
+    stage1_acceptance_p.add_argument(
+        "--end-date",
+        required=True,
+        type=_parse_iso_date,
+        help="必须与 manifest 一致的资格结束日期",
+    )
+    stage1_acceptance_p.add_argument(
+        "--expected-code-commit",
+        required=True,
+        help="当前 checkout 的 40 位 commit；保留策略还必须与 manifest 一致",
+    )
+
     research_readiness_p = sub.add_parser(
         "research-ingest-readiness",
         help="检查日线副本是否已具备研究日增量所需的当日完整数据",
@@ -4392,6 +4469,7 @@ def main() -> int:
         "research-repair-auction": cmd_research_repair_auction,
         "research-repair-minute": cmd_research_repair_minute,
         "formal-smoke-replay": cmd_formal_smoke_replay,
+        "stage1-acceptance": cmd_stage1_acceptance,
         "research-ingest-readiness": cmd_research_ingest_readiness,
         "research-authority-status": cmd_research_authority_status,
         "research-migration": cmd_research_migration,
