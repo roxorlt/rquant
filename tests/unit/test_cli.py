@@ -925,6 +925,7 @@ class TestResearchMinuteRepair:
         from rquant import research_minute_repair as repair_module
 
         state_factory = MagicMock()
+        snapshot_factory = MagicMock()
         run_repair = MagicMock()
         monkeypatch.setattr(
             config_module.settings,
@@ -932,6 +933,11 @@ class TestResearchMinuteRepair:
             False,
         )
         monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
+        monkeypatch.setattr(
+            cli,
+            "open_backfill_state_snapshot",
+            snapshot_factory,
+        )
         monkeypatch.setattr(
             repair_module,
             "run_research_minute_repair",
@@ -950,6 +956,7 @@ class TestResearchMinuteRepair:
 
         assert cli.cmd_research_repair_minute(args) == 3
         state_factory.assert_not_called()
+        snapshot_factory.assert_not_called()
         run_repair.assert_not_called()
 
     def test_preview_is_read_only_and_prints_content_bound_plan_id(
@@ -968,7 +975,11 @@ class TestResearchMinuteRepair:
         source = tmp_path / "rquant_ro.duckdb"
         state_path = tmp_path / "backfill.sqlite3"
         state = MagicMock()
-        state_factory = MagicMock(return_value=state)
+        state_factory = MagicMock(side_effect=AssertionError("live state opened"))
+        snapshot_context = MagicMock()
+        snapshot_context.__enter__.return_value = state
+        snapshot_context.__exit__.return_value = False
+        snapshot_factory = MagicMock(return_value=snapshot_context)
         result = MagicMock(status="planned", plan_id="f" * 64)
         result.model_dump.return_value = {
             "status": "planned",
@@ -994,6 +1005,11 @@ class TestResearchMinuteRepair:
         )
         monkeypatch.setattr(cli, "BackfillStateStore", state_factory)
         monkeypatch.setattr(
+            cli,
+            "open_backfill_state_snapshot",
+            snapshot_factory,
+        )
+        monkeypatch.setattr(
             repair_module,
             "run_research_minute_repair",
             run_repair,
@@ -1012,11 +1028,11 @@ class TestResearchMinuteRepair:
         )
 
         assert cli.cmd_research_repair_minute(args) == 0
-        state_factory.assert_called_once_with(
+        snapshot_factory.assert_called_once_with(
             state_path,
             busy_timeout_ms=config_module.settings.backfill_state_busy_timeout_ms,
-            read_only=True,
         )
+        state_factory.assert_not_called()
         run_repair.assert_called_once_with(
             source_database=source,
             paths=repair_module.ResearchIngestPaths.from_data_dir(tmp_path),
@@ -1044,6 +1060,10 @@ class TestResearchMinuteRepair:
         from rquant import research_minute_repair as repair_module
 
         state = MagicMock()
+        snapshot_context = MagicMock()
+        snapshot_context.__enter__.return_value = state
+        snapshot_context.__exit__.return_value = False
+        snapshot_factory = MagicMock(return_value=snapshot_context)
         result = MagicMock(status="candidate", plan_id="f" * 64)
         result.model_dump.return_value = {
             "status": "candidate",
@@ -1060,7 +1080,12 @@ class TestResearchMinuteRepair:
         monkeypatch.setattr(
             cli,
             "BackfillStateStore",
-            MagicMock(return_value=state),
+            MagicMock(side_effect=AssertionError("live state opened")),
+        )
+        monkeypatch.setattr(
+            cli,
+            "open_backfill_state_snapshot",
+            snapshot_factory,
         )
         monkeypatch.setattr(
             repair_module,
@@ -1084,6 +1109,10 @@ class TestResearchMinuteRepair:
         )
 
         assert cli.cmd_research_repair_minute(args) == 0
+        snapshot_factory.assert_called_once_with(
+            config_module.settings.backfill_state_path_resolved,
+            busy_timeout_ms=config_module.settings.backfill_state_busy_timeout_ms,
+        )
         assert run_repair.call_args.kwargs["apply"] is True
         assert run_repair.call_args.kwargs["plan_id"] == "f" * 64
         output = json.loads(capsys.readouterr().out)

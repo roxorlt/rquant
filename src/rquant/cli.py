@@ -904,26 +904,25 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
             "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
         )
         return 3
-    state = BackfillStateStore(
+    with open_backfill_state_snapshot(
         settings.backfill_state_path_resolved,
         busy_timeout_ms=settings.backfill_state_busy_timeout_ms,
-        read_only=True,
-    )
-    result = run_research_minute_repair(
-        source_database=settings.duckdb_readonly_path_resolved,
-        paths=ResearchIngestPaths(
-            state_dir=settings.data_dir,
-            catalog_path=settings.research_db_path_resolved,
-            readonly_catalog_path=settings.research_readonly_db_path_resolved,
-            lake_root=settings.research_lake_dir_resolved,
-            staging_root=settings.research_staging_dir_resolved,
-        ),
-        state=state,
-        manifest_id=args.manifest_id,
-        code_commit=detect_code_commit() or "unknown",
-        apply=args.apply,
-        plan_id=args.plan_id,
-    )
+    ) as state:
+        result = run_research_minute_repair(
+            source_database=settings.duckdb_readonly_path_resolved,
+            paths=ResearchIngestPaths(
+                state_dir=settings.data_dir,
+                catalog_path=settings.research_db_path_resolved,
+                readonly_catalog_path=settings.research_readonly_db_path_resolved,
+                lake_root=settings.research_lake_dir_resolved,
+                staging_root=settings.research_staging_dir_resolved,
+            ),
+            state=state,
+            manifest_id=args.manifest_id,
+            code_commit=detect_code_commit() or "unknown",
+            apply=args.apply,
+            plan_id=args.plan_id,
+        )
     payload = result.model_dump(mode="json")
     payload["plan_id"] = result.plan_id
     print(json.dumps(payload, ensure_ascii=False, indent=2))
