@@ -5,6 +5,56 @@
 
 ---
 
+## 2026-07-21 · v0.25.3 · 爆量方向与内外盘确认修复
+
+**状态**：PR #117 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
+`v0.25.3` 精确指向 `f85b8d8cddb83b0fc65e48a31eb50f693f635049`。15:19 在交易保护
+窗口外完成 dry-run 和正式发布，生产 tag、HEAD 与包版本分别为 `v0.25.3`、上述精确 SHA
+和 `0.25.3`。
+
+**修复内容**：
+
+- surge-watch 在发送前重新确认当前涨跌方向，要求精确分钟覆盖决策时点、当前一分钟收益为正，
+  并以逐分钟 tick-rule 近似确认外盘主动买量大于内盘主动卖量；当前分钟数据缺失时延迟判断，
+  不用后续分钟补看当时信号。
+- 科创/创业放量历史回放修正了内外盘门槛和评分方向：由错误的 `内盘/外盘 > 1` 改为
+  `内盘/外盘 < 1`，同时保留旧 CLI 参数作为兼容别名。既有相关回测结论已在分析文档标记为
+  失效，等待用修正口径重跑，未把本次方向修复解释为收益已被证明。
+- 严格按信号分钟重放 2026-07-21 上午 4 条实际 Push：300901.SZ、301007.SZ 因当分钟
+  下跌或内盘占优被拒绝；300889.SZ、300203.SZ 在各自决策分钟仍满足方向条件。没有使用
+  信号后的分钟判断信号当时是否成立。
+
+**基线对齐与发布**：生产应用原停在 `v0.25.2`，PR #115 的 backup unit 已于 7 月 20 日
+单独安装而 Git 基线未推进。发布器因此按设计拒绝跨越受保护文件。现场复核云端 unit、
+`v0.25.3` 仓库文件的 SHA-256 均为
+`9a8bb5c92a479bccb076d992d8e2d478b2aff9a6f7c37595c8d35d6cae764003`，
+`systemd-analyze verify` 退出码 0、`TimeoutStartUSec=10min`。随后在部署锁内只快进到
+PR #116 的精确 SHA `752bf66eae08a2faaac7c1823f7d766348b0c9fb`；该步只对齐已验收
+unit、测试与文档，不改变运行时代码，并写入 `baseline_adopted` 审计。标准发布器再从该
+基线发布 `v0.25.3`，变更清单不含受保护路径。
+
+**生产验收**：
+
+- preflight 为 `ok=5 warn=0 fail=0 skip=0`，28 个 unit 全部 verify；dashboard、panorama
+  等发布前活跃服务完成白名单重启，monitor 与 surge-watch 正常保持收盘后的
+  `inactive/dead`，没有盘后强制补跑。
+- `rquant-surge-watch.timer` 与 `rquant-monitor.timer` 均为 `enabled/active/waiting`，下一次
+  触发为 2026-07-22 09:25；daily、research-ingest、replica、backup 等共 11 个 timer
+  均已恢复调度。
+- 主库与只读副本摘要完全一致：`daily_bar=1,650,869`、
+  `stock_status_daily=1,061,544`、`adj_factor=2,469,013`、`screen_result=856`、
+  `minute_bar=46,993,701`，分钟最新为 2026-07-21 14:59，schema migration 为 v10。
+- 发布后备份成功原子更新 `backup/latest.duckdb.gz`，`gzip -t` 退出码 0；主动副本同步
+  `Result=success`、`ExecMainStatus=0`。验收期间短暂停止 backup timer 以消除连续触发
+  竞态，未终止运行中的备份，检查后已恢复为 `enabled/active`。
+
+**回滚**：本版本没有 schema 或业务数据迁移。发现方向过滤异常时必须创建 revert PR，
+合并为新的 main 提交并打更高 SemVer tag 后向前发布；受控发布器禁止直接退回旧 tag，
+也不得在生产机 `git reset`。紧急止住爆量 Push 时可在保留 monitor 的前提下先停止
+`rquant-surge-watch.timer` 与当前 service，保留日志和事件作审计，再发布向前修复。
+
+---
+
 ## 2026-07-20 · v0.25.2 + PR #115 · 研究增量 candidate 与备份修复收尾
 
 **状态**：生产应用继续冻结在 tag `v0.25.2`、精确 SHA
