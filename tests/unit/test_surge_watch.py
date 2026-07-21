@@ -1323,6 +1323,19 @@ class TestU17CumulativeTracker:
         d2 = t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
         assert d2["amount"].iloc[0] == 100 and d2["volume"].iloc[0] == 10
 
+    def test_previous_trade_date_bar_cannot_freeze_current_session(self) -> None:
+        t = CumulativeTracker(session_date=date(2026, 7, 21))
+
+        stale = t.update(self._raw(999, 99, "2026-07-20 15:00:00"))
+        assert stale["amount"].iloc[0] == 0
+        assert stale["volume"].iloc[0] == 0
+
+        first = t.update(self._raw(100, 10, "2026-07-21 09:30:00"))
+        second = t.update(self._raw(60, 6, "2026-07-21 09:31:00"))
+        assert first["amount"].iloc[0] == 100
+        assert second["amount"].iloc[0] == 160
+        assert second["volume"].iloc[0] == 16
+
     def test_new_minute_accumulates_amount_and_volume(self) -> None:
         t = CumulativeTracker()
         t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
