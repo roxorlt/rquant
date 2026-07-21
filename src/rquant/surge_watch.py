@@ -490,11 +490,14 @@ class CumulativeTracker:
 
     重启续算：``seed`` 从上一份当日 snapshot_full.parquet 读回累计额/量 + 最近分钟，
     续到最近一 tick（重启只丢 tick 间隙，确认层 rt_min_daily 恒精确兜底）。
+    真实盘中传入 ``session_date`` 后，接口在开盘前返回的上一交易日末根只作快照展示，
+    不得写入当日累计或分钟锚点。
     """
 
     _CUM_COLS: tuple[str, ...] = ("amount", "volume")
 
-    def __init__(self) -> None:
+    def __init__(self, session_date: date | None = None) -> None:
+        self._session_date = session_date
         self._cum: dict[str, dict[str, float]] = {}
         self._last_minute: dict[str, int] = {}
 
@@ -540,13 +543,23 @@ class CumulativeTracker:
         for r in df.itertuples():
             code = str(r.ts_code)
             minute: int | None = None
+            belongs_to_session = self._session_date is None
             if has_tt:
                 tt = getattr(r, "trade_time", None)
                 if tt is not None and not pd.isna(tt):
-                    minute = _minute_of_day(pd.Timestamp(tt))
+                    ts = pd.Timestamp(tt)
+                    belongs_to_session = (
+                        self._session_date is None or ts.date() == self._session_date
+                    )
+                    if belongs_to_session:
+                        minute = _minute_of_day(ts)
             cum = self._cum.setdefault(code, {c: 0.0 for c in self._CUM_COLS})
             last = self._last_minute.get(code)
-            advance = minute is not None and (last is None or minute > last)
+            advance = (
+                belongs_to_session
+                and minute is not None
+                and (last is None or minute > last)
+            )
             if advance:
                 for col in self._CUM_COLS:
                     v = getattr(r, col, None)
@@ -1348,7 +1361,7 @@ def run_surge_watch(
     # 注入 fake snapshot_fetcher 的单测同时不启用 today_cum_fetcher 网络默认（离线兜底累加器）。
     use_real_sources = snapshot_fetcher is None
     if use_real_sources:
-        tracker = CumulativeTracker()
+        tracker = CumulativeTracker(session_date=day)
         prev_path = live_dir / SNAPSHOT_FULL_NAME
         if prev_path.exists():
             try:
