@@ -25,6 +25,12 @@
 
 ### Fixed
 
+- **生产回补状态库存在 WAL 时只读预演被拒绝**：`backfill-abandon` dry-run 与
+  `stage1-acceptance` 不再把在线 SQLite 文件当作已 checkpoint 的 immutable 快照直接
+  打开；预演先通过 SQLite Backup API 将主文件与 WAL 合成为一次性一致性副本，只读计算
+  完成后自动删除。权威状态库、WAL 和 schema 在预演期间均不变，正式 `--apply` 仍需
+  精确 `plan_id` 并只写权威库。项目版本从 `0.26.0` 更新到 `0.26.1`。
+
 - **爆量粗筛累计额被上一交易日收盘 K 线冻结**：`surge-watch` 于 09:25 启动时，
   Tushare `rt_min` 会在今日首根尚未形成前返回上一交易日 15:00 的末根；原累计器只比较
   时分、不核对交易日期，先把 15:00 写成分钟锚点，导致今日 09:30 至 15:00 全部被视为
