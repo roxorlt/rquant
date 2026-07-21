@@ -25,6 +25,12 @@
 
 ### Fixed
 
+- **分钟研究湖修复仍直读带 WAL 的回补状态库**：`research-repair-minute` 的 preview 与
+  apply 现在都通过 SQLite Backup API 一致性快照读取 manifest；修复写入仍只发生在研究
+  catalog/lake，权威回补状态库不参与写入。修复单策略 Stage 1 验收在 completed manifest
+  上因 `read-only backfill state database must be checkpointed` 首错退出的问题。项目版本从
+  `0.26.1` 更新到 `0.26.2`。
+
 - **生产回补状态库存在 WAL 时只读预演被拒绝**：`backfill-abandon` dry-run 与
   `stage1-acceptance` 不再把在线 SQLite 文件当作已 checkpoint 的 immutable 快照直接
   打开；预演先通过 SQLite Backup API 将主文件与 WAL 合成为一次性一致性副本，只读计算
