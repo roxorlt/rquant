@@ -1109,10 +1109,10 @@ def test_tick_rule_split_classifies_direction() -> None:
     assert _tick_rule_split(10.0, 10.1, 0.0) == (0.0, 0.0)
 
 
-def test_growth_board_surge_inner_outer_gate_blocks_outer_dominant(
+def test_growth_board_surge_inner_outer_gate_allows_outer_dominant(
     store: DuckDBStore,
 ) -> None:
-    """全程上涨的信号日外盘占优，内盘>外盘闸门应拦截；baseline 仍带观察值。"""
+    """全程上涨的信号日外盘占优，主动买盘闸门应放行。"""
     from rquant.growth_board_surge_strategy import (
         GrowthBoardSurgeConfig,
         run_growth_board_surge_replay,
@@ -1144,10 +1144,10 @@ def test_growth_board_surge_inner_outer_gate_blocks_outer_dominant(
         end_date=date(2026, 6, 25),
         config=GrowthBoardSurgeConfig(**common, require_inner_outer=True),
     )
-    assert gated.empty
+    assert len(gated) == 1
 
 
-def test_growth_board_surge_inner_outer_gate_allows_inner_dominant(
+def test_growth_board_surge_inner_outer_gate_blocks_inner_dominant(
     store: DuckDBStore,
 ) -> None:
     from rquant.growth_board_surge_strategy import (
@@ -1172,21 +1172,21 @@ def test_growth_board_surge_inner_outer_gate_allows_inner_dominant(
         end_date=date(2026, 6, 25),
         config=GrowthBoardSurgeConfig(**common, require_inner_outer=True),
     )
-    assert len(trades) == 1
-    row = trades.iloc[0]
-    assert row["entry_time"] == datetime(2026, 6, 25, 9, 34)
-    assert row["inner_outer_ratio"] == pytest.approx(1.4854, abs=0.001)
-    assert row["entry_signal"] == "growth_board_volume_surge"
+    assert trades.empty
 
-    stricter = run_growth_board_surge_replay(
-        store,
-        start_date=date(2026, 6, 25),
-        end_date=date(2026, 6, 25),
-        config=GrowthBoardSurgeConfig(
-            **common, require_inner_outer=True, min_inner_outer_ratio=2.0
-        ),
+
+def test_growth_factor_score_rewards_outer_dominance() -> None:
+    from rquant.growth_board_surge_strategy import GROWTH_SURGE_B_V1_SCORE_TERMS
+    from rquant.topn_selection import score_feature_terms
+
+    outer_dominant = score_feature_terms(
+        {"inner_outer_ratio": 0.5}, GROWTH_SURGE_B_V1_SCORE_TERMS
     )
-    assert stricter.empty
+    inner_dominant = score_feature_terms(
+        {"inner_outer_ratio": 1.5}, GROWTH_SURGE_B_V1_SCORE_TERMS
+    )
+
+    assert outer_dominant > inner_dominant
 
 
 def test_growth_board_surge_large_net_vol_gate_uses_t_minus_1(

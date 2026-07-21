@@ -97,8 +97,8 @@ def test_growth_surge_v1_factor_keys_locked() -> None:
     assert by_name["board_gap_up_ratio"].op == ">="
     assert by_name["board_auction_amount_ratio"].op == ">="
     assert by_name["board_auction_amount_ratio"].basis == "signal_date_auction"
-    # 用户口径：内盘>外盘（tick-rule 近似）判多，方向不得翻转
-    assert by_name["inner_outer_ratio"].op == ">"
+    # 标准口径：外盘>内盘（即 inner/outer < 1）判多，方向不得翻转
+    assert by_name["inner_outer_ratio"].op == "<"
     assert by_name["inner_outer_ratio"].threshold == 1.0
     # 大单净量为 T-1 口径（防未来函数）
     assert by_name["large_net_vol_t1"].op == ">"

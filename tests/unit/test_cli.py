@@ -2591,7 +2591,7 @@ class TestGrowthBoardSurgeReplayParser:
         assert args.min_same_minute_amount_ratio == 2.0
         assert args.max_hold_days == 3
         assert args.require_inner_outer is False
-        assert args.min_inner_outer_ratio == 1.0
+        assert args.max_inner_outer_ratio == 1.0
         assert args.require_large_net_vol is False
         assert args.min_large_net_vol == 0.0
         assert args.factor_confirm is False
@@ -2627,7 +2627,7 @@ class TestGrowthBoardSurgeReplayParser:
         assert args.min_same_minute_amount_ratio == 3.0
         assert args.max_hold_days == 2
         assert args.require_inner_outer is True
-        assert args.min_inner_outer_ratio == 1.2
+        assert args.max_inner_outer_ratio == 1.2
         assert args.require_large_net_vol is True
         assert args.min_large_net_vol == 100.0
         assert args.factor_confirm is True
@@ -3255,7 +3255,7 @@ class TestCmdGrowthBoardSurgeReplay:
             min_cum_amount_ratio=1.4,
             min_same_minute_amount_ratio=2.0,
             require_inner_outer=False,
-            min_inner_outer_ratio=1.0,
+            max_inner_outer_ratio=1.0,
             require_large_net_vol=False,
             min_large_net_vol=0.0,
             require_board_favor=False,

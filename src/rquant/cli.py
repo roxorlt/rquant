@@ -2363,7 +2363,7 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         min_cum_amount_ratio=args.min_cum_amount_ratio,
         min_same_minute_amount_ratio=args.min_same_minute_amount_ratio,
         require_inner_outer=args.require_inner_outer,
-        min_inner_outer_ratio=args.min_inner_outer_ratio,
+        max_inner_outer_ratio=args.max_inner_outer_ratio,
         require_large_net_vol=args.require_large_net_vol,
         min_large_net_vol=args.min_large_net_vol,
         require_fresh_surge=args.require_fresh_surge,
@@ -3795,11 +3795,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     growth_replay_p.add_argument(
         "--require-inner-outer", action="store_true",
-        help="要求信号分钟内盘>外盘（分钟 tick-rule 近似，用户条件 2）",
+        help="要求信号分钟外盘>内盘（分钟 tick-rule 近似）",
     )
     growth_replay_p.add_argument(
-        "--min-inner-outer-ratio", type=float, default=1.0,
-        help="内盘/外盘比下限，须严格大于 (默认 1.0 即内盘>外盘)",
+        "--max-inner-outer-ratio", "--min-inner-outer-ratio",
+        dest="max_inner_outer_ratio", type=float, default=1.0,
+        help="内盘/外盘比上限，须严格小于 (默认 1.0 即外盘>内盘；旧参数名仍兼容)",
     )
     growth_replay_p.add_argument(
         "--require-large-net-vol", action="store_true",

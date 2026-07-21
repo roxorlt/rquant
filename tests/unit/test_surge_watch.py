@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from rquant.surge_watch import (
     CURVE_POINTS,
@@ -42,6 +43,7 @@ from rquant.surge_watch import (
     run_surge_watch,
     series_to_frame,
     today_cum_series_from_rt_min_daily,
+    today_price_strength_from_rt_min_daily,
 )
 
 CST = timezone(timedelta(hours=8))
@@ -318,6 +320,14 @@ class TestU4Confirm:
         w, _bars, now, gi = self._confirm_watcher()
         snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
                          "pct_chg": 5, "volume": 1e6, "amount": 1499}])   # rel 2.498 < 2.5
+        w._evaluate("300001.SZ", snap, now, gi)
+        assert "300001.SZ" not in w.pushed_today
+
+    def test_confirmation_rechecks_current_price_is_above_previous_close(self) -> None:
+        """候选排队后转跌时，确认层必须重新检查当前涨幅，不能沿用粗筛时状态。"""
+        w, _bars, now, gi = self._confirm_watcher()
+        snap = mk_snap([{"ts_code": "300001.SZ", "price": 0.89, "pre_close": 0.9,
+                         "pct_chg": -1.11, "volume": 1e6, "amount": 1500}])
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
 
@@ -671,7 +681,7 @@ class TestU10Push:
         assert "人形机器人" in body                   # 题材
         assert "累计比4日2.7×" in body                # 纯累计比值（N=4）
         assert "距涨停4.5%" in body                   # 距涨停空间
-        assert "口径 v3(纯累计)" in body              # 尾注口径版本
+        assert "口径 v4(累计+方向)" in body            # 尾注口径版本
         assert "累计比值∈[2.5,8]" in body            # 上下门口径
         assert "9:31起判" in body                     # skip=0 → 9:31 起判（首个可确认格）
         assert "增量门" not in body                   # v2 增量门 v3 默认关，报文不出现
@@ -811,7 +821,7 @@ class TestE1Simulate:
         g_push = [p for p in pushes if "机器人G" in p[1]["body"]][0]
         assert "09:31" in g_push[1]["title"]         # 推送发生在 09:31
         body = g_push[1]["body"]
-        assert "口径 v3(纯累计)" in body and "观察提示，非买入信号" in body
+        assert "口径 v4(累计+方向)" in body and "观察提示，非买入信号" in body
         assert all(p[0] == "surge_watch" for p in pushes)
 
 
@@ -1210,7 +1220,7 @@ class TestE2SimulateV3Gates:
         body = pushes[0][1]["body"]
         assert "爆F" in body and "拦E" in body
         assert "🔔临近涨停" in body                    # E 距涨停 0.84%>0 → 临近涨停 icon
-        assert "口径 v3(纯累计)" in body and "观察提示，非买入信号" in body
+        assert "口径 v4(累计+方向)" in body and "观察提示，非买入信号" in body
 
 
 # ── U16 全市场重构（D1）：全市场取数 → 检测层过滤 config.boards ─────────────────
@@ -1510,12 +1520,33 @@ class TestU20RtMinDailyConfirm:
         arr = today_cum_series_from_rt_min_daily(pd.DataFrame())
         assert np.isnan(arr).all()
 
-    def _confirm_setup(self, *, today_cum_fetcher, snap_amount: float) -> tuple:
+    def test_price_strength_uses_only_bars_available_at_decision_minute(self) -> None:
+        bars = mk_rt_min_daily([100.0, 100.0, 100.0])
+        bars["open"] = [10.0, 10.0, 9.9]
+        bars["close"] = [10.0, 9.9, 10.8]
+        bars["vol"] = [100.0, 500.0, 5000.0]
+
+        strength = today_price_strength_from_rt_min_daily(bars, 1)
+
+        assert strength is not None
+        assert strength.minute_index == 1
+        assert strength.return_1m_pct == pytest.approx(-1.0)
+        assert strength.inner_volume > strength.outer_volume
+
+    def _confirm_setup(
+        self,
+        *,
+        today_cum_fetcher,
+        snap_amount: float,
+        require_price_strength: bool = False,
+    ) -> tuple:
         """gi=30（10:00）；stk_mins 基线三日恒 1e5/min → cum_median[30]=31e5=3.1e6。"""
         d = date(2026, 7, 6)
         bars = mk_minute_bars({d - timedelta(days=i): [1e5] * 241 for i in (1, 2, 3)})
         base = mk_baseline({"300001.SZ": 1e4}, curve=flat_curve())  # avg20 微小 → rough 恒过
-        w = SurgeWatcher(base, config=SurgeConfig(),
+        w = SurgeWatcher(
+                         base,
+                         config=SurgeConfig(require_price_strength=require_price_strength),
                          minute_fetcher=lambda c, dd: bars,
                          today_cum_fetcher=today_cum_fetcher)
         now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
@@ -1537,6 +1568,29 @@ class TestU20RtMinDailyConfirm:
         assert "300001.SZ" in w.pushed_today
         assert res.confirmed[0].rel_cum == 4.0
         assert res.confirmed[0].cum_amount == round(1.24e7, 0)  # 精确 cumsum 值入报文
+
+    def test_precise_rt_min_daily_rejects_volume_surge_on_falling_price(self) -> None:
+        """精确分钟线显示放量下跌时拒绝，不能被略滞后的全市场快照误报为上涨。"""
+        daily = mk_rt_min_daily([4e5] * 31)
+        daily["open"] = 100.0
+        daily["high"] = 100.0
+        daily["low"] = 100.0
+        daily["close"] = [100.0] * 30 + [99.0]
+        daily["vol"] = [100.0] * 31
+        daily.loc[daily.index[-1], "low"] = 99.0
+
+        w, snap, now = self._confirm_setup(
+            today_cum_fetcher=lambda c, d: daily,
+            snap_amount=2e6,
+            require_price_strength=True,
+        )
+        # 模拟 rt_min 全市场快照略滞后：它仍显示红盘；rt_min_daily 已显示当前分钟下跌。
+        snap.loc[:, "price"] = 101.0
+        snap.loc[:, "pct_chg"] = 5.0
+        res = w.tick(snap, now)
+
+        assert "300001.SZ" not in w.pushed_today
+        assert res.confirmed == []
 
     def test_empty_rt_min_daily_falls_back_to_accumulator(self) -> None:
         """rt_min_daily 空 → 退快照累加器近似（不阻塞）：rel 由快照 amount 决定。"""

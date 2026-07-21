@@ -7,16 +7,17 @@
   且 pct_chg>0、非 ST、有 20 日基线（缺基线的次新自动落选），只进候选不推送。
   粗筛只负责「值不值得拉 tushare 确认」，不卡收益——2026-07-06 回测发现原 1.5×
   会把候选挡在确认池外、延迟信号，故放松到 1.2×，让候选早进确认层。
-- **确认层（口径 v3，纯累计单条门）**：对新候选拉 tushare stk_mins 近 N（默认 4）个
+- **确认层（口径 v4，累计 + 价格方向）**：对新候选拉 tushare stk_mins 近 N（默认 4）个
   交易日 1min bars，构造同刻累计额中位基准，
   ``rel_cum = today_cum(t) / median_Nday_same_time_cum(t) ∈ [k_cum, ratio_cap]``
-  且 t 越过 skip_first_minutes（默认跳过 9:31 前，base 分母噪声大）即确认。
+  并用 rt_min_daily 精确复核红盘、当分钟上涨、tick-rule 近似外盘占优；所有计算只取
+  当前分钟及之前数据。t 越过 skip_first_minutes 后才确认。
 
 口径演进（诚实标注）：v2 曾叠加 VWAP 门 + 单分钟增量门收紧，但 2026-07-06 全天真实
 分钟回测证明这些门把信号系统性拖到爆量展开后、买在阶段高点；纯累计口径买在爆量刚起
 （86% 在 10:00 前触发），完胜 v2。故 v3 移除两门（字段保留但默认关：k_delta_confirm=0、
 require_vwap=False），ratio_cap 上限挡极端出货毒尾（比值 11-20× 在负收益组扎堆）。
-报文尾注口径版本 v3。
+v4 保留 v3 成交额核心，补上确认时价格方向门，修复候选排队后转跌仍推送的问题。
 
 数据源（2026-07-07 事故后根治）：全市场快照改用 tushare ``rt_min``（token 认证，
 不吃 IP 反爬）。此前爬东财 push2 clist / 新浪快照，2026-07-07 盘中云端 IP 被东财
@@ -163,7 +164,7 @@ def load_progress_curve(path: Path | None = None) -> np.ndarray:
 
 
 class SurgeConfig(BaseModel):
-    """surge-watch 判定参数（口径 v3 纯累计，默认据 2026-07-06 全天真实分钟回测标定）。"""
+    """surge-watch 判定参数（口径 v4：v3 累计核心 + 当前分钟价格方向）。"""
 
     # 粗筛门：2026-07-06 回测发现 1.5× 会把候选挡在确认池外、延迟信号，放松到 1.2×
     # 让候选早进确认层（粗筛只决定「值不值得拉 tushare」，真正的推送决策交给 rel_cum）。
@@ -184,6 +185,12 @@ class SurgeConfig(BaseModel):
     k_delta_confirm: float = 0.0
     # VWAP 门（v2 遗留，同上默认关）：True 时确认要求现价 ≥ 当日均价（amount/volume）。
     require_vwap: bool = False
+    # 价格方向门：真实盘中使用 rt_min_daily 截至确认分钟的精确 K 线，要求当分钟上涨且
+    # tick-rule 近似外盘大于内盘。分钟接口尚未覆盖当前格时暂缓确认，避免用 rt_min
+    # 全市场快照的滞后价格误报。离线 simulate 未注入 rt_min_daily 时只复核当前涨幅。
+    require_price_strength: bool = True
+    min_return_1m_pct: float = 0.0
+    min_outer_inner_ratio: float = Field(default=1.0, gt=0)
     # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）标 unbuyable（报文加「临近涨停」
     # icon,仍推送、仍占「每票每日一次」名额）。0 = 只标已封板；负值可整体关闭（room 恒 > 负值）。
     max_room_to_limit_pct: float = 1.0
@@ -218,6 +225,9 @@ class SurgeConfirmed(BaseModel):
     minute_delta: float | None = None       # 本分钟增量（元，v2 遗留研究字段）
     minute_delta_median: float | None = None  # N 日同分钟增量中位（元，v2 遗留研究字段）
     room_to_limit_pct: float | None = None  # 距涨停空间（%）
+    return_1m_pct: float | None = None
+    outer_inner_ratio_approx: float | None = None
+    price_source: str = "snapshot"
     # confirmed（可买、推送）| unbuyable（距涨停≤门 / 已封板，只落 events 不推送）
     status: str = "confirmed"
 
@@ -653,6 +663,22 @@ _EMPTY_BASELINE = ThreeDayBaseline(
 )
 
 
+class IntradayPriceStrength(BaseModel):
+    """截至某分钟、仅由该分钟及之前 K 线计算的价格与 tick-rule 近似订单流。"""
+
+    minute_index: int
+    price: float
+    return_1m_pct: float | None
+    inner_volume: float
+    outer_volume: float
+
+    @property
+    def outer_inner_ratio(self) -> float | None:
+        if self.inner_volume <= 0:
+            return None
+        return self.outer_volume / self.inner_volume
+
+
 def _day_grid_amount(day_bars: pd.DataFrame) -> np.ndarray:
     """单日分钟 bars → 241 网格逐格成交额（同格相加，缺格 0）。"""
     arr = np.zeros(CURVE_POINTS)
@@ -727,6 +753,62 @@ def today_cum_series_from_rt_min_daily(bars: pd.DataFrame) -> np.ndarray:
         else:
             arr[i] = last
     return arr
+
+
+def today_price_strength_from_rt_min_daily(
+    bars: pd.DataFrame,
+    gi: int,
+) -> IntradayPriceStrength | None:
+    """用不晚于 ``gi`` 的分钟 K 计算当前涨速与外/内盘近似，不读取未来分钟。"""
+    required = {"trade_time", "open", "close", "vol"}
+    if bars is None or bars.empty or not required.issubset(bars.columns):
+        return None
+    df = bars.copy()
+    df["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
+    df["open"] = pd.to_numeric(df["open"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["trade_time", "close"])
+    if df.empty:
+        return None
+    df["_gi"] = df["trade_time"].map(lambda v: grid_index(pd.Timestamp(v).time()))
+    df = df[df["_gi"] <= gi].sort_values("trade_time")
+    if df.empty:
+        return None
+    # 同一分钟若接口返回多根，以最后一根为分钟末状态。
+    df = df.groupby("_gi", sort=True, as_index=False).tail(1).sort_values("_gi")
+    latest = df.iloc[-1]
+    latest_gi = int(latest["_gi"])
+    previous_close: float | None = None
+    inner = 0.0
+    outer = 0.0
+    for row in df.itertuples():
+        close = float(row.close)
+        reference = previous_close
+        if reference is None:
+            reference = float(row.open) if pd.notna(row.open) else close
+        volume = max(float(row.vol), 0.0)
+        if close > reference:
+            outer += volume
+        elif close < reference:
+            inner += volume
+        else:
+            inner += volume / 2
+            outer += volume / 2
+        previous_close = close
+
+    return_1m: float | None = None
+    if len(df) >= 2:
+        prior = float(df.iloc[-2]["close"])
+        if prior > 0:
+            return_1m = (float(latest["close"]) / prior - 1) * 100
+    return IntradayPriceStrength(
+        minute_index=latest_gi,
+        price=float(latest["close"]),
+        return_1m_pct=return_1m,
+        inner_volume=inner,
+        outer_volume=outer,
+    )
 
 
 def _default_today_cum_fetcher(ts_code: str, today: date) -> pd.DataFrame:
@@ -805,8 +887,9 @@ class SurgeWatcher:
 
         self.pushed_today: set[str] = set()
         self.confirm_cache: dict[str, ThreeDayBaseline] = {}
-        # 今日累计精确序列缓存（rt_min_daily cumsum，一天一调；全 NaN=取数失败/空，退累加器）
+        # 今日累计精确序列缓存；价格方向未覆盖当前格时允许下一分钟刷新。
         self.today_cum_series: dict[str, np.ndarray] = {}
+        self.today_price_strength: dict[str, IntradayPriceStrength] = {}
         self._pending_fetch: deque[str] = deque()
         self._queued: set[str] = set()
         self._fetch_fail: dict[str, int] = {}
@@ -828,6 +911,7 @@ class SurgeWatcher:
             if code in self.pushed_today:
                 continue
             if code in self.confirm_cache:
+                self._fetch_today_cum(code, now.date(), gi)
                 self._evaluate(code, snapshot, now, gi)
             elif code not in self._queued:
                 self._queued.add(code)
@@ -883,20 +967,29 @@ class SurgeWatcher:
             self.confirm_cache[code] = build_three_day_baseline(
                 bars, now.date(), self.config.cum_lookback_days
             )
-            self._fetch_today_cum(code, now.date())
+            self._fetch_today_cum(code, now.date(), gi)
             self._evaluate(code, snapshot, now, gi)
         for code in requeue:
             if code not in self.pushed_today:
                 self._queued.add(code)
                 self._pending_fetch.append(code)
 
-    def _fetch_today_cum(self, code: str, today: date) -> None:
-        """新候选拉 rt_min_daily 精确今日累计序列（一天一调，缓存；失败→全 NaN 退累加器）。
+    def _fetch_today_cum(self, code: str, today: date, required_gi: int) -> None:
+        """拉 rt_min_daily 精确累计与价格方向；已覆盖当前格即复用缓存。
 
         opt-in：未注入 today_cum_fetcher（tick 单测/simulate）直接跳过，确认层退回快照
-        累加器近似值。已缓存不重拉（含失败缓存，避免每 tick 重打 rt_min_daily）。
+        累加器近似值。价格方向门开启时，缓存未覆盖当前格会在后续 tick 重试。
         """
-        if self._today_cum_fetcher is None or code in self.today_cum_series:
+        if self._today_cum_fetcher is None:
+            return
+        cached_strength = self.today_price_strength.get(code)
+        if code in self.today_cum_series and (
+            not self.config.require_price_strength
+            or (
+                cached_strength is not None
+                and cached_strength.minute_index >= required_gi
+            )
+        ):
             return
         try:
             bars = self._today_cum_fetcher(code, today)
@@ -912,12 +1005,12 @@ class SurgeWatcher:
             self.today_cum_series[code] = np.full(CURVE_POINTS, np.nan)
             return
         self.today_cum_series[code] = today_cum_series_from_rt_min_daily(bars)
+        strength = today_price_strength_from_rt_min_daily(bars, required_gi)
+        if strength is not None:
+            self.today_price_strength[code] = strength
 
     def _evaluate(self, code: str, snapshot: pd.DataFrame, now: datetime, gi: int) -> None:
-        """确认判定（口径 v3 纯累计）：rel_cum = today_cum / N日同刻累计中位 ∈ [k_cum,
-        ratio_cap]，且 gi 越过 skip_first_minutes 即确认；VWAP 门 / 增量门 v3 默认关，
-        仅在 require_vwap / k_delta_confirm>0 时叠加。通过后若现价距涨停 ≤ max_room
-        （或已封板）标 unbuyable 只落 events 不推送。"""
+        """确认判定（口径 v4）：v3 累计比值门叠加当前红盘、1 分钟上涨和外盘占优。"""
         if code in self.pushed_today:
             return
         # skip_first_minutes：9:30 开盘首格（gi=0）恒不确认，再额外跳 skip_first_minutes
@@ -935,6 +1028,36 @@ class SurgeWatcher:
         price = row.get("price")
         if amount is None or pd.isna(amount) or price is None or pd.isna(price):
             return
+        pct_chg = row.get("pct_chg")
+        if pct_chg is None or pd.isna(pct_chg) or float(pct_chg) <= 0:
+            return
+
+        price_source = "snapshot"
+        return_1m: float | None = None
+        outer_inner_ratio: float | None = None
+        strength = self.today_price_strength.get(code)
+        if self._today_cum_fetcher is not None and self.config.require_price_strength:
+            # 付费实时分钟源存在时必须精确覆盖当前格；滞后或缺字段就等下一分钟重取。
+            if strength is None or strength.minute_index != gi:
+                return
+            if (
+                strength.return_1m_pct is None
+                or strength.return_1m_pct <= self.config.min_return_1m_pct
+                or strength.outer_volume
+                <= self.config.min_outer_inner_ratio * strength.inner_volume
+            ):
+                return
+            price = strength.price
+            return_1m = strength.return_1m_pct
+            outer_inner_ratio = strength.outer_inner_ratio
+            price_source = "tushare_rt_daily"
+            pre_close = row.get("pre_close")
+            if pre_close is None or pd.isna(pre_close):
+                pre_close = self.baseline.pre_close.get(code)
+            if pre_close is not None and not pd.isna(pre_close) and float(pre_close) > 0:
+                pct_chg = (float(price) / float(pre_close) - 1) * 100
+                if pct_chg <= 0:
+                    return
         base_cum = float(base.cum_median[gi])
         if base_cum <= 0:
             return
@@ -979,13 +1102,18 @@ class SurgeWatcher:
             theme=self.theme_map.get(code, ""),
             confirmed_at=now.strftime("%H:%M"),
             price=round(float(price), 2),  # 推送当时价 = 入场价
-            pct_chg=round(float(row.get("pct_chg", 0.0) or 0.0), 2),
+            pct_chg=round(float(pct_chg), 2),
             cum_amount=round(today_cum, 0),  # 决策所用今日累计（rt_min_daily 精确 or 累加器近似）
             rel_cum=round(rel, 2),
             rough_ratio=round(rough_ratio, 2),
             minute_delta=round(minute_delta, 0) if minute_delta is not None else None,
             minute_delta_median=round(float(base.minute_median[gi]), 0),
             room_to_limit_pct=round(room, 2) if room is not None else None,
+            return_1m_pct=round(return_1m, 3) if return_1m is not None else None,
+            outer_inner_ratio_approx=(
+                round(outer_inner_ratio, 3) if outer_inner_ratio is not None else None
+            ),
+            price_source=price_source,
         )
         # 可买性守卫：现价距涨停 ≤ 门（或已封板 room≤0）→ 买不进，标 unbuyable，但**仍推送**
         # （报文标「临近涨停」icon 让用户自行判断），不再吞掉——2026-07-07 回测证明最强的爆量
@@ -1075,10 +1203,18 @@ def build_surge_messages(
             if config.k_delta_confirm > 0
             else ""
         )
+        direction_txt = ""
+        if c.return_1m_pct is not None:
+            flow = (
+                f" 外/内≈{c.outer_inner_ratio_approx:.2f}×"
+                if c.outer_inner_ratio_approx is not None
+                else " 外盘占优"
+            )
+            direction_txt = f" 1分钟{c.return_1m_pct:+.2f}%{flow}"
         lines.append(
             f"- {flag}{c.ts_code} {c.name}{theme} +{c.pct_chg:.1f}% "
             f"累计比{n}日{c.rel_cum:.1f}× 累计{_fmt_amount(c.cum_amount)}"
-            f"{delta_txt}{room}"
+            f"{delta_txt}{direction_txt}{room}"
         )
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
@@ -1089,12 +1225,18 @@ def build_surge_messages(
         f" / 增量门{config.k_delta_confirm:g}×{n}d同分钟" if config.k_delta_confirm > 0 else ""
     )
     vwap_seg = " / VWAP门" if config.require_vwap else ""
+    direction_seg = (
+        f" / 1分钟>{config.min_return_1m_pct:g}%"
+        f"且外/内≈>{config.min_outer_inner_ratio:g}"
+        if config.require_price_strength
+        else ""
+    )
     first_gi = min(config.skip_first_minutes + 1, CURVE_POINTS - 1)
     first_m = _GRID_MINUTES[first_gi]
     lines.append(
-        f"> 口径 v3(纯累计): rough{config.k_rough:g}×20d·curve / "
+        f"> 口径 v4(累计+方向): rough{config.k_rough:g}×20d·curve / "
         f"累计比值∈[{config.k_cum:g},{config.ratio_cap:g}]×{n}d同刻"
-        f" / {first_m // 60}:{first_m % 60:02d}起判{delta_seg}{vwap_seg}"
+        f" / {first_m // 60}:{first_m % 60:02d}起判{delta_seg}{vwap_seg}{direction_seg}"
     )
     lines.append("> ⚠️ 观察提示，非买入信号")
     return [(title, "\n".join(lines))]
