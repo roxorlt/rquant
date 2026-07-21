@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from argparse import Namespace
@@ -237,6 +238,27 @@ def test_backfill_cli_parser_contracts() -> None:
     status = parser.parse_args(
         ["backfill-status", "--manifest-id", "c" * 64, "--json"]
     )
+    abandon_preview = parser.parse_args(
+        [
+            "backfill-abandon",
+            "--manifest-id",
+            "d" * 64,
+            "--reason",
+            "independent auction entry was retired",
+        ]
+    )
+    abandon_apply = parser.parse_args(
+        [
+            "backfill-abandon",
+            "--manifest-id",
+            "d" * 64,
+            "--reason",
+            "independent auction entry was retired",
+            "--plan-id",
+            "e" * 64,
+            "--apply",
+        ]
+    )
     snapshot = parser.parse_args(
         [
             "dataset-snapshot",
@@ -281,6 +303,10 @@ def test_backfill_cli_parser_contracts() -> None:
     assert run.stop_before is None
     assert run.deadline_worker is False
     assert status.json is True
+    assert abandon_preview.apply is False
+    assert abandon_preview.plan_id is None
+    assert abandon_apply.apply is True
+    assert abandon_apply.plan_id == "e" * 64
     assert snapshot.as_of == datetime(2026, 6, 30, 7, tzinfo=UTC)
     assert snapshot.apply is False
     assert snapshot.dry_run is False
@@ -581,6 +607,127 @@ def test_backfill_status_unknown_manifest_is_nonzero(
     )
 
     assert rc != 0
+
+
+def test_backfill_abandon_requires_matching_preview_before_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = _plan_with_task()
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(backfill_state_input(plan))
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    monkeypatch.setattr(
+        "rquant.research_manifest.detect_code_commit",
+        lambda: _COMMIT,
+    )
+    args = Namespace(
+        manifest_id=plan.manifest.manifest_id,
+        reason="independent auction entry was retired",
+        plan_id=None,
+        apply=False,
+    )
+
+    preview_rc = cli.cmd_backfill_abandon(args)
+    preview = json.loads(capsys.readouterr().out)
+
+    assert preview_rc == 0
+    assert preview["status"] == "dry_run"
+    assert preview["apply_required"] is True
+    assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"
+
+    apply_rc = cli.cmd_backfill_abandon(
+        Namespace(
+            manifest_id=plan.manifest.manifest_id,
+            reason=args.reason,
+            plan_id=preview["plan"]["plan_id"],
+            apply=True,
+        )
+    )
+    applied = json.loads(capsys.readouterr().out)
+
+    assert apply_rc == 0
+    assert applied["status"] == "abandoned"
+    assert applied["manifest"]["status"] == "abandoned"
+    assert applied["manifest"]["pending"] == 1
+
+
+def test_backfill_abandon_rejects_wrong_plan_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan_with_task()
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(backfill_state_input(plan))
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    monkeypatch.setattr(
+        "rquant.research_manifest.detect_code_commit",
+        lambda: _COMMIT,
+    )
+
+    rc = cli.cmd_backfill_abandon(
+        Namespace(
+            manifest_id=plan.manifest.manifest_id,
+            reason="independent auction entry was retired",
+            plan_id="f" * 64,
+            apply=True,
+        )
+    )
+
+    assert rc == 2
+    assert state.get_manifest_status(plan.manifest.manifest_id).status == "pending"
+
+
+def test_backfill_run_rejects_abandoned_manifest_before_duckdb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan_with_task()
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(backfill_state_input(plan))
+    abandonment = state.plan_manifest_abandonment(
+        plan.manifest.manifest_id,
+        reason="independent auction entry was retired",
+        code_commit=_COMMIT,
+    )
+    state.apply_manifest_abandonment(abandonment)
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+    readonly_factory = MagicMock()
+    monkeypatch.setattr(cli, "open_readonly_store", readonly_factory)
+
+    rc = cli.cmd_backfill_run(
+        Namespace(manifest_id=plan.manifest.manifest_id, retry_failed=False)
+    )
+
+    assert rc == 2
+    readonly_factory.assert_not_called()
+
+
+def test_backfill_status_treats_abandoned_manifest_as_intentional_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = _plan_with_task()
+    state = BackfillStateStore(tmp_path / "state.sqlite3")
+    state.persist_manifest(backfill_state_input(plan))
+    abandonment = state.plan_manifest_abandonment(
+        plan.manifest.manifest_id,
+        reason="independent auction entry was retired",
+        code_commit=_COMMIT,
+    )
+    state.apply_manifest_abandonment(abandonment)
+    monkeypatch.setattr(cli, "BackfillStateStore", MagicMock(return_value=state))
+
+    rc = cli.cmd_backfill_status(
+        Namespace(manifest_id=plan.manifest.manifest_id, json=True)
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["status"] == "abandoned"
+    assert payload["termination"]["reason"] == abandonment.reason
 
 
 def test_backfill_status_retryable_failure_is_nonzero(

@@ -24,7 +24,9 @@ from loguru import logger
 from rquant.backfill_state import (
     BackfillStateStore,
     BackfillWorkloadTelemetry,
+    ManifestAbandonmentConflictError,
     ManifestContentConflictError,
+    StaleManifestAbandonmentError,
     UnknownManifestError,
 )
 from rquant.logging import setup_logging
@@ -1398,6 +1400,9 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
     if status_before.status == "completed":
         _print_json(status_before.model_dump(mode="json"))
         return 0
+    if status_before.status == "abandoned":
+        _print_json(status_before.model_dump(mode="json"))
+        return 2
     if status_before.status == "failed" and not args.retry_failed:
         logger.error("manifest has failed tasks; pass --retry-failed after inspection")
         return 2
@@ -1495,6 +1500,66 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
         }
     )
     return 0 if status_after.status == "completed" else 1
+
+
+def cmd_backfill_abandon(args: argparse.Namespace) -> int:
+    """Plan or apply an auditable terminal state for a retired manifest."""
+    from rquant.research_manifest import detect_code_commit
+
+    setup_logging()
+    code_commit = detect_code_commit()
+    if not _valid_clean_commit(code_commit):
+        logger.error("manifest abandonment requires a clean 40-character git commit")
+        return 2
+    state = BackfillStateStore()
+    try:
+        plan = state.plan_manifest_abandonment(
+            args.manifest_id,
+            reason=args.reason,
+            code_commit=code_commit,
+        )
+    except (
+        ManifestAbandonmentConflictError,
+        UnknownManifestError,
+        ValueError,
+    ) as exc:
+        logger.error(f"cannot plan manifest abandonment: {exc}")
+        return 2
+
+    if not args.apply:
+        _print_json(
+            {
+                "status": "dry_run",
+                "apply_required": True,
+                "plan": plan.model_dump(mode="json"),
+            }
+        )
+        return 0
+    if args.plan_id is None:
+        logger.error("--apply requires the exact --plan-id from dry-run")
+        return 2
+    if args.plan_id != plan.plan_id:
+        logger.error(
+            "manifest abandonment plan-id mismatch; rerun dry-run and inspect changes"
+        )
+        return 2
+    try:
+        status = state.apply_manifest_abandonment(plan)
+    except (
+        ManifestAbandonmentConflictError,
+        StaleManifestAbandonmentError,
+        UnknownManifestError,
+    ) as exc:
+        logger.error(f"cannot apply manifest abandonment: {exc}")
+        return 2
+    _print_json(
+        {
+            "status": "abandoned",
+            "plan": plan.model_dump(mode="json"),
+            "manifest": status.model_dump(mode="json"),
+        }
+    )
+    return 0
 
 
 def cmd_backfill_status(args: argparse.Namespace) -> int:
@@ -3538,6 +3603,33 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
 
+    backfill_abandon_p = sub.add_parser(
+        "backfill-abandon",
+        help="dry-run 后将已退役的回补 manifest 标记为可审计终态",
+    )
+    backfill_abandon_p.add_argument(
+        "--manifest-id",
+        required=True,
+        type=_parse_sha256,
+        help="64 位 manifest id",
+    )
+    backfill_abandon_p.add_argument(
+        "--reason",
+        required=True,
+        help="停止该回补任务的非空业务原因",
+    )
+    backfill_abandon_p.add_argument(
+        "--plan-id",
+        type=_parse_sha256,
+        default=None,
+        help="apply 时必须传入 dry-run 返回的精确 plan id",
+    )
+    backfill_abandon_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="按精确 plan id 写入 abandoned 终态；默认仅 dry-run",
+    )
+
     backfill_status_p = sub.add_parser(
         "backfill-status",
         help="仅从独立 SQLite 查询回补进度与 ETA",
@@ -4313,6 +4405,7 @@ def main() -> int:
         "data-backfill": cmd_data_backfill,
         "backfill-plan": cmd_backfill_plan,
         "backfill-run": cmd_backfill_run,
+        "backfill-abandon": cmd_backfill_abandon,
         "backfill-status": cmd_backfill_status,
         "suspension-backfill": cmd_suspension_backfill,
         "security-status-backfill": cmd_security_status_backfill,

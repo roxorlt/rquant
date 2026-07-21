@@ -16,7 +16,13 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 BackfillTaskStatus: TypeAlias = Literal["pending", "running", "succeeded", "failed"]
-BackfillManifestStatusValue: TypeAlias = Literal["pending", "running", "completed", "failed"]
+BackfillManifestStatusValue: TypeAlias = Literal[
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "abandoned",
+]
 JsonObject: TypeAlias = dict[str, JsonValue]
 
 
@@ -34,6 +40,18 @@ class UnknownTaskError(LookupError):
 
 class StaleTaskClaimError(RuntimeError):
     """A worker tried to finish a task through an expired or replaced claim."""
+
+
+class ManifestAbandonedError(RuntimeError):
+    """A worker tried to execute an intentionally abandoned manifest."""
+
+
+class ManifestAbandonmentConflictError(RuntimeError):
+    """A manifest cannot be abandoned in its current state."""
+
+
+class StaleManifestAbandonmentError(RuntimeError):
+    """The manifest changed after its abandonment plan was prepared."""
 
 
 def _utc_now() -> datetime:
@@ -168,6 +186,41 @@ class BackfillTaskFailureSummary(BackfillStateModel):
     failure: BackfillFailure
 
 
+class BackfillManifestTermination(BackfillStateModel):
+    reason: str = Field(min_length=1)
+    code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    terminated_at: datetime
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("terminated_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime) -> datetime:
+        return _normalize_time(value)
+
+
+class BackfillManifestAbandonmentPlan(BackfillStateModel):
+    action_id: Literal["backfill-manifest-abandon/v1"] = (
+        "backfill-manifest-abandon/v1"
+    )
+    manifest_id: str = Field(min_length=1)
+    manifest_content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_updated_at: datetime
+    status_before: Literal["pending", "running", "failed"]
+    task_count: int = Field(ge=0)
+    pending: int = Field(ge=0)
+    running: int = Field(ge=0)
+    succeeded: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    reason: str = Field(min_length=1)
+    code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    plan_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("manifest_updated_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime) -> datetime:
+        return _normalize_time(value)
+
+
 class BackfillManifestStatus(BackfillStateModel):
     manifest_id: str
     status: BackfillManifestStatusValue
@@ -186,6 +239,7 @@ class BackfillManifestStatus(BackfillStateModel):
     covered_sessions: int
     allowed_missing_sessions: int
     failures: tuple[BackfillTaskFailureSummary, ...]
+    termination: BackfillManifestTermination | None = None
 
 
 class BackfillWorkloadTelemetry(BackfillStateModel):
@@ -314,6 +368,25 @@ class BackfillStateStore:
                 )
                 """
             )
+            manifest_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(backfill_manifest)"
+                ).fetchall()
+            }
+            manifest_additions = {
+                "terminal_status": "TEXT",
+                "termination_reason": "TEXT",
+                "terminated_at": "TEXT",
+                "terminated_by_commit": "TEXT",
+                "termination_plan_id": "TEXT",
+            }
+            for column_name, column_type in manifest_additions.items():
+                if column_name not in manifest_columns:
+                    connection.execute(
+                        f"ALTER TABLE backfill_manifest "
+                        f"ADD COLUMN {column_name} {column_type}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS backfill_task (
@@ -562,6 +635,22 @@ class BackfillStateStore:
             raise UnknownManifestError(f"unknown backfill manifest {manifest_id!r}")
 
     @staticmethod
+    def _require_manifest_active(
+        connection: sqlite3.Connection,
+        manifest_id: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT terminal_status FROM backfill_manifest WHERE manifest_id = ?",
+            (manifest_id,),
+        ).fetchone()
+        if row is None:
+            raise UnknownManifestError(f"unknown backfill manifest {manifest_id!r}")
+        if row["terminal_status"] == "abandoned":
+            raise ManifestAbandonedError(
+                f"backfill manifest {manifest_id!r} was abandoned"
+            )
+
+    @staticmethod
     def _failure_from_json(value: str | None) -> BackfillFailure | None:
         if value is None:
             return None
@@ -612,7 +701,7 @@ class BackfillStateStore:
         claimed_at = _normalize_time(now or _utc_now())
         lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
         with self._write_transaction() as connection:
-            self._require_manifest(connection, manifest_id)
+            self._require_manifest_active(connection, manifest_id)
             candidate: sqlite3.Row | None = None
             recovery_only = False
             while True:
@@ -969,7 +1058,9 @@ class BackfillStateStore:
         try:
             manifest = connection.execute(
                 """
-                SELECT ewma_duration_seconds
+                SELECT content_hash, updated_at, ewma_duration_seconds,
+                       terminal_status, termination_reason, terminated_at,
+                       terminated_by_commit, termination_plan_id
                 FROM backfill_manifest
                 WHERE manifest_id = ?
                 """,
@@ -1026,7 +1117,17 @@ class BackfillStateStore:
                     retryable_failed += 1
 
         task_count = len(task_rows)
-        if counts["succeeded"] == task_count:
+        termination = None
+        if manifest["terminal_status"] == "abandoned":
+            status_value: BackfillManifestStatusValue = "abandoned"
+            terminal = True
+            termination = BackfillManifestTermination(
+                reason=manifest["termination_reason"],
+                code_commit=manifest["terminated_by_commit"],
+                terminated_at=_decode_time(manifest["terminated_at"]),
+                plan_id=manifest["termination_plan_id"],
+            )
+        elif counts["succeeded"] == task_count:
             status_value: BackfillManifestStatusValue = "completed"
             terminal = True
         elif counts["pending"] == 0 and counts["running"] == 0:
@@ -1041,7 +1142,7 @@ class BackfillStateStore:
 
         remaining = counts["pending"] + counts["running"] + retryable_failed
         ewma = manifest["ewma_duration_seconds"]
-        eta = None if ewma is None else float(ewma) * remaining
+        eta = None if ewma is None or terminal else float(ewma) * remaining
         return BackfillManifestStatus(
             manifest_id=manifest_id,
             status=status_value,
@@ -1060,7 +1161,155 @@ class BackfillStateStore:
             covered_sessions=metric_totals["covered_sessions"],
             allowed_missing_sessions=metric_totals["allowed_missing_sessions"],
             failures=tuple(failures),
+            termination=termination,
         )
+
+    @staticmethod
+    def _abandonment_plan_id(
+        plan: BackfillManifestAbandonmentPlan,
+    ) -> str:
+        payload = plan.model_dump(mode="json", exclude={"plan_id"})
+        return hashlib.sha256(_json_dumps(payload).encode("utf-8")).hexdigest()
+
+    def plan_manifest_abandonment(
+        self,
+        manifest_id: str,
+        *,
+        reason: str,
+        code_commit: str,
+    ) -> BackfillManifestAbandonmentPlan:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("manifest abandonment reason must not be blank")
+        status = self.get_manifest_status(manifest_id)
+        if status.terminal:
+            raise ManifestAbandonmentConflictError(
+                f"manifest {manifest_id!r} is already terminal: {status.status}"
+            )
+        if status.running:
+            raise ManifestAbandonmentConflictError(
+                f"manifest {manifest_id!r} has {status.running} running task(s)"
+            )
+        connection = self._connect()
+        try:
+            manifest = connection.execute(
+                """
+                SELECT content_hash, updated_at
+                FROM backfill_manifest
+                WHERE manifest_id = ?
+                """,
+                (manifest_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if manifest is None:
+            raise UnknownManifestError(f"unknown backfill manifest {manifest_id!r}")
+        draft = BackfillManifestAbandonmentPlan(
+            manifest_id=manifest_id,
+            manifest_content_hash=manifest["content_hash"],
+            manifest_updated_at=_decode_time(manifest["updated_at"]),
+            status_before=status.status,
+            task_count=status.task_count,
+            pending=status.pending,
+            running=status.running,
+            succeeded=status.succeeded,
+            failed=status.failed,
+            reason=normalized_reason,
+            code_commit=code_commit.strip(),
+            plan_id="0" * 64,
+        )
+        return draft.model_copy(
+            update={"plan_id": self._abandonment_plan_id(draft)}
+        )
+
+    def apply_manifest_abandonment(
+        self,
+        plan: BackfillManifestAbandonmentPlan,
+        *,
+        now: datetime | None = None,
+    ) -> BackfillManifestStatus:
+        expected_plan_id = self._abandonment_plan_id(plan)
+        if plan.plan_id != expected_plan_id:
+            raise StaleManifestAbandonmentError(
+                f"manifest {plan.manifest_id!r} abandonment plan hash is invalid"
+            )
+        terminated_at = _normalize_time(now or _utc_now())
+        with self._write_transaction() as connection:
+            manifest = connection.execute(
+                """
+                SELECT content_hash, updated_at, terminal_status
+                FROM backfill_manifest
+                WHERE manifest_id = ?
+                """,
+                (plan.manifest_id,),
+            ).fetchone()
+            if manifest is None:
+                raise UnknownManifestError(
+                    f"unknown backfill manifest {plan.manifest_id!r}"
+                )
+            counts = {
+                row["status"]: int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM backfill_task
+                    WHERE manifest_id = ?
+                    GROUP BY status
+                    """,
+                    (plan.manifest_id,),
+                ).fetchall()
+            }
+            current_counts = {
+                status: counts.get(status, 0)
+                for status in ("pending", "running", "succeeded", "failed")
+            }
+            expected_counts = {
+                "pending": plan.pending,
+                "running": plan.running,
+                "succeeded": plan.succeeded,
+                "failed": plan.failed,
+            }
+            if current_counts["running"]:
+                raise ManifestAbandonmentConflictError(
+                    f"manifest {plan.manifest_id!r} has running task(s)"
+                )
+            if (
+                manifest["terminal_status"] is not None
+                or manifest["content_hash"] != plan.manifest_content_hash
+                or _decode_time(manifest["updated_at"])
+                != plan.manifest_updated_at
+                or current_counts != expected_counts
+            ):
+                raise StaleManifestAbandonmentError(
+                    f"manifest {plan.manifest_id!r} changed after abandonment plan"
+                )
+            connection.execute(
+                """
+                UPDATE backfill_manifest
+                SET terminal_status = 'abandoned', termination_reason = ?,
+                    terminated_at = ?, terminated_by_commit = ?,
+                    termination_plan_id = ?, updated_at = ?
+                WHERE manifest_id = ?
+                  AND terminal_status IS NULL
+                  AND content_hash = ?
+                  AND updated_at = ?
+                """,
+                (
+                    plan.reason,
+                    _encode_time(terminated_at),
+                    plan.code_commit,
+                    plan.plan_id,
+                    _encode_time(terminated_at),
+                    plan.manifest_id,
+                    plan.manifest_content_hash,
+                    _encode_time(plan.manifest_updated_at),
+                ),
+            )
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise StaleManifestAbandonmentError(
+                    f"manifest {plan.manifest_id!r} changed during abandonment"
+                )
+        return self.get_manifest_status(plan.manifest_id)
 
     def get_workload_telemetry(
         self,

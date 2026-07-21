@@ -80,6 +80,132 @@ def test_manifest_tasks_and_eligibility_persist_atomically_and_idempotently(
     assert store.get_manifest_status(manifest.manifest_id).task_count == 2
 
 
+def test_abandon_manifest_is_terminal_preserves_progress_and_blocks_claims(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import (
+        BackfillStateStore,
+        BackfillTaskMetrics,
+        ManifestAbandonedError,
+    )
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    store.persist_manifest(_manifest(task_count=3))
+    now = datetime(2026, 7, 22, 1, 0, tzinfo=UTC)
+    claim = store.claim_task(
+        "manifest-1",
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert claim is not None
+    store.mark_task_succeeded(
+        claim,
+        duration_seconds=3.0,
+        metrics=BackfillTaskMetrics(
+            request_count=1,
+            returned_rows=241,
+            written_rows=241,
+            covered_sessions=1,
+        ),
+        now=now + timedelta(seconds=3),
+    )
+
+    plan = store.plan_manifest_abandonment(
+        "manifest-1",
+        reason="independent auction entry was retired",
+        code_commit="a" * 40,
+    )
+    status = store.apply_manifest_abandonment(
+        plan,
+        now=now + timedelta(seconds=4),
+    )
+
+    assert status.status == "abandoned"
+    assert status.terminal is True
+    assert status.succeeded == 1
+    assert status.pending == 2
+    assert status.request_count == 1
+    assert status.returned_rows == 241
+    assert status.written_rows == 241
+    assert status.covered_sessions == 1
+    assert status.termination is not None
+    assert status.termination.reason == "independent auction entry was retired"
+    assert status.termination.code_commit == "a" * 40
+    with pytest.raises(ManifestAbandonedError, match="manifest-1"):
+        store.claim_task(
+            "manifest-1",
+            worker_id="worker-b",
+            lease_seconds=60,
+            now=now + timedelta(seconds=5),
+        )
+
+
+def test_abandon_manifest_rejects_active_claim(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import (
+        BackfillStateStore,
+        ManifestAbandonmentConflictError,
+    )
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    store.persist_manifest(_manifest(task_count=2))
+    now = datetime(2026, 7, 22, 1, 0, tzinfo=UTC)
+    claim = store.claim_task(
+        "manifest-1",
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert claim is not None
+
+    with pytest.raises(ManifestAbandonmentConflictError, match="running task"):
+        store.plan_manifest_abandonment(
+            "manifest-1",
+            reason="strategy retired",
+            code_commit="a" * 40,
+        )
+
+
+def test_abandon_manifest_apply_rejects_stale_plan(
+    tmp_path: Path,
+) -> None:
+    from rquant.backfill_state import (
+        BackfillStateStore,
+        BackfillTaskMetrics,
+        StaleManifestAbandonmentError,
+    )
+
+    store = BackfillStateStore(tmp_path / "backfill.sqlite3")
+    store.persist_manifest(_manifest(task_count=2))
+    now = datetime(2026, 7, 22, 1, 0, tzinfo=UTC)
+    plan = store.plan_manifest_abandonment(
+        "manifest-1",
+        reason="strategy retired",
+        code_commit="a" * 40,
+    )
+    claim = store.claim_task(
+        "manifest-1",
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert claim is not None
+    store.mark_task_succeeded(
+        claim,
+        duration_seconds=1.0,
+        metrics=BackfillTaskMetrics(written_rows=241),
+        now=now + timedelta(seconds=1),
+    )
+
+    with pytest.raises(StaleManifestAbandonmentError, match="changed"):
+        store.apply_manifest_abandonment(
+            plan,
+            now=now + timedelta(seconds=2),
+        )
+
+
 def test_load_manifest_rejects_tampered_task_content(
     tmp_path: Path,
 ) -> None:
