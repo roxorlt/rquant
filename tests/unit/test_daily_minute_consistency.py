@@ -24,6 +24,7 @@ class _CountingConnection:
         self._connection = connection
         self.overlap_aggregate_queries = 0
         self.session_aggregate_queries = 0
+        self.session_sample_queries = 0
         self.executed_queries: list[str] = []
 
     def execute(
@@ -34,8 +35,10 @@ class _CountingConnection:
         self.executed_queries.append(query)
         if "distinct_payload_count" in query and "struct_pack" in query:
             self.overlap_aggregate_queries += 1
-        if "AS actual_times" in query:
+        if "session_shape AS" in query and "AS actual_count" in query:
             self.session_aggregate_queries += 1
+        if "sampled_sessions" in query and "AS actual_time" in query:
+            self.session_sample_queries += 1
         if parameters is None:
             return self._connection.execute(query)
         return self._connection.execute(query, parameters)
@@ -958,6 +961,56 @@ def test_overlap_normalizes_mixed_timestamp_semantics_to_same_logical_bar(
     assert all(item.rule_id != "cross-source-conflicting-overlap" for item in report.findings)
 
 
+def test_overlap_normalization_keeps_cross_midnight_logical_bar_together(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "cross-midnight-overlap.duckdb"
+    first_date = date(2026, 6, 25)
+    second_date = date(2026, 6, 26)
+    start_feed = _single_minute_spec(require_full_session=False)
+    end_feed = _single_minute_spec(
+        source="end_feed",
+        timestamp_semantics="bar_end",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_minute_row(
+            store,
+            ts_code="600000.SH",
+            trade_time=datetime.combine(first_date, time(23, 59)),
+            source=start_feed.source,
+        )
+        _insert_minute_row(
+            store,
+            ts_code="600000.SH",
+            trade_time=datetime.combine(second_date, time(0, 0)),
+            source=end_feed.source,
+        )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=first_date,
+        end=second_date,
+        specs=(start_feed, end_feed),
+    )
+
+    exact = next(item for item in report.findings if item.rule_id == "cross-source-exact-overlap")
+    assert exact.evidence == {
+        "count": 1,
+        "samples": [
+            {
+                "ts_code": "600000.SH",
+                "trade_time": "2026-06-25T23:59:00",
+                "freq": "1min",
+                "sources": ["end_feed", "feed"],
+                "distinct_payload_count": 1,
+            }
+        ],
+    }
+
+
 def test_overlap_normalization_does_not_merge_adjacent_logical_bars(
     tmp_path: Path,
 ) -> None:
@@ -1146,9 +1199,63 @@ def test_overlap_and_full_session_rules_share_one_aggregate_query_per_store(
 
     assert counter.overlap_aggregate_queries == 1
     assert counter.session_aggregate_queries == 1
-    session_query = next(query for query in counter.executed_queries if "AS actual_times" in query)
-    assert "actual_times IS DISTINCT FROM expected_times" in session_query
+    assert counter.session_sample_queries == 0
+    session_query = next(query for query in counter.executed_queries if "session_shape AS" in query)
+    assert "list(" not in session_query
+    assert "DISTINCT strftime" not in session_query
+    assert "actual_count <> expected_count" in session_query
+    assert "extra_count > 0" in session_query
     assert "WHERE sample_rank <= ?" in session_query
+
+
+def test_overlap_audit_scans_each_populated_trade_date_independently(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "partitioned-overlap.duckdb"
+    first_date = date(2026, 6, 25)
+    second_date = date(2026, 6, 26)
+    primary = _single_minute_spec(require_full_session=False)
+    secondary = _single_minute_spec(
+        source="secondary",
+        authoritative=False,
+        required_for_daily_coverage=False,
+        require_full_session=False,
+    )
+    with DuckDBStore(database_path) as store:
+        for trade_date in (first_date, second_date):
+            _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+            for source in (primary.source, secondary.source):
+                _insert_minutes(
+                    store,
+                    ts_code="600000.SH",
+                    trade_date=trade_date,
+                    source=source,
+                    times=(time(9, 30),),
+                )
+
+    rules = daily_minute_consistency_audit_rules(
+        first_date,
+        second_date,
+        source_specs=(primary, secondary),
+        sample_limit=1,
+    )
+    with DuckDBStore(database_path, read_only=True) as store:
+        counter = _CountingConnection(store._conn)  # noqa: SLF001
+        store._conn = cast(duckdb.DuckDBPyConnection, counter)  # noqa: SLF001
+        report = run_audit(
+            store,
+            rules,
+            observed_at=datetime(2026, 7, 14, tzinfo=UTC),
+        )
+
+    exact = next(
+        item for item in report.findings if item.rule_id == "cross-source-exact-overlap"
+    )
+    assert counter.overlap_aggregate_queries == 2
+    assert exact.evidence["count"] == 2
+    assert [sample["trade_time"] for sample in exact.evidence["samples"]] == [
+        "2026-06-25T09:30:00",
+    ]
 
 
 def test_full_session_query_returns_bounded_mismatches_and_total_count(
@@ -1203,6 +1310,7 @@ def test_full_session_query_returns_bounded_mismatches_and_total_count(
         item for item in report.findings if item.rule_id == "incomplete-authoritative-session"
     )
     assert counter.session_aggregate_queries == 1
+    assert counter.session_sample_queries == 1
     assert finding.evidence == {
         "count": 4,
         "expected_count": 2,
@@ -1231,6 +1339,88 @@ def test_full_session_query_returns_bounded_mismatches_and_total_count(
             },
         ],
     }
+
+
+def test_full_session_detects_missing_and_extra_times_when_count_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "equal-count-session-mismatch.duckdb"
+    trade_date = date(2026, 6, 26)
+    spec = MinuteSourceSessionSpec(
+        source="feed",
+        freq="1min",
+        timestamp_semantics="bar_start",
+        windows=(MinuteSessionWindow(start=time(9, 30), end=time(9, 31), step_minutes=1),),
+        authoritative=True,
+        required_for_daily_coverage=True,
+        require_full_session=True,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+        _insert_minutes(
+            store,
+            ts_code="600000.SH",
+            trade_date=trade_date,
+            source=spec.source,
+            times=(time(9, 30), time(9, 32)),
+        )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(spec,),
+    )
+
+    finding = next(
+        item for item in report.findings if item.rule_id == "incomplete-authoritative-session"
+    )
+    assert finding.evidence["count"] == 1
+    assert finding.evidence["samples"][0]["missing_times"] == ["09:31"]
+    assert finding.evidence["samples"][0]["extra_times"] == ["09:32"]
+
+
+def test_full_session_preserves_subsecond_duplicate_as_extra_evidence(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "subsecond-session-duplicate.duckdb"
+    trade_date = date(2026, 6, 26)
+    spec = MinuteSourceSessionSpec(
+        source="feed",
+        freq="1min",
+        timestamp_semantics="bar_start",
+        windows=(MinuteSessionWindow(start=time(9, 30), end=time(9, 31), step_minutes=1),),
+        authoritative=True,
+        required_for_daily_coverage=True,
+        require_full_session=True,
+    )
+    with DuckDBStore(database_path) as store:
+        _insert_eligible_daily(store, ts_code="600000.SH", trade_date=trade_date)
+        _insert_minute_row(
+            store,
+            ts_code="600000.SH",
+            trade_time=datetime.combine(trade_date, time(9, 30)),
+            source=spec.source,
+        )
+        _insert_minute_row(
+            store,
+            ts_code="600000.SH",
+            trade_time=datetime.combine(trade_date, time(9, 30, 0, 500_000)),
+            source=spec.source,
+        )
+
+    report = _run_consistency_audit(
+        database_path,
+        start=trade_date,
+        end=trade_date,
+        specs=(spec,),
+    )
+
+    finding = next(
+        item for item in report.findings if item.rule_id == "incomplete-authoritative-session"
+    )
+    assert finding.evidence["samples"][0]["missing_times"] == ["09:31"]
+    assert finding.evidence["samples"][0]["extra_times"] == ["09:30:00.500000"]
 
 
 def test_all_minute_range_scans_use_raw_half_open_timestamps(
