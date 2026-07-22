@@ -1145,6 +1145,7 @@ def daily_minute_consistency_audit_rules(
             _minute_frequency_minutes(spec.freq),
         )
     ]
+    max_overlap_bar_minutes = max(_minute_frequency_minutes(spec.freq) for spec in specs)
 
     def load_overlap_summaries(
         store: DuckDBStore,
@@ -1152,14 +1153,14 @@ def daily_minute_consistency_audit_rules(
         nonlocal overlap_cache_store, overlap_cache
         if overlap_cache_store is store:
             return overlap_cache
-        rows = store._conn.execute(  # noqa: SLF001
+        populated_dates = store._conn.execute(  # noqa: SLF001
             f"""
             WITH declared(source, freq, timestamp_semantics, bar_minutes) AS (
                 VALUES {overlap_declared_values}
-            ),
-            normalized_rows AS (
+            )
+            SELECT DISTINCT CAST(logical_bar_start AS DATE) AS trade_date
+            FROM (
                 SELECT
-                    m.*,
                     CASE
                         WHEN d.timestamp_semantics = 'bar_end'
                             THEN m.trade_time - d.bar_minutes * INTERVAL 1 MINUTE
@@ -1171,98 +1172,155 @@ def daily_minute_consistency_audit_rules(
                  AND d.freq = m.freq
                 WHERE m.trade_time >= ?
                   AND m.trade_time < ?
-            ),
-            overlap_rows AS (
-                SELECT
-                    m.ts_code,
-                    m.logical_bar_start AS trade_time,
-                    m.freq,
-                    list(DISTINCT m.source ORDER BY m.source) AS sources,
-                    count(DISTINCT struct_pack(
-                        open_value := m.open,
-                        high_value := m.high,
-                        low_value := m.low,
-                        close_value := m.close,
-                        vol_value := m.vol,
-                        amount_value := m.amount
-                    )) AS distinct_payload_count
-                FROM normalized_rows AS m
-                GROUP BY m.ts_code, m.logical_bar_start, m.freq
-                HAVING count(DISTINCT m.source) > 1
-            ),
-            classified AS (
-                SELECT
-                    *,
-                    CASE
-                        WHEN distinct_payload_count = 1 THEN 'exact'
-                        ELSE 'conflict'
-                    END AS category
-                FROM overlap_rows
-            ),
-            ranked AS (
-                SELECT
-                    *,
-                    count(*) OVER (
-                        PARTITION BY category
-                    ) AS finding_count,
-                    row_number() OVER (
-                        PARTITION BY category
-                        ORDER BY trade_time, ts_code, freq
-                    ) AS sample_rank
-                FROM classified
+            ) AS normalized_rows
+            ORDER BY trade_date
+            """,
+            [*overlap_declared_parameters, range_start, range_end],
+        ).fetchall()
+        finding_counts: dict[Literal["exact", "conflict"], int] = {
+            "exact": 0,
+            "conflict": 0,
+        }
+        samples_by_category: dict[
+            Literal["exact", "conflict"],
+            list[MinuteOverlapSample],
+        ] = {
+            "exact": [],
+            "conflict": [],
+        }
+        for (trade_date_value,) in populated_dates:
+            day_start = datetime.combine(trade_date_value, time.min)
+            day_end = day_start + timedelta(days=1)
+            raw_start = max(range_start, day_start)
+            raw_end = min(
+                range_end,
+                day_end + timedelta(minutes=max_overlap_bar_minutes),
             )
-            SELECT
+            rows = store._conn.execute(  # noqa: SLF001
+                f"""
+                WITH declared(source, freq, timestamp_semantics, bar_minutes) AS (
+                    VALUES {overlap_declared_values}
+                ),
+                normalized_rows AS (
+                    SELECT
+                        m.*,
+                        CASE
+                            WHEN d.timestamp_semantics = 'bar_end'
+                                THEN m.trade_time - d.bar_minutes * INTERVAL 1 MINUTE
+                            ELSE m.trade_time
+                        END AS logical_bar_start
+                    FROM minute_bar AS m
+                    JOIN declared AS d
+                      ON d.source = m.source
+                     AND d.freq = m.freq
+                    WHERE m.trade_time >= ?
+                      AND m.trade_time < ?
+                      AND CASE
+                            WHEN d.timestamp_semantics = 'bar_end'
+                                THEN m.trade_time - d.bar_minutes * INTERVAL 1 MINUTE
+                            ELSE m.trade_time
+                          END >= ?
+                      AND CASE
+                            WHEN d.timestamp_semantics = 'bar_end'
+                                THEN m.trade_time - d.bar_minutes * INTERVAL 1 MINUTE
+                            ELSE m.trade_time
+                          END < ?
+                ),
+                overlap_rows AS (
+                    SELECT
+                        m.ts_code,
+                        m.logical_bar_start AS trade_time,
+                        m.freq,
+                        list(DISTINCT m.source ORDER BY m.source) AS sources,
+                        count(DISTINCT struct_pack(
+                            open_value := m.open,
+                            high_value := m.high,
+                            low_value := m.low,
+                            close_value := m.close,
+                            vol_value := m.vol,
+                            amount_value := m.amount
+                        )) AS distinct_payload_count
+                    FROM normalized_rows AS m
+                    GROUP BY m.ts_code, m.logical_bar_start, m.freq
+                    HAVING count(DISTINCT m.source) > 1
+                ),
+                classified AS (
+                    SELECT
+                        *,
+                        CASE
+                            WHEN distinct_payload_count = 1 THEN 'exact'
+                            ELSE 'conflict'
+                        END AS category
+                    FROM overlap_rows
+                ),
+                ranked AS (
+                    SELECT
+                        *,
+                        count(*) OVER (
+                            PARTITION BY category
+                        ) AS finding_count,
+                        row_number() OVER (
+                            PARTITION BY category
+                            ORDER BY trade_time, ts_code, freq
+                        ) AS sample_rank
+                    FROM classified
+                )
+                SELECT
+                    category,
+                    ts_code,
+                    trade_time,
+                    freq,
+                    sources,
+                    distinct_payload_count,
+                    finding_count
+                FROM ranked
+                WHERE sample_rank <= ?
+                ORDER BY category, trade_time, ts_code, freq
+                """,
+                [
+                    *overlap_declared_parameters,
+                    raw_start,
+                    raw_end,
+                    day_start,
+                    day_end,
+                    sample_limit,
+                ],
+            ).fetchall()
+            counted_categories: set[str] = set()
+            for (
                 category,
                 ts_code,
-                trade_time,
+                trade_time_value,
                 freq,
                 sources,
                 distinct_payload_count,
-                finding_count
-            FROM ranked
-            WHERE sample_rank <= ?
-            ORDER BY category, trade_time, ts_code, freq
-            """,
-            [
-                *overlap_declared_parameters,
-                range_start,
-                range_end,
-                sample_limit,
-            ],
-        ).fetchall()
-        grouped: dict[
-            Literal["exact", "conflict"],
-            tuple[int, list[MinuteOverlapSample]],
-        ] = {}
-        for (
-            category,
-            ts_code,
-            trade_time_value,
-            freq,
-            sources,
-            distinct_payload_count,
-            finding_count,
-        ) in rows:
-            if category not in grouped:
-                grouped[category] = (finding_count, [])
-            grouped[category][1].append(
-                MinuteOverlapSample(
-                    ts_code=ts_code,
-                    trade_time=trade_time_value,
-                    freq=freq,
-                    sources=tuple(sources),
-                    distinct_payload_count=distinct_payload_count,
-                )
-            )
+                finding_count,
+            ) in rows:
+                if category not in ("exact", "conflict"):
+                    raise ValueError(f"unknown overlap category: {category}")
+                if category not in counted_categories:
+                    finding_counts[category] += finding_count
+                    counted_categories.add(category)
+                category_samples = samples_by_category[category]
+                if len(category_samples) < sample_limit:
+                    category_samples.append(
+                        MinuteOverlapSample(
+                            ts_code=ts_code,
+                            trade_time=trade_time_value,
+                            freq=freq,
+                            sources=tuple(sources),
+                            distinct_payload_count=distinct_payload_count,
+                        )
+                    )
         overlap_cache_store = store
         overlap_cache = tuple(
             MinuteOverlapAuditSummary(
                 category=category,
-                finding_count=grouped[category][0],
-                samples=tuple(grouped[category][1]),
+                finding_count=finding_counts[category],
+                samples=tuple(samples_by_category[category]),
             )
             for category in ("exact", "conflict")
-            if category in grouped
+            if finding_counts[category] > 0
         )
         return overlap_cache
 
@@ -1339,25 +1397,29 @@ def daily_minute_consistency_audit_rules(
                 SELECT
                     source,
                     freq,
-                    list(expected_time ORDER BY expected_time) AS expected_times,
                     count(*) AS expected_count
                 FROM expected_grid
                 GROUP BY source, freq
             ),
-            sessions AS (
+            session_shape AS (
                 SELECT
                     m.source,
                     m.freq,
                     m.ts_code,
                     CAST(m.trade_time AS DATE) AS trade_date,
-                    list(
-                        DISTINCT strftime(m.trade_time, '%H:%M:%S')
-                        ORDER BY strftime(m.trade_time, '%H:%M:%S')
-                    ) AS actual_times
+                    count(*) AS actual_count,
+                    count(*) FILTER (
+                        WHERE grid.expected_time IS NULL
+                           OR m.trade_time <> date_trunc('second', m.trade_time)
+                    ) AS extra_count
                 FROM minute_bar AS m
                 JOIN expected_sessions AS e
                   ON e.source = m.source
                  AND e.freq = m.freq
+                LEFT JOIN expected_grid AS grid
+                  ON grid.source = m.source
+                 AND grid.freq = m.freq
+                 AND grid.expected_time = strftime(m.trade_time, '%H:%M:%S')
                 WHERE m.trade_time >= ?
                   AND m.trade_time < ?
                 GROUP BY
@@ -1372,14 +1434,15 @@ def daily_minute_consistency_audit_rules(
                     s.freq,
                     s.ts_code,
                     s.trade_date,
-                    s.actual_times,
-                    e.expected_times,
+                    s.actual_count,
+                    s.extra_count,
                     e.expected_count
-                FROM sessions AS s
+                FROM session_shape AS s
                 JOIN expected_sessions AS e
                   ON e.source = s.source
                  AND e.freq = s.freq
-                WHERE actual_times IS DISTINCT FROM expected_times
+                WHERE actual_count <> expected_count
+                   OR extra_count > 0
             ),
             ranked AS (
                 SELECT
@@ -1398,8 +1461,8 @@ def daily_minute_consistency_audit_rules(
                 freq,
                 ts_code,
                 trade_date,
-                actual_times,
-                expected_times,
+                actual_count,
+                extra_count,
                 expected_count,
                 finding_count
             FROM ranked
@@ -1413,6 +1476,76 @@ def daily_minute_consistency_audit_rules(
                 sample_limit,
             ],
         ).fetchall()
+        if not rows:
+            session_cache_store = store
+            session_cache = ()
+            return session_cache
+
+        sample_values = ", ".join("(?, ?, ?, ?)" for _row in rows)
+        sample_parameters: list[object] = [
+            value
+            for (
+                source,
+                freq,
+                ts_code,
+                trade_date_value,
+                _actual_count,
+                _extra_count,
+                _expected_count,
+                _finding_count,
+            ) in rows
+            for value in (source, freq, ts_code, trade_date_value)
+        ]
+        actual_time_rows = store._conn.execute(  # noqa: SLF001
+            f"""
+            WITH sampled_sessions(source, freq, ts_code, trade_date) AS (
+                VALUES {sample_values}
+            )
+            SELECT
+                sampled.source,
+                sampled.freq,
+                sampled.ts_code,
+                sampled.trade_date,
+                minute.trade_time AS actual_time
+            FROM sampled_sessions AS sampled
+            JOIN minute_bar AS minute
+              ON minute.source = sampled.source
+             AND minute.freq = sampled.freq
+             AND minute.ts_code = sampled.ts_code
+             AND minute.trade_time >= CAST(sampled.trade_date AS TIMESTAMP)
+             AND minute.trade_time < CAST(sampled.trade_date AS TIMESTAMP)
+                                      + INTERVAL 1 DAY
+            ORDER BY
+                sampled.source,
+                sampled.freq,
+                sampled.trade_date,
+                sampled.ts_code,
+                actual_time
+            """,
+            sample_parameters,
+        ).fetchall()
+        actual_times_by_session: dict[
+            tuple[str, str, str, date],
+            set[str],
+        ] = {
+            (source, freq, ts_code, trade_date_value): set()
+            for (
+                source,
+                freq,
+                ts_code,
+                trade_date_value,
+                _actual_count,
+                _extra_count,
+                _expected_count,
+                _finding_count,
+            ) in rows
+        }
+        for source, freq, ts_code, trade_date_value, actual_time in actual_time_rows:
+            time_value = actual_time.time()
+            timespec = "microseconds" if time_value.microsecond else "seconds"
+            actual_times_by_session[(source, freq, ts_code, trade_date_value)].add(
+                time_value.isoformat(timespec=timespec)
+            )
         grouped: dict[
             tuple[str, str],
             tuple[int, list[MinuteSessionGapSample]],
@@ -1422,14 +1555,14 @@ def daily_minute_consistency_audit_rules(
             freq,
             ts_code,
             trade_date_value,
-            actual_values,
-            expected_values,
+            _actual_count,
+            _extra_count,
             _expected_count,
             finding_count,
         ) in rows:
             spec = full_session_by_identity[(source, freq)]
-            expected = set(expected_values)
-            actual = set(actual_values)
+            expected = {value.isoformat(timespec="seconds") for value in spec.expected_times()}
+            actual = actual_times_by_session[(source, freq, ts_code, trade_date_value)]
             missing = sorted(expected - actual)
             extra = sorted(actual - expected)
             identity = (source, freq)
