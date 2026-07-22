@@ -1799,6 +1799,7 @@ def _complete_minute_sessions_from_lake(
     lake_root: Path,
     as_of_time: datetime,
     memory_only: bool = False,
+    desired_sessions: tuple[tuple[str, date], ...] | None = None,
 ) -> tuple[
     set[tuple[str, date]],
     tuple[DatasetSnapshotArtifact, ...],
@@ -1825,6 +1826,18 @@ def _complete_minute_sessions_from_lake(
         artifacts,
         lake_root=lake_root,
     )
+    selected_desired = (
+        _desired_minute_sessions(windows)
+        if desired_sessions is None
+        else tuple(
+            sorted(
+                set(desired_sessions),
+                key=lambda row: (row[1], row[0]),
+            )
+        )
+    )
+    if not selected_desired:
+        return set(), artifacts
     connect_config = {"temp_directory": ""} if memory_only else {}
     with duckdb.connect(config=connect_config) as connection:
         complete = _complete_minute_sessions_from_relation(
@@ -1832,7 +1845,7 @@ def _complete_minute_sessions_from_lake(
             relation_sql="read_parquet(?, hive_partitioning = false)",
             relation_parameters=(),
             relation_parameters_by_date=parameters_by_date,
-            desired=_desired_minute_sessions(windows),
+            desired=selected_desired,
             session_spec=session_spec,
         )
     return complete, artifacts
@@ -2066,6 +2079,7 @@ def plan_minute_backfill(
     )
     demands = _calendar_scope_demands(manifest, open_dates, civil_dates)
     windows = _merge_windows(demands, open_dates)
+    desired_sessions = _desired_minute_sessions(windows)
     complete: set[tuple[str, date]] = set()
     minute_coverage_artifacts: tuple[DatasetSnapshotArtifact, ...] = ()
     if coverage_authority in {"operational", "combined"}:
@@ -2073,11 +2087,14 @@ def plan_minute_backfill(
     if coverage_authority in {"research_lake", "combined"}:
         lake_complete, minute_coverage_artifacts = (
             _complete_minute_sessions_from_lake(
-            windows,
-            selected_spec,
-            catalog=research_catalog,
-            lake_root=research_lake_root,
-            as_of_time=coverage_as_of_time or manifest.as_of_time,
+                windows,
+                selected_spec,
+                catalog=research_catalog,
+                lake_root=research_lake_root,
+                as_of_time=coverage_as_of_time or manifest.as_of_time,
+                desired_sessions=tuple(
+                    row for row in desired_sessions if row not in complete
+                ),
             )
         )
         complete |= lake_complete

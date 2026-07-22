@@ -195,6 +195,56 @@ def test_only_exact_full_session_counts_as_covered(store: DuckDBStore) -> None:
     assert plan.coverage.entry_exit_gate_passed is False
 
 
+def test_combined_coverage_only_queries_lake_for_operational_gaps(
+    store: DuckDBStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import rquant.backfill_manifest as manifest_module
+
+    opens = _weekday_opens(date(2026, 6, 1), 10)
+    _seed_calendar(store, opens)
+    manifest = _manifest(
+        entries=[("300001.SZ", opens[5])],
+        baseline_days=2,
+        exit_days=2,
+    )
+    operational = {("300001.SZ", opens[3])}
+    captured: list[tuple[tuple[str, date], ...] | None] = []
+
+    monkeypatch.setattr(
+        manifest_module,
+        "_complete_minute_sessions",
+        lambda *_args, **_kwargs: operational,
+    )
+
+    def lake_completion(*_args, desired_sessions=None, **_kwargs):
+        captured.append(desired_sessions)
+        return {("300001.SZ", opens[4])}, ()
+
+    monkeypatch.setattr(
+        manifest_module,
+        "_complete_minute_sessions_from_lake",
+        lake_completion,
+    )
+
+    plan = manifest_module.plan_minute_backfill(
+        store,
+        manifest,
+        coverage_authority="combined",
+        research_catalog=object(),
+        research_lake_root=tmp_path,
+    )
+
+    assert captured == [
+        tuple(
+            ("300001.SZ", trade_date)
+            for trade_date in opens[4:8]
+        )
+    ]
+    assert plan.coverage.complete_unique_sessions == 2
+
+
 def test_minute_completion_uses_bounded_exact_target_aggregates(
     store: DuckDBStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -456,6 +506,73 @@ def test_research_lake_completion_reads_only_each_target_date_artifact(
         assert isinstance(paths, list)
         assert len(paths) == 1
         assert f"trade_date={trade_date.isoformat()}" in paths[0]
+
+
+def test_empty_lake_gap_preserves_artifacts_without_scanning_parquet(
+    store: DuckDBStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.backfill_manifest as manifest_module
+    from rquant.backfill_manifest import (
+        MergedBackfillWindow,
+        _complete_minute_sessions_from_lake,
+    )
+    from rquant.research_catalog import ResearchCatalog
+    from rquant.research_lake import export_research_dataset
+
+    trade_date = date(2026, 6, 1)
+    _seed_calendar(store, [trade_date])
+    spec = next(
+        value
+        for value in DEFAULT_MINUTE_SOURCE_SESSION_SPECS
+        if value.source == "tushare" and value.freq == "1min"
+    )
+    _insert_session(
+        store,
+        ts_code="300001.SZ",
+        trade_date=trade_date,
+        times=spec.expected_times(),
+    )
+    catalog = ResearchCatalog(tmp_path / "research.duckdb")
+    lake_root = tmp_path / "lake"
+    export_research_dataset(
+        store._conn,
+        catalog=catalog,
+        lake_root=lake_root,
+        dataset="minute_bar",
+        start_date=trade_date,
+        end_date=trade_date,
+        code_commit="a" * 40,
+    )
+
+    def reject_scan(*_args, **_kwargs):
+        raise AssertionError("empty lake gap must not scan parquet")
+
+    monkeypatch.setattr(
+        manifest_module,
+        "_complete_minute_sessions_from_relation",
+        reject_scan,
+    )
+    complete, artifacts = _complete_minute_sessions_from_lake(
+        (
+            MergedBackfillWindow(
+                ts_code="300001.SZ",
+                start_date=trade_date,
+                end_date=trade_date,
+                open_dates=(trade_date,),
+            ),
+        ),
+        spec,
+        catalog=catalog,
+        lake_root=lake_root,
+        as_of_time=datetime(2026, 6, 2, tzinfo=UTC),
+        memory_only=True,
+        desired_sessions=(),
+    )
+
+    assert complete == set()
+    assert len(artifacts) == 1
 
 
 def test_research_lake_authority_does_not_accept_unpublished_operational_rows(
