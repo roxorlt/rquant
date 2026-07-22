@@ -749,6 +749,152 @@ def test_growth_board_candidates_ignore_signal_day_close_and_state(
     assert after[0].limit_up_price == pytest.approx(12.48)
 
 
+def test_growth_board_candidates_only_load_previous_close_when_ma_is_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    store: DuckDBStore,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.pit_visibility import VisibilityQueryScope
+
+    _seed_base_market(store)
+    previous_date = date(2026, 6, 24)
+    daily_scopes: list[tuple[date | None, date | None]] = []
+    original_query = growth.query_visible_rows
+
+    def track_visible_rows(
+        target: DuckDBStore,
+        dataset_id: str,
+        as_of_time: datetime,
+        *,
+        scope: VisibilityQueryScope | None = None,
+    ) -> pd.DataFrame:
+        if dataset_id == "daily_bar":
+            assert scope is not None
+            daily_scopes.append((scope.start_date, scope.end_date))
+        return original_query(
+            target,
+            dataset_id,
+            as_of_time,
+            scope=scope,
+        )
+
+    monkeypatch.setattr(growth, "query_visible_rows", track_visible_rows)
+
+    candidates = growth.resolve_growth_board_candidates(
+        store,
+        date(2026, 6, 25),
+        previous_date,
+        time(9, 30),
+    )
+
+    assert [candidate.ts_code for candidate in candidates] == ["300001.SZ"]
+    assert daily_scopes == [(previous_date, previous_date)]
+
+
+def test_growth_board_candidates_fall_back_to_daily_history_when_ma_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    store: DuckDBStore,
+) -> None:
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.pit_visibility import VisibilityQueryScope
+
+    dates = [date(2026, 1, 1) + timedelta(days=index) for index in range(61)]
+    previous_date = dates[-2]
+    signal_date = dates[-1]
+    _seed_open_calendar(store, dates)
+    store.upsert_daily(
+        pd.DataFrame(
+            [
+                _daily_row("300001.SZ", trade_date, 10.0 + index * 0.1)
+                for index, trade_date in enumerate(dates[:-1])
+            ]
+            + [
+                _daily_row("301001.SZ", trade_date, 20.0 + index * 0.1)
+                for index, trade_date in enumerate(dates[:-1])
+            ]
+        )
+    )
+    store.upsert_stock_basic(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "symbol": "300001",
+                    "name": "均线回退样本",
+                    "area": "深圳",
+                    "industry": "测试",
+                    "list_date": "20200101",
+                    "market": "创业板",
+                },
+                {
+                    "ts_code": "301001.SZ",
+                    "symbol": "301001",
+                    "name": "完整均线样本",
+                    "area": "深圳",
+                    "industry": "测试",
+                    "list_date": "20200101",
+                    "market": "创业板",
+                },
+            ]
+        )
+    )
+    store.upsert_stock_status(
+        (
+            _known_status("300001.SZ", signal_date, name="均线回退样本"),
+            _known_status("301001.SZ", signal_date, name="完整均线样本"),
+        )
+    )
+    store.upsert_indicators(
+        pd.DataFrame([_indicator_row("301001.SZ", previous_date, bull=True)])
+    )
+    daily_scopes: list[
+        tuple[tuple[str, ...], date | None, date | None]
+    ] = []
+    original_query = growth.query_visible_rows
+
+    def track_visible_rows(
+        target: DuckDBStore,
+        dataset_id: str,
+        as_of_time: datetime,
+        *,
+        scope: VisibilityQueryScope | None = None,
+    ) -> pd.DataFrame:
+        if dataset_id == "daily_bar":
+            assert scope is not None
+            daily_scopes.append(
+                (scope.ts_codes, scope.start_date, scope.end_date)
+            )
+        return original_query(
+            target,
+            dataset_id,
+            as_of_time,
+            scope=scope,
+        )
+
+    monkeypatch.setattr(growth, "query_visible_rows", track_visible_rows)
+
+    candidates = growth.resolve_growth_board_candidates(
+        store,
+        signal_date,
+        previous_date,
+        time(9, 30),
+        structural_excluded_codes=set(),
+    )
+
+    assert [candidate.ts_code for candidate in candidates] == [
+        "300001.SZ",
+        "301001.SZ",
+    ]
+    assert daily_scopes == [
+        (
+            ("300001.SZ", "301001.SZ"),
+            previous_date,
+            previous_date,
+        ),
+        (("300001.SZ",), dates[0], previous_date),
+    ]
+
+
 def test_growth_board_candidates_fail_closed_when_bound_keys_disagree(
     store: DuckDBStore,
 ) -> None:
