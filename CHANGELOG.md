@@ -6,6 +6,11 @@
 
 ### Added
 
+- **工作负载解耦与故障隔离目标架构**：补充数据采集、权威发布、实时特征、策略 runner、
+  信号路由、通知、模拟盘、研究 worker 和页面 serving 的单写者边界；明确不可变批次、
+  持久任务账本、systemd 资源隔离、混合云端/Mac worker、故障演练和渐进迁移顺序，作为
+  v0.27-v0.31 可信策略路线的运行时约束。
+
 - **策略分钟回补 manifest 可审计终止**：新增 `abandoned` 终态和
   `rquant backfill-abandon`。命令默认只生成绑定 manifest 内容、任务计数、终止原因与干净
   Git commit 的 SHA256 计划；只有显式传入同一 `plan_id` 和 `--apply` 才以短事务 CAS

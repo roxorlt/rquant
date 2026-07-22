@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.11/3.12、Pydantic、pandas/numpy、DuckDB、Parquet、SQLite WAL、Tushare、Streamlit、systemd、pytest、ruff；本计划首轮不新增机器学习框架、消息队列、PostgreSQL、容器或新付费数据权限。
 
+**运行时隔离：** 数据采集、权威发布、实时特征、策略推理、信号通知、模拟盘、研究 worker 和页面 serving 的详细职责与迁移顺序，见 [rQuant 工作负载解耦与故障隔离架构设计](../architecture/2026-07-22-workload-isolation-design.md)。本计划中的 v0.27-v0.31 实现应遵守该文档的单写者和不可变发布边界。
+
 ---
 
 ## 0. 执行原则
