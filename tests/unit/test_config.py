@@ -59,6 +59,39 @@ class TestSettings:
             tmp_path / "data" / "backfill_state.sqlite3"
         )
 
+    def test_backfill_planner_resource_limits_are_configurable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        configured = Settings(
+            **_settings_values(tmp_path),
+            backfill_planner_memory_limit_mb=1_024,
+            backfill_planner_threads=3,
+        )
+
+        assert configured.backfill_planner_memory_limit_mb == 1_024
+        assert configured.backfill_planner_threads == 3
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("backfill_planner_memory_limit_mb", 255),
+            ("backfill_planner_threads", 0),
+            ("backfill_planner_threads", 5),
+        ],
+    )
+    def test_backfill_planner_rejects_unsafe_resource_limits(
+        self,
+        tmp_path: Path,
+        field: str,
+        value: int,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            Settings(
+                **_settings_values(tmp_path),
+                **{field: value},
+            )
+
     def test_backfill_state_rejects_duckdb_path(self, tmp_path: Path) -> None:
         duckdb_path = tmp_path / "data" / "rquant.duckdb"
 

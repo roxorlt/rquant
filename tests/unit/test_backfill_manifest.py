@@ -437,6 +437,54 @@ def test_growth_eligibility_uses_shared_daily_resolver_before_minute_reads(
     ]
 
 
+def test_growth_resolution_reuses_one_structural_classification(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rquant.backfill_manifest as manifest
+    import rquant.growth_board_surge_strategy as growth
+    from rquant.storage.duckdb import DuckDBStore
+
+    days = [date(2026, 6, 24), date(2026, 6, 25)]
+    classification_calls: list[dict[date, date]] = []
+
+    def classify_once(
+        _store: DuckDBStore,
+        date_pairs: dict[date, date],
+    ) -> tuple[object, ...]:
+        classification_calls.append(date_pairs)
+        return ()
+
+    monkeypatch.setattr(manifest, "classify_growth_opening_structure", classify_once)
+    monkeypatch.setattr(
+        growth,
+        "resolve_growth_board_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    with DuckDBStore(tmp_path / "growth-shared-structure.duckdb") as store:
+        _seed_open_calendar(store, days)
+        _seed_growth_input_panel(
+            store,
+            previous_date=days[0],
+            signal_date=days[1],
+        )
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date, market)
+            VALUES ('300001.SZ', DATE '2020-01-01', '创业板')
+            """
+        )
+        resolution = manifest.resolve_strategy_eligibility(
+            store,
+            strategy_id="growth_board_surge",
+            start_date=days[1],
+            end_date=days[1],
+        )
+
+    assert resolution.complete_dates == (days[1],)
+    assert classification_calls == [{days[1]: days[0]}]
+
+
 def test_daily_zero_hit_date_is_complete_eligibility_evidence(
     monkeypatch,
     tmp_path,

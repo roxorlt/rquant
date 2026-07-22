@@ -27,7 +27,10 @@ from rquant.data_quality import (
     DEFAULT_MINUTE_SOURCE_SESSION_SPECS,
     MinuteSourceSessionSpec,
 )
-from rquant.growth_eligibility import classify_growth_opening_structure
+from rquant.growth_eligibility import (
+    GrowthOpeningStructure,
+    classify_growth_opening_structure,
+)
 
 EligibilityBasis = Literal["daily", "daily+auction"]
 BackfillPhase = Literal["baseline", "entry", "exit"]
@@ -704,6 +707,7 @@ def resolve_growth_board_eligibility(
     *,
     start_date: date,
     end_date: date,
+    structural_facts: tuple[GrowthOpeningStructure, ...] | None = None,
 ) -> tuple[EligibilityRecord, ...]:
     """Resolve the broad daily growth-board universe before any minute query."""
     import rquant.growth_board_surge_strategy as growth
@@ -723,8 +727,14 @@ def resolve_growth_board_eligibility(
         if current_index == 0:
             raise ValueError("growth eligibility requires a prior open session")
         previous_by_target[trading_date] = calendar[current_index - 1]
+    resolved_structural_facts = structural_facts
+    if resolved_structural_facts is None:
+        resolved_structural_facts = classify_growth_opening_structure(
+            store,
+            previous_by_target,
+        )
     excluded_by_target: dict[date, set[str]] = {}
-    for fact in classify_growth_opening_structure(store, previous_by_target):
+    for fact in resolved_structural_facts:
         excluded_by_target.setdefault(fact.target_date, set()).add(fact.ts_code)
     records: list[EligibilityRecord] = []
     for trading_date in targets:
@@ -852,6 +862,7 @@ def _opening_panel_counts(
     requested_dates: tuple[date, ...],
     calendar: list[date],
     strategy_id: Literal["growth_board_surge", "auction_gap"],
+    growth_structure_facts: tuple[GrowthOpeningStructure, ...] | None = None,
 ) -> dict[date, tuple[int, int]]:
     previous_by_target = _previous_open_dates(requested_dates, calendar)
     if not previous_by_target:
@@ -878,10 +889,12 @@ def _opening_panel_counts(
         else ""
     )
     if strategy_id == "growth_board_surge":
-        structural_facts = classify_growth_opening_structure(
-            store,
-            previous_by_target,
-        )
+        structural_facts = growth_structure_facts
+        if structural_facts is None:
+            structural_facts = classify_growth_opening_structure(
+                store,
+                previous_by_target,
+            )
         structure_frame = pd.DataFrame(
             [
                 {
@@ -1210,6 +1223,7 @@ def _eligibility_input_complete_dates(
     strategy_id: str,
     requested_dates: tuple[date, ...],
     calendar: list[date],
+    growth_structure_facts: tuple[GrowthOpeningStructure, ...] | None = None,
 ) -> tuple[date, ...]:
     if strategy_id == "n_shape":
         return _n_shape_complete_dates(
@@ -1226,6 +1240,7 @@ def _eligibility_input_complete_dates(
             if strategy_id == "growth_board_surge"
             else "auction_gap"
         ),
+        growth_structure_facts=growth_structure_facts,
     )
     return tuple(
         target
@@ -1250,6 +1265,7 @@ def resolve_strategy_eligibility(
         required_end=end_date,
     )
     requested_dates = tuple(_target_open_dates(calendar, start_date, end_date))
+    growth_structure_facts: tuple[GrowthOpeningStructure, ...] | None = None
     if strategy_id == "n_shape":
         records = resolve_n_shape_eligibility(
             store,
@@ -1257,10 +1273,15 @@ def resolve_strategy_eligibility(
             end_date=end_date,
         )
     elif strategy_id == "growth_board_surge":
+        growth_structure_facts = classify_growth_opening_structure(
+            store,
+            _previous_open_dates(requested_dates, calendar),
+        )
         records = resolve_growth_board_eligibility(
             store,
             start_date=start_date,
             end_date=end_date,
+            structural_facts=growth_structure_facts,
         )
     else:
         records = resolve_auction_gap_eligibility(
@@ -1273,6 +1294,7 @@ def resolve_strategy_eligibility(
         strategy_id=strategy_id,
         requested_dates=requested_dates,
         calendar=calendar,
+        growth_structure_facts=growth_structure_facts,
     )
     records = tuple(
         row for row in records if row.eligibility_date in set(complete_dates)

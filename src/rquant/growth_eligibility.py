@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict
 from rquant.storage.duckdb import DuckDBStore
 from rquant.suspension_evidence import suspension_session_evidence_sql
 
+_GROWTH_STRUCTURE_BATCH_SIZE = 8
+
 
 class GrowthOpeningStructure(BaseModel):
     """One authoritative structural exclusion at the opening decision."""
@@ -39,10 +41,36 @@ class GrowthOpeningStructure(BaseModel):
 def classify_growth_opening_structure(
     store: DuckDBStore,
     date_pairs: Mapping[date, date],
+    *,
+    batch_size: int = _GROWTH_STRUCTURE_BATCH_SIZE,
 ) -> tuple[GrowthOpeningStructure, ...]:
     """Classify structural non-candidates and suspension input conflicts."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     if not date_pairs:
         return ()
+    ordered_pairs = sorted(date_pairs.items())
+    facts: list[GrowthOpeningStructure] = []
+    for start in range(0, len(ordered_pairs), batch_size):
+        facts.extend(
+            _classify_growth_opening_structure_batch(
+                store,
+                dict(ordered_pairs[start : start + batch_size]),
+            )
+        )
+    return tuple(
+        sorted(
+            facts,
+            key=lambda fact: (fact.target_date, fact.ts_code, fact.reason),
+        )
+    )
+
+
+def _classify_growth_opening_structure_batch(
+    store: DuckDBStore,
+    date_pairs: Mapping[date, date],
+) -> tuple[GrowthOpeningStructure, ...]:
+    """Classify one bounded target-date batch with unchanged PIT semantics."""
     values = ", ".join("(?, ?)" for _ in date_pairs)
     parameters = [
         value

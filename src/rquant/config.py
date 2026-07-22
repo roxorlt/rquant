@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     duckdb_readonly_path: Path | None = None
     backfill_state_path: Path | None = None
     backfill_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
+    backfill_planner_memory_limit_mb: int = Field(default=2_048, ge=256)
+    backfill_planner_threads: int = Field(default=2, ge=1, le=4)
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
