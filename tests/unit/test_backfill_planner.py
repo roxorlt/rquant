@@ -310,7 +310,7 @@ def test_minute_completion_uses_bounded_exact_target_aggregates(
         )
         if "from minute_bar" in statement.lower()
     ]
-    assert len(completion_sql) == 4
+    assert len(completion_sql) == 3
     assert all("list(" not in statement for statement, _ in completion_sql)
     assert all("values" in statement for statement, _ in completion_sql)
     assert all("minute.trade_time >= ?" in statement for statement, _ in completion_sql)
@@ -321,6 +321,7 @@ def test_minute_completion_uses_bounded_exact_target_aggregates(
     }
     assert observed_bounds == {
         (first_date, first_date + timedelta(days=1)),
+        (first_date, second_date + timedelta(days=1)),
         (second_date, second_date + timedelta(days=1)),
     }
 

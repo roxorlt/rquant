@@ -42,7 +42,7 @@ UnavailableSessionReason = Literal[
 ]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MINUTE_SESSION_AVAILABLE_AT = time(15, 10)
-_MINUTE_COMPLETION_BATCH_SIZE = 512
+_MINUTE_COMPLETION_BATCH_SIZE = 8_192
 
 if TYPE_CHECKING:
     from rquant.backfill_state import BackfillManifestInput
@@ -1641,78 +1641,108 @@ def _complete_minute_sessions_from_relation(
     )
     expected_placeholders = ", ".join("?" for _ in expected_times)
     complete: set[tuple[str, date]] = set()
+    ordered_desired = tuple(
+        sorted(set(desired), key=lambda row: (row[1], row[0]))
+    )
+
+    def collect_batch(
+        batch: tuple[tuple[str, date], ...],
+        *,
+        current_relation_parameters: tuple[object, ...],
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        target_placeholders = ", ".join("(?, ?)" for _ in batch)
+        target_parameters = [
+            value
+            for ts_code, target_date in batch
+            for value in (ts_code, target_date)
+        ]
+        rows = connection.execute(
+            f"""
+            WITH desired_sessions(ts_code, trade_date) AS (
+                VALUES {target_placeholders}
+            )
+            SELECT minute.ts_code,
+                   CAST(minute.trade_time AS DATE) AS trade_date
+            FROM {relation_sql} AS minute
+            INNER JOIN desired_sessions AS desired
+              ON desired.ts_code = minute.ts_code
+             AND desired.trade_date = CAST(minute.trade_time AS DATE)
+            WHERE minute.source = ?
+              AND minute.freq = ?
+              AND minute.trade_time >= ?
+              AND minute.trade_time < ?
+            GROUP BY minute.ts_code, CAST(minute.trade_time AS DATE)
+            HAVING COUNT(
+                       DISTINCT strftime(minute.trade_time, '%H:%M:%S')
+                   ) = ?
+               AND COUNT(
+                       DISTINCT CASE
+                           WHEN strftime(
+                               minute.trade_time,
+                               '%H:%M:%S'
+                           ) IN ({expected_placeholders})
+                           THEN strftime(minute.trade_time, '%H:%M:%S')
+                       END
+                   ) = ?
+            """,
+            [
+                *target_parameters,
+                *current_relation_parameters,
+                session_spec.source,
+                session_spec.freq,
+                start_date,
+                end_date + timedelta(days=1),
+                len(expected_times),
+                *expected_times,
+                len(expected_times),
+            ],
+        ).fetchall()
+        complete.update(
+            (str(ts_code), _as_date(trading_date))
+            for ts_code, trading_date in rows
+        )
+
+    if relation_parameters_by_date is None:
+        for offset in range(
+            0,
+            len(ordered_desired),
+            _MINUTE_COMPLETION_BATCH_SIZE,
+        ):
+            batch = ordered_desired[
+                offset : offset + _MINUTE_COMPLETION_BATCH_SIZE
+            ]
+            collect_batch(
+                batch,
+                current_relation_parameters=relation_parameters,
+                start_date=batch[0][1],
+                end_date=batch[-1][1],
+            )
+        return complete
+
     for trade_date, date_rows in groupby(
-        desired,
+        ordered_desired,
         key=lambda row: row[1],
     ):
+        current_relation_parameters = relation_parameters_by_date.get(
+            trade_date
+        )
+        if current_relation_parameters is None:
+            continue
         date_desired = tuple(date_rows)
-        if relation_parameters_by_date is None:
-            current_relation_parameters = relation_parameters
-        else:
-            current_relation_parameters = relation_parameters_by_date.get(
-                trade_date
-            )
-            if current_relation_parameters is None:
-                continue
-        next_date = trade_date + timedelta(days=1)
         for offset in range(
             0,
             len(date_desired),
             _MINUTE_COMPLETION_BATCH_SIZE,
         ):
-            batch = date_desired[
-                offset : offset + _MINUTE_COMPLETION_BATCH_SIZE
-            ]
-            target_placeholders = ", ".join("(?, ?)" for _ in batch)
-            target_parameters = [
-                value
-                for ts_code, target_date in batch
-                for value in (ts_code, target_date)
-            ]
-            rows = connection.execute(
-                f"""
-                WITH desired_sessions(ts_code, trade_date) AS (
-                    VALUES {target_placeholders}
-                )
-                SELECT minute.ts_code,
-                       CAST(minute.trade_time AS DATE) AS trade_date
-                FROM {relation_sql} AS minute
-                INNER JOIN desired_sessions AS desired
-                  ON desired.ts_code = minute.ts_code
-                 AND desired.trade_date = CAST(minute.trade_time AS DATE)
-                WHERE minute.source = ?
-                  AND minute.freq = ?
-                  AND minute.trade_time >= ?
-                  AND minute.trade_time < ?
-                GROUP BY minute.ts_code, CAST(minute.trade_time AS DATE)
-                HAVING COUNT(
-                           DISTINCT strftime(minute.trade_time, '%H:%M:%S')
-                       ) = ?
-                   AND COUNT(
-                           DISTINCT CASE
-                               WHEN strftime(
-                                   minute.trade_time,
-                                   '%H:%M:%S'
-                               ) IN ({expected_placeholders})
-                               THEN strftime(minute.trade_time, '%H:%M:%S')
-                           END
-                       ) = ?
-                """,
-                [
-                    *target_parameters,
-                    *current_relation_parameters,
-                    session_spec.source,
-                    session_spec.freq,
-                    trade_date,
-                    next_date,
-                    len(expected_times),
-                    *expected_times,
-                    len(expected_times),
+            collect_batch(
+                date_desired[
+                    offset : offset + _MINUTE_COMPLETION_BATCH_SIZE
                 ],
-            ).fetchall()
-            complete.update(
-                (str(ts_code), _as_date(trading_date))
-                for ts_code, trading_date in rows
+                current_relation_parameters=current_relation_parameters,
+                start_date=trade_date,
+                end_date=trade_date,
             )
     return complete
 
