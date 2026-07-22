@@ -367,25 +367,6 @@ def resolve_growth_board_candidates(
     if not calendar_rows:
         return []
     window_start = min(_as_date(row[0]) for row in calendar_rows)
-    daily = query_visible_rows(
-        store,
-        "daily_bar",
-        decision_at,
-        scope=VisibilityQueryScope(
-            ts_codes=codes,
-            start_date=window_start,
-            end_date=previous_date,
-            columns=("ts_code", "trade_date", "close"),
-        ),
-    )
-    if daily.empty:
-        if bound_codes:
-            raise ValueError(
-                "bound growth-board eligibility has no matching daily history"
-            )
-        return []
-    daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
-
     indicators = store._conn.execute(
         """
         SELECT ts_code, ma5, ma10, ma20, ma60
@@ -399,6 +380,56 @@ def resolve_growth_board_candidates(
         for _, row in indicators.iterrows()
         if str(row["ts_code"]) in codes
     }
+    history_fallback_codes = tuple(
+        code
+        for code in codes
+        if (
+            code not in indicator_by_code
+            or any(
+                pd.isna(indicator_by_code[code][column])
+                for column in ("ma5", "ma10", "ma20", "ma60")
+            )
+        )
+    )
+    daily = query_visible_rows(
+        store,
+        "daily_bar",
+        decision_at,
+        scope=VisibilityQueryScope(
+            ts_codes=codes,
+            start_date=previous_date,
+            end_date=previous_date,
+            columns=("ts_code", "trade_date", "close"),
+        ),
+    )
+    if daily.empty:
+        if bound_codes:
+            raise ValueError(
+                "bound growth-board eligibility has no matching daily history"
+            )
+        return []
+    if history_fallback_codes:
+        fallback_history = query_visible_rows(
+            store,
+            "daily_bar",
+            decision_at,
+            scope=VisibilityQueryScope(
+                ts_codes=history_fallback_codes,
+                start_date=window_start,
+                end_date=previous_date,
+                columns=("ts_code", "trade_date", "close"),
+            ),
+        )
+        daily = pd.concat(
+            [
+                daily[
+                    ~daily["ts_code"].astype(str).isin(history_fallback_codes)
+                ],
+                fallback_history,
+            ],
+            ignore_index=True,
+        )
+    daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
 
     placeholders = ", ".join("?" for _ in codes)
     listing = store._conn.execute(

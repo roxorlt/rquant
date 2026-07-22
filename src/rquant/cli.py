@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import FrameType, TracebackType
 from zoneinfo import ZoneInfo
 
@@ -1303,6 +1304,20 @@ def _valid_clean_commit(value: str | None) -> bool:
     return True
 
 
+def _configure_backfill_planner_resources(
+    store: DuckDBStore,
+    *,
+    memory_limit_mb: int,
+    threads: int,
+    spill_directory: Path,
+) -> None:
+    """Bound one planner connection without changing global DuckDB defaults."""
+    spill_directory.mkdir(parents=True, exist_ok=True)
+    store._conn.execute("SET memory_limit = ?", [f"{memory_limit_mb}MB"])
+    store._conn.execute("SET threads = ?", [threads])
+    store._conn.execute("SET temp_directory = ?", [str(spill_directory)])
+
+
 def cmd_backfill_plan(args: argparse.Namespace) -> int:
     """Resolve PIT eligibility, plan exact minute coverage, and persist it."""
     from rquant.backfill_manifest import (
@@ -1331,7 +1346,16 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
     spec = STRATEGY_BACKFILL_SPECS[args.strategy]
     as_of_time = datetime.now(UTC)
     catalog = ResearchCatalog(settings.research_db_path_resolved)
-    with open_readonly_store() as store:
+    with (
+        TemporaryDirectory(prefix="rquant-backfill-plan-") as spill_directory,
+        open_readonly_store() as store,
+    ):
+        _configure_backfill_planner_resources(
+            store,
+            memory_limit_mb=settings.backfill_planner_memory_limit_mb,
+            threads=settings.backfill_planner_threads,
+            spill_directory=Path(spill_directory),
+        )
         try:
             observable_end = latest_observable_eligibility_date(
                 store,

@@ -1011,6 +1011,26 @@ def test_backfill_plan_persists_immutable_plan(
     assert planned.manifest.manifest_id in capsys.readouterr().out
 
 
+def test_backfill_planner_resources_are_connection_scoped(tmp_path: Path) -> None:
+    connection = MagicMock()
+    store = SimpleNamespace(_conn=connection)
+    spill_directory = tmp_path / "spill"
+
+    cli._configure_backfill_planner_resources(
+        store,
+        memory_limit_mb=2_048,
+        threads=2,
+        spill_directory=spill_directory,
+    )
+
+    connection.execute.assert_any_call("SET memory_limit = ?", ["2048MB"])
+    connection.execute.assert_any_call("SET threads = ?", [2])
+    connection.execute.assert_any_call(
+        "SET temp_directory = ?",
+        [str(spill_directory)],
+    )
+
+
 def test_dataset_snapshot_recomputes_and_rejects_failed_coverage_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
