@@ -5,6 +5,47 @@
 
 ---
 
+## 2026-07-23 · v0.26.4 · 成长板 Stage 1 规划内存止损
+
+**状态**：PR #127 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
+`v0.26.4` 精确指向 `b68c37619a90a049b2170866a3e5e86f710857d7`。04:12 在交易保护
+窗口外通过受控发布器从 `v0.26.3` 部署，未修改 schema 或生产业务数据。
+
+**修复内容**：
+
+- 成长板开盘结构分类按目标日稳定分批，资格解析与覆盖核对复用同一份结构事实，不再重复
+  执行全范围分类。
+- `backfill-plan` 的独立 DuckDB 连接默认限制为 2048 MB、2 线程，并使用命令级临时
+  spill 目录；异常退出后自动清理。
+- 前一交易日 MA5/10/20/60 完整时，候选解析只读取当日收盘；仅为缺少任一均线的代码
+  回退读取 60 个交易日日线。混合样本测试锁定 fallback 不扫描完整均线代码。
+
+**验证**：
+
+- 本地全量 2,306 项测试全部通过；受限沙箱内先通过 2,299 项，另外 7 项端口绑定与
+  `ps` 权限测试在放宽对应本机权限后通过。Ruff 与差异检查通过。
+- GitHub Actions `test (3.11)`、`test (3.12)` 分别用时 6 分 44 秒、6 分 34 秒并通过。
+- 修复前成长板 planner 单进程约 5.9 GiB 后被内核 OOM。生产只读隔离基准运行
+  43 分 32 秒、峰值 1,901,112 KiB，未新增 OOM；随后按用户指令以 SIGTERM 终止，
+  未输出最终 planner JSON，也未写入生产 manifest。该结果只证明内存止损有效，不代表
+  Stage 1 或完整耗时验收通过。
+- 部署后版本为 `v0.26.4` 且 HEAD 精确匹配 tag；preflight `ok=5 warn=0 fail=0 skip=0`，
+  28 个 systemd unit 验证通过。主库与只读副本代际差为 0 分钟；日线最新
+  `2026-07-22`、分钟最新 `2026-07-22 14:59`。Dashboard、NL Screen、Panorama 正常
+  running；monitor/surge-watch 在盘前保持 inactive，六个关键 timers 全部 active。
+- 按“不要再启动远端长任务”的明确要求，本次未手工启动备份或 planner；backup 与
+  replica-sync timer 的下一次计划触发均为 2026-07-23 09:00。
+
+**剩余门禁**：需要在另行允许的资源窗口完成新快速路径下的 growth `backfill-plan`，并以
+新 manifest 依次通过 repair、snapshot、data audit 和 formal replay，取得
+`comparable` 结果。完成前不得宣称成长板 Stage 1 已验收。
+
+**回滚**：本版本无 schema 和业务数据变更。部署失败由受控发布器自动回滚；成功发布后的
+回退必须对 `b68c376` 创建 revert PR、合并为新的 main 提交、打新 SemVer tag 后向前发布，
+禁止在生产机使用 `git reset` 或直接覆盖 DuckDB。
+
+---
+
 ## 2026-07-21 · v0.25.4 · 爆量累计器跨日冻结修复
 
 **状态**：PR #119 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
