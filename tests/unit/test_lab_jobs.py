@@ -983,6 +983,52 @@ def test_heartbeat_renews_without_appending_event(tmp_path: Path) -> None:
     assert _count(store.path, "lab_event") == event_count
 
 
+@pytest.mark.parametrize(
+    ("pragma", "tampered_value"),
+    [("user_version", 2), ("application_id", 12_345)],
+)
+def test_writer_mutation_fails_closed_after_database_identity_tamper(
+    tmp_path: Path,
+    pragma: str,
+    tampered_value: int,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    with sqlite3.connect(store.path) as connection:
+        before = connection.execute(
+            """
+            SELECT owner_id, token, fencing_token, acquired_at, heartbeat_at,
+                   expires_at, released_at
+            FROM lab_lease
+            WHERE lease_id = ?
+            """,
+            (lease.lease_id,),
+        ).fetchone()
+        connection.execute(f"PRAGMA {pragma} = {tampered_value}")
+
+    with pytest.raises(LabDatabaseIdentityError, match=pragma):
+        store.renew_scheduler_lease(
+            lease,
+            lease_seconds=60,
+            now=NOW + timedelta(seconds=20),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        after = connection.execute(
+            """
+            SELECT owner_id, token, fencing_token, acquired_at, heartbeat_at,
+                   expires_at, released_at
+            FROM lab_lease
+            WHERE lease_id = ?
+            """,
+            (lease.lease_id,),
+        ).fetchone()
+        persisted_pragma = connection.execute(f"PRAGMA {pragma}").fetchone()[0]
+
+    assert after == before
+    assert persisted_pragma == tampered_value
+
+
 def test_submit_transaction_rolls_back_when_event_insert_fails(tmp_path: Path) -> None:
     store = _store(tmp_path)
     lease = _lease(store)

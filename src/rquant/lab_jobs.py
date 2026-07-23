@@ -480,16 +480,25 @@ class LabJobStore:
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, validate_identity: bool = True) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.path,
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA synchronous = FULL")
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+            if validate_identity:
+                _validate_database_identity(
+                    connection,
+                    allow_unclaimed_empty=False,
+                )
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA synchronous = FULL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
@@ -497,6 +506,10 @@ class LabJobStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            _validate_database_identity(
+                connection,
+                allow_unclaimed_empty=False,
+            )
             yield connection
             connection.commit()
         except BaseException:
@@ -507,7 +520,7 @@ class LabJobStore:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = self._connect()
+        connection = self._connect(validate_identity=False)
         try:
             connection.execute("BEGIN IMMEDIATE")
             unclaimed = _validate_database_identity(
