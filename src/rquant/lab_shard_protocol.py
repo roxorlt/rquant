@@ -31,6 +31,7 @@ _ACK_NAME = re.compile(
     r"(?P<message_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
 )
+MAX_SHARD_HEARTBEAT_EXTENSION_SECONDS = 3_600
 
 
 class LabShardProtocolModel(BaseModel):
@@ -187,7 +188,11 @@ class LabShardClaim(LabShardProtocolModel):
 
 class LabShardHeartbeat(LabShardProtocolModel):
     report_type: Literal["heartbeat"] = "heartbeat"
-    lease_extension_seconds: int = Field(strict=True, ge=1)
+    lease_extension_seconds: int = Field(
+        strict=True,
+        ge=1,
+        le=MAX_SHARD_HEARTBEAT_EXTENSION_SECONDS,
+    )
 
 
 class LabShardSucceeded(LabShardProtocolModel):

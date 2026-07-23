@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -260,6 +262,52 @@ def test_bad_and_symlink_reports_do_not_block_valid_report(tmp_path: Path) -> No
     assert result.reports_processed == 1
     assert result.reports_accepted == 1
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
+    assert reports.pending() == ()
+
+
+def test_oversized_heartbeat_is_quarantined_before_scheduler_or_ledger(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW]
+    reports = LabReportSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(tmp_path, clock=clock, report_spool=reports)
+    job = _planned_job(store, scheduler)
+    assert scheduler.lease is not None
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    report = _report(claim, LabShardHeartbeat(lease_extension_seconds=30))
+    payload = report.model_dump(mode="json")
+    payload["body"]["lease_extension_seconds"] = 3_601
+    hash_payload = {key: value for key, value in payload.items() if key != "content_hash"}
+    hash_payload["reported_at"] = report.reported_at.isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    payload["content_hash"] = hashlib.sha256(
+        json.dumps(
+            hash_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    pending = reports.pending_dir / f"00000000000000000000-{report.report_id}.json"
+    pending.write_text(json.dumps(payload), encoding="utf-8")
+    before = LabJobReader(store.path).list_shards(job.job_id)[0]
+    clock[0] = NOW + timedelta(seconds=3)
+
+    result = scheduler.run_once()
+
+    assert result.reports_quarantined == 1
+    assert result.reports_processed == 0
+    assert LabJobReader(store.path).get_worker_report(report.report_id) is None
+    after = LabJobReader(store.path).list_shards(job.job_id)[0]
+    assert after == before
     assert reports.pending() == ()
 
 

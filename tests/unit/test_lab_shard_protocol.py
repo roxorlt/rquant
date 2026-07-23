@@ -151,6 +151,11 @@ def test_failed_report_canonicalizes_failure_and_rejects_float() -> None:
         LabShardFailed(failure_json='{"loss":0.1}')
 
 
+def test_heartbeat_rejects_extension_above_strict_scheduler_bound() -> None:
+    with pytest.raises(ValidationError, match="less than or equal"):
+        LabShardHeartbeat(lease_extension_seconds=3_601)
+
+
 def test_claim_spool_is_no_clobber_and_reader_detects_tamper(tmp_path: Path) -> None:
     spool = LabClaimSpool(tmp_path / "claims")
     claim = _claim()

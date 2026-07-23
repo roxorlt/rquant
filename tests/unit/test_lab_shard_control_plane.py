@@ -57,12 +57,13 @@ def _setup(
     tmp_path: Path,
     *,
     count: int = 1,
+    max_attempts: int = 3,
     scheduler_lease_seconds: int = 600,
 ) -> tuple[LabJobStore, LabLeaseRecord, UUID]:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
     lease = _lease(store, seconds=scheduler_lease_seconds)
-    job = _submit_job(store, lease)
+    job = _submit_job(store, lease, max_attempts=max_attempts)
     planned = store.plan_job(
         job.job_id,
         tuple(_definition(index) for index in range(count)),
@@ -139,6 +140,53 @@ def _cancel(store: LabJobStore, lease: LabLeaseRecord, job_id: UUID, *, offset: 
         lease=lease,
         now=NOW + timedelta(seconds=offset),
     )
+
+
+def _assert_control_plane_invariants(
+    store: LabJobStore,
+    job_id: UUID,
+    *,
+    lease: LabLeaseRecord,
+    now_offset: int,
+) -> None:
+    reader = LabJobReader(store.path)
+    job = reader.get_job(job_id)
+    assert job is not None
+    shards = reader.list_shards(job_id)
+    terminal = {
+        ShardStatus.SUCCEEDED,
+        ShardStatus.FAILED,
+        ShardStatus.CANCELLED,
+    }
+    for shard in shards:
+        if shard.status in terminal:
+            assert (
+                shard.worker_id,
+                shard.scheduler_fencing_token,
+                shard.claim_token,
+                shard.claimed_at,
+                shard.heartbeat_at,
+                shard.lease_expires_at,
+            ) == (None, None, None, None, None, None)
+
+    if job.status is not JobStatus.RUNNING:
+        return
+    now = NOW + timedelta(seconds=now_offset)
+    active = any(
+        shard.status is ShardStatus.RUNNING
+        and shard.scheduler_fencing_token == lease.fencing_token
+        and shard.lease_expires_at is not None
+        and shard.lease_expires_at > now
+        for shard in shards
+    )
+    claimable = any(
+        shard.status is ShardStatus.QUEUED and shard.attempt_count < shard.max_attempts
+        for shard in shards
+    )
+    if job.control_intent is ControlIntent.NONE:
+        assert active or claimable
+    else:
+        assert active, f"{job.control_intent.value} must converge when no live claim remains"
 
 
 def test_plan_job_is_deterministic_idempotent_and_replan_conflicts(tmp_path: Path) -> None:
@@ -334,6 +382,23 @@ def test_heartbeat_only_extends_current_token(tmp_path: Path) -> None:
     assert LabJobReader(store.path).list_shards(job_id)[0].lease_expires_at == NOW + timedelta(
         seconds=33
     )
+
+
+def test_heartbeat_never_shortens_an_existing_future_lease(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    claim = _claim(store, lease, duration=300)
+
+    receipt = store.apply_worker_report(
+        _report(claim, LabShardHeartbeat(lease_extension_seconds=10), offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert receipt.status == "accepted"
+    shard = LabJobReader(store.path).list_shards(job_id)[0]
+    assert shard.heartbeat_at == NOW + timedelta(seconds=3)
+    assert shard.lease_expires_at == claim.lease_expires_at
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=3)
 
 
 @pytest.mark.parametrize(
@@ -688,6 +753,166 @@ def test_final_shard_success_wins_even_when_pause_was_requested(tmp_path: Path) 
     assert job.control_intent is ControlIntent.NONE
 
 
+def test_cancel_at_idle_shard_boundary_terminalizes_immediately(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    first = _claim(store, lease)
+    success = store.apply_worker_report(
+        _report(first, LabShardSucceeded(result_manifest_hash="6" * 64), offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert success.status == "accepted"
+    boundary = LabJobReader(store.path).get_job(job_id)
+    assert boundary is not None and boundary.status is JobStatus.RUNNING
+
+    receipt = _cancel(store, lease, job_id, offset=4)
+
+    assert receipt.status == "applied"
+    assert receipt.reason == "cancelled"
+    job = LabJobReader(store.path).get_job(job_id)
+    shards = LabJobReader(store.path).list_shards(job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+    assert [shard.status for shard in shards] == [
+        ShardStatus.SUCCEEDED,
+        ShardStatus.CANCELLED,
+    ]
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=4)
+
+
+def test_claim_tick_does_not_confirm_unsharded_legacy_cancel(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    queued = _submit_job(store, lease)
+    running = store.transition_job(
+        queued.job_id,
+        expected_version=queued.version,
+        target_status=JobStatus.RUNNING,
+        lease=lease,
+        reason="legacy worker started",
+        now=NOW + timedelta(seconds=1),
+    )
+    cancel = _cancel(store, lease, running.job_id, offset=2)
+    assert cancel.reason == "cancel_requested"
+
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert claim is None
+    requested = LabJobReader(store.path).get_job(running.job_id)
+    assert requested is not None and requested.status is JobStatus.RUNNING
+    assert requested.control_intent is ControlIntent.CANCEL_REQUESTED
+
+
+def test_cancel_requested_job_converges_when_active_claim_expires(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    claim = _claim(store, lease, duration=5)
+    cancel = _cancel(store, lease, job_id, offset=3)
+    assert cancel.status == "applied" and cancel.reason == "cancel_requested"
+
+    fresh = store.claim_next_shard(
+        worker_id="worker-b",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+    )
+
+    assert fresh is None
+    job = LabJobReader(store.path).get_job(job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+    assert all(
+        shard.status is ShardStatus.CANCELLED
+        for shard in LabJobReader(store.path).list_shards(job_id)
+    )
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=8)
+    late = store.apply_worker_report(
+        _report(claim, LabWorkerStopped(reason="late stop"), offset=9),
+        lease=lease,
+        now=NOW + timedelta(seconds=9),
+    )
+    assert late.status == "rejected"
+
+
+def test_cancel_requested_job_converges_during_scheduler_takeover(tmp_path: Path) -> None:
+    store, old_lease, job_id = _setup(
+        tmp_path,
+        count=2,
+        scheduler_lease_seconds=10,
+    )
+    old_claim = _claim(store, old_lease, duration=30)
+    cancel = _cancel(store, old_lease, job_id, offset=3)
+    assert cancel.status == "applied"
+    new_lease = store.acquire_scheduler_lease(
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        now=NOW + timedelta(seconds=11),
+    )
+
+    fresh = store.claim_next_shard(
+        worker_id="worker-b",
+        shard_lease_seconds=30,
+        lease=new_lease,
+        now=NOW + timedelta(seconds=12),
+    )
+
+    assert fresh is None
+    job = LabJobReader(store.path).get_job(job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+    _assert_control_plane_invariants(store, job_id, lease=new_lease, now_offset=12)
+    late = store.apply_worker_report(
+        _report(old_claim, LabWorkerStopped(reason="old scheduler"), offset=13),
+        lease=new_lease,
+        now=NOW + timedelta(seconds=13),
+    )
+    assert late.status == "rejected"
+
+
+def test_stale_reclaim_exhaustion_fails_shard_and_parent_job(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, max_attempts=1)
+    _claim(store, lease, duration=5)
+
+    claim = store.claim_next_shard(
+        worker_id="worker-b",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+    )
+
+    assert claim is None
+    job = LabJobReader(store.path).get_job(job_id)
+    shard = LabJobReader(store.path).list_shards(job_id)[0]
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.recoverable is False
+    assert shard.status is ShardStatus.FAILED
+    assert shard.failure_json == '{"reason":"attempts_exhausted"}'
+    assert shard.finished_at == NOW + timedelta(seconds=8)
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=8)
+
+
+def test_worker_stopped_at_attempt_limit_fails_shard_and_parent_job(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, max_attempts=1)
+    claim = _claim(store, lease)
+
+    receipt = store.apply_worker_report(
+        _report(claim, LabWorkerStopped(reason="worker shutting down"), offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert receipt.status == "accepted"
+    job = LabJobReader(store.path).get_job(job_id)
+    shard = LabJobReader(store.path).list_shards(job_id)[0]
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.recoverable is False
+    assert shard.status is ShardStatus.FAILED
+    assert shard.failure_json == '{"reason":"attempts_exhausted"}'
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=3)
+
+
 def test_cancel_first_rejects_success_then_stopped_confirms_cancel(tmp_path: Path) -> None:
     store, lease, job_id = _setup(tmp_path)
     claim = _claim(store, lease)
@@ -827,6 +1052,90 @@ def test_explicit_cancel_confirmation_atomically_invalidates_running_claim(
     shards = LabJobReader(store.path).list_shards(job_id)
     assert {shard.status for shard in shards} == {ShardStatus.CANCELLED}
     assert all(shard.finished_at == NOW + timedelta(seconds=4) for shard in shards)
+
+
+def test_explicit_cancel_confirmation_clears_full_claim_identity_and_versions(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    _claim(store, lease)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET worker_id = ?, scheduler_fencing_token = ?, claim_token = ?,
+                claimed_at = ?, heartbeat_at = ?, lease_expires_at = ?,
+                checkpoint_json = ?
+            WHERE job_id = ? AND shard_index = 1
+            """,
+            (
+                "stale-worker",
+                lease.fencing_token,
+                str(uuid4()),
+                NOW.isoformat(timespec="microseconds"),
+                NOW.isoformat(timespec="microseconds"),
+                (NOW + timedelta(seconds=30)).isoformat(timespec="microseconds"),
+                '{"cursor":1}',
+                str(job_id),
+            ),
+        )
+    before = LabJobReader(store.path).list_shards(job_id)
+    cancel = _cancel(store, lease, job_id, offset=3)
+    assert cancel.job_version is not None
+
+    store.confirm_cancelled_job(
+        job_id,
+        expected_version=cancel.job_version,
+        lease=lease,
+        reason="worker supervisor confirmed stop",
+        now=NOW + timedelta(seconds=4),
+    )
+
+    shards = LabJobReader(store.path).list_shards(job_id)
+    assert [shard.version for shard in shards] == [shard.version + 1 for shard in before]
+    assert all(shard.checkpoint_json is None for shard in shards)
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=4)
+
+
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        (LabShardSucceeded(result_manifest_hash="6" * 64), ShardStatus.SUCCEEDED),
+        (LabShardFailed(failure_json='{"reason":"worker"}'), ShardStatus.FAILED),
+    ],
+)
+def test_terminal_worker_reports_clear_complete_claim_identity(
+    tmp_path: Path,
+    body: LabShardSucceeded | LabShardFailed,
+    status: ShardStatus,
+) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    claim = _claim(store, lease)
+
+    receipt = store.apply_worker_report(
+        _report(claim, body, offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert receipt.status == "accepted"
+    assert LabJobReader(store.path).list_shards(job_id)[0].status is status
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=3)
+
+
+def test_running_job_keeps_an_active_or_claimable_progress_path(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, max_attempts=2)
+    claim = _claim(store, lease)
+    stopped = store.apply_worker_report(
+        _report(claim, LabWorkerStopped(reason="cooperative restart"), offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert stopped.status == "accepted"
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=3)
+
+    _claim(store, lease, worker="worker-b", now_offset=4)
+    _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=4)
 
 
 def test_success_first_makes_later_cancel_a_terminal_rejection(tmp_path: Path) -> None:

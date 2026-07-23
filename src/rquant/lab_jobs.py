@@ -80,6 +80,7 @@ _SCHEMA_VERSION = 3
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 _LEGACY_PLAN_HASH = "0" * 64
+_ATTEMPTS_EXHAUSTED_FAILURE_JSON = '{"reason":"attempts_exhausted"}'
 
 
 class JobStatus(StrEnum):
@@ -918,6 +919,22 @@ class LabJobReader:
                 raise ValueError("failed shard is missing failure identity")
             if record.status is ShardStatus.CANCELLED and record.finished_at is None:
                 raise ValueError("cancelled shard is missing finished_at")
+            if record.status in {
+                ShardStatus.SUCCEEDED,
+                ShardStatus.FAILED,
+                ShardStatus.CANCELLED,
+            } and any(
+                value is not None
+                for value in (
+                    record.worker_id,
+                    record.scheduler_fencing_token,
+                    record.claim_token,
+                    record.claimed_at,
+                    record.heartbeat_at,
+                    record.lease_expires_at,
+                )
+            ):
+                raise ValueError("terminal shard retains claim identity")
             return record
         except Exception as exc:
             if isinstance(exc, InvalidStoredJobError):
@@ -1324,6 +1341,142 @@ class LabJobStore:
             (str(job_id),),
         ).fetchone()
 
+    @staticmethod
+    def _active_shard_count(connection: sqlite3.Connection, job_id: UUID) -> int:
+        value = connection.execute(
+            "SELECT COUNT(*) FROM lab_shard WHERE job_id = ? AND status = ?",
+            (str(job_id), ShardStatus.RUNNING.value),
+        ).fetchone()[0]
+        return _strict_sqlite_int(value, field="lab_shard.active_count", minimum=0)
+
+    @staticmethod
+    def _terminalize_claimed_shard(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        target_status: ShardStatus,
+        now: datetime,
+        result_manifest_hash: str | None = None,
+        failure_json: str | None = None,
+    ) -> bool:
+        if target_status not in {
+            ShardStatus.SUCCEEDED,
+            ShardStatus.FAILED,
+            ShardStatus.CANCELLED,
+        }:
+            raise ValueError(f"nonterminal shard target: {target_status.value}")
+        version = _strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0)
+        cursor = connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, version = ?, worker_id = NULL,
+                scheduler_fencing_token = NULL, claim_token = NULL,
+                claimed_at = NULL, heartbeat_at = NULL,
+                lease_expires_at = NULL, result_manifest_hash = ?,
+                failure_json = ?, checkpoint_json = NULL,
+                finished_at = ?, updated_at = ?
+            WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
+            """,
+            (
+                target_status.value,
+                version + 1,
+                result_manifest_hash,
+                failure_json,
+                _dump_time(now),
+                _dump_time(now),
+                str(row["job_id"]),
+                str(row["shard_id"]),
+                version,
+                ShardStatus.RUNNING.value,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _terminalize_nonterminal_shards(
+        connection: sqlite3.Connection,
+        job_id: UUID,
+        *,
+        target_status: ShardStatus,
+        now: datetime,
+    ) -> int:
+        if target_status is not ShardStatus.CANCELLED:
+            raise ValueError(f"unsupported bulk shard target: {target_status.value}")
+        cursor = connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, version = version + 1,
+                worker_id = NULL, scheduler_fencing_token = NULL,
+                claim_token = NULL, claimed_at = NULL,
+                heartbeat_at = NULL, lease_expires_at = NULL,
+                result_manifest_hash = NULL, failure_json = NULL,
+                checkpoint_json = NULL, finished_at = ?, updated_at = ?
+            WHERE job_id = ? AND status IN (?, ?, ?)
+            """,
+            (
+                target_status.value,
+                _dump_time(now),
+                _dump_time(now),
+                str(job_id),
+                ShardStatus.QUEUED.value,
+                ShardStatus.RUNNING.value,
+                ShardStatus.CHECKPOINTED.value,
+            ),
+        )
+        return cursor.rowcount
+
+    def _adopt_running_job_fence(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> sqlite3.Row:
+        if JobStatus(str(row["status"])) is not JobStatus.RUNNING:
+            return row
+        current_fence = _strict_nullable_sqlite_int(
+            row["scheduler_fencing_token"],
+            field="lab_job.scheduler_fencing_token",
+            minimum=1,
+        )
+        if current_fence == lease.fencing_token:
+            return row
+        job_id = UUID(str(row["job_id"]))
+        version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
+        cursor = connection.execute(
+            """
+            UPDATE lab_job
+            SET version = ?, scheduler_fencing_token = ?, updated_at = ?
+            WHERE job_id = ? AND version = ? AND status = ?
+            """,
+            (
+                version + 1,
+                lease.fencing_token,
+                _dump_time(now),
+                str(job_id),
+                version,
+                JobStatus.RUNNING.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise SchedulerLeaseFencedError("running job changed during scheduler takeover")
+        self._insert_event(
+            connection,
+            job_id=job_id,
+            request_id=None,
+            event_type="scheduler_takeover",
+            prior_status=JobStatus.RUNNING,
+            new_status=JobStatus.RUNNING,
+            job_version=version + 1,
+            reason="running shards fenced and reclaimed",
+            fencing_token=lease.fencing_token,
+            now=now,
+        )
+        updated = self._load_job_row(connection, job_id)
+        assert updated is not None
+        return updated
+
     def _transition_in_transaction(
         self,
         connection: sqlite3.Connection,
@@ -1347,10 +1500,7 @@ class LabJobStore:
                 raise CancelConfirmationRequiredError(
                     "cancel_requested blocks later lifecycle results"
                 )
-            if target_status is JobStatus.CANCELLED and (
-                control_intent is not ControlIntent.CANCEL_REQUESTED
-                or not allow_cancel_confirmation
-            ):
+            if target_status is JobStatus.CANCELLED and not allow_cancel_confirmation:
                 raise CancelConfirmationRequiredError(
                     "running cancellation requires requested confirmation"
                 )
@@ -1526,23 +1676,11 @@ class LabJobStore:
                 or ControlIntent(str(row["control_intent"])) is not ControlIntent.CANCEL_REQUESTED
             ):
                 raise CancelConfirmationRequiredError("job does not have an active cancel request")
-            connection.execute(
-                """
-                UPDATE lab_shard
-                SET status = ?, version = version + 1,
-                    result_manifest_hash = NULL, failure_json = NULL,
-                    finished_at = ?, updated_at = ?
-                WHERE job_id = ? AND status IN (?, ?, ?)
-                """,
-                (
-                    ShardStatus.CANCELLED.value,
-                    _dump_time(current),
-                    _dump_time(current),
-                    str(job_id),
-                    ShardStatus.QUEUED.value,
-                    ShardStatus.RUNNING.value,
-                    ShardStatus.CHECKPOINTED.value,
-                ),
+            self._terminalize_nonterminal_shards(
+                connection,
+                job_id,
+                target_status=ShardStatus.CANCELLED,
+                now=current,
             )
             updated = self._transition_in_transaction(
                 connection,
@@ -1745,6 +1883,47 @@ class LabJobStore:
                     job_version=version,
                 )
             if source is JobStatus.RUNNING:
+                shard_count = connection.execute(
+                    "SELECT COUNT(*) FROM lab_shard WHERE job_id = ?",
+                    (str(command.job_id),),
+                ).fetchone()[0]
+                if (
+                    _strict_sqlite_int(
+                        shard_count,
+                        field="lab_shard.count",
+                        minimum=0,
+                    )
+                    > 0
+                    and self._active_shard_count(connection, command.job_id) == 0
+                ):
+                    self._terminalize_nonterminal_shards(
+                        connection,
+                        command.job_id,
+                        target_status=ShardStatus.CANCELLED,
+                        now=now,
+                    )
+                    updated = self._transition_in_transaction(
+                        connection,
+                        row,
+                        target_status=JobStatus.CANCELLED,
+                        lease=lease,
+                        reason=command.reason,
+                        now=now,
+                        request_id=envelope.request_id,
+                        recoverable=None,
+                        event_type="job_cancelled",
+                        allow_cancel_confirmation=True,
+                    )
+                    return LabCommandReceipt(
+                        request_id=envelope.request_id,
+                        content_hash=envelope.content_hash,
+                        job_id=command.job_id,
+                        status="applied",
+                        reason="cancelled",
+                        job_version=_strict_sqlite_int(
+                            updated["version"], field="lab_job.version", minimum=0
+                        ),
+                    )
                 updated = self._set_control_intent_in_transaction(
                     connection,
                     row,
@@ -1764,27 +1943,11 @@ class LabJobStore:
                         updated["version"], field="lab_job.version", minimum=0
                     ),
                 )
-            connection.execute(
-                """
-                UPDATE lab_shard
-                SET status = ?, version = version + 1,
-                    worker_id = NULL, scheduler_fencing_token = NULL,
-                    claim_token = NULL, claimed_at = NULL,
-                    heartbeat_at = NULL, lease_expires_at = NULL,
-                    result_manifest_hash = NULL, failure_json = NULL,
-                    finished_at = ?, checkpoint_json = NULL,
-                    updated_at = ?
-                WHERE job_id = ? AND status IN (?, ?, ?)
-                """,
-                (
-                    ShardStatus.CANCELLED.value,
-                    _dump_time(now),
-                    _dump_time(now),
-                    str(command.job_id),
-                    ShardStatus.QUEUED.value,
-                    ShardStatus.RUNNING.value,
-                    ShardStatus.CHECKPOINTED.value,
-                ),
+            self._terminalize_nonterminal_shards(
+                connection,
+                command.job_id,
+                target_status=ShardStatus.CANCELLED,
+                now=now,
             )
             target = JobStatus.CANCELLED
         elif isinstance(command, PauseJobCommand):
@@ -2132,7 +2295,6 @@ class LabJobStore:
                 JOIN lab_job AS j ON j.job_id = s.job_id
                 WHERE s.status = ?
                   AND j.status = ?
-                  AND j.control_intent <> ?
                   AND (
                     s.scheduler_fencing_token IS NULL
                     OR s.scheduler_fencing_token <> ?
@@ -2144,14 +2306,44 @@ class LabJobStore:
                 (
                     ShardStatus.RUNNING.value,
                     JobStatus.RUNNING.value,
-                    ControlIntent.CANCEL_REQUESTED.value,
                     lease.fencing_token,
                     _dump_time(current),
                 ),
             ).fetchall()
             reclaimed_job_ids: set[UUID] = set()
+            cancelled_job_ids: set[UUID] = set()
+            failed_job_ids: set[UUID] = set()
             for stale in stale_rows:
+                job_id = UUID(str(stale["job_id"]))
+                job_row = self._load_job_row(connection, job_id)
+                assert job_row is not None
                 version = _strict_sqlite_int(stale["version"], field="lab_shard.version", minimum=0)
+                intent = ControlIntent(str(job_row["control_intent"]))
+                attempt_count = _strict_sqlite_int(
+                    stale["attempt_count"], field="lab_shard.attempt_count", minimum=0
+                )
+                max_attempts = _strict_sqlite_int(
+                    stale["max_attempts"], field="lab_shard.max_attempts", minimum=1
+                )
+                if intent is ControlIntent.CANCEL_REQUESTED:
+                    if self._terminalize_claimed_shard(
+                        connection,
+                        stale,
+                        target_status=ShardStatus.CANCELLED,
+                        now=current,
+                    ):
+                        cancelled_job_ids.add(job_id)
+                    continue
+                if attempt_count >= max_attempts:
+                    if self._terminalize_claimed_shard(
+                        connection,
+                        stale,
+                        target_status=ShardStatus.FAILED,
+                        now=current,
+                        failure_json=_ATTEMPTS_EXHAUSTED_FAILURE_JSON,
+                    ):
+                        failed_job_ids.add(job_id)
+                    continue
                 cursor = connection.execute(
                     """
                     UPDATE lab_shard
@@ -2172,31 +2364,73 @@ class LabJobStore:
                     ),
                 )
                 if cursor.rowcount == 1:
-                    reclaimed_job_ids.add(UUID(str(stale["job_id"])))
-            for reclaimed_job_id in sorted(reclaimed_job_ids, key=str):
-                reclaimed_job = self._load_job_row(connection, reclaimed_job_id)
-                assert reclaimed_job is not None
-                if (
-                    JobStatus(str(reclaimed_job["status"])) is not JobStatus.RUNNING
-                    or ControlIntent(str(reclaimed_job["control_intent"]))
-                    is not ControlIntent.PAUSE_REQUESTED
-                ):
+                    reclaimed_job_ids.add(job_id)
+            idle_cancel_rows = connection.execute(
+                """
+                SELECT j.job_id FROM lab_job AS j
+                WHERE j.status = ? AND j.control_intent = ?
+                  AND EXISTS (
+                    SELECT 1 FROM lab_shard AS planned
+                    WHERE planned.job_id = j.job_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM lab_shard AS s
+                    WHERE s.job_id = j.job_id AND s.status = ?
+                  )
+                """,
+                (
+                    JobStatus.RUNNING.value,
+                    ControlIntent.CANCEL_REQUESTED.value,
+                    ShardStatus.RUNNING.value,
+                ),
+            ).fetchall()
+            cancelled_job_ids.update(UUID(str(row["job_id"])) for row in idle_cancel_rows)
+            for failed_job_id in sorted(failed_job_ids, key=str):
+                failed_job = self._load_job_row(connection, failed_job_id)
+                assert failed_job is not None
+                if JobStatus(str(failed_job["status"])) is not JobStatus.RUNNING:
                     continue
-                active_count = connection.execute(
-                    "SELECT COUNT(*) FROM lab_shard WHERE job_id = ? AND status = ?",
-                    (str(reclaimed_job_id), ShardStatus.RUNNING.value),
-                ).fetchone()[0]
-                if (
-                    _strict_sqlite_int(
-                        active_count,
-                        field="lab_shard.active_count",
-                        minimum=0,
-                    )
-                    == 0
-                ):
+                failed_job = self._adopt_running_job_fence(
+                    connection,
+                    failed_job,
+                    lease=lease,
+                    now=current,
+                )
+                self._transition_in_transaction(
+                    connection,
+                    failed_job,
+                    target_status=JobStatus.FAILED,
+                    lease=lease,
+                    reason="shard attempts exhausted during stale reclaim",
+                    now=current,
+                    request_id=None,
+                    recoverable=False,
+                    event_type="job_failed",
+                )
+            convergence_job_ids = reclaimed_job_ids | cancelled_job_ids
+            for job_id in sorted(convergence_job_ids, key=str):
+                job_row = self._load_job_row(connection, job_id)
+                assert job_row is not None
+                if JobStatus(str(job_row["status"])) is not JobStatus.RUNNING:
+                    continue
+                intent = ControlIntent(str(job_row["control_intent"]))
+                if self._active_shard_count(connection, job_id) != 0:
+                    continue
+                if intent not in {
+                    ControlIntent.PAUSE_REQUESTED,
+                    ControlIntent.CANCEL_REQUESTED,
+                }:
+                    continue
+                job_row = self._adopt_running_job_fence(
+                    connection,
+                    job_row,
+                    lease=lease,
+                    now=current,
+                )
+                if intent is ControlIntent.PAUSE_REQUESTED:
                     self._transition_in_transaction(
                         connection,
-                        reclaimed_job,
+                        job_row,
                         target_status=JobStatus.CHECKPOINTED,
                         lease=lease,
                         reason="all active shard leases expired during pause",
@@ -2204,6 +2438,25 @@ class LabJobStore:
                         request_id=None,
                         recoverable=None,
                         event_type="job_checkpointed",
+                    )
+                else:
+                    self._terminalize_nonterminal_shards(
+                        connection,
+                        job_id,
+                        target_status=ShardStatus.CANCELLED,
+                        now=current,
+                    )
+                    self._transition_in_transaction(
+                        connection,
+                        job_row,
+                        target_status=JobStatus.CANCELLED,
+                        lease=lease,
+                        reason="all active shard leases expired during cancel",
+                        now=current,
+                        request_id=None,
+                        recoverable=None,
+                        event_type="job_cancel_confirmed",
+                        allow_cancel_confirmation=True,
                     )
             active_worker = connection.execute(
                 """
@@ -2259,42 +2512,12 @@ class LabJobStore:
                     event_type="job_started",
                 )
             else:
-                job_fence = _strict_nullable_sqlite_int(
-                    job_row["scheduler_fencing_token"],
-                    field="lab_job.scheduler_fencing_token",
-                    minimum=1,
+                job_row = self._adopt_running_job_fence(
+                    connection,
+                    job_row,
+                    lease=lease,
+                    now=current,
                 )
-                if job_fence != lease.fencing_token:
-                    job_version = _strict_sqlite_int(
-                        job_row["version"], field="lab_job.version", minimum=0
-                    )
-                    connection.execute(
-                        """
-                        UPDATE lab_job
-                        SET version = ?, scheduler_fencing_token = ?, updated_at = ?
-                        WHERE job_id = ? AND version = ? AND status = ?
-                        """,
-                        (
-                            job_version + 1,
-                            lease.fencing_token,
-                            _dump_time(current),
-                            str(job_id),
-                            job_version,
-                            JobStatus.RUNNING.value,
-                        ),
-                    )
-                    self._insert_event(
-                        connection,
-                        job_id=job_id,
-                        request_id=None,
-                        event_type="scheduler_takeover",
-                        prior_status=JobStatus.RUNNING,
-                        new_status=JobStatus.RUNNING,
-                        job_version=job_version + 1,
-                        reason="running shards fenced and reclaimed",
-                        fencing_token=lease.fencing_token,
-                        now=current,
-                    )
             shard_version = _strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0)
             generation = (
                 _strict_sqlite_int(
@@ -2505,7 +2728,11 @@ class LabJobStore:
             body = validated.body
             reason: str
             if isinstance(body, LabShardHeartbeat):
-                expires_at = current + timedelta(seconds=body.lease_extension_seconds)
+                existing_expiry = _load_time(str(shard_row["lease_expires_at"]))
+                expires_at = max(
+                    existing_expiry,
+                    current + timedelta(seconds=body.lease_extension_seconds),
+                )
                 connection.execute(
                     """
                     UPDATE lab_shard
@@ -2524,24 +2751,14 @@ class LabJobStore:
                 )
                 reason = "heartbeat_extended"
             elif isinstance(body, LabShardSucceeded):
-                connection.execute(
-                    """
-                    UPDATE lab_shard
-                    SET status = ?, version = ?, result_manifest_hash = ?,
-                        failure_json = NULL, finished_at = ?, updated_at = ?
-                    WHERE job_id = ? AND shard_id = ? AND version = ?
-                    """,
-                    (
-                        ShardStatus.SUCCEEDED.value,
-                        shard_version + 1,
-                        body.result_manifest_hash,
-                        _dump_time(current),
-                        _dump_time(current),
-                        str(validated.job_id),
-                        str(validated.shard_id),
-                        shard_version,
-                    ),
+                terminalized = self._terminalize_claimed_shard(
+                    connection,
+                    shard_row,
+                    target_status=ShardStatus.SUCCEEDED,
+                    now=current,
+                    result_manifest_hash=body.result_manifest_hash,
                 )
+                assert terminalized
                 remaining = connection.execute(
                     """
                     SELECT COUNT(*) FROM lab_shard
@@ -2586,24 +2803,14 @@ class LabJobStore:
                         )
                 reason = "shard_succeeded"
             elif isinstance(body, LabShardFailed):
-                connection.execute(
-                    """
-                    UPDATE lab_shard
-                    SET status = ?, version = ?, failure_json = ?,
-                        result_manifest_hash = NULL, finished_at = ?, updated_at = ?
-                    WHERE job_id = ? AND shard_id = ? AND version = ?
-                    """,
-                    (
-                        ShardStatus.FAILED.value,
-                        shard_version + 1,
-                        body.failure_json,
-                        _dump_time(current),
-                        _dump_time(current),
-                        str(validated.job_id),
-                        str(validated.shard_id),
-                        shard_version,
-                    ),
+                terminalized = self._terminalize_claimed_shard(
+                    connection,
+                    shard_row,
+                    target_status=ShardStatus.FAILED,
+                    now=current,
+                    failure_json=body.failure_json,
                 )
+                assert terminalized
                 self._transition_in_transaction(
                     connection,
                     job_row,
@@ -2619,55 +2826,20 @@ class LabJobStore:
             elif isinstance(body, LabWorkerStopped):
                 intent = ControlIntent(str(job_row["control_intent"]))
                 if intent is ControlIntent.CANCEL_REQUESTED:
-                    connection.execute(
-                        """
-                        UPDATE lab_shard
-                        SET status = ?, version = ?, worker_id = NULL,
-                            scheduler_fencing_token = NULL, claim_token = NULL,
-                            claimed_at = NULL, heartbeat_at = NULL,
-                            lease_expires_at = NULL, result_manifest_hash = NULL,
-                            failure_json = NULL, checkpoint_json = NULL,
-                            finished_at = ?, updated_at = ?
-                        WHERE job_id = ? AND shard_id = ? AND version = ?
-                        """,
-                        (
-                            ShardStatus.CANCELLED.value,
-                            shard_version + 1,
-                            _dump_time(current),
-                            _dump_time(current),
-                            str(validated.job_id),
-                            str(validated.shard_id),
-                            shard_version,
-                        ),
+                    terminalized = self._terminalize_claimed_shard(
+                        connection,
+                        shard_row,
+                        target_status=ShardStatus.CANCELLED,
+                        now=current,
                     )
-                    connection.execute(
-                        """
-                        UPDATE lab_shard
-                        SET status = ?, version = version + 1,
-                            worker_id = NULL, scheduler_fencing_token = NULL,
-                            claim_token = NULL, claimed_at = NULL,
-                            heartbeat_at = NULL, lease_expires_at = NULL,
-                            result_manifest_hash = NULL, failure_json = NULL,
-                            checkpoint_json = NULL, finished_at = ?, updated_at = ?
-                        WHERE job_id = ? AND status IN (?, ?)
-                        """,
-                        (
-                            ShardStatus.CANCELLED.value,
-                            _dump_time(current),
-                            _dump_time(current),
-                            str(validated.job_id),
-                            ShardStatus.QUEUED.value,
-                            ShardStatus.CHECKPOINTED.value,
-                        ),
+                    assert terminalized
+                    self._terminalize_nonterminal_shards(
+                        connection,
+                        validated.job_id,
+                        target_status=ShardStatus.CANCELLED,
+                        now=current,
                     )
-                    active_count = connection.execute(
-                        "SELECT COUNT(*) FROM lab_shard WHERE job_id = ? AND status = ?",
-                        (str(validated.job_id), ShardStatus.RUNNING.value),
-                    ).fetchone()[0]
-                    if (
-                        _strict_sqlite_int(active_count, field="lab_shard.active_count", minimum=0)
-                        == 0
-                    ):
+                    if self._active_shard_count(connection, validated.job_id) == 0:
                         self._transition_in_transaction(
                             connection,
                             job_row,
@@ -2682,34 +2854,59 @@ class LabJobStore:
                         )
                     reason = "worker_stopped_cancelled"
                 else:
-                    connection.execute(
-                        """
-                        UPDATE lab_shard
-                        SET status = ?, version = ?, worker_id = NULL,
-                            scheduler_fencing_token = NULL, claim_token = NULL,
-                            claimed_at = NULL, heartbeat_at = NULL,
-                            lease_expires_at = NULL, updated_at = ?
-                        WHERE job_id = ? AND shard_id = ? AND version = ?
-                        """,
-                        (
-                            ShardStatus.QUEUED.value,
-                            shard_version + 1,
-                            _dump_time(current),
-                            str(validated.job_id),
-                            str(validated.shard_id),
-                            shard_version,
-                        ),
+                    attempt_count = _strict_sqlite_int(
+                        shard_row["attempt_count"],
+                        field="lab_shard.attempt_count",
+                        minimum=0,
                     )
-                    if intent is ControlIntent.PAUSE_REQUESTED:
-                        active_count = connection.execute(
-                            "SELECT COUNT(*) FROM lab_shard WHERE job_id = ? AND status = ?",
-                            (str(validated.job_id), ShardStatus.RUNNING.value),
-                        ).fetchone()[0]
+                    max_attempts = _strict_sqlite_int(
+                        shard_row["max_attempts"],
+                        field="lab_shard.max_attempts",
+                        minimum=1,
+                    )
+                    if attempt_count >= max_attempts:
+                        terminalized = self._terminalize_claimed_shard(
+                            connection,
+                            shard_row,
+                            target_status=ShardStatus.FAILED,
+                            now=current,
+                            failure_json=_ATTEMPTS_EXHAUSTED_FAILURE_JSON,
+                        )
+                        assert terminalized
+                        self._transition_in_transaction(
+                            connection,
+                            job_row,
+                            target_status=JobStatus.FAILED,
+                            lease=lease,
+                            reason="shard attempts exhausted after worker stopped",
+                            now=current,
+                            request_id=None,
+                            recoverable=False,
+                            event_type="job_failed",
+                        )
+                        reason = "worker_stopped_attempts_exhausted"
+                    else:
+                        connection.execute(
+                            """
+                            UPDATE lab_shard
+                            SET status = ?, version = ?, worker_id = NULL,
+                                scheduler_fencing_token = NULL, claim_token = NULL,
+                                claimed_at = NULL, heartbeat_at = NULL,
+                                lease_expires_at = NULL, updated_at = ?
+                            WHERE job_id = ? AND shard_id = ? AND version = ?
+                            """,
+                            (
+                                ShardStatus.QUEUED.value,
+                                shard_version + 1,
+                                _dump_time(current),
+                                str(validated.job_id),
+                                str(validated.shard_id),
+                                shard_version,
+                            ),
+                        )
                         if (
-                            _strict_sqlite_int(
-                                active_count, field="lab_shard.active_count", minimum=0
-                            )
-                            == 0
+                            intent is ControlIntent.PAUSE_REQUESTED
+                            and self._active_shard_count(connection, validated.job_id) == 0
                         ):
                             self._transition_in_transaction(
                                 connection,
@@ -2722,7 +2919,7 @@ class LabJobStore:
                                 recoverable=None,
                                 event_type="job_checkpointed",
                             )
-                    reason = "worker_stopped"
+                        reason = "worker_stopped"
             else:  # pragma: no cover - report union is exhaustive
                 raise TypeError(type(body).__name__)
 
