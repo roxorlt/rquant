@@ -474,3 +474,26 @@ def test_malformed_load_identity_prevents_quarantine_of_replacement(tmp_path: Pa
 
     assert malformed.read_text(encoding="utf-8") == "replacement"
     assert tuple(spool.quarantine_dir.glob("*.bad")) == ()
+
+
+def test_symlink_load_identity_prevents_quarantine_of_replacement(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    victim = tmp_path / "victim.json"
+    victim.write_text("external", encoding="utf-8")
+    symlink = spool.pending_dir / "not-a-command.json"
+    symlink.symlink_to(victim)
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(symlink)
+    identity = captured.value.file_identity
+    assert identity is not None
+    assert identity.file_type == "symlink"
+    assert identity.link_target == str(victim)
+    symlink.unlink()
+    symlink.write_text("replacement", encoding="utf-8")
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(identity, reason="invalid_symlink")
+
+    assert symlink.read_text(encoding="utf-8") == "replacement"
+    assert victim.read_text(encoding="utf-8") == "external"
+    assert tuple(spool.quarantine_dir.glob("*.symlink.bad.json")) == ()

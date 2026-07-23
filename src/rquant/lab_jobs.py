@@ -59,7 +59,8 @@ class LabDatabaseIdentityError(RuntimeError):
 
 
 _APPLICATION_ID = 0x52514A42
-_SCHEMA_VERSION = 1
+_LEGACY_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class JobStatus(StrEnum):
@@ -258,18 +259,62 @@ def _command_record_from_row(
         raise InvalidStoredJobError(f"invalid stored lab command {stored_request}: {exc}") from exc
 
 
+def _receipt_job_version_from_json(payload: str) -> int | None:
+    return LabCommandReceipt.model_validate_json(payload).job_version
+
+
+def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
+    }
+    if "receipt_job_version" not in columns:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v2 is missing lab_command.receipt_job_version"
+        )
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
+    }
+    if "receipt_job_version" in columns:
+        raise LabDatabaseIdentityError("lab jobs SQLite v1 unexpectedly has receipt_job_version")
+    connection.execute(
+        """
+        ALTER TABLE lab_command
+        ADD COLUMN receipt_job_version INTEGER CHECK (
+            receipt_job_version IS NULL OR receipt_job_version >= 0
+        )
+        """
+    )
+    rows = connection.execute(
+        "SELECT request_id, receipt_json FROM lab_command ORDER BY request_id"
+    ).fetchall()
+    for row in rows:
+        job_version = _receipt_job_version_from_json(str(row["receipt_json"]))
+        connection.execute(
+            "UPDATE lab_command SET receipt_job_version = ? WHERE request_id = ?",
+            (job_version, str(row["request_id"])),
+        )
+    for row in connection.execute("SELECT * FROM lab_command ORDER BY request_id").fetchall():
+        _command_record_from_row(row)
+
+
 def _validate_database_identity(
     connection: sqlite3.Connection,
     *,
     allow_unclaimed_empty: bool,
+    accepted_versions: frozenset[int] | None = None,
 ) -> bool:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    versions = accepted_versions or frozenset({_SCHEMA_VERSION})
     if application_id == _APPLICATION_ID:
-        if user_version != _SCHEMA_VERSION:
+        if user_version not in versions:
+            expected = ", ".join(str(version) for version in sorted(versions))
             raise LabDatabaseIdentityError(
                 "lab jobs SQLite user_version mismatch: "
-                f"expected {_SCHEMA_VERSION}, found {user_version}"
+                f"expected one of [{expected}], found {user_version}"
             )
         return False
     if application_id != 0:
@@ -321,6 +366,7 @@ class LabJobReader:
                 connection,
                 allow_unclaimed_empty=False,
             )
+            _validate_v2_schema(connection)
         except BaseException:
             connection.close()
             raise
@@ -518,6 +564,7 @@ class LabJobStore:
                     connection,
                     allow_unclaimed_empty=False,
                 )
+                _validate_v2_schema(connection)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
         except BaseException:
@@ -534,6 +581,7 @@ class LabJobStore:
                 connection,
                 allow_unclaimed_empty=False,
             )
+            _validate_v2_schema(connection)
             yield connection
             connection.commit()
         except BaseException:
@@ -550,11 +598,16 @@ class LabJobStore:
             unclaimed = _validate_database_identity(
                 connection,
                 allow_unclaimed_empty=True,
+                accepted_versions=frozenset({_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION}),
             )
+            starting_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if unclaimed:
                 connection.execute(f"PRAGMA application_id = {self.APPLICATION_ID}")
+            elif starting_version == _LEGACY_SCHEMA_VERSION:
+                _migrate_v1_to_v2(connection)
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            _validate_v2_schema(connection)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")

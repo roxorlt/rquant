@@ -9,9 +9,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import rquant.lab_jobs as lab_jobs
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
+    LabCommandReceipt,
     PauseJobCommand,
     RequestContentConflictError,
     ResumeJobCommand,
@@ -200,7 +202,80 @@ def _count(path: Path, table: str) -> int:
     return int(row[0])
 
 
-def test_initialize_creates_v1_six_table_schema_and_required_pragmas(
+def _create_609c599_v1_fixture(
+    path: Path,
+) -> tuple[tuple[LabCommandEnvelope, LabCommandReceipt], ...]:
+    applied = _submit()
+    applied_receipt = LabCommandReceipt(
+        request_id=applied.request_id,
+        content_hash=applied.content_hash,
+        job_id=applied.command.job_id,
+        status="applied",
+        reason="submitted",
+        job_version=0,
+    )
+    rejected = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=uuid4(),
+            expected_version=0,
+            reason="missing job",
+        ),
+    )
+    rejected_receipt = LabCommandReceipt(
+        request_id=rejected.request_id,
+        content_hash=rejected.content_hash,
+        job_id=rejected.command.job_id,
+        status="rejected",
+        reason="job_not_found",
+        job_version=None,
+    )
+    rows = ((applied, applied_receipt), (rejected, rejected_receipt))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE lab_command (
+                request_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                command_type TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                command_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('applied', 'rejected')),
+                reason TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+            """
+        )
+        for offset, (envelope, receipt) in enumerate(rows):
+            timestamp = (NOW + timedelta(seconds=offset)).isoformat(timespec="microseconds")
+            connection.execute(
+                """
+                INSERT INTO lab_command (
+                    request_id, content_hash, command_type, job_id, command_json,
+                    status, reason, receipt_json, received_at, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    envelope.command.command_type,
+                    str(envelope.command.job_id),
+                    envelope.model_dump_json(),
+                    receipt.status,
+                    receipt.reason,
+                    receipt.model_dump_json(),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        connection.execute(f"PRAGMA application_id = {LabJobStore.APPLICATION_ID}")
+        connection.execute("PRAGMA user_version = 1")
+    return rows
+
+
+def test_initialize_creates_v2_six_table_schema_and_required_pragmas(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -227,7 +302,7 @@ def test_initialize_creates_v1_six_table_schema_and_required_pragmas(
         "lab_artifact",
     } <= tables
     assert application_id == LabJobStore.APPLICATION_ID
-    assert user_version == 1
+    assert user_version == 2
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
     assert "STRICT" not in schema_sql
@@ -266,7 +341,7 @@ def test_initialize_refuses_unclaimed_nonempty_sqlite(tmp_path: Path) -> None:
         LabJobStore(path).initialize()
 
 
-@pytest.mark.parametrize("version", [0, 2, 99])
+@pytest.mark.parametrize("version", [0, 3, 99])
 def test_store_and_reader_fail_closed_on_unknown_schema_version(
     tmp_path: Path,
     version: int,
@@ -290,6 +365,101 @@ def test_reader_refuses_wrong_application_id(tmp_path: Path) -> None:
 
     with pytest.raises(LabDatabaseIdentityError, match="application_id"):
         LabJobReader(path).get_job(uuid4())
+
+
+def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    fixture = _create_609c599_v1_fixture(path)
+    with pytest.raises(LabDatabaseIdentityError, match="user_version"):
+        LabJobReader(path).get_command(fixture[0][0].request_id)
+
+    store = LabJobStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
+        }
+        migrated = tuple(
+            connection.execute(
+                """
+                SELECT request_id, content_hash, status, reason, receipt_job_version
+                FROM lab_command ORDER BY applied_at
+                """
+            ).fetchall()
+        )
+    assert user_version == 2
+    assert "receipt_job_version" in columns
+    assert migrated == (
+        (
+            str(fixture[0][0].request_id),
+            fixture[0][0].content_hash,
+            "applied",
+            "submitted",
+            0,
+        ),
+        (
+            str(fixture[1][0].request_id),
+            fixture[1][0].content_hash,
+            "rejected",
+            "job_not_found",
+            None,
+        ),
+    )
+    reader = LabJobReader(path)
+    assert reader.get_command(fixture[0][0].request_id).receipt_job_version == 0
+    assert reader.get_command(fixture[1][0].request_id).receipt_job_version is None
+
+    lease = store.acquire_scheduler_lease(owner_id="scheduler", lease_seconds=60, now=NOW)
+    new_command = _submit()
+    new_receipt = store.apply_command(new_command, lease=lease, now=NOW)
+    assert new_receipt.job_version == 0
+    assert reader.get_command(new_command.request_id).receipt_job_version == 0
+
+
+def test_v1_migration_fault_rolls_back_schema_rows_and_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    fixture = _create_609c599_v1_fixture(path)
+    original = LabCommandReceipt.model_validate_json
+    calls = 0
+
+    def crash_on_second_receipt(payload: str) -> int | None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated migration crash")
+        return original(payload).job_version
+
+    monkeypatch.setattr(
+        lab_jobs,
+        "_receipt_job_version_from_json",
+        crash_on_second_receipt,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="migration crash"):
+        LabJobStore(path).initialize()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
+        }
+        rows = tuple(
+            connection.execute(
+                "SELECT request_id, receipt_json FROM lab_command ORDER BY applied_at"
+            ).fetchall()
+        )
+    assert "receipt_job_version" not in columns
+    assert rows == tuple(
+        (str(envelope.request_id), receipt.model_dump_json()) for envelope, receipt in fixture
+    )
 
 
 def test_reader_is_readonly_does_not_create_missing_database(tmp_path: Path) -> None:
@@ -1101,7 +1271,7 @@ def test_heartbeat_renews_without_appending_event(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("pragma", "tampered_value"),
-    [("user_version", 2), ("application_id", 12_345)],
+    [("user_version", 3), ("application_id", 12_345)],
 )
 def test_writer_mutation_fails_closed_after_database_identity_tamper(
     tmp_path: Path,

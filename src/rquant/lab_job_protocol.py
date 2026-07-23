@@ -38,6 +38,16 @@ class LabSpoolFileIdentity(LabProtocolModel):
     path: Path
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
+    file_type: Literal["regular", "symlink"] = "regular"
+    link_target: str | None = None
+
+    @model_validator(mode="after")
+    def validate_link_target(self) -> LabSpoolFileIdentity:
+        if self.file_type == "symlink" and self.link_target is None:
+            raise ValueError("symlink identity requires link_target")
+        if self.file_type == "regular" and self.link_target is not None:
+            raise ValueError("regular identity must not have link_target")
+        return self
 
 
 class InvalidCommandEnvelopeError(ValueError):
@@ -161,6 +171,15 @@ class LabQuarantinedCommand(LabProtocolModel):
     reason: str = Field(min_length=1)
 
 
+class LabSymlinkQuarantineArtifact(LabProtocolModel):
+    schema_version: Literal[1] = 1
+    original_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    link_target: str
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+
+
 class LabCommandSpool:
     """Atomic filesystem inbox with durable receipts and quarantine."""
 
@@ -263,13 +282,43 @@ class LabCommandSpool:
         directory_fd = os.open(parent, directory_flags)
         try:
             try:
+                path_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise InvalidCommandEnvelopeError(f"unsafe spool file {name}: {exc}") from exc
+            if stat.S_ISLNK(path_stat.st_mode):
+                link_target = os.readlink(name, dir_fd=directory_fd)
+                identity = LabSpoolFileIdentity(
+                    path=normalized,
+                    device=path_stat.st_dev,
+                    inode=path_stat.st_ino,
+                    file_type="symlink",
+                    link_target=link_target,
+                )
+                raise InvalidCommandEnvelopeError(
+                    f"spool file {name} is a symlink",
+                    file_identity=identity,
+                )
+            if not stat.S_ISREG(path_stat.st_mode):
+                raise InvalidCommandEnvelopeError(f"spool file {name} is not regular")
+            try:
                 descriptor = os.open(name, file_flags, dir_fd=directory_fd)
             except OSError as exc:
                 raise InvalidCommandEnvelopeError(f"unsafe spool file {name}: {exc}") from exc
             try:
                 file_stat = os.fstat(descriptor)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    raise InvalidCommandEnvelopeError(f"spool file {name} is not regular")
+                if (
+                    not stat.S_ISREG(file_stat.st_mode)
+                    or file_stat.st_dev != path_stat.st_dev
+                    or file_stat.st_ino != path_stat.st_ino
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        f"spool file {name} was replaced while opening",
+                        file_identity=LabSpoolFileIdentity(
+                            path=normalized,
+                            device=path_stat.st_dev,
+                            inode=path_stat.st_ino,
+                        ),
+                    )
                 chunks: list[bytes] = []
                 while chunk := os.read(descriptor, 1024 * 1024):
                     chunks.append(chunk)
@@ -526,6 +575,11 @@ class LabCommandSpool:
             else Path(entry_or_path)
         )
         with self._exclusive_lock():
+            if (
+                isinstance(entry_or_path, LabSpoolFileIdentity)
+                and entry_or_path.file_type == "symlink"
+            ):
+                return self._quarantine_symlink_locked(entry_or_path, reason=reason)
             normalized, payload, source_stat = self._read_regular_child(source, self.pending_dir)
             try:
                 _sequence, filename_request_id = self._pending_name_parts(normalized.name)
@@ -588,3 +642,57 @@ class LabCommandSpool:
                 inode=source_stat.st_ino,
             )
             return quarantined
+
+    def _quarantine_symlink_locked(
+        self,
+        identity: LabSpoolFileIdentity,
+        *,
+        reason: str,
+    ) -> LabQuarantinedCommand:
+        name = self._direct_child_name(identity.path, self.pending_dir)
+        directory_fd = os.open(
+            self.pending_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISLNK(current.st_mode)
+                or current.st_dev != identity.device
+                or current.st_ino != identity.inode
+            ):
+                raise InvalidCommandEnvelopeError("pending symlink was replaced before quarantine")
+            link_target = os.readlink(name, dir_fd=directory_fd)
+            if link_target != identity.link_target:
+                raise InvalidCommandEnvelopeError(
+                    "pending symlink target changed before quarantine"
+                )
+            target = self.quarantine_dir / f"{name}.symlink.bad.json"
+            while os.path.lexists(target):
+                target = self.quarantine_dir / f"{name}.{uuid4().hex}.symlink.bad.json"
+            artifact = LabSymlinkQuarantineArtifact(
+                original_name=name,
+                reason=reason,
+                link_target=link_target,
+                device=identity.device,
+                inode=identity.inode,
+            )
+            if not self._publish_no_clobber(
+                target,
+                artifact.model_dump_json().encode("utf-8"),
+            ):
+                raise RequestContentConflictError(
+                    f"symlink quarantine artifact already exists: {target.name}"
+                )
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISLNK(current.st_mode)
+                or current.st_dev != identity.device
+                or current.st_ino != identity.inode
+            ):
+                raise InvalidCommandEnvelopeError("pending symlink was replaced before unlink")
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            return LabQuarantinedCommand(path=target, reason=reason)
+        finally:
+            os.close(directory_fd)
