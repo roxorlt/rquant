@@ -93,6 +93,20 @@ def _submit_envelope(
     )
 
 
+def test_command_receipt_rejects_boolean_job_version() -> None:
+    envelope = _submit_envelope()
+
+    with pytest.raises(ValueError, match="job_version"):
+        LabCommandReceipt(
+            request_id=envelope.request_id,
+            content_hash=envelope.content_hash,
+            job_id=envelope.command.job_id,
+            status="applied",
+            reason="submitted",
+            job_version=True,
+        )
+
+
 def test_protocol_roundtrips_all_command_variants() -> None:
     job_id = uuid4()
     envelopes = (

@@ -306,6 +306,7 @@ def test_initialize_creates_v2_six_table_schema_and_required_pragmas(
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
     assert "STRICT" not in schema_sql
+    assert "TYPEOF(RECEIPT_JOB_VERSION) = 'INTEGER'" in " ".join(schema_sql.split())
 
     pragmas = store.connection_pragmas()
     assert pragmas.journal_mode == "wal"
@@ -386,11 +387,15 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
         migrated = tuple(
             connection.execute(
                 """
-                SELECT request_id, content_hash, status, reason, receipt_job_version
+                SELECT request_id, content_hash, status, reason,
+                       receipt_job_version, typeof(receipt_job_version)
                 FROM lab_command ORDER BY applied_at
                 """
             ).fetchall()
         )
+        migrated_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lab_command'"
+        ).fetchone()[0]
     assert user_version == 2
     assert "receipt_job_version" in columns
     assert migrated == (
@@ -400,6 +405,7 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
             "applied",
             "submitted",
             0,
+            "integer",
         ),
         (
             str(fixture[1][0].request_id),
@@ -407,8 +413,10 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
             "rejected",
             "job_not_found",
             None,
+            "null",
         ),
     )
+    assert "typeof(receipt_job_version) = 'integer'" in migrated_schema
     reader = LabJobReader(path)
     assert reader.get_command(fixture[0][0].request_id).receipt_job_version == 0
     assert reader.get_command(fixture[1][0].request_id).receipt_job_version is None
@@ -583,6 +591,34 @@ def test_receipt_job_version_column_roundtrips_applied_rejected_and_null(
 
 
 @pytest.mark.parametrize(
+    "replacement",
+    [pytest.param(0.5, id="real"), pytest.param(sqlite3.Binary(b"0"), id="blob")],
+)
+def test_receipt_job_version_schema_rejects_noninteger_storage(
+    tmp_path: Path,
+    replacement: object,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    store.apply_command(envelope, lease=lease, now=NOW)
+
+    with sqlite3.connect(store.path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            connection.execute(
+                "UPDATE lab_command SET receipt_job_version = ? WHERE request_id = ?",
+                (replacement, str(envelope.request_id)),
+            )
+        stored = connection.execute(
+            "SELECT receipt_job_version, typeof(receipt_job_version) "
+            "FROM lab_command WHERE request_id = ?",
+            (str(envelope.request_id),),
+        ).fetchone()
+
+    assert stored == (0, "integer")
+
+
+@pytest.mark.parametrize(
     ("target", "replacement"),
     [
         ("column", 9),
@@ -622,6 +658,127 @@ def test_reader_and_replay_fail_closed_on_receipt_job_version_tamper(
         LabJobReader(store.path).get_command(envelope.request_id)
     with pytest.raises(InvalidStoredJobError, match="job version mismatch"):
         store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param(0.5, id="fractional-half"),
+        pytest.param(7.5, id="version-plus-half"),
+        pytest.param(sqlite3.Binary(b"0"), id="quoted-zero-noninteger-storage"),
+    ],
+)
+def test_reader_and_replay_reject_noninteger_receipt_job_version_storage(
+    tmp_path: Path,
+    replacement: object,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    store.apply_command(envelope, lease=lease, now=NOW)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_command SET receipt_job_version = ? WHERE request_id = ?",
+            (replacement, str(envelope.request_id)),
+        )
+        stored_type = connection.execute(
+            "SELECT typeof(receipt_job_version) FROM lab_command WHERE request_id = ?",
+            (str(envelope.request_id),),
+        ).fetchone()[0]
+
+    assert stored_type in {"real", "blob"}
+    with pytest.raises(InvalidStoredJobError, match="SQLite integer"):
+        LabJobReader(store.path).get_command(envelope.request_id)
+    with pytest.raises(InvalidStoredJobError, match="SQLite integer"):
+        store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+
+@pytest.mark.parametrize("replacement", [True, False, 0.0, "0"])
+def test_strict_sqlite_integer_helper_rejects_bool_real_and_text(
+    replacement: object,
+) -> None:
+    with pytest.raises(InvalidStoredJobError, match="SQLite integer"):
+        lab_jobs._strict_sqlite_int(replacement, field="test.value")
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "replacement", "reader_name"),
+    [
+        ("lab_job", "version", 1.5, "job"),
+        ("lab_job", "attempt_count", "0_1", "job"),
+        ("lab_job", "max_attempts", 3.5, "job"),
+        ("lab_job", "scheduler_fencing_token", "0_1", "job"),
+        ("lab_shard", "shard_index", 0.5, "shard"),
+        ("lab_shard", "version", "0_0", "shard"),
+        ("lab_shard", "attempt_count", 0.5, "shard"),
+        ("lab_shard", "max_attempts", "0_3", "shard"),
+        ("lab_shard", "scheduler_fencing_token", 1.5, "shard"),
+        ("lab_event", "job_version", 0.5, "event"),
+        ("lab_event", "scheduler_fencing_token", "0_1", "event"),
+        ("lab_lease", "fencing_token", 1.5, "lease"),
+    ],
+)
+def test_typed_row_readers_reject_noninteger_version_count_and_fence_columns(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    replacement: object,
+    reader_name: str,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    job = store.transition_job(
+        job.job_id,
+        expected_version=job.version,
+        target_status=JobStatus.RUNNING,
+        lease=lease,
+        reason="seed numeric rows",
+        now=NOW + timedelta(seconds=1),
+    )
+    shard_id = uuid4()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            INSERT INTO lab_shard (
+                shard_id, job_id, shard_index, status, version, attempt_count,
+                max_attempts, worker_id, scheduler_fencing_token,
+                checkpoint_json, created_at, updated_at
+            ) VALUES (?, ?, 0, 'running', 0, 1, 3, 'worker-a', ?, NULL, ?, ?)
+            """,
+            (
+                str(shard_id),
+                str(job.job_id),
+                lease.fencing_token,
+                NOW.isoformat(timespec="microseconds"),
+                NOW.isoformat(timespec="microseconds"),
+            ),
+        )
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        where = {
+            "lab_job": ("job_id", str(job.job_id)),
+            "lab_shard": ("shard_id", str(shard_id)),
+            "lab_event": (
+                "event_id",
+                connection.execute("SELECT MIN(event_id) FROM lab_event").fetchone()[0],
+            ),
+            "lab_lease": ("lease_id", lease.lease_id),
+        }[table]
+        connection.execute(
+            f"UPDATE {table} SET {column} = ? WHERE {where[0]} = ?",
+            (replacement, where[1]),
+        )
+
+    reader = LabJobReader(store.path)
+    read = {
+        "job": lambda: reader.get_job(job.job_id),
+        "shard": lambda: reader.list_shards(job.job_id),
+        "event": lambda: reader.list_events(job.job_id),
+        "lease": reader.list_leases,
+    }[reader_name]
+    with pytest.raises(InvalidStoredJobError, match="SQLite integer"):
+        read()
 
 
 def test_same_request_and_hash_is_exactly_once_without_second_event(

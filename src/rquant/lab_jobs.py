@@ -210,6 +210,39 @@ def _load_time(value: str) -> datetime:
     return _utc(parsed)
 
 
+def _strict_sqlite_int(
+    value: object,
+    *,
+    field: str,
+    minimum: int | None = None,
+) -> int:
+    if type(value) is not int:
+        raise InvalidStoredJobError(
+            f"{field} must be a SQLite integer, found {type(value).__name__}"
+        )
+    if minimum is not None and value < minimum:
+        raise InvalidStoredJobError(f"{field} must be >= {minimum}, found {value}")
+    return value
+
+
+def _strict_nullable_sqlite_int(
+    value: object,
+    *,
+    field: str,
+    minimum: int | None = None,
+) -> int | None:
+    if value is None:
+        return None
+    return _strict_sqlite_int(value, field=field, minimum=minimum)
+
+
+def _strict_sqlite_bool(value: object, *, field: str) -> bool:
+    integer = _strict_sqlite_int(value, field=field)
+    if integer not in {0, 1}:
+        raise InvalidStoredJobError(f"{field} must be SQLite integer 0 or 1, found {integer}")
+    return bool(integer)
+
+
 def _command_record_from_row(
     row: sqlite3.Row,
     *,
@@ -225,8 +258,10 @@ def _command_record_from_row(
         job_id = UUID(str(row["job_id"]))
         status = str(row["status"])
         reason = str(row["reason"])
-        receipt_job_version = (
-            int(row["receipt_job_version"]) if row["receipt_job_version"] is not None else None
+        receipt_job_version = _strict_nullable_sqlite_int(
+            row["receipt_job_version"],
+            field="lab_command.receipt_job_version",
+            minimum=0,
         )
         if expected_request_id is not None and request_id != expected_request_id:
             raise ValueError("request id does not match lookup key")
@@ -283,7 +318,10 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         """
         ALTER TABLE lab_command
         ADD COLUMN receipt_job_version INTEGER CHECK (
-            receipt_job_version IS NULL OR receipt_job_version >= 0
+            receipt_job_version IS NULL OR (
+                typeof(receipt_job_version) = 'integer'
+                AND receipt_job_version >= 0
+            )
         )
         """
     )
@@ -306,8 +344,19 @@ def _validate_database_identity(
     allow_unclaimed_empty: bool,
     accepted_versions: frozenset[int] | None = None,
 ) -> bool:
-    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
-    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    try:
+        application_id = _strict_sqlite_int(
+            connection.execute("PRAGMA application_id").fetchone()[0],
+            field="PRAGMA application_id",
+            minimum=0,
+        )
+        user_version = _strict_sqlite_int(
+            connection.execute("PRAGMA user_version").fetchone()[0],
+            field="PRAGMA user_version",
+            minimum=0,
+        )
+    except InvalidStoredJobError as exc:
+        raise LabDatabaseIdentityError(str(exc)) from exc
     versions = accepted_versions or frozenset({_SCHEMA_VERSION})
     if application_id == _APPLICATION_ID:
         if user_version not in versions:
@@ -397,14 +446,18 @@ class LabJobReader:
                 deadline=stored_deadline,
                 status=JobStatus(str(row["status"])),
                 control_intent=ControlIntent(str(row["control_intent"])),
-                version=int(row["version"]),
-                attempt_count=int(row["attempt_count"]),
-                max_attempts=int(row["max_attempts"]),
-                recoverable=bool(row["recoverable"]),
-                scheduler_fencing_token=(
-                    int(row["scheduler_fencing_token"])
-                    if row["scheduler_fencing_token"] is not None
-                    else None
+                version=_strict_sqlite_int(row["version"], field="lab_job.version", minimum=0),
+                attempt_count=_strict_sqlite_int(
+                    row["attempt_count"], field="lab_job.attempt_count", minimum=0
+                ),
+                max_attempts=_strict_sqlite_int(
+                    row["max_attempts"], field="lab_job.max_attempts", minimum=1
+                ),
+                recoverable=_strict_sqlite_bool(row["recoverable"], field="lab_job.recoverable"),
+                scheduler_fencing_token=_strict_nullable_sqlite_int(
+                    row["scheduler_fencing_token"],
+                    field="lab_job.scheduler_fencing_token",
+                    minimum=1,
                 ),
                 created_at=_load_time(str(row["created_at"])),
                 updated_at=_load_time(str(row["updated_at"])),
@@ -416,19 +469,96 @@ class LabJobReader:
 
     @staticmethod
     def _lease_from_row(row: sqlite3.Row) -> LabLeaseRecord:
-        return LabLeaseRecord(
-            lease_id=int(row["lease_id"]),
-            lease_name=str(row["lease_name"]),
-            owner_id=str(row["owner_id"]),
-            token=UUID(str(row["token"])),
-            fencing_token=int(row["fencing_token"]),
-            acquired_at=_load_time(str(row["acquired_at"])),
-            heartbeat_at=_load_time(str(row["heartbeat_at"])),
-            expires_at=_load_time(str(row["expires_at"])),
-            released_at=(
-                _load_time(str(row["released_at"])) if row["released_at"] is not None else None
-            ),
-        )
+        try:
+            return LabLeaseRecord(
+                lease_id=_strict_sqlite_int(row["lease_id"], field="lab_lease.lease_id", minimum=1),
+                lease_name=str(row["lease_name"]),
+                owner_id=str(row["owner_id"]),
+                token=UUID(str(row["token"])),
+                fencing_token=_strict_sqlite_int(
+                    row["fencing_token"], field="lab_lease.fencing_token", minimum=1
+                ),
+                acquired_at=_load_time(str(row["acquired_at"])),
+                heartbeat_at=_load_time(str(row["heartbeat_at"])),
+                expires_at=_load_time(str(row["expires_at"])),
+                released_at=(
+                    _load_time(str(row["released_at"])) if row["released_at"] is not None else None
+                ),
+            )
+        except Exception as exc:
+            if isinstance(exc, InvalidStoredJobError):
+                raise
+            raise InvalidStoredJobError(
+                f"invalid stored lab lease {row['lease_id']}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _event_from_row(row: sqlite3.Row) -> LabEventRecord:
+        try:
+            return LabEventRecord(
+                event_id=_strict_sqlite_int(row["event_id"], field="lab_event.event_id", minimum=1),
+                job_id=UUID(str(row["job_id"])),
+                request_id=(
+                    UUID(str(row["request_id"])) if row["request_id"] is not None else None
+                ),
+                event_type=str(row["event_type"]),
+                prior_status=(
+                    JobStatus(str(row["prior_status"])) if row["prior_status"] is not None else None
+                ),
+                new_status=JobStatus(str(row["new_status"])),
+                job_version=_strict_sqlite_int(
+                    row["job_version"], field="lab_event.job_version", minimum=0
+                ),
+                reason=str(row["reason"]),
+                scheduler_fencing_token=_strict_nullable_sqlite_int(
+                    row["scheduler_fencing_token"],
+                    field="lab_event.scheduler_fencing_token",
+                    minimum=1,
+                ),
+                created_at=_load_time(str(row["created_at"])),
+            )
+        except Exception as exc:
+            if isinstance(exc, InvalidStoredJobError):
+                raise
+            raise InvalidStoredJobError(
+                f"invalid stored lab event {row['event_id']}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _shard_from_row(row: sqlite3.Row) -> LabShardRecord:
+        try:
+            return LabShardRecord(
+                shard_id=UUID(str(row["shard_id"])),
+                job_id=UUID(str(row["job_id"])),
+                shard_index=_strict_sqlite_int(
+                    row["shard_index"], field="lab_shard.shard_index", minimum=0
+                ),
+                status=ShardStatus(str(row["status"])),
+                version=_strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0),
+                attempt_count=_strict_sqlite_int(
+                    row["attempt_count"], field="lab_shard.attempt_count", minimum=0
+                ),
+                max_attempts=_strict_sqlite_int(
+                    row["max_attempts"], field="lab_shard.max_attempts", minimum=1
+                ),
+                worker_id=(str(row["worker_id"]) if row["worker_id"] else None),
+                scheduler_fencing_token=_strict_nullable_sqlite_int(
+                    row["scheduler_fencing_token"],
+                    field="lab_shard.scheduler_fencing_token",
+                    minimum=1,
+                ),
+                checkpoint_json=(
+                    str(row["checkpoint_json"]) if row["checkpoint_json"] is not None else None
+                ),
+                created_at=_load_time(str(row["created_at"])),
+                updated_at=_load_time(str(row["updated_at"])),
+            )
+        except Exception as exc:
+            if isinstance(exc, InvalidStoredJobError):
+                raise
+            raise InvalidStoredJobError(
+                f"invalid stored lab shard {row['shard_id']}: {exc}"
+            ) from exc
 
     def get_job(self, job_id: UUID) -> LabJobRecord | None:
         with self._connect() as connection:
@@ -454,29 +584,7 @@ class LabJobReader:
                 "SELECT * FROM lab_event WHERE job_id = ? ORDER BY event_id",
                 (str(job_id),),
             ).fetchall()
-        return tuple(
-            LabEventRecord(
-                event_id=int(row["event_id"]),
-                job_id=UUID(str(row["job_id"])),
-                request_id=(
-                    UUID(str(row["request_id"])) if row["request_id"] is not None else None
-                ),
-                event_type=str(row["event_type"]),
-                prior_status=(
-                    JobStatus(str(row["prior_status"])) if row["prior_status"] is not None else None
-                ),
-                new_status=JobStatus(str(row["new_status"])),
-                job_version=int(row["job_version"]),
-                reason=str(row["reason"]),
-                scheduler_fencing_token=(
-                    int(row["scheduler_fencing_token"])
-                    if row["scheduler_fencing_token"] is not None
-                    else None
-                ),
-                created_at=_load_time(str(row["created_at"])),
-            )
-            for row in rows
-        )
+        return tuple(self._event_from_row(row) for row in rows)
 
     def list_leases(self) -> tuple[LabLeaseRecord, ...]:
         with self._connect() as connection:
@@ -489,29 +597,7 @@ class LabJobReader:
                 "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
                 (str(job_id),),
             ).fetchall()
-        return tuple(
-            LabShardRecord(
-                shard_id=UUID(str(row["shard_id"])),
-                job_id=UUID(str(row["job_id"])),
-                shard_index=int(row["shard_index"]),
-                status=ShardStatus(str(row["status"])),
-                version=int(row["version"]),
-                attempt_count=int(row["attempt_count"]),
-                max_attempts=int(row["max_attempts"]),
-                worker_id=(str(row["worker_id"]) if row["worker_id"] else None),
-                scheduler_fencing_token=(
-                    int(row["scheduler_fencing_token"])
-                    if row["scheduler_fencing_token"] is not None
-                    else None
-                ),
-                checkpoint_json=(
-                    str(row["checkpoint_json"]) if row["checkpoint_json"] is not None else None
-                ),
-                created_at=_load_time(str(row["created_at"])),
-                updated_at=_load_time(str(row["updated_at"])),
-            )
-            for row in rows
-        )
+        return tuple(self._shard_from_row(row) for row in rows)
 
     def list_artifacts(self, job_id: UUID) -> tuple[LabArtifactRecord, ...]:
         with self._connect() as connection:
@@ -600,7 +686,11 @@ class LabJobStore:
                 allow_unclaimed_empty=True,
                 accepted_versions=frozenset({_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION}),
             )
-            starting_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            starting_version = _strict_sqlite_int(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                field="PRAGMA user_version",
+                minimum=0,
+            )
             if unclaimed:
                 connection.execute(f"PRAGMA application_id = {self.APPLICATION_ID}")
             elif starting_version == _LEGACY_SCHEMA_VERSION:
@@ -621,9 +711,21 @@ class LabJobStore:
         with self._connect() as connection:
             return LabConnectionPragmas(
                 journal_mode=str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower(),
-                synchronous=int(connection.execute("PRAGMA synchronous").fetchone()[0]),
-                foreign_keys=int(connection.execute("PRAGMA foreign_keys").fetchone()[0]),
-                busy_timeout_ms=int(connection.execute("PRAGMA busy_timeout").fetchone()[0]),
+                synchronous=_strict_sqlite_int(
+                    connection.execute("PRAGMA synchronous").fetchone()[0],
+                    field="PRAGMA synchronous",
+                    minimum=0,
+                ),
+                foreign_keys=_strict_sqlite_int(
+                    connection.execute("PRAGMA foreign_keys").fetchone()[0],
+                    field="PRAGMA foreign_keys",
+                    minimum=0,
+                ),
+                busy_timeout_ms=_strict_sqlite_int(
+                    connection.execute("PRAGMA busy_timeout").fetchone()[0],
+                    field="PRAGMA busy_timeout",
+                    minimum=0,
+                ),
             )
 
     def acquire_scheduler_lease(
@@ -654,13 +756,20 @@ class LabJobStore:
                     )
                 connection.execute(
                     "UPDATE lab_lease SET released_at = ? WHERE lease_id = ?",
-                    (_dump_time(acquired_at), int(active["lease_id"])),
+                    (
+                        _dump_time(acquired_at),
+                        _strict_sqlite_int(
+                            active["lease_id"], field="lab_lease.lease_id", minimum=1
+                        ),
+                    ),
                 )
             latest = connection.execute(
                 "SELECT COALESCE(MAX(fencing_token), 0) FROM lab_lease WHERE lease_name = ?",
                 (self.LEASE_NAME,),
             ).fetchone()
-            fencing_token = int(latest[0]) + 1
+            fencing_token = (
+                _strict_sqlite_int(latest[0], field="lab_lease.max_fencing_token", minimum=0) + 1
+            )
             token = uuid4()
             expires_at = acquired_at + timedelta(seconds=lease_seconds)
             cursor = connection.execute(
@@ -680,7 +789,11 @@ class LabJobStore:
                     _dump_time(expires_at),
                 ),
             )
-            lease_id = int(cursor.lastrowid)
+            lease_id = _strict_sqlite_int(
+                cursor.lastrowid,
+                field="lab_lease.lastrowid",
+                minimum=1,
+            )
         return LabLeaseRecord(
             lease_id=lease_id,
             lease_name=self.LEASE_NAME,
@@ -707,7 +820,8 @@ class LabJobStore:
         if (
             row is None
             or str(row["token"]) != str(lease.token)
-            or int(row["fencing_token"]) != lease.fencing_token
+            or _strict_sqlite_int(row["fencing_token"], field="lab_lease.fencing_token", minimum=1)
+            != lease.fencing_token
             or row["released_at"] is not None
             or _load_time(str(row["expires_at"])) <= current
         ):
@@ -720,7 +834,11 @@ class LabJobStore:
             """,
             (lease.lease_name,),
         ).fetchone()
-        if active is None or int(active["lease_id"]) != lease.lease_id:
+        if (
+            active is None
+            or _strict_sqlite_int(active["lease_id"], field="lab_lease.lease_id", minimum=1)
+            != lease.lease_id
+        ):
             raise SchedulerLeaseFencedError("scheduler lease has been superseded")
         return row
 
@@ -846,16 +964,21 @@ class LabJobStore:
             raise InvalidJobTransitionError(
                 f"invalid lab job transition {source.value}->{target_status.value}"
             )
-        row_fence = row["scheduler_fencing_token"]
-        if source is JobStatus.RUNNING and (
-            row_fence is None or int(row_fence) != lease.fencing_token
-        ):
+        row_fence = _strict_nullable_sqlite_int(
+            row["scheduler_fencing_token"],
+            field="lab_job.scheduler_fencing_token",
+            minimum=1,
+        )
+        if source is JobStatus.RUNNING and (row_fence is None or row_fence != lease.fencing_token):
             raise SchedulerLeaseFencedError("running job belongs to a different scheduler fence")
-        version = int(row["version"]) + 1
-        attempt_count = int(row["attempt_count"])
+        stored_version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
+        version = stored_version + 1
+        attempt_count = _strict_sqlite_int(
+            row["attempt_count"], field="lab_job.attempt_count", minimum=0
+        )
         if source is JobStatus.QUEUED and target_status is JobStatus.RUNNING:
             attempt_count += 1
-        next_recoverable = bool(row["recoverable"])
+        next_recoverable = _strict_sqlite_bool(row["recoverable"], field="lab_job.recoverable")
         if target_status is JobStatus.FAILED:
             next_recoverable = bool(recoverable)
         next_fence = row_fence
@@ -877,7 +1000,7 @@ class LabJobStore:
                 next_fence,
                 _dump_time(now),
                 str(row["job_id"]),
-                int(row["version"]),
+                stored_version,
             ),
         )
         self._insert_event(
@@ -908,12 +1031,15 @@ class LabJobStore:
         request_id: UUID,
     ) -> sqlite3.Row:
         status = JobStatus(str(row["status"]))
-        row_fence = row["scheduler_fencing_token"]
-        if status is JobStatus.RUNNING and (
-            row_fence is None or int(row_fence) != lease.fencing_token
-        ):
+        row_fence = _strict_nullable_sqlite_int(
+            row["scheduler_fencing_token"],
+            field="lab_job.scheduler_fencing_token",
+            minimum=1,
+        )
+        if status is JobStatus.RUNNING and (row_fence is None or row_fence != lease.fencing_token):
             raise SchedulerLeaseFencedError("running job belongs to a different scheduler fence")
-        version = int(row["version"]) + 1
+        stored_version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
+        version = stored_version + 1
         connection.execute(
             """
             UPDATE lab_job
@@ -925,7 +1051,7 @@ class LabJobStore:
                 version,
                 _dump_time(now),
                 str(row["job_id"]),
-                int(row["version"]),
+                stored_version,
             ),
         )
         self._insert_event(
@@ -961,7 +1087,8 @@ class LabJobStore:
             row = self._load_job_row(connection, job_id)
             if row is None:
                 raise KeyError(str(job_id))
-            if int(row["version"]) != expected_version:
+            stored_version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
+            if stored_version != expected_version:
                 raise StaleJobVersionError(
                     f"expected job version {expected_version}, found {row['version']}"
                 )
@@ -995,7 +1122,8 @@ class LabJobStore:
             row = self._load_job_row(connection, job_id)
             if row is None:
                 raise KeyError(str(job_id))
-            if int(row["version"]) != expected_version:
+            stored_version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
+            if stored_version != expected_version:
                 raise StaleJobVersionError(
                     f"expected job version {expected_version}, found {row['version']}"
                 )
@@ -1122,7 +1250,9 @@ class LabJobStore:
                 return self._receipt_for_rejection(
                     envelope,
                     reason="job_id_reused",
-                    job_version=int(row["version"]),
+                    job_version=_strict_sqlite_int(
+                        row["version"], field="lab_job.version", minimum=0
+                    ),
                 )
             spec_json = command.spec.model_dump_json(round_trip=True)
             connection.execute(
@@ -1175,7 +1305,7 @@ class LabJobStore:
                 reason="job_not_found",
                 job_version=None,
             )
-        version = int(row["version"])
+        version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
         if version != command.expected_version:
             return self._receipt_for_rejection(
                 envelope,
@@ -1212,7 +1342,9 @@ class LabJobStore:
                     job_id=command.job_id,
                     status="applied",
                     reason="cancel_requested",
-                    job_version=int(updated["version"]),
+                    job_version=_strict_sqlite_int(
+                        updated["version"], field="lab_job.version", minimum=0
+                    ),
                 )
             target = JobStatus.CANCELLED
         elif isinstance(command, PauseJobCommand):
@@ -1243,7 +1375,9 @@ class LabJobStore:
                 job_id=command.job_id,
                 status="applied",
                 reason="pause_requested",
-                job_version=int(updated["version"]),
+                job_version=_strict_sqlite_int(
+                    updated["version"], field="lab_job.version", minimum=0
+                ),
             )
         elif isinstance(command, ResumeJobCommand):
             if source is JobStatus.RUNNING and control_intent is ControlIntent.PAUSE_REQUESTED:
@@ -1262,7 +1396,9 @@ class LabJobStore:
                     job_id=command.job_id,
                     status="applied",
                     reason="pause_withdrawn",
-                    job_version=int(updated["version"]),
+                    job_version=_strict_sqlite_int(
+                        updated["version"], field="lab_job.version", minimum=0
+                    ),
                 )
             if source is not JobStatus.CHECKPOINTED:
                 return self._receipt_for_rejection(
@@ -1278,13 +1414,19 @@ class LabJobStore:
                     reason=f"invalid_state:{source.value}",
                     job_version=version,
                 )
-            if not bool(row["recoverable"]):
+            if not _strict_sqlite_bool(row["recoverable"], field="lab_job.recoverable"):
                 return self._receipt_for_rejection(
                     envelope,
                     reason="not_recoverable",
                     job_version=version,
                 )
-            if int(row["attempt_count"]) >= int(row["max_attempts"]):
+            attempt_count = _strict_sqlite_int(
+                row["attempt_count"], field="lab_job.attempt_count", minimum=0
+            )
+            max_attempts = _strict_sqlite_int(
+                row["max_attempts"], field="lab_job.max_attempts", minimum=1
+            )
+            if attempt_count >= max_attempts:
                 return self._receipt_for_rejection(
                     envelope,
                     reason="attempts_exhausted",
@@ -1345,7 +1487,7 @@ class LabJobStore:
             recoverable=None,
             event_type=f"job_{action_reason}",
         )
-        next_version = int(updated["version"])
+        next_version = _strict_sqlite_int(updated["version"], field="lab_job.version", minimum=0)
         return LabCommandReceipt(
             request_id=envelope.request_id,
             content_hash=envelope.content_hash,
@@ -1378,7 +1520,15 @@ class LabJobStore:
                 (JobStatus.RUNNING.value, lease.fencing_token),
             ).fetchall()
             for row in rows:
-                version = int(row["version"]) + 1
+                stored_version = _strict_sqlite_int(
+                    row["version"], field="lab_job.version", minimum=0
+                )
+                version = stored_version + 1
+                _strict_nullable_sqlite_int(
+                    row["scheduler_fencing_token"],
+                    field="lab_job.scheduler_fencing_token",
+                    minimum=1,
+                )
                 intent = ControlIntent(str(row["control_intent"]))
                 target_status = (
                     JobStatus.CANCELLED
@@ -1399,7 +1549,7 @@ class LabJobStore:
                         lease.fencing_token,
                         _dump_time(current),
                         str(row["job_id"]),
-                        int(row["version"]),
+                        stored_version,
                     ),
                 )
                 self._insert_event(
@@ -1463,7 +1613,10 @@ _SCHEMA_STATEMENTS = (
         reason TEXT NOT NULL,
         receipt_json TEXT NOT NULL,
         receipt_job_version INTEGER CHECK (
-            receipt_job_version IS NULL OR receipt_job_version >= 0
+            receipt_job_version IS NULL OR (
+                typeof(receipt_job_version) = 'integer'
+                AND receipt_job_version >= 0
+            )
         ),
         received_at TEXT NOT NULL,
         applied_at TEXT NOT NULL

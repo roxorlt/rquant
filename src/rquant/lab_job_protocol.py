@@ -151,7 +151,7 @@ class LabCommandReceipt(LabProtocolModel):
     job_id: UUID
     status: Literal["applied", "rejected"]
     reason: str = Field(min_length=1)
-    job_version: int | None = Field(default=None, ge=0)
+    job_version: int | None = Field(default=None, strict=True, ge=0)
 
 
 class LabSpoolEntry(LabProtocolModel):
