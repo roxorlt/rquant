@@ -167,13 +167,37 @@ def test_hash_is_stable_for_mapping_order_parameter_order_and_timezone() -> None
 
 def test_hash_changes_when_a_reproducibility_input_changes() -> None:
     base = _spec()
+    changed_snapshot = DatasetSnapshotIdentity.model_validate(
+        {
+            **_snapshot().model_dump(mode="python"),
+            "binding_hash": "d" * 64,
+        }
+    )
 
     assert _spec(random_seed=base.random_seed + 1).spec_hash != base.spec_hash
     assert _spec(code_sha="2" * 40).spec_hash != base.spec_hash
-    assert (
-        _spec(dataset_snapshot=_snapshot().model_copy(update={"binding_hash": "d" * 64})).spec_hash
-        != base.spec_hash
-    )
+    assert _spec(dataset_snapshot=changed_snapshot).spec_hash != base.spec_hash
+
+
+def test_spec_model_copy_revalidates_snapshot_grade_gate() -> None:
+    comparable = _spec()
+
+    with pytest.raises(ValidationError, match="immutable dataset snapshot"):
+        comparable.model_copy(update={"dataset_snapshot": None})
+
+
+def test_spec_model_copy_rejects_unvalidated_parameter_mapping() -> None:
+    with pytest.raises(ValidationError, match="parameters"):
+        _spec().model_copy(update={"parameters": {"strategy_name": "n_shape"}})
+
+
+def test_spec_model_validate_revalidates_nested_model_instances() -> None:
+    invalid_snapshot = _snapshot().model_copy(update={"snapshot_id": "bad"})
+    payload = _spec().model_dump(mode="python")
+    payload["dataset_snapshot"] = invalid_snapshot
+
+    with pytest.raises(ValidationError, match="snapshot_id"):
+        ResearchRunSpec.model_validate(payload)
 
 
 def test_snapshot_gate_allows_only_exploratory_without_immutable_snapshot() -> None:

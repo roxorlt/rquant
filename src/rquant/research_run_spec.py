@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
-from typing import Literal, TypeAlias
+from typing import Literal, Self, TypeAlias
 
 from pydantic import (
     BaseModel,
@@ -52,6 +52,7 @@ class RunSpecModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
+        revalidate_instances="always",
         str_strip_whitespace=True,
     )
 
@@ -257,6 +258,18 @@ class ResearchRunSpec(RunSpecModel):
         if self.dataset_snapshot is None and self.research_status != "exploratory":
             raise ValueError("an immutable dataset snapshot is required above exploratory status")
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if not update:
+            return super().model_copy(deep=deep)
+        payload = self.model_dump(mode="python", round_trip=True)
+        payload.update(update)
+        return type(self).model_validate(payload)
 
     def canonical_json(self) -> str:
         payload = _canonical_value(self.model_dump(mode="python"))
