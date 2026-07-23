@@ -46,6 +46,8 @@ class ParameterKind(StrEnum):
 
 
 ParameterValue: TypeAlias = StrictBool | StrictInt | Decimal | datetime | date | str
+MAX_DECIMAL_COEFFICIENT_DIGITS = 128
+MAX_DECIMAL_ABS_EXPONENT = 384
 
 
 class RunSpecModel(BaseModel):
@@ -57,15 +59,47 @@ class RunSpecModel(BaseModel):
     )
 
 
+def _decimal_components(
+    value: Decimal,
+    *,
+    field_name: str,
+) -> tuple[int, tuple[int, ...], int]:
+    if not value.is_finite():
+        raise ValueError(f"{field_name} must be finite")
+    parts = value.as_tuple()
+    if not isinstance(parts.exponent, int):
+        raise ValueError(f"{field_name} must have a finite integer exponent")
+    if len(parts.digits) > MAX_DECIMAL_COEFFICIENT_DIGITS:
+        raise ValueError(
+            f"{field_name} coefficient digits cannot exceed {MAX_DECIMAL_COEFFICIENT_DIGITS}"
+        )
+    if abs(parts.exponent) > MAX_DECIMAL_ABS_EXPONENT:
+        raise ValueError(
+            f"{field_name} exponent magnitude cannot exceed {MAX_DECIMAL_ABS_EXPONENT}"
+        )
+    if value.is_zero():
+        return 0, (0,), 0
+
+    digits = list(parts.digits)
+    exponent = parts.exponent
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    if abs(exponent) > MAX_DECIMAL_ABS_EXPONENT:
+        raise ValueError(
+            f"{field_name} normalized exponent magnitude cannot exceed {MAX_DECIMAL_ABS_EXPONENT}"
+        )
+    return parts.sign, tuple(digits), exponent
+
+
 def _parse_decimal(value: object, *, field_name: str) -> Decimal:
     if isinstance(value, (bool, Mapping)):
         raise ValueError(f"{field_name} must be a finite decimal")
     try:
-        parsed = Decimal(str(value))
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be a finite decimal") from exc
-    if not parsed.is_finite():
-        raise ValueError(f"{field_name} must be finite")
+    _decimal_components(parsed, field_name=field_name)
     return Decimal(0) if parsed.is_zero() else parsed
 
 
@@ -73,6 +107,40 @@ def _normalize_datetime(value: datetime, *, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _parse_aware_datetime(value: object, *, field_name: str) -> datetime:
+    if isinstance(value, datetime):
+        return _normalize_datetime(value, field_name=field_name)
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a timezone-aware datetime or ISO datetime string")
+    text = value.strip()
+    if "T" not in text and " " not in text:
+        raise ValueError(f"{field_name} must be a timezone-aware datetime or ISO datetime string")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} requires an ISO datetime string") from exc
+    return _normalize_datetime(parsed, field_name=field_name)
+
+
+def _parse_civil_date(value: object, *, field_name: str) -> date:
+    if isinstance(value, datetime):
+        raise ValueError(f"{field_name} must be a civil date, not a datetime")
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a civil date or ISO date string")
+    text = value.strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} requires an ISO civil date string") from exc
+    if parsed.isoformat() != text:
+        raise ValueError(f"{field_name} requires an ISO civil date string")
+    return parsed
 
 
 class ResearchParameter(RunSpecModel):
@@ -106,24 +174,9 @@ class ResearchParameter(RunSpecModel):
             if not isinstance(value, str):
                 raise ValueError("text parameter requires a string")
         elif kind is ParameterKind.DATE:
-            if isinstance(value, datetime):
-                raise ValueError("date parameter requires a civil date")
-            if isinstance(value, str):
-                try:
-                    parsed["value"] = date.fromisoformat(value)
-                except ValueError as exc:
-                    raise ValueError("date parameter requires an ISO date") from exc
-            elif not isinstance(value, date):
-                raise ValueError("date parameter requires a civil date")
+            parsed["value"] = _parse_civil_date(value, field_name="date parameter")
         else:
-            if isinstance(value, str):
-                try:
-                    value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                except ValueError as exc:
-                    raise ValueError("datetime parameter requires an ISO datetime") from exc
-            if not isinstance(value, datetime):
-                raise ValueError("datetime parameter requires a datetime")
-            parsed["value"] = _normalize_datetime(
+            parsed["value"] = _parse_aware_datetime(
                 value,
                 field_name="datetime parameter",
             )
@@ -149,6 +202,11 @@ class ResearchRunParameters(RunSpecModel):
     start_date: date
     end_date: date
     arguments: tuple[ResearchParameter, ...] = ()
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def validate_civil_date(cls, value: object) -> date:
+        return _parse_civil_date(value, field_name="research date")
 
     @field_validator("arguments")
     @classmethod
@@ -198,11 +256,22 @@ class ExecutionCostSpec(RunSpecModel):
 
 
 def _canonical_decimal(value: Decimal) -> str:
-    if not value.is_finite():
-        raise ValueError("canonical numeric values must be finite")
-    if value.is_zero():
+    sign, digits, exponent = _decimal_components(
+        value,
+        field_name="canonical decimal",
+    )
+    if digits == (0,):
         return "0"
-    return format(value.normalize(), "f")
+    coefficient = "".join(str(digit) for digit in digits)
+    if exponent >= 0:
+        magnitude = f"{coefficient}{'0' * exponent}"
+    else:
+        point = len(coefficient) + exponent
+        if point > 0:
+            magnitude = f"{coefficient[:point]}.{coefficient[point:]}"
+        else:
+            magnitude = f"0.{'0' * -point}{coefficient}"
+    return f"{'-' if sign else ''}{magnitude}"
 
 
 def _canonical_value(value: object) -> object:
@@ -248,10 +317,10 @@ class ResearchRunSpec(RunSpecModel):
     deadline: datetime
     research_status: ResearchStatus = "exploratory"
 
-    @field_validator("deadline")
+    @field_validator("deadline", mode="before")
     @classmethod
-    def validate_deadline(cls, value: datetime) -> datetime:
-        return _normalize_datetime(value, field_name="deadline")
+    def validate_deadline(cls, value: object) -> datetime:
+        return _parse_aware_datetime(value, field_name="deadline")
 
     @model_validator(mode="after")
     def enforce_snapshot_research_status(self) -> ResearchRunSpec:
@@ -269,7 +338,9 @@ class ResearchRunSpec(RunSpecModel):
             return super().model_copy(deep=deep)
         payload = self.model_dump(mode="python", round_trip=True)
         payload.update(update)
-        return type(self).model_validate(payload)
+        validated = type(self).model_validate(payload)
+        validated_update = {field_name: getattr(validated, field_name) for field_name in update}
+        return super().model_copy(update=validated_update, deep=deep)
 
     def canonical_json(self) -> str:
         payload = _canonical_value(self.model_dump(mode="python"))

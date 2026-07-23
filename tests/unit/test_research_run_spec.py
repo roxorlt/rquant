@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 from pydantic import ValidationError
@@ -74,6 +74,14 @@ def _spec(**overrides: object) -> ResearchRunSpec:
     }
     values.update(overrides)
     return ResearchRunSpec.model_validate(values)
+
+
+def _decimal_parameter_spec(value: Decimal) -> ResearchRunSpec:
+    return _spec(
+        parameters=_parameters(
+            ResearchParameter(name="threshold", kind="decimal", value=value),
+        )
+    )
 
 
 def test_valid_spec_freezes_reproducibility_inputs() -> None:
@@ -165,6 +173,94 @@ def test_hash_is_stable_for_mapping_order_parameter_order_and_timezone() -> None
     assert first.spec_hash == reordered.spec_hash
 
 
+def test_decimal_canonicalization_ignores_active_context_precision() -> None:
+    spec = _decimal_parameter_spec(Decimal("123456789.123456789"))
+
+    with localcontext() as context:
+        context.prec = 3
+        low_precision_json = spec.canonical_json()
+        low_precision_hash = spec.spec_hash
+    with localcontext() as context:
+        context.prec = 50
+        high_precision_json = spec.canonical_json()
+        high_precision_hash = spec.spec_hash
+
+    assert low_precision_json == high_precision_json
+    assert low_precision_hash == high_precision_hash
+    assert '"$decimal":"123456789.123456789"' in low_precision_json
+
+
+def test_decimal_canonicalization_does_not_collapse_distinct_values() -> None:
+    left = _decimal_parameter_spec(Decimal("1.2341"))
+    right = _decimal_parameter_spec(Decimal("1.2342"))
+
+    with localcontext() as context:
+        context.prec = 4
+        assert left.spec_hash != right.spec_hash
+
+
+def test_decimal_canonicalization_normalizes_negative_zero() -> None:
+    assert (
+        _decimal_parameter_spec(Decimal("-0.000")).spec_hash
+        == _decimal_parameter_spec(Decimal("0")).spec_hash
+    )
+
+
+def test_canonical_json_and_hash_match_golden_vector() -> None:
+    expected_json = (
+        '{"code_sha":"1111111111111111111111111111111111111111",'
+        '"dataset_snapshot":{"binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        'bbbbbbbbbbbbbbbbbbbbbbbb","snapshot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        'aaaaaaaaaaaaaaaaaaaaaaaa"},"deadline":{"$datetime":"2026-07-25T02:00:00.'
+        '000000Z"},"execution_costs":{"commission_bps":{"$decimal":"2.5"},'
+        '"slippage_bps":{"$decimal":"3"},"stamp_duty_bps":{"$decimal":"5"},'
+        '"transfer_fee_bps":{"$decimal":"0.1"}},"feature_contract":{"contract_hash":'
+        '"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        '"contract_id":"intraday-core","contract_version":"v1"},"job_type":'
+        '"strategy_replay","parameters":{"arguments":[{"kind":"integer","name":'
+        '"hold_days","value":3},{"kind":"boolean","name":"vp_risk_only","value":true}],'
+        '"end_date":{"$date":"2026-07-14"},"start_date":{"$date":"2026-04-01"},'
+        '"strategy_name":"n_shape"},"random_seed":20260724,"research_status":'
+        '"comparable","resource_class":"standard","schema_version":1}'
+    )
+
+    assert _spec().canonical_json() == expected_json
+    assert _spec().spec_hash == "5dfdef4d16e812237792efdff0613b551d4830793af8b828bc7aa1122cda6557"
+
+
+@pytest.mark.parametrize("value", [Decimal("1E+1000000"), Decimal("1E-1000000")])
+def test_decimal_parameter_rejects_extreme_exponents(value: Decimal) -> None:
+    with pytest.raises(ValidationError, match="exponent"):
+        ResearchParameter(name="threshold", kind="decimal", value=value)
+
+
+@pytest.mark.parametrize("value", [Decimal("1E+1000000"), Decimal("1E-1000000")])
+def test_execution_cost_rejects_extreme_exponents(value: Decimal) -> None:
+    with pytest.raises(ValidationError, match="exponent"):
+        ExecutionCostSpec(
+            commission_bps=value,
+            stamp_duty_bps=0,
+            transfer_fee_bps=0,
+            slippage_bps=0,
+        )
+
+
+@pytest.mark.parametrize("target", ["parameter", "execution_cost"])
+def test_decimal_inputs_reject_oversized_coefficients(target: str) -> None:
+    value = Decimal("1" * 129)
+
+    with pytest.raises(ValidationError, match="coefficient digits"):
+        if target == "parameter":
+            ResearchParameter(name="threshold", kind="decimal", value=value)
+        else:
+            ExecutionCostSpec(
+                commission_bps=value,
+                stamp_duty_bps=0,
+                transfer_fee_bps=0,
+                slippage_bps=0,
+            )
+
+
 def test_hash_changes_when_a_reproducibility_input_changes() -> None:
     base = _spec()
     changed_snapshot = DatasetSnapshotIdentity.model_validate(
@@ -189,6 +285,31 @@ def test_spec_model_copy_revalidates_snapshot_grade_gate() -> None:
 def test_spec_model_copy_rejects_unvalidated_parameter_mapping() -> None:
     with pytest.raises(ValidationError, match="parameters"):
         _spec().model_copy(update={"parameters": {"strategy_name": "n_shape"}})
+
+
+def test_spec_model_copy_preserves_shallow_and_deep_identity() -> None:
+    spec = _spec()
+
+    shallow = spec.model_copy(update={"random_seed": 7})
+    deep = spec.model_copy(update={"random_seed": 7}, deep=True)
+
+    assert shallow.parameters is spec.parameters
+    assert shallow.dataset_snapshot is spec.dataset_snapshot
+    assert deep.parameters is not spec.parameters
+    assert deep.dataset_snapshot is not spec.dataset_snapshot
+
+
+def test_spec_model_copy_preserves_fields_set_and_exclude_unset() -> None:
+    payload = _spec().model_dump(mode="python")
+    payload.pop("schema_version")
+    payload.pop("research_status")
+    spec = ResearchRunSpec.model_validate(payload)
+
+    copied = spec.model_copy(update={"research_status": "comparable"})
+
+    assert copied.model_fields_set == spec.model_fields_set | {"research_status"}
+    assert "schema_version" not in copied.model_dump(exclude_unset=True)
+    assert copied.model_dump(exclude_unset=True)["research_status"] == "comparable"
 
 
 def test_spec_model_validate_revalidates_nested_model_instances() -> None:
@@ -276,3 +397,68 @@ def test_parameter_datetime_must_be_timezone_aware_and_is_canonical() -> None:
         _spec(parameters=_parameters(utc_value)).spec_hash
         == _spec(parameters=_parameters(cst_value)).spec_hash
     )
+
+
+@pytest.mark.parametrize("value", [0, 0.5, date(2026, 7, 25), "2026-07-25"])
+def test_deadline_rejects_non_datetime_inputs(value: object) -> None:
+    with pytest.raises(ValidationError, match="ISO datetime"):
+        _spec(deadline=value)
+
+
+def test_temporal_iso_strings_are_parsed_and_normalized() -> None:
+    parameters = ResearchRunParameters.model_validate(
+        {
+            "strategy_name": "n_shape",
+            "start_date": "2026-04-01",
+            "end_date": "2026-07-14",
+            "arguments": [
+                {
+                    "name": "as_of",
+                    "kind": "datetime",
+                    "value": "2026-07-24T09:30:00+08:00",
+                },
+                {"name": "signal_date", "kind": "date", "value": "2026-07-24"},
+            ],
+        }
+    )
+    spec = _spec(
+        parameters=parameters,
+        deadline="2026-07-25T10:00:00+08:00",
+    )
+
+    assert spec.deadline == datetime(2026, 7, 25, 2, tzinfo=UTC)
+    assert parameters.start_date == date(2026, 4, 1)
+    assert parameters.arguments[0].value == datetime(2026, 7, 24, 1, 30, tzinfo=UTC)
+    assert parameters.arguments[1].value == date(2026, 7, 24)
+
+
+@pytest.mark.parametrize("field", ["start_date", "end_date"])
+@pytest.mark.parametrize("value", [0, 0.5, datetime(2026, 4, 1, tzinfo=UTC)])
+def test_research_date_range_rejects_non_civil_dates(field: str, value: object) -> None:
+    values: dict[str, object] = {
+        "strategy_name": "n_shape",
+        "start_date": date(2026, 4, 1),
+        "end_date": date(2026, 7, 14),
+    }
+    values[field] = value
+
+    with pytest.raises(ValidationError, match="civil date"):
+        ResearchRunParameters.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "message"),
+    [
+        ("datetime", 0, "datetime"),
+        ("datetime", 0.5, "datetime"),
+        ("date", 0, "civil date"),
+        ("date", datetime(2026, 7, 24, tzinfo=UTC), "civil date"),
+    ],
+)
+def test_typed_temporal_parameters_reject_numeric_and_cross_type_inputs(
+    kind: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ResearchParameter(name="as_of", kind=kind, value=value)
