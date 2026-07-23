@@ -2149,9 +2149,10 @@ class LabJobStore:
                     _dump_time(current),
                 ),
             ).fetchall()
+            reclaimed_job_ids: set[UUID] = set()
             for stale in stale_rows:
                 version = _strict_sqlite_int(stale["version"], field="lab_shard.version", minimum=0)
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE lab_shard
                     SET status = ?, version = ?, worker_id = NULL,
@@ -2170,6 +2171,40 @@ class LabJobStore:
                         ShardStatus.RUNNING.value,
                     ),
                 )
+                if cursor.rowcount == 1:
+                    reclaimed_job_ids.add(UUID(str(stale["job_id"])))
+            for reclaimed_job_id in sorted(reclaimed_job_ids, key=str):
+                reclaimed_job = self._load_job_row(connection, reclaimed_job_id)
+                assert reclaimed_job is not None
+                if (
+                    JobStatus(str(reclaimed_job["status"])) is not JobStatus.RUNNING
+                    or ControlIntent(str(reclaimed_job["control_intent"]))
+                    is not ControlIntent.PAUSE_REQUESTED
+                ):
+                    continue
+                active_count = connection.execute(
+                    "SELECT COUNT(*) FROM lab_shard WHERE job_id = ? AND status = ?",
+                    (str(reclaimed_job_id), ShardStatus.RUNNING.value),
+                ).fetchone()[0]
+                if (
+                    _strict_sqlite_int(
+                        active_count,
+                        field="lab_shard.active_count",
+                        minimum=0,
+                    )
+                    == 0
+                ):
+                    self._transition_in_transaction(
+                        connection,
+                        reclaimed_job,
+                        target_status=JobStatus.CHECKPOINTED,
+                        lease=lease,
+                        reason="all active shard leases expired during pause",
+                        now=current,
+                        request_id=None,
+                        recoverable=None,
+                        event_type="job_checkpointed",
+                    )
             active_worker = connection.execute(
                 """
                 SELECT 1 FROM lab_shard

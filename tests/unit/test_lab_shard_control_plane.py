@@ -560,6 +560,82 @@ def test_pause_at_idle_shard_boundary_checkpoints_immediately(tmp_path: Path) ->
     assert _claim(store, lease, worker="worker-b", now_offset=7).shard_index == 1
 
 
+def test_pause_checkpoints_when_all_active_claims_expire_and_requeue(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3)
+    first = _claim(store, lease, worker="worker-a", duration=5)
+    second = _claim(
+        store,
+        lease,
+        worker="worker-b",
+        now_offset=3,
+        duration=5,
+    )
+    _pause(store, lease, job_id, offset=4)
+    before = LabJobReader(store.path).list_shards(job_id)
+
+    assert (
+        store.claim_next_shard(
+            worker_id="worker-c",
+            shard_lease_seconds=30,
+            lease=lease,
+            now=NOW + timedelta(seconds=9),
+        )
+        is None
+    )
+
+    checkpointed = LabJobReader(store.path).get_job(job_id)
+    reclaimed = LabJobReader(store.path).list_shards(job_id)
+    assert checkpointed is not None
+    assert checkpointed.status is JobStatus.CHECKPOINTED
+    assert checkpointed.control_intent is ControlIntent.NONE
+    assert [shard.status for shard in reclaimed] == [
+        ShardStatus.QUEUED,
+        ShardStatus.QUEUED,
+        ShardStatus.QUEUED,
+    ]
+    assert [shard.version for shard in reclaimed] == [
+        before[0].version + 1,
+        before[1].version + 1,
+        before[2].version,
+    ]
+    for shard in reclaimed:
+        assert shard.worker_id is None
+        assert shard.scheduler_fencing_token is None
+        assert shard.claim_token is None
+        assert shard.claimed_at is None
+        assert shard.heartbeat_at is None
+        assert shard.lease_expires_at is None
+
+    stale = store.apply_worker_report(
+        _report(first, LabShardSucceeded(result_manifest_hash="9" * 64), offset=10),
+        lease=lease,
+        now=NOW + timedelta(seconds=10),
+    )
+    assert stale.status == "rejected"
+    assert LabJobReader(store.path).list_shards(job_id) == reclaimed
+
+    resume = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=ResumeJobCommand(
+                job_id=job_id,
+                expected_version=checkpointed.version,
+                reason="resume after expired workers",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=11),
+    )
+    assert resume.status == "applied"
+    fresh = _claim(store, lease, worker="worker-c", now_offset=12)
+    assert fresh.shard_id == first.shard_id
+    assert fresh.claim_generation == first.claim_generation + 1
+    assert fresh.claim_token != first.claim_token
+    assert second.shard_id != fresh.shard_id
+
+
 def test_pause_waits_for_every_already_running_shard_before_checkpoint(
     tmp_path: Path,
 ) -> None:
