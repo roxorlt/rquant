@@ -15,9 +15,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -306,7 +308,7 @@ def _canonical_value(value: object) -> object:
 
 
 class ResearchRunSpec(RunSpecModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     job_type: ResearchJobType
     parameters: ResearchRunParameters
     code_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -323,6 +325,21 @@ class ResearchRunSpec(RunSpecModel):
     def validate_deadline(cls, value: object) -> datetime:
         return _parse_aware_datetime(value, field_name="deadline")
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_v1_audit_identity(cls, data: object) -> object:
+        if not isinstance(data, Mapping) or data.get("schema_version", 2) != 1:
+            return data
+        snapshot = data.get("dataset_snapshot")
+        if isinstance(snapshot, Mapping) and "audit_run_id" in snapshot:
+            raise ValueError("v1 dataset_snapshot must not contain audit_run_id")
+        if (
+            isinstance(snapshot, DatasetSnapshotIdentity)
+            and "audit_run_id" in snapshot.model_fields_set
+        ):
+            raise ValueError("v1 dataset_snapshot must not contain audit_run_id")
+        return data
+
     @model_validator(mode="after")
     def enforce_snapshot_research_status(self) -> ResearchRunSpec:
         if self.research_status != "exploratory":
@@ -330,11 +347,23 @@ class ResearchRunSpec(RunSpecModel):
                 raise ValueError(
                     "an immutable dataset snapshot is required above exploratory status"
                 )
-            if self.dataset_snapshot.audit_run_id is None:
+            if self.schema_version == 2 and self.dataset_snapshot.audit_run_id is None:
                 raise ValueError(
                     "dataset_snapshot.audit_run_id is required above exploratory status"
                 )
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_versioned_contract(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> object:
+        payload = handler(self)
+        if self.schema_version == 1 and isinstance(payload, dict):
+            snapshot = payload.get("dataset_snapshot")
+            if isinstance(snapshot, dict):
+                snapshot.pop("audit_run_id", None)
+        return payload
 
     def model_copy(
         self,

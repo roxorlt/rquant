@@ -1246,6 +1246,12 @@ class LabJobStore:
         command = envelope.command
         row = self._load_job_row(connection, command.job_id)
         if isinstance(command, SubmitJobCommand):
+            if command.spec.schema_version != 2:
+                return self._receipt_for_rejection(
+                    envelope,
+                    reason="unsupported_spec_version",
+                    job_version=None,
+                )
             if row is not None:
                 return self._receipt_for_rejection(
                     envelope,

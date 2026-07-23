@@ -28,12 +28,18 @@ def _parameters(*arguments: ResearchParameter) -> ResearchRunParameters:
     )
 
 
-def _snapshot(*, audit_run_id: str | None = "d" * 64) -> DatasetSnapshotIdentity:
-    return DatasetSnapshotIdentity(
-        snapshot_id="a" * 64,
-        binding_hash="b" * 64,
-        audit_run_id=audit_run_id,
-    )
+def _snapshot(
+    *,
+    audit_run_id: str | None = "d" * 64,
+    include_audit: bool = True,
+) -> DatasetSnapshotIdentity:
+    values: dict[str, object] = {
+        "snapshot_id": "a" * 64,
+        "binding_hash": "b" * 64,
+    }
+    if include_audit:
+        values["audit_run_id"] = audit_run_id
+    return DatasetSnapshotIdentity.model_validate(values)
 
 
 def _feature_contract() -> FeatureContractIdentity:
@@ -85,9 +91,20 @@ def _decimal_parameter_spec(value: Decimal) -> ResearchRunSpec:
     )
 
 
+def _v1_spec(**overrides: object) -> ResearchRunSpec:
+    values = _spec().model_dump(mode="python", round_trip=True)
+    values["schema_version"] = 1
+    snapshot = values["dataset_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot.pop("audit_run_id")
+    values.update(overrides)
+    return ResearchRunSpec.model_validate(values)
+
+
 def test_valid_spec_freezes_reproducibility_inputs() -> None:
     spec = _spec()
 
+    assert spec.schema_version == 2
     assert spec.job_type is ResearchJobType.STRATEGY_REPLAY
     assert spec.code_sha == "1" * 40
     assert spec.dataset_snapshot == _snapshot()
@@ -104,6 +121,8 @@ def test_valid_spec_freezes_reproducibility_inputs() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
+        ("schema_version", 0, "schema_version"),
+        ("schema_version", 3, "schema_version"),
         ("job_type", "unknown", "job_type"),
         ("code_sha", "1" * 39, "code_sha"),
         ("code_sha", "G" * 40, "code_sha"),
@@ -208,7 +227,7 @@ def test_decimal_canonicalization_normalizes_negative_zero() -> None:
     )
 
 
-def test_canonical_json_and_hash_match_cross_python_golden_vector() -> None:
+def test_v2_canonical_json_and_hash_match_cross_python_golden_vector() -> None:
     expected_json = (
         '{"code_sha":"1111111111111111111111111111111111111111",'
         '"dataset_snapshot":{"audit_run_id":"dddddddddddddddddddddddddddddddddddddddd'
@@ -224,11 +243,43 @@ def test_canonical_json_and_hash_match_cross_python_golden_vector() -> None:
         '"hold_days","value":3},{"kind":"boolean","name":"vp_risk_only","value":true}],'
         '"end_date":{"$date":"2026-07-14"},"start_date":{"$date":"2026-04-01"},'
         '"strategy_name":"n_shape"},"random_seed":20260724,"research_status":'
-        '"comparable","resource_class":"standard","schema_version":1}'
+        '"comparable","resource_class":"standard","schema_version":2}'
     )
 
     assert _spec().canonical_json() == expected_json
-    assert _spec().spec_hash == "8db01a9103e9c44fa7e35ec9ec63e37f90c01d57749766aa1903550015faa6dc"
+    assert _spec().spec_hash == "2d8fa8e3f3e7a7aa5e43397c8f8fe99b2f37cc1076c915885ebbc0b215f7345f"
+
+
+def test_v1_comparable_canonical_json_and_hash_match_9fd159e_golden() -> None:
+    expected_json = (
+        '{"code_sha":"1111111111111111111111111111111111111111",'
+        '"dataset_snapshot":{"binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        'bbbbbbbbbbbbbbbbbbbbbbbb","snapshot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        'aaaaaaaaaaaaaaaaaaaaaaaa"},"deadline":{"$datetime":"2026-07-25T02:00:00.'
+        '000000Z"},"execution_costs":{"commission_bps":{"$decimal":"2.5"},'
+        '"slippage_bps":{"$decimal":"3"},"stamp_duty_bps":{"$decimal":"5"},'
+        '"transfer_fee_bps":{"$decimal":"0.1"}},"feature_contract":{"contract_hash":'
+        '"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        '"contract_id":"intraday-core","contract_version":"v1"},"job_type":'
+        '"strategy_replay","parameters":{"arguments":[{"kind":"integer","name":'
+        '"hold_days","value":3},{"kind":"boolean","name":"vp_risk_only","value":true}],'
+        '"end_date":{"$date":"2026-07-14"},"start_date":{"$date":"2026-04-01"},'
+        '"strategy_name":"n_shape"},"random_seed":20260724,"research_status":'
+        '"comparable","resource_class":"standard","schema_version":1}'
+    )
+
+    spec = _v1_spec()
+
+    assert spec.canonical_json() == expected_json
+    assert "audit_run_id" not in spec.canonical_json()
+    assert "audit_run_id" not in spec.model_dump_json(round_trip=True)
+    assert spec.spec_hash == "5dfdef4d16e812237792efdff0613b551d4830793af8b828bc7aa1122cda6557"
+
+
+def test_v1_exploratory_without_snapshot_keeps_9fd159e_golden_hash() -> None:
+    spec = _v1_spec(dataset_snapshot=None, research_status="exploratory")
+
+    assert spec.spec_hash == "99ed983adf2b06360aa278a1391041d5d2926babbb2bf94bfc071dceea55b495"
 
 
 @pytest.mark.parametrize("value", [Decimal("1E+1000000"), Decimal("1E-1000000")])
@@ -289,6 +340,16 @@ def test_spec_model_copy_revalidates_snapshot_grade_gate() -> None:
 
     with pytest.raises(ValidationError, match="audit_run_id"):
         comparable.model_copy(update={"dataset_snapshot": _snapshot(audit_run_id=None)})
+
+
+def test_v1_model_copy_preserves_legacy_canonical_shape() -> None:
+    spec = _v1_spec()
+
+    copied = spec.model_copy(update={"random_seed": 7})
+
+    assert copied.schema_version == 1
+    assert "audit_run_id" not in copied.canonical_json()
+    assert copied.random_seed == 7
 
 
 def test_spec_model_copy_rejects_unvalidated_parameter_mapping() -> None:
@@ -353,6 +414,32 @@ def test_comparable_research_requires_snapshot_audit_identity() -> None:
             dataset_snapshot=_snapshot(audit_run_id=None),
             research_status="comparable",
         )
+
+
+def test_v1_comparable_accepts_snapshot_without_audit_identity() -> None:
+    spec = _v1_spec()
+
+    assert spec.schema_version == 1
+    assert spec.research_status == "comparable"
+    assert spec.dataset_snapshot is not None
+    assert spec.dataset_snapshot.audit_run_id is None
+
+
+def test_v1_keeps_legacy_snapshot_gate_above_exploratory() -> None:
+    with pytest.raises(ValidationError, match="immutable dataset snapshot"):
+        _v1_spec(dataset_snapshot=None, research_status="comparable")
+
+
+@pytest.mark.parametrize("audit_run_id", [None, "d" * 64])
+def test_v1_rejects_explicit_audit_field(audit_run_id: str | None) -> None:
+    values = _spec().model_dump(mode="python", round_trip=True)
+    values["schema_version"] = 1
+    snapshot = values["dataset_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["audit_run_id"] = audit_run_id
+
+    with pytest.raises(ValidationError, match="v1.*audit_run_id"):
+        ResearchRunSpec.model_validate(values)
 
 
 def test_exploratory_research_accepts_snapshot_without_audit_identity() -> None:

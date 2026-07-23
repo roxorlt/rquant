@@ -50,6 +50,21 @@ from rquant.research_run_spec import (
 )
 
 NOW = datetime(2026, 7, 24, 1, 0, tzinfo=UTC)
+OLD_V1_SPEC_JSON = (
+    '{"schema_version":1,"job_type":"strategy_replay","parameters":{"strategy_name":'
+    '"n_shape","start_date":"2026-04-01","end_date":"2026-07-14","arguments":[]},'
+    '"code_sha":"1111111111111111111111111111111111111111","dataset_snapshot":'
+    '{"snapshot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    '"binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},'
+    '"feature_contract":{"contract_id":"intraday-core","contract_version":"v1",'
+    '"contract_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},'
+    '"execution_costs":{"commission_bps":"2.5","stamp_duty_bps":"5",'
+    '"transfer_fee_bps":"0.1","slippage_bps":"3"},"random_seed":20260724,'
+    '"resource_class":"standard","deadline":"2026-07-25T02:00:00Z",'
+    '"research_status":"comparable"}'
+)
+OLD_V1_SPEC_HASH = "bab8a079dd4cbad1a7e8343d2872d0f87707945f416af1e3eb088af13c367f3b"
+OLD_V1_COMMAND_HASH = "65c3859a9f38541641cf9b87093042ed863c451c5bb69a0bfd0053b07d86eace"
 
 
 def _spec(
@@ -86,6 +101,10 @@ def _spec(
         deadline=datetime(2026, 7, 25, 2, tzinfo=UTC),
         research_status="comparable",
     )
+
+
+def _v1_spec() -> ResearchRunSpec:
+    return ResearchRunSpec.model_validate_json(OLD_V1_SPEC_JSON)
 
 
 def _submit(
@@ -516,6 +535,116 @@ def test_submit_roundtrips_validated_spec_and_typed_empty_rows(tmp_path: Path) -
     assert isinstance(reader.list_leases()[0], LabLeaseRecord)
     assert LabShardRecord.model_fields
     assert LabArtifactRecord.model_fields
+
+
+def test_new_v1_submit_is_durably_rejected_and_replays_same_receipt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit(spec=_v1_spec())
+
+    first = store.apply_command(envelope, lease=lease, now=NOW)
+    replayed = store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+    assert first.status == "rejected"
+    assert first.reason == "unsupported_spec_version"
+    assert first.job_version is None
+    assert replayed == first
+    reader = LabJobReader(store.path)
+    assert reader.get_job(envelope.command.job_id) is None
+    command_record = reader.get_command(envelope.request_id)
+    assert command_record is not None
+    assert command_record.receipt == first
+    assert _count(store.path, "lab_command") == 1
+    assert _count(store.path, "lab_job") == 0
+
+
+def test_reader_and_exactly_once_replay_accept_real_legacy_v1_ledger(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    spec = _v1_spec()
+    request_id = UUID("00000000-0000-0000-0000-000000000011")
+    job_id = UUID("00000000-0000-0000-0000-000000000012")
+    envelope = LabCommandEnvelope(
+        request_id=request_id,
+        command=SubmitJobCommand(job_id=job_id, spec=spec, max_attempts=3),
+    )
+    assert envelope.content_hash == OLD_V1_COMMAND_HASH
+    receipt = LabCommandReceipt(
+        request_id=request_id,
+        content_hash=OLD_V1_COMMAND_HASH,
+        job_id=job_id,
+        status="applied",
+        reason="submitted",
+        job_version=0,
+    )
+    command_payload = envelope.model_dump(mode="json")
+    command = command_payload["command"]
+    assert isinstance(command, dict)
+    command["spec"] = json.loads(OLD_V1_SPEC_JSON)
+    timestamp = NOW.isoformat(timespec="microseconds")
+    deadline = spec.deadline.isoformat(timespec="microseconds")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            INSERT INTO lab_job (
+                job_id, spec_json, spec_hash, job_type, resource_class,
+                deadline, status, control_intent, version, attempt_count,
+                max_attempts, recoverable, scheduler_fencing_token,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 3, 0, NULL, ?, ?)
+            """,
+            (
+                str(job_id),
+                OLD_V1_SPEC_JSON,
+                OLD_V1_SPEC_HASH,
+                "strategy_replay",
+                "standard",
+                deadline,
+                "queued",
+                "none",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO lab_command (
+                request_id, content_hash, command_type, job_id, command_json,
+                status, reason, receipt_json, receipt_job_version,
+                received_at, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(request_id),
+                OLD_V1_COMMAND_HASH,
+                "submit",
+                str(job_id),
+                json.dumps(command_payload, separators=(",", ":")),
+                "applied",
+                "submitted",
+                receipt.model_dump_json(),
+                0,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    reader = LabJobReader(store.path)
+    job = reader.get_job(job_id)
+    stored_command = reader.get_command(request_id)
+    lease = _lease(store)
+    replayed = store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+    assert spec.spec_hash == OLD_V1_SPEC_HASH
+    assert job is not None
+    assert job.spec.schema_version == 1
+    assert job.spec.spec_hash == OLD_V1_SPEC_HASH
+    assert stored_command is not None
+    assert stored_command.envelope.command.spec.spec_hash == OLD_V1_SPEC_HASH
+    assert replayed == receipt
+    assert _count(store.path, "lab_command") == 1
+    assert _count(store.path, "lab_job") == 1
 
 
 def test_receipt_job_version_column_roundtrips_applied_rejected_and_null(

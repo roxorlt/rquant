@@ -94,6 +94,15 @@ def _submit_envelope(
     )
 
 
+def _v1_spec() -> ResearchRunSpec:
+    values = _spec().model_dump(mode="python", round_trip=True)
+    values["schema_version"] = 1
+    snapshot = values["dataset_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot.pop("audit_run_id")
+    return ResearchRunSpec.model_validate(values)
+
+
 def test_command_receipt_rejects_boolean_job_version() -> None:
     envelope = _submit_envelope()
 
@@ -173,6 +182,17 @@ def test_submit_content_hash_uses_canonical_spec_hash() -> None:
 
     assert first.command.spec.spec_hash == equivalent.command.spec.spec_hash
     assert first.content_hash == equivalent.content_hash
+
+
+def test_submit_envelope_parses_legacy_v1_spec_for_historical_replay() -> None:
+    envelope = _submit_envelope(spec=_v1_spec())
+
+    restored = LabCommandEnvelope.model_validate_json(envelope.model_dump_json())
+
+    assert restored.command.spec.schema_version == 1
+    assert restored.command.spec.spec_hash == (
+        "f7a26c9311d2208eeec24ff172d7e01dabe63398e987dd77314d0fed59c4a9ea"
+    )
 
 
 def test_envelope_rejects_tampered_content_hash() -> None:
