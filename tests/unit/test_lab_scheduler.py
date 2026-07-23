@@ -267,6 +267,28 @@ def test_bad_json_is_quarantined_and_does_not_block_valid_command(
     assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
 
 
+def test_malformed_filename_is_quarantined_across_restart_without_blocking(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+    bad = spool.pending_dir / "not-a-command.json"
+    bad.write_text("{broken", encoding="utf-8")
+    valid = _envelope()
+    spool.publish(valid)
+    restarted = LabCommandSpool(spool.root)
+
+    result = _scheduler(store, restarted).run_once()
+
+    assert result.quarantined == 1
+    assert result.processed == 1
+    assert result.applied == 1
+    assert restarted.pending() == ()
+    assert not bad.exists()
+    assert len(tuple(restarted.quarantine_dir.glob("not-a-command.json*.bad"))) == 1
+    assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
+    assert LabCommandSpool(spool.root).pending() == ()
+
+
 def test_semantic_request_conflict_is_quarantined_and_does_not_block_next_command(
     tmp_path: Path,
 ) -> None:

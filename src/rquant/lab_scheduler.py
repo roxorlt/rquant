@@ -117,7 +117,10 @@ class LabScheduler:
             try:
                 entry = self.spool.load(path)
             except InvalidCommandEnvelopeError as exc:
-                self.spool.quarantine(path, reason=f"invalid_envelope:{exc}")
+                self.spool.quarantine(
+                    exc.file_identity or path,
+                    reason=f"invalid_envelope:{exc}",
+                )
                 quarantined += 1
                 continue
             lease, mutation_now = self._mutation_context()

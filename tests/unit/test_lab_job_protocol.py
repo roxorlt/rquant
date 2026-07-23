@@ -329,6 +329,34 @@ def test_submit_precedes_controls_and_cancel_preempts_same_version_controls(
     )
 
 
+def test_submit_precedes_earlier_controls_after_spool_restart(tmp_path: Path) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root)
+    job_id = UUID("11111111-1111-1111-1111-111111111111")
+    pause = LabCommandEnvelope(
+        request_id=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        command=PauseJobCommand(job_id=job_id, expected_version=0, reason="pause"),
+    )
+    cancel = LabCommandEnvelope(
+        request_id=UUID("00000000-0000-0000-0000-000000000001"),
+        command=CancelJobCommand(job_id=job_id, expected_version=0, reason="cancel"),
+    )
+    submit = _submit_envelope(
+        request_id=UUID("88888888-8888-8888-8888-888888888888"),
+        job_id=job_id,
+    )
+    for envelope in (pause, cancel, submit):
+        spool.publish(envelope)
+
+    restarted = LabCommandSpool(root)
+
+    assert tuple(entry.envelope.command.command_type for entry in restarted.pending()) == (
+        "submit",
+        "cancel",
+        "pause",
+    )
+
+
 def test_publish_after_ack_returns_existing_receipt_and_rejects_conflict(
     tmp_path: Path,
 ) -> None:
@@ -428,3 +456,21 @@ def test_load_rejects_non_direct_lexical_path_alias(tmp_path: Path) -> None:
 
     with pytest.raises(InvalidCommandEnvelopeError, match="unsafe spool path"):
         spool.load(aliased)
+
+
+def test_malformed_load_identity_prevents_quarantine_of_replacement(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    malformed = spool.pending_dir / "not-a-command.json"
+    malformed.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    identity = captured.value.file_identity
+    assert identity is not None
+    malformed.unlink()
+    malformed.write_text("replacement", encoding="utf-8")
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(identity, reason="invalid_envelope")
+
+    assert malformed.read_text(encoding="utf-8") == "replacement"
+    assert tuple(spool.quarantine_dir.glob("*.bad")) == ()

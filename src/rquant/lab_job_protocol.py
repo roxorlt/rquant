@@ -25,10 +25,6 @@ class RequestContentConflictError(RuntimeError):
     """A request id was reused with different immutable content."""
 
 
-class InvalidCommandEnvelopeError(ValueError):
-    """A spool file is not a valid, self-consistent command envelope."""
-
-
 class LabProtocolModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -36,6 +32,25 @@ class LabProtocolModel(BaseModel):
         revalidate_instances="always",
         str_strip_whitespace=True,
     )
+
+
+class LabSpoolFileIdentity(LabProtocolModel):
+    path: Path
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+
+
+class InvalidCommandEnvelopeError(ValueError):
+    """A spool file is not a valid, self-consistent command envelope."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        file_identity: LabSpoolFileIdentity | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.file_identity = file_identity
 
 
 class SubmitJobCommand(LabProtocolModel):
@@ -335,16 +350,29 @@ class LabCommandSpool:
 
     def load(self, path: Path) -> LabSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
-        _sequence, filename_request_id = self._pending_name_parts(candidate.name)
+        identity = LabSpoolFileIdentity(
+            path=candidate,
+            device=file_stat.st_dev,
+            inode=file_stat.st_ino,
+        )
+        try:
+            _sequence, filename_request_id = self._pending_name_parts(candidate.name)
+        except InvalidCommandEnvelopeError as exc:
+            raise InvalidCommandEnvelopeError(
+                str(exc),
+                file_identity=identity,
+            ) from exc
         try:
             envelope = LabCommandEnvelope.model_validate_json(payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
-                f"invalid command envelope {candidate.name}: {exc}"
+                f"invalid command envelope {candidate.name}: {exc}",
+                file_identity=identity,
             ) from exc
         if envelope.request_id != filename_request_id:
             raise InvalidCommandEnvelopeError(
-                f"command request_id does not match basename {candidate.name}"
+                f"command request_id does not match basename {candidate.name}",
+                file_identity=identity,
             )
         return LabSpoolEntry(
             path=candidate,
@@ -364,6 +392,7 @@ class LabCommandSpool:
         return (1, sequence, path.name)
 
     def _apply_command_precedence(self, paths: tuple[Path, ...]) -> tuple[Path, ...]:
+        # Global visibility is intentional: cancel precedence cannot be derived per file.
         entries: dict[int, LabSpoolEntry] = {}
         for index, path in enumerate(paths):
             try:
@@ -382,7 +411,7 @@ class LabCommandSpool:
             if not isinstance(submit_entry.envelope.command, SubmitJobCommand):
                 continue
             for control_index, control_entry in entries.items():
-                if control_index <= submit_index:
+                if isinstance(control_entry.envelope.command, SubmitJobCommand):
                     continue
                 if control_entry.envelope.command.job_id == submit_entry.envelope.command.job_id:
                     add_edge(submit_index, control_index)
@@ -487,25 +516,34 @@ class LabCommandSpool:
 
     def quarantine(
         self,
-        entry_or_path: LabSpoolEntry | Path,
+        entry_or_path: LabSpoolEntry | LabSpoolFileIdentity | Path,
         *,
         reason: str,
     ) -> LabQuarantinedCommand:
         source = (
-            entry_or_path.path if isinstance(entry_or_path, LabSpoolEntry) else Path(entry_or_path)
+            entry_or_path.path
+            if isinstance(entry_or_path, LabSpoolEntry | LabSpoolFileIdentity)
+            else Path(entry_or_path)
         )
         with self._exclusive_lock():
             normalized, payload, source_stat = self._read_regular_child(source, self.pending_dir)
-            _sequence, filename_request_id = self._pending_name_parts(normalized.name)
+            try:
+                _sequence, filename_request_id = self._pending_name_parts(normalized.name)
+            except InvalidCommandEnvelopeError:
+                filename_request_id = None
             try:
                 envelope = LabCommandEnvelope.model_validate_json(payload)
             except Exception:
                 envelope = None
-            if envelope is not None and envelope.request_id != filename_request_id:
+            if (
+                envelope is not None
+                and filename_request_id is not None
+                and envelope.request_id != filename_request_id
+            ):
                 raise InvalidCommandEnvelopeError(
                     f"command request_id does not match basename {normalized.name}"
                 )
-            if isinstance(entry_or_path, LabSpoolEntry):
+            if isinstance(entry_or_path, LabSpoolEntry | LabSpoolFileIdentity):
                 if (source_stat.st_dev, source_stat.st_ino) != (
                     entry_or_path.device,
                     entry_or_path.inode,
@@ -513,7 +551,7 @@ class LabCommandSpool:
                     raise InvalidCommandEnvelopeError(
                         "pending command was replaced before quarantine"
                     )
-                if envelope != entry_or_path.envelope:
+                if isinstance(entry_or_path, LabSpoolEntry) and envelope != entry_or_path.envelope:
                     raise InvalidCommandEnvelopeError("pending command changed before quarantine")
             target = self.quarantine_dir / f"{normalized.name}.bad"
             while os.path.lexists(target):

@@ -116,6 +116,7 @@ class LabCommandRecord(LabRecordModel):
     job_id: UUID
     envelope: LabCommandEnvelope
     receipt: LabCommandReceipt
+    receipt_job_version: int | None = Field(ge=0)
     received_at: datetime
     applied_at: datetime
 
@@ -223,6 +224,9 @@ def _command_record_from_row(
         job_id = UUID(str(row["job_id"]))
         status = str(row["status"])
         reason = str(row["reason"])
+        receipt_job_version = (
+            int(row["receipt_job_version"]) if row["receipt_job_version"] is not None else None
+        )
         if expected_request_id is not None and request_id != expected_request_id:
             raise ValueError("request id does not match lookup key")
         if not (envelope.request_id == receipt.request_id == request_id):
@@ -237,6 +241,8 @@ def _command_record_from_row(
             raise ValueError("receipt status mismatch")
         if receipt.reason != reason:
             raise ValueError("receipt reason mismatch")
+        if receipt.job_version != receipt_job_version:
+            raise ValueError("receipt job version mismatch")
         return LabCommandRecord(
             request_id=request_id,
             content_hash=content_hash,
@@ -244,6 +250,7 @@ def _command_record_from_row(
             job_id=job_id,
             envelope=envelope,
             receipt=receipt,
+            receipt_job_version=receipt_job_version,
             received_at=_load_time(str(row["received_at"])),
             applied_at=_load_time(str(row["applied_at"])),
         )
@@ -987,8 +994,9 @@ class LabJobStore:
             """
             INSERT INTO lab_command (
                 request_id, content_hash, command_type, job_id, command_json,
-                status, reason, receipt_json, received_at, applied_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, reason, receipt_json, receipt_job_version,
+                received_at, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(envelope.request_id),
@@ -999,6 +1007,7 @@ class LabJobStore:
                 receipt.status,
                 receipt.reason,
                 receipt.model_dump_json(),
+                receipt.job_version,
                 _dump_time(now),
                 _dump_time(now),
             ),
@@ -1400,6 +1409,9 @@ _SCHEMA_STATEMENTS = (
         status TEXT NOT NULL CHECK (status IN ('applied', 'rejected')),
         reason TEXT NOT NULL,
         receipt_json TEXT NOT NULL,
+        receipt_job_version INTEGER CHECK (
+            receipt_job_version IS NULL OR receipt_job_version >= 0
+        ),
         received_at TEXT NOT NULL,
         applied_at TEXT NOT NULL
     )

@@ -339,6 +339,121 @@ def test_submit_roundtrips_validated_spec_and_typed_empty_rows(tmp_path: Path) -
     assert LabArtifactRecord.model_fields
 
 
+def test_receipt_job_version_column_roundtrips_applied_rejected_and_null(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    submit = _submit()
+    submitted = store.apply_command(submit, lease=lease, now=NOW)
+    cancel = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=submit.command.job_id,
+            expected_version=0,
+            reason="cancel queued job",
+        ),
+    )
+    cancelled = store.apply_command(cancel, lease=lease, now=NOW + timedelta(seconds=1))
+    missing = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=uuid4(),
+            expected_version=0,
+            reason="missing job",
+        ),
+    )
+    missing_rejection = store.apply_command(
+        missing,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    stale = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=submit.command.job_id,
+            expected_version=0,
+            reason="stale control",
+        ),
+    )
+    stale_rejection = store.apply_command(
+        stale,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert (
+        submitted.job_version,
+        cancelled.job_version,
+        missing_rejection.job_version,
+        stale_rejection.job_version,
+    ) == (0, 1, None, 1)
+    reader = LabJobReader(store.path)
+    records = tuple(
+        reader.get_command(envelope.request_id) for envelope in (submit, cancel, missing, stale)
+    )
+    assert tuple(record.receipt_job_version for record in records if record is not None) == (
+        0,
+        1,
+        None,
+        1,
+    )
+    with sqlite3.connect(store.path) as connection:
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
+        }
+        stored_versions = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT receipt_job_version FROM lab_command ORDER BY applied_at"
+            ).fetchall()
+        )
+    assert "receipt_job_version" in columns
+    assert stored_versions == (0, 1, None, 1)
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        ("column", 9),
+        ("column", None),
+        ("receipt_json", 9),
+        ("receipt_json", None),
+    ],
+)
+def test_reader_and_replay_fail_closed_on_receipt_job_version_tamper(
+    tmp_path: Path,
+    target: str,
+    replacement: int | None,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    store.apply_command(envelope, lease=lease, now=NOW)
+    with sqlite3.connect(store.path) as connection:
+        if target == "column":
+            connection.execute(
+                "UPDATE lab_command SET receipt_job_version = ? WHERE request_id = ?",
+                (replacement, str(envelope.request_id)),
+            )
+        else:
+            row = connection.execute(
+                "SELECT receipt_json FROM lab_command WHERE request_id = ?",
+                (str(envelope.request_id),),
+            ).fetchone()
+            payload = json.loads(str(row[0]))
+            payload["job_version"] = replacement
+            connection.execute(
+                "UPDATE lab_command SET receipt_json = ? WHERE request_id = ?",
+                (json.dumps(payload), str(envelope.request_id)),
+            )
+
+    with pytest.raises(InvalidStoredJobError, match="job version mismatch"):
+        LabJobReader(store.path).get_command(envelope.request_id)
+    with pytest.raises(InvalidStoredJobError, match="job version mismatch"):
+        store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+
 def test_same_request_and_hash_is_exactly_once_without_second_event(
     tmp_path: Path,
 ) -> None:
