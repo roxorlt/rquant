@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import rquant.research_snapshot as research_snapshot
 from rquant.research_snapshot import materialize_table_dependency
 from rquant.strategy_dependencies import (
     STRATEGY_EXECUTION_DEPENDENCIES,
@@ -38,6 +39,164 @@ def test_three_strategy_dependency_contracts_are_unique_and_explicit() -> None:
     ).lake_datasets
     with pytest.raises(ValueError, match="unknown strategy"):
         strategy_execution_dependencies("unknown")
+
+
+def test_growth_snapshot_binds_full_pit_suspension_evidence() -> None:
+    contract = strategy_execution_dependencies("growth_board_surge")
+    dependencies = {
+        dependency.table_name: dependency for dependency in contract.materialized_tables
+    }
+
+    assert contract.contract_version == "stage1-v2"
+    assert dependencies["stock_suspend_session_evidence"] == StrategyTableDependency(
+        dataset_id="stock_suspend_session_evidence",
+        table_name="stock_suspend_session_evidence",
+    )
+    assert "stock_suspend_event" not in dependencies
+    assert "stock_suspend_coverage" not in dependencies
+
+
+def test_growth_suspension_evidence_closes_history_before_materialization(
+    tmp_path: Path,
+) -> None:
+    materialize = getattr(
+        research_snapshot,
+        "materialize_suspension_session_evidence",
+        None,
+    )
+    assert materialize is not None
+    connection = duckdb.connect(":memory:")
+    connection.execute(
+        """
+        CREATE TABLE stock_suspend_event (
+            source VARCHAR NOT NULL,
+            ts_code VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            suspend_type VARCHAR NOT NULL,
+            suspend_timing VARCHAR NOT NULL,
+            session_scope VARCHAR NOT NULL,
+            available_at TIMESTAMPTZ NOT NULL,
+            ingested_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (
+                source, ts_code, trade_date, suspend_type, suspend_timing
+            )
+        );
+        INSERT INTO stock_suspend_event VALUES
+            ('tushare', '000001.SZ', DATE '2026-03-02', 'S', '全天',
+             'full_day', TIMESTAMPTZ '2026-07-14 08:00:00+00',
+             TIMESTAMPTZ '2026-07-14 08:00:00+00'),
+            ('tushare', '000002.SZ', DATE '2026-03-03', 'S', '全天',
+             'full_day', TIMESTAMPTZ '2026-07-14 08:00:00+00',
+             TIMESTAMPTZ '2026-07-14 08:00:00+00');
+
+        CREATE TABLE stock_suspend_coverage (
+            source VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            coverage_state VARCHAR NOT NULL,
+            row_count BIGINT NOT NULL,
+            snapshot_hash VARCHAR NOT NULL,
+            queried_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (source, trade_date)
+        );
+        INSERT INTO stock_suspend_coverage VALUES
+            ('tushare', DATE '2026-03-02', 'complete', 1, 'hash-1',
+             TIMESTAMPTZ '2026-07-14 08:00:00+00'),
+            ('tushare', DATE '2026-03-03', 'complete', 1, 'hash-2',
+             TIMESTAMPTZ '2026-07-14 08:00:00+00');
+
+        CREATE TABLE daily_bar (
+            ts_code VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            PRIMARY KEY (ts_code, trade_date)
+        );
+        INSERT INTO daily_bar VALUES ('000001.SZ', DATE '2026-03-02');
+
+        CREATE TABLE minute_bar (
+            ts_code VARCHAR NOT NULL,
+            trade_time TIMESTAMP NOT NULL,
+            vol DOUBLE,
+            amount DOUBLE
+        );
+        """
+    )
+    as_of = datetime(2026, 7, 15, 8, tzinfo=UTC)
+
+    artifact = materialize(
+        connection,
+        artifact_root=tmp_path,
+        start_date=date(2026, 7, 14),
+        end_date=date(2026, 7, 15),
+        as_of_time=as_of,
+    )
+
+    assert duckdb.connect().execute(
+        "SELECT ts_code, trade_date, evidence_state FROM read_parquet(?) ORDER BY ts_code",
+        [str(tmp_path / artifact.relative_path)],
+    ).fetchall() == [
+        ("000001.SZ", date(2026, 3, 2), "conflict"),
+        ("000002.SZ", date(2026, 3, 3), "full_day"),
+    ]
+
+
+def test_growth_suspension_evidence_rejects_unreconstructable_as_of(
+    tmp_path: Path,
+) -> None:
+    materialize = getattr(
+        research_snapshot,
+        "materialize_suspension_session_evidence",
+        None,
+    )
+    assert materialize is not None
+    connection = duckdb.connect(":memory:")
+    connection.execute(
+        """
+        CREATE TABLE stock_suspend_event (
+            source VARCHAR NOT NULL,
+            ts_code VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            suspend_type VARCHAR NOT NULL,
+            suspend_timing VARCHAR NOT NULL,
+            session_scope VARCHAR NOT NULL,
+            available_at TIMESTAMPTZ NOT NULL,
+            ingested_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (
+                source, ts_code, trade_date, suspend_type, suspend_timing
+            )
+        );
+        CREATE TABLE stock_suspend_coverage (
+            source VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            coverage_state VARCHAR NOT NULL,
+            row_count BIGINT NOT NULL,
+            snapshot_hash VARCHAR NOT NULL,
+            queried_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (source, trade_date)
+        );
+        INSERT INTO stock_suspend_coverage VALUES (
+            'tushare', DATE '2026-03-02', 'complete', 0, 'newer-empty',
+            TIMESTAMPTZ '2026-07-16 08:00:00+00'
+        );
+        CREATE TABLE daily_bar (
+            ts_code VARCHAR NOT NULL,
+            trade_date DATE NOT NULL
+        );
+        CREATE TABLE minute_bar (
+            ts_code VARCHAR NOT NULL,
+            trade_time TIMESTAMP NOT NULL,
+            vol DOUBLE,
+            amount DOUBLE
+        );
+        """
+    )
+
+    with pytest.raises(ValueError, match="cannot reconstruct suspension evidence"):
+        materialize(
+            connection,
+            artifact_root=tmp_path,
+            start_date=date(2026, 7, 14),
+            end_date=date(2026, 7, 15),
+            as_of_time=datetime(2026, 7, 15, 8, tzinfo=UTC),
+        )
 
 
 def test_bound_eligibility_query_distinguishes_operational_and_snapshot_stores() -> None:

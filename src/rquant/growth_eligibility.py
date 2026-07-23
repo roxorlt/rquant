@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import date
 from typing import Literal
 
+import duckdb
 from pydantic import BaseModel, ConfigDict
 
 from rquant.storage.duckdb import DuckDBStore
@@ -78,16 +79,26 @@ def _classify_growth_opening_structure_batch(
         for value in (target_date, previous_date)
     ]
     parameters.append(max(date_pairs.values()))
+    try:
+        store._conn.execute("SELECT 1 FROM stock_suspend_session_evidence LIMIT 0")
+    except duckdb.CatalogException:
+        evidence_sql = suspension_session_evidence_sql(
+            "suspension.source = 'tushare' AND suspension.trade_date <= ?"
+        )
+    else:
+        evidence_sql = """
+            SELECT source, ts_code, trade_date, evidence_state
+            FROM stock_suspend_session_evidence AS suspension
+            WHERE suspension.source = 'tushare'
+              AND suspension.trade_date <= ?
+        """
     rows = store._conn.execute(
         f"""
         WITH requested(target_date, previous_date) AS (
             VALUES {values}
         ),
         suspension_evidence AS (
-            {suspension_session_evidence_sql(
-                "suspension.source = 'tushare' "
-                "AND suspension.trade_date <= ?"
-            )}
+            {evidence_sql}
         ),
         full_day_suspension AS (
             SELECT suspension.ts_code, suspension.trade_date

@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.research_lake import ResearchDataset
 
+SUSPENSION_SESSION_EVIDENCE_DATASET = "stock_suspend_session_evidence"
+
 
 class _DependencyModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
@@ -156,11 +158,15 @@ STRATEGY_EXECUTION_DEPENDENCIES: dict[str, StrategyExecutionDependencies] = {
     ),
     "growth_board_surge": StrategyExecutionDependencies(
         strategy_id="growth_board_surge",
-        contract_version="stage1-v1",
+        contract_version="stage1-v2",
         lake_datasets=("minute_bar",),
         materialized_tables=(
             *_COMMON_DAILY_TABLES,
             _daily("moneyflow_daily"),
+            StrategyTableDependency(
+                dataset_id=SUSPENSION_SESSION_EVIDENCE_DATASET,
+                table_name=SUSPENSION_SESSION_EVIDENCE_DATASET,
+            ),
             StrategyTableDependency(
                 dataset_id="market_sentiment_daily",
                 table_name="market_sentiment_daily",

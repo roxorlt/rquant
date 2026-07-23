@@ -59,3 +59,34 @@ def test_growth_structure_classification_rejects_nonpositive_batch_size(
             {date(2026, 4, 1): date(2026, 3, 31)},
             batch_size=0,
         )
+
+
+def test_growth_structure_uses_bound_suspension_evidence_when_available(
+    tmp_path,
+) -> None:
+    with DuckDBStore(tmp_path / "growth-bound-suspension.duckdb") as store:
+        store._conn.execute(
+            """
+            INSERT INTO stock_basic (ts_code, list_date)
+            VALUES ('300001.SZ', DATE '2020-01-01');
+            CREATE TABLE stock_suspend_session_evidence (
+                source VARCHAR NOT NULL,
+                ts_code VARCHAR NOT NULL,
+                trade_date DATE NOT NULL,
+                evidence_state VARCHAR NOT NULL,
+                PRIMARY KEY (source, ts_code, trade_date)
+            );
+            INSERT INTO stock_suspend_session_evidence VALUES (
+                'tushare', '300001.SZ', DATE '2026-03-01', 'conflict'
+            );
+            """
+        )
+
+        result = growth_eligibility.classify_growth_opening_structure(
+            store,
+            {date(2026, 4, 1): date(2026, 3, 31)},
+        )
+
+    assert [(fact.ts_code, fact.reason) for fact in result] == [
+        ("300001.SZ", "suspension_input_conflict")
+    ]

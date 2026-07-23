@@ -25,6 +25,15 @@
 
 ### Fixed
 
+- **科创/创业正式回放快照缺少停牌证据**：成长板开盘结构判断会读取
+  `stock_suspend_event` 与 `stock_suspend_coverage`，但 `stage1-v1` 执行依赖未声明这两张
+  表，导致快照能够固化为 `ready`，正式回放才以表不存在失败。成长板依赖契约升级为
+  `stage1-v2`；builder 先用主库完整历史日线和分钟线把停牌事件归并为权威
+  `stock_suspend_session_evidence`，再将这张小型派生事实固化进执行 binding，避免按
+  manifest 标的或回测区间裁掉历史交易冲突。若当前停牌覆盖版本晚于请求的 snapshot
+  `as_of`，因旧版本无法从覆盖表还原而明确 fail closed，不伪装成 PIT 快照。项目版本从
+  `0.26.6` 更新到 `0.26.7`。
+
 - **Stage 1 分钟修复误把陈旧只读副本判为运营库缺数**：正式策略回补完成后若暂停了
   `rquant-replica-sync.timer`，`research-repair-minute` 会继续扫描回补前的
   `rquant_ro.duckdb`，并在长时间覆盖计算后错误报告主库缺少完整会话。分钟修复现在以
