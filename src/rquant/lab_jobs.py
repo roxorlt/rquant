@@ -1800,6 +1800,38 @@ class LabJobStore:
                     reason=f"invalid_intent:{control_intent.value}",
                     job_version=version,
                 )
+            shard_count, active_count = connection.execute(
+                """
+                SELECT COUNT(*), SUM(CASE WHEN status = ? THEN 1 ELSE 0 END)
+                FROM lab_shard WHERE job_id = ?
+                """,
+                (ShardStatus.RUNNING.value, str(command.job_id)),
+            ).fetchone()
+            if (
+                _strict_sqlite_int(shard_count, field="lab_shard.count", minimum=0) > 0
+                and _strict_sqlite_int(active_count, field="lab_shard.active_count", minimum=0) == 0
+            ):
+                updated = self._transition_in_transaction(
+                    connection,
+                    row,
+                    target_status=JobStatus.CHECKPOINTED,
+                    lease=lease,
+                    reason=command.reason,
+                    now=now,
+                    request_id=envelope.request_id,
+                    recoverable=None,
+                    event_type="job_checkpointed",
+                )
+                return LabCommandReceipt(
+                    request_id=envelope.request_id,
+                    content_hash=envelope.content_hash,
+                    job_id=command.job_id,
+                    status="applied",
+                    reason="checkpointed",
+                    job_version=_strict_sqlite_int(
+                        updated["version"], field="lab_job.version", minimum=0
+                    ),
+                )
             updated = self._set_control_intent_in_transaction(
                 connection,
                 row,
@@ -2555,7 +2587,12 @@ class LabJobStore:
                     connection.execute(
                         """
                         UPDATE lab_shard
-                        SET status = ?, version = ?, finished_at = ?, updated_at = ?
+                        SET status = ?, version = ?, worker_id = NULL,
+                            scheduler_fencing_token = NULL, claim_token = NULL,
+                            claimed_at = NULL, heartbeat_at = NULL,
+                            lease_expires_at = NULL, result_manifest_hash = NULL,
+                            failure_json = NULL, checkpoint_json = NULL,
+                            finished_at = ?, updated_at = ?
                         WHERE job_id = ? AND shard_id = ? AND version = ?
                         """,
                         (
@@ -2571,7 +2608,12 @@ class LabJobStore:
                     connection.execute(
                         """
                         UPDATE lab_shard
-                        SET status = ?, finished_at = ?, updated_at = ?
+                        SET status = ?, version = version + 1,
+                            worker_id = NULL, scheduler_fencing_token = NULL,
+                            claim_token = NULL, claimed_at = NULL,
+                            heartbeat_at = NULL, lease_expires_at = NULL,
+                            result_manifest_hash = NULL, failure_json = NULL,
+                            checkpoint_json = NULL, finished_at = ?, updated_at = ?
                         WHERE job_id = ? AND status IN (?, ?)
                         """,
                         (

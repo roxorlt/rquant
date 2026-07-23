@@ -513,6 +513,53 @@ def test_pause_during_shard_checkpoints_then_resume_claims_next(tmp_path: Path) 
     assert second.shard_index == 1
 
 
+def test_pause_at_idle_shard_boundary_checkpoints_immediately(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    first = _claim(store, lease)
+    success = store.apply_worker_report(
+        _report(first, LabShardSucceeded(result_manifest_hash="6" * 64), offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert success.status == "accepted"
+    boundary = LabJobReader(store.path).get_job(job_id)
+    assert boundary is not None and boundary.status is JobStatus.RUNNING
+    assert all(
+        shard.status is not ShardStatus.RUNNING
+        for shard in LabJobReader(store.path).list_shards(job_id)
+    )
+
+    _pause(store, lease, job_id, offset=4)
+
+    checkpointed = LabJobReader(store.path).get_job(job_id)
+    assert checkpointed is not None
+    assert checkpointed.status is JobStatus.CHECKPOINTED
+    assert checkpointed.control_intent is ControlIntent.NONE
+    assert (
+        store.claim_next_shard(
+            worker_id="worker-b",
+            shard_lease_seconds=30,
+            lease=lease,
+            now=NOW + timedelta(seconds=5),
+        )
+        is None
+    )
+    resume = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=ResumeJobCommand(
+                job_id=job_id,
+                expected_version=checkpointed.version,
+                reason="resume after boundary pause",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=6),
+    )
+    assert resume.status == "applied"
+    assert _claim(store, lease, worker="worker-b", now_offset=7).shard_index == 1
+
+
 def test_pause_waits_for_every_already_running_shard_before_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -584,6 +631,63 @@ def test_cancel_first_rejects_success_then_stopped_confirms_cancel(tmp_path: Pat
     )
     assert stopped.status == "accepted"
     assert LabJobReader(store.path).get_job(job_id).status is JobStatus.CANCELLED
+
+
+def test_worker_stopped_cancel_versions_and_clears_all_remaining_shards(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3)
+    claim = _claim(store, lease)
+    with sqlite3.connect(store.path) as connection:
+        for shard_index, status in (
+            (1, ShardStatus.QUEUED),
+            (2, ShardStatus.CHECKPOINTED),
+        ):
+            connection.execute(
+                """
+                UPDATE lab_shard
+                SET status = ?, worker_id = ?, scheduler_fencing_token = ?,
+                    claim_token = ?, claim_generation = 1,
+                    claimed_at = ?, heartbeat_at = ?, lease_expires_at = ?,
+                    checkpoint_json = ?
+                WHERE job_id = ? AND shard_index = ?
+                """,
+                (
+                    status.value,
+                    f"stale-worker-{shard_index}",
+                    lease.fencing_token,
+                    str(uuid4()),
+                    NOW.isoformat(timespec="microseconds"),
+                    NOW.isoformat(timespec="microseconds"),
+                    (NOW + timedelta(seconds=30)).isoformat(timespec="microseconds"),
+                    '{"cursor":1}',
+                    str(job_id),
+                    shard_index,
+                ),
+            )
+    before = LabJobReader(store.path).list_shards(job_id)
+    cancel = _cancel(store, lease, job_id, offset=3)
+    assert cancel.status == "applied"
+
+    stopped = store.apply_worker_report(
+        _report(claim, LabWorkerStopped(reason="cancel observed"), offset=4),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert stopped.status == "accepted"
+    shards = LabJobReader(store.path).list_shards(job_id)
+    assert all(shard.status is ShardStatus.CANCELLED for shard in shards)
+    assert [shard.version for shard in shards] == [shard.version + 1 for shard in before]
+    for shard in shards:
+        assert shard.worker_id is None
+        assert shard.scheduler_fencing_token is None
+        assert shard.claim_token is None
+        assert shard.claimed_at is None
+        assert shard.heartbeat_at is None
+        assert shard.lease_expires_at is None
+        assert shard.checkpoint_json is None
+        assert shard.finished_at == NOW + timedelta(seconds=4)
 
 
 def test_queued_cancel_atomically_terminalizes_nonterminal_shards(tmp_path: Path) -> None:
