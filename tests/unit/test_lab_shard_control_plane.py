@@ -38,7 +38,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerStopped,
 )
 
-from .test_lab_jobs import NOW, _lease, _submit_job
+from .test_lab_jobs import NOW, _lease, _submit, _submit_job
 
 PLAN_HASH = "4" * 64
 
@@ -187,6 +187,79 @@ def _assert_control_plane_invariants(
         assert active or claimable
     else:
         assert active, f"{job.control_intent.value} must converge when no live claim remains"
+
+
+def _seed_checkpointed_sibling(
+    store: LabJobStore,
+    lease: LabLeaseRecord,
+    job_id: UUID,
+    *,
+    shard_index: int,
+) -> None:
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, worker_id = ?, scheduler_fencing_token = ?,
+                claim_token = ?, claim_generation = 1,
+                claimed_at = ?, heartbeat_at = ?, lease_expires_at = ?,
+                checkpoint_json = ?
+            WHERE job_id = ? AND shard_index = ?
+            """,
+            (
+                ShardStatus.CHECKPOINTED.value,
+                "checkpoint-worker",
+                lease.fencing_token,
+                str(uuid4()),
+                NOW.isoformat(timespec="microseconds"),
+                NOW.isoformat(timespec="microseconds"),
+                (NOW + timedelta(seconds=30)).isoformat(timespec="microseconds"),
+                '{"cursor":7}',
+                str(job_id),
+                shard_index,
+            ),
+        )
+
+
+def _assert_exhausted_job_tree(
+    store: LabJobStore,
+    job_id: UUID,
+    *,
+    exhausted_index: int,
+    before_versions: tuple[int, ...],
+    finished_offset: int,
+) -> None:
+    reader = LabJobReader(store.path)
+    job = reader.get_job(job_id)
+    shards = reader.list_shards(job_id)
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.recoverable is False
+    assert all(shard.status is ShardStatus.FAILED for shard in shards)
+    assert tuple(shard.version for shard in shards) == tuple(
+        version + 1 for version in before_versions
+    )
+    for shard in shards:
+        expected_reason = (
+            '{"reason":"attempts_exhausted"}'
+            if shard.shard_index == exhausted_index
+            else '{"reason":"parent_failed_attempts_exhausted"}'
+        )
+        assert shard.failure_json == expected_reason
+        assert shard.finished_at == NOW + timedelta(seconds=finished_offset)
+        assert shard.checkpoint_json is None
+        assert (
+            shard.worker_id,
+            shard.scheduler_fencing_token,
+            shard.claim_token,
+            shard.claimed_at,
+            shard.heartbeat_at,
+            shard.lease_expires_at,
+        ) == (None, None, None, None, None, None)
+    assert not any(
+        shard.status is ShardStatus.RUNNING
+        or (shard.status is ShardStatus.QUEUED and shard.attempt_count < shard.max_attempts)
+        for shard in shards
+    )
 
 
 def test_plan_job_is_deterministic_idempotent_and_replan_conflicts(tmp_path: Path) -> None:
@@ -911,6 +984,181 @@ def test_worker_stopped_at_attempt_limit_fails_shard_and_parent_job(tmp_path: Pa
     assert shard.status is ShardStatus.FAILED
     assert shard.failure_json == '{"reason":"attempts_exhausted"}'
     _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=3)
+
+
+def test_worker_stopped_exhaustion_terminalizes_every_nonterminal_sibling(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=4, max_attempts=1)
+    exhausted = _claim(store, lease, worker="worker-exhausted")
+    active_sibling = _claim(store, lease, worker="worker-active", now_offset=3)
+    _seed_checkpointed_sibling(store, lease, job_id, shard_index=3)
+    before = LabJobReader(store.path).list_shards(job_id)
+
+    receipt = store.apply_worker_report(
+        _report(exhausted, LabWorkerStopped(reason="worker lost"), offset=4),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert receipt.status == "accepted"
+    assert receipt.reason == "worker_stopped_attempts_exhausted"
+    _assert_exhausted_job_tree(
+        store,
+        job_id,
+        exhausted_index=exhausted.shard_index,
+        before_versions=tuple(shard.version for shard in before),
+        finished_offset=4,
+    )
+    late = store.apply_worker_report(
+        _report(active_sibling, LabWorkerStopped(reason="late sibling"), offset=5),
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert late.status == "rejected"
+
+
+def test_stale_reclaim_exhaustion_terminalizes_every_nonterminal_sibling(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=4, max_attempts=1)
+    exhausted = _claim(store, lease, worker="worker-exhausted", duration=5)
+    active_sibling = _claim(
+        store,
+        lease,
+        worker="worker-active",
+        now_offset=3,
+        duration=30,
+    )
+    _seed_checkpointed_sibling(store, lease, job_id, shard_index=3)
+    before = LabJobReader(store.path).list_shards(job_id)
+
+    claim = store.claim_next_shard(
+        worker_id="worker-new",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+    )
+
+    assert claim is None
+    _assert_exhausted_job_tree(
+        store,
+        job_id,
+        exhausted_index=exhausted.shard_index,
+        before_versions=tuple(shard.version for shard in before),
+        finished_offset=8,
+    )
+    late = store.apply_worker_report(
+        _report(active_sibling, LabWorkerStopped(reason="late sibling"), offset=9),
+        lease=lease,
+        now=NOW + timedelta(seconds=9),
+    )
+    assert late.status == "rejected"
+
+
+def test_job_round_robin_claim_cursor_is_persistent_across_store_restart(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store, seconds=600)
+    old = _submit_job(store, lease)
+    store.plan_job(
+        old.job_id,
+        tuple(_definition(index) for index in range(32)),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    new_envelope = _submit()
+    assert (
+        store.apply_command(
+            new_envelope,
+            lease=lease,
+            now=NOW + timedelta(seconds=2),
+        ).status
+        == "applied"
+    )
+    new_job_id = new_envelope.command.job_id
+    store.plan_job(
+        new_job_id,
+        (_definition(0),),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    first = _claim(store, lease, worker="worker-old", now_offset=4, duration=300)
+    restarted = LabJobStore(store.path)
+    restarted.initialize()
+    second = _claim(
+        restarted,
+        lease,
+        worker="worker-new",
+        now_offset=5,
+        duration=300,
+    )
+
+    assert first.job_id == old.job_id
+    assert second.job_id == new_job_id
+    assert second.shard_index == 0
+
+
+def test_retried_large_job_cannot_reset_fair_cursor_and_insert_ahead(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store, seconds=600)
+    old = _submit_job(store, lease)
+    store.plan_job(
+        old.job_id,
+        tuple(_definition(index) for index in range(32)),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    new_envelope = _submit()
+    store.apply_command(new_envelope, lease=lease, now=NOW + timedelta(seconds=2))
+    new_job_id = new_envelope.command.job_id
+    store.plan_job(
+        new_job_id,
+        (_definition(0), _definition(1)),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    old_claim = _claim(store, lease, worker="worker-old", now_offset=4)
+    failed = store.apply_worker_report(
+        _report(
+            old_claim,
+            LabShardFailed(failure_json='{"reason":"retryable"}'),
+            offset=5,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert failed.status == "accepted"
+    failed_job = LabJobReader(store.path).get_job(old.job_id)
+    assert failed_job is not None and failed_job.status is JobStatus.FAILED
+    retried = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=old.job_id,
+                expected_version=failed_job.version,
+                reason="retry large job",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=6),
+    )
+    assert retried.status == "applied"
+
+    claim_after_retry = _claim(
+        LabJobStore(store.path),
+        lease,
+        worker="worker-after-retry",
+        now_offset=7,
+    )
+
+    assert claim_after_retry.job_id == new_job_id
 
 
 def test_cancel_first_rejects_success_then_stopped_confirms_cancel(tmp_path: Path) -> None:

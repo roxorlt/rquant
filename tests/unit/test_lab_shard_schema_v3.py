@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 import rquant.lab_jobs as lab_jobs
-from rquant.lab_jobs import LabJobReader, LabJobStore
+from rquant.lab_jobs import InvalidStoredJobError, LabJobReader, LabJobStore, ShardStatus
 
 from .test_lab_jobs import NOW, _create_609c599_v1_fixture, _spec
 
@@ -76,6 +76,7 @@ def test_initialize_creates_v3_report_table_and_claim_columns(tmp_path: Path) ->
 
     assert version == 3
     assert "lab_worker_report" in tables
+    assert "lab_scheduler_state" in tables
     assert {
         "plan_hash",
         "adapter_id",
@@ -127,6 +128,73 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("SELECT COUNT(*) FROM lab_command").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [ShardStatus.SUCCEEDED, ShardStatus.FAILED, ShardStatus.CANCELLED],
+)
+def test_v2_migration_normalizes_legacy_terminal_shard_claim_identity(
+    tmp_path: Path,
+    terminal_status: ShardStatus,
+) -> None:
+    path = tmp_path / f"{terminal_status.value}.sqlite3"
+    job_id, shard_id = _create_real_v2_fixture(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE lab_job SET status = ?, version = 1 WHERE job_id = ?",
+            (terminal_status.value, job_id),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, version = 1, worker_id = 'legacy-worker',
+                scheduler_fencing_token = 7, checkpoint_json = '{"cursor":3}'
+            WHERE job_id = ? AND shard_id = ?
+            """,
+            (terminal_status.value, job_id, shard_id),
+        )
+
+    LabJobStore(path).initialize()
+
+    shard = LabJobReader(path).list_shards(lab_jobs.UUID(job_id))[0]
+    assert shard.status is terminal_status
+    assert shard.finished_at == NOW
+    assert shard.updated_at == NOW
+    assert shard.checkpoint_json is None
+    assert (
+        shard.worker_id,
+        shard.scheduler_fencing_token,
+        shard.claim_token,
+        shard.claimed_at,
+        shard.heartbeat_at,
+        shard.lease_expires_at,
+    ) == (None, None, None, None, None, None)
+
+
+def test_reader_rejects_terminal_legacy_shard_with_claim_identity(tmp_path: Path) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    job_id, shard_id = _create_real_v2_fixture(path)
+    LabJobStore(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_job SET status = 'cancelled', version = 1 WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = 'cancelled', version = 1, worker_id = 'tampered',
+                scheduler_fencing_token = 9, finished_at = updated_at
+            WHERE job_id = ? AND shard_id = ?
+            """,
+            (job_id, shard_id),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="terminal shard retains claim identity"):
+        LabJobReader(path).list_shards(lab_jobs.UUID(job_id))
 
 
 def test_v2_to_v3_migration_fault_rolls_back_all_schema_and_rows(
