@@ -10,7 +10,7 @@ from uuid import uuid4
 import pytest
 
 from rquant.lab_job_protocol import LabCommandSpool
-from rquant.lab_jobs import LabJobReader, LabJobStore
+from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore, ShardStatus
 from rquant.lab_scheduler import LabScheduler
 from rquant.lab_shard_protocol import (
     LabAcknowledgedReport,
@@ -23,7 +23,7 @@ from rquant.lab_shard_protocol import (
 )
 
 from .test_lab_jobs import NOW, _lease, _submit_job
-from .test_lab_shard_control_plane import _definition, _report
+from .test_lab_shard_control_plane import _cancel, _definition, _pause, _report
 
 
 def _scheduler(
@@ -402,3 +402,115 @@ def test_scheduler_takeover_does_not_checkpoint_sharded_job_before_reclaim(
     assert fresh.claim_generation == 2
     assert fresh.scheduler_fencing_token > old_claim.scheduler_fencing_token
     assert LabJobReader(store.path).get_job(job.job_id).status.value == "running"
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_job", "expected_shard"),
+    [
+        ("pause", JobStatus.CHECKPOINTED, ShardStatus.QUEUED),
+        ("cancel", JobStatus.CANCELLED, ShardStatus.CANCELLED),
+    ],
+)
+def test_scheduler_takeover_without_workers_converges_expired_control_intent(
+    tmp_path: Path,
+    intent: str,
+    expected_job: JobStatus,
+    expected_shard: ShardStatus,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    old = _lease(store, seconds=10)
+    job = _submit_job(store, old)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=old,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="lost-worker",
+        shard_lease_seconds=5,
+        lease=old,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    if intent == "pause":
+        _pause(store, old, job.job_id, offset=3)
+    else:
+        assert _cancel(store, old, job.job_id, offset=3).status == "applied"
+    clock = [NOW + timedelta(seconds=11)]
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_worker_ids=(),
+        clock=lambda: clock[0],
+    )
+
+    result = scheduler.run_once()
+
+    reader = LabJobReader(store.path)
+    after = reader.get_job(job.job_id)
+    shard = reader.list_shards(job.job_id)[0]
+    assert result.recovered >= 1
+    assert after is not None and after.status is expected_job
+    assert shard.status is expected_shard
+    assert shard.worker_id is None
+    assert shard.claim_token is None
+
+
+@pytest.mark.parametrize(
+    ("max_attempts", "expected_job", "expected_shard"),
+    [
+        (3, JobStatus.RUNNING, ShardStatus.QUEUED),
+        (1, JobStatus.FAILED, ShardStatus.FAILED),
+    ],
+)
+def test_scheduler_without_workers_recovers_expired_uncontrolled_shard(
+    tmp_path: Path,
+    max_attempts: int,
+    expected_job: JobStatus,
+    expected_shard: ShardStatus,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    old = _lease(store, seconds=10)
+    job = _submit_job(store, old, max_attempts=max_attempts)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=old,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="lost-worker",
+        shard_lease_seconds=5,
+        lease=old,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    clock = [NOW + timedelta(seconds=11)]
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_worker_ids=(),
+        clock=lambda: clock[0],
+    )
+
+    result = scheduler.run_once()
+
+    reader = LabJobReader(store.path)
+    after = reader.get_job(job.job_id)
+    shard = reader.list_shards(job.job_id)[0]
+    assert result.recovered >= 1
+    assert after is not None and after.status is expected_job
+    assert shard.status is expected_shard
+    assert shard.worker_id is None
+    assert shard.claim_token is None

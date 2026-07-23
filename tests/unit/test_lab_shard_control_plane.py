@@ -474,6 +474,60 @@ def test_heartbeat_never_shortens_an_existing_future_lease(tmp_path: Path) -> No
     _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=3)
 
 
+def test_heartbeat_rejects_scheduler_time_before_claimed_at(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    claim = _claim(store, lease, now_offset=10, duration=30)
+    before = LabJobReader(store.path).list_shards(job_id)[0]
+
+    receipt = store.apply_worker_report(
+        _report(claim, LabShardHeartbeat(lease_extension_seconds=10), offset=11),
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+
+    assert receipt.status == "rejected"
+    assert receipt.reason == "backdated_heartbeat"
+    assert LabJobReader(store.path).list_shards(job_id)[0] == before
+
+
+def test_heartbeat_rejects_scheduler_time_before_previous_heartbeat(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    claim = _claim(store, lease, duration=300)
+    first = store.apply_worker_report(
+        _report(claim, LabShardHeartbeat(lease_extension_seconds=10), offset=10),
+        lease=lease,
+        now=NOW + timedelta(seconds=10),
+    )
+    assert first.status == "accepted"
+    before = LabJobReader(store.path).list_shards(job_id)[0]
+
+    receipt = store.apply_worker_report(
+        _report(claim, LabShardHeartbeat(lease_extension_seconds=20), offset=12),
+        lease=lease,
+        now=NOW + timedelta(seconds=9),
+    )
+
+    assert receipt.status == "rejected"
+    assert receipt.reason == "backdated_heartbeat"
+    assert LabJobReader(store.path).list_shards(job_id)[0] == before
+
+
+def test_reader_rejects_heartbeat_before_claimed_at(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    _claim(store, lease, now_offset=10)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE lab_shard SET heartbeat_at = ? WHERE job_id = ?",
+            (
+                (NOW + timedelta(seconds=9)).isoformat(timespec="microseconds"),
+                str(job_id),
+            ),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="heartbeat predates claim"):
+        LabJobReader(store.path).list_shards(job_id)
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -1014,6 +1068,57 @@ def test_worker_stopped_exhaustion_terminalizes_every_nonterminal_sibling(
         _report(active_sibling, LabWorkerStopped(reason="late sibling"), offset=5),
         lease=lease,
         now=NOW + timedelta(seconds=5),
+    )
+    assert late.status == "rejected"
+
+
+def test_explicit_shard_failure_at_attempt_limit_terminalizes_job_tree(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3, max_attempts=1)
+    exhausted = _claim(store, lease, worker="worker-exhausted")
+    active_sibling = _claim(store, lease, worker="worker-active", now_offset=3)
+    before = LabJobReader(store.path).list_shards(job_id)
+
+    receipt = store.apply_worker_report(
+        _report(
+            exhausted,
+            LabShardFailed(failure_json='{"reason":"explicit"}'),
+            offset=4,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert receipt.status == "accepted"
+    assert receipt.reason == "shard_failed_attempts_exhausted"
+    _assert_exhausted_job_tree(
+        store,
+        job_id,
+        exhausted_index=exhausted.shard_index,
+        before_versions=tuple(shard.version for shard in before),
+        finished_offset=4,
+    )
+    failed_job = LabJobReader(store.path).get_job(job_id)
+    assert failed_job is not None and failed_job.recoverable is False
+    retry = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=job_id,
+                expected_version=failed_job.version,
+                reason="must not retry exhausted explicit failure",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert retry.status == "rejected"
+    assert retry.reason == "not_recoverable"
+    late = store.apply_worker_report(
+        _report(active_sibling, LabWorkerStopped(reason="late sibling"), offset=6),
+        lease=lease,
+        now=NOW + timedelta(seconds=6),
     )
     assert late.status == "rejected"
 

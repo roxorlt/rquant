@@ -149,6 +149,14 @@ class LabScheduler:
         if acquired:
             lease, recovery_now = self._mutation_context()
             recovered = len(self.store.recover_expired_jobs(lease, now=recovery_now))
+        else:
+            lease, recovery_now = self._mutation_context()
+        recovered += len(
+            self.store.recover_stale_shards(
+                lease,
+                now=recovery_now,
+            )
+        )
         processed = 0
         applied = 0
         rejected = 0

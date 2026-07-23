@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
 import rquant.lab_jobs as lab_jobs
-from rquant.lab_jobs import InvalidStoredJobError, LabJobReader, LabJobStore, ShardStatus
+from rquant.lab_job_protocol import LabCommandEnvelope, ResumeJobCommand
+from rquant.lab_jobs import (
+    InvalidStoredJobError,
+    JobStatus,
+    LabJobReader,
+    LabJobStore,
+    ShardStatus,
+)
+from rquant.lab_shard_protocol import LabShardDefinition, LabShardHeartbeat, LabWorkerReport
 
-from .test_lab_jobs import NOW, _create_609c599_v1_fixture, _spec
+from .test_lab_jobs import NOW, _create_609c599_v1_fixture, _lease, _spec
 
 
 def _create_real_v2_fixture(path: Path) -> tuple[str, str]:
@@ -117,7 +126,15 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     assert job is not None
     assert len(shards) == 1
     shard = shards[0]
-    assert str(shard.shard_id) == shard_id
+    expected_definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="legacy-v2",
+        adapter_version="v0",
+        plan_hash=lab_jobs._LEGACY_PLAN_HASH,
+        payload_json="{}",
+    )
+    assert shard.shard_id == expected_definition.shard_id
+    assert str(shard.shard_id) != shard_id
     assert shard.adapter_id == "legacy-v2"
     assert shard.adapter_version == "v0"
     assert shard.payload_json == "{}"
@@ -128,6 +145,145 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("SELECT COUNT(*) FROM lab_command").fetchone()[0] == 2
+
+
+def test_v2_running_shard_is_safely_requeued_and_fenced_during_migration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    job_id, shard_id = _create_real_v2_fixture(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = 'running', version = 1, scheduler_fencing_token = 7
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = 'running', version = 1, attempt_count = 1,
+                worker_id = 'legacy-worker', scheduler_fencing_token = 7
+            WHERE job_id = ? AND shard_id = ?
+            """,
+            (job_id, shard_id),
+        )
+
+    store = LabJobStore(path)
+    store.initialize()
+    restarted = LabJobStore(path)
+    restarted.initialize()
+    reader = LabJobReader(path)
+    job = reader.get_job(lab_jobs.UUID(job_id))
+    shard = reader.list_shards(lab_jobs.UUID(job_id))[0]
+
+    assert job is not None and job.status is JobStatus.RUNNING
+    assert shard.status is ShardStatus.QUEUED
+    assert shard.version == 2
+    assert shard.checkpoint_json is None
+    assert (
+        shard.worker_id,
+        shard.scheduler_fencing_token,
+        shard.claim_token,
+        shard.claimed_at,
+        shard.heartbeat_at,
+        shard.lease_expires_at,
+    ) == (None, None, None, None, None, None)
+    lease = _lease(restarted, owner="migration-scheduler", now=NOW + timedelta(seconds=2))
+    forged = LabWorkerReport(
+        report_id=uuid4(),
+        job_id=lab_jobs.UUID(job_id),
+        shard_id=lab_jobs.UUID(shard_id),
+        spec_hash=job.spec_hash,
+        payload_hash=shard.payload_hash,
+        worker_id="legacy-worker",
+        claim_token=uuid4(),
+        claim_generation=1,
+        scheduler_fencing_token=lease.fencing_token,
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardHeartbeat(lease_extension_seconds=30),
+    )
+    rejected = restarted.apply_worker_report(
+        forged,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert rejected.status == "rejected"
+    claim = restarted.claim_next_shard(
+        worker_id="fresh-worker",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert claim is not None
+    assert claim.worker_id == "fresh-worker"
+    assert claim.claim_generation == 1
+
+
+def test_v2_checkpointed_shard_becomes_claimable_only_after_resume(tmp_path: Path) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    job_id, shard_id = _create_real_v2_fixture(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE lab_job SET status = 'checkpointed', version = 1 WHERE job_id = ?",
+            (job_id,),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = 'checkpointed', version = 1,
+                worker_id = 'legacy-worker', scheduler_fencing_token = 7,
+                checkpoint_json = '{"cursor":3}'
+            WHERE job_id = ? AND shard_id = ?
+            """,
+            (job_id, shard_id),
+        )
+
+    store = LabJobStore(path)
+    store.initialize()
+    store = LabJobStore(path)
+    store.initialize()
+    reader = LabJobReader(path)
+    before = reader.get_job(lab_jobs.UUID(job_id))
+    shard = reader.list_shards(lab_jobs.UUID(job_id))[0]
+    assert before is not None and before.status is JobStatus.CHECKPOINTED
+    assert shard.status is ShardStatus.QUEUED
+    assert shard.checkpoint_json is None
+    assert shard.worker_id is None
+    lease = _lease(store, owner="resume-scheduler", now=NOW + timedelta(seconds=2))
+    assert (
+        store.claim_next_shard(
+            worker_id="premature-worker",
+            shard_lease_seconds=30,
+            lease=lease,
+            now=NOW + timedelta(seconds=3),
+        )
+        is None
+    )
+
+    resumed = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=ResumeJobCommand(
+                job_id=lab_jobs.UUID(job_id),
+                expected_version=before.version,
+                reason="resume migrated checkpoint",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    claim = store.claim_next_shard(
+        worker_id="fresh-worker",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+
+    assert resumed.status == "applied"
+    assert claim is not None and claim.job_id == lab_jobs.UUID(job_id)
 
 
 @pytest.mark.parametrize(
@@ -174,8 +330,9 @@ def test_v2_migration_normalizes_legacy_terminal_shard_claim_identity(
 
 def test_reader_rejects_terminal_legacy_shard_with_claim_identity(tmp_path: Path) -> None:
     path = tmp_path / "lab_jobs.sqlite3"
-    job_id, shard_id = _create_real_v2_fixture(path)
+    job_id, _legacy_shard_id = _create_real_v2_fixture(path)
     LabJobStore(path).initialize()
+    shard_id = str(LabJobReader(path).list_shards(lab_jobs.UUID(job_id))[0].shard_id)
     with sqlite3.connect(path) as connection:
         connection.execute(
             """
