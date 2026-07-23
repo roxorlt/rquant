@@ -18,12 +18,14 @@ from rquant.lab_job_protocol import (
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
+    CancelConfirmationRequiredError,
     ControlIntent,
     InvalidJobTransitionError,
     InvalidStoredJobError,
     JobStatus,
     LabArtifactRecord,
     LabCommandRecord,
+    LabDatabaseIdentityError,
     LabEventRecord,
     LabJobReader,
     LabJobRecord,
@@ -160,6 +162,25 @@ def _transition_to(
             reason="checkpoint",
             now=NOW + timedelta(seconds=2),
         )
+    if target is JobStatus.CANCELLED:
+        cancel = LabCommandEnvelope(
+            request_id=uuid4(),
+            command=CancelJobCommand(
+                job_id=job.job_id,
+                expected_version=job.version,
+                reason="cancel",
+            ),
+        )
+        store.apply_command(cancel, lease=lease, now=NOW + timedelta(seconds=2))
+        requested = LabJobReader(store.path).get_job(job.job_id)
+        assert requested is not None
+        return store.confirm_cancelled_job(
+            job.job_id,
+            expected_version=requested.version,
+            lease=lease,
+            reason="claim invalidated",
+            now=NOW + timedelta(seconds=3),
+        )
     return store.transition_job(
         job.job_id,
         expected_version=job.version,
@@ -215,6 +236,59 @@ def test_initialize_creates_v1_six_table_schema_and_required_pragmas(
     assert pragmas.synchronous == 2
     assert pragmas.foreign_keys == 1
     assert pragmas.busy_timeout_ms == 1_234
+
+
+def test_initialize_refuses_other_sqlite_without_overwriting_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "other.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA application_id = 12345")
+        connection.execute("CREATE TABLE other_data (value TEXT)")
+
+    with pytest.raises(LabDatabaseIdentityError, match="application_id"):
+        LabJobStore(path).initialize()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA application_id").fetchone()[0] == 12345
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'other_data'"
+        ).fetchone() == ("other_data",)
+
+
+def test_initialize_refuses_unclaimed_nonempty_sqlite(tmp_path: Path) -> None:
+    path = tmp_path / "unclaimed.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+
+    with pytest.raises(LabDatabaseIdentityError, match="not empty"):
+        LabJobStore(path).initialize()
+
+
+@pytest.mark.parametrize("version", [0, 2, 99])
+def test_store_and_reader_fail_closed_on_unknown_schema_version(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version = {version}")
+
+    with pytest.raises(LabDatabaseIdentityError, match="user_version"):
+        store.initialize()
+    with pytest.raises(LabDatabaseIdentityError, match="user_version"):
+        LabJobReader(store.path).get_job(uuid4())
+
+
+def test_reader_refuses_wrong_application_id(tmp_path: Path) -> None:
+    path = tmp_path / "other.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA application_id = 9876")
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute("CREATE TABLE lab_job (job_id TEXT)")
+
+    with pytest.raises(LabDatabaseIdentityError, match="application_id"):
+        LabJobReader(path).get_job(uuid4())
 
 
 def test_reader_is_readonly_does_not_create_missing_database(tmp_path: Path) -> None:
@@ -500,16 +574,165 @@ def test_running_cancel_records_intent_before_worker_terminal_ack(
     assert requested.status is JobStatus.RUNNING
     assert requested.control_intent is ControlIntent.CANCEL_REQUESTED
 
-    cancelled = store.transition_job(
+    cancelled = store.confirm_cancelled_job(
         requested.job_id,
         expected_version=requested.version,
-        target_status=JobStatus.CANCELLED,
         lease=lease,
         reason="worker invalidated claim",
         now=NOW + timedelta(seconds=4),
     )
     assert cancelled.status is JobStatus.CANCELLED
     assert cancelled.control_intent is ControlIntent.NONE
+
+
+def test_running_cancel_terminal_requires_explicit_requested_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    running = _transition_to(store, lease, JobStatus.RUNNING)
+
+    with pytest.raises(CancelConfirmationRequiredError):
+        store.transition_job(
+            running.job_id,
+            expected_version=running.version,
+            target_status=JobStatus.CANCELLED,
+            lease=lease,
+            reason="unsafe direct cancel",
+            now=NOW + timedelta(seconds=3),
+        )
+    with pytest.raises(CancelConfirmationRequiredError):
+        store.confirm_cancelled_job(
+            running.job_id,
+            expected_version=running.version,
+            lease=lease,
+            reason="missing request",
+            now=NOW + timedelta(seconds=4),
+        )
+
+
+@pytest.mark.parametrize(
+    "late_status",
+    [JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CHECKPOINTED],
+)
+def test_cancel_requested_blocks_late_lifecycle_until_explicit_confirmation(
+    tmp_path: Path,
+    late_status: JobStatus,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    running = _transition_to(store, lease, JobStatus.RUNNING)
+    cancel = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=running.job_id,
+            expected_version=running.version,
+            reason="cancel first",
+        ),
+    )
+    store.apply_command(cancel, lease=lease, now=NOW + timedelta(seconds=3))
+    requested = LabJobReader(store.path).get_job(running.job_id)
+    assert requested is not None
+    event_count = _count(store.path, "lab_event")
+
+    with pytest.raises(CancelConfirmationRequiredError):
+        store.transition_job(
+            requested.job_id,
+            expected_version=requested.version,
+            target_status=late_status,
+            lease=lease,
+            reason="late worker result",
+            recoverable=late_status is JobStatus.FAILED,
+            now=NOW + timedelta(seconds=4),
+        )
+
+    unchanged = LabJobReader(store.path).get_job(requested.job_id)
+    assert unchanged is not None
+    assert unchanged.status is JobStatus.RUNNING
+    assert unchanged.control_intent is ControlIntent.CANCEL_REQUESTED
+    assert _count(store.path, "lab_event") == event_count
+
+    confirmed = store.confirm_cancelled_job(
+        requested.job_id,
+        expected_version=requested.version,
+        lease=lease,
+        reason="worker claim invalidated",
+        now=NOW + timedelta(seconds=5),
+    )
+    assert confirmed.status is JobStatus.CANCELLED
+    assert confirmed.control_intent is ControlIntent.NONE
+
+
+def test_completion_committed_before_cancel_keeps_terminal_result(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    running = _transition_to(store, lease, JobStatus.RUNNING)
+    succeeded = store.transition_job(
+        running.job_id,
+        expected_version=running.version,
+        target_status=JobStatus.SUCCEEDED,
+        lease=lease,
+        reason="completion first",
+        now=NOW + timedelta(seconds=3),
+    )
+    cancel = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=succeeded.job_id,
+            expected_version=succeeded.version,
+            reason="late cancel",
+        ),
+    )
+
+    receipt = store.apply_command(
+        cancel,
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert receipt.status == "rejected"
+    assert receipt.reason == "invalid_state:succeeded"
+    terminal = LabJobReader(store.path).get_job(succeeded.job_id)
+    assert terminal is not None
+    assert terminal.status is JobStatus.SUCCEEDED
+    assert terminal.control_intent is ControlIntent.NONE
+
+
+def test_takeover_finalizes_cancel_requested_and_cannot_resume(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    old = _lease(store, owner="scheduler-old", seconds=10)
+    running = _transition_to(store, old, JobStatus.RUNNING)
+    cancel = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=running.job_id,
+            expected_version=running.version,
+            reason="cancel before crash",
+        ),
+    )
+    store.apply_command(cancel, lease=old, now=NOW + timedelta(seconds=2))
+    takeover_at = NOW + timedelta(seconds=11)
+    new = _lease(store, owner="scheduler-new", now=takeover_at, seconds=60)
+
+    recovered = store.recover_expired_jobs(new, now=takeover_at)
+
+    assert recovered[0].status is JobStatus.CANCELLED
+    assert recovered[0].control_intent is ControlIntent.NONE
+    resume = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=ResumeJobCommand(
+            job_id=running.job_id,
+            expected_version=recovered[0].version,
+            reason="must not revive",
+        ),
+    )
+    receipt = store.apply_command(
+        resume,
+        lease=new,
+        now=takeover_at + timedelta(seconds=1),
+    )
+    assert receipt.status == "rejected"
+    assert receipt.reason == "invalid_state:cancelled"
 
 
 def test_pause_in_wrong_state_is_durably_rejected(tmp_path: Path) -> None:
@@ -539,7 +762,6 @@ def test_pause_in_wrong_state_is_durably_rejected(tmp_path: Path) -> None:
         (JobStatus.RUNNING, JobStatus.CHECKPOINTED),
         (JobStatus.RUNNING, JobStatus.SUCCEEDED),
         (JobStatus.RUNNING, JobStatus.FAILED),
-        (JobStatus.RUNNING, JobStatus.CANCELLED),
         (JobStatus.CHECKPOINTED, JobStatus.RUNNING),
         (JobStatus.CHECKPOINTED, JobStatus.CANCELLED),
     ],

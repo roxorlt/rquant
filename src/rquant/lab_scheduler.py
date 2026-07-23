@@ -70,29 +70,44 @@ class LabScheduler:
         self.lease: LabLeaseRecord | None = None
         self._stop = Event()
 
-    def _acquire_or_renew(self, now: datetime) -> tuple[LabLeaseRecord, bool, int]:
+    def _start_tick(self) -> bool:
         if self.lease is None:
+            now = self.clock()
             lease = self.store.acquire_scheduler_lease(
                 owner_id=self.owner_id,
                 lease_seconds=self.lease_seconds,
                 now=now,
             )
             self.lease = lease
-            recovered = self.store.recover_expired_jobs(lease, now=now)
-            return lease, True, len(recovered)
-        if now < self.lease.heartbeat_at + timedelta(seconds=self.heartbeat_seconds):
-            return self.lease, False, 0
-        renewed = self.store.renew_scheduler_lease(
-            self.lease,
-            lease_seconds=self.lease_seconds,
-            now=now,
-        )
-        self.lease = renewed
-        return renewed, False, 0
+            return True
+        now = self.clock()
+        if now >= self.lease.heartbeat_at + timedelta(seconds=self.heartbeat_seconds):
+            self.lease = self.store.renew_scheduler_lease(
+                self.lease,
+                lease_seconds=self.lease_seconds,
+                now=now,
+            )
+        return False
+
+    def _mutation_context(self) -> tuple[LabLeaseRecord, datetime]:
+        if self.lease is None:  # pragma: no cover - run_once always starts the tick
+            raise RuntimeError("scheduler lease has not been acquired")
+        now = self.clock()
+        if now >= self.lease.heartbeat_at + timedelta(seconds=self.heartbeat_seconds):
+            self.lease = self.store.renew_scheduler_lease(
+                self.lease,
+                lease_seconds=self.lease_seconds,
+                now=now,
+            )
+            now = self.clock()
+        return self.lease, now
 
     def run_once(self) -> SchedulerTickResult:
-        now = self.clock()
-        lease, acquired, recovered = self._acquire_or_renew(now)
+        acquired = self._start_tick()
+        recovered = 0
+        if acquired:
+            lease, recovery_now = self._mutation_context()
+            recovered = len(self.store.recover_expired_jobs(lease, now=recovery_now))
         processed = 0
         applied = 0
         rejected = 0
@@ -104,7 +119,12 @@ class LabScheduler:
                 self.spool.quarantine(path, reason=f"invalid_envelope:{exc}")
                 quarantined += 1
                 continue
-            receipt = self.store.apply_command(entry.envelope, lease=lease, now=now)
+            lease, mutation_now = self._mutation_context()
+            receipt = self.store.apply_command(
+                entry.envelope,
+                lease=lease,
+                now=mutation_now,
+            )
             processed += 1
             if receipt.status == "applied":
                 applied += 1

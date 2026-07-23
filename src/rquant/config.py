@@ -95,9 +95,7 @@ class Settings(BaseSettings):
     # nginx 只认这一个字面值（不验 hmac 签名），所有已登录用户共用同一 cookie 值。
     # 显式配置优先；为空时从 cookie_secret 确定性派生（见 panorama_gate_token_resolved），
     # 免得再单独配一份、且重启后稳定不变。
-    panorama_gate_token: str = Field(
-        default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN"
-    )
+    panorama_gate_token: str = Field(default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN")
 
     @property
     def deepseek_enabled(self) -> bool:
@@ -119,9 +117,7 @@ class Settings(BaseSettings):
         if not normalized:
             return "tushare"
         if normalized not in ("tushare", "akshare"):
-            raise ValueError(
-                f"intraday_quote_source 只允许 'tushare' 或 'akshare'，收到 {v!r}"
-            )
+            raise ValueError(f"intraday_quote_source 只允许 'tushare' 或 'akshare'，收到 {v!r}")
         return normalized
 
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="after")
@@ -176,38 +172,23 @@ class Settings(BaseSettings):
             readonly_path,
         }
         if state_path in operational_paths:
-            raise ValueError(
-                "backfill state path must differ from DuckDB main and readonly paths"
-            )
+            raise ValueError("backfill state path must differ from DuckDB main and readonly paths")
         research_paths = {
             (self.research_db_path or self.data_dir / "research.duckdb").resolve(),
-            (
-                self.research_readonly_db_path
-                or self.data_dir / "research_ro.duckdb"
-            ).resolve(),
+            (self.research_readonly_db_path or self.data_dir / "research_ro.duckdb").resolve(),
             (self.research_lake_dir or self.data_dir / "lake").resolve(),
-            (
-                self.research_staging_dir
-                or self.data_dir / "research_staging"
-            ).resolve(),
+            (self.research_staging_dir or self.data_dir / "research_staging").resolve(),
         }
         if research_paths & operational_paths:
-            raise ValueError(
-                "research paths must differ from DuckDB main and readonly paths"
-            )
+            raise ValueError("research paths must differ from DuckDB main and readonly paths")
         if len(research_paths) != 4:
             raise ValueError("research paths must differ from each other")
         return self
 
     @model_validator(mode="after")
     def validate_lab_scheduler_storage(self) -> "Settings":
-        if (
-            self.lab_scheduler_lease_seconds
-            < 3 * self.lab_scheduler_heartbeat_seconds
-        ):
-            raise ValueError(
-                "lab scheduler lease must be >= 3 * heartbeat interval"
-            )
+        if self.lab_scheduler_lease_seconds < 3 * self.lab_scheduler_heartbeat_seconds:
+            raise ValueError("lab scheduler lease must be >= 3 * heartbeat interval")
         lab_path = self.lab_jobs_path_resolved.resolve()
         existing_database_paths = {
             self.duckdb_path.resolve(),
@@ -218,14 +199,10 @@ class Settings(BaseSettings):
             self.notification_state_path_resolved.resolve(),
         }
         if lab_path in existing_database_paths:
-            raise ValueError(
-                "lab jobs path must differ from all existing database paths"
-            )
+            raise ValueError("lab jobs path must differ from all existing database paths")
         command_dir = self.lab_job_command_dir_resolved.resolve()
         if command_dir == lab_path or command_dir in existing_database_paths:
-            raise ValueError(
-                "lab job command directory must differ from database paths"
-            )
+            raise ValueError("lab job command directory must differ from database paths")
         return self
 
     @property

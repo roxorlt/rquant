@@ -20,6 +20,7 @@ from rquant.lab_jobs import (
     JobStatus,
     LabJobReader,
     LabJobStore,
+    SchedulerLeaseFencedError,
     SchedulerLeaseUnavailableError,
 )
 from rquant.lab_scheduler import LabScheduler, SchedulerTickResult
@@ -174,6 +175,77 @@ def test_commit_before_ack_crash_replays_without_duplicate_effect(
     assert replay.applied == 1
     assert len(reader.list_events(envelope.command.job_id)) == 1
     assert spool.pending() == ()
+
+
+def test_each_command_mutation_uses_a_fresh_clock_value(tmp_path: Path) -> None:
+    store, spool = _components(tmp_path)
+    envelopes = (_envelope(), _envelope())
+    for envelope in envelopes:
+        spool.publish(envelope)
+    moments = iter(
+        (
+            NOW,
+            NOW + timedelta(seconds=1),
+            NOW + timedelta(seconds=2),
+            NOW + timedelta(seconds=3),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        clock=lambda: next(moments),
+    )
+
+    scheduler.run_once()
+
+    reader = LabJobReader(store.path)
+    applied_at = {reader.get_command(envelope.request_id).applied_at for envelope in envelopes}
+    assert applied_at == {
+        NOW + timedelta(seconds=2),
+        NOW + timedelta(seconds=3),
+    }
+
+
+class _SlowAckSpool(LabCommandSpool):
+    def __init__(self, root: Path, current: list[datetime]) -> None:
+        super().__init__(root)
+        self.current = current
+
+    def ack(
+        self,
+        entry: LabSpoolEntry,
+        receipt: LabCommandReceipt,
+    ) -> LabAcknowledgedCommand:
+        acknowledged = super().ack(entry, receipt)
+        self.current[0] += timedelta(seconds=70)
+        return acknowledged
+
+
+def test_slow_ack_expiry_fences_next_command_in_same_tick(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    current = [NOW]
+    spool = _SlowAckSpool(tmp_path / "commands", current)
+    for _ in range(2):
+        spool.publish(_envelope())
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        clock=lambda: current[0],
+    )
+
+    with pytest.raises(SchedulerLeaseFencedError):
+        scheduler.run_once()
+
+    assert len(spool.pending()) == 1
 
 
 def test_bad_json_is_quarantined_and_does_not_block_valid_command(

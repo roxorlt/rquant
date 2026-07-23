@@ -66,17 +66,14 @@ def _ingest_with_retry(trade_date: str) -> int:
                 )
                 time.sleep(_NETWORK_RETRY_INTERVAL)
                 continue
-            logger.error(
-                f"{trade_date} ingest 重试 {_RETRY_COUNT} 次仍失败: {e}"
-            )
+            logger.error(f"{trade_date} ingest 重试 {_RETRY_COUNT} 次仍失败: {e}")
             raise
 
         if bar_count > 0:
             return bar_count
         if attempt < _RETRY_COUNT:
             logger.warning(
-                f"数据未就绪，{_RETRY_INTERVAL // 60} 分钟后重试 "
-                f"({attempt}/{_RETRY_COUNT})"
+                f"数据未就绪，{_RETRY_INTERVAL // 60} 分钟后重试 ({attempt}/{_RETRY_COUNT})"
             )
             time.sleep(_RETRY_INTERVAL)
 
@@ -123,9 +120,7 @@ def _parse_iso_datetime(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"时间格式应为带时区 ISO-8601: {value}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"时间格式应为带时区 ISO-8601: {value}") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise argparse.ArgumentTypeError(f"时间必须显式包含时区: {value}")
     return parsed.astimezone(UTC)
@@ -179,14 +174,8 @@ def _estimate_parallel_backfill(
         raise ValueError("total_tasks must not be negative")
     if not 1 <= worker_count <= 16:
         raise ValueError("worker_count must be between 1 and 16")
-    remaining_ratio = (
-        telemetry.remaining_tasks / total_tasks
-        if total_tasks
-        else 0.0
-    )
-    remaining_rate_limit_seconds = (
-        max(0.0, static_rate_limit_seconds) * remaining_ratio
-    )
+    remaining_ratio = telemetry.remaining_tasks / total_tasks if total_tasks else 0.0
+    remaining_rate_limit_seconds = max(0.0, static_rate_limit_seconds) * remaining_ratio
     task_floor_seconds = 0.0
     candidates = [
         (
@@ -203,8 +192,7 @@ def _estimate_parallel_backfill(
                     "production_cold_start",
                 ),
                 (
-                    telemetry.remaining_expected_rows
-                    / _BACKFILL_COLD_ROWS_PER_SECOND,
+                    telemetry.remaining_expected_rows / _BACKFILL_COLD_ROWS_PER_SECOND,
                     "production_cold_start",
                 ),
             )
@@ -225,10 +213,7 @@ def _estimate_parallel_backfill(
                     "historical_p75",
                 ),
                 (
-                    (
-                        telemetry.remaining_expected_rows
-                        * telemetry.p75_seconds_per_row
-                    ),
+                    (telemetry.remaining_expected_rows * telemetry.p75_seconds_per_row),
                     "historical_p75",
                 ),
             )
@@ -293,10 +278,7 @@ def _in_backfill_protected_window(now: datetime) -> bool:
         raise ValueError("protected-window time must be timezone-aware")
     local = now.astimezone(_SHANGHAI)
     return (
-        local.weekday() < 5
-        and _BACKFILL_PROTECTED_START
-        <= local.time()
-        <= _BACKFILL_PROTECTED_END
+        local.weekday() < 5 and _BACKFILL_PROTECTED_START <= local.time() <= _BACKFILL_PROTECTED_END
     )
 
 
@@ -383,10 +365,7 @@ class _SnapshotDeadlineStoreContext:
     def _arm(self) -> None:
         if self.deadline is None:
             return
-        remaining = (
-            self.deadline
-            - _snapshot_now().astimezone(_SHANGHAI)
-        ).total_seconds()
+        remaining = (self.deadline - _snapshot_now().astimezone(_SHANGHAI)).total_seconds()
         if remaining <= 0:
             raise _SnapshotWriteDeadlineError(
                 "dataset snapshot execution reached the protected-window deadline"
@@ -441,10 +420,7 @@ def _run_deadline_supervised_process(
     *,
     deadline: datetime,
 ) -> int:
-    remaining = (
-        deadline
-        - _snapshot_now().astimezone(_SHANGHAI)
-    ).total_seconds()
+    remaining = (deadline - _snapshot_now().astimezone(_SHANGHAI)).total_seconds()
     if remaining <= 0:
         logger.error("dataset snapshot worker deadline already elapsed")
         return 2
@@ -455,9 +431,7 @@ def _run_deadline_supervised_process(
             timeout=remaining,
         )
     except subprocess.TimeoutExpired:
-        logger.error(
-            "dataset snapshot worker was killed at the protected-window deadline"
-        )
+        logger.error("dataset snapshot worker was killed at the protected-window deadline")
         return 2
     return int(result.returncode)
 
@@ -555,9 +529,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     scheduler = BlockingScheduler()
 
     @scheduler.scheduled_job(
-        "cron", hour=args.hour, minute=0, day_of_week="mon-fri",
+        "cron",
+        hour=args.hour,
+        minute=0,
+        day_of_week="mon-fri",
         misfire_grace_time=7200,  # 允许延迟 2 小时仍执行
-        coalesce=True,            # 多次 misfire 合并为一次执行
+        coalesce=True,  # 多次 misfire 合并为一次执行
     )
     def daily_job() -> None:
         trade_date = date.today().isoformat()
@@ -575,6 +552,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except Exception as e:
             logger.exception(f"=== 每日任务异常 {trade_date} ===")
             from rquant.notify import notify
+
             notify("error", component="daily_job", exc=e)
 
     def handle_signal(signum: int, frame: object) -> None:
@@ -701,9 +679,7 @@ def cmd_rt_minute_fetch(args: argparse.Namespace) -> int:
     with DuckDBStore() as store:
         rows = store.upsert_minute_bars(df)
     latest_time = df["trade_time"].max()
-    logger.info(
-        f"rt_min 写入 minute_bar: rows={rows}, codes={len(ts_codes)}, latest={latest_time}"
-    )
+    logger.info(f"rt_min 写入 minute_bar: rows={rows}, codes={len(ts_codes)}, latest={latest_time}")
     return 0
 
 
@@ -726,8 +702,7 @@ def cmd_rt_minute_daily_fetch(args: argparse.Namespace) -> int:
         rows = store.upsert_minute_bars(df)
     latest_time = df["trade_time"].max()
     logger.info(
-        "rt_min_daily 写入 minute_bar: "
-        f"rows={rows}, codes={len(ts_codes)}, latest={latest_time}"
+        f"rt_min_daily 写入 minute_bar: rows={rows}, codes={len(ts_codes)}, latest={latest_time}"
     )
     return 0
 
@@ -751,9 +726,7 @@ def cmd_research_sync(args: argparse.Namespace) -> int:
     for t in report.tables:
         mark = {"replace": "替换", "merge": "合并", "skipped": "跳过", "error": "失败"}[t.mode]
         logger.info(f"  {t.table}: {mark} {t.rows:,} 行 {t.detail}")
-    logger.info(
-        f"replica: {'已刷新' if report.replica_refreshed else report.replica_detail}"
-    )
+    logger.info(f"replica: {'已刷新' if report.replica_refreshed else report.replica_detail}")
     return 1 if report.has_errors else 0
 
 
@@ -821,9 +794,7 @@ def cmd_research_ingest(args: argparse.Namespace) -> int:
     if args.recover and args.scheduled:
         raise ValueError("research-ingest --recover and --scheduled are mutually exclusive")
     if not args.dry_run and not settings.research_cloud_ingest_enabled:
-        logger.error(
-            "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
-        )
+        logger.error("研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行")
         return 3
     trade_date = args.date or datetime.now(_SHANGHAI).date()
     source_database = settings.duckdb_readonly_path_resolved
@@ -866,9 +837,7 @@ def cmd_research_repair_auction(args: argparse.Namespace) -> int:
     from rquant.research_repair import run_research_auction_repair
 
     if args.apply and not settings.research_cloud_ingest_enabled:
-        logger.error(
-            "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
-        )
+        logger.error("研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行")
         return 3
     result = run_research_auction_repair(
         source_database=settings.duckdb_readonly_path_resolved,
@@ -901,9 +870,7 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
     )
 
     if args.apply and not settings.research_cloud_ingest_enabled:
-        logger.error(
-            "研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行"
-        )
+        logger.error("研究云增量开关未开启；设置 RESEARCH_CLOUD_INGEST_ENABLED=true 后再执行")
         return 3
     with open_backfill_state_snapshot(
         settings.backfill_state_path_resolved,
@@ -942,9 +909,7 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
     setup_logging()
     code_commit = detect_verified_code_commit()
     if not _valid_clean_commit(code_commit):
-        logger.error(
-            "formal smoke replay requires a clean 40-character git commit"
-        )
+        logger.error("formal smoke replay requires a clean 40-character git commit")
         return 2
     request = FormalSmokeReplayRequest(
         strategy=args.strategy,
@@ -1159,16 +1124,10 @@ def cmd_market_daily_backfill(args: argparse.Namespace) -> int:
     )
     logger.info(summary)
     affected_codes = summary.get("affected_codes", [])
-    if (
-        not args.dry_run
-        and not args.skip_state_recompute
-        and affected_codes
-    ):
+    if not args.dry_run and not args.skip_state_recompute and affected_codes:
         tail_start_value = summary.get("state_tail_start_date")
         if not isinstance(tail_start_value, str):
-            raise RuntimeError(
-                "market backfill result is missing state_tail_start_date"
-            )
+            raise RuntimeError("market backfill result is missing state_tail_start_date")
         with DuckDBStore() as store:
             recompute_daily_state(
                 store,
@@ -1244,9 +1203,7 @@ def cmd_limit_list_backfill(args: argparse.Namespace) -> int:
         logger.error("需要 --start-date 和 --end-date（或改用 --today 拉当天）")
         return 1
     with DuckDBStore() as store:
-        summary = backfill_limit_list(
-            args.start_date, args.end_date, store, dry_run=args.dry_run
-        )
+        summary = backfill_limit_list(args.start_date, args.end_date, store, dry_run=args.dry_run)
     logger.info(summary)
     return 1 if summary["failed_dates"] else 0
 
@@ -1258,10 +1215,7 @@ def cmd_data_backfill(args: argparse.Namespace) -> int:
 
     setup_logging()
     if args.dataset != "all" and args.dataset not in DATASETS:
-        logger.error(
-            f"未知数据集：{args.dataset}"
-            f"（可用：all, {', '.join(sorted(DATASETS))}）"
-        )
+        logger.error(f"未知数据集：{args.dataset}（可用：all, {', '.join(sorted(DATASETS))}）")
         return 1
     if args.today:
         start = end = date.today().isoformat()
@@ -1276,9 +1230,7 @@ def cmd_data_backfill(args: argparse.Namespace) -> int:
     has_failure = False
     with DuckDBStore() as store:
         for name in names:
-            summary = backfill_dataset(
-                name, start, end, store, adapter, dry_run=args.dry_run
-            )
+            summary = backfill_dataset(name, start, end, store, adapter, dry_run=args.dry_run)
             logger.info(summary)
             has_failure = has_failure or bool(summary["failed_dates"])
     return 1 if has_failure else 0
@@ -1383,20 +1335,17 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
             )
             if not eligibility_artifacts:
                 logger.error(
-                    "auction eligibility requires immutable auction_bar "
-                    "research-lake partitions"
+                    "auction eligibility requires immutable auction_bar research-lake partitions"
                 )
                 return 2
-            eligibility_resolution = (
-                resolve_strategy_eligibility_from_artifacts(
-                    store,
-                    strategy_id=args.strategy,
-                    start_date=args.start_date,
-                    end_date=end_date,
-                    input_artifacts=eligibility_artifacts,
-                    lake_root=settings.research_lake_dir_resolved,
-                    as_of_time=as_of_time,
-                )
+            eligibility_resolution = resolve_strategy_eligibility_from_artifacts(
+                store,
+                strategy_id=args.strategy,
+                start_date=args.start_date,
+                end_date=end_date,
+                input_artifacts=eligibility_artifacts,
+                lake_root=settings.research_lake_dir_resolved,
+                as_of_time=as_of_time,
             )
         else:
             eligibility_resolution = resolve_strategy_eligibility(
@@ -1429,9 +1378,7 @@ def cmd_backfill_plan(args: argparse.Namespace) -> int:
             "observable_end_date": observable_end.isoformat(),
             "effective_end_date": end_date.isoformat(),
             "eligibility_count": len(plan.manifest.eligibilities),
-            "eligibility_resolution_hash": (
-                eligibility_resolution.resolution_hash
-            ),
+            "eligibility_resolution_hash": (eligibility_resolution.resolution_hash),
             "eligibility_expected_dates": eligibility_resolution.expected_count,
             "eligibility_complete_dates": eligibility_resolution.available_count,
             "task_count": len(plan.tasks),
@@ -1524,9 +1471,7 @@ def cmd_backfill_run(args: argparse.Namespace) -> int:
             execution_estimate.point_seconds,
         )
     ):
-        logger.error(
-            "backfill run would overlap the protected 09:15-15:10 monitor window"
-        )
+        logger.error("backfill run would overlap the protected 09:15-15:10 monitor window")
         return 2
 
     logger.info(
@@ -1616,9 +1561,7 @@ def cmd_backfill_abandon(args: argparse.Namespace) -> int:
         logger.error("--apply requires the exact --plan-id from dry-run")
         return 2
     if args.plan_id != plan.plan_id:
-        logger.error(
-            "manifest abandonment plan-id mismatch; rerun dry-run and inspect changes"
-        )
+        logger.error("manifest abandonment plan-id mismatch; rerun dry-run and inspect changes")
         return 2
     try:
         status = state.apply_manifest_abandonment(plan)
@@ -1710,9 +1653,7 @@ def cmd_security_status_backfill(args: argparse.Namespace) -> int:
             missing_only=not args.full_refresh,
         )
         payload = plan.model_dump(mode="json")
-        payload["total_logical_api_operations"] = (
-            plan.total_logical_api_operations
-        )
+        payload["total_logical_api_operations"] = plan.total_logical_api_operations
         _print_json(payload)
         return 0
 
@@ -1765,9 +1706,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         return 2
     status = state.get_manifest_status(args.manifest_id)
     if status.status != "completed":
-        logger.error(
-            f"manifest must be completed before snapshot finalization: {status.status}"
-        )
+        logger.error(f"manifest must be completed before snapshot finalization: {status.status}")
         return 2
     original = MinuteBackfillPlan.model_validate(persisted.payload)
     if original.manifest.spec.strategy_id != args.strategy:
@@ -1778,16 +1717,9 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         started_at,
         original.estimate.total_seconds,
     ):
-        logger.error(
-            "dataset snapshot apply would overlap the protected "
-            "09:15-15:10 market window"
-        )
+        logger.error("dataset snapshot apply would overlap the protected 09:15-15:10 market window")
         return 2
-    deadline = (
-        None
-        if dry_run
-        else _dataset_snapshot_apply_deadline(started_at)
-    )
+    deadline = None if dry_run else _dataset_snapshot_apply_deadline(started_at)
     deadline_worker = bool(getattr(args, "deadline_worker", True))
     if not dry_run and not deadline_worker:
         if deadline is None:
@@ -1809,14 +1741,10 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         planned_resolution = original.manifest.eligibility_resolution
         if planned_resolution is None:
             logger.error(
-                "dataset snapshot requires an independently verified "
-                "eligibility resolution"
+                "dataset snapshot requires an independently verified eligibility resolution"
             )
             return 2
-        if (
-            args.strategy == "auction_gap"
-            and not planned_resolution.input_artifacts
-        ):
+        if args.strategy == "auction_gap" and not planned_resolution.input_artifacts:
             logger.error(
                 "auction snapshot requires immutable eligibility input artifacts; "
                 "generate a new backfill manifest"
@@ -1853,9 +1781,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
             )
             return 2
         if not coverage.baseline_gate_passed or not coverage.entry_exit_gate_passed:
-            logger.error(
-                "dataset coverage gate failed: baseline must be >=95% and B/S >=99%"
-            )
+            logger.error("dataset coverage gate failed: baseline must be >=95% and B/S >=99%")
             return 2
 
         as_of_shanghai = args.as_of.astimezone(ZoneInfo("Asia/Shanghai"))
@@ -1881,14 +1807,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
             (window.end_date for window in current.windows),
             default=current.manifest.end_date,
         )
-        ts_codes = tuple(
-            sorted(
-                {
-                    row.ts_code
-                    for row in current.manifest.eligibilities
-                }
-            )
-        )
+        ts_codes = tuple(sorted({row.ts_code for row in current.manifest.eligibilities}))
         dependencies = strategy_execution_dependencies(args.strategy)
         pinned_lake_artifacts = list(current.minute_coverage_artifacts)
         resolver = SnapshotArtifactResolver(
@@ -1905,24 +1824,14 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 as_of_time=args.as_of,
             )
             if not resolved:
-                logger.error(
-                    f"research lake has no {dataset} partitions in binding range"
-                )
+                logger.error(f"research lake has no {dataset} partitions in binding range")
                 return 2
             if dataset == "auction_bar" and resolution.input_artifacts:
-                by_key = {
-                    artifact.artifact_key: artifact
-                    for artifact in resolved
-                }
+                by_key = {artifact.artifact_key: artifact for artifact in resolved}
                 by_key.update(
-                    {
-                        artifact.artifact_key: artifact
-                        for artifact in resolution.input_artifacts
-                    }
+                    {artifact.artifact_key: artifact for artifact in resolution.input_artifacts}
                 )
-                resolved = tuple(
-                    by_key[key] for key in sorted(by_key)
-                )
+                resolved = tuple(by_key[key] for key in sorted(by_key))
             pinned_lake_artifacts.extend(resolved)
         if args.strategy == "auction_gap":
             live_resolution = resolve_strategy_eligibility_from_artifacts(
@@ -1955,8 +1864,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                     "lake_datasets": dependencies.lake_datasets,
                     "lake_artifact_count": len(pinned_lake_artifacts),
                     "materialized_tables": tuple(
-                        dependency.table_name
-                        for dependency in dependencies.materialized_tables
+                        dependency.table_name for dependency in dependencies.materialized_tables
                     ),
                     "apply_required": True,
                 }
@@ -1983,9 +1891,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                     table_name="backfill_manifest",
                     expected_count=resolution.expected_count,
                     available_count=resolution.available_count,
-                    missing_reasons=tuple(
-                        sorted({row.reason for row in resolution.incomplete})
-                    ),
+                    missing_reasons=tuple(sorted({row.reason for row in resolution.incomplete})),
                 )
             )
             phases = {
@@ -1994,12 +1900,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 "exit": coverage.exit,
             }
             accepted_missing_reasons = tuple(
-                sorted(
-                    {
-                        row.reason
-                        for row in current.unavailable_sessions
-                    }
-                )
+                sorted({row.reason for row in current.unavailable_sessions})
             )
             for scope, phase in phases.items():
                 missing_reasons = tuple(
@@ -2034,18 +1935,13 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
                 [as_of_shanghai.replace(tzinfo=None)],
             ).fetchone()
             calendar_row = store._conn.execute(
-                "SELECT MAX(cal_date) FROM trade_calendar "
-                "WHERE exchange = 'SSE' AND cal_date <= ?",
+                "SELECT MAX(cal_date) FROM trade_calendar WHERE exchange = 'SSE' AND cal_date <= ?",
                 [as_of_shanghai.date()],
             ).fetchone()
             watermarks: dict[str, str] = {}
-            watermarks["manifest_start_date"] = (
-                current.manifest.start_date.isoformat()
-            )
+            watermarks["manifest_start_date"] = current.manifest.start_date.isoformat()
             watermarks["manifest_end_date"] = current.manifest.end_date.isoformat()
-            watermarks["eligibility_resolution_hash"] = (
-                resolution.resolution_hash
-            )
+            watermarks["eligibility_resolution_hash"] = resolution.resolution_hash
             if minute_row and minute_row[0] is not None:
                 watermarks["minute_bar"] = _watermark_text(minute_row[0])
             if calendar_row and calendar_row[0] is not None:
@@ -2074,8 +1970,7 @@ def cmd_dataset_snapshot(args: argparse.Namespace) -> int:
         _require_snapshot_before_deadline(deadline)
     if guarded_store.expired:
         logger.error(
-            "dataset snapshot apply stopped before the protected "
-            "09:15-15:10 market window"
+            "dataset snapshot apply stopped before the protected 09:15-15:10 market window"
         )
         return 2
     _print_json(
@@ -2128,9 +2023,7 @@ def cmd_data_audit(args: argparse.Namespace) -> int:
             report = run_audit(readonly, rules, observed_at=observed_at)
         current_issue_ids = set(report.issue_ids)
         with DuckDBStore() as writable:
-            previously_open = writable.list_open_data_quality_issues(
-                rule_ids=report.rule_ids
-            )
+            previously_open = writable.list_open_data_quality_issues(rule_ids=report.rule_ids)
             record_audit_report(writable, report)
             resolve_audit_issues(
                 writable,
@@ -2150,9 +2043,7 @@ def cmd_data_audit(args: argparse.Namespace) -> int:
                 audit_run.audit_run_id,
                 DataAuditRunFinalization(
                     finding_issue_ids=report.issue_ids,
-                    p0_count=sum(
-                        1 for finding in report.findings if finding.severity == "P0"
-                    ),
+                    p0_count=sum(1 for finding in report.findings if finding.severity == "P0"),
                     completed_at=datetime.now(UTC),
                 ),
             )
@@ -2320,10 +2211,18 @@ def cmd_auction_gap_replay(args: argparse.Namespace) -> int:
         return 0
 
     preview_cols = [
-        "signal_date", "ts_code", "name", "entry_price",
-        "auction_vol_ratio_5d", "gap_pct_close", "gap_pct_high",
-        "hit_limit_up_today", "intraday_high_ret_pct",
-        "next_trade_date", "next_open_ret_pct", "next_close_ret_pct",
+        "signal_date",
+        "ts_code",
+        "name",
+        "entry_price",
+        "auction_vol_ratio_5d",
+        "gap_pct_close",
+        "gap_pct_high",
+        "hit_limit_up_today",
+        "intraday_high_ret_pct",
+        "next_trade_date",
+        "next_open_ret_pct",
+        "next_close_ret_pct",
     ]
     available_cols = [col for col in preview_cols if col in trades.columns]
     logger.info("\n" + trades[available_cols].tail(20).to_string(index=False))
@@ -2367,15 +2266,15 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         # persist 要写 paper_position/快照表 → 必须写模式直连主库。
         # 盘中 monitor 持写锁会直接撞锁，明确警告后仍执行（撞锁自然报错）
         from datetime import datetime as _dt
+
         now = _dt.now().time()
         if dtime(9, 25) <= now <= dtime(15, 5):
-            logger.warning(
-                "盘中时段 persist 落库会与本地 monitor 抢写锁，建议收盘后执行"
-            )
+            logger.warning("盘中时段 persist 落库会与本地 monitor 抢写锁，建议收盘后执行")
         with DuckDBStore() as store:
             candidates = run_auction_gap_replay(store, config.auction_config())
             trades = run_auction_gap_minute_replay(
-                store, config,
+                store,
+                config,
                 persist_positions=True,
                 run_id=args.run_id,
             )
@@ -2401,10 +2300,19 @@ def cmd_auction_gap_minute_replay(args: argparse.Namespace) -> int:
         return 0
 
     preview_cols = [
-        "signal_date", "ts_code", "name", "auction_price",
-        "entry_time", "entry_price", "b_first_limit_up_time",
-        "b_close_at_limit_up", "hold_policy", "exit_time", "exit_price",
-        "exit_reason", "ret_pct",
+        "signal_date",
+        "ts_code",
+        "name",
+        "auction_price",
+        "entry_time",
+        "entry_price",
+        "b_first_limit_up_time",
+        "b_close_at_limit_up",
+        "hold_policy",
+        "exit_time",
+        "exit_price",
+        "exit_reason",
+        "ret_pct",
     ]
     available_cols = [col for col in preview_cols if col in trades.columns]
     logger.info("\n" + trades[available_cols].tail(20).to_string(index=False))
@@ -2480,9 +2388,17 @@ def cmd_minute_replay(args: argparse.Namespace) -> int:
         f"win={win_rate:.1f}%"
     )
     preview_cols = [
-        "signal_date", "ts_code", "name", "entry_time", "entry_price_raw",
-        "entry_price", "exit_time", "exit_price", "exit_reason",
-        "holding_trading_days", "ret_pct",
+        "signal_date",
+        "ts_code",
+        "name",
+        "entry_time",
+        "entry_price_raw",
+        "entry_price",
+        "exit_time",
+        "exit_price",
+        "exit_reason",
+        "holding_trading_days",
+        "ret_pct",
     ]
     available_cols = [col for col in preview_cols if col in trades.columns]
     logger.info("\n" + trades[available_cols].tail(20).to_string(index=False))
@@ -2557,10 +2473,18 @@ def cmd_growth_board_surge_replay(args: argparse.Namespace) -> int:
         f"win={win_rate:.1f}%"
     )
     preview_cols = [
-        "signal_date", "ts_code", "name", "board_type",
-        "entry_time", "entry_price", "limit_up_price",
-        "hit_limit_up_today", "exit_time", "exit_price",
-        "exit_reason", "ret_pct",
+        "signal_date",
+        "ts_code",
+        "name",
+        "board_type",
+        "entry_time",
+        "entry_price",
+        "limit_up_price",
+        "hit_limit_up_today",
+        "exit_time",
+        "exit_price",
+        "exit_reason",
+        "ret_pct",
     ]
     available_cols = [col for col in preview_cols if col in trades.columns]
     logger.info("\n" + trades[available_cols].tail(20).to_string(index=False))
@@ -2901,11 +2825,12 @@ def cmd_blacklist(args: argparse.Namespace) -> int:
             return 1
         with DuckDBStore() as store:
             n = load_blacklist_parquet(
-                parquet, store, list_label=args.label,
+                parquet,
+                store,
+                list_label=args.label,
             )
         logger.info(
-            f"parquet 落库完成：{n} 行 → "
-            f"{'list_label=' + args.label if args.label else '全表覆盖'}"
+            f"parquet 落库完成：{n} 行 → {'list_label=' + args.label if args.label else '全表覆盖'}"
         )
         return 0
 
@@ -2913,7 +2838,9 @@ def cmd_blacklist(args: argparse.Namespace) -> int:
         out = Path(args.output).expanduser().resolve()
         with DuckDBStore() as store:
             n = export_blacklist_parquet(
-                store, out, list_label=args.label,
+                store,
+                out,
+                list_label=args.label,
             )
         logger.info(f"parquet 导出完成：{n} 行 → {out}")
         return 0
@@ -2996,9 +2923,7 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
                 run_id = spec_path.stem
             # spec 与 status 同目录（strategy_lab_runs/），从 spec 路径反推 base_dir
             base_dir = (
-                spec_path.parent.parent
-                if spec_path.parent.name == "strategy_lab_runs"
-                else None
+                spec_path.parent.parent if spec_path.parent.name == "strategy_lab_runs" else None
             )
             write_run_status(
                 LabRunStatus(
@@ -3088,8 +3013,7 @@ def cmd_panorama_gate_token(args: argparse.Namespace) -> int:
     token = settings.panorama_gate_token_resolved
     if not token:
         print(
-            "RQUANT_PANORAMA_GATE_TOKEN / RQUANT_PANORAMA_COOKIE_SECRET 均未配置，"
-            "无法生成网关令牌",
+            "RQUANT_PANORAMA_GATE_TOKEN / RQUANT_PANORAMA_COOKIE_SECRET 均未配置，无法生成网关令牌",
             file=sys.stderr,
         )
         return 1
@@ -3158,41 +3082,47 @@ def cmd_panorama_user_list(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
-    parser = _RQuantArgumentParser(
-        prog="rquant", description="rQuant 量化选股平台"
-    )
+    parser = _RQuantArgumentParser(prog="rquant", description="rQuant 量化选股平台")
     sub = parser.add_subparsers(dest="command")
 
     serve_p = sub.add_parser("serve", help="启动 APScheduler 常驻进程")
-    serve_p.add_argument(
-        "--hour", type=int, default=17, help="每日触发小时 (默认 17)"
-    )
+    serve_p.add_argument("--hour", type=int, default=17, help="每日触发小时 (默认 17)")
 
     run_p = sub.add_parser("run-daily", help="拉取数据 + 执行全流水线")
     run_p.add_argument(
-        "--date", type=str, default=None,
+        "--date",
+        type=str,
+        default=None,
         help="交易日期 YYYY-MM-DD (默认今天)",
     )
     run_p.add_argument(
-        "--preset", type=str, default=None,
+        "--preset",
+        type=str,
+        default=None,
         help="只跑指定预设 (默认全部)",
     )
     run_p.add_argument(
-        "--no-ingest", action="store_true",
+        "--no-ingest",
+        action="store_true",
         help="跳过数据拉取，只跑筛选",
     )
     run_p.add_argument(
-        "--skip-minute-backfill", action="store_true",
+        "--skip-minute-backfill",
+        action="store_true",
         help="跳过日终 Pool1 90 日分钟上下文回补",
     )
     run_p.add_argument(
-        "--minute-lookback-days", type=int, default=90,
+        "--minute-lookback-days",
+        type=int,
+        default=90,
         help="日终分钟上下文回补交易日数量 (默认 90)",
     )
 
     ingest_p = sub.add_parser("ingest", help="仅拉取数据（不跑筛选）")
     ingest_p.add_argument(
-        "--date", type=str, default=None,
+        "--date",
+        type=str,
+        default=None,
         help="交易日期 YYYY-MM-DD (默认今天)",
     )
 
@@ -3220,7 +3150,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     monitor_p = sub.add_parser("monitor", help="启动盘中实时监控")
     monitor_p.add_argument(
-        "--interval", type=int, default=5,
+        "--interval",
+        type=int,
+        default=5,
         help="轮询间隔秒数 (默认 5)",
     )
 
@@ -3265,19 +3197,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="云端备份(cloud_backup.duckdb)合并进本地研究库，或从旧库恢复研究表",
     )
     rs_p.add_argument(
-        "--backup", type=str, default=None,
+        "--backup",
+        type=str,
+        default=None,
         help="云端备份文件路径（默认 data/cloud_backup.duckdb）",
     )
     rs_p.add_argument(
-        "--restore-from", type=str, default=None,
+        "--restore-from",
+        type=str,
+        default=None,
         help="恢复模式：从指定旧库/旧副本按主键合并研究表",
     )
     rs_p.add_argument(
-        "--tables", type=str, default=None,
+        "--tables",
+        type=str,
+        default=None,
         help="恢复模式下只处理这些表（逗号分隔，默认全部研究表）",
     )
     rs_p.add_argument(
-        "--no-refresh-replica", action="store_true",
+        "--no-refresh-replica",
+        action="store_true",
         help="跳过只读副本刷新",
     )
 
@@ -3588,25 +3527,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="全市场日线历史回补，并在最后统一重算 daily_state",
     )
     market_backfill_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="开始日期 YYYY-MM-DD",
     )
     market_backfill_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="结束日期 YYYY-MM-DD",
     )
     market_backfill_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只报告交易日数与预计请求数，不调 Tushare、不写库",
     )
     market_backfill_p.add_argument(
         "--skip-state-recompute",
         dest="skip_state_recompute",
         action="store_true",
-        help=(
-            "跳过最终 daily_state 原子尾段重算；受影响的状态和日指标"
-            "尾段仍会保持失效"
-        ),
+        help=("跳过最终 daily_state 原子尾段重算；受影响的状态和日指标尾段仍会保持失效"),
     )
     market_backfill_p.add_argument(
         "--skip-state",
@@ -3620,7 +3561,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="采集当日东财涨停池到 limit_up_pool_daily（源只有当天数据，需每日采集）",
     )
     zt_pool_p.add_argument(
-        "--date", type=str, default=None,
+        "--date",
+        type=str,
+        default=None,
         help="交易日期 YYYY-MM-DD (默认今天)",
     )
 
@@ -3643,49 +3586,62 @@ def build_parser() -> argparse.ArgumentParser:
     limit_list_p = sub.add_parser(
         "limit-list-backfill",
         help="Tushare 涨跌停/炸板榜（limit_list_d）回补到 limit_list_daily"
-             "（2020 起，U/D/Z 一次拿齐，不含 ST）",
+        "（2020 起，U/D/Z 一次拿齐，不含 ST）",
     )
     limit_list_p.add_argument(
-        "--start-date", type=str, default=None,
+        "--start-date",
+        type=str,
+        default=None,
         help="开始日期 YYYY-MM-DD",
     )
     limit_list_p.add_argument(
-        "--end-date", type=str, default=None,
+        "--end-date",
+        type=str,
+        default=None,
         help="结束日期 YYYY-MM-DD",
     )
     limit_list_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只报告交易日数与预计请求数，不调 Tushare、不写库",
     )
     limit_list_p.add_argument(
-        "--today", action="store_true",
+        "--today",
+        action="store_true",
         help="只拉当天（日终增量），失败不炸、幂等可重跑",
     )
 
     data_backfill_p = sub.add_parser(
         "data-backfill",
         help="统一数据集回补（板块行情/成分/资金流/龙虎榜/开盘啦等，"
-             "注册表见 rquant.dataset_backfill.DATASETS）",
+        "注册表见 rquant.dataset_backfill.DATASETS）",
     )
     data_backfill_p.add_argument(
-        "--dataset", type=str, required=True,
-        help="数据集名（Tushare 接口名，如 ths_daily / moneyflow_dc / "
-             "top_list），all 跑全部",
+        "--dataset",
+        type=str,
+        required=True,
+        help="数据集名（Tushare 接口名，如 ths_daily / moneyflow_dc / top_list），all 跑全部",
     )
     data_backfill_p.add_argument(
-        "--start-date", type=str, default=None,
+        "--start-date",
+        type=str,
+        default=None,
         help="开始日期 YYYY-MM-DD（snapshot 数据集忽略）",
     )
     data_backfill_p.add_argument(
-        "--end-date", type=str, default=None,
+        "--end-date",
+        type=str,
+        default=None,
         help="结束日期 YYYY-MM-DD（snapshot 数据集取该日往前最近交易日）",
     )
     data_backfill_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只报告交易日数与预计请求数，不调 Tushare、不写库",
     )
     data_backfill_p.add_argument(
-        "--today", action="store_true",
+        "--today",
+        action="store_true",
         help="日终增量：start=end=今天（snapshot 数据集即刷新快照）",
     )
 
@@ -3913,57 +3869,74 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
 
-    minute_p = sub.add_parser(
-        "minute-backfill", help="回补 Pool 命中标的历史分钟线"
-    )
+    minute_p = sub.add_parser("minute-backfill", help="回补 Pool 命中标的历史分钟线")
     minute_p.add_argument(
-        "--date", type=str, required=True,
+        "--date",
+        type=str,
+        required=True,
         help="Pool 筛选日期 YYYY-MM-DD",
     )
     minute_p.add_argument(
-        "--lookback-days", type=int, default=90,
+        "--lookback-days",
+        type=int,
+        default=90,
         help="向前回补交易日数量 (默认 90)",
     )
     minute_p.add_argument(
-        "--freq", type=str, default="1min",
+        "--freq",
+        type=str,
+        default="1min",
         choices=["1min", "5min", "15min", "30min", "60min"],
         help="分钟频度 (默认 1min)",
     )
     minute_p.add_argument(
-        "--preset", type=str, default="n-shape-pool1",
+        "--preset",
+        type=str,
+        default="n-shape-pool1",
         help="筛选 preset (默认 n-shape-pool1)",
     )
     minute_p.add_argument(
-        "--ts-code", type=str, default=None,
+        "--ts-code",
+        type=str,
+        default=None,
         help="只回补单只股票，调试用",
     )
     minute_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只估算请求数，不调用 Tushare、不写库",
     )
 
-    replay_p = sub.add_parser(
-        "minute-replay", help="基于历史分钟线跑强承接/突破模拟回放"
-    )
+    replay_p = sub.add_parser("minute-replay", help="基于历史分钟线跑强承接/突破模拟回放")
     replay_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="Pool 筛选开始日期 YYYY-MM-DD",
     )
     replay_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="Pool 筛选结束日期 YYYY-MM-DD",
     )
     replay_p.add_argument(
-        "--preset", type=str, default="n-shape-pool1",
+        "--preset",
+        type=str,
+        default="n-shape-pool1",
         help="筛选 preset (默认 n-shape-pool1)",
     )
     replay_p.add_argument(
-        "--freq", type=str, default="1min",
+        "--freq",
+        type=str,
+        default="1min",
         choices=["1min", "5min", "15min", "30min", "60min"],
         help="分钟频度 (默认 1min)",
     )
     replay_p.add_argument(
-        "--entry-mode", type=str, default="first_break",
+        "--entry-mode",
+        type=str,
+        default="first_break",
         choices=[
             "first_break",
             "break_retest",
@@ -3975,23 +3948,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="入场模式 (默认 first_break)",
     )
     replay_p.add_argument(
-        "--factor-score-threshold", type=float, default=35.0,
+        "--factor-score-threshold",
+        type=float,
+        default=35.0,
         help="factor_confirm 的 n_shape_b_v1 评分入场阈值，仅该模式生效 (默认 35)",
     )
     replay_p.add_argument(
-        "--max-hold-days", type=int, default=5,
+        "--max-hold-days",
+        type=int,
+        default=5,
         help="最多持有交易日数量 (默认 5)",
     )
     replay_p.add_argument(
-        "--volume-profile", action="store_true",
+        "--volume-profile",
+        action="store_true",
         help="启用 90 日价量分布入场过滤与动态风控",
     )
     replay_p.add_argument(
-        "--volume-profile-lookbacks", type=int, nargs="+", default=[90],
+        "--volume-profile-lookbacks",
+        type=int,
+        nargs="+",
+        default=[90],
         help="价量分布 lookback 交易日列表 (默认 90)",
     )
     replay_p.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="CSV 输出路径（可选）",
     )
 
@@ -4000,97 +3983,139 @@ def build_parser() -> argparse.ArgumentParser:
         help="回测科创/创业板盘中放量追击策略",
     )
     growth_replay_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="回测开始日期 YYYY-MM-DD",
     )
     growth_replay_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="回测结束日期 YYYY-MM-DD",
     )
     growth_replay_p.add_argument(
-        "--freq", type=str, default="1min",
+        "--freq",
+        type=str,
+        default="1min",
         choices=["1min", "5min", "15min", "30min", "60min"],
         help="分钟频度 (默认 1min)",
     )
     growth_replay_p.add_argument(
-        "--min-signal-time", type=str, default="09:30",
+        "--min-signal-time",
+        type=str,
+        default="09:30",
         help="最早 B 信号时间 HH:MM (默认 09:33)",
     )
     growth_replay_p.add_argument(
-        "--lookback-days", type=int, default=20,
+        "--lookback-days",
+        type=int,
+        default=20,
         help="分钟历史基准 lookback 交易日数量 (默认 20)",
     )
     growth_replay_p.add_argument(
-        "--min-hist-days", type=int, default=10,
+        "--min-hist-days",
+        type=int,
+        default=10,
         help="至少需要的历史分钟样本交易日数量 (默认 10)",
     )
     growth_replay_p.add_argument(
-        "--min-cum-amount-ratio", type=float, default=1.4,
+        "--min-cum-amount-ratio",
+        type=float,
+        default=1.4,
         help="截至当前累计成交额相对历史同时间中位数倍数 (默认 1.4)",
     )
     growth_replay_p.add_argument(
-        "--min-same-minute-amount-ratio", type=float, default=2.0,
+        "--min-same-minute-amount-ratio",
+        type=float,
+        default=2.0,
         help="当前分钟成交额相对历史同分钟中位数倍数 (默认 2.0)",
     )
     growth_replay_p.add_argument(
-        "--max-hold-days", type=int, default=3,
+        "--max-hold-days",
+        type=int,
+        default=3,
         help="最多持有交易日数量 (默认 3；接住 2-3 日延续涨幅，见退出结构报告)",
     )
     growth_replay_p.add_argument(
-        "--require-inner-outer", action="store_true",
+        "--require-inner-outer",
+        action="store_true",
         help="要求信号分钟外盘>内盘（分钟 tick-rule 近似）",
     )
     growth_replay_p.add_argument(
-        "--max-inner-outer-ratio", "--min-inner-outer-ratio",
-        dest="max_inner_outer_ratio", type=float, default=1.0,
+        "--max-inner-outer-ratio",
+        "--min-inner-outer-ratio",
+        dest="max_inner_outer_ratio",
+        type=float,
+        default=1.0,
         help="内盘/外盘比上限，须严格小于 (默认 1.0 即外盘>内盘；旧参数名仍兼容)",
     )
     growth_replay_p.add_argument(
-        "--require-large-net-vol", action="store_true",
+        "--require-large-net-vol",
+        action="store_true",
         help="要求 T-1 moneyflow 大单净量>阈值（用户条件 3，T 日盘中不可知）",
     )
     growth_replay_p.add_argument(
-        "--min-large-net-vol", type=float, default=0.0,
+        "--min-large-net-vol",
+        type=float,
+        default=0.0,
         help="T-1 大单净量下限，须严格大于 (默认 0)",
     )
     growth_replay_p.add_argument(
-        "--require-fresh-surge", action="store_true",
+        "--require-fresh-surge",
+        action="store_true",
         help="首爆过滤：放量当天之前 N 日没放量过（经典量比口径，用户条件）",
     )
     growth_replay_p.add_argument(
-        "--fresh-lookback-days", type=int, default=5,
+        "--fresh-lookback-days",
+        type=int,
+        default=5,
         help="首爆回看交易日数 (默认 5)",
     )
     growth_replay_p.add_argument(
-        "--min-listing-trading-days", type=int, default=0,
+        "--min-listing-trading-days",
+        type=int,
+        default=0,
         help="不做新股：上市不满 N 个交易日过滤 (默认 0=关闭；推荐 180)",
     )
     growth_replay_p.add_argument(
-        "--require-board-favor", action="store_true",
+        "--require-board-favor",
+        action="store_true",
         help="板块集合竞价强度闸门：候选票所在题材当日竞价整体达标才入场",
     )
     growth_replay_p.add_argument(
-        "--min-board-gap-up-ratio", type=float, default=0.5,
+        "--min-board-gap-up-ratio",
+        type=float,
+        default=0.5,
         help="板块竞价高开占比下限 (默认 0.5)",
     )
     growth_replay_p.add_argument(
-        "--min-board-auction-amount-ratio", type=float, default=1.0,
+        "--min-board-auction-amount-ratio",
+        type=float,
+        default=1.0,
         help="板块竞价总额相对历史中位下限 (默认 1.0)",
     )
     growth_replay_p.add_argument(
-        "--board-hist-days", type=int, default=3,
+        "--board-hist-days",
+        type=int,
+        default=3,
         help="板块竞价额历史比较窗口天数 (默认 3；短窗口抓当下资金青睐)",
     )
     growth_replay_p.add_argument(
-        "--factor-confirm", action="store_true",
+        "--factor-confirm",
+        action="store_true",
         help="启用 growth_surge_b_v1 多因子评分确认层（宽门不动，评分过阈值才入场）",
     )
     growth_replay_p.add_argument(
-        "--factor-score-threshold", type=float, default=45.0,
+        "--factor-score-threshold",
+        type=float,
+        default=45.0,
         help="factor_confirm 评分入场阈值，仅 --factor-confirm 时生效 (默认 45)",
     )
     growth_replay_p.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="CSV 输出路径（可选）",
     )
 
@@ -4099,32 +4124,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="回补分钟 replay 所需的 B 日到退出窗口分钟线",
     )
     replay_backfill_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="Pool 筛选开始日期 YYYY-MM-DD",
     )
     replay_backfill_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="Pool 筛选结束日期 YYYY-MM-DD",
     )
     replay_backfill_p.add_argument(
-        "--preset", type=str, default="n-shape-pool1",
+        "--preset",
+        type=str,
+        default="n-shape-pool1",
         help="筛选 preset (默认 n-shape-pool1)",
     )
     replay_backfill_p.add_argument(
-        "--freq", type=str, default="1min",
+        "--freq",
+        type=str,
+        default="1min",
         choices=["1min", "5min", "15min", "30min", "60min"],
         help="分钟频度 (默认 1min)",
     )
     replay_backfill_p.add_argument(
-        "--max-hold-days", type=int, default=5,
+        "--max-hold-days",
+        type=int,
+        default=5,
         help="最多持有交易日数量 (默认 5)",
     )
     replay_backfill_p.add_argument(
-        "--ts-code", type=str, default=None,
+        "--ts-code",
+        type=str,
+        default=None,
         help="只回补单只股票，调试用",
     )
     replay_backfill_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只估算请求数，不调用 Tushare、不写库",
     )
 
@@ -4133,15 +4171,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="回补 Tushare 集合竞价数据",
     )
     auction_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="开始日期 YYYY-MM-DD",
     )
     auction_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="结束日期 YYYY-MM-DD",
     )
     auction_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只估算交易日请求数，不调用 Tushare、不写库",
     )
 
@@ -4166,33 +4209,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="回测集合竞价跳空高开策略",
     )
     auction_gap_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="开始日期 YYYY-MM-DD",
     )
     auction_gap_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="结束日期 YYYY-MM-DD",
     )
     auction_gap_p.add_argument(
-        "--gap-mode", type=str, default="close",
+        "--gap-mode",
+        type=str,
+        default="close",
         choices=["close", "strict_high"],
         help="跳空定义：close=竞价价高于昨收；strict_high=竞价价高于昨高",
     )
     auction_gap_p.add_argument(
-        "--st-filter", type=str, default="case_insensitive",
+        "--st-filter",
+        type=str,
+        default="case_insensitive",
         choices=["case_insensitive", "literal_lower", "none"],
         help="ST 过滤：默认大小写不敏感过滤 ST/*ST",
     )
     auction_gap_p.add_argument(
-        "--min-ratio", type=float, default=0.15,
+        "--min-ratio",
+        type=float,
+        default=0.15,
         help="竞价量/近5日均量下限 (默认 0.15)",
     )
     auction_gap_p.add_argument(
-        "--max-ratio", type=float, default=5.0,
+        "--max-ratio",
+        type=float,
+        default=5.0,
         help="竞价量/近5日均量上限 (默认 5)",
     )
     auction_gap_p.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="CSV 输出路径（可选）",
     )
 
@@ -4201,57 +4258,82 @@ def build_parser() -> argparse.ArgumentParser:
         help="回测集合竞价候选 + 分钟 B/S 策略",
     )
     auction_gap_minute_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="开始日期 YYYY-MM-DD",
     )
     auction_gap_minute_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="结束日期 YYYY-MM-DD",
     )
     auction_gap_minute_p.add_argument(
-        "--gap-mode", type=str, default="close",
+        "--gap-mode",
+        type=str,
+        default="close",
         choices=["close", "strict_high"],
         help="跳空定义：close=竞价价高于昨收；strict_high=竞价价高于昨高",
     )
     auction_gap_minute_p.add_argument(
-        "--st-filter", type=str, default="case_insensitive",
+        "--st-filter",
+        type=str,
+        default="case_insensitive",
         choices=["case_insensitive", "literal_lower", "none"],
         help="ST 过滤：默认大小写不敏感过滤 ST/*ST",
     )
     auction_gap_minute_p.add_argument(
-        "--min-ratio", type=float, default=0.15,
+        "--min-ratio",
+        type=float,
+        default=0.15,
         help="竞价量/近5日均量下限 (默认 0.15)",
     )
     auction_gap_minute_p.add_argument(
-        "--max-ratio", type=float, default=5.0,
+        "--max-ratio",
+        type=float,
+        default=5.0,
         help="竞价量/近5日均量上限 (默认 5)",
     )
     auction_gap_minute_p.add_argument(
-        "--max-hold-days", type=int, default=1,
+        "--max-hold-days",
+        type=int,
+        default=1,
         help="最多持有交易日数量 (默认 1)",
     )
     auction_gap_minute_p.add_argument(
-        "--seal-hold-days", type=int, default=None,
+        "--seal-hold-days",
+        type=int,
+        default=None,
         help="封板质量达标仓位的持有上限（交易日）；不传保持关闭（全部 T+1）",
     )
     auction_gap_minute_p.add_argument(
-        "--seal-hold-max-open-times", type=int, default=0,
+        "--seal-hold-max-open-times",
+        type=int,
+        default=0,
         help="seal_hold 允许的最大开板次数（官方 limit_list_daily.open_times，默认 0）",
     )
     auction_gap_minute_p.add_argument(
-        "--factor-score-threshold", type=float, default=None,
+        "--factor-score-threshold",
+        type=float,
+        default=None,
         help="分钟 B 确认的 auction_gap_b_v1 评分阈值（不传=现状不评分；判死复核用）",
     )
     auction_gap_minute_p.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="CSV 输出路径（可选）",
     )
     auction_gap_minute_p.add_argument(
-        "--persist-positions", action="store_true",
+        "--persist-positions",
+        action="store_true",
         help="模拟仓落库（run_mode=replay，带信号溯源；写主库，盘中会撞 monitor 写锁）",
     )
     auction_gap_minute_p.add_argument(
-        "--run-id", type=str, default=None,
+        "--run-id",
+        type=str,
+        default=None,
         help="落库批次标识（不传自动生成；可按 run_id 整批清理）",
     )
 
@@ -4260,50 +4342,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="回补集合竞价跳空候选的分钟 replay 窗口",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="开始日期 YYYY-MM-DD",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="结束日期 YYYY-MM-DD",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--gap-mode", type=str, default="close",
+        "--gap-mode",
+        type=str,
+        default="close",
         choices=["close", "strict_high"],
         help="跳空定义：close=竞价价高于昨收；strict_high=竞价价高于昨高",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--st-filter", type=str, default="case_insensitive",
+        "--st-filter",
+        type=str,
+        default="case_insensitive",
         choices=["case_insensitive", "literal_lower", "none"],
         help="ST 过滤：默认大小写不敏感过滤 ST/*ST",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--min-ratio", type=float, default=0.15,
+        "--min-ratio",
+        type=float,
+        default=0.15,
         help="竞价量/近5日均量下限 (默认 0.15)",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--max-ratio", type=float, default=5.0,
+        "--max-ratio",
+        type=float,
+        default=5.0,
         help="竞价量/近5日均量上限 (默认 5)",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--max-hold-days", type=int, default=1,
+        "--max-hold-days",
+        type=int,
+        default=1,
         help="最多持有交易日数量 (默认 1)",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--freq", type=str, default="1min",
+        "--freq",
+        type=str,
+        default="1min",
         choices=["1min", "5min", "15min", "30min", "60min"],
         help="分钟频度 (默认 1min)",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--ts-code", type=str, default=None,
+        "--ts-code",
+        type=str,
+        default=None,
         help="只回补单只股票，调试用",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--lookback-days", type=int, default=0,
+        "--lookback-days",
+        type=int,
+        default=0,
         help="窗口起点向前扩 N 个交易日（相对放量特征需要信号日前的历史分钟，默认 0）",
     )
     auction_gap_minute_backfill_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只估算请求数，不调用 Tushare、不写库",
     )
 
@@ -4312,11 +4415,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="重算市场情绪/温度指标（market_sentiment_daily，含 60 日新高占比等）",
     )
     sentiment_p.add_argument(
-        "--start-date", type=str, required=True,
+        "--start-date",
+        type=str,
+        required=True,
         help="开始日期 YYYY-MM-DD",
     )
     sentiment_p.add_argument(
-        "--end-date", type=str, required=True,
+        "--end-date",
+        type=str,
+        required=True,
         help="结束日期 YYYY-MM-DD",
     )
 
@@ -4332,40 +4439,44 @@ def build_parser() -> argparse.ArgumentParser:
     bl_imp = bl_sub.add_parser("import", help="从 PDF 导入黑名单（mac 端用）")
     bl_imp.add_argument("pdf", type=str, help="PDF 路径")
     bl_imp.add_argument(
-        "--label", type=str, default="430黑名单",
+        "--label",
+        type=str,
+        default="430黑名单",
         help="名单标签 (默认 430黑名单)",
     )
     bl_imp.add_argument(
-        "--validity", type=int, default=365,
+        "--validity",
+        type=int,
+        default=365,
         help="有效期天数 (默认 365)",
     )
 
-    bl_load = bl_sub.add_parser(
-        "load-parquet", help="从 parquet 加载到 DuckDB（云端推送后用）"
-    )
+    bl_load = bl_sub.add_parser("load-parquet", help="从 parquet 加载到 DuckDB（云端推送后用）")
     bl_load.add_argument("parquet", type=str, help="parquet 文件路径")
     bl_load.add_argument(
-        "--label", type=str, default=None,
+        "--label",
+        type=str,
+        default=None,
         help="只替换该 label 的行（默认全表覆盖）",
     )
 
-    bl_exp = bl_sub.add_parser(
-        "export-parquet", help="导出黑名单到 parquet（mac 端推云前用）"
-    )
+    bl_exp = bl_sub.add_parser("export-parquet", help="导出黑名单到 parquet（mac 端推云前用）")
     bl_exp.add_argument(
-        "--output", type=str, default="data/risk_blacklist.parquet",
+        "--output",
+        type=str,
+        default="data/risk_blacklist.parquet",
         help="输出路径 (默认 data/risk_blacklist.parquet)",
     )
     bl_exp.add_argument(
-        "--label", type=str, default=None,
+        "--label",
+        type=str,
+        default=None,
         help="只导出该 label（默认全表导出）",
     )
 
     bl_ls = bl_sub.add_parser("list", help="列出黑名单")
     bl_ls.add_argument("--label", type=str, default=None, help="过滤 label")
-    bl_ls.add_argument(
-        "--include-expired", action="store_true", help="包含已过期条目"
-    )
+    bl_ls.add_argument("--include-expired", action="store_true", help="包含已过期条目")
 
     bl_chk = bl_sub.add_parser("check", help="查询某只股票是否在黑名单")
     bl_chk.add_argument("ts_code", type=str, help="股票代码 (如 600340.SH)")
@@ -4376,42 +4487,54 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("notify-test", help="推一条 PushDeer 测试消息")
     dr_p = sub.add_parser("daily-report", help="生成并推送当日健康摘要（systemd timer 自动跑）")
     dr_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只打印不推送（mac 本地 smoke 测试用）",
     )
 
     mp_p = sub.add_parser(
-        "morning-pulse", help="盘中 30 分钟脉搏（launchd 10:00/10:30/11:00/11:30 自动跑）",
+        "morning-pulse",
+        help="盘中 30 分钟脉搏（launchd 10:00/10:30/11:00/11:30 自动跑）",
     )
     mp_p.add_argument(
-        "--slot", type=str, default=None,
+        "--slot",
+        type=str,
+        default=None,
         help="手动补跑指定槽位 HH:MM（10:00/10:30/11:00/11:30）；不传按当前时间归槽",
     )
     mp_p.add_argument("--force", action="store_true", help="绕过当日去重，覆盖重跑")
     mp_p.add_argument(
-        "--dry-run", action="store_true", help="全流程跑但不推送（打印报文，parquet 照落）",
+        "--dry-run",
+        action="store_true",
+        help="全流程跑但不推送（打印报文，parquet 照落）",
     )
 
     mdr_p = sub.add_parser("midday-report", help="午间战报（launchd 12:00 自动跑）")
     mdr_p.add_argument("--date", type=str, default=None, help="指定日期 YYYY-MM-DD（默认今天）")
     mdr_p.add_argument("--force", action="store_true", help="绕过当日去重，覆盖重跑")
     mdr_p.add_argument(
-        "--dry-run", action="store_true", help="全流程跑但不推送（打印报文，parquet 照落）",
+        "--dry-run",
+        action="store_true",
+        help="全流程跑但不推送（打印报文，parquet 照落）",
     )
 
     pmc_p = sub.add_parser(
-        "pre-market-check", help="开盘前主动健康体检（systemd timer Mon..Fri 09:00 自动跑）",
+        "pre-market-check",
+        help="开盘前主动健康体检（systemd timer Mon..Fri 09:00 自动跑）",
     )
     pmc_p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="只打印不推送（mac 本地 smoke 测试用）",
     )
 
     pf_p = sub.add_parser(
-        "preflight", help="全家服务深度体检（手动触发，dry-run，不重启服务）",
+        "preflight",
+        help="全家服务深度体检（手动触发，dry-run，不重启服务）",
     )
     pf_p.add_argument(
-        "--notify", action="store_true",
+        "--notify",
+        action="store_true",
         help="跑完推一条摘要到 PushDeer（默认只 stdout）",
     )
     pf_p.add_argument(
@@ -4424,45 +4547,63 @@ def build_parser() -> argparse.ArgumentParser:
     from rquant.surge_watch import SurgeConfig
 
     sw_p = sub.add_parser(
-        "surge-watch", help="每分钟爆量推送（云端 systemd timer 09:25 拉起，15:02 自退）",
+        "surge-watch",
+        help="每分钟爆量推送（云端 systemd timer 09:25 拉起，15:02 自退）",
     )
     sw_p.add_argument(
-        "--dry-run", action="store_true", help="全流程跑但不推送（打印报文，parquet 照落）",
+        "--dry-run",
+        action="store_true",
+        help="全流程跑但不推送（打印报文，parquet 照落）",
     )
     sw_p.add_argument(
-        "--simulate", type=str, default=None,
+        "--simulate",
+        type=str,
+        default=None,
         help="离线回放目录内快照 parquet 序列（逐分钟，可测性设施）",
     )
     sw_p.add_argument(
-        "--force-session", action="store_true", help="忽略时段守卫（盘后验收用）",
+        "--force-session",
+        action="store_true",
+        help="忽略时段守卫（盘后验收用）",
     )
     sw_p.add_argument(
-        "--max-ticks", type=int, default=None,
+        "--max-ticks",
+        type=int,
+        default=None,
         help="限定循环次数（dry-run / 盘后 smoke，默认跑到 15:02）",
     )
     sw_p.add_argument(
-        "--k-cum", type=float, default=SurgeConfig.model_fields["k_cum"].default,
+        "--k-cum",
+        type=float,
+        default=SurgeConfig.model_fields["k_cum"].default,
         help="确认层纯累计比值下门（默认 2.5，2026-07-06 全天分钟回测标定）",
     )
     sw_p.add_argument(
-        "--ratio-cap", type=float, default=SurgeConfig.model_fields["ratio_cap"].default,
+        "--ratio-cap",
+        type=float,
+        default=SurgeConfig.model_fields["ratio_cap"].default,
         help="累计比值上门/毒尾封顶（默认 8.0，超过视为极端出货不推）",
     )
     sw_p.add_argument(
-        "--skip-first-minutes", type=int,
+        "--skip-first-minutes",
+        type=int,
         default=SurgeConfig.model_fields["skip_first_minutes"].default,
         help="跳过开盘前 N 分钟确认（默认 1，9:32 起才确认，base 分母噪声大）",
     )
     sw_p.add_argument(
-        "--k-delta", type=float, default=SurgeConfig.model_fields["k_delta_confirm"].default,
+        "--k-delta",
+        type=float,
+        default=SurgeConfig.model_fields["k_delta_confirm"].default,
         help="单分钟增量门倍数（v2 遗留，默认 0=关闭）",
     )
     sw_p.add_argument(
-        "--require-vwap", action="store_true",
+        "--require-vwap",
+        action="store_true",
         help="启用 VWAP 门（v2 遗留，默认关；现价 ≥ 当日均价才确认）",
     )
     sw_p.add_argument(
-        "--max-room", type=float,
+        "--max-room",
+        type=float,
         default=SurgeConfig.model_fields["max_room_to_limit_pct"].default,
         help="可买性守卫：现价距涨停 ≤ 该%%（或已封板）不推送（默认 1.0）",
     )
@@ -4483,10 +4624,13 @@ def build_parser() -> argparse.ArgumentParser:
     alert_resolve_p.add_argument("--dedup-key", required=True, help="要关闭的事故事件键")
 
     lab_run_p = sub.add_parser(
-        "lab-run", help="执行 Strategy Lab 后台任务 spec（UI「后台运行」派生，内部命令）",
+        "lab-run",
+        help="执行 Strategy Lab 后台任务 spec（UI「后台运行」派生，内部命令）",
     )
     lab_run_p.add_argument(
-        "--spec", type=str, required=True,
+        "--spec",
+        type=str,
+        required=True,
         help="任务 spec JSON 路径（launch_background_run 生成）",
     )
 
@@ -4505,16 +4649,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="启动全景页登录网关服务（微信友好 cookie 登录，标准库 http.server）",
     )
     pa_serve_p.add_argument(
-        "--host", type=str, default="127.0.0.1",
+        "--host",
+        type=str,
+        default="127.0.0.1",
         help="监听地址 (默认 127.0.0.1，只给 nginx 反代)",
     )
     pa_serve_p.add_argument(
-        "--port", type=int, default=8507,
+        "--port",
+        type=int,
+        default=8507,
         help="监听端口 (默认 8507)",
     )
 
     pa_add_p = sub.add_parser(
-        "panorama-user-add", help="添加/更新全景页登录用户（交互式输密码，覆盖同名）",
+        "panorama-user-add",
+        help="添加/更新全景页登录用户（交互式输密码，覆盖同名）",
     )
     pa_add_p.add_argument("name", type=str, help="用户名（字母/数字/点/下划线/短横）")
 
@@ -4611,11 +4760,21 @@ def main() -> int:
     # panorama-auth-* 是独立登录网关，不依赖 notify 体系，SECRET 缺失走 SystemExit
     # （非 Exception，本就不被下方 except 捕获），不该再包一层运维告警。
     if args.command in (
-        "serve", "notify-test", "alert", "alert-resolve",
-        "daily-report", "pre-market-check", "preflight", "data-audit", "lab-run",
+        "serve",
+        "notify-test",
+        "alert",
+        "alert-resolve",
+        "daily-report",
+        "pre-market-check",
+        "preflight",
+        "data-audit",
+        "lab-run",
         "lab-scheduler",
-        "panorama-auth-serve", "panorama-user-add",
-        "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
+        "panorama-auth-serve",
+        "panorama-user-add",
+        "panorama-user-remove",
+        "panorama-user-list",
+        "panorama-gate-token",
     ):
         return handler(args)
 
@@ -4624,6 +4783,7 @@ def main() -> int:
     except Exception as e:
         logger.exception(f"=== {args.command} 异常 ===")
         from rquant.notify import notify
+
         if args.command not in {"monitor", "surge-watch"}:
             notify("error", component=f"cli:{args.command}", exc=e)
         return 1

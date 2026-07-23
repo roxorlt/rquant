@@ -50,6 +50,18 @@ class InvalidStoredJobError(RuntimeError):
     """Stored spec content or denormalized query columns were tampered with."""
 
 
+class CancelConfirmationRequiredError(RuntimeError):
+    """Cancellation must preserve intent until a worker claim is invalidated."""
+
+
+class LabDatabaseIdentityError(RuntimeError):
+    """The configured SQLite file is not this ledger at a supported version."""
+
+
+_APPLICATION_ID = 0x52514A42
+_SCHEMA_VERSION = 1
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -196,6 +208,43 @@ def _load_time(value: str) -> datetime:
     return _utc(parsed)
 
 
+def _validate_database_identity(
+    connection: sqlite3.Connection,
+    *,
+    allow_unclaimed_empty: bool,
+) -> bool:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id == _APPLICATION_ID:
+        if user_version != _SCHEMA_VERSION:
+            raise LabDatabaseIdentityError(
+                "lab jobs SQLite user_version mismatch: "
+                f"expected {_SCHEMA_VERSION}, found {user_version}"
+            )
+        return False
+    if application_id != 0:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite application_id mismatch: "
+            f"expected {_APPLICATION_ID}, found {application_id}"
+        )
+    if user_version != 0:
+        raise LabDatabaseIdentityError(
+            f"unclaimed SQLite has unsupported user_version {user_version}"
+        )
+    objects = connection.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+          AND type IN ('table', 'index', 'view', 'trigger')
+        LIMIT 1
+        """
+    ).fetchone()
+    if not allow_unclaimed_empty or objects is not None:
+        detail = "not empty" if objects is not None else "unclaimed"
+        raise LabDatabaseIdentityError(f"lab jobs SQLite is {detail}")
+    return True
+
+
 class LabJobReader:
     """Read-only view of committed WAL state; never creates the database."""
 
@@ -217,6 +266,14 @@ class LabJobReader:
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA query_only = ON")
+        try:
+            _validate_database_identity(
+                connection,
+                allow_unclaimed_empty=False,
+            )
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @staticmethod
@@ -413,8 +470,8 @@ class LabJobReader:
 class LabJobStore:
     """The scheduler-owned writer for the Strategy Lab SQLite ledger."""
 
-    APPLICATION_ID = 0x52514A42
-    SCHEMA_VERSION = 1
+    APPLICATION_ID = _APPLICATION_ID
+    SCHEMA_VERSION = _SCHEMA_VERSION
     LEASE_NAME = "strategy-lab-scheduler"
 
     def __init__(self, path: Path, *, busy_timeout_ms: int = 5_000) -> None:
@@ -452,13 +509,18 @@ class LabJobStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(f"PRAGMA application_id = {self.APPLICATION_ID}")
             connection.execute("BEGIN IMMEDIATE")
+            unclaimed = _validate_database_identity(
+                connection,
+                allow_unclaimed_empty=True,
+            )
+            if unclaimed:
+                connection.execute(f"PRAGMA application_id = {self.APPLICATION_ID}")
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             connection.commit()
+            connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
             connection.rollback()
             raise
@@ -672,8 +734,24 @@ class LabJobStore:
         request_id: UUID | None,
         recoverable: bool | None,
         event_type: str,
+        allow_cancel_confirmation: bool = False,
     ) -> sqlite3.Row:
         source = JobStatus(str(row["status"]))
+        control_intent = ControlIntent(str(row["control_intent"]))
+        if source is JobStatus.RUNNING:
+            if control_intent is ControlIntent.CANCEL_REQUESTED and not (
+                target_status is JobStatus.CANCELLED and allow_cancel_confirmation
+            ):
+                raise CancelConfirmationRequiredError(
+                    "cancel_requested blocks later lifecycle results"
+                )
+            if target_status is JobStatus.CANCELLED and (
+                control_intent is not ControlIntent.CANCEL_REQUESTED
+                or not allow_cancel_confirmation
+            ):
+                raise CancelConfirmationRequiredError(
+                    "running cancellation requires requested confirmation"
+                )
         if target_status not in _ALLOWED_TRANSITIONS[source]:
             raise InvalidJobTransitionError(
                 f"invalid lab job transition {source.value}->{target_status.value}"
@@ -807,6 +885,46 @@ class LabJobStore:
                 request_id=None,
                 recoverable=recoverable,
                 event_type="job_transitioned",
+            )
+            record = LabJobReader._job_from_row(updated)
+        return record
+
+    def confirm_cancelled_job(
+        self,
+        job_id: UUID,
+        *,
+        expected_version: int,
+        lease: LabLeaseRecord,
+        reason: str,
+        now: datetime,
+    ) -> LabJobRecord:
+        """Confirm terminal cancellation after the active worker claim is invalid."""
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, now=current)
+            row = self._load_job_row(connection, job_id)
+            if row is None:
+                raise KeyError(str(job_id))
+            if int(row["version"]) != expected_version:
+                raise StaleJobVersionError(
+                    f"expected job version {expected_version}, found {row['version']}"
+                )
+            if (
+                JobStatus(str(row["status"])) is not JobStatus.RUNNING
+                or ControlIntent(str(row["control_intent"])) is not ControlIntent.CANCEL_REQUESTED
+            ):
+                raise CancelConfirmationRequiredError("job does not have an active cancel request")
+            updated = self._transition_in_transaction(
+                connection,
+                row,
+                target_status=JobStatus.CANCELLED,
+                lease=lease,
+                reason=reason,
+                now=current,
+                request_id=None,
+                recoverable=None,
+                event_type="job_cancel_confirmed",
+                allow_cancel_confirmation=True,
             )
             record = LabJobReader._job_from_row(updated)
         return record
@@ -1171,14 +1289,22 @@ class LabJobStore:
             ).fetchall()
             for row in rows:
                 version = int(row["version"]) + 1
+                intent = ControlIntent(str(row["control_intent"]))
+                target_status = (
+                    JobStatus.CANCELLED
+                    if intent is ControlIntent.CANCEL_REQUESTED
+                    else JobStatus.CHECKPOINTED
+                )
                 connection.execute(
                     """
                     UPDATE lab_job
-                    SET status = ?, version = ?, scheduler_fencing_token = ?, updated_at = ?
+                    SET status = ?, control_intent = ?, version = ?,
+                        scheduler_fencing_token = ?, updated_at = ?
                     WHERE job_id = ? AND version = ?
                     """,
                     (
-                        JobStatus.CHECKPOINTED.value,
+                        target_status.value,
+                        ControlIntent.NONE.value,
                         version,
                         lease.fencing_token,
                         _dump_time(current),
@@ -1192,9 +1318,13 @@ class LabJobStore:
                     request_id=None,
                     event_type="lease_recovered",
                     prior_status=JobStatus.RUNNING,
-                    new_status=JobStatus.CHECKPOINTED,
+                    new_status=target_status,
                     job_version=version,
-                    reason="scheduler lease expired",
+                    reason=(
+                        "scheduler lease expired after cancel request"
+                        if target_status is JobStatus.CANCELLED
+                        else "scheduler lease expired"
+                    ),
                     fencing_token=lease.fencing_token,
                     now=current,
                 )
