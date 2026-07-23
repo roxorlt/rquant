@@ -51,6 +51,33 @@ def test_strategy_acceptance_script_runs_preview_before_each_apply() -> None:
     assert "preflight" in content
 
 
+def test_apply_refreshes_replica_after_stopping_writers_before_repair_preview() -> None:
+    content = SCRIPT.read_text(encoding="utf-8")
+    apply_flow = content[content.index("assert_outside_market_window") :]
+
+    stop_units = apply_flow.index("capture_and_stop_mutating_units\n")
+    replica_sync = apply_flow.index(
+        'run_guarded "${PROJECT_DIR}/scripts/sync-readonly-replica.sh"',
+        stop_units,
+    )
+    repair_preview = apply_flow.index(
+        'run_guarded "${RQUANT_BIN}" research-repair-minute',
+        stop_units,
+    )
+
+    assert stop_units < replica_sync < repair_preview
+
+
+def test_apply_repair_preview_is_bounded_by_rollout_hard_deadline() -> None:
+    content = SCRIPT.read_text(encoding="utf-8")
+    apply_flow = content[content.index("capture_and_stop_mutating_units\n") :]
+    preview_end = apply_flow.index("REPAIR_STATUS=")
+    preview_flow = apply_flow[:preview_end]
+
+    assert 'run_guarded "${RQUANT_BIN}" research-repair-minute' in preview_flow
+    assert 'run_json "${REPAIR_PREVIEW}"' not in preview_flow
+
+
 def test_strategy_acceptance_script_reuses_snapshot_as_of_and_saves_evidence() -> None:
     content = SCRIPT.read_text(encoding="utf-8")
 

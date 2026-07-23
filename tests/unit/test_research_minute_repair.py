@@ -20,6 +20,196 @@ def _repair_clock() -> datetime:
     return datetime(2026, 7, 18, 16, 0, tzinfo=_CST)
 
 
+def _file_watermark_payload(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _database_watermark_payload(path: Path) -> dict[str, object]:
+    wal_path = Path(f"{path}.wal")
+    return {
+        "main": _file_watermark_payload(path),
+        "wal": _file_watermark_payload(wal_path) if wal_path.exists() else None,
+    }
+
+
+def _write_replica_generation_metadata(
+    *,
+    primary_path: Path,
+    source_path: Path,
+) -> None:
+    source_watermark = _database_watermark_payload(primary_path)
+    Path(f"{source_path}.generation.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_database": str(primary_path.resolve()),
+                "source_before": source_watermark,
+                "source_after": source_watermark,
+                "replica": _file_watermark_payload(source_path),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_minute_repair_rejects_stale_readonly_source_before_scanning(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from rquant.research_minute_repair import run_research_minute_repair
+
+    primary_path = tmp_path / "rquant.duckdb"
+    source_path = tmp_path / "rquant_ro.duckdb"
+    primary_path.write_bytes(b"primary")
+    source_path.write_bytes(b"replica")
+    os.utime(source_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(primary_path, ns=(2_000_000_000, 2_000_000_000))
+    _write_replica_generation_metadata(
+        primary_path=primary_path,
+        source_path=source_path,
+    )
+    state = MagicMock()
+
+    with pytest.raises(ValueError, match="read-only replica is stale"):
+        run_research_minute_repair(
+            source_database=source_path,
+            primary_database=primary_path,
+            paths=_paths(tmp_path),
+            state=state,
+            manifest_id="b" * 64,
+            code_commit=_COMMIT,
+            now=_repair_clock,
+        )
+
+    state.load_manifest.assert_not_called()
+
+
+def test_minute_repair_rejects_wal_newer_than_readonly_source(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from rquant.research_minute_repair import run_research_minute_repair
+
+    primary_path = tmp_path / "rquant.duckdb"
+    wal_path = Path(f"{primary_path}.wal")
+    source_path = tmp_path / "rquant_ro.duckdb"
+    primary_path.write_bytes(b"primary")
+    source_path.write_bytes(b"replica")
+    wal_path.write_bytes(b"wal")
+    os.utime(primary_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(source_path, ns=(2_000_000_000, 2_000_000_000))
+    os.utime(wal_path, ns=(3_000_000_000, 3_000_000_000))
+    _write_replica_generation_metadata(
+        primary_path=primary_path,
+        source_path=source_path,
+    )
+    state = MagicMock()
+
+    with pytest.raises(ValueError, match="read-only replica is stale"):
+        run_research_minute_repair(
+            source_database=source_path,
+            primary_database=primary_path,
+            paths=_paths(tmp_path),
+            state=state,
+            manifest_id="b" * 64,
+            code_commit=_COMMIT,
+            now=_repair_clock,
+        )
+
+    state.load_manifest.assert_not_called()
+
+
+def test_minute_repair_rejects_primary_change_during_planning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_minute_repair as repair_module
+
+    paths, state, source_path, backfill_plan = _seed_minute_repair_case(tmp_path)
+    primary_path = tmp_path / "rquant.duckdb"
+    primary_path.write_bytes(b"primary")
+    source_mtime_ns = source_path.stat().st_mtime_ns
+    os.utime(
+        primary_path,
+        ns=(source_mtime_ns - 1, source_mtime_ns - 1),
+    )
+    _write_replica_generation_metadata(
+        primary_path=primary_path,
+        source_path=source_path,
+    )
+    original_build = repair_module._build_prepared_minute_repair
+
+    def mutate_primary_after_scan(**kwargs):
+        prepared = original_build(**kwargs)
+        os.utime(
+            primary_path,
+            ns=(source_mtime_ns + 1, source_mtime_ns + 1),
+        )
+        return prepared
+
+    monkeypatch.setattr(
+        repair_module,
+        "_build_prepared_minute_repair",
+        mutate_primary_after_scan,
+    )
+
+    with pytest.raises(ValueError, match="primary database changed while planning"):
+        repair_module.run_research_minute_repair(
+            source_database=source_path,
+            primary_database=primary_path,
+            paths=paths,
+            state=state,
+            manifest_id=backfill_plan.manifest.manifest_id,
+            code_commit=_COMMIT,
+            now=_repair_clock,
+        )
+
+
+def test_minute_repair_rejects_touched_replica_from_old_generation(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from rquant.research_minute_repair import run_research_minute_repair
+
+    primary_path = tmp_path / "rquant.duckdb"
+    source_path = tmp_path / "rquant_ro.duckdb"
+    primary_path.write_bytes(b"old-primary")
+    source_path.write_bytes(b"old-replica")
+    os.utime(primary_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(source_path, ns=(2_000_000_000, 2_000_000_000))
+    _write_replica_generation_metadata(
+        primary_path=primary_path,
+        source_path=source_path,
+    )
+    primary_path.write_bytes(b"current-primary-generation")
+    os.utime(primary_path, ns=(3_000_000_000, 3_000_000_000))
+    os.utime(source_path, ns=(4_000_000_000, 4_000_000_000))
+    state = MagicMock()
+
+    with pytest.raises(ValueError, match="generation metadata"):
+        run_research_minute_repair(
+            source_database=source_path,
+            primary_database=primary_path,
+            paths=_paths(tmp_path),
+            state=state,
+            manifest_id="b" * 64,
+            code_commit=_COMMIT,
+            now=_repair_clock,
+        )
+
+    state.load_manifest.assert_not_called()
+
+
 def _paths(tmp_path: Path):
     from rquant.research_ingest import ResearchIngestPaths
 

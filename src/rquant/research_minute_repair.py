@@ -31,6 +31,10 @@ from rquant.backfill_manifest import (
 )
 from rquant.backfill_state import BackfillStateStore
 from rquant.data_metadata import DatasetSnapshotArtifact
+from rquant.replica_generation import (
+    ReplicaDatabaseWatermark,
+    validate_replica_generation,
+)
 from rquant.research_catalog import ResearchCatalog, exclusive_file_lock
 from rquant.research_ingest import (
     ResearchAuthorityObservation,
@@ -85,6 +89,22 @@ _MARKET_PROTECTION_END = time(15, 10)
 
 class _MinuteRepairModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+def _require_current_readonly_source(
+    *,
+    source_database: Path,
+    primary_database: Path,
+    expected_primary_watermark: ReplicaDatabaseWatermark | None = None,
+) -> ReplicaDatabaseWatermark:
+    try:
+        return validate_replica_generation(
+            primary_path=primary_database,
+            replica_path=source_database,
+            expected_primary_watermark=expected_primary_watermark,
+        )
+    except ValueError as exc:
+        raise ValueError(f"minute repair {exc}") from exc
 
 
 class MinuteRepairSession(_MinuteRepairModel):
@@ -1676,6 +1696,7 @@ def rollback_research_minute_repair_publish(
 def run_research_minute_repair(
     *,
     source_database: Path,
+    primary_database: Path | None = None,
     paths: ResearchIngestPaths,
     state: BackfillStateStore,
     manifest_id: str,
@@ -1685,6 +1706,12 @@ def run_research_minute_repair(
     now: Callable[[], datetime] | None = None,
 ) -> ResearchMinuteRepairResult:
     """Plan or atomically publish a content-bound historical minute repair."""
+    primary_watermark: ReplicaDatabaseWatermark | None = None
+    if primary_database is not None:
+        primary_watermark = _require_current_readonly_source(
+            source_database=source_database,
+            primary_database=primary_database,
+        )
     clock = now or (lambda: datetime.now(_CST))
     generated_at = clock()
     if generated_at.tzinfo is None or generated_at.utcoffset() is None:
@@ -1703,6 +1730,12 @@ def run_research_minute_repair(
             code_commit=code_commit,
             as_of_time=generated_at,
         )
+        if primary_database is not None:
+            _require_current_readonly_source(
+                source_database=source_database,
+                primary_database=primary_database,
+                expected_primary_watermark=primary_watermark,
+            )
         return ResearchMinuteRepairResult(
             status=(
                 "unchanged"
@@ -1720,6 +1753,12 @@ def run_research_minute_repair(
 
         def publish_guard() -> None:
             _require_outside_market_protection(clock())
+            if primary_database is not None:
+                _require_current_readonly_source(
+                    source_database=source_database,
+                    primary_database=primary_database,
+                    expected_primary_watermark=primary_watermark,
+                )
 
         prepared = _build_prepared_minute_repair(
             source_database=source_database,
@@ -1729,6 +1768,12 @@ def run_research_minute_repair(
             code_commit=code_commit,
             as_of_time=generated_at,
         )
+        if primary_database is not None:
+            _require_current_readonly_source(
+                source_database=source_database,
+                primary_database=primary_database,
+                expected_primary_watermark=primary_watermark,
+            )
         if prepared.plan.plan_id != plan_id:
             raise ValueError(
                 "stale minute repair plan: rerun preview and apply the new plan_id"

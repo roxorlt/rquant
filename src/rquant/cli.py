@@ -911,6 +911,7 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
     ) as state:
         result = run_research_minute_repair(
             source_database=settings.duckdb_readonly_path_resolved,
+            primary_database=settings.duckdb_path,
             paths=ResearchIngestPaths(
                 state_dir=settings.data_dir,
                 catalog_path=settings.research_db_path_resolved,

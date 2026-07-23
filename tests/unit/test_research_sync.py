@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1948,9 +1949,54 @@ class TestReplicaRefresh:
         ok, detail = refresh_readonly_replica(local_db, replica)
         assert ok, detail
 
+        generation = json.loads(
+            Path(f"{replica}.generation.json").read_text(encoding="utf-8")
+        )
+        assert generation["schema_version"] == 1
+        assert generation["source_database"] == str(local_db.resolve())
+        assert generation["source_before"] == generation["source_after"]
+
         conn = duckdb.connect(str(replica), read_only=True)
         assert conn.execute("SELECT COUNT(*) FROM minute_bar").fetchone()[0] == 2
         conn.close()
+
+    def test_generation_write_failure_keeps_previous_replica_and_sidecar(
+        self,
+        local_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        replica = tmp_path / "rquant_ro.duckdb"
+        ok, detail = refresh_readonly_replica(local_db, replica)
+        assert ok, detail
+        previous_replica = replica.read_bytes()
+        generation_path = Path(f"{replica}.generation.json")
+        previous_generation = generation_path.read_bytes()
+
+        local = duckdb.connect(str(local_db))
+        local.execute(
+            "INSERT INTO minute_bar "
+            "(ts_code, trade_time, freq, open, high, low, close, source) "
+            "VALUES ('000001.SZ', TIMESTAMP '2026-07-13 09:33:00', "
+            "'1min', 1, 1, 1, 1, 'test')"
+        )
+        local.close()
+
+        def fail_generation_write(*args: Any, **kwargs: Any) -> None:
+            raise OSError("generation write failed")
+
+        monkeypatch.setattr(
+            research_sync,
+            "write_replica_generation_metadata",
+            fail_generation_write,
+        )
+
+        ok, detail = refresh_readonly_replica(local_db, replica)
+
+        assert not ok
+        assert "generation write failed" in detail
+        assert replica.read_bytes() == previous_replica
+        assert generation_path.read_bytes() == previous_generation
 
     def test_refresh_refuses_when_wal_present(
         self, local_db: Path, tmp_path: Path

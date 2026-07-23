@@ -8,7 +8,9 @@
 # 设计：
 #   1. cp 主库 + WAL（如有）→ tmp
 #   2. 在 tmp 回放并 checkpoint WAL，再只读验证为单文件（防 cp 撞 monitor 写入）
-#   3. 验证通过 → atomic mv 替换 WAL-free 副本；失败 → 保留上次成功副本
+#   3. 验证通过 → atomic mv 替换 WAL-free 副本
+#   4. 发布绑定主库/WAL 水位和副本指纹的 generation sidecar
+#      （DB 与 sidecar 间崩溃时指纹不匹配，正式研究命令会 fail closed）
 #
 # 部署：rquant-replica-sync.timer 每 5min 触发，无需手动跑。
 
@@ -18,13 +20,16 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${PROJECT_DIR}/data/rquant.duckdb"
 DST="${PROJECT_DIR}/data/rquant_ro.duckdb"
 TMP="${DST}.tmp.$$"
+GENERATION_FILE="${DST}.generation.json"
+GENERATION_TMP="${GENERATION_FILE}.tmp.$$"
 LOG="${PROJECT_DIR}/logs/replica-sync.log"
 VENV_PY="${PROJECT_DIR}/.venv/bin/python"
+RQUANT_PYTHONPATH="${PROJECT_DIR}/src"
 
 mkdir -p "$(dirname "${LOG}")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG}"; }
-cleanup() { rm -f "${TMP}" "${TMP}.wal"; }
+cleanup() { rm -f "${TMP}" "${TMP}.wal" "${GENERATION_TMP}"; }
 on_error() {
     local rc=$?
     trap - ERR
@@ -42,6 +47,15 @@ fi
 
 src_size=$(file_size "${SRC}")
 log "sync start: src=${src_size}B"
+source_before=$(PYTHONPATH="${RQUANT_PYTHONPATH}" \
+    "${VENV_PY}" - "${SRC}" <<'PY'
+import sys
+
+from rquant.replica_generation import capture_database_watermark
+
+print(capture_database_watermark(sys.argv[1]).model_dump_json())
+PY
+)
 
 # 1. cp 主库 + WAL 到 tmp（cp 本身不受 DuckDB advisory lock 阻塞）
 if ! cp "${SRC}" "${TMP}"; then
@@ -85,12 +99,36 @@ PY
     exit 2
 fi
 
+# Publish a sidecar bound to both the copied primary generation and the exact
+# replica inode. A crash between DB and sidecar publication fails closed: the
+# previous sidecar cannot match the new replica fingerprint.
+PYTHONPATH="${RQUANT_PYTHONPATH}" "${VENV_PY}" - \
+    "${SRC}" "${TMP}" "${GENERATION_TMP}" "${source_before}" <<'PY'
+import sys
+
+from rquant.replica_generation import (
+    ReplicaDatabaseWatermark,
+    write_replica_generation_metadata,
+)
+
+source, replica, target, source_before_json = sys.argv[1:]
+write_replica_generation_metadata(
+    primary_path=source,
+    replica_path=replica,
+    output_path=target,
+    source_before=ReplicaDatabaseWatermark.model_validate_json(
+        source_before_json
+    ),
+)
+PY
+
 # 3. atomic mv 替换 WAL-free 副本（同分区 mv 是 rename(2) 原子操作）。
 if ! mv "${TMP}" "${DST}"; then
     log "ERROR: mv tmp → dst 失败"
     exit 1
 fi
 rm -f "${DST}.wal"
+mv "${GENERATION_TMP}" "${GENERATION_FILE}"
 
 dst_size=$(file_size "${DST}")
 log "sync OK: dst=${dst_size}B, tables=${table_count}, wal_free=1"

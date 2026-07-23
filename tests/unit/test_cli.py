@@ -1035,6 +1035,7 @@ class TestResearchMinuteRepair:
         state_factory.assert_not_called()
         run_repair.assert_called_once_with(
             source_database=source,
+            primary_database=config_module.settings.duckdb_path,
             paths=repair_module.ResearchIngestPaths.from_data_dir(tmp_path),
             state=state,
             manifest_id="b" * 64,
@@ -1115,6 +1116,10 @@ class TestResearchMinuteRepair:
         )
         assert run_repair.call_args.kwargs["apply"] is True
         assert run_repair.call_args.kwargs["plan_id"] == "f" * 64
+        assert (
+            run_repair.call_args.kwargs["primary_database"]
+            == config_module.settings.duckdb_path
+        )
         output = json.loads(capsys.readouterr().out)
         assert output["status"] == "candidate"
         assert output["plan_id"] == "f" * 64
