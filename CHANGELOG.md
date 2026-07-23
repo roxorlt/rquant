@@ -6,6 +6,14 @@
 
 ### Added
 
+- **Strategy Lab 分片控制面**：新增确定性分片定义、带 scheduler fence 与租约代际的 claim、
+  worker report/receipt typed protocol，以及独立的原子 claim/report spool。Lab ledger 升级到
+  schema v3，支持幂等规划、过期重领、心跳续租、成功/失败/停止报告验收、暂停/恢复与
+  两阶段取消；旧 claim、旧 scheduler fence、过期租约和被篡改 payload/report 均只能得到
+  持久 rejected receipt，不能覆盖新结果。scheduler 可有界消费报告并发布 claim，报告在
+  commit 后 ack 前崩溃时可 exactly-once 重放。本次仅交付控制面，不包含策略 adapter、
+  Pandas 回测、subprocess worker 或页面。
+
 - **策略分钟回补 manifest 可审计终止**：新增 `abandoned` 终态和
   `rquant backfill-abandon`。命令默认只生成绑定 manifest 内容、任务计数、终止原因与干净
   Git commit 的 SHA256 计划；只有显式传入同一 `plan_id` 和 `--apply` 才以短事务 CAS

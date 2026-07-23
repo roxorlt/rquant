@@ -3674,7 +3674,7 @@ class TestLabSchedulerCli:
     ) -> None:
         import argparse
 
-        from rquant import lab_job_protocol, lab_jobs, lab_scheduler
+        from rquant import lab_job_protocol, lab_jobs, lab_scheduler, lab_shard_protocol
         from rquant.cli import cmd_lab_scheduler
 
         calls: list[str] = []
@@ -3690,6 +3690,14 @@ class TestLabSchedulerCli:
             def __init__(self, path: Path) -> None:
                 calls.append(f"spool:{path.name}")
 
+        class FakeClaimSpool:
+            def __init__(self, path: Path) -> None:
+                calls.append(f"claim_spool:{path.name}")
+
+        class FakeReportSpool:
+            def __init__(self, path: Path) -> None:
+                calls.append(f"report_spool:{path.name}")
+
         class FakeScheduler:
             def __init__(self, **kwargs: object) -> None:
                 calls.append(f"scheduler:{kwargs['owner_id']}")
@@ -3703,6 +3711,8 @@ class TestLabSchedulerCli:
 
         monkeypatch.setattr(lab_jobs, "LabJobStore", FakeStore)
         monkeypatch.setattr(lab_job_protocol, "LabCommandSpool", FakeSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", FakeClaimSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeReportSpool)
         monkeypatch.setattr(lab_scheduler, "LabScheduler", FakeScheduler)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
@@ -3710,6 +3720,8 @@ class TestLabSchedulerCli:
 
         assert result == 0
         assert "initialize" in calls
+        assert "claim_spool:lab_shard_claims" in calls
+        assert "report_spool:lab_worker_reports" in calls
         assert calls[-2:] == ["run_once", "release"]
 
     def test_cmd_lab_scheduler_forever_installs_cooperative_signal_handlers(

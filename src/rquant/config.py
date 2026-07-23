@@ -32,10 +32,16 @@ class Settings(BaseSettings):
     backfill_planner_threads: int = Field(default=2, ge=1, le=4)
     lab_jobs_path: Path | None = None
     lab_job_command_dir: Path | None = None
+    lab_job_claim_dir: Path | None = None
+    lab_job_report_dir: Path | None = None
     lab_jobs_busy_timeout_ms: int = Field(default=5_000, ge=1)
     lab_scheduler_poll_interval_ms: int = Field(default=250, ge=1)
     lab_scheduler_lease_seconds: int = Field(default=60, ge=1)
     lab_scheduler_heartbeat_seconds: int = Field(default=10, ge=1)
+    lab_scheduler_shard_lease_seconds: int = Field(default=300, ge=1)
+    lab_scheduler_max_reports_per_tick: int = Field(default=64, ge=1)
+    lab_scheduler_max_claims_per_tick: int = Field(default=16, ge=1)
+    lab_scheduler_worker_ids: str = ""
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
@@ -137,7 +143,13 @@ class Settings(BaseSettings):
     def normalize_empty_backfill_state_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("lab_jobs_path", "lab_job_command_dir", mode="before")
+    @field_validator(
+        "lab_jobs_path",
+        "lab_job_command_dir",
+        "lab_job_claim_dir",
+        "lab_job_report_dir",
+        mode="before",
+    )
     @classmethod
     def normalize_empty_lab_job_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
@@ -200,9 +212,18 @@ class Settings(BaseSettings):
         }
         if lab_path in existing_database_paths:
             raise ValueError("lab jobs path must differ from all existing database paths")
-        command_dir = self.lab_job_command_dir_resolved.resolve()
-        if command_dir == lab_path or command_dir in existing_database_paths:
-            raise ValueError("lab job command directory must differ from database paths")
+        spool_dirs = {
+            self.lab_job_command_dir_resolved.resolve(),
+            self.lab_job_claim_dir_resolved.resolve(),
+            self.lab_job_report_dir_resolved.resolve(),
+        }
+        if len(spool_dirs) != 3:
+            raise ValueError("lab job spool directories must differ from each other")
+        if lab_path in spool_dirs or spool_dirs & existing_database_paths:
+            raise ValueError("lab job spool directories must differ from database paths")
+        workers = self.lab_scheduler_worker_id_list
+        if len(set(workers)) != len(workers):
+            raise ValueError("lab scheduler worker ids must be unique")
         return self
 
     @property
@@ -230,6 +251,24 @@ class Settings(BaseSettings):
         path = self.lab_job_command_dir or self.data_dir / "lab_job_commands"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @property
+    def lab_job_claim_dir_resolved(self) -> Path:
+        path = self.lab_job_claim_dir or self.data_dir / "lab_shard_claims"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def lab_job_report_dir_resolved(self) -> Path:
+        path = self.lab_job_report_dir or self.data_dir / "lab_worker_reports"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def lab_scheduler_worker_id_list(self) -> tuple[str, ...]:
+        return tuple(
+            worker.strip() for worker in self.lab_scheduler_worker_ids.split(",") if worker.strip()
+        )
 
     @property
     def research_db_path_resolved(self) -> Path:

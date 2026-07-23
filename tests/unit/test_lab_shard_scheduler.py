@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import sqlite3
+from datetime import timedelta
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+
+from rquant.lab_job_protocol import LabCommandSpool
+from rquant.lab_jobs import LabJobReader, LabJobStore
+from rquant.lab_scheduler import LabScheduler
+from rquant.lab_shard_protocol import (
+    LabAcknowledgedReport,
+    LabClaimSpool,
+    LabReportReceipt,
+    LabReportSpool,
+    LabReportSpoolEntry,
+    LabShardHeartbeat,
+)
+
+from .test_lab_jobs import NOW, _lease, _submit_job
+from .test_lab_shard_control_plane import _definition, _report
+
+
+def _scheduler(
+    tmp_path: Path,
+    *,
+    clock: list,
+    report_spool: LabReportSpool | None = None,
+    claim_spool: LabClaimSpool | None = None,
+    claim_worker_ids: tuple[str, ...] = (),
+    max_reports: int = 64,
+    max_claims: int = 16,
+) -> tuple[LabJobStore, LabScheduler]:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        report_spool=report_spool,
+        claim_spool=claim_spool,
+        claim_worker_ids=claim_worker_ids,
+        shard_lease_seconds=30,
+        max_reports_per_tick=max_reports,
+        max_claims_per_tick=max_claims,
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    assert scheduler.lease is not None
+    return store, scheduler
+
+
+def _planned_job(store: LabJobStore, scheduler: LabScheduler, *, count: int = 1):
+    assert scheduler.lease is not None
+    job = _submit_job(store, scheduler.lease)
+    store.plan_job(
+        job.job_id,
+        tuple(_definition(index) for index in range(count)),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    return job
+
+
+def test_scheduler_publishes_only_bounded_claims(tmp_path: Path) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a", "worker-b"),
+        max_claims=1,
+    )
+    job = _planned_job(store, scheduler, count=2)
+    clock[0] = NOW + timedelta(seconds=2)
+
+    result = scheduler.run_once()
+
+    assert result.claims_published == 1
+    assert len(claims.pending()) == 1
+    shards = LabJobReader(store.path).list_shards(job.job_id)
+    assert sum(shard.status.value == "running" for shard in shards) == 1
+
+
+def test_scheduler_consumes_only_bounded_reports(tmp_path: Path) -> None:
+    clock = [NOW]
+    reports = LabReportSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(tmp_path, clock=clock, report_spool=reports, max_reports=1)
+    job = _planned_job(store, scheduler, count=2)
+    assert scheduler.lease is not None
+    claims = tuple(
+        store.claim_next_shard(
+            worker_id=f"worker-{index}",
+            shard_lease_seconds=30,
+            lease=scheduler.lease,
+            now=NOW + timedelta(seconds=2),
+        )
+        for index in range(2)
+    )
+    assert all(claim is not None for claim in claims)
+    for claim in claims:
+        assert claim is not None
+        reports.publish(_report(claim, LabShardHeartbeat(lease_extension_seconds=30)))
+
+    clock[0] = NOW + timedelta(seconds=3)
+    first = scheduler.run_once()
+    assert first.reports_processed == 1
+    assert len(reports.pending()) == 1
+    second = scheduler.run_once()
+    assert second.reports_processed == 1
+    assert reports.pending() == ()
+    assert len(LabJobReader(store.path).list_shards(job.job_id)) == 2
+
+
+class _CrashBeforeReportAckSpool(LabReportSpool):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.crash = True
+
+    def ack(
+        self,
+        entry: LabReportSpoolEntry,
+        receipt: LabReportReceipt,
+    ) -> LabAcknowledgedReport:
+        if self.crash:
+            self.crash = False
+            raise RuntimeError("simulated report crash after ledger commit")
+        return super().ack(entry, receipt)
+
+
+def test_report_commit_before_ack_crash_replays_exactly_once(tmp_path: Path) -> None:
+    clock = [NOW]
+    reports = _CrashBeforeReportAckSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(tmp_path, clock=clock, report_spool=reports)
+    job = _planned_job(store, scheduler)
+    assert scheduler.lease is not None
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    report = _report(claim, LabShardHeartbeat(lease_extension_seconds=30))
+    reports.publish(report)
+    clock[0] = NOW + timedelta(seconds=3)
+
+    with pytest.raises(RuntimeError, match="after ledger commit"):
+        scheduler.run_once()
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM lab_worker_report").fetchone()[0] == 1
+    assert len(reports.pending()) == 1
+
+    replay = scheduler.run_once()
+    assert replay.reports_processed == 1
+    assert reports.pending() == ()
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM lab_worker_report").fetchone()[0] == 1
+    assert LabJobReader(store.path).get_job(job.job_id) is not None
+
+
+def test_bad_and_symlink_reports_do_not_block_valid_report(tmp_path: Path) -> None:
+    clock = [NOW]
+    reports = LabReportSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(tmp_path, clock=clock, report_spool=reports)
+    _planned_job(store, scheduler)
+    assert scheduler.lease is not None
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    bad = reports.pending_dir / f"00000000000000000000-{uuid4()}.json"
+    bad.write_text("{broken", encoding="utf-8")
+    victim = tmp_path / "victim.json"
+    victim.write_text("do-not-touch", encoding="utf-8")
+    symlink = reports.pending_dir / f"00000000000000000001-{uuid4()}.json"
+    symlink.symlink_to(victim)
+    reports.publish(_report(claim, LabShardHeartbeat(lease_extension_seconds=30)))
+    clock[0] = NOW + timedelta(seconds=3)
+
+    result = scheduler.run_once()
+
+    assert result.reports_quarantined == 2
+    assert result.reports_processed == 1
+    assert result.reports_accepted == 1
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+    assert reports.pending() == ()
+
+
+def test_scheduler_takeover_does_not_checkpoint_sharded_job_before_reclaim(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    old = _lease(store, seconds=10)
+    job = _submit_job(store, old)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=old,
+        now=NOW + timedelta(seconds=1),
+    )
+    old_claim = store.claim_next_shard(
+        worker_id="worker-old",
+        shard_lease_seconds=30,
+        lease=old,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert old_claim is not None
+    claims = LabClaimSpool(tmp_path / "claims")
+    clock = [NOW + timedelta(seconds=11)]
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_spool=claims,
+        claim_worker_ids=("worker-new",),
+        shard_lease_seconds=30,
+        clock=lambda: clock[0],
+    )
+
+    result = scheduler.run_once()
+
+    assert result.claims_published == 1
+    fresh = claims.pending()[0].claim
+    assert fresh.claim_generation == 2
+    assert fresh.scheduler_fencing_token > old_claim.scheduler_fencing_token
+    assert LabJobReader(store.path).get_job(job.job_id).status.value == "running"

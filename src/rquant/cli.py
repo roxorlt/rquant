@@ -2953,6 +2953,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     from rquant.lab_job_protocol import LabCommandSpool
     from rquant.lab_jobs import LabJobStore
     from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
 
     setup_logging()
     store = LabJobStore(
@@ -2967,6 +2968,12 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         lease_seconds=settings.lab_scheduler_lease_seconds,
         heartbeat_seconds=settings.lab_scheduler_heartbeat_seconds,
         poll_interval_ms=settings.lab_scheduler_poll_interval_ms,
+        report_spool=LabReportSpool(settings.lab_job_report_dir_resolved),
+        claim_spool=LabClaimSpool(settings.lab_job_claim_dir_resolved),
+        claim_worker_ids=settings.lab_scheduler_worker_id_list,
+        shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
+        max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
+        max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
     )
     if args.once:
         try:

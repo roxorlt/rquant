@@ -313,7 +313,7 @@ def _create_609c599_v1_fixture(
     return rows
 
 
-def test_initialize_creates_v2_six_table_schema_and_required_pragmas(
+def test_initialize_creates_v3_schema_and_required_pragmas(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -340,7 +340,7 @@ def test_initialize_creates_v2_six_table_schema_and_required_pragmas(
         "lab_artifact",
     } <= tables
     assert application_id == LabJobStore.APPLICATION_ID
-    assert user_version == 2
+    assert user_version == 3
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
     assert "STRICT" not in schema_sql
@@ -380,7 +380,7 @@ def test_initialize_refuses_unclaimed_nonempty_sqlite(tmp_path: Path) -> None:
         LabJobStore(path).initialize()
 
 
-@pytest.mark.parametrize("version", [0, 3, 99])
+@pytest.mark.parametrize("version", [0, 2, 99])
 def test_store_and_reader_fail_closed_on_unknown_schema_version(
     tmp_path: Path,
     version: int,
@@ -389,7 +389,7 @@ def test_store_and_reader_fail_closed_on_unknown_schema_version(
     with sqlite3.connect(store.path) as connection:
         connection.execute(f"PRAGMA user_version = {version}")
 
-    with pytest.raises(LabDatabaseIdentityError, match="user_version"):
+    with pytest.raises(LabDatabaseIdentityError, match="user_version|unexpectedly"):
         store.initialize()
     with pytest.raises(LabDatabaseIdentityError, match="user_version"):
         LabJobReader(store.path).get_job(uuid4())
@@ -434,7 +434,7 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
         migrated_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lab_command'"
         ).fetchone()[0]
-    assert user_version == 2
+    assert user_version == 3
     assert "receipt_job_version" in columns
     assert migrated == (
         (
@@ -1596,7 +1596,7 @@ def test_heartbeat_renews_without_appending_event(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("pragma", "tampered_value"),
-    [("user_version", 3), ("application_id", 12_345)],
+    [("user_version", 2), ("application_id", 12_345)],
 )
 def test_writer_mutation_fails_closed_after_database_identity_tamper(
     tmp_path: Path,

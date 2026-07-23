@@ -18,6 +18,7 @@ from rquant.lab_jobs import (
     LabLeaseRecord,
     SchedulerLeaseFencedError,
 )
+from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
 
 
 class SchedulerTickResult(BaseModel):
@@ -29,6 +30,11 @@ class SchedulerTickResult(BaseModel):
     rejected: int = Field(ge=0)
     quarantined: int = Field(ge=0)
     recovered: int = Field(ge=0)
+    reports_processed: int = Field(default=0, ge=0)
+    reports_accepted: int = Field(default=0, ge=0)
+    reports_rejected: int = Field(default=0, ge=0)
+    reports_quarantined: int = Field(default=0, ge=0)
+    claims_published: int = Field(default=0, ge=0)
 
 
 def _system_clock() -> datetime:
@@ -48,6 +54,12 @@ class LabScheduler:
         heartbeat_seconds: int,
         poll_interval_ms: int,
         max_commands_per_tick: int = 64,
+        report_spool: LabReportSpool | None = None,
+        claim_spool: LabClaimSpool | None = None,
+        claim_worker_ids: tuple[str, ...] = (),
+        shard_lease_seconds: int = 300,
+        max_reports_per_tick: int = 64,
+        max_claims_per_tick: int = 16,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
         if not owner_id.strip():
@@ -60,6 +72,17 @@ class LabScheduler:
             raise ValueError("poll_interval_ms must be positive")
         if max_commands_per_tick < 1:
             raise ValueError("max_commands_per_tick must be positive")
+        if shard_lease_seconds < 1:
+            raise ValueError("shard_lease_seconds must be positive")
+        if max_reports_per_tick < 1:
+            raise ValueError("max_reports_per_tick must be positive")
+        if max_claims_per_tick < 1:
+            raise ValueError("max_claims_per_tick must be positive")
+        normalized_workers = tuple(worker.strip() for worker in claim_worker_ids)
+        if any(not worker for worker in normalized_workers):
+            raise ValueError("claim_worker_ids must not contain empty values")
+        if len(set(normalized_workers)) != len(normalized_workers):
+            raise ValueError("claim_worker_ids must be unique")
         self.store = store
         self.spool = spool
         self.owner_id = owner_id.strip()
@@ -67,6 +90,12 @@ class LabScheduler:
         self.heartbeat_seconds = heartbeat_seconds
         self.poll_interval_ms = poll_interval_ms
         self.max_commands_per_tick = max_commands_per_tick
+        self.report_spool = report_spool
+        self.claim_spool = claim_spool
+        self.claim_worker_ids = normalized_workers
+        self.shard_lease_seconds = shard_lease_seconds
+        self.max_reports_per_tick = max_reports_per_tick
+        self.max_claims_per_tick = max_claims_per_tick
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
         self._stop = Event()
@@ -143,6 +172,55 @@ class LabScheduler:
             else:
                 rejected += 1
             self.spool.ack(entry, receipt)
+        reports_processed = 0
+        reports_accepted = 0
+        reports_rejected = 0
+        reports_quarantined = 0
+        if self.report_spool is not None:
+            for path in self.report_spool.pending_paths(limit=self.max_reports_per_tick):
+                try:
+                    entry = self.report_spool.load(path)
+                except InvalidCommandEnvelopeError as exc:
+                    self.report_spool.quarantine(
+                        exc.file_identity or path,
+                        reason=f"invalid_report:{exc}",
+                    )
+                    reports_quarantined += 1
+                    continue
+                lease, mutation_now = self._mutation_context()
+                try:
+                    receipt = self.store.apply_worker_report(
+                        entry.report,
+                        lease=lease,
+                        now=mutation_now,
+                    )
+                except RequestContentConflictError as exc:
+                    self.report_spool.quarantine(
+                        entry,
+                        reason=f"report_content_conflict:{exc}",
+                    )
+                    reports_quarantined += 1
+                    continue
+                reports_processed += 1
+                if receipt.status == "accepted":
+                    reports_accepted += 1
+                else:
+                    reports_rejected += 1
+                self.report_spool.ack(entry, receipt)
+        claims_published = 0
+        if self.claim_spool is not None:
+            for worker_id in self.claim_worker_ids[: self.max_claims_per_tick]:
+                lease, mutation_now = self._mutation_context()
+                claim = self.store.claim_next_shard(
+                    worker_id=worker_id,
+                    shard_lease_seconds=self.shard_lease_seconds,
+                    lease=lease,
+                    now=mutation_now,
+                )
+                if claim is None:
+                    continue
+                self.claim_spool.publish(claim)
+                claims_published += 1
         return SchedulerTickResult(
             lease_acquired=acquired,
             processed=processed,
@@ -150,6 +228,11 @@ class LabScheduler:
             rejected=rejected,
             quarantined=quarantined,
             recovered=recovered,
+            reports_processed=reports_processed,
+            reports_accepted=reports_accepted,
+            reports_rejected=reports_rejected,
+            reports_quarantined=reports_quarantined,
+            claims_published=claims_published,
         )
 
     def request_stop(self) -> None:
