@@ -3022,6 +3022,46 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lab_scheduler(args: argparse.Namespace) -> int:
+    """Run the durable Strategy Lab control-plane scheduler."""
+    from rquant.config import settings
+    from rquant.lab_job_protocol import LabCommandSpool
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+
+    setup_logging()
+    store = LabJobStore(
+        settings.lab_jobs_path_resolved,
+        busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+    )
+    store.initialize()
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(settings.lab_job_command_dir_resolved),
+        owner_id=f"{socket.gethostname()}:{os.getpid()}",
+        lease_seconds=settings.lab_scheduler_lease_seconds,
+        heartbeat_seconds=settings.lab_scheduler_heartbeat_seconds,
+        poll_interval_ms=settings.lab_scheduler_poll_interval_ms,
+    )
+    if args.once:
+        try:
+            result = scheduler.run_once()
+            logger.info(f"lab-scheduler tick: {result.model_dump_json()}")
+            return 0
+        finally:
+            scheduler.release()
+
+    def handle_signal(signum: int, frame: object) -> None:
+        del frame
+        logger.info(f"lab-scheduler 收到信号 {signum}，请求停止")
+        scheduler.request_stop()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    scheduler.run_forever()
+    return 0
+
+
 def cmd_panorama_auth_serve(args: argparse.Namespace) -> int:
     """启动全景页登录网关服务（标准库 http.server，systemd 拉起）。"""
     from rquant.config import settings
@@ -4450,6 +4490,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="任务 spec JSON 路径（launch_background_run 生成）",
     )
 
+    lab_scheduler_p = sub.add_parser(
+        "lab-scheduler",
+        help="运行 Strategy Lab 持久任务控制面",
+    )
+    lab_scheduler_p.add_argument(
+        "--once",
+        action="store_true",
+        help="只消费一批命令并退出",
+    )
+
     pa_serve_p = sub.add_parser(
         "panorama-auth-serve",
         help="启动全景页登录网关服务（微信友好 cookie 登录，标准库 http.server）",
@@ -4544,6 +4594,7 @@ def main() -> int:
         "preflight": cmd_preflight,
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
+        "lab-scheduler": cmd_lab_scheduler,
         "panorama-auth-serve": cmd_panorama_auth_serve,
         "panorama-user-add": cmd_panorama_user_add,
         "panorama-user-remove": cmd_panorama_user_remove,
@@ -4562,6 +4613,7 @@ def main() -> int:
     if args.command in (
         "serve", "notify-test", "alert", "alert-resolve",
         "daily-report", "pre-market-check", "preflight", "data-audit", "lab-run",
+        "lab-scheduler",
         "panorama-auth-serve", "panorama-user-add",
         "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
     ):

@@ -72,6 +72,102 @@ class TestSettings:
         assert configured.backfill_planner_memory_limit_mb == 1_024
         assert configured.backfill_planner_threads == 3
 
+    def test_lab_job_paths_default_under_data_dir_and_create_parents(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        configured = Settings(
+            **_settings_values(tmp_path),
+            lab_jobs_path="",
+            lab_job_command_dir="",
+        )
+
+        assert configured.lab_jobs_path_resolved == (
+            tmp_path / "data" / "lab_jobs.sqlite3"
+        )
+        assert configured.lab_job_command_dir_resolved == (
+            tmp_path / "data" / "lab_job_commands"
+        )
+        assert configured.lab_jobs_path_resolved.parent.is_dir()
+        assert configured.lab_job_command_dir_resolved.is_dir()
+
+    def test_lab_scheduler_runtime_settings_are_configurable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        configured = Settings(
+            **_settings_values(tmp_path),
+            lab_jobs_busy_timeout_ms=1_234,
+            lab_scheduler_poll_interval_ms=250,
+            lab_scheduler_lease_seconds=90,
+            lab_scheduler_heartbeat_seconds=30,
+        )
+
+        assert configured.lab_jobs_busy_timeout_ms == 1_234
+        assert configured.lab_scheduler_poll_interval_ms == 250
+        assert configured.lab_scheduler_lease_seconds == 90
+        assert configured.lab_scheduler_heartbeat_seconds == 30
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("lab_jobs_busy_timeout_ms", 0),
+            ("lab_scheduler_poll_interval_ms", 0),
+            ("lab_scheduler_lease_seconds", 0),
+            ("lab_scheduler_heartbeat_seconds", 0),
+        ],
+    )
+    def test_lab_scheduler_rejects_non_positive_runtime_settings(
+        self,
+        tmp_path: Path,
+        field: str,
+        value: int,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            Settings(**_settings_values(tmp_path), **{field: value})
+
+    def test_lab_scheduler_lease_must_cover_three_heartbeats(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValidationError, match="3.*heartbeat"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_scheduler_lease_seconds=29,
+                lab_scheduler_heartbeat_seconds=10,
+            )
+
+    @pytest.mark.parametrize(
+        "existing_path",
+        [
+            "duckdb_path",
+            "duckdb_readonly_path",
+            "backfill_state_path",
+            "research_db_path",
+            "research_readonly_db_path",
+            "notification_state_path",
+        ],
+    )
+    def test_lab_jobs_database_must_not_alias_existing_database_paths(
+        self,
+        tmp_path: Path,
+        existing_path: str,
+    ) -> None:
+        values = _settings_values(tmp_path)
+        default_paths = {
+            "duckdb_path": tmp_path / "data" / "rquant.duckdb",
+            "duckdb_readonly_path": tmp_path / "data" / "rquant_ro.duckdb",
+            "backfill_state_path": tmp_path / "data" / "backfill.sqlite3",
+            "research_db_path": tmp_path / "data" / "research.duckdb",
+            "research_readonly_db_path": tmp_path / "data" / "research_ro.duckdb",
+            "notification_state_path": tmp_path / "data" / "notification.sqlite3",
+        }
+        values.update(default_paths)
+        alias = default_paths[existing_path]
+
+        with pytest.raises(ValidationError, match="lab jobs path must differ"):
+            Settings(**values, lab_jobs_path=alias)
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [

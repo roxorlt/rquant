@@ -3583,3 +3583,107 @@ class TestIngestRetryBusinessError:
         monkeypatch.setattr("rquant.ingest.ingest_daily", always_fail)
         with patch("rquant.cli.time.sleep"), pytest.raises(Exception, match="接口下线"):
             cli._ingest_with_retry("2026-06-04")
+
+
+class TestLabSchedulerCli:
+    def test_parser_accepts_once_and_preserves_lab_run(self) -> None:
+        scheduler = build_parser().parse_args(["lab-scheduler", "--once"])
+        legacy = build_parser().parse_args(["lab-run", "--spec", "/tmp/spec.json"])
+
+        assert scheduler.command == "lab-scheduler"
+        assert scheduler.once is True
+        assert legacy.command == "lab-run"
+        assert legacy.spec == "/tmp/spec.json"
+
+    def test_parser_defaults_to_forever(self) -> None:
+        args = build_parser().parse_args(["lab-scheduler"])
+
+        assert args.once is False
+
+    def test_cmd_lab_scheduler_once_initializes_ticks_and_releases(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+
+        from rquant import lab_job_protocol, lab_jobs, lab_scheduler
+        from rquant.cli import cmd_lab_scheduler
+
+        calls: list[str] = []
+
+        class FakeStore:
+            def __init__(self, path: Path, *, busy_timeout_ms: int) -> None:
+                calls.append(f"store:{path.name}:{busy_timeout_ms}")
+
+            def initialize(self) -> None:
+                calls.append("initialize")
+
+        class FakeSpool:
+            def __init__(self, path: Path) -> None:
+                calls.append(f"spool:{path.name}")
+
+        class FakeScheduler:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append(f"scheduler:{kwargs['owner_id']}")
+
+            def run_once(self) -> SimpleNamespace:
+                calls.append("run_once")
+                return SimpleNamespace(model_dump_json=lambda: "{}")
+
+            def release(self) -> None:
+                calls.append("release")
+
+        monkeypatch.setattr(lab_jobs, "LabJobStore", FakeStore)
+        monkeypatch.setattr(lab_job_protocol, "LabCommandSpool", FakeSpool)
+        monkeypatch.setattr(lab_scheduler, "LabScheduler", FakeScheduler)
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+
+        result = cmd_lab_scheduler(argparse.Namespace(once=True))
+
+        assert result == 0
+        assert "initialize" in calls
+        assert calls[-2:] == ["run_once", "release"]
+
+    def test_cmd_lab_scheduler_forever_installs_cooperative_signal_handlers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+        import signal
+
+        from rquant import lab_scheduler
+        from rquant.cli import cmd_lab_scheduler
+
+        handlers: dict[int, object] = {}
+        calls: list[str] = []
+
+        class FakeScheduler:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def request_stop(self) -> None:
+                calls.append("request_stop")
+
+            def run_forever(self) -> None:
+                calls.append("run_forever")
+
+        def fake_signal(signum: int, handler: object) -> object:
+            previous = handlers.get(signum, signal.SIG_DFL)
+            handlers[signum] = handler
+            return previous
+
+        monkeypatch.setattr(lab_scheduler, "LabScheduler", FakeScheduler)
+        monkeypatch.setattr(
+            "rquant.lab_jobs.LabJobStore.initialize",
+            lambda _self: None,
+        )
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        monkeypatch.setattr(signal, "signal", fake_signal)
+
+        result = cmd_lab_scheduler(argparse.Namespace(once=False))
+        term_handler = handlers[signal.SIGTERM]
+        assert callable(term_handler)
+        term_handler(signal.SIGTERM, None)
+
+        assert result == 0
+        assert calls == ["run_forever", "request_stop"]

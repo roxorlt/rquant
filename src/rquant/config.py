@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     backfill_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
     backfill_planner_memory_limit_mb: int = Field(default=2_048, ge=256)
     backfill_planner_threads: int = Field(default=2, ge=1, le=4)
+    lab_jobs_path: Path | None = None
+    lab_job_command_dir: Path | None = None
+    lab_jobs_busy_timeout_ms: int = Field(default=5_000, ge=1)
+    lab_scheduler_poll_interval_ms: int = Field(default=250, ge=1)
+    lab_scheduler_lease_seconds: int = Field(default=60, ge=1)
+    lab_scheduler_heartbeat_seconds: int = Field(default=10, ge=1)
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
@@ -135,6 +141,11 @@ class Settings(BaseSettings):
     def normalize_empty_backfill_state_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
 
+    @field_validator("lab_jobs_path", "lab_job_command_dir", mode="before")
+    @classmethod
+    def normalize_empty_lab_job_path(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
+
     @field_validator(
         "research_db_path",
         "research_readonly_db_path",
@@ -188,6 +199,35 @@ class Settings(BaseSettings):
             raise ValueError("research paths must differ from each other")
         return self
 
+    @model_validator(mode="after")
+    def validate_lab_scheduler_storage(self) -> "Settings":
+        if (
+            self.lab_scheduler_lease_seconds
+            < 3 * self.lab_scheduler_heartbeat_seconds
+        ):
+            raise ValueError(
+                "lab scheduler lease must be >= 3 * heartbeat interval"
+            )
+        lab_path = self.lab_jobs_path_resolved.resolve()
+        existing_database_paths = {
+            self.duckdb_path.resolve(),
+            self.duckdb_readonly_path_resolved.resolve(),
+            self.backfill_state_path_resolved.resolve(),
+            self.research_db_path_resolved.resolve(),
+            self.research_readonly_db_path_resolved.resolve(),
+            self.notification_state_path_resolved.resolve(),
+        }
+        if lab_path in existing_database_paths:
+            raise ValueError(
+                "lab jobs path must differ from all existing database paths"
+            )
+        command_dir = self.lab_job_command_dir_resolved.resolve()
+        if command_dir == lab_path or command_dir in existing_database_paths:
+            raise ValueError(
+                "lab job command directory must differ from database paths"
+            )
+        return self
+
     @property
     def duckdb_readonly_path_resolved(self) -> Path:
         """副本路径未显式配置时，从主库路径派生（同目录、_ro 后缀）。"""
@@ -200,6 +240,18 @@ class Settings(BaseSettings):
         """回补状态库独立于 DuckDB；未配置时放在 data_dir。"""
         path = self.backfill_state_path or self.data_dir / "backfill_state.sqlite3"
         path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def lab_jobs_path_resolved(self) -> Path:
+        path = self.lab_jobs_path or self.data_dir / "lab_jobs.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def lab_job_command_dir_resolved(self) -> Path:
+        path = self.lab_job_command_dir or self.data_dir / "lab_job_commands"
+        path.mkdir(parents=True, exist_ok=True)
         return path
 
     @property
