@@ -229,6 +229,7 @@ class ResearchRunParameters(RunSpecModel):
 class DatasetSnapshotIdentity(RunSpecModel):
     snapshot_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     binding_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    audit_run_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class FeatureContractIdentity(RunSpecModel):
@@ -324,8 +325,15 @@ class ResearchRunSpec(RunSpecModel):
 
     @model_validator(mode="after")
     def enforce_snapshot_research_status(self) -> ResearchRunSpec:
-        if self.dataset_snapshot is None and self.research_status != "exploratory":
-            raise ValueError("an immutable dataset snapshot is required above exploratory status")
+        if self.research_status != "exploratory":
+            if self.dataset_snapshot is None:
+                raise ValueError(
+                    "an immutable dataset snapshot is required above exploratory status"
+                )
+            if self.dataset_snapshot.audit_run_id is None:
+                raise ValueError(
+                    "dataset_snapshot.audit_run_id is required above exploratory status"
+                )
         return self
 
     def model_copy(

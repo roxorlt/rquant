@@ -28,10 +28,11 @@ def _parameters(*arguments: ResearchParameter) -> ResearchRunParameters:
     )
 
 
-def _snapshot() -> DatasetSnapshotIdentity:
+def _snapshot(*, audit_run_id: str | None = "d" * 64) -> DatasetSnapshotIdentity:
     return DatasetSnapshotIdentity(
         snapshot_id="a" * 64,
         binding_hash="b" * 64,
+        audit_run_id=audit_run_id,
     )
 
 
@@ -152,6 +153,7 @@ def test_hash_is_stable_for_mapping_order_parameter_order_and_timezone() -> None
                 "contract_id": "intraday-core",
             },
             "dataset_snapshot": {
+                "audit_run_id": "d" * 64,
                 "binding_hash": "b" * 64,
                 "snapshot_id": "a" * 64,
             },
@@ -206,10 +208,11 @@ def test_decimal_canonicalization_normalizes_negative_zero() -> None:
     )
 
 
-def test_canonical_json_and_hash_match_golden_vector() -> None:
+def test_canonical_json_and_hash_match_cross_python_golden_vector() -> None:
     expected_json = (
         '{"code_sha":"1111111111111111111111111111111111111111",'
-        '"dataset_snapshot":{"binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        '"dataset_snapshot":{"audit_run_id":"dddddddddddddddddddddddddddddddddddddddd'
+        'dddddddddddddddddddddddd","binding_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
         'bbbbbbbbbbbbbbbbbbbbbbbb","snapshot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
         'aaaaaaaaaaaaaaaaaaaaaaaa"},"deadline":{"$datetime":"2026-07-25T02:00:00.'
         '000000Z"},"execution_costs":{"commission_bps":{"$decimal":"2.5"},'
@@ -225,7 +228,7 @@ def test_canonical_json_and_hash_match_golden_vector() -> None:
     )
 
     assert _spec().canonical_json() == expected_json
-    assert _spec().spec_hash == "5dfdef4d16e812237792efdff0613b551d4830793af8b828bc7aa1122cda6557"
+    assert _spec().spec_hash == "8db01a9103e9c44fa7e35ec9ec63e37f90c01d57749766aa1903550015faa6dc"
 
 
 @pytest.mark.parametrize("value", [Decimal("1E+1000000"), Decimal("1E-1000000")])
@@ -274,12 +277,18 @@ def test_hash_changes_when_a_reproducibility_input_changes() -> None:
     assert _spec(code_sha="2" * 40).spec_hash != base.spec_hash
     assert _spec(dataset_snapshot=changed_snapshot).spec_hash != base.spec_hash
 
+    changed_audit = _snapshot(audit_run_id="e" * 64)
+    assert _spec(dataset_snapshot=changed_audit).spec_hash != base.spec_hash
+
 
 def test_spec_model_copy_revalidates_snapshot_grade_gate() -> None:
     comparable = _spec()
 
     with pytest.raises(ValidationError, match="immutable dataset snapshot"):
         comparable.model_copy(update={"dataset_snapshot": None})
+
+    with pytest.raises(ValidationError, match="audit_run_id"):
+        comparable.model_copy(update={"dataset_snapshot": _snapshot(audit_run_id=None)})
 
 
 def test_spec_model_copy_rejects_unvalidated_parameter_mapping() -> None:
@@ -321,12 +330,45 @@ def test_spec_model_validate_revalidates_nested_model_instances() -> None:
         ResearchRunSpec.model_validate(payload)
 
 
+def test_spec_model_validate_rejects_tampered_nested_audit_identity() -> None:
+    invalid_snapshot = _snapshot().model_copy(update={"audit_run_id": "bad"})
+    payload = _spec().model_dump(mode="python")
+    payload["dataset_snapshot"] = invalid_snapshot
+
+    with pytest.raises(ValidationError, match="audit_run_id"):
+        ResearchRunSpec.model_validate(payload)
+
+
 def test_snapshot_gate_allows_only_exploratory_without_immutable_snapshot() -> None:
     exploratory = _spec(dataset_snapshot=None, research_status="exploratory")
 
     assert exploratory.dataset_snapshot is None
     with pytest.raises(ValidationError, match="immutable dataset snapshot"):
         _spec(dataset_snapshot=None, research_status="comparable")
+
+
+def test_comparable_research_requires_snapshot_audit_identity() -> None:
+    with pytest.raises(ValidationError, match="audit_run_id"):
+        _spec(
+            dataset_snapshot=_snapshot(audit_run_id=None),
+            research_status="comparable",
+        )
+
+
+def test_exploratory_research_accepts_snapshot_without_audit_identity() -> None:
+    spec = _spec(
+        dataset_snapshot=_snapshot(audit_run_id=None),
+        research_status="exploratory",
+    )
+
+    assert spec.dataset_snapshot is not None
+    assert spec.dataset_snapshot.audit_run_id is None
+
+
+@pytest.mark.parametrize("audit_run_id", ["d" * 63, "D" * 64, "g" * 64, "audit-latest"])
+def test_snapshot_rejects_invalid_audit_run_id(audit_run_id: str) -> None:
+    with pytest.raises(ValidationError, match="audit_run_id"):
+        _snapshot(audit_run_id=audit_run_id)
 
 
 @pytest.mark.parametrize("status", ["comparable", "paper_candidate", "monitor_approved"])

@@ -50,6 +50,7 @@ def _spec() -> ResearchRunSpec:
         dataset_snapshot=DatasetSnapshotIdentity(
             snapshot_id="a" * 64,
             binding_hash="b" * 64,
+            audit_run_id="d" * 64,
         ),
         feature_contract=FeatureContractIdentity(
             contract_id="intraday-core",
