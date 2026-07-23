@@ -407,6 +407,20 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _shard_primary_key_columns(connection: sqlite3.Connection) -> tuple[str, ...]:
+    rows = connection.execute("PRAGMA table_info(lab_shard)").fetchall()
+    return tuple(
+        str(row[1])
+        for row in sorted(
+            rows,
+            key=lambda row: _strict_sqlite_int(
+                row[5], field="lab_shard.primary_key_position", minimum=0
+            ),
+        )
+        if _strict_sqlite_int(row[5], field="lab_shard.primary_key_position", minimum=0) > 0
+    )
+
+
 def _validate_v3_schema(connection: sqlite3.Connection) -> None:
     _validate_v2_schema(connection)
     shard_columns = {
@@ -431,6 +445,11 @@ def _validate_v3_schema(connection: sqlite3.Connection) -> None:
     if missing:
         raise LabDatabaseIdentityError(
             f"lab jobs SQLite v3 is missing lab_shard columns: {', '.join(missing)}"
+        )
+    shard_primary_key = _shard_primary_key_columns(connection)
+    if shard_primary_key != ("job_id", "shard_id"):
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v3 lab_shard primary key must be (job_id, shard_id)"
         )
     report_table = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lab_worker_report'"
@@ -522,9 +541,83 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     )
     for statement in additions:
         connection.execute(statement)
+    _migrate_global_shard_primary_key(connection, include_worker_reports=False)
     connection.execute(_V3_REPORT_TABLE_STATEMENT)
     connection.execute(_V3_REPORT_INDEX_STATEMENT)
     _validate_v3_schema(connection)
+
+
+def _migrate_global_shard_primary_key(
+    connection: sqlite3.Connection,
+    *,
+    include_worker_reports: bool,
+) -> None:
+    report_suffix = ""
+    if include_worker_reports:
+        connection.execute("ALTER TABLE lab_worker_report RENAME TO lab_worker_report_global_shard")
+        report_suffix = "_global_shard"
+    connection.execute("ALTER TABLE lab_artifact RENAME TO lab_artifact_global_shard")
+    connection.execute("ALTER TABLE lab_shard RENAME TO lab_shard_global_shard")
+    connection.execute(_V3_SHARD_TABLE_STATEMENT)
+    connection.execute(
+        """
+        INSERT INTO lab_shard (
+            shard_id, job_id, shard_index, status, version,
+            attempt_count, max_attempts, plan_hash, adapter_id,
+            adapter_version, payload_json, payload_hash, worker_id,
+            scheduler_fencing_token, claim_token, claim_generation,
+            claimed_at, heartbeat_at, lease_expires_at,
+            result_manifest_hash, failure_json, finished_at,
+            checkpoint_json, created_at, updated_at
+        )
+        SELECT
+            shard_id, job_id, shard_index, status, version,
+            attempt_count, max_attempts, plan_hash, adapter_id,
+            adapter_version, payload_json, payload_hash, worker_id,
+            scheduler_fencing_token, claim_token, claim_generation,
+            claimed_at, heartbeat_at, lease_expires_at,
+            result_manifest_hash, failure_json, finished_at,
+            checkpoint_json, created_at, updated_at
+        FROM lab_shard_global_shard
+        """
+    )
+    connection.execute(_V3_ARTIFACT_TABLE_STATEMENT)
+    connection.execute(
+        """
+        INSERT INTO lab_artifact (
+            artifact_id, job_id, shard_id, artifact_type, uri,
+            content_hash, created_at
+        )
+        SELECT
+            artifact_id, job_id, shard_id, artifact_type, uri,
+            content_hash, created_at
+        FROM lab_artifact_global_shard
+        """
+    )
+    if include_worker_reports:
+        connection.execute(_V3_REPORT_TABLE_STATEMENT)
+        connection.execute(
+            f"""
+            INSERT INTO lab_worker_report (
+                report_id, content_hash, job_id, shard_id, report_type,
+                report_json, status, reason, receipt_json, claim_generation,
+                scheduler_fencing_token, received_at, applied_at
+            )
+            SELECT
+                report_id, content_hash, job_id, shard_id, report_type,
+                report_json, status, reason, receipt_json, claim_generation,
+                scheduler_fencing_token, received_at, applied_at
+            FROM lab_worker_report{report_suffix}
+            """
+        )
+        connection.execute("DROP TABLE lab_worker_report_global_shard")
+    connection.execute("DROP TABLE lab_artifact_global_shard")
+    connection.execute("DROP TABLE lab_shard_global_shard")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ix_lab_artifact_job ON lab_artifact(job_id, created_at)"
+    )
+    if include_worker_reports:
+        connection.execute(_V3_REPORT_INDEX_STATEMENT)
 
 
 def _validate_database_identity(
@@ -985,6 +1078,17 @@ class LabJobStore:
                 _migrate_v2_to_v3(connection)
             elif starting_version == _PREVIOUS_SCHEMA_VERSION:
                 _migrate_v2_to_v3(connection)
+            elif starting_version == _SCHEMA_VERSION:
+                shard_primary_key = _shard_primary_key_columns(connection)
+                if shard_primary_key == ("shard_id",):
+                    _migrate_global_shard_primary_key(
+                        connection,
+                        include_worker_reports=True,
+                    )
+                elif shard_primary_key != ("job_id", "shard_id"):
+                    raise LabDatabaseIdentityError(
+                        "lab jobs SQLite v3 has an unsupported lab_shard primary key"
+                    )
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
             _validate_v3_schema(connection)
@@ -1660,6 +1764,28 @@ class LabJobStore:
                         updated["version"], field="lab_job.version", minimum=0
                     ),
                 )
+            connection.execute(
+                """
+                UPDATE lab_shard
+                SET status = ?, version = version + 1,
+                    worker_id = NULL, scheduler_fencing_token = NULL,
+                    claim_token = NULL, claimed_at = NULL,
+                    heartbeat_at = NULL, lease_expires_at = NULL,
+                    result_manifest_hash = NULL, failure_json = NULL,
+                    finished_at = ?, checkpoint_json = NULL,
+                    updated_at = ?
+                WHERE job_id = ? AND status IN (?, ?, ?)
+                """,
+                (
+                    ShardStatus.CANCELLED.value,
+                    _dump_time(now),
+                    _dump_time(now),
+                    str(command.job_id),
+                    ShardStatus.QUEUED.value,
+                    ShardStatus.RUNNING.value,
+                    ShardStatus.CHECKPOINTED.value,
+                ),
+            )
             target = JobStatus.CANCELLED
         elif isinstance(command, PauseJobCommand):
             if source is not JobStatus.RUNNING:
@@ -1747,6 +1873,28 @@ class LabJobStore:
                     job_version=version,
                 )
             next_version = version + 1
+            connection.execute(
+                """
+                UPDATE lab_shard
+                SET status = ?, version = version + 1,
+                    worker_id = NULL, scheduler_fencing_token = NULL,
+                    claim_token = NULL, claimed_at = NULL,
+                    heartbeat_at = NULL, lease_expires_at = NULL,
+                    result_manifest_hash = NULL, failure_json = NULL,
+                    finished_at = NULL, checkpoint_json = NULL,
+                    updated_at = ?
+                WHERE job_id = ? AND status IN (?, ?, ?, ?)
+                """,
+                (
+                    ShardStatus.QUEUED.value,
+                    _dump_time(now),
+                    str(command.job_id),
+                    ShardStatus.QUEUED.value,
+                    ShardStatus.RUNNING.value,
+                    ShardStatus.CHECKPOINTED.value,
+                    ShardStatus.FAILED.value,
+                ),
+            )
             connection.execute(
                 """
                 UPDATE lab_job
@@ -1978,12 +2126,13 @@ class LabJobStore:
                         scheduler_fencing_token = NULL, claim_token = NULL,
                         claimed_at = NULL, heartbeat_at = NULL,
                         lease_expires_at = NULL, updated_at = ?
-                    WHERE shard_id = ? AND version = ? AND status = ?
+                    WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
                     """,
                     (
                         ShardStatus.QUEUED.value,
                         version + 1,
                         _dump_time(current),
+                        str(stale["job_id"]),
                         str(stale["shard_id"]),
                         version,
                         ShardStatus.RUNNING.value,
@@ -2102,7 +2251,7 @@ class LabJobStore:
                     claim_generation = ?, claimed_at = ?, heartbeat_at = ?,
                     lease_expires_at = ?, result_manifest_hash = NULL,
                     failure_json = NULL, finished_at = NULL, updated_at = ?
-                WHERE shard_id = ? AND version = ? AND status = ?
+                WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
                 """,
                 (
                     ShardStatus.RUNNING.value,
@@ -2116,6 +2265,7 @@ class LabJobStore:
                     _dump_time(current),
                     _dump_time(expires_at),
                     _dump_time(current),
+                    str(row["job_id"]),
                     str(row["shard_id"]),
                     shard_version,
                     ShardStatus.QUEUED.value,
@@ -2211,12 +2361,19 @@ class LabJobStore:
                     )
                 return record.receipt
             shard_row = connection.execute(
-                "SELECT * FROM lab_shard WHERE shard_id = ?",
-                (str(validated.shard_id),),
+                "SELECT * FROM lab_shard WHERE job_id = ? AND shard_id = ?",
+                (str(validated.job_id), str(validated.shard_id)),
             ).fetchone()
             job_row = self._load_job_row(connection, validated.job_id)
-            if shard_row is None or job_row is None:
-                raise InvalidStoredJobError("worker report references an unknown job or shard")
+            if job_row is None or shard_row is None:
+                receipt = self._report_receipt(
+                    validated,
+                    status="rejected",
+                    reason="job_not_found" if job_row is None else "shard_not_found",
+                    now=current,
+                )
+                self._record_worker_report(connection, validated, receipt, now=current)
+                return receipt
 
             rejection: str | None = None
             if str(shard_row["job_id"]) != str(validated.job_id):
@@ -2286,13 +2443,14 @@ class LabJobStore:
                     """
                     UPDATE lab_shard
                     SET heartbeat_at = ?, lease_expires_at = ?, version = ?, updated_at = ?
-                    WHERE shard_id = ? AND version = ?
+                    WHERE job_id = ? AND shard_id = ? AND version = ?
                     """,
                     (
                         _dump_time(current),
                         _dump_time(expires_at),
                         shard_version + 1,
                         _dump_time(current),
+                        str(validated.job_id),
                         str(validated.shard_id),
                         shard_version,
                     ),
@@ -2304,7 +2462,7 @@ class LabJobStore:
                     UPDATE lab_shard
                     SET status = ?, version = ?, result_manifest_hash = ?,
                         failure_json = NULL, finished_at = ?, updated_at = ?
-                    WHERE shard_id = ? AND version = ?
+                    WHERE job_id = ? AND shard_id = ? AND version = ?
                     """,
                     (
                         ShardStatus.SUCCEEDED.value,
@@ -2312,6 +2470,7 @@ class LabJobStore:
                         body.result_manifest_hash,
                         _dump_time(current),
                         _dump_time(current),
+                        str(validated.job_id),
                         str(validated.shard_id),
                         shard_version,
                     ),
@@ -2365,7 +2524,7 @@ class LabJobStore:
                     UPDATE lab_shard
                     SET status = ?, version = ?, failure_json = ?,
                         result_manifest_hash = NULL, finished_at = ?, updated_at = ?
-                    WHERE shard_id = ? AND version = ?
+                    WHERE job_id = ? AND shard_id = ? AND version = ?
                     """,
                     (
                         ShardStatus.FAILED.value,
@@ -2373,6 +2532,7 @@ class LabJobStore:
                         body.failure_json,
                         _dump_time(current),
                         _dump_time(current),
+                        str(validated.job_id),
                         str(validated.shard_id),
                         shard_version,
                     ),
@@ -2396,13 +2556,14 @@ class LabJobStore:
                         """
                         UPDATE lab_shard
                         SET status = ?, version = ?, finished_at = ?, updated_at = ?
-                        WHERE shard_id = ? AND version = ?
+                        WHERE job_id = ? AND shard_id = ? AND version = ?
                         """,
                         (
                             ShardStatus.CANCELLED.value,
                             shard_version + 1,
                             _dump_time(current),
                             _dump_time(current),
+                            str(validated.job_id),
                             str(validated.shard_id),
                             shard_version,
                         ),
@@ -2451,12 +2612,13 @@ class LabJobStore:
                             scheduler_fencing_token = NULL, claim_token = NULL,
                             claimed_at = NULL, heartbeat_at = NULL,
                             lease_expires_at = NULL, updated_at = ?
-                        WHERE shard_id = ? AND version = ?
+                        WHERE job_id = ? AND shard_id = ? AND version = ?
                         """,
                         (
                             ShardStatus.QUEUED.value,
                             shard_version + 1,
                             _dump_time(current),
+                            str(validated.job_id),
                             str(validated.shard_id),
                             shard_version,
                         ),
@@ -2692,7 +2854,7 @@ _V2_SCHEMA_STATEMENTS = (
 
 _V3_SHARD_TABLE_STATEMENT = f"""
 CREATE TABLE IF NOT EXISTS lab_shard (
-    shard_id TEXT PRIMARY KEY,
+    shard_id TEXT NOT NULL,
     job_id TEXT NOT NULL REFERENCES lab_job(job_id) ON DELETE CASCADE,
     shard_index INTEGER NOT NULL CHECK (
         typeof(shard_index) = 'integer' AND shard_index >= 0
@@ -2725,7 +2887,22 @@ CREATE TABLE IF NOT EXISTS lab_shard (
     checkpoint_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, shard_id),
     UNIQUE (job_id, shard_index)
+)
+"""
+
+_V3_ARTIFACT_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_artifact (
+    artifact_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES lab_job(job_id) ON DELETE CASCADE,
+    shard_id TEXT,
+    artifact_type TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id, shard_id)
+        REFERENCES lab_shard(job_id, shard_id) ON DELETE CASCADE
 )
 """
 
@@ -2733,8 +2910,8 @@ _V3_REPORT_TABLE_STATEMENT = """
 CREATE TABLE IF NOT EXISTS lab_worker_report (
     report_id TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
-    job_id TEXT NOT NULL REFERENCES lab_job(job_id) ON DELETE CASCADE,
-    shard_id TEXT NOT NULL REFERENCES lab_shard(shard_id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
+    shard_id TEXT NOT NULL,
     report_type TEXT NOT NULL CHECK (
         report_type IN ('heartbeat', 'shard_succeeded', 'shard_failed', 'worker_stopped')
     ),
@@ -2756,10 +2933,16 @@ CREATE TABLE IF NOT EXISTS lab_worker_report (
 
 _V3_REPORT_INDEX_STATEMENT = """
 CREATE INDEX IF NOT EXISTS ix_lab_worker_report_shard
-ON lab_worker_report(shard_id, applied_at)
+ON lab_worker_report(job_id, shard_id, applied_at)
 """
 
 _SCHEMA_STATEMENTS = tuple(
-    _V3_SHARD_TABLE_STATEMENT if "CREATE TABLE IF NOT EXISTS lab_shard" in statement else statement
+    (
+        _V3_SHARD_TABLE_STATEMENT
+        if "CREATE TABLE IF NOT EXISTS lab_shard" in statement
+        else _V3_ARTIFACT_TABLE_STATEMENT
+        if "CREATE TABLE IF NOT EXISTS lab_artifact" in statement
+        else statement
+    )
     for statement in _V2_SCHEMA_STATEMENTS
 ) + (_V3_REPORT_TABLE_STATEMENT, _V3_REPORT_INDEX_STATEMENT)

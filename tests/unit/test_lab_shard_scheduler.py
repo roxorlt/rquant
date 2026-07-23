@@ -17,6 +17,7 @@ from rquant.lab_shard_protocol import (
     LabReportSpool,
     LabReportSpoolEntry,
     LabShardHeartbeat,
+    LabWorkerReport,
 )
 
 from .test_lab_jobs import NOW, _lease, _submit_job
@@ -86,6 +87,72 @@ def test_scheduler_publishes_only_bounded_claims(tmp_path: Path) -> None:
     assert len(claims.pending()) == 1
     shards = LabJobReader(store.path).list_shards(job.job_id)
     assert sum(shard.status.value == "running" for shard in shards) == 1
+
+
+def test_scheduler_rotates_fairly_across_bounded_claim_ticks(tmp_path: Path) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a", "worker-b", "worker-c"),
+        max_claims=1,
+    )
+    _planned_job(store, scheduler, count=3)
+
+    published = []
+    for offset in (2, 3, 4):
+        clock[0] = NOW + timedelta(seconds=offset)
+        published.append(scheduler.run_once().claims_published)
+
+    assert published == [1, 1, 1]
+    assert [entry.claim.worker_id for entry in claims.pending()] == [
+        "worker-a",
+        "worker-b",
+        "worker-c",
+    ]
+
+
+def test_scheduler_restart_seeds_rotation_from_new_fencing_generation(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    store, first = _scheduler(
+        tmp_path,
+        clock=clock,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a", "worker-b", "worker-c"),
+        max_claims=1,
+    )
+    _planned_job(store, first, count=2)
+    clock[0] = NOW + timedelta(seconds=2)
+    assert first.run_once().claims_published == 1
+    first.release()
+
+    restarted = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a", "worker-b", "worker-c"),
+        shard_lease_seconds=30,
+        max_claims_per_tick=1,
+        clock=lambda: clock[0],
+    )
+    clock[0] = NOW + timedelta(seconds=3)
+
+    result = restarted.run_once()
+
+    assert result.claims_published == 1
+    assert [entry.claim.worker_id for entry in claims.pending()] == [
+        "worker-a",
+        "worker-b",
+    ]
 
 
 def test_scheduler_consumes_only_bounded_reports(tmp_path: Path) -> None:
@@ -194,6 +261,55 @@ def test_bad_and_symlink_reports_do_not_block_valid_report(tmp_path: Path) -> No
     assert result.reports_accepted == 1
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
     assert reports.pending() == ()
+
+
+def test_unknown_job_and_shard_reports_are_rejected_without_blocking_tick(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW]
+    reports = LabReportSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(tmp_path, clock=clock, report_spool=reports)
+    job = _planned_job(store, scheduler)
+    assert scheduler.lease is not None
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+
+    def report_with_identity(*, job_id, shard_id) -> LabWorkerReport:
+        return LabWorkerReport(
+            report_id=uuid4(),
+            job_id=job_id,
+            shard_id=shard_id,
+            spec_hash=claim.spec_hash,
+            payload_hash=claim.payload_hash,
+            worker_id=claim.worker_id,
+            claim_token=claim.claim_token,
+            claim_generation=claim.claim_generation,
+            scheduler_fencing_token=claim.scheduler_fencing_token,
+            reported_at=NOW + timedelta(seconds=3),
+            body=LabShardHeartbeat(lease_extension_seconds=30),
+        )
+
+    unknown_job = report_with_identity(job_id=uuid4(), shard_id=claim.shard_id)
+    unknown_shard = report_with_identity(job_id=job.job_id, shard_id=uuid4())
+    valid = _report(claim, LabShardHeartbeat(lease_extension_seconds=30))
+    for report in (unknown_job, unknown_shard, valid):
+        reports.publish(report)
+    clock[0] = NOW + timedelta(seconds=3)
+
+    result = scheduler.run_once()
+
+    assert result.reports_processed == 3
+    assert result.reports_rejected == 2
+    assert result.reports_accepted == 1
+    assert reports.pending() == ()
+    reader = LabJobReader(store.path)
+    assert reader.get_worker_report(unknown_job.report_id).receipt.reason == "job_not_found"
+    assert reader.get_worker_report(unknown_shard.report_id).receipt.reason == "shard_not_found"
 
 
 def test_scheduler_takeover_does_not_checkpoint_sharded_job_before_reclaim(

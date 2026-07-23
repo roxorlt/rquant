@@ -16,6 +16,7 @@ from rquant.lab_job_protocol import (
     PauseJobCommand,
     RequestContentConflictError,
     ResumeJobCommand,
+    RetryJobCommand,
 )
 from rquant.lab_jobs import (
     ControlIntent,
@@ -160,6 +161,66 @@ def test_plan_job_is_deterministic_idempotent_and_replan_conflicts(tmp_path: Pat
             now=NOW + timedelta(seconds=3),
         )
     assert LabJobReader(store.path).list_shards(job_id) == first
+
+
+def test_same_deterministic_plan_is_job_scoped_in_ledger(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    first_job = _submit_job(store, lease)
+    second_job = _submit_job(store, lease)
+    definitions = (_definition(0), _definition(1))
+
+    first = store.plan_job(
+        first_job.job_id,
+        definitions,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    second = store.plan_job(
+        second_job.job_id,
+        definitions,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert tuple(shard.shard_id for shard in first) == tuple(shard.shard_id for shard in second)
+    with sqlite3.connect(store.path) as connection:
+        primary_key = tuple(
+            str(row[1])
+            for row in sorted(
+                connection.execute("PRAGMA table_info(lab_shard)"),
+                key=lambda row: int(row[5]),
+            )
+            if int(row[5]) > 0
+        )
+    assert primary_key == ("job_id", "shard_id")
+
+
+def test_job_scoped_claim_mutates_only_one_matching_shard(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    jobs = (_submit_job(store, lease), _submit_job(store, lease))
+    for job in jobs:
+        store.plan_job(
+            job.job_id,
+            (_definition(0),),
+            lease=lease,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert claim is not None
+    shards = tuple(LabJobReader(store.path).list_shards(job.job_id)[0] for job in jobs)
+    assert sum(shard.status is ShardStatus.RUNNING for shard in shards) == 1
+    assert sum(shard.status is ShardStatus.QUEUED for shard in shards) == 1
 
 
 def test_two_workers_can_claim_only_one_shard(tmp_path: Path) -> None:
@@ -328,6 +389,65 @@ def test_scheduler_takeover_fences_old_report_and_reclaims_shard(tmp_path: Path)
     assert LabJobReader(store.path).list_shards(job_id)[0].claim_token == fresh.claim_token
 
 
+def test_retry_atomically_fences_old_nonterminal_claims(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3)
+    failed_claim = _claim(store, lease, worker="worker-failed")
+    stale_claim = _claim(store, lease, worker="worker-stale", now_offset=3)
+    failed = store.apply_worker_report(
+        _report(
+            failed_claim,
+            LabShardFailed(failure_json='{"kind":"source"}'),
+            offset=4,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert failed.status == "accepted"
+    failed_job = LabJobReader(store.path).get_job(job_id)
+    assert failed_job is not None and failed_job.status is JobStatus.FAILED
+
+    retry = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=job_id,
+                expected_version=failed_job.version,
+                reason="source recovered",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert retry.status == "applied"
+    reset = LabJobReader(store.path).list_shards(job_id)
+    assert all(shard.status is ShardStatus.QUEUED for shard in reset)
+    assert all(shard.claim_token is None for shard in reset)
+
+    _claim(store, lease, worker="worker-new-a", now_offset=6)
+    fresh_for_same_shard = _claim(store, lease, worker="worker-new-b", now_offset=7)
+    assert fresh_for_same_shard.shard_id == stale_claim.shard_id
+    assert fresh_for_same_shard.claim_generation > stale_claim.claim_generation
+
+    stale = store.apply_worker_report(
+        _report(
+            stale_claim,
+            LabShardSucceeded(result_manifest_hash="8" * 64),
+            offset=8,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+    )
+    assert stale.status == "rejected"
+    assert stale.reason in {
+        "stale_claim_worker",
+        "stale_claim_token",
+        "stale_claim_generation",
+    }
+    current = LabJobReader(store.path).list_shards(job_id)[stale_claim.shard_index]
+    assert current.status is ShardStatus.RUNNING
+    assert current.result_manifest_hash is None
+
+
 def test_report_commit_replay_is_exactly_once_and_conflict_is_rejected(tmp_path: Path) -> None:
     store, lease, job_id = _setup(tmp_path)
     claim = _claim(store, lease)
@@ -463,6 +583,47 @@ def test_cancel_first_rejects_success_then_stopped_confirms_cancel(tmp_path: Pat
         now=NOW + timedelta(seconds=5),
     )
     assert stopped.status == "accepted"
+    assert LabJobReader(store.path).get_job(job_id).status is JobStatus.CANCELLED
+
+
+def test_queued_cancel_atomically_terminalizes_nonterminal_shards(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    before = LabJobReader(store.path).list_shards(job_id)
+
+    receipt = _cancel(store, lease, job_id, offset=2)
+
+    assert receipt.status == "applied"
+    job = LabJobReader(store.path).get_job(job_id)
+    shards = LabJobReader(store.path).list_shards(job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+    assert all(shard.status is ShardStatus.CANCELLED for shard in shards)
+    assert [shard.version for shard in shards] == [shard.version + 1 for shard in before]
+    assert all(shard.finished_at == NOW + timedelta(seconds=2) for shard in shards)
+
+
+def test_checkpointed_cancel_preserves_success_and_terminalizes_remaining_shards(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    claim = _claim(store, lease)
+    _pause(store, lease, job_id, offset=3)
+    success = store.apply_worker_report(
+        _report(claim, LabShardSucceeded(result_manifest_hash="6" * 64), offset=4),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert success.status == "accepted"
+    before = LabJobReader(store.path).list_shards(job_id)
+    assert LabJobReader(store.path).get_job(job_id).status is JobStatus.CHECKPOINTED
+
+    receipt = _cancel(store, lease, job_id, offset=5)
+
+    assert receipt.status == "applied"
+    shards = LabJobReader(store.path).list_shards(job_id)
+    assert shards[0] == before[0]
+    assert shards[1].status is ShardStatus.CANCELLED
+    assert shards[1].version == before[1].version + 1
+    assert shards[1].finished_at == NOW + timedelta(seconds=5)
     assert LabJobReader(store.path).get_job(job_id).status is JobStatus.CANCELLED
 
 

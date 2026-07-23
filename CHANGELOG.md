@@ -33,6 +33,12 @@
 
 ### Fixed
 
+- **Strategy Lab 分片控制面规格缺口**：`lab_shard` 改为 `(job_id, shard_id)` 复合主键，
+  同一确定性计划可安全用于不同 job；retry 会原子重置 nonterminal/failed shard 并永久废止
+  旧 claim。scheduler claim 发布改为有界公平轮转，重启起点由 lease fencing generation
+  确定。协议合法但未知 job/shard 的 report 会持久 rejected receipt 并继续消费队列；
+  queued/checkpointed job 直接取消时会在同一事务终态化其 nonterminal shard。
+
 - **Stage 1 分钟修复误把陈旧只读副本判为运营库缺数**：正式策略回补完成后若暂停了
   `rquant-replica-sync.timer`，`research-repair-minute` 会继续扫描回补前的
   `rquant_ro.duckdb`，并在长时间覆盖计算后错误报告主库缺少完整会话。分钟修复现在以

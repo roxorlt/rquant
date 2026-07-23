@@ -98,7 +98,17 @@ class LabScheduler:
         self.max_claims_per_tick = max_claims_per_tick
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
+        self._claim_cursor = 0
+        self._claim_cursor_fence: int | None = None
         self._stop = Event()
+
+    def _seed_claim_cursor(self, lease: LabLeaseRecord) -> None:
+        if self._claim_cursor_fence == lease.fencing_token:
+            return
+        self._claim_cursor_fence = lease.fencing_token
+        self._claim_cursor = (
+            (lease.fencing_token - 1) % len(self.claim_worker_ids) if self.claim_worker_ids else 0
+        )
 
     def _start_tick(self) -> bool:
         if self.lease is None:
@@ -109,6 +119,7 @@ class LabScheduler:
                 now=now,
             )
             self.lease = lease
+            self._seed_claim_cursor(lease)
             return True
         now = self.clock()
         if now >= self.lease.heartbeat_at + timedelta(seconds=self.heartbeat_seconds):
@@ -208,8 +219,13 @@ class LabScheduler:
                     reports_rejected += 1
                 self.report_spool.ack(entry, receipt)
         claims_published = 0
-        if self.claim_spool is not None:
-            for worker_id in self.claim_worker_ids[: self.max_claims_per_tick]:
+        if self.claim_spool is not None and self.claim_worker_ids:
+            worker_count = len(self.claim_worker_ids)
+            start = self._claim_cursor
+            inspected = 0
+            while inspected < worker_count and claims_published < self.max_claims_per_tick:
+                worker_id = self.claim_worker_ids[(start + inspected) % worker_count]
+                inspected += 1
                 lease, mutation_now = self._mutation_context()
                 claim = self.store.claim_next_shard(
                     worker_id=worker_id,
@@ -221,6 +237,7 @@ class LabScheduler:
                     continue
                 self.claim_spool.publish(claim)
                 claims_published += 1
+            self._claim_cursor = (start + inspected) % worker_count
         return SchedulerTickResult(
             lease_acquired=acquired,
             processed=processed,
