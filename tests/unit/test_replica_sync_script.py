@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,6 +17,7 @@ def _project(tmp_path: Path) -> Path:
     (project / "scripts").mkdir(parents=True)
     (project / "data").mkdir()
     (project / ".venv").symlink_to((ROOT / ".venv").resolve(), target_is_directory=True)
+    (project / "src").symlink_to(ROOT / "src", target_is_directory=True)
     shutil.copy2(
         ROOT / "scripts" / "sync-readonly-replica.sh",
         project / "scripts" / "sync-readonly-replica.sh",
@@ -59,6 +61,13 @@ def test_replica_consolidates_source_wal_before_atomic_publish(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     assert _marker(replica) == ["base", "wal"]
     assert not Path(f"{replica}.wal").exists()
+    generation = json.loads(
+        Path(f"{replica}.generation.json").read_text(encoding="utf-8")
+    )
+    assert generation["schema_version"] == 1
+    assert generation["source_database"] == str(main.resolve())
+    assert generation["source_before"] == generation["source_after"]
+    assert generation["replica"]["size"] == replica.stat().st_size
 
 
 def test_invalid_source_preserves_previous_verified_replica(tmp_path: Path) -> None:
@@ -70,9 +79,12 @@ def test_invalid_source_preserves_previous_verified_replica(tmp_path: Path) -> N
     conn.execute("INSERT INTO marker VALUES ('good')")
     conn.close()
     assert _run(project).returncode == 0
+    generation_path = Path(f"{replica}.generation.json")
+    previous_generation = generation_path.read_bytes()
 
     main.write_bytes(b"not a duckdb database")
     result = _run(project)
 
     assert result.returncode != 0
     assert _marker(replica) == ["good"]
+    assert generation_path.read_bytes() == previous_generation

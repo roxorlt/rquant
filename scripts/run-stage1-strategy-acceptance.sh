@@ -223,10 +223,9 @@ if [[ "${DISPOSITION}" != "ready" ]]; then
 fi
 
 REPAIR_PREVIEW="${RUN_DIR}/minute-repair-preview.json"
-run_json "${REPAIR_PREVIEW}" \
-    "${RQUANT_BIN}" research-repair-minute --manifest-id "${MANIFEST_ID}"
-
 if (( ! APPLY )); then
+    run_json "${REPAIR_PREVIEW}" \
+        "${RQUANT_BIN}" research-repair-minute --manifest-id "${MANIFEST_ID}"
     echo "ROLLOUT_RESULT=dry_run"
     echo "ROLLOUT_EVIDENCE=${RUN_DIR}"
     exit 0
@@ -237,6 +236,9 @@ command -v timeout >/dev/null
 configure_rollout_hard_deadline
 trap on_exit EXIT
 capture_and_stop_mutating_units
+run_guarded "${PROJECT_DIR}/scripts/sync-readonly-replica.sh"
+run_guarded "${RQUANT_BIN}" research-repair-minute \
+    --manifest-id "${MANIFEST_ID}" > "${REPAIR_PREVIEW}"
 
 REPAIR_STATUS="$(json_value "${REPAIR_PREVIEW}" status)"
 case "${REPAIR_STATUS}" in

@@ -52,6 +52,11 @@ from rquant.data_metadata import (
     DatasetSnapshot,
     DatasetSnapshotBinding,
 )
+from rquant.replica_generation import (
+    capture_database_watermark,
+    replica_generation_path,
+    write_replica_generation_metadata,
+)
 from rquant.security_status import SecurityStatusWriteConflictError
 from rquant.storage.duckdb import (
     _coverage_from_row,
@@ -1510,6 +1515,10 @@ def refresh_readonly_replica(
     db_path = db_path or settings.duckdb_path
     replica_path = replica_path or settings.duckdb_readonly_path_resolved
     tmp = replica_path.with_name(replica_path.name + ".sync-tmp")
+    generation_path = replica_generation_path(replica_path)
+    generation_tmp = generation_path.with_name(
+        generation_path.name + ".sync-tmp"
+    )
     wal_path = db_path.with_name(db_path.name + ".wal")
     guard: duckdb.DuckDBPyConnection | None = None
     verify: duckdb.DuckDBPyConnection | None = None
@@ -1519,6 +1528,7 @@ def refresh_readonly_replica(
             raise RuntimeError(
                 f"主库存在活跃 WAL（{wal_path.name}），跳过副本刷新"
             )
+        source_before = capture_database_watermark(db_path)
         shutil.copy2(db_path, tmp)
         verify = duckdb.connect(str(tmp), read_only=True)
         verify.execute("SELECT COUNT(*) FROM daily_bar").fetchone()
@@ -1532,9 +1542,17 @@ def refresh_readonly_replica(
         except Exception as exc:
             raise RuntimeError(f"guard close failed: {exc}") from exc
         guard = None
+        write_replica_generation_metadata(
+            primary_path=db_path,
+            replica_path=tmp,
+            output_path=generation_tmp,
+            source_before=source_before,
+        )
         os.replace(tmp, replica_path)
+        os.replace(generation_tmp, generation_path)
     except Exception as e:
         _remove_replica_temp_safely(tmp)
+        _remove_replica_temp_safely(generation_tmp)
         return False, f"副本刷新失败：{e}"
     finally:
         if verify is not None:

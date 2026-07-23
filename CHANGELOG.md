@@ -25,6 +25,15 @@
 
 ### Fixed
 
+- **Stage 1 分钟修复误把陈旧只读副本判为运营库缺数**：正式策略回补完成后若暂停了
+  `rquant-replica-sync.timer`，`research-repair-minute` 会继续扫描回补前的
+  `rquant_ro.duckdb`，并在长时间覆盖计算后错误报告主库缺少完整会话。分钟修复现在以
+  副本同步时原子发布的 generation sidecar 为证据，精确绑定同步前后主库/WAL 的
+  device、inode、size、mtime_ns 水位以及发布后的副本指纹；大扫描前后和 apply 发布边界
+  都要求代际稳定，旧副本即使被 touch 或迁移也不能冒充当前数据。Stage 1 apply 流程先
+  停止写者、刷新副本，再生成与 apply 绑定且受次日 09:10 硬截止保护的修复计划。项目
+  版本从 `0.26.5` 更新到 `0.26.6`。
+
 - **成长板回补覆盖规划反复扫描原始分钟表**：运营库分钟完整性检查改为跨日期的 8192
   session 有界批次，依靠精确 `(ts_code, trade_date)` join 保持逐会话口径；`combined`
   模式只把运营库缺口交给研究湖，同时仍保留完整 artifact provenance。2026-04-01 至
