@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -1062,6 +1063,74 @@ def test_readonly_reader_sees_committed_wal_data(tmp_path: Path) -> None:
     assert reader.get_job(envelope.command.job_id) is not None
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         reader.execute_for_test("DELETE FROM lab_job")
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("request_id", str(UUID("00000000-0000-0000-0000-000000000001"))),
+        ("content_hash", "f" * 64),
+        ("job_id", str(UUID("00000000-0000-0000-0000-000000000002"))),
+        ("status", "rejected"),
+        ("reason", "tampered"),
+    ],
+)
+def test_reader_and_replay_share_full_receipt_consistency_validation(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    store.apply_command(envelope, lease=lease, now=NOW)
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT receipt_json FROM lab_command WHERE request_id = ?",
+            (str(envelope.request_id),),
+        ).fetchone()
+        payload = json.loads(str(row[0]))
+        payload[field] = replacement
+        connection.execute(
+            "UPDATE lab_command SET receipt_json = ? WHERE request_id = ?",
+            (json.dumps(payload), str(envelope.request_id)),
+        )
+
+    with pytest.raises(InvalidStoredJobError):
+        LabJobReader(store.path).get_command(envelope.request_id)
+    with pytest.raises(InvalidStoredJobError):
+        store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement"),
+    [
+        ("content_hash", "f" * 64),
+        ("command_type", "cancel"),
+        ("job_id", str(UUID("00000000-0000-0000-0000-000000000003"))),
+        ("status", "rejected"),
+        ("reason", "tampered"),
+    ],
+)
+def test_reader_and_replay_share_full_command_column_consistency_validation(
+    tmp_path: Path,
+    column: str,
+    replacement: str,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    store.apply_command(envelope, lease=lease, now=NOW)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            f"UPDATE lab_command SET {column} = ? WHERE request_id = ?",
+            (replacement, str(envelope.request_id)),
+        )
+
+    with pytest.raises(InvalidStoredJobError):
+        LabJobReader(store.path).get_command(envelope.request_id)
+    with pytest.raises(InvalidStoredJobError):
+        store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
 
 
 @pytest.mark.parametrize(

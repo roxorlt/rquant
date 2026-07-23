@@ -267,6 +267,39 @@ def test_bad_json_is_quarantined_and_does_not_block_valid_command(
     assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
 
 
+def test_semantic_request_conflict_is_quarantined_and_does_not_block_next_command(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+    scheduler = _scheduler(store, spool)
+    scheduler.run_once()
+    assert scheduler.lease is not None
+    request_id = uuid4()
+    accepted = LabCommandEnvelope(
+        request_id=request_id,
+        command=SubmitJobCommand(job_id=uuid4(), spec=_spec(), max_attempts=3),
+    )
+    store.apply_command(accepted, lease=scheduler.lease, now=NOW)
+    conflict = LabCommandEnvelope(
+        request_id=request_id,
+        command=SubmitJobCommand(job_id=uuid4(), spec=_spec(), max_attempts=3),
+    )
+    valid = _envelope()
+    spool.publish(conflict)
+    spool.publish(valid)
+
+    result = scheduler.run_once()
+
+    assert result.quarantined == 1
+    assert result.processed == 1
+    assert result.applied == 1
+    assert spool.pending() == ()
+    quarantine_records = tuple(spool.quarantine_dir.glob("*.bad.json"))
+    assert len(quarantine_records) == 1
+    assert "request_content_conflict" in quarantine_records[0].read_text(encoding="utf-8")
+    assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
+
+
 def test_second_scheduler_is_refused_while_first_lease_is_valid(
     tmp_path: Path,
 ) -> None:

@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import heapq
 import json
 import os
+import re
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -125,6 +132,8 @@ class LabCommandReceipt(LabProtocolModel):
 class LabSpoolEntry(LabProtocolModel):
     path: Path
     envelope: LabCommandEnvelope
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
 
 
 class LabAcknowledgedCommand(LabProtocolModel):
@@ -140,13 +149,37 @@ class LabQuarantinedCommand(LabProtocolModel):
 class LabCommandSpool:
     """Atomic filesystem inbox with durable receipts and quarantine."""
 
+    _PENDING_NAME = re.compile(
+        r"(?:(?P<sequence>[0-9]{20})-)?"
+        r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
+    )
+    _ACK_NAME = re.compile(
+        r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
+    )
+
     def __init__(self, root: Path) -> None:
-        self.root = Path(root)
+        self.root = Path(os.path.abspath(root))
         self.pending_dir = self.root / "pending"
         self.ack_dir = self.root / "ack"
         self.quarantine_dir = self.root / "quarantine"
+        self._lock_path = self.root / ".spool.lock"
+        self._sequence_path = self.root / ".delivery-sequence"
+        self._thread_lock = RLock()
         for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def _exclusive_lock(self) -> Iterator[None]:
+        with self._thread_lock:
+            descriptor = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -173,32 +206,217 @@ class LabCommandSpool:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def publish(self, envelope: LabCommandEnvelope) -> LabSpoolEntry:
+    def _next_sequence_locked(self) -> int:
+        if self._sequence_path.exists():
+            raw = self._sequence_path.read_text(encoding="ascii").strip()
+            if not raw.isdigit():
+                raise InvalidCommandEnvelopeError("invalid durable delivery sequence")
+            current = int(raw)
+        else:
+            current = 0
+        sequence = current + 1
+        temporary = self.root / f".{self._sequence_path.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(f"{sequence}\n".encode("ascii"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._sequence_path)
+            self._fsync_directory(self.root)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return sequence
+
+    @staticmethod
+    def _direct_child_name(path: Path, parent: Path) -> str:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        expected_parent = Path(parent)
+        if candidate.parent != expected_parent:
+            raise InvalidCommandEnvelopeError(
+                f"unsafe spool path outside {expected_parent.name}: {candidate}"
+            )
+        return candidate.name
+
+    @staticmethod
+    def _read_regular_child(path: Path, parent: Path) -> tuple[Path, bytes, os.stat_result]:
+        name = LabCommandSpool._direct_child_name(path, parent)
+        normalized = Path(os.path.abspath(parent)) / name
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(parent, directory_flags)
+        try:
+            try:
+                descriptor = os.open(name, file_flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise InvalidCommandEnvelopeError(f"unsafe spool file {name}: {exc}") from exc
+            try:
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise InvalidCommandEnvelopeError(f"spool file {name} is not regular")
+                chunks: list[bytes] = []
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    chunks.append(chunk)
+                return normalized, b"".join(chunks), file_stat
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory_fd)
+
+    @classmethod
+    def _pending_name_parts(cls, name: str) -> tuple[int | None, UUID]:
+        match = cls._PENDING_NAME.fullmatch(name)
+        if match is None:
+            raise InvalidCommandEnvelopeError(f"invalid pending command basename: {name}")
+        sequence = match.group("sequence")
+        return (int(sequence) if sequence is not None else None, UUID(match.group("request_id")))
+
+    @classmethod
+    def _ack_request_id(cls, name: str) -> UUID:
+        match = cls._ACK_NAME.fullmatch(name)
+        if match is None:
+            raise InvalidCommandEnvelopeError(f"invalid ack basename: {name}")
+        return UUID(match.group("request_id"))
+
+    def _pending_for_request_locked(self, request_id: UUID) -> Path | None:
+        matches: list[Path] = []
+        for candidate in self.pending_dir.glob("*.json"):
+            try:
+                _sequence, candidate_request_id = self._pending_name_parts(candidate.name)
+            except InvalidCommandEnvelopeError:
+                continue
+            if candidate_request_id == request_id:
+                matches.append(candidate)
+        if len(matches) > 1:
+            raise InvalidCommandEnvelopeError(
+                f"multiple pending commands for request_id {request_id}"
+            )
+        return matches[0] if matches else None
+
+    def publish(
+        self,
+        envelope: LabCommandEnvelope,
+    ) -> LabSpoolEntry | LabAcknowledgedCommand:
         validated = LabCommandEnvelope.model_validate(envelope)
-        target = self.pending_dir / f"{validated.request_id}.json"
         payload = validated.model_dump_json().encode("utf-8")
-        created = self._publish_no_clobber(target, payload)
-        if not created:
-            existing = self.load(target).envelope
-            if existing.content_hash != validated.content_hash:
-                raise RequestContentConflictError(
-                    f"request_id {validated.request_id} already has different content"
-                )
-        return LabSpoolEntry(path=target, envelope=validated)
+        with self._exclusive_lock():
+            ack_path = self.ack_dir / f"{validated.request_id}.json"
+            pending_path = self._pending_for_request_locked(validated.request_id)
+            if os.path.lexists(ack_path):
+                receipt = self.load_receipt(ack_path)
+                if pending_path is not None:
+                    pending = self.load(pending_path)
+                    if pending.envelope.content_hash != receipt.content_hash:
+                        raise RequestContentConflictError(
+                            f"request_id {validated.request_id} has conflicting ack and pending"
+                        )
+                if receipt.content_hash != validated.content_hash:
+                    raise RequestContentConflictError(
+                        f"request_id {validated.request_id} already has different content"
+                    )
+                if receipt.job_id != validated.command.job_id:
+                    raise InvalidCommandEnvelopeError(
+                        f"ack job_id does not match request_id {validated.request_id}"
+                    )
+                return LabAcknowledgedCommand(path=ack_path, receipt=receipt)
+            if pending_path is not None:
+                existing = self.load(pending_path)
+                if existing.envelope.content_hash != validated.content_hash:
+                    raise RequestContentConflictError(
+                        f"request_id {validated.request_id} already has different content"
+                    )
+                return existing
+            sequence = self._next_sequence_locked()
+            target = self.pending_dir / f"{sequence:020d}-{validated.request_id}.json"
+            if not self._publish_no_clobber(target, payload):
+                raise RequestContentConflictError(f"delivery sequence {sequence} already exists")
+            return self.load(target)
 
     def load(self, path: Path) -> LabSpoolEntry:
-        candidate = Path(path)
+        candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
+        _sequence, filename_request_id = self._pending_name_parts(candidate.name)
         try:
-            envelope = LabCommandEnvelope.model_validate_json(candidate.read_bytes())
+            envelope = LabCommandEnvelope.model_validate_json(payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command envelope {candidate.name}: {exc}"
             ) from exc
-        return LabSpoolEntry(path=candidate, envelope=envelope)
+        if envelope.request_id != filename_request_id:
+            raise InvalidCommandEnvelopeError(
+                f"command request_id does not match basename {candidate.name}"
+            )
+        return LabSpoolEntry(
+            path=candidate,
+            envelope=envelope,
+            device=file_stat.st_dev,
+            inode=file_stat.st_ino,
+        )
+
+    @staticmethod
+    def _delivery_key(path: Path) -> tuple[int, int, str]:
+        try:
+            sequence, _request_id = LabCommandSpool._pending_name_parts(path.name)
+        except InvalidCommandEnvelopeError:
+            return (0, 0, path.name)
+        if sequence is None:
+            return (0, 0, path.name)
+        return (1, sequence, path.name)
+
+    def _apply_command_precedence(self, paths: tuple[Path, ...]) -> tuple[Path, ...]:
+        entries: dict[int, LabSpoolEntry] = {}
+        for index, path in enumerate(paths):
+            try:
+                entries[index] = self.load(path)
+            except InvalidCommandEnvelopeError:
+                continue
+        edges: list[set[int]] = [set() for _path in paths]
+        indegree = [0 for _path in paths]
+
+        def add_edge(before: int, after: int) -> None:
+            if before != after and after not in edges[before]:
+                edges[before].add(after)
+                indegree[after] += 1
+
+        for submit_index, submit_entry in entries.items():
+            if not isinstance(submit_entry.envelope.command, SubmitJobCommand):
+                continue
+            for control_index, control_entry in entries.items():
+                if control_index <= submit_index:
+                    continue
+                if control_entry.envelope.command.job_id == submit_entry.envelope.command.job_id:
+                    add_edge(submit_index, control_index)
+        for cancel_index, cancel_entry in entries.items():
+            cancel = cancel_entry.envelope.command
+            if not isinstance(cancel, CancelJobCommand):
+                continue
+            for control_index, control_entry in entries.items():
+                control = control_entry.envelope.command
+                if isinstance(control, PauseJobCommand | ResumeJobCommand) and (
+                    control.job_id == cancel.job_id
+                    and control.expected_version == cancel.expected_version
+                ):
+                    add_edge(cancel_index, control_index)
+
+        ready = [index for index, count in enumerate(indegree) if count == 0]
+        heapq.heapify(ready)
+        ordered: list[Path] = []
+        while ready:
+            index = heapq.heappop(ready)
+            ordered.append(paths[index])
+            for dependent in edges[index]:
+                indegree[dependent] -= 1
+                if indegree[dependent] == 0:
+                    heapq.heappush(ready, dependent)
+        if len(ordered) != len(paths):
+            raise InvalidCommandEnvelopeError("cyclic command precedence in pending spool")
+        return tuple(ordered)
 
     def pending_paths(self, *, limit: int | None = None) -> tuple[Path, ...]:
-        paths = tuple(sorted(self.pending_dir.glob("*.json")))
-        return paths if limit is None else paths[:limit]
+        with self._exclusive_lock():
+            paths = tuple(sorted(self.pending_dir.glob("*.json"), key=self._delivery_key))
+            ordered = self._apply_command_precedence(paths)
+            return ordered if limit is None else ordered[:limit]
 
     def pending(self, *, limit: int | None = None) -> tuple[LabSpoolEntry, ...]:
         return tuple(self.load(path) for path in self.pending_paths(limit=limit))
@@ -211,38 +429,124 @@ class LabCommandSpool:
         if (
             receipt.request_id != entry.envelope.request_id
             or receipt.content_hash != entry.envelope.content_hash
+            or receipt.job_id != entry.envelope.command.job_id
         ):
             raise ValueError("receipt does not match command envelope")
-        target = self.ack_dir / f"{receipt.request_id}.json"
-        payload = receipt.model_dump_json().encode("utf-8")
-        created = self._publish_no_clobber(target, payload)
-        if not created and self.load_receipt(target) != receipt:
-            raise RequestContentConflictError(
-                f"request_id {receipt.request_id} already has a different receipt"
-            )
-        entry.path.unlink(missing_ok=True)
-        self._fsync_directory(entry.path.parent)
-        return LabAcknowledgedCommand(path=target, receipt=receipt)
+        with self._exclusive_lock():
+            current = self.load(entry.path)
+            if (current.device, current.inode) != (entry.device, entry.inode):
+                raise InvalidCommandEnvelopeError("pending command was replaced before ack")
+            if current.envelope != entry.envelope:
+                raise InvalidCommandEnvelopeError("pending command changed before ack")
+            target = self.ack_dir / f"{receipt.request_id}.json"
+            payload = receipt.model_dump_json().encode("utf-8")
+            created = self._publish_no_clobber(target, payload)
+            if not created and self.load_receipt(target) != receipt:
+                raise RequestContentConflictError(
+                    f"request_id {receipt.request_id} already has a different receipt"
+                )
+            self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
+            return LabAcknowledgedCommand(path=target, receipt=receipt)
 
-    @staticmethod
-    def load_receipt(path: Path) -> LabCommandReceipt:
+    def load_receipt(self, path: Path) -> LabCommandReceipt:
+        candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
+        filename_request_id = self._ack_request_id(candidate.name)
         try:
-            return LabCommandReceipt.model_validate_json(Path(path).read_bytes())
+            receipt = LabCommandReceipt.model_validate_json(payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
-                f"invalid command receipt {Path(path).name}: {exc}"
+                f"invalid command receipt {candidate.name}: {exc}"
             ) from exc
+        if receipt.request_id != filename_request_id:
+            raise InvalidCommandEnvelopeError(
+                f"receipt request_id does not match basename {candidate.name}"
+            )
+        return receipt
 
-    def quarantine(self, path: Path, *, reason: str) -> LabQuarantinedCommand:
-        source = Path(path)
-        target = self.quarantine_dir / f"{source.name}.bad"
-        while True:
+    def _unlink_pending(self, path: Path, *, device: int, inode: int) -> None:
+        name = self._direct_child_name(path, self.pending_dir)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(self.pending_dir, directory_flags)
+        try:
             try:
-                os.link(source, target)
-                break
-            except FileExistsError:
-                target = self.quarantine_dir / f"{source.name}.{uuid4().hex}.bad"
-        self._fsync_directory(self.quarantine_dir)
-        source.unlink()
-        self._fsync_directory(source.parent)
-        return LabQuarantinedCommand(path=target, reason=reason)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise InvalidCommandEnvelopeError(
+                    f"pending command disappeared before unlink: {name}"
+                ) from exc
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != device
+                or current.st_ino != inode
+            ):
+                raise InvalidCommandEnvelopeError("pending command was replaced before unlink")
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def quarantine(
+        self,
+        entry_or_path: LabSpoolEntry | Path,
+        *,
+        reason: str,
+    ) -> LabQuarantinedCommand:
+        source = (
+            entry_or_path.path if isinstance(entry_or_path, LabSpoolEntry) else Path(entry_or_path)
+        )
+        with self._exclusive_lock():
+            normalized, payload, source_stat = self._read_regular_child(source, self.pending_dir)
+            _sequence, filename_request_id = self._pending_name_parts(normalized.name)
+            try:
+                envelope = LabCommandEnvelope.model_validate_json(payload)
+            except Exception:
+                envelope = None
+            if envelope is not None and envelope.request_id != filename_request_id:
+                raise InvalidCommandEnvelopeError(
+                    f"command request_id does not match basename {normalized.name}"
+                )
+            if isinstance(entry_or_path, LabSpoolEntry):
+                if (source_stat.st_dev, source_stat.st_ino) != (
+                    entry_or_path.device,
+                    entry_or_path.inode,
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        "pending command was replaced before quarantine"
+                    )
+                if envelope != entry_or_path.envelope:
+                    raise InvalidCommandEnvelopeError("pending command changed before quarantine")
+            target = self.quarantine_dir / f"{normalized.name}.bad"
+            while os.path.lexists(target):
+                target = self.quarantine_dir / f"{normalized.name}.{uuid4().hex}.bad"
+            source_fd = os.open(
+                self.pending_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            target_fd = os.open(
+                self.quarantine_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.link(
+                    normalized.name,
+                    target.name,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=target_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(target_fd)
+            finally:
+                os.close(target_fd)
+                os.close(source_fd)
+            quarantined = LabQuarantinedCommand(path=target, reason=reason)
+            metadata = self.quarantine_dir / f"{target.name}.json"
+            self._publish_no_clobber(
+                metadata,
+                quarantined.model_dump_json().encode("utf-8"),
+            )
+            self._unlink_pending(
+                normalized,
+                device=source_stat.st_dev,
+                inode=source_stat.st_ino,
+            )
+            return quarantined

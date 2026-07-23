@@ -208,6 +208,49 @@ def _load_time(value: str) -> datetime:
     return _utc(parsed)
 
 
+def _command_record_from_row(
+    row: sqlite3.Row,
+    *,
+    expected_request_id: UUID | None = None,
+) -> LabCommandRecord:
+    stored_request = str(row["request_id"])
+    try:
+        request_id = UUID(stored_request)
+        envelope = LabCommandEnvelope.model_validate_json(str(row["command_json"]))
+        receipt = LabCommandReceipt.model_validate_json(str(row["receipt_json"]))
+        content_hash = str(row["content_hash"])
+        command_type = str(row["command_type"])
+        job_id = UUID(str(row["job_id"]))
+        status = str(row["status"])
+        reason = str(row["reason"])
+        if expected_request_id is not None and request_id != expected_request_id:
+            raise ValueError("request id does not match lookup key")
+        if not (envelope.request_id == receipt.request_id == request_id):
+            raise ValueError("request id mismatch")
+        if not (envelope.content_hash == receipt.content_hash == content_hash):
+            raise ValueError("content hash mismatch")
+        if envelope.command.command_type != command_type:
+            raise ValueError("command type mismatch")
+        if not (envelope.command.job_id == receipt.job_id == job_id):
+            raise ValueError("job id mismatch")
+        if receipt.status != status:
+            raise ValueError("receipt status mismatch")
+        if receipt.reason != reason:
+            raise ValueError("receipt reason mismatch")
+        return LabCommandRecord(
+            request_id=request_id,
+            content_hash=content_hash,
+            command_type=command_type,
+            job_id=job_id,
+            envelope=envelope,
+            receipt=receipt,
+            received_at=_load_time(str(row["received_at"])),
+            applied_at=_load_time(str(row["applied_at"])),
+        )
+    except Exception as exc:
+        raise InvalidStoredJobError(f"invalid stored lab command {stored_request}: {exc}") from exc
+
+
 def _validate_database_identity(
     connection: sqlite3.Connection,
     *,
@@ -350,33 +393,7 @@ class LabJobReader:
             ).fetchone()
         if row is None:
             return None
-        try:
-            envelope = LabCommandEnvelope.model_validate_json(str(row["command_json"]))
-            receipt = LabCommandReceipt.model_validate_json(str(row["receipt_json"]))
-            if envelope.request_id != request_id or receipt.request_id != request_id:
-                raise ValueError("request id mismatch")
-            if not (envelope.content_hash == receipt.content_hash == str(row["content_hash"])):
-                raise ValueError("content hash mismatch")
-            if envelope.command.command_type != str(row["command_type"]):
-                raise ValueError("command type mismatch")
-            if envelope.command.job_id != UUID(str(row["job_id"])):
-                raise ValueError("job id mismatch")
-            if receipt.status != str(row["status"]):
-                raise ValueError("receipt status mismatch")
-            if receipt.reason != str(row["reason"]):
-                raise ValueError("receipt reason mismatch")
-            return LabCommandRecord(
-                request_id=request_id,
-                content_hash=envelope.content_hash,
-                command_type=envelope.command.command_type,
-                job_id=envelope.command.job_id,
-                envelope=envelope,
-                receipt=receipt,
-                received_at=_load_time(str(row["received_at"])),
-                applied_at=_load_time(str(row["applied_at"])),
-            )
-        except Exception as exc:
-            raise InvalidStoredJobError(f"invalid stored lab command {request_id}: {exc}") from exc
+        return _command_record_from_row(row, expected_request_id=request_id)
 
     def list_events(self, job_id: UUID) -> tuple[LabEventRecord, ...]:
         with self._connect() as connection:
@@ -993,19 +1010,17 @@ class LabJobStore:
         envelope: LabCommandEnvelope,
     ) -> LabCommandReceipt | None:
         row = connection.execute(
-            "SELECT content_hash, receipt_json FROM lab_command WHERE request_id = ?",
+            "SELECT * FROM lab_command WHERE request_id = ?",
             (str(envelope.request_id),),
         ).fetchone()
         if row is None:
             return None
-        if str(row["content_hash"]) != envelope.content_hash:
+        record = _command_record_from_row(row, expected_request_id=envelope.request_id)
+        if record.content_hash != envelope.content_hash:
             raise RequestContentConflictError(
                 f"request_id {envelope.request_id} already has different content"
             )
-        receipt = LabCommandReceipt.model_validate_json(str(row["receipt_json"]))
-        if receipt.content_hash != envelope.content_hash:
-            raise InvalidStoredJobError("stored receipt content hash mismatch")
-        return receipt
+        return record.receipt
 
     def apply_command(
         self,

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
     LabCommandSpool,
+    RequestContentConflictError,
 )
 from rquant.lab_jobs import (
     LabJobStore,
@@ -120,11 +121,19 @@ class LabScheduler:
                 quarantined += 1
                 continue
             lease, mutation_now = self._mutation_context()
-            receipt = self.store.apply_command(
-                entry.envelope,
-                lease=lease,
-                now=mutation_now,
-            )
+            try:
+                receipt = self.store.apply_command(
+                    entry.envelope,
+                    lease=lease,
+                    now=mutation_now,
+                )
+            except RequestContentConflictError as exc:
+                self.spool.quarantine(
+                    entry,
+                    reason=f"request_content_conflict:{exc}",
+                )
+                quarantined += 1
+                continue
             processed += 1
             if receipt.status == "applied":
                 applied += 1
