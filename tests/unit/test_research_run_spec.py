@@ -101,6 +101,23 @@ def _v1_spec(**overrides: object) -> ResearchRunSpec:
     return ResearchRunSpec.model_validate(values)
 
 
+def _hidden_audit_v1_spec() -> ResearchRunSpec:
+    base = _v1_spec()
+    assert base.dataset_snapshot is not None
+    hidden_snapshot = DatasetSnapshotIdentity.model_construct(
+        snapshot_id=base.dataset_snapshot.snapshot_id,
+        binding_hash=base.dataset_snapshot.binding_hash,
+        audit_run_id="e" * 64,
+        _fields_set={"snapshot_id", "binding_hash"},
+    )
+    values = {name: getattr(base, name) for name in type(base).model_fields}
+    values["dataset_snapshot"] = hidden_snapshot
+    return ResearchRunSpec.model_construct(
+        **values,
+        _fields_set=set(base.model_fields_set),
+    )
+
+
 def test_valid_spec_freezes_reproducibility_inputs() -> None:
     spec = _spec()
 
@@ -121,8 +138,6 @@ def test_valid_spec_freezes_reproducibility_inputs() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("schema_version", 0, "schema_version"),
-        ("schema_version", 3, "schema_version"),
         ("job_type", "unknown", "job_type"),
         ("code_sha", "1" * 39, "code_sha"),
         ("code_sha", "G" * 40, "code_sha"),
@@ -139,6 +154,18 @@ def test_spec_rejects_invalid_contract_values(
 ) -> None:
     with pytest.raises(ValidationError, match=message):
         _spec(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [0, 3, True, False, 1.0, 2.0, Decimal("1"), Decimal("2"), "1", "2"],
+)
+def test_schema_version_requires_exact_supported_integer(schema_version: object) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="schema_version must be integer 1 or 2",
+    ):
+        _spec(schema_version=schema_version)
 
 
 def test_hash_is_stable_for_mapping_order_parameter_order_and_timezone() -> None:
@@ -350,6 +377,51 @@ def test_v1_model_copy_preserves_legacy_canonical_shape() -> None:
     assert copied.schema_version == 1
     assert "audit_run_id" not in copied.canonical_json()
     assert copied.random_seed == 7
+
+
+def test_v1_revalidation_rejects_hidden_audit_actual_value() -> None:
+    unsafe = _hidden_audit_v1_spec()
+    assert unsafe.dataset_snapshot is not None
+    assert unsafe.dataset_snapshot.audit_run_id == "e" * 64
+    assert "audit_run_id" not in unsafe.dataset_snapshot.model_fields_set
+
+    with pytest.raises(ValidationError, match="v1.*audit_run_id"):
+        ResearchRunSpec.model_validate(unsafe)
+
+    base = _v1_spec()
+    with pytest.raises(ValidationError, match="v1.*audit_run_id"):
+        base.model_copy(update={"dataset_snapshot": unsafe.dataset_snapshot})
+
+
+def test_hidden_v1_audit_cannot_use_legacy_spec_hash_collision() -> None:
+    base = _v1_spec()
+    unsafe = _hidden_audit_v1_spec()
+
+    assert unsafe.spec_hash == base.spec_hash
+    with pytest.raises(ValidationError, match="v1.*audit_run_id"):
+        ResearchRunSpec.model_validate(unsafe)
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, False, 1.0, 2.0, Decimal("1"), Decimal("2"), "1", "2"],
+)
+def test_model_construct_revalidation_rejects_noninteger_schema_version(
+    schema_version: object,
+) -> None:
+    base = _spec()
+    values = {name: getattr(base, name) for name in type(base).model_fields}
+    values["schema_version"] = schema_version
+    unsafe = ResearchRunSpec.model_construct(
+        **values,
+        _fields_set=set(base.model_fields_set),
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="schema_version must be integer 1 or 2",
+    ):
+        ResearchRunSpec.model_validate(unsafe)
 
 
 def test_spec_model_copy_rejects_unvalidated_parameter_mapping() -> None:

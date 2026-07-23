@@ -9,7 +9,9 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 
+import rquant.lab_job_protocol as lab_job_protocol
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     InvalidCommandEnvelopeError,
@@ -103,6 +105,23 @@ def _v1_spec() -> ResearchRunSpec:
     return ResearchRunSpec.model_validate(values)
 
 
+def _hidden_audit_v1_spec() -> ResearchRunSpec:
+    base = _v1_spec()
+    assert base.dataset_snapshot is not None
+    hidden_snapshot = DatasetSnapshotIdentity.model_construct(
+        snapshot_id=base.dataset_snapshot.snapshot_id,
+        binding_hash=base.dataset_snapshot.binding_hash,
+        audit_run_id="e" * 64,
+        _fields_set={"snapshot_id", "binding_hash"},
+    )
+    values = {name: getattr(base, name) for name in type(base).model_fields}
+    values["dataset_snapshot"] = hidden_snapshot
+    return ResearchRunSpec.model_construct(
+        **values,
+        _fields_set=set(base.model_fields_set),
+    )
+
+
 def test_command_receipt_rejects_boolean_job_version() -> None:
     envelope = _submit_envelope()
 
@@ -193,6 +212,33 @@ def test_submit_envelope_parses_legacy_v1_spec_for_historical_replay() -> None:
     assert restored.command.spec.spec_hash == (
         "f7a26c9311d2208eeec24ff172d7e01dabe63398e987dd77314d0fed59c4a9ea"
     )
+
+
+def test_hidden_v1_audit_cannot_replay_colliding_lab_command_hash() -> None:
+    job_id = UUID("00000000-0000-0000-0000-000000000021")
+    request_id = UUID("00000000-0000-0000-0000-000000000022")
+    baseline = LabCommandEnvelope(
+        request_id=request_id,
+        command=SubmitJobCommand(job_id=job_id, spec=_v1_spec(), max_attempts=3),
+    )
+    unsafe_spec = _hidden_audit_v1_spec()
+    unsafe_command = SubmitJobCommand.model_construct(
+        command_type="submit",
+        job_id=job_id,
+        spec=unsafe_spec,
+        max_attempts=3,
+    )
+    unsafe_envelope = LabCommandEnvelope.model_construct(
+        schema_version=1,
+        request_id=request_id,
+        command=unsafe_command,
+        content_hash=baseline.content_hash,
+    )
+
+    assert unsafe_spec.spec_hash == baseline.command.spec.spec_hash
+    assert lab_job_protocol._command_hash(unsafe_command) == baseline.content_hash
+    with pytest.raises(ValidationError, match="v1.*audit_run_id"):
+        LabCommandEnvelope.model_validate(unsafe_envelope)
 
 
 def test_envelope_rejects_tampered_content_hash() -> None:

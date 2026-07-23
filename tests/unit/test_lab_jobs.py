@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 
 import rquant.lab_jobs as lab_jobs
 from rquant.lab_job_protocol import (
@@ -105,6 +106,23 @@ def _spec(
 
 def _v1_spec() -> ResearchRunSpec:
     return ResearchRunSpec.model_validate_json(OLD_V1_SPEC_JSON)
+
+
+def _hidden_audit_v1_spec() -> ResearchRunSpec:
+    base = _v1_spec()
+    assert base.dataset_snapshot is not None
+    hidden_snapshot = DatasetSnapshotIdentity.model_construct(
+        snapshot_id=base.dataset_snapshot.snapshot_id,
+        binding_hash=base.dataset_snapshot.binding_hash,
+        audit_run_id="e" * 64,
+        _fields_set={"snapshot_id", "binding_hash"},
+    )
+    values = {name: getattr(base, name) for name in type(base).model_fields}
+    values["dataset_snapshot"] = hidden_snapshot
+    return ResearchRunSpec.model_construct(
+        **values,
+        _fields_set=set(base.model_fields_set),
+    )
 
 
 def _submit(
@@ -643,6 +661,26 @@ def test_reader_and_exactly_once_replay_accept_real_legacy_v1_ledger(
     assert stored_command is not None
     assert stored_command.envelope.command.spec.spec_hash == OLD_V1_SPEC_HASH
     assert replayed == receipt
+
+    unsafe_command = SubmitJobCommand.model_construct(
+        command_type="submit",
+        job_id=job_id,
+        spec=_hidden_audit_v1_spec(),
+        max_attempts=3,
+    )
+    unsafe_replay = LabCommandEnvelope.model_construct(
+        schema_version=1,
+        request_id=request_id,
+        command=unsafe_command,
+        content_hash=OLD_V1_COMMAND_HASH,
+    )
+    with pytest.raises(ValidationError, match="v1.*audit_run_id"):
+        store.apply_command(
+            unsafe_replay,
+            lease=lease,
+            now=NOW + timedelta(seconds=2),
+        )
+
     assert _count(store.path, "lab_command") == 1
     assert _count(store.path, "lab_job") == 1
 

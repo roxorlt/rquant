@@ -327,8 +327,13 @@ class ResearchRunSpec(RunSpecModel):
 
     @model_validator(mode="before")
     @classmethod
-    def reject_v1_audit_identity(cls, data: object) -> object:
-        if not isinstance(data, Mapping) or data.get("schema_version", 2) != 1:
+    def validate_versioned_input(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+        schema_version = data.get("schema_version", 2)
+        if type(schema_version) is not int or schema_version not in {1, 2}:
+            raise ValueError("schema_version must be integer 1 or 2")
+        if schema_version != 1:
             return data
         snapshot = data.get("dataset_snapshot")
         if isinstance(snapshot, Mapping) and "audit_run_id" in snapshot:
@@ -342,6 +347,12 @@ class ResearchRunSpec(RunSpecModel):
 
     @model_validator(mode="after")
     def enforce_snapshot_research_status(self) -> ResearchRunSpec:
+        if (
+            self.schema_version == 1
+            and self.dataset_snapshot is not None
+            and self.dataset_snapshot.audit_run_id is not None
+        ):
+            raise ValueError("v1 dataset_snapshot must not contain audit_run_id")
         if self.research_status != "exploratory":
             if self.dataset_snapshot is None:
                 raise ValueError(
