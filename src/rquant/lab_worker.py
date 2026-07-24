@@ -2486,24 +2486,38 @@ class LabArtifactReclaimer:
     ) -> None:
         if not self._has_external_orphan_identity(metadata):
             raise LabArtifactConflictError("external orphan metadata has no expected identity")
-        try:
-            observed = orphan.lstat()
-        except OSError as exc:
-            raise LabArtifactConflictError(
-                "legacy empty staging orphan identity conflicts"
-            ) from exc
         expected = (
             metadata.expected_device,
             metadata.expected_inode,
             stat.S_IFDIR,
             metadata.expected_nlink,
         )
+        try:
+            entry = orphan.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "legacy empty staging orphan identity conflicts"
+            ) from exc
         if (
             orphan.parent != self.garbage_intent_orphan_dir
-            or orphan.is_symlink()
-            or not stat.S_ISDIR(observed.st_mode)
-            or self._directory_identity(observed) != expected
-            or any(orphan.iterdir())
+            or stat.S_ISLNK(entry.st_mode)
+            or not stat.S_ISDIR(entry.st_mode)
+            or self._directory_identity(entry) != expected
+        ):
+            raise LabArtifactConflictError("legacy empty staging orphan identity conflicts")
+        try:
+            children = tuple(orphan.iterdir())
+            exit_observed = orphan.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "legacy empty staging orphan identity conflicts"
+            ) from exc
+        if (
+            children
+            or stat.S_ISLNK(exit_observed.st_mode)
+            or not stat.S_ISDIR(exit_observed.st_mode)
+            or self._directory_identity(exit_observed) != expected
+            or self._directory_identity(exit_observed) != self._directory_identity(entry)
         ):
             raise LabArtifactConflictError("legacy empty staging orphan identity conflicts")
 

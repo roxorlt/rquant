@@ -3726,6 +3726,59 @@ def test_legacy_empty_staging_normal_orphan_binds_original_inode(tmp_path: Path)
     assert metadata["expected_empty"] is True
 
 
+def test_external_orphan_identity_rejects_empty_replacement_after_entry_lstat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    legacy_id = uuid4().hex
+    staging = reclaimer.garbage_staging_dir / legacy_id
+    staging.mkdir(mode=0o700)
+    reclaimer.collect_garbage()
+    orphan = next(reclaimer.garbage_intent_orphan_dir.glob(f"legacy-empty-staging-{legacy_id}-*"))
+    ledger = reclaimer.garbage_orphan_metadata_dir / f"{orphan.name}.json"
+    metadata = reclaimer._load_external_orphan_metadata(ledger)
+    original_orphan_identity = (orphan.lstat().st_dev, orphan.lstat().st_ino)
+    original_ledger = (ledger.lstat().st_dev, ledger.lstat().st_ino, ledger.read_bytes())
+    preserved_orphan = tmp_path / "preserved-entry-orphan"
+    original_lstat = Path.lstat
+    replaced = False
+    replacement_identity: tuple[int, int] | None = None
+
+    def replace_after_entry_lstat(path: Path) -> os.stat_result:
+        nonlocal replaced, replacement_identity
+        observed = original_lstat(path)
+        if path == orphan and not replaced:
+            replaced = True
+            os.rename(orphan, preserved_orphan)
+            orphan.mkdir(mode=0o700)
+            replacement = original_lstat(orphan)
+            replacement_identity = (replacement.st_dev, replacement.st_ino)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", replace_after_entry_lstat)
+
+    with pytest.raises(LabArtifactConflictError, match="orphan identity conflicts"):
+        reclaimer._assert_external_orphan_identity(orphan, metadata)
+
+    assert replaced
+    assert replacement_identity is not None
+    assert (original_lstat(preserved_orphan).st_dev, original_lstat(preserved_orphan).st_ino) == (
+        original_orphan_identity
+    )
+    assert (original_lstat(orphan).st_dev, original_lstat(orphan).st_ino) == replacement_identity
+    assert tuple(preserved_orphan.iterdir()) == ()
+    assert tuple(orphan.iterdir()) == ()
+    assert (original_lstat(ledger).st_dev, original_lstat(ledger).st_ino, ledger.read_bytes()) == (
+        original_ledger
+    )
+
+
 def test_external_orphan_metadata_entry_replacement_never_writes_business_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
