@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -652,16 +653,322 @@ class LabQuarantineQueueCursor(LabWorkerModel):
         )
 
 
+class LabQuarantineQueueConflictObservation(LabWorkerModel):
+    location: Literal["pending", "archive"]
+    status: Literal["missing", "regular", "symlink", "directory", "other"]
+    device: int | None = Field(default=None, ge=0)
+    inode: int | None = Field(default=None, ge=1)
+    mode: int | None = Field(default=None, ge=0)
+    nlink: int | None = Field(default=None, ge=1)
+    size: int | None = Field(default=None, ge=0)
+    sha256: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    raw_base64: str | None = None
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> LabQuarantineQueueConflictObservation:
+        identity = (self.device, self.inode, self.mode, self.nlink, self.size)
+        if self.status == "missing":
+            if any(value is not None for value in identity) or any(
+                value is not None for value in (self.sha256, self.raw_base64)
+            ):
+                raise ValueError("missing queue observation cannot contain identity")
+            return self
+        if any(value is None for value in identity):
+            raise ValueError("queue conflict observation requires complete identity")
+        if self.raw_base64 is None:
+            if self.sha256 is not None:
+                raise ValueError("queue conflict hash requires preserved bytes")
+            return self
+        try:
+            payload = base64.b64decode(self.raw_base64, validate=True)
+        except Exception as exc:
+            raise ValueError("queue conflict bytes are not canonical base64") from exc
+        if self.status != "regular" or self.sha256 != _sha256_bytes(payload):
+            raise ValueError("queue conflict preserved bytes conflict with identity")
+        return self
+
+    @property
+    def raw_bytes(self) -> bytes | None:
+        if self.raw_base64 is None:
+            return None
+        return base64.b64decode(self.raw_base64, validate=True)
+
+
+class LabQuarantineQueueConflict(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    sequence: int = Field(ge=1)
+    reason: Literal[
+        "missing_pending",
+        "corrupt_pending",
+        "corrupt_archived",
+        "ambiguous_delivery",
+    ]
+    pending: LabQuarantineQueueConflictObservation
+    archived: LabQuarantineQueueConflictObservation
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueConflict:
+        if self.pending.location != "pending" or self.archived.location != "archive":
+            raise ValueError("queue conflict observations are mislabelled")
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("queue conflict hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueRepairIntent(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    sequence: int = Field(ge=1)
+    phase: Literal["active", "cold_health"]
+    intent: LabGarbagePreparedIntent
+    conflict_hash: str = Field(pattern=_HASH_PATTERN)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueRepairIntent:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("queue repair intent hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueRepairResult(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    sequence: int = Field(ge=1)
+    new_sequence: int = Field(ge=1)
+    phase: Literal["active", "cold_health"]
+    intent_hash: str = Field(pattern=_HASH_PATTERN)
+    conflict_hash: str = Field(pattern=_HASH_PATTERN)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueRepairResult:
+        if self.new_sequence <= self.sequence:
+            raise ValueError("queue repair must publish a later sequence")
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("queue repair result hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
 class LabQuarantineMigrationResult(LabWorkerModel):
     scanned: int = Field(ge=0)
     enqueued: int = Field(ge=0)
     complete: bool
 
 
+class LabQuarantineMigrationInitializationResult(LabWorkerModel):
+    indexed: int = Field(ge=0)
+    complete: bool
+
+
+class LabQuarantineQueueMigrationIndexEntry(LabWorkerModel):
+    schema_version: Literal[2] = 2
+    index: int = Field(ge=1)
+    namespace: Literal["active", "cold_health", "authority"]
+    file_name: str = Field(pattern=r"^[0-9a-f]{32}-prepared-intent-v1\.json$")
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueMigrationIndexEntry:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("quarantine migration index hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueMigrationDirectory(LabWorkerModel):
+    namespace: Literal["active", "cold_health", "authority"]
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    mode: int = Field(ge=0)
+    nlink: int = Field(ge=1)
+    mtime_ns: int = Field(ge=0)
+    ctime_ns: int = Field(ge=0)
+
+
+class LabQuarantineQueueMigrationCycle(LabWorkerModel):
+    schema_version: Literal[2] = 2
+    cycle_id: UUID = Field(default_factory=lambda: UUID(int=0))
+    total_entries: int = Field(ge=0)
+    index_hash: str = Field(pattern=_HASH_PATTERN)
+    directories: tuple[LabQuarantineQueueMigrationDirectory, ...]
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueMigrationCycle:
+        namespaces = tuple(item.namespace for item in self.directories)
+        if namespaces != ("active", "cold_health", "authority"):
+            raise ValueError("quarantine migration directories are incomplete or unordered")
+        identity = self.model_dump(mode="json", exclude={"cycle_id", "content_hash"})
+        canonical = json.dumps(
+            identity,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        content_hash = _sha256_bytes(canonical.encode("utf-8"))
+        cycle_id = uuid5(NAMESPACE_URL, f"rquant:lab-quarantine-migration:{content_hash}")
+        if self.content_hash and self.content_hash != content_hash:
+            raise ValueError("quarantine migration cycle hash conflicts")
+        if self.cycle_id.int and self.cycle_id != cycle_id:
+            raise ValueError("quarantine migration cycle identity conflicts")
+        object.__setattr__(self, "content_hash", content_hash)
+        object.__setattr__(self, "cycle_id", cycle_id)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueMigrationCursor(LabWorkerModel):
+    schema_version: Literal[2] = 2
+    cycle_id: UUID
+    last_index: int = Field(default=0, ge=0)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueMigrationCursor:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("quarantine migration cursor hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueMigrationComplete(LabWorkerModel):
+    schema_version: Literal[2] = 2
+    state: Literal["complete"] = "complete"
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueMigrationComplete:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("quarantine queue migration marker hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
 class LabQuarantineRecoveryResult(LabWorkerModel):
     inspected: int = Field(ge=0)
     reconciled: int = Field(ge=0)
     cold_metadata_checked: int = Field(ge=0)
+    queue_conflicts: int = Field(default=0, ge=0)
 
 
 class LabReclaimLedger(LabWorkerModel):
@@ -2123,11 +2430,29 @@ class LabArtifactReclaimer:
         self.garbage_recovery_queue_pending_dir = self.garbage_recovery_queue_root / "pending"
         self.garbage_recovery_queue_archive_dir = self.garbage_recovery_queue_root / "archive"
         self.garbage_recovery_queue_enqueued_dir = self.garbage_recovery_queue_root / "enqueued"
+        self.garbage_recovery_queue_conflict_dir = self.garbage_recovery_queue_root / "conflicts"
+        self.garbage_recovery_queue_conflict_markers_dir = (
+            self.garbage_recovery_queue_root / "conflict_markers"
+        )
+        self.garbage_recovery_queue_repair_intents_dir = (
+            self.garbage_recovery_queue_root / "repair_intents"
+        )
+        self.garbage_recovery_queue_repair_results_dir = (
+            self.garbage_recovery_queue_root / "repair_results"
+        )
         self.garbage_recovery_queue_sequence_path = (
             self.garbage_recovery_queue_root / "sequence-v1.json"
         )
         self.garbage_recovery_queue_cursor_path = (
             self.garbage_recovery_queue_root / "cursor-v1.json"
+        )
+        self.garbage_queue_migration_root = self.garbage_recovery_queue_root / "migration-v2"
+        self.garbage_queue_migration_cycles_dir = self.garbage_queue_migration_root / "cycles"
+        self.garbage_queue_migration_active_path = (
+            self.garbage_queue_migration_root / "active-cycle-v2.json"
+        )
+        self.garbage_queue_migration_complete_path = (
+            self.garbage_queue_migration_root / "complete-v2.json"
         )
         self.garbage_intent_temp_dir = self.garbage_root / "intent_temporary"
         self.garbage_intent_orphan_dir = self.garbage_root / "intent_orphans"
@@ -2148,6 +2473,12 @@ class LabArtifactReclaimer:
             self.garbage_recovery_queue_pending_dir,
             self.garbage_recovery_queue_archive_dir,
             self.garbage_recovery_queue_enqueued_dir,
+            self.garbage_recovery_queue_conflict_dir,
+            self.garbage_recovery_queue_conflict_markers_dir,
+            self.garbage_recovery_queue_repair_intents_dir,
+            self.garbage_recovery_queue_repair_results_dir,
+            self.garbage_queue_migration_root,
+            self.garbage_queue_migration_cycles_dir,
             self.garbage_intent_temp_dir,
             self.garbage_intent_orphan_dir,
             self.garbage_orphan_metadata_dir,
@@ -2159,9 +2490,11 @@ class LabArtifactReclaimer:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
                 raise LabArtifactConflictError("garbage quarantine directory is unsafe")
-            directory.chmod(0o700)
+            if stat.S_IMODE(directory.lstat().st_mode) != 0o700:
+                directory.chmod(0o700)
         if garbage_namespace_was_missing:
             self._write_migration_complete_locked()
+            self._write_queue_migration_complete_locked()
 
     @staticmethod
     def _attempt_name(claim: LabShardClaim) -> str:
@@ -2565,15 +2898,84 @@ class LabArtifactReclaimer:
             f"{phase}-{intent.owner.garbage_id.hex}.json"
         )
 
-    def _read_recovery_metadata(self, path: Path, *, label: str) -> str:
-        identity = self._regular_file_identity(path, label=label)
+    @staticmethod
+    def _read_recovery_metadata_bytes(path: Path, *, label: str) -> bytes:
+        parent_descriptor = -1
+        descriptor = -1
         try:
-            raw = path.read_text(encoding="utf-8")
+            parent_flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            parent_descriptor = os.open(path.parent, parent_flags)
+            parent_before = os.fstat(parent_descriptor)
+            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(parent_before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+            ):
+                raise LabArtifactConflictError(f"{label} is not a private regular file")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+            ):
+                raise LabArtifactConflictError(f"{label} changed while opening")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after_open = os.fstat(descriptor)
+            after_path = path.lstat()
+            parent_after = os.fstat(parent_descriptor)
+            parent_after_path = path.parent.lstat()
         except OSError as exc:
             raise LabArtifactConflictError(f"{label} cannot be read") from exc
-        if self._regular_file_identity(path, label=label) != identity:
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if parent_descriptor >= 0:
+                with suppress(OSError):
+                    os.close(parent_descriptor)
+
+        def parent_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                stat.S_IFMT(value.st_mode),
+                value.st_nlink,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        def file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                stat.S_IFMT(value.st_mode),
+                value.st_size,
+                value.st_nlink,
+            )
+
+        if (
+            parent_identity(parent_after) != parent_identity(parent_before)
+            or parent_identity(parent_after_path) != parent_identity(parent_before)
+            or file_identity(after_open) != file_identity(opened)
+            or file_identity(after_path) != file_identity(opened)
+        ):
             raise LabArtifactConflictError(f"{label} changed while reading")
-        return raw
+        return b"".join(chunks)
+
+    def _read_recovery_metadata(self, path: Path, *, label: str) -> str:
+        payload = self._read_recovery_metadata_bytes(path, label=label)
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LabArtifactConflictError(f"{label} is not valid UTF-8") from exc
 
     def _load_recovery_queue_entry(self, path: Path) -> LabQuarantineQueueEntry:
         match = _GARBAGE_RECOVERY_QUEUE_NAME.fullmatch(path.name)
@@ -2598,6 +3000,171 @@ class LabArtifactReclaimer:
         if path.name != expected_name or raw != entry.canonical_json():
             raise LabArtifactConflictError("quarantine queue marker identity conflicts")
         return entry
+
+    def _recovery_queue_conflict_path(self, sequence: int) -> Path:
+        return self.garbage_recovery_queue_conflict_dir / f"{sequence:020d}.json"
+
+    def _recovery_queue_repair_intent_path(self, sequence: int) -> Path:
+        return self.garbage_recovery_queue_repair_intents_dir / f"{sequence:020d}.json"
+
+    def _recovery_queue_repair_result_path(self, sequence: int) -> Path:
+        return self.garbage_recovery_queue_repair_results_dir / f"{sequence:020d}.json"
+
+    def _observe_recovery_queue_delivery(
+        self,
+        path: Path,
+        *,
+        location: Literal["pending", "archive"],
+    ) -> LabQuarantineQueueConflictObservation:
+        if not os.path.lexists(path):
+            return LabQuarantineQueueConflictObservation(
+                location=location,
+                status="missing",
+            )
+        try:
+            observed = path.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError(f"quarantine queue {location} evidence changed") from exc
+        if stat.S_ISLNK(observed.st_mode):
+            status: Literal["regular", "symlink", "directory", "other"] = "symlink"
+        elif stat.S_ISREG(observed.st_mode):
+            status = "regular"
+        elif stat.S_ISDIR(observed.st_mode):
+            status = "directory"
+        else:
+            status = "other"
+        payload: bytes | None = None
+        if status == "regular" and observed.st_nlink == 1:
+            payload = self._read_recovery_metadata_bytes(
+                path,
+                label=f"quarantine queue {location} evidence",
+            )
+            after = path.lstat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                stat.S_IFMT(after.st_mode),
+                after.st_nlink,
+                after.st_size,
+            ) != (
+                observed.st_dev,
+                observed.st_ino,
+                stat.S_IFMT(observed.st_mode),
+                observed.st_nlink,
+                observed.st_size,
+            ):
+                raise LabArtifactConflictError(f"quarantine queue {location} evidence changed")
+        return LabQuarantineQueueConflictObservation(
+            location=location,
+            status=status,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=stat.S_IFMT(observed.st_mode),
+            nlink=observed.st_nlink,
+            size=observed.st_size,
+            sha256=_sha256_bytes(payload) if payload is not None else None,
+            raw_base64=(base64.b64encode(payload).decode("ascii") if payload is not None else None),
+        )
+
+    def _load_recovery_queue_conflict(self, path: Path) -> LabQuarantineQueueConflict:
+        raw = self._read_recovery_metadata(path, label="quarantine queue conflict")
+        try:
+            conflict = LabQuarantineQueueConflict.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine queue conflict: {exc}") from exc
+        if path != self._recovery_queue_conflict_path(conflict.sequence):
+            raise LabArtifactConflictError("quarantine queue conflict path is invalid")
+        if raw != conflict.canonical_json():
+            raise LabArtifactConflictError("quarantine queue conflict is not canonical")
+        return conflict
+
+    def _ensure_recovery_queue_conflict_locked(
+        self,
+        sequence: int,
+        *,
+        reason: Literal[
+            "missing_pending",
+            "corrupt_pending",
+            "corrupt_archived",
+            "ambiguous_delivery",
+        ],
+    ) -> LabQuarantineQueueConflict:
+        conflict = LabQuarantineQueueConflict(
+            sequence=sequence,
+            reason=reason,
+            pending=self._observe_recovery_queue_delivery(
+                self._recovery_queue_path(sequence),
+                location="pending",
+            ),
+            archived=self._observe_recovery_queue_delivery(
+                self._recovery_queue_path(sequence, archived=True),
+                location="archive",
+            ),
+        )
+        path = self._recovery_queue_conflict_path(sequence)
+        if os.path.lexists(path):
+            if self._load_recovery_queue_conflict(path) != conflict:
+                raise LabArtifactConflictError("quarantine queue conflict evidence changed")
+            return conflict
+        self._write_derived_canonical_file(path, conflict.canonical_json())
+        if self._load_recovery_queue_conflict(path) != conflict:
+            raise LabArtifactConflictError("quarantine queue conflict publication changed")
+        return conflict
+
+    def _retire_recovery_queue_conflict_locked(
+        self,
+        sequence: int,
+        *,
+        reason: Literal[
+            "missing_pending",
+            "corrupt_pending",
+            "corrupt_archived",
+            "ambiguous_delivery",
+        ],
+    ) -> LabQuarantineQueueCursor:
+        conflict = self._ensure_recovery_queue_conflict_locked(sequence, reason=reason)
+        _safe_structured_log(
+            "warning",
+            "lab_quarantine_queue_conflict",
+            message="durable quarantine queue conflict retired from hot recovery",
+            component="lab_worker",
+            sequence=sequence,
+            reason=conflict.reason,
+            conflict_hash=conflict.content_hash,
+        )
+        cursor = LabQuarantineQueueCursor(last_sequence=sequence)
+        self._write_recovery_queue_cursor_locked(cursor)
+        return cursor
+
+    def _load_recovery_queue_repair_intent(
+        self,
+        path: Path,
+    ) -> LabQuarantineQueueRepairIntent:
+        raw = self._read_recovery_metadata(path, label="quarantine queue repair intent")
+        try:
+            intent = LabQuarantineQueueRepairIntent.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid queue repair intent: {exc}") from exc
+        if path != self._recovery_queue_repair_intent_path(intent.sequence):
+            raise LabArtifactConflictError("queue repair intent path conflicts")
+        if raw != intent.canonical_json():
+            raise LabArtifactConflictError("queue repair intent is not canonical")
+        return intent
+
+    def _load_recovery_queue_repair_result(
+        self,
+        path: Path,
+    ) -> LabQuarantineQueueRepairResult:
+        raw = self._read_recovery_metadata(path, label="quarantine queue repair result")
+        try:
+            result = LabQuarantineQueueRepairResult.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid queue repair result: {exc}") from exc
+        if path != self._recovery_queue_repair_result_path(result.sequence):
+            raise LabArtifactConflictError("queue repair result path conflicts")
+        if raw != result.canonical_json():
+            raise LabArtifactConflictError("queue repair result is not canonical")
+        return result
 
     def _load_recovery_queue_sequence_locked(self) -> LabQuarantineQueueSequence:
         if not os.path.lexists(self.garbage_recovery_queue_sequence_path):
@@ -2637,7 +3204,9 @@ class LabArtifactReclaimer:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
-            _fsync_directory(self.garbage_recovery_queue_root)
+            _fsync_directory(target.parent)
+            if target.parent != self.garbage_recovery_queue_root:
+                _fsync_directory(self.garbage_recovery_queue_root)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -2751,6 +3320,129 @@ class LabArtifactReclaimer:
         )
         self._ensure_recovery_queue_marker(entry)
         return entry
+
+    def repair_recovery_queue_conflict(
+        self,
+        *,
+        sequence: int,
+        intent: LabGarbagePreparedIntent,
+        phase: Literal["active", "cold_health"],
+    ) -> LabQuarantineQueueRepairResult:
+        """Requeue one dead-letter only from canonical marker and authority evidence."""
+        with self.report_spool.evidence_lock():
+            conflict = self._load_recovery_queue_conflict(
+                self._recovery_queue_conflict_path(sequence)
+            )
+            if conflict.reason == "ambiguous_delivery":
+                raise LabArtifactConflictError(
+                    "ambiguous queue delivery cannot reassign its marker"
+                )
+            cursor = self._load_recovery_queue_cursor_locked()
+            if cursor.last_sequence < sequence:
+                raise LabArtifactConflictError("queue conflict has not retired from hot recovery")
+            expected_pending = self._observe_recovery_queue_delivery(
+                self._recovery_queue_path(sequence),
+                location="pending",
+            )
+            expected_archived = self._observe_recovery_queue_delivery(
+                self._recovery_queue_path(sequence, archived=True),
+                location="archive",
+            )
+            if expected_pending != conflict.pending or expected_archived != conflict.archived:
+                raise LabArtifactConflictError("queue conflict delivery evidence changed")
+            authoritative = self._load_prepared_intent(
+                self._prepared_intent_path(intent.owner.garbage_id)
+            )
+            if authoritative != intent:
+                raise LabArtifactConflictError("queue repair authority intent conflicts")
+            repair_intent = LabQuarantineQueueRepairIntent(
+                sequence=sequence,
+                phase=phase,
+                intent=intent,
+                conflict_hash=conflict.content_hash,
+            )
+            repair_intent_path = self._recovery_queue_repair_intent_path(sequence)
+            if os.path.lexists(repair_intent_path):
+                if self._load_recovery_queue_repair_intent(repair_intent_path) != repair_intent:
+                    raise LabArtifactConflictError("queue repair intent conflicts")
+            else:
+                self._write_derived_canonical_file(
+                    repair_intent_path,
+                    repair_intent.canonical_json(),
+                )
+            result_path = self._recovery_queue_repair_result_path(sequence)
+            if os.path.lexists(result_path):
+                result = self._load_recovery_queue_repair_result(result_path)
+                if (
+                    result.phase != phase
+                    or result.intent_hash != intent.intent_hash
+                    or result.conflict_hash != conflict.content_hash
+                ):
+                    raise LabArtifactConflictError("queue repair result conflicts")
+                return result
+
+            marker = self._recovery_queue_enqueued_path(intent, phase)
+            marker_archive_dir = (
+                self.garbage_recovery_queue_conflict_markers_dir / f"{sequence:020d}"
+            )
+            marker_archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if marker_archive_dir.is_symlink() or not marker_archive_dir.is_dir():
+                raise LabArtifactConflictError("queue conflict marker archive is unsafe")
+            marker_archive_dir.chmod(0o700)
+            archived_marker = marker_archive_dir / marker.name
+            new_entry: LabQuarantineQueueEntry | None = None
+            marker_exists = os.path.lexists(marker)
+            archived_marker_exists = os.path.lexists(archived_marker)
+            if marker_exists and archived_marker_exists:
+                current_marker = self._load_recovery_queue_marker(marker)
+                retired_marker = self._load_recovery_queue_marker(archived_marker)
+                if (
+                    current_marker.intent != intent
+                    or current_marker.phase != phase
+                    or current_marker.sequence <= sequence
+                    or retired_marker.intent != intent
+                    or retired_marker.phase != phase
+                    or retired_marker.sequence != sequence
+                ):
+                    raise LabArtifactConflictError("queue repair marker states conflict")
+                new_entry = current_marker
+            elif marker_exists:
+                marker_entry = self._load_recovery_queue_marker(marker)
+                if marker_entry.intent != intent or marker_entry.phase != phase:
+                    raise LabArtifactConflictError("queue repair marker identity conflicts")
+                if marker_entry.sequence == sequence:
+                    os.rename(marker, archived_marker)
+                    _fsync_directory(self.garbage_recovery_queue_enqueued_dir)
+                    _fsync_directory(marker_archive_dir)
+                    if self._load_recovery_queue_marker(archived_marker) != marker_entry:
+                        raise LabArtifactConflictError("queue repair marker archive changed")
+                elif marker_entry.sequence > sequence:
+                    new_entry = marker_entry
+                else:
+                    raise LabArtifactConflictError("queue repair marker sequence regressed")
+            elif archived_marker_exists:
+                marker_entry = self._load_recovery_queue_marker(archived_marker)
+                if (
+                    marker_entry.sequence != sequence
+                    or marker_entry.intent != intent
+                    or marker_entry.phase != phase
+                ):
+                    raise LabArtifactConflictError("archived queue repair marker conflicts")
+            else:
+                raise LabArtifactConflictError("queue repair has no canonical enqueued marker")
+            if new_entry is None:
+                new_entry = self._enqueue_recovery_intent(intent, phase=phase)
+            result = LabQuarantineQueueRepairResult(
+                sequence=sequence,
+                new_sequence=new_entry.sequence,
+                phase=phase,
+                intent_hash=intent.intent_hash,
+                conflict_hash=conflict.content_hash,
+            )
+            self._write_derived_canonical_file(result_path, result.canonical_json())
+            if self._load_recovery_queue_repair_result(result_path) != result:
+                raise LabArtifactConflictError("queue repair completion changed")
+            return result
 
     def _prepared_intent(
         self,
@@ -3956,10 +4648,12 @@ class LabArtifactReclaimer:
 
     def _load_migration_complete_locked(self) -> None:
         path = self.garbage_legacy_complete_path
-        identity = self._regular_file_identity(path, label="quarantine migration marker")
         payload: object = None
         try:
-            raw = path.read_text(encoding="utf-8")
+            raw = self._read_recovery_metadata(
+                path,
+                label="legacy quarantine migration marker",
+            )
             payload = json.loads(raw)
             marker = LabQuarantineMigrationComplete.model_validate(payload)
             canonical = marker.canonical_json()
@@ -4004,13 +4698,8 @@ class LabArtifactReclaimer:
                 raise LabArtifactConflictError(
                     f"invalid quarantine migration marker: {exc}"
                 ) from exc
-        if (
-            self._regular_file_identity(path, label="quarantine migration marker") != identity
-            or raw != canonical
-        ):
-            raise LabArtifactConflictError(
-                "quarantine migration marker changed or is not canonical"
-            )
+        if raw != canonical:
+            raise LabArtifactConflictError("legacy quarantine migration marker is not canonical")
 
     def _write_migration_complete_locked(self) -> None:
         if os.path.lexists(self.garbage_legacy_complete_path):
@@ -4022,6 +4711,31 @@ class LabArtifactReclaimer:
             marker.canonical_json(),
         )
         self._load_migration_complete_locked()
+
+    def _load_queue_migration_complete_locked(self) -> None:
+        raw = self._read_recovery_metadata(
+            self.garbage_queue_migration_complete_path,
+            label="quarantine queue migration marker",
+        )
+        try:
+            marker = LabQuarantineQueueMigrationComplete.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(
+                f"invalid quarantine queue migration marker: {exc}"
+            ) from exc
+        if raw != marker.canonical_json():
+            raise LabArtifactConflictError("quarantine queue migration marker is not canonical")
+
+    def _write_queue_migration_complete_locked(self) -> None:
+        if os.path.lexists(self.garbage_queue_migration_complete_path):
+            self._load_queue_migration_complete_locked()
+            return
+        marker = LabQuarantineQueueMigrationComplete()
+        self._write_derived_canonical_file(
+            self.garbage_queue_migration_complete_path,
+            marker.canonical_json(),
+        )
+        self._load_queue_migration_complete_locked()
 
     def _recovery_intent_paths_locked(self, directory: Path) -> tuple[Path, ...]:
         paths: list[Path] = []
@@ -4047,6 +4761,271 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError("prepared intent recovery scan failed") from exc
         return tuple(paths)
 
+    def _migration_namespace_directories(
+        self,
+    ) -> tuple[tuple[Literal["active", "cold_health", "authority"], Path], ...]:
+        return (
+            ("active", self.garbage_active_intent_dir),
+            ("cold_health", self.garbage_cold_health_dir),
+            ("authority", self.garbage_intent_dir),
+        )
+
+    @staticmethod
+    def _migration_directory_identity(
+        namespace: Literal["active", "cold_health", "authority"],
+        directory: Path,
+    ) -> LabQuarantineQueueMigrationDirectory:
+        try:
+            observed = directory.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                f"quarantine migration {namespace} directory is unavailable"
+            ) from exc
+        if directory.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+            raise LabArtifactConflictError(f"quarantine migration {namespace} directory is unsafe")
+        return LabQuarantineQueueMigrationDirectory(
+            namespace=namespace,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=stat.S_IFMT(observed.st_mode),
+            nlink=observed.st_nlink,
+            mtime_ns=observed.st_mtime_ns,
+            ctime_ns=observed.st_ctime_ns,
+        )
+
+    def _migration_directory_identities(
+        self,
+    ) -> tuple[LabQuarantineQueueMigrationDirectory, ...]:
+        return tuple(
+            self._migration_directory_identity(namespace, directory)
+            for namespace, directory in self._migration_namespace_directories()
+        )
+
+    def _migration_index_path(
+        self,
+        cycle: LabQuarantineQueueMigrationCycle,
+        index: int,
+    ) -> Path:
+        return (
+            self.garbage_queue_migration_cycles_dir
+            / cycle.cycle_id.hex
+            / "index"
+            / f"{index:020d}.json"
+        )
+
+    def _migration_cycle_path(self, cycle_id: UUID) -> Path:
+        return self.garbage_queue_migration_cycles_dir / cycle_id.hex / "cycle-v2.json"
+
+    def _migration_cursor_path(self, cycle_id: UUID) -> Path:
+        return self.garbage_queue_migration_cycles_dir / cycle_id.hex / "cursor-v2.json"
+
+    def _load_queue_migration_cycle(
+        self,
+        path: Path,
+    ) -> LabQuarantineQueueMigrationCycle:
+        raw = self._read_recovery_metadata(path, label="quarantine migration cycle")
+        try:
+            cycle = LabQuarantineQueueMigrationCycle.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine migration cycle: {exc}") from exc
+        if raw != cycle.canonical_json():
+            raise LabArtifactConflictError("quarantine migration cycle is not canonical")
+        return cycle
+
+    def _load_active_queue_migration_cycle_locked(
+        self,
+    ) -> LabQuarantineQueueMigrationCycle:
+        active = self._load_queue_migration_cycle(self.garbage_queue_migration_active_path)
+        authoritative = self._load_queue_migration_cycle(
+            self._migration_cycle_path(active.cycle_id)
+        )
+        if active != authoritative:
+            raise LabArtifactConflictError("active quarantine migration cycle conflicts")
+        return active
+
+    def _load_queue_migration_cursor(
+        self,
+        cycle: LabQuarantineQueueMigrationCycle,
+    ) -> LabQuarantineQueueMigrationCursor:
+        raw = self._read_recovery_metadata(
+            self._migration_cursor_path(cycle.cycle_id),
+            label="quarantine migration cursor",
+        )
+        try:
+            cursor = LabQuarantineQueueMigrationCursor.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine migration cursor: {exc}") from exc
+        if (
+            raw != cursor.canonical_json()
+            or cursor.cycle_id != cycle.cycle_id
+            or cursor.last_index > cycle.total_entries
+        ):
+            raise LabArtifactConflictError("quarantine migration cursor conflicts with cycle")
+        return cursor
+
+    def _write_queue_migration_cursor(
+        self,
+        cycle: LabQuarantineQueueMigrationCycle,
+        cursor: LabQuarantineQueueMigrationCursor,
+    ) -> None:
+        validated = LabQuarantineQueueMigrationCursor.model_validate(cursor)
+        current = self._load_queue_migration_cursor(cycle)
+        if (
+            validated.cycle_id != cycle.cycle_id
+            or validated.last_index > cycle.total_entries
+            or validated.last_index < current.last_index
+        ):
+            raise LabArtifactConflictError("quarantine migration cursor cannot move backward")
+        if validated == current:
+            return
+        path = self._migration_cursor_path(cycle.cycle_id)
+        self._replace_recovery_queue_state(path, validated.canonical_json())
+        if self._load_queue_migration_cursor(cycle) != validated:
+            raise LabArtifactConflictError("quarantine migration cursor readback mismatch")
+
+    def _load_queue_migration_index_entry(
+        self,
+        cycle: LabQuarantineQueueMigrationCycle,
+        index: int,
+    ) -> LabQuarantineQueueMigrationIndexEntry:
+        path = self._migration_index_path(cycle, index)
+        raw = self._read_recovery_metadata(path, label="quarantine migration index entry")
+        try:
+            entry = LabQuarantineQueueMigrationIndexEntry.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(
+                f"invalid quarantine migration index entry: {exc}"
+            ) from exc
+        if entry.index != index or raw != entry.canonical_json():
+            raise LabArtifactConflictError("quarantine migration index identity conflicts")
+        return entry
+
+    def _migration_index_entries_locked(
+        self,
+    ) -> tuple[
+        tuple[LabQuarantineQueueMigrationIndexEntry, ...],
+        tuple[LabQuarantineQueueMigrationDirectory, ...],
+    ]:
+        before = self._migration_directory_identities()
+        candidates: list[tuple[Literal["active", "cold_health", "authority"], str]] = []
+        for namespace, directory in self._migration_namespace_directories():
+            for path in self._recovery_intent_paths_locked(directory):
+                match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
+                if match is None:  # pragma: no cover - scanner validates names
+                    raise LabArtifactConflictError("legacy recovery marker name is invalid")
+                garbage_id = UUID(hex=match.group("garbage_id"))
+                if namespace == "authority":
+                    if self._has_recovery_marker_locked(garbage_id):
+                        continue
+                elif os.path.lexists(
+                    self.garbage_recovery_queue_enqueued_dir / f"{namespace}-{garbage_id.hex}.json"
+                ):
+                    continue
+                candidates.append((namespace, path.name))
+        after = self._migration_directory_identities()
+        if after != before:
+            raise LabArtifactConflictError("legacy recovery namespaces changed while indexing")
+        ordered = sorted(candidates, key=lambda item: (item[0], item[1]))
+        entries = tuple(
+            LabQuarantineQueueMigrationIndexEntry(
+                index=index,
+                namespace=namespace,
+                file_name=file_name,
+            )
+            for index, (namespace, file_name) in enumerate(ordered, start=1)
+        )
+        return entries, after
+
+    def _ensure_queue_migration_cycle_locked(
+        self,
+        entries: tuple[LabQuarantineQueueMigrationIndexEntry, ...],
+        directories: tuple[LabQuarantineQueueMigrationDirectory, ...],
+    ) -> LabQuarantineQueueMigrationCycle:
+        index_hash = _sha256_bytes(
+            json.dumps(
+                [entry.content_hash for entry in entries],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        cycle = LabQuarantineQueueMigrationCycle(
+            total_entries=len(entries),
+            index_hash=index_hash,
+            directories=directories,
+        )
+        cycle_root = self.garbage_queue_migration_cycles_dir / cycle.cycle_id.hex
+        index_root = cycle_root / "index"
+        for directory in (cycle_root, index_root):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if directory.is_symlink() or not directory.is_dir():
+                raise LabArtifactConflictError("quarantine migration cycle directory is unsafe")
+            directory.chmod(0o700)
+        for entry in entries:
+            path = self._migration_index_path(cycle, entry.index)
+            if os.path.lexists(path):
+                if self._load_queue_migration_index_entry(cycle, entry.index) != entry:
+                    raise LabArtifactConflictError("quarantine migration index conflicts")
+            else:
+                self._write_derived_canonical_file(path, entry.canonical_json())
+                if self._load_queue_migration_index_entry(cycle, entry.index) != entry:
+                    raise LabArtifactConflictError("quarantine migration index changed")
+        cycle_path = self._migration_cycle_path(cycle.cycle_id)
+        if os.path.lexists(cycle_path):
+            if self._load_queue_migration_cycle(cycle_path) != cycle:
+                raise LabArtifactConflictError("quarantine migration cycle conflicts")
+        else:
+            self._write_derived_canonical_file(cycle_path, cycle.canonical_json())
+        cursor_path = self._migration_cursor_path(cycle.cycle_id)
+        if not os.path.lexists(cursor_path):
+            cursor = LabQuarantineQueueMigrationCursor(cycle_id=cycle.cycle_id)
+            self._write_derived_canonical_file(cursor_path, cursor.canonical_json())
+        self._load_queue_migration_cursor(cycle)
+        if os.path.lexists(self.garbage_queue_migration_active_path):
+            current = self._load_queue_migration_cycle(self.garbage_queue_migration_active_path)
+            if current != cycle:
+                self._replace_recovery_queue_state(
+                    self.garbage_queue_migration_active_path,
+                    cycle.canonical_json(),
+                )
+        else:
+            self._write_derived_canonical_file(
+                self.garbage_queue_migration_active_path,
+                cycle.canonical_json(),
+            )
+        if self._load_active_queue_migration_cycle_locked() != cycle:
+            raise LabArtifactConflictError("quarantine migration activation changed")
+        return cycle
+
+    def initialize_legacy_recovery_migration(
+        self,
+    ) -> LabQuarantineMigrationInitializationResult:
+        """Build one explicit immutable legacy snapshot outside ordinary worker recovery."""
+        with self.report_spool.evidence_lock():
+            if os.path.lexists(self.garbage_queue_migration_complete_path):
+                self._load_queue_migration_complete_locked()
+                return LabQuarantineMigrationInitializationResult(indexed=0, complete=True)
+            if os.path.lexists(self.garbage_queue_migration_active_path):
+                active = self._load_active_queue_migration_cycle_locked()
+                cursor = self._load_queue_migration_cursor(active)
+                if cursor.last_index < active.total_entries:
+                    return LabQuarantineMigrationInitializationResult(
+                        indexed=active.total_entries,
+                        complete=False,
+                    )
+                if self._migration_directory_identities() == active.directories:
+                    self._write_queue_migration_complete_locked()
+                    return LabQuarantineMigrationInitializationResult(indexed=0, complete=True)
+            entries, directories = self._migration_index_entries_locked()
+            self._ensure_queue_migration_cycle_locked(entries, directories)
+            complete = not entries
+            if complete:
+                self._write_queue_migration_complete_locked()
+            return LabQuarantineMigrationInitializationResult(
+                indexed=len(entries),
+                complete=complete,
+            )
+
     def _has_recovery_marker_locked(self, garbage_id: UUID) -> bool:
         return any(
             os.path.lexists(self._intent_marker_path(directory, garbage_id))
@@ -4070,52 +5049,49 @@ class LabArtifactReclaimer:
         *,
         max_entries: int,
     ) -> LabQuarantineMigrationResult:
-        """Explicitly index legacy intents; ordinary worker ticks never call this scan."""
+        """Consume a bounded explicit migration snapshot without namespace scans."""
         if max_entries < 1:
             raise ValueError("legacy quarantine migration max_entries must be positive")
         with self.report_spool.evidence_lock():
-            if os.path.lexists(self.garbage_legacy_complete_path):
-                self._load_migration_complete_locked()
+            if os.path.lexists(self.garbage_queue_migration_complete_path):
+                self._load_queue_migration_complete_locked()
                 return LabQuarantineMigrationResult(scanned=0, enqueued=0, complete=True)
+            if not os.path.lexists(self.garbage_queue_migration_active_path):
+                raise LabArtifactConflictError(
+                    "legacy recovery migration requires explicit initialization"
+                )
+            cycle = self._load_active_queue_migration_cycle_locked()
+            cursor = self._load_queue_migration_cursor(cycle)
             scanned = 0
             enqueued = 0
-            more_missing = False
-            for directory, phase in (
-                (self.garbage_active_intent_dir, "active"),
-                (self.garbage_cold_health_dir, "cold_health"),
-            ):
-                for path in self._recovery_intent_paths_locked(directory):
-                    scanned += 1
-                    match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
-                    if match is None:  # pragma: no cover - scanner validates names
-                        raise LabArtifactConflictError("legacy recovery marker name is invalid")
-                    marker = self.garbage_recovery_queue_enqueued_dir / (
-                        f"{phase}-{match.group('garbage_id')}.json"
-                    )
-                    if os.path.lexists(marker):
-                        continue
-                    if enqueued >= max_entries:
-                        more_missing = True
-                        continue
-                    intent = self._load_prepared_intent(path)
-                    self._enqueue_recovery_intent(intent, phase=phase)
-                    enqueued += 1
-            for path in self._recovery_intent_paths_locked(self.garbage_intent_dir):
-                scanned += 1
-                match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
-                if match is None:  # pragma: no cover - scanner validates names
-                    raise LabArtifactConflictError("legacy prepared intent name is invalid")
-                if self._has_recovery_marker_locked(UUID(hex=match.group("garbage_id"))):
-                    continue
-                if enqueued >= max_entries:
-                    more_missing = True
-                    continue
+            directories = dict(self._migration_namespace_directories())
+            while scanned < max_entries and cursor.last_index < cycle.total_entries:
+                index = cursor.last_index + 1
+                entry = self._load_queue_migration_index_entry(cycle, index)
+                path = directories[entry.namespace] / entry.file_name
                 intent = self._load_prepared_intent(path)
-                self._ensure_intent_recovery_marker(intent)
+                match = _GARBAGE_INTENT_NAME.fullmatch(entry.file_name)
+                if match is None:  # pragma: no cover - model validates the name
+                    raise LabArtifactConflictError("legacy migration index name is invalid")
+                if intent.owner.garbage_id.hex != match.group("garbage_id"):
+                    raise LabArtifactConflictError("legacy migration source identity conflicts")
+                if entry.namespace == "authority":
+                    self._ensure_intent_recovery_marker(intent)
+                else:
+                    self._enqueue_recovery_intent(intent, phase=entry.namespace)
+                scanned += 1
                 enqueued += 1
-            complete = not more_missing
+                cursor = LabQuarantineQueueMigrationCursor(
+                    cycle_id=cycle.cycle_id,
+                    last_index=index,
+                )
+                self._write_queue_migration_cursor(cycle, cursor)
+            complete = (
+                cursor.last_index == cycle.total_entries
+                and self._migration_directory_identities() == cycle.directories
+            )
             if complete:
-                self._write_migration_complete_locked()
+                self._write_queue_migration_complete_locked()
             return LabQuarantineMigrationResult(
                 scanned=scanned,
                 enqueued=enqueued,
@@ -4237,9 +5213,8 @@ class LabArtifactReclaimer:
         first_error: Exception | None = None
         reconciled = 0
         cold_metadata_checked = 0
+        queue_conflicts = 0
         with self.report_spool.evidence_lock():
-            if os.path.lexists(self.garbage_legacy_complete_path):
-                self._load_migration_complete_locked()
             sequence_state = self._load_recovery_queue_sequence_locked()
             sequence_state, _unsequenced = self._commit_unsequenced_recovery_entry_locked(
                 sequence_state
@@ -4258,17 +5233,45 @@ class LabArtifactReclaimer:
                 pending = self._recovery_queue_path(sequence)
                 archived = self._recovery_queue_path(sequence, archived=True)
                 if os.path.lexists(pending) and os.path.lexists(archived):
-                    raise LabArtifactConflictError("quarantine queue sequence has two deliveries")
+                    cursor = self._retire_recovery_queue_conflict_locked(
+                        sequence,
+                        reason="ambiguous_delivery",
+                    )
+                    queue_conflicts += 1
+                    processed += 1
+                    continue
                 if os.path.lexists(archived):
-                    self._load_recovery_queue_entry(archived)
+                    try:
+                        self._load_recovery_queue_entry(archived)
+                    except LabArtifactConflictError:
+                        cursor = self._retire_recovery_queue_conflict_locked(
+                            sequence,
+                            reason="corrupt_archived",
+                        )
+                        queue_conflicts += 1
+                        processed += 1
+                        continue
                     cursor = LabQuarantineQueueCursor(last_sequence=sequence)
                     self._write_recovery_queue_cursor_locked(cursor)
                     continue
                 if not os.path.lexists(pending):
-                    cursor = LabQuarantineQueueCursor(last_sequence=sequence)
-                    self._write_recovery_queue_cursor_locked(cursor)
+                    cursor = self._retire_recovery_queue_conflict_locked(
+                        sequence,
+                        reason="missing_pending",
+                    )
+                    queue_conflicts += 1
+                    processed += 1
                     continue
-                entry = self._load_recovery_queue_entry(pending)
+                try:
+                    entry = self._load_recovery_queue_entry(pending)
+                except LabArtifactConflictError:
+                    cursor = self._retire_recovery_queue_conflict_locked(
+                        sequence,
+                        reason="corrupt_pending",
+                    )
+                    queue_conflicts += 1
+                    processed += 1
+                    continue
                 self._ensure_recovery_queue_marker(entry)
                 if entry.phase == "active":
                     self._process_active_queue_entry(entry)
@@ -4288,6 +5291,7 @@ class LabArtifactReclaimer:
             inspected=reconciled,
             reconciled=reconciled,
             cold_metadata_checked=cold_metadata_checked,
+            queue_conflicts=queue_conflicts,
         )
 
     def quarantine_entries(self) -> tuple[LabQuarantineEntry, ...]:
