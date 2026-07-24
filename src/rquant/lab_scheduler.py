@@ -45,6 +45,11 @@ def _system_clock() -> datetime:
     return datetime.now(UTC)
 
 
+def _safe_plan_failure(exc: Exception) -> str:
+    message = " ".join((str(exc) or type(exc).__name__).split())
+    return f"{type(exc).__name__}: {message[:400]}"
+
+
 class LabScheduler:
     """Own the writer lease and apply a bounded number of durable commands."""
 
@@ -252,11 +257,11 @@ class LabScheduler:
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 try:
                     definitions = self.adapter_registry.plan(job.spec)
-                except ValueError as exc:
+                except Exception as exc:
                     lease, mutation_now = self._mutation_context()
                     self.store.fail_unplanned_job(
                         job.job_id,
-                        reason=f"adapter plan failed: {exc}",
+                        reason=f"adapter plan failed: {_safe_plan_failure(exc)}",
                         lease=lease,
                         now=mutation_now,
                     )

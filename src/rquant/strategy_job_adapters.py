@@ -388,7 +388,7 @@ def _date_buckets(start_date: date, end_date: date) -> tuple[DateBucketShardInpu
 class NShapeCompareAdapter:
     adapter_id = "nshape-compare"
     adapter_version = ADAPTER_VERSION
-    strategy_name = "NShapeCompare"
+    strategy_name = "n_shape"
     snapshot_strategy_name = "n_shape"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
@@ -436,7 +436,7 @@ class NShapeCompareAdapter:
 class NShapeOptimizeAdapter:
     adapter_id = "nshape-optimize"
     adapter_version = ADAPTER_VERSION
-    strategy_name = "NShapeOptimize"
+    strategy_name = "n_shape"
     snapshot_strategy_name = "n_shape"
     job_type = ResearchJobType.PARAMETER_SEARCH
 
@@ -494,7 +494,7 @@ class NShapeOptimizeAdapter:
 class AuctionGapAdapter:
     adapter_id = "auction-gap"
     adapter_version = ADAPTER_VERSION
-    strategy_name = "AuctionGap"
+    strategy_name = "auction_gap"
     snapshot_strategy_name = "auction_gap"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
@@ -556,7 +556,7 @@ _GROWTH_VARIANT_FLAGS: dict[GrowthVariant, tuple[bool, bool, bool]] = {
 class GrowthBoardSurgeAdapter:
     adapter_id = "growth-board-surge"
     adapter_version = ADAPTER_VERSION
-    strategy_name = "GrowthBoardSurge"
+    strategy_name = "growth_board_surge"
     snapshot_strategy_name = "growth_board_surge"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
@@ -625,7 +625,7 @@ class StrategyJobAdapterRegistry:
     def __init__(self, adapters: Iterable[StrategyJobAdapter]) -> None:
         ordered = tuple(adapters)
         identities = tuple((adapter.adapter_id, adapter.adapter_version) for adapter in ordered)
-        strategies = tuple(adapter.strategy_name for adapter in ordered)
+        strategies = tuple((adapter.strategy_name, adapter.job_type) for adapter in ordered)
         if len(identities) != len(set(identities)):
             raise ValueError("adapter registry identities must be unique")
         if len(strategies) != len(set(strategies)):
@@ -634,16 +634,18 @@ class StrategyJobAdapterRegistry:
 
     def for_spec(self, spec: ResearchRunSpec) -> StrategyJobAdapter:
         validated = ResearchRunSpec.model_validate(spec)
+        key = (validated.parameters.strategy_name, validated.job_type)
         matches = tuple(
             adapter
             for adapter in self._adapters
-            if adapter.strategy_name == validated.parameters.strategy_name
+            if (adapter.strategy_name, adapter.job_type) == key
         )
         if len(matches) != 1:
-            raise ValueError(f"unsupported strategy_name: {validated.parameters.strategy_name}")
+            raise ValueError(
+                "unsupported strategy/job_type: "
+                f"{validated.parameters.strategy_name}/{validated.job_type.value}"
+            )
         adapter = matches[0]
-        if validated.job_type is not adapter.job_type:
-            raise ValueError(f"{adapter.strategy_name} requires job_type {adapter.job_type.value}")
         expected_contract = build_adapter_execution_contract(
             adapter.adapter_id,
             adapter.adapter_version,

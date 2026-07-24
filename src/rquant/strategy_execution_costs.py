@@ -12,6 +12,22 @@ COST_MODEL_VERSION = "a-share-round-trip-v1"
 _BPS_SCALE = Decimal(10_000)
 
 
+def _cost_totals(costs: ExecutionCostSpec) -> tuple[Decimal, Decimal]:
+    buy_cost_bps = (
+        costs.commission_bps + costs.transfer_fee_bps + costs.slippage_bps
+    )
+    sell_cost_bps = buy_cost_bps + costs.stamp_duty_bps
+    return buy_cost_bps, sell_cost_bps
+
+
+def _validate_positive_cost_factors(costs: ExecutionCostSpec) -> None:
+    buy_cost_bps, sell_cost_bps = _cost_totals(costs)
+    if Decimal(1) + buy_cost_bps / _BPS_SCALE <= 0:
+        raise ValueError("buy-side execution cost factor must be positive")
+    if Decimal(1) - sell_cost_bps / _BPS_SCALE <= 0:
+        raise ValueError("sell-side execution cost factor must be positive")
+
+
 def execution_costs_are_zero(costs: ExecutionCostSpec) -> bool:
     validated = ExecutionCostSpec.model_validate(costs)
     return all(
@@ -38,10 +54,16 @@ def _net_return_pct(
     if not gross.is_finite():
         raise ValueError("ret_pct must contain finite numeric values")
     gross_factor = Decimal(1) + gross / Decimal(100)
+    buy_factor = Decimal(1) + buy_cost_bps / _BPS_SCALE
+    sell_factor = Decimal(1) - sell_cost_bps / _BPS_SCALE
+    if gross_factor <= 0:
+        raise ValueError("gross return factor must be positive")
+    if buy_factor <= 0 or sell_factor <= 0:
+        raise ValueError("round-trip execution cost factors must be positive")
     net_factor = (
         gross_factor
-        * (Decimal(1) - sell_cost_bps / _BPS_SCALE)
-        / (Decimal(1) + buy_cost_bps / _BPS_SCALE)
+        * sell_factor
+        / buy_factor
     )
     return float((net_factor - Decimal(1)) * Decimal(100))
 
@@ -51,23 +73,14 @@ def apply_round_trip_execution_costs(
     costs: ExecutionCostSpec,
 ) -> pd.DataFrame:
     """Apply buy/sell costs to gross ``ret_pct`` while retaining provenance."""
+    _validate_positive_cost_factors(costs)
     validated = ExecutionCostSpec.model_validate(costs)
     if execution_costs_are_zero(validated) or trades.empty:
         return trades.copy()
     if "ret_pct" not in trades.columns:
         raise ValueError("nonzero execution costs require a ret_pct trade column")
 
-    buy_cost_bps = (
-        validated.commission_bps
-        + validated.transfer_fee_bps
-        + validated.slippage_bps
-    )
-    sell_cost_bps = (
-        validated.commission_bps
-        + validated.transfer_fee_bps
-        + validated.stamp_duty_bps
-        + validated.slippage_bps
-    )
+    buy_cost_bps, sell_cost_bps = _cost_totals(validated)
     output = trades.copy()
     output["gross_ret_pct"] = output["ret_pct"]
     output["ret_pct"] = output["gross_ret_pct"].map(

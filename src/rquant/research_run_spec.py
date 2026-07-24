@@ -297,6 +297,16 @@ class ExecutionCostSpec(RunSpecModel):
     def validate_finite_decimal(cls, value: object) -> Decimal:
         return _parse_decimal(value, field_name="execution cost")
 
+    @model_validator(mode="after")
+    def validate_round_trip_factors(self) -> ExecutionCostSpec:
+        buy_total = self.commission_bps + self.transfer_fee_bps + self.slippage_bps
+        sell_total = buy_total + self.stamp_duty_bps
+        if buy_total >= 10_000:
+            raise ValueError("buy-side execution costs must total less than 10000 bps")
+        if sell_total >= 10_000:
+            raise ValueError("sell-side execution costs must total less than 10000 bps")
+        return self
+
 
 def _canonical_decimal(value: Decimal) -> str:
     sign, digits, exponent = _decimal_components(

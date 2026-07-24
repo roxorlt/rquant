@@ -230,6 +230,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "lab worker heartbeat must precede scheduler shard lease expiry"
             )
+        if self.lab_worker_heartbeat_seconds >= self.lab_worker_lease_extension_seconds:
+            raise ValueError("lab worker heartbeat must precede lease extension")
         lab_path = self.lab_jobs_path_resolved.resolve()
         existing_database_paths = {
             self.duckdb_path.resolve(),

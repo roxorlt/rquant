@@ -3713,7 +3713,15 @@ class TestLabWorkerCli:
 
     @pytest.mark.parametrize(
         ("status", "expected_exit"),
-        [("succeeded", 0), ("failed", 1)],
+        [
+            ("idle", 0),
+            ("succeeded", 0),
+            ("failed", 1),
+            ("stopped", 1),
+            ("reported", 2),
+            ("awaiting_receipt", 2),
+            ("unknown", 2),
+        ],
     )
     def test_cmd_lab_worker_builds_spools_and_runs_one_tick(
         self,

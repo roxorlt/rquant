@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pandas as pd
 import pytest
@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from rquant.lab_shard_protocol import LabShardClaim
 from rquant.research_run_spec import (
+    DatasetSnapshotIdentity,
     ExecutionCostSpec,
     ResearchJobType,
     ResearchParameter,
@@ -27,23 +28,20 @@ def _parameter(name: str, kind: str, value: object) -> ResearchParameter:
 def _spec(
     strategy_name: str,
     *arguments: ResearchParameter,
+    job_type: ResearchJobType = ResearchJobType.STRATEGY_REPLAY,
     start_date: date = date(2026, 1, 1),
     end_date: date = date(2026, 2, 10),
 ) -> ResearchRunSpec:
     from rquant.strategy_job_adapters import build_adapter_execution_contract
 
     adapter_id = {
-        "NShapeCompare": "nshape-compare",
-        "NShapeOptimize": "nshape-optimize",
-        "AuctionGap": "auction-gap",
-        "GrowthBoardSurge": "growth-board-surge",
-    }[strategy_name]
+        ("n_shape", ResearchJobType.STRATEGY_REPLAY): "nshape-compare",
+        ("n_shape", ResearchJobType.PARAMETER_SEARCH): "nshape-optimize",
+        ("auction_gap", ResearchJobType.STRATEGY_REPLAY): "auction-gap",
+        ("growth_board_surge", ResearchJobType.STRATEGY_REPLAY): "growth-board-surge",
+    }[(strategy_name, job_type)]
     return ResearchRunSpec(
-        job_type=(
-            ResearchJobType.PARAMETER_SEARCH
-            if strategy_name == "NShapeOptimize"
-            else ResearchJobType.STRATEGY_REPLAY
-        ),
+        job_type=job_type,
         parameters=ResearchRunParameters(
             strategy_name=strategy_name,
             start_date=start_date,
@@ -86,7 +84,7 @@ def _claim(spec: ResearchRunSpec, shard_index: int = 0) -> LabShardClaim:
 
 def _nshape_compare_spec(*, hold_days: tuple[int, ...] = (1, 3, 5)) -> ResearchRunSpec:
     return _spec(
-        "NShapeCompare",
+        "n_shape",
         _parameter("hold_days", "integer_list", hold_days),
         _parameter("entry_modes", "text_list", ("late_confirm", "first_break")),
         _parameter("profile_variants", "text_list", ("baseline",)),
@@ -95,36 +93,37 @@ def _nshape_compare_spec(*, hold_days: tuple[int, ...] = (1, 3, 5)) -> ResearchR
 
 def _nshape_optimize_spec(*, hold_days: tuple[int, ...] = (1, 3, 5)) -> ResearchRunSpec:
     return _spec(
-        "NShapeOptimize",
+        "n_shape",
         _parameter("hold_days", "integer_list", hold_days),
         _parameter("entry_modes", "text_list", ("first_break",)),
         _parameter("profile_variants", "text_list", ("baseline",)),
         _parameter("top_n_options", "integer_list", (1,)),
         _parameter("score_profile_names", "text_list", ("v1",)),
+        job_type=ResearchJobType.PARAMETER_SEARCH,
     )
 
 
 def _auction_spec() -> ResearchRunSpec:
     return _spec(
-        "AuctionGap",
+        "auction_gap",
         _parameter("max_hold_days", "integer", 1),
     )
 
 
 def _growth_spec(*, variants: tuple[str, ...] = ("no_vwap", "full")) -> ResearchRunSpec:
     return _spec(
-        "GrowthBoardSurge",
+        "growth_board_surge",
         _parameter("variants", "text_list", variants),
         _parameter("max_hold_days", "integer", 1),
     )
 
 
-def _extreme_costs() -> ExecutionCostSpec:
+def _nonzero_costs() -> ExecutionCostSpec:
     return ExecutionCostSpec(
-        commission_bps=Decimal("10000"),
-        stamp_duty_bps=Decimal("10000"),
-        transfer_fee_bps=Decimal("10000"),
-        slippage_bps=Decimal("10000"),
+        commission_bps=Decimal("10"),
+        stamp_duty_bps=Decimal("5"),
+        transfer_fee_bps=Decimal("1"),
+        slippage_bps=Decimal("2"),
     )
 
 
@@ -149,6 +148,28 @@ def test_registry_plans_all_supported_strategy_jobs(
     assert {item.adapter_id for item in definitions} == {expected_adapter}
     assert [item.shard_index for item in definitions] == list(range(len(definitions)))
     assert len({item.plan_hash for item in definitions}) == 1
+
+
+def test_registry_selects_n_shape_adapter_by_job_type_and_plans_formal_spec() -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    registry = default_strategy_job_adapter_registry()
+    compare = _nshape_compare_spec(hold_days=(1,))
+    optimize = _nshape_optimize_spec(hold_days=(1,))
+    formal = compare.model_copy(
+        update={
+            "dataset_snapshot": DatasetSnapshotIdentity(
+                snapshot_id="a" * 64,
+                binding_hash="b" * 64,
+                audit_run_id="c" * 64,
+            ),
+            "research_status": "comparable",
+        }
+    )
+
+    assert registry.for_spec(compare).adapter_id == "nshape-compare"
+    assert registry.for_spec(optimize).adapter_id == "nshape-optimize"
+    assert registry.plan(formal)
 
 
 @pytest.mark.parametrize(
@@ -211,7 +232,7 @@ def test_hold_day_plan_is_unique_sorted_and_input_order_independent() -> None:
     [
         (
             _spec(
-                "NShapeCompare",
+                "n_shape",
                 _parameter("hold_days", "integer_list", (1,)),
                 _parameter("entry_modes", "text_list", ("first_break",)),
                 _parameter("mystery", "text", "x"),
@@ -220,19 +241,20 @@ def test_hold_day_plan_is_unique_sorted_and_input_order_independent() -> None:
         ),
         (
             _spec(
-                "NShapeOptimize",
+                "n_shape",
                 _parameter("entry_modes", "text_list", ("first_break",)),
                 _parameter("profile_variants", "text_list", ("baseline",)),
+                job_type=ResearchJobType.PARAMETER_SEARCH,
             ),
             "hold_days",
         ),
         (
-            _spec("AuctionGap", _parameter("max_hold_days", "text", "1")),
+            _spec("auction_gap", _parameter("max_hold_days", "text", "1")),
             "max_hold_days",
         ),
         (
             _spec(
-                "GrowthBoardSurge",
+                "growth_board_surge",
                 _parameter("variants", "text_list", ("unknown",)),
                 _parameter("max_hold_days", "integer", 1),
             ),
@@ -344,7 +366,7 @@ def test_nshape_compare_adapter_matches_legacy_fixture(tmp_path) -> None:
     from tests.unit.test_minute_replay import _seed_daily_and_screen, _seed_minutes
 
     spec = _spec(
-        "NShapeCompare",
+        "n_shape",
         _parameter("hold_days", "integer_list", (1,)),
         _parameter("entry_modes", "text_list", ("first_break",)),
         _parameter("profile_variants", "text_list", ("baseline",)),
@@ -364,7 +386,7 @@ def test_nshape_compare_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
-        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly_spec = spec.model_copy(update={"execution_costs": _nonzero_costs()})
         costly = registry.execute_shard(
             registry.validate_claim(_claim(costly_spec)),
             store,
@@ -388,7 +410,7 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
     from tests.unit.test_minute_replay import _seed_daily_and_screen, _seed_minutes
 
     spec = _spec(
-        "NShapeOptimize",
+        "n_shape",
         _parameter("hold_days", "integer_list", (1,)),
         _parameter("entry_modes", "text_list", ("first_break",)),
         _parameter("profile_variants", "text_list", ("baseline",)),
@@ -396,6 +418,7 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
         _parameter("score_profile_names", "text_list", ("v1",)),
         _parameter("validation_ratio", "decimal", Decimal("0")),
         _parameter("min_trades", "integer", 1),
+        job_type=ResearchJobType.PARAMETER_SEARCH,
         start_date=date(2026, 6, 24),
         end_date=date(2026, 6, 24),
     )
@@ -416,7 +439,7 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
-        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly_spec = spec.model_copy(update={"execution_costs": _nonzero_costs()})
         costly = registry.execute_shard(
             registry.validate_claim(_claim(costly_spec)),
             store,
@@ -448,7 +471,7 @@ def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
     from tests.unit.test_auction_gap_minute_replay import _seed_base
 
     spec = _spec(
-        "AuctionGap",
+        "auction_gap",
         _parameter("max_hold_days", "integer", 1),
         start_date=date(2026, 6, 25),
         end_date=date(2026, 6, 25),
@@ -468,7 +491,7 @@ def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
-        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly_spec = spec.model_copy(update={"execution_costs": _nonzero_costs()})
         costly = registry.execute_shard(
             registry.validate_claim(_claim(costly_spec)),
             store,
@@ -494,7 +517,7 @@ def test_growth_board_adapter_matches_legacy_fixture(tmp_path) -> None:
     )
 
     spec = _spec(
-        "GrowthBoardSurge",
+        "growth_board_surge",
         _parameter("variants", "text_list", ("full",)),
         _parameter("max_hold_days", "integer", 1),
         _parameter("lookback_days", "integer", 2),
@@ -523,7 +546,7 @@ def test_growth_board_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
-        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly_spec = spec.model_copy(update={"execution_costs": _nonzero_costs()})
         costly = registry.execute_shard(
             registry.validate_claim(_claim(costly_spec)),
             store,
@@ -545,7 +568,7 @@ def test_nshape_optimize_multi_hold_aggregate_matches_legacy_global_result(
     from tests.unit.test_minute_replay import _seed_daily_and_screen, _seed_minutes
 
     spec = _spec(
-        "NShapeOptimize",
+        "n_shape",
         _parameter("hold_days", "integer_list", (1, 3)),
         _parameter("entry_modes", "text_list", ("first_break",)),
         _parameter("profile_variants", "text_list", ("baseline",)),
@@ -553,6 +576,7 @@ def test_nshape_optimize_multi_hold_aggregate_matches_legacy_global_result(
         _parameter("score_profile_names", "text_list", ("v1",)),
         _parameter("validation_ratio", "decimal", Decimal("0")),
         _parameter("min_trades", "integer", 1),
+        job_type=ResearchJobType.PARAMETER_SEARCH,
         start_date=date(2026, 6, 24),
         end_date=date(2026, 6, 24),
     )
@@ -595,7 +619,7 @@ def test_auction_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) -
     from tests.unit.test_auction_gap_minute_replay import _seed_base
 
     spec = _spec(
-        "AuctionGap",
+        "auction_gap",
         _parameter("max_hold_days", "integer", 1),
         start_date=date(2026, 6, 5),
         end_date=date(2026, 6, 25),
@@ -640,7 +664,7 @@ def test_growth_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) ->
     )
 
     spec = _spec(
-        "GrowthBoardSurge",
+        "growth_board_surge",
         _parameter("variants", "text_list", ("full",)),
         _parameter("max_hold_days", "integer", 1),
         _parameter("lookback_days", "integer", 2),
@@ -762,6 +786,67 @@ def test_scheduler_persists_first_adapter_plan_failure(tmp_path) -> None:
     assert job is not None and job.status is JobStatus.FAILED
     assert reader.list_shards(command.command.job_id) == ()
     assert "execution contract" in reader.list_events(command.command.job_id)[-1].reason
+
+
+def test_scheduler_persists_runtime_plan_failure_and_continues_next_job(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    class RuntimeFailingRegistry:
+        def __init__(self) -> None:
+            self.delegate = default_strategy_job_adapter_registry()
+
+        def plan(self, spec: ResearchRunSpec):
+            if spec.random_seed == 1:
+                raise RuntimeError("fixture plan exploded\nunsafe detail")
+            return self.delegate.plan(spec)
+
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    bad_job_id = UUID(int=1)
+    good_job_id = UUID(int=2)
+    for job_id, seed in ((bad_job_id, 1), (good_job_id, 2)):
+        spool.publish(
+            LabCommandEnvelope(
+                request_id=uuid4(),
+                command=SubmitJobCommand(
+                    job_id=job_id,
+                    spec=_nshape_compare_spec(hold_days=(1,)).model_copy(
+                        update={"random_seed": seed}
+                    ),
+                    max_attempts=2,
+                ),
+            )
+        )
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        adapter_registry=RuntimeFailingRegistry(),
+        clock=lambda: datetime(2026, 7, 24, 1, tzinfo=UTC),
+    )
+
+    result = scheduler.run_once()
+    reader = LabJobReader(store.path)
+    bad = reader.get_job(bad_job_id)
+    good = reader.get_job(good_job_id)
+    reason = reader.list_events(bad_job_id)[-1].reason
+
+    assert result.plans_failed == 1
+    assert result.plans_created == 1
+    assert bad is not None and bad.status is JobStatus.FAILED
+    assert good is not None and good.status is JobStatus.QUEUED
+    assert reader.list_shards(good_job_id)
+    assert "RuntimeError: fixture plan exploded unsafe detail" in reason
+    assert "\n" not in reason
 
 
 def test_scheduler_deadline_terminalizes_running_job_and_shards(tmp_path) -> None:

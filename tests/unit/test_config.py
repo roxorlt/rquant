@@ -186,6 +186,19 @@ class TestSettings:
                 lab_worker_heartbeat_seconds=30,
             )
 
+    def test_lab_worker_heartbeat_must_precede_lease_extension(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValidationError, match="worker heartbeat must precede lease extension"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_scheduler_shard_lease_seconds=31,
+                lab_worker_heartbeat_seconds=30,
+                lab_worker_lease_extension_seconds=29,
+                lab_worker_receipt_timeout_seconds=1,
+            )
+
     @pytest.mark.parametrize(
         "existing_path",
         [

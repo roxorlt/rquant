@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -182,9 +183,58 @@ class LabWorkerFailure(LabWorkerModel):
 
 
 class LabWorkerTickResult(LabWorkerModel):
-    status: Literal["idle", "succeeded", "failed", "stopped"]
+    status: Literal[
+        "idle",
+        "succeeded",
+        "failed",
+        "stopped",
+        "reported",
+        "awaiting_receipt",
+        "unknown",
+    ]
     claim_token: UUID | None = None
     manifest_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    report_id: UUID | None = None
+
+
+class LabPreparedShardBundle(LabWorkerModel):
+    temporary: Path | None
+    manifest: LabShardResultManifest
+    reuses_existing: bool = False
+    existing_device: int | None = Field(default=None, ge=0)
+    existing_inode: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_existing_identity(self) -> LabPreparedShardBundle:
+        has_identity = self.existing_device is not None and self.existing_inode is not None
+        if self.reuses_existing != has_identity or self.reuses_existing != (
+            self.temporary is None
+        ):
+            raise ValueError("prepared bundle reuse identity is inconsistent")
+        return self
+
+
+class LabSealedShardBundle(LabWorkerModel):
+    path: Path
+    manifest: LabShardResultManifest
+    created: bool
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+
+
+class LabPendingSuccess(LabWorkerModel):
+    claim: LabShardClaim
+    report: LabWorkerReport
+    bundle: LabSealedShardBundle
+    receipt_state: Literal["reported", "awaiting_receipt", "unknown"]
+
+    @model_validator(mode="after")
+    def validate_success_identity(self) -> LabPendingSuccess:
+        if not isinstance(self.report.body, LabShardSucceeded):
+            raise ValueError("pending success must contain shard_succeeded report")
+        if self.report.body.result_manifest_hash != self.bundle.manifest.manifest_hash:
+            raise ValueError("pending success manifest hash does not match sealed bundle")
+        return self
 
 
 class LabArtifactConflictError(RuntimeError):
@@ -245,9 +295,12 @@ class LabWorker:
         self.verified_code_sha_provider = verified_code_sha_provider
         self.clock = clock
         self._stop = threading.Event()
+        self._terminal_lock = threading.Lock()
+        self._pending_success: LabPendingSuccess | None = None
 
     def request_stop(self) -> None:
-        self._stop.set()
+        with self._terminal_lock:
+            self._stop.set()
 
     def sealed_bundle_path(self, claim: LabShardClaim) -> Path:
         shard_root = (
@@ -332,6 +385,31 @@ class LabWorker:
                     f"artifact path ancestor is not a directory: {part}"
                 )
 
+    def _reclaim_current_candidate_directories(
+        self,
+        attempt_root: Path,
+        shard_root: Path,
+    ) -> None:
+        self._assert_safe_temporary_tree(attempt_root)
+        for child in tuple(attempt_root.iterdir()):
+            try:
+                candidate_id = UUID(child.name)
+            except ValueError:
+                continue
+            if candidate_id.hex != child.name:
+                continue
+            self._assert_safe_temporary_tree(child)
+            reclaimed = attempt_root / f".reclaim-{child.name}-{uuid4().hex}"
+            os.rename(child, reclaimed)
+            _fsync_directory(attempt_root)
+            shutil.rmtree(reclaimed)
+            _fsync_directory(attempt_root)
+        try:
+            attempt_root.rmdir()
+        except OSError:
+            return
+        _fsync_directory(shard_root)
+
     def _reclaim_obsolete_temporaries(self, claim: LabShardClaim) -> None:
         current_root = self._temporary_bundle_path(claim)
         shard_root = current_root.parent
@@ -355,6 +433,11 @@ class LabWorker:
                     raise LabArtifactConflictError(
                         "same-generation temporary attempt has conflicting identity"
                     )
+                if not self.claim_spool.is_current(claim):
+                    raise LabArtifactConflictError(
+                        "current temporary attempt is no longer the claim high-water"
+                    )
+                self._reclaim_current_candidate_directories(candidate, shard_root)
                 continue
             self._assert_safe_temporary_tree(candidate)
             reclaimed = shard_root / f".reclaim-{candidate.name}-{uuid4().hex}"
@@ -363,17 +446,37 @@ class LabWorker:
             shutil.rmtree(reclaimed)
             _fsync_directory(shard_root)
 
-    def _publish_report(
+    @staticmethod
+    def _validate_receipt_identity(
+        report: LabWorkerReport,
+        receipt: LabReportReceipt,
+    ) -> None:
+        if (
+            receipt.report_id != report.report_id
+            or receipt.content_hash != report.content_hash
+            or receipt.job_id != report.job_id
+            or receipt.shard_id != report.shard_id
+        ):
+            raise ValueError("report receipt identity does not match published report")
+
+    def _make_report(
         self,
         claim: LabShardClaim,
         body: LabShardHeartbeat | LabShardSucceeded | LabShardFailed | LabWorkerStopped,
     ) -> LabWorkerReport:
-        report = LabWorkerReport.from_claim(
+        return LabWorkerReport.from_claim(
             claim,
             report_id=uuid4(),
             reported_at=_utc(self.clock()),
             body=body,
         )
+
+    def _publish_report(
+        self,
+        claim: LabShardClaim,
+        body: LabShardHeartbeat | LabShardSucceeded | LabShardFailed | LabWorkerStopped,
+    ) -> LabWorkerReport:
+        report = self._make_report(claim, body)
         self.report_spool.publish(report)
         return report
 
@@ -412,13 +515,7 @@ class LabWorker:
     ) -> LabReportReceipt:
         report = self._publish_report(claim, body)
         receipt = self.receipt_waiter(report, self.receipt_timeout_seconds, stop)
-        if (
-            receipt.report_id != report.report_id
-            or receipt.content_hash != report.content_hash
-            or receipt.job_id != report.job_id
-            or receipt.shard_id != report.shard_id
-        ):
-            raise ValueError("report receipt identity does not match published report")
+        self._validate_receipt_identity(report, receipt)
         if receipt.status != "accepted":
             raise PermissionError(f"worker report rejected: {receipt.reason}")
         return receipt
@@ -724,6 +821,175 @@ class LabWorker:
                 break
             parent = parent.parent
 
+    @staticmethod
+    def _bundle_file_identity(path: Path) -> tuple[int, int]:
+        file_stat = os.lstat(path)
+        if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
+            raise LabArtifactConflictError("sealed shard bundle is not a regular directory")
+        return file_stat.st_dev, file_stat.st_ino
+
+    def _prepare_result(
+        self,
+        claim: LabShardClaim,
+        result: LabShardExecutionResult,
+    ) -> LabPreparedShardBundle:
+        self._validate_result_identity(claim, result)
+        sealed = self.sealed_bundle_path(claim)
+        temporary_root = self._temporary_bundle_path(claim)
+        self._assert_safe_artifact_ancestors(temporary_root)
+        self._assert_safe_artifact_ancestors(sealed.parent)
+        sealed.parent.mkdir(parents=True, exist_ok=True)
+        _fsync_directory(sealed.parent)
+        temporary = temporary_root / uuid4().hex
+        try:
+            self._write_bundle(temporary, claim, result)
+            candidate = self._validate_bundle(temporary, claim)
+            if sealed.exists() or sealed.is_symlink():
+                existing = self._validate_bundle(sealed, claim)
+                if existing.manifest_hash != candidate.manifest_hash:
+                    raise LabArtifactConflictError(
+                        "same attempt produced a conflicting result manifest"
+                    )
+                device, inode = self._bundle_file_identity(sealed)
+                self._cleanup_temporary(temporary)
+                return LabPreparedShardBundle(
+                    temporary=None,
+                    manifest=existing,
+                    reuses_existing=True,
+                    existing_device=device,
+                    existing_inode=inode,
+                )
+            return LabPreparedShardBundle(
+                temporary=temporary,
+                manifest=candidate,
+            )
+        except BaseException:
+            self._cleanup_temporary(temporary)
+            raise
+
+    def _discard_prepared(self, prepared: LabPreparedShardBundle | None) -> None:
+        if prepared is not None and prepared.temporary is not None:
+            self._cleanup_temporary(prepared.temporary)
+
+    def _assert_publish_boundary(
+        self,
+        claim: LabShardClaim,
+        *,
+        deadline: datetime | None,
+        effective_expiry: datetime | None,
+        require_current_claim: bool,
+    ) -> None:
+        if self._stop.is_set():
+            raise InterruptedError("worker stop requested before success point-of-no-return")
+        now = _utc(self.clock())
+        if deadline is not None and now >= deadline:
+            raise TimeoutError("ResearchRunSpec deadline reached before success publish")
+        if effective_expiry is not None and now >= effective_expiry:
+            raise PermissionError("accepted heartbeat lease expired before success publish")
+        if require_current_claim and not self.claim_spool.is_current(claim):
+            raise PermissionError("claim is no longer the durable shard high-water")
+
+    def _rollback_sealed(self, bundle: LabSealedShardBundle) -> None:
+        if not bundle.created or not os.path.lexists(bundle.path):
+            return
+        device, inode = self._bundle_file_identity(bundle.path)
+        if (device, inode) != (bundle.device, bundle.inode):
+            raise LabArtifactConflictError(
+                "sealed bundle changed identity before compensating rollback"
+            )
+        rollback = bundle.path.parent / f".rollback-{bundle.path.name}-{uuid4().hex}"
+        os.rename(bundle.path, rollback)
+        _fsync_directory(bundle.path.parent)
+        self._assert_safe_temporary_tree(rollback)
+        shutil.rmtree(rollback)
+        _fsync_directory(bundle.path.parent)
+
+    def _publish_candidate(
+        self,
+        claim: LabShardClaim,
+        prepared: LabPreparedShardBundle,
+        *,
+        deadline: datetime | None,
+        effective_expiry: datetime | None,
+        validate_concurrent_race: bool,
+    ) -> LabSealedShardBundle:
+        sealed = self.sealed_bundle_path(claim)
+        self._assert_publish_boundary(
+            claim,
+            deadline=deadline,
+            effective_expiry=effective_expiry,
+            require_current_claim=effective_expiry is not None,
+        )
+        if prepared.reuses_existing:
+            device, inode = self._bundle_file_identity(sealed)
+            if (device, inode) != (prepared.existing_device, prepared.existing_inode):
+                raise LabArtifactConflictError(
+                    "sealed bundle changed after candidate validation"
+                )
+            self._assert_publish_boundary(
+                claim,
+                deadline=deadline,
+                effective_expiry=effective_expiry,
+                require_current_claim=effective_expiry is not None,
+            )
+            return LabSealedShardBundle(
+                path=sealed,
+                manifest=prepared.manifest,
+                created=False,
+                device=device,
+                inode=inode,
+            )
+
+        temporary = prepared.temporary
+        if temporary is None:  # pragma: no cover - enforced by prepared model
+            raise RuntimeError("new prepared bundle has no temporary path")
+        created_bundle: LabSealedShardBundle | None = None
+        try:
+            try:
+                os.rename(temporary, sealed)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                if not validate_concurrent_race:
+                    raise LabArtifactConflictError(
+                        "sealed bundle appeared after final fence confirmation"
+                    ) from exc
+                existing = self._validate_bundle(sealed, claim)
+                if existing.manifest_hash != prepared.manifest.manifest_hash:
+                    raise LabArtifactConflictError(
+                        "concurrent attempt produced a conflicting result manifest"
+                    ) from exc
+                device, inode = self._bundle_file_identity(sealed)
+                return LabSealedShardBundle(
+                    path=sealed,
+                    manifest=existing,
+                    created=False,
+                    device=device,
+                    inode=inode,
+                )
+            device, inode = self._bundle_file_identity(sealed)
+            created_bundle = LabSealedShardBundle(
+                path=sealed,
+                manifest=prepared.manifest,
+                created=True,
+                device=device,
+                inode=inode,
+            )
+            _fsync_directory(sealed.parent)
+            self._assert_publish_boundary(
+                claim,
+                deadline=deadline,
+                effective_expiry=effective_expiry,
+                require_current_claim=effective_expiry is not None,
+            )
+            return created_bundle
+        except BaseException:
+            if created_bundle is not None:
+                self._rollback_sealed(created_bundle)
+            raise
+        finally:
+            self._cleanup_temporary(temporary)
+
     def _seal_result(
         self,
         claim: LabShardClaim,
@@ -731,48 +997,79 @@ class LabWorker:
         *,
         deadline: datetime | None = None,
     ) -> LabShardResultManifest:
-        self._validate_result_identity(claim, result)
-        sealed = self.sealed_bundle_path(claim)
-        temporary_root = self._temporary_bundle_path(claim)
-        self._assert_safe_artifact_ancestors(temporary_root)
-        self._assert_safe_artifact_ancestors(sealed.parent)
-        temporary = temporary_root / uuid4().hex
-        try:
-            self._write_bundle(temporary, claim, result)
-            candidate = self._validate_bundle(temporary, claim)
-            if self._stop.is_set():
-                raise InterruptedError("worker stop requested before atomic seal")
-            if deadline is not None and _utc(self.clock()) >= deadline:
-                raise TimeoutError("ResearchRunSpec deadline reached before atomic seal")
-            if sealed.exists() or sealed.is_symlink():
-                existing = self._validate_bundle(sealed, claim)
-                if existing.manifest_hash != candidate.manifest_hash:
-                    raise LabArtifactConflictError(
-                        "same attempt produced a conflicting result manifest"
-                    )
-                return existing
-            sealed.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.rename(temporary, sealed)
-            except OSError as exc:
-                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                    raise
-                existing = self._validate_bundle(sealed, claim)
-                if existing.manifest_hash != candidate.manifest_hash:
-                    raise LabArtifactConflictError(
-                        "concurrent attempt produced a conflicting result manifest"
-                    ) from exc
-                return existing
-            _fsync_directory(sealed.parent)
-            return candidate
-        finally:
-            self._cleanup_temporary(temporary)
+        prepared = self._prepare_result(claim, result)
+        bundle = self._publish_candidate(
+            claim,
+            prepared,
+            deadline=deadline,
+            effective_expiry=None,
+            validate_concurrent_race=True,
+        )
+        return bundle.manifest
 
     def _reuse_sealed(self, claim: LabShardClaim) -> LabShardResultManifest | None:
         sealed = self.sealed_bundle_path(claim)
         if not sealed.exists() and not sealed.is_symlink():
             return None
         return self._validate_bundle(sealed, claim)
+
+    @staticmethod
+    def _pending_tick_result(pending: LabPendingSuccess) -> LabWorkerTickResult:
+        return LabWorkerTickResult(
+            status=pending.receipt_state,
+            claim_token=pending.claim.claim_token,
+            manifest_hash=pending.bundle.manifest.manifest_hash,
+            report_id=pending.report.report_id,
+        )
+
+    def _set_pending_receipt_state(
+        self,
+        state: Literal["reported", "awaiting_receipt", "unknown"],
+    ) -> LabWorkerTickResult:
+        pending = self._pending_success
+        if pending is None:  # pragma: no cover - internal state invariant
+            raise RuntimeError("worker has no pending success report")
+        pending = pending.model_copy(update={"receipt_state": state})
+        self._pending_success = pending
+        return self._pending_tick_result(pending)
+
+    def _await_pending_success(self) -> LabWorkerTickResult:
+        pending = self._pending_success
+        if pending is None:  # pragma: no cover - guarded by caller
+            raise RuntimeError("worker has no pending success report")
+        try:
+            self.report_spool.publish(pending.report)
+        except Exception:
+            return self._set_pending_receipt_state("unknown")
+        try:
+            receipt = self.receipt_waiter(
+                pending.report,
+                self.receipt_timeout_seconds,
+                self._stop,
+            )
+            self._validate_receipt_identity(pending.report, receipt)
+        except TimeoutError:
+            return self._set_pending_receipt_state("awaiting_receipt")
+        except InterruptedError:
+            return self._set_pending_receipt_state("reported")
+        except Exception:
+            return self._set_pending_receipt_state("unknown")
+        if receipt.status == "rejected":
+            self._rollback_sealed(pending.bundle)
+            self._pending_success = None
+            return LabWorkerTickResult(
+                status="failed",
+                claim_token=pending.claim.claim_token,
+                manifest_hash=pending.bundle.manifest.manifest_hash,
+                report_id=pending.report.report_id,
+            )
+        self._pending_success = None
+        return LabWorkerTickResult(
+            status="succeeded",
+            claim_token=pending.claim.claim_token,
+            manifest_hash=pending.bundle.manifest.manifest_hash,
+            report_id=pending.report.report_id,
+        )
 
     def _failure_result(
         self,
@@ -797,6 +1094,8 @@ class LabWorker:
         return LabWorkerTickResult(status="stopped", claim_token=claim.claim_token)
 
     def run_once(self) -> LabWorkerTickResult:
+        if self._pending_success is not None:
+            return self._await_pending_success()
         if self._stop.is_set():
             return LabWorkerTickResult(status="stopped")
         claim = self._next_owned_claim()
@@ -832,35 +1131,82 @@ class LabWorker:
             daemon=True,
         )
         heartbeat.start()
+        prepared: LabPreparedShardBundle | None = None
+        operation_error: Exception | None = None
+        operation_phase: Literal["session", "execute", "deadline", "seal"] = "execute"
+        stop_reason: str | None = None
         try:
-            with self._open_store(validated.spec) as store:
-                result = self.adapter_registry.execute_shard(validated, store)
-        except PermissionError as exc:
-            return self._failure_result(claim, phase="session", error=exc)
-        except Exception as exc:
-            return self._failure_result(claim, phase="execute", error=exc)
+            try:
+                with self._open_store(validated.spec) as store:
+                    result = self.adapter_registry.execute_shard(validated, store)
+            except PermissionError as exc:
+                operation_phase = "session"
+                operation_error = exc
+            except Exception as exc:
+                operation_phase = "execute"
+                operation_error = exc
+            if operation_error is None:
+                if self._stop.is_set():
+                    stop_reason = "worker stop requested after shard execution"
+                else:
+                    try:
+                        self._check_deadline(validated.spec)
+                    except Exception as exc:
+                        operation_phase = "deadline"
+                        operation_error = exc
+            if operation_error is None and stop_reason is None:
+                try:
+                    prepared = self._prepare_result(claim, result)
+                    self._check_deadline(validated.spec)
+                except TimeoutError as exc:
+                    operation_phase = "deadline"
+                    operation_error = exc
+                except Exception as exc:
+                    operation_phase = "seal"
+                    operation_error = exc
+                if self._stop.is_set():
+                    stop_reason = "worker stop requested after candidate serialization"
         finally:
             finished.set()
             heartbeat.join()
 
+        if stop_reason is not None:
+            self._discard_prepared(prepared)
+            return self._stopped_result(claim, reason=stop_reason)
+        if operation_error is not None:
+            self._discard_prepared(prepared)
+            return self._failure_result(
+                claim,
+                phase=operation_phase,
+                error=operation_error,
+            )
         if heartbeat_errors:
+            self._discard_prepared(prepared)
             return self._failure_result(
                 claim,
                 phase="fence",
                 error=heartbeat_errors[0],
             )
-        try:
-            self._check_deadline(validated.spec)
-        except Exception as exc:
-            return self._failure_result(claim, phase="deadline", error=exc)
         if self._stop.is_set():
+            self._discard_prepared(prepared)
             return self._stopped_result(
                 claim,
-                reason="worker stop requested after shard execution",
+                reason="worker stop requested after candidate serialization",
+            )
+        if prepared is None:  # pragma: no cover - operation state invariant
+            return self._failure_result(
+                claim,
+                phase="seal",
+                error=RuntimeError("worker did not prepare a shard result"),
             )
 
         try:
-            self._check_deadline(validated.spec)
+            self._assert_publish_boundary(
+                claim,
+                deadline=validated.spec.deadline,
+                effective_expiry=None,
+                require_current_claim=True,
+            )
             receipt = self._publish_and_wait(
                 claim,
                 LabShardHeartbeat(
@@ -871,44 +1217,76 @@ class LabWorker:
             effective_expiry = receipt.accepted_at + timedelta(
                 seconds=self.lease_extension_seconds
             )
-            if _utc(self.clock()) >= effective_expiry:
-                raise PermissionError("accepted heartbeat lease expired before seal")
-            self._check_deadline(validated.spec)
+            self._assert_publish_boundary(
+                claim,
+                deadline=validated.spec.deadline,
+                effective_expiry=effective_expiry,
+                require_current_claim=True,
+            )
         except InterruptedError:
+            self._discard_prepared(prepared)
             return self._stopped_result(
                 claim,
                 reason="worker stop requested while confirming final shard fence",
             )
         except Exception as exc:
+            self._discard_prepared(prepared)
             return self._failure_result(claim, phase="fence", error=exc)
 
         try:
-            manifest = self._seal_result(
+            bundle = self._publish_candidate(
                 claim,
-                result,
+                prepared,
                 deadline=validated.spec.deadline,
+                effective_expiry=effective_expiry,
+                validate_concurrent_race=False,
             )
         except InterruptedError:
             return self._stopped_result(
                 claim,
-                reason="worker stop requested before atomic shard seal",
+                reason="worker stop requested at atomic shard publish boundary",
             )
+        except TimeoutError as exc:
+            return self._failure_result(claim, phase="deadline", error=exc)
         except Exception as exc:
             return self._failure_result(claim, phase="seal", error=exc)
 
         try:
-            self._publish_and_wait(
+            with self._terminal_lock:
+                self._assert_publish_boundary(
+                    claim,
+                    deadline=validated.spec.deadline,
+                    effective_expiry=effective_expiry,
+                    require_current_claim=True,
+                )
+                report = self._make_report(
+                    claim,
+                    LabShardSucceeded(
+                        result_manifest_hash=bundle.manifest.manifest_hash,
+                    ),
+                )
+                self._pending_success = LabPendingSuccess(
+                    claim=claim,
+                    report=report,
+                    bundle=bundle,
+                    receipt_state="reported",
+                )
+                self.report_spool.publish(report)
+        except InterruptedError:
+            self._rollback_sealed(bundle)
+            return self._stopped_result(
                 claim,
-                LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
-                stop=threading.Event(),
+                reason="worker stop requested before success point-of-no-return",
             )
+        except TimeoutError as exc:
+            self._rollback_sealed(bundle)
+            return self._failure_result(claim, phase="deadline", error=exc)
         except Exception as exc:
-            return self._failure_result(claim, phase="fence", error=exc)
-        return LabWorkerTickResult(
-            status="succeeded",
-            claim_token=claim.claim_token,
-            manifest_hash=manifest.manifest_hash,
-        )
+            if self._pending_success is None:
+                self._rollback_sealed(bundle)
+                return self._failure_result(claim, phase="fence", error=exc)
+            return self._set_pending_receipt_state("unknown")
+        return self._await_pending_success()
 
     def run_forever(self, *, install_signal_handlers: bool = True) -> None:
         previous_handler: object | None = None
@@ -922,7 +1300,10 @@ class LabWorker:
         try:
             while True:
                 result = self.run_once()
-                if result.status == "stopped" or (self._stop.is_set() and result.status == "idle"):
+                if result.status == "stopped" or (
+                    self._stop.is_set()
+                    and result.status in {"idle", "reported", "awaiting_receipt", "unknown"}
+                ):
                     return
                 self._stop.wait(self.poll_interval_ms / 1_000)
         finally:

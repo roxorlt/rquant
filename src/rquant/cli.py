@@ -3097,7 +3097,11 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     if args.once:
         result = worker.run_once()
         logger.info(f"lab-worker tick: {result.model_dump_json()}")
-        return 1 if result.status == "failed" else 0
+        if result.status in {"idle", "succeeded"}:
+            return 0
+        if result.status in {"failed", "stopped"}:
+            return 1
+        return 2
     worker.run_forever()
     return 0
 

@@ -43,12 +43,15 @@
 
 - **Strategy Lab worker fencing 与研究科学性缺口**：claim spool 新增持久 shard 高水位，旧
   generation 即使在新 claim 被消费后也不能复活；artifact 绑定 claim token、generation 与
-  scheduler fence，并在 heartbeat receipt 被 scheduler 接受后才可按 attempt 原子 seal。
-  worker 在 stop、heartbeat 发布失败、deadline、并发 rename 与崩溃临时目录回收边界均
-  fail closed。正式任务复用完整 research gate 并核对运行时代码 SHA、snapshot/binding/audit
-  证据；adapter execution contract 绑定代码身份。四类策略统一应用版本化 A 股双边交易成本，
-  N 字优化以净收益完成训练、验证、TopN 与 walk-forward 排序；scheduler 持久终态化 deadline
-  和 adapter plan 首错，避免无限领取或重复规划失败。
+  scheduler fence；后台 heartbeat 覆盖 candidate 的完整写入、回读、hash 与 fsync，最终同步
+  heartbeat receipt 被 scheduler 接受且 rename 前后 fence 仍有效时才可按 attempt 原子 seal。
+  success report 的已发布、等待 receipt 与未知状态保持同一 report identity，超时不再追加矛盾
+  的 failed report。worker 在 stop、heartbeat 发布失败、deadline、并发 rename 与崩溃临时目录
+  回收边界均 fail closed。正式任务复用完整 research gate 并核对运行时代码 SHA、snapshot/
+  binding/audit 证据；adapter registry 以既有 strategy name 与 job type 共同选型，execution
+  contract 绑定代码身份。四类策略统一应用版本化 A 股双边交易成本，N 字优化以净收益完成
+  训练、验证、TopN 与 walk-forward 排序；scheduler 持久终态化 deadline 和 adapter plan
+  首错，避免无限领取或重复规划失败。
 
 - **Strategy Lab 分片控制面规格缺口**：`lab_shard` 改为 `(job_id, shard_id)` 复合主键，
   同一确定性计划可安全用于不同 job；retry 会原子重置 nonterminal/failed shard 并永久废止

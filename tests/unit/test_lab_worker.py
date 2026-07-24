@@ -104,6 +104,8 @@ def _worker(
     claims: LabClaimSpool | None = None,
     reports: LabReportSpool | None = None,
     heartbeat_interval_seconds: float = 60.0,
+    lease_extension_seconds: int = 30,
+    receipt_timeout_seconds: float = 0.2,
     exploratory_store_factory=_store_factory,
     metadata_store_factory=None,
     lake_root: Path | None = None,
@@ -123,9 +125,9 @@ def _worker(
         metadata_store_factory=metadata_store_factory,
         research_lake_root=lake_root,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
-        lease_extension_seconds=30,
+        lease_extension_seconds=lease_extension_seconds,
         poll_interval_ms=5,
-        receipt_timeout_seconds=0.2,
+        receipt_timeout_seconds=receipt_timeout_seconds,
         receipt_waiter=receipt_waiter,
         verified_code_sha_provider=verified_code_sha_provider,
         clock=clock,
@@ -280,6 +282,137 @@ def test_worker_heartbeats_during_long_shard_then_succeeds(tmp_path: Path) -> No
     bodies = tuple(report.body for report in _reports(reports))
     assert any(isinstance(body, LabShardHeartbeat) for body in bodies)
     assert isinstance(bodies[-1], LabShardSucceeded)
+
+
+def test_background_heartbeat_covers_candidate_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        heartbeat_interval_seconds=0.01,
+    )
+    original_write = worker._write_bundle
+
+    def slow_write(*args: object, **kwargs: object):
+        time.sleep(0.05)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_write_bundle", slow_write)
+
+    result = worker.run_once()
+
+    heartbeats = [
+        report for report in _reports(reports) if isinstance(report.body, LabShardHeartbeat)
+    ]
+    assert result.status == "succeeded"
+    assert len(heartbeats) >= 2  # periodic during candidate write, then synchronous final fence
+
+
+def test_slow_candidate_loses_one_second_lease_to_new_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    commands.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(
+                job_id=uuid4(),
+                spec=_nshape_compare_spec(hold_days=(1,)),
+                max_attempts=2,
+            ),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=1,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    original = claims.pending()[0].claim
+    published: list[LabWorkerReport] = []
+    original_publish = reports.publish
+
+    def capture_publish(report: LabWorkerReport):
+        published.append(report)
+        return original_publish(report)
+
+    monkeypatch.setattr(reports, "publish", capture_publish)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        heartbeat_interval_seconds=0.05,
+        lease_extension_seconds=1,
+        receipt_timeout_seconds=0.5,
+        receipt_waiter=None,
+        clock=lambda: clock[0],
+    )
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_write = worker._write_bundle
+
+    def slow_write(*args: object, **kwargs: object):
+        write_started.set()
+        assert release_write.wait(timeout=3)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_write_bundle", slow_write)
+    outcomes = []
+    thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+    thread.start()
+    write_timeout = time.monotonic() + 1
+    while not write_started.is_set() and time.monotonic() < write_timeout:
+        scheduler.run_once()
+        time.sleep(0.01)
+    assert write_started.is_set()
+    time.sleep(1.05)
+    clock[0] = NOW + timedelta(seconds=2)
+    recovery = scheduler.run_once()
+    replacement = claims.pending()[0].claim
+    release_write.set()
+    timeout_at = time.monotonic() + 2
+    while thread.is_alive() and time.monotonic() < timeout_at:
+        scheduler.run_once()
+        time.sleep(0.01)
+    thread.join(timeout=0.2)
+    scheduler.release()
+
+    assert not thread.is_alive()
+    assert recovery.recovered == 1
+    assert replacement.claim_generation == original.claim_generation + 1
+    assert outcomes[0].status == "failed"
+    assert not worker.sealed_bundle_path(original).exists()
+    assert not any(
+        isinstance(report.body, LabShardSucceeded)
+        and report.claim_token == original.claim_token
+        for report in published
+    )
 
 
 def test_final_fence_rejection_prevents_seal_and_success(tmp_path: Path) -> None:
@@ -453,6 +586,136 @@ def test_worker_deadline_during_bundle_write_prevents_atomic_seal(
 
     assert result.status == "failed"
     assert not worker.sealed_bundle_path(claim).exists()
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+
+
+def test_stop_triggered_at_atomic_rename_rolls_back_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(tmp_path, claims=claims, reports=reports)
+    sealed = worker.sealed_bundle_path(claim)
+    original_rename = lab_worker.os.rename
+
+    def rename_then_stop(source: object, target: object) -> None:
+        original_rename(source, target)
+        if Path(target) == sealed:
+            worker.request_stop()
+
+    monkeypatch.setattr(lab_worker.os, "rename", rename_then_stop)
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert not sealed.exists()
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+
+
+def test_deadline_triggered_at_atomic_rename_rolls_back_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    clock = [NOW]
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"deadline": NOW + timedelta(seconds=1)}
+    )
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(spec)
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        clock=lambda: clock[0],
+    )
+    sealed = worker.sealed_bundle_path(claim)
+    original_rename = lab_worker.os.rename
+
+    def rename_then_expire(source: object, target: object) -> None:
+        original_rename(source, target)
+        if Path(target) == sealed:
+            clock[0] = spec.deadline
+
+    monkeypatch.setattr(lab_worker.os, "rename", rename_then_expire)
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert not sealed.exists()
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+
+
+def test_lease_expiry_at_atomic_rename_rolls_back_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        lease_extension_seconds=1,
+        clock=lambda: clock[0],
+    )
+    sealed = worker.sealed_bundle_path(claim)
+    original_rename = lab_worker.os.rename
+
+    def rename_then_expire_lease(source: object, target: object) -> None:
+        original_rename(source, target)
+        if Path(target) == sealed:
+            clock[0] = NOW + timedelta(seconds=1)
+
+    monkeypatch.setattr(lab_worker.os, "rename", rename_then_expire_lease)
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert not sealed.exists()
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+
+
+def test_high_water_change_at_atomic_rename_rolls_back_old_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(tmp_path, claims=claims, reports=reports)
+    sealed = worker.sealed_bundle_path(claim)
+    replacement = _retry_claim(claim)
+    original_rename = lab_worker.os.rename
+
+    def rename_then_replace_claim(source: object, target: object) -> None:
+        original_rename(source, target)
+        if Path(target) == sealed:
+            claims.publish(replacement)
+
+    monkeypatch.setattr(lab_worker.os, "rename", rename_then_replace_claim)
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert claims.current(claim.job_id, claim.shard_id).claim == replacement
+    assert not sealed.exists()
     assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
 
 
@@ -639,6 +902,21 @@ def test_new_generation_reclaims_only_obsolete_crash_temporary(tmp_path: Path) -
 
     assert not obsolete.exists()
     assert (current / "still-active").read_bytes() == b"active"
+
+
+def test_current_attempt_reclaims_known_crash_candidate_directory(tmp_path: Path) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path, claims=claims)
+    abandoned = worker._temporary_bundle_path(claim) / uuid4().hex
+    abandoned.mkdir(parents=True)
+    (abandoned / "partial.parquet").write_bytes(b"partial")
+    claims.publish(claim)
+
+    worker._reclaim_obsolete_temporaries(claim)
+
+    assert not abandoned.exists()
+    assert not worker._temporary_bundle_path(claim).exists()
 
 
 def test_obsolete_temporary_symlink_is_rejected_without_following(tmp_path: Path) -> None:
@@ -986,6 +1264,227 @@ def test_worker_execution_runtime_blocks_provider_and_notification_imports(
 
     assert result.status == "succeeded"
     assert isinstance(_reports(reports)[-1].body, LabShardSucceeded)
+
+
+def test_success_receipt_timeout_stays_pending_without_failed_report(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job_id = uuid4()
+    commands.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(
+                job_id=job_id,
+                spec=_nshape_compare_spec(hold_days=(1,)),
+                max_attempts=2,
+            ),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=20,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: NOW,
+    )
+    scheduler.run_once()
+    registry = RecordingRegistry()
+
+    def delayed_success(
+        report: LabWorkerReport,
+        _timeout_seconds: float,
+        _stop: object,
+    ) -> LabReportReceipt:
+        if isinstance(report.body, LabShardSucceeded):
+            raise TimeoutError("delayed success receipt")
+        return _accept_report(report, _timeout_seconds, _stop)
+
+    worker = _worker(
+        tmp_path,
+        registry=registry,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=delayed_success,
+    )
+
+    first = worker.run_once()
+    bodies = tuple(report.body for report in _reports(reports))
+
+    assert first.status == "awaiting_receipt"
+    assert first.report_id is not None
+    assert first.manifest_hash is not None
+    assert sum(isinstance(body, LabShardSucceeded) for body in bodies) == 1
+    assert not any(isinstance(body, LabShardFailed) for body in bodies)
+
+    scheduler.run_once()
+    worker.receipt_waiter = worker._wait_for_receipt
+    second = worker.run_once()
+    job = LabJobReader(store.path).get_job(job_id)
+    scheduler.release()
+
+    assert second.status == "succeeded"
+    assert second.report_id == first.report_id
+    assert registry.executions == 1
+    assert job is not None and job.status is JobStatus.SUCCEEDED
+
+
+def test_success_receipt_transport_error_is_unknown_without_failed_report(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+
+    def unavailable_receipt(
+        report: LabWorkerReport,
+        _timeout_seconds: float,
+        _stop: object,
+    ) -> LabReportReceipt:
+        if isinstance(report.body, LabShardSucceeded):
+            raise OSError("receipt channel unavailable")
+        return _accept_report(report, _timeout_seconds, _stop)
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=unavailable_receipt,
+    )
+
+    result = worker.run_once()
+    bodies = tuple(report.body for report in _reports(reports))
+
+    assert result.status == "unknown"
+    assert result.report_id is not None
+    assert result.manifest_hash is not None
+    assert sum(isinstance(body, LabShardSucceeded) for body in bodies) == 1
+    assert not any(isinstance(body, LabShardFailed) for body in bodies)
+
+
+def test_success_publish_failure_retries_same_report_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    class FailFirstSuccessSpool(LabReportSpool):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.failed = False
+
+        def publish(self, report: LabWorkerReport):
+            if isinstance(report.body, LabShardSucceeded) and not self.failed:
+                self.failed = True
+                raise OSError("injected success publish failure")
+            return super().publish(report)
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = FailFirstSuccessSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        registry=registry,
+        claims=claims,
+        reports=reports,
+    )
+
+    first = worker.run_once()
+    second = worker.run_once()
+    bodies = tuple(report.body for report in _reports(reports))
+
+    assert first.status == "unknown"
+    assert second.status == "succeeded"
+    assert first.report_id == second.report_id
+    assert registry.executions == 1
+    assert sum(isinstance(body, LabShardSucceeded) for body in bodies) == 1
+    assert not any(isinstance(body, LabShardFailed) for body in bodies)
+
+
+def test_stop_after_success_publish_keeps_single_reported_terminal(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = None
+
+    def stop_after_success(
+        report: LabWorkerReport,
+        _timeout_seconds: float,
+        _stop: object,
+    ) -> LabReportReceipt:
+        if isinstance(report.body, LabShardSucceeded):
+            assert worker is not None
+            worker.request_stop()
+            raise InterruptedError("stop after success publish")
+        return _accept_report(report, _timeout_seconds, _stop)
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=stop_after_success,
+    )
+
+    result = worker.run_once()
+    bodies = tuple(report.body for report in _reports(reports))
+
+    assert result.status == "reported"
+    assert sum(isinstance(body, LabShardSucceeded) for body in bodies) == 1
+    assert not any(isinstance(body, LabShardFailed | LabWorkerStopped) for body in bodies)
+
+
+def test_rejected_success_receipt_returns_failed_without_second_terminal_report(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+
+    def reject_success(
+        report: LabWorkerReport,
+        _timeout_seconds: float,
+        _stop: object,
+    ) -> LabReportReceipt:
+        return LabReportReceipt.from_report(
+            report,
+            status="rejected" if isinstance(report.body, LabShardSucceeded) else "accepted",
+            reason="stale_success" if isinstance(report.body, LabShardSucceeded) else "accepted",
+            accepted_at=NOW,
+        )
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=reject_success,
+    )
+
+    result = worker.run_once()
+    bodies = tuple(report.body for report in _reports(reports))
+
+    assert result.status == "failed"
+    assert sum(isinstance(body, LabShardSucceeded) for body in bodies) == 1
+    assert not any(isinstance(body, LabShardFailed) for body in bodies)
+    assert not worker.sealed_bundle_path(claim).exists()
 
 
 def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Path) -> None:
