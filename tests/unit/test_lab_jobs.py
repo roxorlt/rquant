@@ -313,7 +313,7 @@ def _create_609c599_v1_fixture(
     return rows
 
 
-def test_initialize_creates_v3_schema_and_required_pragmas(
+def test_initialize_creates_v4_schema_and_required_pragmas(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -340,7 +340,7 @@ def test_initialize_creates_v3_schema_and_required_pragmas(
         "lab_artifact",
     } <= tables
     assert application_id == LabJobStore.APPLICATION_ID
-    assert user_version == 3
+    assert user_version == 4
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
     assert "STRICT" not in schema_sql
@@ -434,7 +434,7 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
         migrated_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lab_command'"
         ).fetchone()[0]
-    assert user_version == 3
+    assert user_version == 4
     assert "receipt_job_version" in columns
     assert migrated == (
         (

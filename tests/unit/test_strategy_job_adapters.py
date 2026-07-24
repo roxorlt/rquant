@@ -156,6 +156,58 @@ def test_registry_plans_all_supported_strategy_jobs(
     assert len({item.plan_hash for item in definitions}) == 1
 
 
+@pytest.mark.parametrize(
+    ("spec", "phase", "work_unit_name", "expected_units"),
+    [
+        (_nshape_compare_spec(hold_days=(1,)), "nshape_compare", "parameter_case", 2),
+        (_nshape_optimize_spec(hold_days=(1,)), "nshape_optimize", "parameter_case", 1),
+        (_auction_spec(), "auction_gap_replay", "calendar_day", 20),
+        (_growth_spec(variants=("full",)), "growth_board_surge_replay", "calendar_day", 20),
+    ],
+)
+def test_registry_maps_all_contract_jobs_to_explicit_work_plans(
+    spec: ResearchRunSpec,
+    phase: str,
+    work_unit_name: str,
+    expected_units: int,
+) -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    definitions = default_strategy_job_adapter_registry().plan(spec)
+
+    assert definitions
+    assert all(item.work_plan is not None for item in definitions)
+    first = definitions[0].work_plan
+    assert first is not None
+    assert first.phase == phase
+    assert first.work_unit_name == work_unit_name
+    assert first.work_units == expected_units
+    assert first.static_duration_ms > 0
+
+
+@pytest.mark.parametrize(
+    ("spec", "legacy_name"),
+    [
+        (_nshape_compare_spec(hold_days=(1,)), "NShapeCompare"),
+        (_nshape_optimize_spec(hold_days=(1,)), "NShapeOptimize"),
+        (_auction_spec(), "AuctionGap"),
+        (_growth_spec(variants=("full",)), "GrowthBoardSurge"),
+    ],
+)
+def test_legacy_aliases_keep_the_same_typed_work_plan_mapping(
+    spec: ResearchRunSpec,
+    legacy_name: str,
+) -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    registry = default_strategy_job_adapter_registry()
+
+    legacy = registry.plan(_legacy_strategy_spec(spec, legacy_name))
+    canonical = registry.plan(spec)
+
+    assert tuple(item.work_plan for item in legacy) == tuple(item.work_plan for item in canonical)
+
+
 def test_registry_selects_n_shape_adapter_by_job_type_and_plans_formal_spec() -> None:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 

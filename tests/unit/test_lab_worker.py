@@ -33,6 +33,7 @@ from rquant.lab_shard_protocol import (
     LabShardFailed,
     LabShardHeartbeat,
     LabShardSucceeded,
+    LabShardTelemetry,
     LabWorkerReport,
     LabWorkerStopped,
 )
@@ -138,6 +139,7 @@ def _worker(
     receipt_waiter=_accept_report,
     verified_code_sha_provider=lambda: "1" * 40,
     clock=lambda: NOW,
+    monotonic_clock=time.monotonic,
 ):
     from rquant.lab_worker import LabWorker
 
@@ -158,6 +160,7 @@ def _worker(
         receipt_waiter=receipt_waiter,
         verified_code_sha_provider=verified_code_sha_provider,
         clock=clock,
+        monotonic_clock=monotonic_clock,
     )
 
 
@@ -3761,6 +3764,39 @@ def test_success_publish_failure_retries_same_report_without_reexecution(
     assert not any(isinstance(body, LabShardFailed) for body in bodies)
 
 
+def test_worker_success_report_uses_monotonic_duration_and_claim_work_plan(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    assert claim.definition.work_plan is not None
+    claims.publish(claim)
+    monotonic_values = iter((100.0, 102.5))
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        monotonic_clock=lambda: next(monotonic_values),
+    )
+
+    result = worker.run_once()
+    success = next(
+        report.body for report in _reports(reports) if isinstance(report.body, LabShardSucceeded)
+    )
+
+    assert result.status == "succeeded"
+    assert success.telemetry is not None
+    assert success.telemetry.phase == claim.definition.work_plan.phase
+    assert success.telemetry.work_unit_name == claim.definition.work_plan.work_unit_name
+    assert success.telemetry.work_units == claim.definition.work_plan.work_units
+    assert success.telemetry.static_duration_ms == claim.definition.work_plan.static_duration_ms
+    assert success.telemetry.duration_ms == 2_500
+    assert success.telemetry.throughput_units_per_second == pytest.approx(
+        claim.definition.work_plan.work_units / 2.5
+    )
+
+
 def test_stop_after_success_publish_keeps_single_reported_terminal(
     tmp_path: Path,
 ) -> None:
@@ -6366,11 +6402,19 @@ def test_scheduler_retires_accepted_success_from_hot_claim_authority(tmp_path: P
     )
     scheduler.run_once()
     claim = claims.consume(claims.pending()[0])
+    assert claim.definition.work_plan is not None
     success = LabWorkerReport.from_claim(
         claim,
         report_id=uuid4(),
         reported_at=NOW,
-        body=LabShardSucceeded(result_manifest_hash="a" * 64),
+        body=LabShardSucceeded(
+            result_manifest_hash="a" * 64,
+            telemetry=LabShardTelemetry.from_work_plan(
+                claim.definition.work_plan,
+                monotonic_started=10,
+                monotonic_finished=11,
+            ),
+        ),
     )
     reports.publish(success)
 

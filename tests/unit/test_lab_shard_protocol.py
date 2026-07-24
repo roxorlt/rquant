@@ -29,6 +29,8 @@ from rquant.lab_shard_protocol import (
     LabShardFailed,
     LabShardHeartbeat,
     LabShardSucceeded,
+    LabShardTelemetry,
+    LabShardWorkPlan,
     LabWorkerReport,
     LabWorkerStopped,
 )
@@ -90,6 +92,96 @@ def test_definition_has_deterministic_identity_and_canonical_payload() -> None:
     assert first.shard_id == second.shard_id
     assert first.payload_hash == second.payload_hash
     assert _definition(index=1).shard_id != first.shard_id
+
+
+def test_definition_roundtrips_typed_work_plan_and_legacy_definition_stays_optional() -> None:
+    work_plan = LabShardWorkPlan(
+        phase="strategy_replay",
+        work_unit_name="parameter_case",
+        work_units=4,
+        static_duration_ms=12_000,
+    )
+    definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="n-shape-replay",
+        adapter_version="v1",
+        plan_hash=PLAN_HASH,
+        payload_json='{"hold_days":3}',
+        work_plan=work_plan,
+    )
+
+    assert definition.work_plan == work_plan
+    assert LabShardDefinition.model_validate_json(definition.model_dump_json()) == definition
+    assert _definition().work_plan is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("work_units", 0),
+        ("static_duration_ms", 0),
+        ("phase", ""),
+        ("work_unit_name", ""),
+    ],
+)
+def test_work_plan_rejects_nonpositive_or_empty_fields(field: str, value: object) -> None:
+    payload = {
+        "phase": "strategy_replay",
+        "work_unit_name": "parameter_case",
+        "work_units": 4,
+        "static_duration_ms": 12_000,
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        LabShardWorkPlan.model_validate(payload)
+
+
+@pytest.mark.parametrize("duration", [0.0, -1.0, float("nan"), float("inf")])
+def test_success_telemetry_fails_closed_on_invalid_monotonic_duration(duration: float) -> None:
+    with pytest.raises(ValidationError):
+        LabShardTelemetry(
+            phase="strategy_replay",
+            work_unit_name="parameter_case",
+            work_units=4,
+            static_duration_ms=12_000,
+            duration_ms=duration,
+            throughput_units_per_second=1.0,
+        )
+
+
+def test_success_telemetry_rejects_inconsistent_throughput() -> None:
+    with pytest.raises(ValidationError, match="throughput"):
+        LabShardTelemetry(
+            phase="strategy_replay",
+            work_unit_name="parameter_case",
+            work_units=4,
+            static_duration_ms=12_000,
+            duration_ms=2_000,
+            throughput_units_per_second=99,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duration_ms", "2000"),
+        ("throughput_units_per_second", "2"),
+    ],
+)
+def test_success_telemetry_rejects_numeric_strings(field: str, value: str) -> None:
+    payload = {
+        "phase": "strategy_replay",
+        "work_unit_name": "parameter_case",
+        "work_units": 4,
+        "static_duration_ms": 12_000,
+        "duration_ms": 2_000,
+        "throughput_units_per_second": 2,
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        LabShardTelemetry.model_validate(payload)
 
 
 @pytest.mark.parametrize(

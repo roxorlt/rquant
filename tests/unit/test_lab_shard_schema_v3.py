@@ -73,7 +73,7 @@ def _create_real_v2_fixture(path: Path) -> tuple[str, str]:
     return job_id, shard_id
 
 
-def test_initialize_creates_v3_report_table_and_claim_columns(tmp_path: Path) -> None:
+def test_initialize_creates_v4_telemetry_columns(tmp_path: Path) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
 
@@ -84,13 +84,15 @@ def test_initialize_creates_v3_report_table_and_claim_columns(tmp_path: Path) ->
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         shard_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(lab_shard)")}
+        job_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)")}
         report_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(lab_worker_report)")
         }
 
-    assert version == 3
+    assert version == 4
     assert "lab_worker_report" in tables
     assert "lab_scheduler_state" in tables
+    assert "result_contract_version" in job_columns
     assert {
         "plan_hash",
         "adapter_id",
@@ -105,6 +107,13 @@ def test_initialize_creates_v3_report_table_and_claim_columns(tmp_path: Path) ->
         "result_manifest_hash",
         "failure_json",
         "finished_at",
+        "phase",
+        "work_unit_name",
+        "work_units",
+        "static_duration_ms",
+        "duration_ms",
+        "throughput_units_per_second",
+        "completion_sequence",
     } <= shard_columns
     assert {
         "report_id",
@@ -148,7 +157,7 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     assert shard.result_manifest_hash is None
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("SELECT COUNT(*) FROM lab_command").fetchone()[0] == 2
 
 
@@ -554,6 +563,70 @@ def test_v2_to_v3_migration_fault_rolls_back_all_schema_and_rows(
 
     # WAL-free fixture bytes remain exactly unchanged after the rolled-back transaction.
     assert path.read_bytes() == original
+
+
+def test_initialize_migrates_v3_additively_without_inventing_legacy_telemetry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    job_id, _shard_id = _create_real_v2_fixture(path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN IMMEDIATE")
+        lab_jobs._migrate_v2_to_v3(connection)
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+        before_job = tuple(
+            connection.execute("SELECT * FROM lab_job WHERE job_id = ?", (job_id,)).fetchone()
+        )
+        before_shard = tuple(
+            connection.execute("SELECT * FROM lab_shard WHERE job_id = ?", (job_id,)).fetchone()
+        )
+
+    store = LabJobStore(path)
+    store.initialize()
+    first = LabJobReader(path).list_shards(lab_jobs.UUID(job_id))[0]
+    first_job = LabJobReader(path).get_job(lab_jobs.UUID(job_id))
+    store.initialize()
+    second = LabJobReader(path).list_shards(lab_jobs.UUID(job_id))[0]
+
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        migrated_job = connection.execute(
+            "SELECT * FROM lab_job WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        migrated_shard = connection.execute(
+            "SELECT * FROM lab_shard WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        assert tuple(migrated_job)[: len(before_job)] == before_job
+        assert tuple(migrated_shard)[: len(before_shard)] == before_shard
+        assert migrated_job["result_contract_version"] is None
+        assert (
+            tuple(
+                migrated_shard[name]
+                for name in (
+                    "phase",
+                    "work_unit_name",
+                    "work_units",
+                    "static_duration_ms",
+                    "duration_ms",
+                    "throughput_units_per_second",
+                    "completion_sequence",
+                )
+            )
+            == (None,) * 7
+        )
+
+    assert first_job is not None and first_job.result_contract_version is None
+    assert first == second
+    assert first.phase is None
+    assert first.work_unit_name is None
+    assert first.work_units is None
+    assert first.static_duration_ms is None
+    assert first.duration_ms is None
+    assert first.throughput_units_per_second is None
+    assert first.completion_sequence is None
 
 
 def test_v3_identity_validation_rejects_incomplete_worker_report_table(

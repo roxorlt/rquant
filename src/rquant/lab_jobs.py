@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -31,6 +32,8 @@ from rquant.lab_shard_protocol import (
     LabShardFailed,
     LabShardHeartbeat,
     LabShardSucceeded,
+    LabShardTelemetry,
+    LabShardWorkPlan,
     LabWorkerReport,
     LabWorkerStopped,
 )
@@ -39,6 +42,9 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
+
+if TYPE_CHECKING:
+    from rquant.lab_eta import LabEtaEstimate, LabEtaInput
 
 
 class SchedulerLeaseUnavailableError(RuntimeError):
@@ -75,8 +81,10 @@ class ShardPlanConflictError(RuntimeError):
 
 _APPLICATION_ID = 0x52514A42
 _LEGACY_SCHEMA_VERSION = 1
-_PREVIOUS_SCHEMA_VERSION = 2
-_SCHEMA_VERSION = 3
+_V2_SCHEMA_VERSION = 2
+_PREVIOUS_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
+RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 _LEGACY_PLAN_HASH = "0" * 64
@@ -159,6 +167,7 @@ class LabJobRecord(LabRecordModel):
     max_attempts: int = Field(ge=1)
     recoverable: bool
     scheduler_fencing_token: int | None = Field(default=None, ge=1)
+    result_contract_version: str | None = Field(default=None, min_length=1)
     created_at: datetime
     updated_at: datetime
 
@@ -176,6 +185,17 @@ class LabShardRecord(LabRecordModel):
     adapter_version: str
     payload_json: str
     payload_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    phase: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
+    work_unit_name: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
+    work_units: int | None = Field(default=None, strict=True, ge=1)
+    static_duration_ms: int | None = Field(default=None, strict=True, ge=1)
+    duration_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    throughput_units_per_second: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    completion_sequence: int | None = Field(default=None, strict=True, ge=1)
     worker_id: str | None = None
     scheduler_fencing_token: int | None = Field(default=None, ge=1)
     claim_token: UUID | None = None
@@ -189,6 +209,29 @@ class LabShardRecord(LabRecordModel):
     checkpoint_json: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    @property
+    def work_plan(self) -> LabShardWorkPlan | None:
+        values = (self.phase, self.work_unit_name, self.work_units, self.static_duration_ms)
+        if all(value is None for value in values):
+            return None
+        return LabShardWorkPlan(
+            phase=self.phase,
+            work_unit_name=self.work_unit_name,
+            work_units=self.work_units,
+            static_duration_ms=self.static_duration_ms,
+        )
+
+    @property
+    def telemetry(self) -> LabShardTelemetry | None:
+        plan = self.work_plan
+        if self.duration_ms is None and self.throughput_units_per_second is None:
+            return None
+        return LabShardTelemetry(
+            **plan.model_dump() if plan is not None else {},
+            duration_ms=self.duration_ms,
+            throughput_units_per_second=self.throughput_units_per_second,
+        )
 
 
 class LabEventRecord(LabRecordModel):
@@ -279,6 +322,23 @@ def _strict_nullable_sqlite_int(
     if value is None:
         return None
     return _strict_sqlite_int(value, field=field, minimum=minimum)
+
+
+def _strict_nullable_sqlite_real(
+    value: object,
+    *,
+    field: str,
+    positive: bool = False,
+) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidStoredJobError(f"{field} must be a SQLite real, found {type(value).__name__}")
+    converted = float(value)
+    if not math.isfinite(converted) or (positive and converted <= 0):
+        qualifier = "finite and positive" if positive else "finite"
+        raise InvalidStoredJobError(f"{field} must be {qualifier}, found {converted}")
+    return converted
 
 
 def _strict_sqlite_bool(value: object, *, field: str) -> bool:
@@ -507,6 +567,55 @@ def _validate_v3_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_v4_schema(connection: sqlite3.Connection) -> None:
+    _validate_v3_schema(connection)
+    job_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()
+    }
+    if "result_contract_version" not in job_columns:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v4 is missing lab_job.result_contract_version"
+        )
+    shard_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_shard)").fetchall()
+    }
+    required = {
+        "phase",
+        "work_unit_name",
+        "work_units",
+        "static_duration_ms",
+        "duration_ms",
+        "throughput_units_per_second",
+        "completion_sequence",
+    }
+    missing = sorted(required - shard_columns)
+    if missing:
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v4 is missing lab_shard columns: {', '.join(missing)}"
+        )
+    indexes = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'index' AND name IN (
+                'ix_lab_shard_job_completion_sequence',
+                'ix_lab_shard_job_status_index'
+            )
+            """
+        ).fetchall()
+    }
+    required_indexes = {
+        "ix_lab_shard_job_completion_sequence",
+        "ix_lab_shard_job_status_index",
+    }
+    if indexes != required_indexes:
+        missing_indexes = ", ".join(sorted(required_indexes - indexes))
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v4 is missing telemetry indexes: {missing_indexes}"
+        )
+
+
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
     columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
@@ -575,6 +684,92 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     _normalize_v2_exhausted_nonterminal_jobs(connection)
     _normalize_v2_legacy_nonterminal_shards(connection)
     _validate_v3_schema(connection)
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    _validate_v3_schema(connection)
+    job_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()
+    }
+    shard_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_shard)").fetchall()
+    }
+    if "result_contract_version" in job_columns or "phase" in shard_columns:
+        raise LabDatabaseIdentityError("lab jobs SQLite v3 unexpectedly has v4 telemetry columns")
+    additions = (
+        """
+        ALTER TABLE lab_job ADD COLUMN result_contract_version TEXT
+        CHECK (
+            result_contract_version IS NULL
+            OR (typeof(result_contract_version) = 'text' AND length(result_contract_version) > 0)
+        )
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN phase TEXT
+        CHECK (phase IS NULL OR (typeof(phase) = 'text' AND length(phase) > 0))
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN work_unit_name TEXT
+        CHECK (
+            work_unit_name IS NULL
+            OR (typeof(work_unit_name) = 'text' AND length(work_unit_name) > 0)
+        )
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN work_units INTEGER
+        CHECK (
+            work_units IS NULL
+            OR (typeof(work_units) = 'integer' AND work_units >= 1)
+        )
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN static_duration_ms INTEGER
+        CHECK (
+            (phase IS NULL AND work_unit_name IS NULL
+             AND work_units IS NULL AND static_duration_ms IS NULL)
+            OR
+            (phase IS NOT NULL AND work_unit_name IS NOT NULL
+             AND work_units IS NOT NULL
+             AND typeof(static_duration_ms) = 'integer'
+             AND static_duration_ms >= 1)
+        )
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN duration_ms REAL
+        CHECK (
+            duration_ms IS NULL
+            OR (typeof(duration_ms) IN ('integer', 'real')
+                AND duration_ms > 0 AND duration_ms < 1e15)
+        )
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN throughput_units_per_second REAL
+        CHECK (
+            (duration_ms IS NULL AND throughput_units_per_second IS NULL)
+            OR
+            (duration_ms IS NOT NULL
+             AND typeof(throughput_units_per_second) IN ('integer', 'real')
+             AND throughput_units_per_second > 0
+             AND throughput_units_per_second < 1e18)
+        )
+        """,
+        """
+        ALTER TABLE lab_shard ADD COLUMN completion_sequence INTEGER
+        CHECK (
+            completion_sequence IS NULL
+            OR (typeof(completion_sequence) = 'integer'
+                AND completion_sequence >= 1
+                AND status = 'succeeded'
+                AND duration_ms IS NOT NULL
+                AND throughput_units_per_second IS NOT NULL)
+        )
+        """,
+    )
+    for statement in additions:
+        connection.execute(statement)
+    connection.execute(_V4_COMPLETION_INDEX_STATEMENT)
+    connection.execute(_V4_STATUS_INDEX_STATEMENT)
+    _validate_v4_schema(connection)
 
 
 def _normalize_legacy_terminal_shards(connection: sqlite3.Connection) -> None:
@@ -932,7 +1127,7 @@ class LabJobReader:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v3_schema(connection)
+            _validate_v4_schema(connection)
         except BaseException:
             connection.close()
             raise
@@ -975,6 +1170,11 @@ class LabJobReader:
                     row["scheduler_fencing_token"],
                     field="lab_job.scheduler_fencing_token",
                     minimum=1,
+                ),
+                result_contract_version=(
+                    str(row["result_contract_version"])
+                    if row["result_contract_version"] is not None
+                    else None
                 ),
                 created_at=_load_time(str(row["created_at"])),
                 updated_at=_load_time(str(row["updated_at"])),
@@ -1072,6 +1272,35 @@ class LabJobReader:
                 adapter_version=str(row["adapter_version"]),
                 payload_json=str(row["payload_json"]),
                 payload_hash=str(row["payload_hash"]),
+                phase=(str(row["phase"]) if row["phase"] is not None else None),
+                work_unit_name=(
+                    str(row["work_unit_name"]) if row["work_unit_name"] is not None else None
+                ),
+                work_units=_strict_nullable_sqlite_int(
+                    row["work_units"],
+                    field="lab_shard.work_units",
+                    minimum=1,
+                ),
+                static_duration_ms=_strict_nullable_sqlite_int(
+                    row["static_duration_ms"],
+                    field="lab_shard.static_duration_ms",
+                    minimum=1,
+                ),
+                duration_ms=_strict_nullable_sqlite_real(
+                    row["duration_ms"],
+                    field="lab_shard.duration_ms",
+                    positive=True,
+                ),
+                throughput_units_per_second=_strict_nullable_sqlite_real(
+                    row["throughput_units_per_second"],
+                    field="lab_shard.throughput_units_per_second",
+                    positive=True,
+                ),
+                completion_sequence=_strict_nullable_sqlite_int(
+                    row["completion_sequence"],
+                    field="lab_shard.completion_sequence",
+                    minimum=1,
+                ),
                 claim_token=(
                     UUID(str(row["claim_token"])) if row["claim_token"] is not None else None
                 ),
@@ -1125,7 +1354,45 @@ class LabJobReader:
                     plan_hash=record.plan_hash,
                     payload_json=record.payload_json,
                     payload_hash=record.payload_hash,
+                    work_plan=record.work_plan,
                 )
+            plan_values = (
+                record.phase,
+                record.work_unit_name,
+                record.work_units,
+                record.static_duration_ms,
+            )
+            if not (
+                all(value is None for value in plan_values)
+                or all(value is not None for value in plan_values)
+            ):
+                raise ValueError("shard work plan must be entirely present or absent")
+            telemetry_values = (
+                record.duration_ms,
+                record.throughput_units_per_second,
+                record.completion_sequence,
+            )
+            if not (
+                all(value is None for value in telemetry_values)
+                or all(value is not None for value in telemetry_values)
+            ):
+                raise ValueError("shard completion telemetry must be entirely present or absent")
+            if record.duration_ms is not None:
+                if record.work_plan is None:
+                    raise ValueError("shard telemetry is missing its work plan")
+                LabShardTelemetry(
+                    **record.work_plan.model_dump(),
+                    duration_ms=record.duration_ms,
+                    throughput_units_per_second=record.throughput_units_per_second,
+                )
+                if record.status is not ShardStatus.SUCCEEDED:
+                    raise ValueError("non-succeeded shard retains completion telemetry")
+            if (
+                record.status is ShardStatus.SUCCEEDED
+                and record.work_plan is not None
+                and record.duration_ms is None
+            ):
+                raise ValueError("telemetry-planned succeeded shard is missing telemetry")
             if record.status is ShardStatus.RUNNING and any(
                 value is None
                 for value in (
@@ -1233,6 +1500,148 @@ class LabJobReader:
             ).fetchall()
         return tuple(self._shard_from_row(row) for row in rows)
 
+    def get_eta_input(
+        self,
+        job_id: UUID,
+        *,
+        as_of: datetime,
+        completed_limit: int = 256,
+    ) -> LabEtaInput | None:
+        from rquant.lab_eta import LabEtaCompletedShard, LabEtaInput, LabEtaRemainingShard
+
+        if completed_limit < 3:
+            raise ValueError("completed telemetry limit must be at least three")
+        current = _utc(as_of)
+        with self._connect() as connection:
+            job_row = connection.execute(
+                "SELECT status FROM lab_job WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if job_row is None:
+                return None
+            completed_rows = connection.execute(
+                """
+                SELECT shard_id, phase, work_unit_name, work_units,
+                       static_duration_ms, duration_ms,
+                       throughput_units_per_second, completion_sequence
+                FROM lab_shard
+                WHERE job_id = ? AND status = 'succeeded'
+                  AND completion_sequence IS NOT NULL
+                ORDER BY completion_sequence DESC
+                LIMIT ?
+                """,
+                (str(job_id), completed_limit),
+            ).fetchall()
+            remaining_rows = connection.execute(
+                """
+                SELECT shard_id, phase, work_unit_name, work_units,
+                       static_duration_ms
+                FROM lab_shard INDEXED BY ix_lab_shard_job_status_index
+                WHERE job_id = ?
+                  AND status IN ('queued', 'running', 'checkpointed', 'failed', 'cancelled')
+                ORDER BY shard_index, shard_id
+                """,
+                (str(job_id),),
+            ).fetchall()
+
+        completed: list[LabEtaCompletedShard] = []
+        for row in completed_rows:
+            telemetry = LabShardTelemetry(
+                phase=str(row["phase"]),
+                work_unit_name=str(row["work_unit_name"]),
+                work_units=_strict_sqlite_int(
+                    row["work_units"],
+                    field="lab_shard.work_units",
+                    minimum=1,
+                ),
+                static_duration_ms=_strict_sqlite_int(
+                    row["static_duration_ms"],
+                    field="lab_shard.static_duration_ms",
+                    minimum=1,
+                ),
+                duration_ms=_strict_nullable_sqlite_real(
+                    row["duration_ms"],
+                    field="lab_shard.duration_ms",
+                    positive=True,
+                ),
+                throughput_units_per_second=_strict_nullable_sqlite_real(
+                    row["throughput_units_per_second"],
+                    field="lab_shard.throughput_units_per_second",
+                    positive=True,
+                ),
+            )
+            completed.append(
+                LabEtaCompletedShard(
+                    shard_id=UUID(str(row["shard_id"])),
+                    completion_sequence=_strict_sqlite_int(
+                        row["completion_sequence"],
+                        field="lab_shard.completion_sequence",
+                        minimum=1,
+                    ),
+                    telemetry=telemetry,
+                )
+            )
+        completed.sort(key=lambda item: item.completion_sequence)
+
+        remaining: list[LabEtaRemainingShard] = []
+        for row in remaining_rows:
+            plan_values = (
+                row["phase"],
+                row["work_unit_name"],
+                row["work_units"],
+                row["static_duration_ms"],
+            )
+            if all(value is None for value in plan_values):
+                plan = None
+            elif all(value is not None for value in plan_values):
+                plan = LabShardWorkPlan(
+                    phase=str(row["phase"]),
+                    work_unit_name=str(row["work_unit_name"]),
+                    work_units=_strict_sqlite_int(
+                        row["work_units"],
+                        field="lab_shard.work_units",
+                        minimum=1,
+                    ),
+                    static_duration_ms=_strict_sqlite_int(
+                        row["static_duration_ms"],
+                        field="lab_shard.static_duration_ms",
+                        minimum=1,
+                    ),
+                )
+            else:
+                raise InvalidStoredJobError(
+                    "lab_shard work plan must be entirely present or absent"
+                )
+            remaining.append(
+                LabEtaRemainingShard(
+                    shard_id=UUID(str(row["shard_id"])),
+                    work_plan=plan,
+                )
+            )
+        return LabEtaInput(
+            job_id=job_id,
+            status=str(job_row["status"]),
+            as_of=current,
+            completed=tuple(completed),
+            remaining=tuple(remaining),
+        )
+
+    def estimate_eta(
+        self,
+        job_id: UUID,
+        *,
+        as_of: datetime,
+        completed_limit: int = 256,
+    ) -> LabEtaEstimate | None:
+        from rquant.lab_eta import estimate_lab_eta
+
+        projection = self.get_eta_input(
+            job_id,
+            as_of=as_of,
+            completed_limit=completed_limit,
+        )
+        return None if projection is None else estimate_lab_eta(projection)
+
     def list_artifacts(self, job_id: UUID) -> tuple[LabArtifactRecord, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1294,7 +1703,7 @@ class LabJobStore:
                     connection,
                     allow_unclaimed_empty=False,
                 )
-                _validate_v3_schema(connection)
+                _validate_v4_schema(connection)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
         except BaseException:
@@ -1311,7 +1720,7 @@ class LabJobStore:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v3_schema(connection)
+            _validate_v4_schema(connection)
             yield connection
             connection.commit()
         except BaseException:
@@ -1329,7 +1738,12 @@ class LabJobStore:
                 connection,
                 allow_unclaimed_empty=True,
                 accepted_versions=frozenset(
-                    {_LEGACY_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}
+                    {
+                        _LEGACY_SCHEMA_VERSION,
+                        _V2_SCHEMA_VERSION,
+                        _PREVIOUS_SCHEMA_VERSION,
+                        _SCHEMA_VERSION,
+                    }
                 ),
             )
             starting_version = _strict_sqlite_int(
@@ -1344,9 +1758,11 @@ class LabJobStore:
                 for statement in _V2_SCHEMA_STATEMENTS:
                     connection.execute(statement)
                 _migrate_v2_to_v3(connection)
-            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
+                _migrate_v3_to_v4(connection)
+            elif starting_version == _V2_SCHEMA_VERSION:
                 _migrate_v2_to_v3(connection)
-            elif starting_version == _SCHEMA_VERSION:
+                _migrate_v3_to_v4(connection)
+            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
                 shard_primary_key = _shard_primary_key_columns(connection)
                 if shard_primary_key == ("shard_id",):
                     _migrate_global_shard_primary_key(
@@ -1357,10 +1773,11 @@ class LabJobStore:
                     raise LabDatabaseIdentityError(
                         "lab jobs SQLite v3 has an unsupported lab_shard primary key"
                     )
+                _migrate_v3_to_v4(connection)
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
             _normalize_legacy_terminal_shards(connection)
-            _validate_v3_schema(connection)
+            _validate_v4_schema(connection)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
@@ -1610,6 +2027,8 @@ class LabJobStore:
         now: datetime,
         result_manifest_hash: str | None = None,
         failure_json: str | None = None,
+        telemetry: LabShardTelemetry | None = None,
+        completion_sequence: int | None = None,
     ) -> bool:
         if target_status not in {
             ShardStatus.SUCCEEDED,
@@ -1626,7 +2045,8 @@ class LabJobStore:
                 claimed_at = NULL, heartbeat_at = NULL,
                 lease_expires_at = NULL, result_manifest_hash = ?,
                 failure_json = ?, checkpoint_json = NULL,
-                finished_at = ?, updated_at = ?
+                finished_at = ?, updated_at = ?, duration_ms = ?,
+                throughput_units_per_second = ?, completion_sequence = ?
             WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
             """,
             (
@@ -1636,6 +2056,9 @@ class LabJobStore:
                 failure_json,
                 _dump_time(now),
                 _dump_time(now),
+                telemetry.duration_ms if telemetry is not None else None,
+                (telemetry.throughput_units_per_second if telemetry is not None else None),
+                completion_sequence,
                 str(row["job_id"]),
                 str(row["shard_id"]),
                 version,
@@ -2740,6 +3163,10 @@ class LabJobStore:
         plan_hashes = {item.plan_hash for item in ordered}
         if len(plan_hashes) != 1:
             raise ValueError("all shard definitions must share one plan_hash")
+        work_plan_presence = tuple(item.work_plan is not None for item in ordered)
+        if any(work_plan_presence) and not all(work_plan_presence):
+            raise ValueError("a shard plan cannot mix telemetry and legacy definitions")
+        result_contract_version = RESULT_CONTRACT_VERSION if all(work_plan_presence) else None
         current = _utc(now)
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
@@ -2761,6 +3188,7 @@ class LabJobStore:
                         record.plan_hash,
                         record.payload_json,
                         record.payload_hash,
+                        record.work_plan,
                     )
                     for record in records
                 )
@@ -2773,12 +3201,22 @@ class LabJobStore:
                         item.plan_hash,
                         item.payload_json,
                         item.payload_hash,
+                        item.work_plan,
                     )
                     for item in ordered
                 )
                 if stored_identity != requested_identity:
                     raise ShardPlanConflictError(
                         f"job {job_id} is already bound to a different plan"
+                    )
+                stored_contract = (
+                    str(job_row["result_contract_version"])
+                    if job_row["result_contract_version"] is not None
+                    else None
+                )
+                if stored_contract != result_contract_version:
+                    raise ShardPlanConflictError(
+                        f"job {job_id} result contract does not match its shard plan"
                     )
                 return records
             status = JobStatus(str(job_row["status"]))
@@ -2789,7 +3227,13 @@ class LabJobStore:
             max_attempts = _strict_sqlite_int(
                 job_row["max_attempts"], field="lab_job.max_attempts", minimum=1
             )
+            if result_contract_version is not None:
+                connection.execute(
+                    "UPDATE lab_job SET result_contract_version = ? WHERE job_id = ?",
+                    (result_contract_version, str(job_id)),
+                )
             for item in ordered:
+                work_plan = item.work_plan
                 connection.execute(
                     """
                     INSERT INTO lab_shard (
@@ -2799,11 +3243,15 @@ class LabJobStore:
                         worker_id, scheduler_fencing_token, claim_token,
                         claim_generation, claimed_at, heartbeat_at,
                         lease_expires_at, result_manifest_hash, failure_json,
-                        finished_at, checkpoint_json, created_at, updated_at
+                        finished_at, checkpoint_json, created_at, updated_at,
+                        phase, work_unit_name, work_units, static_duration_ms,
+                        duration_ms, throughput_units_per_second,
+                        completion_sequence
                     ) VALUES (
                         ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?,
                         NULL, NULL, NULL, 0, NULL, NULL, NULL,
-                        NULL, NULL, NULL, NULL, ?, ?
+                        NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?,
+                        NULL, NULL, NULL
                     )
                     """,
                     (
@@ -2819,6 +3267,10 @@ class LabJobStore:
                         item.payload_hash,
                         _dump_time(current),
                         _dump_time(current),
+                        work_plan.phase if work_plan is not None else None,
+                        work_plan.work_unit_name if work_plan is not None else None,
+                        work_plan.work_units if work_plan is not None else None,
+                        work_plan.static_duration_ms if work_plan is not None else None,
                     ),
                 )
             rows = connection.execute(
@@ -3009,6 +3461,24 @@ class LabJobStore:
             plan_hash=str(row["plan_hash"]),
             payload_json=str(row["payload_json"]),
             payload_hash=str(row["payload_hash"]),
+            work_plan=(
+                LabShardWorkPlan(
+                    phase=str(row["phase"]),
+                    work_unit_name=str(row["work_unit_name"]),
+                    work_units=_strict_sqlite_int(
+                        row["work_units"],
+                        field="lab_shard.work_units",
+                        minimum=1,
+                    ),
+                    static_duration_ms=_strict_sqlite_int(
+                        row["static_duration_ms"],
+                        field="lab_shard.static_duration_ms",
+                        minimum=1,
+                    ),
+                )
+                if row["phase"] is not None
+                else None
+            ),
         )
 
     def _recover_stale_shards_in_transaction(
@@ -3701,6 +4171,23 @@ class LabJobStore:
             report.body, LabWorkerStopped
         ):
             return "cancel_requested"
+        if isinstance(report.body, LabShardSucceeded):
+            expected_plan = LabJobStore._definition_from_shard_row(shard_row).work_plan
+            reported_telemetry = report.body.telemetry
+            if expected_plan is None:
+                if reported_telemetry is not None:
+                    return "unexpected_shard_telemetry"
+            elif reported_telemetry is None:
+                return "missing_shard_telemetry"
+            else:
+                reported_plan = LabShardWorkPlan(
+                    phase=reported_telemetry.phase,
+                    work_unit_name=reported_telemetry.work_unit_name,
+                    work_units=reported_telemetry.work_units,
+                    static_duration_ms=reported_telemetry.static_duration_ms,
+                )
+                if reported_plan != expected_plan:
+                    return "shard_telemetry_plan_mismatch"
         return None
 
     def _apply_heartbeat_report(
@@ -3747,12 +4234,33 @@ class LabJobStore:
         shard_row: sqlite3.Row,
         now: datetime,
     ) -> str:
+        completion_sequence: int | None = None
+        if body.telemetry is not None:
+            latest = connection.execute(
+                """
+                SELECT MAX(completion_sequence) FROM lab_shard
+                WHERE job_id = ? AND status = 'succeeded'
+                  AND completion_sequence IS NOT NULL
+                """,
+                (str(report.job_id),),
+            ).fetchone()[0]
+            completion_sequence = (
+                0
+                if latest is None
+                else _strict_sqlite_int(
+                    latest,
+                    field="lab_shard.max_completion_sequence",
+                    minimum=1,
+                )
+            ) + 1
         terminalized = self._terminalize_claimed_shard(
             connection,
             shard_row,
             target_status=ShardStatus.SUCCEEDED,
             now=now,
             result_manifest_hash=body.result_manifest_hash,
+            telemetry=body.telemetry,
+            completion_sequence=completion_sequence,
         )
         assert terminalized
         remaining = connection.execute(
@@ -4307,6 +4815,114 @@ CREATE TABLE IF NOT EXISTS lab_shard (
 )
 """
 
+_V4_JOB_TABLE_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS lab_job (
+    job_id TEXT PRIMARY KEY,
+    spec_json TEXT NOT NULL,
+    spec_hash TEXT NOT NULL,
+    job_type TEXT NOT NULL,
+    resource_class TEXT NOT NULL,
+    deadline TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ({_STATUS_VALUES})),
+    control_intent TEXT NOT NULL CHECK (
+        control_intent IN ({_CONTROL_INTENT_VALUES})
+    ),
+    version INTEGER NOT NULL CHECK (version >= 0),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+    recoverable INTEGER NOT NULL CHECK (recoverable IN (0, 1)),
+    scheduler_fencing_token INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    result_contract_version TEXT CHECK (
+        result_contract_version IS NULL
+        OR (typeof(result_contract_version) = 'text'
+            AND length(result_contract_version) > 0)
+    )
+)
+"""
+
+_V4_SHARD_TABLE_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS lab_shard (
+    shard_id TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES lab_job(job_id) ON DELETE CASCADE,
+    shard_index INTEGER NOT NULL CHECK (
+        typeof(shard_index) = 'integer' AND shard_index >= 0
+    ),
+    status TEXT NOT NULL CHECK (status IN ({_SHARD_STATUS_VALUES})),
+    version INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version >= 0),
+    attempt_count INTEGER NOT NULL CHECK (
+        typeof(attempt_count) = 'integer' AND attempt_count >= 0
+    ),
+    max_attempts INTEGER NOT NULL CHECK (
+        typeof(max_attempts) = 'integer' AND max_attempts >= 1
+    ),
+    plan_hash TEXT NOT NULL DEFAULT '{_LEGACY_PLAN_HASH}',
+    adapter_id TEXT NOT NULL DEFAULT 'legacy-v2',
+    adapter_version TEXT NOT NULL DEFAULT 'v0',
+    payload_json TEXT NOT NULL DEFAULT '{_EMPTY_PAYLOAD_JSON}',
+    payload_hash TEXT NOT NULL DEFAULT '{_EMPTY_PAYLOAD_HASH}',
+    worker_id TEXT,
+    scheduler_fencing_token INTEGER,
+    claim_token TEXT,
+    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (
+        typeof(claim_generation) = 'integer' AND claim_generation >= 0
+    ),
+    claimed_at TEXT,
+    heartbeat_at TEXT,
+    lease_expires_at TEXT,
+    result_manifest_hash TEXT,
+    failure_json TEXT,
+    finished_at TEXT,
+    checkpoint_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    phase TEXT CHECK (
+        phase IS NULL OR (typeof(phase) = 'text' AND length(phase) > 0)
+    ),
+    work_unit_name TEXT CHECK (
+        work_unit_name IS NULL
+        OR (typeof(work_unit_name) = 'text' AND length(work_unit_name) > 0)
+    ),
+    work_units INTEGER CHECK (
+        work_units IS NULL
+        OR (typeof(work_units) = 'integer' AND work_units >= 1)
+    ),
+    static_duration_ms INTEGER CHECK (
+        (phase IS NULL AND work_unit_name IS NULL
+         AND work_units IS NULL AND static_duration_ms IS NULL)
+        OR
+        (phase IS NOT NULL AND work_unit_name IS NOT NULL
+         AND work_units IS NOT NULL
+         AND typeof(static_duration_ms) = 'integer'
+         AND static_duration_ms >= 1)
+    ),
+    duration_ms REAL CHECK (
+        duration_ms IS NULL
+        OR (typeof(duration_ms) IN ('integer', 'real')
+            AND duration_ms > 0 AND duration_ms < 1e15)
+    ),
+    throughput_units_per_second REAL CHECK (
+        (duration_ms IS NULL AND throughput_units_per_second IS NULL)
+        OR
+        (duration_ms IS NOT NULL
+         AND typeof(throughput_units_per_second) IN ('integer', 'real')
+         AND throughput_units_per_second > 0
+         AND throughput_units_per_second < 1e18)
+    ),
+    completion_sequence INTEGER CHECK (
+        completion_sequence IS NULL
+        OR (typeof(completion_sequence) = 'integer'
+            AND completion_sequence >= 1
+            AND status = 'succeeded'
+            AND duration_ms IS NOT NULL
+            AND throughput_units_per_second IS NOT NULL)
+    ),
+    PRIMARY KEY (job_id, shard_id),
+    UNIQUE (job_id, shard_index)
+)
+"""
+
 _V3_ARTIFACT_TABLE_STATEMENT = """
 CREATE TABLE IF NOT EXISTS lab_artifact (
     artifact_id TEXT PRIMARY KEY,
@@ -4351,6 +4967,17 @@ CREATE INDEX IF NOT EXISTS ix_lab_worker_report_shard
 ON lab_worker_report(job_id, shard_id, applied_at)
 """
 
+_V4_COMPLETION_INDEX_STATEMENT = """
+CREATE UNIQUE INDEX IF NOT EXISTS ix_lab_shard_job_completion_sequence
+ON lab_shard(job_id, completion_sequence DESC)
+WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+"""
+
+_V4_STATUS_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_job_status_index
+ON lab_shard(job_id, status, shard_index)
+"""
+
 _V3_SCHEDULER_STATE_TABLE_STATEMENT = """
 CREATE TABLE IF NOT EXISTS lab_scheduler_state (
     state_key TEXT PRIMARY KEY CHECK (
@@ -4368,7 +4995,9 @@ CREATE TABLE IF NOT EXISTS lab_scheduler_state (
 
 _SCHEMA_STATEMENTS = tuple(
     (
-        _V3_SHARD_TABLE_STATEMENT
+        _V4_JOB_TABLE_STATEMENT
+        if "CREATE TABLE IF NOT EXISTS lab_job" in statement
+        else _V4_SHARD_TABLE_STATEMENT
         if "CREATE TABLE IF NOT EXISTS lab_shard" in statement
         else _V3_ARTIFACT_TABLE_STATEMENT
         if "CREATE TABLE IF NOT EXISTS lab_artifact" in statement
@@ -4379,4 +5008,6 @@ _SCHEMA_STATEMENTS = tuple(
     _V3_REPORT_TABLE_STATEMENT,
     _V3_REPORT_INDEX_STATEMENT,
     _V3_SCHEDULER_STATE_TABLE_STATEMENT,
+    _V4_COMPLETION_INDEX_STATEMENT,
+    _V4_STATUS_INDEX_STATEMENT,
 )

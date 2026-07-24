@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -57,6 +58,48 @@ class LabShardProtocolModel(BaseModel):
         revalidate_instances="always",
         str_strip_whitespace=True,
     )
+
+
+class LabShardWorkPlan(LabShardProtocolModel):
+    phase: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
+    work_unit_name: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
+    work_units: int = Field(strict=True, ge=1)
+    static_duration_ms: int = Field(strict=True, ge=1)
+
+
+class LabShardTelemetry(LabShardWorkPlan):
+    duration_ms: float = Field(strict=True, gt=0, allow_inf_nan=False)
+    throughput_units_per_second: float = Field(strict=True, gt=0, allow_inf_nan=False)
+
+    @classmethod
+    def from_work_plan(
+        cls,
+        work_plan: LabShardWorkPlan,
+        *,
+        monotonic_started: float,
+        monotonic_finished: float,
+    ) -> LabShardTelemetry:
+        elapsed_seconds = monotonic_finished - monotonic_started
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+            raise ValueError("monotonic shard duration must be finite and positive")
+        duration_ms = elapsed_seconds * 1_000
+        return cls(
+            **work_plan.model_dump(),
+            duration_ms=duration_ms,
+            throughput_units_per_second=work_plan.work_units / elapsed_seconds,
+        )
+
+    @model_validator(mode="after")
+    def validate_throughput(self) -> LabShardTelemetry:
+        expected = self.work_units / (self.duration_ms / 1_000)
+        if not math.isclose(
+            self.throughput_units_per_second,
+            expected,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("throughput_units_per_second does not match duration and work_units")
+        return self
 
 
 def _utc(value: datetime, *, field: str) -> datetime:
@@ -117,6 +160,7 @@ class LabShardDefinition(LabShardProtocolModel):
     plan_hash: str = Field(pattern=_HASH_PATTERN)
     payload_json: str = Field(min_length=2)
     payload_hash: str = ""
+    work_plan: LabShardWorkPlan | None = None
 
     @classmethod
     def from_payload(
@@ -127,6 +171,7 @@ class LabShardDefinition(LabShardProtocolModel):
         adapter_version: str,
         plan_hash: str,
         payload_json: str,
+        work_plan: LabShardWorkPlan | None = None,
     ) -> LabShardDefinition:
         return cls(
             shard_index=shard_index,
@@ -134,6 +179,7 @@ class LabShardDefinition(LabShardProtocolModel):
             adapter_version=adapter_version,
             plan_hash=plan_hash,
             payload_json=payload_json,
+            work_plan=work_plan,
         )
 
     @model_validator(mode="after")
@@ -142,14 +188,17 @@ class LabShardDefinition(LabShardProtocolModel):
         payload_hash = _sha256_text(canonical_payload)
         if self.payload_hash and self.payload_hash != payload_hash:
             raise ValueError("payload_hash does not match canonical payload_json")
+        shard_identity: dict[str, object] = {
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "payload_hash": payload_hash,
+            "plan_hash": self.plan_hash,
+            "shard_index": self.shard_index,
+        }
+        if self.work_plan is not None:
+            shard_identity["work_plan"] = self.work_plan.model_dump(mode="json")
         shard_name = json.dumps(
-            {
-                "adapter_id": self.adapter_id,
-                "adapter_version": self.adapter_version,
-                "payload_hash": payload_hash,
-                "plan_hash": self.plan_hash,
-                "shard_index": self.shard_index,
-            },
+            shard_identity,
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -209,7 +258,7 @@ class LabClaimHighWater(LabShardProtocolModel):
 
     @model_validator(mode="after")
     def validate_content_hash(self) -> LabClaimHighWater:
-        expected = _canonical_hash(self.claim.model_dump(mode="json"))
+        expected = _canonical_hash(self.claim.model_dump(mode="json", exclude_none=True))
         if self.content_hash and self.content_hash != expected:
             raise ValueError("content_hash does not match current claim")
         object.__setattr__(self, "content_hash", expected)
@@ -227,7 +276,7 @@ class LabRetiredClaimAuthority(LabShardProtocolModel):
     def validate_content_hash(self) -> LabRetiredClaimAuthority:
         expected = _canonical_hash(
             {
-                "claim": self.claim.model_dump(mode="json"),
+                "claim": self.claim.model_dump(mode="json", exclude_none=True),
                 "outcome": self.outcome,
                 "reason": self.reason,
                 "schema_version": self.schema_version,
@@ -266,7 +315,7 @@ class LabClaimDeliveryReceipt(LabShardProtocolModel):
 
     @model_validator(mode="after")
     def validate_content_hash(self) -> LabClaimDeliveryReceipt:
-        expected = _canonical_hash(self.claim.model_dump(mode="json"))
+        expected = _canonical_hash(self.claim.model_dump(mode="json", exclude_none=True))
         if self.content_hash and self.content_hash != expected:
             raise ValueError("content_hash does not match claim delivery receipt")
         if self.status == "revoked" and self.reason is None:
@@ -287,7 +336,7 @@ class LabClaimRevocation(LabShardProtocolModel):
     def validate_content_hash(self) -> LabClaimRevocation:
         expected = _canonical_hash(
             {
-                "claim": self.claim.model_dump(mode="json"),
+                "claim": self.claim.model_dump(mode="json", exclude_none=True),
                 "reason": self.reason,
                 "schema_version": self.schema_version,
             }
@@ -308,7 +357,7 @@ class LabExecutionAdmission(LabShardProtocolModel):
     def validate_content_hash(self) -> LabExecutionAdmission:
         expected = _canonical_hash(
             {
-                "claim": self.claim.model_dump(mode="json"),
+                "claim": self.claim.model_dump(mode="json", exclude_none=True),
                 "delivery_content_hash": self.delivery_content_hash,
                 "schema_version": self.schema_version,
             }
@@ -345,6 +394,7 @@ class LabShardHeartbeat(LabShardProtocolModel):
 class LabShardSucceeded(LabShardProtocolModel):
     report_type: Literal["shard_succeeded"] = "shard_succeeded"
     result_manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    telemetry: LabShardTelemetry | None = None
 
 
 class LabShardFailed(LabShardProtocolModel):
@@ -415,7 +465,7 @@ class LabWorkerReport(LabShardProtocolModel):
     @model_validator(mode="after")
     def validate_content_hash(self) -> LabWorkerReport:
         reported_at = _utc(self.reported_at, field="reported_at")
-        body = self.body.model_dump(mode="json")
+        body = self.body.model_dump(mode="json", exclude_none=True)
         expected = _canonical_hash(
             {
                 "body": body,

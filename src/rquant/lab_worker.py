@@ -39,6 +39,7 @@ from rquant.lab_shard_protocol import (
     LabShardFailed,
     LabShardHeartbeat,
     LabShardSucceeded,
+    LabShardTelemetry,
     LabWorkerReport,
     LabWorkerStopped,
 )
@@ -1110,6 +1111,7 @@ class LabWorker:
         receipt_waiter: ReceiptWaiter | None = None,
         verified_code_sha_provider: CodeShaProvider | None = None,
         clock: Callable[[], datetime] = _system_clock,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         normalized_worker_id = worker_id.strip()
         if not normalized_worker_id:
@@ -1142,6 +1144,7 @@ class LabWorker:
         self.receipt_waiter = receipt_waiter or self._wait_for_receipt
         self.verified_code_sha_provider = verified_code_sha_provider
         self.clock = clock
+        self.monotonic_clock = monotonic_clock
         self.artifact_reclaimer = LabArtifactReclaimer(
             artifact_root=self.artifact_root,
             report_spool=self.report_spool,
@@ -2230,6 +2233,7 @@ class LabWorker:
         except Exception as exc:
             return self._failure_result(claim, phase="claim", error=exc)
 
+        monotonic_started = self.monotonic_clock()
         finished = threading.Event()
         heartbeat_errors: list[Exception] = []
         heartbeat = threading.Thread(
@@ -2365,10 +2369,21 @@ class LabWorker:
                     effective_expiry=effective_expiry,
                     require_current_claim=True,
                 )
+                work_plan = claim.definition.work_plan
+                telemetry = (
+                    LabShardTelemetry.from_work_plan(
+                        work_plan,
+                        monotonic_started=monotonic_started,
+                        monotonic_finished=self.monotonic_clock(),
+                    )
+                    if work_plan is not None
+                    else None
+                )
                 report = self._make_report(
                     claim,
                     LabShardSucceeded(
                         result_manifest_hash=bundle.manifest.manifest_hash,
+                        telemetry=telemetry,
                     ),
                 )
                 self._pending_success = LabPendingSuccess(

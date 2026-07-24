@@ -26,7 +26,7 @@ from rquant.lab_shard_protocol import (
 )
 
 from .test_lab_jobs import NOW, _lease, _submit, _submit_job
-from .test_lab_shard_control_plane import _cancel, _definition, _pause, _report
+from .test_lab_shard_control_plane import _cancel, _definition, _pause, _report, _success
 
 
 def _scheduler(
@@ -813,6 +813,51 @@ def test_scheduler_does_not_revoke_consumed_claim_after_accepted_success(
     assert consumed_path.read_bytes() == consumed_payload
     assert not claims.is_revoked(claim)
     assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.SUCCEEDED
+
+
+def test_scheduler_report_commit_before_ack_replay_does_not_duplicate_telemetry(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = _CrashBeforeReportAckSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+    )
+    assert scheduler.lease is not None
+    job = _submit_job(store, scheduler.lease)
+    store.plan_job(
+        job.job_id,
+        (_definition(0, with_work_plan=True),),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    clock[0] = NOW + timedelta(seconds=2)
+    assert scheduler.run_once().claims_published == 1
+    claim = claims.consume(claims.pending()[0])
+    report = _report(claim, _success(claim, duration_ms=500))
+    reports.publish(report)
+    clock[0] = NOW + timedelta(seconds=3)
+
+    with pytest.raises(RuntimeError, match="report crash after ledger commit"):
+        scheduler.run_once()
+    committed = LabJobReader(store.path).list_shards(job.job_id)[0]
+    assert committed.duration_ms == 500
+    assert committed.completion_sequence == 1
+    assert len(reports.pending()) == 1
+
+    clock[0] = NOW + timedelta(seconds=4)
+    replay = scheduler.run_once()
+    after_replay = LabJobReader(store.path).list_shards(job.job_id)[0]
+
+    assert replay.reports_accepted == 1
+    assert reports.pending() == ()
+    assert after_replay.duration_ms == 500
+    assert after_replay.completion_sequence == 1
 
 
 def test_scheduler_terminal_failure_preserves_consumed_history_and_revokes_separately(

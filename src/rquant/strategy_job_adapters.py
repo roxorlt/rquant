@@ -15,7 +15,7 @@ import pandas as pd
 from pandas.api.types import is_dtype_equal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from rquant.lab_shard_protocol import LabShardClaim, LabShardDefinition
+from rquant.lab_shard_protocol import LabShardClaim, LabShardDefinition, LabShardWorkPlan
 from rquant.research_run_spec import (
     FeatureContractIdentity,
     ResearchJobType,
@@ -27,6 +27,10 @@ DATE_BUCKET_DAYS = 20
 ADAPTER_VERSION = "1"
 EXECUTION_CONTRACT_ID = "strategy-adapter-execution"
 EXECUTION_CONTRACT_VERSION = "p13b-adapter-v1"
+N_SHAPE_COMPARE_MS_PER_CASE = 30_000
+N_SHAPE_OPTIMIZE_MS_PER_CASE = 120_000
+AUCTION_GAP_MS_PER_DAY = 30_000
+GROWTH_BOARD_SURGE_MS_PER_DAY = 45_000
 _LEGACY_STRATEGY_ALIASES: dict[
     tuple[str, ResearchJobType],
     tuple[str, ResearchJobType, str, frozenset[str]],
@@ -390,6 +394,12 @@ class StrategyJobAdapter(Protocol):
 
     def build_shard_inputs(self, spec: ResearchRunSpec) -> tuple[StrategyShardInput, ...]: ...
 
+    def build_work_plan(
+        self,
+        spec: ResearchRunSpec,
+        shard: StrategyShardInput,
+    ) -> LabShardWorkPlan: ...
+
     def execute_shard(
         self,
         validated: ValidatedStrategyShard,
@@ -436,6 +446,22 @@ class NShapeCompareAdapter:
     def build_shard_inputs(self, spec: ResearchRunSpec) -> tuple[StrategyShardInput, ...]:
         parameters = self.parameters(spec)
         return tuple(HoldDaysShardInput(hold_days=value) for value in parameters.hold_days)
+
+    def build_work_plan(
+        self,
+        spec: ResearchRunSpec,
+        shard: StrategyShardInput,
+    ) -> LabShardWorkPlan:
+        if not isinstance(shard, HoldDaysShardInput):
+            raise TypeError("NShapeCompare requires a hold_days shard")
+        parameters = self.parameters(spec)
+        work_units = len(parameters.entry_modes) * len(parameters.profile_variants)
+        return LabShardWorkPlan(
+            phase="nshape_compare",
+            work_unit_name="parameter_case",
+            work_units=work_units,
+            static_duration_ms=work_units * N_SHAPE_COMPARE_MS_PER_CASE,
+        )
 
     def execute_shard(
         self,
@@ -484,6 +510,28 @@ class NShapeOptimizeAdapter:
     def build_shard_inputs(self, spec: ResearchRunSpec) -> tuple[StrategyShardInput, ...]:
         parameters = self.parameters(spec)
         return tuple(HoldDaysShardInput(hold_days=value) for value in parameters.hold_days)
+
+    def build_work_plan(
+        self,
+        spec: ResearchRunSpec,
+        shard: StrategyShardInput,
+    ) -> LabShardWorkPlan:
+        if not isinstance(shard, HoldDaysShardInput):
+            raise TypeError("NShapeOptimize requires a hold_days shard")
+        parameters = self.parameters(spec)
+        work_units = (
+            len(parameters.entry_modes)
+            * len(parameters.profile_variants)
+            * len(parameters.top_n_options)
+            * len(parameters.score_profile_names)
+            * max(1, parameters.walk_forward_folds + 1)
+        )
+        return LabShardWorkPlan(
+            phase="nshape_optimize",
+            work_unit_name="parameter_case",
+            work_units=work_units,
+            static_duration_ms=work_units * N_SHAPE_OPTIMIZE_MS_PER_CASE,
+        )
 
     def execute_shard(
         self,
@@ -540,6 +588,22 @@ class AuctionGapAdapter:
     def build_shard_inputs(self, spec: ResearchRunSpec) -> tuple[StrategyShardInput, ...]:
         self.parameters(spec)
         return _date_buckets(spec.parameters.start_date, spec.parameters.end_date)
+
+    def build_work_plan(
+        self,
+        spec: ResearchRunSpec,
+        shard: StrategyShardInput,
+    ) -> LabShardWorkPlan:
+        self.parameters(spec)
+        if not isinstance(shard, DateBucketShardInput):
+            raise TypeError("AuctionGap requires a date_bucket shard")
+        work_units = (shard.end_date - shard.start_date).days + 1
+        return LabShardWorkPlan(
+            phase="auction_gap_replay",
+            work_unit_name="calendar_day",
+            work_units=work_units,
+            static_duration_ms=work_units * AUCTION_GAP_MS_PER_DAY,
+        )
 
     def execute_shard(
         self,
@@ -611,6 +675,22 @@ class GrowthBoardSurgeAdapter:
             )
             for bucket in _date_buckets(spec.parameters.start_date, spec.parameters.end_date)
             for variant in parameters.variants
+        )
+
+    def build_work_plan(
+        self,
+        spec: ResearchRunSpec,
+        shard: StrategyShardInput,
+    ) -> LabShardWorkPlan:
+        self.parameters(spec)
+        if not isinstance(shard, GrowthDateVariantShardInput):
+            raise TypeError("GrowthBoardSurge requires a growth_date_variant shard")
+        work_units = (shard.end_date - shard.start_date).days + 1
+        return LabShardWorkPlan(
+            phase="growth_board_surge_replay",
+            work_unit_name="calendar_day",
+            work_units=work_units,
+            static_duration_ms=work_units * GROWTH_BOARD_SURGE_MS_PER_DAY,
         )
 
     def execute_shard(
@@ -721,10 +801,17 @@ class StrategyJobAdapterRegistry:
         shard_inputs = adapter.build_shard_inputs(validated)
         if not shard_inputs:
             raise ValueError("strategy adapter produced an empty shard plan")
+        work_plans = tuple(adapter.build_work_plan(validated, shard) for shard in shard_inputs)
         plan_payload = {
             "adapter_id": adapter.adapter_id,
             "adapter_version": adapter.adapter_version,
-            "shards": [item.model_dump(mode="json") for item in shard_inputs],
+            "shards": [
+                {
+                    "input": shard.model_dump(mode="json"),
+                    "work_plan": work_plan.model_dump(mode="json"),
+                }
+                for shard, work_plan in zip(shard_inputs, work_plans, strict=True)
+            ],
             "spec_hash": validated.spec_hash,
         }
         canonical_plan = json.dumps(
@@ -747,6 +834,7 @@ class StrategyJobAdapterRegistry:
                     spec=validated,
                     shard=shard,
                 ).model_dump_json(round_trip=True),
+                work_plan=work_plans[index],
             )
             for index, shard in enumerate(shard_inputs)
         )

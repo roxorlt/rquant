@@ -35,6 +35,8 @@ from rquant.lab_shard_protocol import (
     LabShardFailed,
     LabShardHeartbeat,
     LabShardSucceeded,
+    LabShardTelemetry,
+    LabShardWorkPlan,
     LabWorkerReport,
     LabWorkerStopped,
 )
@@ -44,13 +46,28 @@ from .test_lab_jobs import NOW, _lease, _submit, _submit_job
 PLAN_HASH = "4" * 64
 
 
-def _definition(index: int, *, plan_hash: str = PLAN_HASH) -> LabShardDefinition:
+def _definition(
+    index: int,
+    *,
+    plan_hash: str = PLAN_HASH,
+    with_work_plan: bool = False,
+) -> LabShardDefinition:
     return LabShardDefinition.from_payload(
         shard_index=index,
         adapter_id="n-shape-replay",
         adapter_version="v1",
         plan_hash=plan_hash,
         payload_json=f'{{"hold_days":{index + 1}}}',
+        work_plan=(
+            LabShardWorkPlan(
+                phase="strategy_replay",
+                work_unit_name="parameter_case",
+                work_units=index + 1,
+                static_duration_ms=(index + 1) * 1_000,
+            )
+            if with_work_plan
+            else None
+        ),
     )
 
 
@@ -60,6 +77,7 @@ def _setup(
     count: int = 1,
     max_attempts: int = 3,
     scheduler_lease_seconds: int = 600,
+    with_work_plan: bool = False,
 ) -> tuple[LabJobStore, LabLeaseRecord, UUID]:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
@@ -67,7 +85,7 @@ def _setup(
     job = _submit_job(store, lease, max_attempts=max_attempts)
     planned = store.plan_job(
         job.job_id,
-        tuple(_definition(index) for index in range(count)),
+        tuple(_definition(index, with_work_plan=with_work_plan) for index in range(count)),
         lease=lease,
         now=NOW + timedelta(seconds=1),
     )
@@ -105,6 +123,22 @@ def _report(
         report_id=report_id or uuid4(),
         reported_at=NOW + timedelta(seconds=offset),
         body=body,
+    )
+
+
+def _success(claim: LabShardClaim, *, duration_ms: float) -> LabShardSucceeded:
+    plan = claim.definition.work_plan
+    assert plan is not None
+    return LabShardSucceeded(
+        result_manifest_hash=f"{claim.shard_index + 1:x}" * 64,
+        telemetry=LabShardTelemetry(
+            phase=plan.phase,
+            work_unit_name=plan.work_unit_name,
+            work_units=plan.work_units,
+            static_duration_ms=plan.static_duration_ms,
+            duration_ms=duration_ms,
+            throughput_units_per_second=plan.work_units / (duration_ms / 1_000),
+        ),
     )
 
 
@@ -942,6 +976,127 @@ def test_report_commit_replay_is_exactly_once_and_conflict_is_rejected(tmp_path:
     )
     with pytest.raises(RequestContentConflictError):
         store.apply_worker_report(conflict, lease=lease, now=NOW + timedelta(seconds=5))
+
+
+def test_telemetry_completion_sequence_is_acceptance_ordered_exactly_once_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, with_work_plan=True)
+    first_claim = _claim(store, lease, worker="worker-a", now_offset=2)
+    second_claim = _claim(store, lease, worker="worker-b", now_offset=3)
+    second_report = _report(second_claim, _success(second_claim, duration_ms=2_000), offset=4)
+    first_report = _report(first_claim, _success(first_claim, duration_ms=500), offset=5)
+
+    second_receipt = store.apply_worker_report(
+        second_report,
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    first_receipt = store.apply_worker_report(
+        first_report,
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+    replay = LabJobStore(store.path).apply_worker_report(
+        second_report,
+        lease=lease,
+        now=NOW + timedelta(seconds=6),
+    )
+    shards = LabJobReader(store.path).list_shards(job_id)
+    job = LabJobReader(store.path).get_job(job_id)
+
+    assert second_receipt.status == first_receipt.status == "accepted"
+    assert replay == second_receipt
+    assert [shard.completion_sequence for shard in shards] == [2, 1]
+    assert [shard.duration_ms for shard in shards] == [500, 2_000]
+    assert shards[0].throughput_units_per_second == pytest.approx(2)
+    assert shards[1].throughput_units_per_second == pytest.approx(1)
+    assert job is not None
+    assert job.result_contract_version == "p1.4a-telemetry-v1"
+
+
+def test_stale_and_plan_mismatched_success_reports_cannot_write_telemetry(
+    tmp_path: Path,
+) -> None:
+    store, old_lease, job_id = _setup(
+        tmp_path,
+        with_work_plan=True,
+        scheduler_lease_seconds=5,
+    )
+    old_claim = _claim(store, old_lease, duration=3)
+    new_lease = _lease(store, owner="scheduler-b", now=NOW + timedelta(seconds=8))
+    fresh_claim = _claim(store, new_lease, worker="worker-b", now_offset=9)
+    stale = store.apply_worker_report(
+        _report(old_claim, _success(old_claim, duration_ms=123), offset=10),
+        lease=new_lease,
+        now=NOW + timedelta(seconds=10),
+    )
+    plan = fresh_claim.definition.work_plan
+    assert plan is not None
+    mismatched = LabShardSucceeded(
+        result_manifest_hash="a" * 64,
+        telemetry=LabShardTelemetry(
+            phase="wrong_phase",
+            work_unit_name=plan.work_unit_name,
+            work_units=plan.work_units,
+            static_duration_ms=plan.static_duration_ms,
+            duration_ms=1_000,
+            throughput_units_per_second=plan.work_units,
+        ),
+    )
+    mismatch = store.apply_worker_report(
+        _report(fresh_claim, mismatched, offset=11),
+        lease=new_lease,
+        now=NOW + timedelta(seconds=11),
+    )
+    shard = LabJobReader(store.path).list_shards(job_id)[0]
+
+    assert stale.status == "rejected"
+    assert mismatch.status == "rejected"
+    assert shard.status is ShardStatus.RUNNING
+    assert shard.duration_ms is None
+    assert shard.throughput_units_per_second is None
+    assert shard.completion_sequence is None
+
+
+def test_report_insert_crash_rolls_back_telemetry_then_replay_commits_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, with_work_plan=True)
+    claim = _claim(store, lease)
+    report = _report(claim, _success(claim, duration_ms=750))
+    original = LabJobStore._record_worker_report
+
+    def persist_then_crash(*args, **kwargs) -> None:
+        original(*args, **kwargs)
+        raise RuntimeError("simulated crash before ledger commit")
+
+    monkeypatch.setattr(
+        LabJobStore,
+        "_record_worker_report",
+        staticmethod(persist_then_crash),
+    )
+    with pytest.raises(RuntimeError, match="before ledger commit"):
+        store.apply_worker_report(report, lease=lease, now=NOW + timedelta(seconds=3))
+
+    rolled_back = LabJobReader(store.path).list_shards(job_id)[0]
+    assert rolled_back.status is ShardStatus.RUNNING
+    assert rolled_back.duration_ms is None
+    assert rolled_back.completion_sequence is None
+    assert LabJobReader(store.path).get_worker_report(report.report_id) is None
+
+    monkeypatch.setattr(LabJobStore, "_record_worker_report", staticmethod(original))
+    receipt = LabJobStore(store.path).apply_worker_report(
+        report,
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    committed = LabJobReader(store.path).list_shards(job_id)[0]
+
+    assert receipt.status == "accepted"
+    assert committed.duration_ms == 750
+    assert committed.completion_sequence == 1
 
 
 def test_pause_during_shard_checkpoints_then_resume_claims_next(tmp_path: Path) -> None:
