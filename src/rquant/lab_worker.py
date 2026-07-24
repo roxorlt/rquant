@@ -27,6 +27,7 @@ from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_shard_protocol import (
     LabClaimAlreadyConsumedError,
+    LabClaimRevokedError,
     LabClaimSpool,
     LabClaimSupersededError,
     LabReportReceipt,
@@ -200,9 +201,19 @@ class LabWorkerTickResult(LabWorkerModel):
     report_id: UUID | None = None
 
 
+class LabPreparedFileIdentity(LabWorkerModel):
+    file_name: str = Field(
+        pattern=r"^(?:manifest\.json|[0-9]{3}-[a-z][a-z0-9_]*\.parquet)$"
+    )
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    size: int = Field(ge=0)
+
+
 class LabPreparedShardBundle(LabWorkerModel):
     temporary: Path | None
     manifest: LabShardResultManifest
+    file_identities: tuple[LabPreparedFileIdentity, ...]
     reuses_existing: bool = False
     existing_device: int | None = Field(default=None, ge=0)
     existing_inode: int | None = Field(default=None, ge=1)
@@ -214,19 +225,50 @@ class LabPreparedShardBundle(LabWorkerModel):
             self.temporary is None
         ):
             raise ValueError("prepared bundle reuse identity is inconsistent")
+        expected_files = {"manifest.json"} | {
+            artifact.file_name for artifact in self.manifest.artifacts
+        }
+        observed_files = tuple(item.file_name for item in self.file_identities)
+        if (
+            observed_files != tuple(sorted(observed_files))
+            or set(observed_files) != expected_files
+        ):
+            raise ValueError("prepared bundle file identities are incomplete")
         return self
 
 
+class LabReclaimInventoryEntry(LabWorkerModel):
+    relative_path: str = Field(pattern=r"^(?:manifest\.json|[0-9]{3}-[a-z][a-z0-9_]*\.parquet)$")
+    file_type: Literal["regular"] = "regular"
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=_HASH_PATTERN)
+
+
 class LabReclaimLedger(LabWorkerModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     state: Literal["prepared", "isolated"]
     current_claim: LabShardClaim
     obsolete_claim: LabShardClaim
-    manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    manifest: LabShardResultManifest
+    inventory: tuple[LabReclaimInventoryEntry, ...]
     source_name: str = Field(min_length=1)
     tombstone_name: str = Field(min_length=1)
     source_device: int = Field(ge=0)
     source_inode: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> LabReclaimLedger:
+        paths = tuple(entry.relative_path for entry in self.inventory)
+        expected = ("manifest.json",) + tuple(
+            artifact.file_name for artifact in self.manifest.artifacts
+        )
+        if paths != tuple(sorted(paths)) or set(paths) != set(expected):
+            raise ValueError("reclaim inventory must exactly cover manifest files")
+        if len(paths) != len(set(paths)):
+            raise ValueError("reclaim inventory paths must be unique")
+        return self
 
     def canonical_json(self) -> str:
         return json.dumps(
@@ -610,6 +652,7 @@ class LabWorker:
             except (
                 InvalidCommandEnvelopeError,
                 LabClaimAlreadyConsumedError,
+                LabClaimRevokedError,
                 LabClaimSupersededError,
                 OSError,
             ):
@@ -807,12 +850,38 @@ class LabWorker:
         bundle: Path,
         claim: LabShardClaim,
     ) -> LabShardResultManifest:
-        if bundle.is_symlink() or not bundle.is_dir():
+        try:
+            bundle_before = bundle.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError("sealed shard bundle is missing") from exc
+        if not stat.S_ISDIR(bundle_before.st_mode) or bundle.is_symlink():
             raise LabArtifactConflictError("sealed shard bundle is not a regular directory")
         manifest_path = bundle / "manifest.json"
         try:
+            manifest_before = manifest_path.lstat()
+            if not stat.S_ISREG(manifest_before.st_mode):
+                raise LabArtifactConflictError("sealed result manifest is not regular")
+            if manifest_before.st_nlink != 1:
+                raise LabArtifactConflictError("sealed result manifest has an external hard link")
             raw = manifest_path.read_text(encoding="utf-8")
+            manifest_after = manifest_path.lstat()
+            if (
+                manifest_after.st_dev,
+                manifest_after.st_ino,
+                manifest_after.st_size,
+                manifest_after.st_nlink,
+            ) != (
+                manifest_before.st_dev,
+                manifest_before.st_ino,
+                manifest_before.st_size,
+                1,
+            ):
+                raise LabArtifactConflictError(
+                    "sealed result manifest changed while validating"
+                )
             manifest = LabShardResultManifest.model_validate_json(raw)
+        except LabArtifactConflictError:
+            raise
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid sealed result manifest: {exc}") from exc
         if raw != manifest.canonical_json():
@@ -835,10 +904,12 @@ class LabWorker:
                 raise LabArtifactConflictError(
                     f"sealed artifact path is missing or unsafe: {artifact.file_name}"
                 )
-            if (
-                path.stat().st_size != artifact.file_size
-                or _file_sha256(path) != artifact.file_sha256
-            ):
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise LabArtifactConflictError(
+                    f"sealed artifact has an external hard link: {artifact.file_name}"
+                )
+            if before.st_size != artifact.file_size or _file_sha256(path) != artifact.file_sha256:
                 raise LabArtifactConflictError(
                     f"sealed artifact bytes conflict: {artifact.file_name}"
                 )
@@ -852,6 +923,22 @@ class LabWorker:
                 raise LabArtifactConflictError(
                     f"sealed artifact content conflicts: {artifact.file_name}"
                 )
+            after = path.lstat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_nlink,
+            ) != (before.st_dev, before.st_ino, before.st_size, 1):
+                raise LabArtifactConflictError(
+                    f"sealed artifact changed while validating: {artifact.file_name}"
+                )
+        bundle_after = bundle.lstat()
+        if (bundle_after.st_dev, bundle_after.st_ino) != (
+            bundle_before.st_dev,
+            bundle_before.st_ino,
+        ):
+            raise LabArtifactConflictError("sealed shard bundle changed while validating")
         return manifest
 
     def _cleanup_temporary(self, temporary: Path) -> None:
@@ -862,6 +949,10 @@ class LabWorker:
                 if child.is_symlink() or not child.is_file():
                     raise LabArtifactConflictError(
                         f"temporary shard bundle contains unsafe path: {child.name}"
+                    )
+                if child.lstat().st_nlink != 1:
+                    raise LabArtifactConflictError(
+                        f"temporary shard bundle contains a hard link: {child.name}"
                     )
                 child.unlink()
             temporary.rmdir()
@@ -875,6 +966,39 @@ class LabWorker:
             if parent == stop:
                 break
             parent = parent.parent
+
+    @staticmethod
+    def _prepared_file_identities(
+        bundle: Path,
+        manifest: LabShardResultManifest,
+    ) -> tuple[LabPreparedFileIdentity, ...]:
+        names = sorted(
+            ("manifest.json",) + tuple(
+                artifact.file_name for artifact in manifest.artifacts
+            )
+        )
+        identities: list[LabPreparedFileIdentity] = []
+        for name in names:
+            path = bundle / name
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or path.is_symlink():
+                raise LabArtifactConflictError(f"prepared bundle file is unsafe: {name}")
+            if observed.st_nlink != 1:
+                raise LabArtifactConflictError(
+                    f"prepared bundle file has an external hard link: {name}"
+                )
+            identities.append(
+                LabPreparedFileIdentity(
+                    file_name=name,
+                    device=observed.st_dev,
+                    inode=observed.st_ino,
+                    size=observed.st_size,
+                )
+            )
+        actual = {child.name for child in bundle.iterdir()}
+        if actual != set(names):
+            raise LabArtifactConflictError("prepared bundle file inventory changed")
+        return tuple(identities)
 
     @staticmethod
     def _bundle_file_identity(path: Path) -> tuple[int, int]:
@@ -899,6 +1023,7 @@ class LabWorker:
         try:
             self._write_bundle(temporary, claim, result)
             candidate = self._validate_bundle(temporary, claim)
+            candidate_files = self._prepared_file_identities(temporary, candidate)
             if sealed.exists() or sealed.is_symlink():
                 existing = self._validate_bundle(sealed, claim)
                 if existing.manifest_hash != candidate.manifest_hash:
@@ -906,10 +1031,12 @@ class LabWorker:
                         "same attempt produced a conflicting result manifest"
                     )
                 device, inode = self._bundle_file_identity(sealed)
+                existing_files = self._prepared_file_identities(sealed, existing)
                 self._cleanup_temporary(temporary)
                 return LabPreparedShardBundle(
                     temporary=None,
                     manifest=existing,
+                    file_identities=existing_files,
                     reuses_existing=True,
                     existing_device=device,
                     existing_inode=inode,
@@ -917,6 +1044,7 @@ class LabWorker:
             return LabPreparedShardBundle(
                 temporary=temporary,
                 manifest=candidate,
+                file_identities=candidate_files,
             )
         except BaseException:
             self._cleanup_temporary(temporary)
@@ -944,9 +1072,14 @@ class LabWorker:
         if require_current_claim and not self.claim_spool.is_current(claim):
             raise PermissionError("claim is no longer the durable shard high-water")
 
-    def _rollback_sealed(self, bundle: LabSealedShardBundle) -> None:
+    def _rollback_sealed(
+        self,
+        claim: LabShardClaim,
+        bundle: LabSealedShardBundle,
+    ) -> None:
         if not bundle.created or not os.path.lexists(bundle.path):
             return
+        self._validate_bundle(bundle.path, claim)
         device, inode = self._bundle_file_identity(bundle.path)
         if (device, inode) != (bundle.device, bundle.inode):
             raise LabArtifactConflictError(
@@ -976,6 +1109,13 @@ class LabWorker:
             require_current_claim=effective_expiry is not None,
         )
         if prepared.reuses_existing:
+            if (
+                self._prepared_file_identities(sealed, prepared.manifest)
+                != prepared.file_identities
+            ):
+                raise LabArtifactConflictError(
+                    "sealed bundle files changed after candidate validation"
+                )
             device, inode = self._bundle_file_identity(sealed)
             if (device, inode) != (prepared.existing_device, prepared.existing_inode):
                 raise LabArtifactConflictError(
@@ -1000,6 +1140,13 @@ class LabWorker:
             raise RuntimeError("new prepared bundle has no temporary path")
         created_bundle: LabSealedShardBundle | None = None
         try:
+            if (
+                self._prepared_file_identities(temporary, prepared.manifest)
+                != prepared.file_identities
+            ):
+                raise LabArtifactConflictError(
+                    "prepared bundle files changed before atomic publish"
+                )
             try:
                 os.rename(temporary, sealed)
             except OSError as exc:
@@ -1022,6 +1169,13 @@ class LabWorker:
                     device=device,
                     inode=inode,
                 )
+            if (
+                self._prepared_file_identities(sealed, prepared.manifest)
+                != prepared.file_identities
+            ):
+                raise LabArtifactConflictError(
+                    "prepared bundle files changed during atomic publish"
+                )
             device, inode = self._bundle_file_identity(sealed)
             created_bundle = LabSealedShardBundle(
                 path=sealed,
@@ -1040,7 +1194,7 @@ class LabWorker:
             return created_bundle
         except BaseException:
             if created_bundle is not None:
-                self._rollback_sealed(created_bundle)
+                self._rollback_sealed(claim, created_bundle)
             raise
         finally:
             self._cleanup_temporary(temporary)
@@ -1110,7 +1264,7 @@ class LabWorker:
         except Exception:
             return self._set_pending_receipt_state("unknown")
         if receipt.status == "rejected":
-            self._rollback_sealed(pending.bundle)
+            self._rollback_sealed(pending.claim, pending.bundle)
             self._pending_success = None
             return LabWorkerTickResult(
                 status="failed",
@@ -1329,17 +1483,17 @@ class LabWorker:
                 )
                 self.report_spool.publish(report)
         except InterruptedError:
-            self._rollback_sealed(bundle)
+            self._rollback_sealed(claim, bundle)
             return self._stopped_result(
                 claim,
                 reason="worker stop requested before success point-of-no-return",
             )
         except TimeoutError as exc:
-            self._rollback_sealed(bundle)
+            self._rollback_sealed(claim, bundle)
             return self._failure_result(claim, phase="deadline", error=exc)
         except Exception as exc:
             if self._pending_success is None:
-                self._rollback_sealed(bundle)
+                self._rollback_sealed(claim, bundle)
                 return self._failure_result(claim, phase="fence", error=exc)
             return self._set_pending_receipt_state("unknown")
         return self._await_pending_success()
@@ -1378,6 +1532,7 @@ class LabArtifactReclaimer:
         r"[0-9a-f]{4}-[0-9a-f]{12})-"
         r"(?P<manifest_hash>[0-9a-f]{64})"
     )
+    _LEDGER_TEMP_NAME = re.compile(r"\.reclaim-ledger-tmp-v1-[0-9a-f]{32}\.tmp")
 
     def __init__(
         self,
@@ -1506,7 +1661,9 @@ class LabArtifactReclaimer:
         self._assert_safe_artifact_ancestors(directory)
         directory.mkdir(parents=True, exist_ok=True)
         target = self._ledger_path(ledger.current_claim, ledger.tombstone_name)
-        temporary = directory / f".{target.name}.{uuid4().hex}.tmp"
+        if os.path.lexists(target):
+            self._load_ledger(target)
+        temporary = directory / f".reclaim-ledger-tmp-v1-{uuid4().hex}.tmp"
         try:
             with temporary.open("xb") as stream:
                 stream.write(ledger.canonical_json().encode("utf-8"))
@@ -1519,11 +1676,27 @@ class LabArtifactReclaimer:
         return target
 
     def _load_ledger(self, path: Path) -> LabReclaimLedger:
-        if path.is_symlink() or not path.is_file():
+        try:
+            before = path.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError("reclaim ledger is missing or unsafe") from exc
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
             raise LabArtifactConflictError("reclaim ledger is missing or unsafe")
+        if before.st_nlink != 1:
+            raise LabArtifactConflictError("reclaim ledger has an external hard link")
         try:
             raw = path.read_text(encoding="utf-8")
+            after = path.lstat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_nlink,
+            ) != (before.st_dev, before.st_ino, before.st_size, 1):
+                raise LabArtifactConflictError("reclaim ledger changed while validating")
             ledger = LabReclaimLedger.model_validate_json(raw)
+        except LabArtifactConflictError:
+            raise
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid reclaim ledger: {exc}") from exc
         if raw != ledger.canonical_json():
@@ -1582,16 +1755,144 @@ class LabArtifactReclaimer:
             or not monotonic_high_water
             or not exact_if_same_generation
             or not same_obsolete_attempt
-            or ledger.manifest_hash != manifest.manifest_hash
+            or ledger.manifest != manifest
             or ledger.source_name != self._attempt_name(obsolete_claim)
             or ledger.tombstone_name != self._tombstone_name(obsolete_claim, manifest)
         ):
             raise LabArtifactConflictError("reclaim ledger identity conflicts with artifact")
 
-    @staticmethod
-    def _remove_ledger(path: Path) -> None:
-        path.unlink(missing_ok=True)
+    def _remove_ledger(self, path: Path) -> None:
+        if not os.path.lexists(path):
+            return
+        self._load_ledger(path)
+        path.unlink()
         _fsync_directory(path.parent)
+
+    @staticmethod
+    def _inventory_entry(path: Path, *, relative_path: str) -> LabReclaimInventoryEntry:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+            raise LabArtifactConflictError(f"reclaim inventory path is unsafe: {relative_path}")
+        if before.st_nlink != 1:
+            raise LabArtifactConflictError(
+                f"reclaim inventory file has an external hard link: {relative_path}"
+            )
+        digest = _file_sha256(path)
+        after = path.lstat()
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_nlink,
+        ) != (before.st_dev, before.st_ino, before.st_size, 1):
+            raise LabArtifactConflictError(
+                f"reclaim inventory file changed while hashing: {relative_path}"
+            )
+        return LabReclaimInventoryEntry(
+            relative_path=relative_path,
+            device=before.st_dev,
+            inode=before.st_ino,
+            size=before.st_size,
+            sha256=digest,
+        )
+
+    def _build_inventory(
+        self,
+        bundle: Path,
+        manifest: LabShardResultManifest,
+    ) -> tuple[LabReclaimInventoryEntry, ...]:
+        names = sorted(
+            ("manifest.json",) + tuple(
+                artifact.file_name for artifact in manifest.artifacts
+            )
+        )
+        return tuple(
+            self._inventory_entry(bundle / name, relative_path=name) for name in names
+        )
+
+    def _validate_isolated_tree(
+        self,
+        path: Path,
+        ledger: LabReclaimLedger,
+    ) -> None:
+        root_before = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(root_before.st_mode):
+            raise LabArtifactConflictError("reclaim tombstone is unsafe")
+        if (root_before.st_dev, root_before.st_ino) != (
+            ledger.source_device,
+            ledger.source_inode,
+        ):
+            raise LabArtifactConflictError(
+                "reclaim tombstone inode conflicts with durable ledger"
+            )
+        expected = {entry.relative_path: entry for entry in ledger.inventory}
+        actual = {candidate.name: candidate for candidate in path.iterdir()}
+        unknown = set(actual) - set(expected)
+        if unknown:
+            raise LabArtifactConflictError(
+                f"reclaim tombstone contains unknown paths: {sorted(unknown)}"
+            )
+        if ledger.state == "prepared" and set(actual) != set(expected):
+            raise LabArtifactConflictError("prepared reclaim tombstone is incomplete")
+        for name, candidate in actual.items():
+            observed = self._inventory_entry(candidate, relative_path=name)
+            if observed != expected[name]:
+                raise LabArtifactConflictError(
+                    f"reclaim tombstone inventory identity conflicts: {name}"
+                )
+        root_after = path.lstat()
+        if (root_after.st_dev, root_after.st_ino) != (
+            root_before.st_dev,
+            root_before.st_ino,
+        ):
+            raise LabArtifactConflictError("reclaim tombstone changed while validating")
+
+    def _delete_inventory_entry(
+        self,
+        directory: Path,
+        entry: LabReclaimInventoryEntry,
+    ) -> None:
+        target = directory / entry.relative_path
+        if not os.path.lexists(target):
+            return
+        if self._inventory_entry(target, relative_path=entry.relative_path) != entry:
+            raise LabArtifactConflictError(
+                f"reclaim inventory changed before deletion: {entry.relative_path}"
+            )
+        target.unlink()
+        _fsync_directory(directory)
+
+    def _delete_isolated_tombstone(
+        self,
+        tombstone: Path,
+        ledger: LabReclaimLedger,
+    ) -> None:
+        self._validate_isolated_tree(tombstone, ledger)
+        for entry in ledger.inventory:
+            self._delete_inventory_entry(tombstone, entry)
+        if tuple(tombstone.iterdir()):
+            raise LabArtifactConflictError("reclaim tombstone gained unknown content")
+        root = tombstone.lstat()
+        if (root.st_dev, root.st_ino) != (ledger.source_device, ledger.source_inode):
+            raise LabArtifactConflictError("reclaim tombstone changed before removal")
+        tombstone.rmdir()
+        _fsync_directory(tombstone.parent)
+
+    def _cleanup_ledger_temporaries(self, directory: Path) -> None:
+        if not directory.exists():
+            return
+        if directory.is_symlink() or not directory.is_dir():
+            raise LabArtifactConflictError("reclaim ledger directory is unsafe")
+        for candidate in sorted(directory.iterdir(), key=lambda path: path.name):
+            if not candidate.name.endswith(".tmp"):
+                continue
+            if self._LEDGER_TEMP_NAME.fullmatch(candidate.name) is None:
+                raise LabArtifactConflictError("unknown reclaim ledger temporary file")
+            before = candidate.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise LabArtifactConflictError("unsafe reclaim ledger temporary file")
+            candidate.unlink()
+            _fsync_directory(directory)
 
     def _assert_no_terminal_success_evidence_from(
         self,
@@ -1705,12 +2006,19 @@ class LabArtifactReclaimer:
             generation=generation,
             token=token,
         )
-        self._assert_safe_temporary_tree(path)
-        manifest = self._validate_bundle(path, obsolete_claim)
+        ledger = self._load_ledger(self._ledger_path(current_claim, path.name))
+        manifest = ledger.manifest
+        self._validate_ledger(
+            ledger,
+            current_claim=current_claim,
+            obsolete_claim=obsolete_claim,
+            manifest=manifest,
+        )
         if manifest.manifest_hash != expected_hash:
             raise LabArtifactConflictError(
                 "reclaim tombstone manifest does not match its durable identity"
             )
+        self._validate_isolated_tree(path, ledger)
         return obsolete_claim, manifest
 
     def _classify_attempt(
@@ -1771,7 +2079,33 @@ class LabArtifactReclaimer:
             tuple[int, int, UUID],
             tuple[Path, LabShardClaim, LabShardResultManifest],
         ] = {}
-        for candidate in tuple(sorted(attempts_root.iterdir(), key=lambda path: path.name)):
+        candidates = tuple(sorted(attempts_root.iterdir(), key=lambda path: path.name))
+        source_names: set[tuple[int, int, UUID]] = set()
+        tombstone_names: set[tuple[int, int, UUID]] = set()
+        for candidate in candidates:
+            if candidate.name.startswith(".reclaim-"):
+                fence, generation, token, _manifest_hash = self._parse_tombstone_name(
+                    candidate.name
+                )
+                identity = (fence, generation, token)
+                if identity in tombstone_names:
+                    raise LabArtifactConflictError(
+                        "multiple tombstones claim the same attempt identity"
+                    )
+                tombstone_names.add(identity)
+            else:
+                identity = self._parse_attempt_name(candidate.name)
+                if identity in source_names:
+                    raise LabArtifactConflictError(
+                        "multiple sources claim the same attempt identity"
+                    )
+                source_names.add(identity)
+        if source_names & tombstone_names:
+            raise LabArtifactConflictError(
+                "source and tombstone coexist for the same attempt identity"
+            )
+
+        for candidate in candidates:
             if candidate.is_symlink() or not candidate.is_dir():
                 raise LabArtifactConflictError(
                     f"sealed attempt is a symlink or not a directory: {candidate.name}"
@@ -1798,10 +2132,6 @@ class LabArtifactReclaimer:
                     "multiple sources claim the same attempt identity"
                 )
             sources[identity] = (candidate, obsolete_claim, manifest)
-        if set(sources) & set(tombstones):
-            raise LabArtifactConflictError(
-                "source and tombstone coexist for the same attempt identity"
-            )
         return tuple(sources.values()), tuple(tombstones.values())
 
     def _preflight(self, current_claim: LabShardClaim, attempts_root: Path) -> None:
@@ -1821,13 +2151,7 @@ class LabArtifactReclaimer:
                 obsolete_claim=obsolete_claim,
                 manifest=manifest,
             )
-            if LabWorker._bundle_file_identity(tombstone) != (
-                ledger.source_device,
-                ledger.source_inode,
-            ):
-                raise LabArtifactConflictError(
-                    "reclaim tombstone inode conflicts with durable ledger"
-                )
+            self._validate_isolated_tree(tombstone, ledger)
             self._assert_no_terminal_success_evidence(
                 obsolete_claim,
                 manifest,
@@ -1845,13 +2169,7 @@ class LabArtifactReclaimer:
                 obsolete_claim=obsolete_claim,
                 manifest=manifest,
             )
-            if LabWorker._bundle_file_identity(tombstone) != (
-                ledger.source_device,
-                ledger.source_inode,
-            ):
-                raise LabArtifactConflictError(
-                    "reclaim tombstone inode conflicts with durable ledger"
-                )
+            self._validate_isolated_tree(tombstone, ledger)
             self._assert_no_terminal_success_evidence_locked(
                 obsolete_claim,
                 manifest,
@@ -1860,8 +2178,7 @@ class LabArtifactReclaimer:
             if ledger.state == "prepared":
                 ledger = ledger.model_copy(update={"state": "isolated"})
                 self._write_ledger(ledger)
-            shutil.rmtree(tombstone)
-            _fsync_directory(attempts_root)
+            self._delete_isolated_tombstone(tombstone, ledger)
             self._remove_ledger(ledger_path)
 
         for candidate, obsolete_claim, manifest in sources:
@@ -1872,6 +2189,7 @@ class LabArtifactReclaimer:
             )
             tombstone = attempts_root / self._tombstone_name(obsolete_claim, manifest)
             source_identity = LabWorker._bundle_file_identity(candidate)
+            inventory = self._build_inventory(candidate, manifest)
             ledger_path = self._ledger_path(current_claim, tombstone.name)
             if os.path.lexists(ledger_path):
                 stale = self._load_ledger(ledger_path)
@@ -1884,7 +2202,7 @@ class LabArtifactReclaimer:
                 if stale.state != "prepared" or source_identity != (
                     stale.source_device,
                     stale.source_inode,
-                ):
+                ) or stale.inventory != inventory:
                     raise LabArtifactConflictError(
                         "stale reclaim ledger conflicts with live source"
                     )
@@ -1893,7 +2211,8 @@ class LabArtifactReclaimer:
                 state="prepared",
                 current_claim=current_claim,
                 obsolete_claim=obsolete_claim,
-                manifest_hash=manifest.manifest_hash,
+                manifest=manifest,
+                inventory=inventory,
                 source_name=candidate.name,
                 tombstone_name=tombstone.name,
                 source_device=source_identity[0],
@@ -1909,7 +2228,7 @@ class LabArtifactReclaimer:
                     raise LabArtifactConflictError(
                         "reclaim tombstone conflicts with sealed attempt"
                     ) from exc
-                self._validate_tombstone(tombstone, current_claim)
+                self._validate_isolated_tree(tombstone, ledger)
             _fsync_directory(attempts_root)
             if LabWorker._bundle_file_identity(tombstone) != source_identity:
                 if os.path.lexists(candidate):
@@ -1922,7 +2241,7 @@ class LabArtifactReclaimer:
                 raise LabArtifactConflictError(
                     "sealed attempt was replaced during isolation"
                 )
-            self._validate_tombstone(tombstone, current_claim)
+            self._validate_isolated_tree(tombstone, ledger)
             ledger = ledger.model_copy(update={"state": "isolated"})
             self._write_ledger(ledger)
             self._assert_no_terminal_success_evidence_locked(
@@ -1930,18 +2249,59 @@ class LabArtifactReclaimer:
                 manifest,
                 current_claim,
             )
-            shutil.rmtree(tombstone)
-            _fsync_directory(attempts_root)
+            self._delete_isolated_tombstone(tombstone, ledger)
             self._remove_ledger(ledger_path)
+
+    def _reconcile_orphan_ledgers(self, current_claim: LabShardClaim) -> None:
+        directory = self._ledger_dir(current_claim)
+        if not directory.exists():
+            return
+        attempts_root = self.sealed_bundle_path(current_claim).parent
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            if path.name.endswith(".tmp"):
+                raise LabArtifactConflictError(
+                    "reclaim ledger temporary remained after cleanup"
+                )
+            if path.suffix != ".json":
+                raise LabArtifactConflictError("unknown reclaim ledger file")
+            ledger = self._load_ledger(path)
+            source = attempts_root / ledger.source_name
+            tombstone = attempts_root / ledger.tombstone_name
+            if os.path.lexists(source) or os.path.lexists(tombstone):
+                continue
+            if ledger.state != "isolated":
+                raise LabArtifactConflictError(
+                    "prepared reclaim ledger has no source or tombstone"
+                )
+            self._validate_ledger(
+                ledger,
+                current_claim=current_claim,
+                obsolete_claim=ledger.obsolete_claim,
+                manifest=ledger.manifest,
+            )
+            self._assert_no_terminal_success_evidence_locked(
+                ledger.obsolete_claim,
+                ledger.manifest,
+                current_claim,
+            )
+            self._remove_ledger(path)
 
     def reclaim(self, current_claim: LabShardClaim) -> None:
         validated = LabShardClaim.model_validate(current_claim)
         attempts_root = self.sealed_bundle_path(validated).parent
+        ledger_dir = self._ledger_dir(validated)
         self._assert_safe_artifact_ancestors(attempts_root)
-        if not attempts_root.exists():
+        self._assert_safe_artifact_ancestors(ledger_dir)
+        if not attempts_root.exists() and not ledger_dir.exists():
             return
-        if attempts_root.is_symlink() or not attempts_root.is_dir():
+        if attempts_root.exists() and (
+            attempts_root.is_symlink() or not attempts_root.is_dir()
+        ):
             raise LabArtifactConflictError("sealed attempts root is unsafe")
-        self._preflight(validated, attempts_root)
+        if attempts_root.exists():
+            self._preflight(validated, attempts_root)
         with self.report_spool.evidence_lock():
-            self._reclaim_locked(validated, attempts_root)
+            self._cleanup_ledger_temporaries(ledger_dir)
+            if attempts_root.exists():
+                self._reclaim_locked(validated, attempts_root)
+            self._reconcile_orphan_ledgers(validated)

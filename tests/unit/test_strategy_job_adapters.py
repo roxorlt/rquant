@@ -893,7 +893,8 @@ def test_scheduler_deadline_terminalizes_running_job_and_shards(tmp_path) -> Non
     assert job is not None and job.status is JobStatus.FAILED
     assert {shard.status for shard in shards} == {ShardStatus.FAILED}
     assert all(shard.failure_json == '{"reason":"deadline_exceeded"}' for shard in shards)
-    assert claims.pending()  # stale filesystem claim remains fenced by its marker/DB identity
+    assert result.claims_revoked == 1
+    assert claims.pending() == ()
 
 
 def test_scheduler_terminalizes_deadline_at_claim_boundary(tmp_path: Path) -> None:

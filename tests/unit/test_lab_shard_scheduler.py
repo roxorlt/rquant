@@ -22,7 +22,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
 )
 
-from .test_lab_jobs import NOW, _lease, _submit_job
+from .test_lab_jobs import NOW, _lease, _submit, _submit_job
 from .test_lab_shard_control_plane import _cancel, _definition, _pause, _report
 
 
@@ -202,8 +202,8 @@ def test_scheduler_restart_seeds_rotation_from_new_fencing_generation(
     result = restarted.run_once()
 
     assert result.claims_published == 1
+    assert result.claims_revoked == 1
     assert [entry.claim.worker_id for entry in claims.pending()] == [
-        "worker-a",
         "worker-b",
     ]
 
@@ -485,6 +485,8 @@ def test_scheduler_takeover_without_workers_converges_expired_control_intent(
         now=NOW + timedelta(seconds=2),
     )
     assert claim is not None
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(claim)
     if intent == "pause":
         _pause(store, old, job.job_id, offset=3)
     else:
@@ -497,6 +499,7 @@ def test_scheduler_takeover_without_workers_converges_expired_control_intent(
         lease_seconds=60,
         heartbeat_seconds=10,
         poll_interval_ms=10,
+        claim_spool=claims,
         claim_worker_ids=(),
         clock=lambda: clock[0],
     )
@@ -511,6 +514,9 @@ def test_scheduler_takeover_without_workers_converges_expired_control_intent(
     assert shard.status is expected_shard
     assert shard.worker_id is None
     assert shard.claim_token is None
+    assert result.claims_revoked == 1
+    assert claims.pending() == ()
+    assert claims.publish(claim).receipt.status == "revoked"
 
 
 @pytest.mark.parametrize(
@@ -565,3 +571,208 @@ def test_scheduler_without_workers_recovers_expired_uncontrolled_shard(
     assert shard.status is expected_shard
     assert shard.worker_id is None
     assert shard.claim_token is None
+
+
+def test_scheduler_takeover_revokes_terminal_max_attempts_claim(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    old = _lease(store, seconds=10)
+    job = _submit_job(store, old, max_attempts=1)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=old,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="lost-worker",
+        shard_lease_seconds=5,
+        lease=old,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(claim)
+    clock = [NOW + timedelta(seconds=11)]
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_spool=claims,
+        claim_worker_ids=(),
+        shard_lease_seconds=5,
+        clock=lambda: clock[0],
+    )
+
+    result = scheduler.run_once()
+
+    assert result.claims_revoked == 1
+    assert result.claim_revoke_failures == 0
+    assert claims.pending() == ()
+    assert claims.publish(claim).receipt.status == "revoked"
+    reader = LabJobReader(store.path)
+    assert reader.get_job(job.job_id).status is JobStatus.FAILED
+    assert reader.list_shards(job.job_id)[0].status is ShardStatus.FAILED
+
+
+def test_scheduler_takeover_revokes_pending_only_delivery(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    old = _lease(store, seconds=10)
+    job = _submit_job(store, old, max_attempts=1)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=old,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="lost-worker",
+        shard_lease_seconds=5,
+        lease=old,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    claims = LabClaimSpool(tmp_path / "claims")
+    original_publish_current = claims._publish_current_locked
+    claims._publish_current_locked = lambda _marker: (_ for _ in ()).throw(
+        OSError("injected current write failure")
+    )
+    with pytest.raises(OSError, match="current write"):
+        claims.publish(claim)
+    claims._publish_current_locked = original_publish_current
+    assert len(claims.pending()) == 1
+    clock = [NOW + timedelta(seconds=11)]
+    scheduler = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_spool=claims,
+        claim_worker_ids=(),
+        shard_lease_seconds=5,
+        clock=lambda: clock[0],
+    )
+
+    result = scheduler.run_once()
+
+    assert result.claims_revoked == 1
+    assert claims.pending() == ()
+    assert claims.publish(claim).receipt.status == "revoked"
+
+
+def test_scheduler_restart_retries_failed_claim_revoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    old = _lease(store, seconds=10)
+    job = _submit_job(store, old, max_attempts=1)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=old,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="lost-worker",
+        shard_lease_seconds=5,
+        lease=old,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(claim)
+    original_revoke = claims.revoke
+    failed = False
+
+    def fail_once(claim_to_revoke, *, reason: str):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected revoke failure")
+        return original_revoke(claim_to_revoke, reason=reason)
+
+    monkeypatch.setattr(claims, "revoke", fail_once)
+    clock = [NOW + timedelta(seconds=11)]
+    first = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_spool=claims,
+        claim_worker_ids=(),
+        shard_lease_seconds=5,
+        clock=lambda: clock[0],
+    )
+
+    result = first.run_once()
+    assert result.claim_revoke_failures == 1
+    assert len(claims.pending()) == 1
+    first.release()
+
+    restarted_claims = LabClaimSpool(tmp_path / "claims")
+    clock[0] += timedelta(seconds=1)
+    restarted = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "commands"),
+        owner_id="scheduler-c",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        claim_spool=restarted_claims,
+        claim_worker_ids=(),
+        shard_lease_seconds=5,
+        clock=lambda: clock[0],
+    )
+
+    retried = restarted.run_once()
+
+    assert retried.claims_revoked == 1
+    assert retried.claim_revoke_failures == 0
+    assert restarted_claims.pending() == ()
+    assert restarted_claims.publish(claim).receipt.status == "revoked"
+
+
+def test_scheduler_deadline_expiry_revokes_running_delivery(tmp_path: Path) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+    )
+    assert scheduler.lease is not None
+    base = _submit()
+    envelope = _submit(
+        spec=base.command.spec.model_copy(
+            update={"deadline": NOW + timedelta(seconds=3)}
+        )
+    )
+    store.apply_command(envelope, lease=scheduler.lease, now=NOW)
+    store.plan_job(
+        envelope.command.job_id,
+        (_definition(0),),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    clock[0] = NOW + timedelta(seconds=2)
+    assert scheduler.run_once().claims_published == 1
+    claim = claims.pending()[0].claim
+
+    clock[0] = NOW + timedelta(seconds=3)
+    expired = scheduler.run_once()
+
+    assert expired.deadlines_expired == 1
+    assert expired.claims_revoked == 1
+    assert claims.pending() == ()
+    assert claims.publish(claim).receipt.status == "revoked"

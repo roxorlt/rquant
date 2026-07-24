@@ -235,7 +235,6 @@ def _crash_reclaimer_after_tombstone_rename_child(
     root_value: str,
     claim_payload: str,
 ) -> None:
-    import rquant.lab_worker as lab_worker_module
     from rquant.lab_worker import LabArtifactReclaimer
 
     root = Path(root_value)
@@ -243,14 +242,14 @@ def _crash_reclaimer_after_tombstone_rename_child(
         artifact_root=root / "artifacts",
         report_spool=LabReportSpool(root / "reports"),
     )
-    original_rmtree = lab_worker_module.shutil.rmtree
+    original_delete = reclaimer._delete_isolated_tombstone
 
-    def crash_before_tombstone_delete(path: Path) -> None:
-        if Path(path).name.startswith(".reclaim-"):
+    def crash_before_tombstone_delete(path: Path, ledger: object) -> None:
+        if path.name.startswith(".reclaim-"):
             os._exit(79)
-        original_rmtree(path)
+        original_delete(path, ledger)
 
-    lab_worker_module.shutil.rmtree = crash_before_tombstone_delete
+    reclaimer._delete_isolated_tombstone = crash_before_tombstone_delete  # type: ignore[method-assign]
     reclaimer.reclaim(LabShardClaim.model_validate_json(claim_payload))
     os._exit(80)
 
@@ -416,6 +415,38 @@ def test_consumed_new_generation_prevents_old_claim_resurrection(tmp_path: Path)
     assert claims.pending() == ()
     assert len(tuple(claims.quarantine_dir.glob("*.json"))) == 1
     assert LabClaimSpool(claims.root).current(stale.job_id, stale.shard_id).claim == fresh
+
+
+def test_worker_never_executes_revoked_claim_after_cleanup_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    original_unlink_current = claims._unlink_current_locked
+    monkeypatch.setattr(
+        claims,
+        "_unlink_current_locked",
+        lambda _claim: (_ for _ in ()).throw(OSError("injected cleanup interruption")),
+    )
+    with pytest.raises(OSError, match="cleanup interruption"):
+        claims.revoke(claim, reason="sqlite terminal")
+    monkeypatch.setattr(claims, "_unlink_current_locked", original_unlink_current)
+
+    result = _worker(
+        tmp_path,
+        registry=registry,
+        claims=claims,
+        reports=reports,
+    ).run_once()
+
+    assert result.status == "idle"
+    assert registry.executions == 0
+    assert reports.pending() == ()
+    assert claims.pending() == ()
 
 
 def test_worker_fails_closed_when_claim_high_water_marker_is_missing(tmp_path: Path) -> None:
@@ -2535,6 +2566,313 @@ def test_unknown_reclaim_tombstone_remains_fail_closed(tmp_path: Path) -> None:
 
     assert unknown.is_dir()
     assert sealed.is_dir()
+
+
+@pytest.mark.parametrize("file_name", ["manifest.json", "artifact"])
+def test_reclaimer_rejects_hardlinked_bundle_file_without_deleting(
+    tmp_path: Path,
+    file_name: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    target = (
+        sealed / "manifest.json"
+        if file_name == "manifest.json"
+        else next(sealed.glob("*.parquet"))
+    )
+    external = tmp_path / f"external-{target.name}"
+    os.link(target, external)
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="hard link"):
+        reclaimer.reclaim(current_claim)
+
+    assert sealed.is_dir()
+    assert target.is_file()
+    assert external.is_file()
+    assert target.stat().st_nlink == 2
+
+
+def test_seal_rejects_hardlink_created_at_atomic_rename_without_deleting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+    from rquant.lab_worker import LabArtifactConflictError
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path)
+    validated = worker.adapter_registry.validate_claim(claim)
+    result = RecordingRegistry().execute_shard(validated, object())
+    sealed = worker.sealed_bundle_path(claim)
+    external = tmp_path / "external-rename-artifact.parquet"
+    original_rename = lab_worker_module.os.rename
+
+    def hardlink_at_rename(source: Path, target: Path) -> None:
+        original_rename(source, target)
+        if Path(target) == sealed:
+            os.link(next(sealed.glob("*.parquet")), external)
+
+    monkeypatch.setattr(lab_worker_module.os, "rename", hardlink_at_rename)
+
+    with pytest.raises(LabArtifactConflictError, match="hard link"):
+        worker._seal_result(claim, result)
+
+    assert sealed.is_dir()
+    assert external.is_file()
+
+
+def test_reclaimer_rejects_hardlinked_ledger_without_deleting_tombstone(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    completed = _run_worker_child(
+        "_crash_reclaimer_after_tombstone_rename_child",
+        tmp_path,
+        current_claim.model_dump_json(),
+    )
+    assert completed.returncode == 79, completed.stderr
+    tombstone = tuple(sealed.parent.glob(".reclaim-*"))[0]
+    ledger = tuple((tmp_path / "artifacts" / ".reclaim-ledger").rglob("*.json"))[0]
+    external = tmp_path / "external-ledger.json"
+    os.link(ledger, external)
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="hard link"):
+        restarted.reclaim(current_claim)
+
+    assert tombstone.is_dir()
+    assert ledger.is_file()
+    assert external.is_file()
+
+
+def test_reclaimer_resumes_after_partial_inventory_deletion(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    original_delete = reclaimer._delete_inventory_entry
+    deleted = False
+
+    def interrupt_after_one(directory: Path, entry: object) -> None:
+        nonlocal deleted
+        original_delete(directory, entry)
+        if not deleted:
+            deleted = True
+            raise InterruptedError("injected partial deletion")
+
+    reclaimer._delete_inventory_entry = interrupt_after_one  # type: ignore[method-assign]
+    with pytest.raises(InterruptedError, match="partial deletion"):
+        reclaimer.reclaim(current_claim)
+
+    tombstone = tuple(sealed.parent.glob(".reclaim-*"))[0]
+    assert tombstone.is_dir()
+    assert len(tuple(tombstone.iterdir())) == 1
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    second_delete = restarted._delete_inventory_entry
+    interrupted_again = False
+
+    def interrupt_second_restart(directory: Path, entry: object) -> None:
+        nonlocal interrupted_again
+        second_delete(directory, entry)
+        if not interrupted_again:
+            interrupted_again = True
+            raise InterruptedError("injected second restart")
+
+    restarted._delete_inventory_entry = interrupt_second_restart  # type: ignore[method-assign]
+    with pytest.raises(InterruptedError, match="second restart"):
+        restarted.reclaim(current_claim)
+
+    LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    ).reclaim(current_claim)
+
+    assert not tombstone.exists()
+    assert tuple((tmp_path / "artifacts" / ".reclaim-ledger").rglob("*.json")) == ()
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "replace"])
+def test_partial_reclaim_rejects_unknown_or_replaced_remaining_file(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    original_delete = reclaimer._delete_inventory_entry
+    deleted = False
+
+    def interrupt_after_one(directory: Path, entry: object) -> None:
+        nonlocal deleted
+        original_delete(directory, entry)
+        if not deleted:
+            deleted = True
+            raise InterruptedError("injected partial deletion")
+
+    reclaimer._delete_inventory_entry = interrupt_after_one  # type: ignore[method-assign]
+    with pytest.raises(InterruptedError):
+        reclaimer.reclaim(current_claim)
+    tombstone = tuple(sealed.parent.glob(".reclaim-*"))[0]
+    if mutation == "unknown":
+        (tombstone / "intruder").write_text("unexpected", encoding="utf-8")
+    else:
+        remaining = next(tombstone.iterdir())
+        replacement = tombstone / ".replacement"
+        replacement.write_bytes(remaining.read_bytes())
+        os.replace(replacement, remaining)
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+
+    with pytest.raises(LabArtifactConflictError):
+        restarted.reclaim(current_claim)
+
+    assert tombstone.is_dir()
+
+
+def test_accepted_success_protects_partially_deleted_tombstone(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    old_claim, current_claim, sealed, manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    original_delete = reclaimer._delete_inventory_entry
+    deleted = False
+
+    def interrupt_after_one(directory: Path, entry: object) -> None:
+        nonlocal deleted
+        original_delete(directory, entry)
+        if not deleted:
+            deleted = True
+            raise InterruptedError("injected partial deletion")
+
+    reclaimer._delete_inventory_entry = interrupt_after_one  # type: ignore[method-assign]
+    with pytest.raises(InterruptedError):
+        reclaimer.reclaim(current_claim)
+    tombstone = tuple(sealed.parent.glob(".reclaim-*"))[0]
+    success = LabWorkerReport.from_claim(
+        old_claim,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+    )
+    entry = reports.publish(success)
+    reports.ack(
+        entry,
+        LabReportReceipt.from_report(
+            success,
+            status="accepted",
+            reason="accepted before partial restart",
+            accepted_at=NOW,
+        ),
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="accepted success"):
+        LabArtifactReclaimer(
+            artifact_root=tmp_path / "artifacts",
+            report_spool=LabReportSpool(tmp_path / "reports"),
+        ).reclaim(current_claim)
+
+    assert tombstone.is_dir()
+
+
+def test_reclaimer_cleans_only_recognized_single_link_ledger_temporaries(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    current = _retry_claim(_claim(_nshape_compare_spec(hold_days=(1,))))
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    ledger_dir = reclaimer._ledger_dir(current)
+    ledger_dir.mkdir(parents=True)
+    temporary = ledger_dir / f".reclaim-ledger-tmp-v1-{uuid4().hex}.tmp"
+    temporary.write_bytes(b"x" * 32)
+
+    reclaimer.reclaim(current)
+    reclaimer.reclaim(current)
+
+    assert not temporary.exists()
+
+
+@pytest.mark.parametrize("kind", ["unknown", "symlink", "hardlink"])
+def test_reclaimer_rejects_unsafe_ledger_temporary(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    current = _retry_claim(_claim(_nshape_compare_spec(hold_days=(1,))))
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    ledger_dir = reclaimer._ledger_dir(current)
+    ledger_dir.mkdir(parents=True)
+    external = tmp_path / "external-ledger-temp"
+    external.write_bytes(b"preserve")
+    if kind == "unknown":
+        temporary = ledger_dir / ".unknown.tmp"
+        temporary.write_bytes(b"unknown")
+    else:
+        temporary = ledger_dir / f".reclaim-ledger-tmp-v1-{uuid4().hex}.tmp"
+        if kind == "symlink":
+            temporary.symlink_to(external)
+        else:
+            os.link(external, temporary)
+
+    with pytest.raises(LabArtifactConflictError):
+        reclaimer.reclaim(current)
+
+    assert os.path.lexists(temporary)
+    assert external.read_bytes() == b"preserve"
 
 
 def test_reclaimer_does_not_isolate_directory_replaced_at_rename(

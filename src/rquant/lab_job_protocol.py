@@ -300,6 +300,10 @@ class LabCommandSpool:
                 )
             if not stat.S_ISREG(path_stat.st_mode):
                 raise InvalidCommandEnvelopeError(f"spool file {name} is not regular")
+            if path_stat.st_nlink != 1:
+                raise InvalidCommandEnvelopeError(
+                    f"spool file {name} has an external hard link"
+                )
             try:
                 descriptor = os.open(name, file_flags, dir_fd=directory_fd)
             except OSError as exc:
@@ -310,6 +314,7 @@ class LabCommandSpool:
                     not stat.S_ISREG(file_stat.st_mode)
                     or file_stat.st_dev != path_stat.st_dev
                     or file_stat.st_ino != path_stat.st_ino
+                    or file_stat.st_nlink != 1
                 ):
                     raise InvalidCommandEnvelopeError(
                         f"spool file {name} was replaced while opening",
@@ -541,7 +546,14 @@ class LabCommandSpool:
             )
         return receipt
 
-    def _unlink_pending(self, path: Path, *, device: int, inode: int) -> None:
+    def _unlink_pending(
+        self,
+        path: Path,
+        *,
+        device: int,
+        inode: int,
+        expected_link_count: int = 1,
+    ) -> None:
         name = self._direct_child_name(path, self.pending_dir)
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         directory_fd = os.open(self.pending_dir, directory_flags)
@@ -556,6 +568,7 @@ class LabCommandSpool:
                 not stat.S_ISREG(current.st_mode)
                 or current.st_dev != device
                 or current.st_ino != inode
+                or current.st_nlink != expected_link_count
             ):
                 raise InvalidCommandEnvelopeError("pending command was replaced before unlink")
             os.unlink(name, dir_fd=directory_fd)
@@ -640,6 +653,7 @@ class LabCommandSpool:
                 normalized,
                 device=source_stat.st_dev,
                 inode=source_stat.st_ino,
+                expected_link_count=2,
             )
             return quarantined
 

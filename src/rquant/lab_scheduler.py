@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from threading import Event
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,7 +19,7 @@ from rquant.lab_jobs import (
     LabLeaseRecord,
     SchedulerLeaseFencedError,
 )
-from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim
 from rquant.strategy_job_adapters import StrategyJobAdapterRegistry
 
 
@@ -43,6 +44,8 @@ class SchedulerTickResult(BaseModel):
     claim_delivery_failures: int = Field(default=0, ge=0)
     claims_reconciled: int = Field(default=0, ge=0)
     claim_reconcile_failures: int = Field(default=0, ge=0)
+    claims_revoked: int = Field(default=0, ge=0)
+    claim_revoke_failures: int = Field(default=0, ge=0)
 
 
 def _system_clock() -> datetime:
@@ -162,6 +165,44 @@ class LabScheduler:
             now = self.clock()
         return self.lease, now
 
+    def _reconcile_claim_authority(
+        self,
+        lease: LabLeaseRecord,
+        *,
+        now: datetime,
+        attempted: set[UUID],
+    ) -> tuple[int, int, tuple[LabShardClaim, ...]]:
+        if self.claim_spool is None:
+            return 0, 0, ()
+        active = self.store.list_active_claims(
+            lease,
+            now=now,
+            initial_lease_seconds=self.shard_lease_seconds,
+        )
+        active_by_token = {claim.claim_token: claim for claim in active}
+        revoked = 0
+        failures = 0
+        try:
+            deliveries = self.claim_spool.delivery_claims()
+        except Exception:
+            return 0, 1, active
+        for delivery in deliveries:
+            if active_by_token.get(delivery.claim_token) == delivery:
+                continue
+            if delivery.claim_token in attempted:
+                continue
+            attempted.add(delivery.claim_token)
+            try:
+                self.claim_spool.revoke(
+                    delivery,
+                    reason="sqlite claim is no longer active",
+                )
+            except Exception:
+                failures += 1
+            else:
+                revoked += 1
+        return revoked, failures, active
+
     def run_once(self) -> SchedulerTickResult:
         acquired = self._start_tick()
         recovered = 0
@@ -176,14 +217,19 @@ class LabScheduler:
                 now=recovery_now,
             )
         )
+        authority_now = recovery_now
+        attempted_revokes: set[UUID] = set()
+        claims_revoked, claim_revoke_failures, active_claims = (
+            self._reconcile_claim_authority(
+                lease,
+                now=recovery_now,
+                attempted=attempted_revokes,
+            )
+        )
         claims_replayed = 0
         claim_delivery_failures = 0
         if self.claim_spool is not None:
-            for active_claim in self.store.list_active_claims(
-                lease,
-                now=recovery_now,
-                initial_lease_seconds=self.shard_lease_seconds,
-            ):
+            for active_claim in active_claims:
                 try:
                     self.claim_spool.publish(active_claim)
                 except Exception:
@@ -207,6 +253,7 @@ class LabScheduler:
                 quarantined += 1
                 continue
             lease, mutation_now = self._mutation_context()
+            authority_now = mutation_now
             deadline_lease = lease
             deadline_now = mutation_now
             try:
@@ -250,6 +297,7 @@ class LabScheduler:
                     reports_quarantined += 1
                     continue
                 lease, mutation_now = self._mutation_context()
+                authority_now = mutation_now
                 try:
                     receipt = self.store.apply_worker_report(
                         entry.report,
@@ -277,6 +325,7 @@ class LabScheduler:
                     definitions = self.adapter_registry.plan(job.spec)
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()
+                    authority_now = mutation_now
                     self.store.fail_unplanned_job(
                         job.job_id,
                         reason=f"adapter plan failed: {_safe_plan_failure(exc)}",
@@ -286,6 +335,7 @@ class LabScheduler:
                     plans_failed += 1
                     continue
                 lease, mutation_now = self._mutation_context()
+                authority_now = mutation_now
                 self.store.plan_job(
                     job.job_id,
                     definitions,
@@ -302,6 +352,7 @@ class LabScheduler:
                 worker_id = self.claim_worker_ids[(start + inspected) % worker_count]
                 inspected += 1
                 lease, mutation_now = self._mutation_context()
+                authority_now = mutation_now
                 deadlines_expired += len(
                     self.store.expire_deadline_jobs(
                         lease=lease,
@@ -323,6 +374,16 @@ class LabScheduler:
                 else:
                     claims_published += 1
             self._claim_cursor = (start + inspected) % worker_count
+        if self.claim_spool is not None:
+            final_revoked, final_revoke_failures, _active = (
+                self._reconcile_claim_authority(
+                    lease,
+                    now=authority_now,
+                    attempted=attempted_revokes,
+                )
+            )
+            claims_revoked += final_revoked
+            claim_revoke_failures += final_revoke_failures
         claims_reconciled = 0
         claim_reconcile_failures = 0
         if self.claim_spool is not None:
@@ -350,6 +411,8 @@ class LabScheduler:
             claim_delivery_failures=claim_delivery_failures,
             claims_reconciled=claims_reconciled,
             claim_reconcile_failures=claim_reconcile_failures,
+            claims_revoked=claims_revoked,
+            claim_revoke_failures=claim_revoke_failures,
         )
 
     def request_stop(self) -> None:

@@ -361,6 +361,158 @@ def test_reclaim_hook_failure_never_changes_successful_delivery_semantics(
     assert attempts == 2
 
 
+def test_revoke_removes_exact_pending_and_current_and_blocks_republish(
+    tmp_path: Path,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    entry = spool.publish(claim)
+
+    revoked = spool.revoke(claim, reason="lease exhausted")
+
+    assert revoked.receipt.status == "revoked"
+    assert revoked.receipt.reason == "lease exhausted"
+    assert spool.pending() == ()
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.current(claim.job_id, claim.shard_id)
+    replay = spool.publish(claim)
+    assert replay.receipt.status == "revoked"
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.consume(entry)
+
+
+def test_revoke_cleans_pending_only_after_current_publish_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    original_publish_current = spool._publish_current_locked
+
+    def fail_current(_marker: object) -> None:
+        raise OSError("injected current failure")
+
+    monkeypatch.setattr(spool, "_publish_current_locked", fail_current)
+    with pytest.raises(OSError, match="current failure"):
+        spool.publish(claim)
+    assert len(spool.pending()) == 1
+    monkeypatch.setattr(spool, "_publish_current_locked", original_publish_current)
+
+    revoked = spool.revoke(claim, reason="sqlite terminal")
+
+    assert revoked.receipt.status == "revoked"
+    assert spool.pending() == ()
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.current(claim.job_id, claim.shard_id)
+
+
+def test_revoke_upgrades_consumed_receipt_and_fences_current(tmp_path: Path) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    assert spool.consume(spool.publish(claim)) == claim
+
+    revoked = LabClaimSpool(root).revoke(claim, reason="scheduler takeover")
+
+    assert revoked.receipt.status == "revoked"
+    assert not LabClaimSpool(root).is_current(claim)
+    assert LabClaimSpool(root).publish(claim).receipt.status == "revoked"
+
+
+def test_revoke_receipt_failure_is_retryable_without_partial_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    spool.publish(claim)
+    original_publish = spool._publish_no_clobber
+
+    def fail_receipt(target: Path, payload: bytes) -> bool:
+        if target.parent == spool.ack_dir:
+            raise OSError("injected revoke receipt failure")
+        return original_publish(target, payload)
+
+    monkeypatch.setattr(spool, "_publish_no_clobber", fail_receipt)
+    with pytest.raises(OSError, match="revoke receipt"):
+        spool.revoke(claim, reason="expired")
+
+    assert len(spool.pending()) == 1
+    assert spool.is_current(claim)
+    monkeypatch.setattr(spool, "_publish_no_clobber", original_publish)
+    assert spool.revoke(claim, reason="expired").receipt.status == "revoked"
+    assert spool.pending() == ()
+
+
+def test_revoke_receipt_fences_before_unlink_and_current_removal_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.publish(claim)
+    original_unlink = spool._unlink_pending
+
+    def fail_unlink(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected revoke unlink failure")
+
+    monkeypatch.setattr(spool, "_unlink_pending", fail_unlink)
+    with pytest.raises(OSError, match="revoke unlink"):
+        spool.revoke(claim, reason="expired")
+
+    assert not spool.is_current(claim)
+    assert len(spool.pending()) == 1
+    assert spool.publish(claim).receipt.status == "revoked"
+    monkeypatch.setattr(spool, "_unlink_pending", original_unlink)
+    assert LabClaimSpool(root).revoke(claim, reason="expired").receipt.status == "revoked"
+    assert LabClaimSpool(root).pending() == ()
+
+
+def test_revoke_current_removal_failure_is_fenced_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.publish(claim)
+    original_unlink_current = spool._unlink_current_locked
+
+    def fail_current(_claim: LabShardClaim) -> None:
+        raise OSError("injected current removal failure")
+
+    monkeypatch.setattr(spool, "_unlink_current_locked", fail_current)
+    with pytest.raises(OSError, match="current removal"):
+        spool.revoke(claim, reason="expired")
+
+    assert not spool.is_current(claim)
+    assert spool.current(claim.job_id, claim.shard_id).claim == claim
+    assert spool.publish(claim).receipt.status == "revoked"
+    monkeypatch.setattr(spool, "_unlink_current_locked", original_unlink_current)
+    LabClaimSpool(root).revoke(claim, reason="expired")
+    with pytest.raises(InvalidCommandEnvelopeError):
+        LabClaimSpool(root).current(claim.job_id, claim.shard_id)
+    assert LabClaimSpool(root).pending() == ()
+
+
+def test_claim_receipt_hardlink_fails_closed_without_unlinking(tmp_path: Path) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    receipt = spool.ack_dir / f"{claim.claim_token}.json"
+    external = tmp_path / "external-receipt.json"
+    os.link(receipt, external)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="hard link"):
+        spool.publish(claim)
+
+    assert receipt.is_file()
+    assert external.is_file()
+    assert receipt.stat().st_nlink == 2
+
+
 def test_report_spool_exactly_once_ack_restart_and_conflict(tmp_path: Path) -> None:
     root = tmp_path / "reports"
     spool = LabReportSpool(root)
