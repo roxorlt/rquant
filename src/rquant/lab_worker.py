@@ -75,6 +75,9 @@ _LEGACY_EMPTY_STAGING_ORPHAN_NAME = re.compile(
     r"(?:-(?P<orphan_token>[0-9a-f]{32}))?"
 )
 _GARBAGE_RECOVERY_QUEUE_NAME = re.compile(r"(?P<sequence>[0-9]{20})\.json")
+_QUEUE_MIGRATION_CHAIN_GENESIS = hashlib.sha256(
+    b"rquant:lab-quarantine-recovery-migration-chain:v3"
+).hexdigest()
 
 
 def _system_clock() -> datetime:
@@ -818,14 +821,28 @@ class LabQuarantineMigrationInitializationResult(LabWorkerModel):
 
 
 class LabQuarantineQueueMigrationIndexEntry(LabWorkerModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     index: int = Field(ge=1)
     namespace: Literal["active", "cold_health", "authority"]
     file_name: str = Field(pattern=r"^[0-9a-f]{32}-prepared-intent-v1\.json$")
+    previous_chain_hash: str = Field(pattern=_HASH_PATTERN)
+    chain_hash: str = ""
     content_hash: str = ""
 
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueMigrationIndexEntry:
+        chain_hash = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"chain_hash", "content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.chain_hash and self.chain_hash != chain_hash:
+            raise ValueError("quarantine migration index chain hash conflicts")
+        object.__setattr__(self, "chain_hash", chain_hash)
         expected = _sha256_bytes(
             json.dumps(
                 self.model_dump(mode="json", exclude={"content_hash"}),
@@ -861,7 +878,7 @@ class LabQuarantineQueueMigrationDirectory(LabWorkerModel):
 
 
 class LabQuarantineQueueMigrationCycle(LabWorkerModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     cycle_id: UUID = Field(default_factory=lambda: UUID(int=0))
     total_entries: int = Field(ge=0)
     index_hash: str = Field(pattern=_HASH_PATTERN)
@@ -873,6 +890,8 @@ class LabQuarantineQueueMigrationCycle(LabWorkerModel):
         namespaces = tuple(item.namespace for item in self.directories)
         if namespaces != ("active", "cold_health", "authority"):
             raise ValueError("quarantine migration directories are incomplete or unordered")
+        if self.total_entries == 0 and self.index_hash != _QUEUE_MIGRATION_CHAIN_GENESIS:
+            raise ValueError("empty quarantine migration cycle has a non-genesis index hash")
         identity = self.model_dump(mode="json", exclude={"cycle_id", "content_hash"})
         canonical = json.dumps(
             identity,
@@ -902,9 +921,13 @@ class LabQuarantineQueueMigrationCycle(LabWorkerModel):
 
 
 class LabQuarantineQueueMigrationCursor(LabWorkerModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     cycle_id: UUID
     last_index: int = Field(default=0, ge=0)
+    last_chain_hash: str = Field(
+        default=_QUEUE_MIGRATION_CHAIN_GENESIS,
+        pattern=_HASH_PATTERN,
+    )
     content_hash: str = ""
 
     @model_validator(mode="after")
@@ -934,12 +957,20 @@ class LabQuarantineQueueMigrationCursor(LabWorkerModel):
 
 
 class LabQuarantineQueueMigrationComplete(LabWorkerModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     state: Literal["complete"] = "complete"
+    cycle_id: UUID
+    index_hash: str = Field(pattern=_HASH_PATTERN)
+    final_index: int = Field(ge=0)
+    final_chain_hash: str = Field(pattern=_HASH_PATTERN)
+    directories: tuple[LabQuarantineQueueMigrationDirectory, ...]
     content_hash: str = ""
 
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueMigrationComplete:
+        namespaces = tuple(item.namespace for item in self.directories)
+        if namespaces != ("active", "cold_health", "authority"):
+            raise ValueError("quarantine migration completion directories are incomplete")
         expected = _sha256_bytes(
             json.dumps(
                 self.model_dump(mode="json", exclude={"content_hash"}),
@@ -2447,12 +2478,18 @@ class LabArtifactReclaimer:
             self.garbage_recovery_queue_root / "cursor-v1.json"
         )
         self.garbage_queue_migration_root = self.garbage_recovery_queue_root / "migration-v2"
-        self.garbage_queue_migration_cycles_dir = self.garbage_queue_migration_root / "cycles"
+        self.garbage_queue_migration_cycles_dir = self.garbage_queue_migration_root / "cycles-v3"
         self.garbage_queue_migration_active_path = (
-            self.garbage_queue_migration_root / "active-cycle-v2.json"
+            self.garbage_queue_migration_root / "active-cycle-v3.json"
+        )
+        self.garbage_queue_migration_legacy_complete_path = (
+            self.garbage_queue_migration_root / "complete-v2.json"
         )
         self.garbage_queue_migration_complete_path = (
-            self.garbage_queue_migration_root / "complete-v2.json"
+            self.garbage_queue_migration_root / "complete-v3.json"
+        )
+        self.garbage_queue_migration_complete_archive_dir = (
+            self.garbage_queue_migration_root / "complete_archive"
         )
         self.garbage_intent_temp_dir = self.garbage_root / "intent_temporary"
         self.garbage_intent_orphan_dir = self.garbage_root / "intent_orphans"
@@ -2479,6 +2516,7 @@ class LabArtifactReclaimer:
             self.garbage_recovery_queue_repair_results_dir,
             self.garbage_queue_migration_root,
             self.garbage_queue_migration_cycles_dir,
+            self.garbage_queue_migration_complete_archive_dir,
             self.garbage_intent_temp_dir,
             self.garbage_intent_orphan_dir,
             self.garbage_orphan_metadata_dir,
@@ -2494,7 +2532,13 @@ class LabArtifactReclaimer:
                 directory.chmod(0o700)
         if garbage_namespace_was_missing:
             self._write_migration_complete_locked()
-            self._write_queue_migration_complete_locked()
+            directories = self._migration_directory_identities()
+            cycle = self._ensure_queue_migration_cycle_locked((), directories)
+            cursor = self._load_queue_migration_cursor(cycle)
+            if not self._write_queue_migration_complete_locked(cycle, cursor, directories):
+                raise LabArtifactConflictError(
+                    "fresh quarantine migration namespace changed during initialization"
+                )
 
     @staticmethod
     def _attempt_name(claim: LabShardClaim) -> str:
@@ -4712,7 +4756,7 @@ class LabArtifactReclaimer:
         )
         self._load_migration_complete_locked()
 
-    def _load_queue_migration_complete_locked(self) -> None:
+    def _load_queue_migration_complete_locked(self) -> LabQuarantineQueueMigrationComplete:
         raw = self._read_recovery_metadata(
             self.garbage_queue_migration_complete_path,
             label="quarantine queue migration marker",
@@ -4725,17 +4769,91 @@ class LabArtifactReclaimer:
             ) from exc
         if raw != marker.canonical_json():
             raise LabArtifactConflictError("quarantine queue migration marker is not canonical")
+        cycle = self._load_active_queue_migration_cycle_locked()
+        cursor = self._load_queue_migration_cursor(cycle)
+        if (
+            marker.cycle_id != cycle.cycle_id
+            or marker.index_hash != cycle.index_hash
+            or marker.final_index != cycle.total_entries
+            or marker.final_chain_hash != cycle.index_hash
+            or marker.directories != cycle.directories
+            or cursor.last_index != cycle.total_entries
+            or cursor.last_chain_hash != cycle.index_hash
+        ):
+            raise LabArtifactConflictError(
+                "quarantine queue migration marker conflicts with active cycle"
+            )
+        return marker
 
-    def _write_queue_migration_complete_locked(self) -> None:
+    def _archive_queue_migration_complete_locked(
+        self,
+        marker: LabQuarantineQueueMigrationComplete,
+    ) -> None:
+        target = self.garbage_queue_migration_complete_archive_dir / (
+            f"{marker.cycle_id.hex}-{marker.content_hash}-{uuid4().hex}.json"
+        )
+        if os.path.lexists(target):  # pragma: no cover - UUID collision
+            raise LabArtifactConflictError("quarantine migration completion archive conflicts")
+        try:
+            os.rename(self.garbage_queue_migration_complete_path, target)
+            _fsync_directory(self.garbage_queue_migration_root)
+            _fsync_directory(self.garbage_queue_migration_complete_archive_dir)
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "quarantine migration completion archive failed"
+            ) from exc
+        raw = self._read_recovery_metadata(
+            target,
+            label="archived quarantine queue migration marker",
+        )
+        if raw != marker.canonical_json():
+            raise LabArtifactConflictError(
+                "archived quarantine queue migration marker changed identity"
+            )
+
+    def _write_queue_migration_complete_locked(
+        self,
+        cycle: LabQuarantineQueueMigrationCycle,
+        cursor: LabQuarantineQueueMigrationCursor,
+        directories: tuple[LabQuarantineQueueMigrationDirectory, ...],
+    ) -> bool:
+        if (
+            cursor.cycle_id != cycle.cycle_id
+            or cursor.last_index != cycle.total_entries
+            or cursor.last_chain_hash != cycle.index_hash
+            or directories != cycle.directories
+        ):
+            raise LabArtifactConflictError("quarantine migration cannot complete an unbound cycle")
+        marker = LabQuarantineQueueMigrationComplete(
+            cycle_id=cycle.cycle_id,
+            index_hash=cycle.index_hash,
+            final_index=cursor.last_index,
+            final_chain_hash=cursor.last_chain_hash,
+            directories=directories,
+        )
+        if self._migration_directory_identities() != directories:
+            return False
         if os.path.lexists(self.garbage_queue_migration_complete_path):
-            self._load_queue_migration_complete_locked()
-            return
-        marker = LabQuarantineQueueMigrationComplete()
+            existing = self._load_queue_migration_complete_locked()
+            if existing != marker:
+                raise LabArtifactConflictError(
+                    "quarantine queue migration completion identity conflicts"
+                )
+            if self._migration_directory_identities() != directories:
+                self._archive_queue_migration_complete_locked(existing)
+                return False
+            return True
         self._write_derived_canonical_file(
             self.garbage_queue_migration_complete_path,
             marker.canonical_json(),
         )
-        self._load_queue_migration_complete_locked()
+        persisted = self._load_queue_migration_complete_locked()
+        if persisted != marker:
+            raise LabArtifactConflictError("quarantine queue migration marker changed identity")
+        if self._migration_directory_identities() != directories:
+            self._archive_queue_migration_complete_locked(persisted)
+            return False
+        return True
 
     def _recovery_intent_paths_locked(self, directory: Path) -> tuple[Path, ...]:
         paths: list[Path] = []
@@ -4814,10 +4932,10 @@ class LabArtifactReclaimer:
         )
 
     def _migration_cycle_path(self, cycle_id: UUID) -> Path:
-        return self.garbage_queue_migration_cycles_dir / cycle_id.hex / "cycle-v2.json"
+        return self.garbage_queue_migration_cycles_dir / cycle_id.hex / "cycle-v3.json"
 
     def _migration_cursor_path(self, cycle_id: UUID) -> Path:
-        return self.garbage_queue_migration_cycles_dir / cycle_id.hex / "cursor-v2.json"
+        return self.garbage_queue_migration_cycles_dir / cycle_id.hex / "cursor-v3.json"
 
     def _load_queue_migration_cycle(
         self,
@@ -4859,25 +4977,39 @@ class LabArtifactReclaimer:
             raw != cursor.canonical_json()
             or cursor.cycle_id != cycle.cycle_id
             or cursor.last_index > cycle.total_entries
+            or (cursor.last_index == 0 and cursor.last_chain_hash != _QUEUE_MIGRATION_CHAIN_GENESIS)
+            or (
+                cursor.last_index == cycle.total_entries
+                and cursor.last_chain_hash != cycle.index_hash
+            )
         ):
             raise LabArtifactConflictError("quarantine migration cursor conflicts with cycle")
+        if cursor.last_index:
+            entry = self._load_queue_migration_index_entry(cycle, cursor.last_index)
+            if entry.chain_hash != cursor.last_chain_hash:
+                raise LabArtifactConflictError(
+                    "quarantine migration cursor chain conflicts with index"
+                )
         return cursor
 
     def _write_queue_migration_cursor(
         self,
         cycle: LabQuarantineQueueMigrationCycle,
         cursor: LabQuarantineQueueMigrationCursor,
+        entry: LabQuarantineQueueMigrationIndexEntry,
     ) -> None:
         validated = LabQuarantineQueueMigrationCursor.model_validate(cursor)
         current = self._load_queue_migration_cursor(cycle)
         if (
             validated.cycle_id != cycle.cycle_id
             or validated.last_index > cycle.total_entries
-            or validated.last_index < current.last_index
+            or validated.last_index != current.last_index + 1
+            or entry.index != validated.last_index
+            or entry.previous_chain_hash != current.last_chain_hash
+            or entry.chain_hash != validated.last_chain_hash
+            or (entry.index == cycle.total_entries and entry.chain_hash != cycle.index_hash)
         ):
-            raise LabArtifactConflictError("quarantine migration cursor cannot move backward")
-        if validated == current:
-            return
+            raise LabArtifactConflictError("quarantine migration cursor chain cannot advance")
         path = self._migration_cursor_path(cycle.cycle_id)
         self._replace_recovery_queue_state(path, validated.canonical_json())
         if self._load_queue_migration_cursor(cycle) != validated:
@@ -4898,6 +5030,8 @@ class LabArtifactReclaimer:
             ) from exc
         if entry.index != index or raw != entry.canonical_json():
             raise LabArtifactConflictError("quarantine migration index identity conflicts")
+        if index == cycle.total_entries and entry.chain_hash != cycle.index_hash:
+            raise LabArtifactConflictError("quarantine migration index final chain conflicts")
         return entry
 
     def _migration_index_entries_locked(
@@ -4926,29 +5060,30 @@ class LabArtifactReclaimer:
         if after != before:
             raise LabArtifactConflictError("legacy recovery namespaces changed while indexing")
         ordered = sorted(candidates, key=lambda item: (item[0], item[1]))
-        entries = tuple(
-            LabQuarantineQueueMigrationIndexEntry(
+        entries: list[LabQuarantineQueueMigrationIndexEntry] = []
+        previous_chain_hash = _QUEUE_MIGRATION_CHAIN_GENESIS
+        for index, (namespace, file_name) in enumerate(ordered, start=1):
+            entry = LabQuarantineQueueMigrationIndexEntry(
                 index=index,
                 namespace=namespace,
                 file_name=file_name,
+                previous_chain_hash=previous_chain_hash,
             )
-            for index, (namespace, file_name) in enumerate(ordered, start=1)
-        )
-        return entries, after
+            entries.append(entry)
+            previous_chain_hash = entry.chain_hash
+        return tuple(entries), after
 
     def _ensure_queue_migration_cycle_locked(
         self,
         entries: tuple[LabQuarantineQueueMigrationIndexEntry, ...],
         directories: tuple[LabQuarantineQueueMigrationDirectory, ...],
     ) -> LabQuarantineQueueMigrationCycle:
-        index_hash = _sha256_bytes(
-            json.dumps(
-                [entry.content_hash for entry in entries],
-                ensure_ascii=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-        )
+        previous_chain_hash = _QUEUE_MIGRATION_CHAIN_GENESIS
+        for expected_index, entry in enumerate(entries, start=1):
+            if entry.index != expected_index or entry.previous_chain_hash != previous_chain_hash:
+                raise LabArtifactConflictError("quarantine migration index chain is discontinuous")
+            previous_chain_hash = entry.chain_hash
+        index_hash = entries[-1].chain_hash if entries else _QUEUE_MIGRATION_CHAIN_GENESIS
         cycle = LabQuarantineQueueMigrationCycle(
             total_entries=len(entries),
             index_hash=index_hash,
@@ -4978,7 +5113,10 @@ class LabArtifactReclaimer:
             self._write_derived_canonical_file(cycle_path, cycle.canonical_json())
         cursor_path = self._migration_cursor_path(cycle.cycle_id)
         if not os.path.lexists(cursor_path):
-            cursor = LabQuarantineQueueMigrationCursor(cycle_id=cycle.cycle_id)
+            cursor = LabQuarantineQueueMigrationCursor(
+                cycle_id=cycle.cycle_id,
+                last_chain_hash=_QUEUE_MIGRATION_CHAIN_GENESIS,
+            )
             self._write_derived_canonical_file(cursor_path, cursor.canonical_json())
         self._load_queue_migration_cursor(cycle)
         if os.path.lexists(self.garbage_queue_migration_active_path):
@@ -5003,8 +5141,10 @@ class LabArtifactReclaimer:
         """Build one explicit immutable legacy snapshot outside ordinary worker recovery."""
         with self.report_spool.evidence_lock():
             if os.path.lexists(self.garbage_queue_migration_complete_path):
-                self._load_queue_migration_complete_locked()
-                return LabQuarantineMigrationInitializationResult(indexed=0, complete=True)
+                marker = self._load_queue_migration_complete_locked()
+                if self._migration_directory_identities() == marker.directories:
+                    return LabQuarantineMigrationInitializationResult(indexed=0, complete=True)
+                self._archive_queue_migration_complete_locked(marker)
             if os.path.lexists(self.garbage_queue_migration_active_path):
                 active = self._load_active_queue_migration_cycle_locked()
                 cursor = self._load_queue_migration_cursor(active)
@@ -5013,14 +5153,26 @@ class LabArtifactReclaimer:
                         indexed=active.total_entries,
                         complete=False,
                     )
-                if self._migration_directory_identities() == active.directories:
-                    self._write_queue_migration_complete_locked()
+                directories = self._migration_directory_identities()
+                if (
+                    directories == active.directories
+                    and self._write_queue_migration_complete_locked(
+                        active,
+                        cursor,
+                        directories,
+                    )
+                ):
                     return LabQuarantineMigrationInitializationResult(indexed=0, complete=True)
             entries, directories = self._migration_index_entries_locked()
-            self._ensure_queue_migration_cycle_locked(entries, directories)
+            cycle = self._ensure_queue_migration_cycle_locked(entries, directories)
             complete = not entries
             if complete:
-                self._write_queue_migration_complete_locked()
+                cursor = self._load_queue_migration_cursor(cycle)
+                complete = self._write_queue_migration_complete_locked(
+                    cycle,
+                    cursor,
+                    directories,
+                )
             return LabQuarantineMigrationInitializationResult(
                 indexed=len(entries),
                 complete=complete,
@@ -5054,8 +5206,11 @@ class LabArtifactReclaimer:
             raise ValueError("legacy quarantine migration max_entries must be positive")
         with self.report_spool.evidence_lock():
             if os.path.lexists(self.garbage_queue_migration_complete_path):
-                self._load_queue_migration_complete_locked()
-                return LabQuarantineMigrationResult(scanned=0, enqueued=0, complete=True)
+                marker = self._load_queue_migration_complete_locked()
+                if self._migration_directory_identities() == marker.directories:
+                    return LabQuarantineMigrationResult(scanned=0, enqueued=0, complete=True)
+                self._archive_queue_migration_complete_locked(marker)
+                return LabQuarantineMigrationResult(scanned=0, enqueued=0, complete=False)
             if not os.path.lexists(self.garbage_queue_migration_active_path):
                 raise LabArtifactConflictError(
                     "legacy recovery migration requires explicit initialization"
@@ -5068,6 +5223,10 @@ class LabArtifactReclaimer:
             while scanned < max_entries and cursor.last_index < cycle.total_entries:
                 index = cursor.last_index + 1
                 entry = self._load_queue_migration_index_entry(cycle, index)
+                if entry.previous_chain_hash != cursor.last_chain_hash:
+                    raise LabArtifactConflictError(
+                        "quarantine migration index previous chain conflicts"
+                    )
                 path = directories[entry.namespace] / entry.file_name
                 intent = self._load_prepared_intent(path)
                 match = _GARBAGE_INTENT_NAME.fullmatch(entry.file_name)
@@ -5084,14 +5243,22 @@ class LabArtifactReclaimer:
                 cursor = LabQuarantineQueueMigrationCursor(
                     cycle_id=cycle.cycle_id,
                     last_index=index,
+                    last_chain_hash=entry.chain_hash,
                 )
-                self._write_queue_migration_cursor(cycle, cursor)
-            complete = (
-                cursor.last_index == cycle.total_entries
-                and self._migration_directory_identities() == cycle.directories
-            )
-            if complete:
-                self._write_queue_migration_complete_locked()
+                self._write_queue_migration_cursor(cycle, cursor, entry)
+            complete = False
+            if cursor.last_index == cycle.total_entries:
+                if cursor.last_chain_hash != cycle.index_hash:
+                    raise LabArtifactConflictError(
+                        "quarantine migration final cursor chain conflicts"
+                    )
+                observed_directories = self._migration_directory_identities()
+                if observed_directories == cycle.directories:
+                    complete = self._write_queue_migration_complete_locked(
+                        cycle,
+                        cursor,
+                        observed_directories,
+                    )
             return LabQuarantineMigrationResult(
                 scanned=scanned,
                 enqueued=enqueued,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import inspect
 import json
 import os
@@ -1373,6 +1374,24 @@ def test_old_migration_marker_does_not_hide_queue_index_migration(
     legacy.garbage_recovery_queue_sequence_path.unlink(missing_ok=True)
     legacy.garbage_recovery_queue_cursor_path.unlink(missing_ok=True)
     legacy.garbage_queue_migration_complete_path.unlink(missing_ok=True)
+    old_queue_marker_identity = {"schema_version": 2, "state": "complete"}
+    old_queue_marker_hash = hashlib.sha256(
+        json.dumps(
+            old_queue_marker_identity,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    legacy.garbage_queue_migration_legacy_complete_path.write_text(
+        json.dumps(
+            {**old_queue_marker_identity, "content_hash": old_queue_marker_hash},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
 
     active_victim = artifact_root / "legacy-v2-active" / "result.bin"
     active_victim.parent.mkdir(parents=True)
@@ -1393,6 +1412,7 @@ def test_old_migration_marker_does_not_hide_queue_index_migration(
         active_owner.garbage_id,
     ).write_text(active_intent.canonical_json(), encoding="utf-8")
     old_marker_bytes = legacy.garbage_legacy_complete_path.read_bytes()
+    old_queue_marker_bytes = legacy.garbage_queue_migration_legacy_complete_path.read_bytes()
 
     restarted = LabArtifactReclaimer(
         artifact_root=artifact_root,
@@ -1417,6 +1437,10 @@ def test_old_migration_marker_does_not_hide_queue_index_migration(
     assert second.complete
     assert restarted.garbage_queue_migration_complete_path.is_file()
     assert restarted.garbage_legacy_complete_path.read_bytes() == old_marker_bytes
+    assert (
+        restarted.garbage_queue_migration_legacy_complete_path.read_bytes()
+        == old_queue_marker_bytes
+    )
 
     for _ in range(3):
         restarted.recover_active(max_entries=1)
@@ -1529,8 +1553,8 @@ def test_legacy_queue_migration_consumes_ten_thousand_index_boundedly(
     assert first.scanned == first.enqueued == 1
     assert second.scanned == second.enqueued == 1
     assert intent_loads == 2
-    assert index_parses == 2
-    assert metadata_reads == 20
+    assert index_parses == 6
+    assert metadata_reads == 24
     assert enumerations == 0
     assert reclaimer._load_recovery_queue_cursor_locked().last_sequence == 0
     assert reclaimer._recovery_queue_path(1).is_file()
@@ -1650,6 +1674,335 @@ def test_legacy_queue_migration_cursor_resumes_after_restart(tmp_path: Path) -> 
     assert all(
         restarted._recovery_queue_enqueued_path(intent, "active").is_file() for intent in intents
     )
+
+
+def test_legacy_queue_migration_rejects_canonical_duplicate_index_entry(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import (
+        LabArtifactConflictError,
+        LabArtifactReclaimer,
+        LabGarbagePreparedIntent,
+        LabQuarantineQueueMigrationIndexEntry,
+    )
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    reclaimer.garbage_queue_migration_complete_path.unlink()
+    intents: list[LabGarbagePreparedIntent] = []
+    for index in range(2):
+        victim = reclaimer.artifact_root / "migration-index-integrity" / f"{index}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"migration-index-integrity-{index}".encode())
+        owner = reclaimer._garbage_owner(victim, purpose=f"index integrity {index}")
+        intent = LabGarbagePreparedIntent(
+            schema_version=1,
+            source_relative_path=owner.original_relative_path,
+            staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+            owner=owner,
+        )
+        payload = intent.canonical_json()
+        reclaimer._prepared_intent_path(owner.garbage_id).write_text(payload, encoding="utf-8")
+        reclaimer._intent_marker_path(
+            reclaimer.garbage_active_intent_dir,
+            owner.garbage_id,
+        ).write_text(payload, encoding="utf-8")
+        intents.append(intent)
+
+    assert reclaimer.initialize_legacy_recovery_migration().indexed == 2
+    cycle = reclaimer._load_active_queue_migration_cycle_locked()
+    first = reclaimer._load_queue_migration_index_entry(cycle, 1)
+    original_second = reclaimer._load_queue_migration_index_entry(cycle, 2)
+    omitted = next(
+        intent
+        for intent in intents
+        if original_second.file_name.startswith(intent.owner.garbage_id.hex)
+    )
+    replacement = LabQuarantineQueueMigrationIndexEntry(
+        index=2,
+        namespace=first.namespace,
+        file_name=first.file_name,
+        previous_chain_hash=first.chain_hash,
+    )
+    replacement_path = reclaimer._migration_index_path(cycle, 2)
+    temporary = replacement_path.with_name("replacement.json")
+    temporary.write_text(replacement.canonical_json(), encoding="utf-8")
+    os.replace(temporary, replacement_path)
+
+    assert reclaimer.migrate_legacy_recovery_queue(max_entries=1).enqueued == 1
+    with pytest.raises(LabArtifactConflictError, match="migration index"):
+        reclaimer.migrate_legacy_recovery_queue(max_entries=1)
+
+    assert not reclaimer.garbage_queue_migration_complete_path.exists()
+    assert not reclaimer._recovery_queue_enqueued_path(omitted, "active").exists()
+
+
+def test_queue_migration_complete_marker_detects_post_observation_insertion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer, LabGarbagePreparedIntent
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    reclaimer.garbage_queue_migration_complete_path.unlink()
+    old_marker_bytes = reclaimer.garbage_legacy_complete_path.read_bytes()
+
+    def publish_legacy(index: int) -> LabGarbagePreparedIntent:
+        victim = reclaimer.artifact_root / "migration-complete-race" / f"{index}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"migration-complete-race-{index}".encode())
+        owner = reclaimer._garbage_owner(victim, purpose=f"complete race {index}")
+        intent = LabGarbagePreparedIntent(
+            schema_version=1,
+            source_relative_path=owner.original_relative_path,
+            staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+            owner=owner,
+        )
+        payload = intent.canonical_json()
+        reclaimer._prepared_intent_path(owner.garbage_id).write_text(payload, encoding="utf-8")
+        reclaimer._intent_marker_path(
+            reclaimer.garbage_active_intent_dir,
+            owner.garbage_id,
+        ).write_text(payload, encoding="utf-8")
+        return intent
+
+    first = publish_legacy(1)
+    assert reclaimer.initialize_legacy_recovery_migration().indexed == 1
+    original_write_derived = reclaimer._write_derived_canonical_file
+    inserted: list[LabGarbagePreparedIntent] = []
+
+    def insert_during_marker_publish(target: Path, payload: str) -> None:
+        if target == reclaimer.garbage_queue_migration_complete_path and not inserted:
+            inserted.append(publish_legacy(2))
+        original_write_derived(target, payload)
+
+    monkeypatch.setattr(
+        reclaimer,
+        "_write_derived_canonical_file",
+        insert_during_marker_publish,
+    )
+    raced = reclaimer.migrate_legacy_recovery_queue(max_entries=1)
+    monkeypatch.setattr(
+        reclaimer,
+        "_write_derived_canonical_file",
+        original_write_derived,
+    )
+
+    assert not raced.complete
+    assert inserted
+    assert not reclaimer.garbage_queue_migration_complete_path.exists()
+    assert len(tuple(reclaimer.garbage_queue_migration_complete_archive_dir.iterdir())) == 1
+    restarted = LabArtifactReclaimer(
+        artifact_root=reclaimer.artifact_root,
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    assert restarted.initialize_legacy_recovery_migration().indexed == 1
+    assert restarted.migrate_legacy_recovery_queue(max_entries=1).complete
+    assert restarted._recovery_queue_enqueued_path(first, "active").is_file()
+    assert restarted._recovery_queue_enqueued_path(inserted[0], "active").is_file()
+    assert restarted.garbage_legacy_complete_path.read_bytes() == old_marker_bytes
+
+
+@pytest.mark.parametrize(
+    "tamper_case",
+    [
+        "canonical_first",
+        "canonical_middle",
+        "canonical_final",
+        "duplicate",
+        "reordered",
+        "swapped",
+        "wrong_previous",
+    ],
+)
+def test_legacy_queue_migration_chain_rejects_index_tampering(
+    tmp_path: Path,
+    tamper_case: str,
+) -> None:
+    from rquant.lab_worker import (
+        LabArtifactConflictError,
+        LabArtifactReclaimer,
+        LabGarbagePreparedIntent,
+        LabQuarantineQueueMigrationIndexEntry,
+    )
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    reclaimer.garbage_queue_migration_complete_path.unlink()
+    for index in range(3):
+        victim = reclaimer.artifact_root / "migration-chain-tamper" / f"{index}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"migration-chain-tamper-{index}".encode())
+        owner = reclaimer._garbage_owner(victim, purpose=f"chain tamper {index}")
+        intent = LabGarbagePreparedIntent(
+            schema_version=1,
+            source_relative_path=owner.original_relative_path,
+            staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+            owner=owner,
+        )
+        payload = intent.canonical_json()
+        reclaimer._prepared_intent_path(owner.garbage_id).write_text(payload, encoding="utf-8")
+        reclaimer._intent_marker_path(
+            reclaimer.garbage_active_intent_dir,
+            owner.garbage_id,
+        ).write_text(payload, encoding="utf-8")
+
+    assert reclaimer.initialize_legacy_recovery_migration().indexed == 3
+    cycle = reclaimer._load_active_queue_migration_cycle_locked()
+    entries = [reclaimer._load_queue_migration_index_entry(cycle, index) for index in range(1, 4)]
+    paths = [reclaimer._migration_index_path(cycle, index) for index in range(1, 4)]
+
+    def replace(index: int, entry: LabQuarantineQueueMigrationIndexEntry) -> None:
+        temporary = paths[index - 1].with_name(f"replacement-{tamper_case}.json")
+        temporary.write_text(entry.canonical_json(), encoding="utf-8")
+        os.replace(temporary, paths[index - 1])
+
+    if tamper_case == "canonical_first":
+        replace(
+            1,
+            LabQuarantineQueueMigrationIndexEntry(
+                index=1,
+                namespace=entries[1].namespace,
+                file_name=entries[1].file_name,
+                previous_chain_hash=entries[0].previous_chain_hash,
+            ),
+        )
+    elif tamper_case == "canonical_middle":
+        replace(
+            2,
+            LabQuarantineQueueMigrationIndexEntry(
+                index=2,
+                namespace=entries[0].namespace,
+                file_name=entries[0].file_name,
+                previous_chain_hash=entries[0].chain_hash,
+            ),
+        )
+    elif tamper_case == "canonical_final":
+        replace(
+            3,
+            LabQuarantineQueueMigrationIndexEntry(
+                index=3,
+                namespace=entries[0].namespace,
+                file_name=entries[0].file_name,
+                previous_chain_hash=entries[1].chain_hash,
+            ),
+        )
+    elif tamper_case == "duplicate":
+        replace(
+            2,
+            LabQuarantineQueueMigrationIndexEntry(
+                index=2,
+                namespace=entries[0].namespace,
+                file_name=entries[0].file_name,
+                previous_chain_hash=entries[0].chain_hash,
+            ),
+        )
+    elif tamper_case == "reordered":
+        replace(
+            2,
+            LabQuarantineQueueMigrationIndexEntry(
+                index=2,
+                namespace=entries[2].namespace,
+                file_name=entries[2].file_name,
+                previous_chain_hash=entries[0].chain_hash,
+            ),
+        )
+    elif tamper_case == "swapped":
+        first_raw = paths[0].read_bytes()
+        second_raw = paths[1].read_bytes()
+        first_temporary = paths[0].with_name("swapped-first.json")
+        second_temporary = paths[1].with_name("swapped-second.json")
+        first_temporary.write_bytes(second_raw)
+        second_temporary.write_bytes(first_raw)
+        os.replace(first_temporary, paths[0])
+        os.replace(second_temporary, paths[1])
+    else:
+        replace(
+            2,
+            LabQuarantineQueueMigrationIndexEntry(
+                index=2,
+                namespace=entries[1].namespace,
+                file_name=entries[1].file_name,
+                previous_chain_hash=entries[0].previous_chain_hash,
+            ),
+        )
+
+    with pytest.raises(LabArtifactConflictError, match="migration index"):
+        for _ in range(3):
+            reclaimer.migrate_legacy_recovery_queue(max_entries=1)
+    assert not reclaimer.garbage_queue_migration_complete_path.exists()
+
+
+def test_queue_migration_complete_marker_tracks_successive_cycles(tmp_path: Path) -> None:
+    from rquant.lab_worker import (
+        LabArtifactConflictError,
+        LabArtifactReclaimer,
+        LabGarbagePreparedIntent,
+        LabQuarantineQueueMigrationComplete,
+    )
+
+    artifact_root = tmp_path / "artifacts"
+    reports_root = tmp_path / "reports"
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=artifact_root,
+        report_spool=LabReportSpool(reports_root),
+    )
+    reclaimer.garbage_queue_migration_complete_path.unlink()
+    completed_cycles: list[UUID] = []
+
+    for index in range(3):
+        victim = artifact_root / "successive-migration-cycles" / f"{index}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"successive-migration-cycle-{index}".encode())
+        owner = reclaimer._garbage_owner(victim, purpose=f"successive cycle {index}")
+        intent = LabGarbagePreparedIntent(
+            schema_version=1,
+            source_relative_path=owner.original_relative_path,
+            staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+            owner=owner,
+        )
+        payload = intent.canonical_json()
+        reclaimer._prepared_intent_path(owner.garbage_id).write_text(payload, encoding="utf-8")
+        reclaimer._intent_marker_path(
+            reclaimer.garbage_active_intent_dir,
+            owner.garbage_id,
+        ).write_text(payload, encoding="utf-8")
+
+        restarted = LabArtifactReclaimer(
+            artifact_root=artifact_root,
+            report_spool=LabReportSpool(reports_root),
+        )
+        initialized = restarted.initialize_legacy_recovery_migration()
+        assert initialized.indexed == 1
+        assert restarted.migrate_legacy_recovery_queue(max_entries=1).complete
+        marker = LabQuarantineQueueMigrationComplete.model_validate_json(
+            restarted.garbage_queue_migration_complete_path.read_text(encoding="utf-8")
+        )
+        cycle = restarted._load_active_queue_migration_cycle_locked()
+        cursor = restarted._load_queue_migration_cursor(cycle)
+        assert marker.cycle_id == cycle.cycle_id
+        assert marker.index_hash == marker.final_chain_hash == cycle.index_hash
+        assert marker.final_index == cursor.last_index == cycle.total_entries
+        assert marker.directories == cycle.directories
+        completed_cycles.append(marker.cycle_id)
+        reclaimer = restarted
+
+    assert len(set(completed_cycles)) == 3
+    archived = tuple(reclaimer.garbage_queue_migration_complete_archive_dir.iterdir())
+    assert len(archived) == 2
+
+    replay = reclaimer.garbage_queue_migration_complete_path.with_name("replayed-complete.json")
+    replay.write_bytes(archived[0].read_bytes())
+    os.replace(replay, reclaimer.garbage_queue_migration_complete_path)
+    with pytest.raises(LabArtifactConflictError, match="active cycle"):
+        reclaimer.initialize_legacy_recovery_migration()
 
 
 def test_damaged_cold_quarantine_warns_without_blocking_unrelated_claim(
