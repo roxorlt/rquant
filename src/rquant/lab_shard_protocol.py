@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -554,8 +555,6 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def publish(self, claim: LabShardClaim) -> LabClaimSpoolEntry:
         validated = LabShardClaim.model_validate(claim)
-        if self._claim_advance_hook is not None:
-            self._claim_advance_hook(validated)
         payload = validated.model_dump_json().encode("utf-8")
         with self._exclusive_lock():
             if os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
@@ -582,6 +581,9 @@ class LabClaimSpool(_TypedSpoolBase):
                     raise RequestContentConflictError(
                         f"claim_token {validated.claim_token} already has different content"
                     )
+            if current is None or current.claim != validated:
+                self._publish_current_locked(LabClaimHighWater(claim=validated))
+            if pending is not None:
                 entry = existing
             else:
                 sequence = self._next_sequence_locked()
@@ -591,9 +593,9 @@ class LabClaimSpool(_TypedSpoolBase):
                         f"delivery sequence {sequence} already exists"
                     )
                 entry = self.load(target)
-            if current is None or current.claim != validated:
-                self._publish_current_locked(LabClaimHighWater(claim=validated))
-            return entry
+        if self._claim_advance_hook is not None:
+            self._claim_advance_hook(validated)
+        return entry
 
     def load(self, path: Path) -> LabClaimSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
@@ -643,6 +645,19 @@ class LabClaimSpool(_TypedSpoolBase):
 
 class LabReportSpool(_TypedSpoolBase):
     """Worker-to-scheduler durable report channel with exactly-once receipts."""
+
+    @contextmanager
+    def evidence_lock(self) -> Iterator[None]:
+        """Serialize report evidence mutation with artifact isolation."""
+        with self._exclusive_lock():
+            yield
+
+    def pending_locked(self) -> tuple[LabReportSpoolEntry, ...]:
+        paths = tuple(sorted(self.pending_dir.glob("*.json"), key=self._delivery_key))
+        return tuple(self.load(path) for path in paths)
+
+    def receipt_paths_locked(self) -> tuple[Path, ...]:
+        return tuple(sorted(self.ack_dir.glob("*.json")))
 
     def publish(self, report: LabWorkerReport) -> LabReportSpoolEntry | LabAcknowledgedReport:
         validated = LabWorkerReport.model_validate(report)

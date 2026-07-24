@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -29,6 +30,7 @@ from rquant.lab_shard_protocol import (
     LabClaimSupersededError,
     LabReportReceipt,
     LabReportSpool,
+    LabReportSpoolEntry,
     LabShardClaim,
     LabShardFailed,
     LabShardHeartbeat,
@@ -1338,6 +1340,15 @@ class LabWorker:
 class LabArtifactReclaimer:
     """Remove only superseded attempt bundles without accepted success evidence."""
 
+    _TOMBSTONE_NAME = re.compile(
+        r"\.reclaim-v1-"
+        r"(?P<fence>[0-9]{20})-"
+        r"(?P<generation>[0-9]{20})-"
+        r"(?P<token>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})-"
+        r"(?P<manifest_hash>[0-9a-f]{64})"
+    )
+
     def __init__(
         self,
         *,
@@ -1425,12 +1436,39 @@ class LabArtifactReclaimer:
             claim.scheduler_fencing_token,
         )
 
-    def _assert_no_terminal_success_evidence(
+    @classmethod
+    def _tombstone_name(
+        cls,
+        claim: LabShardClaim,
+        manifest: LabShardResultManifest,
+    ) -> str:
+        return (
+            f".reclaim-v1-{claim.scheduler_fencing_token:020d}-"
+            f"{claim.claim_generation:020d}-{claim.claim_token}-"
+            f"{manifest.manifest_hash}"
+        )
+
+    @classmethod
+    def _parse_tombstone_name(cls, name: str) -> tuple[int, int, UUID, str]:
+        match = cls._TOMBSTONE_NAME.fullmatch(name)
+        if match is None:
+            raise LabArtifactConflictError(f"invalid reclaim tombstone identity: {name}")
+        return (
+            int(match.group("fence")),
+            int(match.group("generation")),
+            UUID(match.group("token")),
+            match.group("manifest_hash"),
+        )
+
+    def _assert_no_terminal_success_evidence_from(
         self,
         claim: LabShardClaim,
         manifest: LabShardResultManifest,
+        *,
+        pending: tuple[LabReportSpoolEntry, ...],
+        receipt_paths: tuple[Path, ...],
     ) -> None:
-        for entry in self.report_spool.pending():
+        for entry in pending:
             report = entry.report
             if not self._report_matches_attempt(report, claim):
                 continue
@@ -1444,7 +1482,7 @@ class LabArtifactReclaimer:
                 "pending success may already be committed before receipt ack"
             )
 
-        for path in sorted(self.report_spool.ack_dir.glob("*.json")):
+        for path in receipt_paths:
             receipt = self.report_spool.load_receipt(path)
             if (receipt.job_id, receipt.shard_id) != (claim.job_id, claim.shard_id):
                 continue
@@ -1467,6 +1505,174 @@ class LabArtifactReclaimer:
                     "accepted success receipt protects terminal artifact"
                 )
 
+    def _assert_no_terminal_success_evidence(
+        self,
+        claim: LabShardClaim,
+        manifest: LabShardResultManifest,
+    ) -> None:
+        self._assert_no_terminal_success_evidence_from(
+            claim,
+            manifest,
+            pending=self.report_spool.pending(),
+            receipt_paths=tuple(sorted(self.report_spool.ack_dir.glob("*.json"))),
+        )
+
+    def _assert_no_terminal_success_evidence_locked(
+        self,
+        claim: LabShardClaim,
+        manifest: LabShardResultManifest,
+    ) -> None:
+        self._assert_no_terminal_success_evidence_from(
+            claim,
+            manifest,
+            pending=self.report_spool.pending_locked(),
+            receipt_paths=self.report_spool.receipt_paths_locked(),
+        )
+
+    @staticmethod
+    def _obsolete_claim(
+        current_claim: LabShardClaim,
+        *,
+        fence: int,
+        generation: int,
+        token: UUID,
+    ) -> LabShardClaim:
+        if generation >= current_claim.claim_generation:
+            raise LabArtifactConflictError(
+                "reclaim identity is not older than durable claim high-water"
+            )
+        if fence > current_claim.scheduler_fencing_token:
+            raise LabArtifactConflictError(
+                "obsolete attempt has a future scheduler fencing token"
+            )
+        return current_claim.model_copy(
+            update={
+                "claim_token": token,
+                "claim_generation": generation,
+                "scheduler_fencing_token": fence,
+            }
+        )
+
+    def _validate_tombstone(
+        self,
+        path: Path,
+        current_claim: LabShardClaim,
+    ) -> tuple[LabShardClaim, LabShardResultManifest]:
+        fence, generation, token, expected_hash = self._parse_tombstone_name(path.name)
+        obsolete_claim = self._obsolete_claim(
+            current_claim,
+            fence=fence,
+            generation=generation,
+            token=token,
+        )
+        self._assert_safe_temporary_tree(path)
+        manifest = self._validate_bundle(path, obsolete_claim)
+        if manifest.manifest_hash != expected_hash:
+            raise LabArtifactConflictError(
+                "reclaim tombstone manifest does not match its durable identity"
+            )
+        return obsolete_claim, manifest
+
+    def _classify_attempt(
+        self,
+        candidate: Path,
+        current_claim: LabShardClaim,
+    ) -> tuple[LabShardClaim, LabShardResultManifest] | None:
+        fence, generation, token = self._parse_attempt_name(candidate.name)
+        candidate_identity = (fence, generation, token)
+        current_identity = (
+            current_claim.scheduler_fencing_token,
+            current_claim.claim_generation,
+            current_claim.claim_token,
+        )
+        if generation > current_claim.claim_generation:
+            raise LabArtifactConflictError(
+                "future sealed attempt conflicts with durable claim high-water"
+            )
+        if generation == current_claim.claim_generation:
+            if candidate_identity != current_identity:
+                raise LabArtifactConflictError(
+                    "current-generation sealed attempt has conflicting identity"
+                )
+            return None
+        obsolete_claim = self._obsolete_claim(
+            current_claim,
+            fence=fence,
+            generation=generation,
+            token=token,
+        )
+        if self.sealed_bundle_path(obsolete_claim) != candidate:
+            raise LabArtifactConflictError(
+                "sealed attempt directory does not match parsed identity"
+            )
+        return obsolete_claim, self._validate_bundle(candidate, obsolete_claim)
+
+    def _preflight(self, current_claim: LabShardClaim, attempts_root: Path) -> None:
+        for candidate in tuple(attempts_root.iterdir()):
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise LabArtifactConflictError(
+                    f"sealed attempt is a symlink or not a directory: {candidate.name}"
+                )
+            if candidate.name.startswith(".reclaim-"):
+                self._validate_tombstone(candidate, current_claim)
+                continue
+            classified = self._classify_attempt(candidate, current_claim)
+            if classified is None:
+                continue
+            obsolete_claim, manifest = classified
+            self._assert_no_terminal_success_evidence(obsolete_claim, manifest)
+
+    def _reclaim_locked(self, current_claim: LabShardClaim, attempts_root: Path) -> None:
+        candidates = tuple(
+            sorted(
+                attempts_root.iterdir(),
+                key=lambda path: (not path.name.startswith(".reclaim-"), path.name),
+            )
+        )
+        for candidate in candidates:
+            if not os.path.lexists(candidate):
+                continue
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise LabArtifactConflictError(
+                    f"sealed attempt is a symlink or not a directory: {candidate.name}"
+                )
+            if candidate.name.startswith(".reclaim-"):
+                self._validate_tombstone(candidate, current_claim)
+                shutil.rmtree(candidate)
+                _fsync_directory(attempts_root)
+                continue
+            classified = self._classify_attempt(candidate, current_claim)
+            if classified is None:
+                continue
+            obsolete_claim, manifest = classified
+            self._assert_no_terminal_success_evidence_locked(obsolete_claim, manifest)
+            tombstone = attempts_root / self._tombstone_name(obsolete_claim, manifest)
+            source_identity = LabWorker._bundle_file_identity(candidate)
+            try:
+                os.rename(candidate, tombstone)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                if not tombstone.is_dir() or candidate.exists():
+                    raise LabArtifactConflictError(
+                        "reclaim tombstone conflicts with sealed attempt"
+                    ) from exc
+                self._validate_tombstone(tombstone, current_claim)
+            _fsync_directory(attempts_root)
+            if LabWorker._bundle_file_identity(tombstone) != source_identity:
+                if os.path.lexists(candidate):
+                    raise LabArtifactConflictError(
+                        "sealed attempt was replaced during isolation and cannot be restored"
+                    )
+                os.rename(tombstone, candidate)
+                _fsync_directory(attempts_root)
+                raise LabArtifactConflictError(
+                    "sealed attempt was replaced during isolation"
+                )
+            self._validate_tombstone(tombstone, current_claim)
+            shutil.rmtree(tombstone)
+            _fsync_directory(attempts_root)
+
     def reclaim(self, current_claim: LabShardClaim) -> None:
         validated = LabShardClaim.model_validate(current_claim)
         attempts_root = self.sealed_bundle_path(validated).parent
@@ -1475,46 +1681,6 @@ class LabArtifactReclaimer:
             return
         if attempts_root.is_symlink() or not attempts_root.is_dir():
             raise LabArtifactConflictError("sealed attempts root is unsafe")
-
-        current_identity = (
-            validated.scheduler_fencing_token,
-            validated.claim_generation,
-            validated.claim_token,
-        )
-        for candidate in tuple(attempts_root.iterdir()):
-            if candidate.is_symlink() or not candidate.is_dir():
-                raise LabArtifactConflictError(
-                    f"sealed attempt is a symlink or not a directory: {candidate.name}"
-                )
-            fence, generation, token = self._parse_attempt_name(candidate.name)
-            candidate_identity = (fence, generation, token)
-            if generation > validated.claim_generation:
-                raise LabArtifactConflictError(
-                    "future sealed attempt conflicts with durable claim high-water"
-                )
-            if generation == validated.claim_generation:
-                if candidate_identity != current_identity:
-                    raise LabArtifactConflictError(
-                        "current-generation sealed attempt has conflicting identity"
-                    )
-                continue
-
-            obsolete_claim = validated.model_copy(
-                update={
-                    "claim_token": token,
-                    "claim_generation": generation,
-                    "scheduler_fencing_token": fence,
-                }
-            )
-            if self.sealed_bundle_path(obsolete_claim) != candidate:
-                raise LabArtifactConflictError(
-                    "sealed attempt directory does not match parsed identity"
-                )
-            manifest = self._validate_bundle(candidate, obsolete_claim)
-            self._assert_no_terminal_success_evidence(obsolete_claim, manifest)
-            reclaimed = attempts_root / f".reclaim-{candidate.name}-{uuid4().hex}"
-            os.rename(candidate, reclaimed)
-            _fsync_directory(attempts_root)
-            self._assert_safe_temporary_tree(reclaimed)
-            shutil.rmtree(reclaimed)
-            _fsync_directory(attempts_root)
+        self._preflight(validated, attempts_root)
+        with self.report_spool.evidence_lock():
+            self._reclaim_locked(validated, attempts_root)
