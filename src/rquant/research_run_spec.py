@@ -41,13 +41,24 @@ class ResourceClass(StrEnum):
 class ParameterKind(StrEnum):
     BOOLEAN = "boolean"
     INTEGER = "integer"
+    INTEGER_LIST = "integer_list"
     DECIMAL = "decimal"
     TEXT = "text"
+    TEXT_LIST = "text_list"
     DATE = "date"
     DATETIME = "datetime"
 
 
-ParameterValue: TypeAlias = StrictBool | StrictInt | Decimal | datetime | date | str
+ParameterValue: TypeAlias = (
+    StrictBool
+    | StrictInt
+    | tuple[StrictInt, ...]
+    | Decimal
+    | datetime
+    | date
+    | str
+    | tuple[str, ...]
+)
 MAX_DECIMAL_COEFFICIENT_DIGITS = 128
 MAX_DECIMAL_ABS_EXPONENT = 384
 
@@ -157,7 +168,7 @@ class ResearchParameter(RunSpecModel):
             return data
         parsed = dict(data)
         value = parsed.get("value")
-        if isinstance(value, (Mapping, list, tuple, set)):
+        if isinstance(value, (Mapping, set)):
             raise ValueError("parameter value must be a typed scalar")
         try:
             kind = ParameterKind(parsed.get("kind"))
@@ -170,11 +181,30 @@ class ResearchParameter(RunSpecModel):
         elif kind is ParameterKind.INTEGER:
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError("integer parameter requires an int")
+        elif kind is ParameterKind.INTEGER_LIST:
+            if not isinstance(value, (list, tuple)) or not value:
+                raise ValueError("integer_list parameter requires a non-empty integer list")
+            if any(not isinstance(item, int) or isinstance(item, bool) for item in value):
+                raise ValueError("integer_list parameter requires integer items")
+            if len(value) != len(set(value)):
+                raise ValueError("integer_list parameter items must be unique")
+            parsed["value"] = tuple(sorted(value))
         elif kind is ParameterKind.DECIMAL:
             parsed["value"] = _parse_decimal(value, field_name="decimal parameter")
         elif kind is ParameterKind.TEXT:
             if not isinstance(value, str):
                 raise ValueError("text parameter requires a string")
+        elif kind is ParameterKind.TEXT_LIST:
+            if not isinstance(value, (list, tuple)) or not value:
+                raise ValueError("text_list parameter requires a non-empty string list")
+            if any(not isinstance(item, str) for item in value):
+                raise ValueError("text_list parameter requires string items")
+            normalized = tuple(item.strip() for item in value)
+            if any(not item for item in normalized):
+                raise ValueError("text_list parameter items must not be empty")
+            if len(normalized) != len(set(normalized)):
+                raise ValueError("text_list parameter items must be unique")
+            parsed["value"] = tuple(sorted(normalized))
         elif kind is ParameterKind.DATE:
             parsed["value"] = _parse_civil_date(value, field_name="date parameter")
         else:
@@ -189,8 +219,18 @@ class ResearchParameter(RunSpecModel):
         matches = {
             ParameterKind.BOOLEAN: type(self.value) is bool,
             ParameterKind.INTEGER: type(self.value) is int,
+            ParameterKind.INTEGER_LIST: (
+                isinstance(self.value, tuple)
+                and bool(self.value)
+                and all(type(item) is int for item in self.value)
+            ),
             ParameterKind.DECIMAL: isinstance(self.value, Decimal),
             ParameterKind.TEXT: type(self.value) is str,
+            ParameterKind.TEXT_LIST: (
+                isinstance(self.value, tuple)
+                and bool(self.value)
+                and all(type(item) is str for item in self.value)
+            ),
             ParameterKind.DATE: type(self.value) is date,
             ParameterKind.DATETIME: type(self.value) is datetime,
         }

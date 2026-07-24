@@ -19,6 +19,7 @@ from rquant.lab_jobs import (
     SchedulerLeaseFencedError,
 )
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+from rquant.strategy_job_adapters import StrategyJobAdapterRegistry
 
 
 class SchedulerTickResult(BaseModel):
@@ -34,6 +35,8 @@ class SchedulerTickResult(BaseModel):
     reports_accepted: int = Field(default=0, ge=0)
     reports_rejected: int = Field(default=0, ge=0)
     reports_quarantined: int = Field(default=0, ge=0)
+    plans_created: int = Field(default=0, ge=0)
+    plans_failed: int = Field(default=0, ge=0)
     claims_published: int = Field(default=0, ge=0)
 
 
@@ -59,6 +62,8 @@ class LabScheduler:
         claim_worker_ids: tuple[str, ...] = (),
         shard_lease_seconds: int = 300,
         max_reports_per_tick: int = 64,
+        adapter_registry: StrategyJobAdapterRegistry | None = None,
+        max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
@@ -76,6 +81,8 @@ class LabScheduler:
             raise ValueError("shard_lease_seconds must be positive")
         if max_reports_per_tick < 1:
             raise ValueError("max_reports_per_tick must be positive")
+        if max_plans_per_tick < 1:
+            raise ValueError("max_plans_per_tick must be positive")
         if max_claims_per_tick < 1:
             raise ValueError("max_claims_per_tick must be positive")
         normalized_workers = tuple(worker.strip() for worker in claim_worker_ids)
@@ -95,6 +102,8 @@ class LabScheduler:
         self.claim_worker_ids = normalized_workers
         self.shard_lease_seconds = shard_lease_seconds
         self.max_reports_per_tick = max_reports_per_tick
+        self.adapter_registry = adapter_registry
+        self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
@@ -226,6 +235,23 @@ class LabScheduler:
                 else:
                     reports_rejected += 1
                 self.report_spool.ack(entry, receipt)
+        plans_created = 0
+        plans_failed = 0
+        if self.adapter_registry is not None:
+            for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
+                try:
+                    definitions = self.adapter_registry.plan(job.spec)
+                except ValueError:
+                    plans_failed += 1
+                    continue
+                lease, mutation_now = self._mutation_context()
+                self.store.plan_job(
+                    job.job_id,
+                    definitions,
+                    lease=lease,
+                    now=mutation_now,
+                )
+                plans_created += 1
         claims_published = 0
         if self.claim_spool is not None and self.claim_worker_ids:
             worker_count = len(self.claim_worker_ids)
@@ -257,6 +283,8 @@ class LabScheduler:
             reports_accepted=reports_accepted,
             reports_rejected=reports_rejected,
             reports_quarantined=reports_quarantined,
+            plans_created=plans_created,
+            plans_failed=plans_failed,
             claims_published=claims_published,
         )
 

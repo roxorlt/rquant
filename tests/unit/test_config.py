@@ -82,6 +82,7 @@ class TestSettings:
             lab_job_command_dir="",
             lab_job_claim_dir="",
             lab_job_report_dir="",
+            lab_worker_artifact_dir="",
         )
 
         assert configured.lab_jobs_path_resolved == (
@@ -96,10 +97,14 @@ class TestSettings:
         assert configured.lab_job_report_dir_resolved == (
             tmp_path / "data" / "lab_worker_reports"
         )
+        assert configured.lab_worker_artifact_dir_resolved == (
+            tmp_path / "data" / "lab_worker_artifacts"
+        )
         assert configured.lab_jobs_path_resolved.parent.is_dir()
         assert configured.lab_job_command_dir_resolved.is_dir()
         assert configured.lab_job_claim_dir_resolved.is_dir()
         assert configured.lab_job_report_dir_resolved.is_dir()
+        assert configured.lab_worker_artifact_dir_resolved.is_dir()
 
     def test_lab_scheduler_runtime_settings_are_configurable(
         self,
@@ -115,6 +120,9 @@ class TestSettings:
             lab_scheduler_max_reports_per_tick=11,
             lab_scheduler_max_claims_per_tick=3,
             lab_scheduler_worker_ids="worker-a, worker-b",
+            lab_worker_poll_interval_ms=125,
+            lab_worker_heartbeat_seconds=15,
+            lab_worker_lease_extension_seconds=90,
         )
 
         assert configured.lab_jobs_busy_timeout_ms == 1_234
@@ -125,6 +133,9 @@ class TestSettings:
         assert configured.lab_scheduler_max_reports_per_tick == 11
         assert configured.lab_scheduler_max_claims_per_tick == 3
         assert configured.lab_scheduler_worker_id_list == ("worker-a", "worker-b")
+        assert configured.lab_worker_poll_interval_ms == 125
+        assert configured.lab_worker_heartbeat_seconds == 15
+        assert configured.lab_worker_lease_extension_seconds == 90
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -136,6 +147,9 @@ class TestSettings:
             ("lab_scheduler_shard_lease_seconds", 0),
             ("lab_scheduler_max_reports_per_tick", 0),
             ("lab_scheduler_max_claims_per_tick", 0),
+            ("lab_worker_poll_interval_ms", 0),
+            ("lab_worker_heartbeat_seconds", 0),
+            ("lab_worker_lease_extension_seconds", 0),
         ],
     )
     def test_lab_scheduler_rejects_non_positive_runtime_settings(

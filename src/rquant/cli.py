@@ -3029,6 +3029,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     from rquant.lab_jobs import LabJobStore
     from rquant.lab_scheduler import LabScheduler
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
     store = LabJobStore(
@@ -3048,6 +3049,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         claim_worker_ids=settings.lab_scheduler_worker_id_list,
         shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
         max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
+        adapter_registry=default_strategy_job_adapter_registry(),
         max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
     )
     if args.once:
@@ -3066,6 +3068,34 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
     scheduler.run_forever()
+    return 0
+
+
+def cmd_lab_worker(args: argparse.Namespace) -> int:
+    """Run a fenced Strategy Lab shard worker."""
+    from rquant.config import settings
+    from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+    from rquant.lab_worker import LabWorker
+    from rquant.storage.duckdb import open_readonly_store
+
+    setup_logging()
+    worker = LabWorker(
+        worker_id=args.worker_id,
+        claim_spool=LabClaimSpool(settings.lab_job_claim_dir_resolved),
+        report_spool=LabReportSpool(settings.lab_job_report_dir_resolved),
+        artifact_root=settings.lab_worker_artifact_dir_resolved,
+        exploratory_store_factory=open_readonly_store,
+        metadata_store_factory=open_readonly_store,
+        research_lake_root=settings.research_lake_dir_resolved,
+        heartbeat_interval_seconds=settings.lab_worker_heartbeat_seconds,
+        lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
+        poll_interval_ms=settings.lab_worker_poll_interval_ms,
+    )
+    if args.once:
+        result = worker.run_once()
+        logger.info(f"lab-worker tick: {result.model_dump_json()}")
+        return 0
+    worker.run_forever()
     return 0
 
 
@@ -4507,6 +4537,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="只消费一批命令并退出",
     )
 
+    lab_worker_p = sub.add_parser(
+        "lab-worker",
+        help="运行 Strategy Lab 后台分片 worker",
+    )
+    lab_worker_p.add_argument(
+        "--worker-id",
+        required=True,
+        help="只消费分配给该 worker id 的 claim",
+    )
+    lab_worker_p.add_argument(
+        "--once",
+        action="store_true",
+        help="只消费一个分片并退出",
+    )
+
     pa_serve_p = sub.add_parser(
         "panorama-auth-serve",
         help="启动全景页登录网关服务（微信友好 cookie 登录，标准库 http.server）",
@@ -4602,6 +4647,7 @@ def main() -> int:
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
         "lab-scheduler": cmd_lab_scheduler,
+        "lab-worker": cmd_lab_worker,
         "panorama-auth-serve": cmd_panorama_auth_serve,
         "panorama-user-add": cmd_panorama_user_add,
         "panorama-user-remove": cmd_panorama_user_remove,
@@ -4620,7 +4666,7 @@ def main() -> int:
     if args.command in (
         "serve", "notify-test", "alert", "alert-resolve",
         "daily-report", "pre-market-check", "preflight", "data-audit", "lab-run",
-        "lab-scheduler",
+        "lab-scheduler", "lab-worker",
         "panorama-auth-serve", "panorama-user-add",
         "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
     ):

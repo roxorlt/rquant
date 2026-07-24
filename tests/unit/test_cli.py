@@ -3699,3 +3699,51 @@ class TestLabSchedulerCli:
 
         assert result == 0
         assert calls == ["run_forever", "request_stop"]
+
+
+class TestLabWorkerCli:
+    def test_parser_accepts_worker_identity_and_once(self) -> None:
+        args = build_parser().parse_args(
+            ["lab-worker", "--worker-id", "worker-a", "--once"]
+        )
+
+        assert args.command == "lab-worker"
+        assert args.worker_id == "worker-a"
+        assert args.once is True
+
+    def test_cmd_lab_worker_builds_spools_and_runs_one_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+
+        from rquant import lab_shard_protocol, lab_worker
+        from rquant.cli import cmd_lab_worker
+
+        calls: list[str] = []
+
+        class FakeSpool:
+            def __init__(self, path: Path) -> None:
+                calls.append(f"spool:{path.name}")
+
+        class FakeWorker:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append(f"worker:{kwargs['worker_id']}")
+                assert kwargs["exploratory_store_factory"] is not None
+                assert kwargs["metadata_store_factory"] is not None
+
+            def run_once(self) -> SimpleNamespace:
+                calls.append("run_once")
+                return SimpleNamespace(model_dump_json=lambda: "{}")
+
+        monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", FakeSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeSpool)
+        monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+
+        result = cmd_lab_worker(argparse.Namespace(worker_id="worker-a", once=True))
+
+        assert result == 0
+        assert "spool:lab_shard_claims" in calls
+        assert "spool:lab_worker_reports" in calls
+        assert calls[-2:] == ["worker:worker-a", "run_once"]

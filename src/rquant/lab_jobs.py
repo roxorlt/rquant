@@ -2827,6 +2827,26 @@ class LabJobStore:
             records = tuple(LabJobReader._shard_from_row(row) for row in rows)
         return records
 
+    def list_unplanned_jobs(self, *, limit: int = 64) -> tuple[LabJobRecord, ...]:
+        if limit < 1:
+            raise ValueError("unplanned job limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job.*
+                FROM lab_job AS job
+                WHERE job.status = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lab_shard AS shard
+                      WHERE shard.job_id = job.job_id
+                  )
+                ORDER BY job.created_at, job.job_id
+                LIMIT ?
+                """,
+                (JobStatus.QUEUED.value, limit),
+            ).fetchall()
+        return tuple(LabJobReader._job_from_row(row) for row in rows)
+
     @staticmethod
     def _definition_from_shard_row(row: sqlite3.Row) -> LabShardDefinition:
         return LabShardDefinition(

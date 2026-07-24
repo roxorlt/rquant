@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     lab_job_command_dir: Path | None = None
     lab_job_claim_dir: Path | None = None
     lab_job_report_dir: Path | None = None
+    lab_worker_artifact_dir: Path | None = None
     lab_jobs_busy_timeout_ms: int = Field(default=5_000, ge=1)
     lab_scheduler_poll_interval_ms: int = Field(default=250, ge=1)
     lab_scheduler_lease_seconds: int = Field(default=60, ge=1)
@@ -42,6 +43,9 @@ class Settings(BaseSettings):
     lab_scheduler_max_reports_per_tick: int = Field(default=64, ge=1)
     lab_scheduler_max_claims_per_tick: int = Field(default=16, ge=1)
     lab_scheduler_worker_ids: str = ""
+    lab_worker_poll_interval_ms: int = Field(default=250, ge=1)
+    lab_worker_heartbeat_seconds: int = Field(default=30, ge=1)
+    lab_worker_lease_extension_seconds: int = Field(default=120, ge=1, le=3_600)
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
@@ -152,6 +156,7 @@ class Settings(BaseSettings):
         "lab_job_command_dir",
         "lab_job_claim_dir",
         "lab_job_report_dir",
+        "lab_worker_artifact_dir",
         mode="before",
     )
     @classmethod
@@ -242,6 +247,15 @@ class Settings(BaseSettings):
             raise ValueError("lab job spool directories must differ from each other")
         if lab_path in spool_dirs or spool_dirs & existing_database_paths:
             raise ValueError("lab job spool directories must differ from database paths")
+        artifact_dir = self.lab_worker_artifact_dir_resolved.resolve()
+        if (
+            artifact_dir == lab_path
+            or artifact_dir in spool_dirs
+            or artifact_dir in existing_database_paths
+        ):
+            raise ValueError(
+                "lab worker artifact directory must differ from spools and database paths"
+            )
         workers = self.lab_scheduler_worker_id_list
         if len(set(workers)) != len(workers):
             raise ValueError("lab scheduler worker ids must be unique")
@@ -282,6 +296,12 @@ class Settings(BaseSettings):
     @property
     def lab_job_report_dir_resolved(self) -> Path:
         path = self.lab_job_report_dir or self.data_dir / "lab_worker_reports"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def lab_worker_artifact_dir_resolved(self) -> Path:
+        path = self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

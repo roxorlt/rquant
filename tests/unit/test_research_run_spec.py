@@ -568,6 +568,41 @@ def test_costs_and_parameter_values_reject_invalid_numeric_boundaries() -> None:
         )
 
 
+def test_list_parameters_are_typed_unique_and_canonical() -> None:
+    first = ResearchParameter(
+        name="hold_days",
+        kind="integer_list",
+        value=[5, 1, 3],
+    )
+    second = ResearchParameter(
+        name="hold_days",
+        kind="integer_list",
+        value=(3, 5, 1),
+    )
+
+    assert first.value == (1, 3, 5)
+    assert first == second
+
+    with pytest.raises(ValidationError, match="unique"):
+        ResearchParameter(
+            name="hold_days",
+            kind="integer_list",
+            value=[1, 1],
+        )
+    with pytest.raises(ValidationError, match="integer"):
+        ResearchParameter(
+            name="hold_days",
+            kind="integer_list",
+            value=[1, True],
+        )
+    with pytest.raises(ValidationError, match="string"):
+        ResearchParameter(
+            name="variants",
+            kind="text_list",
+            value=["full", 1],
+        )
+
+
 def test_parameter_datetime_must_be_timezone_aware_and_is_canonical() -> None:
     with pytest.raises(ValidationError, match="timezone-aware"):
         ResearchParameter(

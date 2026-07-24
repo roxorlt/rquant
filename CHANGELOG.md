@@ -11,8 +11,15 @@
   schema v3，支持幂等规划、过期重领、心跳续租、成功/失败/停止报告验收、暂停/恢复与
   两阶段取消；旧 claim、旧 scheduler fence、过期租约和被篡改 payload/report 均只能得到
   持久 rejected receipt，不能覆盖新结果。scheduler 可有界消费报告并发布 claim，报告在
-  commit 后 ack 前崩溃时可 exactly-once 重放。本次仅交付控制面，不包含策略 adapter、
-  Pandas 回测、subprocess worker 或页面。
+  commit 后 ack 前崩溃时可 exactly-once 重放。该阶段仅交付控制面；后台策略执行由下条
+  P1.3b 能力补齐。
+
+- **Strategy Lab 后台 worker 与策略 adapter**：新增 typed adapter registry，并为 N 字入口
+  对比、N 字参数优化、集合竞价缺口和科创/创业放量回放提供稳定分片；计划、payload、shard
+  身份均以 canonical JSON 和 SHA256 固化。`lab-worker` 只通过 claim/report spool 协作，
+  支持 fenced 领取、长任务心跳、协作停止和 lease 崩溃恢复；正式研究严格打开绑定的 immutable
+  `ResearchExecutionSession`。每片结果先写 claim 临时目录，校验 Parquet 后原子 seal 为带
+  canonical manifest 的 bundle，重试可幂等复用且内容冲突时 fail closed。
 
 - **策略分钟回补 manifest 可审计终止**：新增 `abandoned` 终态和
   `rquant backfill-abandon`。命令默认只生成绑定 manifest 内容、任务计数、终止原因与干净
