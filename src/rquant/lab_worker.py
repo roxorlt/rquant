@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -27,6 +27,7 @@ from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_shard_protocol import (
     LabClaimAlreadyConsumedError,
+    LabClaimNotConsumedError,
     LabClaimRevokedError,
     LabClaimSpool,
     LabClaimSupersededError,
@@ -51,6 +52,7 @@ from rquant.strategy_job_adapters import (
 )
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
+_GARBAGE_DISPOSAL_SESSION = re.compile(r"(?P<garbage_id>[0-9a-f]{32})-(?P<nonce>[0-9a-f]{32})")
 
 
 def _system_clock() -> datetime:
@@ -244,6 +246,83 @@ class LabRegularFileIdentity(LabWorkerModel):
     inode: int = Field(ge=1)
     size: int = Field(ge=0)
     sha256: str = Field(pattern=_HASH_PATTERN)
+
+
+class LabGarbageInventoryEntry(LabWorkerModel):
+    relative_path: str = Field(min_length=1)
+    file_type: Literal["directory", "regular"]
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    size: int | None = Field(default=None, ge=0)
+    sha256: str | None = Field(default=None, pattern=_HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_file_identity(self) -> LabGarbageInventoryEntry:
+        parts = self.relative_path.split("/")
+        if self.relative_path != "." and (
+            self.relative_path.startswith("/") or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("garbage inventory path is unsafe")
+        has_content = self.size is not None and self.sha256 is not None
+        if has_content != (self.file_type == "regular"):
+            raise ValueError("garbage regular inventory requires size and hash")
+        return self
+
+
+class LabGarbageOwner(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    garbage_id: UUID = UUID(int=0)
+    purpose: str = Field(min_length=1)
+    original_relative_path: str = Field(min_length=1)
+    payload_type: Literal["directory", "regular"]
+    inventory: tuple[LabGarbageInventoryEntry, ...]
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabGarbageOwner:
+        path_parts = self.original_relative_path.split("/")
+        if self.original_relative_path.startswith("/") or any(
+            part in {"", ".", ".."} for part in path_parts
+        ):
+            raise ValueError("garbage original path is unsafe")
+        paths = tuple(entry.relative_path for entry in self.inventory)
+        if not paths or paths[0] != "." or paths != tuple(sorted(paths)):
+            raise ValueError("garbage inventory must be non-empty and sorted")
+        if len(paths) != len(set(paths)):
+            raise ValueError("garbage inventory paths must be unique")
+        if self.inventory[0].file_type != self.payload_type:
+            raise ValueError("garbage root inventory type conflicts with payload")
+        canonical = json.dumps(
+            {
+                "inventory": [entry.model_dump(mode="json") for entry in self.inventory],
+                "original_relative_path": self.original_relative_path,
+                "payload_type": self.payload_type,
+                "purpose": self.purpose,
+                "schema_version": self.schema_version,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        content_hash = _sha256_bytes(canonical.encode("utf-8"))
+        garbage_id = uuid5(NAMESPACE_URL, f"rquant:lab-garbage:{content_hash}")
+        if self.content_hash and self.content_hash != content_hash:
+            raise ValueError("garbage owner content_hash conflicts with inventory")
+        if self.garbage_id.int and self.garbage_id != garbage_id:
+            raise ValueError("garbage_id conflicts with deterministic inventory")
+        object.__setattr__(self, "content_hash", content_hash)
+        object.__setattr__(self, "garbage_id", garbage_id)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
 
 
 class LabReclaimLedger(LabWorkerModel):
@@ -485,6 +564,7 @@ class LabWorker:
         self,
         attempt_root: Path,
         shard_root: Path,
+        claim: LabShardClaim,
     ) -> None:
         self._assert_safe_temporary_tree(attempt_root)
         for child in tuple(attempt_root.iterdir()):
@@ -494,12 +574,10 @@ class LabWorker:
                 continue
             if candidate_id.hex != child.name:
                 continue
-            self._assert_safe_temporary_tree(child)
-            reclaimed = attempt_root / f".reclaim-{child.name}-{uuid4().hex}"
-            os.rename(child, reclaimed)
-            _fsync_directory(attempt_root)
-            shutil.rmtree(reclaimed)
-            _fsync_directory(attempt_root)
+            self.artifact_reclaimer.logical_delete_temporary_tree(
+                child,
+                current_claim=claim,
+            )
         try:
             attempt_root.rmdir()
         except OSError:
@@ -507,6 +585,7 @@ class LabWorker:
         _fsync_directory(shard_root)
 
     def _reclaim_obsolete_temporaries(self, claim: LabShardClaim) -> None:
+        self.artifact_reclaimer.collect_garbage()
         current_root = self._temporary_bundle_path(claim)
         shard_root = current_root.parent
         self._assert_safe_artifact_ancestors(shard_root)
@@ -533,14 +612,12 @@ class LabWorker:
                     raise LabArtifactConflictError(
                         "current temporary attempt is no longer the claim high-water"
                     )
-                self._reclaim_current_candidate_directories(candidate, shard_root)
+                self._reclaim_current_candidate_directories(candidate, shard_root, claim)
                 continue
-            self._assert_safe_temporary_tree(candidate)
-            reclaimed = shard_root / f".reclaim-{candidate.name}-{uuid4().hex}"
-            os.rename(candidate, reclaimed)
-            _fsync_directory(shard_root)
-            shutil.rmtree(reclaimed)
-            _fsync_directory(shard_root)
+            self.artifact_reclaimer.logical_delete_temporary_tree(
+                candidate,
+                current_claim=claim,
+            )
 
     @staticmethod
     def _validate_receipt_identity(
@@ -1329,11 +1406,19 @@ class LabWorker:
         except Exception as exc:
             return self._failure_result(claim, phase="deadline", error=exc)
 
-        if not self.claim_spool.is_admitted(claim):
+        try:
+            self.claim_spool.admit_execution(claim)
+        except (
+            LabClaimNotConsumedError,
+            LabClaimRevokedError,
+            LabClaimSupersededError,
+        ):
             return self._stopped_result(
                 claim,
                 reason="claim revoked or superseded before shard execution",
             )
+        except Exception as exc:
+            return self._failure_result(claim, phase="claim", error=exc)
 
         finished = threading.Event()
         heartbeat_errors: list[Exception] = []
@@ -1543,6 +1628,25 @@ class LabArtifactReclaimer:
     ) -> None:
         self.artifact_root = Path(artifact_root).resolve()
         self.report_spool = report_spool
+        self.garbage_root = self.artifact_root / ".garbage-v1"
+        self.garbage_owner_dir = self.garbage_root / "owners"
+        self.garbage_staging_dir = self.garbage_root / "staging"
+        self.garbage_pending_dir = self.garbage_root / "pending"
+        self.garbage_collecting_dir = self.garbage_root / "collecting"
+        self.garbage_owned_dir = self.garbage_root / "owned"
+        self.garbage_disposal_dir = self.garbage_root / "disposal"
+        for directory in (
+            self.garbage_owner_dir,
+            self.garbage_staging_dir,
+            self.garbage_pending_dir,
+            self.garbage_collecting_dir,
+            self.garbage_owned_dir,
+            self.garbage_disposal_dir,
+        ):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if directory.is_symlink() or not directory.is_dir():
+                raise LabArtifactConflictError("garbage quarantine directory is unsafe")
+            directory.chmod(0o700)
 
     @staticmethod
     def _attempt_name(claim: LabShardClaim) -> str:
@@ -1832,6 +1936,413 @@ class LabArtifactReclaimer:
             sha256=digest.hexdigest(),
         )
 
+    def _garbage_relative_path(self, path: Path) -> str:
+        try:
+            relative = path.relative_to(self.artifact_root)
+        except ValueError as exc:
+            raise LabArtifactConflictError("garbage source escapes artifact root") from exc
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise LabArtifactConflictError("garbage source path is unsafe")
+        return relative.as_posix()
+
+    @staticmethod
+    def _inventory_regular(
+        path: Path,
+        *,
+        relative_path: str,
+        label: str,
+    ) -> LabGarbageInventoryEntry:
+        identity = LabArtifactReclaimer._regular_file_identity(path, label=label)
+        return LabGarbageInventoryEntry(
+            relative_path=relative_path,
+            file_type="regular",
+            device=identity.device,
+            inode=identity.inode,
+            size=identity.size,
+            sha256=identity.sha256,
+        )
+
+    def _garbage_inventory(self, path: Path) -> tuple[LabGarbageInventoryEntry, ...]:
+        root = path.lstat()
+        if stat.S_ISREG(root.st_mode):
+            if root.st_nlink != 1 or path.is_symlink():
+                raise LabArtifactConflictError("garbage regular payload is unsafe")
+            return (
+                self._inventory_regular(
+                    path,
+                    relative_path=".",
+                    label="garbage regular payload",
+                ),
+            )
+        if not stat.S_ISDIR(root.st_mode) or path.is_symlink():
+            raise LabArtifactConflictError("garbage directory payload is unsafe")
+        entries: list[LabGarbageInventoryEntry] = [
+            LabGarbageInventoryEntry(
+                relative_path=".",
+                file_type="directory",
+                device=root.st_dev,
+                inode=root.st_ino,
+            )
+        ]
+        for current, directories, files in os.walk(path, followlinks=False):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            for name in directories:
+                child = current_path / name
+                observed = child.lstat()
+                if child.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+                    raise LabArtifactConflictError(
+                        f"garbage tree contains unsafe directory: {name}"
+                    )
+                entries.append(
+                    LabGarbageInventoryEntry(
+                        relative_path=child.relative_to(path).as_posix(),
+                        file_type="directory",
+                        device=observed.st_dev,
+                        inode=observed.st_ino,
+                    )
+                )
+            for name in files:
+                child = current_path / name
+                entries.append(
+                    self._inventory_regular(
+                        child,
+                        relative_path=child.relative_to(path).as_posix(),
+                        label=f"garbage tree file {name}",
+                    )
+                )
+        return tuple(sorted(entries, key=lambda entry: entry.relative_path))
+
+    def _garbage_owner(
+        self,
+        path: Path,
+        *,
+        purpose: str,
+        inventory: tuple[LabGarbageInventoryEntry, ...] | None = None,
+    ) -> LabGarbageOwner:
+        observed = inventory or self._garbage_inventory(path)
+        return LabGarbageOwner(
+            purpose=" ".join(purpose.split()),
+            original_relative_path=self._garbage_relative_path(path),
+            payload_type=observed[0].file_type,
+            inventory=observed,
+        )
+
+    @staticmethod
+    def _garbage_bundle_name(owner: LabGarbageOwner) -> str:
+        return owner.garbage_id.hex
+
+    def _write_garbage_owner(self, bundle: Path, owner: LabGarbageOwner) -> None:
+        for marker in (
+            self.garbage_owner_dir / f"{owner.garbage_id.hex}.json",
+            bundle / "owner.json",
+        ):
+            if os.path.lexists(marker):
+                loaded = self._load_garbage_owner(marker)
+                if loaded != owner:
+                    raise LabArtifactConflictError("garbage owner marker conflicts")
+                continue
+            with marker.open("xb") as stream:
+                stream.write(owner.canonical_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(marker.parent)
+
+    def _load_garbage_owner(self, marker: Path) -> LabGarbageOwner:
+        identity = self._regular_file_identity(marker, label="garbage owner marker")
+        try:
+            raw = marker.read_text(encoding="utf-8")
+            owner = LabGarbageOwner.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid garbage owner marker: {exc}") from exc
+        after = self._regular_file_identity(marker, label="garbage owner marker")
+        if after != identity or raw != owner.canonical_json():
+            raise LabArtifactConflictError("garbage owner marker changed or is not canonical")
+        return owner
+
+    def _load_garbage_owner_ledger(self, garbage_id: UUID) -> LabGarbageOwner:
+        marker = self.garbage_owner_dir / f"{garbage_id.hex}.json"
+        owner = self._load_garbage_owner(marker)
+        if owner.garbage_id != garbage_id:
+            raise LabArtifactConflictError("garbage owner ledger identity conflicts")
+        return owner
+
+    def _validate_garbage_bundle(self, bundle: Path) -> LabGarbageOwner:
+        root = bundle.lstat()
+        if bundle.is_symlink() or not stat.S_ISDIR(root.st_mode):
+            raise LabArtifactConflictError("garbage bundle is unsafe")
+        try:
+            bundle_id = UUID(hex=bundle.name)
+        except ValueError as exc:
+            raise LabArtifactConflictError("garbage bundle name is invalid") from exc
+        names = {child.name for child in bundle.iterdir()}
+        if names != {"owner.json", "payload"}:
+            raise LabArtifactConflictError(
+                f"garbage bundle has unexpected entries: {sorted(names)}"
+            )
+        owner = self._load_garbage_owner(bundle / "owner.json")
+        if owner.garbage_id != bundle_id:
+            raise LabArtifactConflictError("garbage bundle name conflicts with owner")
+        if self._load_garbage_owner_ledger(bundle_id) != owner:
+            raise LabArtifactConflictError("garbage bundle owner conflicts with ledger")
+        observed = self._garbage_inventory(bundle / "payload")
+        if observed != owner.inventory:
+            raise LabArtifactConflictError("garbage payload conflicts with owner inventory")
+        after = bundle.lstat()
+        if (after.st_dev, after.st_ino) != (root.st_dev, root.st_ino):
+            raise LabArtifactConflictError("garbage bundle changed while validating")
+        return owner
+
+    def _validate_owned_garbage_bundle(self, bundle: Path) -> LabGarbageOwner:
+        root = bundle.lstat()
+        if bundle.is_symlink() or not stat.S_ISDIR(root.st_mode):
+            raise LabArtifactConflictError("owned garbage bundle is unsafe")
+        try:
+            bundle_id = UUID(hex=bundle.name)
+        except ValueError as exc:
+            raise LabArtifactConflictError("owned garbage bundle name is invalid") from exc
+        names = {child.name for child in bundle.iterdir()}
+        if names - {"owner.json", "payload"}:
+            raise LabArtifactConflictError(
+                f"owned garbage bundle has unexpected entries: {sorted(names)}"
+            )
+        owner = self._load_garbage_owner_ledger(bundle_id)
+        if "owner.json" in names:
+            bundle_owner = self._load_garbage_owner(bundle / "owner.json")
+            if bundle_owner != owner:
+                raise LabArtifactConflictError("owned garbage marker conflicts with ledger")
+        payload = bundle / "payload"
+        if os.path.lexists(payload):
+            expected = {entry.relative_path: entry for entry in owner.inventory}
+            observed = self._garbage_inventory(payload)
+            for entry in observed:
+                if expected.get(entry.relative_path) != entry:
+                    raise LabArtifactConflictError(
+                        "owned garbage payload contains unknown or replaced objects"
+                    )
+        after = bundle.lstat()
+        if (after.st_dev, after.st_ino) != (root.st_dev, root.st_ino):
+            raise LabArtifactConflictError("owned garbage bundle changed while validating")
+        return owner
+
+    def _promote_garbage_bundle(self, source: Path, target: Path) -> None:
+        if os.path.lexists(target):
+            raise LabArtifactConflictError("garbage state has duplicate bundle ownership")
+        os.rename(source, target)
+        _fsync_directory(source.parent)
+        _fsync_directory(target.parent)
+        if os.path.lexists(source):
+            raise LabArtifactConflictError("garbage source path was replaced during promotion")
+
+    @staticmethod
+    def _garbage_directory_identity(path: Path, *, label: str) -> tuple[int, int]:
+        observed = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+            raise LabArtifactConflictError(f"{label} is unsafe")
+        return observed.st_dev, observed.st_ino
+
+    def _validate_disposal_session(self, session: Path) -> Path | None:
+        before = self._garbage_directory_identity(session, label="garbage disposal session")
+        match = _GARBAGE_DISPOSAL_SESSION.fullmatch(session.name)
+        if match is None:
+            raise LabArtifactConflictError("garbage disposal session name is invalid")
+        expected_owner = self._load_garbage_owner_ledger(UUID(hex=match.group("garbage_id")))
+        children = tuple(session.iterdir())
+        if len(children) > 1:
+            raise LabArtifactConflictError("garbage disposal session has extra entries")
+        bundle = children[0] if children else None
+        if bundle is not None:
+            if bundle.name != expected_owner.garbage_id.hex:
+                raise LabArtifactConflictError("garbage disposal bundle identity is invalid")
+            if self._validate_owned_garbage_bundle(bundle) != expected_owner:
+                raise LabArtifactConflictError("garbage disposal owner conflicts with session")
+        after = self._garbage_directory_identity(session, label="garbage disposal session")
+        if after != before:
+            raise LabArtifactConflictError("garbage disposal session changed during validation")
+        return bundle
+
+    def _isolate_owned_garbage_bundle(self, bundle: Path) -> Path:
+        before = self._garbage_directory_identity(bundle, label="owned garbage bundle")
+        owner = self._validate_owned_garbage_bundle(bundle)
+        after_validation = self._garbage_directory_identity(
+            bundle,
+            label="owned garbage bundle",
+        )
+        if after_validation != before:
+            raise LabArtifactConflictError("owned garbage bundle changed during final isolation")
+        session = self.garbage_disposal_dir / f"{owner.garbage_id.hex}-{uuid4().hex}"
+        session.mkdir(mode=0o700)
+        _fsync_directory(self.garbage_disposal_dir)
+        isolated = session / self._garbage_bundle_name(owner)
+        try:
+            os.rename(bundle, isolated)
+            _fsync_directory(self.garbage_owned_dir)
+            _fsync_directory(session)
+            isolated_identity = self._garbage_directory_identity(
+                isolated,
+                label="isolated garbage bundle",
+            )
+            if isolated_identity != before or os.path.lexists(bundle):
+                if isolated_identity != before and not os.path.lexists(bundle):
+                    os.rename(isolated, bundle)
+                    _fsync_directory(self.garbage_owned_dir)
+                    _fsync_directory(session)
+                raise LabArtifactConflictError(
+                    "owned garbage bundle changed during final isolation"
+                )
+            if self._validate_owned_garbage_bundle(isolated) != owner:
+                raise LabArtifactConflictError("isolated garbage owner changed")
+        except BaseException:
+            if not any(session.iterdir()):
+                session.rmdir()
+                _fsync_directory(self.garbage_disposal_dir)
+            raise
+        return session
+
+    def _remove_disposal_session(self, session: Path) -> None:
+        bundle = self._validate_disposal_session(session)
+        if bundle is not None:
+            before = self._garbage_directory_identity(
+                bundle,
+                label="disposal garbage bundle",
+            )
+            self._validate_owned_garbage_bundle(bundle)
+            after = self._garbage_directory_identity(
+                bundle,
+                label="disposal garbage bundle",
+            )
+            if after != before:
+                raise LabArtifactConflictError("disposal garbage bundle changed before collection")
+            shutil.rmtree(bundle)
+            _fsync_directory(session)
+        try:
+            session.rmdir()
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "garbage disposal session was replaced or is not empty"
+            ) from exc
+        _fsync_directory(self.garbage_disposal_dir)
+
+    def _remove_owned_garbage_bundle(self, bundle: Path) -> None:
+        session = self._isolate_owned_garbage_bundle(bundle)
+        self._remove_disposal_session(session)
+
+    def _collect_garbage_locked(self) -> None:
+        for marker in self.garbage_owner_dir.iterdir():
+            if marker.is_symlink() or not marker.is_file() or marker.suffix != ".json":
+                raise LabArtifactConflictError("garbage owner namespace is unsafe")
+            try:
+                garbage_id = UUID(hex=marker.stem)
+            except ValueError as exc:
+                raise LabArtifactConflictError("garbage owner ledger name is invalid") from exc
+            self._load_garbage_owner_ledger(garbage_id)
+        for directory in (
+            self.garbage_staging_dir,
+            self.garbage_pending_dir,
+            self.garbage_collecting_dir,
+            self.garbage_owned_dir,
+        ):
+            for bundle in directory.iterdir():
+                if bundle.is_symlink() or not bundle.is_dir():
+                    raise LabArtifactConflictError("garbage namespace contains unsafe entry")
+                try:
+                    UUID(hex=bundle.name)
+                except ValueError as exc:
+                    raise LabArtifactConflictError(
+                        "garbage namespace contains unknown bundle"
+                    ) from exc
+                if directory == self.garbage_owned_dir:
+                    self._validate_owned_garbage_bundle(bundle)
+                else:
+                    self._validate_garbage_bundle(bundle)
+        for session in tuple(sorted(self.garbage_disposal_dir.iterdir())):
+            if session.is_symlink() or not session.is_dir():
+                raise LabArtifactConflictError("garbage disposal namespace contains unsafe entry")
+            self._remove_disposal_session(session)
+        for staging in tuple(sorted(self.garbage_staging_dir.iterdir())):
+            owner = self._validate_garbage_bundle(staging)
+            self._promote_garbage_bundle(
+                staging,
+                self.garbage_pending_dir / self._garbage_bundle_name(owner),
+            )
+        for pending in tuple(sorted(self.garbage_pending_dir.iterdir())):
+            owner = self._validate_garbage_bundle(pending)
+            collecting = self.garbage_collecting_dir / self._garbage_bundle_name(owner)
+            self._promote_garbage_bundle(pending, collecting)
+            self._validate_garbage_bundle(collecting)
+        for collecting in tuple(sorted(self.garbage_collecting_dir.iterdir())):
+            owner = self._validate_garbage_bundle(collecting)
+            owned = self.garbage_owned_dir / self._garbage_bundle_name(owner)
+            self._promote_garbage_bundle(collecting, owned)
+            self._validate_garbage_bundle(owned)
+        for owned in tuple(sorted(self.garbage_owned_dir.iterdir())):
+            self._remove_owned_garbage_bundle(owned)
+
+    def collect_garbage(self) -> None:
+        with self.report_spool.evidence_lock():
+            self._collect_garbage_locked()
+
+    def _logical_delete(
+        self,
+        path: Path,
+        *,
+        owner: LabGarbageOwner,
+    ) -> bool:
+        staging = self.garbage_staging_dir / self._garbage_bundle_name(owner)
+        pending = self.garbage_pending_dir / self._garbage_bundle_name(owner)
+        if os.path.lexists(pending):
+            if os.path.lexists(path):
+                raise LabArtifactConflictError("garbage source and pending quarantine both exist")
+            self._validate_garbage_bundle(pending)
+            return True
+        if os.path.lexists(staging):
+            if os.path.lexists(path):
+                raise LabArtifactConflictError("garbage source and staging quarantine both exist")
+            self._validate_garbage_bundle(staging)
+        else:
+            staging.mkdir(mode=0o700)
+            self._write_garbage_owner(staging, owner)
+            payload = staging / "payload"
+            try:
+                os.rename(path, payload)
+            except FileNotFoundError:
+                return False
+            _fsync_directory(path.parent)
+            _fsync_directory(staging)
+            try:
+                self._validate_garbage_bundle(staging)
+            except BaseException:
+                if os.path.lexists(payload) and not os.path.lexists(path):
+                    os.rename(payload, path)
+                    _fsync_directory(path.parent)
+                raise
+        self._promote_garbage_bundle(staging, pending)
+        self._validate_garbage_bundle(pending)
+        return True
+
+    def logical_delete_temporary_tree(
+        self,
+        path: Path,
+        *,
+        current_claim: LabShardClaim,
+    ) -> bool:
+        self._assert_safe_artifact_ancestors(path.parent)
+        self._assert_safe_temporary_tree(path)
+        inventory = self._garbage_inventory(path)
+        owner = self._garbage_owner(
+            path,
+            purpose=(
+                "crash temporary cleanup "
+                f"job={current_claim.job_id} shard={current_claim.shard_id} "
+                f"generation={current_claim.claim_generation} "
+                f"token={current_claim.claim_token}"
+            ),
+            inventory=inventory,
+        )
+        with self.report_spool.evidence_lock():
+            return self._logical_delete(path, owner=owner)
+
     def _safe_remove_regular_child(
         self,
         path: Path,
@@ -1845,57 +2356,26 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError(f"{label} path is unsafe")
         if parent.is_symlink() or not parent.is_dir():
             raise LabArtifactConflictError(f"{label} parent is unsafe")
-        parent_before = parent.lstat()
-        if not stat.S_ISDIR(parent_before.st_mode):
-            raise LabArtifactConflictError(f"{label} parent is unsafe")
-        isolated = parent / f".safe-remove-v1-{uuid4().hex}.tmp"
-        if os.path.lexists(isolated):  # pragma: no cover - UUID collision
-            raise LabArtifactConflictError(f"{label} isolation path already exists")
         try:
-            os.rename(path, isolated)
-        except FileNotFoundError:
-            return False
-        removed = False
-        try:
-            _fsync_directory(parent)
-            parent_after_isolation = parent.lstat()
-            if (parent_after_isolation.st_dev, parent_after_isolation.st_ino) != (
-                parent_before.st_dev,
-                parent_before.st_ino,
-            ):
-                raise LabArtifactConflictError(f"{label} parent changed during isolation")
-            observed = self._regular_file_identity(
-                isolated,
-                label=f"isolated {label}",
-            )
-            if observed != expected:
-                raise LabArtifactConflictError(f"{label} changed before deletion")
-            final = isolated.lstat()
-            if (
-                not stat.S_ISREG(final.st_mode)
-                or final.st_nlink != 1
-                or (final.st_dev, final.st_ino, final.st_size)
-                != (expected.device, expected.inode, expected.size)
-            ):
-                raise LabArtifactConflictError(f"{label} changed before deletion")
-            parent_before_unlink = parent.lstat()
-            if (parent_before_unlink.st_dev, parent_before_unlink.st_ino) != (
-                parent_before.st_dev,
-                parent_before.st_ino,
-            ):
-                raise LabArtifactConflictError(f"{label} parent changed before deletion")
-            isolated.unlink()
-            removed = True
-            _fsync_directory(parent)
-            return True
-        except BaseException:
-            if os.path.lexists(isolated) and not os.path.lexists(path):
-                os.rename(isolated, path)
-                _fsync_directory(parent)
+            observed = self._regular_file_identity(path, label=label)
+        except LabArtifactConflictError:
+            if not os.path.lexists(path):
+                return False
             raise
-        finally:
-            if removed and os.path.lexists(isolated):  # pragma: no cover - invariant
-                raise LabArtifactConflictError(f"{label} isolation cleanup conflicted")
+        if observed != expected:
+            raise LabArtifactConflictError(f"{label} changed before deletion")
+        inventory = (
+            LabGarbageInventoryEntry(
+                relative_path=".",
+                file_type="regular",
+                device=expected.device,
+                inode=expected.inode,
+                size=expected.size,
+                sha256=expected.sha256,
+            ),
+        )
+        owner = self._garbage_owner(path, purpose=label, inventory=inventory)
+        return self._logical_delete(path, owner=owner)
 
     def _remove_ledger(self, path: Path) -> None:
         if not os.path.lexists(path):

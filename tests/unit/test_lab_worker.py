@@ -456,17 +456,16 @@ def test_worker_rechecks_admission_after_consume_before_open_or_execute(
     registry = RecordingRegistry()
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     claims.publish(claim)
-    consumed = threading.Event()
+    admission_attempted = threading.Event()
     release = threading.Event()
-    original_consume = claims.consume
+    original_admit = claims.admit_execution
 
-    def consume_then_pause(entry: object) -> LabShardClaim:
-        delivered = original_consume(entry)  # type: ignore[arg-type]
-        consumed.set()
+    def pause_before_admission(exact_claim: LabShardClaim):
+        admission_attempted.set()
         assert release.wait(2)
-        return delivered
+        return original_admit(exact_claim)
 
-    monkeypatch.setattr(claims, "consume", consume_then_pause)
+    monkeypatch.setattr(claims, "admit_execution", pause_before_admission)
     stores_opened = 0
 
     @contextmanager
@@ -485,7 +484,7 @@ def test_worker_rechecks_admission_after_consume_before_open_or_execute(
     results: list[object] = []
     thread = threading.Thread(target=lambda: results.append(worker.run_once()))
     thread.start()
-    assert consumed.wait(2)
+    assert admission_attempted.wait(2)
 
     claims.revoke(claim, reason="scheduler terminalized consumed claim")
     release.set()
@@ -496,6 +495,51 @@ def test_worker_rechecks_admission_after_consume_before_open_or_execute(
     assert stores_opened == 0
     assert registry.executions == 0
     assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_worker_admission_then_revoke_allows_compute_but_never_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    admitted = threading.Event()
+    release = threading.Event()
+    original_admit = claims.admit_execution
+
+    def admit_then_pause(exact_claim: LabShardClaim):
+        receipt = original_admit(exact_claim)
+        admitted.set()
+        assert release.wait(2)
+        return receipt
+
+    monkeypatch.setattr(claims, "admit_execution", admit_then_pause)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        heartbeat_interval_seconds=0.01,
+    )
+    results: list[object] = []
+    thread = threading.Thread(target=lambda: results.append(worker.run_once()))
+    thread.start()
+    assert admitted.wait(2)
+
+    claims.revoke(claim, reason="scheduler revoked admitted execution")
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert results[0].status == "failed"
+    assert registry.executions == 1
+    assert claims.execution_admission(claim.claim_token).admission.claim == claim
+    assert claims.revocation(claim.claim_token).revocation.claim == claim
+    assert not worker.sealed_bundle_path(claim).exists()
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
 
 
 def test_revoke_during_execute_is_fenced_before_seal_and_success(
@@ -1195,6 +1239,175 @@ def test_new_generation_reclaims_only_obsolete_crash_temporary(tmp_path: Path) -
 
     assert not obsolete.exists()
     assert (current / "still-active").read_bytes() == b"active"
+
+
+def test_generation_three_recovers_crash_after_temporary_tree_isolation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = _claim(_nshape_compare_spec(hold_days=(1,)))
+    generation_two = _retry_claim(old)
+    generation_three = _retry_claim(generation_two)
+    worker = _worker(tmp_path)
+    obsolete = worker._temporary_bundle_path(old)
+    nested = obsolete / "nested"
+    nested.mkdir(parents=True)
+    (obsolete / "manifest.partial").write_bytes(b"manifest")
+    (nested / "artifact.partial").write_bytes(b"artifact")
+    original_promote = worker.artifact_reclaimer._promote_garbage_bundle
+    interrupted = False
+
+    def crash_before_pending(source: Path, target: Path) -> None:
+        nonlocal interrupted
+        if source.parent == worker.artifact_reclaimer.garbage_staging_dir and not interrupted:
+            interrupted = True
+            raise InterruptedError("crash after temporary tree isolation")
+        original_promote(source, target)
+
+    monkeypatch.setattr(
+        worker.artifact_reclaimer,
+        "_promote_garbage_bundle",
+        crash_before_pending,
+    )
+    with pytest.raises(InterruptedError, match="tree isolation"):
+        worker._reclaim_obsolete_temporaries(generation_two)
+
+    assert not obsolete.exists()
+    staging = tuple(worker.artifact_reclaimer.garbage_staging_dir.iterdir())
+    assert len(staging) == 1
+    assert (staging[0] / "owner.json").is_file()
+    assert (staging[0] / "payload" / "nested" / "artifact.partial").is_file()
+    monkeypatch.setattr(
+        worker.artifact_reclaimer,
+        "_promote_garbage_bundle",
+        original_promote,
+    )
+
+    restarted = _worker(tmp_path)
+    restarted._reclaim_obsolete_temporaries(generation_three)
+    restarted.artifact_reclaimer.collect_garbage()
+
+    assert not obsolete.exists()
+    assert tuple(restarted.artifact_reclaimer.garbage_staging_dir.iterdir()) == ()
+    assert tuple(restarted.artifact_reclaimer.garbage_pending_dir.iterdir()) == ()
+    assert tuple(restarted.artifact_reclaimer.garbage_collecting_dir.iterdir()) == ()
+    assert tuple(restarted.artifact_reclaimer.garbage_owned_dir.iterdir()) == ()
+    assert tuple(restarted.artifact_reclaimer.garbage_disposal_dir.iterdir()) == ()
+
+
+def test_temporary_tree_gc_resumes_partial_delete_across_restarts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = _claim(_nshape_compare_spec(hold_days=(1,)))
+    current = _retry_claim(old)
+    worker = _worker(tmp_path)
+    obsolete = worker._temporary_bundle_path(old)
+    nested = obsolete / "nested"
+    nested.mkdir(parents=True)
+    first = obsolete / "first.partial"
+    second = nested / "second.partial"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    worker._reclaim_obsolete_temporaries(current)
+    original_remove = worker.artifact_reclaimer._remove_owned_garbage_bundle
+    removed_once = False
+
+    def partially_remove(bundle: Path) -> None:
+        nonlocal removed_once
+        if not removed_once:
+            removed_once = True
+            payload = bundle / "payload"
+            (payload / "first.partial").unlink()
+            raise InterruptedError("crash after one private payload unlink")
+        original_remove(bundle)
+
+    monkeypatch.setattr(
+        worker.artifact_reclaimer,
+        "_remove_owned_garbage_bundle",
+        partially_remove,
+    )
+    with pytest.raises(InterruptedError, match="one private payload"):
+        worker.artifact_reclaimer.collect_garbage()
+    owned = tuple(worker.artifact_reclaimer.garbage_owned_dir.iterdir())
+    assert len(owned) == 1
+    assert not (owned[0] / "payload" / "first.partial").exists()
+    assert (owned[0] / "payload" / "nested" / "second.partial").is_file()
+
+    restarted = _worker(tmp_path)
+    restarted_remove = restarted.artifact_reclaimer._remove_owned_garbage_bundle
+    interrupted_again = False
+
+    def partially_remove_again(bundle: Path) -> None:
+        nonlocal interrupted_again
+        if not interrupted_again:
+            interrupted_again = True
+            (bundle / "payload" / "nested" / "second.partial").unlink()
+            raise InterruptedError("second restart partial delete")
+        restarted_remove(bundle)
+
+    monkeypatch.setattr(
+        restarted.artifact_reclaimer,
+        "_remove_owned_garbage_bundle",
+        partially_remove_again,
+    )
+    with pytest.raises(InterruptedError, match="second restart"):
+        restarted.artifact_reclaimer.collect_garbage()
+
+    final_restart = _worker(tmp_path)
+    final_restart.artifact_reclaimer.collect_garbage()
+    final_restart.artifact_reclaimer.collect_garbage()
+
+    assert tuple(final_restart.artifact_reclaimer.garbage_owned_dir.iterdir()) == ()
+    assert tuple(final_restart.artifact_reclaimer.garbage_disposal_dir.iterdir()) == ()
+
+
+@pytest.mark.parametrize("mutation", ["extra", "replace", "hardlink", "symlink"])
+def test_temporary_tree_gc_rejects_mutated_owned_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError
+
+    old = _claim(_nshape_compare_spec(hold_days=(1,)))
+    current = _retry_claim(old)
+    worker = _worker(tmp_path)
+    obsolete = worker._temporary_bundle_path(old)
+    obsolete.mkdir(parents=True)
+    original = obsolete / "partial.bin"
+    original.write_bytes(b"original")
+    worker._reclaim_obsolete_temporaries(current)
+    monkeypatch.setattr(
+        worker.artifact_reclaimer,
+        "_remove_owned_garbage_bundle",
+        lambda _bundle: (_ for _ in ()).throw(InterruptedError("pause owned")),
+    )
+    with pytest.raises(InterruptedError):
+        worker.artifact_reclaimer.collect_garbage()
+    owned = tuple(worker.artifact_reclaimer.garbage_owned_dir.iterdir())[0]
+    payload = owned / "payload"
+    external = tmp_path / f"external-{mutation}"
+    external.write_bytes(b"external")
+    if mutation == "extra":
+        (payload / "extra.bin").write_bytes(b"extra")
+    elif mutation == "replace":
+        os.replace(external, payload / "partial.bin")
+    elif mutation == "hardlink":
+        original_payload = payload / "partial.bin"
+        external.unlink()
+        os.link(original_payload, external)
+    else:
+        (payload / "partial.bin").unlink()
+        (payload / "partial.bin").symlink_to(external)
+
+    restarted = _worker(tmp_path)
+    with pytest.raises(LabArtifactConflictError):
+        restarted.artifact_reclaimer.collect_garbage()
+
+    assert owned.exists()
+    if mutation in {"hardlink", "symlink"}:
+        assert external.exists()
 
 
 def test_current_attempt_reclaims_known_crash_candidate_directory(tmp_path: Path) -> None:
@@ -3102,6 +3315,263 @@ def test_ledger_temporary_replacement_after_identity_check_survives(
 
     assert temporary.read_bytes() == b"replacement-temporary-must-survive"
     assert saved_original.is_file()
+
+
+def test_safe_remove_logically_quarantines_then_gc_reclaims(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "logical-delete" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"owned-payload")
+    expected = reclaimer._regular_file_identity(victim, label="logical delete fixture")
+
+    assert reclaimer._safe_remove_regular_child(
+        victim,
+        expected=expected,
+        label="logical delete fixture",
+    )
+
+    assert not victim.exists()
+    assert len(tuple(reclaimer.garbage_pending_dir.iterdir())) == 1
+    reclaimer.collect_garbage()
+    reclaimer.collect_garbage()
+    assert tuple(reclaimer.garbage_pending_dir.iterdir()) == ()
+    assert tuple(reclaimer.garbage_collecting_dir.iterdir()) == ()
+    assert tuple(reclaimer.garbage_owned_dir.iterdir()) == ()
+    assert tuple(reclaimer.garbage_disposal_dir.iterdir()) == ()
+
+
+def test_garbage_gc_preserves_replacement_after_collecting_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "logical-delete" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"validated-original")
+    expected = reclaimer._regular_file_identity(victim, label="replacement fixture")
+    reclaimer._safe_remove_regular_child(
+        victim,
+        expected=expected,
+        label="replacement fixture",
+    )
+    saved_original = tmp_path / "saved-garbage-original.bin"
+    original_validate = reclaimer._validate_garbage_bundle
+    replaced = False
+
+    def replace_after_validation(bundle: Path):
+        nonlocal replaced
+        owner = original_validate(bundle)
+        if bundle.parent == reclaimer.garbage_collecting_dir and not replaced:
+            replaced = True
+            payload = bundle / "payload"
+            os.replace(payload, saved_original)
+            payload.write_bytes(b"external-replacement-must-survive")
+        return owner
+
+    monkeypatch.setattr(reclaimer, "_validate_garbage_bundle", replace_after_validation)
+
+    with pytest.raises(LabArtifactConflictError):
+        reclaimer.collect_garbage()
+
+    preserved = tuple(reclaimer.garbage_collecting_dir.rglob("payload")) + tuple(
+        reclaimer.garbage_owned_dir.rglob("payload")
+    )
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == b"external-replacement-must-survive"
+    assert saved_original.read_bytes() == b"validated-original"
+
+
+def test_garbage_gc_preserves_bundle_replaced_after_owned_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "logical-delete" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"validated-original")
+    expected = reclaimer._regular_file_identity(victim, label="owned replacement fixture")
+    reclaimer._safe_remove_regular_child(
+        victim,
+        expected=expected,
+        label="owned replacement fixture",
+    )
+    saved_original = tmp_path / "saved-owned-bundle"
+    original_validate = reclaimer._validate_owned_garbage_bundle
+    replaced = False
+
+    def replace_after_validation(bundle: Path):
+        nonlocal replaced
+        owner = original_validate(bundle)
+        if bundle.parent == reclaimer.garbage_owned_dir and not replaced:
+            replaced = True
+            os.rename(bundle, saved_original)
+            bundle.mkdir()
+            (bundle / "foreign.bin").write_bytes(b"foreign-must-survive")
+        return owner
+
+    monkeypatch.setattr(reclaimer, "_validate_owned_garbage_bundle", replace_after_validation)
+
+    with pytest.raises(LabArtifactConflictError, match="changed during final isolation"):
+        reclaimer.collect_garbage()
+
+    owned = tuple(reclaimer.garbage_owned_dir.iterdir())
+    assert len(owned) == 1
+    assert (owned[0] / "foreign.bin").read_bytes() == b"foreign-must-survive"
+    assert (saved_original / "payload").read_bytes() == b"validated-original"
+
+
+def test_garbage_gc_resumes_owned_bundle_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    victim = tmp_path / "artifacts" / "logical-delete" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"restart-owned-payload")
+    expected = reclaimer._regular_file_identity(victim, label="restart fixture")
+    reclaimer._safe_remove_regular_child(
+        victim,
+        expected=expected,
+        label="restart fixture",
+    )
+    original_remove = reclaimer._remove_owned_garbage_bundle
+
+    def interrupt_once(_bundle: Path) -> None:
+        raise InterruptedError("crash before private garbage collection")
+
+    monkeypatch.setattr(reclaimer, "_remove_owned_garbage_bundle", interrupt_once)
+    with pytest.raises(InterruptedError, match="crash before"):
+        reclaimer.collect_garbage()
+    assert len(tuple(reclaimer.garbage_owned_dir.iterdir())) == 1
+    monkeypatch.setattr(reclaimer, "_remove_owned_garbage_bundle", original_remove)
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.collect_garbage()
+    restarted.collect_garbage()
+
+    assert tuple(restarted.garbage_pending_dir.iterdir()) == ()
+    assert tuple(restarted.garbage_collecting_dir.iterdir()) == ()
+    assert tuple(restarted.garbage_owned_dir.iterdir()) == ()
+    assert tuple(restarted.garbage_disposal_dir.iterdir()) == ()
+
+
+def test_garbage_gc_resumes_private_disposal_session_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "logical-delete" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"private-disposal-restart")
+    expected = reclaimer._regular_file_identity(victim, label="disposal restart fixture")
+    reclaimer._safe_remove_regular_child(
+        victim,
+        expected=expected,
+        label="disposal restart fixture",
+    )
+
+    def interrupt_after_isolation(session: Path) -> None:
+        assert session.parent == reclaimer.garbage_disposal_dir
+        assert len(tuple(session.iterdir())) == 1
+        raise InterruptedError("crash after private disposal isolation")
+
+    monkeypatch.setattr(reclaimer, "_remove_disposal_session", interrupt_after_isolation)
+    with pytest.raises(InterruptedError, match="private disposal"):
+        reclaimer.collect_garbage()
+
+    assert tuple(reclaimer.garbage_owned_dir.iterdir()) == ()
+    assert len(tuple(reclaimer.garbage_disposal_dir.iterdir())) == 1
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.collect_garbage()
+    restarted.collect_garbage()
+
+    assert tuple(restarted.garbage_disposal_dir.iterdir()) == ()
+
+
+def test_garbage_gc_rejects_unknown_empty_disposal_session(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    (reclaimer.garbage_disposal_dir / uuid4().hex).mkdir()
+
+    with pytest.raises(LabArtifactConflictError, match="session name"):
+        reclaimer.collect_garbage()
+
+
+def test_garbage_gc_recovers_after_payload_and_bundle_owner_are_already_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "logical-delete" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"final-cleanup-crash")
+    identity = reclaimer._regular_file_identity(victim, label="final cleanup fixture")
+    reclaimer._safe_remove_regular_child(
+        victim,
+        expected=identity,
+        label="final cleanup fixture",
+    )
+    monkeypatch.setattr(
+        reclaimer,
+        "_remove_owned_garbage_bundle",
+        lambda _bundle: (_ for _ in ()).throw(InterruptedError("pause owned")),
+    )
+    with pytest.raises(InterruptedError):
+        reclaimer.collect_garbage()
+    owned = tuple(reclaimer.garbage_owned_dir.iterdir())[0]
+    (owned / "payload").unlink()
+    (owned / "owner.json").unlink()
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.collect_garbage()
+
+    assert not owned.exists()
+    assert tuple(restarted.garbage_owned_dir.iterdir()) == ()
 
 
 def test_reclaimer_does_not_isolate_directory_replaced_at_rename(

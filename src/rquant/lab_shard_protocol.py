@@ -40,6 +40,12 @@ _CURRENT_CLAIM_NAME = re.compile(
     r"(?P<shard_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
 )
+_ADMISSION_TEMP_NAME = re.compile(
+    r"execution-admission-v1-"
+    r"(?P<claim_token>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})-"
+    r"[0-9a-f]{32}\.tmp"
+)
 MAX_SHARD_HEARTBEAT_EXTENSION_SECONDS = 3_600
 
 
@@ -221,6 +227,10 @@ class LabClaimRevokedError(RuntimeError):
     """A durable receipt proves that this exact claim must not be delivered."""
 
 
+class LabClaimNotConsumedError(RuntimeError):
+    """Execution admission requires immutable delivery history first."""
+
+
 class LabClaimDeliveryReceipt(LabShardProtocolModel):
     """Immutable delivery history; ``revoked`` is accepted for legacy ledgers only."""
 
@@ -260,6 +270,27 @@ class LabClaimRevocation(LabShardProtocolModel):
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("content_hash does not match claim revocation")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+
+class LabExecutionAdmission(LabShardProtocolModel):
+    schema_version: Literal[1] = 1
+    claim: LabShardClaim
+    delivery_content_hash: str = Field(pattern=_HASH_PATTERN)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> LabExecutionAdmission:
+        expected = _canonical_hash(
+            {
+                "claim": self.claim.model_dump(mode="json"),
+                "delivery_content_hash": self.delivery_content_hash,
+                "schema_version": self.schema_version,
+            }
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("content_hash does not match execution admission")
         object.__setattr__(self, "content_hash", expected)
         return self
 
@@ -478,6 +509,11 @@ class LabRevokedClaim(LabShardProtocolModel):
     revocation: LabClaimRevocation
 
 
+class LabAdmittedExecution(LabShardProtocolModel):
+    path: Path
+    admission: LabExecutionAdmission
+
+
 class LabReportSpoolEntry(LabShardProtocolModel):
     path: Path
     report: LabWorkerReport
@@ -560,8 +596,12 @@ class LabClaimSpool(_TypedSpoolBase):
         super().__init__(root)
         self.current_dir = self.root / "current"
         self.revoked_dir = self.root / "revoked"
+        self.admitted_dir = self.root / "admitted"
+        self.admission_tmp_dir = self.admitted_dir / ".tmp"
         self.current_dir.mkdir(parents=True, exist_ok=True)
         self.revoked_dir.mkdir(parents=True, exist_ok=True)
+        self.admitted_dir.mkdir(parents=True, exist_ok=True)
+        self.admission_tmp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._claim_advance_hook = claim_advance_hook
 
     def set_claim_advance_hook(
@@ -587,6 +627,9 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def _revoked_path(self, claim_token: UUID) -> Path:
         return self.revoked_dir / f"{claim_token}.json"
+
+    def _admission_path(self, claim_token: UUID) -> Path:
+        return self.admitted_dir / f"{claim_token}.json"
 
     def _load_consumed_locked(self, claim_token: UUID) -> LabConsumedClaim:
         path = self._consumed_path(claim_token)
@@ -625,6 +668,97 @@ class LabClaimSpool(_TypedSpoolBase):
                 f"revoked claim identity does not match basename {candidate.name}"
             )
         return LabRevokedClaim(path=candidate, revocation=revocation)
+
+    def _load_admission_locked(self, claim_token: UUID) -> LabAdmittedExecution:
+        path = self._admission_path(claim_token)
+        candidate, payload, _file_stat = self._read_regular_child(path, self.admitted_dir)
+        if self._ack_message_id(candidate.name) != claim_token:
+            raise InvalidCommandEnvelopeError(
+                f"execution admission token does not match basename {candidate.name}"
+            )
+        try:
+            admission = LabExecutionAdmission.model_validate_json(payload)
+        except Exception as exc:
+            raise InvalidCommandEnvelopeError(
+                f"invalid execution admission {candidate.name}: {exc}"
+            ) from exc
+        if admission.claim.claim_token != claim_token:
+            raise InvalidCommandEnvelopeError(
+                f"execution admission identity does not match basename {candidate.name}"
+            )
+        return LabAdmittedExecution(path=candidate, admission=admission)
+
+    def _cleanup_admission_temporaries_locked(self) -> None:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(self.admission_tmp_dir, directory_flags)
+        try:
+            for temporary in sorted(self.admission_tmp_dir.iterdir()):
+                match = _ADMISSION_TEMP_NAME.fullmatch(temporary.name)
+                if match is None:
+                    raise InvalidCommandEnvelopeError(
+                        f"unknown execution admission temporary: {temporary.name}"
+                    )
+                observed = os.stat(
+                    temporary.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISREG(observed.st_mode) or observed.st_nlink not in {1, 2}:
+                    raise InvalidCommandEnvelopeError(
+                        f"unsafe execution admission temporary: {temporary.name}"
+                    )
+                if observed.st_nlink == 2:
+                    token = UUID(match.group("claim_token"))
+                    target = self._admission_path(token)
+                    if not os.path.lexists(target):
+                        raise InvalidCommandEnvelopeError(
+                            "linked execution admission temporary has no marker"
+                        )
+                    target_stat = target.lstat()
+                    if (target_stat.st_dev, target_stat.st_ino) != (
+                        observed.st_dev,
+                        observed.st_ino,
+                    ):
+                        raise InvalidCommandEnvelopeError(
+                            "execution admission temporary conflicts with marker"
+                        )
+                os.unlink(temporary.name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _publish_admission_locked(
+        self,
+        admission: LabExecutionAdmission,
+    ) -> LabAdmittedExecution:
+        target = self._admission_path(admission.claim.claim_token)
+        temporary = self.admission_tmp_dir / (
+            f"execution-admission-v1-{admission.claim.claim_token}-{uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(admission.model_dump_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                existing = self._load_admission_locked(admission.claim.claim_token)
+                if existing.admission != admission:
+                    raise RequestContentConflictError(
+                        f"claim_token {admission.claim.claim_token} has conflicting admission"
+                    ) from None
+            self._fsync_directory(self.admitted_dir)
+        finally:
+            if os.path.lexists(temporary):
+                temporary.unlink()
+                self._fsync_directory(self.admission_tmp_dir)
+        published = self._load_admission_locked(admission.claim.claim_token)
+        if published.admission != admission:
+            raise RequestContentConflictError(
+                f"claim_token {admission.claim.claim_token} has conflicting admission"
+            )
+        return published
 
     def _revocation_locked(self, claim: LabShardClaim) -> LabRevokedClaim | None:
         path = self._revoked_path(claim.claim_token)
@@ -762,17 +896,72 @@ class LabClaimSpool(_TypedSpoolBase):
                 ),
             )
 
-    def is_admitted(self, claim: LabShardClaim) -> bool:
-        """Atomically require the exact high-water and absence of revocation."""
+    def execution_admission(self, claim_token: UUID) -> LabAdmittedExecution:
+        with self._exclusive_lock():
+            self._cleanup_admission_temporaries_locked()
+            return self._load_admission_locked(claim_token)
+
+    def admit_execution(self, claim: LabShardClaim) -> LabAdmittedExecution:
+        """Persist the single execution point-of-admission under the claim lock."""
         validated = LabShardClaim.model_validate(claim)
         with self._exclusive_lock():
+            self._cleanup_admission_temporaries_locked()
             if self._revocation_locked(validated) is not None:
-                return False
+                raise LabClaimRevokedError(
+                    f"claim {validated.claim_token} was revoked before execution admission"
+                )
             current_path = self._current_path(validated.job_id, validated.shard_id)
             if not os.path.lexists(current_path):
-                return False
+                raise LabClaimSupersededError(
+                    "claim has no durable high-water at execution admission"
+                )
             marker = self._load_current_locked(validated.job_id, validated.shard_id)
-            return marker.claim == validated
+            if marker.claim != validated:
+                raise LabClaimSupersededError(
+                    "claim is not the durable high-water at execution admission"
+                )
+            consumed_path = self._consumed_path(validated.claim_token)
+            if not os.path.lexists(consumed_path):
+                raise LabClaimNotConsumedError(
+                    f"claim {validated.claim_token} has no consumed delivery receipt"
+                )
+            consumed = self._load_consumed_locked(validated.claim_token)
+            if consumed.receipt.claim != validated:
+                raise RequestContentConflictError(
+                    f"claim_token {validated.claim_token} has conflicting receipt"
+                )
+            if consumed.receipt.status != "consumed":
+                raise LabClaimRevokedError(
+                    f"claim {validated.claim_token} has legacy revocation evidence"
+                )
+            admission = LabExecutionAdmission(
+                claim=validated,
+                delivery_content_hash=consumed.receipt.content_hash,
+            )
+            admission_path = self._admission_path(validated.claim_token)
+            if os.path.lexists(admission_path):
+                existing = self._load_admission_locked(validated.claim_token)
+                if existing.admission != admission:
+                    raise RequestContentConflictError(
+                        f"claim_token {validated.claim_token} has conflicting admission"
+                    )
+                return existing
+            return self._publish_admission_locked(admission)
+
+    def is_admitted(self, claim: LabShardClaim) -> bool:
+        """Return whether immutable execution-admission history exists for the claim."""
+        validated = LabShardClaim.model_validate(claim)
+        with self._exclusive_lock():
+            self._cleanup_admission_temporaries_locked()
+            admission_path = self._admission_path(validated.claim_token)
+            if not os.path.lexists(admission_path):
+                return False
+            admission = self._load_admission_locked(validated.claim_token)
+            if admission.admission.claim != validated:
+                raise RequestContentConflictError(
+                    f"claim_token {validated.claim_token} has conflicting admission"
+                )
+            return True
 
     def publish(
         self,
@@ -838,6 +1027,7 @@ class LabClaimSpool(_TypedSpoolBase):
             reason=normalized_reason,
         )
         with self._exclusive_lock():
+            self._cleanup_admission_temporaries_locked()
             receipt_path = self._consumed_path(validated.claim_token)
             if os.path.lexists(receipt_path):
                 existing = self._load_consumed_locked(validated.claim_token)

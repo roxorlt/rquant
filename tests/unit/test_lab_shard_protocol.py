@@ -14,10 +14,13 @@ from pydantic import ValidationError
 
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError, RequestContentConflictError
 from rquant.lab_shard_protocol import (
+    LabAdmittedExecution,
     LabClaimDeliveryReceipt,
+    LabClaimNotConsumedError,
     LabClaimRevokedError,
     LabClaimSpool,
     LabClaimSupersededError,
+    LabExecutionAdmission,
     LabReportReceipt,
     LabReportSpool,
     LabRevokedClaim,
@@ -480,6 +483,146 @@ def test_consume_checks_independent_revocation_before_delivery(
 
     assert spool.pending() == ()
     assert spool.is_revoked(claim)
+
+
+def test_execution_admission_is_durable_exact_and_idempotent(tmp_path: Path) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+
+    admitted = spool.admit_execution(claim)
+    repeated = spool.admit_execution(claim)
+    restarted = LabClaimSpool(root).execution_admission(claim.claim_token)
+
+    assert isinstance(admitted, LabAdmittedExecution)
+    assert repeated == admitted
+    assert restarted == admitted
+    assert admitted.admission.claim == claim
+    assert (
+        admitted.admission.delivery_content_hash
+        == spool._load_consumed_locked(claim.claim_token).receipt.content_hash
+    )
+
+
+def test_execution_admission_requires_consumed_current_unrevoked_claim(
+    tmp_path: Path,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    unconsumed = _claim()
+    spool.publish(unconsumed)
+
+    with pytest.raises(LabClaimNotConsumedError):
+        spool.admit_execution(unconsumed)
+
+    consumed = _claim(definition=_definition(index=1))
+    spool.consume(spool.publish(consumed))
+    spool.revoke(consumed, reason="scheduler revoked before admission")
+
+    with pytest.raises(LabClaimRevokedError):
+        spool.admit_execution(consumed)
+
+
+def test_execution_admission_and_later_revocation_are_both_immutable_audit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    admitted = spool.admit_execution(claim)
+    admitted_payload = admitted.path.read_bytes()
+
+    revoked = spool.revoke(claim, reason="scheduler revoked after admission")
+
+    assert admitted.path.read_bytes() == admitted_payload
+    assert LabClaimSpool(root).execution_admission(claim.claim_token) == admitted
+    assert LabClaimSpool(root).revocation(claim.claim_token) == revoked
+    with pytest.raises(LabClaimRevokedError):
+        LabClaimSpool(root).admit_execution(claim)
+
+
+def test_execution_admission_recovers_protocol_half_write_and_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    temporary = (
+        spool.admission_tmp_dir / f"execution-admission-v1-{claim.claim_token}-{uuid4().hex}.tmp"
+    )
+    temporary.write_bytes(b"half-written-admission")
+
+    admitted = LabClaimSpool(root).admit_execution(claim)
+    repeated = LabClaimSpool(root).admit_execution(claim)
+
+    assert admitted == repeated
+    assert not temporary.exists()
+    assert tuple(spool.admission_tmp_dir.iterdir()) == ()
+
+
+def test_execution_admission_recovers_crash_after_marker_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AdmissionCrash(BaseException):
+        pass
+
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    original_unlink = Path.unlink
+
+    def crash_before_temporary_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path.parent == spool.admission_tmp_dir:
+            raise AdmissionCrash("crash after admission marker link")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", crash_before_temporary_unlink)
+    with pytest.raises(AdmissionCrash):
+        spool.admit_execution(claim)
+    marker = spool.admitted_dir / f"{claim.claim_token}.json"
+    temporary = tuple(spool.admission_tmp_dir.iterdir())[0]
+    assert marker.stat().st_ino == temporary.stat().st_ino
+    assert marker.stat().st_nlink == 2
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+
+    recovered = LabClaimSpool(root).admit_execution(claim)
+
+    assert recovered.path == marker
+    assert marker.stat().st_nlink == 1
+    assert tuple(spool.admission_tmp_dir.iterdir()) == ()
+
+
+def test_execution_admission_rejects_conflicting_claim_identity(tmp_path: Path) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    spool.admit_execution(claim)
+    conflicting = claim.model_copy(update={"worker_id": "worker-conflict"})
+
+    with pytest.raises(RequestContentConflictError):
+        spool.admit_execution(conflicting)
+
+
+def test_execution_admission_rejects_conflicting_marker_content(tmp_path: Path) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    admitted = spool.admit_execution(claim)
+    consumed = spool._load_consumed_locked(claim.claim_token)
+    conflicting = LabExecutionAdmission(
+        claim=claim.model_copy(update={"worker_id": "worker-conflict"}),
+        delivery_content_hash=consumed.receipt.content_hash,
+    )
+    replacement = admitted.path.with_suffix(".replacement")
+    replacement.write_text(conflicting.model_dump_json(), encoding="utf-8")
+    os.replace(replacement, admitted.path)
+
+    with pytest.raises(RequestContentConflictError):
+        spool.admit_execution(claim)
 
 
 def test_revoke_receipt_failure_is_retryable_without_partial_cleanup(
