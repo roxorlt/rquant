@@ -65,7 +65,10 @@ _GARBAGE_INTENT_TEMP_NAME = re.compile(
     r"\.prepared-intent-tmp-v1-(?P<garbage_id>[0-9a-f]{32})-[0-9a-f]{32}\.tmp"
 )
 _GARBAGE_DERIVED_TEMP_NAME = re.compile(r"\.derived-json-tmp-v1-[0-9a-f]{32}\.tmp")
-_LEGACY_EMPTY_STAGING_ORPHAN_NAME = re.compile(r"legacy-empty-staging-(?P<staging_id>[0-9a-f]{32})")
+_LEGACY_EMPTY_STAGING_ORPHAN_NAME = re.compile(
+    r"legacy-empty-staging-(?P<staging_id>[0-9a-f]{32})"
+    r"(?:-(?P<orphan_token>[0-9a-f]{32}))?"
+)
 
 
 def _system_clock() -> datetime:
@@ -399,6 +402,7 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
     schema_version: Literal[1] = 1
     reason: Literal["no_proven_source"] = "no_proven_source"
     staging_id: UUID
+    orphan_token: UUID | None = None
     original_staging_relative_path: str
     orphan_relative_path: str
     metadata_hash: str = ""
@@ -406,19 +410,25 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabGarbageOrphanMetadata:
         expected_source = f".garbage-v1/staging/{self.staging_id.hex}"
-        expected_orphan = f".garbage-v1/intent_orphans/legacy-empty-staging-{self.staging_id.hex}"
+        token_suffix = f"-{self.orphan_token.hex}" if self.orphan_token is not None else ""
+        expected_orphan = (
+            f".garbage-v1/intent_orphans/legacy-empty-staging-{self.staging_id.hex}{token_suffix}"
+        )
         if self.original_staging_relative_path != expected_source:
             raise ValueError("orphan metadata source conflicts with staging identity")
         if self.orphan_relative_path != expected_orphan:
             raise ValueError("orphan metadata target conflicts with staging identity")
+        canonical_payload: dict[str, object] = {
+            "orphan_relative_path": self.orphan_relative_path,
+            "original_staging_relative_path": self.original_staging_relative_path,
+            "reason": self.reason,
+            "schema_version": self.schema_version,
+            "staging_id": str(self.staging_id),
+        }
+        if self.orphan_token is not None:
+            canonical_payload["orphan_token"] = str(self.orphan_token)
         canonical = json.dumps(
-            {
-                "orphan_relative_path": self.orphan_relative_path,
-                "original_staging_relative_path": self.original_staging_relative_path,
-                "reason": self.reason,
-                "schema_version": self.schema_version,
-                "staging_id": str(self.staging_id),
-            },
+            canonical_payload,
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -432,7 +442,7 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
 
     def canonical_json(self) -> str:
         return json.dumps(
-            self.model_dump(mode="json"),
+            self.model_dump(mode="json", exclude_none=True),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -2317,12 +2327,15 @@ class LabArtifactReclaimer:
     def _legacy_empty_staging_orphan_metadata(
         self,
         staging_id: UUID,
+        orphan_token: UUID | None,
     ) -> LabGarbageOrphanMetadata:
+        token_suffix = f"-{orphan_token.hex}" if orphan_token is not None else ""
         return LabGarbageOrphanMetadata(
             staging_id=staging_id,
+            orphan_token=orphan_token,
             original_staging_relative_path=f".garbage-v1/staging/{staging_id.hex}",
             orphan_relative_path=(
-                f".garbage-v1/intent_orphans/legacy-empty-staging-{staging_id.hex}"
+                f".garbage-v1/intent_orphans/legacy-empty-staging-{staging_id.hex}{token_suffix}"
             ),
         )
 
@@ -2342,8 +2355,9 @@ class LabArtifactReclaimer:
         self,
         orphan: Path,
         staging_id: UUID,
+        orphan_token: UUID | None,
     ) -> None:
-        expected = self._legacy_empty_staging_orphan_metadata(staging_id)
+        expected = self._legacy_empty_staging_orphan_metadata(staging_id, orphan_token)
         marker = orphan / "orphan.json"
         if os.path.lexists(marker):
             if self._load_garbage_orphan_metadata(marker) != expected:
@@ -2370,6 +2384,11 @@ class LabArtifactReclaimer:
                 self._ensure_legacy_empty_staging_orphan_metadata(
                     orphan,
                     UUID(hex=match.group("staging_id")),
+                    (
+                        UUID(hex=match.group("orphan_token"))
+                        if match.group("orphan_token") is not None
+                        else None
+                    ),
                 )
                 continue
             if (
@@ -2668,20 +2687,100 @@ class LabArtifactReclaimer:
             intents[intent.owner.garbage_id] = intent
         return intents
 
+    @staticmethod
+    def _directory_identity(observed: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            stat.S_IFMT(observed.st_mode),
+            observed.st_nlink,
+        )
+
+    def _restore_changed_staging_from_orphan(
+        self,
+        *,
+        staging: Path,
+        orphan: Path,
+        moved: os.stat_result,
+    ) -> None:
+        if os.path.lexists(staging):
+            raise LabArtifactConflictError(
+                "legacy empty staging changed during orphan isolation; "
+                "original path is occupied and both paths were preserved"
+            )
+        if orphan.is_symlink() or not stat.S_ISDIR(moved.st_mode):
+            raise LabArtifactConflictError(
+                "legacy empty staging changed during orphan isolation; "
+                "isolated replacement is unsafe and was preserved"
+            )
+        try:
+            os.rename(orphan, staging)
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "legacy empty staging changed during orphan isolation; "
+                "replacement could not be restored and both paths were preserved"
+            ) from exc
+        _fsync_directory(self.garbage_intent_orphan_dir)
+        _fsync_directory(self.garbage_staging_dir)
+        restored = staging.lstat()
+        if (
+            staging.is_symlink()
+            or not stat.S_ISDIR(restored.st_mode)
+            or self._directory_identity(restored) != self._directory_identity(moved)
+            or os.path.lexists(orphan)
+        ):
+            raise LabArtifactConflictError(
+                "legacy empty staging changed during orphan isolation; "
+                "replacement restore identity conflicts"
+            )
+
     def _orphan_legacy_empty_staging_locked(self, staging: Path) -> None:
         try:
             legacy_id = UUID(hex=staging.name)
         except ValueError as exc:
             raise LabArtifactConflictError("legacy empty staging name is invalid") from exc
-        if staging.is_symlink() or not staging.is_dir() or any(staging.iterdir()):
+        expected = staging.lstat()
+        if (
+            staging.is_symlink()
+            or not stat.S_ISDIR(expected.st_mode)
+            or expected.st_nlink < 1
+            or any(staging.iterdir())
+        ):
             raise LabArtifactConflictError("legacy empty staging is unsafe")
-        orphan = self.garbage_intent_orphan_dir / f"legacy-empty-staging-{legacy_id.hex}"
+        orphan_token = uuid4()
+        orphan = self.garbage_intent_orphan_dir / (
+            f"legacy-empty-staging-{legacy_id.hex}-{orphan_token.hex}"
+        )
         if os.path.lexists(orphan):
             raise LabArtifactConflictError("legacy empty staging orphan already exists")
         os.rename(staging, orphan)
         _fsync_directory(self.garbage_staging_dir)
         _fsync_directory(self.garbage_intent_orphan_dir)
-        self._ensure_legacy_empty_staging_orphan_metadata(orphan, legacy_id)
+        moved = orphan.lstat()
+        moved_is_empty = not any(orphan.iterdir())
+        source_is_absent = not os.path.lexists(staging)
+        if (
+            orphan.is_symlink()
+            or not stat.S_ISDIR(moved.st_mode)
+            or self._directory_identity(moved) != self._directory_identity(expected)
+            or not moved_is_empty
+            or not source_is_absent
+        ):
+            if source_is_absent:
+                self._restore_changed_staging_from_orphan(
+                    staging=staging,
+                    orphan=orphan,
+                    moved=moved,
+                )
+            raise LabArtifactConflictError(
+                "legacy empty staging changed during orphan isolation; "
+                "successful orphan metadata was not written"
+            )
+        self._ensure_legacy_empty_staging_orphan_metadata(
+            orphan,
+            legacy_id,
+            orphan_token,
+        )
 
     def _migrate_legacy_prepared_state_locked(self) -> None:
         intents = self._prepared_intents_locked()
