@@ -3779,6 +3779,88 @@ def test_external_orphan_identity_rejects_empty_replacement_after_entry_lstat(
     )
 
 
+@pytest.mark.parametrize(
+    ("a_payload", "b_payload", "expects_conflict"),
+    [
+        (None, None, False),
+        (None, b"b-must-not-affect-a", False),
+        (b"a-must-be-observed", None, True),
+    ],
+)
+def test_external_orphan_identity_fd_enumeration_resists_path_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    a_payload: bytes | None,
+    b_payload: bytes | None,
+    expects_conflict: bool,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    legacy_id = uuid4().hex
+    staging = reclaimer.garbage_staging_dir / legacy_id
+    staging.mkdir(mode=0o700)
+    reclaimer.collect_garbage()
+    orphan = next(reclaimer.garbage_intent_orphan_dir.glob(f"legacy-empty-staging-{legacy_id}-*"))
+    ledger = reclaimer.garbage_orphan_metadata_dir / f"{orphan.name}.json"
+    metadata = reclaimer._load_external_orphan_metadata(ledger)
+    if a_payload is not None:
+        (orphan / "a.bin").write_bytes(a_payload)
+        observed_a = orphan.lstat()
+        metadata = reclaimer._legacy_empty_staging_orphan_metadata(
+            metadata.staging_id,
+            metadata.orphan_token,
+            reclaimer._directory_identity(observed_a),
+        )
+        ledger.write_text(metadata.canonical_json(), encoding="utf-8")
+    replacement = tmp_path / "aba-replacement"
+    replacement.mkdir(mode=0o700)
+    if b_payload is not None:
+        (replacement / "b.bin").write_bytes(b_payload)
+    parked_a = tmp_path / "aba-parked-a"
+    original_listdir = lab_worker_module.os.listdir
+    original_a = (orphan.lstat().st_dev, orphan.lstat().st_ino)
+    original_b = (replacement.lstat().st_dev, replacement.lstat().st_ino)
+    original_ledger = (ledger.lstat().st_dev, ledger.lstat().st_ino, ledger.read_bytes())
+    swapped = False
+
+    def swap_around_fd_enumeration(path: int | str | bytes | os.PathLike[str]) -> list[str]:
+        nonlocal swapped
+        if isinstance(path, int) and not swapped:
+            swapped = True
+            os.rename(orphan, parked_a)
+            os.rename(replacement, orphan)
+            try:
+                return original_listdir(path)
+            finally:
+                os.rename(orphan, replacement)
+                os.rename(parked_a, orphan)
+        return original_listdir(path)
+
+    monkeypatch.setattr(lab_worker_module.os, "listdir", swap_around_fd_enumeration)
+
+    if expects_conflict:
+        with pytest.raises(LabArtifactConflictError, match="orphan identity conflicts"):
+            reclaimer._assert_external_orphan_identity(orphan, metadata)
+    else:
+        reclaimer._assert_external_orphan_identity(orphan, metadata)
+
+    assert swapped
+    assert (orphan.lstat().st_dev, orphan.lstat().st_ino) == original_a
+    assert (replacement.lstat().st_dev, replacement.lstat().st_ino) == original_b
+    assert ({child.name: child.read_bytes() for child in orphan.iterdir()}) == (
+        {"a.bin": a_payload} if a_payload is not None else {}
+    )
+    assert ({child.name: child.read_bytes() for child in replacement.iterdir()}) == (
+        {"b.bin": b_payload} if b_payload is not None else {}
+    )
+    assert (ledger.lstat().st_dev, ledger.lstat().st_ino, ledger.read_bytes()) == original_ledger
+
+
 def test_external_orphan_metadata_entry_replacement_never_writes_business_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -2505,19 +2505,45 @@ class LabArtifactReclaimer:
             or self._directory_identity(entry) != expected
         ):
             raise LabArtifactConflictError("legacy empty staging orphan identity conflicts")
+        descriptor: int | None = None
         try:
-            children = tuple(orphan.iterdir())
-            exit_observed = orphan.lstat()
+            descriptor = os.open(
+                orphan,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            opened_identity = self._directory_identity(opened)
+            if (
+                stat.S_ISLNK(opened.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened_identity != expected
+            ):
+                raise LabArtifactConflictError("legacy empty staging orphan identity conflicts")
+            children = os.listdir(descriptor)
+            exit_opened = os.fstat(descriptor)
+            exit_path = orphan.lstat()
         except OSError as exc:
             raise LabArtifactConflictError(
                 "legacy empty staging orphan identity conflicts"
             ) from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    raise LabArtifactConflictError(
+                        "legacy empty staging orphan identity conflicts"
+                    ) from exc
+        exit_opened_identity = self._directory_identity(exit_opened)
         if (
             children
-            or stat.S_ISLNK(exit_observed.st_mode)
-            or not stat.S_ISDIR(exit_observed.st_mode)
-            or self._directory_identity(exit_observed) != expected
-            or self._directory_identity(exit_observed) != self._directory_identity(entry)
+            or stat.S_ISLNK(exit_opened.st_mode)
+            or not stat.S_ISDIR(exit_opened.st_mode)
+            or exit_opened_identity != expected
+            or exit_opened_identity != opened_identity
+            or stat.S_ISLNK(exit_path.st_mode)
+            or not stat.S_ISDIR(exit_path.st_mode)
+            or self._directory_identity(exit_path) != expected
         ):
             raise LabArtifactConflictError("legacy empty staging orphan identity conflicts")
 
