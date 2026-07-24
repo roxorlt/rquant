@@ -85,6 +85,7 @@ _V2_SCHEMA_VERSION = 2
 _PREVIOUS_SCHEMA_VERSION = 3
 _SCHEMA_VERSION = 4
 RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
+LAB_ETA_COMPLETED_LIMIT_MAX = 256
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 _LEGACY_PLAN_HASH = "0" * 64
@@ -567,6 +568,82 @@ def _validate_v3_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _canonical_index_predicate(sql: str) -> str | None:
+    tokens = sql.strip().rstrip(";").split()
+    where_positions = tuple(
+        position for position, token in enumerate(tokens) if token.upper() == "WHERE"
+    )
+    if len(where_positions) != 1:
+        return None
+    return "".join(tokens[where_positions[0] + 1 :])
+
+
+def _validate_v4_index(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    unique: bool,
+    partial: bool,
+    key_columns: tuple[tuple[str, bool], ...],
+    predicate: str | None,
+) -> None:
+    matching = tuple(
+        row
+        for row in connection.execute("PRAGMA index_list(lab_shard)").fetchall()
+        if str(row[1]) == name
+    )
+    if len(matching) != 1:
+        raise LabDatabaseIdentityError(f"lab jobs SQLite v4 telemetry index {name} is missing")
+    index_row = matching[0]
+    actual_unique = _strict_sqlite_int(index_row[2], field=f"{name}.unique", minimum=0)
+    actual_partial = _strict_sqlite_int(index_row[4], field=f"{name}.partial", minimum=0)
+    if actual_unique != int(unique) or str(index_row[3]) != "c" or actual_partial != int(partial):
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v4 telemetry index {name} has invalid identity flags"
+        )
+
+    xinfo = connection.execute(f'PRAGMA index_xinfo("{name}")').fetchall()
+    actual_keys = tuple(
+        row for row in xinfo if _strict_sqlite_int(row[5], field=f"{name}.key", minimum=0) == 1
+    )
+    if len(actual_keys) != len(key_columns):
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v4 telemetry index {name} has invalid key column count"
+        )
+    for position, (row, expected) in enumerate(zip(actual_keys, key_columns, strict=True)):
+        expected_name, expected_desc = expected
+        sequence = _strict_sqlite_int(row[0], field=f"{name}.seqno", minimum=0)
+        column_id = _strict_sqlite_int(row[1], field=f"{name}.cid")
+        descending = _strict_sqlite_int(row[3], field=f"{name}.desc", minimum=0)
+        if (
+            sequence != position
+            or column_id < 0
+            or row[2] is None
+            or str(row[2]) != expected_name
+            or descending != int(expected_desc)
+            or str(row[4]).upper() != "BINARY"
+        ):
+            raise LabDatabaseIdentityError(
+                f"lab jobs SQLite v4 telemetry index {name} has invalid key structure"
+            )
+
+    sql_row = connection.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND tbl_name = 'lab_shard' AND name = ?
+        """,
+        (name,),
+    ).fetchone()
+    if sql_row is None or sql_row[0] is None:
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v4 telemetry index {name} has no explicit DDL"
+        )
+    if _canonical_index_predicate(str(sql_row[0])) != predicate:
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v4 telemetry index {name} has invalid partial predicate"
+        )
+
+
 def _validate_v4_schema(connection: sqlite3.Connection) -> None:
     _validate_v3_schema(connection)
     job_columns = {
@@ -593,27 +670,22 @@ def _validate_v4_schema(connection: sqlite3.Connection) -> None:
         raise LabDatabaseIdentityError(
             f"lab jobs SQLite v4 is missing lab_shard columns: {', '.join(missing)}"
         )
-    indexes = {
-        str(row[0])
-        for row in connection.execute(
-            """
-            SELECT name FROM sqlite_master
-            WHERE type = 'index' AND name IN (
-                'ix_lab_shard_job_completion_sequence',
-                'ix_lab_shard_job_status_index'
-            )
-            """
-        ).fetchall()
-    }
-    required_indexes = {
-        "ix_lab_shard_job_completion_sequence",
-        "ix_lab_shard_job_status_index",
-    }
-    if indexes != required_indexes:
-        missing_indexes = ", ".join(sorted(required_indexes - indexes))
-        raise LabDatabaseIdentityError(
-            f"lab jobs SQLite v4 is missing telemetry indexes: {missing_indexes}"
-        )
+    _validate_v4_index(
+        connection,
+        name="ix_lab_shard_job_completion_sequence",
+        unique=True,
+        partial=True,
+        key_columns=(("job_id", False), ("completion_sequence", True)),
+        predicate="status='succeeded'ANDcompletion_sequenceISNOTNULL",
+    )
+    _validate_v4_index(
+        connection,
+        name="ix_lab_shard_job_status_index",
+        unique=False,
+        partial=False,
+        key_columns=(("job_id", False), ("status", False), ("shard_index", False)),
+        predicate=None,
+    )
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -1505,12 +1577,14 @@ class LabJobReader:
         job_id: UUID,
         *,
         as_of: datetime,
-        completed_limit: int = 256,
+        completed_limit: int = LAB_ETA_COMPLETED_LIMIT_MAX,
     ) -> LabEtaInput | None:
         from rquant.lab_eta import LabEtaCompletedShard, LabEtaInput, LabEtaRemainingShard
 
-        if completed_limit < 3:
-            raise ValueError("completed telemetry limit must be at least three")
+        if not 3 <= completed_limit <= LAB_ETA_COMPLETED_LIMIT_MAX:
+            raise ValueError(
+                f"completed telemetry limit must be between 3 and {LAB_ETA_COMPLETED_LIMIT_MAX}"
+            )
         current = _utc(as_of)
         with self._connect() as connection:
             job_row = connection.execute(
@@ -1538,7 +1612,7 @@ class LabJobReader:
                        static_duration_ms
                 FROM lab_shard INDEXED BY ix_lab_shard_job_status_index
                 WHERE job_id = ?
-                  AND status IN ('queued', 'running', 'checkpointed', 'failed', 'cancelled')
+                  AND status IN ('queued', 'running', 'checkpointed')
                 ORDER BY shard_index, shard_id
                 """,
                 (str(job_id),),
@@ -1631,7 +1705,7 @@ class LabJobReader:
         job_id: UUID,
         *,
         as_of: datetime,
-        completed_limit: int = 256,
+        completed_limit: int = LAB_ETA_COMPLETED_LIMIT_MAX,
     ) -> LabEtaEstimate | None:
         from rquant.lab_eta import estimate_lab_eta
 

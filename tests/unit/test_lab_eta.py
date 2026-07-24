@@ -321,7 +321,7 @@ def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
                        static_duration_ms
                 FROM lab_shard INDEXED BY ix_lab_shard_job_status_index
                 WHERE job_id = ?
-                  AND status IN ('queued', 'running', 'checkpointed', 'failed', 'cancelled')
+                  AND status IN ('queued', 'running', 'checkpointed')
                 ORDER BY shard_index, shard_id
                 """,
                 (str(job.job_id),),
@@ -353,3 +353,129 @@ def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
     assert any("ix_lab_shard_job_completion_sequence" in step for step in query_plan)
     assert any("ix_lab_shard_job_status_index" in step for step in remaining_query_plan)
     assert any("ix_lab_shard_job_completion_sequence" in step for step in sequence_query_plan)
+
+
+def _seed_eta_job_with_terminal_shards(
+    tmp_path: Path,
+    *,
+    job_status: str,
+) -> tuple[LabJobReader, UUID]:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    timestamp = AS_OF.isoformat(timespec="microseconds")
+    shard_rows = tuple(
+        (
+            str(UUID(int=20_000 + index)),
+            str(job.job_id),
+            index,
+            shard_status,
+            "terminal-filter-fixture",
+            static_duration_ms,
+            timestamp,
+            timestamp,
+        )
+        for index, (shard_status, static_duration_ms) in enumerate(
+            (("queued", 1_000), ("failed", 50_000), ("cancelled", 60_000))
+        )
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE lab_job SET status = ? WHERE job_id = ?",
+            (job_status, str(job.job_id)),
+        )
+        connection.executemany(
+            """
+            INSERT INTO lab_shard (
+                shard_id, job_id, shard_index, status, version,
+                attempt_count, max_attempts, plan_hash, adapter_id,
+                adapter_version, payload_json, payload_hash,
+                phase, work_unit_name, work_units, static_duration_ms,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, 0, 0, 3, ?, 'eta-fixture', 'v1', '{}',
+                '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',
+                'scan', 'trading_day', 1, ?, ?, ?
+            )
+            """,
+            shard_rows,
+        )
+    return LabJobReader(store.path), job.job_id
+
+
+@pytest.mark.parametrize("job_status", ["running", "checkpointed"])
+def test_running_and_paused_checkpointed_eta_ignore_terminal_shards(
+    tmp_path: Path,
+    job_status: str,
+) -> None:
+    reader, job_id = _seed_eta_job_with_terminal_shards(
+        tmp_path,
+        job_status=job_status,
+    )
+
+    projection = reader.get_eta_input(job_id, as_of=AS_OF)
+    estimate = reader.estimate_eta(job_id, as_of=AS_OF)
+
+    assert projection is not None
+    assert tuple(item.shard_id for item in projection.remaining) == (UUID(int=20_000),)
+    assert estimate is not None
+    assert estimate.remaining_shards == 1
+    assert estimate.remaining_duration is not None
+    assert estimate.remaining_duration.center_ms == 1_000
+
+
+@pytest.mark.parametrize("job_status", ["failed", "cancelled"])
+def test_terminal_job_eta_is_unavailable_regardless_of_shard_rows(
+    tmp_path: Path,
+    job_status: str,
+) -> None:
+    reader, job_id = _seed_eta_job_with_terminal_shards(
+        tmp_path,
+        job_status=job_status,
+    )
+
+    estimate = reader.estimate_eta(job_id, as_of=AS_OF)
+
+    assert estimate is not None
+    assert estimate.estimator == "unavailable"
+    assert estimate.remaining_duration is None
+    assert estimate.finish_at is None
+
+
+@pytest.mark.parametrize("completed_limit", [2, 257, 10_000])
+def test_eta_reader_rejects_completed_limit_outside_hard_bounds_before_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed_limit: int,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    reader = LabJobReader(store.path)
+
+    def fail_if_sql_is_opened() -> None:
+        raise AssertionError("completed_limit validation must happen before SQL")
+
+    monkeypatch.setattr(reader, "_connect", fail_if_sql_is_opened)
+
+    with pytest.raises(ValueError, match="between 3 and 256"):
+        reader.get_eta_input(UUID(int=1), as_of=AS_OF, completed_limit=completed_limit)
+
+
+@pytest.mark.parametrize("completed_limit", [3, 256])
+def test_eta_reader_accepts_completed_limit_boundaries(
+    tmp_path: Path,
+    completed_limit: int,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+
+    projection = LabJobReader(store.path).get_eta_input(
+        job.job_id,
+        as_of=AS_OF,
+        completed_limit=completed_limit,
+    )
+
+    assert projection is not None

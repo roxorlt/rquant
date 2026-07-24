@@ -17,13 +17,17 @@ from rquant.lab_job_protocol import (
 from rquant.lab_jobs import (
     InvalidStoredJobError,
     JobStatus,
+    LabDatabaseIdentityError,
     LabJobReader,
     LabJobStore,
     ShardStatus,
 )
 from rquant.lab_shard_protocol import LabShardDefinition, LabShardHeartbeat, LabWorkerReport
 
-from .test_lab_jobs import NOW, _create_609c599_v1_fixture, _lease, _spec
+from .test_lab_jobs import NOW, _create_609c599_v1_fixture, _lease, _spec, _submit_job
+
+_COMPLETION_INDEX = "ix_lab_shard_job_completion_sequence"
+_STATUS_INDEX = "ix_lab_shard_job_status_index"
 
 
 def _create_real_v2_fixture(path: Path) -> tuple[str, str]:
@@ -123,6 +127,233 @@ def test_initialize_creates_v4_telemetry_columns(tmp_path: Path) -> None:
         "claim_generation",
         "scheduler_fencing_token",
     } <= report_columns
+
+
+@pytest.mark.parametrize(
+    ("index_name", "replacement_sql"),
+    [
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC)
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC)
+            WHERE status = 'failed' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC)
+            WHERE status = 'SUCCEEDED' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC)
+            WHERE status = 'succeeded'
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(completion_sequence DESC, job_id)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC, shard_index)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, -completion_sequence DESC)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _COMPLETION_INDEX,
+            f"""
+            CREATE UNIQUE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id COLLATE NOCASE, completion_sequence DESC)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """,
+        ),
+        (
+            _STATUS_INDEX,
+            f"""
+            CREATE INDEX {_STATUS_INDEX}
+            ON lab_shard(job_id, shard_index, status)
+            """,
+        ),
+    ],
+    ids=[
+        "completion-not-unique",
+        "completion-not-partial",
+        "completion-wrong-status-predicate",
+        "completion-wrong-status-literal-case",
+        "completion-missing-non-null-predicate",
+        "completion-wrong-desc",
+        "completion-wrong-order",
+        "completion-extra-key-column",
+        "completion-expression-key",
+        "completion-wrong-collation",
+        "status-wrong-columns",
+    ],
+)
+def test_initialize_rejects_same_name_structurally_wrong_v4_indexes_without_replacing_them(
+    tmp_path: Path,
+    index_name: str,
+    replacement_sql: str,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    LabJobStore(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.execute(f"DROP INDEX {index_name}")
+        connection.execute(replacement_sql)
+        corrupted_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()[0]
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="telemetry index"):
+        LabJobStore(path).initialize()
+
+    with sqlite3.connect(path) as connection:
+        retained_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()[0]
+        )
+    assert retained_sql == corrupted_sql
+
+
+def _insert_completed_telemetry_shard(
+    connection: sqlite3.Connection,
+    *,
+    job_id: str,
+    shard_index: int,
+    completion_sequence: int,
+) -> None:
+    timestamp = NOW.isoformat(timespec="microseconds")
+    connection.execute(
+        """
+        INSERT INTO lab_shard (
+            shard_id, job_id, shard_index, status, version,
+            attempt_count, max_attempts, plan_hash, adapter_id,
+            adapter_version, payload_json, payload_hash,
+            phase, work_unit_name, work_units, static_duration_ms,
+            duration_ms, throughput_units_per_second, completion_sequence,
+            result_manifest_hash, finished_at, created_at, updated_at
+        ) VALUES (
+            ?, ?, ?, 'succeeded', 1, 1, 3, ?, 'index-fixture', 'v1', '{}',
+            '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',
+            'scan', 'trading_day', 1, 1000, 1000.0, 1.0, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            str(uuid4()),
+            job_id,
+            shard_index,
+            "4" * 64,
+            completion_sequence,
+            "6" * 64,
+            timestamp,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def test_valid_completion_index_rejects_duplicate_sequence_for_one_job(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job = _submit_job(store, _lease(store))
+    with sqlite3.connect(store.path) as connection:
+        _insert_completed_telemetry_shard(
+            connection,
+            job_id=str(job.job_id),
+            shard_index=0,
+            completion_sequence=1,
+        )
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"),
+    ):
+        _insert_completed_telemetry_shard(
+            connection,
+            job_id=str(job.job_id),
+            shard_index=1,
+            completion_sequence=1,
+        )
+
+
+def test_same_name_non_unique_completion_index_allows_duplicates_but_fails_initialization(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job = _submit_job(store, _lease(store))
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"DROP INDEX {_COMPLETION_INDEX}")
+        connection.execute(
+            f"""
+            CREATE INDEX {_COMPLETION_INDEX}
+            ON lab_shard(job_id, completion_sequence DESC)
+            WHERE status = 'succeeded' AND completion_sequence IS NOT NULL
+            """
+        )
+        _insert_completed_telemetry_shard(
+            connection,
+            job_id=str(job.job_id),
+            shard_index=0,
+            completion_sequence=1,
+        )
+        _insert_completed_telemetry_shard(
+            connection,
+            job_id=str(job.job_id),
+            shard_index=1,
+            completion_sequence=1,
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="telemetry index"):
+        LabJobStore(store.path).initialize()
 
 
 def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
