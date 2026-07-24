@@ -60,6 +60,11 @@ _GARBAGE_STATE_SEQUENCE = {
     "quarantined": 1,
     "deferred_gc": 2,
 }
+_GARBAGE_INTENT_NAME = re.compile(r"(?P<garbage_id>[0-9a-f]{32})-prepared-intent-v1\.json")
+_GARBAGE_INTENT_TEMP_NAME = re.compile(
+    r"\.prepared-intent-tmp-v1-(?P<garbage_id>[0-9a-f]{32})-[0-9a-f]{32}\.tmp"
+)
+_GARBAGE_DERIVED_TEMP_NAME = re.compile(r"\.derived-json-tmp-v1-[0-9a-f]{32}\.tmp")
 
 
 def _system_clock() -> datetime:
@@ -333,6 +338,50 @@ class LabGarbageOwner(LabWorkerModel):
             raise ValueError("garbage_id conflicts with deterministic inventory")
         object.__setattr__(self, "content_hash", content_hash)
         object.__setattr__(self, "garbage_id", garbage_id)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabGarbagePreparedIntent(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    state: Literal["prepared"] = "prepared"
+    source_relative_path: str = Field(min_length=1)
+    staging_relative_path: str = Field(min_length=1)
+    owner: LabGarbageOwner
+    intent_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabGarbagePreparedIntent:
+        expected_staging = f".garbage-v1/staging/{self.owner.garbage_id.hex}"
+        if self.source_relative_path != self.owner.original_relative_path:
+            raise ValueError("prepared intent source conflicts with owner")
+        if self.staging_relative_path != expected_staging:
+            raise ValueError("prepared intent staging conflicts with owner")
+        canonical = json.dumps(
+            {
+                "owner": self.owner.model_dump(mode="json"),
+                "schema_version": self.schema_version,
+                "source_relative_path": self.source_relative_path,
+                "staging_relative_path": self.staging_relative_path,
+                "state": self.state,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        intent_hash = _sha256_bytes(canonical.encode("utf-8"))
+        if self.intent_hash and self.intent_hash != intent_hash:
+            raise ValueError("prepared intent hash conflicts with canonical content")
+        object.__setattr__(self, "intent_hash", intent_hash)
         return self
 
     def canonical_json(self) -> str:
@@ -1659,12 +1708,18 @@ class LabArtifactReclaimer:
         self.artifact_root = Path(artifact_root).resolve()
         self.report_spool = report_spool
         self.garbage_root = self.artifact_root / ".garbage-v1"
+        self.garbage_intent_dir = self.garbage_root / "prepared_intents"
+        self.garbage_intent_temp_dir = self.garbage_root / "intent_temporary"
+        self.garbage_intent_orphan_dir = self.garbage_root / "intent_orphans"
         self.garbage_owner_dir = self.garbage_root / "owners"
         self.garbage_ledger_dir = self.garbage_root / "ledger"
         self.garbage_staging_dir = self.garbage_root / "staging"
         self.garbage_deferred_dir = self.garbage_root / "deferred_gc"
         self.garbage_pending_dir = self.garbage_deferred_dir
         for directory in (
+            self.garbage_intent_dir,
+            self.garbage_intent_temp_dir,
+            self.garbage_intent_orphan_dir,
             self.garbage_owner_dir,
             self.garbage_ledger_dir,
             self.garbage_staging_dir,
@@ -2060,6 +2115,235 @@ class LabArtifactReclaimer:
     def _garbage_bundle_name(owner: LabGarbageOwner) -> str:
         return owner.garbage_id.hex
 
+    def _prepared_intent(self, owner: LabGarbageOwner) -> LabGarbagePreparedIntent:
+        return LabGarbagePreparedIntent(
+            source_relative_path=owner.original_relative_path,
+            staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+            owner=owner,
+        )
+
+    def _prepared_intent_path(self, garbage_id: UUID) -> Path:
+        return self.garbage_intent_dir / f"{garbage_id.hex}-prepared-intent-v1.json"
+
+    @staticmethod
+    def _read_prepared_intent_file(
+        path: Path,
+        *,
+        allowed_links: frozenset[int] = frozenset({1}),
+    ) -> LabGarbagePreparedIntent:
+        try:
+            before = path.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError("prepared intent is missing or unsafe") from exc
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink not in allowed_links
+        ):
+            raise LabArtifactConflictError("prepared intent is not an owned regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise LabArtifactConflictError("prepared intent changed while opening") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink not in allowed_links
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+            ):
+                raise LabArtifactConflictError("prepared intent changed while opening")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after_open = os.fstat(descriptor)
+            after_path = path.lstat()
+            if (
+                after_open.st_dev,
+                after_open.st_ino,
+                after_open.st_size,
+                after_open.st_nlink,
+                after_path.st_dev,
+                after_path.st_ino,
+                after_path.st_size,
+                after_path.st_nlink,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_nlink,
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_nlink,
+            ):
+                raise LabArtifactConflictError("prepared intent changed while validating")
+        except OSError as exc:
+            raise LabArtifactConflictError("prepared intent changed while validating") from exc
+        finally:
+            os.close(descriptor)
+        try:
+            raw = b"".join(chunks).decode("utf-8")
+            intent = LabGarbagePreparedIntent.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid prepared intent: {exc}") from exc
+        if raw != intent.canonical_json():
+            raise LabArtifactConflictError("prepared intent is not canonical JSON")
+        return intent
+
+    def _load_prepared_intent(self, path: Path) -> LabGarbagePreparedIntent:
+        match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
+        if match is None:
+            raise LabArtifactConflictError("prepared intent name is invalid")
+        intent = self._read_prepared_intent_file(path)
+        if intent.owner.garbage_id.hex != match.group("garbage_id"):
+            raise LabArtifactConflictError("prepared intent path conflicts with owner")
+        return intent
+
+    def _isolate_intent_temporary(self, temporary: Path) -> None:
+        target = self.garbage_intent_orphan_dir / temporary.name
+        if os.path.lexists(target):
+            raise LabArtifactConflictError("prepared intent temporary orphan conflicts")
+        os.rename(temporary, target)
+        _fsync_directory(self.garbage_intent_temp_dir)
+        _fsync_directory(self.garbage_intent_orphan_dir)
+
+    def _drop_published_intent_temporary(self, temporary: Path, target: Path) -> None:
+        temporary_stat = temporary.lstat()
+        target_stat = target.lstat()
+        if (
+            temporary.is_symlink()
+            or target.is_symlink()
+            or not stat.S_ISREG(temporary_stat.st_mode)
+            or not stat.S_ISREG(target_stat.st_mode)
+            or (temporary_stat.st_dev, temporary_stat.st_ino)
+            != (target_stat.st_dev, target_stat.st_ino)
+            or temporary_stat.st_nlink != 2
+            or target_stat.st_nlink != 2
+        ):
+            raise LabArtifactConflictError("published intent temporary identity conflicts")
+        os.unlink(temporary)
+        _fsync_directory(self.garbage_intent_temp_dir)
+        if target.lstat().st_nlink != 1:
+            raise LabArtifactConflictError("prepared intent retained an unexpected hard link")
+
+    def _write_prepared_intent(self, intent: LabGarbagePreparedIntent) -> Path:
+        target = self._prepared_intent_path(intent.owner.garbage_id)
+        if os.path.lexists(target):
+            existing = self._load_prepared_intent(target)
+            if existing != intent:
+                raise LabArtifactConflictError("prepared intent conflicts with durable intent")
+            return target
+        temporary = self.garbage_intent_temp_dir / (
+            f".prepared-intent-tmp-v1-{intent.owner.garbage_id.hex}-{uuid4().hex}.tmp"
+        )
+        linked = False
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(intent.canonical_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(self.garbage_intent_temp_dir)
+            try:
+                os.link(temporary, target, follow_symlinks=False)
+                linked = True
+                _fsync_directory(self.garbage_intent_dir)
+            except FileExistsError as exc:
+                existing = self._load_prepared_intent(target)
+                if existing != intent:
+                    raise LabArtifactConflictError(
+                        "prepared intent no-clobber publication found conflicting content"
+                    ) from exc
+            if linked:
+                self._drop_published_intent_temporary(temporary, target)
+            else:
+                self._isolate_intent_temporary(temporary)
+            if self._load_prepared_intent(target) != intent:
+                raise LabArtifactConflictError("prepared intent publication changed content")
+        except BaseException:
+            if os.path.lexists(temporary):
+                self._isolate_intent_temporary(temporary)
+            raise
+        return target
+
+    def _reconcile_intent_temporaries_locked(self) -> None:
+        for orphan in self.garbage_intent_orphan_dir.iterdir():
+            observed = orphan.lstat()
+            if orphan.is_symlink():
+                raise LabArtifactConflictError("prepared intent orphan is unsafe")
+            if stat.S_ISDIR(observed.st_mode):
+                if not orphan.name.startswith("legacy-empty-staging-") or any(orphan.iterdir()):
+                    raise LabArtifactConflictError("prepared intent orphan directory is unsafe")
+                continue
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_nlink != 1
+                or (
+                    _GARBAGE_INTENT_TEMP_NAME.fullmatch(orphan.name) is None
+                    and _GARBAGE_DERIVED_TEMP_NAME.fullmatch(orphan.name) is None
+                )
+            ):
+                raise LabArtifactConflictError("prepared intent orphan file is unsafe")
+        for temporary in tuple(sorted(self.garbage_intent_temp_dir.iterdir())):
+            match = _GARBAGE_INTENT_TEMP_NAME.fullmatch(temporary.name)
+            if match is None or temporary.is_symlink():
+                raise LabArtifactConflictError("unknown prepared intent temporary")
+            observed = temporary.lstat()
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink not in {1, 2}:
+                raise LabArtifactConflictError("prepared intent temporary is unsafe")
+            target = self.garbage_intent_dir / (
+                f"{match.group('garbage_id')}-prepared-intent-v1.json"
+            )
+            if observed.st_nlink == 2:
+                if not os.path.lexists(target):
+                    raise LabArtifactConflictError("linked intent temporary has no target")
+                intent = self._read_prepared_intent_file(
+                    temporary,
+                    allowed_links=frozenset({2}),
+                )
+                target_intent = self._read_prepared_intent_file(
+                    target,
+                    allowed_links=frozenset({2}),
+                )
+                if intent != target_intent or intent.owner.garbage_id.hex != match.group(
+                    "garbage_id"
+                ):
+                    raise LabArtifactConflictError("linked intent temporary conflicts with target")
+                self._drop_published_intent_temporary(temporary, target)
+                continue
+            try:
+                intent = self._read_prepared_intent_file(temporary)
+            except LabArtifactConflictError:
+                self._isolate_intent_temporary(temporary)
+                continue
+            if intent.owner.garbage_id.hex != match.group("garbage_id"):
+                raise LabArtifactConflictError("intent temporary name conflicts with content")
+            if os.path.lexists(target):
+                if self._load_prepared_intent(target) != intent:
+                    raise LabArtifactConflictError("intent temporary conflicts with durable target")
+                self._isolate_intent_temporary(temporary)
+                continue
+            os.link(temporary, target, follow_symlinks=False)
+            _fsync_directory(self.garbage_intent_dir)
+            self._drop_published_intent_temporary(temporary, target)
+
+    def _write_derived_canonical_file(self, target: Path, payload: str) -> None:
+        if os.path.lexists(target):
+            raise LabArtifactConflictError("derived garbage metadata target already exists")
+        temporary = self.garbage_intent_orphan_dir / (f".derived-json-tmp-v1-{uuid4().hex}.tmp")
+        with temporary.open("xb") as stream:
+            stream.write(payload.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(self.garbage_intent_orphan_dir)
+        if os.path.lexists(target):
+            return
+        os.rename(temporary, target)
+        _fsync_directory(target.parent)
+        _fsync_directory(self.garbage_intent_orphan_dir)
+
     def _garbage_ledger_path(
         self,
         owner: LabGarbageOwner,
@@ -2080,11 +2364,9 @@ class LabArtifactReclaimer:
             if existing != ledger:
                 raise LabArtifactConflictError("garbage ledger state conflicts")
             return target
-        with target.open("xb") as stream:
-            stream.write(ledger.canonical_json().encode("utf-8"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        _fsync_directory(self.garbage_ledger_dir)
+        self._write_derived_canonical_file(target, ledger.canonical_json())
+        if self._load_garbage_ledger(target) != ledger:
+            raise LabArtifactConflictError("derived garbage ledger changed after publication")
         return target
 
     def _load_garbage_ledger(self, path: Path) -> LabGarbageLedger:
@@ -2127,21 +2409,56 @@ class LabArtifactReclaimer:
         return self._load_garbage_ledger(paths[-1])
 
     def _write_garbage_owner(self, bundle: Path, owner: LabGarbageOwner) -> None:
-        for marker in (
-            self.garbage_owner_dir / f"{owner.garbage_id.hex}.json",
-            bundle / "owner.json",
-        ):
-            if os.path.lexists(marker):
-                loaded = self._load_garbage_owner(marker)
-                if loaded != owner:
-                    raise LabArtifactConflictError("garbage owner marker conflicts")
-                continue
-            with marker.open("xb") as stream:
-                stream.write(owner.canonical_json().encode("utf-8"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            _fsync_directory(marker.parent)
+        self._ensure_global_garbage_owner(owner)
+        self._ensure_bundle_garbage_owner(bundle, owner)
         self._write_garbage_ledger(owner, "prepared")
+
+    def _ensure_global_garbage_owner(self, owner: LabGarbageOwner) -> Path:
+        marker = self.garbage_owner_dir / f"{owner.garbage_id.hex}.json"
+        if os.path.lexists(marker):
+            if self._load_garbage_owner(marker) != owner:
+                raise LabArtifactConflictError("global garbage owner marker conflicts")
+            return marker
+        self._write_derived_canonical_file(marker, owner.canonical_json())
+        if self._load_garbage_owner(marker) != owner:
+            raise LabArtifactConflictError("global garbage owner changed after publication")
+        return marker
+
+    def _ensure_garbage_staging(self, intent: LabGarbagePreparedIntent) -> Path:
+        staging = self.artifact_root / intent.staging_relative_path
+        expected = self.garbage_staging_dir / intent.owner.garbage_id.hex
+        if staging != expected:
+            raise LabArtifactConflictError("prepared intent staging path is unsafe")
+        if not os.path.lexists(staging):
+            staging.mkdir(mode=0o700)
+            _fsync_directory(self.garbage_staging_dir)
+        observed = staging.lstat()
+        if staging.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+            raise LabArtifactConflictError("garbage staging bundle is unsafe")
+        names = {child.name for child in staging.iterdir()}
+        if not names.issubset({"owner.json", "payload"}):
+            raise LabArtifactConflictError(
+                f"garbage staging bundle has unexpected entries: {sorted(names)}"
+            )
+        return staging
+
+    def _ensure_bundle_garbage_owner(
+        self,
+        staging: Path,
+        owner: LabGarbageOwner,
+    ) -> Path:
+        marker = staging / "owner.json"
+        if os.path.lexists(marker):
+            if self._load_garbage_owner(marker) != owner:
+                raise LabArtifactConflictError("bundle garbage owner marker conflicts")
+            return marker
+        payload = staging / "payload"
+        if os.path.lexists(payload) and self._garbage_inventory(payload) != owner.inventory:
+            raise LabArtifactConflictError("staged payload conflicts with prepared intent")
+        self._write_derived_canonical_file(marker, owner.canonical_json())
+        if self._load_garbage_owner(marker) != owner:
+            raise LabArtifactConflictError("bundle garbage owner changed after publication")
+        return marker
 
     def _load_garbage_owner(self, marker: Path) -> LabGarbageOwner:
         identity = self._regular_file_identity(marker, label="garbage owner marker")
@@ -2178,6 +2495,9 @@ class LabArtifactReclaimer:
         owner = self._load_garbage_owner(bundle / "owner.json")
         if owner.garbage_id != bundle_id:
             raise LabArtifactConflictError("garbage bundle name conflicts with owner")
+        intent = self._load_prepared_intent(self._prepared_intent_path(bundle_id))
+        if intent.owner != owner:
+            raise LabArtifactConflictError("garbage bundle conflicts with prepared intent")
         if self._load_garbage_owner_ledger(bundle_id) != owner:
             raise LabArtifactConflictError("garbage bundle owner conflicts with ledger")
         observed = self._garbage_inventory(bundle / "payload")
@@ -2223,57 +2543,223 @@ class LabArtifactReclaimer:
 
     def _reconcile_staging_bundle(self, staging: Path) -> LabGarbageOwner:
         owner = self._staging_owner(staging)
-        source = self._source_path_for_owner(owner)
-        payload = staging / "payload"
-        source_exists = os.path.lexists(source)
-        payload_exists = os.path.lexists(payload)
-        if source_exists and payload_exists:
-            raise LabArtifactConflictError("garbage source and staged payload both exist")
-        if not source_exists and not payload_exists:
-            raise LabArtifactConflictError("garbage owner has neither source nor payload")
-        if source_exists:
-            observed = self._garbage_inventory(source)
-            if observed != owner.inventory:
-                raise LabArtifactConflictError("garbage source conflicts with owner inventory")
-            os.rename(source, payload)
-            _fsync_directory(source.parent)
-            _fsync_directory(staging)
-            if os.path.lexists(source):
-                raise LabArtifactConflictError("garbage source was replaced during isolation")
-        if self._validate_garbage_bundle(staging) != owner:
-            raise LabArtifactConflictError("garbage staged payload conflicts with owner")
-        self._write_garbage_ledger(owner, "quarantined")
+        intent_path = self._prepared_intent_path(owner.garbage_id)
+        if not os.path.lexists(intent_path):
+            self._write_prepared_intent(self._prepared_intent(owner))
+        intent = self._load_prepared_intent(intent_path)
+        if intent.owner != owner:
+            raise LabArtifactConflictError("staging owner conflicts with prepared intent")
+        self._reconcile_prepared_intent(intent)
         return owner
 
-    def _collect_garbage_locked(self) -> None:
-        for marker in self.garbage_owner_dir.iterdir():
+    @staticmethod
+    def _register_legacy_owner(
+        owners: dict[UUID, LabGarbageOwner],
+        owner: LabGarbageOwner,
+    ) -> None:
+        existing = owners.get(owner.garbage_id)
+        if existing is not None and existing != owner:
+            raise LabArtifactConflictError("legacy garbage owner identities conflict")
+        owners[owner.garbage_id] = owner
+
+    def _prepared_intents_locked(self) -> dict[UUID, LabGarbagePreparedIntent]:
+        intents: dict[UUID, LabGarbagePreparedIntent] = {}
+        for path in sorted(self.garbage_intent_dir.iterdir()):
+            if path.is_symlink() or not path.is_file():
+                raise LabArtifactConflictError("prepared intent namespace is unsafe")
+            intent = self._load_prepared_intent(path)
+            if intent.owner.garbage_id in intents:
+                raise LabArtifactConflictError("duplicate prepared intent identity")
+            intents[intent.owner.garbage_id] = intent
+        return intents
+
+    def _legacy_unique_active_source(self) -> Path:
+        files: list[Path] = []
+        excluded = {self.garbage_root.name, ".reclaim-ledger"}
+        for current, directories, names in os.walk(self.artifact_root, followlinks=False):
+            current_path = Path(current)
+            if current_path == self.artifact_root:
+                directories[:] = sorted(name for name in directories if name not in excluded)
+            else:
+                directories.sort()
+            for directory in directories:
+                child = current_path / directory
+                if child.is_symlink():
+                    raise LabArtifactConflictError("legacy source tree contains a symlink")
+            for name in sorted(names):
+                child = current_path / name
+                observed = child.lstat()
+                if child.is_symlink() or not stat.S_ISREG(observed.st_mode):
+                    raise LabArtifactConflictError("legacy source tree contains an unsafe file")
+                if observed.st_nlink != 1:
+                    raise LabArtifactConflictError("legacy source tree contains a hard link")
+                files.append(child)
+        if not files:
+            raise LabArtifactConflictError("legacy empty staging has no provable source")
+        if len(files) == 1:
+            return files[0]
+        common = Path(os.path.commonpath([str(path.parent) for path in files]))
+        if common == self.artifact_root or not common.is_relative_to(self.artifact_root):
+            raise LabArtifactConflictError("legacy empty staging source is ambiguous")
+        return common
+
+    def _migrate_legacy_empty_staging_locked(
+        self,
+        staging: Path,
+        intents: dict[UUID, LabGarbagePreparedIntent],
+    ) -> None:
+        try:
+            legacy_id = UUID(hex=staging.name)
+        except ValueError as exc:
+            raise LabArtifactConflictError("legacy empty staging name is invalid") from exc
+        if staging.is_symlink() or not staging.is_dir() or any(staging.iterdir()):
+            raise LabArtifactConflictError("legacy empty staging is unsafe")
+        purpose = f"legacy empty staging recovery {legacy_id.hex}"
+        recovered = tuple(intent for intent in intents.values() if intent.owner.purpose == purpose)
+        if len(recovered) > 1:
+            raise LabArtifactConflictError("legacy empty staging has duplicate recovery intents")
+        if recovered:
+            intent = recovered[0]
+        else:
+            source = self._legacy_unique_active_source()
+            owner = self._garbage_owner(source, purpose=purpose)
+            intent = self._prepared_intent(owner)
+            self._write_prepared_intent(intent)
+            intents[owner.garbage_id] = intent
+        if intent.owner.garbage_id == legacy_id:
+            raise LabArtifactConflictError("legacy empty staging conflicts with recovered intent")
+        orphan = self.garbage_intent_orphan_dir / f"legacy-empty-staging-{legacy_id.hex}"
+        if os.path.lexists(orphan):
+            raise LabArtifactConflictError("legacy empty staging orphan already exists")
+        os.rename(staging, orphan)
+        _fsync_directory(self.garbage_staging_dir)
+        _fsync_directory(self.garbage_intent_orphan_dir)
+
+    def _migrate_legacy_prepared_state_locked(self) -> None:
+        intents = self._prepared_intents_locked()
+        owners: dict[UUID, LabGarbageOwner] = {}
+        empty_staging: list[Path] = []
+        for marker in sorted(self.garbage_owner_dir.iterdir()):
             if marker.is_symlink() or not marker.is_file() or marker.suffix != ".json":
                 raise LabArtifactConflictError("garbage owner namespace is unsafe")
             try:
                 garbage_id = UUID(hex=marker.stem)
             except ValueError as exc:
                 raise LabArtifactConflictError("garbage owner ledger name is invalid") from exc
-            self._load_garbage_owner_ledger(garbage_id)
-        for ledger_path in self.garbage_ledger_dir.iterdir():
+            owner = self._load_garbage_owner_ledger(garbage_id)
+            self._register_legacy_owner(owners, owner)
+        for ledger_path in sorted(self.garbage_ledger_dir.iterdir()):
             if ledger_path.is_symlink() or not ledger_path.is_file():
                 raise LabArtifactConflictError("garbage ledger namespace is unsafe")
-            self._load_garbage_ledger(ledger_path)
-        for deferred in tuple(sorted(self.garbage_deferred_dir.iterdir())):
-            owner = self._validate_garbage_bundle(deferred)
-            latest = self._latest_garbage_ledger(owner)
-            if latest.state != "deferred_gc":
-                self._write_garbage_ledger(owner, "deferred_gc")
-        for staging in tuple(sorted(self.garbage_staging_dir.iterdir())):
-            owner = self._reconcile_staging_bundle(staging)
-            deferred = self.garbage_deferred_dir / self._garbage_bundle_name(owner)
-            if os.path.lexists(deferred):
-                raise LabArtifactConflictError("garbage staging and deferred bundle both exist")
-            self._promote_garbage_bundle(
-                staging,
-                deferred,
+            ledger = self._load_garbage_ledger(ledger_path)
+            self._register_legacy_owner(owners, ledger.owner)
+        for staging in sorted(self.garbage_staging_dir.iterdir()):
+            observed = staging.lstat()
+            if staging.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+                raise LabArtifactConflictError("garbage staging namespace is unsafe")
+            try:
+                staging_id = UUID(hex=staging.name)
+            except ValueError as exc:
+                raise LabArtifactConflictError("garbage staging name is invalid") from exc
+            names = {child.name for child in staging.iterdir()}
+            if not names:
+                if staging_id not in intents and staging_id not in owners:
+                    empty_staging.append(staging)
+                continue
+            if not names.issubset({"owner.json", "payload"}):
+                raise LabArtifactConflictError("legacy staging contains unknown derived state")
+            if "owner.json" in names:
+                owner = self._load_garbage_owner(staging / "owner.json")
+                if owner.garbage_id != staging_id:
+                    raise LabArtifactConflictError("legacy staging owner conflicts with directory")
+                self._register_legacy_owner(owners, owner)
+            elif staging_id not in owners and staging_id not in intents:
+                raise LabArtifactConflictError("legacy staged payload has no provable owner")
+        for deferred in sorted(self.garbage_deferred_dir.iterdir()):
+            observed = deferred.lstat()
+            if deferred.is_symlink() or not stat.S_ISDIR(observed.st_mode):
+                raise LabArtifactConflictError("deferred garbage namespace is unsafe")
+            names = {child.name for child in deferred.iterdir()}
+            if names != {"owner.json", "payload"}:
+                raise LabArtifactConflictError("legacy deferred bundle inventory is unsafe")
+            owner = self._load_garbage_owner(deferred / "owner.json")
+            if deferred.name != owner.garbage_id.hex:
+                raise LabArtifactConflictError("legacy deferred owner conflicts with directory")
+            if self._garbage_inventory(deferred / "payload") != owner.inventory:
+                raise LabArtifactConflictError("legacy deferred payload conflicts with owner")
+            self._register_legacy_owner(owners, owner)
+        for garbage_id, owner in sorted(owners.items(), key=lambda item: item[0].hex):
+            existing = intents.get(garbage_id)
+            expected = self._prepared_intent(owner)
+            if existing is not None:
+                if existing != expected:
+                    raise LabArtifactConflictError("legacy owner conflicts with prepared intent")
+                continue
+            self._write_prepared_intent(expected)
+            intents[garbage_id] = expected
+        if len(empty_staging) > 1:
+            raise LabArtifactConflictError(
+                "multiple legacy empty staging directories are ambiguous"
             )
-            self._validate_garbage_bundle(deferred)
-            self._write_garbage_ledger(owner, "deferred_gc")
+        for staging in empty_staging:
+            self._migrate_legacy_empty_staging_locked(staging, intents)
+
+    def _reconcile_prepared_intent(self, intent: LabGarbagePreparedIntent) -> None:
+        owner = intent.owner
+        if self._load_prepared_intent(self._prepared_intent_path(owner.garbage_id)) != intent:
+            raise LabArtifactConflictError("prepared intent changed before reconciliation")
+        source = self._source_path_for_owner(owner)
+        staging = self.artifact_root / intent.staging_relative_path
+        deferred = self.garbage_deferred_dir / owner.garbage_id.hex
+        source_exists = os.path.lexists(source)
+        staging_exists = os.path.lexists(staging)
+        deferred_exists = os.path.lexists(deferred)
+        if deferred_exists:
+            if source_exists or staging_exists:
+                raise LabArtifactConflictError("deferred quarantine conflicts with active source")
+            self._ensure_global_garbage_owner(owner)
+            if self._validate_garbage_bundle(deferred) != owner:
+                raise LabArtifactConflictError("deferred garbage conflicts with prepared intent")
+            for state in ("prepared", "quarantined", "deferred_gc"):
+                self._write_garbage_ledger(owner, state)
+            return
+        staging = self._ensure_garbage_staging(intent)
+        self._ensure_global_garbage_owner(owner)
+        self._ensure_bundle_garbage_owner(staging, owner)
+        self._write_garbage_ledger(owner, "prepared")
+        payload = staging / "payload"
+        source_exists = os.path.lexists(source)
+        payload_exists = os.path.lexists(payload)
+        if source_exists and payload_exists:
+            raise LabArtifactConflictError("garbage source and staged payload both exist")
+        if not source_exists and not payload_exists:
+            raise LabArtifactConflictError("prepared intent has neither source nor staged payload")
+        if source_exists:
+            if self._garbage_inventory(source) != owner.inventory:
+                raise LabArtifactConflictError(
+                    "garbage source conflicts with owner inventory and prepared intent"
+                )
+            os.rename(source, payload)
+            _fsync_directory(source.parent)
+            _fsync_directory(staging)
+            if os.path.lexists(source):
+                raise LabArtifactConflictError("garbage source was replaced during isolation")
+        if self._validate_garbage_bundle(staging) != owner:
+            raise LabArtifactConflictError("staged garbage conflicts with prepared intent")
+        self._write_garbage_ledger(owner, "quarantined")
+        self._promote_garbage_bundle(staging, deferred)
+        if self._validate_garbage_bundle(deferred) != owner:
+            raise LabArtifactConflictError("promoted garbage conflicts with prepared intent")
+        self._write_garbage_ledger(owner, "deferred_gc")
+
+    def _collect_garbage_locked(self) -> None:
+        self._reconcile_intent_temporaries_locked()
+        self._migrate_legacy_prepared_state_locked()
+        intents = self._prepared_intents_locked()
+        for intent in sorted(intents.values(), key=lambda item: item.owner.garbage_id.hex):
+            self._reconcile_prepared_intent(intent)
+        if any(self.garbage_staging_dir.iterdir()):
+            raise LabArtifactConflictError("garbage staging remained after intent reconciliation")
 
     def collect_garbage(self) -> None:
         """Reconcile durable quarantine state without physically deleting retained bytes."""
@@ -2317,26 +2803,9 @@ class LabArtifactReclaimer:
         *,
         owner: LabGarbageOwner,
     ) -> bool:
-        staging = self.garbage_staging_dir / self._garbage_bundle_name(owner)
-        deferred = self.garbage_deferred_dir / self._garbage_bundle_name(owner)
-        if os.path.lexists(deferred):
-            if os.path.lexists(path):
-                raise LabArtifactConflictError("garbage source and deferred quarantine both exist")
-            if self._validate_garbage_bundle(deferred) != owner:
-                raise LabArtifactConflictError("deferred garbage owner conflicts")
-            if self._latest_garbage_ledger(owner).state != "deferred_gc":
-                self._write_garbage_ledger(owner, "deferred_gc")
-            return True
-        if os.path.lexists(staging):
-            if self._staging_owner(staging) != owner:
-                raise LabArtifactConflictError("garbage staging owner conflicts")
-        else:
-            staging.mkdir(mode=0o700)
-            self._write_garbage_owner(staging, owner)
-        self._reconcile_staging_bundle(staging)
-        self._promote_garbage_bundle(staging, deferred)
-        self._validate_garbage_bundle(deferred)
-        self._write_garbage_ledger(owner, "deferred_gc")
+        intent = self._prepared_intent(owner)
+        self._write_prepared_intent(intent)
+        self._reconcile_prepared_intent(intent)
         return True
 
     def logical_quarantine_tree(

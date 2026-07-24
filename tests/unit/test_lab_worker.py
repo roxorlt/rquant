@@ -309,6 +309,51 @@ def _crash_sealed_rollback_after_payload_isolation_child(
     os._exit(84)
 
 
+def _crash_sealed_rollback_after_prepared_phase_child(
+    root_value: str,
+    claim_payload: str,
+    crash_phase: str,
+) -> None:
+    from rquant.lab_worker import LabSealedShardBundle
+
+    root = Path(root_value)
+    claim = LabShardClaim.model_validate_json(claim_payload)
+    worker = _worker(root)
+    sealed = worker.sealed_bundle_path(claim)
+    manifest = worker._validate_bundle(sealed, claim)
+    device, inode = worker._bundle_file_identity(sealed)
+    bundle = LabSealedShardBundle(
+        path=sealed,
+        manifest=manifest,
+        created=True,
+        device=device,
+        inode=inode,
+    )
+    reclaimer = worker.artifact_reclaimer
+    method_by_phase = {
+        "intent": "_write_prepared_intent",
+        "staging": "_ensure_garbage_staging",
+        "global_owner": "_ensure_global_garbage_owner",
+        "bundle_owner": "_ensure_bundle_garbage_owner",
+        "prepared_ledger": "_write_garbage_ledger",
+    }
+    method_name = method_by_phase[crash_phase]
+    original = getattr(reclaimer, method_name)
+
+    def crash_after_phase(*args, **kwargs):
+        result = original(*args, **kwargs)
+        state = kwargs.get("state")
+        if len(args) > 1:
+            state = args[1]
+        if crash_phase != "prepared_ledger" or state == "prepared":
+            os._exit(85)
+        return result
+
+    setattr(reclaimer, method_name, crash_after_phase)
+    worker._rollback_sealed(claim, bundle)
+    os._exit(86)
+
+
 def _publish_report_child(root_value: str, report_payload: str) -> None:
     root = Path(root_value)
     report = LabWorkerReport.model_validate_json(report_payload)
@@ -3330,6 +3375,247 @@ def test_owner_only_staging_resumes_source_isolation_after_restart(tmp_path: Pat
     assert (entry.bundle_path / "payload").read_bytes() == b"owner-before-payload"
 
 
+@pytest.mark.parametrize(
+    "derived_state",
+    ["missing", "empty_staging", "global_owner_only", "both_owners_without_ledger"],
+)
+def test_prepared_intent_rebuilds_incomplete_derived_state(
+    tmp_path: Path,
+    derived_state: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    victim = tmp_path / "artifacts" / "prepared-intent" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(f"intent-{derived_state}".encode())
+    owner = reclaimer._garbage_owner(victim, purpose="prepared intent recovery fixture")
+    intent = reclaimer._prepared_intent(owner)
+    intent_path = reclaimer._write_prepared_intent(intent)
+    staging = reclaimer.garbage_staging_dir / owner.garbage_id.hex
+    global_owner = reclaimer.garbage_owner_dir / f"{owner.garbage_id.hex}.json"
+    if derived_state in {"empty_staging", "both_owners_without_ledger"}:
+        staging.mkdir(mode=0o700)
+    if derived_state in {"global_owner_only", "both_owners_without_ledger"}:
+        global_owner.write_text(owner.canonical_json(), encoding="utf-8")
+    if derived_state == "both_owners_without_ledger":
+        (staging / "owner.json").write_text(owner.canonical_json(), encoding="utf-8")
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.collect_garbage()
+
+    entry = restarted.quarantine_entries()[0]
+    assert intent_path.is_file()
+    assert not victim.exists()
+    assert entry.state == "deferred_gc"
+    assert (entry.bundle_path / "payload").read_bytes() == f"intent-{derived_state}".encode()
+    assert tuple(restarted.garbage_staging_dir.iterdir()) == ()
+    assert len(tuple(restarted.garbage_ledger_dir.glob(f"{owner.garbage_id.hex}-*.json"))) == 3
+
+
+def test_prepared_intent_publish_is_no_clobber_and_idempotent(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "intent-publish" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"authoritative-intent")
+    owner = reclaimer._garbage_owner(victim, purpose="intent no-clobber fixture")
+    intent = reclaimer._prepared_intent(owner)
+
+    first = reclaimer._write_prepared_intent(intent)
+    second = reclaimer._write_prepared_intent(intent)
+    assert first == second
+    assert first.read_text(encoding="utf-8") == intent.canonical_json()
+    assert intent.state == "prepared"
+    assert intent.source_relative_path == owner.original_relative_path
+    assert intent.staging_relative_path == f".garbage-v1/staging/{owner.garbage_id.hex}"
+    assert intent.owner.inventory == owner.inventory
+    assert len(intent.intent_hash) == 64
+
+    replacement = first.with_suffix(".replacement")
+    replacement.write_text("foreign-intent", encoding="utf-8")
+    os.replace(replacement, first)
+    with pytest.raises(LabArtifactConflictError):
+        reclaimer._write_prepared_intent(intent)
+    assert first.read_text(encoding="utf-8") == "foreign-intent"
+
+
+def test_partial_prepared_intent_temporary_is_isolated_and_does_not_block(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "partial-intent" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"source-survives-partial-intent")
+    owner = reclaimer._garbage_owner(victim, purpose="partial intent fixture")
+    temporary = reclaimer.garbage_intent_temp_dir / (
+        f".prepared-intent-tmp-v1-{owner.garbage_id.hex}-{uuid4().hex}.tmp"
+    )
+    temporary.write_bytes(b"{" + b"x" * 31)
+
+    reclaimer.collect_garbage()
+    assert not temporary.exists()
+    assert len(tuple(reclaimer.garbage_intent_orphan_dir.iterdir())) == 1
+    assert victim.is_file()
+
+    assert reclaimer.logical_quarantine_tree(victim, purpose="partial intent fixture")
+    assert reclaimer.quarantine_summary().bundle_count == 1
+
+
+@pytest.mark.parametrize("publish_boundary", ["before_link", "after_link"])
+def test_complete_prepared_intent_temporary_recovers_atomic_publish_boundary(
+    tmp_path: Path,
+    publish_boundary: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "intent-link-crash" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(f"intent-{publish_boundary}".encode())
+    owner = reclaimer._garbage_owner(victim, purpose="intent link crash fixture")
+    intent = reclaimer._prepared_intent(owner)
+    temporary = reclaimer.garbage_intent_temp_dir / (
+        f".prepared-intent-tmp-v1-{owner.garbage_id.hex}-{uuid4().hex}.tmp"
+    )
+    temporary.write_text(intent.canonical_json(), encoding="utf-8")
+    target = reclaimer._prepared_intent_path(owner.garbage_id)
+    if publish_boundary == "after_link":
+        os.link(temporary, target)
+        assert temporary.lstat().st_nlink == 2
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.collect_garbage()
+
+    assert not temporary.exists()
+    assert target.lstat().st_nlink == 1
+    assert restarted._load_prepared_intent(target) == intent
+    assert restarted.quarantine_summary().bundle_count == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["different_global_owner", "bundle_owner_symlink", "global_owner_hardlink", "staging_extra"],
+)
+def test_prepared_intent_rejects_conflicting_derived_state(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "derived-conflict" / "victim.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"derived-state-source")
+    owner = reclaimer._garbage_owner(victim, purpose="derived conflict fixture")
+    intent = reclaimer._prepared_intent(owner)
+    reclaimer._write_prepared_intent(intent)
+    staging = reclaimer.garbage_staging_dir / owner.garbage_id.hex
+    staging.mkdir(mode=0o700)
+    global_owner = reclaimer.garbage_owner_dir / f"{owner.garbage_id.hex}.json"
+    bundle_owner = staging / "owner.json"
+    if mutation == "different_global_owner":
+        global_owner.write_text("different", encoding="utf-8")
+    elif mutation == "bundle_owner_symlink":
+        external = tmp_path / "external-owner.json"
+        external.write_text(owner.canonical_json(), encoding="utf-8")
+        bundle_owner.symlink_to(external)
+    elif mutation == "global_owner_hardlink":
+        global_owner.write_text(owner.canonical_json(), encoding="utf-8")
+        os.link(global_owner, tmp_path / "external-owner-hardlink.json")
+    else:
+        (staging / "unexpected.bin").write_bytes(b"foreign")
+
+    with pytest.raises(LabArtifactConflictError):
+        reclaimer.collect_garbage()
+
+    assert victim.read_bytes() == b"derived-state-source"
+
+
+@pytest.mark.parametrize("legacy_state", ["empty_staging", "global_owner", "both_owners"])
+def test_legacy_partial_staging_reconstructs_unique_prepared_intent(
+    tmp_path: Path,
+    legacy_state: str,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "legacy-partial.bin"
+    victim.write_bytes(f"legacy-{legacy_state}".encode())
+    if legacy_state == "empty_staging":
+        legacy_id = uuid4().hex
+        (reclaimer.garbage_staging_dir / legacy_id).mkdir(mode=0o700)
+    else:
+        owner = reclaimer._garbage_owner(victim, purpose="legacy prepared fixture")
+        global_owner = reclaimer.garbage_owner_dir / f"{owner.garbage_id.hex}.json"
+        global_owner.write_text(owner.canonical_json(), encoding="utf-8")
+        if legacy_state == "both_owners":
+            staging = reclaimer.garbage_staging_dir / owner.garbage_id.hex
+            staging.mkdir(mode=0o700)
+            (staging / "owner.json").write_text(owner.canonical_json(), encoding="utf-8")
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.collect_garbage()
+
+    entries = restarted.quarantine_entries()
+    assert len(entries) == 1
+    assert entries[0].state == "deferred_gc"
+    assert not victim.exists()
+    assert len(tuple(restarted.garbage_intent_dir.glob("*.json"))) == 1
+    if legacy_state == "empty_staging":
+        assert len(tuple(restarted.garbage_intent_orphan_dir.iterdir())) == 1
+
+
+def test_legacy_empty_staging_fails_closed_when_source_is_ambiguous(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    (tmp_path / "artifacts" / "first.bin").write_bytes(b"first")
+    (tmp_path / "artifacts" / "second.bin").write_bytes(b"second")
+    staging = reclaimer.garbage_staging_dir / uuid4().hex
+    staging.mkdir(mode=0o700)
+
+    with pytest.raises(LabArtifactConflictError, match="ambiguous"):
+        reclaimer.collect_garbage()
+
+    assert staging.is_dir()
+    assert tuple(reclaimer.garbage_intent_dir.iterdir()) == ()
+
+
 @pytest.mark.parametrize("failure", ["missing", "both", "identity"])
 def test_owner_only_staging_fails_closed_on_source_conflict(
     tmp_path: Path,
@@ -3445,6 +3731,103 @@ def test_sealed_rollback_hard_crash_resumes_in_new_process(tmp_path: Path) -> No
     assert len(entries) == 1
     assert entries[0].state == "deferred_gc"
     assert "sealed rollback" in entries[0].owner.purpose
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    ["intent", "staging", "global_owner", "bundle_owner", "prepared_ledger"],
+)
+def test_sealed_rollback_recovers_every_prepared_intent_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_phase: str,
+) -> None:
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path)
+    validated = worker.adapter_registry.validate_claim(claim)
+    prepared = worker._prepare_result(
+        claim,
+        RecordingRegistry().execute_shard(validated, object()),
+    )
+    bundle = worker._publish_candidate(
+        claim,
+        prepared,
+        deadline=None,
+        effective_expiry=None,
+        validate_concurrent_race=True,
+    )
+    reclaimer = worker.artifact_reclaimer
+    method_by_phase = {
+        "intent": "_write_prepared_intent",
+        "staging": "_ensure_garbage_staging",
+        "global_owner": "_ensure_global_garbage_owner",
+        "bundle_owner": "_ensure_bundle_garbage_owner",
+        "prepared_ledger": "_write_garbage_ledger",
+    }
+    method_name = method_by_phase[crash_phase]
+    original = getattr(reclaimer, method_name)
+    interrupted = False
+
+    def interrupt_after_phase(*args, **kwargs):
+        nonlocal interrupted
+        result = original(*args, **kwargs)
+        state = kwargs.get("state")
+        if len(args) > 1:
+            state = args[1]
+        should_interrupt = crash_phase != "prepared_ledger" or state == "prepared"
+        if should_interrupt and not interrupted:
+            interrupted = True
+            raise InterruptedError(f"crash after {crash_phase}")
+        return result
+
+    monkeypatch.setattr(reclaimer, method_name, interrupt_after_phase)
+    with pytest.raises(InterruptedError, match=crash_phase):
+        worker._rollback_sealed(claim, bundle)
+    monkeypatch.setattr(reclaimer, method_name, original)
+
+    restarted = _worker(tmp_path)
+    restarted.artifact_reclaimer.collect_garbage()
+    restarted.artifact_reclaimer.reclaim(_retry_claim(claim))
+    first = restarted.artifact_reclaimer.quarantine_summary()
+    restarted.artifact_reclaimer.collect_garbage()
+    second = restarted.artifact_reclaimer.quarantine_summary()
+
+    assert not bundle.path.exists()
+    assert first == second
+    assert first.bundle_count == 1
+    assert first.retained_bytes > 0
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    ["intent", "staging", "global_owner", "bundle_owner", "prepared_ledger"],
+)
+def test_sealed_rollback_hard_exit_recovers_every_prepared_intent_boundary(
+    tmp_path: Path,
+    crash_phase: str,
+) -> None:
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path)
+    validated = worker.adapter_registry.validate_claim(claim)
+    worker._seal_result(
+        claim,
+        RecordingRegistry().execute_shard(validated, object()),
+    )
+
+    crashed = _run_worker_child(
+        "_crash_sealed_rollback_after_prepared_phase_child",
+        tmp_path,
+        claim.model_dump_json(),
+        crash_phase,
+    )
+
+    assert crashed.returncode == 85, crashed.stderr
+    restarted = _worker(tmp_path)
+    restarted.artifact_reclaimer.collect_garbage()
+    restarted.artifact_reclaimer.reclaim(_retry_claim(claim))
+    summary = restarted.artifact_reclaimer.quarantine_summary()
+    assert summary.bundle_count == 1
+    assert summary.retained_bytes > 0
 
 
 def test_quarantine_preserves_payload_replaced_after_final_validation(
