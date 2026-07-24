@@ -47,6 +47,20 @@ from tests.unit.test_strategy_job_adapters import _claim, _nshape_compare_spec
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
 
 
+@contextmanager
+def _raising_loguru_sink() -> Iterator[None]:
+    from loguru import logger
+
+    def fail_sink(_message: object) -> None:
+        raise RuntimeError("injected catch-false log sink failure")
+
+    sink = logger.add(fail_sink, level="WARNING", catch=False)
+    try:
+        yield
+    finally:
+        logger.remove(sink)
+
+
 def _accept_report(
     report: LabWorkerReport,
     _timeout_seconds: float,
@@ -523,7 +537,9 @@ def test_bounded_quarantine_recovery_never_rehashes_deferred_payloads(
 
     assert result.inspected == 0
     assert result.cold_metadata_checked == 1
-    assert len(tuple(reclaimer.garbage_cold_intent_dir.iterdir())) == bundle_count
+    archived = len(tuple(reclaimer.garbage_cold_intent_dir.iterdir()))
+    pending_health = len(tuple(reclaimer.garbage_cold_health_dir.iterdir()))
+    assert archived + pending_health == bundle_count
     assert inventory_calls == 0
 
 
@@ -557,10 +573,83 @@ def test_bounded_quarantine_recovery_is_fair_across_restarts(tmp_path: Path) -> 
     assert restarted.quarantine_summary().bundle_count == 5
 
 
+def test_quarantine_recovery_uses_created_at_not_uuid_across_restarts(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer, LabGarbageOwner
+
+    artifact_root = tmp_path / "artifacts"
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=artifact_root,
+        report_spool=reports,
+    )
+    fixtures: list[tuple[LabGarbageOwner, Path]] = []
+    for index in range(121):
+        victim = artifact_root / "active-created-at" / f"result-{index:03d}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"active-{index}".encode())
+        fixtures.append((reclaimer._garbage_owner(victim, purpose="fairness fixture"), victim))
+    fixtures.sort(key=lambda item: item[0].garbage_id.hex)
+    old_owner, old_victim = fixtures[-1]
+    reclaimer._write_prepared_intent(
+        reclaimer._prepared_intent(old_owner, created_at=NOW),
+    )
+
+    old_processed_at: int | None = None
+    for index, (owner, _victim) in enumerate(fixtures[:-1], start=1):
+        reclaimer._write_prepared_intent(
+            reclaimer._prepared_intent(
+                owner,
+                created_at=NOW + timedelta(seconds=index),
+            )
+        )
+        restarted = LabArtifactReclaimer(
+            artifact_root=artifact_root,
+            report_spool=LabReportSpool(tmp_path / "reports"),
+        )
+        restarted.recover_active(max_entries=1)
+        if old_processed_at is None and not old_victim.exists():
+            old_processed_at = index
+
+    assert old_processed_at is not None, "oldest active intent was starved by newer UUIDs"
+    assert old_processed_at <= 3
+
+
+def test_quarantine_recovery_does_not_parse_cold_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    for index in range(10_000):
+        marker = reclaimer.garbage_cold_intent_dir / (
+            f"{UUID(int=index + 1).hex}-prepared-intent-v1.json"
+        )
+        marker.write_bytes(b"cold history must not be parsed")
+    original_load = reclaimer._load_prepared_intent
+
+    def reject_cold_parse(path: Path) -> object:
+        if path.parent == reclaimer.garbage_cold_intent_dir:
+            raise AssertionError("ordinary recovery parsed cold quarantine history")
+        return original_load(path)
+
+    monkeypatch.setattr(reclaimer, "_load_prepared_intent", reject_cold_parse)
+
+    result = reclaimer.recover_active(max_entries=1)
+
+    assert result.inspected == 0
+    assert result.cold_metadata_checked == 0
+
+
 def test_bounded_quarantine_recovery_migrates_legacy_intent_once(
     tmp_path: Path,
 ) -> None:
-    from rquant.lab_worker import LabArtifactReclaimer
+    from rquant.lab_worker import LabArtifactReclaimer, LabGarbagePreparedIntent
 
     artifact_root = tmp_path / "artifacts"
     reports = LabReportSpool(tmp_path / "reports")
@@ -573,7 +662,12 @@ def test_bounded_quarantine_recovery_migrates_legacy_intent_once(
     victim.parent.mkdir(parents=True)
     victim.write_bytes(b"legacy-active")
     owner = legacy._garbage_owner(victim, purpose="legacy active fixture")
-    intent = legacy._prepared_intent(owner)
+    intent = LabGarbagePreparedIntent(
+        schema_version=1,
+        source_relative_path=owner.original_relative_path,
+        staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+        owner=owner,
+    )
     legacy._prepared_intent_path(owner.garbage_id).write_text(
         intent.canonical_json(),
         encoding="utf-8",
@@ -611,7 +705,8 @@ def test_damaged_cold_quarantine_warns_without_blocking_unrelated_claim(
     deferred = next(worker.artifact_reclaimer.garbage_deferred_dir.iterdir())
     (deferred / "unexpected.bin").write_bytes(b"foreign-metadata")
 
-    result = worker.run_once()
+    with _raising_loguru_sink():
+        result = worker.run_once()
 
     assert result.status == "succeeded"
     assert registry.executions == 1
@@ -648,7 +743,8 @@ def test_success_receipt_timeout_emits_structured_worker_warning(tmp_path: Path)
         level="WARNING",
     )
     try:
-        result = worker.run_once()
+        with _raising_loguru_sink():
+            result = worker.run_once()
     finally:
         logger.remove(sink)
 
@@ -707,12 +803,7 @@ def test_adapter_runtime_error_emits_structured_worker_failure(tmp_path: Path) -
     assert extra["error_type"] == "RuntimeError"  # type: ignore[index]
 
 
-def test_worker_failure_logging_error_does_not_change_tick_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import rquant.lab_worker as lab_worker_module
-
+def test_worker_failure_logging_error_does_not_change_tick_result(tmp_path: Path) -> None:
     claims = LabClaimSpool(tmp_path / "claims")
     claims.publish(_claim(_nshape_compare_spec(hold_days=(1,))))
     worker = _worker(
@@ -721,12 +812,10 @@ def test_worker_failure_logging_error_does_not_change_tick_result(
         registry=RecordingRegistry(failure=RuntimeError("adapter failure")),
     )
 
-    def fail_logging(**_fields: object) -> object:
-        raise RuntimeError("logging transport failed")
+    with _raising_loguru_sink():
+        result = worker.run_once()
 
-    monkeypatch.setattr(lab_worker_module.logger, "bind", fail_logging)
-
-    assert worker.run_once().status == "failed"
+    assert result.status == "failed"
 
 
 @pytest.mark.parametrize("mode", ["idle", "stopped"])
@@ -4898,7 +4987,8 @@ def test_stale_success_rejection_retries_failed_reconciliation(
 
     claims.set_claim_advance_hook(flaky_reclaim)
     clock[0] = NOW + timedelta(seconds=21)
-    recovery = scheduler.run_once()
+    with _raising_loguru_sink():
+        recovery = scheduler.run_once()
     fresh_claim = claims.current(old_claim.job_id, old_claim.shard_id).claim
     assert recovery.claim_reconcile_failures == 1
     assert sealed.is_dir()

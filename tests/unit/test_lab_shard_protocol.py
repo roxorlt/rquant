@@ -309,7 +309,61 @@ def test_hot_claim_batches_are_fair_bounded_and_ignore_cold_consumed_history(
     assert consumed.claim_token in observed_tokens
     assert revoked.claim_token in observed_tokens
     assert observed_namespaces == {"pending", "current", "revoked"}
-    assert all(batch.inspected <= 2 for batch in batches)
+    always_hot = len(tuple(spool.current_dir.iterdir())) + len(tuple(spool.revoked_dir.iterdir()))
+    assert all(batch.inspected <= always_hot + 2 for batch in batches)
+
+
+@pytest.mark.parametrize("namespace", ["current", "revoked"])
+def test_uuid_hot_authority_cannot_starve_across_restart_and_continuous_insert(
+    tmp_path: Path,
+    namespace: str,
+) -> None:
+    root = tmp_path / "claims"
+    old = _claim(definition=_definition(index=20_000)).model_copy(
+        update={
+            "job_id": UUID(int=(1 << 128) - 2),
+            "claim_token": UUID(int=(1 << 128) - 2),
+        }
+    )
+    spool = LabClaimSpool(root)
+    if namespace == "current":
+        spool.consume(spool.publish(old))
+    else:
+        spool.revoke(old, reason="old unreconciled fixture")
+
+    observed_at: int | None = None
+    for index in range(1, 121):
+        fresh = _claim(definition=_definition(index=index)).model_copy(
+            update={
+                "job_id": UUID(int=index),
+                "claim_token": UUID(int=index),
+            }
+        )
+        restarted = LabClaimSpool(root)
+        if namespace == "current":
+            restarted.consume(restarted.publish(fresh))
+        else:
+            restarted.revoke(fresh, reason="new unreconciled fixture")
+        batch = LabClaimSpool(root).hot_delivery_batch(limit=1)
+        if observed_at is None and old.claim_token in {claim.claim_token for claim in batch.claims}:
+            observed_at = index
+
+    assert observed_at is not None, f"old {namespace} authority was starved by newer UUIDs"
+    assert observed_at <= 3
+
+
+def test_pending_hot_cursor_advances_only_by_monotonic_delivery_sequence(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    for index in range(4):
+        spool.publish(_claim(definition=_definition(index=index)))
+
+    cursors = tuple(LabClaimSpool(root).hot_delivery_batch(limit=1).next_cursor for _ in range(4))
+
+    assert [cursor.after_sequence for cursor in cursors] == [1, 2, 3, 4]
+    assert {cursor.cycle_ceiling_sequence for cursor in cursors} == {4}
 
 
 def test_hot_claim_scan_does_not_glob_or_parse_cold_history(

@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from threading import Event
 from uuid import UUID
 
-from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.lab_job_protocol import (
@@ -20,6 +19,7 @@ from rquant.lab_jobs import (
     LabLeaseRecord,
     SchedulerLeaseFencedError,
 )
+from rquant.lab_logging import _safe_structured_log
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim
 from rquant.strategy_job_adapters import StrategyJobAdapterRegistry
 
@@ -212,17 +212,16 @@ class LabScheduler:
                 self.claim_spool.publish(active_claim)
             except Exception as exc:
                 delivery_failures += 1
-                logger.bind(
+                _safe_structured_log(
+                    "error",
+                    "claim_publish_failed",
+                    message=_safe_error_message(exc),
                     component="lab_scheduler",
                     owner_id=self.owner_id,
-                    failure="claim_publish_failed",
                     job_id=str(active_claim.job_id),
                     shard_id=str(active_claim.shard_id),
                     claim_token=str(active_claim.claim_token),
                     error_type=type(exc).__name__,
-                ).error(
-                    "Strategy Lab claim publish failed: {message}",
-                    message=_safe_error_message(exc),
                 )
             else:
                 if active_claim.claim_token in new_claim_tokens:
@@ -236,14 +235,13 @@ class LabScheduler:
                 limit=self.max_claim_authority_per_tick,
             )
         except Exception as exc:
-            logger.bind(
+            _safe_structured_log(
+                "error",
+                "claim_authority_scan_failed",
+                message=_safe_error_message(exc),
                 component="lab_scheduler",
                 owner_id=self.owner_id,
-                failure="claim_authority_scan_failed",
                 error_type=type(exc).__name__,
-            ).error(
-                "Strategy Lab bounded claim authority scan failed: {message}",
-                message=_safe_error_message(exc),
             )
             return _ClaimAuthorityTick(
                 claims_published=published,
@@ -263,15 +261,14 @@ class LabScheduler:
                 claims=stale,
             )
         except Exception as exc:
-            logger.bind(
+            _safe_structured_log(
+                "error",
+                "claim_success_evidence_failed",
+                message=_safe_error_message(exc),
                 component="lab_scheduler",
                 owner_id=self.owner_id,
-                failure="claim_success_evidence_failed",
                 candidate_count=len(stale),
                 error_type=type(exc).__name__,
-            ).error(
-                "Strategy Lab claim success evidence lookup failed: {message}",
-                message=_safe_error_message(exc),
             )
             return _ClaimAuthorityTick(
                 claims_published=published,
@@ -302,17 +299,16 @@ class LabScheduler:
                     )
             except Exception as exc:
                 revoke_failures += 1
-                logger.bind(
+                _safe_structured_log(
+                    "error",
+                    "claim_retire_failed",
+                    message=_safe_error_message(exc),
                     component="lab_scheduler",
                     owner_id=self.owner_id,
-                    failure="claim_retire_failed",
                     job_id=str(delivery.job_id),
                     shard_id=str(delivery.shard_id),
                     claim_token=str(delivery.claim_token),
                     error_type=type(exc).__name__,
-                ).error(
-                    "Strategy Lab claim revoke/retire failed: {message}",
-                    message=_safe_error_message(exc),
                 )
             else:
                 retired += 1
@@ -327,16 +323,15 @@ class LabScheduler:
             elif outcome.status == "failed":
                 reconcile_failures += 1
                 hook_claim = hook_claim_by_token[outcome.claim_token]
-                logger.bind(
+                _safe_structured_log(
+                    "warning",
+                    "claim_reconcile_failed",
+                    message=outcome.error or "unknown reconciliation failure",
                     component="lab_scheduler",
                     owner_id=self.owner_id,
-                    failure="claim_reconcile_failed",
                     job_id=str(hook_claim.job_id),
                     shard_id=str(hook_claim.shard_id),
                     claim_token=str(hook_claim.claim_token),
-                ).warning(
-                    "Strategy Lab claim artifact reconciliation failed: {message}",
-                    message=outcome.error or "unknown reconciliation failure",
                 )
         return _ClaimAuthorityTick(
             claims_published=published,
@@ -433,17 +428,16 @@ class LabScheduler:
                         now=mutation_now,
                     )
                 except RequestContentConflictError as exc:
-                    logger.bind(
+                    _safe_structured_log(
+                        "error",
+                        "report_content_conflict",
+                        message=_safe_error_message(exc),
                         component="lab_scheduler",
                         owner_id=self.owner_id,
-                        failure="report_content_conflict",
                         job_id=str(entry.report.job_id),
                         shard_id=str(entry.report.shard_id),
                         report_id=str(entry.report.report_id),
                         error_type=type(exc).__name__,
-                    ).error(
-                        "Strategy Lab worker report content conflict: {message}",
-                        message=_safe_error_message(exc),
                     )
                     self.report_spool.quarantine(
                         entry,
@@ -456,18 +450,17 @@ class LabScheduler:
                     reports_accepted += 1
                 else:
                     reports_rejected += 1
-                    logger.bind(
+                    _safe_structured_log(
+                        "warning",
+                        "worker_report_rejected",
+                        message=receipt.reason,
                         component="lab_scheduler",
                         owner_id=self.owner_id,
-                        failure="worker_report_rejected",
                         job_id=str(entry.report.job_id),
                         shard_id=str(entry.report.shard_id),
                         claim_token=str(entry.report.claim_token),
                         report_id=str(entry.report.report_id),
                         report_type=entry.report.body.report_type,
-                    ).warning(
-                        "Strategy Lab worker report was rejected: {reason}",
-                        reason=" ".join(receipt.reason.split())[:400],
                     )
                 self.report_spool.ack(entry, receipt)
         plans_created = 0
@@ -479,15 +472,14 @@ class LabScheduler:
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()
                     authority_now = mutation_now
-                    logger.bind(
+                    _safe_structured_log(
+                        "error",
+                        "adapter_plan_failed",
+                        message=_safe_error_message(exc),
                         component="lab_scheduler",
                         owner_id=self.owner_id,
-                        failure="adapter_plan_failed",
                         job_id=str(job.job_id),
                         error_type=type(exc).__name__,
-                    ).error(
-                        "Strategy Lab adapter planning failed: {message}",
-                        message=_safe_error_message(exc),
                     )
                     self.store.fail_unplanned_job(
                         job.job_id,
@@ -602,9 +594,11 @@ class LabScheduler:
         }
         if not anomaly_counts:
             return
-        logger.bind(
+        _safe_structured_log(
+            "warning",
+            "tick_anomalies",
+            message="Strategy Lab scheduler tick completed with anomalies",
             component="lab_scheduler",
             owner_id=self.owner_id,
-            failure="tick_anomalies",
             anomaly_counts=anomaly_counts,
-        ).warning("Strategy Lab scheduler tick completed with anomalies")
+        )

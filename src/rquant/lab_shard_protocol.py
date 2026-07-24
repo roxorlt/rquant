@@ -541,43 +541,32 @@ class LabAdmittedExecution(LabShardProtocolModel):
 LabHotClaimNamespace = Literal["pending", "current", "revoked"]
 
 
-class LabHotNamespaceCursor(LabShardProtocolModel):
-    after_name: str | None = None
-    cycle_ceiling: str | None = None
-
-    @model_validator(mode="after")
-    def validate_cycle(self) -> LabHotNamespaceCursor:
-        if (self.after_name is None) != (self.cycle_ceiling is None):
-            raise ValueError("hot namespace cursor bounds must be both present or absent")
-        if (
-            self.after_name is not None
-            and self.cycle_ceiling is not None
-            and self.after_name > self.cycle_ceiling
-        ):
-            raise ValueError("hot namespace cursor exceeds its cycle ceiling")
-        return self
-
-
-class LabHotClaimCursor(LabShardProtocolModel):
+class LabPendingClaimCursor(LabShardProtocolModel):
     schema_version: Literal[1] = 1
-    pending: LabHotNamespaceCursor = Field(default_factory=LabHotNamespaceCursor)
-    current: LabHotNamespaceCursor = Field(default_factory=LabHotNamespaceCursor)
-    revoked: LabHotNamespaceCursor = Field(default_factory=LabHotNamespaceCursor)
-    next_namespace: LabHotClaimNamespace = "pending"
+    after_sequence: int | None = Field(default=None, ge=0)
+    cycle_ceiling_sequence: int | None = Field(default=None, ge=0)
     content_hash: str = ""
 
     @model_validator(mode="after")
-    def validate_content_hash(self) -> LabHotClaimCursor:
+    def validate_content_hash(self) -> LabPendingClaimCursor:
+        if (self.after_sequence is None) != (self.cycle_ceiling_sequence is None):
+            raise ValueError("pending claim cursor bounds must be both present or absent")
+        if (
+            self.after_sequence is not None
+            and self.cycle_ceiling_sequence is not None
+            and self.after_sequence > self.cycle_ceiling_sequence
+        ):
+            raise ValueError("pending claim cursor exceeds its cycle ceiling")
         expected = _canonical_hash(self.model_dump(mode="json", exclude={"content_hash"}))
         if self.content_hash and self.content_hash != expected:
-            raise ValueError("content_hash does not match hot claim cursor")
+            raise ValueError("content_hash does not match pending claim cursor")
         object.__setattr__(self, "content_hash", expected)
         return self
 
 
 class LabHotClaimBatch(LabShardProtocolModel):
     claims: tuple[LabShardClaim, ...]
-    next_cursor: LabHotClaimCursor
+    next_cursor: LabPendingClaimCursor
     scanned_namespaces: tuple[LabHotClaimNamespace, ...] = ()
     inspected: int = Field(ge=0)
 
@@ -666,7 +655,7 @@ class LabClaimSpool(_TypedSpoolBase):
         self.retired_dir = self.root / "archive" / "retired"
         self.revoked_dir = self.root / "revoked"
         self.archived_revoked_dir = self.root / "archive" / "revoked"
-        self.hot_cursor_path = self.root / ".hot-authority-cursor-v1.json"
+        self.pending_cursor_path = self.root / ".hot-pending-cursor-v1.json"
         self.admitted_dir = self.root / "admitted"
         self.admission_tmp_dir = self.admitted_dir / ".tmp"
         self.current_dir.mkdir(parents=True, exist_ok=True)
@@ -710,32 +699,34 @@ class LabClaimSpool(_TypedSpoolBase):
     def _admission_path(self, claim_token: UUID) -> Path:
         return self.admitted_dir / f"{claim_token}.json"
 
-    def _load_hot_cursor_locked(self) -> LabHotClaimCursor:
-        if not os.path.lexists(self.hot_cursor_path):
-            return LabHotClaimCursor()
+    def _load_pending_cursor_locked(self) -> LabPendingClaimCursor:
+        if not os.path.lexists(self.pending_cursor_path):
+            return LabPendingClaimCursor()
         _candidate, payload, _file_stat = self._read_regular_child(
-            self.hot_cursor_path,
+            self.pending_cursor_path,
             self.root,
         )
         try:
-            return LabHotClaimCursor.model_validate_json(payload)
+            return LabPendingClaimCursor.model_validate_json(payload)
         except Exception as exc:
-            raise InvalidCommandEnvelopeError(f"invalid durable hot claim cursor: {exc}") from exc
+            raise InvalidCommandEnvelopeError(
+                f"invalid durable pending claim cursor: {exc}"
+            ) from exc
 
-    def _publish_hot_cursor_locked(self, cursor: LabHotClaimCursor) -> None:
-        validated = LabHotClaimCursor.model_validate(cursor)
-        temporary = self.root / f".{self.hot_cursor_path.name}.{uuid4().hex}.tmp"
+    def _publish_pending_cursor_locked(self, cursor: LabPendingClaimCursor) -> None:
+        validated = LabPendingClaimCursor.model_validate(cursor)
+        temporary = self.root / f".{self.pending_cursor_path.name}.{uuid4().hex}.tmp"
         try:
             with temporary.open("xb") as stream:
                 stream.write(validated.model_dump_json().encode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.hot_cursor_path)
+            os.replace(temporary, self.pending_cursor_path)
             self._fsync_directory(self.root)
         finally:
             temporary.unlink(missing_ok=True)
-        if self._load_hot_cursor_locked() != validated:
-            raise InvalidCommandEnvelopeError("durable hot claim cursor readback mismatch")
+        if self._load_pending_cursor_locked() != validated:
+            raise InvalidCommandEnvelopeError("durable pending claim cursor readback mismatch")
 
     @staticmethod
     def _hot_namespace_paths(directory: Path) -> tuple[Path, ...]:
@@ -763,36 +754,46 @@ class LabClaimSpool(_TypedSpoolBase):
         return tuple(sorted(paths, key=lambda path: path.name))
 
     @staticmethod
-    def _hot_namespace_slice(
+    def _pending_slice(
         paths: tuple[Path, ...],
         *,
-        cursor: LabHotNamespaceCursor,
+        cursor: LabPendingClaimCursor,
         limit: int,
-    ) -> tuple[tuple[Path, ...], LabHotNamespaceCursor]:
+    ) -> tuple[tuple[Path, ...], LabPendingClaimCursor]:
         if not paths:
-            return (), LabHotNamespaceCursor()
-        names = [path.name for path in paths]
-        after_name = cursor.after_name
-        cycle_ceiling = cursor.cycle_ceiling
-        if after_name is None or cycle_ceiling is None:
-            after_name = ""
-            cycle_ceiling = names[-1]
-        start = bisect_right(names, after_name)
-        stop = bisect_right(names, cycle_ceiling)
+            return (), LabPendingClaimCursor()
+        sequenced: list[tuple[int, Path]] = []
+        for path in paths:
+            sequence, _message_id = _TypedSpoolBase._message_name_parts(path.name)
+            if sequence is None:
+                raise InvalidCommandEnvelopeError(
+                    f"hot pending claim lacks durable delivery sequence: {path.name}"
+                )
+            sequenced.append((sequence, path))
+        sequenced.sort(key=lambda item: item[0])
+        sequences = [item[0] for item in sequenced]
+        after_sequence = cursor.after_sequence
+        cycle_ceiling = cursor.cycle_ceiling_sequence
+        if after_sequence is None or cycle_ceiling is None:
+            after_sequence = 0
+            cycle_ceiling = sequences[-1]
+        start = bisect_right(sequences, after_sequence)
+        stop = bisect_right(sequences, cycle_ceiling)
         if start >= stop:
-            after_name = ""
-            cycle_ceiling = names[-1]
+            after_sequence = 0
+            cycle_ceiling = sequences[-1]
             start = 0
-            stop = len(paths)
-        selected = paths[start : min(stop, start + limit)]
+            stop = len(sequenced)
+        selected_items = sequenced[start : min(stop, start + limit)]
+        selected = tuple(path for _sequence, path in selected_items)
         if not selected:
-            return (), LabHotNamespaceCursor(
-                after_name=after_name,
-                cycle_ceiling=cycle_ceiling,
+            return (), LabPendingClaimCursor(
+                after_sequence=after_sequence,
+                cycle_ceiling_sequence=cycle_ceiling,
             )
-        return selected, LabHotNamespaceCursor(
-            after_name=selected[-1].name,
-            cycle_ceiling=cycle_ceiling,
+        return selected, LabPendingClaimCursor(
+            after_sequence=selected_items[-1][0],
+            cycle_ceiling_sequence=cycle_ceiling,
         )
 
     def _load_consumed_locked(self, claim_token: UUID) -> LabConsumedClaim:
@@ -1443,20 +1444,19 @@ class LabClaimSpool(_TypedSpoolBase):
         self,
         *,
         limit: int,
-        cursor: LabHotClaimCursor | None = None,
+        cursor: LabPendingClaimCursor | None = None,
     ) -> LabHotClaimBatch:
-        """Read a fair bounded slice of hot authority without touching cold history."""
+        """Read bounded pending plus every active/unreconciled hot authority entry."""
         if limit < 1:
             raise ValueError("hot delivery batch limit must be positive")
         with self._exclusive_lock():
-            durable_cursor = self._load_hot_cursor_locked()
+            durable_cursor = self._load_pending_cursor_locked()
             if cursor is not None:
-                requested_cursor = LabHotClaimCursor.model_validate(cursor)
+                requested_cursor = LabPendingClaimCursor.model_validate(cursor)
                 if requested_cursor != durable_cursor:
                     raise RequestContentConflictError(
-                        "hot claim cursor conflicts with durable authority cursor"
+                        "pending claim cursor conflicts with durable authority cursor"
                     )
-            active_cursor = durable_cursor
             namespace_order: tuple[LabHotClaimNamespace, ...] = (
                 "pending",
                 "current",
@@ -1471,49 +1471,23 @@ class LabClaimSpool(_TypedSpoolBase):
                 namespace: self._hot_namespace_paths(directories[namespace])
                 for namespace in namespace_order
             }
-            nonempty = {
-                namespace
-                for namespace, namespace_paths in paths_by_namespace.items()
-                if namespace_paths
-            }
-            budgets: dict[LabHotClaimNamespace, int] = {
-                namespace: 0 for namespace in namespace_order
+            claims: dict[UUID, LabShardClaim] = {}
+            pending_paths, next_cursor = self._pending_slice(
+                paths_by_namespace["pending"],
+                cursor=durable_cursor,
+                limit=limit,
+            )
+            selected_by_namespace = {
+                "pending": pending_paths,
+                "current": paths_by_namespace["current"],
+                "revoked": paths_by_namespace["revoked"],
             }
             scanned_namespaces: list[LabHotClaimNamespace] = []
-            position = namespace_order.index(active_cursor.next_namespace)
-            for _ in range(limit):
-                if not nonempty:
-                    break
-                for offset in range(len(namespace_order)):
-                    candidate_position = (position + offset) % len(namespace_order)
-                    namespace = namespace_order[candidate_position]
-                    if namespace in nonempty:
-                        budgets[namespace] += 1
-                        if namespace not in scanned_namespaces:
-                            scanned_namespaces.append(namespace)
-                        position = (candidate_position + 1) % len(namespace_order)
-                        break
-
-            claims: dict[UUID, LabShardClaim] = {}
-            inspected = 0
-            namespace_cursors: dict[LabHotClaimNamespace, LabHotNamespaceCursor] = {}
+            inspected = sum(len(paths) for paths in selected_by_namespace.values())
             for namespace in namespace_order:
-                selected, namespace_cursor = (
-                    self._hot_namespace_slice(
-                        paths_by_namespace[namespace],
-                        cursor=getattr(active_cursor, namespace),
-                        limit=budgets[namespace],
-                    )
-                    if budgets[namespace]
-                    else (
-                        (),
-                        getattr(active_cursor, namespace)
-                        if paths_by_namespace[namespace]
-                        else LabHotNamespaceCursor(),
-                    )
-                )
-                namespace_cursors[namespace] = namespace_cursor
-                inspected += len(selected)
+                selected = selected_by_namespace[namespace]
+                if selected:
+                    scanned_namespaces.append(namespace)
                 for path in selected:
                     if namespace == "pending":
                         claim = self.load(path).claim
@@ -1536,14 +1510,8 @@ class LabClaimSpool(_TypedSpoolBase):
                             f"claim_token {claim.claim_token} has conflicting hot evidence"
                         )
                     claims[claim.claim_token] = claim
-            next_cursor = LabHotClaimCursor(
-                pending=namespace_cursors["pending"],
-                current=namespace_cursors["current"],
-                revoked=namespace_cursors["revoked"],
-                next_namespace=namespace_order[position],
-            )
             if next_cursor != durable_cursor:
-                self._publish_hot_cursor_locked(next_cursor)
+                self._publish_pending_cursor_locked(next_cursor)
             return LabHotClaimBatch(
                 claims=tuple(claims.values()),
                 next_cursor=next_cursor,
