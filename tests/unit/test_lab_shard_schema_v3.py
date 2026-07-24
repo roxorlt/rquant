@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 import rquant.lab_jobs as lab_jobs
-from rquant.lab_job_protocol import LabCommandEnvelope, ResumeJobCommand
+from rquant.lab_job_protocol import LabCommandEnvelope, ResumeJobCommand, RetryJobCommand
 from rquant.lab_jobs import (
     InvalidStoredJobError,
     JobStatus,
@@ -284,6 +284,127 @@ def test_v2_checkpointed_shard_becomes_claimable_only_after_resume(tmp_path: Pat
 
     assert resumed.status == "applied"
     assert claim is not None and claim.job_id == lab_jobs.UUID(job_id)
+
+
+@pytest.mark.parametrize("legacy_status", [ShardStatus.RUNNING, ShardStatus.CHECKPOINTED])
+def test_v2_exhausted_nonterminal_shard_fails_entire_job_during_migration(
+    tmp_path: Path,
+    legacy_status: ShardStatus,
+) -> None:
+    path = tmp_path / f"exhausted-{legacy_status.value}.sqlite3"
+    job_id, shard_id = _create_real_v2_fixture(path)
+    sibling_id = str(uuid4())
+    timestamp = NOW.isoformat(timespec="microseconds")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = ?, version = 1, attempt_count = 1,
+                recoverable = 1, scheduler_fencing_token = 7
+            WHERE job_id = ?
+            """,
+            (legacy_status.value, job_id),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, version = 1, attempt_count = max_attempts,
+                worker_id = 'legacy-exhausted', scheduler_fencing_token = 7,
+                checkpoint_json = '{"cursor":9}'
+            WHERE job_id = ? AND shard_id = ?
+            """,
+            (legacy_status.value, job_id, shard_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO lab_shard (
+                shard_id, job_id, shard_index, status, version,
+                attempt_count, max_attempts, worker_id,
+                scheduler_fencing_token, checkpoint_json, created_at, updated_at
+            ) VALUES (?, ?, 1, 'queued', 0, 0, 3, NULL, NULL, NULL, ?, ?)
+            """,
+            (sibling_id, job_id, timestamp, timestamp),
+        )
+
+    store = LabJobStore(path)
+    store.initialize()
+    restarted = LabJobStore(path)
+    restarted.initialize()
+    reader = LabJobReader(path)
+    job = reader.get_job(lab_jobs.UUID(job_id))
+    shards = reader.list_shards(lab_jobs.UUID(job_id))
+
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.recoverable is False
+    assert job.control_intent.value == "none"
+    assert job.version == 2
+    assert all(shard.status is ShardStatus.FAILED for shard in shards)
+    assert [shard.version for shard in shards] == [2, 1]
+    assert shards[0].failure_json == '{"reason":"attempts_exhausted"}'
+    assert shards[1].failure_json == '{"reason":"parent_failed_attempts_exhausted"}'
+    for shard in shards:
+        assert shard.finished_at == NOW
+        assert shard.checkpoint_json is None
+        assert (
+            shard.worker_id,
+            shard.scheduler_fencing_token,
+            shard.claim_token,
+            shard.claimed_at,
+            shard.heartbeat_at,
+            shard.lease_expires_at,
+        ) == (None, None, None, None, None, None)
+    lease = _lease(restarted, owner="migration-review", now=NOW + timedelta(seconds=2))
+    retry = restarted.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=lab_jobs.UUID(job_id),
+                expected_version=job.version,
+                reason="must not retry migrated exhaustion",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert retry.status == "rejected"
+    assert retry.reason == "not_recoverable"
+
+
+def test_v2_migrated_idle_pause_converges_without_worker(tmp_path: Path) -> None:
+    path = tmp_path / "idle-pause.sqlite3"
+    job_id, shard_id = _create_real_v2_fixture(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = 'running', control_intent = 'pause_requested',
+                version = 1, scheduler_fencing_token = 7
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = 'running', version = 1, attempt_count = 1,
+                worker_id = 'legacy-worker', scheduler_fencing_token = 7
+            WHERE job_id = ? AND shard_id = ?
+            """,
+            (job_id, shard_id),
+        )
+
+    store = LabJobStore(path)
+    store.initialize()
+    lease = _lease(store, owner="migration-pause", now=NOW + timedelta(seconds=2))
+    recovered = store.recover_stale_shards(lease, now=NOW + timedelta(seconds=3))
+    job = LabJobReader(path).get_job(lab_jobs.UUID(job_id))
+    shard = LabJobReader(path).list_shards(lab_jobs.UUID(job_id))[0]
+
+    assert recovered == (lab_jobs.UUID(job_id),)
+    assert job is not None and job.status is JobStatus.CHECKPOINTED
+    assert job.control_intent.value == "none"
+    assert shard.status is ShardStatus.QUEUED
+    assert shard.worker_id is None and shard.claim_token is None
 
 
 @pytest.mark.parametrize(

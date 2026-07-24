@@ -20,6 +20,7 @@ from rquant.lab_job_protocol import (
 )
 from rquant.lab_jobs import (
     ControlIntent,
+    InvalidJobTransitionError,
     InvalidStoredJobError,
     JobStatus,
     LabJobReader,
@@ -486,7 +487,7 @@ def test_heartbeat_rejects_scheduler_time_before_claimed_at(tmp_path: Path) -> N
     )
 
     assert receipt.status == "rejected"
-    assert receipt.reason == "backdated_heartbeat"
+    assert receipt.reason == "backdated_report"
     assert LabJobReader(store.path).list_shards(job_id)[0] == before
 
 
@@ -508,8 +509,55 @@ def test_heartbeat_rejects_scheduler_time_before_previous_heartbeat(tmp_path: Pa
     )
 
     assert receipt.status == "rejected"
-    assert receipt.reason == "backdated_heartbeat"
+    assert receipt.reason == "backdated_report"
     assert LabJobReader(store.path).list_shards(job_id)[0] == before
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        LabShardHeartbeat(lease_extension_seconds=30),
+        LabShardSucceeded(result_manifest_hash="6" * 64),
+        LabShardFailed(failure_json='{"reason":"backdated"}'),
+        LabWorkerStopped(reason="backdated stop"),
+    ],
+)
+@pytest.mark.parametrize("backdated_source", ["scheduler_now", "reported_at"])
+def test_all_report_types_reject_backdated_scheduler_or_reported_time(
+    tmp_path: Path,
+    body: LabShardHeartbeat | LabShardSucceeded | LabShardFailed | LabWorkerStopped,
+    backdated_source: str,
+) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    if backdated_source == "scheduler_now":
+        claim = _claim(store, lease, now_offset=10, duration=300)
+        report = _report(claim, body, offset=11)
+        apply_at = NOW + timedelta(seconds=9)
+    else:
+        claim = _claim(store, lease, duration=300)
+        heartbeat = store.apply_worker_report(
+            _report(claim, LabShardHeartbeat(lease_extension_seconds=30), offset=10),
+            lease=lease,
+            now=NOW + timedelta(seconds=10),
+        )
+        assert heartbeat.status == "accepted"
+        report = _report(claim, body, offset=9)
+        apply_at = NOW + timedelta(seconds=11)
+    before = LabJobReader(store.path).list_shards(job_id)[0]
+
+    receipt = store.apply_worker_report(
+        report,
+        lease=lease,
+        now=apply_at,
+    )
+
+    assert receipt.status == "rejected"
+    assert receipt.reason == "backdated_report"
+    persisted = LabJobReader(store.path).get_worker_report(report.report_id)
+    assert persisted is not None and persisted.receipt == receipt
+    after = LabJobReader(store.path).list_shards(job_id)[0]
+    assert after == before
+    assert after.finished_at is None
 
 
 def test_reader_rejects_heartbeat_before_claimed_at(tmp_path: Path) -> None:
@@ -638,6 +686,87 @@ def test_retry_atomically_fences_old_nonterminal_claims(tmp_path: Path) -> None:
     current = LabJobReader(store.path).list_shards(job_id)[stale_claim.shard_index]
     assert current.status is ShardStatus.RUNNING
     assert current.result_manifest_hash is None
+
+
+def test_recoverable_shard_failure_terminalizes_tree_before_atomic_retry(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=4, max_attempts=3)
+    failed_claim = _claim(store, lease, worker="worker-failed")
+    active_claim = _claim(store, lease, worker="worker-active", now_offset=3)
+    _seed_checkpointed_sibling(store, lease, job_id, shard_index=3)
+    before = LabJobReader(store.path).list_shards(job_id)
+
+    failed = store.apply_worker_report(
+        _report(
+            failed_claim,
+            LabShardFailed(failure_json='{"kind":"recoverable"}'),
+            offset=4,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert failed.status == "accepted"
+    failed_job = LabJobReader(store.path).get_job(job_id)
+    failed_shards = LabJobReader(store.path).list_shards(job_id)
+    assert failed_job is not None and failed_job.status is JobStatus.FAILED
+    assert failed_job.recoverable is True
+    assert all(shard.status is ShardStatus.FAILED for shard in failed_shards)
+    assert tuple(shard.version for shard in failed_shards) == tuple(
+        shard.version + 1 for shard in before
+    )
+    for shard in failed_shards:
+        assert (
+            shard.worker_id,
+            shard.scheduler_fencing_token,
+            shard.claim_token,
+            shard.claimed_at,
+            shard.heartbeat_at,
+            shard.lease_expires_at,
+            shard.checkpoint_json,
+        ) == (None, None, None, None, None, None, None)
+    assert failed_shards[failed_claim.shard_index].failure_json == '{"kind":"recoverable"}'
+    assert all(
+        shard.failure_json == '{"reason":"parent_failed_recoverable"}'
+        for shard in failed_shards
+        if shard.shard_index != failed_claim.shard_index
+    )
+    late = store.apply_worker_report(
+        _report(active_claim, LabWorkerStopped(reason="late active sibling"), offset=5),
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert late.status == "rejected"
+
+    retried = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=job_id,
+                expected_version=failed_job.version,
+                reason="retry coherent tree",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=6),
+    )
+
+    assert retried.status == "applied"
+    retried_job = LabJobReader(store.path).get_job(job_id)
+    retried_shards = LabJobReader(store.path).list_shards(job_id)
+    assert retried_job is not None and retried_job.status is JobStatus.QUEUED
+    assert all(shard.status is ShardStatus.QUEUED for shard in retried_shards)
+    assert tuple(shard.version for shard in retried_shards) == tuple(
+        shard.version + 1 for shard in failed_shards
+    )
+    assert all(
+        shard.failure_json is None
+        and shard.finished_at is None
+        and shard.worker_id is None
+        and shard.claim_token is None
+        for shard in retried_shards
+    )
 
 
 def test_report_commit_replay_is_exactly_once_and_conflict_is_rejected(tmp_path: Path) -> None:
@@ -1264,6 +1393,38 @@ def test_retried_large_job_cannot_reset_fair_cursor_and_insert_ahead(
     )
 
     assert claim_after_retry.job_id == new_job_id
+
+
+@pytest.mark.parametrize(
+    "target_status",
+    [JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CHECKPOINTED],
+)
+def test_public_transition_rejects_direct_lifecycle_change_for_sharded_job(
+    tmp_path: Path,
+    target_status: JobStatus,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    _claim(store, lease)
+    before_job = LabJobReader(store.path).get_job(job_id)
+    before_shards = LabJobReader(store.path).list_shards(job_id)
+    assert before_job is not None and before_job.status is JobStatus.RUNNING
+
+    with pytest.raises(
+        InvalidJobTransitionError,
+        match="sharded jobs require shard control-plane APIs",
+    ):
+        store.transition_job(
+            job_id,
+            expected_version=before_job.version,
+            target_status=target_status,
+            lease=lease,
+            reason="forbidden direct transition",
+            now=NOW + timedelta(seconds=3),
+            recoverable=True if target_status is JobStatus.FAILED else None,
+        )
+
+    assert LabJobReader(store.path).get_job(job_id) == before_job
+    assert LabJobReader(store.path).list_shards(job_id) == before_shards
 
 
 def test_cancel_first_rejects_success_then_stopped_confirms_cancel(tmp_path: Path) -> None:
