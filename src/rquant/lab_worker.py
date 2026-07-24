@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import signal
 import stat
 import threading
@@ -52,7 +51,15 @@ from rquant.strategy_job_adapters import (
 )
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
-_GARBAGE_DISPOSAL_SESSION = re.compile(r"(?P<garbage_id>[0-9a-f]{32})-(?P<nonce>[0-9a-f]{32})")
+_GARBAGE_LEDGER_NAME = re.compile(
+    r"(?P<garbage_id>[0-9a-f]{32})-(?P<sequence>[0-2])-"
+    r"(?P<state>prepared|quarantined|deferred_gc)\.json"
+)
+_GARBAGE_STATE_SEQUENCE = {
+    "prepared": 0,
+    "quarantined": 1,
+    "deferred_gc": 2,
+}
 
 
 def _system_clock() -> datetime:
@@ -274,6 +281,9 @@ class LabGarbageOwner(LabWorkerModel):
     garbage_id: UUID = UUID(int=0)
     purpose: str = Field(min_length=1)
     original_relative_path: str = Field(min_length=1)
+    protocol_phase: Literal["source_identified"] = "source_identified"
+    source_device: int = Field(default=0, ge=0)
+    source_inode: int = Field(default=0, ge=0)
     payload_type: Literal["directory", "regular"]
     inventory: tuple[LabGarbageInventoryEntry, ...]
     content_hash: str = ""
@@ -292,13 +302,23 @@ class LabGarbageOwner(LabWorkerModel):
             raise ValueError("garbage inventory paths must be unique")
         if self.inventory[0].file_type != self.payload_type:
             raise ValueError("garbage root inventory type conflicts with payload")
+        source = self.inventory[0]
+        if self.source_device and self.source_device != source.device:
+            raise ValueError("garbage owner source device conflicts with inventory")
+        if self.source_inode and self.source_inode != source.inode:
+            raise ValueError("garbage owner source inode conflicts with inventory")
+        object.__setattr__(self, "source_device", source.device)
+        object.__setattr__(self, "source_inode", source.inode)
         canonical = json.dumps(
             {
                 "inventory": [entry.model_dump(mode="json") for entry in self.inventory],
                 "original_relative_path": self.original_relative_path,
                 "payload_type": self.payload_type,
+                "protocol_phase": self.protocol_phase,
                 "purpose": self.purpose,
                 "schema_version": self.schema_version,
+                "source_device": source.device,
+                "source_inode": source.inode,
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -325,9 +345,37 @@ class LabGarbageOwner(LabWorkerModel):
         )
 
 
+class LabGarbageLedger(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    state: Literal["prepared", "quarantined", "deferred_gc"]
+    owner: LabGarbageOwner
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineEntry(LabWorkerModel):
+    state: Literal["prepared", "quarantined", "deferred_gc"]
+    owner: LabGarbageOwner
+    ledger_paths: tuple[Path, ...]
+    bundle_path: Path
+    retained_bytes: int = Field(ge=0)
+
+
+class LabQuarantineSummary(LabWorkerModel):
+    bundle_count: int = Field(ge=0)
+    retained_bytes: int = Field(ge=0)
+
+
 class LabReclaimLedger(LabWorkerModel):
     schema_version: Literal[2] = 2
-    state: Literal["prepared", "isolated"]
+    state: Literal["prepared", "isolated", "deferred_gc"]
     current_claim: LabShardClaim
     obsolete_claim: LabShardClaim
     manifest: LabShardResultManifest
@@ -336,6 +384,7 @@ class LabReclaimLedger(LabWorkerModel):
     tombstone_name: str = Field(min_length=1)
     source_device: int = Field(ge=0)
     source_inode: int = Field(ge=1)
+    quarantine_id: UUID | None = None
 
     @model_validator(mode="after")
     def validate_inventory(self) -> LabReclaimLedger:
@@ -347,6 +396,8 @@ class LabReclaimLedger(LabWorkerModel):
             raise ValueError("reclaim inventory must exactly cover manifest files")
         if len(paths) != len(set(paths)):
             raise ValueError("reclaim inventory paths must be unique")
+        if self.state == "deferred_gc" and self.quarantine_id is None:
+            raise ValueError("deferred reclaim ledger requires quarantine identity")
         return self
 
     def canonical_json(self) -> str:
@@ -563,7 +614,7 @@ class LabWorker:
     def _reclaim_current_candidate_directories(
         self,
         attempt_root: Path,
-        shard_root: Path,
+        _shard_root: Path,
         claim: LabShardClaim,
     ) -> None:
         self._assert_safe_temporary_tree(attempt_root)
@@ -578,11 +629,6 @@ class LabWorker:
                 child,
                 current_claim=claim,
             )
-        try:
-            attempt_root.rmdir()
-        except OSError:
-            return
-        _fsync_directory(shard_root)
 
     def _reclaim_obsolete_temporaries(self, claim: LabShardClaim) -> None:
         self.artifact_reclaimer.collect_garbage()
@@ -1020,30 +1066,12 @@ class LabWorker:
         return manifest
 
     def _cleanup_temporary(self, temporary: Path) -> None:
-        if temporary.is_symlink():
-            raise LabArtifactConflictError("temporary shard bundle is a symlink")
-        if temporary.exists():
-            for child in temporary.iterdir():
-                if child.is_symlink() or not child.is_file():
-                    raise LabArtifactConflictError(
-                        f"temporary shard bundle contains unsafe path: {child.name}"
-                    )
-                if child.lstat().st_nlink != 1:
-                    raise LabArtifactConflictError(
-                        f"temporary shard bundle contains a hard link: {child.name}"
-                    )
-                child.unlink()
-            temporary.rmdir()
-        stop = self.artifact_root / ".tmp"
-        parent = temporary.parent
-        while parent != stop.parent and parent != self.artifact_root:
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-            if parent == stop:
-                break
-            parent = parent.parent
+        if not os.path.lexists(temporary):
+            return
+        self.artifact_reclaimer.logical_quarantine_tree(
+            temporary,
+            purpose="worker candidate temporary cleanup",
+        )
 
     @staticmethod
     def _prepared_file_identities(
@@ -1161,12 +1189,14 @@ class LabWorker:
             raise LabArtifactConflictError(
                 "sealed bundle changed identity before compensating rollback"
             )
-        rollback = bundle.path.parent / f".rollback-{bundle.path.name}-{uuid4().hex}"
-        os.rename(bundle.path, rollback)
-        _fsync_directory(bundle.path.parent)
-        self._assert_safe_temporary_tree(rollback)
-        shutil.rmtree(rollback)
-        _fsync_directory(bundle.path.parent)
+        self.artifact_reclaimer.logical_quarantine_tree(
+            bundle.path,
+            purpose=(
+                "sealed rollback "
+                f"job={claim.job_id} shard={claim.shard_id} "
+                f"generation={claim.claim_generation} token={claim.claim_token}"
+            ),
+        )
 
     def _publish_candidate(
         self,
@@ -1608,7 +1638,7 @@ class LabWorker:
 
 
 class LabArtifactReclaimer:
-    """Remove only superseded attempt bundles without accepted success evidence."""
+    """Quarantine superseded bundles; physical deletion belongs to the later lifecycle GC."""
 
     _TOMBSTONE_NAME = re.compile(
         r"\.reclaim-v1-"
@@ -1630,18 +1660,15 @@ class LabArtifactReclaimer:
         self.report_spool = report_spool
         self.garbage_root = self.artifact_root / ".garbage-v1"
         self.garbage_owner_dir = self.garbage_root / "owners"
+        self.garbage_ledger_dir = self.garbage_root / "ledger"
         self.garbage_staging_dir = self.garbage_root / "staging"
-        self.garbage_pending_dir = self.garbage_root / "pending"
-        self.garbage_collecting_dir = self.garbage_root / "collecting"
-        self.garbage_owned_dir = self.garbage_root / "owned"
-        self.garbage_disposal_dir = self.garbage_root / "disposal"
+        self.garbage_deferred_dir = self.garbage_root / "deferred_gc"
+        self.garbage_pending_dir = self.garbage_deferred_dir
         for directory in (
             self.garbage_owner_dir,
+            self.garbage_ledger_dir,
             self.garbage_staging_dir,
-            self.garbage_pending_dir,
-            self.garbage_collecting_dir,
-            self.garbage_owned_dir,
-            self.garbage_disposal_dir,
+            self.garbage_deferred_dir,
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
@@ -2033,6 +2060,72 @@ class LabArtifactReclaimer:
     def _garbage_bundle_name(owner: LabGarbageOwner) -> str:
         return owner.garbage_id.hex
 
+    def _garbage_ledger_path(
+        self,
+        owner: LabGarbageOwner,
+        state: Literal["prepared", "quarantined", "deferred_gc"],
+    ) -> Path:
+        sequence = _GARBAGE_STATE_SEQUENCE[state]
+        return self.garbage_ledger_dir / (f"{owner.garbage_id.hex}-{sequence}-{state}.json")
+
+    def _write_garbage_ledger(
+        self,
+        owner: LabGarbageOwner,
+        state: Literal["prepared", "quarantined", "deferred_gc"],
+    ) -> Path:
+        ledger = LabGarbageLedger(state=state, owner=owner)
+        target = self._garbage_ledger_path(owner, state)
+        if os.path.lexists(target):
+            existing = self._load_garbage_ledger(target)
+            if existing != ledger:
+                raise LabArtifactConflictError("garbage ledger state conflicts")
+            return target
+        with target.open("xb") as stream:
+            stream.write(ledger.canonical_json().encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(self.garbage_ledger_dir)
+        return target
+
+    def _load_garbage_ledger(self, path: Path) -> LabGarbageLedger:
+        identity = self._regular_file_identity(path, label="garbage ledger")
+        match = _GARBAGE_LEDGER_NAME.fullmatch(path.name)
+        if match is None:
+            raise LabArtifactConflictError("garbage ledger name is invalid")
+        try:
+            raw = path.read_text(encoding="utf-8")
+            ledger = LabGarbageLedger.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid garbage ledger: {exc}") from exc
+        after = self._regular_file_identity(path, label="garbage ledger")
+        expected_state = match.group("state")
+        if (
+            after != identity
+            or raw != ledger.canonical_json()
+            or ledger.owner.garbage_id.hex != match.group("garbage_id")
+            or ledger.state != expected_state
+            or _GARBAGE_STATE_SEQUENCE[ledger.state] != int(match.group("sequence"))
+        ):
+            raise LabArtifactConflictError("garbage ledger identity is not canonical")
+        return ledger
+
+    def _garbage_ledgers(self, owner: LabGarbageOwner) -> tuple[Path, ...]:
+        paths = tuple(sorted(self.garbage_ledger_dir.glob(f"{owner.garbage_id.hex}-*.json")))
+        if not paths:
+            raise LabArtifactConflictError("garbage owner has no durable ledger")
+        ledgers = tuple(self._load_garbage_ledger(path) for path in paths)
+        for ledger in ledgers:
+            if ledger.owner != owner:
+                raise LabArtifactConflictError("garbage ledger owner conflicts")
+        sequences = tuple(_GARBAGE_STATE_SEQUENCE[ledger.state] for ledger in ledgers)
+        if sequences != tuple(range(max(sequences) + 1)):
+            raise LabArtifactConflictError("garbage ledger state history is incomplete")
+        return paths
+
+    def _latest_garbage_ledger(self, owner: LabGarbageOwner) -> LabGarbageLedger:
+        paths = self._garbage_ledgers(owner)
+        return self._load_garbage_ledger(paths[-1])
+
     def _write_garbage_owner(self, bundle: Path, owner: LabGarbageOwner) -> None:
         for marker in (
             self.garbage_owner_dir / f"{owner.garbage_id.hex}.json",
@@ -2048,6 +2141,7 @@ class LabArtifactReclaimer:
                 stream.flush()
                 os.fsync(stream.fileno())
             _fsync_directory(marker.parent)
+        self._write_garbage_ledger(owner, "prepared")
 
     def _load_garbage_owner(self, marker: Path) -> LabGarbageOwner:
         identity = self._regular_file_identity(marker, label="garbage owner marker")
@@ -2094,38 +2188,6 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError("garbage bundle changed while validating")
         return owner
 
-    def _validate_owned_garbage_bundle(self, bundle: Path) -> LabGarbageOwner:
-        root = bundle.lstat()
-        if bundle.is_symlink() or not stat.S_ISDIR(root.st_mode):
-            raise LabArtifactConflictError("owned garbage bundle is unsafe")
-        try:
-            bundle_id = UUID(hex=bundle.name)
-        except ValueError as exc:
-            raise LabArtifactConflictError("owned garbage bundle name is invalid") from exc
-        names = {child.name for child in bundle.iterdir()}
-        if names - {"owner.json", "payload"}:
-            raise LabArtifactConflictError(
-                f"owned garbage bundle has unexpected entries: {sorted(names)}"
-            )
-        owner = self._load_garbage_owner_ledger(bundle_id)
-        if "owner.json" in names:
-            bundle_owner = self._load_garbage_owner(bundle / "owner.json")
-            if bundle_owner != owner:
-                raise LabArtifactConflictError("owned garbage marker conflicts with ledger")
-        payload = bundle / "payload"
-        if os.path.lexists(payload):
-            expected = {entry.relative_path: entry for entry in owner.inventory}
-            observed = self._garbage_inventory(payload)
-            for entry in observed:
-                if expected.get(entry.relative_path) != entry:
-                    raise LabArtifactConflictError(
-                        "owned garbage payload contains unknown or replaced objects"
-                    )
-        after = bundle.lstat()
-        if (after.st_dev, after.st_ino) != (root.st_dev, root.st_ino):
-            raise LabArtifactConflictError("owned garbage bundle changed while validating")
-        return owner
-
     def _promote_garbage_bundle(self, source: Path, target: Path) -> None:
         if os.path.lexists(target):
             raise LabArtifactConflictError("garbage state has duplicate bundle ownership")
@@ -2135,98 +2197,53 @@ class LabArtifactReclaimer:
         if os.path.lexists(source):
             raise LabArtifactConflictError("garbage source path was replaced during promotion")
 
-    @staticmethod
-    def _garbage_directory_identity(path: Path, *, label: str) -> tuple[int, int]:
-        observed = path.lstat()
-        if path.is_symlink() or not stat.S_ISDIR(observed.st_mode):
-            raise LabArtifactConflictError(f"{label} is unsafe")
-        return observed.st_dev, observed.st_ino
-
-    def _validate_disposal_session(self, session: Path) -> Path | None:
-        before = self._garbage_directory_identity(session, label="garbage disposal session")
-        match = _GARBAGE_DISPOSAL_SESSION.fullmatch(session.name)
-        if match is None:
-            raise LabArtifactConflictError("garbage disposal session name is invalid")
-        expected_owner = self._load_garbage_owner_ledger(UUID(hex=match.group("garbage_id")))
-        children = tuple(session.iterdir())
-        if len(children) > 1:
-            raise LabArtifactConflictError("garbage disposal session has extra entries")
-        bundle = children[0] if children else None
-        if bundle is not None:
-            if bundle.name != expected_owner.garbage_id.hex:
-                raise LabArtifactConflictError("garbage disposal bundle identity is invalid")
-            if self._validate_owned_garbage_bundle(bundle) != expected_owner:
-                raise LabArtifactConflictError("garbage disposal owner conflicts with session")
-        after = self._garbage_directory_identity(session, label="garbage disposal session")
-        if after != before:
-            raise LabArtifactConflictError("garbage disposal session changed during validation")
-        return bundle
-
-    def _isolate_owned_garbage_bundle(self, bundle: Path) -> Path:
-        before = self._garbage_directory_identity(bundle, label="owned garbage bundle")
-        owner = self._validate_owned_garbage_bundle(bundle)
-        after_validation = self._garbage_directory_identity(
-            bundle,
-            label="owned garbage bundle",
-        )
-        if after_validation != before:
-            raise LabArtifactConflictError("owned garbage bundle changed during final isolation")
-        session = self.garbage_disposal_dir / f"{owner.garbage_id.hex}-{uuid4().hex}"
-        session.mkdir(mode=0o700)
-        _fsync_directory(self.garbage_disposal_dir)
-        isolated = session / self._garbage_bundle_name(owner)
-        try:
-            os.rename(bundle, isolated)
-            _fsync_directory(self.garbage_owned_dir)
-            _fsync_directory(session)
-            isolated_identity = self._garbage_directory_identity(
-                isolated,
-                label="isolated garbage bundle",
-            )
-            if isolated_identity != before or os.path.lexists(bundle):
-                if isolated_identity != before and not os.path.lexists(bundle):
-                    os.rename(isolated, bundle)
-                    _fsync_directory(self.garbage_owned_dir)
-                    _fsync_directory(session)
-                raise LabArtifactConflictError(
-                    "owned garbage bundle changed during final isolation"
-                )
-            if self._validate_owned_garbage_bundle(isolated) != owner:
-                raise LabArtifactConflictError("isolated garbage owner changed")
-        except BaseException:
-            if not any(session.iterdir()):
-                session.rmdir()
-                _fsync_directory(self.garbage_disposal_dir)
-            raise
-        return session
-
-    def _remove_disposal_session(self, session: Path) -> None:
-        bundle = self._validate_disposal_session(session)
-        if bundle is not None:
-            before = self._garbage_directory_identity(
-                bundle,
-                label="disposal garbage bundle",
-            )
-            self._validate_owned_garbage_bundle(bundle)
-            after = self._garbage_directory_identity(
-                bundle,
-                label="disposal garbage bundle",
-            )
-            if after != before:
-                raise LabArtifactConflictError("disposal garbage bundle changed before collection")
-            shutil.rmtree(bundle)
-            _fsync_directory(session)
-        try:
-            session.rmdir()
-        except OSError as exc:
+    def _staging_owner(self, staging: Path) -> LabGarbageOwner:
+        root = staging.lstat()
+        if staging.is_symlink() or not stat.S_ISDIR(root.st_mode):
+            raise LabArtifactConflictError("garbage staging bundle is unsafe")
+        names = {child.name for child in staging.iterdir()}
+        if names not in ({"owner.json"}, {"owner.json", "payload"}):
             raise LabArtifactConflictError(
-                "garbage disposal session was replaced or is not empty"
-            ) from exc
-        _fsync_directory(self.garbage_disposal_dir)
+                f"garbage staging bundle has unexpected entries: {sorted(names)}"
+            )
+        owner = self._load_garbage_owner(staging / "owner.json")
+        if staging.name != owner.garbage_id.hex:
+            raise LabArtifactConflictError("garbage staging name conflicts with owner")
+        if self._load_garbage_owner_ledger(owner.garbage_id) != owner:
+            raise LabArtifactConflictError("garbage staging owner conflicts with ledger")
+        self._garbage_ledgers(owner)
+        return owner
 
-    def _remove_owned_garbage_bundle(self, bundle: Path) -> None:
-        session = self._isolate_owned_garbage_bundle(bundle)
-        self._remove_disposal_session(session)
+    def _source_path_for_owner(self, owner: LabGarbageOwner) -> Path:
+        source = self.artifact_root / owner.original_relative_path
+        if source.parent == source or not source.is_relative_to(self.artifact_root):
+            raise LabArtifactConflictError("garbage owner source path escapes artifact root")
+        self._assert_safe_artifact_ancestors(source.parent)
+        return source
+
+    def _reconcile_staging_bundle(self, staging: Path) -> LabGarbageOwner:
+        owner = self._staging_owner(staging)
+        source = self._source_path_for_owner(owner)
+        payload = staging / "payload"
+        source_exists = os.path.lexists(source)
+        payload_exists = os.path.lexists(payload)
+        if source_exists and payload_exists:
+            raise LabArtifactConflictError("garbage source and staged payload both exist")
+        if not source_exists and not payload_exists:
+            raise LabArtifactConflictError("garbage owner has neither source nor payload")
+        if source_exists:
+            observed = self._garbage_inventory(source)
+            if observed != owner.inventory:
+                raise LabArtifactConflictError("garbage source conflicts with owner inventory")
+            os.rename(source, payload)
+            _fsync_directory(source.parent)
+            _fsync_directory(staging)
+            if os.path.lexists(source):
+                raise LabArtifactConflictError("garbage source was replaced during isolation")
+        if self._validate_garbage_bundle(staging) != owner:
+            raise LabArtifactConflictError("garbage staged payload conflicts with owner")
+        self._write_garbage_ledger(owner, "quarantined")
+        return owner
 
     def _collect_garbage_locked(self) -> None:
         for marker in self.garbage_owner_dir.iterdir():
@@ -2237,51 +2254,62 @@ class LabArtifactReclaimer:
             except ValueError as exc:
                 raise LabArtifactConflictError("garbage owner ledger name is invalid") from exc
             self._load_garbage_owner_ledger(garbage_id)
-        for directory in (
-            self.garbage_staging_dir,
-            self.garbage_pending_dir,
-            self.garbage_collecting_dir,
-            self.garbage_owned_dir,
-        ):
-            for bundle in directory.iterdir():
-                if bundle.is_symlink() or not bundle.is_dir():
-                    raise LabArtifactConflictError("garbage namespace contains unsafe entry")
-                try:
-                    UUID(hex=bundle.name)
-                except ValueError as exc:
-                    raise LabArtifactConflictError(
-                        "garbage namespace contains unknown bundle"
-                    ) from exc
-                if directory == self.garbage_owned_dir:
-                    self._validate_owned_garbage_bundle(bundle)
-                else:
-                    self._validate_garbage_bundle(bundle)
-        for session in tuple(sorted(self.garbage_disposal_dir.iterdir())):
-            if session.is_symlink() or not session.is_dir():
-                raise LabArtifactConflictError("garbage disposal namespace contains unsafe entry")
-            self._remove_disposal_session(session)
+        for ledger_path in self.garbage_ledger_dir.iterdir():
+            if ledger_path.is_symlink() or not ledger_path.is_file():
+                raise LabArtifactConflictError("garbage ledger namespace is unsafe")
+            self._load_garbage_ledger(ledger_path)
+        for deferred in tuple(sorted(self.garbage_deferred_dir.iterdir())):
+            owner = self._validate_garbage_bundle(deferred)
+            latest = self._latest_garbage_ledger(owner)
+            if latest.state != "deferred_gc":
+                self._write_garbage_ledger(owner, "deferred_gc")
         for staging in tuple(sorted(self.garbage_staging_dir.iterdir())):
-            owner = self._validate_garbage_bundle(staging)
+            owner = self._reconcile_staging_bundle(staging)
+            deferred = self.garbage_deferred_dir / self._garbage_bundle_name(owner)
+            if os.path.lexists(deferred):
+                raise LabArtifactConflictError("garbage staging and deferred bundle both exist")
             self._promote_garbage_bundle(
                 staging,
-                self.garbage_pending_dir / self._garbage_bundle_name(owner),
+                deferred,
             )
-        for pending in tuple(sorted(self.garbage_pending_dir.iterdir())):
-            owner = self._validate_garbage_bundle(pending)
-            collecting = self.garbage_collecting_dir / self._garbage_bundle_name(owner)
-            self._promote_garbage_bundle(pending, collecting)
-            self._validate_garbage_bundle(collecting)
-        for collecting in tuple(sorted(self.garbage_collecting_dir.iterdir())):
-            owner = self._validate_garbage_bundle(collecting)
-            owned = self.garbage_owned_dir / self._garbage_bundle_name(owner)
-            self._promote_garbage_bundle(collecting, owned)
-            self._validate_garbage_bundle(owned)
-        for owned in tuple(sorted(self.garbage_owned_dir.iterdir())):
-            self._remove_owned_garbage_bundle(owned)
+            self._validate_garbage_bundle(deferred)
+            self._write_garbage_ledger(owner, "deferred_gc")
 
     def collect_garbage(self) -> None:
+        """Reconcile durable quarantine state without physically deleting retained bytes."""
         with self.report_spool.evidence_lock():
             self._collect_garbage_locked()
+
+    def quarantine_entries(self) -> tuple[LabQuarantineEntry, ...]:
+        with self.report_spool.evidence_lock():
+            self._collect_garbage_locked()
+            entries: list[LabQuarantineEntry] = []
+            for bundle in sorted(self.garbage_deferred_dir.iterdir()):
+                owner = self._validate_garbage_bundle(bundle)
+                latest = self._latest_garbage_ledger(owner)
+                if latest.state != "deferred_gc":
+                    raise LabArtifactConflictError("deferred quarantine has no deferred_gc ledger")
+                retained_bytes = sum(
+                    entry.size or 0 for entry in owner.inventory if entry.file_type == "regular"
+                )
+                entries.append(
+                    LabQuarantineEntry(
+                        state=latest.state,
+                        owner=owner,
+                        ledger_paths=self._garbage_ledgers(owner),
+                        bundle_path=bundle,
+                        retained_bytes=retained_bytes,
+                    )
+                )
+            return tuple(entries)
+
+    def quarantine_summary(self) -> LabQuarantineSummary:
+        """Expose retained P1.3 bytes for the later exclusive-window lifecycle GC."""
+        entries = self.quarantine_entries()
+        return LabQuarantineSummary(
+            bundle_count=len(entries),
+            retained_bytes=sum(entry.retained_bytes for entry in entries),
+        )
 
     def _logical_delete(
         self,
@@ -2290,36 +2318,44 @@ class LabArtifactReclaimer:
         owner: LabGarbageOwner,
     ) -> bool:
         staging = self.garbage_staging_dir / self._garbage_bundle_name(owner)
-        pending = self.garbage_pending_dir / self._garbage_bundle_name(owner)
-        if os.path.lexists(pending):
+        deferred = self.garbage_deferred_dir / self._garbage_bundle_name(owner)
+        if os.path.lexists(deferred):
             if os.path.lexists(path):
-                raise LabArtifactConflictError("garbage source and pending quarantine both exist")
-            self._validate_garbage_bundle(pending)
+                raise LabArtifactConflictError("garbage source and deferred quarantine both exist")
+            if self._validate_garbage_bundle(deferred) != owner:
+                raise LabArtifactConflictError("deferred garbage owner conflicts")
+            if self._latest_garbage_ledger(owner).state != "deferred_gc":
+                self._write_garbage_ledger(owner, "deferred_gc")
             return True
         if os.path.lexists(staging):
-            if os.path.lexists(path):
-                raise LabArtifactConflictError("garbage source and staging quarantine both exist")
-            self._validate_garbage_bundle(staging)
+            if self._staging_owner(staging) != owner:
+                raise LabArtifactConflictError("garbage staging owner conflicts")
         else:
             staging.mkdir(mode=0o700)
             self._write_garbage_owner(staging, owner)
-            payload = staging / "payload"
-            try:
-                os.rename(path, payload)
-            except FileNotFoundError:
-                return False
-            _fsync_directory(path.parent)
-            _fsync_directory(staging)
-            try:
-                self._validate_garbage_bundle(staging)
-            except BaseException:
-                if os.path.lexists(payload) and not os.path.lexists(path):
-                    os.rename(payload, path)
-                    _fsync_directory(path.parent)
-                raise
-        self._promote_garbage_bundle(staging, pending)
-        self._validate_garbage_bundle(pending)
+        self._reconcile_staging_bundle(staging)
+        self._promote_garbage_bundle(staging, deferred)
+        self._validate_garbage_bundle(deferred)
+        self._write_garbage_ledger(owner, "deferred_gc")
         return True
+
+    def logical_quarantine_tree(
+        self,
+        path: Path,
+        *,
+        purpose: str,
+    ) -> bool:
+        if not os.path.lexists(path):
+            return False
+        self._assert_safe_artifact_ancestors(path.parent)
+        inventory = self._garbage_inventory(path)
+        owner = self._garbage_owner(
+            path,
+            purpose=purpose,
+            inventory=inventory,
+        )
+        with self.report_spool.evidence_lock():
+            return self._logical_delete(path, owner=owner)
 
     def logical_delete_temporary_tree(
         self,
@@ -2327,10 +2363,8 @@ class LabArtifactReclaimer:
         *,
         current_claim: LabShardClaim,
     ) -> bool:
-        self._assert_safe_artifact_ancestors(path.parent)
         self._assert_safe_temporary_tree(path)
-        inventory = self._garbage_inventory(path)
-        owner = self._garbage_owner(
+        return self.logical_quarantine_tree(
             path,
             purpose=(
                 "crash temporary cleanup "
@@ -2338,10 +2372,7 @@ class LabArtifactReclaimer:
                 f"generation={current_claim.claim_generation} "
                 f"token={current_claim.claim_token}"
             ),
-            inventory=inventory,
         )
-        with self.report_spool.evidence_lock():
-            return self._logical_delete(path, owner=owner)
 
     def _safe_remove_regular_child(
         self,
@@ -2426,6 +2457,62 @@ class LabArtifactReclaimer:
         )
         return tuple(self._inventory_entry(bundle / name, relative_path=name) for name in names)
 
+    def _sealed_quarantine_owner(
+        self,
+        tombstone: Path,
+        *,
+        obsolete_claim: LabShardClaim,
+        source_device: int,
+        source_inode: int,
+        inventory: tuple[LabReclaimInventoryEntry, ...],
+    ) -> LabGarbageOwner:
+        garbage_inventory = (
+            LabGarbageInventoryEntry(
+                relative_path=".",
+                file_type="directory",
+                device=source_device,
+                inode=source_inode,
+            ),
+            *(
+                LabGarbageInventoryEntry(
+                    relative_path=entry.relative_path,
+                    file_type="regular",
+                    device=entry.device,
+                    inode=entry.inode,
+                    size=entry.size,
+                    sha256=entry.sha256,
+                )
+                for entry in inventory
+            ),
+        )
+        return LabGarbageOwner(
+            purpose=(
+                "obsolete sealed attempt "
+                f"job={obsolete_claim.job_id} shard={obsolete_claim.shard_id} "
+                f"generation={obsolete_claim.claim_generation} "
+                f"token={obsolete_claim.claim_token}"
+            ),
+            original_relative_path=self._garbage_relative_path(tombstone),
+            payload_type="directory",
+            inventory=tuple(sorted(garbage_inventory, key=lambda entry: entry.relative_path)),
+        )
+
+    def _reclaim_quarantine_owner(
+        self,
+        tombstone: Path,
+        ledger: LabReclaimLedger,
+    ) -> LabGarbageOwner:
+        owner = self._sealed_quarantine_owner(
+            tombstone,
+            obsolete_claim=ledger.obsolete_claim,
+            source_device=ledger.source_device,
+            source_inode=ledger.source_inode,
+            inventory=ledger.inventory,
+        )
+        if ledger.quarantine_id is not None and ledger.quarantine_id != owner.garbage_id:
+            raise LabArtifactConflictError("reclaim quarantine identity conflicts with ledger")
+        return owner
+
     def _validate_isolated_tree(
         self,
         path: Path,
@@ -2488,17 +2575,11 @@ class LabArtifactReclaimer:
         self,
         tombstone: Path,
         ledger: LabReclaimLedger,
-    ) -> None:
+    ) -> LabGarbageOwner:
         self._validate_isolated_tree(tombstone, ledger)
-        for entry in ledger.inventory:
-            self._delete_inventory_entry(tombstone, entry)
-        if tuple(tombstone.iterdir()):
-            raise LabArtifactConflictError("reclaim tombstone gained unknown content")
-        root = tombstone.lstat()
-        if (root.st_dev, root.st_ino) != (ledger.source_device, ledger.source_inode):
-            raise LabArtifactConflictError("reclaim tombstone changed before removal")
-        tombstone.rmdir()
-        _fsync_directory(tombstone.parent)
+        owner = self._reclaim_quarantine_owner(tombstone, ledger)
+        self._logical_delete(tombstone, owner=owner)
+        return owner
 
     def _cleanup_ledger_temporaries(self, directory: Path) -> None:
         if not directory.exists():
@@ -2800,8 +2881,14 @@ class LabArtifactReclaimer:
             if ledger.state == "prepared":
                 ledger = ledger.model_copy(update={"state": "isolated"})
                 self._write_ledger(ledger)
-            self._delete_isolated_tombstone(tombstone, ledger)
-            self._remove_ledger(ledger_path)
+            owner = self._delete_isolated_tombstone(tombstone, ledger)
+            ledger = ledger.model_copy(
+                update={
+                    "state": "deferred_gc",
+                    "quarantine_id": owner.garbage_id,
+                }
+            )
+            self._write_ledger(ledger)
 
         for candidate, obsolete_claim, manifest in sources:
             self._assert_no_terminal_success_evidence_locked(
@@ -2812,6 +2899,13 @@ class LabArtifactReclaimer:
             tombstone = attempts_root / self._tombstone_name(obsolete_claim, manifest)
             source_identity = LabWorker._bundle_file_identity(candidate)
             inventory = self._build_inventory(candidate, manifest)
+            owner = self._sealed_quarantine_owner(
+                tombstone,
+                obsolete_claim=obsolete_claim,
+                source_device=source_identity[0],
+                source_inode=source_identity[1],
+                inventory=inventory,
+            )
             ledger_path = self._ledger_path(current_claim, tombstone.name)
             if os.path.lexists(ledger_path):
                 stale = self._load_ledger(ledger_path)
@@ -2833,19 +2927,25 @@ class LabArtifactReclaimer:
                     raise LabArtifactConflictError(
                         "stale reclaim ledger conflicts with live source"
                     )
-                self._remove_ledger(ledger_path)
-            ledger = LabReclaimLedger(
-                state="prepared",
-                current_claim=current_claim,
-                obsolete_claim=obsolete_claim,
-                manifest=manifest,
-                inventory=inventory,
-                source_name=candidate.name,
-                tombstone_name=tombstone.name,
-                source_device=source_identity[0],
-                source_inode=source_identity[1],
-            )
-            self._write_ledger(ledger)
+                if stale.quarantine_id not in {None, owner.garbage_id}:
+                    raise LabArtifactConflictError(
+                        "stale reclaim ledger quarantine identity conflicts"
+                    )
+                ledger = stale
+            else:
+                ledger = LabReclaimLedger(
+                    state="prepared",
+                    current_claim=current_claim,
+                    obsolete_claim=obsolete_claim,
+                    manifest=manifest,
+                    inventory=inventory,
+                    source_name=candidate.name,
+                    tombstone_name=tombstone.name,
+                    source_device=source_identity[0],
+                    source_inode=source_identity[1],
+                    quarantine_id=owner.garbage_id,
+                )
+                self._write_ledger(ledger)
             try:
                 os.rename(candidate, tombstone)
             except OSError as exc:
@@ -2864,7 +2964,6 @@ class LabArtifactReclaimer:
                     )
                 os.rename(tombstone, candidate)
                 _fsync_directory(attempts_root)
-                self._remove_ledger(ledger_path)
                 raise LabArtifactConflictError("sealed attempt was replaced during isolation")
             self._validate_isolated_tree(tombstone, ledger)
             ledger = ledger.model_copy(update={"state": "isolated"})
@@ -2874,8 +2973,14 @@ class LabArtifactReclaimer:
                 manifest,
                 current_claim,
             )
-            self._delete_isolated_tombstone(tombstone, ledger)
-            self._remove_ledger(ledger_path)
+            quarantined_owner = self._delete_isolated_tombstone(tombstone, ledger)
+            ledger = ledger.model_copy(
+                update={
+                    "state": "deferred_gc",
+                    "quarantine_id": quarantined_owner.garbage_id,
+                }
+            )
+            self._write_ledger(ledger)
 
     def _reconcile_orphan_ledgers(self, current_claim: LabShardClaim) -> None:
         directory = self._ledger_dir(current_claim)
@@ -2892,8 +2997,6 @@ class LabArtifactReclaimer:
             tombstone = attempts_root / ledger.tombstone_name
             if os.path.lexists(source) or os.path.lexists(tombstone):
                 continue
-            if ledger.state != "isolated":
-                raise LabArtifactConflictError("prepared reclaim ledger has no source or tombstone")
             self._validate_ledger(
                 ledger,
                 current_claim=current_claim,
@@ -2905,7 +3008,27 @@ class LabArtifactReclaimer:
                 ledger.manifest,
                 current_claim,
             )
-            self._remove_ledger(path)
+            owner = self._reclaim_quarantine_owner(tombstone, ledger)
+            if ledger.quarantine_id not in {None, owner.garbage_id}:
+                raise LabArtifactConflictError(
+                    "orphan reclaim ledger quarantine identity conflicts"
+                )
+            self._collect_garbage_locked()
+            deferred = self.garbage_deferred_dir / owner.garbage_id.hex
+            if not os.path.lexists(deferred):
+                raise LabArtifactConflictError(
+                    "reclaim ledger has no source, tombstone, or deferred quarantine"
+                )
+            if self._validate_garbage_bundle(deferred) != owner:
+                raise LabArtifactConflictError("deferred reclaim quarantine conflicts")
+            if ledger.state != "deferred_gc":
+                ledger = ledger.model_copy(
+                    update={
+                        "state": "deferred_gc",
+                        "quarantine_id": owner.garbage_id,
+                    }
+                )
+                self._write_ledger(ledger)
 
     def reclaim(self, current_claim: LabShardClaim) -> None:
         validated = LabShardClaim.model_validate(current_claim)

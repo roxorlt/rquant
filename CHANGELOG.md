@@ -41,6 +41,15 @@
 
 ### Fixed
 
+- **Strategy Lab P1.3 逻辑回收边界**：worker 的 candidate cleanup、sealed rollback、旧
+  generation attempt reclaim 与 ledger temporary cleanup 不再在关键路径执行 path unlink、
+  rmdir 或 rmtree。安全回收现在只把完整核验过的 source 原子移入协议私有 quarantine，
+  以 append-only `prepared -> quarantined -> deferred_gc` ledger 固化 owner、原路径、inode、
+  canonical inventory 与保留字节数；owner-only 和 rename 后崩溃可在重启时继续收敛，未知、
+  替换、symlink 或 hardlink 内容仍 fail closed。P1.3 不物理释放这些 bytes，后续由 P7 存储
+  生命周期在停机或独占窗口接管；当前可通过 typed quarantine entries/summary 枚举 retained
+  bundle 数量与容量。
+
 - **Strategy Lab worker fencing 与研究科学性缺口**：claim spool 新增持久 shard 高水位，旧
   generation 即使在新 claim 被消费后也不能复活；artifact 绑定 claim token、generation 与
   scheduler fence；后台 heartbeat 覆盖 candidate 的完整写入、回读、hash 与 fsync，最终同步
