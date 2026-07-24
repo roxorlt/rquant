@@ -43,10 +43,12 @@ from rquant.research_lake import (
     verify_research_partition,
 )
 from rquant.strategy_dependencies import (
+    SUSPENSION_SESSION_EVIDENCE_DATASET,
     StrategyExecutionDependencies,
     StrategyTableDependency,
     strategy_execution_dependencies,
 )
+from rquant.suspension_evidence import suspension_session_evidence_sql
 
 if TYPE_CHECKING:
     from rquant.backfill_manifest import EligibilityResolution
@@ -237,6 +239,78 @@ def materialize_table_dependency(
     finally:
         if temp_path.exists():
             temp_path.unlink()
+
+
+def materialize_suspension_session_evidence(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    artifact_root: Path,
+    start_date: date,
+    end_date: date,
+    as_of_time: datetime,
+) -> DatasetSnapshotArtifact:
+    """Freeze suspension evidence after resolving its full historical inputs."""
+    as_of_time = normalize_utc_datetime(as_of_time)
+    newer_coverage = connection.execute(
+        """
+        SELECT COUNT(*), MIN(trade_date), MAX(trade_date)
+        FROM stock_suspend_coverage
+        WHERE source = 'tushare'
+          AND trade_date <= ?
+          AND queried_at > ?
+        """,
+        [end_date, as_of_time],
+    ).fetchone()
+    if newer_coverage is not None and int(newer_coverage[0]) > 0:
+        raise ValueError(
+            "cannot reconstruct suspension evidence at requested as_of: "
+            f"{int(newer_coverage[0])} current coverage versions from "
+            f"{newer_coverage[1]} through {newer_coverage[2]} are newer"
+        )
+
+    temp_table = f"_snapshot_suspension_evidence_{uuid.uuid4().hex}"
+    connection.execute(
+        f"""
+        CREATE TEMP TABLE {_quoted_identifier(temp_table)} (
+            source VARCHAR NOT NULL,
+            ts_code VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            evidence_state VARCHAR NOT NULL,
+            PRIMARY KEY (source, ts_code, trade_date)
+        )
+        """
+    )
+    try:
+        evidence_sql = suspension_session_evidence_sql(
+            "suspension.source = 'tushare' "
+            "AND suspension.trade_date <= ? "
+            "AND suspension.available_at <= ? "
+            "AND coverage.queried_at <= ?"
+        )
+        connection.execute(
+            f"""
+            INSERT INTO {_quoted_identifier(temp_table)}
+            SELECT source, ts_code, trade_date, evidence_state
+            FROM ({evidence_sql})
+            """,
+            [end_date, as_of_time, as_of_time],
+        )
+        return materialize_table_dependency(
+            connection,
+            dependency=StrategyTableDependency(
+                dataset_id=SUSPENSION_SESSION_EVIDENCE_DATASET,
+                table_name=SUSPENSION_SESSION_EVIDENCE_DATASET,
+            ),
+            source_table_name=temp_table,
+            artifact_root=artifact_root,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_time=as_of_time,
+        )
+    finally:
+        connection.execute(
+            f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}"
+        )
 
 
 def materialize_eligibility_resolution(
@@ -865,17 +939,28 @@ def build_dataset_snapshot_binding(
             )
         artifacts.extend(lake_artifacts)
     for dependency in selected_dependencies.materialized_tables:
-        artifacts.append(
-            materialize_table_dependency(
-                source_connection,
-                dependency=dependency,
-                artifact_root=lake_root,
-                start_date=start_date,
-                end_date=end_date,
-                as_of_time=snapshot.as_of_time,
-                ts_codes=ts_codes,
+        if dependency.dataset_id == SUSPENSION_SESSION_EVIDENCE_DATASET:
+            artifacts.append(
+                materialize_suspension_session_evidence(
+                    source_connection,
+                    artifact_root=lake_root,
+                    start_date=start_date,
+                    end_date=end_date,
+                    as_of_time=snapshot.as_of_time,
+                )
             )
-        )
+        else:
+            artifacts.append(
+                materialize_table_dependency(
+                    source_connection,
+                    dependency=dependency,
+                    artifact_root=lake_root,
+                    start_date=start_date,
+                    end_date=end_date,
+                    as_of_time=snapshot.as_of_time,
+                    ts_codes=ts_codes,
+                )
+            )
 
     manifest = DatasetSnapshotBindingManifest(
         snapshot_id=snapshot.snapshot_id,

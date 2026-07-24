@@ -5,6 +5,47 @@
 
 ---
 
+## 2026-07-24 · v0.26.7 · Growth 固定回放停牌证据绑定修复
+
+**状态**：PR #131 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
+`v0.26.7` 精确指向 `9bb5235a8a2fd1d4d874a2c71858e99acb58f9fe`。07:38 在交易保护
+窗口前完成 dry-run 和正式发布，生产 tag、HEAD 与目标 SHA 精确匹配；发布器从
+`v0.26.6` 的 `92c9308cafdf9a24271239d7490d6437471ba01a` 快进部署，没有 schema、systemd
+或生产数据迁移。
+
+**修复内容**：Growth Stage 1 执行依赖由 `stage1-v1` 升级为 `stage1-v2`。snapshot
+builder 在生产源库中使用完整历史日线、分钟线、停牌事件与覆盖版本，先物化小型
+`stock_suspend_session_evidence`，再把它绑定进不可变 execution snapshot。正式回放不再
+访问未声明的 `stock_suspend_event`，也不会因按回测日期裁掉历史冲突而把未知停牌误判为
+整日停牌；无法还原旧 `as_of` 覆盖版本时明确 fail closed。
+
+**验证与生产验收**：
+
+- 本地聚焦测试 66 项、全量测试 2,319 项通过；ruff、锁文件和差异检查通过。独立语义
+  审查重放历史冲突、旧版本 fail-closed、空工件与 binding 身份反例后结论为通过。
+- 发布前 dry-run 只包含 9 个 Growth 快照契约、实现、测试和版本文件，目标 SHA 精确；
+  正式发布状态为 `deployed`。发布后两次 preflight 均为
+  `ok=5 warn=0 fail=0 skip=0`，28 个 unit 全部 verify。
+- 发布后备份 07:38:56 开始、07:42:06 成功结束，`Result=success`、
+  `ExecMainStatus=0`；随后主动刷新只读副本成功，第二次 preflight 显示副本年龄 0 分钟、
+  主副本工件延迟 0 分钟。
+- `daily_bar` 最新为 2026-07-23、1,667,446 行；`minute_bar` 最新为
+  2026-07-23 14:59、47,549,142 行。daily、monitor、surge-watch、replica 与 backup
+  timers 均为 `enabled/active`，monitor 与 surge-watch 下一次触发为当日 09:25。
+
+**Growth Stage 1 后续**：使用独立临时状态库完成了 `v0.26.7` 只读 planner，未写生产
+manifest。范围为 2026-04-01 至 2026-07-09，资格记录 22,879 条；baseline 覆盖率
+99.9829%，entry/exit 覆盖率 99.9146%；剩余 132 个任务、预计 136,406 行。planner
+实耗 1,989.97 秒，若开盘前再向生产状态库重算并继续 snapshot、审计和固定回放，存在跨越
+09:10 硬截止的风险，因此正式写入延至交易保护窗口后执行，不将临时 manifest
+`2c9bd7b023316c11f40cf8768e2de9e9d9f53d81abc3764ae47a24ac1b9ae58e` 冒充生产证据。
+
+**回滚**：本版本没有 schema 或业务数据写入。若发现 Growth snapshot 语义异常，创建
+revert PR、合并后打更高 SemVer tag 并向前发布；禁止生产机直接回退旧 tag 或修改已发布
+binding。紧急情况下只停止新的 Stage 1 研究任务，不停止 monitor、daily 和数据采集链路。
+
+---
+
 ## 2026-07-21 · v0.25.4 · 爆量累计器跨日冻结修复
 
 **状态**：PR #119 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
