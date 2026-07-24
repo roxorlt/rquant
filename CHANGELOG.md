@@ -48,8 +48,10 @@
   hardlink publish 中断继续收敛；旧半提交状态仅在 canonical owner/ledger 证据存在时迁移。
   无 owner、ledger 或 intent 的空 staging 不再扫描或猜测业务 source，只把该空 metadata 目录
   按预先记录的 inode/type/nlink 原子隔离到随机 orphan，复核仍为空后才记录
-  `reason=no_proven_source`；rename 替代或原路径占用会恢复或保留双方并 fail closed。半写
-  intent temp 同样保留在私有 orphan namespace。
+  `reason=no_proven_source`；orphan 本体保持只读且为空，身份与原因以独立、no-clobber 的
+  `intent_orphans_metadata` ledger 固化，重启以该 ledger 为权威交叉核验。旧目录内
+  `orphan.json` 只读兼容，不会迁移或改写；rename 替代、后续内容替换或原路径占用会恢复或
+  保留双方并 fail closed。半写 intent temp 同样保留在私有 orphan namespace。
 
 - **Strategy Lab P1.3 逻辑回收边界**：worker 的 candidate cleanup、sealed rollback、旧
   generation attempt reclaim 与 ledger temporary cleanup 不再在关键路径执行 path unlink、

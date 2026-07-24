@@ -3640,7 +3640,10 @@ def test_recovers_legacy_empty_staging_without_intent(
     orphans = tuple(reclaimer.garbage_intent_orphan_dir.glob(f"legacy-empty-staging-{legacy_id}-*"))
     assert len(orphans) == 1
     orphan = orphans[0]
-    metadata = json.loads((orphan / "orphan.json").read_text(encoding="utf-8"))
+    assert tuple(orphan.iterdir()) == ()
+    ledgers = tuple(reclaimer.garbage_orphan_metadata_dir.glob(f"{orphan.name}.json"))
+    assert len(ledgers) == 1
+    metadata = json.loads(ledgers[0].read_text(encoding="utf-8"))
     assert metadata["reason"] == "no_proven_source"
     assert metadata["original_staging_relative_path"] == f".garbage-v1/staging/{legacy_id}"
     assert not hasattr(reclaimer, "_legacy_unique_active_source")
@@ -3685,12 +3688,10 @@ def test_legacy_empty_staging_rename_replacement_restores_business_directory(
     assert (staging / "result.bin").read_bytes() == b"business-result-must-survive"
     assert (preserved_empty.lstat().st_dev, preserved_empty.lstat().st_ino) == expected_empty
     assert tuple(reclaimer.garbage_intent_orphan_dir.rglob("orphan.json")) == ()
+    assert tuple(reclaimer.garbage_orphan_metadata_dir.iterdir()) == ()
 
 
-def test_legacy_empty_staging_normal_orphan_binds_original_inode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_legacy_empty_staging_normal_orphan_binds_original_inode(tmp_path: Path) -> None:
     from rquant.lab_worker import LabArtifactReclaimer
 
     reclaimer = LabArtifactReclaimer(
@@ -3701,25 +3702,6 @@ def test_legacy_empty_staging_normal_orphan_binds_original_inode(
     staging = reclaimer.garbage_staging_dir / legacy_id
     staging.mkdir(mode=0o700)
     before = staging.lstat()
-    before_metadata: tuple[int, int, int, tuple[str, ...]] | None = None
-    original_write_metadata = reclaimer._ensure_legacy_empty_staging_orphan_metadata
-
-    def capture_before_metadata(orphan: Path, staging_id: UUID, orphan_token: UUID | None) -> None:
-        nonlocal before_metadata
-        observed = orphan.lstat()
-        before_metadata = (
-            observed.st_dev,
-            observed.st_ino,
-            observed.st_nlink,
-            tuple(child.name for child in orphan.iterdir()),
-        )
-        original_write_metadata(orphan, staging_id, orphan_token)
-
-    monkeypatch.setattr(
-        reclaimer,
-        "_ensure_legacy_empty_staging_orphan_metadata",
-        capture_before_metadata,
-    )
 
     reclaimer.collect_garbage()
 
@@ -3727,17 +3709,131 @@ def test_legacy_empty_staging_normal_orphan_binds_original_inode(
     assert len(orphans) == 1
     orphan = orphans[0]
     after = orphan.lstat()
-    assert before_metadata == (
+    assert (after.st_dev, after.st_ino, after.st_nlink) == (
         before.st_dev,
         before.st_ino,
         before.st_nlink,
-        (),
     )
-    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
-    assert {child.name for child in orphan.iterdir()} == {"orphan.json"}
-    metadata = json.loads((orphan / "orphan.json").read_text(encoding="utf-8"))
+    assert tuple(orphan.iterdir()) == ()
+    ledger = reclaimer.garbage_orphan_metadata_dir / f"{orphan.name}.json"
+    metadata = json.loads(ledger.read_text(encoding="utf-8"))
     assert metadata["reason"] == "no_proven_source"
     assert metadata["orphan_relative_path"].endswith(orphan.name)
+    assert metadata["expected_device"] == before.st_dev
+    assert metadata["expected_inode"] == before.st_ino
+    assert metadata["expected_file_type"] == "directory"
+    assert metadata["expected_nlink"] == before.st_nlink
+    assert metadata["expected_empty"] is True
+
+
+def test_external_orphan_metadata_entry_replacement_never_writes_business_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    legacy_id = uuid4().hex
+    staging = reclaimer.garbage_staging_dir / legacy_id
+    staging.mkdir(mode=0o700)
+    preserved_orphan = tmp_path / "preserved-validated-orphan"
+    original_metadata = reclaimer._ensure_legacy_empty_staging_orphan_metadata
+
+    def replace_at_external_metadata_entry(
+        orphan: Path,
+        staging_id: UUID,
+        orphan_token: UUID | None,
+        expected_identity: tuple[int, int, int, int],
+    ) -> None:
+        os.rename(orphan, preserved_orphan)
+        orphan.mkdir(mode=0o700)
+        (orphan / "business.bin").write_bytes(b"business-directory-must-stay-pristine")
+        original_metadata(orphan, staging_id, orphan_token, expected_identity)
+
+    monkeypatch.setattr(
+        reclaimer,
+        "_ensure_legacy_empty_staging_orphan_metadata",
+        replace_at_external_metadata_entry,
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="orphan identity conflicts"):
+        reclaimer.collect_garbage()
+
+    orphans = tuple(reclaimer.garbage_intent_orphan_dir.glob(f"legacy-empty-staging-{legacy_id}-*"))
+    assert len(orphans) == 1
+    assert {child.name for child in orphans[0].iterdir()} == {"business.bin"}
+    assert (orphans[0] / "business.bin").read_bytes() == b"business-directory-must-stay-pristine"
+    assert tuple(reclaimer.garbage_orphan_metadata_dir.iterdir()) == ()
+    assert tuple(orphans[0].glob("orphan.json")) == ()
+    assert preserved_orphan.is_dir()
+
+
+def test_external_orphan_metadata_is_authoritative_after_orphan_replacement(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    legacy_id = uuid4().hex
+    staging = reclaimer.garbage_staging_dir / legacy_id
+    staging.mkdir(mode=0o700)
+    reclaimer.collect_garbage()
+    orphan = next(reclaimer.garbage_intent_orphan_dir.glob(f"legacy-empty-staging-{legacy_id}-*"))
+    ledger = reclaimer.garbage_orphan_metadata_dir / f"{orphan.name}.json"
+    expected_ledger = ledger.read_bytes()
+    preserved_orphan = tmp_path / "preserved-ledger-orphan"
+    os.rename(orphan, preserved_orphan)
+    orphan.mkdir(mode=0o700)
+    (orphan / "business.bin").write_bytes(b"replacement-must-not-be-claimed")
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    with pytest.raises(LabArtifactConflictError, match="orphan identity conflicts"):
+        restarted.collect_garbage()
+
+    assert ledger.read_bytes() == expected_ledger
+    assert {child.name for child in orphan.iterdir()} == {"business.bin"}
+    assert (orphan / "business.bin").read_bytes() == b"replacement-must-not-be-claimed"
+    assert tuple(orphan.glob("orphan.json")) == ()
+    assert tuple(preserved_orphan.iterdir()) == ()
+
+
+def test_legacy_internal_orphan_metadata_is_read_only_compatible(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    staging_id = uuid4()
+    orphan = reclaimer.garbage_intent_orphan_dir / f"legacy-empty-staging-{staging_id.hex}"
+    orphan.mkdir(mode=0o700)
+    metadata = reclaimer._legacy_empty_staging_orphan_metadata(staging_id, None)
+    marker = orphan / "orphan.json"
+    marker.write_text(metadata.canonical_json(), encoding="utf-8")
+    before = marker.lstat()
+    before_bytes = marker.read_bytes()
+
+    reclaimer.collect_garbage()
+
+    after = marker.lstat()
+    assert (after.st_dev, after.st_ino, after.st_nlink) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_nlink,
+    )
+    assert marker.read_bytes() == before_bytes
+    assert {child.name for child in orphan.iterdir()} == {"orphan.json"}
+    assert tuple(reclaimer.garbage_orphan_metadata_dir.iterdir()) == ()
 
 
 def test_legacy_empty_staging_rename_occupation_preserves_both_paths(
@@ -3772,6 +3868,7 @@ def test_legacy_empty_staging_rename_occupation_preserves_both_paths(
     assert len(orphans) == 1
     assert tuple(orphans[0].iterdir()) == ()
     assert tuple(reclaimer.garbage_intent_orphan_dir.rglob("orphan.json")) == ()
+    assert tuple(reclaimer.garbage_orphan_metadata_dir.iterdir()) == ()
 
 
 @pytest.mark.parametrize("failure", ["missing", "both", "identity"])

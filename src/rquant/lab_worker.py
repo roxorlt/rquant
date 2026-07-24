@@ -65,6 +65,9 @@ _GARBAGE_INTENT_TEMP_NAME = re.compile(
     r"\.prepared-intent-tmp-v1-(?P<garbage_id>[0-9a-f]{32})-[0-9a-f]{32}\.tmp"
 )
 _GARBAGE_DERIVED_TEMP_NAME = re.compile(r"\.derived-json-tmp-v1-[0-9a-f]{32}\.tmp")
+_GARBAGE_ORPHAN_METADATA_TEMP_NAME = re.compile(
+    r"\.orphan-metadata-tmp-v1-(?P<metadata_hash>[0-9a-f]{64})-[0-9a-f]{32}\.tmp"
+)
 _LEGACY_EMPTY_STAGING_ORPHAN_NAME = re.compile(
     r"legacy-empty-staging-(?P<staging_id>[0-9a-f]{32})"
     r"(?:-(?P<orphan_token>[0-9a-f]{32}))?"
@@ -405,6 +408,11 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
     orphan_token: UUID | None = None
     original_staging_relative_path: str
     orphan_relative_path: str
+    expected_device: int | None = Field(default=None, ge=0)
+    expected_inode: int | None = Field(default=None, ge=0)
+    expected_file_type: Literal["directory"] | None = None
+    expected_nlink: int | None = Field(default=None, ge=1)
+    expected_empty: Literal[True] | None = None
     metadata_hash: str = ""
 
     @model_validator(mode="after")
@@ -418,6 +426,17 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
             raise ValueError("orphan metadata source conflicts with staging identity")
         if self.orphan_relative_path != expected_orphan:
             raise ValueError("orphan metadata target conflicts with staging identity")
+        identity_fields = (
+            self.expected_device,
+            self.expected_inode,
+            self.expected_file_type,
+            self.expected_nlink,
+            self.expected_empty,
+        )
+        if any(value is not None for value in identity_fields) and any(
+            value is None for value in identity_fields
+        ):
+            raise ValueError("orphan metadata expected identity is incomplete")
         canonical_payload: dict[str, object] = {
             "orphan_relative_path": self.orphan_relative_path,
             "original_staging_relative_path": self.original_staging_relative_path,
@@ -427,6 +446,16 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
         }
         if self.orphan_token is not None:
             canonical_payload["orphan_token"] = str(self.orphan_token)
+        if self.expected_device is not None:
+            canonical_payload.update(
+                {
+                    "expected_device": self.expected_device,
+                    "expected_empty": self.expected_empty,
+                    "expected_file_type": self.expected_file_type,
+                    "expected_inode": self.expected_inode,
+                    "expected_nlink": self.expected_nlink,
+                }
+            )
         canonical = json.dumps(
             canonical_payload,
             ensure_ascii=True,
@@ -1767,6 +1796,7 @@ class LabArtifactReclaimer:
         self.garbage_intent_dir = self.garbage_root / "prepared_intents"
         self.garbage_intent_temp_dir = self.garbage_root / "intent_temporary"
         self.garbage_intent_orphan_dir = self.garbage_root / "intent_orphans"
+        self.garbage_orphan_metadata_dir = self.garbage_root / "intent_orphans_metadata"
         self.garbage_owner_dir = self.garbage_root / "owners"
         self.garbage_ledger_dir = self.garbage_root / "ledger"
         self.garbage_staging_dir = self.garbage_root / "staging"
@@ -1776,6 +1806,7 @@ class LabArtifactReclaimer:
             self.garbage_intent_dir,
             self.garbage_intent_temp_dir,
             self.garbage_intent_orphan_dir,
+            self.garbage_orphan_metadata_dir,
             self.garbage_owner_dir,
             self.garbage_ledger_dir,
             self.garbage_staging_dir,
@@ -2328,8 +2359,13 @@ class LabArtifactReclaimer:
         self,
         staging_id: UUID,
         orphan_token: UUID | None,
+        expected_identity: tuple[int, int, int, int] | None = None,
     ) -> LabGarbageOrphanMetadata:
         token_suffix = f"-{orphan_token.hex}" if orphan_token is not None else ""
+        if expected_identity is not None and (
+            expected_identity[2] != stat.S_IFDIR or expected_identity[3] < 1
+        ):
+            raise LabArtifactConflictError("legacy empty staging expected identity is unsafe")
         return LabGarbageOrphanMetadata(
             staging_id=staging_id,
             orphan_token=orphan_token,
@@ -2337,37 +2373,274 @@ class LabArtifactReclaimer:
             orphan_relative_path=(
                 f".garbage-v1/intent_orphans/legacy-empty-staging-{staging_id.hex}{token_suffix}"
             ),
+            expected_device=(expected_identity[0] if expected_identity is not None else None),
+            expected_inode=(expected_identity[1] if expected_identity is not None else None),
+            expected_file_type=("directory" if expected_identity is not None else None),
+            expected_nlink=(expected_identity[3] if expected_identity is not None else None),
+            expected_empty=(True if expected_identity is not None else None),
         )
 
-    def _load_garbage_orphan_metadata(self, marker: Path) -> LabGarbageOrphanMetadata:
-        identity = self._regular_file_identity(marker, label="garbage orphan metadata")
+    @staticmethod
+    def _read_garbage_orphan_metadata_file(
+        marker: Path,
+        *,
+        allowed_links: frozenset[int] = frozenset({1}),
+    ) -> LabGarbageOrphanMetadata:
         try:
-            raw = marker.read_text(encoding="utf-8")
+            before = marker.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError("garbage orphan metadata is missing") from exc
+        if (
+            marker.is_symlink()
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink not in allowed_links
+        ):
+            raise LabArtifactConflictError("garbage orphan metadata is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(marker, flags)
+        except OSError as exc:
+            raise LabArtifactConflictError("garbage orphan metadata changed while opening") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink not in allowed_links
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+            ):
+                raise LabArtifactConflictError("garbage orphan metadata changed while opening")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after_open = os.fstat(descriptor)
+            after_path = marker.lstat()
+            if (
+                after_open.st_dev,
+                after_open.st_ino,
+                after_open.st_size,
+                after_open.st_nlink,
+                after_path.st_dev,
+                after_path.st_ino,
+                after_path.st_size,
+                after_path.st_nlink,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_nlink,
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_nlink,
+            ):
+                raise LabArtifactConflictError("garbage orphan metadata changed while validating")
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "garbage orphan metadata changed while validating"
+            ) from exc
+        finally:
+            os.close(descriptor)
+        try:
+            raw = b"".join(chunks).decode("utf-8")
             metadata = LabGarbageOrphanMetadata.model_validate_json(raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid garbage orphan metadata: {exc}") from exc
-        after = self._regular_file_identity(marker, label="garbage orphan metadata")
-        if after != identity or raw != metadata.canonical_json():
+        if raw != metadata.canonical_json():
             raise LabArtifactConflictError("garbage orphan metadata is not canonical")
         return metadata
+
+    def _load_garbage_orphan_metadata(self, marker: Path) -> LabGarbageOrphanMetadata:
+        return self._read_garbage_orphan_metadata_file(marker)
+
+    def _external_orphan_metadata_path(self, metadata: LabGarbageOrphanMetadata) -> Path:
+        return self.garbage_orphan_metadata_dir / (
+            f"{Path(metadata.orphan_relative_path).name}.json"
+        )
+
+    @staticmethod
+    def _has_external_orphan_identity(metadata: LabGarbageOrphanMetadata) -> bool:
+        return all(
+            value is not None
+            for value in (
+                metadata.expected_device,
+                metadata.expected_inode,
+                metadata.expected_file_type,
+                metadata.expected_nlink,
+                metadata.expected_empty,
+            )
+        )
+
+    def _load_external_orphan_metadata(self, marker: Path) -> LabGarbageOrphanMetadata:
+        metadata = self._load_garbage_orphan_metadata(marker)
+        if not self._has_external_orphan_identity(
+            metadata
+        ) or marker != self._external_orphan_metadata_path(metadata):
+            raise LabArtifactConflictError("external orphan metadata identity conflicts")
+        return metadata
+
+    def _assert_external_orphan_identity(
+        self,
+        orphan: Path,
+        metadata: LabGarbageOrphanMetadata,
+    ) -> None:
+        if not self._has_external_orphan_identity(metadata):
+            raise LabArtifactConflictError("external orphan metadata has no expected identity")
+        try:
+            observed = orphan.lstat()
+        except OSError as exc:
+            raise LabArtifactConflictError(
+                "legacy empty staging orphan identity conflicts"
+            ) from exc
+        expected = (
+            metadata.expected_device,
+            metadata.expected_inode,
+            stat.S_IFDIR,
+            metadata.expected_nlink,
+        )
+        if (
+            orphan.parent != self.garbage_intent_orphan_dir
+            or orphan.is_symlink()
+            or not stat.S_ISDIR(observed.st_mode)
+            or self._directory_identity(observed) != expected
+            or any(orphan.iterdir())
+        ):
+            raise LabArtifactConflictError("legacy empty staging orphan identity conflicts")
+
+    def _drop_published_orphan_metadata_temporary(
+        self,
+        temporary: Path,
+        target: Path,
+    ) -> None:
+        temporary_stat = temporary.lstat()
+        target_stat = target.lstat()
+        if (
+            temporary.is_symlink()
+            or target.is_symlink()
+            or not stat.S_ISREG(temporary_stat.st_mode)
+            or not stat.S_ISREG(target_stat.st_mode)
+            or (temporary_stat.st_dev, temporary_stat.st_ino)
+            != (target_stat.st_dev, target_stat.st_ino)
+            or temporary_stat.st_nlink != 2
+            or target_stat.st_nlink != 2
+        ):
+            raise LabArtifactConflictError("published orphan metadata temporary conflicts")
+        os.unlink(temporary)
+        _fsync_directory(self.garbage_orphan_metadata_dir)
+        if target.lstat().st_nlink != 1:
+            raise LabArtifactConflictError("orphan metadata retained an unexpected hard link")
+
+    def _isolate_orphan_metadata_temporary(self, temporary: Path) -> None:
+        target = self.garbage_intent_orphan_dir / f".derived-json-tmp-v1-{uuid4().hex}.tmp"
+        if os.path.lexists(target):
+            raise LabArtifactConflictError("orphan metadata temporary isolation conflicts")
+        os.rename(temporary, target)
+        _fsync_directory(self.garbage_orphan_metadata_dir)
+        _fsync_directory(self.garbage_intent_orphan_dir)
+
+    def _write_external_orphan_metadata(self, metadata: LabGarbageOrphanMetadata) -> Path:
+        if not self._has_external_orphan_identity(metadata):
+            raise LabArtifactConflictError("external orphan metadata has no expected identity")
+        target = self._external_orphan_metadata_path(metadata)
+        if os.path.lexists(target):
+            if self._load_external_orphan_metadata(target) != metadata:
+                raise LabArtifactConflictError("external orphan metadata conflicts")
+            return target
+        temporary = self.garbage_orphan_metadata_dir / (
+            f".orphan-metadata-tmp-v1-{metadata.metadata_hash}-{uuid4().hex}.tmp"
+        )
+        with temporary.open("xb") as stream:
+            stream.write(metadata.canonical_json().encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(self.garbage_orphan_metadata_dir)
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+            _fsync_directory(self.garbage_orphan_metadata_dir)
+        except FileExistsError as exc:
+            if self._load_external_orphan_metadata(target) != metadata:
+                raise LabArtifactConflictError(
+                    "external orphan metadata no-clobber publication conflicts"
+                ) from exc
+            self._isolate_orphan_metadata_temporary(temporary)
+        else:
+            self._drop_published_orphan_metadata_temporary(temporary, target)
+        if self._load_external_orphan_metadata(target) != metadata:
+            raise LabArtifactConflictError("external orphan metadata changed after publication")
+        return target
 
     def _ensure_legacy_empty_staging_orphan_metadata(
         self,
         orphan: Path,
         staging_id: UUID,
         orphan_token: UUID | None,
+        expected_identity: tuple[int, int, int, int],
     ) -> None:
-        expected = self._legacy_empty_staging_orphan_metadata(staging_id, orphan_token)
-        marker = orphan / "orphan.json"
-        if os.path.lexists(marker):
-            if self._load_garbage_orphan_metadata(marker) != expected:
-                raise LabArtifactConflictError("legacy empty staging orphan metadata conflicts")
-            return
-        self._write_derived_canonical_file(marker, expected.canonical_json())
-        if self._load_garbage_orphan_metadata(marker) != expected:
-            raise LabArtifactConflictError("legacy empty staging orphan metadata changed")
+        expected = self._legacy_empty_staging_orphan_metadata(
+            staging_id,
+            orphan_token,
+            expected_identity,
+        )
+        self._assert_external_orphan_identity(orphan, expected)
+        self._write_external_orphan_metadata(expected)
+        self._assert_external_orphan_identity(orphan, expected)
+
+    def _reconcile_orphan_metadata_temporaries_locked(self) -> None:
+        for temporary in tuple(sorted(self.garbage_orphan_metadata_dir.iterdir())):
+            match = _GARBAGE_ORPHAN_METADATA_TEMP_NAME.fullmatch(temporary.name)
+            if match is None:
+                continue
+            observed = temporary.lstat()
+            if (
+                temporary.is_symlink()
+                or not stat.S_ISREG(observed.st_mode)
+                or observed.st_nlink not in {1, 2}
+            ):
+                raise LabArtifactConflictError("orphan metadata temporary is unsafe")
+            metadata = self._read_garbage_orphan_metadata_file(
+                temporary,
+                allowed_links=frozenset({observed.st_nlink}),
+            )
+            if metadata.metadata_hash != match.group(
+                "metadata_hash"
+            ) or not self._has_external_orphan_identity(metadata):
+                raise LabArtifactConflictError("orphan metadata temporary identity conflicts")
+            target = self._external_orphan_metadata_path(metadata)
+            if observed.st_nlink == 2:
+                if not os.path.lexists(target):
+                    raise LabArtifactConflictError("linked orphan metadata temporary has no target")
+                target_stat = target.lstat()
+                if (target_stat.st_dev, target_stat.st_ino) != (
+                    observed.st_dev,
+                    observed.st_ino,
+                ):
+                    raise LabArtifactConflictError(
+                        "linked orphan metadata temporary conflicts with target"
+                    )
+                self._drop_published_orphan_metadata_temporary(temporary, target)
+                continue
+            if os.path.lexists(target):
+                if self._load_external_orphan_metadata(target) != metadata:
+                    raise LabArtifactConflictError(
+                        "orphan metadata temporary conflicts with durable target"
+                    )
+                self._isolate_orphan_metadata_temporary(temporary)
+                continue
+            os.link(temporary, target, follow_symlinks=False)
+            _fsync_directory(self.garbage_orphan_metadata_dir)
+            self._drop_published_orphan_metadata_temporary(temporary, target)
 
     def _reconcile_intent_temporaries_locked(self) -> None:
+        self._reconcile_orphan_metadata_temporaries_locked()
+        external_metadata: dict[str, LabGarbageOrphanMetadata] = {}
+        for marker in tuple(sorted(self.garbage_orphan_metadata_dir.iterdir())):
+            if _GARBAGE_ORPHAN_METADATA_TEMP_NAME.fullmatch(marker.name) is not None:
+                raise LabArtifactConflictError("orphan metadata temporary remained unreconciled")
+            metadata = self._load_external_orphan_metadata(marker)
+            orphan_name = Path(metadata.orphan_relative_path).name
+            if orphan_name in external_metadata:
+                raise LabArtifactConflictError("duplicate external orphan metadata")
+            external_metadata[orphan_name] = metadata
         for orphan in tuple(sorted(self.garbage_intent_orphan_dir.iterdir())):
             observed = orphan.lstat()
             if orphan.is_symlink():
@@ -2377,20 +2650,32 @@ class LabArtifactReclaimer:
                 if match is None:
                     raise LabArtifactConflictError("prepared intent orphan directory is unsafe")
                 names = {child.name for child in orphan.iterdir()}
-                if not names.issubset({"orphan.json"}):
+                if names == {"orphan.json"}:
+                    legacy = self._load_garbage_orphan_metadata(orphan / "orphan.json")
+                    expected_legacy = self._legacy_empty_staging_orphan_metadata(
+                        UUID(hex=match.group("staging_id")),
+                        (
+                            UUID(hex=match.group("orphan_token"))
+                            if match.group("orphan_token") is not None
+                            else None
+                        ),
+                    )
+                    if legacy != expected_legacy:
+                        raise LabArtifactConflictError(
+                            "legacy empty staging orphan metadata conflicts"
+                        )
+                    continue
+                metadata = external_metadata.pop(orphan.name, None)
+                if metadata is not None:
+                    self._assert_external_orphan_identity(orphan, metadata)
+                    continue
+                if names:
                     raise LabArtifactConflictError(
                         "prepared intent orphan directory has unexpected metadata"
                     )
-                self._ensure_legacy_empty_staging_orphan_metadata(
-                    orphan,
-                    UUID(hex=match.group("staging_id")),
-                    (
-                        UUID(hex=match.group("orphan_token"))
-                        if match.group("orphan_token") is not None
-                        else None
-                    ),
+                raise LabArtifactConflictError(
+                    "legacy empty staging orphan has no external metadata"
                 )
-                continue
             if (
                 not stat.S_ISREG(observed.st_mode)
                 or observed.st_nlink != 1
@@ -2400,6 +2685,8 @@ class LabArtifactReclaimer:
                 )
             ):
                 raise LabArtifactConflictError("prepared intent orphan file is unsafe")
+        if external_metadata:
+            raise LabArtifactConflictError("external orphan metadata has no matching orphan")
         for temporary in tuple(sorted(self.garbage_intent_temp_dir.iterdir())):
             match = _GARBAGE_INTENT_TEMP_NAME.fullmatch(temporary.name)
             if match is None or temporary.is_symlink():
@@ -2780,6 +3067,7 @@ class LabArtifactReclaimer:
             orphan,
             legacy_id,
             orphan_token,
+            self._directory_identity(expected),
         )
 
     def _migrate_legacy_prepared_state_locked(self) -> None:
