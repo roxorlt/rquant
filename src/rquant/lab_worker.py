@@ -73,6 +73,7 @@ _LEGACY_EMPTY_STAGING_ORPHAN_NAME = re.compile(
     r"legacy-empty-staging-(?P<staging_id>[0-9a-f]{32})"
     r"(?:-(?P<orphan_token>[0-9a-f]{32}))?"
 )
+_GARBAGE_RECOVERY_QUEUE_NAME = re.compile(r"(?P<sequence>[0-9]{20})\.json")
 
 
 def _system_clock() -> datetime:
@@ -554,6 +555,107 @@ class LabQuarantineMigrationComplete(LabWorkerModel):
             separators=(",", ":"),
             allow_nan=False,
         )
+
+
+class LabQuarantineQueueEntry(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    sequence: int = Field(strict=True, ge=1)
+    phase: Literal["active", "cold_health"]
+    intent: LabGarbagePreparedIntent
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueEntry:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("quarantine queue entry hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueSequence(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    last_sequence: int = Field(default=0, strict=True, ge=0)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueSequence:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("quarantine queue sequence hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineQueueCursor(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    last_sequence: int = Field(default=0, strict=True, ge=0)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabQuarantineQueueCursor:
+        expected = _sha256_bytes(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("quarantine queue cursor hash conflicts")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabQuarantineMigrationResult(LabWorkerModel):
+    scanned: int = Field(ge=0)
+    enqueued: int = Field(ge=0)
+    complete: bool
 
 
 class LabQuarantineRecoveryResult(LabWorkerModel):
@@ -2017,6 +2119,16 @@ class LabArtifactReclaimer:
         self.garbage_cold_health_dir = self.garbage_root / "cold_health_pending"
         self.garbage_cold_conflict_dir = self.garbage_root / "cold_health_conflicts"
         self.garbage_cold_intent_dir = self.garbage_root / "archive" / "deferred_intents"
+        self.garbage_recovery_queue_root = self.garbage_root / "recovery_queue"
+        self.garbage_recovery_queue_pending_dir = self.garbage_recovery_queue_root / "pending"
+        self.garbage_recovery_queue_archive_dir = self.garbage_recovery_queue_root / "archive"
+        self.garbage_recovery_queue_enqueued_dir = self.garbage_recovery_queue_root / "enqueued"
+        self.garbage_recovery_queue_sequence_path = (
+            self.garbage_recovery_queue_root / "sequence-v1.json"
+        )
+        self.garbage_recovery_queue_cursor_path = (
+            self.garbage_recovery_queue_root / "cursor-v1.json"
+        )
         self.garbage_intent_temp_dir = self.garbage_root / "intent_temporary"
         self.garbage_intent_orphan_dir = self.garbage_root / "intent_orphans"
         self.garbage_orphan_metadata_dir = self.garbage_root / "intent_orphans_metadata"
@@ -2032,6 +2144,10 @@ class LabArtifactReclaimer:
             self.garbage_cold_health_dir,
             self.garbage_cold_conflict_dir,
             self.garbage_cold_intent_dir,
+            self.garbage_recovery_queue_root,
+            self.garbage_recovery_queue_pending_dir,
+            self.garbage_recovery_queue_archive_dir,
+            self.garbage_recovery_queue_enqueued_dir,
             self.garbage_intent_temp_dir,
             self.garbage_intent_orphan_dir,
             self.garbage_orphan_metadata_dir,
@@ -2432,6 +2548,210 @@ class LabArtifactReclaimer:
     def _garbage_bundle_name(owner: LabGarbageOwner) -> str:
         return owner.garbage_id.hex
 
+    def _recovery_queue_path(self, sequence: int, *, archived: bool = False) -> Path:
+        directory = (
+            self.garbage_recovery_queue_archive_dir
+            if archived
+            else self.garbage_recovery_queue_pending_dir
+        )
+        return directory / f"{sequence:020d}.json"
+
+    def _recovery_queue_enqueued_path(
+        self,
+        intent: LabGarbagePreparedIntent,
+        phase: Literal["active", "cold_health"],
+    ) -> Path:
+        return self.garbage_recovery_queue_enqueued_dir / (
+            f"{phase}-{intent.owner.garbage_id.hex}.json"
+        )
+
+    def _read_recovery_metadata(self, path: Path, *, label: str) -> str:
+        identity = self._regular_file_identity(path, label=label)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LabArtifactConflictError(f"{label} cannot be read") from exc
+        if self._regular_file_identity(path, label=label) != identity:
+            raise LabArtifactConflictError(f"{label} changed while reading")
+        return raw
+
+    def _load_recovery_queue_entry(self, path: Path) -> LabQuarantineQueueEntry:
+        match = _GARBAGE_RECOVERY_QUEUE_NAME.fullmatch(path.name)
+        if match is None:
+            raise LabArtifactConflictError("quarantine queue entry name is invalid")
+        raw = self._read_recovery_metadata(path, label="quarantine queue entry")
+        try:
+            entry = LabQuarantineQueueEntry.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine queue entry: {exc}") from exc
+        if entry.sequence != int(match.group("sequence")) or raw != entry.canonical_json():
+            raise LabArtifactConflictError("quarantine queue entry identity conflicts")
+        return entry
+
+    def _load_recovery_queue_marker(self, path: Path) -> LabQuarantineQueueEntry:
+        raw = self._read_recovery_metadata(path, label="quarantine queue marker")
+        try:
+            entry = LabQuarantineQueueEntry.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine queue marker: {exc}") from exc
+        expected_name = f"{entry.phase}-{entry.intent.owner.garbage_id.hex}.json"
+        if path.name != expected_name or raw != entry.canonical_json():
+            raise LabArtifactConflictError("quarantine queue marker identity conflicts")
+        return entry
+
+    def _load_recovery_queue_sequence_locked(self) -> LabQuarantineQueueSequence:
+        if not os.path.lexists(self.garbage_recovery_queue_sequence_path):
+            return LabQuarantineQueueSequence()
+        raw = self._read_recovery_metadata(
+            self.garbage_recovery_queue_sequence_path,
+            label="quarantine queue sequence",
+        )
+        try:
+            state = LabQuarantineQueueSequence.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine queue sequence: {exc}") from exc
+        if raw != state.canonical_json():
+            raise LabArtifactConflictError("quarantine queue sequence is not canonical")
+        return state
+
+    def _load_recovery_queue_cursor_locked(self) -> LabQuarantineQueueCursor:
+        if not os.path.lexists(self.garbage_recovery_queue_cursor_path):
+            return LabQuarantineQueueCursor()
+        raw = self._read_recovery_metadata(
+            self.garbage_recovery_queue_cursor_path,
+            label="quarantine queue cursor",
+        )
+        try:
+            cursor = LabQuarantineQueueCursor.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid quarantine queue cursor: {exc}") from exc
+        if raw != cursor.canonical_json():
+            raise LabArtifactConflictError("quarantine queue cursor is not canonical")
+        return cursor
+
+    def _replace_recovery_queue_state(self, target: Path, payload: str) -> None:
+        temporary = self.garbage_recovery_queue_root / (f".queue-state-tmp-v1-{uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(payload.encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            _fsync_directory(self.garbage_recovery_queue_root)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _write_recovery_queue_sequence_locked(
+        self,
+        state: LabQuarantineQueueSequence,
+    ) -> None:
+        validated = LabQuarantineQueueSequence.model_validate(state)
+        current = self._load_recovery_queue_sequence_locked()
+        if validated.last_sequence < current.last_sequence:
+            raise LabArtifactConflictError("quarantine queue sequence cannot move backward")
+        if validated == current:
+            return
+        self._replace_recovery_queue_state(
+            self.garbage_recovery_queue_sequence_path,
+            validated.canonical_json(),
+        )
+        if self._load_recovery_queue_sequence_locked() != validated:
+            raise LabArtifactConflictError("quarantine queue sequence readback mismatch")
+
+    def _write_recovery_queue_cursor_locked(
+        self,
+        cursor: LabQuarantineQueueCursor,
+    ) -> None:
+        validated = LabQuarantineQueueCursor.model_validate(cursor)
+        current = self._load_recovery_queue_cursor_locked()
+        if validated.last_sequence < current.last_sequence:
+            raise LabArtifactConflictError("quarantine queue cursor cannot move backward")
+        if validated == current:
+            return
+        self._replace_recovery_queue_state(
+            self.garbage_recovery_queue_cursor_path,
+            validated.canonical_json(),
+        )
+        if self._load_recovery_queue_cursor_locked() != validated:
+            raise LabArtifactConflictError("quarantine queue cursor readback mismatch")
+
+    def _ensure_recovery_queue_marker(
+        self,
+        entry: LabQuarantineQueueEntry,
+    ) -> None:
+        marker = self._recovery_queue_enqueued_path(entry.intent, entry.phase)
+        if os.path.lexists(marker):
+            if self._load_recovery_queue_marker(marker) != entry:
+                raise LabArtifactConflictError("quarantine queue marker conflicts")
+            return
+        self._write_derived_canonical_file(marker, entry.canonical_json())
+        if self._load_recovery_queue_marker(marker) != entry:
+            raise LabArtifactConflictError("quarantine queue marker changed")
+
+    def _commit_unsequenced_recovery_entry_locked(
+        self,
+        state: LabQuarantineQueueSequence,
+    ) -> tuple[LabQuarantineQueueSequence, LabQuarantineQueueEntry | None]:
+        sequence = state.last_sequence + 1
+        pending = self._recovery_queue_path(sequence)
+        archived = self._recovery_queue_path(sequence, archived=True)
+        pending_exists = os.path.lexists(pending)
+        archived_exists = os.path.lexists(archived)
+        if pending_exists and archived_exists:
+            raise LabArtifactConflictError("unsequenced recovery entry has two deliveries")
+        if archived_exists:
+            raise LabArtifactConflictError("unsequenced recovery entry is already archived")
+        if not pending_exists:
+            return state, None
+        entry = self._load_recovery_queue_entry(pending)
+        committed = LabQuarantineQueueSequence(last_sequence=sequence)
+        self._write_recovery_queue_sequence_locked(committed)
+        self._ensure_recovery_queue_marker(entry)
+        return committed, entry
+
+    def _enqueue_recovery_intent(
+        self,
+        intent: LabGarbagePreparedIntent,
+        *,
+        phase: Literal["active", "cold_health"],
+    ) -> LabQuarantineQueueEntry:
+        marker = self._recovery_queue_enqueued_path(intent, phase)
+        if os.path.lexists(marker):
+            entry = self._load_recovery_queue_marker(marker)
+            if entry.intent != intent or entry.phase != phase:
+                raise LabArtifactConflictError("quarantine queue identity conflicts")
+            state = self._load_recovery_queue_sequence_locked()
+            if state.last_sequence < entry.sequence:
+                if state.last_sequence + 1 != entry.sequence:
+                    raise LabArtifactConflictError("quarantine queue sequence has a gap")
+                self._write_recovery_queue_sequence_locked(
+                    LabQuarantineQueueSequence(last_sequence=entry.sequence)
+                )
+            pending = self._recovery_queue_path(entry.sequence)
+            archived = self._recovery_queue_path(entry.sequence, archived=True)
+            if os.path.lexists(pending) == os.path.lexists(archived):
+                raise LabArtifactConflictError("quarantine queue delivery state conflicts")
+            return entry
+        state = self._load_recovery_queue_sequence_locked()
+        state, unsequenced = self._commit_unsequenced_recovery_entry_locked(state)
+        if unsequenced is not None and unsequenced.intent == intent and unsequenced.phase == phase:
+            return unsequenced
+        sequence = state.last_sequence + 1
+        entry = LabQuarantineQueueEntry(
+            sequence=sequence,
+            phase=phase,
+            intent=intent,
+        )
+        target = self._recovery_queue_path(sequence)
+        self._write_derived_canonical_file(target, entry.canonical_json())
+        if self._load_recovery_queue_entry(target) != entry:
+            raise LabArtifactConflictError("quarantine queue publication changed")
+        self._write_recovery_queue_sequence_locked(
+            LabQuarantineQueueSequence(last_sequence=sequence)
+        )
+        self._ensure_recovery_queue_marker(entry)
+        return entry
+
     def _prepared_intent(
         self,
         owner: LabGarbageOwner,
@@ -2561,6 +2881,7 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError("prepared intent retained an unexpected hard link")
 
     def _write_prepared_intent(self, intent: LabGarbagePreparedIntent) -> Path:
+        self._enqueue_recovery_intent(intent, phase="active")
         target = self._prepared_intent_path(intent.owner.garbage_id)
         if os.path.lexists(target):
             existing = self._load_prepared_intent(target)
@@ -2627,14 +2948,17 @@ class LabArtifactReclaimer:
             if self._load_prepared_intent(marker) != intent:
                 raise LabArtifactConflictError("prepared intent recovery marker conflicts")
             if state == "active":
+                self._enqueue_recovery_intent(intent, phase="active")
                 return "active"
             if state == "cold_health":
+                self._enqueue_recovery_intent(intent, phase="cold_health")
                 return "cold_health"
             if state == "cold":
                 return "cold"
             return "cold_conflict"
         deferred = self.garbage_deferred_dir / intent.owner.garbage_id.hex
         state = "cold_health" if os.path.lexists(deferred) else "active"
+        self._enqueue_recovery_intent(intent, phase=state)
         target = self._intent_marker_path(
             marker_directories[state],
             intent.owner.garbage_id,
@@ -2645,6 +2969,7 @@ class LabArtifactReclaimer:
         return state
 
     def _retire_active_intent_marker(self, intent: LabGarbagePreparedIntent) -> None:
+        self._enqueue_recovery_intent(intent, phase="cold_health")
         active = self._intent_marker_path(
             self.garbage_active_intent_dir,
             intent.owner.garbage_id,
@@ -3722,27 +4047,6 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError("prepared intent recovery scan failed") from exc
         return tuple(paths)
 
-    @staticmethod
-    def _intent_recovery_order(
-        intent: LabGarbagePreparedIntent,
-    ) -> tuple[datetime, str]:
-        return (
-            intent.created_at or datetime.min.replace(tzinfo=UTC),
-            intent.owner.garbage_id.hex,
-        )
-
-    def _oldest_recovery_intents_locked(
-        self,
-        directory: Path,
-        *,
-        limit: int,
-    ) -> tuple[tuple[Path, LabGarbagePreparedIntent], ...]:
-        loaded = tuple(
-            (path, self._load_prepared_intent(path))
-            for path in self._recovery_intent_paths_locked(directory)
-        )
-        return tuple(sorted(loaded, key=lambda item: self._intent_recovery_order(item[1]))[:limit])
-
     def _has_recovery_marker_locked(self, garbage_id: UUID) -> bool:
         return any(
             os.path.lexists(self._intent_marker_path(directory, garbage_id))
@@ -3754,40 +4058,69 @@ class LabArtifactReclaimer:
             )
         )
 
-    def _migrate_legacy_recovery_markers_locked(
+    def _is_recovery_phase_enqueued(
+        self,
+        intent: LabGarbagePreparedIntent,
+        phase: Literal["active", "cold_health"],
+    ) -> bool:
+        return os.path.lexists(self._recovery_queue_enqueued_path(intent, phase))
+
+    def migrate_legacy_recovery_queue(
         self,
         *,
         max_entries: int,
-    ) -> Exception | None:
-        if os.path.lexists(self.garbage_legacy_complete_path):
-            self._load_migration_complete_locked()
-            return None
-        paths = self._recovery_intent_paths_locked(self.garbage_intent_dir)
-        selected: list[Path] = []
-        for path in paths:
-            match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
-            if match is None:  # pragma: no cover - scanner already validates this
-                raise LabArtifactConflictError("prepared intent migration name is invalid")
-            if not self._has_recovery_marker_locked(UUID(hex=match.group("garbage_id"))):
-                selected.append(path)
-                if len(selected) == max_entries:
-                    break
-        first_error: Exception | None = None
-        for path in selected:
-            try:
-                self._ensure_intent_recovery_marker(self._load_prepared_intent(path))
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-        migration_complete = all(
-            self._has_recovery_marker_locked(
-                UUID(hex=_GARBAGE_INTENT_NAME.fullmatch(path.name).group("garbage_id"))
+    ) -> LabQuarantineMigrationResult:
+        """Explicitly index legacy intents; ordinary worker ticks never call this scan."""
+        if max_entries < 1:
+            raise ValueError("legacy quarantine migration max_entries must be positive")
+        with self.report_spool.evidence_lock():
+            if os.path.lexists(self.garbage_legacy_complete_path):
+                self._load_migration_complete_locked()
+                return LabQuarantineMigrationResult(scanned=0, enqueued=0, complete=True)
+            scanned = 0
+            enqueued = 0
+            more_missing = False
+            for directory, phase in (
+                (self.garbage_active_intent_dir, "active"),
+                (self.garbage_cold_health_dir, "cold_health"),
+            ):
+                for path in self._recovery_intent_paths_locked(directory):
+                    scanned += 1
+                    match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
+                    if match is None:  # pragma: no cover - scanner validates names
+                        raise LabArtifactConflictError("legacy recovery marker name is invalid")
+                    marker = self.garbage_recovery_queue_enqueued_dir / (
+                        f"{phase}-{match.group('garbage_id')}.json"
+                    )
+                    if os.path.lexists(marker):
+                        continue
+                    if enqueued >= max_entries:
+                        more_missing = True
+                        continue
+                    intent = self._load_prepared_intent(path)
+                    self._enqueue_recovery_intent(intent, phase=phase)
+                    enqueued += 1
+            for path in self._recovery_intent_paths_locked(self.garbage_intent_dir):
+                scanned += 1
+                match = _GARBAGE_INTENT_NAME.fullmatch(path.name)
+                if match is None:  # pragma: no cover - scanner validates names
+                    raise LabArtifactConflictError("legacy prepared intent name is invalid")
+                if self._has_recovery_marker_locked(UUID(hex=match.group("garbage_id"))):
+                    continue
+                if enqueued >= max_entries:
+                    more_missing = True
+                    continue
+                intent = self._load_prepared_intent(path)
+                self._ensure_intent_recovery_marker(intent)
+                enqueued += 1
+            complete = not more_missing
+            if complete:
+                self._write_migration_complete_locked()
+            return LabQuarantineMigrationResult(
+                scanned=scanned,
+                enqueued=enqueued,
+                complete=complete,
             )
-            for path in paths
-        )
-        if migration_complete:
-            self._write_migration_complete_locked()
-        return first_error
 
     def _retire_cold_health_marker_locked(
         self,
@@ -3808,66 +4141,151 @@ class LabArtifactReclaimer:
         if os.path.lexists(path) or self._load_prepared_intent(target) != intent:
             raise LabArtifactConflictError("cold health marker retirement changed identity")
 
+    def _ensure_authoritative_queue_intent(
+        self,
+        intent: LabGarbagePreparedIntent,
+    ) -> None:
+        target = self._prepared_intent_path(intent.owner.garbage_id)
+        if not os.path.lexists(target):
+            self._write_derived_canonical_file(target, intent.canonical_json())
+        if self._load_prepared_intent(target) != intent:
+            raise LabArtifactConflictError("queue intent conflicts with authoritative intent")
+
+    def _process_active_queue_entry(self, entry: LabQuarantineQueueEntry) -> None:
+        self._ensure_authoritative_queue_intent(entry.intent)
+        self._ensure_intent_recovery_marker(entry.intent)
+        self._reconcile_prepared_intent(entry.intent)
+
+    def _recovery_marker_paths(
+        self,
+        intent: LabGarbagePreparedIntent,
+    ) -> dict[str, Path]:
+        return {
+            state: self._intent_marker_path(directory, intent.owner.garbage_id)
+            for state, directory in {
+                "active": self.garbage_active_intent_dir,
+                "cold_health": self.garbage_cold_health_dir,
+                "cold": self.garbage_cold_intent_dir,
+                "cold_conflict": self.garbage_cold_conflict_dir,
+            }.items()
+        }
+
+    def _process_cold_health_queue_entry(
+        self,
+        entry: LabQuarantineQueueEntry,
+    ) -> Exception | None:
+        intent = entry.intent
+        self._ensure_authoritative_queue_intent(intent)
+        paths = self._recovery_marker_paths(intent)
+        existing = {state: path for state, path in paths.items() if os.path.lexists(path)}
+        if len(existing) > 1:
+            raise LabArtifactConflictError("cold health queue has duplicate intent markers")
+        if "cold" in existing:
+            if self._load_prepared_intent(existing["cold"]) != intent:
+                raise LabArtifactConflictError("cold intent marker conflicts")
+            return None
+        if "cold_conflict" in existing:
+            if self._load_prepared_intent(existing["cold_conflict"]) != intent:
+                raise LabArtifactConflictError("cold conflict marker conflicts")
+            return None
+        if "active" in existing:
+            self._retire_active_intent_marker(intent)
+            existing = {"cold_health": paths["cold_health"]}
+        if not existing:
+            self._write_derived_canonical_file(
+                paths["cold_health"],
+                intent.canonical_json(),
+            )
+            existing = {"cold_health": paths["cold_health"]}
+        health = existing.get("cold_health")
+        if health is None or self._load_prepared_intent(health) != intent:
+            raise LabArtifactConflictError("cold health intent marker conflicts")
+        try:
+            self._validate_deferred_bundle_metadata(
+                self.garbage_deferred_dir / intent.owner.garbage_id.hex,
+                expected_owner=intent.owner,
+            )
+        except Exception as exc:
+            self._retire_cold_health_marker_locked(health, intent, conflict=True)
+            return exc
+        self._retire_cold_health_marker_locked(health, intent, conflict=False)
+        return None
+
+    def _retire_recovery_queue_entry(self, entry: LabQuarantineQueueEntry) -> None:
+        pending = self._recovery_queue_path(entry.sequence)
+        archived = self._recovery_queue_path(entry.sequence, archived=True)
+        pending_exists = os.path.lexists(pending)
+        archived_exists = os.path.lexists(archived)
+        if pending_exists and archived_exists:
+            raise LabArtifactConflictError("quarantine queue entry exists in two states")
+        if archived_exists:
+            if self._load_recovery_queue_entry(archived) != entry:
+                raise LabArtifactConflictError("archived quarantine queue entry conflicts")
+            return
+        if not pending_exists or self._load_recovery_queue_entry(pending) != entry:
+            raise LabArtifactConflictError("pending quarantine queue entry is missing")
+        os.rename(pending, archived)
+        _fsync_directory(self.garbage_recovery_queue_pending_dir)
+        _fsync_directory(self.garbage_recovery_queue_archive_dir)
+        if os.path.lexists(pending) or self._load_recovery_queue_entry(archived) != entry:
+            raise LabArtifactConflictError("quarantine queue retirement changed identity")
+
     def recover_active(self, *, max_entries: int = 16) -> LabQuarantineRecoveryResult:
-        """Reconcile one durable active-intent slice without traversing cold payloads."""
+        """Consume a bounded durable recovery queue without enumerating intent history."""
         if max_entries < 1:
             raise ValueError("quarantine recovery max_entries must be positive")
         first_error: Exception | None = None
         reconciled = 0
         cold_metadata_checked = 0
         with self.report_spool.evidence_lock():
-            migration_error = self._migrate_legacy_recovery_markers_locked(
-                max_entries=min(max_entries, 4),
+            if os.path.lexists(self.garbage_legacy_complete_path):
+                self._load_migration_complete_locked()
+            sequence_state = self._load_recovery_queue_sequence_locked()
+            sequence_state, _unsequenced = self._commit_unsequenced_recovery_entry_locked(
+                sequence_state
             )
-            selected = self._oldest_recovery_intents_locked(
-                self.garbage_active_intent_dir,
-                limit=max_entries,
-            )
-            for _path, intent in selected:
-                try:
-                    authoritative = self._load_prepared_intent(
-                        self._prepared_intent_path(intent.owner.garbage_id)
-                    )
-                    if authoritative != intent:
-                        raise LabArtifactConflictError(
-                            "active intent marker conflicts with authoritative intent"
-                        )
-                    self._reconcile_prepared_intent(intent)
-                except Exception as exc:
-                    if first_error is None:
-                        first_error = exc
-                else:
+            cursor = self._load_recovery_queue_cursor_locked()
+            processed = 0
+            probes = 0
+            probe_limit = max(16, max_entries * 4)
+            while (
+                processed < max_entries
+                and probes < probe_limit
+                and cursor.last_sequence < sequence_state.last_sequence
+            ):
+                sequence = cursor.last_sequence + 1
+                probes += 1
+                pending = self._recovery_queue_path(sequence)
+                archived = self._recovery_queue_path(sequence, archived=True)
+                if os.path.lexists(pending) and os.path.lexists(archived):
+                    raise LabArtifactConflictError("quarantine queue sequence has two deliveries")
+                if os.path.lexists(archived):
+                    self._load_recovery_queue_entry(archived)
+                    cursor = LabQuarantineQueueCursor(last_sequence=sequence)
+                    self._write_recovery_queue_cursor_locked(cursor)
+                    continue
+                if not os.path.lexists(pending):
+                    cursor = LabQuarantineQueueCursor(last_sequence=sequence)
+                    self._write_recovery_queue_cursor_locked(cursor)
+                    continue
+                entry = self._load_recovery_queue_entry(pending)
+                self._ensure_recovery_queue_marker(entry)
+                if entry.phase == "active":
+                    self._process_active_queue_entry(entry)
                     reconciled += 1
-            cold_selected = self._oldest_recovery_intents_locked(
-                self.garbage_cold_health_dir,
-                limit=1,
-            )
-            for path, intent in cold_selected:
-                cold_metadata_checked += 1
-                try:
-                    authoritative = self._load_prepared_intent(
-                        self._prepared_intent_path(intent.owner.garbage_id)
-                    )
-                    if authoritative != intent:
-                        raise LabArtifactConflictError(
-                            "cold intent marker conflicts with authoritative intent"
-                        )
-                    self._validate_deferred_bundle_metadata(
-                        self.garbage_deferred_dir / intent.owner.garbage_id.hex,
-                        expected_owner=intent.owner,
-                    )
-                except Exception as exc:
-                    self._retire_cold_health_marker_locked(path, intent, conflict=True)
-                    if first_error is None:
-                        first_error = exc
                 else:
-                    self._retire_cold_health_marker_locked(path, intent, conflict=False)
-            if first_error is None:
-                first_error = migration_error
+                    cold_metadata_checked += 1
+                    failure = self._process_cold_health_queue_entry(entry)
+                    if failure is not None and first_error is None:
+                        first_error = failure
+                self._retire_recovery_queue_entry(entry)
+                cursor = LabQuarantineQueueCursor(last_sequence=sequence)
+                self._write_recovery_queue_cursor_locked(cursor)
+                processed += 1
         if first_error is not None:
             raise first_error
         return LabQuarantineRecoveryResult(
-            inspected=len(selected),
+            inspected=reconciled,
             reconciled=reconciled,
             cold_metadata_checked=cold_metadata_checked,
         )

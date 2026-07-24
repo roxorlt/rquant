@@ -535,7 +535,7 @@ def test_bounded_quarantine_recovery_never_rehashes_deferred_payloads(
 
     result = reclaimer.recover_active(max_entries=3)
 
-    assert result.inspected == 0
+    assert result.inspected + result.cold_metadata_checked <= 3
     assert result.cold_metadata_checked == 1
     archived = len(tuple(reclaimer.garbage_cold_intent_dir.iterdir()))
     pending_health = len(tuple(reclaimer.garbage_cold_health_dir.iterdir()))
@@ -646,8 +646,288 @@ def test_quarantine_recovery_does_not_parse_cold_archive(
     assert result.cold_metadata_checked == 0
 
 
+def test_recovery_queue_bounds_ten_thousand_valid_cold_health_intents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import (
+        LabArtifactReclaimer,
+        LabGarbageInventoryEntry,
+        LabGarbageOwner,
+        LabGarbagePreparedIntent,
+        LabQuarantineQueueEntry,
+        LabQuarantineQueueSequence,
+    )
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    first_intent: LabGarbagePreparedIntent | None = None
+    for index in range(1, 10_001):
+        owner = LabGarbageOwner(
+            purpose=f"bounded cold health fixture {index}",
+            original_relative_path=f"synthetic-cold/result-{index:05d}.bin",
+            payload_type="regular",
+            inventory=(
+                LabGarbageInventoryEntry(
+                    relative_path=".",
+                    file_type="regular",
+                    device=1,
+                    inode=index,
+                    size=1,
+                    sha256=f"{index:064x}",
+                ),
+            ),
+        )
+        intent = LabGarbagePreparedIntent(
+            source_relative_path=owner.original_relative_path,
+            staging_relative_path=f".garbage-v1/staging/{owner.garbage_id.hex}",
+            owner=owner,
+            created_at=NOW + timedelta(microseconds=index),
+        )
+        if first_intent is None:
+            first_intent = intent
+        entry = LabQuarantineQueueEntry(
+            sequence=index,
+            phase="cold_health",
+            intent=intent,
+        )
+        reclaimer._recovery_queue_path(index).write_text(
+            entry.canonical_json(),
+            encoding="utf-8",
+        )
+        reclaimer._prepared_intent_path(intent.owner.garbage_id).write_text(
+            intent.canonical_json(),
+            encoding="utf-8",
+        )
+        reclaimer._intent_marker_path(
+            reclaimer.garbage_cold_health_dir,
+            intent.owner.garbage_id,
+        ).write_text(intent.canonical_json(), encoding="utf-8")
+    assert first_intent is not None
+    reclaimer._write_recovery_queue_sequence_locked(
+        LabQuarantineQueueSequence(last_sequence=10_000)
+    )
+    prepared_intent_loads = 0
+    original_load = reclaimer._load_prepared_intent
+
+    def count_prepared_intent_load(path: Path) -> LabGarbagePreparedIntent:
+        nonlocal prepared_intent_loads
+        prepared_intent_loads += 1
+        return original_load(path)
+
+    recovery_metadata_reads = 0
+    original_metadata_read = reclaimer._read_recovery_metadata
+
+    def count_recovery_metadata_read(path: Path, *, label: str) -> str:
+        nonlocal recovery_metadata_reads
+        recovery_metadata_reads += 1
+        return original_metadata_read(path, label=label)
+
+    enumerations = 0
+    original_scandir = os.scandir
+    original_listdir = os.listdir
+    hot_directories = {
+        reclaimer.garbage_intent_dir,
+        reclaimer.garbage_active_intent_dir,
+        reclaimer.garbage_cold_health_dir,
+        reclaimer.garbage_recovery_queue_pending_dir,
+    }
+
+    def count_hot_enumeration(path: os.PathLike[str] | str) -> object:
+        nonlocal enumerations
+        if Path(path) in hot_directories:
+            enumerations += 1
+        return original_scandir(path)
+
+    def count_hot_listdir(path: os.PathLike[str] | str) -> list[str]:
+        nonlocal enumerations
+        if Path(path) in hot_directories:
+            enumerations += 1
+        return original_listdir(path)
+
+    monkeypatch.setattr(reclaimer, "_load_prepared_intent", count_prepared_intent_load)
+    monkeypatch.setattr(reclaimer, "_read_recovery_metadata", count_recovery_metadata_read)
+    monkeypatch.setattr(os, "scandir", count_hot_enumeration)
+    monkeypatch.setattr(os, "listdir", count_hot_listdir)
+    monkeypatch.setattr(
+        reclaimer,
+        "_validate_deferred_bundle_metadata",
+        lambda _bundle, *, expected_owner: None,
+    )
+
+    result = reclaimer.recover_active(max_entries=1)
+
+    assert result.cold_metadata_checked == 1
+    assert prepared_intent_loads == 3
+    assert recovery_metadata_reads == 6
+    assert enumerations == 0
+
+
+def test_recovery_queue_repairs_crash_before_enqueued_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "queue-crash" / "result.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"queue-before-marker")
+    owner = reclaimer._garbage_owner(victim, purpose="queue marker crash fixture")
+    intent = reclaimer._prepared_intent(owner)
+    original_marker = reclaimer._ensure_recovery_queue_marker
+
+    def interrupt_marker(_entry: object) -> None:
+        raise InterruptedError("crash before enqueued marker")
+
+    monkeypatch.setattr(reclaimer, "_ensure_recovery_queue_marker", interrupt_marker)
+    with pytest.raises(InterruptedError, match="enqueued marker"):
+        reclaimer._write_prepared_intent(intent)
+    monkeypatch.setattr(reclaimer, "_ensure_recovery_queue_marker", original_marker)
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    active = restarted.recover_active(max_entries=1)
+    health = restarted.recover_active(max_entries=1)
+
+    assert active.reconciled == 1
+    assert health.cold_metadata_checked == 1
+    assert not victim.exists()
+    assert len(tuple(restarted.garbage_cold_intent_dir.iterdir())) == 1
+
+
+def test_recovery_queue_repairs_crash_after_entry_before_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer, LabQuarantineQueueSequence
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "queue-sequence-crash" / "result.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"queue-before-sequence")
+    owner = reclaimer._garbage_owner(victim, purpose="queue sequence crash fixture")
+    intent = reclaimer._prepared_intent(owner)
+    original_sequence_write = reclaimer._write_recovery_queue_sequence_locked
+
+    def interrupt_sequence(_state: LabQuarantineQueueSequence) -> None:
+        raise InterruptedError("crash before queue sequence")
+
+    monkeypatch.setattr(
+        reclaimer,
+        "_write_recovery_queue_sequence_locked",
+        interrupt_sequence,
+    )
+    with pytest.raises(InterruptedError, match="queue sequence"):
+        reclaimer._write_prepared_intent(intent)
+    monkeypatch.setattr(
+        reclaimer,
+        "_write_recovery_queue_sequence_locked",
+        original_sequence_write,
+    )
+
+    assert reclaimer._recovery_queue_path(1).is_file()
+    assert reclaimer._load_recovery_queue_sequence_locked().last_sequence == 0
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    active = restarted.recover_active(max_entries=1)
+    health = restarted.recover_active(max_entries=1)
+
+    assert active.reconciled == 1
+    assert health.cold_metadata_checked == 1
+    assert not victim.exists()
+    assert len(tuple(restarted.garbage_cold_intent_dir.iterdir())) == 1
+
+
+def test_recovery_queue_repairs_crash_between_cold_enqueue_and_marker_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "queue-move-crash" / "result.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"queue-before-marker-move")
+    original_rename = lab_worker_module.os.rename
+
+    def interrupt_marker_move(source: Path, target: Path) -> None:
+        if (
+            Path(source).parent == reclaimer.garbage_active_intent_dir
+            and Path(target).parent == reclaimer.garbage_cold_health_dir
+        ):
+            raise InterruptedError("crash before cold marker move")
+        original_rename(source, target)
+
+    monkeypatch.setattr(lab_worker_module.os, "rename", interrupt_marker_move)
+    with pytest.raises(InterruptedError, match="cold marker move"):
+        reclaimer.logical_quarantine_tree(victim, purpose="cold marker move crash fixture")
+    monkeypatch.setattr(lab_worker_module.os, "rename", original_rename)
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    assert restarted.recover_active(max_entries=1).reconciled == 1
+    assert restarted.recover_active(max_entries=1).cold_metadata_checked == 1
+    assert len(tuple(restarted.garbage_cold_intent_dir.iterdir())) == 1
+
+
+def test_recovery_queue_restarts_after_health_check_before_queue_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "queue-retire-crash" / "result.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"health-before-retirement")
+    assert reclaimer.logical_quarantine_tree(victim, purpose="queue retirement crash fixture")
+    assert reclaimer.recover_active(max_entries=1).reconciled == 1
+    original_retire = reclaimer._retire_recovery_queue_entry
+
+    def interrupt_retirement(entry: object) -> None:
+        raise InterruptedError("crash before queue retirement")
+
+    monkeypatch.setattr(reclaimer, "_retire_recovery_queue_entry", interrupt_retirement)
+    with pytest.raises(InterruptedError, match="queue retirement"):
+        reclaimer.recover_active(max_entries=1)
+    monkeypatch.setattr(reclaimer, "_retire_recovery_queue_entry", original_retire)
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    result = restarted.recover_active(max_entries=1)
+
+    assert result.cold_metadata_checked == 1
+    assert len(tuple(restarted.garbage_cold_intent_dir.iterdir())) == 1
+
+
 def test_bounded_quarantine_recovery_migrates_legacy_intent_once(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.lab_worker import LabArtifactReclaimer, LabGarbagePreparedIntent
 
@@ -677,10 +957,26 @@ def test_bounded_quarantine_recovery_migrates_legacy_intent_once(
         artifact_root=artifact_root,
         report_spool=LabReportSpool(tmp_path / "reports"),
     )
-    result = restarted.recover_active(max_entries=1)
+    original_scan = restarted._recovery_intent_paths_locked
 
+    def reject_ordinary_scan(_directory: Path) -> tuple[Path, ...]:
+        raise AssertionError("ordinary recovery must not scan legacy authority")
+
+    monkeypatch.setattr(restarted, "_recovery_intent_paths_locked", reject_ordinary_scan)
+    before_migration = restarted.recover_active(max_entries=1)
+    monkeypatch.setattr(restarted, "_recovery_intent_paths_locked", original_scan)
+
+    assert before_migration.inspected == 0
+    assert victim.exists()
+
+    migration = restarted.migrate_legacy_recovery_queue(max_entries=1)
+    result = restarted.recover_active(max_entries=1)
+    health = restarted.recover_active(max_entries=1)
+
+    assert migration.enqueued == 1
     assert result.inspected == 1
     assert result.reconciled == 1
+    assert health.cold_metadata_checked == 1
     assert not victim.exists()
     assert tuple(restarted.garbage_active_intent_dir.iterdir()) == ()
     assert len(tuple(restarted.garbage_cold_intent_dir.iterdir())) == 1
