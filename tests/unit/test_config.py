@@ -84,10 +84,18 @@ class TestSettings:
             lab_job_report_dir="",
         )
 
-        assert configured.lab_jobs_path_resolved == (tmp_path / "data" / "lab_jobs.sqlite3")
-        assert configured.lab_job_command_dir_resolved == (tmp_path / "data" / "lab_job_commands")
-        assert configured.lab_job_claim_dir_resolved == (tmp_path / "data" / "lab_shard_claims")
-        assert configured.lab_job_report_dir_resolved == (tmp_path / "data" / "lab_worker_reports")
+        assert configured.lab_jobs_path_resolved == (
+            tmp_path / "data" / "lab_jobs.sqlite3"
+        )
+        assert configured.lab_job_command_dir_resolved == (
+            tmp_path / "data" / "lab_job_commands"
+        )
+        assert configured.lab_job_claim_dir_resolved == (
+            tmp_path / "data" / "lab_shard_claims"
+        )
+        assert configured.lab_job_report_dir_resolved == (
+            tmp_path / "data" / "lab_worker_reports"
+        )
         assert configured.lab_jobs_path_resolved.parent.is_dir()
         assert configured.lab_job_command_dir_resolved.is_dir()
         assert configured.lab_job_claim_dir_resolved.is_dir()
@@ -234,7 +242,9 @@ class TestSettings:
             tmp_path / "data" / "research_ro.duckdb"
         )
         assert configured.research_lake_dir_resolved == tmp_path / "data" / "lake"
-        assert configured.research_staging_dir_resolved == (tmp_path / "data" / "research_staging")
+        assert configured.research_staging_dir_resolved == (
+            tmp_path / "data" / "research_staging"
+        )
         assert configured.research_lake_dir_resolved.is_dir()
         assert configured.research_staging_dir_resolved.is_dir()
         assert configured.research_cloud_ingest_enabled is False
