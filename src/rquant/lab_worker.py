@@ -65,6 +65,7 @@ _GARBAGE_INTENT_TEMP_NAME = re.compile(
     r"\.prepared-intent-tmp-v1-(?P<garbage_id>[0-9a-f]{32})-[0-9a-f]{32}\.tmp"
 )
 _GARBAGE_DERIVED_TEMP_NAME = re.compile(r"\.derived-json-tmp-v1-[0-9a-f]{32}\.tmp")
+_LEGACY_EMPTY_STAGING_ORPHAN_NAME = re.compile(r"legacy-empty-staging-(?P<staging_id>[0-9a-f]{32})")
 
 
 def _system_clock() -> datetime:
@@ -382,6 +383,51 @@ class LabGarbagePreparedIntent(LabWorkerModel):
         if self.intent_hash and self.intent_hash != intent_hash:
             raise ValueError("prepared intent hash conflicts with canonical content")
         object.__setattr__(self, "intent_hash", intent_hash)
+        return self
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+
+class LabGarbageOrphanMetadata(LabWorkerModel):
+    schema_version: Literal[1] = 1
+    reason: Literal["no_proven_source"] = "no_proven_source"
+    staging_id: UUID
+    original_staging_relative_path: str
+    orphan_relative_path: str
+    metadata_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabGarbageOrphanMetadata:
+        expected_source = f".garbage-v1/staging/{self.staging_id.hex}"
+        expected_orphan = f".garbage-v1/intent_orphans/legacy-empty-staging-{self.staging_id.hex}"
+        if self.original_staging_relative_path != expected_source:
+            raise ValueError("orphan metadata source conflicts with staging identity")
+        if self.orphan_relative_path != expected_orphan:
+            raise ValueError("orphan metadata target conflicts with staging identity")
+        canonical = json.dumps(
+            {
+                "orphan_relative_path": self.orphan_relative_path,
+                "original_staging_relative_path": self.original_staging_relative_path,
+                "reason": self.reason,
+                "schema_version": self.schema_version,
+                "staging_id": str(self.staging_id),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        metadata_hash = _sha256_bytes(canonical.encode("utf-8"))
+        if self.metadata_hash and self.metadata_hash != metadata_hash:
+            raise ValueError("orphan metadata hash conflicts with canonical content")
+        object.__setattr__(self, "metadata_hash", metadata_hash)
         return self
 
     def canonical_json(self) -> str:
@@ -2268,14 +2314,63 @@ class LabArtifactReclaimer:
             raise
         return target
 
+    def _legacy_empty_staging_orphan_metadata(
+        self,
+        staging_id: UUID,
+    ) -> LabGarbageOrphanMetadata:
+        return LabGarbageOrphanMetadata(
+            staging_id=staging_id,
+            original_staging_relative_path=f".garbage-v1/staging/{staging_id.hex}",
+            orphan_relative_path=(
+                f".garbage-v1/intent_orphans/legacy-empty-staging-{staging_id.hex}"
+            ),
+        )
+
+    def _load_garbage_orphan_metadata(self, marker: Path) -> LabGarbageOrphanMetadata:
+        identity = self._regular_file_identity(marker, label="garbage orphan metadata")
+        try:
+            raw = marker.read_text(encoding="utf-8")
+            metadata = LabGarbageOrphanMetadata.model_validate_json(raw)
+        except Exception as exc:
+            raise LabArtifactConflictError(f"invalid garbage orphan metadata: {exc}") from exc
+        after = self._regular_file_identity(marker, label="garbage orphan metadata")
+        if after != identity or raw != metadata.canonical_json():
+            raise LabArtifactConflictError("garbage orphan metadata is not canonical")
+        return metadata
+
+    def _ensure_legacy_empty_staging_orphan_metadata(
+        self,
+        orphan: Path,
+        staging_id: UUID,
+    ) -> None:
+        expected = self._legacy_empty_staging_orphan_metadata(staging_id)
+        marker = orphan / "orphan.json"
+        if os.path.lexists(marker):
+            if self._load_garbage_orphan_metadata(marker) != expected:
+                raise LabArtifactConflictError("legacy empty staging orphan metadata conflicts")
+            return
+        self._write_derived_canonical_file(marker, expected.canonical_json())
+        if self._load_garbage_orphan_metadata(marker) != expected:
+            raise LabArtifactConflictError("legacy empty staging orphan metadata changed")
+
     def _reconcile_intent_temporaries_locked(self) -> None:
-        for orphan in self.garbage_intent_orphan_dir.iterdir():
+        for orphan in tuple(sorted(self.garbage_intent_orphan_dir.iterdir())):
             observed = orphan.lstat()
             if orphan.is_symlink():
                 raise LabArtifactConflictError("prepared intent orphan is unsafe")
             if stat.S_ISDIR(observed.st_mode):
-                if not orphan.name.startswith("legacy-empty-staging-") or any(orphan.iterdir()):
+                match = _LEGACY_EMPTY_STAGING_ORPHAN_NAME.fullmatch(orphan.name)
+                if match is None:
                     raise LabArtifactConflictError("prepared intent orphan directory is unsafe")
+                names = {child.name for child in orphan.iterdir()}
+                if not names.issubset({"orphan.json"}):
+                    raise LabArtifactConflictError(
+                        "prepared intent orphan directory has unexpected metadata"
+                    )
+                self._ensure_legacy_empty_staging_orphan_metadata(
+                    orphan,
+                    UUID(hex=match.group("staging_id")),
+                )
                 continue
             if (
                 not stat.S_ISREG(observed.st_mode)
@@ -2573,67 +2668,20 @@ class LabArtifactReclaimer:
             intents[intent.owner.garbage_id] = intent
         return intents
 
-    def _legacy_unique_active_source(self) -> Path:
-        files: list[Path] = []
-        excluded = {self.garbage_root.name, ".reclaim-ledger"}
-        for current, directories, names in os.walk(self.artifact_root, followlinks=False):
-            current_path = Path(current)
-            if current_path == self.artifact_root:
-                directories[:] = sorted(name for name in directories if name not in excluded)
-            else:
-                directories.sort()
-            for directory in directories:
-                child = current_path / directory
-                if child.is_symlink():
-                    raise LabArtifactConflictError("legacy source tree contains a symlink")
-            for name in sorted(names):
-                child = current_path / name
-                observed = child.lstat()
-                if child.is_symlink() or not stat.S_ISREG(observed.st_mode):
-                    raise LabArtifactConflictError("legacy source tree contains an unsafe file")
-                if observed.st_nlink != 1:
-                    raise LabArtifactConflictError("legacy source tree contains a hard link")
-                files.append(child)
-        if not files:
-            raise LabArtifactConflictError("legacy empty staging has no provable source")
-        if len(files) == 1:
-            return files[0]
-        common = Path(os.path.commonpath([str(path.parent) for path in files]))
-        if common == self.artifact_root or not common.is_relative_to(self.artifact_root):
-            raise LabArtifactConflictError("legacy empty staging source is ambiguous")
-        return common
-
-    def _migrate_legacy_empty_staging_locked(
-        self,
-        staging: Path,
-        intents: dict[UUID, LabGarbagePreparedIntent],
-    ) -> None:
+    def _orphan_legacy_empty_staging_locked(self, staging: Path) -> None:
         try:
             legacy_id = UUID(hex=staging.name)
         except ValueError as exc:
             raise LabArtifactConflictError("legacy empty staging name is invalid") from exc
         if staging.is_symlink() or not staging.is_dir() or any(staging.iterdir()):
             raise LabArtifactConflictError("legacy empty staging is unsafe")
-        purpose = f"legacy empty staging recovery {legacy_id.hex}"
-        recovered = tuple(intent for intent in intents.values() if intent.owner.purpose == purpose)
-        if len(recovered) > 1:
-            raise LabArtifactConflictError("legacy empty staging has duplicate recovery intents")
-        if recovered:
-            intent = recovered[0]
-        else:
-            source = self._legacy_unique_active_source()
-            owner = self._garbage_owner(source, purpose=purpose)
-            intent = self._prepared_intent(owner)
-            self._write_prepared_intent(intent)
-            intents[owner.garbage_id] = intent
-        if intent.owner.garbage_id == legacy_id:
-            raise LabArtifactConflictError("legacy empty staging conflicts with recovered intent")
         orphan = self.garbage_intent_orphan_dir / f"legacy-empty-staging-{legacy_id.hex}"
         if os.path.lexists(orphan):
             raise LabArtifactConflictError("legacy empty staging orphan already exists")
         os.rename(staging, orphan)
         _fsync_directory(self.garbage_staging_dir)
         _fsync_directory(self.garbage_intent_orphan_dir)
+        self._ensure_legacy_empty_staging_orphan_metadata(orphan, legacy_id)
 
     def _migrate_legacy_prepared_state_locked(self) -> None:
         intents = self._prepared_intents_locked()
@@ -2697,12 +2745,8 @@ class LabArtifactReclaimer:
                 continue
             self._write_prepared_intent(expected)
             intents[garbage_id] = expected
-        if len(empty_staging) > 1:
-            raise LabArtifactConflictError(
-                "multiple legacy empty staging directories are ambiguous"
-            )
         for staging in empty_staging:
-            self._migrate_legacy_empty_staging_locked(staging, intents)
+            self._orphan_legacy_empty_staging_locked(staging)
 
     def _reconcile_prepared_intent(self, intent: LabGarbagePreparedIntent) -> None:
         owner = intent.owner

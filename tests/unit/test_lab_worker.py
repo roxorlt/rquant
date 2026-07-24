@@ -3557,7 +3557,7 @@ def test_prepared_intent_rejects_conflicting_derived_state(
     assert victim.read_bytes() == b"derived-state-source"
 
 
-@pytest.mark.parametrize("legacy_state", ["empty_staging", "global_owner", "both_owners"])
+@pytest.mark.parametrize("legacy_state", ["global_owner", "both_owners"])
 def test_legacy_partial_staging_reconstructs_unique_prepared_intent(
     tmp_path: Path,
     legacy_state: str,
@@ -3570,17 +3570,13 @@ def test_legacy_partial_staging_reconstructs_unique_prepared_intent(
     )
     victim = tmp_path / "artifacts" / "legacy-partial.bin"
     victim.write_bytes(f"legacy-{legacy_state}".encode())
-    if legacy_state == "empty_staging":
-        legacy_id = uuid4().hex
-        (reclaimer.garbage_staging_dir / legacy_id).mkdir(mode=0o700)
-    else:
-        owner = reclaimer._garbage_owner(victim, purpose="legacy prepared fixture")
-        global_owner = reclaimer.garbage_owner_dir / f"{owner.garbage_id.hex}.json"
-        global_owner.write_text(owner.canonical_json(), encoding="utf-8")
-        if legacy_state == "both_owners":
-            staging = reclaimer.garbage_staging_dir / owner.garbage_id.hex
-            staging.mkdir(mode=0o700)
-            (staging / "owner.json").write_text(owner.canonical_json(), encoding="utf-8")
+    owner = reclaimer._garbage_owner(victim, purpose="legacy prepared fixture")
+    global_owner = reclaimer.garbage_owner_dir / f"{owner.garbage_id.hex}.json"
+    global_owner.write_text(owner.canonical_json(), encoding="utf-8")
+    if legacy_state == "both_owners":
+        staging = reclaimer.garbage_staging_dir / owner.garbage_id.hex
+        staging.mkdir(mode=0o700)
+        (staging / "owner.json").write_text(owner.canonical_json(), encoding="utf-8")
 
     restarted = LabArtifactReclaimer(
         artifact_root=tmp_path / "artifacts",
@@ -3593,27 +3589,59 @@ def test_legacy_partial_staging_reconstructs_unique_prepared_intent(
     assert entries[0].state == "deferred_gc"
     assert not victim.exists()
     assert len(tuple(restarted.garbage_intent_dir.glob("*.json"))) == 1
-    if legacy_state == "empty_staging":
-        assert len(tuple(restarted.garbage_intent_orphan_dir.iterdir())) == 1
 
 
-def test_legacy_empty_staging_fails_closed_when_source_is_ambiguous(tmp_path: Path) -> None:
-    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+@pytest.mark.parametrize("business_shape", ["unique_file", "multiple_files", "directory"])
+def test_recovers_legacy_empty_staging_without_intent(
+    tmp_path: Path,
+    business_shape: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+    from rquant.lab_worker import LabArtifactReclaimer
 
     reclaimer = LabArtifactReclaimer(
         artifact_root=tmp_path / "artifacts",
         report_spool=LabReportSpool(tmp_path / "reports"),
     )
-    (tmp_path / "artifacts" / "first.bin").write_bytes(b"first")
-    (tmp_path / "artifacts" / "second.bin").write_bytes(b"second")
-    staging = reclaimer.garbage_staging_dir / uuid4().hex
+    live_result = tmp_path / "artifacts" / "live-result.bin"
+    live_result.write_bytes(b"live-result-must-not-move")
+    business_files = [live_result]
+    if business_shape == "multiple_files":
+        second = tmp_path / "artifacts" / "second-result.bin"
+        second.write_bytes(b"second-result-must-not-move")
+        business_files.append(second)
+    elif business_shape == "directory":
+        nested = tmp_path / "artifacts" / "business-run" / "nested" / "result.bin"
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b"nested-result-must-not-move")
+        business_files.append(nested)
+    identities = {
+        path: (path.lstat().st_dev, path.lstat().st_ino, path.read_bytes())
+        for path in business_files
+    }
+    legacy_id = uuid4().hex
+    staging = reclaimer.garbage_staging_dir / legacy_id
     staging.mkdir(mode=0o700)
 
-    with pytest.raises(LabArtifactConflictError, match="ambiguous"):
-        reclaimer.collect_garbage()
+    def reject_business_tree_scan(*args, **kwargs):
+        raise AssertionError("legacy empty staging must not scan the artifact business tree")
 
-    assert staging.is_dir()
+    monkeypatch.setattr(lab_worker_module.os, "walk", reject_business_tree_scan)
+
+    reclaimer.collect_garbage()
+
+    assert not staging.exists()
+    for path, identity in identities.items():
+        assert path.is_file()
+        assert (path.lstat().st_dev, path.lstat().st_ino, path.read_bytes()) == identity
     assert tuple(reclaimer.garbage_intent_dir.iterdir()) == ()
+    assert tuple(reclaimer.garbage_deferred_dir.iterdir()) == ()
+    orphan = reclaimer.garbage_intent_orphan_dir / f"legacy-empty-staging-{legacy_id}"
+    metadata = json.loads((orphan / "orphan.json").read_text(encoding="utf-8"))
+    assert metadata["reason"] == "no_proven_source"
+    assert metadata["original_staging_relative_path"] == f".garbage-v1/staging/{legacy_id}"
+    assert not hasattr(reclaimer, "_legacy_unique_active_source")
 
 
 @pytest.mark.parametrize("failure", ["missing", "both", "identity"])
