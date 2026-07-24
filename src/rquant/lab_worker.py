@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import shutil
 import signal
 import threading
+import time
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
-from datetime import UTC, datetime
+from contextlib import AbstractContextManager, contextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
 from typing import Literal
@@ -18,9 +21,12 @@ from uuid import UUID, uuid4
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_shard_protocol import (
     LabClaimSpool,
+    LabClaimSupersededError,
+    LabReportReceipt,
     LabReportSpool,
     LabShardClaim,
     LabShardFailed,
@@ -29,6 +35,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
     LabWorkerStopped,
 )
+from rquant.research_gate import ResearchGateRequest, open_gated_research_store
 from rquant.research_run_spec import ResearchRunSpec
 from rquant.research_snapshot import ResearchExecutionSession
 from rquant.strategy_job_adapters import (
@@ -124,6 +131,9 @@ class LabShardResultManifest(LabWorkerModel):
     schema_version: Literal[1] = 1
     job_id: UUID
     shard_id: UUID
+    claim_token: UUID
+    claim_generation: int = Field(ge=1)
+    scheduler_fencing_token: int = Field(ge=1)
     spec_hash: str = Field(pattern=_HASH_PATTERN)
     payload_hash: str = Field(pattern=_HASH_PATTERN)
     plan_hash: str = Field(pattern=_HASH_PATTERN)
@@ -157,7 +167,7 @@ class LabShardResultManifest(LabWorkerModel):
 
 
 class LabWorkerFailure(LabWorkerModel):
-    phase: Literal["claim", "session", "execute", "seal"]
+    phase: Literal["claim", "session", "execute", "deadline", "fence", "seal"]
     error_type: str = Field(min_length=1)
     message: str = Field(min_length=1)
 
@@ -182,6 +192,8 @@ class LabArtifactConflictError(RuntimeError):
 
 
 StoreFactory = Callable[[], AbstractContextManager[object]]
+ReceiptWaiter = Callable[[LabWorkerReport, float, threading.Event], LabReportReceipt]
+CodeShaProvider = Callable[[], str | None]
 
 
 class LabWorker:
@@ -199,6 +211,9 @@ class LabWorker:
         heartbeat_interval_seconds: float = 30.0,
         lease_extension_seconds: int = 120,
         poll_interval_ms: int = 250,
+        receipt_timeout_seconds: float = 30.0,
+        receipt_waiter: ReceiptWaiter | None = None,
+        verified_code_sha_provider: CodeShaProvider | None = None,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
         normalized_worker_id = worker_id.strip()
@@ -210,6 +225,8 @@ class LabWorker:
             raise ValueError("lease_extension_seconds must be from 1 through 3600")
         if poll_interval_ms < 1:
             raise ValueError("poll_interval_ms must be positive")
+        if receipt_timeout_seconds <= 0:
+            raise ValueError("receipt_timeout_seconds must be positive")
         self.worker_id = normalized_worker_id
         self.claim_spool = claim_spool
         self.report_spool = report_spool
@@ -223,6 +240,9 @@ class LabWorker:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.lease_extension_seconds = lease_extension_seconds
         self.poll_interval_ms = poll_interval_ms
+        self.receipt_timeout_seconds = receipt_timeout_seconds
+        self.receipt_waiter = receipt_waiter or self._wait_for_receipt
+        self.verified_code_sha_provider = verified_code_sha_provider
         self.clock = clock
         self._stop = threading.Event()
 
@@ -230,7 +250,26 @@ class LabWorker:
         self._stop.set()
 
     def sealed_bundle_path(self, claim: LabShardClaim) -> Path:
-        return self.artifact_root / "jobs" / str(claim.job_id) / "shards" / str(claim.shard_id)
+        shard_root = (
+            self.artifact_root / "jobs" / str(claim.job_id) / "shards" / str(claim.shard_id)
+        )
+        if not all(
+            hasattr(claim, field)
+            for field in (
+                "scheduler_fencing_token",
+                "claim_generation",
+                "claim_token",
+            )
+        ):
+            return shard_root / "accepted"
+        return shard_root / "attempts" / self._attempt_name(claim)
+
+    @staticmethod
+    def _attempt_name(claim: LabShardClaim) -> str:
+        return (
+            f"{claim.scheduler_fencing_token:020d}-"
+            f"{claim.claim_generation:020d}-{claim.claim_token}"
+        )
 
     def _temporary_bundle_path(self, claim: LabShardClaim) -> Path:
         return (
@@ -238,8 +277,91 @@ class LabWorker:
             / ".tmp"
             / str(claim.job_id)
             / str(claim.shard_id)
-            / f"{claim.claim_generation:020d}-{claim.claim_token}"
+            / self._attempt_name(claim)
         )
+
+    @staticmethod
+    def _parse_attempt_name(name: str) -> tuple[int, int, UUID]:
+        parts = name.split("-", 2)
+        if (
+            len(parts) != 3
+            or len(parts[0]) != 20
+            or len(parts[1]) != 20
+            or not parts[0].isdigit()
+            or not parts[1].isdigit()
+        ):
+            raise LabArtifactConflictError(f"invalid temporary attempt identity: {name}")
+        try:
+            token = UUID(parts[2])
+        except ValueError as exc:
+            raise LabArtifactConflictError(
+                f"invalid temporary attempt token: {name}"
+            ) from exc
+        return int(parts[0]), int(parts[1]), token
+
+    @staticmethod
+    def _assert_safe_temporary_tree(path: Path) -> None:
+        if path.is_symlink() or not path.is_dir():
+            raise LabArtifactConflictError(
+                f"obsolete temporary attempt is a symlink or not a directory: {path.name}"
+            )
+        for root, directories, files in os.walk(path, followlinks=False):
+            for name in (*directories, *files):
+                child = Path(root) / name
+                if child.is_symlink():
+                    raise LabArtifactConflictError(
+                        f"obsolete temporary attempt contains a symlink: {name}"
+                    )
+
+    def _assert_safe_artifact_ancestors(self, path: Path) -> None:
+        try:
+            relative = path.relative_to(self.artifact_root)
+        except ValueError as exc:
+            raise LabArtifactConflictError("artifact path escapes configured root") from exc
+        current = self.artifact_root
+        for part in relative.parts:
+            if part in {"", ".", ".."}:
+                raise LabArtifactConflictError("artifact path contains traversal components")
+            current /= part
+            if current.is_symlink():
+                raise LabArtifactConflictError(
+                    f"artifact path ancestor is a symlink: {part}"
+                )
+            if os.path.lexists(current) and not current.is_dir():
+                raise LabArtifactConflictError(
+                    f"artifact path ancestor is not a directory: {part}"
+                )
+
+    def _reclaim_obsolete_temporaries(self, claim: LabShardClaim) -> None:
+        current_root = self._temporary_bundle_path(claim)
+        shard_root = current_root.parent
+        self._assert_safe_artifact_ancestors(shard_root)
+        if not shard_root.exists():
+            return
+        if shard_root.is_symlink() or not shard_root.is_dir():
+            raise LabArtifactConflictError("temporary shard root is unsafe")
+        for candidate in tuple(shard_root.iterdir()):
+            fence, generation, token = self._parse_attempt_name(candidate.name)
+            if generation > claim.claim_generation:
+                continue
+            if generation == claim.claim_generation:
+                if (
+                    fence,
+                    token,
+                ) != (
+                    claim.scheduler_fencing_token,
+                    claim.claim_token,
+                ):
+                    raise LabArtifactConflictError(
+                        "same-generation temporary attempt has conflicting identity"
+                    )
+                continue
+            self._assert_safe_temporary_tree(candidate)
+            reclaimed = shard_root / f".reclaim-{candidate.name}-{uuid4().hex}"
+            os.rename(candidate, reclaimed)
+            _fsync_directory(shard_root)
+            shutil.rmtree(reclaimed)
+            _fsync_directory(shard_root)
 
     def _publish_report(
         self,
@@ -255,38 +377,90 @@ class LabWorker:
         self.report_spool.publish(report)
         return report
 
+    def _wait_for_receipt(
+        self,
+        report: LabWorkerReport,
+        timeout_seconds: float,
+        stop: threading.Event,
+    ) -> LabReportReceipt:
+        timeout_at = time.monotonic() + timeout_seconds
+        receipt_path = self.report_spool.ack_dir / f"{report.report_id}.json"
+        while True:
+            if os.path.lexists(receipt_path):
+                receipt = self.report_spool.load_receipt(receipt_path)
+                if (
+                    receipt.report_id != report.report_id
+                    or receipt.content_hash != report.content_hash
+                    or receipt.job_id != report.job_id
+                    or receipt.shard_id != report.shard_id
+                ):
+                    raise ValueError("report receipt identity does not match published report")
+                return receipt
+            if stop.is_set():
+                raise InterruptedError("worker stop requested while waiting for report receipt")
+            remaining = timeout_at - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"report receipt timed out: {report.report_id}")
+            stop.wait(min(0.05, remaining))
+
+    def _publish_and_wait(
+        self,
+        claim: LabShardClaim,
+        body: LabShardHeartbeat | LabShardSucceeded,
+        *,
+        stop: threading.Event,
+    ) -> LabReportReceipt:
+        report = self._publish_report(claim, body)
+        receipt = self.receipt_waiter(report, self.receipt_timeout_seconds, stop)
+        if (
+            receipt.report_id != report.report_id
+            or receipt.content_hash != report.content_hash
+            or receipt.job_id != report.job_id
+            or receipt.shard_id != report.shard_id
+        ):
+            raise ValueError("report receipt identity does not match published report")
+        if receipt.status != "accepted":
+            raise PermissionError(f"worker report rejected: {receipt.reason}")
+        return receipt
+
+    def _best_effort_report(
+        self,
+        claim: LabShardClaim,
+        body: LabShardFailed | LabWorkerStopped,
+    ) -> bool:
+        try:
+            self._publish_report(claim, body)
+        except Exception:
+            return False
+        return True
+
     def _next_owned_claim(self) -> LabShardClaim | None:
         now = _utc(self.clock())
-        entries = []
         for path in self.claim_spool.pending_paths():
             try:
                 entry = self.claim_spool.load(path)
             except InvalidCommandEnvelopeError:
                 continue
             claim = entry.claim
+            try:
+                marker = self.claim_spool.current(claim.job_id, claim.shard_id)
+            except InvalidCommandEnvelopeError:
+                continue
+            if marker.claim != claim:
+                if claim.worker_id == self.worker_id:
+                    with suppress(InvalidCommandEnvelopeError):
+                        self.claim_spool.quarantine(
+                            entry,
+                            reason="superseded_by_current_claim_marker",
+                        )
+                continue
             if claim.lease_expires_at <= now:
                 continue
-            entries.append(entry)
-        latest_by_shard = {}
-        for entry in entries:
-            claim = entry.claim
-            key = (claim.job_id, claim.shard_id)
-            identity = (
-                claim.scheduler_fencing_token,
-                claim.claim_generation,
-                claim.claimed_at,
-                claim.claim_token.int,
-            )
-            current = latest_by_shard.get(key)
-            if current is None or identity > current[0]:
-                latest_by_shard[key] = (identity, entry)
-        latest_entries = {id(value[1]) for value in latest_by_shard.values()}
-        for entry in entries:
-            if id(entry) not in latest_entries or entry.claim.worker_id != self.worker_id:
+            if claim.worker_id != self.worker_id:
                 continue
             try:
                 return self.claim_spool.consume(entry)
-            except InvalidCommandEnvelopeError:
+            except (InvalidCommandEnvelopeError, LabClaimSupersededError):
                 continue
         return None
 
@@ -308,37 +482,46 @@ class LabWorker:
             raise PermissionError(
                 "formal worker execution requires metadata store and research lake"
             )
-        with self.metadata_store_factory() as metadata_store:
-            snapshot = metadata_store.get_dataset_snapshot(identity.snapshot_id)
-            if (
-                snapshot is None
-                or snapshot.snapshot_id != identity.snapshot_id
-                or snapshot.status != "ready"
-            ):
-                raise PermissionError(
-                    "formal dataset snapshot identity is unavailable or not ready"
-                )
-            binding = metadata_store.get_dataset_snapshot_binding(identity.snapshot_id)
-            if (
-                binding is None
-                or binding.snapshot_id != identity.snapshot_id
-                or binding.binding_hash != identity.binding_hash
-                or binding.status != "ready"
-            ):
-                raise PermissionError("formal dataset binding identity is unavailable or changed")
-            if identity.audit_run_id is not None:
-                audit = metadata_store.get_data_audit_run(identity.audit_run_id)
-                if (
-                    audit is None
-                    or audit.audit_run_id != identity.audit_run_id
-                    or audit.status != "completed"
-                ):
-                    raise PermissionError("formal data audit identity is unavailable or incomplete")
-            with ResearchExecutionSession(
+        if self.verified_code_sha_provider is None:
+            raise PermissionError("formal worker execution requires verified runtime code SHA")
+        runtime_code_sha = self.verified_code_sha_provider()
+        if (
+            runtime_code_sha is None
+            or len(runtime_code_sha) != 40
+            or any(character not in "0123456789abcdef" for character in runtime_code_sha)
+            or runtime_code_sha != spec.code_sha
+        ):
+            raise PermissionError(
+                "formal runtime clean code SHA does not match ResearchRunSpec"
+            )
+        adapter = self.adapter_registry.for_spec(spec)
+        request = ResearchGateRequest(
+            mode="formal",
+            strategy_name=adapter.snapshot_strategy_name,
+            start_date=spec.parameters.start_date,
+            end_date=spec.parameters.end_date,
+            audit_run_id=identity.audit_run_id,
+            dataset_snapshot_id=identity.snapshot_id,
+            dataset_binding_hash=identity.binding_hash,
+            code_commit=runtime_code_sha,
+        )
+
+        def execution_session_factory(
+            binding: DatasetSnapshotBinding,
+            lake_root: Path,
+        ) -> AbstractContextManager[object]:
+            return ResearchExecutionSession(
                 binding=binding,
-                lake_root=self.research_lake_root,
-            ) as session:
-                yield session
+                lake_root=lake_root,
+            )
+
+        with open_gated_research_store(
+            request,
+            metadata_store_factory=self.metadata_store_factory,
+            execution_session_factory=execution_session_factory,
+            lake_root=self.research_lake_root,
+        ) as (execution_store, _decision):
+            yield execution_store
 
     def _heartbeat_loop(
         self,
@@ -357,6 +540,10 @@ class LabWorker:
             except Exception as exc:
                 errors.append(exc)
                 finished.set()
+
+    def _check_deadline(self, spec: ResearchRunSpec) -> None:
+        if _utc(self.clock()) >= spec.deadline:
+            raise TimeoutError("ResearchRunSpec deadline reached")
 
     @staticmethod
     def _validate_result_identity(
@@ -415,6 +602,9 @@ class LabWorker:
         manifest = LabShardResultManifest(
             job_id=claim.job_id,
             shard_id=claim.shard_id,
+            claim_token=claim.claim_token,
+            claim_generation=claim.claim_generation,
+            scheduler_fencing_token=claim.scheduler_fencing_token,
             spec_hash=claim.spec_hash,
             payload_hash=claim.payload_hash,
             plan_hash=claim.plan_hash,
@@ -439,6 +629,9 @@ class LabWorker:
         return (
             manifest.job_id,
             manifest.shard_id,
+            manifest.claim_token,
+            manifest.claim_generation,
+            manifest.scheduler_fencing_token,
             manifest.spec_hash,
             manifest.payload_hash,
             manifest.plan_hash,
@@ -447,6 +640,9 @@ class LabWorker:
         ) == (
             claim.job_id,
             claim.shard_id,
+            claim.claim_token,
+            claim.claim_generation,
+            claim.scheduler_fencing_token,
             claim.spec_hash,
             claim.payload_hash,
             claim.plan_hash,
@@ -471,6 +667,16 @@ class LabWorker:
             raise LabArtifactConflictError("sealed result manifest is not canonical JSON")
         if not self._expected_manifest_identity(claim, manifest):
             raise LabArtifactConflictError("sealed result manifest identity conflicts with claim")
+        expected_files = {"manifest.json"} | {
+            artifact.file_name for artifact in manifest.artifacts
+        }
+        actual_files = {child.name for child in bundle.iterdir()}
+        if actual_files != expected_files:
+            unexpected = sorted(actual_files - expected_files)
+            missing = sorted(expected_files - actual_files)
+            raise LabArtifactConflictError(
+                f"sealed bundle has unexpected={unexpected} missing={missing} files"
+            )
         for artifact in manifest.artifacts:
             path = bundle / artifact.file_name
             if path.parent != bundle or path.is_symlink() or not path.is_file():
@@ -497,8 +703,14 @@ class LabWorker:
         return manifest
 
     def _cleanup_temporary(self, temporary: Path) -> None:
+        if temporary.is_symlink():
+            raise LabArtifactConflictError("temporary shard bundle is a symlink")
         if temporary.exists():
             for child in temporary.iterdir():
+                if child.is_symlink() or not child.is_file():
+                    raise LabArtifactConflictError(
+                        f"temporary shard bundle contains unsafe path: {child.name}"
+                    )
                 child.unlink()
             temporary.rmdir()
         stop = self.artifact_root / ".tmp"
@@ -516,22 +728,43 @@ class LabWorker:
         self,
         claim: LabShardClaim,
         result: LabShardExecutionResult,
+        *,
+        deadline: datetime | None = None,
     ) -> LabShardResultManifest:
         self._validate_result_identity(claim, result)
         sealed = self.sealed_bundle_path(claim)
-        if sealed.exists() or sealed.is_symlink():
-            return self._validate_bundle(sealed, claim)
-        temporary = self._temporary_bundle_path(claim)
+        temporary_root = self._temporary_bundle_path(claim)
+        self._assert_safe_artifact_ancestors(temporary_root)
+        self._assert_safe_artifact_ancestors(sealed.parent)
+        temporary = temporary_root / uuid4().hex
         try:
             self._write_bundle(temporary, claim, result)
-            manifest = self._validate_bundle(temporary, claim)
+            candidate = self._validate_bundle(temporary, claim)
+            if self._stop.is_set():
+                raise InterruptedError("worker stop requested before atomic seal")
+            if deadline is not None and _utc(self.clock()) >= deadline:
+                raise TimeoutError("ResearchRunSpec deadline reached before atomic seal")
+            if sealed.exists() or sealed.is_symlink():
+                existing = self._validate_bundle(sealed, claim)
+                if existing.manifest_hash != candidate.manifest_hash:
+                    raise LabArtifactConflictError(
+                        "same attempt produced a conflicting result manifest"
+                    )
+                return existing
             sealed.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.rename(temporary, sealed)
-            except FileExistsError:
-                return self._validate_bundle(sealed, claim)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                existing = self._validate_bundle(sealed, claim)
+                if existing.manifest_hash != candidate.manifest_hash:
+                    raise LabArtifactConflictError(
+                        "concurrent attempt produced a conflicting result manifest"
+                    ) from exc
+                return existing
             _fsync_directory(sealed.parent)
-            return manifest
+            return candidate
         finally:
             self._cleanup_temporary(temporary)
 
@@ -545,7 +778,7 @@ class LabWorker:
         self,
         claim: LabShardClaim,
         *,
-        phase: Literal["claim", "session", "execute", "seal"],
+        phase: Literal["claim", "session", "execute", "deadline", "fence", "seal"],
         error: Exception,
     ) -> LabWorkerTickResult:
         failure = LabWorkerFailure(
@@ -553,22 +786,32 @@ class LabWorker:
             error_type=type(error).__name__,
             message=str(error) or type(error).__name__,
         )
-        self._publish_report(
+        self._best_effort_report(
             claim,
             LabShardFailed(failure_json=failure.canonical_json()),
         )
         return LabWorkerTickResult(status="failed", claim_token=claim.claim_token)
 
+    def _stopped_result(self, claim: LabShardClaim, *, reason: str) -> LabWorkerTickResult:
+        self._best_effort_report(claim, LabWorkerStopped(reason=reason))
+        return LabWorkerTickResult(status="stopped", claim_token=claim.claim_token)
+
     def run_once(self) -> LabWorkerTickResult:
+        if self._stop.is_set():
+            return LabWorkerTickResult(status="stopped")
         claim = self._next_owned_claim()
         if claim is None:
             return LabWorkerTickResult(status="idle")
         if self._stop.is_set():
-            self._publish_report(
+            return self._stopped_result(
                 claim,
-                LabWorkerStopped(reason="worker stop requested before shard execution"),
+                reason="worker stop requested before shard execution",
             )
-            return LabWorkerTickResult(status="stopped", claim_token=claim.claim_token)
+
+        try:
+            self._reclaim_obsolete_temporaries(claim)
+        except Exception as exc:
+            return self._failure_result(claim, phase="claim", error=exc)
 
         try:
             validated = self.adapter_registry.validate_claim(claim)
@@ -576,19 +819,9 @@ class LabWorker:
             return self._failure_result(claim, phase="claim", error=exc)
 
         try:
-            reused = self._reuse_sealed(claim)
+            self._check_deadline(validated.spec)
         except Exception as exc:
-            return self._failure_result(claim, phase="seal", error=exc)
-        if reused is not None:
-            self._publish_report(
-                claim,
-                LabShardSucceeded(result_manifest_hash=reused.manifest_hash),
-            )
-            return LabWorkerTickResult(
-                status="succeeded",
-                claim_token=claim.claim_token,
-                manifest_hash=reused.manifest_hash,
-            )
+            return self._failure_result(claim, phase="deadline", error=exc)
 
         finished = threading.Event()
         heartbeat_errors: list[Exception] = []
@@ -600,27 +833,77 @@ class LabWorker:
         )
         heartbeat.start()
         try:
-            try:
-                with self._open_store(validated.spec) as store:
-                    result = self.adapter_registry.execute_shard(validated, store)
-            except PermissionError as exc:
-                return self._failure_result(claim, phase="session", error=exc)
-            except Exception as exc:
-                return self._failure_result(claim, phase="execute", error=exc)
-            if heartbeat_errors:
-                raise heartbeat_errors[0]
-            try:
-                manifest = self._seal_result(claim, result)
-            except Exception as exc:
-                return self._failure_result(claim, phase="seal", error=exc)
+            with self._open_store(validated.spec) as store:
+                result = self.adapter_registry.execute_shard(validated, store)
+        except PermissionError as exc:
+            return self._failure_result(claim, phase="session", error=exc)
+        except Exception as exc:
+            return self._failure_result(claim, phase="execute", error=exc)
         finally:
             finished.set()
             heartbeat.join()
 
-        self._publish_report(
-            claim,
-            LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
-        )
+        if heartbeat_errors:
+            return self._failure_result(
+                claim,
+                phase="fence",
+                error=heartbeat_errors[0],
+            )
+        try:
+            self._check_deadline(validated.spec)
+        except Exception as exc:
+            return self._failure_result(claim, phase="deadline", error=exc)
+        if self._stop.is_set():
+            return self._stopped_result(
+                claim,
+                reason="worker stop requested after shard execution",
+            )
+
+        try:
+            self._check_deadline(validated.spec)
+            receipt = self._publish_and_wait(
+                claim,
+                LabShardHeartbeat(
+                    lease_extension_seconds=self.lease_extension_seconds,
+                ),
+                stop=self._stop,
+            )
+            effective_expiry = receipt.accepted_at + timedelta(
+                seconds=self.lease_extension_seconds
+            )
+            if _utc(self.clock()) >= effective_expiry:
+                raise PermissionError("accepted heartbeat lease expired before seal")
+            self._check_deadline(validated.spec)
+        except InterruptedError:
+            return self._stopped_result(
+                claim,
+                reason="worker stop requested while confirming final shard fence",
+            )
+        except Exception as exc:
+            return self._failure_result(claim, phase="fence", error=exc)
+
+        try:
+            manifest = self._seal_result(
+                claim,
+                result,
+                deadline=validated.spec.deadline,
+            )
+        except InterruptedError:
+            return self._stopped_result(
+                claim,
+                reason="worker stop requested before atomic shard seal",
+            )
+        except Exception as exc:
+            return self._failure_result(claim, phase="seal", error=exc)
+
+        try:
+            self._publish_and_wait(
+                claim,
+                LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+                stop=threading.Event(),
+            )
+        except Exception as exc:
+            return self._failure_result(claim, phase="fence", error=exc)
         return LabWorkerTickResult(
             status="succeeded",
             claim_token=claim.claim_token,

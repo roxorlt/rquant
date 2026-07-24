@@ -35,6 +35,7 @@ class SchedulerTickResult(BaseModel):
     reports_accepted: int = Field(default=0, ge=0)
     reports_rejected: int = Field(default=0, ge=0)
     reports_quarantined: int = Field(default=0, ge=0)
+    deadlines_expired: int = Field(default=0, ge=0)
     plans_created: int = Field(default=0, ge=0)
     plans_failed: int = Field(default=0, ge=0)
     claims_published: int = Field(default=0, ge=0)
@@ -170,6 +171,8 @@ class LabScheduler:
         applied = 0
         rejected = 0
         quarantined = 0
+        deadline_lease = lease
+        deadline_now = recovery_now
         for path in self.spool.pending_paths(limit=self.max_commands_per_tick):
             try:
                 entry = self.spool.load(path)
@@ -181,6 +184,8 @@ class LabScheduler:
                 quarantined += 1
                 continue
             lease, mutation_now = self._mutation_context()
+            deadline_lease = lease
+            deadline_now = mutation_now
             try:
                 receipt = self.store.apply_command(
                     entry.envelope,
@@ -200,6 +205,12 @@ class LabScheduler:
             else:
                 rejected += 1
             self.spool.ack(entry, receipt)
+        deadlines_expired = len(
+            self.store.expire_deadline_jobs(
+                lease=deadline_lease,
+                now=deadline_now,
+            )
+        )
         reports_processed = 0
         reports_accepted = 0
         reports_rejected = 0
@@ -241,7 +252,14 @@ class LabScheduler:
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 try:
                     definitions = self.adapter_registry.plan(job.spec)
-                except ValueError:
+                except ValueError as exc:
+                    lease, mutation_now = self._mutation_context()
+                    self.store.fail_unplanned_job(
+                        job.job_id,
+                        reason=f"adapter plan failed: {exc}",
+                        lease=lease,
+                        now=mutation_now,
+                    )
                     plans_failed += 1
                     continue
                 lease, mutation_now = self._mutation_context()
@@ -261,6 +279,12 @@ class LabScheduler:
                 worker_id = self.claim_worker_ids[(start + inspected) % worker_count]
                 inspected += 1
                 lease, mutation_now = self._mutation_context()
+                deadlines_expired += len(
+                    self.store.expire_deadline_jobs(
+                        lease=lease,
+                        now=mutation_now,
+                    )
+                )
                 claim = self.store.claim_next_shard(
                     worker_id=worker_id,
                     shard_lease_seconds=self.shard_lease_seconds,
@@ -283,6 +307,7 @@ class LabScheduler:
             reports_accepted=reports_accepted,
             reports_rejected=reports_rejected,
             reports_quarantined=reports_quarantined,
+            deadlines_expired=deadlines_expired,
             plans_created=plans_created,
             plans_failed=plans_failed,
             claims_published=claims_published,

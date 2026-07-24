@@ -83,6 +83,7 @@ _LEGACY_PLAN_HASH = "0" * 64
 _ATTEMPTS_EXHAUSTED_FAILURE_JSON = '{"reason":"attempts_exhausted"}'
 _PARENT_ATTEMPTS_EXHAUSTED_FAILURE_JSON = '{"reason":"parent_failed_attempts_exhausted"}'
 _PARENT_RECOVERABLE_FAILURE_JSON = '{"reason":"parent_failed_recoverable"}'
+_DEADLINE_EXCEEDED_FAILURE_JSON = '{"reason":"deadline_exceeded"}'
 
 
 class JobStatus(StrEnum):
@@ -2827,6 +2828,157 @@ class LabJobStore:
             records = tuple(LabJobReader._shard_from_row(row) for row in rows)
         return records
 
+    def fail_unplanned_job(
+        self,
+        job_id: UUID,
+        *,
+        reason: str,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> bool:
+        failure_reason = reason.strip()
+        if not failure_reason:
+            raise ValueError("unplanned job failure reason must not be empty")
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, now=current)
+            row = self._load_job_row(connection, job_id)
+            if row is None:
+                raise KeyError(f"lab job not found: {job_id}")
+            if JobStatus(str(row["status"])) is not JobStatus.QUEUED:
+                return False
+            shard_count = connection.execute(
+                "SELECT COUNT(*) FROM lab_shard WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()[0]
+            if _strict_sqlite_int(
+                shard_count,
+                field="lab_shard.unplanned_count",
+                minimum=0,
+            ):
+                return False
+            version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
+            cursor = connection.execute(
+                """
+                UPDATE lab_job
+                SET status = ?, control_intent = ?, version = ?, recoverable = 0,
+                    scheduler_fencing_token = NULL, updated_at = ?
+                WHERE job_id = ? AND version = ? AND status = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    ControlIntent.NONE.value,
+                    version + 1,
+                    _dump_time(current),
+                    str(job_id),
+                    version,
+                    JobStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleJobVersionError("unplanned job changed while recording plan failure")
+            self._insert_event(
+                connection,
+                job_id=job_id,
+                request_id=None,
+                event_type="job_plan_failed",
+                prior_status=JobStatus.QUEUED,
+                new_status=JobStatus.FAILED,
+                job_version=version + 1,
+                reason=failure_reason,
+                fencing_token=lease.fencing_token,
+                now=current,
+            )
+        return True
+
+    def expire_deadline_jobs(
+        self,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> tuple[UUID, ...]:
+        current = _utc(now)
+        expired: list[UUID] = []
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, now=current)
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_job
+                WHERE status IN (?, ?, ?)
+                  AND deadline <= ?
+                ORDER BY deadline, created_at, job_id
+                """,
+                (
+                    JobStatus.QUEUED.value,
+                    JobStatus.RUNNING.value,
+                    JobStatus.CHECKPOINTED.value,
+                    _dump_time(current),
+                ),
+            ).fetchall()
+            for row in rows:
+                job_id = UUID(str(row["job_id"]))
+                source = JobStatus(str(row["status"]))
+                version = _strict_sqlite_int(
+                    row["version"], field="lab_job.version", minimum=0
+                )
+                connection.execute(
+                    """
+                    UPDATE lab_shard
+                    SET status = ?, version = version + 1,
+                        worker_id = NULL, scheduler_fencing_token = NULL,
+                        claim_token = NULL, claimed_at = NULL,
+                        heartbeat_at = NULL, lease_expires_at = NULL,
+                        result_manifest_hash = NULL, failure_json = ?,
+                        checkpoint_json = NULL, finished_at = ?, updated_at = ?
+                    WHERE job_id = ? AND status IN (?, ?, ?)
+                    """,
+                    (
+                        ShardStatus.FAILED.value,
+                        _DEADLINE_EXCEEDED_FAILURE_JSON,
+                        _dump_time(current),
+                        _dump_time(current),
+                        str(job_id),
+                        ShardStatus.QUEUED.value,
+                        ShardStatus.RUNNING.value,
+                        ShardStatus.CHECKPOINTED.value,
+                    ),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE lab_job
+                    SET status = ?, control_intent = ?, version = ?, recoverable = 0,
+                        scheduler_fencing_token = NULL, updated_at = ?
+                    WHERE job_id = ? AND version = ? AND status = ?
+                    """,
+                    (
+                        JobStatus.FAILED.value,
+                        ControlIntent.NONE.value,
+                        version + 1,
+                        _dump_time(current),
+                        str(job_id),
+                        version,
+                        source.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StaleJobVersionError(
+                        "job changed while applying ResearchRunSpec deadline"
+                    )
+                self._insert_event(
+                    connection,
+                    job_id=job_id,
+                    request_id=None,
+                    event_type="job_deadline_exceeded",
+                    prior_status=source,
+                    new_status=JobStatus.FAILED,
+                    job_version=version + 1,
+                    reason="ResearchRunSpec deadline exceeded",
+                    fencing_token=lease.fencing_token,
+                    now=current,
+                )
+                expired.append(job_id)
+        return tuple(expired)
+
     def list_unplanned_jobs(self, *, limit: int = 64) -> tuple[LabJobRecord, ...]:
         if limit < 1:
             raise ValueError("unplanned job limit must be positive")
@@ -3133,6 +3285,7 @@ class LabJobStore:
                     FROM lab_job AS j
                     WHERE j.status IN (?, ?)
                       AND j.control_intent = ?
+                      AND j.deadline > ?
                       AND EXISTS (
                         SELECT 1 FROM lab_shard AS s
                         WHERE s.job_id = j.job_id
@@ -3146,6 +3299,7 @@ class LabJobStore:
                         JobStatus.QUEUED.value,
                         JobStatus.RUNNING.value,
                         ControlIntent.NONE.value,
+                        _dump_time(current),
                         ShardStatus.QUEUED.value,
                     ),
                 ).fetchone()
@@ -3162,6 +3316,7 @@ class LabJobStore:
                     FROM lab_job AS j
                     WHERE j.status IN (?, ?)
                       AND j.control_intent = ?
+                      AND j.deadline > ?
                       AND EXISTS (
                         SELECT 1 FROM lab_shard AS s
                         WHERE s.job_id = j.job_id
@@ -3179,6 +3334,7 @@ class LabJobStore:
                         JobStatus.QUEUED.value,
                         JobStatus.RUNNING.value,
                         ControlIntent.NONE.value,
+                        _dump_time(current),
                         ShardStatus.QUEUED.value,
                         cursor_created_at_dump,
                         cursor_created_at_dump,

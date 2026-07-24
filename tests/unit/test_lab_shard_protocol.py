@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError, RequestContentConflictError
 from rquant.lab_shard_protocol import (
     LabClaimSpool,
+    LabClaimSupersededError,
     LabReportReceipt,
     LabReportSpool,
     LabShardClaim,
@@ -170,6 +171,44 @@ def test_claim_spool_is_no_clobber_and_reader_detects_tamper(tmp_path: Path) -> 
     os.replace(replacement, entries[0].path)
     with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
         spool.consume(entries[0])
+
+
+def test_claim_spool_persists_exact_high_water_across_consume_and_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    old = _claim(generation=1)
+    old_entry = spool.publish(old)
+    current = old.model_copy(
+        update={
+            "worker_id": "worker-b",
+            "claim_token": uuid4(),
+            "claim_generation": 2,
+            "claimed_at": NOW + timedelta(minutes=1),
+            "lease_expires_at": NOW + timedelta(minutes=6),
+        }
+    )
+    current_entry = spool.publish(current)
+
+    restarted = LabClaimSpool(root)
+    assert restarted.current(old.job_id, old.shard_id).claim == current
+    with pytest.raises(LabClaimSupersededError):
+        restarted.consume(old_entry)
+
+    assert restarted.consume(current_entry) == current
+    assert LabClaimSpool(root).current(old.job_id, old.shard_id).claim == current
+    with pytest.raises(LabClaimSupersededError):
+        LabClaimSpool(root).publish(old)
+
+
+def test_claim_spool_rejects_same_generation_with_different_token(tmp_path: Path) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    spool.publish(claim)
+
+    with pytest.raises(LabClaimSupersededError):
+        spool.publish(claim.model_copy(update={"claim_token": uuid4()}))
 
 
 def test_report_spool_exactly_once_ack_restart_and_conflict(tmp_path: Path) -> None:

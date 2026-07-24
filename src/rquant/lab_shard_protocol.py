@@ -9,7 +9,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -29,6 +29,12 @@ _SPOOL_NAME = re.compile(
 )
 _ACK_NAME = re.compile(
     r"(?P<message_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
+)
+_CURRENT_CLAIM_NAME = re.compile(
+    r"(?P<job_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\."
+    r"(?P<shard_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
 )
 MAX_SHARD_HEARTBEAT_EXTENSION_SECONDS = 3_600
@@ -184,6 +190,24 @@ class LabShardClaim(LabShardProtocolModel):
     @property
     def plan_hash(self) -> str:
         return self.definition.plan_hash
+
+
+class LabClaimHighWater(LabShardProtocolModel):
+    schema_version: Literal[1] = 1
+    claim: LabShardClaim
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> LabClaimHighWater:
+        expected = _canonical_hash(self.claim.model_dump(mode="json"))
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("content_hash does not match current claim")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+
+class LabClaimSupersededError(RuntimeError):
+    """A claim is older than, or conflicts with, the durable shard high-water."""
 
 
 class LabShardHeartbeat(LabShardProtocolModel):
@@ -409,10 +433,96 @@ class _TypedSpoolBase(LabCommandSpool):
 class LabClaimSpool(_TypedSpoolBase):
     """Scheduler-to-worker durable claim channel."""
 
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.current_dir = self.root / "current"
+        self.current_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _claim_order(claim: LabShardClaim) -> tuple[int, int, datetime, int]:
+        return (
+            claim.claim_generation,
+            claim.scheduler_fencing_token,
+            claim.claimed_at,
+            claim.claim_token.int,
+        )
+
+    def _current_path(self, job_id: UUID, shard_id: UUID) -> Path:
+        return self.current_dir / f"{job_id}.{shard_id}.json"
+
+    def _load_current_locked(self, job_id: UUID, shard_id: UUID) -> LabClaimHighWater:
+        path = self._current_path(job_id, shard_id)
+        candidate, payload, _file_stat = self._read_regular_child(path, self.current_dir)
+        match = _CURRENT_CLAIM_NAME.fullmatch(candidate.name)
+        if match is None:
+            raise InvalidCommandEnvelopeError(
+                f"invalid current claim basename: {candidate.name}"
+            )
+        try:
+            marker = LabClaimHighWater.model_validate_json(payload)
+        except Exception as exc:
+            raise InvalidCommandEnvelopeError(
+                f"invalid current claim marker {candidate.name}: {exc}"
+            ) from exc
+        if (
+            marker.claim.job_id != UUID(match.group("job_id"))
+            or marker.claim.shard_id != UUID(match.group("shard_id"))
+            or marker.claim.job_id != job_id
+            or marker.claim.shard_id != shard_id
+        ):
+            raise InvalidCommandEnvelopeError(
+                f"current claim marker identity does not match basename {candidate.name}"
+            )
+        return marker
+
+    def current(self, job_id: UUID, shard_id: UUID) -> LabClaimHighWater:
+        with self._exclusive_lock():
+            return self._load_current_locked(job_id, shard_id)
+
+    def _publish_current_locked(self, marker: LabClaimHighWater) -> None:
+        target = self._current_path(marker.claim.job_id, marker.claim.shard_id)
+        temporary = self.current_dir / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(marker.model_dump_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            self._fsync_directory(self.current_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def is_current(self, claim: LabShardClaim) -> bool:
+        validated = LabShardClaim.model_validate(claim)
+        with self._exclusive_lock():
+            if not os.path.lexists(
+                self._current_path(validated.job_id, validated.shard_id)
+            ):
+                return False
+            marker = self._load_current_locked(validated.job_id, validated.shard_id)
+            return marker.claim == validated
+
     def publish(self, claim: LabShardClaim) -> LabClaimSpoolEntry:
         validated = LabShardClaim.model_validate(claim)
         payload = validated.model_dump_json().encode("utf-8")
         with self._exclusive_lock():
+            if os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
+                current = self._load_current_locked(validated.job_id, validated.shard_id)
+            else:
+                current = None
+            if (
+                current is not None
+                and current.claim != validated
+                and (
+                    validated.claim_generation <= current.claim.claim_generation
+                    or validated.scheduler_fencing_token
+                    < current.claim.scheduler_fencing_token
+                    or self._claim_order(validated) <= self._claim_order(current.claim)
+                )
+            ):
+                raise LabClaimSupersededError(
+                    "claim does not advance the durable shard high-water"
+                )
             pending = self._pending_for_message_locked(validated.claim_token)
             if pending is not None:
                 existing = self.load(pending)
@@ -420,12 +530,18 @@ class LabClaimSpool(_TypedSpoolBase):
                     raise RequestContentConflictError(
                         f"claim_token {validated.claim_token} already has different content"
                     )
-                return existing
-            sequence = self._next_sequence_locked()
-            target = self.pending_dir / f"{sequence:020d}-{validated.claim_token}.json"
-            if not self._publish_no_clobber(target, payload):
-                raise RequestContentConflictError(f"delivery sequence {sequence} already exists")
-            return self.load(target)
+                entry = existing
+            else:
+                sequence = self._next_sequence_locked()
+                target = self.pending_dir / f"{sequence:020d}-{validated.claim_token}.json"
+                if not self._publish_no_clobber(target, payload):
+                    raise RequestContentConflictError(
+                        f"delivery sequence {sequence} already exists"
+                    )
+                entry = self.load(target)
+            if current is None or current.claim != validated:
+                self._publish_current_locked(LabClaimHighWater(claim=validated))
+            return entry
 
     def load(self, path: Path) -> LabClaimSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
@@ -464,6 +580,11 @@ class LabClaimSpool(_TypedSpoolBase):
                 raise InvalidCommandEnvelopeError("pending claim was replaced before consume")
             if current.claim != entry.claim:
                 raise InvalidCommandEnvelopeError("pending claim changed before consume")
+            marker = self._load_current_locked(entry.claim.job_id, entry.claim.shard_id)
+            if marker.claim != entry.claim:
+                raise LabClaimSupersededError(
+                    "pending claim is not the durable shard high-water"
+                )
             self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
         return entry.claim
 

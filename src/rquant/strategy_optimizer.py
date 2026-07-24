@@ -9,6 +9,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.minute_replay import MinuteFreq
+from rquant.research_run_spec import ExecutionCostSpec
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strategy_compare import EntryMode, ProfileVariant, run_entry_mode_comparison
 from rquant.topn_selection import (
@@ -239,6 +240,7 @@ def run_strategy_optimization(
     score_profile_names: list[str] | None = None,
     walk_forward_folds: int = 0,
     freq: MinuteFreq = "1min",
+    execution_costs: ExecutionCostSpec | None = None,
 ) -> StrategyOptimizationResult:
     """自动枚举策略组合，并按训练/验证稳健分排序。"""
     start = _parse_date(start_date)
@@ -273,6 +275,7 @@ def run_strategy_optimization(
             preset_name=preset_name,
             max_hold_days=hold_days,
             freq=freq,
+            execution_costs=execution_costs,
         )
         test = run_entry_mode_comparison(
             store,
@@ -283,6 +286,7 @@ def run_strategy_optimization(
             preset_name=preset_name,
             max_hold_days=hold_days,
             freq=freq,
+            execution_costs=execution_costs,
         )
         train_trades = _attach_market_temperature(store, train.trades)
         test_trades = _attach_market_temperature(store, test.trades)
@@ -354,6 +358,7 @@ def run_strategy_optimization(
                 preset_name=preset_name,
                 max_hold_days=hold_days,
                 freq=freq,
+                execution_costs=execution_costs,
             )
             min_train_dates = max(2, len(dates) // 3)
             folds = build_expanding_folds(

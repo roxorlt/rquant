@@ -15,10 +15,40 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from rquant.lab_shard_protocol import LabShardClaim, LabShardDefinition
-from rquant.research_run_spec import ResearchJobType, ResearchRunSpec
+from rquant.research_run_spec import (
+    FeatureContractIdentity,
+    ResearchJobType,
+    ResearchRunSpec,
+)
+from rquant.strategy_execution_costs import apply_round_trip_execution_costs
 
 DATE_BUCKET_DAYS = 20
 ADAPTER_VERSION = "1"
+EXECUTION_CONTRACT_ID = "strategy-adapter-execution"
+EXECUTION_CONTRACT_VERSION = "p13b-adapter-v1"
+
+
+def build_adapter_execution_contract(
+    adapter_id: str,
+    adapter_version: str,
+    code_sha: str,
+) -> FeatureContractIdentity:
+    canonical = json.dumps(
+        {
+            "adapter_id": adapter_id,
+            "adapter_version": adapter_version,
+            "code_sha": code_sha,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return FeatureContractIdentity(
+        contract_id=EXECUTION_CONTRACT_ID,
+        contract_version=EXECUTION_CONTRACT_VERSION,
+        contract_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
 
 EntryMode: TypeAlias = Literal[
     "first_break",
@@ -263,10 +293,63 @@ class LabShardExecutionResult(BaseModel):
         )
 
 
+class LabJobExecutionResult(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        revalidate_instances="always",
+    )
+
+    spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_id: str
+    adapter_version: str
+    tables: tuple[LabShardTable, ...]
+
+    @model_validator(mode="after")
+    def validate_table_names(self) -> LabJobExecutionResult:
+        names = tuple(table.name for table in self.tables)
+        if not names or len(names) != len(set(names)):
+            raise ValueError("job execution table names must be nonempty and unique")
+        return self
+
+    @property
+    def result_hash(self) -> str:
+        payload = {
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "plan_hash": self.plan_hash,
+            "spec_hash": self.spec_hash,
+            "tables": [
+                {
+                    "frame": table.frame.to_json(
+                        orient="split",
+                        date_format="iso",
+                        date_unit="us",
+                        double_precision=15,
+                        force_ascii=True,
+                        index=False,
+                    ),
+                    "name": table.name,
+                }
+                for table in self.tables
+            ],
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class StrategyJobAdapter(Protocol):
     adapter_id: str
     adapter_version: str
     strategy_name: str
+    snapshot_strategy_name: str
     job_type: ResearchJobType
 
     def build_shard_inputs(self, spec: ResearchRunSpec) -> tuple[StrategyShardInput, ...]: ...
@@ -306,6 +389,7 @@ class NShapeCompareAdapter:
     adapter_id = "nshape-compare"
     adapter_version = ADAPTER_VERSION
     strategy_name = "NShapeCompare"
+    snapshot_strategy_name = "n_shape"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
     def parameters(self, spec: ResearchRunSpec) -> NShapeCompareParameters:
@@ -337,6 +421,7 @@ class NShapeCompareAdapter:
             max_hold_days=validated.shard.hold_days,
             freq=parameters.freq,
             factor_score_threshold=float(parameters.factor_score_threshold),
+            execution_costs=validated.spec.execution_costs,
         )
         return LabShardExecutionResult.from_validated(
             validated,
@@ -352,6 +437,7 @@ class NShapeOptimizeAdapter:
     adapter_id = "nshape-optimize"
     adapter_version = ADAPTER_VERSION
     strategy_name = "NShapeOptimize"
+    snapshot_strategy_name = "n_shape"
     job_type = ResearchJobType.PARAMETER_SEARCH
 
     def parameters(self, spec: ResearchRunSpec) -> NShapeOptimizeParameters:
@@ -387,6 +473,7 @@ class NShapeOptimizeAdapter:
             score_profile_names=list(parameters.score_profile_names),
             walk_forward_folds=parameters.walk_forward_folds,
             freq=parameters.freq,
+            execution_costs=validated.spec.execution_costs,
         )
         return LabShardExecutionResult.from_validated(
             validated,
@@ -408,6 +495,7 @@ class AuctionGapAdapter:
     adapter_id = "auction-gap"
     adapter_version = ADAPTER_VERSION
     strategy_name = "AuctionGap"
+    snapshot_strategy_name = "auction_gap"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
     def parameters(self, spec: ResearchRunSpec) -> AuctionGapParameters:
@@ -443,6 +531,10 @@ class AuctionGapAdapter:
         )
         candidates = run_auction_gap_replay(store, config.auction_config())
         trades = run_auction_gap_minute_replay(store, config, candidates=candidates)
+        trades = apply_round_trip_execution_costs(
+            trades,
+            validated.spec.execution_costs,
+        )
         return LabShardExecutionResult.from_validated(
             validated,
             tables=(
@@ -465,6 +557,7 @@ class GrowthBoardSurgeAdapter:
     adapter_id = "growth-board-surge"
     adapter_version = ADAPTER_VERSION
     strategy_name = "GrowthBoardSurge"
+    snapshot_strategy_name = "growth_board_surge"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
     def parameters(self, spec: ResearchRunSpec) -> GrowthBoardSurgeParameters:
@@ -515,6 +608,10 @@ class GrowthBoardSurgeAdapter:
             end_date=validated.shard.end_date,
             config=config,
         )
+        trades = apply_round_trip_execution_costs(
+            trades,
+            validated.spec.execution_costs,
+        )
         if not trades.empty:
             trades = trades.copy()
             trades.insert(0, "variant", validated.shard.variant)
@@ -547,6 +644,15 @@ class StrategyJobAdapterRegistry:
         adapter = matches[0]
         if validated.job_type is not adapter.job_type:
             raise ValueError(f"{adapter.strategy_name} requires job_type {adapter.job_type.value}")
+        expected_contract = build_adapter_execution_contract(
+            adapter.adapter_id,
+            adapter.adapter_version,
+            validated.code_sha,
+        )
+        if validated.feature_contract != expected_contract:
+            raise ValueError(
+                f"{adapter.strategy_name} execution contract does not match adapter/code identity"
+            )
         return adapter
 
     def get(self, adapter_id: str, adapter_version: str) -> StrategyJobAdapter:
@@ -632,6 +738,95 @@ class StrategyJobAdapterRegistry:
             validated.claim.definition.adapter_version,
         )
         return adapter.execute_shard(validated, store)
+
+    def aggregate_results(
+        self,
+        spec: ResearchRunSpec,
+        results: tuple[LabShardExecutionResult, ...],
+    ) -> LabJobExecutionResult:
+        validated = ResearchRunSpec.model_validate(spec)
+        adapter = self.for_spec(validated)
+        definitions = self.plan(validated)
+        if len(results) != len(definitions):
+            raise ValueError("aggregation requires the complete shard plan")
+
+        by_shard_id = {result.shard_id: result for result in results}
+        if len(by_shard_id) != len(results):
+            raise ValueError("aggregation shard results must have unique shard identities")
+
+        ordered: list[LabShardExecutionResult] = []
+        for definition in definitions:
+            result = by_shard_id.get(definition.shard_id)
+            if result is None:
+                raise ValueError("aggregation requires the complete shard plan")
+            if (
+                result.spec_hash,
+                result.payload_hash,
+                result.plan_hash,
+                result.adapter_id,
+                result.adapter_version,
+            ) != (
+                validated.spec_hash,
+                definition.payload_hash,
+                definition.plan_hash,
+                definition.adapter_id,
+                definition.adapter_version,
+            ):
+                raise ValueError("aggregation shard result identity conflicts with plan")
+            ordered.append(result)
+
+        expected_table_names = tuple(table.name for table in ordered[0].tables)
+        if any(
+            tuple(table.name for table in result.tables) != expected_table_names
+            for result in ordered[1:]
+        ):
+            raise ValueError("aggregation shard table schemas do not match")
+
+        tables = tuple(
+            LabShardTable(
+                name=name,
+                frame=_concat_shard_frames(
+                    tuple(result.tables[index].frame for result in ordered)
+                ),
+            )
+            for index, name in enumerate(expected_table_names)
+        )
+        if adapter.adapter_id == NShapeOptimizeAdapter.adapter_id:
+            tables = tuple(
+                LabShardTable(name=table.name, frame=_rerank_optimizer_table(table))
+                for table in tables
+            )
+        return LabJobExecutionResult(
+            spec_hash=validated.spec_hash,
+            plan_hash=definitions[0].plan_hash,
+            adapter_id=adapter.adapter_id,
+            adapter_version=adapter.adapter_version,
+            tables=tables,
+        )
+
+
+def _concat_shard_frames(frames: tuple[pd.DataFrame, ...]) -> pd.DataFrame:
+    populated = tuple(frame for frame in frames if not frame.empty)
+    if populated:
+        return pd.concat(populated, ignore_index=True)
+    return frames[0].copy()
+
+
+def _rerank_optimizer_table(table: LabShardTable) -> pd.DataFrame:
+    frame = table.frame
+    sort_columns: tuple[str, ...] | None = None
+    if table.name in {"rankings", "topn_rankings"}:
+        sort_columns = ("robust_score", "test_trades", "train_trades")
+    elif table.name == "walk_forward_rankings":
+        sort_columns = ("robust_score", "folds", "test_trades")
+    if sort_columns is None or frame.empty:
+        return frame
+    reranked = frame.drop(columns="rank").sort_values(
+        list(sort_columns),
+        ascending=[False] * len(sort_columns),
+    ).reset_index(drop=True)
+    reranked.insert(0, "rank", range(1, len(reranked) + 1))
+    return reranked
 
 
 @lru_cache(maxsize=1)

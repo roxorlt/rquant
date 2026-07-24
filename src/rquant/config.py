@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     lab_worker_poll_interval_ms: int = Field(default=250, ge=1)
     lab_worker_heartbeat_seconds: int = Field(default=30, ge=1)
     lab_worker_lease_extension_seconds: int = Field(default=120, ge=1, le=3_600)
+    lab_worker_receipt_timeout_seconds: int = Field(default=30, ge=1)
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
@@ -224,6 +225,10 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "lab scheduler lease must be >= 3 * heartbeat interval"
+            )
+        if self.lab_worker_heartbeat_seconds >= self.lab_scheduler_shard_lease_seconds:
+            raise ValueError(
+                "lab worker heartbeat must precede scheduler shard lease expiry"
             )
         lab_path = self.lab_jobs_path_resolved.resolve()
         existing_database_paths = {

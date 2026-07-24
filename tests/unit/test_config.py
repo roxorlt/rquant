@@ -123,6 +123,7 @@ class TestSettings:
             lab_worker_poll_interval_ms=125,
             lab_worker_heartbeat_seconds=15,
             lab_worker_lease_extension_seconds=90,
+            lab_worker_receipt_timeout_seconds=20,
         )
 
         assert configured.lab_jobs_busy_timeout_ms == 1_234
@@ -136,6 +137,7 @@ class TestSettings:
         assert configured.lab_worker_poll_interval_ms == 125
         assert configured.lab_worker_heartbeat_seconds == 15
         assert configured.lab_worker_lease_extension_seconds == 90
+        assert configured.lab_worker_receipt_timeout_seconds == 20
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -150,6 +152,7 @@ class TestSettings:
             ("lab_worker_poll_interval_ms", 0),
             ("lab_worker_heartbeat_seconds", 0),
             ("lab_worker_lease_extension_seconds", 0),
+            ("lab_worker_receipt_timeout_seconds", 0),
         ],
     )
     def test_lab_scheduler_rejects_non_positive_runtime_settings(
@@ -170,6 +173,17 @@ class TestSettings:
                 **_settings_values(tmp_path),
                 lab_scheduler_lease_seconds=29,
                 lab_scheduler_heartbeat_seconds=10,
+            )
+
+    def test_lab_worker_heartbeat_must_precede_scheduler_shard_lease(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValidationError, match="worker heartbeat must precede"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_scheduler_shard_lease_seconds=30,
+                lab_worker_heartbeat_seconds=30,
             )
 
     @pytest.mark.parametrize(

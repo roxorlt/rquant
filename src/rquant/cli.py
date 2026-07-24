@@ -3076,6 +3076,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     from rquant.config import settings
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LabWorker
+    from rquant.research_manifest import detect_verified_code_commit
     from rquant.storage.duckdb import open_readonly_store
 
     setup_logging()
@@ -3090,11 +3091,13 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         heartbeat_interval_seconds=settings.lab_worker_heartbeat_seconds,
         lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
         poll_interval_ms=settings.lab_worker_poll_interval_ms,
+        receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
+        verified_code_sha_provider=detect_verified_code_commit,
     )
     if args.once:
         result = worker.run_once()
         logger.info(f"lab-worker tick: {result.model_dump_json()}")
-        return 0
+        return 1 if result.status == "failed" else 0
     worker.run_forever()
     return 0
 

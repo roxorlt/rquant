@@ -19,7 +19,8 @@
   身份均以 canonical JSON 和 SHA256 固化。`lab-worker` 只通过 claim/report spool 协作，
   支持 fenced 领取、长任务心跳、协作停止和 lease 崩溃恢复；正式研究严格打开绑定的 immutable
   `ResearchExecutionSession`。每片结果先写 claim 临时目录，校验 Parquet 后原子 seal 为带
-  canonical manifest 的 bundle，重试可幂等复用且内容冲突时 fail closed。
+  canonical manifest 的 attempt bundle；同一 attempt 可幂等复用，跨 generation 严格隔离，
+  内容冲突时 fail closed。
 
 - **策略分钟回补 manifest 可审计终止**：新增 `abandoned` 终态和
   `rquant backfill-abandon`。命令默认只生成绑定 manifest 内容、任务计数、终止原因与干净
@@ -39,6 +40,15 @@
   `0.25.4` 更新到 `0.26.0`。
 
 ### Fixed
+
+- **Strategy Lab worker fencing 与研究科学性缺口**：claim spool 新增持久 shard 高水位，旧
+  generation 即使在新 claim 被消费后也不能复活；artifact 绑定 claim token、generation 与
+  scheduler fence，并在 heartbeat receipt 被 scheduler 接受后才可按 attempt 原子 seal。
+  worker 在 stop、heartbeat 发布失败、deadline、并发 rename 与崩溃临时目录回收边界均
+  fail closed。正式任务复用完整 research gate 并核对运行时代码 SHA、snapshot/binding/audit
+  证据；adapter execution contract 绑定代码身份。四类策略统一应用版本化 A 股双边交易成本，
+  N 字优化以净收益完成训练、验证、TopN 与 walk-forward 排序；scheduler 持久终态化 deadline
+  和 adapter plan 首错，避免无限领取或重复规划失败。
 
 - **Strategy Lab 分片控制面规格缺口**：`lab_shard` 改为 `(job_id, shard_id)` 复合主键，
   同一确定性计划可安全用于不同 job；retry 会原子重置 nonterminal/failed shard 并永久废止

@@ -3711,9 +3711,15 @@ class TestLabWorkerCli:
         assert args.worker_id == "worker-a"
         assert args.once is True
 
+    @pytest.mark.parametrize(
+        ("status", "expected_exit"),
+        [("succeeded", 0), ("failed", 1)],
+    )
     def test_cmd_lab_worker_builds_spools_and_runs_one_tick(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        status: str,
+        expected_exit: int,
     ) -> None:
         import argparse
 
@@ -3731,10 +3737,11 @@ class TestLabWorkerCli:
                 calls.append(f"worker:{kwargs['worker_id']}")
                 assert kwargs["exploratory_store_factory"] is not None
                 assert kwargs["metadata_store_factory"] is not None
+                assert kwargs["verified_code_sha_provider"] is not None
 
             def run_once(self) -> SimpleNamespace:
                 calls.append("run_once")
-                return SimpleNamespace(model_dump_json=lambda: "{}")
+                return SimpleNamespace(status=status, model_dump_json=lambda: "{}")
 
         monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", FakeSpool)
         monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeSpool)
@@ -3743,7 +3750,7 @@ class TestLabWorkerCli:
 
         result = cmd_lab_worker(argparse.Namespace(worker_id="worker-a", once=True))
 
-        assert result == 0
+        assert result == expected_exit
         assert "spool:lab_shard_claims" in calls
         assert "spool:lab_worker_reports" in calls
         assert calls[-2:] == ["worker:worker-a", "run_once"]

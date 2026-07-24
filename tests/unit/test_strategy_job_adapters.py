@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
@@ -11,7 +12,6 @@ from pydantic import ValidationError
 from rquant.lab_shard_protocol import LabShardClaim
 from rquant.research_run_spec import (
     ExecutionCostSpec,
-    FeatureContractIdentity,
     ResearchJobType,
     ResearchParameter,
     ResearchRunParameters,
@@ -30,6 +30,14 @@ def _spec(
     start_date: date = date(2026, 1, 1),
     end_date: date = date(2026, 2, 10),
 ) -> ResearchRunSpec:
+    from rquant.strategy_job_adapters import build_adapter_execution_contract
+
+    adapter_id = {
+        "NShapeCompare": "nshape-compare",
+        "NShapeOptimize": "nshape-optimize",
+        "AuctionGap": "auction-gap",
+        "GrowthBoardSurge": "growth-board-surge",
+    }[strategy_name]
     return ResearchRunSpec(
         job_type=(
             ResearchJobType.PARAMETER_SEARCH
@@ -44,16 +52,12 @@ def _spec(
         ),
         code_sha="1" * 40,
         dataset_snapshot=None,
-        feature_contract=FeatureContractIdentity(
-            contract_id="strategy-lab",
-            contract_version="v1",
-            contract_hash="2" * 64,
-        ),
+        feature_contract=build_adapter_execution_contract(adapter_id, "1", "1" * 40),
         execution_costs=ExecutionCostSpec(
-            commission_bps=Decimal("2.5"),
-            stamp_duty_bps=Decimal("5"),
-            transfer_fee_bps=Decimal("0.1"),
-            slippage_bps=Decimal("3"),
+            commission_bps=Decimal("0"),
+            stamp_duty_bps=Decimal("0"),
+            transfer_fee_bps=Decimal("0"),
+            slippage_bps=Decimal("0"),
         ),
         random_seed=20260724,
         resource_class=ResourceClass.STANDARD,
@@ -115,6 +119,15 @@ def _growth_spec(*, variants: tuple[str, ...] = ("no_vwap", "full")) -> Research
     )
 
 
+def _extreme_costs() -> ExecutionCostSpec:
+    return ExecutionCostSpec(
+        commission_bps=Decimal("10000"),
+        stamp_duty_bps=Decimal("10000"),
+        transfer_fee_bps=Decimal("10000"),
+        slippage_bps=Decimal("10000"),
+    )
+
+
 @pytest.mark.parametrize(
     ("spec", "expected_adapter"),
     [
@@ -136,6 +149,39 @@ def test_registry_plans_all_supported_strategy_jobs(
     assert {item.adapter_id for item in definitions} == {expected_adapter}
     assert [item.shard_index for item in definitions] == list(range(len(definitions)))
     assert len({item.plan_hash for item in definitions}) == 1
+
+
+@pytest.mark.parametrize(
+    ("spec", "snapshot_strategy"),
+    [
+        (_nshape_compare_spec(), "n_shape"),
+        (_nshape_optimize_spec(), "n_shape"),
+        (_auction_spec(), "auction_gap"),
+        (_growth_spec(), "growth_board_surge"),
+    ],
+)
+def test_adapter_declares_snapshot_strategy_mapping(
+    spec: ResearchRunSpec,
+    snapshot_strategy: str,
+) -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    assert (
+        default_strategy_job_adapter_registry().for_spec(spec).snapshot_strategy_name
+        == snapshot_strategy
+    )
+
+
+def test_adapter_execution_contract_mismatch_fails_closed() -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    spec = _nshape_compare_spec()
+    bad_contract = spec.feature_contract.model_copy(update={"contract_hash": "f" * 64})
+
+    with pytest.raises(ValueError, match="execution contract"):
+        default_strategy_job_adapter_registry().plan(
+            spec.model_copy(update={"feature_contract": bad_contract})
+        )
 
 
 def test_hold_day_plan_is_unique_sorted_and_input_order_independent() -> None:
@@ -318,9 +364,21 @@ def test_nshape_compare_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
+        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly = registry.execute_shard(
+            registry.validate_claim(_claim(costly_spec)),
+            store,
+        )
 
     pd.testing.assert_frame_equal(_result_table(actual, "summary"), expected.summary)
     pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected.trades)
+    costly_trades = _result_table(costly, "trades")
+    costly_summary = _result_table(costly, "summary")
+    assert not costly_trades["ret_pct"].equals(expected.trades["ret_pct"])
+    assert costly_trades["gross_ret_pct"].tolist() == expected.trades["ret_pct"].tolist()
+    assert costly_summary.iloc[0]["mean_ret_pct"] == round(
+        float(costly_trades["ret_pct"].mean()), 4
+    )
 
 
 def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
@@ -358,10 +416,25 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
+        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly = registry.execute_shard(
+            registry.validate_claim(_claim(costly_spec)),
+            store,
+        )
 
     pd.testing.assert_frame_equal(_result_table(actual, "rankings"), expected.rankings)
     pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected.trades)
     pd.testing.assert_frame_equal(_result_table(actual, "topn_rankings"), expected.topn_rankings)
+    costly_trades = _result_table(costly, "trades")
+    costly_rankings = _result_table(costly, "rankings")
+    assert "gross_ret_pct" in costly_trades.columns
+    assert costly_rankings.iloc[0]["train_mean_ret_pct"] == round(
+        float(costly_trades.loc[costly_trades["split"] == "train", "ret_pct"].mean()),
+        4,
+    )
+    assert costly_rankings.iloc[0]["robust_score"] != expected.rankings.iloc[0][
+        "robust_score"
+    ]
 
 
 def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
@@ -395,9 +468,17 @@ def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
+        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly = registry.execute_shard(
+            registry.validate_claim(_claim(costly_spec)),
+            store,
+        )
 
     pd.testing.assert_frame_equal(_result_table(actual, "candidates"), candidates)
     pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected)
+    costly_trades = _result_table(costly, "trades")
+    assert costly_trades["gross_ret_pct"].tolist() == expected["ret_pct"].tolist()
+    assert not costly_trades["ret_pct"].equals(expected["ret_pct"])
 
 
 def test_growth_board_adapter_matches_legacy_fixture(tmp_path) -> None:
@@ -442,9 +523,154 @@ def test_growth_board_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
+        costly_spec = spec.model_copy(update={"execution_costs": _extreme_costs()})
+        costly = registry.execute_shard(
+            registry.validate_claim(_claim(costly_spec)),
+            store,
+        )
 
     adapter_trades = _result_table(actual, "trades").drop(columns="variant")
     pd.testing.assert_frame_equal(adapter_trades, expected)
+    costly_trades = _result_table(costly, "trades")
+    assert costly_trades["gross_ret_pct"].tolist() == expected["ret_pct"].tolist()
+    assert not costly_trades["ret_pct"].equals(expected["ret_pct"])
+
+
+def test_nshape_optimize_multi_hold_aggregate_matches_legacy_global_result(
+    tmp_path: Path,
+) -> None:
+    from rquant.storage.duckdb import DuckDBStore
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_optimizer import run_strategy_optimization
+    from tests.unit.test_minute_replay import _seed_daily_and_screen, _seed_minutes
+
+    spec = _spec(
+        "NShapeOptimize",
+        _parameter("hold_days", "integer_list", (1, 3)),
+        _parameter("entry_modes", "text_list", ("first_break",)),
+        _parameter("profile_variants", "text_list", ("baseline",)),
+        _parameter("top_n_options", "integer_list", (1,)),
+        _parameter("score_profile_names", "text_list", ("v1",)),
+        _parameter("validation_ratio", "decimal", Decimal("0")),
+        _parameter("min_trades", "integer", 1),
+        start_date=date(2026, 6, 24),
+        end_date=date(2026, 6, 24),
+    )
+    registry = default_strategy_job_adapter_registry()
+    with DuckDBStore(tmp_path / "aggregate-optimize.duckdb") as store:
+        _seed_daily_and_screen(store)
+        _seed_minutes(store)
+        expected = run_strategy_optimization(
+            store,
+            start_date=spec.parameters.start_date,
+            end_date=spec.parameters.end_date,
+            entry_modes=["first_break"],
+            profile_variants=["baseline"],
+            max_hold_days_options=[1, 3],
+            validation_ratio=0.0,
+            min_trades=1,
+            top_n_options=[1],
+            score_profile_names=["v1"],
+            execution_costs=spec.execution_costs,
+        )
+        results = tuple(
+            registry.execute_shard(registry.validate_claim(_claim(spec, index)), store)
+            for index in range(2)
+        )
+        actual = registry.aggregate_results(spec, results)
+
+    pd.testing.assert_frame_equal(_result_table(actual, "rankings"), expected.rankings)
+    pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected.trades)
+    pd.testing.assert_frame_equal(_result_table(actual, "topn_rankings"), expected.topn_rankings)
+
+
+def test_auction_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) -> None:
+    from rquant.auction_gap_strategy import (
+        AuctionGapMinuteReplayConfig,
+        run_auction_gap_minute_replay,
+        run_auction_gap_replay,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from tests.unit.test_auction_gap_minute_replay import _seed_base
+
+    spec = _spec(
+        "AuctionGap",
+        _parameter("max_hold_days", "integer", 1),
+        start_date=date(2026, 6, 5),
+        end_date=date(2026, 6, 25),
+    )
+    registry = default_strategy_job_adapter_registry()
+    with DuckDBStore(tmp_path / "aggregate-auction.duckdb") as store:
+        _seed_base(store)
+        config = AuctionGapMinuteReplayConfig(
+            start_date=spec.parameters.start_date.isoformat(),
+            end_date=spec.parameters.end_date.isoformat(),
+            max_hold_days=1,
+        )
+        candidates = run_auction_gap_replay(store, config.auction_config())
+        expected = run_auction_gap_minute_replay(store, config, candidates=candidates)
+        definitions = registry.plan(spec)
+        results = tuple(
+            registry.execute_shard(registry.validate_claim(_claim(spec, index)), store)
+            for index in range(len(definitions))
+        )
+        actual = registry.aggregate_results(spec, tuple(reversed(results)))
+        ordered = registry.aggregate_results(spec, results)
+
+    pd.testing.assert_frame_equal(_result_table(actual, "candidates"), candidates)
+    pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected)
+    assert actual.result_hash == ordered.result_hash
+    with pytest.raises(ValueError, match="complete shard plan"):
+        registry.aggregate_results(spec, results[:-1])
+    with pytest.raises(ValueError, match="unique"):
+        registry.aggregate_results(spec, (results[0], results[0]))
+
+
+def test_growth_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) -> None:
+    from rquant.growth_board_surge_strategy import (
+        GrowthBoardSurgeConfig,
+        run_growth_board_surge_replay,
+    )
+    from rquant.storage.duckdb import DuckDBStore
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from tests.unit.test_growth_board_surge_strategy import (
+        _seed_base_market,
+        _seed_volume_surge_minutes,
+    )
+
+    spec = _spec(
+        "GrowthBoardSurge",
+        _parameter("variants", "text_list", ("full",)),
+        _parameter("max_hold_days", "integer", 1),
+        _parameter("lookback_days", "integer", 2),
+        _parameter("min_hist_days", "integer", 2),
+        start_date=date(2026, 6, 5),
+        end_date=date(2026, 6, 25),
+    )
+    registry = default_strategy_job_adapter_registry()
+    with DuckDBStore(tmp_path / "aggregate-growth.duckdb") as store:
+        _seed_base_market(store)
+        _seed_volume_surge_minutes(store)
+        expected = run_growth_board_surge_replay(
+            store,
+            start_date=spec.parameters.start_date,
+            end_date=spec.parameters.end_date,
+            config=GrowthBoardSurgeConfig(
+                lookback_days=2,
+                min_hist_days=2,
+                max_hold_days=1,
+            ),
+        )
+        definitions = registry.plan(spec)
+        results = tuple(
+            registry.execute_shard(registry.validate_claim(_claim(spec, index)), store)
+            for index in range(len(definitions))
+        )
+        actual = registry.aggregate_results(spec, tuple(reversed(results)))
+
+    aggregated = _result_table(actual, "trades").drop(columns="variant")
+    pd.testing.assert_frame_equal(aggregated, expected)
 
 
 def test_scheduler_registry_plans_unplanned_submissions_after_restart(tmp_path) -> None:
@@ -491,3 +717,142 @@ def test_scheduler_registry_plans_unplanned_submissions_after_restart(tmp_path) 
     assert result.plans_created == 1
     assert [shard.shard_index for shard in shards] == [0, 1, 2]
     assert len({shard.plan_hash for shard in shards}) == 1
+
+
+def test_scheduler_persists_first_adapter_plan_failure(tmp_path) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    spec = _nshape_compare_spec()
+    bad = spec.model_copy(
+        update={
+            "feature_contract": spec.feature_contract.model_copy(
+                update={"contract_hash": "f" * 64}
+            )
+        }
+    )
+    command = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=SubmitJobCommand(job_id=uuid4(), spec=bad, max_attempts=2),
+    )
+    spool.publish(command)
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: datetime(2026, 7, 24, 1, tzinfo=UTC),
+    )
+
+    first = scheduler.run_once()
+    second = scheduler.run_once()
+    reader = LabJobReader(store.path)
+    job = reader.get_job(command.command.job_id)
+
+    assert first.plans_failed == 1
+    assert second.plans_failed == 0
+    assert job is not None and job.status is JobStatus.FAILED
+    assert reader.list_shards(command.command.job_id) == ()
+    assert "execution contract" in reader.list_events(command.command.job_id)[-1].reason
+
+
+def test_scheduler_deadline_terminalizes_running_job_and_shards(tmp_path) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore, ShardStatus
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_shard_protocol import LabClaimSpool
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    clock = [datetime(2026, 7, 24, 1, tzinfo=UTC)]
+    deadline = clock[0] + timedelta(seconds=30)
+    spec = _nshape_compare_spec().model_copy(update={"deadline": deadline})
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    claims = LabClaimSpool(tmp_path / "claims")
+    command = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=SubmitJobCommand(job_id=uuid4(), spec=spec, max_attempts=2),
+    )
+    spool.publish(command)
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=30,
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    clock[0] = deadline
+
+    result = scheduler.run_once()
+    reader = LabJobReader(store.path)
+    job = reader.get_job(command.command.job_id)
+    shards = reader.list_shards(command.command.job_id)
+
+    assert result.deadlines_expired == 1
+    assert job is not None and job.status is JobStatus.FAILED
+    assert {shard.status for shard in shards} == {ShardStatus.FAILED}
+    assert all(shard.failure_json == '{"reason":"deadline_exceeded"}' for shard in shards)
+    assert claims.pending()  # stale filesystem claim remains fenced by its marker/DB identity
+
+
+def test_scheduler_terminalizes_deadline_at_claim_boundary(tmp_path: Path) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore, ShardStatus
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_shard_protocol import LabClaimSpool
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    now = datetime(2026, 7, 24, 1, tzinfo=UTC)
+    deadline = now + timedelta(seconds=5)
+    moments = iter((now, now, now, now, deadline))
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(update={"deadline": deadline})
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    claims = LabClaimSpool(tmp_path / "claims")
+    job_id = uuid4()
+    spool.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(job_id=job_id, spec=spec, max_attempts=2),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=30,
+        clock=lambda: next(moments),
+    )
+
+    result = scheduler.run_once()
+    reader = LabJobReader(store.path)
+    job = reader.get_job(job_id)
+
+    assert result.deadlines_expired == 1
+    assert result.claims_published == 0
+    assert claims.pending() == ()
+    assert job is not None and job.status is JobStatus.FAILED
+    assert {shard.status for shard in reader.list_shards(job_id)} == {ShardStatus.FAILED}
