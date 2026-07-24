@@ -3550,6 +3550,51 @@ class LabJobStore:
                 tokens.add(record.report.claim_token)
         return frozenset(tokens)
 
+    def accepted_success_claim_tokens_for(
+        self,
+        lease: LabLeaseRecord,
+        *,
+        now: datetime,
+        claims: tuple[LabShardClaim, ...],
+    ) -> frozenset[UUID]:
+        """Return accepted success evidence only for a bounded authority batch."""
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, now=current)
+            tokens: set[UUID] = set()
+            for claim in claims:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM lab_worker_report
+                    WHERE job_id = ? AND shard_id = ?
+                      AND claim_generation = ?
+                      AND scheduler_fencing_token = ?
+                      AND status = 'accepted'
+                      AND report_type = 'shard_succeeded'
+                    ORDER BY applied_at, report_id
+                    LIMIT 2
+                    """,
+                    (
+                        str(claim.job_id),
+                        str(claim.shard_id),
+                        claim.claim_generation,
+                        claim.scheduler_fencing_token,
+                    ),
+                ).fetchall()
+                for row in rows:
+                    report_id = UUID(str(row["report_id"]))
+                    record = _worker_report_record_from_row(
+                        row,
+                        expected_report_id=report_id,
+                    )
+                    if not isinstance(record.report.body, LabShardSucceeded):
+                        raise InvalidStoredJobError(
+                            f"accepted success report {report_id} has invalid body"
+                        )
+                    if record.report.claim_token == claim.claim_token:
+                        tokens.add(claim.claim_token)
+        return frozenset(tokens)
+
     @staticmethod
     def _report_receipt(
         report: LabWorkerReport,

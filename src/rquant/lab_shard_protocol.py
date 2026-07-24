@@ -215,6 +215,29 @@ class LabClaimHighWater(LabShardProtocolModel):
         return self
 
 
+class LabRetiredClaimAuthority(LabShardProtocolModel):
+    schema_version: Literal[1] = 1
+    claim: LabShardClaim
+    outcome: Literal["accepted", "revoked"]
+    reason: str = Field(min_length=1)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> LabRetiredClaimAuthority:
+        expected = _canonical_hash(
+            {
+                "claim": self.claim.model_dump(mode="json"),
+                "outcome": self.outcome,
+                "reason": self.reason,
+                "schema_version": self.schema_version,
+            }
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("content_hash does not match retired claim authority")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+
 class LabClaimSupersededError(RuntimeError):
     """A claim is older than, or conflicts with, the durable shard high-water."""
 
@@ -514,6 +537,12 @@ class LabAdmittedExecution(LabShardProtocolModel):
     admission: LabExecutionAdmission
 
 
+class LabHotClaimBatch(LabShardProtocolModel):
+    claims: tuple[LabShardClaim, ...]
+    next_cursor: str | None = None
+    inspected: int = Field(ge=0)
+
+
 class LabReportSpoolEntry(LabShardProtocolModel):
     path: Path
     report: LabWorkerReport
@@ -595,11 +624,15 @@ class LabClaimSpool(_TypedSpoolBase):
     ) -> None:
         super().__init__(root)
         self.current_dir = self.root / "current"
+        self.retired_dir = self.root / "archive" / "retired"
         self.revoked_dir = self.root / "revoked"
+        self.archived_revoked_dir = self.root / "archive" / "revoked"
         self.admitted_dir = self.root / "admitted"
         self.admission_tmp_dir = self.admitted_dir / ".tmp"
         self.current_dir.mkdir(parents=True, exist_ok=True)
+        self.retired_dir.mkdir(parents=True, exist_ok=True)
         self.revoked_dir.mkdir(parents=True, exist_ok=True)
+        self.archived_revoked_dir.mkdir(parents=True, exist_ok=True)
         self.admitted_dir.mkdir(parents=True, exist_ok=True)
         self.admission_tmp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._claim_advance_hook = claim_advance_hook
@@ -625,8 +658,14 @@ class LabClaimSpool(_TypedSpoolBase):
     def _consumed_path(self, claim_token: UUID) -> Path:
         return self.ack_dir / f"{claim_token}.json"
 
+    def _retired_path(self, job_id: UUID, shard_id: UUID) -> Path:
+        return self.retired_dir / f"{job_id}.{shard_id}.json"
+
     def _revoked_path(self, claim_token: UUID) -> Path:
         return self.revoked_dir / f"{claim_token}.json"
+
+    def _archived_revoked_path(self, claim_token: UUID) -> Path:
+        return self.archived_revoked_dir / f"{claim_token}.json"
 
     def _admission_path(self, claim_token: UUID) -> Path:
         return self.admitted_dir / f"{claim_token}.json"
@@ -650,9 +689,14 @@ class LabClaimSpool(_TypedSpoolBase):
             )
         return LabConsumedClaim(path=candidate, receipt=receipt)
 
-    def _load_revocation_locked(self, claim_token: UUID) -> LabRevokedClaim:
-        path = self._revoked_path(claim_token)
-        candidate, payload, _file_stat = self._read_regular_child(path, self.revoked_dir)
+    def _load_revocation_file_locked(
+        self,
+        claim_token: UUID,
+        *,
+        path: Path,
+        parent: Path,
+    ) -> LabRevokedClaim:
+        candidate, payload, _file_stat = self._read_regular_child(path, parent)
         if self._ack_message_id(candidate.name) != claim_token:
             raise InvalidCommandEnvelopeError(
                 f"revoked claim token does not match basename {candidate.name}"
@@ -668,6 +712,20 @@ class LabClaimSpool(_TypedSpoolBase):
                 f"revoked claim identity does not match basename {candidate.name}"
             )
         return LabRevokedClaim(path=candidate, revocation=revocation)
+
+    def _load_revocation_locked(self, claim_token: UUID) -> LabRevokedClaim:
+        return self._load_revocation_file_locked(
+            claim_token,
+            path=self._revoked_path(claim_token),
+            parent=self.revoked_dir,
+        )
+
+    def _load_archived_revocation_locked(self, claim_token: UUID) -> LabRevokedClaim:
+        return self._load_revocation_file_locked(
+            claim_token,
+            path=self._archived_revoked_path(claim_token),
+            parent=self.archived_revoked_dir,
+        )
 
     def _load_admission_locked(self, claim_token: UUID) -> LabAdmittedExecution:
         path = self._admission_path(claim_token)
@@ -769,6 +827,14 @@ class LabClaimSpool(_TypedSpoolBase):
                     f"claim_token {claim.claim_token} has conflicting revocation"
                 )
             return revoked
+        archived_path = self._archived_revoked_path(claim.claim_token)
+        if os.path.lexists(archived_path):
+            revoked = self._load_archived_revocation_locked(claim.claim_token)
+            if revoked.revocation.claim != claim:
+                raise RequestContentConflictError(
+                    f"claim_token {claim.claim_token} has conflicting archived revocation"
+                )
+            return revoked
         consumed_path = self._consumed_path(claim.claim_token)
         if not os.path.lexists(consumed_path):
             return None
@@ -831,9 +897,89 @@ class LabClaimSpool(_TypedSpoolBase):
             )
         return marker
 
+    def _load_retired_locked(
+        self,
+        job_id: UUID,
+        shard_id: UUID,
+    ) -> LabRetiredClaimAuthority:
+        path = self._retired_path(job_id, shard_id)
+        candidate, payload, _file_stat = self._read_regular_child(path, self.retired_dir)
+        match = _CURRENT_CLAIM_NAME.fullmatch(candidate.name)
+        if match is None:
+            raise InvalidCommandEnvelopeError(f"invalid retired claim basename: {candidate.name}")
+        try:
+            marker = LabRetiredClaimAuthority.model_validate_json(payload)
+        except Exception as exc:
+            raise InvalidCommandEnvelopeError(
+                f"invalid retired claim marker {candidate.name}: {exc}"
+            ) from exc
+        if (
+            marker.claim.job_id != UUID(match.group("job_id"))
+            or marker.claim.shard_id != UUID(match.group("shard_id"))
+            or marker.claim.job_id != job_id
+            or marker.claim.shard_id != shard_id
+        ):
+            raise InvalidCommandEnvelopeError(
+                f"retired claim marker identity does not match basename {candidate.name}"
+            )
+        return marker
+
+    def _publish_retired_locked(
+        self,
+        marker: LabRetiredClaimAuthority,
+    ) -> LabRetiredClaimAuthority:
+        target = self._retired_path(marker.claim.job_id, marker.claim.shard_id)
+        if os.path.lexists(target):
+            existing = self._load_retired_locked(marker.claim.job_id, marker.claim.shard_id)
+            if existing == marker:
+                return existing
+            if (
+                marker.claim.claim_generation <= existing.claim.claim_generation
+                or marker.claim.scheduler_fencing_token < existing.claim.scheduler_fencing_token
+                or self._claim_order(marker.claim) <= self._claim_order(existing.claim)
+            ):
+                raise LabClaimSupersededError(
+                    "retired claim does not advance durable cold high-water"
+                )
+        temporary = self.retired_dir / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(marker.model_dump_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            self._fsync_directory(self.retired_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+        published = self._load_retired_locked(marker.claim.job_id, marker.claim.shard_id)
+        if published != marker:
+            raise RequestContentConflictError("retired claim authority changed during publish")
+        return published
+
+    def _retired_blocks_locked(self, claim: LabShardClaim) -> bool:
+        path = self._retired_path(claim.job_id, claim.shard_id)
+        if not os.path.lexists(path):
+            return False
+        retired = self._load_retired_locked(claim.job_id, claim.shard_id)
+        if retired.claim == claim:
+            return True
+        return (
+            claim.claim_generation <= retired.claim.claim_generation
+            or claim.scheduler_fencing_token < retired.claim.scheduler_fencing_token
+            or self._claim_order(claim) <= self._claim_order(retired.claim)
+        )
+
     def current(self, job_id: UUID, shard_id: UUID) -> LabClaimHighWater:
         with self._exclusive_lock():
             return self._load_current_locked(job_id, shard_id)
+
+    def retired_high_water(
+        self,
+        job_id: UUID,
+        shard_id: UUID,
+    ) -> LabRetiredClaimAuthority:
+        with self._exclusive_lock():
+            return self._load_retired_locked(job_id, shard_id)
 
     def current_claims(self) -> tuple[LabShardClaim, ...]:
         with self._exclusive_lock():
@@ -870,6 +1016,8 @@ class LabClaimSpool(_TypedSpoolBase):
         with self._exclusive_lock():
             if self._revocation_locked(validated) is not None:
                 return False
+            if self._retired_blocks_locked(validated):
+                return False
             if not os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
                 return False
             marker = self._load_current_locked(validated.job_id, validated.shard_id)
@@ -885,6 +1033,9 @@ class LabClaimSpool(_TypedSpoolBase):
             path = self._revoked_path(claim_token)
             if os.path.lexists(path):
                 return self._load_revocation_locked(claim_token)
+            archived_path = self._archived_revoked_path(claim_token)
+            if os.path.lexists(archived_path):
+                return self._load_archived_revocation_locked(claim_token)
             legacy = self._load_consumed_locked(claim_token)
             if legacy.receipt.status != "revoked":
                 raise InvalidCommandEnvelopeError(f"claim {claim_token} has no revocation evidence")
@@ -909,6 +1060,10 @@ class LabClaimSpool(_TypedSpoolBase):
             if self._revocation_locked(validated) is not None:
                 raise LabClaimRevokedError(
                     f"claim {validated.claim_token} was revoked before execution admission"
+                )
+            if self._retired_blocks_locked(validated):
+                raise LabClaimSupersededError(
+                    "claim was terminally retired before execution admission"
                 )
             current_path = self._current_path(validated.job_id, validated.shard_id)
             if not os.path.lexists(current_path):
@@ -981,6 +1136,10 @@ class LabClaimSpool(_TypedSpoolBase):
                         f"claim_token {validated.claim_token} was consumed with different content"
                     )
                 return consumed
+            if self._retired_blocks_locked(validated):
+                raise LabClaimSupersededError(
+                    "claim does not advance the durable retired shard high-water"
+                )
             if os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
                 current = self._load_current_locked(validated.job_id, validated.shard_id)
             else:
@@ -1070,6 +1229,157 @@ class LabClaimSpool(_TypedSpoolBase):
                 )
             return revoked
 
+    def _archive_revocation_locked(self, claim: LabShardClaim) -> None:
+        source = self._revoked_path(claim.claim_token)
+        if not os.path.lexists(source):
+            archived = self._load_archived_revocation_locked(claim.claim_token)
+            if archived.revocation.claim != claim:
+                raise RequestContentConflictError(
+                    f"claim_token {claim.claim_token} has conflicting archived revocation"
+                )
+            return
+        revoked = self._load_revocation_locked(claim.claim_token)
+        if revoked.revocation.claim != claim:
+            raise RequestContentConflictError(
+                f"claim_token {claim.claim_token} has conflicting revocation"
+            )
+        target = self._archived_revoked_path(claim.claim_token)
+        created = self._publish_no_clobber(
+            target,
+            revoked.revocation.model_dump_json().encode("utf-8"),
+        )
+        archived = self._load_archived_revocation_locked(claim.claim_token)
+        if archived.revocation != revoked.revocation:
+            raise RequestContentConflictError(
+                f"claim_token {claim.claim_token} has conflicting archived revocation"
+            )
+        if created or archived.revocation == revoked.revocation:
+            source.unlink()
+            self._fsync_directory(self.revoked_dir)
+
+    def retire(
+        self,
+        claim: LabShardClaim,
+        *,
+        outcome: Literal["accepted", "revoked"],
+        reason: str,
+    ) -> LabRetiredClaimAuthority:
+        """Move exact terminal delivery authority out of the scheduler hot set."""
+        validated = LabShardClaim.model_validate(claim)
+        normalized_reason = " ".join(reason.split())
+        if not normalized_reason:
+            raise ValueError("retire reason must not be empty")
+        marker = LabRetiredClaimAuthority(
+            claim=validated,
+            outcome=outcome,
+            reason=normalized_reason,
+        )
+        with self._exclusive_lock():
+            if outcome == "accepted":
+                consumed_path = self._consumed_path(validated.claim_token)
+                if not os.path.lexists(consumed_path):
+                    raise LabClaimNotConsumedError(
+                        "accepted retirement requires immutable consumed delivery history"
+                    )
+                consumed = self._load_consumed_locked(validated.claim_token)
+                if consumed.receipt.claim != validated:
+                    raise RequestContentConflictError(
+                        f"claim_token {validated.claim_token} has conflicting receipt"
+                    )
+                if consumed.receipt.status != "consumed":
+                    raise LabClaimRevokedError(
+                        "accepted retirement conflicts with legacy revocation history"
+                    )
+                if self._revocation_locked(validated) is not None:
+                    raise LabClaimRevokedError(
+                        "accepted retirement conflicts with durable revocation history"
+                    )
+            elif self._revocation_locked(validated) is None:
+                raise LabClaimRevokedError("revoked retirement requires durable revocation history")
+            retired = self._publish_retired_locked(marker)
+            self._unlink_current_locked(validated)
+            pending = self._pending_for_message_locked(validated.claim_token)
+            if pending is not None:
+                entry = self.load(pending)
+                if entry.claim != validated:
+                    raise RequestContentConflictError(
+                        f"claim_token {validated.claim_token} has conflicting pending delivery"
+                    )
+                self._unlink_pending(
+                    entry.path,
+                    device=entry.device,
+                    inode=entry.inode,
+                )
+            if outcome == "revoked":
+                self._archive_revocation_locked(validated)
+            return retired
+
+    def hot_delivery_batch(
+        self,
+        *,
+        limit: int,
+        cursor: str | None = None,
+    ) -> LabHotClaimBatch:
+        """Read a bounded pending/current migration slice without cold receipts."""
+        if limit < 1:
+            raise ValueError("hot delivery batch limit must be positive")
+        with self._exclusive_lock():
+            candidates = (
+                sorted(
+                    ((f"pending/{path.name}", path) for path in self.pending_dir.glob("*.json")),
+                    key=lambda item: item[0],
+                )
+                + sorted(
+                    ((f"current/{path.name}", path) for path in self.current_dir.glob("*.json")),
+                    key=lambda item: item[0],
+                )
+                + sorted(
+                    ((f"revoked/{path.name}", path) for path in self.revoked_dir.glob("*.json")),
+                    key=lambda item: item[0],
+                )
+            )
+            start = 0
+            if cursor is not None:
+                start = next(
+                    (
+                        index
+                        for index, (candidate_cursor, _path) in enumerate(candidates)
+                        if candidate_cursor > cursor
+                    ),
+                    0,
+                )
+            selected = candidates[start : start + limit]
+            claims: dict[UUID, LabShardClaim] = {}
+            for candidate_cursor, path in selected:
+                if candidate_cursor.startswith("pending/"):
+                    claim = self.load(path).claim
+                elif candidate_cursor.startswith("current/"):
+                    match = _CURRENT_CLAIM_NAME.fullmatch(path.name)
+                    if match is None:
+                        raise InvalidCommandEnvelopeError(
+                            f"invalid current claim basename: {path.name}"
+                        )
+                    claim = self._load_current_locked(
+                        UUID(match.group("job_id")),
+                        UUID(match.group("shard_id")),
+                    ).claim
+                else:
+                    token = self._ack_message_id(path.name)
+                    claim = self._load_revocation_locked(token).revocation.claim
+                existing = claims.get(claim.claim_token)
+                if existing is not None and existing != claim:
+                    raise RequestContentConflictError(
+                        f"claim_token {claim.claim_token} has conflicting hot evidence"
+                    )
+                claims[claim.claim_token] = claim
+            has_more = start + len(selected) < len(candidates)
+            next_cursor = selected[-1][0] if selected and has_more else None
+            return LabHotClaimBatch(
+                claims=tuple(claims.values()),
+                next_cursor=next_cursor,
+                inspected=len(selected),
+            )
+
     def delivery_claims(self) -> tuple[LabShardClaim, ...]:
         """Return every non-revoked claim requiring SQLite reconciliation."""
         with self._exclusive_lock():
@@ -1117,7 +1427,13 @@ class LabClaimSpool(_TypedSpoolBase):
     def reconcile_current(self) -> tuple[LabClaimReconcileResult, ...]:
         # Lock order invariant: claim snapshots are complete before callbacks may take
         # the report/artifact lock. No callback runs while the claim lock is held.
-        claims = self.current_claims()
+        return self.reconcile_claims(self.current_claims())
+
+    def reconcile_claims(
+        self,
+        claims: tuple[LabShardClaim, ...],
+    ) -> tuple[LabClaimReconcileResult, ...]:
+        """Run claim hooks for an authority-selected snapshot without directory scans."""
         results: list[LabClaimReconcileResult] = []
         for claim in claims:
             if self._claim_advance_hook is None:
@@ -1188,6 +1504,8 @@ class LabClaimSpool(_TypedSpoolBase):
             if self._revocation_locked(entry.claim) is not None:
                 self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
                 raise LabClaimRevokedError(f"claim {entry.claim.claim_token} was revoked")
+            if self._retired_blocks_locked(entry.claim):
+                raise LabClaimSupersededError("pending claim was terminally retired before consume")
             consumed_path = self._consumed_path(entry.claim.claim_token)
             if os.path.lexists(consumed_path):
                 consumed = self._load_consumed_locked(entry.claim.claim_token)

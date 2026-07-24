@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from threading import Event
 from uuid import UUID
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.lab_job_protocol import (
@@ -45,7 +46,21 @@ class SchedulerTickResult(BaseModel):
     claims_reconciled: int = Field(default=0, ge=0)
     claim_reconcile_failures: int = Field(default=0, ge=0)
     claims_revoked: int = Field(default=0, ge=0)
+    claims_retired: int = Field(default=0, ge=0)
     claim_revoke_failures: int = Field(default=0, ge=0)
+
+
+class _ClaimAuthorityTick(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claims_published: int = Field(default=0, ge=0)
+    claims_replayed: int = Field(default=0, ge=0)
+    delivery_failures: int = Field(default=0, ge=0)
+    claims_reconciled: int = Field(default=0, ge=0)
+    reconcile_failures: int = Field(default=0, ge=0)
+    claims_revoked: int = Field(default=0, ge=0)
+    claims_retired: int = Field(default=0, ge=0)
+    revoke_failures: int = Field(default=0, ge=0)
 
 
 def _system_clock() -> datetime:
@@ -55,6 +70,10 @@ def _system_clock() -> datetime:
 def _safe_plan_failure(exc: Exception) -> str:
     message = " ".join((str(exc) or type(exc).__name__).split())
     return f"{type(exc).__name__}: {message[:400]}"
+
+
+def _safe_error_message(exc: Exception) -> str:
+    return " ".join((str(exc) or type(exc).__name__).split())[:400]
 
 
 class LabScheduler:
@@ -78,6 +97,7 @@ class LabScheduler:
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
+        max_claim_authority_per_tick: int = 128,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
         if not owner_id.strip():
@@ -98,6 +118,8 @@ class LabScheduler:
             raise ValueError("max_plans_per_tick must be positive")
         if max_claims_per_tick < 1:
             raise ValueError("max_claims_per_tick must be positive")
+        if max_claim_authority_per_tick < 1:
+            raise ValueError("max_claim_authority_per_tick must be positive")
         normalized_workers = tuple(worker.strip() for worker in claim_worker_ids)
         if any(not worker for worker in normalized_workers):
             raise ValueError("claim_worker_ids must not contain empty values")
@@ -118,10 +140,12 @@ class LabScheduler:
         self.adapter_registry = adapter_registry
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
+        self.max_claim_authority_per_tick = max_claim_authority_per_tick
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
         self._claim_cursor = 0
         self._claim_cursor_fence: int | None = None
+        self._claim_authority_cursor: str | None = None
         self._stop = Event()
 
     def _seed_claim_cursor(self, lease: LabLeaseRecord) -> None:
@@ -170,44 +194,163 @@ class LabScheduler:
         lease: LabLeaseRecord,
         *,
         now: datetime,
-        attempted: set[UUID],
-    ) -> tuple[int, int, tuple[LabShardClaim, ...]]:
+        new_claim_tokens: frozenset[UUID],
+    ) -> _ClaimAuthorityTick:
         if self.claim_spool is None:
-            return 0, 0, ()
+            return _ClaimAuthorityTick()
         active = self.store.list_active_claims(
             lease,
             now=now,
             initial_lease_seconds=self.shard_lease_seconds,
         )
         active_by_token = {claim.claim_token: claim for claim in active}
-        accepted_success_tokens = self.store.list_accepted_success_claim_tokens(
-            lease,
-            now=now,
-        )
-        revoked = 0
-        failures = 0
-        try:
-            deliveries = self.claim_spool.delivery_claims()
-        except Exception:
-            return 0, 1, active
-        for delivery in deliveries:
-            if active_by_token.get(delivery.claim_token) == delivery:
-                continue
-            if delivery.claim_token in accepted_success_tokens:
-                continue
-            if delivery.claim_token in attempted:
-                continue
-            attempted.add(delivery.claim_token)
+        published = 0
+        replayed = 0
+        delivery_failures = 0
+        hook_claims: list[LabShardClaim] = []
+        for active_claim in active:
             try:
-                self.claim_spool.revoke(
-                    delivery,
-                    reason="sqlite claim is no longer active",
+                self.claim_spool.publish(active_claim)
+            except Exception as exc:
+                delivery_failures += 1
+                logger.bind(
+                    component="lab_scheduler",
+                    owner_id=self.owner_id,
+                    failure="claim_publish_failed",
+                    job_id=str(active_claim.job_id),
+                    shard_id=str(active_claim.shard_id),
+                    claim_token=str(active_claim.claim_token),
+                    error_type=type(exc).__name__,
+                ).error(
+                    "Strategy Lab claim publish failed: {message}",
+                    message=_safe_error_message(exc),
                 )
-            except Exception:
-                failures += 1
             else:
-                revoked += 1
-        return revoked, failures, active
+                if active_claim.claim_token in new_claim_tokens:
+                    published += 1
+                else:
+                    replayed += 1
+                if self.claim_spool.is_current(active_claim):
+                    hook_claims.append(active_claim)
+        try:
+            hot_batch = self.claim_spool.hot_delivery_batch(
+                limit=self.max_claim_authority_per_tick,
+                cursor=self._claim_authority_cursor,
+            )
+        except Exception as exc:
+            logger.bind(
+                component="lab_scheduler",
+                owner_id=self.owner_id,
+                failure="claim_authority_scan_failed",
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab bounded claim authority scan failed: {message}",
+                message=_safe_error_message(exc),
+            )
+            return _ClaimAuthorityTick(
+                claims_published=published,
+                claims_replayed=replayed,
+                delivery_failures=delivery_failures,
+                revoke_failures=1,
+            )
+        self._claim_authority_cursor = hot_batch.next_cursor
+        stale = tuple(
+            delivery
+            for delivery in hot_batch.claims
+            if active_by_token.get(delivery.claim_token) != delivery
+        )
+        try:
+            accepted_success_tokens = self.store.accepted_success_claim_tokens_for(
+                lease,
+                now=now,
+                claims=stale,
+            )
+        except Exception as exc:
+            logger.bind(
+                component="lab_scheduler",
+                owner_id=self.owner_id,
+                failure="claim_success_evidence_failed",
+                candidate_count=len(stale),
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab claim success evidence lookup failed: {message}",
+                message=_safe_error_message(exc),
+            )
+            return _ClaimAuthorityTick(
+                claims_published=published,
+                claims_replayed=replayed,
+                delivery_failures=delivery_failures,
+                revoke_failures=1,
+            )
+        revoked = 0
+        retired = 0
+        revoke_failures = 0
+        for delivery in stale:
+            try:
+                if delivery.claim_token in accepted_success_tokens:
+                    self.claim_spool.retire(
+                        delivery,
+                        outcome="accepted",
+                        reason="scheduler accepted shard success",
+                    )
+                else:
+                    self.claim_spool.revoke(
+                        delivery,
+                        reason="sqlite claim is no longer active",
+                    )
+                    self.claim_spool.retire(
+                        delivery,
+                        outcome="revoked",
+                        reason="sqlite claim is no longer active",
+                    )
+            except Exception as exc:
+                revoke_failures += 1
+                logger.bind(
+                    component="lab_scheduler",
+                    owner_id=self.owner_id,
+                    failure="claim_retire_failed",
+                    job_id=str(delivery.job_id),
+                    shard_id=str(delivery.shard_id),
+                    claim_token=str(delivery.claim_token),
+                    error_type=type(exc).__name__,
+                ).error(
+                    "Strategy Lab claim revoke/retire failed: {message}",
+                    message=_safe_error_message(exc),
+                )
+            else:
+                retired += 1
+                if delivery.claim_token not in accepted_success_tokens:
+                    revoked += 1
+        reconciled = 0
+        reconcile_failures = 0
+        hook_claim_by_token = {claim.claim_token: claim for claim in hook_claims}
+        for outcome in self.claim_spool.reconcile_claims(tuple(hook_claims)):
+            if outcome.status == "reconciled":
+                reconciled += 1
+            elif outcome.status == "failed":
+                reconcile_failures += 1
+                hook_claim = hook_claim_by_token[outcome.claim_token]
+                logger.bind(
+                    component="lab_scheduler",
+                    owner_id=self.owner_id,
+                    failure="claim_reconcile_failed",
+                    job_id=str(hook_claim.job_id),
+                    shard_id=str(hook_claim.shard_id),
+                    claim_token=str(hook_claim.claim_token),
+                ).warning(
+                    "Strategy Lab claim artifact reconciliation failed: {message}",
+                    message=outcome.error or "unknown reconciliation failure",
+                )
+        return _ClaimAuthorityTick(
+            claims_published=published,
+            claims_replayed=replayed,
+            delivery_failures=delivery_failures,
+            claims_reconciled=reconciled,
+            reconcile_failures=reconcile_failures,
+            claims_revoked=revoked,
+            claims_retired=retired,
+            revoke_failures=revoke_failures,
+        )
 
     def run_once(self) -> SchedulerTickResult:
         acquired = self._start_tick()
@@ -224,22 +367,6 @@ class LabScheduler:
             )
         )
         authority_now = recovery_now
-        attempted_revokes: set[UUID] = set()
-        claims_revoked, claim_revoke_failures, active_claims = self._reconcile_claim_authority(
-            lease,
-            now=recovery_now,
-            attempted=attempted_revokes,
-        )
-        claims_replayed = 0
-        claim_delivery_failures = 0
-        if self.claim_spool is not None:
-            for active_claim in active_claims:
-                try:
-                    self.claim_spool.publish(active_claim)
-                except Exception:
-                    claim_delivery_failures += 1
-                else:
-                    claims_replayed += 1
         processed = 0
         applied = 0
         rejected = 0
@@ -309,6 +436,18 @@ class LabScheduler:
                         now=mutation_now,
                     )
                 except RequestContentConflictError as exc:
+                    logger.bind(
+                        component="lab_scheduler",
+                        owner_id=self.owner_id,
+                        failure="report_content_conflict",
+                        job_id=str(entry.report.job_id),
+                        shard_id=str(entry.report.shard_id),
+                        report_id=str(entry.report.report_id),
+                        error_type=type(exc).__name__,
+                    ).error(
+                        "Strategy Lab worker report content conflict: {message}",
+                        message=_safe_error_message(exc),
+                    )
                     self.report_spool.quarantine(
                         entry,
                         reason=f"report_content_conflict:{exc}",
@@ -320,6 +459,19 @@ class LabScheduler:
                     reports_accepted += 1
                 else:
                     reports_rejected += 1
+                    logger.bind(
+                        component="lab_scheduler",
+                        owner_id=self.owner_id,
+                        failure="worker_report_rejected",
+                        job_id=str(entry.report.job_id),
+                        shard_id=str(entry.report.shard_id),
+                        claim_token=str(entry.report.claim_token),
+                        report_id=str(entry.report.report_id),
+                        report_type=entry.report.body.report_type,
+                    ).warning(
+                        "Strategy Lab worker report was rejected: {reason}",
+                        reason=" ".join(receipt.reason.split())[:400],
+                    )
                 self.report_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
@@ -330,6 +482,16 @@ class LabScheduler:
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()
                     authority_now = mutation_now
+                    logger.bind(
+                        component="lab_scheduler",
+                        owner_id=self.owner_id,
+                        failure="adapter_plan_failed",
+                        job_id=str(job.job_id),
+                        error_type=type(exc).__name__,
+                    ).error(
+                        "Strategy Lab adapter planning failed: {message}",
+                        message=_safe_error_message(exc),
+                    )
                     self.store.fail_unplanned_job(
                         job.job_id,
                         reason=f"adapter plan failed: {_safe_plan_failure(exc)}",
@@ -347,12 +509,13 @@ class LabScheduler:
                     now=mutation_now,
                 )
                 plans_created += 1
-        claims_published = 0
+        new_claim_tokens: set[UUID] = set()
+        claims_created = 0
         if self.claim_spool is not None and self.claim_worker_ids:
             worker_count = len(self.claim_worker_ids)
             start = self._claim_cursor
             inspected = 0
-            while inspected < worker_count and claims_published < self.max_claims_per_tick:
+            while inspected < worker_count and claims_created < self.max_claims_per_tick:
                 worker_id = self.claim_worker_ids[(start + inspected) % worker_count]
                 inspected += 1
                 lease, mutation_now = self._mutation_context()
@@ -371,29 +534,14 @@ class LabScheduler:
                 )
                 if claim is None:
                     continue
-                try:
-                    self.claim_spool.publish(claim)
-                except Exception:
-                    claim_delivery_failures += 1
-                else:
-                    claims_published += 1
+                new_claim_tokens.add(claim.claim_token)
+                claims_created += 1
             self._claim_cursor = (start + inspected) % worker_count
-        if self.claim_spool is not None:
-            final_revoked, final_revoke_failures, _active = self._reconcile_claim_authority(
-                lease,
-                now=authority_now,
-                attempted=attempted_revokes,
-            )
-            claims_revoked += final_revoked
-            claim_revoke_failures += final_revoke_failures
-        claims_reconciled = 0
-        claim_reconcile_failures = 0
-        if self.claim_spool is not None:
-            for outcome in self.claim_spool.reconcile_current():
-                if outcome.status == "reconciled":
-                    claims_reconciled += 1
-                elif outcome.status == "failed":
-                    claim_reconcile_failures += 1
+        authority = self._reconcile_claim_authority(
+            lease,
+            now=authority_now,
+            new_claim_tokens=frozenset(new_claim_tokens),
+        )
         return SchedulerTickResult(
             lease_acquired=acquired,
             processed=processed,
@@ -408,13 +556,14 @@ class LabScheduler:
             deadlines_expired=deadlines_expired,
             plans_created=plans_created,
             plans_failed=plans_failed,
-            claims_published=claims_published,
-            claims_replayed=claims_replayed,
-            claim_delivery_failures=claim_delivery_failures,
-            claims_reconciled=claims_reconciled,
-            claim_reconcile_failures=claim_reconcile_failures,
-            claims_revoked=claims_revoked,
-            claim_revoke_failures=claim_revoke_failures,
+            claims_published=authority.claims_published,
+            claims_replayed=authority.claims_replayed,
+            claim_delivery_failures=authority.delivery_failures,
+            claims_reconciled=authority.claims_reconciled,
+            claim_reconcile_failures=authority.reconcile_failures,
+            claims_revoked=authority.claims_revoked,
+            claims_retired=authority.claims_retired,
+            claim_revoke_failures=authority.revoke_failures,
         )
 
     def request_stop(self) -> None:
@@ -433,7 +582,32 @@ class LabScheduler:
     def run_forever(self) -> None:
         try:
             while not self._stop.is_set():
-                self.run_once()
+                result = self.run_once()
+                self._log_tick_anomalies(result)
                 self._stop.wait(self.poll_interval_ms / 1_000)
         finally:
             self.release()
+
+    def _log_tick_anomalies(self, result: SchedulerTickResult) -> None:
+        anomaly_counts = {
+            name: value
+            for name, value in {
+                "quarantined": result.quarantined,
+                "reports_rejected": result.reports_rejected,
+                "reports_quarantined": result.reports_quarantined,
+                "plans_failed": result.plans_failed,
+                "claim_delivery_failures": result.claim_delivery_failures,
+                "claim_reconcile_failures": result.claim_reconcile_failures,
+                "claims_revoked": result.claims_revoked,
+                "claim_revoke_failures": result.claim_revoke_failures,
+            }.items()
+            if value
+        }
+        if not anomaly_counts:
+            return
+        logger.bind(
+            component="lab_scheduler",
+            owner_id=self.owner_id,
+            failure="tick_anomalies",
+            anomaly_counts=anomaly_counts,
+        ).warning("Strategy Lab scheduler tick completed with anomalies")

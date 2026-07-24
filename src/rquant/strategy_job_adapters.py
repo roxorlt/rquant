@@ -26,6 +26,40 @@ DATE_BUCKET_DAYS = 20
 ADAPTER_VERSION = "1"
 EXECUTION_CONTRACT_ID = "strategy-adapter-execution"
 EXECUTION_CONTRACT_VERSION = "p13b-adapter-v1"
+_LEGACY_STRATEGY_ALIASES: dict[
+    tuple[str, ResearchJobType],
+    tuple[str, ResearchJobType, str, frozenset[str]],
+] = {
+    ("NShapeCompare", ResearchJobType.STRATEGY_REPLAY): (
+        "n_shape",
+        ResearchJobType.STRATEGY_REPLAY,
+        EXECUTION_CONTRACT_ID,
+        frozenset({EXECUTION_CONTRACT_VERSION}),
+    ),
+    ("NShapeOptimize", ResearchJobType.PARAMETER_SEARCH): (
+        "n_shape",
+        ResearchJobType.PARAMETER_SEARCH,
+        EXECUTION_CONTRACT_ID,
+        frozenset({EXECUTION_CONTRACT_VERSION}),
+    ),
+    ("AuctionGap", ResearchJobType.STRATEGY_REPLAY): (
+        "auction_gap",
+        ResearchJobType.STRATEGY_REPLAY,
+        EXECUTION_CONTRACT_ID,
+        frozenset({EXECUTION_CONTRACT_VERSION}),
+    ),
+    ("GrowthBoardSurge", ResearchJobType.STRATEGY_REPLAY): (
+        "growth_board_surge",
+        ResearchJobType.STRATEGY_REPLAY,
+        EXECUTION_CONTRACT_ID,
+        frozenset({EXECUTION_CONTRACT_VERSION}),
+    ),
+}
+_LEGACY_SPARSE_EMPTY_TABLE_COLUMNS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("auction-gap", "candidates"): ("signal_date", "ts_code", "name"),
+    ("auction-gap", "trades"): (),
+    ("growth-board-surge", "trades"): (),
+}
 
 
 def build_adapter_execution_contract(
@@ -49,6 +83,7 @@ def build_adapter_execution_contract(
         contract_version=EXECUTION_CONTRACT_VERSION,
         contract_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     )
+
 
 EntryMode: TypeAlias = Literal[
     "first_break",
@@ -634,7 +669,9 @@ class StrategyJobAdapterRegistry:
 
     def for_spec(self, spec: ResearchRunSpec) -> StrategyJobAdapter:
         validated = ResearchRunSpec.model_validate(spec)
-        key = (validated.parameters.strategy_name, validated.job_type)
+        requested_key = (validated.parameters.strategy_name, validated.job_type)
+        legacy_alias = _LEGACY_STRATEGY_ALIASES.get(requested_key)
+        key = requested_key if legacy_alias is None else legacy_alias[:2]
         matches = tuple(
             adapter
             for adapter in self._adapters
@@ -646,6 +683,16 @@ class StrategyJobAdapterRegistry:
                 f"{validated.parameters.strategy_name}/{validated.job_type.value}"
             )
         adapter = matches[0]
+        if legacy_alias is not None:
+            _strategy_name, _job_type, contract_id, contract_versions = legacy_alias
+            if (
+                validated.feature_contract.contract_id != contract_id
+                or validated.feature_contract.contract_version not in contract_versions
+            ):
+                raise ValueError(
+                    f"{validated.parameters.strategy_name} legacy execution contract "
+                    "version is not supported"
+                )
         expected_contract = build_adapter_execution_contract(
             adapter.adapter_id,
             adapter.adapter_version,
@@ -788,7 +835,11 @@ class StrategyJobAdapterRegistry:
             LabShardTable(
                 name=name,
                 frame=_concat_shard_frames(
-                    tuple(result.tables[index].frame for result in ordered)
+                    _normalize_legacy_sparse_empty_frames(
+                        adapter_id=adapter.adapter_id,
+                        table_name=name,
+                        frames=tuple(result.tables[index].frame for result in ordered),
+                    )
                 ),
             )
             for index, name in enumerate(expected_table_names)
@@ -807,7 +858,40 @@ class StrategyJobAdapterRegistry:
         )
 
 
+def _normalize_legacy_sparse_empty_frames(
+    *,
+    adapter_id: str,
+    table_name: str,
+    frames: tuple[pd.DataFrame, ...],
+) -> tuple[pd.DataFrame, ...]:
+    expected_sparse_columns = _LEGACY_SPARSE_EMPTY_TABLE_COLUMNS.get((adapter_id, table_name))
+    if expected_sparse_columns is None:
+        return frames
+    populated = tuple(frame for frame in frames if not frame.empty)
+    if not populated:
+        return frames
+    reference = populated[0].iloc[0:0].copy()
+    return tuple(
+        reference.copy()
+        if frame.empty and tuple(frame.columns) == expected_sparse_columns
+        else frame
+        for frame in frames
+    )
+
+
 def _concat_shard_frames(frames: tuple[pd.DataFrame, ...]) -> pd.DataFrame:
+    expected_schema = tuple(
+        (column, str(dtype))
+        for column, dtype in zip(frames[0].columns, frames[0].dtypes, strict=True)
+    )
+    for index, frame in enumerate(frames[1:], start=1):
+        schema = tuple(
+            (column, str(dtype)) for column, dtype in zip(frame.columns, frame.dtypes, strict=True)
+        )
+        if schema != expected_schema:
+            raise ValueError(
+                f"aggregation shard frame {index} schema does not match the first shard"
+            )
     populated = tuple(frame for frame in frames if not frame.empty)
     if populated:
         return pd.concat(populated, ignore_index=True)
@@ -823,10 +907,14 @@ def _rerank_optimizer_table(table: LabShardTable) -> pd.DataFrame:
         sort_columns = ("robust_score", "folds", "test_trades")
     if sort_columns is None or frame.empty:
         return frame
-    reranked = frame.drop(columns="rank").sort_values(
-        list(sort_columns),
-        ascending=[False] * len(sort_columns),
-    ).reset_index(drop=True)
+    reranked = (
+        frame.drop(columns="rank")
+        .sort_values(
+            list(sort_columns),
+            ascending=[False] * len(sort_columns),
+        )
+        .reset_index(drop=True)
+    )
     reranked.insert(0, "rank", range(1, len(reranked) + 1))
     return reranked
 

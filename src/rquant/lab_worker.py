@@ -20,6 +20,7 @@ from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pandas as pd
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.data_metadata import DatasetSnapshotBinding
@@ -207,6 +208,12 @@ class LabWorkerFailure(LabWorkerModel):
         )
 
 
+class LabWorkerHealthWarning(LabWorkerModel):
+    category: Literal["quarantine_reconcile_failed"]
+    error_type: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+
+
 class LabWorkerTickResult(LabWorkerModel):
     status: Literal[
         "idle",
@@ -220,6 +227,7 @@ class LabWorkerTickResult(LabWorkerModel):
     claim_token: UUID | None = None
     manifest_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
     report_id: UUID | None = None
+    health_warnings: tuple[LabWorkerHealthWarning, ...] = ()
 
 
 class LabPreparedFileIdentity(LabWorkerModel):
@@ -611,6 +619,7 @@ class LabWorker:
         lease_extension_seconds: int = 120,
         poll_interval_ms: int = 250,
         receipt_timeout_seconds: float = 30.0,
+        quarantine_reconcile_interval_seconds: float = 300.0,
         receipt_waiter: ReceiptWaiter | None = None,
         verified_code_sha_provider: CodeShaProvider | None = None,
         clock: Callable[[], datetime] = _system_clock,
@@ -626,6 +635,8 @@ class LabWorker:
             raise ValueError("poll_interval_ms must be positive")
         if receipt_timeout_seconds <= 0:
             raise ValueError("receipt_timeout_seconds must be positive")
+        if quarantine_reconcile_interval_seconds <= 0:
+            raise ValueError("quarantine_reconcile_interval_seconds must be positive")
         self.worker_id = normalized_worker_id
         self.claim_spool = claim_spool
         self.report_spool = report_spool
@@ -640,6 +651,7 @@ class LabWorker:
         self.lease_extension_seconds = lease_extension_seconds
         self.poll_interval_ms = poll_interval_ms
         self.receipt_timeout_seconds = receipt_timeout_seconds
+        self.quarantine_reconcile_interval_seconds = quarantine_reconcile_interval_seconds
         self.receipt_waiter = receipt_waiter or self._wait_for_receipt
         self.verified_code_sha_provider = verified_code_sha_provider
         self.clock = clock
@@ -651,6 +663,7 @@ class LabWorker:
         self._stop = LabStopSignal()
         self._terminal_lock = threading.Lock()
         self._pending_success: LabPendingSuccess | None = None
+        self._next_quarantine_reconcile_at = 0.0
 
     def request_stop(self) -> None:
         self._stop.request()
@@ -765,7 +778,6 @@ class LabWorker:
             )
 
     def _reclaim_obsolete_temporaries(self, claim: LabShardClaim) -> None:
-        self.artifact_reclaimer.collect_garbage()
         current_root = self._temporary_bundle_path(claim)
         shard_root = current_root.parent
         self._assert_safe_artifact_ancestors(shard_root)
@@ -830,7 +842,24 @@ class LabWorker:
         body: LabShardHeartbeat | LabShardSucceeded | LabShardFailed | LabWorkerStopped,
     ) -> LabWorkerReport:
         report = self._make_report(claim, body)
-        self.report_spool.publish(report)
+        try:
+            self.report_spool.publish(report)
+        except Exception as exc:
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="report_publish_failed",
+                job_id=str(report.job_id),
+                shard_id=str(report.shard_id),
+                claim_token=str(report.claim_token),
+                report_id=str(report.report_id),
+                report_type=report.body.report_type,
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab worker report publish failed: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
+            raise
         return report
 
     def _wait_for_receipt(
@@ -867,7 +896,39 @@ class LabWorker:
         stop: LabStopSignal,
     ) -> LabReportReceipt:
         report = self._publish_report(claim, body)
-        receipt = self.receipt_waiter(report, self.receipt_timeout_seconds, stop)
+        try:
+            receipt = self.receipt_waiter(report, self.receipt_timeout_seconds, stop)
+        except TimeoutError as exc:
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="report_receipt_timeout",
+                job_id=str(report.job_id),
+                shard_id=str(report.shard_id),
+                claim_token=str(report.claim_token),
+                report_id=str(report.report_id),
+                report_type=report.body.report_type,
+            ).warning(
+                "Strategy Lab worker report receipt timed out: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
+            raise
+        except Exception as exc:
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="report_receipt_transport_failed",
+                job_id=str(report.job_id),
+                shard_id=str(report.shard_id),
+                claim_token=str(report.claim_token),
+                report_id=str(report.report_id),
+                report_type=report.body.report_type,
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab worker report receipt failed: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
+            raise
         self._validate_receipt_identity(report, receipt)
         if receipt.status != "accepted":
             raise PermissionError(f"worker report rejected: {receipt.reason}")
@@ -1486,7 +1547,20 @@ class LabWorker:
             raise RuntimeError("worker has no pending success report")
         try:
             self.report_spool.publish(pending.report)
-        except Exception:
+        except Exception as exc:
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="success_report_publish_failed",
+                job_id=str(pending.claim.job_id),
+                shard_id=str(pending.claim.shard_id),
+                claim_token=str(pending.claim.claim_token),
+                report_id=str(pending.report.report_id),
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab success report publish is uncertain: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
             return self._set_pending_receipt_state("unknown")
         try:
             receipt = self.receipt_waiter(
@@ -1495,11 +1569,36 @@ class LabWorker:
                 self._stop,
             )
             self._validate_receipt_identity(pending.report, receipt)
-        except TimeoutError:
+        except TimeoutError as exc:
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="success_receipt_timeout",
+                job_id=str(pending.claim.job_id),
+                shard_id=str(pending.claim.shard_id),
+                claim_token=str(pending.claim.claim_token),
+                report_id=str(pending.report.report_id),
+            ).warning(
+                "Strategy Lab success receipt is still pending: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
             return self._set_pending_receipt_state("awaiting_receipt")
         except InterruptedError:
             return self._set_pending_receipt_state("reported")
-        except Exception:
+        except Exception as exc:
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="success_receipt_transport_failed",
+                job_id=str(pending.claim.job_id),
+                shard_id=str(pending.claim.shard_id),
+                claim_token=str(pending.claim.claim_token),
+                report_id=str(pending.report.report_id),
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab success receipt state is unknown: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
             return self._set_pending_receipt_state("unknown")
         if receipt.status == "rejected":
             self._rollback_sealed(pending.claim, pending.bundle)
@@ -1540,7 +1639,42 @@ class LabWorker:
         self._best_effort_report(claim, LabWorkerStopped(reason=reason))
         return LabWorkerTickResult(status="stopped", claim_token=claim.claim_token)
 
+    def _maybe_reconcile_quarantine(self) -> tuple[LabWorkerHealthWarning, ...]:
+        now = time.monotonic()
+        if now < self._next_quarantine_reconcile_at:
+            return ()
+        self._next_quarantine_reconcile_at = now + self.quarantine_reconcile_interval_seconds
+        try:
+            self.artifact_reclaimer.collect_garbage()
+        except Exception as exc:
+            message = " ".join((str(exc) or type(exc).__name__).split())[:400]
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="quarantine_reconcile_failed",
+                error_type=type(exc).__name__,
+            ).warning("Strategy Lab quarantine reconciliation failed: {message}", message=message)
+            return (
+                LabWorkerHealthWarning(
+                    category="quarantine_reconcile_failed",
+                    error_type=type(exc).__name__,
+                    message=message,
+                ),
+            )
+        return ()
+
     def run_once(self) -> LabWorkerTickResult:
+        warnings = (
+            ()
+            if self._pending_success is not None or self._stop.is_set()
+            else self._maybe_reconcile_quarantine()
+        )
+        result = self._run_claim_once()
+        if not warnings:
+            return result
+        return result.model_copy(update={"health_warnings": warnings})
+
+    def _run_claim_once(self) -> LabWorkerTickResult:
         if self._pending_success is not None:
             return self._await_pending_success()
         if self._stop.is_set():
@@ -1745,6 +1879,19 @@ class LabWorker:
             if self._pending_success is None:
                 self._rollback_sealed(claim, bundle)
                 return self._failure_result(claim, phase="fence", error=exc)
+            logger.bind(
+                component="lab_worker",
+                worker_id=self.worker_id,
+                failure="success_report_publish_failed",
+                job_id=str(claim.job_id),
+                shard_id=str(claim.shard_id),
+                claim_token=str(claim.claim_token),
+                report_id=str(self._pending_success.report.report_id),
+                error_type=type(exc).__name__,
+            ).error(
+                "Strategy Lab success report publish is uncertain: {message}",
+                message=" ".join((str(exc) or type(exc).__name__).split())[:400],
+            )
             return self._set_pending_receipt_state("unknown")
         return self._await_pending_success()
 
@@ -3262,11 +3409,68 @@ class LabArtifactReclaimer:
 
     def quarantine_summary(self) -> LabQuarantineSummary:
         """Expose retained P1.3 bytes for the later exclusive-window lifecycle GC."""
-        entries = self.quarantine_entries()
-        return LabQuarantineSummary(
-            bundle_count=len(entries),
-            retained_bytes=sum(entry.retained_bytes for entry in entries),
-        )
+        with self.report_spool.evidence_lock():
+            bundle_count = 0
+            retained_bytes = 0
+            for bundle in sorted(self.garbage_deferred_dir.iterdir()):
+                try:
+                    bundle_id = UUID(hex=bundle.name)
+                    root = bundle.lstat()
+                except (OSError, ValueError) as exc:
+                    raise LabArtifactConflictError(
+                        "deferred quarantine bundle identity is invalid"
+                    ) from exc
+                if bundle.is_symlink() or not stat.S_ISDIR(root.st_mode):
+                    raise LabArtifactConflictError("deferred quarantine bundle is unsafe")
+                names = {child.name for child in bundle.iterdir()}
+                if names != {"owner.json", "payload"}:
+                    raise LabArtifactConflictError(
+                        f"deferred quarantine has unexpected entries: {sorted(names)}"
+                    )
+                owner = self._load_garbage_owner_ledger(bundle_id)
+                if self._load_garbage_owner(bundle / "owner.json") != owner:
+                    raise LabArtifactConflictError(
+                        "deferred quarantine bundle owner conflicts with ledger"
+                    )
+                intent = self._load_prepared_intent(self._prepared_intent_path(bundle_id))
+                if intent.owner != owner:
+                    raise LabArtifactConflictError(
+                        "deferred quarantine prepared intent conflicts with ledger"
+                    )
+                latest = self._latest_garbage_ledger(owner)
+                if latest.state != "deferred_gc":
+                    raise LabArtifactConflictError("deferred quarantine has no deferred_gc ledger")
+                payload = bundle / "payload"
+                try:
+                    payload_stat = payload.lstat()
+                except OSError as exc:
+                    raise LabArtifactConflictError(
+                        "deferred quarantine payload root is missing"
+                    ) from exc
+                root_inventory = owner.inventory[0]
+                expected_mode = (
+                    stat.S_ISDIR(payload_stat.st_mode)
+                    if root_inventory.file_type == "directory"
+                    else stat.S_ISREG(payload_stat.st_mode)
+                )
+                if (
+                    payload.is_symlink()
+                    or not expected_mode
+                    or (payload_stat.st_dev, payload_stat.st_ino)
+                    != (root_inventory.device, root_inventory.inode)
+                    or (root_inventory.file_type == "regular" and payload_stat.st_nlink != 1)
+                ):
+                    raise LabArtifactConflictError(
+                        "deferred quarantine payload root conflicts with ledger"
+                    )
+                bundle_count += 1
+                retained_bytes += sum(
+                    entry.size or 0 for entry in owner.inventory if entry.file_type == "regular"
+                )
+            return LabQuarantineSummary(
+                bundle_count=bundle_count,
+                retained_bytes=retained_bytes,
+            )
 
     def _logical_delete(
         self,

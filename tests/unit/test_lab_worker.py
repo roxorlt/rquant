@@ -15,11 +15,13 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from uuid import UUID, uuid4
 
 import pandas as pd
 import pytest
 
+from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_shard_protocol import (
     LabClaimSpool,
     LabReportReceipt,
@@ -111,6 +113,7 @@ def _worker(
     reports: LabReportSpool | None = None,
     heartbeat_interval_seconds: float = 60.0,
     lease_extension_seconds: int = 30,
+    quarantine_reconcile_interval_seconds: float = 300.0,
     receipt_timeout_seconds: float = 0.2,
     exploratory_store_factory=_store_factory,
     metadata_store_factory=None,
@@ -132,6 +135,7 @@ def _worker(
         research_lake_root=lake_root,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
         lease_extension_seconds=lease_extension_seconds,
+        quarantine_reconcile_interval_seconds=quarantine_reconcile_interval_seconds,
         poll_interval_ms=5,
         receipt_timeout_seconds=receipt_timeout_seconds,
         receipt_waiter=receipt_waiter,
@@ -422,6 +426,109 @@ def test_worker_consumes_only_its_owned_unexpired_claim(tmp_path: Path) -> None:
     assert report.scheduler_fencing_token == owned.scheduler_fencing_token
     assert report.claim_token == owned.claim_token
     assert report.worker_id == owned.worker_id
+
+
+def test_worker_does_not_rehash_large_quarantine_for_each_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    spec = _nshape_compare_spec(hold_days=(1,))
+    for _ in range(2):
+        claims.publish(_claim(spec))
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        quarantine_reconcile_interval_seconds=3_600,
+    )
+    hash_calls = 0
+
+    def simulated_large_recovery() -> None:
+        nonlocal hash_calls
+        hash_calls += 10_000
+
+    monkeypatch.setattr(
+        worker.artifact_reclaimer,
+        "collect_garbage",
+        simulated_large_recovery,
+    )
+
+    first = worker.run_once()
+    second = worker.run_once()
+
+    assert first.status == "succeeded"
+    assert second.status == "succeeded"
+    assert hash_calls == 10_000
+    assert registry.executions == 2
+
+
+def test_unrelated_quarantine_recovery_failure_is_typed_and_does_not_block_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(tmp_path, claims=claims)
+
+    def fail_recovery() -> None:
+        raise RuntimeError("unrelated deferred quarantine is corrupt")
+
+    monkeypatch.setattr(worker.artifact_reclaimer, "collect_garbage", fail_recovery)
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert len(result.health_warnings) == 1
+    assert result.health_warnings[0].category == "quarantine_reconcile_failed"
+    assert result.health_warnings[0].error_type == "RuntimeError"
+
+
+def test_success_receipt_timeout_emits_structured_worker_warning(tmp_path: Path) -> None:
+    from loguru import logger
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+
+    def delayed_success_receipt(
+        report: LabWorkerReport,
+        timeout_seconds: float,
+        stop: object,
+    ) -> LabReportReceipt:
+        if isinstance(report.body, LabShardSucceeded):
+            raise TimeoutError("scheduler receipt delayed")
+        return _accept_report(report, timeout_seconds, stop)
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        receipt_waiter=delayed_success_receipt,
+    )
+    records: list[dict[str, object]] = []
+    sink = logger.add(
+        lambda message: records.append(dict(message.record["extra"])),
+        level="WARNING",
+    )
+    try:
+        result = worker.run_once()
+    finally:
+        logger.remove(sink)
+
+    assert result.status == "awaiting_receipt"
+    timeout_records = [
+        record for record in records if record.get("failure") == "success_receipt_timeout"
+    ]
+    assert len(timeout_records) == 1
+    assert timeout_records[0]["component"] == "lab_worker"
+    assert timeout_records[0]["worker_id"] == "worker-a"
+    assert timeout_records[0]["job_id"] == str(claim.job_id)
+    assert timeout_records[0]["shard_id"] == str(claim.shard_id)
+    assert timeout_records[0]["report_id"] == str(result.report_id)
 
 
 def test_worker_leaves_expired_claim_for_lease_recovery(tmp_path: Path) -> None:
@@ -1681,6 +1788,54 @@ def test_formal_job_opens_verified_research_execution_session(
     assert result.status == "succeeded"
     assert opened == [(metadata.binding, tmp_path / "lake")]
     assert registry.stores == [session_store]
+
+
+def test_legacy_formal_spec_uses_canonical_snapshot_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.research_gate import ResearchGateRequest
+
+    spec = _formal_spec().model_copy(
+        update={
+            "parameters": _formal_spec().parameters.model_copy(
+                update={"strategy_name": "NShapeCompare"}
+            )
+        }
+    )
+    requests: list[ResearchGateRequest] = []
+
+    @contextmanager
+    def gated_store(
+        request: ResearchGateRequest,
+        **_kwargs: object,
+    ) -> Iterator[tuple[object, object]]:
+        requests.append(request)
+        yield object(), object()
+
+    @contextmanager
+    def metadata_factory() -> Iterator[object]:
+        yield object()
+
+    monkeypatch.setattr(lab_worker, "open_gated_research_store", gated_store)
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(_claim(spec))
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        exploratory_store_factory=None,
+        metadata_store_factory=metadata_factory,
+        lake_root=tmp_path / "lake",
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert len(requests) == 1
+    assert requests[0].strategy_name == "n_shape"
+    assert requests[0].dataset_snapshot_id == spec.dataset_snapshot.snapshot_id
+    assert requests[0].dataset_binding_hash == spec.dataset_snapshot.binding_hash
 
 
 def test_formal_snapshot_identity_mismatch_fails_before_execution(tmp_path: Path) -> None:
@@ -3328,6 +3483,34 @@ def test_logical_quarantine_retains_bytes_and_reports_deferred_gc(
     assert summary.retained_bytes == len(b"retained-until-p7")
 
 
+def test_quarantine_summary_uses_verified_ledgers_without_rehashing_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    victim = tmp_path / "artifacts" / "summary" / "retained.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"ledger-sized-payload")
+    assert reclaimer.logical_quarantine_tree(victim, purpose="summary fixture")
+
+    def forbid_payload_hash(_path: Path) -> tuple[object, ...]:
+        raise AssertionError("summary must not rehash immutable deferred payload")
+
+    monkeypatch.setattr(reclaimer, "_garbage_inventory", forbid_payload_hash)
+
+    first = reclaimer.quarantine_summary()
+    second = reclaimer.quarantine_summary()
+
+    assert first == second
+    assert first.bundle_count == 1
+    assert first.retained_bytes == len(b"ledger-sized-payload")
+
+
 def test_p13_reclaim_critical_paths_have_no_physical_delete_calls() -> None:
     from rquant.lab_worker import LabArtifactReclaimer, LabWorker
 
@@ -4514,3 +4697,206 @@ def test_stale_success_rejection_retries_failed_reconciliation(
     assert processed.claim_reconcile_failures == 0
     assert receipt.status == "rejected"
     assert not sealed.exists()
+
+
+def test_scheduler_retires_accepted_success_from_hot_claim_authority(tmp_path: Path) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+
+    reports = LabReportSpool(tmp_path / "reports")
+    claims = LabClaimSpool(tmp_path / "claims")
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job_id = uuid4()
+    commands.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(
+                job_id=job_id,
+                spec=_nshape_compare_spec(hold_days=(1,)),
+                max_attempts=2,
+            ),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=20,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: NOW,
+    )
+    scheduler.run_once()
+    claim = claims.consume(claims.pending()[0])
+    success = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardSucceeded(result_manifest_hash="a" * 64),
+    )
+    reports.publish(success)
+
+    result = scheduler.run_once()
+
+    assert result.reports_accepted == 1
+    with pytest.raises(InvalidCommandEnvelopeError):
+        claims.current(claim.job_id, claim.shard_id)
+    retired = claims.retired_high_water(claim.job_id, claim.shard_id)
+    assert retired.claim == claim
+    assert retired.outcome == "accepted"
+
+
+def test_scheduler_retries_revocation_retirement_from_hot_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_shard_protocol import LabRetiredClaimAuthority
+
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    commands.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(
+                job_id=uuid4(),
+                spec=_nshape_compare_spec(hold_days=(1,)),
+                max_attempts=1,
+            ),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=20,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    claim = claims.consume(claims.pending()[0])
+    original_retire = claims.retire
+    failed_once = False
+
+    def fail_first_retire(
+        stale: LabShardClaim,
+        *,
+        outcome: Literal["accepted", "revoked"],
+        reason: str,
+    ) -> LabRetiredClaimAuthority:
+        nonlocal failed_once
+        if outcome == "revoked" and not failed_once:
+            failed_once = True
+            raise OSError("injected cold archive outage")
+        return original_retire(stale, outcome=outcome, reason=reason)
+
+    monkeypatch.setattr(claims, "retire", fail_first_retire)
+    clock[0] = NOW + timedelta(seconds=21)
+    interrupted = scheduler.run_once()
+
+    assert interrupted.claim_revoke_failures == 1
+    assert claims.hot_delivery_batch(limit=8).claims == (claim,)
+
+    recovered = scheduler.run_once()
+
+    assert recovered.claim_revoke_failures == 0
+    assert recovered.claims_retired == 1
+    assert claims.hot_delivery_batch(limit=8).claims == ()
+    assert claims.retired_high_water(claim.job_id, claim.shard_id).outcome == "revoked"
+
+
+def test_scheduler_tick_history_work_is_active_plus_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_shard_protocol import LabClaimDeliveryReceipt, LabConsumedClaim
+
+    reports = LabReportSpool(tmp_path / "reports")
+    claims = LabClaimSpool(tmp_path / "claims")
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    for _ in range(3):
+        commands.publish(
+            LabCommandEnvelope(
+                request_id=uuid4(),
+                command=SubmitJobCommand(
+                    job_id=uuid4(),
+                    spec=_nshape_compare_spec(hold_days=(1,)),
+                    max_attempts=2,
+                ),
+            )
+        )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a", "worker-b", "worker-c"),
+        shard_lease_seconds=20,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: NOW,
+    )
+    scheduler.run_once()
+    active = tuple(claims.consume(entry) for entry in claims.pending())
+    assert len(active) == 3
+    for index in range(5_000):
+        token = UUID(int=index + 10_000)
+        (claims.ack_dir / f"{token}.json").write_bytes(b"{}")
+        report_id = UUID(int=index + 20_000)
+        (reports.ack_dir / f"{report_id}.json").write_bytes(b"{}")
+
+    consumed_parses = 0
+    report_parses = 0
+    original_consumed = claims._load_consumed_locked
+    original_receipt = reports.load_receipt
+
+    def count_consumed(token: UUID) -> LabConsumedClaim:
+        nonlocal consumed_parses
+        consumed_parses += 1
+        path = claims.ack_dir / f"{token}.json"
+        if path.read_bytes() == b"{}":
+            return LabConsumedClaim(
+                path=path,
+                receipt=LabClaimDeliveryReceipt(claim=active[0]),
+            )
+        return original_consumed(token)
+
+    def count_report(path: Path) -> LabReportReceipt:
+        nonlocal report_parses
+        report_parses += 1
+        return original_receipt(path)
+
+    monkeypatch.setattr(claims, "_load_consumed_locked", count_consumed)
+    monkeypatch.setattr(reports, "load_receipt", count_report)
+
+    result = scheduler.run_once()
+
+    assert result.claim_revoke_failures == 0
+    assert consumed_parses <= 12
+    assert report_parses == 0

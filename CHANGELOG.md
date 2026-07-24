@@ -41,6 +41,14 @@
 
 ### Fixed
 
+- **Strategy Lab worker 热路径与升级兼容**：scheduler claim authority 每 tick 只处理 SQLite
+  active claims 和有 cursor/limit 的 pending/current 热集合，终态 claim 退役到持久 cold
+  high-water，不再扫描永久 consumed/report receipt 历史。四个 P1.3b 旧策略名通过严格的
+  `(strategy_name, job_type)` versioned alias 继续规划与执行，并保持原 spec identity；worker
+  quarantine 恢复改为启动/低频执行，失败以 typed health warning 和结构化日志暴露，每个
+  claim 只回收自身 shard。跨 shard 表聚合在 concat 前校验列顺序和 dtype，已知 legacy 稀疏
+  空表先按同计划完整 schema 规范化，其余冲突一律 fail closed。
+
 - **Strategy Lab quarantine prepared intent 原子性**：逻辑回收现在先以单文件、no-clobber
   方式持久化包含 source、目标 staging、owner、canonical inventory、state 与 hash 的权威
   prepared intent；staging、global/bundle owner 和状态 ledger 均为可重建派生状态。重启可从

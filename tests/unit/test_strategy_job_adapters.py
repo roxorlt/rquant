@@ -127,6 +127,12 @@ def _nonzero_costs() -> ExecutionCostSpec:
     )
 
 
+def _legacy_strategy_spec(spec: ResearchRunSpec, strategy_name: str) -> ResearchRunSpec:
+    return spec.model_copy(
+        update={"parameters": spec.parameters.model_copy(update={"strategy_name": strategy_name})}
+    )
+
+
 @pytest.mark.parametrize(
     ("spec", "expected_adapter"),
     [
@@ -193,6 +199,104 @@ def test_adapter_declares_snapshot_strategy_mapping(
     )
 
 
+@pytest.mark.parametrize(
+    ("canonical", "legacy_name", "adapter_id", "snapshot_strategy"),
+    [
+        (_nshape_compare_spec(), "NShapeCompare", "nshape-compare", "n_shape"),
+        (_nshape_optimize_spec(), "NShapeOptimize", "nshape-optimize", "n_shape"),
+        (_auction_spec(), "AuctionGap", "auction-gap", "auction_gap"),
+        (
+            _growth_spec(),
+            "GrowthBoardSurge",
+            "growth-board-surge",
+            "growth_board_surge",
+        ),
+    ],
+)
+def test_registry_supports_versioned_legacy_strategy_aliases(
+    canonical: ResearchRunSpec,
+    legacy_name: str,
+    adapter_id: str,
+    snapshot_strategy: str,
+) -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    legacy = _legacy_strategy_spec(canonical, legacy_name)
+    original_hash = legacy.spec_hash
+    registry = default_strategy_job_adapter_registry()
+
+    adapter = registry.for_spec(legacy)
+    definitions = registry.plan(legacy)
+    formal = legacy.model_copy(
+        update={
+            "dataset_snapshot": DatasetSnapshotIdentity(
+                snapshot_id="a" * 64,
+                binding_hash="b" * 64,
+                audit_run_id="c" * 64,
+            ),
+            "research_status": "comparable",
+        }
+    )
+
+    assert adapter.adapter_id == adapter_id
+    assert adapter.snapshot_strategy_name == snapshot_strategy
+    assert definitions
+    assert legacy.spec_hash == original_hash
+    assert registry.for_spec(formal) is adapter
+    assert registry.plan(formal)
+
+
+def test_legacy_inflight_claim_rebuilds_and_executes_without_spec_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.strategy_job_adapters import (
+        LabShardExecutionResult,
+        LabShardTable,
+        NShapeCompareAdapter,
+        ValidatedStrategyShard,
+        default_strategy_job_adapter_registry,
+    )
+
+    legacy = _legacy_strategy_spec(_nshape_compare_spec(hold_days=(1,)), "NShapeCompare")
+    claim = _claim(legacy)
+    registry = default_strategy_job_adapter_registry()
+    executions = 0
+
+    def execute_fixture(
+        _self: NShapeCompareAdapter,
+        validated: ValidatedStrategyShard,
+        _store: object,
+    ) -> LabShardExecutionResult:
+        nonlocal executions
+        executions += 1
+        return LabShardExecutionResult.from_validated(
+            validated,
+            tables=(LabShardTable(name="trades", frame=pd.DataFrame([{"value": 1}])),),
+        )
+
+    monkeypatch.setattr(NShapeCompareAdapter, "execute_shard", execute_fixture)
+
+    validated = registry.validate_claim(claim)
+    result = registry.execute_shard(validated, object())
+
+    assert validated.spec == legacy
+    assert validated.claim.spec_hash == legacy.spec_hash
+    assert result.spec_hash == legacy.spec_hash
+    assert executions == 1
+
+
+def test_legacy_strategy_alias_rejects_unknown_contract_version() -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    spec = _legacy_strategy_spec(_nshape_compare_spec(), "NShapeCompare")
+    unsupported = spec.feature_contract.model_copy(update={"contract_version": "p13b-adapter-v0"})
+
+    with pytest.raises(ValueError, match="legacy execution contract version"):
+        default_strategy_job_adapter_registry().plan(
+            spec.model_copy(update={"feature_contract": unsupported})
+        )
+
+
 def test_adapter_execution_contract_mismatch_fails_closed() -> None:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
@@ -222,6 +326,46 @@ def test_hold_day_plan_is_unique_sorted_and_input_order_independent() -> None:
     assert first == second
     assert [payload.shard.hold_days for payload in first_payloads] == [1, 3, 5]
     assert all(isinstance(payload.shard, HoldDaysShardInput) for payload in first_payloads)
+
+
+@pytest.mark.parametrize(
+    "frames",
+    [
+        (
+            pd.DataFrame({"left": pd.Series([1], dtype="int64")}),
+            pd.DataFrame({"right": pd.Series([2], dtype="int64")}),
+        ),
+        (
+            pd.DataFrame(
+                {
+                    "left": pd.Series([1], dtype="int64"),
+                    "right": pd.Series([2], dtype="int64"),
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "right": pd.Series([2], dtype="int64"),
+                    "left": pd.Series([1], dtype="int64"),
+                }
+            ),
+        ),
+        (
+            pd.DataFrame({"value": pd.Series([1], dtype="int64")}),
+            pd.DataFrame({"value": pd.Series([1.0], dtype="float64")}),
+        ),
+        (
+            pd.DataFrame({"value": pd.Series([], dtype="int64")}),
+            pd.DataFrame({"value": pd.Series([1.0], dtype="float64")}),
+        ),
+    ],
+)
+def test_aggregate_rejects_column_order_and_dtype_conflicts(
+    frames: tuple[pd.DataFrame, pd.DataFrame],
+) -> None:
+    from rquant.strategy_job_adapters import _concat_shard_frames
+
+    with pytest.raises(ValueError, match="schema"):
+        _concat_shard_frames(frames)
 
     with pytest.raises(ValidationError, match="unique"):
         _nshape_compare_spec(hold_days=(1, 1))
@@ -455,9 +599,7 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
         float(costly_trades.loc[costly_trades["split"] == "train", "ret_pct"].mean()),
         4,
     )
-    assert costly_rankings.iloc[0]["robust_score"] != expected.rankings.iloc[0][
-        "robust_score"
-    ]
+    assert costly_rankings.iloc[0]["robust_score"] != expected.rankings.iloc[0]["robust_score"]
 
 
 def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
@@ -743,6 +885,49 @@ def test_scheduler_registry_plans_unplanned_submissions_after_restart(tmp_path) 
     assert len({shard.plan_hash for shard in shards}) == 1
 
 
+def test_scheduler_plans_legacy_queued_spec_without_rewriting_hash(tmp_path: Path) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    spec = _legacy_strategy_spec(
+        _nshape_compare_spec(hold_days=(1, 2)),
+        "NShapeCompare",
+    )
+    job_id = uuid4()
+    spool.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(job_id=job_id, spec=spec, max_attempts=2),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: datetime(2026, 7, 24, 1, tzinfo=UTC),
+    )
+
+    result = scheduler.run_once()
+    reader = LabJobReader(store.path)
+    persisted = reader.get_job(job_id)
+
+    assert result.plans_created == 1
+    assert result.plans_failed == 0
+    assert persisted is not None and persisted.status is JobStatus.QUEUED
+    assert persisted.spec == spec
+    assert persisted.spec_hash == spec.spec_hash
+    assert len(reader.list_shards(job_id)) == 2
+
+
 def test_scheduler_persists_first_adapter_plan_failure(tmp_path) -> None:
     from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
     from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
@@ -755,9 +940,7 @@ def test_scheduler_persists_first_adapter_plan_failure(tmp_path) -> None:
     spec = _nshape_compare_spec()
     bad = spec.model_copy(
         update={
-            "feature_contract": spec.feature_contract.model_copy(
-                update={"contract_hash": "f" * 64}
-            )
+            "feature_contract": spec.feature_contract.model_copy(update={"contract_hash": "f" * 64})
         }
     )
     command = LabCommandEnvelope(

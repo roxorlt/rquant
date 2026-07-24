@@ -855,5 +855,5 @@ def test_scheduler_terminal_failure_preserves_consumed_history_and_revokes_separ
     assert result.claims_revoked == 1
     assert consumed_path.read_bytes() == consumed_payload
     assert claims.is_revoked(claim)
-    assert claims.revocation(claim.claim_token).path.parent == claims.revoked_dir
+    assert claims.revocation(claim.claim_token).path.parent == claims.archived_revoked_dir
     assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.FAILED

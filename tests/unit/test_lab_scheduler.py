@@ -470,3 +470,46 @@ def test_run_forever_stops_cooperatively_and_releases_lease(tmp_path: Path) -> N
     assert not thread.is_alive()
     assert calls == 1
     assert LabJobReader(store.path).list_leases()[-1].released_at is not None
+
+
+def test_run_forever_logs_only_nonzero_structured_tick_anomalies(tmp_path: Path) -> None:
+    from loguru import logger
+
+    store, spool = _components(tmp_path)
+    scheduler = _scheduler(store, spool)
+    baseline = scheduler.run_once()
+    scheduler.release()
+    records: list[dict[str, object]] = []
+    sink = logger.add(
+        lambda message: records.append(dict(message.record["extra"])),
+        level="WARNING",
+    )
+
+    def anomaly_tick() -> SchedulerTickResult:
+        scheduler.request_stop()
+        return baseline.model_copy(
+            update={
+                "plans_failed": 1,
+                "claim_revoke_failures": 2,
+            }
+        )
+
+    scheduler.run_once = anomaly_tick  # type: ignore[method-assign]
+    try:
+        scheduler._log_tick_anomalies(baseline)
+        scheduler.run_forever()
+    finally:
+        logger.remove(sink)
+
+    scheduler_records = [record for record in records if record.get("component") == "lab_scheduler"]
+    assert scheduler_records == [
+        {
+            "component": "lab_scheduler",
+            "owner_id": "scheduler-a",
+            "failure": "tick_anomalies",
+            "anomaly_counts": {
+                "plans_failed": 1,
+                "claim_revoke_failures": 2,
+            },
+        }
+    ]

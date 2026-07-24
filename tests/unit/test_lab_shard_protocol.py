@@ -288,6 +288,84 @@ def test_consumed_claim_republish_is_idempotent_without_second_delivery(
     assert len(tuple(LabClaimSpool(root).ack_dir.glob("*.json"))) == 1
 
 
+def test_hot_claim_batches_are_bounded_and_ignore_consumed_history(tmp_path: Path) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claims = tuple(_claim(definition=_definition(index=index)) for index in range(4))
+    for claim in claims:
+        spool.publish(claim)
+    consumed = _claim(definition=_definition(index=10))
+    spool.consume(spool.publish(consumed))
+
+    first = spool.hot_delivery_batch(limit=2)
+    second = spool.hot_delivery_batch(limit=2, cursor=first.next_cursor)
+
+    assert len(first.claims) == 2
+    assert len(second.claims) == 2
+    assert {claim.claim_token for claim in first.claims + second.claims} == {
+        claim.claim_token for claim in claims
+    }
+    assert consumed.claim_token not in {claim.claim_token for claim in first.claims + second.claims}
+    assert first.inspected <= 2
+    assert second.inspected <= 2
+
+
+def test_retire_removes_hot_current_but_preserves_exact_high_water(tmp_path: Path) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    spool.consume(spool.publish(claim))
+    spool.admit_execution(claim)
+
+    retired = spool.retire(
+        claim,
+        outcome="accepted",
+        reason="scheduler accepted shard success",
+    )
+
+    assert retired.claim == claim
+    assert spool.pending() == ()
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.current(claim.job_id, claim.shard_id)
+    assert spool.retired_high_water(claim.job_id, claim.shard_id) == retired
+    assert spool.publish(claim).receipt.claim == claim
+    stale = claim.model_copy(update={"claim_token": uuid4()})
+    with pytest.raises(LabClaimSupersededError):
+        spool.publish(stale)
+    advanced = claim.model_copy(
+        update={
+            "claim_token": uuid4(),
+            "claim_generation": claim.claim_generation + 1,
+            "scheduler_fencing_token": claim.scheduler_fencing_token + 1,
+        }
+    )
+    assert spool.publish(advanced).claim == advanced
+
+
+def test_revocation_stays_hot_until_retired_then_moves_to_cold_archive(
+    tmp_path: Path,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    spool.publish(claim)
+    spool.revoke(claim, reason="sqlite terminal fixture")
+
+    interrupted = spool.hot_delivery_batch(limit=8)
+
+    assert interrupted.claims == (claim,)
+    assert tuple(spool.revoked_dir.glob("*.json"))
+
+    retired = spool.retire(
+        claim,
+        outcome="revoked",
+        reason="sqlite terminal fixture",
+    )
+
+    assert retired.outcome == "revoked"
+    assert spool.hot_delivery_batch(limit=8).claims == ()
+    assert tuple(spool.revoked_dir.glob("*.json")) == ()
+    assert spool.revocation(claim.claim_token).revocation.claim == claim
+    assert tuple(spool.archived_revoked_dir.glob("*.json"))
+
+
 def test_claim_receipt_failure_keeps_pending_deliverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
