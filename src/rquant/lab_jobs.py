@@ -3462,6 +3462,66 @@ class LabJobStore:
             )
         return claim
 
+    def list_active_claims(
+        self,
+        lease: LabLeaseRecord,
+        *,
+        now: datetime,
+        initial_lease_seconds: int,
+    ) -> tuple[LabShardClaim, ...]:
+        if initial_lease_seconds < 1:
+            raise ValueError("initial_lease_seconds must be positive")
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, now=current)
+            rows = connection.execute(
+                """
+                SELECT s.*, j.spec_hash AS job_spec_hash
+                FROM lab_shard AS s
+                JOIN lab_job AS j ON j.job_id = s.job_id
+                WHERE s.status = ?
+                  AND s.scheduler_fencing_token = ?
+                  AND s.lease_expires_at > ?
+                ORDER BY s.job_id, s.shard_index, s.shard_id
+                """,
+                (
+                    ShardStatus.RUNNING.value,
+                    lease.fencing_token,
+                    _dump_time(current),
+                ),
+            ).fetchall()
+            claims: list[LabShardClaim] = []
+            for row in rows:
+                try:
+                    claimed_at = _load_time(str(row["claimed_at"]))
+                    claims.append(
+                        LabShardClaim(
+                            job_id=UUID(str(row["job_id"])),
+                            spec_hash=str(row["job_spec_hash"]),
+                            definition=self._definition_from_shard_row(row),
+                            worker_id=str(row["worker_id"]),
+                            claim_token=UUID(str(row["claim_token"])),
+                            claim_generation=_strict_sqlite_int(
+                                row["claim_generation"],
+                                field="lab_shard.claim_generation",
+                                minimum=1,
+                            ),
+                            scheduler_fencing_token=_strict_sqlite_int(
+                                row["scheduler_fencing_token"],
+                                field="lab_shard.scheduler_fencing_token",
+                                minimum=1,
+                            ),
+                            claimed_at=claimed_at,
+                            lease_expires_at=claimed_at
+                            + timedelta(seconds=initial_lease_seconds),
+                        )
+                    )
+                except Exception as exc:
+                    raise InvalidStoredJobError(
+                        f"invalid active claim for shard {row['shard_id']}: {exc}"
+                    ) from exc
+        return tuple(claims)
+
     @staticmethod
     def _report_receipt(
         report: LabWorkerReport,

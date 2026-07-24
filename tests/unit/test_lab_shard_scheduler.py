@@ -91,6 +91,57 @@ def test_scheduler_publishes_only_bounded_claims(tmp_path: Path) -> None:
     assert sum(shard.status.value == "running" for shard in shards) == 1
 
 
+def test_scheduler_repairs_max_attempts_one_claim_after_pending_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+    )
+    assert scheduler.lease is not None
+    job = _submit_job(store, scheduler.lease, max_attempts=1)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    original_publish = claims._publish_no_clobber
+    failed = False
+
+    def fail_pending_once(target: Path, payload: bytes) -> bool:
+        nonlocal failed
+        if target.parent == claims.pending_dir and not failed:
+            failed = True
+            raise OSError("injected claim pending failure")
+        return original_publish(target, payload)
+
+    monkeypatch.setattr(claims, "_publish_no_clobber", fail_pending_once)
+    clock[0] = NOW + timedelta(seconds=2)
+
+    first = scheduler.run_once()
+
+    assert first.claim_delivery_failures == 1
+    assert claims.pending() == ()
+    shard = LabJobReader(store.path).list_shards(job.job_id)[0]
+    assert shard.status is ShardStatus.RUNNING
+    assert shard.attempt_count == 1
+
+    clock[0] = NOW + timedelta(seconds=3)
+    repaired = scheduler.run_once()
+
+    assert repaired.claims_replayed == 1
+    assert repaired.claim_delivery_failures == 0
+    assert len(claims.pending()) == 1
+    assert claims.current(job.job_id, shard.shard_id).claim == claims.pending()[0].claim
+    assert LabJobReader(store.path).list_shards(job.job_id)[0].attempt_count == 1
+
+
 def test_scheduler_rotates_fairly_across_bounded_claim_ticks(tmp_path: Path) -> None:
     clock = [NOW]
     claims = LabClaimSpool(tmp_path / "claims")

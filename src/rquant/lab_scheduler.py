@@ -39,6 +39,10 @@ class SchedulerTickResult(BaseModel):
     plans_created: int = Field(default=0, ge=0)
     plans_failed: int = Field(default=0, ge=0)
     claims_published: int = Field(default=0, ge=0)
+    claims_replayed: int = Field(default=0, ge=0)
+    claim_delivery_failures: int = Field(default=0, ge=0)
+    claims_reconciled: int = Field(default=0, ge=0)
+    claim_reconcile_failures: int = Field(default=0, ge=0)
 
 
 def _system_clock() -> datetime:
@@ -172,6 +176,20 @@ class LabScheduler:
                 now=recovery_now,
             )
         )
+        claims_replayed = 0
+        claim_delivery_failures = 0
+        if self.claim_spool is not None:
+            for active_claim in self.store.list_active_claims(
+                lease,
+                now=recovery_now,
+                initial_lease_seconds=self.shard_lease_seconds,
+            ):
+                try:
+                    self.claim_spool.publish(active_claim)
+                except Exception:
+                    claim_delivery_failures += 1
+                else:
+                    claims_replayed += 1
         processed = 0
         applied = 0
         rejected = 0
@@ -298,9 +316,21 @@ class LabScheduler:
                 )
                 if claim is None:
                     continue
-                self.claim_spool.publish(claim)
-                claims_published += 1
+                try:
+                    self.claim_spool.publish(claim)
+                except Exception:
+                    claim_delivery_failures += 1
+                else:
+                    claims_published += 1
             self._claim_cursor = (start + inspected) % worker_count
+        claims_reconciled = 0
+        claim_reconcile_failures = 0
+        if self.claim_spool is not None:
+            for outcome in self.claim_spool.reconcile_current():
+                if outcome.status == "reconciled":
+                    claims_reconciled += 1
+                elif outcome.status == "failed":
+                    claim_reconcile_failures += 1
         return SchedulerTickResult(
             lease_acquired=acquired,
             processed=processed,
@@ -316,6 +346,10 @@ class LabScheduler:
             plans_created=plans_created,
             plans_failed=plans_failed,
             claims_published=claims_published,
+            claims_replayed=claims_replayed,
+            claim_delivery_failures=claim_delivery_failures,
+            claims_reconciled=claims_reconciled,
+            claim_reconcile_failures=claim_reconcile_failures,
         )
 
     def request_stop(self) -> None:

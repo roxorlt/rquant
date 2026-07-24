@@ -212,6 +212,39 @@ class LabClaimSupersededError(RuntimeError):
     """A claim is older than, or conflicts with, the durable shard high-water."""
 
 
+class LabClaimAlreadyConsumedError(RuntimeError):
+    """A durable receipt proves that this exact claim was already delivered."""
+
+
+class LabClaimDeliveryReceipt(LabShardProtocolModel):
+    schema_version: Literal[1] = 1
+    status: Literal["consumed"] = "consumed"
+    claim: LabShardClaim
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> LabClaimDeliveryReceipt:
+        expected = _canonical_hash(self.claim.model_dump(mode="json"))
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("content_hash does not match consumed claim")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+
+class LabClaimReconcileResult(LabShardProtocolModel):
+    claim_token: UUID
+    status: Literal["reconciled", "failed", "not_configured"]
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def validate_error(self) -> LabClaimReconcileResult:
+        if self.status == "failed" and not self.error:
+            raise ValueError("failed reconciliation requires error")
+        if self.status != "failed" and self.error is not None:
+            raise ValueError("successful reconciliation cannot include error")
+        return self
+
+
 class LabShardHeartbeat(LabShardProtocolModel):
     report_type: Literal["heartbeat"] = "heartbeat"
     lease_extension_seconds: int = Field(
@@ -399,6 +432,11 @@ class LabClaimSpoolEntry(LabShardProtocolModel):
     inode: int = Field(ge=1)
 
 
+class LabConsumedClaim(LabShardProtocolModel):
+    path: Path
+    receipt: LabClaimDeliveryReceipt
+
+
 class LabReportSpoolEntry(LabShardProtocolModel):
     path: Path
     report: LabWorkerReport
@@ -501,6 +539,28 @@ class LabClaimSpool(_TypedSpoolBase):
     def _current_path(self, job_id: UUID, shard_id: UUID) -> Path:
         return self.current_dir / f"{job_id}.{shard_id}.json"
 
+    def _consumed_path(self, claim_token: UUID) -> Path:
+        return self.ack_dir / f"{claim_token}.json"
+
+    def _load_consumed_locked(self, claim_token: UUID) -> LabConsumedClaim:
+        path = self._consumed_path(claim_token)
+        candidate, payload, _file_stat = self._read_regular_child(path, self.ack_dir)
+        if self._ack_message_id(candidate.name) != claim_token:
+            raise InvalidCommandEnvelopeError(
+                f"consumed claim token does not match basename {candidate.name}"
+            )
+        try:
+            receipt = LabClaimDeliveryReceipt.model_validate_json(payload)
+        except Exception as exc:
+            raise InvalidCommandEnvelopeError(
+                f"invalid consumed claim receipt {candidate.name}: {exc}"
+            ) from exc
+        if receipt.claim.claim_token != claim_token:
+            raise InvalidCommandEnvelopeError(
+                f"consumed claim identity does not match basename {candidate.name}"
+            )
+        return LabConsumedClaim(path=candidate, receipt=receipt)
+
     def _load_current_locked(self, job_id: UUID, shard_id: UUID) -> LabClaimHighWater:
         path = self._current_path(job_id, shard_id)
         candidate, payload, _file_stat = self._read_regular_child(path, self.current_dir)
@@ -530,6 +590,23 @@ class LabClaimSpool(_TypedSpoolBase):
         with self._exclusive_lock():
             return self._load_current_locked(job_id, shard_id)
 
+    def current_claims(self) -> tuple[LabShardClaim, ...]:
+        with self._exclusive_lock():
+            claims: list[LabShardClaim] = []
+            for path in sorted(self.current_dir.glob("*.json")):
+                match = _CURRENT_CLAIM_NAME.fullmatch(path.name)
+                if match is None:
+                    raise InvalidCommandEnvelopeError(
+                        f"invalid current claim basename: {path.name}"
+                    )
+                claims.append(
+                    self._load_current_locked(
+                        UUID(match.group("job_id")),
+                        UUID(match.group("shard_id")),
+                    ).claim
+                )
+            return tuple(claims)
+
     def _publish_current_locked(self, marker: LabClaimHighWater) -> None:
         target = self._current_path(marker.claim.job_id, marker.claim.shard_id)
         temporary = self.current_dir / f".{target.name}.{uuid4().hex}.tmp"
@@ -553,10 +630,18 @@ class LabClaimSpool(_TypedSpoolBase):
             marker = self._load_current_locked(validated.job_id, validated.shard_id)
             return marker.claim == validated
 
-    def publish(self, claim: LabShardClaim) -> LabClaimSpoolEntry:
+    def publish(self, claim: LabShardClaim) -> LabClaimSpoolEntry | LabConsumedClaim:
         validated = LabShardClaim.model_validate(claim)
         payload = validated.model_dump_json().encode("utf-8")
         with self._exclusive_lock():
+            consumed_path = self._consumed_path(validated.claim_token)
+            if os.path.lexists(consumed_path):
+                consumed = self._load_consumed_locked(validated.claim_token)
+                if consumed.receipt.claim != validated:
+                    raise RequestContentConflictError(
+                        f"claim_token {validated.claim_token} was consumed with different content"
+                    )
+                return consumed
             if os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
                 current = self._load_current_locked(validated.job_id, validated.shard_id)
             else:
@@ -581,8 +666,6 @@ class LabClaimSpool(_TypedSpoolBase):
                     raise RequestContentConflictError(
                         f"claim_token {validated.claim_token} already has different content"
                     )
-            if current is None or current.claim != validated:
-                self._publish_current_locked(LabClaimHighWater(claim=validated))
             if pending is not None:
                 entry = existing
             else:
@@ -593,9 +676,43 @@ class LabClaimSpool(_TypedSpoolBase):
                         f"delivery sequence {sequence} already exists"
                     )
                 entry = self.load(target)
-        if self._claim_advance_hook is not None:
-            self._claim_advance_hook(validated)
-        return entry
+            if current is None or current.claim != validated:
+                self._publish_current_locked(LabClaimHighWater(claim=validated))
+            return entry
+
+    def reconcile_current(self) -> tuple[LabClaimReconcileResult, ...]:
+        # Lock order invariant: claim snapshots are complete before callbacks may take
+        # the report/artifact lock. No callback runs while the claim lock is held.
+        claims = self.current_claims()
+        results: list[LabClaimReconcileResult] = []
+        for claim in claims:
+            if self._claim_advance_hook is None:
+                results.append(
+                    LabClaimReconcileResult(
+                        claim_token=claim.claim_token,
+                        status="not_configured",
+                    )
+                )
+                continue
+            try:
+                self._claim_advance_hook(claim)
+            except Exception as exc:
+                message = " ".join((str(exc) or type(exc).__name__).split())[:400]
+                results.append(
+                    LabClaimReconcileResult(
+                        claim_token=claim.claim_token,
+                        status="failed",
+                        error=f"{type(exc).__name__}: {message}",
+                    )
+                )
+            else:
+                results.append(
+                    LabClaimReconcileResult(
+                        claim_token=claim.claim_token,
+                        status="reconciled",
+                    )
+                )
+        return tuple(results)
 
     def load(self, path: Path) -> LabClaimSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
@@ -634,11 +751,33 @@ class LabClaimSpool(_TypedSpoolBase):
                 raise InvalidCommandEnvelopeError("pending claim was replaced before consume")
             if current.claim != entry.claim:
                 raise InvalidCommandEnvelopeError("pending claim changed before consume")
+            consumed_path = self._consumed_path(entry.claim.claim_token)
+            if os.path.lexists(consumed_path):
+                consumed = self._load_consumed_locked(entry.claim.claim_token)
+                if consumed.receipt.claim != entry.claim:
+                    raise RequestContentConflictError(
+                        f"claim_token {entry.claim.claim_token} has conflicting receipt"
+                    )
+                self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
+                raise LabClaimAlreadyConsumedError(
+                    f"claim {entry.claim.claim_token} was already consumed"
+                )
             marker = self._load_current_locked(entry.claim.job_id, entry.claim.shard_id)
             if marker.claim != entry.claim:
                 raise LabClaimSupersededError(
                     "pending claim is not the durable shard high-water"
                 )
+            receipt = LabClaimDeliveryReceipt(claim=entry.claim)
+            created = self._publish_no_clobber(
+                consumed_path,
+                receipt.model_dump_json().encode("utf-8"),
+            )
+            if not created:
+                consumed = self._load_consumed_locked(entry.claim.claim_token)
+                if consumed.receipt != receipt:
+                    raise RequestContentConflictError(
+                        f"claim_token {entry.claim.claim_token} has conflicting receipt"
+                    )
             self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
         return entry.claim
 

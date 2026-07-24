@@ -211,6 +211,156 @@ def test_claim_spool_rejects_same_generation_with_different_token(tmp_path: Path
         spool.publish(claim.model_copy(update={"claim_token": uuid4()}))
 
 
+def test_claim_pending_failure_never_advances_current_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+
+    def fail_pending(_target: Path, _payload: bytes) -> bool:
+        raise OSError("injected pending write failure")
+
+    monkeypatch.setattr(spool, "_publish_no_clobber", fail_pending)
+
+    with pytest.raises(OSError, match="pending write"):
+        spool.publish(claim)
+
+    assert spool.pending() == ()
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.current(claim.job_id, claim.shard_id)
+
+
+def test_claim_current_failure_leaves_unconsumable_repairable_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    original_publish_current = spool._publish_current_locked
+    failed = False
+
+    def fail_current_once(marker: object) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected current write failure")
+        original_publish_current(marker)
+
+    monkeypatch.setattr(spool, "_publish_current_locked", fail_current_once)
+
+    with pytest.raises(OSError, match="current write"):
+        spool.publish(claim)
+
+    pending = spool.pending()
+    assert len(pending) == 1
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.current(claim.job_id, claim.shard_id)
+    with pytest.raises(InvalidCommandEnvelopeError):
+        spool.consume(pending[0])
+
+    repaired = spool.publish(claim)
+
+    assert repaired.path == pending[0].path
+    assert spool.current(claim.job_id, claim.shard_id).claim == claim
+    assert spool.consume(repaired) == claim
+
+
+def test_consumed_claim_republish_is_idempotent_without_second_delivery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    entry = spool.publish(claim)
+    assert spool.consume(entry) == claim
+
+    replay = LabClaimSpool(root).publish(claim)
+
+    assert replay.receipt.claim == claim
+    assert LabClaimSpool(root).pending() == ()
+    assert len(tuple(LabClaimSpool(root).ack_dir.glob("*.json"))) == 1
+
+
+def test_claim_receipt_failure_keeps_pending_deliverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    entry = spool.publish(claim)
+    original_publish = spool._publish_no_clobber
+
+    def fail_receipt(target: Path, payload: bytes) -> bool:
+        if target.parent == spool.ack_dir:
+            raise OSError("injected receipt write failure")
+        return original_publish(target, payload)
+
+    monkeypatch.setattr(spool, "_publish_no_clobber", fail_receipt)
+    with pytest.raises(OSError, match="receipt write"):
+        spool.consume(entry)
+
+    assert spool.pending() == (entry,)
+    assert tuple(spool.ack_dir.glob("*.json")) == ()
+    monkeypatch.setattr(spool, "_publish_no_clobber", original_publish)
+    assert spool.consume(entry) == claim
+
+
+def test_claim_unlink_failure_recovers_consumed_receipt_without_redelivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
+    claim = _claim()
+    entry = spool.publish(claim)
+    original_unlink = spool._unlink_pending
+
+    def fail_unlink(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected pending unlink failure")
+
+    monkeypatch.setattr(spool, "_unlink_pending", fail_unlink)
+    with pytest.raises(OSError, match="pending unlink"):
+        spool.consume(entry)
+
+    assert len(tuple(spool.ack_dir.glob("*.json"))) == 1
+    assert len(spool.pending()) == 1
+    restarted = LabClaimSpool(root)
+    with pytest.raises(Exception, match="already consumed"):
+        restarted.consume(restarted.pending()[0])
+
+    assert restarted.pending() == ()
+    replay = restarted.publish(claim)
+    assert replay.receipt.claim == claim
+    assert original_unlink is not None
+
+
+def test_reclaim_hook_failure_never_changes_successful_delivery_semantics(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    def flaky_hook(_claim: LabShardClaim) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected reclaim failure")
+
+    spool = LabClaimSpool(tmp_path / "claims", claim_advance_hook=flaky_hook)
+    claim = _claim()
+
+    entry = spool.publish(claim)
+    first = spool.reconcile_current()
+    second = spool.reconcile_current()
+
+    assert entry.claim == claim
+    assert spool.current(claim.job_id, claim.shard_id).claim == claim
+    assert first[0].status == "failed"
+    assert "RuntimeError" in first[0].error
+    assert second[0].status == "reconciled"
+    assert attempts == 2
+
+
 def test_report_spool_exactly_once_ack_restart_and_conflict(tmp_path: Path) -> None:
     root = tmp_path / "reports"
     spool = LabReportSpool(root)

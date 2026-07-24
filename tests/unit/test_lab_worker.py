@@ -4,6 +4,7 @@ import builtins
 import inspect
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -252,6 +253,30 @@ def _crash_reclaimer_after_tombstone_rename_child(
     lab_worker_module.shutil.rmtree = crash_before_tombstone_delete
     reclaimer.reclaim(LabShardClaim.model_validate_json(claim_payload))
     os._exit(80)
+
+
+def _crash_reclaimer_after_prepared_ledger_child(
+    root_value: str,
+    claim_payload: str,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    root = Path(root_value)
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=root / "artifacts",
+        report_spool=LabReportSpool(root / "reports"),
+    )
+    original_rename = lab_worker_module.os.rename
+
+    def crash_before_isolation(source: Path, target: Path) -> None:
+        if Path(target).name.startswith(".reclaim-v1-"):
+            os._exit(81)
+        original_rename(source, target)
+
+    lab_worker_module.os.rename = crash_before_isolation
+    reclaimer.reclaim(LabShardClaim.model_validate_json(claim_payload))
+    os._exit(82)
 
 
 def _publish_report_child(root_value: str, report_payload: str) -> None:
@@ -936,6 +961,7 @@ def test_bundle_is_canonical_and_obsolete_attempt_is_reclaimed_across_retry(
     assert (sealed / manifest.artifacts[0].file_name).is_file()
     retry = _retry_claim(claim)
     claims.publish(retry)
+    claims.reconcile_current()
     assert not sealed.exists()
     second = worker.run_once()
 
@@ -1117,9 +1143,9 @@ def test_conflicting_sealed_bundle_fails_closed(tmp_path: Path) -> None:
         claims=claims,
         reports=reports,
     )
-    worker.run_once()
+    validated = registry.validate_claim(claim)
+    worker._seal_result(claim, registry.execute_shard(validated, object()))
     (worker.sealed_bundle_path(claim) / "manifest.json").write_text("{}", encoding="utf-8")
-    claims.publish(claim)
 
     result = worker.run_once()
 
@@ -1878,10 +1904,10 @@ def test_hard_crash_after_rename_is_reclaimed_before_generation_two_runs(
     assert job is not None and job.status is JobStatus.SUCCEEDED
 
 
-def test_pending_success_evidence_blocks_obsolete_sealed_reclamation(
+def test_stale_pending_success_does_not_block_obsolete_sealed_reclamation(
     tmp_path: Path,
 ) -> None:
-    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+    from rquant.lab_worker import LabArtifactReclaimer
 
     reports = LabReportSpool(tmp_path / "reports")
     reclaimer = LabArtifactReclaimer(
@@ -1907,11 +1933,13 @@ def test_pending_success_evidence_blocks_obsolete_sealed_reclamation(
     reports.publish(success)
 
     generation_two = _retry_claim(generation_one)
-    with pytest.raises(LabArtifactConflictError, match="pending success"):
-        claims.publish(generation_two)
+    claims.publish(generation_two)
+    outcomes = claims.reconcile_current()
 
     assert claims.current(generation_one.job_id, generation_one.shard_id).claim == generation_two
-    assert worker.sealed_bundle_path(generation_one).is_dir()
+    assert outcomes[0].status == "reconciled"
+    assert not worker.sealed_bundle_path(generation_one).exists()
+    assert reports.pending()[0].report == success
 
 
 def test_rejected_success_receipt_allows_obsolete_sealed_reclamation(
@@ -2009,7 +2037,7 @@ def test_unread_accepted_success_receipt_preserves_terminal_artifact(
     from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
     from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
     from rquant.lab_scheduler import LabScheduler
-    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+    from rquant.lab_worker import LabArtifactReclaimer
 
     clock = [NOW]
     reports = LabReportSpool(tmp_path / "reports")
@@ -2076,10 +2104,12 @@ def test_unread_accepted_success_receipt_preserves_terminal_artifact(
     assert job is not None and job.status is JobStatus.SUCCEEDED
     assert reports.ack_dir.joinpath(f"{pending.report_id}.json").is_file()
     generation_two = _retry_claim(generation_one)
-    with pytest.raises(LabArtifactConflictError, match="accepted success"):
-        claims.publish(generation_two)
+    claims.publish(generation_two)
+    outcomes = claims.reconcile_current()
 
     assert claims.current(generation_one.job_id, generation_one.shard_id).claim == generation_two
+    assert outcomes[0].status == "failed"
+    assert "accepted success" in outcomes[0].error
     assert worker.sealed_bundle_path(generation_one).is_dir()
     scheduler.release()
 
@@ -2101,10 +2131,10 @@ def _sealed_obsolete_attempt(
     return old_claim, current_claim, worker.sealed_bundle_path(old_claim), manifest
 
 
-def test_pending_success_published_after_preflight_scan_preserves_attempt(
+def test_pending_success_published_after_preflight_scan_is_stale_and_reclaimed(
     tmp_path: Path,
 ) -> None:
-    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+    from rquant.lab_worker import LabArtifactReclaimer
 
     reports = LabReportSpool(tmp_path / "reports")
     old_claim, current_claim, sealed, manifest = _sealed_obsolete_attempt(
@@ -2119,8 +2149,12 @@ def test_pending_success_published_after_preflight_scan_preserves_attempt(
     release = threading.Event()
     original_scan = reclaimer._assert_no_terminal_success_evidence
 
-    def pause_after_scan(claim: LabShardClaim, candidate_manifest: object) -> None:
-        original_scan(claim, candidate_manifest)
+    def pause_after_scan(
+        claim: LabShardClaim,
+        candidate_manifest: object,
+        durable_claim: LabShardClaim,
+    ) -> None:
+        original_scan(claim, candidate_manifest, durable_claim)
         scanned.set()
         assert release.wait(2)
 
@@ -2147,9 +2181,9 @@ def test_pending_success_published_after_preflight_scan_preserves_attempt(
     thread.join(timeout=2)
 
     assert not thread.is_alive()
-    assert len(errors) == 1
-    assert isinstance(errors[0], LabArtifactConflictError)
-    assert sealed.is_dir()
+    assert errors == []
+    assert not sealed.exists()
+    assert reports.pending()[0].report == success
 
 
 def test_accepted_receipt_published_after_preflight_scan_preserves_attempt(
@@ -2170,8 +2204,12 @@ def test_accepted_receipt_published_after_preflight_scan_preserves_attempt(
     release = threading.Event()
     original_scan = reclaimer._assert_no_terminal_success_evidence
 
-    def pause_after_scan(claim: LabShardClaim, candidate_manifest: object) -> None:
-        original_scan(claim, candidate_manifest)
+    def pause_after_scan(
+        claim: LabShardClaim,
+        candidate_manifest: object,
+        durable_claim: LabShardClaim,
+    ) -> None:
+        original_scan(claim, candidate_manifest, durable_claim)
         scanned.set()
         assert release.wait(2)
 
@@ -2231,7 +2269,11 @@ def test_claim_high_water_is_durable_before_reclaimer_hook_runs(tmp_path: Path) 
     claims.set_claim_advance_hook(observe_marker)
     claims.publish(current_claim)
 
+    assert observed == []
+    outcomes = claims.reconcile_current()
+
     assert observed == [current_claim]
+    assert outcomes[0].status == "reconciled"
 
 
 def test_report_publish_uses_cross_process_evidence_lock(tmp_path: Path) -> None:
@@ -2292,10 +2334,11 @@ def test_two_reclaimers_are_idempotent_for_same_obsolete_attempt(
         def synchronized_scan(
             claim: LabShardClaim,
             manifest: object,
+            durable_claim: LabShardClaim,
             *,
             scan=original_scan,
         ) -> None:
-            scan(claim, manifest)
+            scan(claim, manifest, durable_claim)
             barrier.wait(timeout=2)
 
         reclaimer._assert_no_terminal_success_evidence = synchronized_scan  # type: ignore[method-assign]
@@ -2345,6 +2388,131 @@ def test_reclaimer_recovers_verified_tombstone_after_process_crash(
     restarted.reclaim(current_claim)
 
     assert tuple(sealed.parent.iterdir()) == ()
+
+
+def test_reclaimer_recovers_prepared_ledger_after_crash_before_rename(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    completed = _run_worker_child(
+        "_crash_reclaimer_after_prepared_ledger_child",
+        tmp_path,
+        current_claim.model_dump_json(),
+    )
+
+    assert completed.returncode == 81, completed.stderr
+    assert sealed.is_dir()
+    assert len(tuple((tmp_path / "artifacts" / ".reclaim-ledger").rglob("*.json"))) == 1
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    restarted.reclaim(current_claim)
+
+    assert not sealed.exists()
+    assert tuple((tmp_path / "artifacts" / ".reclaim-ledger").rglob("*.json")) == ()
+
+
+def test_newer_high_water_can_finish_verified_older_reclaim_ledger(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, generation_two, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    completed = _run_worker_child(
+        "_crash_reclaimer_after_tombstone_rename_child",
+        tmp_path,
+        generation_two.model_dump_json(),
+    )
+    assert completed.returncode == 79, completed.stderr
+    generation_three = _retry_claim(generation_two)
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+
+    restarted.reclaim(generation_three)
+
+    assert not sealed.exists()
+    assert tuple(sealed.parent.glob(".reclaim-*")) == ()
+    assert tuple((tmp_path / "artifacts" / ".reclaim-ledger").rglob("*.json")) == ()
+
+
+def test_accepted_success_protects_tombstone_during_restart(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    old_claim, current_claim, sealed, manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    completed = _run_worker_child(
+        "_crash_reclaimer_after_tombstone_rename_child",
+        tmp_path,
+        current_claim.model_dump_json(),
+    )
+    assert completed.returncode == 79, completed.stderr
+    tombstone = tuple(sealed.parent.glob(".reclaim-*"))[0]
+    success = LabWorkerReport.from_claim(
+        old_claim,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+    )
+    entry = reports.publish(success)
+    reports.ack(
+        entry,
+        LabReportReceipt.from_report(
+            success,
+            status="accepted",
+            reason="accepted before restart",
+            accepted_at=NOW,
+        ),
+    )
+    restarted = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="accepted success"):
+        restarted.reclaim(current_claim)
+
+    assert tombstone.is_dir()
+
+
+def test_source_and_same_identity_tombstone_are_preserved_as_conflict(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    old_claim, current_claim, sealed, manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    tombstone = sealed.parent / reclaimer._tombstone_name(old_claim, manifest)
+    shutil.copytree(sealed, tombstone)
+
+    with pytest.raises(LabArtifactConflictError, match="source and tombstone"):
+        reclaimer.reclaim(current_claim)
+
+    assert sealed.is_dir()
+    assert tombstone.is_dir()
 
 
 def test_unknown_reclaim_tombstone_remains_fail_closed(tmp_path: Path) -> None:
@@ -2405,13 +2573,13 @@ def test_reclaimer_does_not_isolate_directory_replaced_at_rename(
     assert tuple(sealed.parent.glob(".reclaim-*")) == ()
 
 
-def test_old_success_during_claim_advance_is_rejected_without_deadlock(
+def test_stale_success_rejection_retries_failed_reconciliation(
     tmp_path: Path,
 ) -> None:
     from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
     from rquant.lab_jobs import LabJobStore
     from rquant.lab_scheduler import LabScheduler
-    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+    from rquant.lab_worker import LabArtifactReclaimer
 
     clock = [NOW]
     reports = LabReportSpool(tmp_path / "reports")
@@ -2462,29 +2630,22 @@ def test_old_success_during_claim_advance_is_rejected_without_deadlock(
     result = RecordingRegistry().execute_shard(validated, object())
     manifest = sealing_worker._seal_result(old_claim, result)
     sealed = sealing_worker.sealed_bundle_path(old_claim)
-    high_water_written = threading.Event()
-    continue_reclaim = threading.Event()
+    failed_once = False
 
-    def delayed_reclaim(claim: LabShardClaim) -> None:
+    def flaky_reclaim(claim: LabShardClaim) -> None:
+        nonlocal failed_once
         assert claims.current(claim.job_id, claim.shard_id).claim == claim
-        high_water_written.set()
-        assert continue_reclaim.wait(2)
+        if claim.claim_generation > old_claim.claim_generation and not failed_once:
+            failed_once = True
+            raise RuntimeError("injected first reconciliation failure")
         reclaimer.reclaim(claim)
 
-    claims.set_claim_advance_hook(delayed_reclaim)
+    claims.set_claim_advance_hook(flaky_reclaim)
     clock[0] = NOW + timedelta(seconds=21)
-    errors: list[BaseException] = []
-
-    def recover() -> None:
-        try:
-            scheduler.run_once()
-        except BaseException as exc:
-            errors.append(exc)
-
-    recovery_thread = threading.Thread(target=recover)
-    recovery_thread.start()
-    assert high_water_written.wait(2)
+    recovery = scheduler.run_once()
     fresh_claim = claims.current(old_claim.job_id, old_claim.shard_id).claim
+    assert recovery.claim_reconcile_failures == 1
+    assert sealed.is_dir()
     success = LabWorkerReport.from_claim(
         old_claim,
         report_id=uuid4(),
@@ -2492,16 +2653,13 @@ def test_old_success_during_claim_advance_is_rejected_without_deadlock(
         body=LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
     )
     reports.publish(success)
-    continue_reclaim.set()
-    recovery_thread.join(timeout=3)
-
-    assert not recovery_thread.is_alive()
     assert fresh_claim.claim_generation == old_claim.claim_generation + 1
-    assert len(errors) == 1 and isinstance(errors[0], LabArtifactConflictError)
     processed = scheduler.run_once()
     receipt = reports.load_receipt(reports.ack_dir / f"{success.report_id}.json")
     scheduler.release()
 
     assert processed.reports_rejected == 1
+    assert processed.claims_reconciled == 1
+    assert processed.claim_reconcile_failures == 0
     assert receipt.status == "rejected"
-    assert sealed.is_dir()
+    assert not sealed.exists()
