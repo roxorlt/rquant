@@ -8,7 +8,12 @@ from uuid import uuid4
 import pytest
 
 import rquant.lab_jobs as lab_jobs
-from rquant.lab_job_protocol import LabCommandEnvelope, ResumeJobCommand, RetryJobCommand
+from rquant.lab_job_protocol import (
+    LabCommandEnvelope,
+    ResumeJobCommand,
+    RetryJobCommand,
+    SubmitJobCommand,
+)
 from rquant.lab_jobs import (
     InvalidStoredJobError,
     JobStatus,
@@ -286,7 +291,10 @@ def test_v2_checkpointed_shard_becomes_claimable_only_after_resume(tmp_path: Pat
     assert claim is not None and claim.job_id == lab_jobs.UUID(job_id)
 
 
-@pytest.mark.parametrize("legacy_status", [ShardStatus.RUNNING, ShardStatus.CHECKPOINTED])
+@pytest.mark.parametrize(
+    "legacy_status",
+    [ShardStatus.QUEUED, ShardStatus.RUNNING, ShardStatus.CHECKPOINTED],
+)
 def test_v2_exhausted_nonterminal_shard_fails_entire_job_during_migration(
     tmp_path: Path,
     legacy_status: ShardStatus,
@@ -368,6 +376,47 @@ def test_v2_exhausted_nonterminal_shard_fails_entire_job_during_migration(
     )
     assert retry.status == "rejected"
     assert retry.reason == "not_recoverable"
+
+
+def test_reader_rejects_exhausted_queued_shard(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "queued-exhausted.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    submitted = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=SubmitJobCommand(
+            job_id=uuid4(),
+            spec=_spec(),
+            max_attempts=2,
+        ),
+    )
+    receipt = store.apply_command(submitted, lease=lease, now=NOW)
+    assert receipt.status == "applied"
+    store.plan_job(
+        submitted.command.job_id,
+        (
+            LabShardDefinition.from_payload(
+                shard_index=0,
+                adapter_id="reader-invariant",
+                adapter_version="v1",
+                plan_hash="7" * 64,
+                payload_json="{}",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_shard SET attempt_count = max_attempts
+            WHERE job_id = ? AND status = 'queued'
+            """,
+            (str(submitted.command.job_id),),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="queued shard exhausted attempts"):
+        LabJobReader(store.path).list_shards(submitted.command.job_id)
 
 
 def test_v2_migrated_idle_pause_converges_without_worker(tmp_path: Path) -> None:

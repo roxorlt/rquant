@@ -605,12 +605,13 @@ def _normalize_v2_exhausted_nonterminal_jobs(connection: sqlite3.Connection) -> 
         FROM lab_job AS job
         JOIN lab_shard AS shard ON shard.job_id = job.job_id
         WHERE shard.adapter_id = 'legacy-v2'
-          AND job.status IN (?, ?)
+          AND job.status IN (?, ?, ?)
           AND shard.status IN (?, ?, ?)
           AND shard.attempt_count >= shard.max_attempts
         ORDER BY job.job_id, shard.shard_index
         """,
         (
+            JobStatus.QUEUED.value,
             JobStatus.RUNNING.value,
             JobStatus.CHECKPOINTED.value,
             ShardStatus.QUEUED.value,
@@ -660,7 +661,7 @@ def _normalize_v2_exhausted_nonterminal_jobs(connection: sqlite3.Connection) -> 
             UPDATE lab_job
             SET status = ?, control_intent = ?, version = ?, recoverable = 0,
                 scheduler_fencing_token = NULL, updated_at = ?
-            WHERE job_id = ? AND version = ? AND status IN (?, ?)
+            WHERE job_id = ? AND version = ? AND status IN (?, ?, ?)
             """,
             (
                 JobStatus.FAILED.value,
@@ -669,6 +670,7 @@ def _normalize_v2_exhausted_nonterminal_jobs(connection: sqlite3.Connection) -> 
                 failed_at,
                 job_id,
                 job_version,
+                JobStatus.QUEUED.value,
                 JobStatus.RUNNING.value,
                 JobStatus.CHECKPOINTED.value,
             ),
@@ -1135,6 +1137,8 @@ class LabJobReader:
                 )
             ):
                 raise ValueError("running shard is missing claim identity")
+            if record.status is ShardStatus.QUEUED and record.attempt_count >= record.max_attempts:
+                raise ValueError("queued shard exhausted attempts")
             if (
                 record.claimed_at is not None
                 and record.heartbeat_at is not None
@@ -1686,6 +1690,21 @@ class LabJobStore:
         reason: str,
     ) -> sqlite3.Row:
         job_id = UUID(str(job_row["job_id"]))
+        exhausted_candidate = connection.execute(
+            """
+            SELECT 1 FROM lab_shard
+            WHERE job_id = ? AND status <> ?
+              AND attempt_count >= max_attempts
+            LIMIT 1
+            """,
+            (str(job_id), ShardStatus.SUCCEEDED.value),
+        ).fetchone()
+        tree_recoverable = recoverable and exhausted_candidate is None
+        effective_sibling_failure_json = (
+            _PARENT_ATTEMPTS_EXHAUSTED_FAILURE_JSON
+            if recoverable and not tree_recoverable
+            else sibling_failure_json
+        )
         job_row = self._adopt_running_job_fence(
             connection,
             job_row,
@@ -1708,7 +1727,7 @@ class LabJobStore:
                 ShardStatus.FAILED.value,
                 str(failed_shard_id),
                 failed_shard_failure_json,
-                sibling_failure_json,
+                effective_sibling_failure_json,
                 _dump_time(now),
                 _dump_time(now),
                 str(job_id),
@@ -1719,6 +1738,49 @@ class LabJobStore:
         )
         if cursor.rowcount < 1:
             raise InvalidStoredJobError("failed job has no nonterminal shard to terminalize")
+        source = JobStatus(str(job_row["status"]))
+        if source in {JobStatus.QUEUED, JobStatus.CHECKPOINTED}:
+            stored_version = _strict_sqlite_int(
+                job_row["version"], field="lab_job.version", minimum=0
+            )
+            version = stored_version + 1
+            job_cursor = connection.execute(
+                """
+                UPDATE lab_job
+                SET status = ?, control_intent = ?, version = ?, recoverable = ?,
+                    scheduler_fencing_token = NULL, updated_at = ?
+                WHERE job_id = ? AND version = ? AND status = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    ControlIntent.NONE.value,
+                    version,
+                    int(tree_recoverable),
+                    _dump_time(now),
+                    str(job_id),
+                    stored_version,
+                    source.value,
+                ),
+            )
+            if job_cursor.rowcount != 1:
+                raise StaleJobVersionError(
+                    "inactive job changed while terminalizing exhausted shard tree"
+                )
+            self._insert_event(
+                connection,
+                job_id=job_id,
+                request_id=None,
+                event_type="job_failed",
+                prior_status=source,
+                new_status=JobStatus.FAILED,
+                job_version=version,
+                reason=reason,
+                fencing_token=lease.fencing_token,
+                now=now,
+            )
+            updated = self._load_job_row(connection, job_id)
+            assert updated is not None
+            return updated
         return self._transition_in_transaction(
             connection,
             job_row,
@@ -1727,7 +1789,7 @@ class LabJobStore:
             reason=reason,
             now=now,
             request_id=None,
-            recoverable=recoverable,
+            recoverable=tree_recoverable,
             event_type="job_failed",
         )
 
@@ -2385,7 +2447,60 @@ class LabJobStore:
                     reason=f"invalid_state:{source.value}",
                     job_version=version,
                 )
-            if not _strict_sqlite_bool(row["recoverable"], field="lab_job.recoverable"):
+            job_recoverable = _strict_sqlite_bool(row["recoverable"], field="lab_job.recoverable")
+            exhausted_candidate = connection.execute(
+                """
+                SELECT 1 FROM lab_shard
+                WHERE job_id = ? AND status <> ?
+                  AND attempt_count >= max_attempts
+                LIMIT 1
+                """,
+                (str(command.job_id), ShardStatus.SUCCEEDED.value),
+            ).fetchone()
+            if exhausted_candidate is not None:
+                if not job_recoverable:
+                    return self._receipt_for_rejection(
+                        envelope,
+                        reason="not_recoverable",
+                        job_version=version,
+                    )
+                next_version = version + 1
+                cursor = connection.execute(
+                    """
+                    UPDATE lab_job
+                    SET recoverable = 0, version = ?, updated_at = ?
+                    WHERE job_id = ? AND version = ? AND status = ?
+                    """,
+                    (
+                        next_version,
+                        _dump_time(now),
+                        str(command.job_id),
+                        version,
+                        JobStatus.FAILED.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StaleJobVersionError(
+                        "failed job changed while fencing exhausted shard retry"
+                    )
+                self._insert_event(
+                    connection,
+                    job_id=command.job_id,
+                    request_id=envelope.request_id,
+                    event_type="job_retry_rejected",
+                    prior_status=JobStatus.FAILED,
+                    new_status=JobStatus.FAILED,
+                    job_version=next_version,
+                    reason="shard attempts exhausted",
+                    fencing_token=lease.fencing_token,
+                    now=now,
+                )
+                return self._receipt_for_rejection(
+                    envelope,
+                    reason="shard_attempts_exhausted",
+                    job_version=next_version,
+                )
+            if not job_recoverable:
                 return self._receipt_for_rejection(
                     envelope,
                     reason="not_recoverable",
@@ -2414,16 +2529,13 @@ class LabJobStore:
                     result_manifest_hash = NULL, failure_json = NULL,
                     finished_at = NULL, checkpoint_json = NULL,
                     updated_at = ?
-                WHERE job_id = ? AND status IN (?, ?, ?, ?)
+                WHERE job_id = ? AND status <> ?
                 """,
                 (
                     ShardStatus.QUEUED.value,
                     _dump_time(now),
                     str(command.job_id),
-                    ShardStatus.QUEUED.value,
-                    ShardStatus.RUNNING.value,
-                    ShardStatus.CHECKPOINTED.value,
-                    ShardStatus.FAILED.value,
+                    ShardStatus.SUCCEEDED.value,
                 ),
             )
             connection.execute(
@@ -2640,19 +2752,44 @@ class LabJobStore:
         reclaimed_job_ids: set[UUID] = set()
         paused_job_ids: set[UUID] = set()
         cancelled_job_ids: set[UUID] = set()
+        exhausted_rows = connection.execute(
+            """
+            SELECT s.job_id, s.shard_id FROM lab_shard AS s
+            JOIN lab_job AS j ON j.job_id = s.job_id
+            WHERE j.status IN (?, ?, ?) AND j.control_intent <> ?
+              AND s.status IN (?, ?)
+              AND s.attempt_count >= s.max_attempts
+            ORDER BY j.created_at, s.shard_index
+            """,
+            (
+                JobStatus.QUEUED.value,
+                JobStatus.RUNNING.value,
+                JobStatus.CHECKPOINTED.value,
+                ControlIntent.CANCEL_REQUESTED.value,
+                ShardStatus.QUEUED.value,
+                ShardStatus.CHECKPOINTED.value,
+            ),
+        ).fetchall()
         failed_job_causes: dict[UUID, UUID] = {}
+        for exhausted in exhausted_rows:
+            failed_job_causes.setdefault(
+                UUID(str(exhausted["job_id"])),
+                UUID(str(exhausted["shard_id"])),
+            )
         for stale in stale_rows:
             job_id = UUID(str(stale["job_id"]))
             job_row = self._load_job_row(connection, job_id)
             assert job_row is not None
-            intent = ControlIntent(str(job_row["control_intent"]))
             attempt_count = _strict_sqlite_int(
                 stale["attempt_count"], field="lab_shard.attempt_count", minimum=0
             )
             max_attempts = _strict_sqlite_int(
                 stale["max_attempts"], field="lab_shard.max_attempts", minimum=1
             )
-            if intent is not ControlIntent.CANCEL_REQUESTED and attempt_count >= max_attempts:
+            if (
+                ControlIntent(str(job_row["control_intent"])) is not ControlIntent.CANCEL_REQUESTED
+                and attempt_count >= max_attempts
+            ):
                 failed_job_causes.setdefault(job_id, UUID(str(stale["shard_id"])))
         for stale in stale_rows:
             job_id = UUID(str(stale["job_id"]))
@@ -2721,7 +2858,11 @@ class LabJobStore:
         for failed_job_id in sorted(failed_job_causes, key=str):
             failed_job = self._load_job_row(connection, failed_job_id)
             assert failed_job is not None
-            if JobStatus(str(failed_job["status"])) is not JobStatus.RUNNING:
+            if JobStatus(str(failed_job["status"])) not in {
+                JobStatus.QUEUED,
+                JobStatus.RUNNING,
+                JobStatus.CHECKPOINTED,
+            }:
                 continue
             self._fail_job_tree_after_attempts_exhausted(
                 connection,

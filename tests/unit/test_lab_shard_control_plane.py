@@ -160,6 +160,9 @@ def _assert_control_plane_invariants(
         ShardStatus.CANCELLED,
     }
     for shard in shards:
+        assert not (
+            shard.status is ShardStatus.QUEUED and shard.attempt_count >= shard.max_attempts
+        )
         if shard.status in terminal:
             assert (
                 shard.worker_id,
@@ -767,6 +770,153 @@ def test_recoverable_shard_failure_terminalizes_tree_before_atomic_retry(
         and shard.claim_token is None
         for shard in retried_shards
     )
+
+
+def test_retry_rejects_mixed_exhausted_failed_tree_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, max_attempts=2)
+    first = _claim(store, lease, worker="worker-first")
+    second = _claim(store, lease, worker="worker-second", now_offset=3)
+    stopped = store.apply_worker_report(
+        _report(second, LabWorkerStopped(reason="retry sibling"), offset=4),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert stopped.status == "accepted"
+    exhausted = _claim(store, lease, worker="worker-second-retry", now_offset=5)
+    assert exhausted.shard_id == second.shard_id
+    assert exhausted.claim_generation == second.claim_generation + 1
+    assert exhausted.definition.shard_index == 1
+
+    failed = store.apply_worker_report(
+        _report(
+            first,
+            LabShardFailed(failure_json='{"reason":"mixed-attempt-failure"}'),
+            offset=6,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=6),
+    )
+    before_job = LabJobReader(store.path).get_job(job_id)
+    before_shards = LabJobReader(store.path).list_shards(job_id)
+
+    assert failed.status == "accepted"
+    assert before_job is not None and before_job.status is JobStatus.FAILED
+    assert before_job.recoverable is False
+    assert tuple(shard.attempt_count for shard in before_shards) == (1, 2)
+    assert all(shard.status is ShardStatus.FAILED for shard in before_shards)
+
+    retry = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=job_id,
+                expected_version=before_job.version,
+                reason="must reject mixed exhausted tree",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=7),
+    )
+
+    assert retry.status == "rejected"
+    assert retry.reason == "not_recoverable"
+    assert LabJobReader(store.path).get_job(job_id) == before_job
+    assert LabJobReader(store.path).list_shards(job_id) == before_shards
+
+
+def test_retry_converges_legacy_recoverable_exhausted_tree_without_restoring_shards(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, max_attempts=2)
+    finished_at = (NOW + timedelta(seconds=2)).isoformat(timespec="microseconds")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = ?, recoverable = 1, version = version + 1
+            WHERE job_id = ?
+            """,
+            (JobStatus.FAILED.value, str(job_id)),
+        )
+        connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, version = version + 1,
+                attempt_count = CASE WHEN shard_index = 0 THEN 1 ELSE 2 END,
+                failure_json = '{"reason":"legacy-mixed-tree"}',
+                finished_at = ?, updated_at = ?
+            WHERE job_id = ?
+            """,
+            (ShardStatus.FAILED.value, finished_at, finished_at, str(job_id)),
+        )
+    before_job = LabJobReader(store.path).get_job(job_id)
+    before_shards = LabJobReader(store.path).list_shards(job_id)
+    assert before_job is not None and before_job.recoverable is True
+
+    retry = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=RetryJobCommand(
+                job_id=job_id,
+                expected_version=before_job.version,
+                reason="converge legacy mixed tree",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    after_job = LabJobReader(store.path).get_job(job_id)
+
+    assert retry.status == "rejected"
+    assert retry.reason == "shard_attempts_exhausted"
+    assert after_job is not None and after_job.status is JobStatus.FAILED
+    assert after_job.recoverable is False
+    assert after_job.version == before_job.version + 1
+    assert LabJobReader(store.path).list_shards(job_id) == before_shards
+
+
+@pytest.mark.parametrize(
+    "parent_status",
+    [JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CHECKPOINTED],
+)
+def test_recovery_fails_tree_with_exhausted_queued_sibling(
+    tmp_path: Path,
+    parent_status: JobStatus,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, max_attempts=2)
+    if parent_status is JobStatus.RUNNING:
+        _claim(store, lease, worker="active-worker", duration=300)
+    with sqlite3.connect(store.path) as connection:
+        if parent_status is JobStatus.CHECKPOINTED:
+            connection.execute(
+                """
+                UPDATE lab_job SET status = ?, version = version + 1
+                WHERE job_id = ?
+                """,
+                (JobStatus.CHECKPOINTED.value, str(job_id)),
+            )
+        connection.execute(
+            """
+            UPDATE lab_shard SET attempt_count = max_attempts
+            WHERE job_id = ? AND shard_index = 1 AND status = ?
+            """,
+            (str(job_id), ShardStatus.QUEUED.value),
+        )
+
+    recovered = store.recover_stale_shards(
+        lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    job = LabJobReader(store.path).get_job(job_id)
+    shards = LabJobReader(store.path).list_shards(job_id)
+
+    assert recovered == (job_id,)
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.recoverable is False
+    assert all(shard.status is ShardStatus.FAILED for shard in shards)
+    assert all(shard.claim_token is None for shard in shards)
 
 
 def test_report_commit_replay_is_exactly_once_and_conflict_is_rejected(tmp_path: Path) -> None:
