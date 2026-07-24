@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -537,9 +538,47 @@ class LabAdmittedExecution(LabShardProtocolModel):
     admission: LabExecutionAdmission
 
 
+LabHotClaimNamespace = Literal["pending", "current", "revoked"]
+
+
+class LabHotNamespaceCursor(LabShardProtocolModel):
+    after_name: str | None = None
+    cycle_ceiling: str | None = None
+
+    @model_validator(mode="after")
+    def validate_cycle(self) -> LabHotNamespaceCursor:
+        if (self.after_name is None) != (self.cycle_ceiling is None):
+            raise ValueError("hot namespace cursor bounds must be both present or absent")
+        if (
+            self.after_name is not None
+            and self.cycle_ceiling is not None
+            and self.after_name > self.cycle_ceiling
+        ):
+            raise ValueError("hot namespace cursor exceeds its cycle ceiling")
+        return self
+
+
+class LabHotClaimCursor(LabShardProtocolModel):
+    schema_version: Literal[1] = 1
+    pending: LabHotNamespaceCursor = Field(default_factory=LabHotNamespaceCursor)
+    current: LabHotNamespaceCursor = Field(default_factory=LabHotNamespaceCursor)
+    revoked: LabHotNamespaceCursor = Field(default_factory=LabHotNamespaceCursor)
+    next_namespace: LabHotClaimNamespace = "pending"
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> LabHotClaimCursor:
+        expected = _canonical_hash(self.model_dump(mode="json", exclude={"content_hash"}))
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("content_hash does not match hot claim cursor")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+
 class LabHotClaimBatch(LabShardProtocolModel):
     claims: tuple[LabShardClaim, ...]
-    next_cursor: str | None = None
+    next_cursor: LabHotClaimCursor
+    scanned_namespaces: tuple[LabHotClaimNamespace, ...] = ()
     inspected: int = Field(ge=0)
 
 
@@ -627,6 +666,7 @@ class LabClaimSpool(_TypedSpoolBase):
         self.retired_dir = self.root / "archive" / "retired"
         self.revoked_dir = self.root / "revoked"
         self.archived_revoked_dir = self.root / "archive" / "revoked"
+        self.hot_cursor_path = self.root / ".hot-authority-cursor-v1.json"
         self.admitted_dir = self.root / "admitted"
         self.admission_tmp_dir = self.admitted_dir / ".tmp"
         self.current_dir.mkdir(parents=True, exist_ok=True)
@@ -669,6 +709,91 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def _admission_path(self, claim_token: UUID) -> Path:
         return self.admitted_dir / f"{claim_token}.json"
+
+    def _load_hot_cursor_locked(self) -> LabHotClaimCursor:
+        if not os.path.lexists(self.hot_cursor_path):
+            return LabHotClaimCursor()
+        _candidate, payload, _file_stat = self._read_regular_child(
+            self.hot_cursor_path,
+            self.root,
+        )
+        try:
+            return LabHotClaimCursor.model_validate_json(payload)
+        except Exception as exc:
+            raise InvalidCommandEnvelopeError(f"invalid durable hot claim cursor: {exc}") from exc
+
+    def _publish_hot_cursor_locked(self, cursor: LabHotClaimCursor) -> None:
+        validated = LabHotClaimCursor.model_validate(cursor)
+        temporary = self.root / f".{self.hot_cursor_path.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(validated.model_dump_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.hot_cursor_path)
+            self._fsync_directory(self.root)
+        finally:
+            temporary.unlink(missing_ok=True)
+        if self._load_hot_cursor_locked() != validated:
+            raise InvalidCommandEnvelopeError("durable hot claim cursor readback mismatch")
+
+    @staticmethod
+    def _hot_namespace_paths(directory: Path) -> tuple[Path, ...]:
+        paths: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise InvalidCommandEnvelopeError(
+                            f"unsafe hot claim entry {entry.name}: {exc}"
+                        ) from exc
+                    if not entry.name.endswith(".json"):
+                        raise InvalidCommandEnvelopeError(
+                            f"unexpected hot claim entry {entry.name}"
+                        )
+                    if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
+                        raise InvalidCommandEnvelopeError(f"unsafe hot claim entry {entry.name}")
+                    paths.append(Path(entry.path))
+        except OSError as exc:
+            raise InvalidCommandEnvelopeError(
+                f"cannot enumerate hot claim namespace {directory.name}: {exc}"
+            ) from exc
+        return tuple(sorted(paths, key=lambda path: path.name))
+
+    @staticmethod
+    def _hot_namespace_slice(
+        paths: tuple[Path, ...],
+        *,
+        cursor: LabHotNamespaceCursor,
+        limit: int,
+    ) -> tuple[tuple[Path, ...], LabHotNamespaceCursor]:
+        if not paths:
+            return (), LabHotNamespaceCursor()
+        names = [path.name for path in paths]
+        after_name = cursor.after_name
+        cycle_ceiling = cursor.cycle_ceiling
+        if after_name is None or cycle_ceiling is None:
+            after_name = ""
+            cycle_ceiling = names[-1]
+        start = bisect_right(names, after_name)
+        stop = bisect_right(names, cycle_ceiling)
+        if start >= stop:
+            after_name = ""
+            cycle_ceiling = names[-1]
+            start = 0
+            stop = len(paths)
+        selected = paths[start : min(stop, start + limit)]
+        if not selected:
+            return (), LabHotNamespaceCursor(
+                after_name=after_name,
+                cycle_ceiling=cycle_ceiling,
+            )
+        return selected, LabHotNamespaceCursor(
+            after_name=selected[-1].name,
+            cycle_ceiling=cycle_ceiling,
+        )
 
     def _load_consumed_locked(self, claim_token: UUID) -> LabConsumedClaim:
         path = self._consumed_path(claim_token)
@@ -1318,66 +1443,112 @@ class LabClaimSpool(_TypedSpoolBase):
         self,
         *,
         limit: int,
-        cursor: str | None = None,
+        cursor: LabHotClaimCursor | None = None,
     ) -> LabHotClaimBatch:
-        """Read a bounded pending/current migration slice without cold receipts."""
+        """Read a fair bounded slice of hot authority without touching cold history."""
         if limit < 1:
             raise ValueError("hot delivery batch limit must be positive")
         with self._exclusive_lock():
-            candidates = (
-                sorted(
-                    ((f"pending/{path.name}", path) for path in self.pending_dir.glob("*.json")),
-                    key=lambda item: item[0],
-                )
-                + sorted(
-                    ((f"current/{path.name}", path) for path in self.current_dir.glob("*.json")),
-                    key=lambda item: item[0],
-                )
-                + sorted(
-                    ((f"revoked/{path.name}", path) for path in self.revoked_dir.glob("*.json")),
-                    key=lambda item: item[0],
-                )
-            )
-            start = 0
+            durable_cursor = self._load_hot_cursor_locked()
             if cursor is not None:
-                start = next(
-                    (
-                        index
-                        for index, (candidate_cursor, _path) in enumerate(candidates)
-                        if candidate_cursor > cursor
-                    ),
-                    0,
-                )
-            selected = candidates[start : start + limit]
-            claims: dict[UUID, LabShardClaim] = {}
-            for candidate_cursor, path in selected:
-                if candidate_cursor.startswith("pending/"):
-                    claim = self.load(path).claim
-                elif candidate_cursor.startswith("current/"):
-                    match = _CURRENT_CLAIM_NAME.fullmatch(path.name)
-                    if match is None:
-                        raise InvalidCommandEnvelopeError(
-                            f"invalid current claim basename: {path.name}"
-                        )
-                    claim = self._load_current_locked(
-                        UUID(match.group("job_id")),
-                        UUID(match.group("shard_id")),
-                    ).claim
-                else:
-                    token = self._ack_message_id(path.name)
-                    claim = self._load_revocation_locked(token).revocation.claim
-                existing = claims.get(claim.claim_token)
-                if existing is not None and existing != claim:
+                requested_cursor = LabHotClaimCursor.model_validate(cursor)
+                if requested_cursor != durable_cursor:
                     raise RequestContentConflictError(
-                        f"claim_token {claim.claim_token} has conflicting hot evidence"
+                        "hot claim cursor conflicts with durable authority cursor"
                     )
-                claims[claim.claim_token] = claim
-            has_more = start + len(selected) < len(candidates)
-            next_cursor = selected[-1][0] if selected and has_more else None
+            active_cursor = durable_cursor
+            namespace_order: tuple[LabHotClaimNamespace, ...] = (
+                "pending",
+                "current",
+                "revoked",
+            )
+            directories = {
+                "pending": self.pending_dir,
+                "current": self.current_dir,
+                "revoked": self.revoked_dir,
+            }
+            paths_by_namespace = {
+                namespace: self._hot_namespace_paths(directories[namespace])
+                for namespace in namespace_order
+            }
+            nonempty = {
+                namespace
+                for namespace, namespace_paths in paths_by_namespace.items()
+                if namespace_paths
+            }
+            budgets: dict[LabHotClaimNamespace, int] = {
+                namespace: 0 for namespace in namespace_order
+            }
+            scanned_namespaces: list[LabHotClaimNamespace] = []
+            position = namespace_order.index(active_cursor.next_namespace)
+            for _ in range(limit):
+                if not nonempty:
+                    break
+                for offset in range(len(namespace_order)):
+                    candidate_position = (position + offset) % len(namespace_order)
+                    namespace = namespace_order[candidate_position]
+                    if namespace in nonempty:
+                        budgets[namespace] += 1
+                        if namespace not in scanned_namespaces:
+                            scanned_namespaces.append(namespace)
+                        position = (candidate_position + 1) % len(namespace_order)
+                        break
+
+            claims: dict[UUID, LabShardClaim] = {}
+            inspected = 0
+            namespace_cursors: dict[LabHotClaimNamespace, LabHotNamespaceCursor] = {}
+            for namespace in namespace_order:
+                selected, namespace_cursor = (
+                    self._hot_namespace_slice(
+                        paths_by_namespace[namespace],
+                        cursor=getattr(active_cursor, namespace),
+                        limit=budgets[namespace],
+                    )
+                    if budgets[namespace]
+                    else (
+                        (),
+                        getattr(active_cursor, namespace)
+                        if paths_by_namespace[namespace]
+                        else LabHotNamespaceCursor(),
+                    )
+                )
+                namespace_cursors[namespace] = namespace_cursor
+                inspected += len(selected)
+                for path in selected:
+                    if namespace == "pending":
+                        claim = self.load(path).claim
+                    elif namespace == "current":
+                        match = _CURRENT_CLAIM_NAME.fullmatch(path.name)
+                        if match is None:
+                            raise InvalidCommandEnvelopeError(
+                                f"invalid current claim basename: {path.name}"
+                            )
+                        claim = self._load_current_locked(
+                            UUID(match.group("job_id")),
+                            UUID(match.group("shard_id")),
+                        ).claim
+                    else:
+                        token = self._ack_message_id(path.name)
+                        claim = self._load_revocation_locked(token).revocation.claim
+                    existing = claims.get(claim.claim_token)
+                    if existing is not None and existing != claim:
+                        raise RequestContentConflictError(
+                            f"claim_token {claim.claim_token} has conflicting hot evidence"
+                        )
+                    claims[claim.claim_token] = claim
+            next_cursor = LabHotClaimCursor(
+                pending=namespace_cursors["pending"],
+                current=namespace_cursors["current"],
+                revoked=namespace_cursors["revoked"],
+                next_namespace=namespace_order[position],
+            )
+            if next_cursor != durable_cursor:
+                self._publish_hot_cursor_locked(next_cursor)
             return LabHotClaimBatch(
                 claims=tuple(claims.values()),
                 next_cursor=next_cursor,
-                inspected=len(selected),
+                scanned_namespaces=tuple(scanned_namespaces),
+                inspected=inspected,
             )
 
     def delivery_claims(self) -> tuple[LabShardClaim, ...]:

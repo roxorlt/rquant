@@ -12,6 +12,7 @@ from typing import Annotated, Literal, Protocol, TypeAlias
 from uuid import UUID
 
 import pandas as pd
+from pandas.api.types import is_dtype_equal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from rquant.lab_shard_protocol import LabShardClaim, LabShardDefinition
@@ -880,22 +881,24 @@ def _normalize_legacy_sparse_empty_frames(
 
 
 def _concat_shard_frames(frames: tuple[pd.DataFrame, ...]) -> pd.DataFrame:
-    expected_schema = tuple(
-        (column, str(dtype))
-        for column, dtype in zip(frames[0].columns, frames[0].dtypes, strict=True)
-    )
+    expected_columns = tuple(frames[0].columns)
+    expected_dtypes = tuple(frames[0].dtypes)
     for index, frame in enumerate(frames[1:], start=1):
-        schema = tuple(
-            (column, str(dtype)) for column, dtype in zip(frame.columns, frame.dtypes, strict=True)
-        )
-        if schema != expected_schema:
+        if tuple(frame.columns) != expected_columns or any(
+            not is_dtype_equal(actual, expected)
+            for actual, expected in zip(frame.dtypes, expected_dtypes, strict=True)
+        ):
             raise ValueError(
                 f"aggregation shard frame {index} schema does not match the first shard"
             )
     populated = tuple(frame for frame in frames if not frame.empty)
-    if populated:
-        return pd.concat(populated, ignore_index=True)
-    return frames[0].copy()
+    aggregated = pd.concat(populated, ignore_index=True) if populated else frames[0].copy()
+    if tuple(aggregated.columns) != expected_columns or any(
+        not is_dtype_equal(actual, expected)
+        for actual, expected in zip(aggregated.dtypes, expected_dtypes, strict=True)
+    ):
+        raise ValueError("aggregation output schema does not match the shard schema")
+    return aggregated
 
 
 def _rerank_optimizer_table(table: LabShardTable) -> pd.DataFrame:

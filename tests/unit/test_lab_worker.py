@@ -23,7 +23,9 @@ import pytest
 
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_shard_protocol import (
+    LabClaimRevokedError,
     LabClaimSpool,
+    LabClaimSupersededError,
     LabReportReceipt,
     LabReportSpool,
     LabShardClaim,
@@ -447,13 +449,14 @@ def test_worker_does_not_rehash_large_quarantine_for_each_claim(
     )
     hash_calls = 0
 
-    def simulated_large_recovery() -> None:
+    def simulated_large_recovery(*, max_entries: int) -> None:
         nonlocal hash_calls
-        hash_calls += 10_000
+        assert max_entries == 16
+        hash_calls += max_entries
 
     monkeypatch.setattr(
         worker.artifact_reclaimer,
-        "collect_garbage",
+        "recover_active",
         simulated_large_recovery,
     )
 
@@ -462,7 +465,7 @@ def test_worker_does_not_rehash_large_quarantine_for_each_claim(
 
     assert first.status == "succeeded"
     assert second.status == "succeeded"
-    assert hash_calls == 10_000
+    assert hash_calls == 16
     assert registry.executions == 2
 
 
@@ -475,10 +478,11 @@ def test_unrelated_quarantine_recovery_failure_is_typed_and_does_not_block_claim
     claims.publish(claim)
     worker = _worker(tmp_path, claims=claims)
 
-    def fail_recovery() -> None:
+    def fail_recovery(*, max_entries: int) -> None:
+        assert max_entries == 16
         raise RuntimeError("unrelated deferred quarantine is corrupt")
 
-    monkeypatch.setattr(worker.artifact_reclaimer, "collect_garbage", fail_recovery)
+    monkeypatch.setattr(worker.artifact_reclaimer, "recover_active", fail_recovery)
 
     result = worker.run_once()
 
@@ -486,6 +490,135 @@ def test_unrelated_quarantine_recovery_failure_is_typed_and_does_not_block_claim
     assert len(result.health_warnings) == 1
     assert result.health_warnings[0].category == "quarantine_reconcile_failed"
     assert result.health_warnings[0].error_type == "RuntimeError"
+
+
+@pytest.mark.parametrize("bundle_count", [1, 10, 40])
+def test_bounded_quarantine_recovery_never_rehashes_deferred_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bundle_count: int,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    for index in range(bundle_count):
+        victim = tmp_path / "artifacts" / "cold" / f"result-{index:03d}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"cold-{index}".encode())
+        assert reclaimer.logical_quarantine_tree(victim, purpose=f"cold fixture {index}")
+
+    inventory_calls = 0
+
+    def reject_inventory(_path: Path) -> tuple[object, ...]:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        raise AssertionError("bounded recovery must not traverse deferred payload inventory")
+
+    monkeypatch.setattr(reclaimer, "_garbage_inventory", reject_inventory)
+
+    result = reclaimer.recover_active(max_entries=3)
+
+    assert result.inspected == 0
+    assert result.cold_metadata_checked == 1
+    assert len(tuple(reclaimer.garbage_cold_intent_dir.iterdir())) == bundle_count
+    assert inventory_calls == 0
+
+
+def test_bounded_quarantine_recovery_is_fair_across_restarts(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    artifact_root = tmp_path / "artifacts"
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=artifact_root,
+        report_spool=reports,
+    )
+    victims: list[Path] = []
+    for index in range(5):
+        victim = artifact_root / "active" / f"result-{index:03d}.bin"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(f"active-{index}".encode())
+        owner = reclaimer._garbage_owner(victim, purpose=f"active fixture {index}")
+        reclaimer._write_prepared_intent(reclaimer._prepared_intent(owner))
+        victims.append(victim)
+
+    for _ in range(5):
+        restarted = LabArtifactReclaimer(
+            artifact_root=artifact_root,
+            report_spool=LabReportSpool(tmp_path / "reports"),
+        )
+        result = restarted.recover_active(max_entries=1)
+        assert result.inspected == 1
+
+    assert all(not victim.exists() for victim in victims)
+    assert restarted.quarantine_summary().bundle_count == 5
+
+
+def test_bounded_quarantine_recovery_migrates_legacy_intent_once(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    artifact_root = tmp_path / "artifacts"
+    reports = LabReportSpool(tmp_path / "reports")
+    legacy = LabArtifactReclaimer(
+        artifact_root=artifact_root,
+        report_spool=reports,
+    )
+    legacy.garbage_legacy_complete_path.unlink()
+    victim = artifact_root / "legacy-active" / "result.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"legacy-active")
+    owner = legacy._garbage_owner(victim, purpose="legacy active fixture")
+    intent = legacy._prepared_intent(owner)
+    legacy._prepared_intent_path(owner.garbage_id).write_text(
+        intent.canonical_json(),
+        encoding="utf-8",
+    )
+
+    restarted = LabArtifactReclaimer(
+        artifact_root=artifact_root,
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    result = restarted.recover_active(max_entries=1)
+
+    assert result.inspected == 1
+    assert result.reconciled == 1
+    assert not victim.exists()
+    assert tuple(restarted.garbage_active_intent_dir.iterdir()) == ()
+    assert len(tuple(restarted.garbage_cold_intent_dir.iterdir())) == 1
+    assert restarted.garbage_legacy_complete_path.is_file()
+
+
+def test_damaged_cold_quarantine_warns_without_blocking_unrelated_claim(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    registry = RecordingRegistry()
+    worker = _worker(tmp_path, claims=claims, registry=registry)
+    victim = tmp_path / "artifacts" / "cold-damage" / "result.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"retained-cold-result")
+    assert worker.artifact_reclaimer.logical_quarantine_tree(
+        victim,
+        purpose="cold health fixture",
+    )
+    deferred = next(worker.artifact_reclaimer.garbage_deferred_dir.iterdir())
+    (deferred / "unexpected.bin").write_bytes(b"foreign-metadata")
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert registry.executions == 1
+    assert len(result.health_warnings) == 1
+    assert result.health_warnings[0].category == "quarantine_reconcile_failed"
+    assert result.health_warnings[0].error_type == "LabArtifactConflictError"
+    assert (deferred / "unexpected.bin").read_bytes() == b"foreign-metadata"
 
 
 def test_success_receipt_timeout_emits_structured_worker_warning(tmp_path: Path) -> None:
@@ -529,6 +662,95 @@ def test_success_receipt_timeout_emits_structured_worker_warning(tmp_path: Path)
     assert timeout_records[0]["job_id"] == str(claim.job_id)
     assert timeout_records[0]["shard_id"] == str(claim.shard_id)
     assert timeout_records[0]["report_id"] == str(result.report_id)
+
+
+def test_adapter_runtime_error_emits_structured_worker_failure(tmp_path: Path) -> None:
+    from loguru import logger
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=RecordingRegistry(failure=RuntimeError("adapter probe failed")),
+    )
+    records: list[dict[str, object]] = []
+    sink = logger.add(
+        lambda message: records.append(
+            {
+                "extra": dict(message.record["extra"]),
+                "level": message.record["level"].name,
+            }
+        ),
+        level="WARNING",
+    )
+    try:
+        result = worker.run_once()
+    finally:
+        logger.remove(sink)
+
+    assert result.status == "failed"
+    failures = [
+        record
+        for record in records
+        if record["extra"].get("failure") == "shard_execution_failed"  # type: ignore[union-attr]
+    ]
+    assert len(failures) == 1
+    assert failures[0]["level"] == "ERROR"
+    extra = failures[0]["extra"]
+    assert extra["component"] == "lab_worker"  # type: ignore[index]
+    assert extra["phase"] == "execute"  # type: ignore[index]
+    assert extra["job_id"] == str(claim.job_id)  # type: ignore[index]
+    assert extra["shard_id"] == str(claim.shard_id)  # type: ignore[index]
+    assert extra["claim_generation"] == claim.claim_generation  # type: ignore[index]
+    assert extra["error_type"] == "RuntimeError"  # type: ignore[index]
+
+
+def test_worker_failure_logging_error_does_not_change_tick_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(_claim(_nshape_compare_spec(hold_days=(1,))))
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=RecordingRegistry(failure=RuntimeError("adapter failure")),
+    )
+
+    def fail_logging(**_fields: object) -> object:
+        raise RuntimeError("logging transport failed")
+
+    monkeypatch.setattr(lab_worker_module.logger, "bind", fail_logging)
+
+    assert worker.run_once().status == "failed"
+
+
+@pytest.mark.parametrize("mode", ["idle", "stopped"])
+def test_idle_and_cooperative_stop_do_not_log_worker_failure(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from loguru import logger
+
+    worker = _worker(tmp_path)
+    if mode == "stopped":
+        worker.request_stop()
+    failures: list[dict[str, object]] = []
+    sink = logger.add(
+        lambda message: failures.append(dict(message.record["extra"])),
+        level="WARNING",
+    )
+    try:
+        result = worker.run_once()
+    finally:
+        logger.remove(sink)
+
+    assert result.status == mode
+    assert not [record for record in failures if record.get("failure") == "shard_execution_failed"]
 
 
 def test_worker_leaves_expired_claim_for_lease_recovery(tmp_path: Path) -> None:
@@ -4752,6 +4974,67 @@ def test_scheduler_retires_accepted_success_from_hot_claim_authority(tmp_path: P
     retired = claims.retired_high_water(claim.job_id, claim.shard_id)
     assert retired.claim == claim
     assert retired.outcome == "accepted"
+
+
+def test_scheduler_authority_fairly_retires_orphan_current_across_restart(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    spec = _nshape_compare_spec(hold_days=(1,))
+    for _ in range(2):
+        commands.publish(
+            LabCommandEnvelope(
+                request_id=uuid4(),
+                command=SubmitJobCommand(job_id=uuid4(), spec=spec, max_attempts=2),
+            )
+        )
+
+    def scheduler(owner_id: str) -> LabScheduler:
+        return LabScheduler(
+            store=store,
+            spool=commands,
+            owner_id=owner_id,
+            lease_seconds=60,
+            heartbeat_seconds=10,
+            poll_interval_ms=5,
+            claim_spool=claims,
+            claim_worker_ids=("worker-a", "worker-b"),
+            shard_lease_seconds=20,
+            max_claim_authority_per_tick=2,
+            adapter_registry=default_strategy_job_adapter_registry(),
+            clock=lambda: NOW,
+        )
+
+    first = scheduler("scheduler-a")
+    first.run_once()
+    orphan = _claim(spec)
+    claims.consume(claims.publish(orphan))
+    first.run_once()
+    first.release()
+
+    restarted = scheduler("scheduler-b")
+    for _ in range(8):
+        restarted.run_once()
+        try:
+            retired = claims.retired_high_water(orphan.job_id, orphan.shard_id)
+        except InvalidCommandEnvelopeError:
+            continue
+        assert retired.claim == orphan
+        assert retired.outcome == "revoked"
+        break
+    else:
+        pytest.fail("orphan current claim was starved by persistent pending deliveries")
+
+    with pytest.raises((LabClaimRevokedError, LabClaimSupersededError)):
+        claims.admit_execution(orphan)
+    assert len(claims.pending()) >= 2
 
 
 def test_scheduler_retries_revocation_retirement_from_hot_marker(

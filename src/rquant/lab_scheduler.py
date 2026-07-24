@@ -145,7 +145,6 @@ class LabScheduler:
         self.lease: LabLeaseRecord | None = None
         self._claim_cursor = 0
         self._claim_cursor_fence: int | None = None
-        self._claim_authority_cursor: str | None = None
         self._stop = Event()
 
     def _seed_claim_cursor(self, lease: LabLeaseRecord) -> None:
@@ -235,7 +234,6 @@ class LabScheduler:
         try:
             hot_batch = self.claim_spool.hot_delivery_batch(
                 limit=self.max_claim_authority_per_tick,
-                cursor=self._claim_authority_cursor,
             )
         except Exception as exc:
             logger.bind(
@@ -253,7 +251,6 @@ class LabScheduler:
                 delivery_failures=delivery_failures,
                 revoke_failures=1,
             )
-        self._claim_authority_cursor = hot_batch.next_cursor
         stale = tuple(
             delivery
             for delivery in hot_batch.claims

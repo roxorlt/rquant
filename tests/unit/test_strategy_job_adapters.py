@@ -372,6 +372,93 @@ def test_aggregate_rejects_column_order_and_dtype_conflicts(
 
 
 @pytest.mark.parametrize(
+    "frames",
+    [
+        (
+            pd.DataFrame(
+                {
+                    "value": pd.Series(
+                        ["a"],
+                        dtype=pd.CategoricalDtype(["a", "b"], ordered=False),
+                    )
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "value": pd.Series(
+                        ["a"],
+                        dtype=pd.CategoricalDtype(["a", "c"], ordered=False),
+                    )
+                }
+            ),
+        ),
+        (
+            pd.DataFrame(
+                {
+                    "value": pd.Series(
+                        ["a"],
+                        dtype=pd.CategoricalDtype(["a", "b"], ordered=False),
+                    )
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "value": pd.Series(
+                        ["a"],
+                        dtype=pd.CategoricalDtype(["a", "b"], ordered=True),
+                    )
+                }
+            ),
+        ),
+        (
+            pd.DataFrame({"value": pd.Series(pd.to_datetime(["2026-01-01"], utc=True))}),
+            pd.DataFrame(
+                {
+                    "value": pd.Series(
+                        pd.to_datetime(["2026-01-01"], utc=True).tz_convert("Asia/Shanghai")
+                    )
+                }
+            ),
+        ),
+        (
+            pd.DataFrame({"value": pd.Series([1], dtype="Int64")}),
+            pd.DataFrame({"value": pd.Series([1], dtype="UInt64")}),
+        ),
+    ],
+    ids=("categorical-values", "categorical-ordered", "timezone", "nullable"),
+)
+def test_aggregate_rejects_full_dtype_identity_conflicts(
+    frames: tuple[pd.DataFrame, pd.DataFrame],
+) -> None:
+    from rquant.strategy_job_adapters import _concat_shard_frames
+
+    with pytest.raises(ValueError, match="schema"):
+        _concat_shard_frames(frames)
+
+
+def test_aggregate_rejects_concat_output_dtype_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.strategy_job_adapters as adapters
+
+    original_concat = pd.concat
+
+    def drift_dtype(*args: object, **kwargs: object) -> pd.DataFrame:
+        result = original_concat(*args, **kwargs)
+        result["value"] = result["value"].astype("float64")
+        return result
+
+    monkeypatch.setattr(adapters.pd, "concat", drift_dtype)
+    frames = (
+        pd.DataFrame({"value": pd.Series([1], dtype="int64")}),
+        pd.DataFrame({"value": pd.Series([2], dtype="int64")}),
+    )
+
+    with pytest.raises(ValueError, match="output schema"):
+        adapters._concat_shard_frames(frames)
+
+
+@pytest.mark.parametrize(
     ("spec", "message"),
     [
         (

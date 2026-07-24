@@ -288,25 +288,54 @@ def test_consumed_claim_republish_is_idempotent_without_second_delivery(
     assert len(tuple(LabClaimSpool(root).ack_dir.glob("*.json"))) == 1
 
 
-def test_hot_claim_batches_are_bounded_and_ignore_consumed_history(tmp_path: Path) -> None:
-    spool = LabClaimSpool(tmp_path / "claims")
+def test_hot_claim_batches_are_fair_bounded_and_ignore_cold_consumed_history(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    spool = LabClaimSpool(root)
     claims = tuple(_claim(definition=_definition(index=index)) for index in range(4))
     for claim in claims:
         spool.publish(claim)
     consumed = _claim(definition=_definition(index=10))
     spool.consume(spool.publish(consumed))
+    revoked = _claim(definition=_definition(index=11))
+    spool.revoke(spool.publish(revoked).claim, reason="terminal fixture")
 
-    first = spool.hot_delivery_batch(limit=2)
-    second = spool.hot_delivery_batch(limit=2, cursor=first.next_cursor)
+    batches = tuple(LabClaimSpool(root).hot_delivery_batch(limit=2) for _ in range(8))
+    observed_tokens = {claim.claim_token for batch in batches for claim in batch.claims}
+    observed_namespaces = {namespace for batch in batches for namespace in batch.scanned_namespaces}
 
-    assert len(first.claims) == 2
-    assert len(second.claims) == 2
-    assert {claim.claim_token for claim in first.claims + second.claims} == {
-        claim.claim_token for claim in claims
-    }
-    assert consumed.claim_token not in {claim.claim_token for claim in first.claims + second.claims}
-    assert first.inspected <= 2
-    assert second.inspected <= 2
+    assert {claim.claim_token for claim in claims}.issubset(observed_tokens)
+    assert consumed.claim_token in observed_tokens
+    assert revoked.claim_token in observed_tokens
+    assert observed_namespaces == {"pending", "current", "revoked"}
+    assert all(batch.inspected <= 2 for batch in batches)
+
+
+def test_hot_claim_scan_does_not_glob_or_parse_cold_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    for index in range(10_000):
+        (spool.ack_dir / f"{UUID(int=index + 1)}.json").write_bytes(b"{}")
+        (spool.archived_revoked_dir / f"{UUID(int=index + 20_000)}.json").write_bytes(b"{}")
+
+    def reject_glob(_self: Path, _pattern: str) -> tuple[Path, ...]:
+        raise AssertionError("hot authority scan must use bounded namespace scandir")
+
+    def reject_cold_parse(_token: UUID) -> object:
+        raise AssertionError("hot authority scan must not parse cold claim history")
+
+    monkeypatch.setattr(Path, "glob", reject_glob)
+    monkeypatch.setattr(spool, "_load_consumed_locked", reject_cold_parse)
+    monkeypatch.setattr(spool, "_load_archived_revocation_locked", reject_cold_parse)
+
+    batch = spool.hot_delivery_batch(limit=2)
+
+    assert batch.claims == ()
+    assert batch.inspected == 0
+    assert batch.scanned_namespaces == ()
 
 
 def test_retire_removes_hot_current_but_preserves_exact_high_water(tmp_path: Path) -> None:
