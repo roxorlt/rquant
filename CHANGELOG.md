@@ -46,8 +46,11 @@
   scheduler fence；后台 heartbeat 覆盖 candidate 的完整写入、回读、hash 与 fsync，最终同步
   heartbeat receipt 被 scheduler 接受且 rename 前后 fence 仍有效时才可按 attempt 原子 seal。
   success report 的已发布、等待 receipt 与未知状态保持同一 report identity，超时不再追加矛盾
-  的 failed report。worker 在 stop、heartbeat 发布失败、deadline、并发 rename 与崩溃临时目录
-  回收边界均 fail closed。正式任务复用完整 research gate 并核对运行时代码 SHA、snapshot/
+  的 failed report；SIGTERM 只置位无锁 stop flag，不会重入 success PNR 锁。新 generation
+  发布前会交叉验证 canonical manifest、artifact bytes 与 durable success report/receipt，安全
+  回收未被 scheduler 接受的旧 sealed attempt，同时保护 pending/accepted terminal artifact。
+  worker 在 stop、heartbeat 发布失败、deadline、并发 rename 与崩溃临时目录回收边界均
+  fail closed。正式任务复用完整 research gate 并核对运行时代码 SHA、snapshot/
   binding/audit 证据；adapter registry 以既有 strategy name 与 job type 共同选型，execution
   contract 绑定代码身份。四类策略统一应用版本化 A 股双边交易成本，N 字优化以净收益完成
   训练、验证、TopN 与 walk-forward 排序；scheduler 持久终态化 deadline 和 adapter plan

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import builtins
 import inspect
+import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -150,6 +155,114 @@ def _retry_claim(claim: LabShardClaim) -> LabShardClaim:
 
 def _reports(spool: LabReportSpool):
     return tuple(entry.report for entry in spool.pending())
+
+
+def _sigterm_publication_child(root_value: str, phase: str) -> None:
+    root = Path(root_value)
+    claims = LabClaimSpool(root / "claims")
+    reports = LabReportSpool(root / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker_ref: list[object] = []
+
+    def receipt_waiter(
+        report: LabWorkerReport,
+        timeout_seconds: float,
+        stop: object,
+    ) -> LabReportReceipt:
+        if phase == "after" and isinstance(report.body, LabShardSucceeded):
+            worker = worker_ref[0]
+            return worker._wait_for_receipt(report, timeout_seconds, stop)
+        return _accept_report(report, timeout_seconds, stop)
+
+    worker = _worker(
+        root,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=receipt_waiter,
+    )
+    worker_ref.append(worker)
+    original_publish = reports.publish
+    signalled = False
+
+    def signal_at_boundary(report: LabWorkerReport) -> object:
+        nonlocal signalled
+        before = phase == "before" and isinstance(report.body, LabShardHeartbeat)
+        after = phase == "after" and isinstance(report.body, LabShardSucceeded)
+        if not signalled and (before or after):
+            signalled = True
+            os.kill(os.getpid(), signal.SIGTERM)
+        return original_publish(report)
+
+    reports.publish = signal_at_boundary  # type: ignore[method-assign]
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: worker.request_stop())
+    result = worker.run_once()
+    bodies = tuple(report.body for report in _reports(reports))
+    (root / "result.json").write_text(
+        json.dumps(
+            {
+                "failed": sum(isinstance(body, LabShardFailed) for body in bodies),
+                "sealed": worker.sealed_bundle_path(claim).exists(),
+                "status": result.status,
+                "stopped": sum(isinstance(body, LabWorkerStopped) for body in bodies),
+                "succeeded": sum(isinstance(body, LabShardSucceeded) for body in bodies),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _crash_after_atomic_rename_child(root_value: str) -> None:
+    root = Path(root_value)
+    claims = LabClaimSpool(root / "claims")
+    reports = LabReportSpool(root / "reports")
+    worker = _worker(root, claims=claims, reports=reports)
+    original_publish = reports.publish
+
+    def crash_before_success_publish(report: LabWorkerReport) -> object:
+        if isinstance(report.body, LabShardSucceeded):
+            os._exit(77)
+        return original_publish(report)
+
+    reports.publish = crash_before_success_publish  # type: ignore[method-assign]
+    worker.run_once()
+    os._exit(78)
+
+
+def _run_worker_child(
+    helper_name: str,
+    root: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    source = (
+        f"from tests.unit.test_lab_worker import {helper_name}; "
+        f"{helper_name}(*__import__('sys').argv[1:])"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2])
+    process = subprocess.Popen(
+        [sys.executable, "-c", source, str(root), *arguments],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=4)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate(timeout=1)
+        pytest.fail(
+            f"worker child timed out: stdout={stdout!r} stderr={stderr!r}"
+        )
+    return subprocess.CompletedProcess(
+        process.args,
+        process.returncode,
+        stdout,
+        stderr,
+    )
 
 
 def test_worker_consumes_only_its_owned_unexpired_claim(tmp_path: Path) -> None:
@@ -765,7 +878,9 @@ def test_stop_during_execution_reports_stopped_without_sealing(tmp_path: Path) -
     assert not worker.sealed_bundle_path(claim).exists()
 
 
-def test_bundle_is_atomic_canonical_and_attempt_scoped_across_retry(tmp_path: Path) -> None:
+def test_bundle_is_canonical_and_obsolete_attempt_is_reclaimed_across_retry(
+    tmp_path: Path,
+) -> None:
     from rquant.lab_worker import LabShardResultManifest
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -780,18 +895,21 @@ def test_bundle_is_atomic_canonical_and_attempt_scoped_across_retry(tmp_path: Pa
         reports=reports,
     )
 
-    first = worker.run_once()
+    validated = worker.adapter_registry.validate_claim(claim)
+    first_result = registry.execute_shard(validated, object())
+    first = worker._seal_result(claim, first_result)
     sealed = worker.sealed_bundle_path(claim)
     manifest_path = sealed / "manifest.json"
     manifest = LabShardResultManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-    retry = _retry_claim(claim)
-    claims.publish(retry)
-    second = worker.run_once()
-
     assert first.manifest_hash == manifest.manifest_hash
-    assert second.manifest_hash != first.manifest_hash
     assert manifest_path.read_text(encoding="utf-8") == manifest.canonical_json()
     assert (sealed / manifest.artifacts[0].file_name).is_file()
+    retry = _retry_claim(claim)
+    claims.publish(retry)
+    assert not sealed.exists()
+    second = worker.run_once()
+
+    assert second.manifest_hash != first.manifest_hash
     assert manifest.claim_token == claim.claim_token
     assert manifest.claim_generation == claim.claim_generation
     assert manifest.scheduler_fencing_token == claim.scheduler_fencing_token
@@ -1451,6 +1569,33 @@ def test_stop_after_success_publish_keeps_single_reported_terminal(
     assert not any(isinstance(body, LabShardFailed | LabWorkerStopped) for body in bodies)
 
 
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        (
+            "before",
+            {"failed": 0, "sealed": False, "status": "stopped", "stopped": 1, "succeeded": 0},
+        ),
+        (
+            "after",
+            {"failed": 0, "sealed": True, "status": "reported", "stopped": 0, "succeeded": 1},
+        ),
+    ],
+)
+def test_real_sigterm_never_deadlocks_success_publication_boundary(
+    tmp_path: Path,
+    phase: str,
+    expected: dict[str, object],
+) -> None:
+    root = tmp_path / phase
+    root.mkdir()
+
+    completed = _run_worker_child("_sigterm_publication_child", root, phase)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((root / "result.json").read_text(encoding="utf-8")) == expected
+
+
 def test_rejected_success_receipt_returns_failed_without_second_terminal_report(
     tmp_path: Path,
 ) -> None:
@@ -1614,3 +1759,294 @@ def test_crash_without_report_is_reclaimed_by_existing_lease_recovery(
     assert recovered.shard_id == original.shard_id
     assert recovered.claim_generation == original.claim_generation + 1
     assert recovered.claim_token != original.claim_token
+
+
+def test_hard_crash_after_rename_is_reclaimed_before_generation_two_runs(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    clock = [NOW]
+    artifact_root = tmp_path / "artifacts"
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=artifact_root,
+        report_spool=reports,
+    )
+    claims = LabClaimSpool(
+        tmp_path / "claims",
+        claim_advance_hook=reclaimer.reclaim,
+    )
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job_id = uuid4()
+    commands.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(
+                job_id=job_id,
+                spec=_nshape_compare_spec(hold_days=(1,)),
+                max_attempts=2,
+            ),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=20,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    generation_one = claims.pending()[0].claim
+    crashed = _run_worker_child("_crash_after_atomic_rename_child", tmp_path)
+    sealed_one = reclaimer.sealed_bundle_path(generation_one)
+
+    assert crashed.returncode == 77, crashed.stderr
+    assert sealed_one.is_dir()
+
+    clock[0] = NOW + timedelta(seconds=21)
+    recovery = scheduler.run_once()
+    generation_two = claims.pending()[0].claim
+
+    assert recovery.recovered == 1
+    assert generation_two.claim_generation == generation_one.claim_generation + 1
+    assert not sealed_one.exists()
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=None,
+        clock=lambda: clock[0],
+    )
+    outcomes = []
+    thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+    thread.start()
+    timeout_at = time.monotonic() + 3
+    while thread.is_alive() and time.monotonic() < timeout_at:
+        scheduler.run_once()
+        time.sleep(0.01)
+    thread.join(timeout=0.2)
+    job = LabJobReader(store.path).get_job(job_id)
+    scheduler.release()
+
+    assert not thread.is_alive()
+    assert outcomes[0].status == "succeeded"
+    assert worker.sealed_bundle_path(generation_two).is_dir()
+    assert job is not None and job.status is JobStatus.SUCCEEDED
+
+
+def test_pending_success_evidence_blocks_obsolete_sealed_reclamation(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    claims = LabClaimSpool(
+        tmp_path / "claims",
+        claim_advance_hook=reclaimer.reclaim,
+    )
+    generation_one = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(generation_one)
+    worker = _worker(tmp_path, claims=claims, reports=reports)
+    validated = worker.adapter_registry.validate_claim(generation_one)
+    result = RecordingRegistry().execute_shard(validated, object())
+    manifest = worker._seal_result(generation_one, result)
+    success = LabWorkerReport.from_claim(
+        generation_one,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+    )
+    reports.publish(success)
+
+    with pytest.raises(LabArtifactConflictError, match="pending success"):
+        claims.publish(_retry_claim(generation_one))
+
+    assert claims.current(generation_one.job_id, generation_one.shard_id).claim == generation_one
+    assert worker.sealed_bundle_path(generation_one).is_dir()
+
+
+def test_rejected_success_receipt_allows_obsolete_sealed_reclamation(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    generation_one = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path, reports=reports)
+    validated = worker.adapter_registry.validate_claim(generation_one)
+    result = RecordingRegistry().execute_shard(validated, object())
+    manifest = worker._seal_result(generation_one, result)
+    success = LabWorkerReport.from_claim(
+        generation_one,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+    )
+    entry = reports.publish(success)
+    reports.ack(
+        entry,
+        LabReportReceipt.from_report(
+            success,
+            status="rejected",
+            reason="claim_generation_mismatch",
+            accepted_at=NOW,
+        ),
+    )
+
+    reclaimer.reclaim(_retry_claim(generation_one))
+
+    assert not worker.sealed_bundle_path(generation_one).exists()
+
+
+def test_reclaimer_preserves_current_attempt_and_rejects_unsafe_entries(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    current = _retry_claim(_claim(_nshape_compare_spec(hold_days=(1,))))
+    worker = _worker(tmp_path, reports=reports)
+    validated = worker.adapter_registry.validate_claim(current)
+    result = RecordingRegistry().execute_shard(validated, object())
+    worker._seal_result(current, result)
+    current_path = worker.sealed_bundle_path(current)
+
+    reclaimer.reclaim(current)
+    assert current_path.is_dir()
+
+    attempts_root = current_path.parent
+    unknown = attempts_root / "unknown-attempt"
+    unknown.mkdir()
+    with pytest.raises(LabArtifactConflictError, match="invalid temporary attempt"):
+        reclaimer.reclaim(current)
+    assert unknown.is_dir()
+    unknown.rmdir()
+
+    future = _retry_claim(current)
+    future_path = reclaimer.sealed_bundle_path(future)
+    future_path.mkdir()
+    with pytest.raises(LabArtifactConflictError, match="future sealed attempt"):
+        reclaimer.reclaim(current)
+    assert future_path.is_dir()
+    future_path.rmdir()
+
+    outside = tmp_path / "outside-sealed"
+    outside.mkdir()
+    (outside / "keep").write_text("safe", encoding="utf-8")
+    obsolete = current.model_copy(
+        update={
+            "claim_generation": current.claim_generation - 1,
+            "claim_token": uuid4(),
+        }
+    )
+    obsolete_path = reclaimer.sealed_bundle_path(obsolete)
+    obsolete_path.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(LabArtifactConflictError, match="symlink"):
+        reclaimer.reclaim(current)
+    assert (outside / "keep").read_text(encoding="utf-8") == "safe"
+
+
+def test_unread_accepted_success_receipt_preserves_terminal_artifact(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
+    from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    clock = [NOW]
+    reports = LabReportSpool(tmp_path / "reports")
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    claims = LabClaimSpool(
+        tmp_path / "claims",
+        claim_advance_hook=reclaimer.reclaim,
+    )
+    commands = LabCommandSpool(tmp_path / "commands")
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job_id = uuid4()
+    commands.publish(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=SubmitJobCommand(
+                job_id=job_id,
+                spec=_nshape_compare_spec(hold_days=(1,)),
+                max_attempts=2,
+            ),
+        )
+    )
+    scheduler = LabScheduler(
+        store=store,
+        spool=commands,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=5,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+        shard_lease_seconds=20,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    generation_one = claims.pending()[0].claim
+
+    def delay_success_receipt(
+        report: LabWorkerReport,
+        timeout_seconds: float,
+        stop: object,
+    ) -> LabReportReceipt:
+        if isinstance(report.body, LabShardSucceeded):
+            raise TimeoutError("leave accepted receipt unread")
+        return _accept_report(report, timeout_seconds, stop)
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=delay_success_receipt,
+        clock=lambda: clock[0],
+    )
+    pending = worker.run_once()
+    scheduler.run_once()
+    job = LabJobReader(store.path).get_job(job_id)
+
+    assert pending.status == "awaiting_receipt"
+    assert job is not None and job.status is JobStatus.SUCCEEDED
+    assert reports.ack_dir.joinpath(f"{pending.report_id}.json").is_file()
+    with pytest.raises(LabArtifactConflictError, match="accepted success"):
+        claims.publish(_retry_claim(generation_one))
+
+    assert claims.current(generation_one.job_id, generation_one.shard_id).claim == generation_one
+    assert worker.sealed_bundle_path(generation_one).is_dir()
+    scheduler.release()

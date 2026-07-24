@@ -3029,6 +3029,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     from rquant.lab_jobs import LabJobStore
     from rquant.lab_scheduler import LabScheduler
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+    from rquant.lab_worker import LabArtifactReclaimer
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
@@ -3037,6 +3038,15 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
     )
     store.initialize()
+    report_spool = LabReportSpool(settings.lab_job_report_dir_resolved)
+    artifact_reclaimer = LabArtifactReclaimer(
+        artifact_root=settings.lab_worker_artifact_dir_resolved,
+        report_spool=report_spool,
+    )
+    claim_spool = LabClaimSpool(
+        settings.lab_job_claim_dir_resolved,
+        claim_advance_hook=artifact_reclaimer.reclaim,
+    )
     scheduler = LabScheduler(
         store=store,
         spool=LabCommandSpool(settings.lab_job_command_dir_resolved),
@@ -3044,8 +3054,8 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         lease_seconds=settings.lab_scheduler_lease_seconds,
         heartbeat_seconds=settings.lab_scheduler_heartbeat_seconds,
         poll_interval_ms=settings.lab_scheduler_poll_interval_ms,
-        report_spool=LabReportSpool(settings.lab_job_report_dir_resolved),
-        claim_spool=LabClaimSpool(settings.lab_job_claim_dir_resolved),
+        report_spool=report_spool,
+        claim_spool=claim_spool,
         claim_worker_ids=settings.lab_scheduler_worker_id_list,
         shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
         max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,

@@ -238,6 +238,25 @@ def test_report_spool_exactly_once_ack_restart_and_conflict(tmp_path: Path) -> N
         restarted.publish(conflict)
 
 
+def test_success_receipt_carries_attempt_and_manifest_identity() -> None:
+    claim = _claim(generation=2, fence=9)
+    report = _report(claim, LabShardSucceeded(result_manifest_hash="3" * 64))
+
+    receipt = LabReportReceipt.from_report(
+        report,
+        status="accepted",
+        reason="shard_succeeded",
+        accepted_at=NOW + timedelta(seconds=6),
+    )
+
+    assert receipt.worker_id == claim.worker_id
+    assert receipt.claim_token == claim.claim_token
+    assert receipt.claim_generation == claim.claim_generation
+    assert receipt.scheduler_fencing_token == claim.scheduler_fencing_token
+    assert receipt.report_type == "shard_succeeded"
+    assert receipt.result_manifest_hash == "3" * 64
+
+
 def test_report_commit_before_ack_replay_keeps_same_typed_receipt(tmp_path: Path) -> None:
     spool = LabReportSpool(tmp_path / "reports")
     report = _report(_claim(), LabShardHeartbeat(lease_extension_seconds=15))

@@ -3623,8 +3623,14 @@ class TestLabSchedulerCli:
                 calls.append(f"spool:{path.name}")
 
         class FakeClaimSpool:
-            def __init__(self, path: Path) -> None:
+            def __init__(
+                self,
+                path: Path,
+                *,
+                claim_advance_hook: object,
+            ) -> None:
                 calls.append(f"claim_spool:{path.name}")
+                assert callable(claim_advance_hook)
 
         class FakeReportSpool:
             def __init__(self, path: Path) -> None:

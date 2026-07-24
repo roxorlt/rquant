@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -324,6 +325,17 @@ class LabReportReceipt(LabShardProtocolModel):
     content_hash: str = Field(pattern=_HASH_PATTERN)
     job_id: UUID
     shard_id: UUID
+    worker_id: str | None = Field(default=None, min_length=1)
+    claim_token: UUID | None = None
+    claim_generation: int | None = Field(default=None, strict=True, ge=1)
+    scheduler_fencing_token: int | None = Field(default=None, strict=True, ge=1)
+    report_type: Literal[
+        "heartbeat",
+        "shard_succeeded",
+        "shard_failed",
+        "worker_stopped",
+    ] | None = None
+    result_manifest_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
     status: Literal["accepted", "rejected"]
     reason: str = Field(min_length=1)
     accepted_at: datetime
@@ -342,6 +354,16 @@ class LabReportReceipt(LabShardProtocolModel):
             content_hash=report.content_hash,
             job_id=report.job_id,
             shard_id=report.shard_id,
+            worker_id=report.worker_id,
+            claim_token=report.claim_token,
+            claim_generation=report.claim_generation,
+            scheduler_fencing_token=report.scheduler_fencing_token,
+            report_type=report.body.report_type,
+            result_manifest_hash=(
+                report.body.result_manifest_hash
+                if isinstance(report.body, LabShardSucceeded)
+                else None
+            ),
             status=status,
             reason=reason,
             accepted_at=accepted_at,
@@ -349,6 +371,22 @@ class LabReportReceipt(LabShardProtocolModel):
 
     @model_validator(mode="after")
     def validate_time(self) -> LabReportReceipt:
+        identity = (
+            self.worker_id,
+            self.claim_token,
+            self.claim_generation,
+            self.scheduler_fencing_token,
+            self.report_type,
+        )
+        if any(value is not None for value in identity) and not all(
+            value is not None for value in identity
+        ):
+            raise ValueError("receipt attempt identity must be complete when present")
+        if self.report_type == "shard_succeeded":
+            if self.result_manifest_hash is None:
+                raise ValueError("success receipt requires result_manifest_hash")
+        elif self.result_manifest_hash is not None:
+            raise ValueError("only success receipt may contain result_manifest_hash")
         object.__setattr__(self, "accepted_at", _utc(self.accepted_at, field="accepted_at"))
         return self
 
@@ -433,10 +471,22 @@ class _TypedSpoolBase(LabCommandSpool):
 class LabClaimSpool(_TypedSpoolBase):
     """Scheduler-to-worker durable claim channel."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        claim_advance_hook: Callable[[LabShardClaim], None] | None = None,
+    ) -> None:
         super().__init__(root)
         self.current_dir = self.root / "current"
         self.current_dir.mkdir(parents=True, exist_ok=True)
+        self._claim_advance_hook = claim_advance_hook
+
+    def set_claim_advance_hook(
+        self,
+        hook: Callable[[LabShardClaim], None],
+    ) -> None:
+        self._claim_advance_hook = hook
 
     @staticmethod
     def _claim_order(claim: LabShardClaim) -> tuple[int, int, datetime, int]:
@@ -504,6 +554,8 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def publish(self, claim: LabShardClaim) -> LabClaimSpoolEntry:
         validated = LabShardClaim.model_validate(claim)
+        if self._claim_advance_hook is not None:
+            self._claim_advance_hook(validated)
         payload = validated.model_dump_json().encode("utf-8")
         with self._exclusive_lock():
             if os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
@@ -660,6 +712,26 @@ class LabReportSpool(_TypedSpoolBase):
             or receipt.shard_id != entry.report.shard_id
         ):
             raise ValueError("receipt does not match worker report")
+        if receipt.claim_token is not None and (
+            receipt.worker_id,
+            receipt.claim_token,
+            receipt.claim_generation,
+            receipt.scheduler_fencing_token,
+            receipt.report_type,
+            receipt.result_manifest_hash,
+        ) != (
+            entry.report.worker_id,
+            entry.report.claim_token,
+            entry.report.claim_generation,
+            entry.report.scheduler_fencing_token,
+            entry.report.body.report_type,
+            (
+                entry.report.body.result_manifest_hash
+                if isinstance(entry.report.body, LabShardSucceeded)
+                else None
+            ),
+        ):
+            raise ValueError("receipt attempt identity does not match worker report")
         with self._exclusive_lock():
             current = self.load(entry.path)
             if (current.device, current.inode) != (entry.device, entry.inode):

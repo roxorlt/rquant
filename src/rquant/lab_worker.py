@@ -241,8 +241,27 @@ class LabArtifactConflictError(RuntimeError):
     """A sealed shard bundle exists but is not the expected immutable result."""
 
 
+class LabStopSignal:
+    """Signal-handler-safe cooperative stop flag with bounded polling waits."""
+
+    def __init__(self) -> None:
+        self._requested = False
+
+    def request(self) -> None:
+        self._requested = True
+
+    def is_set(self) -> bool:
+        return self._requested
+
+    def wait(self, timeout_seconds: float) -> bool:
+        if self._requested:
+            return True
+        time.sleep(max(0.0, timeout_seconds))
+        return self._requested
+
+
 StoreFactory = Callable[[], AbstractContextManager[object]]
-ReceiptWaiter = Callable[[LabWorkerReport, float, threading.Event], LabReportReceipt]
+ReceiptWaiter = Callable[[LabWorkerReport, float, LabStopSignal], LabReportReceipt]
 CodeShaProvider = Callable[[], str | None]
 
 
@@ -294,13 +313,17 @@ class LabWorker:
         self.receipt_waiter = receipt_waiter or self._wait_for_receipt
         self.verified_code_sha_provider = verified_code_sha_provider
         self.clock = clock
-        self._stop = threading.Event()
+        self.artifact_reclaimer = LabArtifactReclaimer(
+            artifact_root=self.artifact_root,
+            report_spool=self.report_spool,
+        )
+        self.claim_spool.set_claim_advance_hook(self.artifact_reclaimer.reclaim)
+        self._stop = LabStopSignal()
         self._terminal_lock = threading.Lock()
         self._pending_success: LabPendingSuccess | None = None
 
     def request_stop(self) -> None:
-        with self._terminal_lock:
-            self._stop.set()
+        self._stop.request()
 
     def sealed_bundle_path(self, claim: LabShardClaim) -> Path:
         shard_root = (
@@ -484,7 +507,7 @@ class LabWorker:
         self,
         report: LabWorkerReport,
         timeout_seconds: float,
-        stop: threading.Event,
+        stop: LabStopSignal,
     ) -> LabReportReceipt:
         timeout_at = time.monotonic() + timeout_seconds
         receipt_path = self.report_spool.ack_dir / f"{report.report_id}.json"
@@ -511,7 +534,7 @@ class LabWorker:
         claim: LabShardClaim,
         body: LabShardHeartbeat | LabShardSucceeded,
         *,
-        stop: threading.Event,
+        stop: LabStopSignal,
     ) -> LabReportReceipt:
         report = self._publish_report(claim, body)
         receipt = self.receipt_waiter(report, self.receipt_timeout_seconds, stop)
@@ -1109,6 +1132,7 @@ class LabWorker:
 
         try:
             self._reclaim_obsolete_temporaries(claim)
+            self.artifact_reclaimer.reclaim(claim)
         except Exception as exc:
             return self._failure_result(claim, phase="claim", error=exc)
 
@@ -1309,3 +1333,188 @@ class LabWorker:
         finally:
             if previous_handler is not None:
                 signal.signal(signal.SIGTERM, previous_handler)
+
+
+class LabArtifactReclaimer:
+    """Remove only superseded attempt bundles without accepted success evidence."""
+
+    def __init__(
+        self,
+        *,
+        artifact_root: Path,
+        report_spool: LabReportSpool,
+    ) -> None:
+        self.artifact_root = Path(artifact_root).resolve()
+        self.report_spool = report_spool
+
+    @staticmethod
+    def _attempt_name(claim: LabShardClaim) -> str:
+        return LabWorker._attempt_name(claim)
+
+    @staticmethod
+    def _parse_attempt_name(name: str) -> tuple[int, int, UUID]:
+        return LabWorker._parse_attempt_name(name)
+
+    @staticmethod
+    def _expected_manifest_identity(
+        claim: LabShardClaim,
+        manifest: LabShardResultManifest,
+    ) -> bool:
+        return LabWorker._expected_manifest_identity(claim, manifest)
+
+    @staticmethod
+    def _assert_safe_temporary_tree(path: Path) -> None:
+        LabWorker._assert_safe_temporary_tree(path)
+
+    def _assert_safe_artifact_ancestors(self, path: Path) -> None:
+        LabWorker._assert_safe_artifact_ancestors(self, path)
+
+    def _validate_bundle(
+        self,
+        bundle: Path,
+        claim: LabShardClaim,
+    ) -> LabShardResultManifest:
+        return LabWorker._validate_bundle(self, bundle, claim)
+
+    def sealed_bundle_path(self, claim: LabShardClaim) -> Path:
+        return (
+            self.artifact_root
+            / "jobs"
+            / str(claim.job_id)
+            / "shards"
+            / str(claim.shard_id)
+            / "attempts"
+            / self._attempt_name(claim)
+        )
+
+    @staticmethod
+    def _report_matches_attempt(
+        report: LabWorkerReport,
+        claim: LabShardClaim,
+    ) -> bool:
+        return (
+            report.job_id,
+            report.shard_id,
+            report.claim_token,
+            report.claim_generation,
+            report.scheduler_fencing_token,
+        ) == (
+            claim.job_id,
+            claim.shard_id,
+            claim.claim_token,
+            claim.claim_generation,
+            claim.scheduler_fencing_token,
+        )
+
+    @staticmethod
+    def _receipt_matches_attempt(
+        receipt: LabReportReceipt,
+        claim: LabShardClaim,
+    ) -> bool:
+        return (
+            receipt.job_id,
+            receipt.shard_id,
+            receipt.claim_token,
+            receipt.claim_generation,
+            receipt.scheduler_fencing_token,
+        ) == (
+            claim.job_id,
+            claim.shard_id,
+            claim.claim_token,
+            claim.claim_generation,
+            claim.scheduler_fencing_token,
+        )
+
+    def _assert_no_terminal_success_evidence(
+        self,
+        claim: LabShardClaim,
+        manifest: LabShardResultManifest,
+    ) -> None:
+        for entry in self.report_spool.pending():
+            report = entry.report
+            if not self._report_matches_attempt(report, claim):
+                continue
+            if not isinstance(report.body, LabShardSucceeded):
+                continue
+            if report.body.result_manifest_hash != manifest.manifest_hash:
+                raise LabArtifactConflictError(
+                    "pending success manifest conflicts with sealed attempt"
+                )
+            raise LabArtifactConflictError(
+                "pending success may already be committed before receipt ack"
+            )
+
+        for path in sorted(self.report_spool.ack_dir.glob("*.json")):
+            receipt = self.report_spool.load_receipt(path)
+            if (receipt.job_id, receipt.shard_id) != (claim.job_id, claim.shard_id):
+                continue
+            if receipt.claim_token is None:
+                if receipt.status == "accepted":
+                    raise LabArtifactConflictError(
+                        "legacy accepted receipt cannot prove a safe attempt deletion"
+                    )
+                continue
+            if not self._receipt_matches_attempt(receipt, claim):
+                continue
+            if receipt.report_type != "shard_succeeded":
+                continue
+            if receipt.result_manifest_hash != manifest.manifest_hash:
+                raise LabArtifactConflictError(
+                    "success receipt manifest conflicts with sealed attempt"
+                )
+            if receipt.status == "accepted":
+                raise LabArtifactConflictError(
+                    "accepted success receipt protects terminal artifact"
+                )
+
+    def reclaim(self, current_claim: LabShardClaim) -> None:
+        validated = LabShardClaim.model_validate(current_claim)
+        attempts_root = self.sealed_bundle_path(validated).parent
+        self._assert_safe_artifact_ancestors(attempts_root)
+        if not attempts_root.exists():
+            return
+        if attempts_root.is_symlink() or not attempts_root.is_dir():
+            raise LabArtifactConflictError("sealed attempts root is unsafe")
+
+        current_identity = (
+            validated.scheduler_fencing_token,
+            validated.claim_generation,
+            validated.claim_token,
+        )
+        for candidate in tuple(attempts_root.iterdir()):
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise LabArtifactConflictError(
+                    f"sealed attempt is a symlink or not a directory: {candidate.name}"
+                )
+            fence, generation, token = self._parse_attempt_name(candidate.name)
+            candidate_identity = (fence, generation, token)
+            if generation > validated.claim_generation:
+                raise LabArtifactConflictError(
+                    "future sealed attempt conflicts with durable claim high-water"
+                )
+            if generation == validated.claim_generation:
+                if candidate_identity != current_identity:
+                    raise LabArtifactConflictError(
+                        "current-generation sealed attempt has conflicting identity"
+                    )
+                continue
+
+            obsolete_claim = validated.model_copy(
+                update={
+                    "claim_token": token,
+                    "claim_generation": generation,
+                    "scheduler_fencing_token": fence,
+                }
+            )
+            if self.sealed_bundle_path(obsolete_claim) != candidate:
+                raise LabArtifactConflictError(
+                    "sealed attempt directory does not match parsed identity"
+                )
+            manifest = self._validate_bundle(candidate, obsolete_claim)
+            self._assert_no_terminal_success_evidence(obsolete_claim, manifest)
+            reclaimed = attempts_root / f".reclaim-{candidate.name}-{uuid4().hex}"
+            os.rename(candidate, reclaimed)
+            _fsync_directory(attempts_root)
+            self._assert_safe_temporary_tree(reclaimed)
+            shutil.rmtree(reclaimed)
+            _fsync_directory(attempts_root)
