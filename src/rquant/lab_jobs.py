@@ -2918,9 +2918,7 @@ class LabJobStore:
             for row in rows:
                 job_id = UUID(str(row["job_id"]))
                 source = JobStatus(str(row["status"]))
-                version = _strict_sqlite_int(
-                    row["version"], field="lab_job.version", minimum=0
-                )
+                version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
                 connection.execute(
                     """
                     UPDATE lab_shard
@@ -3512,8 +3510,7 @@ class LabJobStore:
                                 minimum=1,
                             ),
                             claimed_at=claimed_at,
-                            lease_expires_at=claimed_at
-                            + timedelta(seconds=initial_lease_seconds),
+                            lease_expires_at=claimed_at + timedelta(seconds=initial_lease_seconds),
                         )
                     )
                 except Exception as exc:
@@ -3521,6 +3518,37 @@ class LabJobStore:
                         f"invalid active claim for shard {row['shard_id']}: {exc}"
                     ) from exc
         return tuple(claims)
+
+    def list_accepted_success_claim_tokens(
+        self,
+        lease: LabLeaseRecord,
+        *,
+        now: datetime,
+    ) -> frozenset[UUID]:
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, now=current)
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_worker_report
+                WHERE status = 'accepted'
+                  AND report_type = 'shard_succeeded'
+                ORDER BY applied_at, report_id
+                """
+            ).fetchall()
+            tokens: set[UUID] = set()
+            for row in rows:
+                report_id = UUID(str(row["report_id"]))
+                record = _worker_report_record_from_row(
+                    row,
+                    expected_report_id=report_id,
+                )
+                if not isinstance(record.report.body, LabShardSucceeded):
+                    raise InvalidStoredJobError(
+                        f"accepted success report {report_id} has invalid body"
+                    )
+                tokens.add(record.report.claim_token)
+        return frozenset(tokens)
 
     @staticmethod
     def _report_receipt(

@@ -18,7 +18,10 @@ from rquant.lab_shard_protocol import (
     LabReportReceipt,
     LabReportSpool,
     LabReportSpoolEntry,
+    LabRevokedClaim,
+    LabShardFailed,
     LabShardHeartbeat,
+    LabShardSucceeded,
     LabWorkerReport,
 )
 
@@ -516,7 +519,7 @@ def test_scheduler_takeover_without_workers_converges_expired_control_intent(
     assert shard.claim_token is None
     assert result.claims_revoked == 1
     assert claims.pending() == ()
-    assert claims.publish(claim).receipt.status == "revoked"
+    assert isinstance(claims.publish(claim), LabRevokedClaim)
 
 
 @pytest.mark.parametrize(
@@ -612,7 +615,7 @@ def test_scheduler_takeover_revokes_terminal_max_attempts_claim(tmp_path: Path) 
     assert result.claims_revoked == 1
     assert result.claim_revoke_failures == 0
     assert claims.pending() == ()
-    assert claims.publish(claim).receipt.status == "revoked"
+    assert isinstance(claims.publish(claim), LabRevokedClaim)
     reader = LabJobReader(store.path)
     assert reader.get_job(job.job_id).status is JobStatus.FAILED
     assert reader.list_shards(job.job_id)[0].status is ShardStatus.FAILED
@@ -663,7 +666,7 @@ def test_scheduler_takeover_revokes_pending_only_delivery(tmp_path: Path) -> Non
 
     assert result.claims_revoked == 1
     assert claims.pending() == ()
-    assert claims.publish(claim).receipt.status == "revoked"
+    assert isinstance(claims.publish(claim), LabRevokedClaim)
 
 
 def test_scheduler_restart_retries_failed_claim_revoke(
@@ -739,7 +742,7 @@ def test_scheduler_restart_retries_failed_claim_revoke(
     assert retried.claims_revoked == 1
     assert retried.claim_revoke_failures == 0
     assert restarted_claims.pending() == ()
-    assert restarted_claims.publish(claim).receipt.status == "revoked"
+    assert isinstance(restarted_claims.publish(claim), LabRevokedClaim)
 
 
 def test_scheduler_deadline_expiry_revokes_running_delivery(tmp_path: Path) -> None:
@@ -754,9 +757,7 @@ def test_scheduler_deadline_expiry_revokes_running_delivery(tmp_path: Path) -> N
     assert scheduler.lease is not None
     base = _submit()
     envelope = _submit(
-        spec=base.command.spec.model_copy(
-            update={"deadline": NOW + timedelta(seconds=3)}
-        )
+        spec=base.command.spec.model_copy(update={"deadline": NOW + timedelta(seconds=3)})
     )
     store.apply_command(envelope, lease=scheduler.lease, now=NOW)
     store.plan_job(
@@ -775,4 +776,84 @@ def test_scheduler_deadline_expiry_revokes_running_delivery(tmp_path: Path) -> N
     assert expired.deadlines_expired == 1
     assert expired.claims_revoked == 1
     assert claims.pending() == ()
-    assert claims.publish(claim).receipt.status == "revoked"
+    assert isinstance(claims.publish(claim), LabRevokedClaim)
+
+
+def test_scheduler_does_not_revoke_consumed_claim_after_accepted_success(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+    )
+    job = _planned_job(store, scheduler)
+    clock[0] = NOW + timedelta(seconds=2)
+    assert scheduler.run_once().claims_published == 1
+    claim = claims.consume(claims.pending()[0])
+    consumed_path = claims.ack_dir / f"{claim.claim_token}.json"
+    consumed_payload = consumed_path.read_bytes()
+    reports.publish(
+        _report(
+            claim,
+            LabShardSucceeded(result_manifest_hash="a" * 64),
+        )
+    )
+    clock[0] = NOW + timedelta(seconds=3)
+
+    result = scheduler.run_once()
+
+    assert result.reports_accepted == 1
+    assert result.claims_revoked == 0
+    assert consumed_path.read_bytes() == consumed_payload
+    assert not claims.is_revoked(claim)
+    assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.SUCCEEDED
+
+
+def test_scheduler_terminal_failure_preserves_consumed_history_and_revokes_separately(
+    tmp_path: Path,
+) -> None:
+    clock = [NOW]
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    store, scheduler = _scheduler(
+        tmp_path,
+        clock=clock,
+        report_spool=reports,
+        claim_spool=claims,
+        claim_worker_ids=("worker-a",),
+    )
+    assert scheduler.lease is not None
+    job = _submit_job(store, scheduler.lease, max_attempts=1)
+    store.plan_job(
+        job.job_id,
+        (_definition(0),),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    clock[0] = NOW + timedelta(seconds=2)
+    assert scheduler.run_once().claims_published == 1
+    claim = claims.consume(claims.pending()[0])
+    consumed_path = claims.ack_dir / f"{claim.claim_token}.json"
+    consumed_payload = consumed_path.read_bytes()
+    reports.publish(
+        _report(
+            claim,
+            LabShardFailed(failure_json='{"reason":"fixture failure"}'),
+        )
+    )
+    clock[0] = NOW + timedelta(seconds=3)
+
+    result = scheduler.run_once()
+
+    assert result.reports_accepted == 1
+    assert result.claims_revoked == 1
+    assert consumed_path.read_bytes() == consumed_payload
+    assert claims.is_revoked(claim)
+    assert claims.revocation(claim.claim_token).path.parent == claims.revoked_dir
+    assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.FAILED

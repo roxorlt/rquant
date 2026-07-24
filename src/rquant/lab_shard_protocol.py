@@ -222,6 +222,8 @@ class LabClaimRevokedError(RuntimeError):
 
 
 class LabClaimDeliveryReceipt(LabShardProtocolModel):
+    """Immutable delivery history; ``revoked`` is accepted for legacy ledgers only."""
+
     schema_version: Literal[1] = 1
     status: Literal["consumed", "revoked"] = "consumed"
     claim: LabShardClaim
@@ -237,6 +239,27 @@ class LabClaimDeliveryReceipt(LabShardProtocolModel):
             raise ValueError("revoked claim receipt requires reason")
         if self.status == "consumed" and self.reason is not None:
             raise ValueError("consumed claim receipt cannot include reason")
+        object.__setattr__(self, "content_hash", expected)
+        return self
+
+
+class LabClaimRevocation(LabShardProtocolModel):
+    schema_version: Literal[1] = 1
+    claim: LabShardClaim
+    reason: str = Field(min_length=1)
+    content_hash: str = ""
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> LabClaimRevocation:
+        expected = _canonical_hash(
+            {
+                "claim": self.claim.model_dump(mode="json"),
+                "reason": self.reason,
+                "schema_version": self.schema_version,
+            }
+        )
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("content_hash does not match claim revocation")
         object.__setattr__(self, "content_hash", expected)
         return self
 
@@ -373,12 +396,15 @@ class LabReportReceipt(LabShardProtocolModel):
     claim_token: UUID | None = None
     claim_generation: int | None = Field(default=None, strict=True, ge=1)
     scheduler_fencing_token: int | None = Field(default=None, strict=True, ge=1)
-    report_type: Literal[
-        "heartbeat",
-        "shard_succeeded",
-        "shard_failed",
-        "worker_stopped",
-    ] | None = None
+    report_type: (
+        Literal[
+            "heartbeat",
+            "shard_succeeded",
+            "shard_failed",
+            "worker_stopped",
+        ]
+        | None
+    ) = None
     result_manifest_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
     status: Literal["accepted", "rejected"]
     reason: str = Field(min_length=1)
@@ -445,6 +471,11 @@ class LabClaimSpoolEntry(LabShardProtocolModel):
 class LabConsumedClaim(LabShardProtocolModel):
     path: Path
     receipt: LabClaimDeliveryReceipt
+
+
+class LabRevokedClaim(LabShardProtocolModel):
+    path: Path
+    revocation: LabClaimRevocation
 
 
 class LabReportSpoolEntry(LabShardProtocolModel):
@@ -528,7 +559,9 @@ class LabClaimSpool(_TypedSpoolBase):
     ) -> None:
         super().__init__(root)
         self.current_dir = self.root / "current"
+        self.revoked_dir = self.root / "revoked"
         self.current_dir.mkdir(parents=True, exist_ok=True)
+        self.revoked_dir.mkdir(parents=True, exist_ok=True)
         self._claim_advance_hook = claim_advance_hook
 
     def set_claim_advance_hook(
@@ -552,6 +585,9 @@ class LabClaimSpool(_TypedSpoolBase):
     def _consumed_path(self, claim_token: UUID) -> Path:
         return self.ack_dir / f"{claim_token}.json"
 
+    def _revoked_path(self, claim_token: UUID) -> Path:
+        return self.revoked_dir / f"{claim_token}.json"
+
     def _load_consumed_locked(self, claim_token: UUID) -> LabConsumedClaim:
         path = self._consumed_path(claim_token)
         candidate, payload, _file_stat = self._read_regular_child(path, self.ack_dir)
@@ -571,27 +607,51 @@ class LabClaimSpool(_TypedSpoolBase):
             )
         return LabConsumedClaim(path=candidate, receipt=receipt)
 
-    def _replace_delivery_receipt_locked(
-        self,
-        receipt: LabClaimDeliveryReceipt,
-    ) -> LabConsumedClaim:
-        target = self._consumed_path(receipt.claim.claim_token)
-        temporary = self.ack_dir / f".{target.name}.{uuid4().hex}.tmp"
-        try:
-            with temporary.open("xb") as stream:
-                stream.write(receipt.model_dump_json().encode("utf-8"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-            self._fsync_directory(self.ack_dir)
-        finally:
-            temporary.unlink(missing_ok=True)
-        replaced = self._load_consumed_locked(receipt.claim.claim_token)
-        if replaced.receipt != receipt:
-            raise RequestContentConflictError(
-                f"claim_token {receipt.claim.claim_token} receipt replacement conflicted"
+    def _load_revocation_locked(self, claim_token: UUID) -> LabRevokedClaim:
+        path = self._revoked_path(claim_token)
+        candidate, payload, _file_stat = self._read_regular_child(path, self.revoked_dir)
+        if self._ack_message_id(candidate.name) != claim_token:
+            raise InvalidCommandEnvelopeError(
+                f"revoked claim token does not match basename {candidate.name}"
             )
-        return replaced
+        try:
+            revocation = LabClaimRevocation.model_validate_json(payload)
+        except Exception as exc:
+            raise InvalidCommandEnvelopeError(
+                f"invalid claim revocation {candidate.name}: {exc}"
+            ) from exc
+        if revocation.claim.claim_token != claim_token:
+            raise InvalidCommandEnvelopeError(
+                f"revoked claim identity does not match basename {candidate.name}"
+            )
+        return LabRevokedClaim(path=candidate, revocation=revocation)
+
+    def _revocation_locked(self, claim: LabShardClaim) -> LabRevokedClaim | None:
+        path = self._revoked_path(claim.claim_token)
+        if os.path.lexists(path):
+            revoked = self._load_revocation_locked(claim.claim_token)
+            if revoked.revocation.claim != claim:
+                raise RequestContentConflictError(
+                    f"claim_token {claim.claim_token} has conflicting revocation"
+                )
+            return revoked
+        consumed_path = self._consumed_path(claim.claim_token)
+        if not os.path.lexists(consumed_path):
+            return None
+        legacy = self._load_consumed_locked(claim.claim_token)
+        if legacy.receipt.claim != claim:
+            raise RequestContentConflictError(
+                f"claim_token {claim.claim_token} has conflicting receipt"
+            )
+        if legacy.receipt.status != "revoked":
+            return None
+        return LabRevokedClaim(
+            path=legacy.path,
+            revocation=LabClaimRevocation(
+                claim=claim,
+                reason=legacy.receipt.reason or "legacy revocation",
+            ),
+        )
 
     def _unlink_current_locked(self, claim: LabShardClaim) -> None:
         path = self._current_path(claim.job_id, claim.shard_id)
@@ -619,9 +679,7 @@ class LabClaimSpool(_TypedSpoolBase):
         candidate, payload, _file_stat = self._read_regular_child(path, self.current_dir)
         match = _CURRENT_CLAIM_NAME.fullmatch(candidate.name)
         if match is None:
-            raise InvalidCommandEnvelopeError(
-                f"invalid current claim basename: {candidate.name}"
-            )
+            raise InvalidCommandEnvelopeError(f"invalid current claim basename: {candidate.name}")
         try:
             marker = LabClaimHighWater.model_validate_json(payload)
         except Exception as exc:
@@ -652,12 +710,12 @@ class LabClaimSpool(_TypedSpoolBase):
                     raise InvalidCommandEnvelopeError(
                         f"invalid current claim basename: {path.name}"
                     )
-                claims.append(
-                    self._load_current_locked(
-                        UUID(match.group("job_id")),
-                        UUID(match.group("shard_id")),
-                    ).claim
-                )
+                claim = self._load_current_locked(
+                    UUID(match.group("job_id")),
+                    UUID(match.group("shard_id")),
+                ).claim
+                if self._revocation_locked(claim) is None:
+                    claims.append(claim)
             return tuple(claims)
 
     def _publish_current_locked(self, marker: LabClaimHighWater) -> None:
@@ -676,26 +734,56 @@ class LabClaimSpool(_TypedSpoolBase):
     def is_current(self, claim: LabShardClaim) -> bool:
         validated = LabShardClaim.model_validate(claim)
         with self._exclusive_lock():
-            receipt_path = self._consumed_path(validated.claim_token)
-            if os.path.lexists(receipt_path):
-                receipt = self._load_consumed_locked(validated.claim_token).receipt
-                if receipt.claim != validated:
-                    raise RequestContentConflictError(
-                        f"claim_token {validated.claim_token} has conflicting receipt"
-                    )
-                if receipt.status == "revoked":
-                    return False
-            if not os.path.lexists(
-                self._current_path(validated.job_id, validated.shard_id)
-            ):
+            if self._revocation_locked(validated) is not None:
+                return False
+            if not os.path.lexists(self._current_path(validated.job_id, validated.shard_id)):
                 return False
             marker = self._load_current_locked(validated.job_id, validated.shard_id)
             return marker.claim == validated
 
-    def publish(self, claim: LabShardClaim) -> LabClaimSpoolEntry | LabConsumedClaim:
+    def is_revoked(self, claim: LabShardClaim) -> bool:
+        validated = LabShardClaim.model_validate(claim)
+        with self._exclusive_lock():
+            return self._revocation_locked(validated) is not None
+
+    def revocation(self, claim_token: UUID) -> LabRevokedClaim:
+        with self._exclusive_lock():
+            path = self._revoked_path(claim_token)
+            if os.path.lexists(path):
+                return self._load_revocation_locked(claim_token)
+            legacy = self._load_consumed_locked(claim_token)
+            if legacy.receipt.status != "revoked":
+                raise InvalidCommandEnvelopeError(f"claim {claim_token} has no revocation evidence")
+            return LabRevokedClaim(
+                path=legacy.path,
+                revocation=LabClaimRevocation(
+                    claim=legacy.receipt.claim,
+                    reason=legacy.receipt.reason or "legacy revocation",
+                ),
+            )
+
+    def is_admitted(self, claim: LabShardClaim) -> bool:
+        """Atomically require the exact high-water and absence of revocation."""
+        validated = LabShardClaim.model_validate(claim)
+        with self._exclusive_lock():
+            if self._revocation_locked(validated) is not None:
+                return False
+            current_path = self._current_path(validated.job_id, validated.shard_id)
+            if not os.path.lexists(current_path):
+                return False
+            marker = self._load_current_locked(validated.job_id, validated.shard_id)
+            return marker.claim == validated
+
+    def publish(
+        self,
+        claim: LabShardClaim,
+    ) -> LabClaimSpoolEntry | LabConsumedClaim | LabRevokedClaim:
         validated = LabShardClaim.model_validate(claim)
         payload = validated.model_dump_json().encode("utf-8")
         with self._exclusive_lock():
+            revoked = self._revocation_locked(validated)
+            if revoked is not None:
+                return revoked
             consumed_path = self._consumed_path(validated.claim_token)
             if os.path.lexists(consumed_path):
                 consumed = self._load_consumed_locked(validated.claim_token)
@@ -713,14 +801,11 @@ class LabClaimSpool(_TypedSpoolBase):
                 and current.claim != validated
                 and (
                     validated.claim_generation <= current.claim.claim_generation
-                    or validated.scheduler_fencing_token
-                    < current.claim.scheduler_fencing_token
+                    or validated.scheduler_fencing_token < current.claim.scheduler_fencing_token
                     or self._claim_order(validated) <= self._claim_order(current.claim)
                 )
             ):
-                raise LabClaimSupersededError(
-                    "claim does not advance the durable shard high-water"
-                )
+                raise LabClaimSupersededError("claim does not advance the durable shard high-water")
             pending = self._pending_for_message_locked(validated.claim_token)
             if pending is not None:
                 existing = self.load(pending)
@@ -742,14 +827,13 @@ class LabClaimSpool(_TypedSpoolBase):
                 self._publish_current_locked(LabClaimHighWater(claim=validated))
             return entry
 
-    def revoke(self, claim: LabShardClaim, *, reason: str) -> LabConsumedClaim:
+    def revoke(self, claim: LabShardClaim, *, reason: str) -> LabRevokedClaim:
         """Durably fence an exact delivery before removing its spool visibility."""
         validated = LabShardClaim.model_validate(claim)
         normalized_reason = " ".join(reason.split())
         if not normalized_reason:
             raise ValueError("revoke reason must not be empty")
-        revoked_receipt = LabClaimDeliveryReceipt(
-            status="revoked",
+        revocation = LabClaimRevocation(
             claim=validated,
             reason=normalized_reason,
         )
@@ -761,27 +845,25 @@ class LabClaimSpool(_TypedSpoolBase):
                     raise RequestContentConflictError(
                         f"claim_token {validated.claim_token} has conflicting receipt"
                     )
-                if existing.receipt.status == "revoked":
-                    revoked = existing
-                else:
-                    revoked = self._replace_delivery_receipt_locked(revoked_receipt)
+            revoked_path = self._revoked_path(validated.claim_token)
+            if os.path.lexists(revoked_path):
+                revoked = self._load_revocation_locked(validated.claim_token)
+                if revoked.revocation != revocation:
+                    raise RequestContentConflictError(
+                        f"claim_token {validated.claim_token} has conflicting revocation"
+                    )
             else:
                 created = self._publish_no_clobber(
-                    receipt_path,
-                    revoked_receipt.model_dump_json().encode("utf-8"),
+                    revoked_path,
+                    revocation.model_dump_json().encode("utf-8"),
                 )
                 if not created:
-                    existing = self._load_consumed_locked(validated.claim_token)
-                    if existing.receipt.claim != validated:
+                    revoked = self._load_revocation_locked(validated.claim_token)
+                    if revoked.revocation != revocation:
                         raise RequestContentConflictError(
-                            f"claim_token {validated.claim_token} has conflicting receipt"
+                            f"claim_token {validated.claim_token} has conflicting revocation"
                         )
-                    if existing.receipt.status != "revoked":
-                        revoked = self._replace_delivery_receipt_locked(revoked_receipt)
-                    else:
-                        revoked = existing
-                else:
-                    revoked = self._load_consumed_locked(validated.claim_token)
+                revoked = self._load_revocation_locked(validated.claim_token)
 
             self._unlink_current_locked(validated)
             pending = self._pending_for_message_locked(validated.claim_token)
@@ -828,7 +910,7 @@ class LabClaimSpool(_TypedSpoolBase):
             for path in sorted(self.ack_dir.glob("*.json")):
                 token = self._ack_message_id(path.name)
                 receipt = self._load_consumed_locked(token).receipt
-                if receipt.status == "consumed":
+                if receipt.status == "consumed" and self._revocation_locked(receipt.claim) is None:
                     remember(receipt.claim)
             return tuple(
                 sorted(
@@ -913,6 +995,9 @@ class LabClaimSpool(_TypedSpoolBase):
                 raise InvalidCommandEnvelopeError("pending claim was replaced before consume")
             if current.claim != entry.claim:
                 raise InvalidCommandEnvelopeError("pending claim changed before consume")
+            if self._revocation_locked(entry.claim) is not None:
+                self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
+                raise LabClaimRevokedError(f"claim {entry.claim.claim_token} was revoked")
             consumed_path = self._consumed_path(entry.claim.claim_token)
             if os.path.lexists(consumed_path):
                 consumed = self._load_consumed_locked(entry.claim.claim_token)
@@ -922,17 +1007,13 @@ class LabClaimSpool(_TypedSpoolBase):
                     )
                 self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
                 if consumed.receipt.status == "revoked":
-                    raise LabClaimRevokedError(
-                        f"claim {entry.claim.claim_token} was revoked"
-                    )
+                    raise LabClaimRevokedError(f"claim {entry.claim.claim_token} was revoked")
                 raise LabClaimAlreadyConsumedError(
                     f"claim {entry.claim.claim_token} was already consumed"
                 )
             marker = self._load_current_locked(entry.claim.job_id, entry.claim.shard_id)
             if marker.claim != entry.claim:
-                raise LabClaimSupersededError(
-                    "pending claim is not the durable shard high-water"
-                )
+                raise LabClaimSupersededError("pending claim is not the durable shard high-water")
             receipt = LabClaimDeliveryReceipt(claim=entry.claim)
             created = self._publish_no_clobber(
                 consumed_path,

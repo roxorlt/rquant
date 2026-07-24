@@ -180,6 +180,10 @@ class LabScheduler:
             initial_lease_seconds=self.shard_lease_seconds,
         )
         active_by_token = {claim.claim_token: claim for claim in active}
+        accepted_success_tokens = self.store.list_accepted_success_claim_tokens(
+            lease,
+            now=now,
+        )
         revoked = 0
         failures = 0
         try:
@@ -188,6 +192,8 @@ class LabScheduler:
             return 0, 1, active
         for delivery in deliveries:
             if active_by_token.get(delivery.claim_token) == delivery:
+                continue
+            if delivery.claim_token in accepted_success_tokens:
                 continue
             if delivery.claim_token in attempted:
                 continue
@@ -219,12 +225,10 @@ class LabScheduler:
         )
         authority_now = recovery_now
         attempted_revokes: set[UUID] = set()
-        claims_revoked, claim_revoke_failures, active_claims = (
-            self._reconcile_claim_authority(
-                lease,
-                now=recovery_now,
-                attempted=attempted_revokes,
-            )
+        claims_revoked, claim_revoke_failures, active_claims = self._reconcile_claim_authority(
+            lease,
+            now=recovery_now,
+            attempted=attempted_revokes,
         )
         claims_replayed = 0
         claim_delivery_failures = 0
@@ -375,12 +379,10 @@ class LabScheduler:
                     claims_published += 1
             self._claim_cursor = (start + inspected) % worker_count
         if self.claim_spool is not None:
-            final_revoked, final_revoke_failures, _active = (
-                self._reconcile_claim_authority(
-                    lease,
-                    now=authority_now,
-                    attempted=attempted_revokes,
-                )
+            final_revoked, final_revoke_failures, _active = self._reconcile_claim_authority(
+                lease,
+                now=authority_now,
+                attempted=attempted_revokes,
             )
             claims_revoked += final_revoked
             claim_revoke_failures += final_revoke_failures

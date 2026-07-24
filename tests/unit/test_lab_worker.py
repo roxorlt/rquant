@@ -308,9 +308,7 @@ def _run_worker_child(
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate(timeout=1)
-        pytest.fail(
-            f"worker child timed out: stdout={stdout!r} stderr={stderr!r}"
-        )
+        pytest.fail(f"worker child timed out: stdout={stdout!r} stderr={stderr!r}")
     return subprocess.CompletedProcess(
         process.args,
         process.returncode,
@@ -447,6 +445,101 @@ def test_worker_never_executes_revoked_claim_after_cleanup_interruption(
     assert registry.executions == 0
     assert reports.pending() == ()
     assert claims.pending() == ()
+
+
+def test_worker_rechecks_admission_after_consume_before_open_or_execute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    consumed = threading.Event()
+    release = threading.Event()
+    original_consume = claims.consume
+
+    def consume_then_pause(entry: object) -> LabShardClaim:
+        delivered = original_consume(entry)  # type: ignore[arg-type]
+        consumed.set()
+        assert release.wait(2)
+        return delivered
+
+    monkeypatch.setattr(claims, "consume", consume_then_pause)
+    stores_opened = 0
+
+    @contextmanager
+    def counted_store() -> Iterator[object]:
+        nonlocal stores_opened
+        stores_opened += 1
+        yield object()
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        exploratory_store_factory=counted_store,
+    )
+    results: list[object] = []
+    thread = threading.Thread(target=lambda: results.append(worker.run_once()))
+    thread.start()
+    assert consumed.wait(2)
+
+    claims.revoke(claim, reason="scheduler terminalized consumed claim")
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert results[0].status == "stopped"
+    assert stores_opened == 0
+    assert registry.executions == 0
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_revoke_during_execute_is_fenced_before_seal_and_success(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    executing = threading.Event()
+    release = threading.Event()
+
+    class BlockingRegistry(RecordingRegistry):
+        def execute_shard(
+            self,
+            validated: ValidatedStrategyShard,
+            store: object,
+        ) -> LabShardExecutionResult:
+            executing.set()
+            assert release.wait(2)
+            return super().execute_shard(validated, store)
+
+    registry = BlockingRegistry()
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        heartbeat_interval_seconds=0.01,
+    )
+    results: list[object] = []
+    thread = threading.Thread(target=lambda: results.append(worker.run_once()))
+    thread.start()
+    assert executing.wait(2)
+
+    claims.revoke(claim, reason="scheduler revoked running attempt")
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert results[0].status == "failed"
+    assert registry.executions == 1
+    assert not worker.sealed_bundle_path(claim).exists()
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
 
 
 def test_worker_fails_closed_when_claim_high_water_marker_is_missing(tmp_path: Path) -> None:
@@ -608,8 +701,7 @@ def test_slow_candidate_loses_one_second_lease_to_new_generation(
     assert outcomes[0].status == "failed"
     assert not worker.sealed_bundle_path(original).exists()
     assert not any(
-        isinstance(report.body, LabShardSucceeded)
-        and report.claim_token == original.claim_token
+        isinstance(report.body, LabShardSucceeded) and report.claim_token == original.claim_token
         for report in published
     )
 
@@ -1023,9 +1115,7 @@ def test_same_attempt_conflicting_result_fails_closed(tmp_path: Path) -> None:
     same = worker._seal_result(claim, result(1))
 
     assert same.manifest_hash == first.manifest_hash
-    persisted = pd.read_parquet(
-        worker.sealed_bundle_path(claim) / first.artifacts[0].file_name
-    )
+    persisted = pd.read_parquet(worker.sealed_bundle_path(claim) / first.artifacts[0].file_name)
     assert persisted["value"].tolist() == [1]
 
 
@@ -1053,9 +1143,7 @@ def test_concurrent_same_attempt_conflicting_results_have_one_atomic_winner(
     def seal(worker: object, value: int) -> None:
         result = LabShardExecutionResult.from_validated(
             validated,
-            tables=(
-                LabShardTable(name="trades", frame=pd.DataFrame([{"value": value}])),
-            ),
+            tables=(LabShardTable(name="trades", frame=pd.DataFrame([{"value": value}])),),
         )
         try:
             outcomes.append(worker._seal_result(claim, result))
@@ -1139,6 +1227,31 @@ def test_obsolete_temporary_symlink_is_rejected_without_following(tmp_path: Path
         worker._reclaim_obsolete_temporaries(new)
 
     assert (outside / "keep").read_text(encoding="utf-8") == "safe"
+
+
+def test_obsolete_temporary_hardlink_is_rejected_without_deleting_tree(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError
+
+    old = _claim(_nshape_compare_spec(hold_days=(1,)))
+    new = _retry_claim(old)
+    worker = _worker(tmp_path)
+    obsolete = worker._temporary_bundle_path(old)
+    nested = obsolete / "nested"
+    nested.mkdir(parents=True)
+    partial = nested / "partial.parquet"
+    partial.write_bytes(b"partial")
+    external = tmp_path / "external-partial.parquet"
+    os.link(partial, external)
+
+    with pytest.raises(LabArtifactConflictError, match="hard link"):
+        worker._reclaim_obsolete_temporaries(new)
+
+    assert obsolete.is_dir()
+    assert partial.read_bytes() == b"partial"
+    assert external.read_bytes() == b"partial"
+    assert partial.stat().st_nlink == 2
 
 
 def test_obsolete_temporary_parent_symlink_is_rejected_without_following(
@@ -1779,10 +1892,7 @@ def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Pa
     job = LabJobReader(store.path).get_job(job_id)
     assert job is not None
     assert job.status is JobStatus.SUCCEEDED
-    receipts = tuple(
-        reports.load_receipt(path)
-        for path in sorted(reports.ack_dir.glob("*.json"))
-    )
+    receipts = tuple(reports.load_receipt(path) for path in sorted(reports.ack_dir.glob("*.json")))
     assert len(receipts) == 2
     assert all(receipt.status == "accepted" for receipt in receipts)
 
@@ -2581,9 +2691,7 @@ def test_reclaimer_rejects_hardlinked_bundle_file_without_deleting(
         reports,
     )
     target = (
-        sealed / "manifest.json"
-        if file_name == "manifest.json"
-        else next(sealed.glob("*.parquet"))
+        sealed / "manifest.json" if file_name == "manifest.json" else next(sealed.glob("*.parquet"))
     )
     external = tmp_path / f"external-{target.name}"
     os.link(target, external)
@@ -2661,6 +2769,90 @@ def test_reclaimer_rejects_hardlinked_ledger_without_deleting_tombstone(
     assert tombstone.is_dir()
     assert ledger.is_file()
     assert external.is_file()
+
+
+def test_inventory_replacement_after_validation_is_restored_and_not_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    original_inventory = reclaimer._inventory_entry
+    validated_in_tombstone = 0
+    saved_original = tmp_path / "saved-original-manifest.json"
+
+    def replace_after_validation(path: Path, *, relative_path: str):
+        nonlocal validated_in_tombstone
+        observed = original_inventory(path, relative_path=relative_path)
+        if path.parent.name.startswith(".reclaim-v1-") and relative_path == "manifest.json":
+            validated_in_tombstone += 1
+            if validated_in_tombstone == 2:
+                os.replace(path, saved_original)
+                path.write_bytes(b"replacement-must-survive")
+        return observed
+
+    monkeypatch.setattr(reclaimer, "_inventory_entry", replace_after_validation)
+
+    with pytest.raises(LabArtifactConflictError, match="changed before deletion"):
+        reclaimer.reclaim(current_claim)
+
+    tombstone = tuple(sealed.parent.glob(".reclaim-v1-*"))[0]
+    assert (tombstone / "manifest.json").read_bytes() == b"replacement-must-survive"
+    assert saved_original.is_file()
+
+
+def test_ledger_replacement_after_validation_is_restored_and_not_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    _old_claim, current_claim, sealed, _manifest = _sealed_obsolete_attempt(
+        tmp_path,
+        reports,
+    )
+    completed = _run_worker_child(
+        "_crash_reclaimer_after_tombstone_rename_child",
+        tmp_path,
+        current_claim.model_dump_json(),
+    )
+    assert completed.returncode == 79, completed.stderr
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    ledger = tuple((tmp_path / "artifacts" / ".reclaim-ledger").rglob("*.json"))[0]
+    saved_original = tmp_path / "saved-original-ledger.json"
+    original_load = reclaimer._load_ledger
+    replaced = False
+
+    def replace_after_load(path: Path):
+        nonlocal replaced
+        loaded = original_load(path)
+        if path == ledger and not replaced:
+            replaced = True
+            os.replace(path, saved_original)
+            path.write_bytes(b"replacement-ledger-must-survive")
+        return loaded
+
+    monkeypatch.setattr(reclaimer, "_load_ledger", replace_after_load)
+
+    with pytest.raises(LabArtifactConflictError, match="changed before deletion"):
+        reclaimer._remove_ledger(ledger)
+
+    assert ledger.read_bytes() == b"replacement-ledger-must-survive"
+    assert saved_original.is_file()
+    assert tuple(sealed.parent.glob(".reclaim-v1-*"))
 
 
 def test_reclaimer_resumes_after_partial_inventory_deletion(tmp_path: Path) -> None:
@@ -2873,6 +3065,43 @@ def test_reclaimer_rejects_unsafe_ledger_temporary(
 
     assert os.path.lexists(temporary)
     assert external.read_bytes() == b"preserve"
+
+
+def test_ledger_temporary_replacement_after_identity_check_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError, LabArtifactReclaimer
+
+    current = _retry_claim(_claim(_nshape_compare_spec(hold_days=(1,))))
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=LabReportSpool(tmp_path / "reports"),
+    )
+    ledger_dir = reclaimer._ledger_dir(current)
+    ledger_dir.mkdir(parents=True)
+    temporary = ledger_dir / f".reclaim-ledger-tmp-v1-{uuid4().hex}.tmp"
+    temporary.write_bytes(b"original")
+    saved_original = tmp_path / "saved-ledger-temporary"
+    original_identity = reclaimer._regular_file_identity
+    replaced = False
+
+    def replace_after_identity(path: Path, *, label: str):
+        nonlocal replaced
+        identity = original_identity(path, label=label)
+        if path == temporary and not replaced:
+            replaced = True
+            os.replace(path, saved_original)
+            path.write_bytes(b"replacement-temporary-must-survive")
+        return identity
+
+    monkeypatch.setattr(reclaimer, "_regular_file_identity", replace_after_identity)
+
+    with pytest.raises(LabArtifactConflictError, match="changed before deletion"):
+        reclaimer._cleanup_ledger_temporaries(ledger_dir)
+
+    assert temporary.read_bytes() == b"replacement-temporary-must-survive"
+    assert saved_original.is_file()
 
 
 def test_reclaimer_does_not_isolate_directory_replaced_at_rename(
