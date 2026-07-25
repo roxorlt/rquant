@@ -55,6 +55,7 @@ _LEGACY_PROCESS_LOCKS: dict[str, _LegacyProcessLockEntry] = {}
 class _ArtifactProcessLockEntry:
     lock: threading.RLock
     references: int
+    owner_thread_id: int | None = None
 
 
 _ARTIFACT_PROCESS_LOCKS: dict[str, _ArtifactProcessLockEntry] = {}
@@ -1877,6 +1878,7 @@ class LabJobArtifactStore:
                 _ARTIFACT_PROCESS_LOCKS[lock_key] = entry
             entry.references += 1
             self._process_lock = entry.lock
+            self._process_lock_entry = entry
             self._process_lock_registered = True
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -1968,6 +1970,10 @@ class LabJobArtifactStore:
     def poisoned(self) -> bool:
         return self._poisoned
 
+    def _assert_store_operational(self) -> None:
+        if self._poisoned:
+            raise LabArtifactIntegrityError("artifact store is poisoned")
+
     def _assert_namespace_guard_lock_identity(self) -> None:
         if self._guard_lock_descriptor < 0 or self._guard_lock_identity is None:
             raise LabArtifactIntegrityError("namespace guard lock is unavailable")
@@ -2001,9 +2007,14 @@ class LabJobArtifactStore:
         with self._process_lock:
             if self._poisoned and not allow_poisoned:
                 raise LabArtifactIntegrityError("artifact store is poisoned")
+            current_thread_id = threading.get_ident()
+            if self._process_lock_entry.owner_thread_id == current_thread_id:
+                raise LabArtifactIntegrityError("reentrant namespace guard operation is forbidden")
             if self._guard_lock_descriptor < 0:
                 raise LabArtifactIntegrityError("namespace guard lock is unavailable")
             outermost = self._guard_lock_depth == 0
+            if not outermost:
+                raise LabArtifactIntegrityError("namespace guard depth is inconsistent")
             if outermost:
                 self._assert_namespace_guard_lock_identity()
                 fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
@@ -2012,6 +2023,7 @@ class LabJobArtifactStore:
                 except BaseException:
                     fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
                     raise
+                self._process_lock_entry.owner_thread_id = current_thread_id
             self._guard_lock_depth += 1
             operation_error: BaseException | None = None
             try:
@@ -2028,6 +2040,7 @@ class LabJobArtifactStore:
                         self._poisoned = True
                         integrity_error = exc
                     finally:
+                        self._process_lock_entry.owner_thread_id = None
                         fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
                     if operation_error is not None and integrity_error is not None:
                         raise BaseExceptionGroup(
@@ -2702,6 +2715,7 @@ class LabJobArtifactStore:
         report_markdown: str,
         tables: Mapping[str, pd.DataFrame],
     ) -> LabJobArtifactCandidate:
+        self._assert_store_operational()
         request = LabPrepareCandidateRequest.model_validate(
             {
                 "job_id": job_id,
@@ -4036,6 +4050,7 @@ class LabJobArtifactStore:
         *,
         allow_interrupted_seal: bool = False,
     ) -> LabJobArtifactManifest:
+        self._assert_store_operational()
         finalized = self._finalize_public_candidate(
             candidate,
             allow_interrupted_seal=allow_interrupted_seal,
@@ -4150,6 +4165,7 @@ class LabJobArtifactStore:
                 raise caller_error
 
     def verify_sealed(self, path: Path) -> LabSealedJobArtifact:
+        self._assert_store_operational()
         return self._finalize_public_sealed(path)
 
     @staticmethod
@@ -4287,6 +4303,7 @@ class LabJobArtifactStore:
     ) -> Iterator[LabVerifiedSealedBinding]:
         """Hold every sealed bundle fd open across a caller-owned transaction."""
 
+        self._assert_store_operational()
         with self._bind_verified_sealed(path) as sealed:
             evidence = LabArtifactIndexEvidence(
                 job_id=sealed.manifest.job_id,
@@ -4315,6 +4332,7 @@ class LabJobArtifactStore:
         )
 
     def seal_candidate(self, candidate: LabJobArtifactCandidate) -> LabSealedJobArtifact:
+        self._assert_store_operational()
         candidate = self._defensively_validate_candidate(candidate)
         if self.verify_candidate(candidate, allow_interrupted_seal=True) != candidate.manifest:
             raise LabArtifactIntegrityError("candidate manifest changed before seal")
@@ -4463,6 +4481,7 @@ class LabJobArtifactStore:
                 )
 
     def list_candidate_recovery(self) -> tuple[LabArtifactRecoveryRecord, ...]:
+        self._assert_store_operational()
         records: list[LabArtifactRecoveryRecord] = []
         candidates_descriptor = self._managed_parent_descriptor(self.candidates_root)
         quarantine_descriptor = self._managed_parent_descriptor(self.quarantine_root)
@@ -4605,6 +4624,7 @@ class LabJobArtifactStore:
         *,
         authority: LabArtifactRecoveryAuthority | None = None,
     ) -> LabSealedJobArtifact:
+        self._assert_store_operational()
         record = self._defensively_validate_recovery_record(record)
         if record.status not in {"recoverable", "needs_authority", "recoverable_torn"}:
             raise LabArtifactIntegrityError("only candidate recovery records can be sealed")
@@ -4644,6 +4664,7 @@ class LabJobArtifactStore:
     def recover_interrupted_seal(self, path: Path) -> LabSealedJobArtifact:
         """Finish a durable seal intent after rename without trusting path identity."""
 
+        self._assert_store_operational()
         managed = self._assert_managed_child(
             path, self.sealed_root, label="interrupted sealed bundle"
         )
@@ -4765,6 +4786,7 @@ class LabJobArtifactStore:
         *,
         reason: str,
     ) -> LabArtifactRecoveryRecord:
+        self._assert_store_operational()
         if not reason.strip():
             raise ValueError("quarantine reason must not be empty")
         candidate = self._defensively_validate_candidate(candidate)
@@ -4801,6 +4823,7 @@ class LabJobArtifactStore:
     ) -> LabArtifactRecoveryRecord:
         """Logically isolate an invalid or recoverable candidate without deleting it."""
 
+        self._assert_store_operational()
         record = self._defensively_validate_recovery_record(record)
         if record.status == "quarantined":
             raise LabArtifactIntegrityError("candidate is already quarantined")
@@ -5119,6 +5142,7 @@ class LabJobArtifactStore:
     ) -> Path:
         """Export stable bytes for this Python/ZIP runtime, not a cross-platform guarantee."""
 
+        self._assert_store_operational()
         evidence = self._defensively_validate_index_evidence(evidence)
         try:
             managed = self._assert_managed_child(
@@ -5131,11 +5155,10 @@ class LabJobArtifactStore:
                 "only a managed sealed bundle can be exported"
             ) from exc
         destination = destination.absolute()
-        _ensure_private_directory(destination.parent, manage_existing=False)
         if destination.name in {"", ".", ".."}:
             raise LabArtifactPathError("ZIP destination name is unsafe")
-        destination_parent = _secure_open_directory(destination.parent, create=True)
-        destination_parent_identity = _FileObservation.from_stat(os.fstat(destination_parent))
+        destination_parent = -1
+        destination_parent_identity: _FileObservation | None = None
         temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
         temporary_descriptor = -1
         destination_descriptor = -1
@@ -5176,6 +5199,11 @@ class LabJobArtifactStore:
                     export_payloads[relative_path] = payload
                 self._assert_bound_paths(bound)
                 self._assert_managed_roots()
+                _ensure_private_directory(destination.parent, manage_existing=False)
+                destination_parent = _secure_open_directory(destination.parent, create=True)
+                destination_parent_identity = _FileObservation.from_stat(
+                    os.fstat(destination_parent)
+                )
                 temporary_descriptor = os.open(
                     temporary_name,
                     os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -5301,7 +5329,8 @@ class LabJobArtifactStore:
                 os.close(destination_descriptor)
             if temporary_descriptor >= 0:
                 os.close(temporary_descriptor)
-            os.close(destination_parent)
+            if destination_parent >= 0:
+                os.close(destination_parent)
 
 
 @dataclass(frozen=True)

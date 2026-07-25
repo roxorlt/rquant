@@ -11,6 +11,7 @@ import sys
 import textwrap
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +39,7 @@ from rquant.lab_artifacts import (
     LabJobArtifactManifest,
     LabJobArtifactStore,
     LabLegacyArtifactConflictError,
+    LabSealedJobArtifact,
     LegacyArtifactIndex,
     canonical_json_bytes,
 )
@@ -143,7 +145,7 @@ def _prepare_arguments() -> dict[str, object]:
     }
 
 
-def _evidence(sealed):
+def _evidence(sealed: LabSealedJobArtifact) -> LabArtifactIndexEvidence:
     return LabArtifactIndexEvidence(
         job_id=sealed.manifest.job_id,
         sealed_path=sealed.path,
@@ -1596,7 +1598,10 @@ def test_zip_export_rechecks_bytes_after_authorization(
     evidence = _evidence(sealed)
     original = store._authorize_export
 
-    def tamper_after_authorization(verified, supplied) -> None:
+    def tamper_after_authorization(
+        verified: LabSealedJobArtifact,
+        supplied: LabArtifactIndexEvidence,
+    ) -> None:
         original(verified, supplied)
         _allow_writes(verified.path)
         (verified.path / "report.md").write_text("changed", encoding="utf-8")
@@ -1619,7 +1624,10 @@ def test_zip_export_rejects_bundle_inode_swap_after_authorization(
     shutil.copytree(sealed.path, replacement)
     original = store._authorize_export
 
-    def swap_after_authorization(verified, supplied) -> None:
+    def swap_after_authorization(
+        verified: LabSealedJobArtifact,
+        supplied: LabArtifactIndexEvidence,
+    ) -> None:
         original(verified, supplied)
         os.chmod(sealed.path, 0o700)
         os.chmod(replacement, 0o700)
@@ -2206,7 +2214,10 @@ def test_legacy_detects_toctou_before_index_commit(
     index = LegacyArtifactIndex(tmp_path / "legacy-index.sqlite3")
     original = index._before_commit_source_check
 
-    def replace_then_check(path: Path, expected) -> None:
+    def replace_then_check(
+        path: Path,
+        expected: lab_artifacts_module._FileObservation,
+    ) -> None:
         replacement = path.with_suffix(".replacement")
         replacement.write_text('{"changed":true}', encoding="utf-8")
         os.replace(replacement, path)
@@ -3853,6 +3864,20 @@ def test_zip_revalidates_forged_evidence_before_creating_destination_parent(
     assert not destination.parent.exists()
 
 
+def test_zip_authorizes_valid_but_wrong_evidence_before_destination_side_effects(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    wrong = _evidence(sealed).model_copy(update={"job_id": uuid4()})
+    destination = tmp_path / "must-not-exist-valid-evidence" / "nested" / "bundle.zip"
+
+    with pytest.raises(LabArtifactAuthorizationError, match="does not authorize"):
+        store.export_deterministic_zip(sealed.path, wrong, destination)
+
+    assert not destination.parent.exists()
+
+
 @pytest.mark.parametrize("operation", ["verify", "prepare"])
 def test_candidate_public_return_rechecks_last_moment_path_swap(
     tmp_path: Path,
@@ -4107,6 +4132,147 @@ def test_namespace_guard_cleanup_failure_poison_store_and_preserves_intent(
     recovered = LabJobArtifactStore(store.root)
     assert list(recovered.namespace_guard_active_root.iterdir()) == []
     recovered.close()
+
+
+def test_poisoned_store_rejects_all_public_artifact_operations_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    verify_candidate = _prepare(store, job_id=uuid4())
+    seal_candidate = _prepare(store, job_id=uuid4())
+    quarantine_candidate = _prepare(store, job_id=uuid4())
+    recovery_candidate = _prepare(store, job_id=uuid4())
+    recovery_record = next(
+        record
+        for record in store.list_candidate_recovery()
+        if record.path == recovery_candidate.path
+    )
+    recovery_authority = _recovery_authority(recovery_candidate)
+    sealed = store.seal_candidate(_prepare(store, job_id=uuid4()))
+    evidence = _evidence(sealed)
+    destination = tmp_path / "poisoned-export" / "bundle.zip"
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise OSError("restore failed")
+
+    monkeypatch.setattr(store, "_restore_candidate_namespace_guard", fail_restore)
+    with pytest.raises(BaseException, match="restore failed|namespace guard"):
+        _prepare(store, job_id=uuid4())
+    assert store.poisoned is True
+    active = next(store.namespace_guard_active_root.glob("*.json"))
+    active_bytes = active.read_bytes()
+
+    def bind_for_index() -> None:
+        with store.bind_verified_sealed(
+            sealed.path,
+            indexed_at=datetime(2026, 7, 26, 9, tzinfo=UTC),
+        ):
+            pass
+
+    operations: tuple[tuple[str, Callable[[], object]], ...] = (
+        ("verify candidate", lambda: store.verify_candidate(verify_candidate)),
+        ("verify sealed", lambda: store.verify_sealed(sealed.path)),
+        ("bind for index", bind_for_index),
+        ("list recovery", store.list_candidate_recovery),
+        ("seal", lambda: store.seal_candidate(seal_candidate)),
+        (
+            "quarantine candidate",
+            lambda: store.quarantine_candidate(quarantine_candidate, reason="poisoned"),
+        ),
+        (
+            "quarantine recovery",
+            lambda: store.quarantine_recovery_record(recovery_record, reason="poisoned"),
+        ),
+        (
+            "recover candidate",
+            lambda: store.recover_candidate(
+                recovery_record,
+                authority=recovery_authority,
+            ),
+        ),
+        (
+            "recover interrupted",
+            lambda: store.recover_interrupted_seal(sealed.path),
+        ),
+        (
+            "export",
+            lambda: store.export_deterministic_zip(sealed.path, evidence, destination),
+        ),
+    )
+    before = tuple(
+        sorted(
+            (
+                path.relative_to(store.root).as_posix(),
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+                path.lstat().st_ctime_ns,
+                path.read_bytes() if path.is_file() else b"",
+            )
+            for path in store.root.rglob("*")
+        )
+    )
+    try:
+        for _label, operation in operations:
+            with pytest.raises(LabArtifactIntegrityError, match="poisoned"):
+                operation()
+
+        after = tuple(
+            sorted(
+                (
+                    path.relative_to(store.root).as_posix(),
+                    path.lstat().st_dev,
+                    path.lstat().st_ino,
+                    path.lstat().st_mode,
+                    path.lstat().st_size,
+                    path.lstat().st_mtime_ns,
+                    path.lstat().st_ctime_ns,
+                    path.read_bytes() if path.is_file() else b"",
+                )
+                for path in store.root.rglob("*")
+            )
+        )
+        assert after == before
+        assert active.read_bytes() == active_bytes
+        assert not destination.parent.exists()
+    finally:
+        monkeypatch.undo()
+        store.close()
+        recovered = LabJobArtifactStore(store.root)
+        recovered.close()
+
+
+def test_same_thread_reentrant_prepare_fails_without_recovering_outer_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    reentry_checked = False
+
+    def attempt_reentry(
+        intent: lab_artifacts_module.LabCandidateNamespaceGuardIntent,
+    ) -> None:
+        nonlocal reentry_checked
+        active = store.namespace_guard_active_root / f"{intent.candidate_name}.json"
+        active_bytes = active.read_bytes()
+        with pytest.raises(LabArtifactIntegrityError, match="reentrant"):
+            _prepare(store, job_id=uuid4())
+        assert active.read_bytes() == active_bytes
+        assert list(store.namespace_guard_history_root.iterdir()) == []
+        reentry_checked = True
+
+    monkeypatch.setattr(store, "_after_candidate_namespace_guarded", attempt_reentry)
+
+    candidate = _prepare(store)
+
+    assert reentry_checked is True
+    assert store.poisoned is False
+    assert list(store.namespace_guard_active_root.iterdir()) == []
+    assert len(list(store.namespace_guard_history_root.glob("*.json"))) == 1
+    assert [path.name for path in store.candidates_root.iterdir()] == [candidate.path.name]
 
 
 def test_namespace_guard_lock_path_swap_fails_before_candidate_side_effect(
