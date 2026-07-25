@@ -839,6 +839,42 @@ class StrategyJobAdapterRegistry:
             for index, shard in enumerate(shard_inputs)
         )
 
+    def _plan_p13_legacy(self, spec: ResearchRunSpec) -> tuple[LabShardDefinition, ...]:
+        validated = ResearchRunSpec.model_validate(spec)
+        adapter = self.for_spec(validated)
+        shard_inputs = adapter.build_shard_inputs(validated)
+        if not shard_inputs:
+            raise ValueError("strategy adapter produced an empty shard plan")
+        plan_payload = {
+            "adapter_id": adapter.adapter_id,
+            "adapter_version": adapter.adapter_version,
+            "shards": [item.model_dump(mode="json") for item in shard_inputs],
+            "spec_hash": validated.spec_hash,
+        }
+        canonical_plan = json.dumps(
+            plan_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        plan_hash = hashlib.sha256(canonical_plan.encode("utf-8")).hexdigest()
+        return tuple(
+            LabShardDefinition.from_payload(
+                shard_index=index,
+                adapter_id=adapter.adapter_id,
+                adapter_version=adapter.adapter_version,
+                plan_hash=plan_hash,
+                payload_json=StrategyShardPayload(
+                    adapter_id=adapter.adapter_id,
+                    adapter_version=adapter.adapter_version,
+                    spec=validated,
+                    shard=shard,
+                ).model_dump_json(round_trip=True),
+            )
+            for index, shard in enumerate(shard_inputs)
+        )
+
     def validate_claim(self, claim: LabShardClaim) -> ValidatedStrategyShard:
         validated_claim = LabShardClaim.model_validate(claim)
         payload = StrategyShardPayload.model_validate_json(validated_claim.definition.payload_json)
@@ -855,7 +891,11 @@ class StrategyJobAdapterRegistry:
         adapter = self.get(payload.adapter_id, payload.adapter_version)
         if self.for_spec(payload.spec) is not adapter:
             raise ValueError("claim adapter does not match ResearchRunSpec")
-        definitions = self.plan(payload.spec)
+        definitions = (
+            self._plan_p13_legacy(payload.spec)
+            if validated_claim.definition.work_plan is None
+            else self.plan(payload.spec)
+        )
         if validated_claim.shard_index >= len(definitions):
             raise ValueError("claim shard_index is outside the regenerated plan")
         if definitions[validated_claim.shard_index] != validated_claim.definition:

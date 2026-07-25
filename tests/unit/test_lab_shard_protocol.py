@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -182,6 +183,87 @@ def test_success_telemetry_rejects_numeric_strings(field: str, value: str) -> No
 
     with pytest.raises(ValidationError):
         LabShardTelemetry.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("work_units", "duration_ms", "throughput"),
+    [
+        (1, 5e-324, 1.0),
+        (1, math.nextafter(1e-6, 0.0), 1 / (math.nextafter(1e-6, 0.0) / 1_000)),
+        (1, 1e15, 1e-12),
+        (1_000_000_000, 1e-6, 1e18),
+        (2**63, 1_000.0, float(2**63)),
+    ],
+)
+def test_telemetry_rejects_values_outside_shared_storage_domain(
+    work_units: int,
+    duration_ms: float,
+    throughput: float,
+) -> None:
+    with pytest.raises(ValidationError):
+        LabShardTelemetry(
+            phase="strategy_replay",
+            work_unit_name="parameter_case",
+            work_units=work_units,
+            static_duration_ms=12_000,
+            duration_ms=duration_ms,
+            throughput_units_per_second=throughput,
+        )
+
+
+@pytest.mark.parametrize(
+    ("work_units", "duration_ms", "throughput"),
+    [
+        (1, 1e-6, 1e9),
+        (1, math.nextafter(1e15, 0.0), 1 / (math.nextafter(1e15, 0.0) / 1_000)),
+        (999_999_999, 1e-6, 999_999_999 / 1e-9),
+    ],
+)
+def test_telemetry_accepts_near_storage_domain_boundaries(
+    work_units: int,
+    duration_ms: float,
+    throughput: float,
+) -> None:
+    telemetry = LabShardTelemetry(
+        phase="strategy_replay",
+        work_unit_name="parameter_case",
+        work_units=work_units,
+        static_duration_ms=12_000,
+        duration_ms=duration_ms,
+        throughput_units_per_second=throughput,
+    )
+
+    assert telemetry.duration_ms == duration_ms
+    assert telemetry.throughput_units_per_second == throughput
+
+
+@pytest.mark.parametrize(
+    ("work_units", "elapsed_seconds"),
+    [
+        (1, 5e-324),
+        (1, 1e12),
+        (10**18, 1.0),
+    ],
+)
+def test_from_work_plan_rejects_elapsed_or_throughput_outside_storage_domain(
+    work_units: int,
+    elapsed_seconds: float,
+) -> None:
+    plan = LabShardWorkPlan(
+        phase="strategy_replay",
+        work_unit_name="parameter_case",
+        work_units=work_units,
+        static_duration_ms=12_000,
+    )
+
+    with pytest.raises(ValueError) as captured:
+        LabShardTelemetry.from_work_plan(
+            plan,
+            monotonic_started=0.0,
+            monotonic_finished=elapsed_seconds,
+        )
+
+    assert type(captured.value) is ValueError
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,10 @@ from rquant.lab_job_protocol import (
     SubmitJobCommand,
 )
 from rquant.lab_shard_protocol import (
+    LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
+    LAB_SHARD_DURATION_MS_MIN,
+    LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
+    SQLITE_SIGNED_INTEGER_MAX,
     LabReportReceipt,
     LabShardClaim,
     LabShardDefinition,
@@ -188,12 +192,28 @@ class LabShardRecord(LabRecordModel):
     payload_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     phase: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
     work_unit_name: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
-    work_units: int | None = Field(default=None, strict=True, ge=1)
-    static_duration_ms: int | None = Field(default=None, strict=True, ge=1)
-    duration_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    work_units: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        le=SQLITE_SIGNED_INTEGER_MAX,
+    )
+    static_duration_ms: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        le=SQLITE_SIGNED_INTEGER_MAX,
+    )
+    duration_ms: float | None = Field(
+        default=None,
+        ge=LAB_SHARD_DURATION_MS_MIN,
+        lt=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
+        allow_inf_nan=False,
+    )
     throughput_units_per_second: float | None = Field(
         default=None,
         gt=0,
+        lt=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
         allow_inf_nan=False,
     )
     completion_sequence: int | None = Field(default=None, strict=True, ge=1)
@@ -304,6 +324,7 @@ def _strict_sqlite_int(
     *,
     field: str,
     minimum: int | None = None,
+    maximum: int | None = None,
 ) -> int:
     if type(value) is not int:
         raise InvalidStoredJobError(
@@ -311,6 +332,8 @@ def _strict_sqlite_int(
         )
     if minimum is not None and value < minimum:
         raise InvalidStoredJobError(f"{field} must be >= {minimum}, found {value}")
+    if maximum is not None and value > maximum:
+        raise InvalidStoredJobError(f"{field} must be <= {maximum}, found {value}")
     return value
 
 
@@ -319,10 +342,11 @@ def _strict_nullable_sqlite_int(
     *,
     field: str,
     minimum: int | None = None,
+    maximum: int | None = None,
 ) -> int | None:
     if value is None:
         return None
-    return _strict_sqlite_int(value, field=field, minimum=minimum)
+    return _strict_sqlite_int(value, field=field, minimum=minimum, maximum=maximum)
 
 
 def _strict_nullable_sqlite_real(
@@ -330,6 +354,8 @@ def _strict_nullable_sqlite_real(
     *,
     field: str,
     positive: bool = False,
+    minimum_inclusive: float | None = None,
+    maximum_exclusive: float | None = None,
 ) -> float | None:
     if value is None:
         return None
@@ -339,6 +365,10 @@ def _strict_nullable_sqlite_real(
     if not math.isfinite(converted) or (positive and converted <= 0):
         qualifier = "finite and positive" if positive else "finite"
         raise InvalidStoredJobError(f"{field} must be {qualifier}, found {converted}")
+    if minimum_inclusive is not None and converted < minimum_inclusive:
+        raise InvalidStoredJobError(f"{field} must be >= {minimum_inclusive}, found {converted}")
+    if maximum_exclusive is not None and converted >= maximum_exclusive:
+        raise InvalidStoredJobError(f"{field} must be < {maximum_exclusive}, found {converted}")
     return converted
 
 
@@ -787,14 +817,16 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             OR (typeof(work_unit_name) = 'text' AND length(work_unit_name) > 0)
         )
         """,
-        """
+        f"""
         ALTER TABLE lab_shard ADD COLUMN work_units INTEGER
         CHECK (
             work_units IS NULL
-            OR (typeof(work_units) = 'integer' AND work_units >= 1)
+            OR (typeof(work_units) = 'integer'
+                AND work_units >= 1
+                AND work_units <= {SQLITE_SIGNED_INTEGER_MAX})
         )
         """,
-        """
+        f"""
         ALTER TABLE lab_shard ADD COLUMN static_duration_ms INTEGER
         CHECK (
             (phase IS NULL AND work_unit_name IS NULL
@@ -803,18 +835,20 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             (phase IS NOT NULL AND work_unit_name IS NOT NULL
              AND work_units IS NOT NULL
              AND typeof(static_duration_ms) = 'integer'
-             AND static_duration_ms >= 1)
+             AND static_duration_ms >= 1
+             AND static_duration_ms <= {SQLITE_SIGNED_INTEGER_MAX})
         )
         """,
-        """
+        f"""
         ALTER TABLE lab_shard ADD COLUMN duration_ms REAL
         CHECK (
             duration_ms IS NULL
             OR (typeof(duration_ms) IN ('integer', 'real')
-                AND duration_ms > 0 AND duration_ms < 1e15)
+                AND duration_ms >= {LAB_SHARD_DURATION_MS_MIN}
+                AND duration_ms < {LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE})
         )
         """,
-        """
+        f"""
         ALTER TABLE lab_shard ADD COLUMN throughput_units_per_second REAL
         CHECK (
             (duration_ms IS NULL AND throughput_units_per_second IS NULL)
@@ -822,7 +856,7 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             (duration_ms IS NOT NULL
              AND typeof(throughput_units_per_second) IN ('integer', 'real')
              AND throughput_units_per_second > 0
-             AND throughput_units_per_second < 1e18)
+             AND throughput_units_per_second < {LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE})
         )
         """,
         """
@@ -1352,21 +1386,26 @@ class LabJobReader:
                     row["work_units"],
                     field="lab_shard.work_units",
                     minimum=1,
+                    maximum=SQLITE_SIGNED_INTEGER_MAX,
                 ),
                 static_duration_ms=_strict_nullable_sqlite_int(
                     row["static_duration_ms"],
                     field="lab_shard.static_duration_ms",
                     minimum=1,
+                    maximum=SQLITE_SIGNED_INTEGER_MAX,
                 ),
                 duration_ms=_strict_nullable_sqlite_real(
                     row["duration_ms"],
                     field="lab_shard.duration_ms",
                     positive=True,
+                    minimum_inclusive=LAB_SHARD_DURATION_MS_MIN,
+                    maximum_exclusive=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
                 ),
                 throughput_units_per_second=_strict_nullable_sqlite_real(
                     row["throughput_units_per_second"],
                     field="lab_shard.throughput_units_per_second",
                     positive=True,
+                    maximum_exclusive=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
                 ),
                 completion_sequence=_strict_nullable_sqlite_int(
                     row["completion_sequence"],
@@ -1627,21 +1666,26 @@ class LabJobReader:
                     row["work_units"],
                     field="lab_shard.work_units",
                     minimum=1,
+                    maximum=SQLITE_SIGNED_INTEGER_MAX,
                 ),
                 static_duration_ms=_strict_sqlite_int(
                     row["static_duration_ms"],
                     field="lab_shard.static_duration_ms",
                     minimum=1,
+                    maximum=SQLITE_SIGNED_INTEGER_MAX,
                 ),
                 duration_ms=_strict_nullable_sqlite_real(
                     row["duration_ms"],
                     field="lab_shard.duration_ms",
                     positive=True,
+                    minimum_inclusive=LAB_SHARD_DURATION_MS_MIN,
+                    maximum_exclusive=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
                 ),
                 throughput_units_per_second=_strict_nullable_sqlite_real(
                     row["throughput_units_per_second"],
                     field="lab_shard.throughput_units_per_second",
                     positive=True,
+                    maximum_exclusive=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
                 ),
             )
             completed.append(
@@ -1675,11 +1719,13 @@ class LabJobReader:
                         row["work_units"],
                         field="lab_shard.work_units",
                         minimum=1,
+                        maximum=SQLITE_SIGNED_INTEGER_MAX,
                     ),
                     static_duration_ms=_strict_sqlite_int(
                         row["static_duration_ms"],
                         field="lab_shard.static_duration_ms",
                         minimum=1,
+                        maximum=SQLITE_SIGNED_INTEGER_MAX,
                     ),
                 )
             else:
@@ -3543,11 +3589,13 @@ class LabJobStore:
                         row["work_units"],
                         field="lab_shard.work_units",
                         minimum=1,
+                        maximum=SQLITE_SIGNED_INTEGER_MAX,
                     ),
                     static_duration_ms=_strict_sqlite_int(
                         row["static_duration_ms"],
                         field="lab_shard.static_duration_ms",
                         minimum=1,
+                        maximum=SQLITE_SIGNED_INTEGER_MAX,
                     ),
                 )
                 if row["phase"] is not None
@@ -4960,7 +5008,9 @@ CREATE TABLE IF NOT EXISTS lab_shard (
     ),
     work_units INTEGER CHECK (
         work_units IS NULL
-        OR (typeof(work_units) = 'integer' AND work_units >= 1)
+        OR (typeof(work_units) = 'integer'
+            AND work_units >= 1
+            AND work_units <= {SQLITE_SIGNED_INTEGER_MAX})
     ),
     static_duration_ms INTEGER CHECK (
         (phase IS NULL AND work_unit_name IS NULL
@@ -4969,12 +5019,14 @@ CREATE TABLE IF NOT EXISTS lab_shard (
         (phase IS NOT NULL AND work_unit_name IS NOT NULL
          AND work_units IS NOT NULL
          AND typeof(static_duration_ms) = 'integer'
-         AND static_duration_ms >= 1)
+         AND static_duration_ms >= 1
+         AND static_duration_ms <= {SQLITE_SIGNED_INTEGER_MAX})
     ),
     duration_ms REAL CHECK (
         duration_ms IS NULL
         OR (typeof(duration_ms) IN ('integer', 'real')
-            AND duration_ms > 0 AND duration_ms < 1e15)
+            AND duration_ms >= {LAB_SHARD_DURATION_MS_MIN}
+            AND duration_ms < {LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE})
     ),
     throughput_units_per_second REAL CHECK (
         (duration_ms IS NULL AND throughput_units_per_second IS NULL)
@@ -4982,7 +5034,7 @@ CREATE TABLE IF NOT EXISTS lab_shard (
         (duration_ms IS NOT NULL
          AND typeof(throughput_units_per_second) IN ('integer', 'real')
          AND throughput_units_per_second > 0
-         AND throughput_units_per_second < 1e18)
+         AND throughput_units_per_second < {LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE})
     ),
     completion_sequence INTEGER CHECK (
         completion_sequence IS NULL

@@ -9,7 +9,12 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-from rquant.lab_shard_protocol import LabShardClaim
+from rquant.lab_shard_protocol import (
+    LabClaimDeliveryReceipt,
+    LabClaimHighWater,
+    LabShardClaim,
+    LabShardDefinition,
+)
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
     ExecutionCostSpec,
@@ -19,6 +24,15 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
+
+_P13_PLAN_HASH = "dbab9770704e67d6ca06c73cc59e02fc7fd1430ce6ea26be00eff4e624543a49"
+_P13_SHARD_ID = UUID("688270f0-2359-5276-b9f3-7338a0c3254e")
+_P13_ENVELOPE_HASH = "723899d882f2f4bfda6b335d17b4a16c62a920f985cb8ecd72177686c8ac6cb1"
+_P13_CLAIM_JSON = r"""{"schema_version":1,"job_id":"11111111-2222-3333-4444-555555555555","spec_hash":"452390fb85bd62aac6b02eb89b45fe1773c0b916cdd992b20ef5750d322bef7c","definition":{"schema_version":1,"shard_id":"688270f0-2359-5276-b9f3-7338a0c3254e","shard_index":0,"adapter_id":"nshape-compare","adapter_version":"1","plan_hash":"dbab9770704e67d6ca06c73cc59e02fc7fd1430ce6ea26be00eff4e624543a49","payload_json":"{\"adapter_id\":\"nshape-compare\",\"adapter_version\":\"1\",\"schema_version\":1,\"shard\":{\"hold_days\":1,\"kind\":\"hold_days\"},\"spec\":{\"code_sha\":\"1111111111111111111111111111111111111111\",\"dataset_snapshot\":null,\"deadline\":\"2026-08-01T00:00:00Z\",\"execution_costs\":{\"commission_bps\":\"0\",\"slippage_bps\":\"0\",\"stamp_duty_bps\":\"0\",\"transfer_fee_bps\":\"0\"},\"feature_contract\":{\"contract_hash\":\"ae9dfef2a24213b119b3b71e1a63b05b62bf0df1083660e8ea52edfd42095daf\",\"contract_id\":\"strategy-adapter-execution\",\"contract_version\":\"p13b-adapter-v1\"},\"job_type\":\"strategy_replay\",\"parameters\":{\"arguments\":[{\"kind\":\"text_list\",\"name\":\"entry_modes\",\"value\":[\"first_break\",\"late_confirm\"]},{\"kind\":\"integer_list\",\"name\":\"hold_days\",\"value\":[1]},{\"kind\":\"text_list\",\"name\":\"profile_variants\",\"value\":[\"baseline\"]}],\"end_date\":\"2026-02-10\",\"start_date\":\"2026-01-01\",\"strategy_name\":\"n_shape\"},\"random_seed\":20260724,\"research_status\":\"exploratory\",\"resource_class\":\"standard\",\"schema_version\":2}}","payload_hash":"054ccf2d5b6423c8791553d7e16de6b948ffe792e6ddee8a73936f1a18f3c45c"},"worker_id":"worker-legacy","claim_token":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","claim_generation":1,"scheduler_fencing_token":7,"claimed_at":"2026-07-24T00:00:00Z","lease_expires_at":"2026-07-24T00:05:00Z"}"""  # noqa: E501
+
+
+def _p13_frozen_claim() -> LabShardClaim:
+    return LabShardClaim.model_validate_json(_P13_CLAIM_JSON)
 
 
 def _parameter(name: str, kind: str, value: object) -> ResearchParameter:
@@ -611,6 +625,93 @@ def test_claim_validation_rebuilds_the_full_identity() -> None:
                 update={"definition": claim.definition.model_copy(update={"plan_hash": "f" * 64})}
             )
         )
+
+
+def test_frozen_p13_claim_preserves_plan_shard_and_envelope_identity() -> None:
+    claim = _p13_frozen_claim()
+
+    assert claim.definition.work_plan is None
+    assert claim.plan_hash == _P13_PLAN_HASH
+    assert claim.shard_id == _P13_SHARD_ID
+    assert LabClaimHighWater(claim=claim).content_hash == _P13_ENVELOPE_HASH
+    assert LabClaimDeliveryReceipt(claim=claim).content_hash == _P13_ENVELOPE_HASH
+
+
+def test_claim_validation_accepts_only_the_exact_regenerated_p13_definition() -> None:
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    registry = default_strategy_job_adapter_registry()
+    claim = _p13_frozen_claim()
+
+    validated = registry.validate_claim(claim)
+
+    assert validated.claim == claim
+    assert validated.shard.hold_days == 1
+
+    forged_definitions = (
+        LabShardDefinition.from_payload(
+            shard_index=claim.shard_index,
+            adapter_id=claim.definition.adapter_id,
+            adapter_version=claim.definition.adapter_version,
+            plan_hash="f" * 64,
+            payload_json=claim.definition.payload_json,
+        ),
+        LabShardDefinition.from_payload(
+            shard_index=1,
+            adapter_id=claim.definition.adapter_id,
+            adapter_version=claim.definition.adapter_version,
+            plan_hash=claim.plan_hash,
+            payload_json=claim.definition.payload_json,
+        ),
+        LabShardDefinition.from_payload(
+            shard_index=claim.shard_index,
+            adapter_id=claim.definition.adapter_id,
+            adapter_version=claim.definition.adapter_version,
+            plan_hash=claim.plan_hash,
+            payload_json=claim.definition.payload_json.replace(
+                '"hold_days":1',
+                '"hold_days":2',
+                1,
+            ),
+        ),
+    )
+    for forged in forged_definitions:
+        with pytest.raises(ValueError):
+            registry.validate_claim(claim.model_copy(update={"definition": forged}))
+
+
+def test_current_claim_cannot_downgrade_to_missing_or_changed_work_plan() -> None:
+    from rquant.lab_shard_protocol import LabShardWorkPlan
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    registry = default_strategy_job_adapter_registry()
+    current = _claim(_nshape_compare_spec(hold_days=(1,)))
+    plan = current.definition.work_plan
+    assert plan is not None
+    missing = LabShardDefinition.from_payload(
+        shard_index=current.shard_index,
+        adapter_id=current.definition.adapter_id,
+        adapter_version=current.definition.adapter_version,
+        plan_hash=current.plan_hash,
+        payload_json=current.definition.payload_json,
+    )
+    changed = LabShardDefinition.from_payload(
+        shard_index=current.shard_index,
+        adapter_id=current.definition.adapter_id,
+        adapter_version=current.definition.adapter_version,
+        plan_hash=current.plan_hash,
+        payload_json=current.definition.payload_json,
+        work_plan=LabShardWorkPlan(
+            phase=plan.phase,
+            work_unit_name=plan.work_unit_name,
+            work_units=plan.work_units + 1,
+            static_duration_ms=plan.static_duration_ms,
+        ),
+    )
+
+    for forged in (missing, changed):
+        with pytest.raises(ValueError, match="definition"):
+            registry.validate_claim(current.model_copy(update={"definition": forged}))
 
 
 def _result_table(result: object, name: str) -> pd.DataFrame:

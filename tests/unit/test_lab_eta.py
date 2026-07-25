@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from rquant.lab_eta import (
     LabEtaCompletedShard,
     LabEtaInput,
+    LabEtaProjectionError,
     LabEtaRemainingShard,
     estimate_lab_eta,
 )
@@ -479,3 +480,46 @@ def test_eta_reader_accepts_completed_limit_boundaries(
     )
 
     assert projection is not None
+
+
+def test_eta_huge_static_duration_raises_typed_projection_error() -> None:
+    with pytest.raises(LabEtaProjectionError):
+        estimate_lab_eta(
+            _input(remaining=(_remaining(1, work_units=1, static_duration_ms=10**18),))
+        )
+
+
+def test_eta_multiple_legal_shards_with_overflowing_total_raise_projection_error() -> None:
+    static_duration_ms = 150_000_000_000_000
+    with pytest.raises(LabEtaProjectionError):
+        estimate_lab_eta(
+            _input(
+                as_of=datetime.min.replace(tzinfo=UTC),
+                remaining=(
+                    _remaining(1, work_units=1, static_duration_ms=static_duration_ms),
+                    _remaining(2, work_units=1, static_duration_ms=static_duration_ms),
+                ),
+            )
+        )
+
+
+def test_eta_near_datetime_max_raises_projection_error_without_raw_overflow() -> None:
+    with pytest.raises(LabEtaProjectionError):
+        estimate_lab_eta(
+            _input(
+                as_of=datetime.max.replace(tzinfo=UTC),
+                remaining=(_remaining(1, work_units=1, static_duration_ms=1),),
+            )
+        )
+
+
+def test_eta_near_datetime_min_projects_small_duration() -> None:
+    estimate = estimate_lab_eta(
+        _input(
+            as_of=datetime.min.replace(tzinfo=UTC),
+            remaining=(_remaining(1, work_units=1, static_duration_ms=1),),
+        )
+    )
+
+    assert estimate.finish_at is not None
+    assert estimate.finish_at.center == datetime.min.replace(tzinfo=UTC) + timedelta(milliseconds=1)

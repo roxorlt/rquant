@@ -33,6 +33,10 @@ _STATIC_LOW_FACTOR = 0.75
 _STATIC_HIGH_FACTOR = 1.5
 
 
+class LabEtaProjectionError(ValueError):
+    """ETA arithmetic cannot be represented as a finite duration or datetime."""
+
+
 class LabEtaModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
@@ -170,11 +174,25 @@ def _ewma_range(
 
 
 def _finish_window(as_of: datetime, duration: LabEtaDurationRange) -> LabEtaFinishWindow:
-    return LabEtaFinishWindow(
-        low=as_of + timedelta(milliseconds=duration.low_ms),
-        center=as_of + timedelta(milliseconds=duration.center_ms),
-        high=as_of + timedelta(milliseconds=duration.high_ms),
-    )
+    try:
+        return LabEtaFinishWindow(
+            low=as_of + timedelta(milliseconds=duration.low_ms),
+            center=as_of + timedelta(milliseconds=duration.center_ms),
+            high=as_of + timedelta(milliseconds=duration.high_ms),
+        )
+    except (OverflowError, ValueError) as exc:
+        raise LabEtaProjectionError("ETA finish window is outside the datetime domain") from exc
+
+
+def _duration_range(*, low_ms: float, center_ms: float, high_ms: float) -> LabEtaDurationRange:
+    try:
+        return LabEtaDurationRange(
+            low_ms=low_ms,
+            center_ms=center_ms,
+            high_ms=high_ms,
+        )
+    except (OverflowError, ValueError) as exc:
+        raise LabEtaProjectionError("ETA duration is outside the numeric domain") from exc
 
 
 def estimate_lab_eta(value: LabEtaInput) -> LabEtaEstimate:
@@ -196,7 +214,7 @@ def estimate_lab_eta(value: LabEtaInput) -> LabEtaEstimate:
             finish_at=None,
         )
     if eta_input.status == "succeeded":
-        duration = LabEtaDurationRange(low_ms=0, center_ms=0, high_ms=0)
+        duration = _duration_range(low_ms=0, center_ms=0, high_ms=0)
         return LabEtaEstimate(
             **{**common, "remaining_shards": 0},
             estimator="terminal",
@@ -230,7 +248,7 @@ def estimate_lab_eta(value: LabEtaInput) -> LabEtaEstimate:
         low_ms += low
         center_ms += center
         high_ms += high
-    duration = LabEtaDurationRange(
+    duration = _duration_range(
         low_ms=low_ms,
         center_ms=center_ms,
         high_ms=high_ms,

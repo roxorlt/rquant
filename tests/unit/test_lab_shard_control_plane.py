@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 import subprocess
 import sys
@@ -30,6 +31,9 @@ from rquant.lab_jobs import (
     ShardStatus,
 )
 from rquant.lab_shard_protocol import (
+    LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
+    LAB_SHARD_DURATION_MS_MIN,
+    SQLITE_SIGNED_INTEGER_MAX,
     LabShardClaim,
     LabShardDefinition,
     LabShardFailed,
@@ -40,8 +44,10 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
     LabWorkerStopped,
 )
+from rquant.strategy_job_adapters import StrategyShardPayload
 
 from .test_lab_jobs import NOW, _lease, _submit, _submit_job
+from .test_strategy_job_adapters import _p13_frozen_claim
 
 PLAN_HASH = "4" * 64
 
@@ -1013,6 +1019,117 @@ def test_telemetry_completion_sequence_is_acceptance_ordered_exactly_once_and_re
     assert shards[1].throughput_units_per_second == pytest.approx(1)
     assert job is not None
     assert job.result_contract_version == "p1.4a-telemetry-v1"
+
+
+def test_p13_inflight_success_keeps_legacy_telemetry_columns_null(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    frozen = _p13_frozen_claim()
+    payload = StrategyShardPayload.model_validate_json(frozen.definition.payload_json)
+    submitted = _submit(job_id=frozen.job_id, spec=payload.spec)
+    assert store.apply_command(submitted, lease=lease, now=NOW).status == "applied"
+    store.plan_job(
+        frozen.job_id,
+        (frozen.definition,),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id=frozen.worker_id,
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None and claim.definition == frozen.definition
+
+    receipt = store.apply_worker_report(
+        _report(
+            claim,
+            LabShardSucceeded(result_manifest_hash="a" * 64),
+            offset=3,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    shard = LabJobReader(store.path).list_shards(frozen.job_id)[0]
+    job = LabJobReader(store.path).get_job(frozen.job_id)
+
+    assert receipt.status == "accepted"
+    assert shard.status is ShardStatus.SUCCEEDED
+    assert shard.duration_ms is None
+    assert shard.throughput_units_per_second is None
+    assert shard.completion_sequence is None
+    assert job is not None and job.result_contract_version is None
+
+
+@pytest.mark.parametrize(
+    ("work_units", "duration_ms", "throughput"),
+    [
+        (
+            999_999_999,
+            LAB_SHARD_DURATION_MS_MIN,
+            999_999_999 / (LAB_SHARD_DURATION_MS_MIN / 1_000),
+        ),
+        (
+            1,
+            math.nextafter(LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE, 0.0),
+            1 / (math.nextafter(LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE, 0.0) / 1_000),
+        ),
+    ],
+)
+def test_validated_near_bound_telemetry_commits_without_sqlite_integrity_error(
+    tmp_path: Path,
+    work_units: int,
+    duration_ms: float,
+    throughput: float,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    plan = LabShardWorkPlan(
+        phase="strategy_replay",
+        work_unit_name="parameter_case",
+        work_units=work_units,
+        static_duration_ms=SQLITE_SIGNED_INTEGER_MAX,
+    )
+    definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="numeric-boundary",
+        adapter_version="v1",
+        plan_hash="9" * 64,
+        payload_json="{}",
+        work_plan=plan,
+    )
+    store.plan_job(
+        job.job_id,
+        (definition,),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = _claim(store, lease)
+    telemetry = LabShardTelemetry(
+        **plan.model_dump(),
+        duration_ms=duration_ms,
+        throughput_units_per_second=throughput,
+    )
+
+    receipt = store.apply_worker_report(
+        _report(
+            claim,
+            LabShardSucceeded(
+                result_manifest_hash="b" * 64,
+                telemetry=telemetry,
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    shard = LabJobReader(store.path).list_shards(job.job_id)[0]
+
+    assert receipt.status == "accepted"
+    assert shard.telemetry == telemetry
 
 
 def test_stale_and_plan_mismatched_success_reports_cannot_write_telemetry(

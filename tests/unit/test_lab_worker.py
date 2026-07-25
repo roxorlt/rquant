@@ -44,7 +44,11 @@ from rquant.strategy_job_adapters import (
     ValidatedStrategyShard,
     default_strategy_job_adapter_registry,
 )
-from tests.unit.test_strategy_job_adapters import _claim, _nshape_compare_spec
+from tests.unit.test_strategy_job_adapters import (
+    _claim,
+    _nshape_compare_spec,
+    _p13_frozen_claim,
+)
 
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
 
@@ -3795,6 +3799,29 @@ def test_worker_success_report_uses_monotonic_duration_and_claim_work_plan(
     assert success.telemetry.throughput_units_per_second == pytest.approx(
         claim.definition.work_plan.work_units / 2.5
     )
+
+
+def test_worker_executes_frozen_p13_claim_and_reports_success_without_telemetry(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _p13_frozen_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        worker_id=claim.worker_id,
+        claims=claims,
+        reports=reports,
+    )
+
+    result = worker.run_once()
+    success = next(
+        report.body for report in _reports(reports) if isinstance(report.body, LabShardSucceeded)
+    )
+
+    assert result.status == "succeeded"
+    assert success.telemetry is None
 
 
 def test_stop_after_success_publish_keeps_single_reported_terminal(

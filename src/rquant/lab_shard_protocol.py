@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -49,6 +49,10 @@ _ADMISSION_TEMP_NAME = re.compile(
     r"[0-9a-f]{32}\.tmp"
 )
 MAX_SHARD_HEARTBEAT_EXTENSION_SECONDS = 3_600
+SQLITE_SIGNED_INTEGER_MAX: Final[int] = (1 << 63) - 1
+LAB_SHARD_DURATION_MS_MIN: Final[float] = 1e-6
+LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE: Final[float] = 1e15
+LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE: Final[float] = 1e18
 
 
 class LabShardProtocolModel(BaseModel):
@@ -63,13 +67,23 @@ class LabShardProtocolModel(BaseModel):
 class LabShardWorkPlan(LabShardProtocolModel):
     phase: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
     work_unit_name: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
-    work_units: int = Field(strict=True, ge=1)
-    static_duration_ms: int = Field(strict=True, ge=1)
+    work_units: int = Field(strict=True, ge=1, le=SQLITE_SIGNED_INTEGER_MAX)
+    static_duration_ms: int = Field(strict=True, ge=1, le=SQLITE_SIGNED_INTEGER_MAX)
 
 
 class LabShardTelemetry(LabShardWorkPlan):
-    duration_ms: float = Field(strict=True, gt=0, allow_inf_nan=False)
-    throughput_units_per_second: float = Field(strict=True, gt=0, allow_inf_nan=False)
+    duration_ms: float = Field(
+        strict=True,
+        ge=LAB_SHARD_DURATION_MS_MIN,
+        lt=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
+        allow_inf_nan=False,
+    )
+    throughput_units_per_second: float = Field(
+        strict=True,
+        gt=0,
+        lt=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
+        allow_inf_nan=False,
+    )
 
     @classmethod
     def from_work_plan(
@@ -83,20 +97,33 @@ class LabShardTelemetry(LabShardWorkPlan):
         if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
             raise ValueError("monotonic shard duration must be finite and positive")
         duration_ms = elapsed_seconds * 1_000
+        if (
+            not math.isfinite(duration_ms)
+            or duration_ms < LAB_SHARD_DURATION_MS_MIN
+            or duration_ms >= LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE
+        ):
+            raise ValueError("monotonic shard duration is outside the persisted telemetry domain")
+        throughput = work_plan.work_units / elapsed_seconds
+        if (
+            not math.isfinite(throughput)
+            or throughput <= 0
+            or throughput >= LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE
+        ):
+            raise ValueError("shard throughput is outside the persisted telemetry domain")
         return cls(
             **work_plan.model_dump(),
             duration_ms=duration_ms,
-            throughput_units_per_second=work_plan.work_units / elapsed_seconds,
+            throughput_units_per_second=throughput,
         )
 
     @model_validator(mode="after")
     def validate_throughput(self) -> LabShardTelemetry:
-        expected = self.work_units / (self.duration_ms / 1_000)
+        observed_work_units = self.throughput_units_per_second * (self.duration_ms * 0.001)
         if not math.isclose(
-            self.throughput_units_per_second,
-            expected,
+            observed_work_units,
+            float(self.work_units),
             rel_tol=1e-12,
-            abs_tol=1e-12,
+            abs_tol=1e-9,
         ):
             raise ValueError("throughput_units_per_second does not match duration and work_units")
         return self
