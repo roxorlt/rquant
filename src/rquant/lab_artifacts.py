@@ -415,6 +415,14 @@ class LabArtifactFileIdentity(LabArtifactModel):
     mtime_ns: int = Field(ge=0)
     ctime_ns: int = Field(ge=0)
 
+    @model_validator(mode="after")
+    def validate_relative_path(self) -> LabArtifactFileIdentity:
+        try:
+            _safe_relative_path(self.relative_path)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
 
 class LabJobArtifactCandidate(LabArtifactModel):
     path: Path
@@ -427,6 +435,45 @@ class LabJobArtifactCandidate(LabArtifactModel):
     mtime_ns: int = Field(ge=0)
     ctime_ns: int = Field(ge=0)
     file_identities: tuple[LabArtifactFileIdentity, ...]
+
+    @model_validator(mode="after")
+    def validate_candidate_identity(self) -> LabJobArtifactCandidate:
+        if self.job_id != self.manifest.job_id:
+            raise ValueError("candidate job_id conflicts with manifest")
+        if self.manifest_hash != self.manifest.manifest_hash:
+            raise ValueError("candidate manifest_hash conflicts with manifest")
+        paths = tuple(item.relative_path for item in self.file_identities)
+        expected_paths = {
+            "manifest.json",
+            "SHA256SUMS",
+            *(item.relative_path for item in self.manifest.files),
+        }
+        if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise ValueError("candidate file identities must be sorted and unique")
+        if set(paths) != expected_paths:
+            raise ValueError("candidate file identities conflict with manifest inventory")
+        identities = {item.relative_path: item for item in self.file_identities}
+        expected_sizes = {item.relative_path: item.size for item in self.manifest.files}
+        manifest_bytes = self.manifest.canonical_json_bytes()
+        expected_sizes["manifest.json"] = len(manifest_bytes)
+        sums = {item.relative_path: item.sha256 for item in self.manifest.files}
+        sums["manifest.json"] = self.manifest.manifest_hash
+        expected_sizes["SHA256SUMS"] = len(
+            "".join(
+                f"{digest}  {relative_path}\n" for relative_path, digest in sorted(sums.items())
+            ).encode("ascii")
+        )
+        if any(
+            identities[relative_path].size != expected_size
+            for relative_path, expected_size in expected_sizes.items()
+        ):
+            raise ValueError("candidate file sizes conflict with manifest inventory")
+        file_nodes = tuple((item.device, item.inode) for item in self.file_identities)
+        if any(item.device != self.device for item in self.file_identities):
+            raise ValueError("candidate files must share the bundle filesystem")
+        if len(file_nodes) != len(set(file_nodes)) or (self.device, self.inode) in file_nodes:
+            raise ValueError("candidate file identities are not unique")
+        return self
 
 
 class LabArtifactSealIntent(LabArtifactModel):
@@ -444,6 +491,8 @@ class LabArtifactSealIntent(LabArtifactModel):
 
     @model_validator(mode="after")
     def validate_file_identities(self) -> LabArtifactSealIntent:
+        if not self.candidate_name.startswith(f"{self.job_id.hex}-"):
+            raise ValueError("seal intent candidate name conflicts with job identity")
         paths = tuple(item.relative_path for item in self.file_identities)
         if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
             raise ValueError("seal intent file identities must be sorted and unique")
@@ -518,6 +567,24 @@ class LabArtifactRecoveryRecord(LabArtifactModel):
     def validate_path_identity(self) -> LabArtifactRecoveryRecord:
         if (self.device is None) != (self.inode is None):
             raise ValueError("recovery device and inode must appear together")
+        if self.status in {"recoverable", "needs_authority"}:
+            if (
+                self.job_id is None
+                or self.manifest_hash is None
+                or self.device is None
+                or self.inode is None
+            ):
+                raise ValueError("candidate recovery evidence is incomplete")
+            if (
+                re.fullmatch(
+                    rf"{self.job_id.hex}-[0-9a-f]{{32}}",
+                    self.path.name,
+                )
+                is None
+            ):
+                raise ValueError("candidate recovery path conflicts with job identity")
+        if self.status == "quarantined" and (self.device is None or self.inode is None):
+            raise ValueError("quarantined recovery identity is incomplete")
         return self
 
 
@@ -3016,6 +3083,7 @@ class LabJobArtifactStore:
             ctime_ns=observed.ctime_ns,
             file_identities=identities,
         )
+        candidate = self._defensively_validate_candidate(candidate)
         if allow_interrupted_seal and intent_state == "valid":
             intent = self._load_seal_intent(manifest.job_id)
             if not self._intent_matches_candidate(intent, candidate):
@@ -3024,17 +3092,79 @@ class LabJobArtifactStore:
                 )
         return candidate
 
+    def _defensively_validate_candidate(
+        self,
+        candidate: LabJobArtifactCandidate,
+    ) -> LabJobArtifactCandidate:
+        try:
+            payload = {
+                field_name: getattr(candidate, field_name)
+                for field_name in LabJobArtifactCandidate.model_fields
+            }
+            rebuilt = LabJobArtifactCandidate.model_validate(payload)
+        except Exception as exc:
+            raise LabArtifactIntegrityError("candidate typed identity is invalid") from exc
+        managed = self._assert_managed_child(
+            rebuilt.path,
+            self.candidates_root,
+            label="candidate",
+        )
+        if (
+            re.fullmatch(
+                rf"{rebuilt.job_id.hex}-[0-9a-f]{{32}}",
+                managed.name,
+            )
+            is None
+        ):
+            raise LabArtifactIntegrityError("candidate path conflicts with job identity")
+        if managed != rebuilt.path:
+            rebuilt = rebuilt.model_copy(update={"path": managed})
+        return rebuilt
+
+    @staticmethod
+    def _defensively_validate_recovery_record(
+        record: LabArtifactRecoveryRecord,
+    ) -> LabArtifactRecoveryRecord:
+        try:
+            return LabArtifactRecoveryRecord.model_validate(
+                {
+                    field_name: getattr(record, field_name)
+                    for field_name in LabArtifactRecoveryRecord.model_fields
+                }
+            )
+        except Exception as exc:
+            raise LabArtifactIntegrityError("candidate recovery evidence is invalid") from exc
+
+    @staticmethod
+    def _defensively_validate_recovery_authority(
+        authority: LabArtifactRecoveryAuthority,
+    ) -> LabArtifactRecoveryAuthority:
+        try:
+            return LabArtifactRecoveryAuthority.model_validate(
+                {
+                    field_name: getattr(authority, field_name)
+                    for field_name in LabArtifactRecoveryAuthority.model_fields
+                }
+            )
+        except Exception as exc:
+            raise LabArtifactAuthorizationError("external recovery authority is invalid") from exc
+
     def verify_candidate(
         self,
         candidate: LabJobArtifactCandidate,
         *,
         allow_interrupted_seal: bool = False,
     ) -> LabJobArtifactManifest:
+        candidate = self._defensively_validate_candidate(candidate)
         path = self._assert_managed_child(candidate.path, self.candidates_root, label="candidate")
         intent_state = self._seal_intent_state(candidate.job_id)
+        intent = self._load_seal_intent(candidate.job_id) if intent_state == "valid" else None
+        intent_matches_candidate = intent is not None and self._intent_matches_candidate(
+            intent, candidate
+        )
         profile: Literal["candidate", "interrupted", "sealed"] = (
             "interrupted"
-            if allow_interrupted_seal and intent_state in {"valid", "torn"}
+            if allow_interrupted_seal and (intent_state == "torn" or intent_matches_candidate)
             else "candidate"
         )
         manifest, identities, observed = self._validate_bundle(
@@ -3044,8 +3174,7 @@ class LabJobArtifactStore:
         )
         if not self._same_bundle_identity(observed, candidate):
             raise LabArtifactIntegrityError("candidate bundle identity changed")
-        if allow_interrupted_seal and intent_state == "valid":
-            intent = self._load_seal_intent(manifest.job_id)
+        if allow_interrupted_seal and intent_matches_candidate and intent is not None:
             current = candidate.model_copy(update={"file_identities": identities})
             if not self._intent_matches_candidate(intent, current):
                 raise LabArtifactIntegrityError(
@@ -3225,6 +3354,9 @@ class LabJobArtifactStore:
         )
 
     def seal_candidate(self, candidate: LabJobArtifactCandidate) -> LabSealedJobArtifact:
+        candidate = self._defensively_validate_candidate(candidate)
+        if self.verify_candidate(candidate, allow_interrupted_seal=True) != candidate.manifest:
+            raise LabArtifactIntegrityError("candidate manifest changed before seal")
         self._assert_managed_roots()
         target = self.sealed_root / candidate.job_id.hex
         sealed_parent_probe = self._managed_parent_descriptor(self.sealed_root)
@@ -3325,8 +3457,13 @@ class LabJobArtifactStore:
                                     and existing.manifest.complete_result_hash
                                     == candidate.manifest.complete_result_hash
                                 ):
+                                    current_candidate = candidate.model_copy(
+                                        update={
+                                            "file_identities": self._bound_file_identities(bound)
+                                        }
+                                    )
                                     self.quarantine_candidate(
-                                        candidate,
+                                        current_candidate,
                                         reason="idempotent racing sealed bundle reuse",
                                     )
                                     result = existing.model_copy(update={"reused_existing": True})
@@ -3447,6 +3584,18 @@ class LabJobArtifactStore:
             raise LabArtifactAuthorizationError(
                 "external recovery authority is required for an unbound candidate"
             )
+        try:
+            candidate = LabJobArtifactCandidate.model_validate(
+                {
+                    field_name: getattr(candidate, field_name)
+                    for field_name in LabJobArtifactCandidate.model_fields
+                }
+            )
+            authority = LabJobArtifactStore._defensively_validate_recovery_authority(authority)
+        except LabArtifactAuthorizationError:
+            raise
+        except Exception as exc:
+            raise LabArtifactAuthorizationError("candidate recovery identity is invalid") from exc
         manifest = candidate.manifest
         expected = (
             candidate.job_id,
@@ -3481,6 +3630,7 @@ class LabJobArtifactStore:
         *,
         authority: LabArtifactRecoveryAuthority | None = None,
     ) -> LabSealedJobArtifact:
+        record = self._defensively_validate_recovery_record(record)
         if record.status not in {"recoverable", "needs_authority"}:
             raise LabArtifactIntegrityError("only candidate recovery records can be sealed")
         if record.device is None or record.inode is None:
@@ -3489,6 +3639,8 @@ class LabJobArtifactStore:
             record.path,
             allow_interrupted_seal=True,
         )
+        if self.verify_candidate(candidate, allow_interrupted_seal=True) != candidate.manifest:
+            raise LabArtifactIntegrityError("candidate recovery manifest changed")
         if (candidate.device, candidate.inode) != (record.device, record.inode):
             raise LabArtifactIntegrityError("candidate recovery record identity changed")
         if (
@@ -3636,6 +3788,9 @@ class LabJobArtifactStore:
     ) -> LabArtifactRecoveryRecord:
         if not reason.strip():
             raise ValueError("quarantine reason must not be empty")
+        candidate = self._defensively_validate_candidate(candidate)
+        if self.verify_candidate(candidate, allow_interrupted_seal=True) != candidate.manifest:
+            raise LabArtifactIntegrityError("candidate manifest changed before quarantine")
         path = self._assert_managed_child(candidate.path, self.candidates_root, label="candidate")
         target = self.quarantine_root / (
             f"{path.name}-{candidate.manifest_hash[:16]}-{uuid4().hex}"
@@ -3666,6 +3821,7 @@ class LabJobArtifactStore:
     ) -> LabArtifactRecoveryRecord:
         """Logically isolate an invalid or recoverable candidate without deleting it."""
 
+        record = self._defensively_validate_recovery_record(record)
         if record.status == "quarantined":
             raise LabArtifactIntegrityError("candidate is already quarantined")
         if record.device is None or record.inode is None:

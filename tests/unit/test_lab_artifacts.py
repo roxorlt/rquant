@@ -31,6 +31,7 @@ from rquant.lab_artifacts import (
     LabArtifactPathError,
     LabArtifactPlatformError,
     LabArtifactRecoveryAuthority,
+    LabArtifactRecoveryRecord,
     LabJobArtifactCandidate,
     LabJobArtifactFile,
     LabJobArtifactManifest,
@@ -163,6 +164,39 @@ def _allow_writes(path: Path) -> None:
             os.chmod(child, stat.S_IRUSR | stat.S_IWUSR)
 
 
+def _tree_identity(path: Path) -> tuple[tuple[object, ...], ...]:
+    entries: list[tuple[object, ...]] = []
+    for item in (path, *sorted(path.rglob("*"))):
+        observed = item.lstat()
+        relative_path = "." if item == path else item.relative_to(path).as_posix()
+        payload = item.read_bytes() if item.is_file() and not item.is_symlink() else None
+        entries.append(
+            (
+                relative_path,
+                stat.S_IFMT(observed.st_mode),
+                stat.S_IMODE(observed.st_mode),
+                observed.st_dev,
+                observed.st_ino,
+                observed.st_size,
+                observed.st_mtime_ns,
+                observed.st_ctime_ns,
+                payload,
+            )
+        )
+    return tuple(entries)
+
+
+def _artifact_namespace_identity(store: LabJobArtifactStore) -> dict[str, tuple[str, ...]]:
+    roots = (
+        store.candidates_root,
+        store.sealed_root,
+        store.quarantine_root,
+        store.seal_intents_root,
+        store.seal_intents_quarantine_root,
+    )
+    return {root.name: tuple(sorted(item.name for item in root.iterdir())) for root in roots}
+
+
 def _persist_forged_manifest(
     candidate: LabJobArtifactCandidate,
     *,
@@ -255,6 +289,116 @@ def test_prepare_verify_seal_and_idempotently_reuse_complete_bundle(tmp_path: Pa
         not (child.stat().st_mode & 0o222) for child in sealed.path.rglob("*") if child.is_file()
     )
     assert store.verify_sealed(sealed.path).manifest == sealed.manifest
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "job_id",
+        "manifest_hash",
+        "inventory_order",
+        "inventory_missing",
+        "inventory_size",
+        "inventory_device",
+        "inventory_inode",
+    ],
+)
+def test_candidate_model_rejects_cross_field_identity_conflicts(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    payload = candidate.model_dump(mode="python", round_trip=True)
+    if mutation == "job_id":
+        payload["job_id"] = uuid4()
+    elif mutation == "manifest_hash":
+        payload["manifest_hash"] = "f" * 64
+    elif mutation == "inventory_order":
+        payload["file_identities"] = tuple(reversed(candidate.file_identities))
+    elif mutation == "inventory_missing":
+        payload["file_identities"] = candidate.file_identities[:-1]
+    elif mutation == "inventory_size":
+        first, *remaining = candidate.file_identities
+        payload["file_identities"] = (
+            first.model_copy(update={"size": first.size + 1}),
+            *remaining,
+        )
+    elif mutation == "inventory_device":
+        first, *remaining = candidate.file_identities
+        payload["file_identities"] = (
+            first.model_copy(update={"device": first.device + 1}),
+            *remaining,
+        )
+    else:
+        first, second, *remaining = candidate.file_identities
+        payload["file_identities"] = (
+            first,
+            second.model_copy(update={"inode": first.inode}),
+            *remaining,
+        )
+
+    with pytest.raises(ValidationError):
+        LabJobArtifactCandidate.model_validate(payload)
+
+    if mutation == "job_id":
+        with pytest.raises(ValidationError):
+            candidate.model_copy(update={"job_id": payload["job_id"]})
+
+
+@pytest.mark.parametrize("operation", ["seal", "quarantine"])
+def test_forged_candidate_job_identity_has_zero_side_effects(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    forged_job_id = uuid4()
+    forged_payload = candidate.model_dump(mode="python", round_trip=True)
+    forged_payload["job_id"] = forged_job_id
+    forged = LabJobArtifactCandidate.model_construct(**forged_payload)
+    candidate_before = _tree_identity(candidate.path)
+    namespaces_before = _artifact_namespace_identity(store)
+
+    with pytest.raises(LabArtifactIntegrityError, match="candidate.*identity"):
+        if operation == "seal":
+            store.seal_candidate(forged)
+        else:
+            store.quarantine_candidate(forged, reason="reviewer forged job")
+
+    assert candidate.path.exists()
+    assert _tree_identity(candidate.path) == candidate_before
+    assert _artifact_namespace_identity(store) == namespaces_before
+    assert not (store.sealed_root / forged_job_id.hex).exists()
+    assert not (store.seal_intents_root / f"{forged_job_id.hex}.json").exists()
+
+    sealed = store.seal_candidate(candidate)
+    assert sealed.path == store.sealed_root / candidate.job_id.hex
+
+
+def test_forged_recovery_record_is_revalidated_before_any_recovery_side_effect(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
+    forged_job_id = uuid4()
+    forged = LabArtifactRecoveryRecord.model_construct(
+        **{
+            **record.model_dump(mode="python", round_trip=True),
+            "job_id": forged_job_id,
+        }
+    )
+    candidate_before = _tree_identity(candidate.path)
+    namespaces_before = _artifact_namespace_identity(store)
+
+    with pytest.raises(LabArtifactIntegrityError, match="recovery evidence"):
+        store.recover_candidate(forged, authority=_recovery_authority(candidate))
+
+    assert _tree_identity(candidate.path) == candidate_before
+    assert _artifact_namespace_identity(store) == namespaces_before
+    sealed = store.recover_candidate(record, authority=_recovery_authority(candidate))
+    assert sealed.manifest_hash == candidate.manifest_hash
 
 
 def test_candidate_creation_path_swap_never_writes_external_directory(
