@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
+import subprocess
+import sys
+import textwrap
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +25,7 @@ from rquant.lab_artifacts import (
     LabArtifactIndexEvidence,
     LabArtifactIntegrityError,
     LabArtifactPathError,
+    LabArtifactPlatformError,
     LabJobArtifactCandidate,
     LabJobArtifactFile,
     LabJobArtifactManifest,
@@ -208,6 +213,65 @@ def test_prepare_verify_seal_and_idempotently_reuse_complete_bundle(tmp_path: Pa
     assert store.verify_sealed(sealed.path).manifest == sealed.manifest
 
 
+def test_candidate_creation_path_swap_never_writes_external_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    external = tmp_path / "external"
+    external.mkdir()
+    displaced = store.candidates_root / "displaced-construction"
+    swapped = False
+
+    def swap_after_directory_bound(candidate_name: str, _descriptor: int) -> None:
+        nonlocal swapped
+        candidate_path = store.candidates_root / candidate_name
+        os.rename(candidate_path, displaced)
+        candidate_path.symlink_to(external, target_is_directory=True)
+        swapped = True
+
+    monkeypatch.setattr(
+        store,
+        "_after_candidate_directory_bound",
+        swap_after_directory_bound,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="candidate.*identity"):
+        _prepare(store)
+
+    assert swapped is True
+    assert list(external.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+
+
+def test_candidate_creation_parent_swap_stops_before_writing_displaced_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    external = tmp_path / "external-parent"
+    external.mkdir()
+    displaced_root = tmp_path / "displaced-candidates"
+
+    def swap_parent_after_directory_bound(_candidate_name: str, _descriptor: int) -> None:
+        os.rename(store.candidates_root, displaced_root)
+        store.candidates_root.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(
+        store,
+        "_after_candidate_directory_bound",
+        swap_parent_after_directory_bound,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="candidate.*identity"):
+        _prepare(store)
+
+    displaced_candidate = next(displaced_root.iterdir())
+    assert list(external.iterdir()) == []
+    assert list(displaced_candidate.iterdir()) == []
+
+
 def test_same_job_with_different_result_conflicts_without_clobber(tmp_path: Path) -> None:
     store = LabJobArtifactStore(tmp_path / "artifacts")
     first = store.seal_candidate(_prepare(store))
@@ -230,6 +294,105 @@ def test_same_job_with_different_result_conflicts_without_clobber(tmp_path: Path
     assert changed.path.exists()
 
 
+def test_atomic_publish_never_replaces_racing_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    target = store.sealed_root / candidate.job_id.hex
+    original = lab_artifacts_module._rename_noreplace
+    reserved = False
+
+    def reserve_then_publish(
+        source_parent: int,
+        source_name: str,
+        destination_parent: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal reserved
+        os.mkdir(destination_name, mode=0o700, dir_fd=destination_parent)
+        reserved = True
+        original(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(
+        store,
+        "_atomic_publish_noreplace",
+        reserve_then_publish,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="atomically sealed"):
+        store.seal_candidate(candidate)
+
+    assert reserved is True
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+    assert candidate.path.is_dir()
+
+
+def test_atomic_publish_fails_closed_on_unsupported_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_parent = tmp_path / "source"
+    destination_parent = tmp_path / "destination"
+    source_parent.mkdir()
+    destination_parent.mkdir()
+    (source_parent / "bundle").mkdir()
+    source_descriptor = os.open(source_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    destination_descriptor = os.open(
+        destination_parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    monkeypatch.setattr(lab_artifacts_module.sys, "platform", "unsupported-test-os")
+    try:
+        with pytest.raises(LabArtifactPlatformError, match="unsupported"):
+            lab_artifacts_module._rename_noreplace(
+                source_descriptor,
+                "bundle",
+                destination_descriptor,
+                "sealed",
+            )
+    finally:
+        os.close(source_descriptor)
+        os.close(destination_descriptor)
+
+    assert (source_parent / "bundle").is_dir()
+    assert not (destination_parent / "sealed").exists()
+
+
+def test_atomic_publish_race_reuses_identical_completed_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    target = store.sealed_root / candidate.job_id.hex
+    original = lab_artifacts_module._rename_noreplace
+
+    def publish_identical_then_race(
+        source_parent: int,
+        source_name: str,
+        destination_parent: int,
+        destination_name: str,
+    ) -> None:
+        shutil.copytree(candidate.path, target)
+        for path in target.rglob("*"):
+            os.chmod(path, 0o500 if path.is_dir() else 0o400)
+        os.chmod(target, 0o500)
+        original(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(store, "_atomic_publish_noreplace", publish_identical_then_race)
+
+    reused = store.seal_candidate(candidate)
+
+    assert reused.reused_existing is True
+    assert reused.manifest_hash == candidate.manifest_hash
+    assert not candidate.path.exists()
+    assert store.verify_sealed(target).manifest_hash == candidate.manifest_hash
+
+
 def test_seal_rejects_same_job_candidate_path_swap_after_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -250,8 +413,15 @@ def test_seal_rejects_same_job_candidate_path_swap_after_verification(
     displaced_a = tmp_path / "displaced-a"
     original_verify = store.verify_candidate
 
-    def verify_then_swap(candidate: LabJobArtifactCandidate) -> LabJobArtifactManifest:
-        manifest = original_verify(candidate)
+    def verify_then_swap(
+        candidate: LabJobArtifactCandidate,
+        *,
+        allow_interrupted_seal: bool = False,
+    ) -> LabJobArtifactManifest:
+        manifest = original_verify(
+            candidate,
+            allow_interrupted_seal=allow_interrupted_seal,
+        )
         os.rename(candidate_a.path, displaced_a)
         os.rename(candidate_b.path, candidate_a.path)
         return manifest
@@ -529,6 +699,113 @@ def test_seal_fsyncs_each_fd_after_fchmod_0400(
             operation == "fsync" and later_descriptor == descriptor
             for operation, later_descriptor, _mode in events[chmod_index + 1 :]
         )
+
+
+@pytest.mark.parametrize("freeze_count", [1, 7])
+def test_candidate_with_seal_intent_recovers_after_partial_file_freeze(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    freeze_count: int,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    expected_count = len(candidate.file_identities)
+    count = min(freeze_count, expected_count)
+    original = store._seal_bound_files
+
+    def freeze_then_crash(bound: object) -> None:
+        files = bound.files  # type: ignore[attr-defined]
+        for relative_path in sorted(files)[:count]:
+            descriptor = files[relative_path].descriptor
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        raise OSError(f"crash after {count} file freezes")
+
+    monkeypatch.setattr(store, "_seal_bound_files", freeze_then_crash)
+    with pytest.raises(OSError, match="file freezes"):
+        store.seal_candidate(candidate)
+    monkeypatch.setattr(store, "_seal_bound_files", original)
+
+    restarted = LabJobArtifactStore(tmp_path / "artifacts")
+    records = restarted.list_candidate_recovery()
+    record = next(item for item in records if item.path == candidate.path)
+
+    assert record.status == "recoverable"
+    sealed = restarted.recover_candidate(record)
+    assert restarted.verify_sealed(sealed.path).manifest_hash == candidate.manifest_hash
+
+
+def test_candidate_mixed_permissions_without_seal_intent_remains_invalid(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    os.chmod(candidate.path / "report.md", 0o400)
+
+    record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
+
+    assert record.status == "invalid"
+    assert "permissions" in (record.reason or "")
+
+
+def test_process_crash_after_first_file_freeze_is_recoverable(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LabJobArtifactStore
+
+        store = LabJobArtifactStore(Path(sys.argv[1]))
+        record = next(
+            item
+            for item in store.list_candidate_recovery()
+            if item.status == "recoverable"
+        )
+
+        def freeze_one_then_exit(bound):
+            item = bound.files[sorted(bound.files)[0]]
+            os.fchmod(item.descriptor, 0o400)
+            os.fsync(item.descriptor)
+            os._exit(86)
+
+        store._seal_bound_files = freeze_one_then_exit
+        store.recover_candidate(record)
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(store.root)],
+        check=False,
+        cwd=Path(__file__).parents[2],
+        env=os.environ.copy(),
+    )
+
+    assert completed.returncode == 86
+    restarted = LabJobArtifactStore(store.root)
+    record = next(
+        item for item in restarted.list_candidate_recovery() if item.path == candidate.path
+    )
+    assert record.status == "recoverable"
+    assert restarted.recover_candidate(record).manifest_hash == candidate.manifest_hash
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "mode"),
+    [("report.md", 0o444), ("tables", 0o555), (".", 0o555)],
+)
+def test_sealed_bundle_requires_exact_file_and_directory_permissions(
+    tmp_path: Path,
+    relative_path: str,
+    mode: int,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    target = sealed.path if relative_path == "." else sealed.path / relative_path
+    os.chmod(target, mode)
+
+    with pytest.raises(LabArtifactIntegrityError, match="permissions"):
+        store.verify_sealed(sealed.path)
 
 
 def test_zip_export_is_byte_identical_and_requires_matching_index_evidence(tmp_path: Path) -> None:
@@ -920,3 +1197,64 @@ def test_legacy_detects_toctou_before_index_commit(
     with pytest.raises(LabArtifactIntegrityError, match="changed"):
         index.import_file(logical_run_id="old-run", source_path=source)
     assert index.get("old-run") is None
+
+
+def test_legacy_path_swap_after_precommit_check_never_publishes_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"original":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "legacy-index.sqlite3")
+    original = index._before_commit_source_check
+    swapped = False
+
+    def check_then_replace(path: Path, expected: object) -> None:
+        nonlocal swapped
+        original(path, expected)  # type: ignore[arg-type]
+        replacement = path.with_suffix(".replacement")
+        replacement.write_text('{"changed":true}', encoding="utf-8")
+        os.replace(replacement, path)
+        swapped = True
+
+    monkeypatch.setattr(index, "_before_commit_source_check", check_then_replace)
+
+    with pytest.raises(LabArtifactIntegrityError, match="changed"):
+        index.import_file(logical_run_id="old-run", source_path=source)
+
+    assert swapped is True
+    assert index.get("old-run") is None
+
+
+def test_legacy_process_crash_after_stage_commit_remains_invisible_and_resumable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    index_path = tmp_path / "legacy-index.sqlite3"
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LegacyArtifactIndex
+
+        index = LegacyArtifactIndex(Path(sys.argv[1]))
+        index._after_stage_commit = lambda _record: os._exit(87)
+        index.import_file(logical_run_id="old-run", source_path=Path(sys.argv[2]))
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(index_path), str(source)],
+        check=False,
+        cwd=Path(__file__).parents[2],
+        env=os.environ.copy(),
+    )
+
+    assert completed.returncode == 87
+    restarted = LegacyArtifactIndex(index_path)
+    assert restarted.get("old-run") is None
+    imported = restarted.import_file(logical_run_id="old-run", source_path=source)
+    assert imported.status == "imported"
+    assert restarted.get("old-run") == imported.record
