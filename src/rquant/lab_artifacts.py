@@ -554,9 +554,51 @@ class LabArtifactRecoveryAuthority(LabArtifactModel):
     expected_manifest_hash: str = Field(pattern=_HASH_PATTERN)
 
 
+class LabPrepareCandidateRequest(LabArtifactModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        str_strip_whitespace=False,
+        strict=True,
+        arbitrary_types_allowed=True,
+    )
+
+    job_id: UUID
+    spec: ResearchRunSpec
+    plan_hash: str = Field(pattern=_HASH_PATTERN)
+    adapter_id: str = Field(min_length=1)
+    adapter_version: str = Field(min_length=1)
+    result_contract_version: str = Field(min_length=1)
+    metrics: Mapping[str, object]
+    report_markdown: str
+    tables: Mapping[str, pd.DataFrame]
+
+    @model_validator(mode="after")
+    def validate_request_shape(self) -> LabPrepareCandidateRequest:
+        if not self.tables:
+            raise ValueError("job artifact requires at least one complete table")
+        if any(
+            not value.strip()
+            for value in (
+                self.adapter_id,
+                self.adapter_version,
+                self.result_contract_version,
+            )
+        ):
+            raise ValueError("adapter and result contract identities must not be empty")
+        return self
+
+
 class LabArtifactRecoveryRecord(LabArtifactModel):
     path: Path
-    status: Literal["recoverable", "needs_authority", "invalid", "quarantined"]
+    status: Literal[
+        "recoverable",
+        "needs_authority",
+        "recoverable_torn",
+        "invalid",
+        "quarantined",
+    ]
     job_id: UUID | None = None
     manifest_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
     device: int | None = Field(default=None, ge=0)
@@ -567,7 +609,12 @@ class LabArtifactRecoveryRecord(LabArtifactModel):
     def validate_path_identity(self) -> LabArtifactRecoveryRecord:
         if (self.device is None) != (self.inode is None):
             raise ValueError("recovery device and inode must appear together")
-        if self.status in {"recoverable", "needs_authority"}:
+        if self.status == "invalid":
+            if self.job_id is not None or self.manifest_hash is not None:
+                raise ValueError("invalid recovery evidence cannot claim logical identity")
+            if not self.reason:
+                raise ValueError("invalid recovery evidence requires a reason")
+        if self.status in {"recoverable", "needs_authority", "recoverable_torn"}:
             if (
                 self.job_id is None
                 or self.manifest_hash is None
@@ -583,8 +630,15 @@ class LabArtifactRecoveryRecord(LabArtifactModel):
                 is None
             ):
                 raise ValueError("candidate recovery path conflicts with job identity")
+            if self.status == "recoverable_torn":
+                if not self.reason:
+                    raise ValueError("torn candidate recovery requires a reason")
+            elif self.reason is not None:
+                raise ValueError("non-torn candidate recovery must not carry a reason")
         if self.status == "quarantined" and (self.device is None or self.inode is None):
             raise ValueError("quarantined recovery identity is incomplete")
+        if self.status == "quarantined" and (self.job_id is None) != (self.manifest_hash is None):
+            raise ValueError("quarantined logical identity must be complete or absent")
         return self
 
 
@@ -1898,28 +1952,88 @@ class LabJobArtifactStore:
         report_markdown: str,
         tables: Mapping[str, pd.DataFrame],
     ) -> LabJobArtifactCandidate:
-        self._assert_managed_roots()
-        if re.fullmatch(_HASH_PATTERN, plan_hash) is None:
-            raise ValueError("plan_hash must be a lowercase SHA-256 hash")
-        if not tables:
-            raise ValueError("job artifact requires at least one complete table")
-        if any(not isinstance(name, str) for name in tables):
-            raise LabArtifactPathError("table names must be strings")
-        for table_name, frame in tables.items():
+        request = LabPrepareCandidateRequest.model_validate(
+            {
+                "job_id": job_id,
+                "spec": spec,
+                "plan_hash": plan_hash,
+                "adapter_id": adapter_id,
+                "adapter_version": adapter_version,
+                "result_contract_version": result_contract_version,
+                "metrics": metrics,
+                "report_markdown": report_markdown,
+                "tables": tables,
+            }
+        )
+        spec_bytes = request.spec.canonical_json().encode("utf-8")
+        rebuilt_spec = _rebuild_research_run_spec(spec_bytes)
+        if rebuilt_spec != request.spec:
+            raise LabArtifactIntegrityError("prepare request spec canonical identity changed")
+        validated_tables = dict(request.tables)
+        for table_name, frame in validated_tables.items():
             if not isinstance(frame, pd.DataFrame):
                 raise TypeError("artifact tables must be pandas DataFrames")
             self._validate_table(table_name, frame)
-        metrics_bytes = canonical_json_bytes(metrics)
+        metrics_bytes = canonical_json_bytes(dict(request.metrics))
+        _validate_metrics_payload(metrics_bytes)
         try:
-            report_bytes = report_markdown.encode("utf-8", errors="strict")
+            report_bytes = request.report_markdown.encode("utf-8", errors="strict")
         except UnicodeEncodeError as exc:
             raise ValueError("report_markdown must be valid UTF-8 text") from exc
         parquet_payloads = {
-            table_name: self._serialize_parquet(table_name, tables[table_name])
-            for table_name in sorted(tables)
+            table_name: self._serialize_parquet(table_name, validated_tables[table_name])
+            for table_name in sorted(validated_tables)
         }
-        candidate_name = f"{job_id.hex}-{uuid4().hex}"
+        payloads: dict[str, tuple[str, bytes]] = {
+            "spec.json": ("application/json", spec_bytes),
+            "metrics.json": ("application/json", metrics_bytes),
+            "report.md": ("text/markdown; charset=utf-8", report_bytes),
+        }
+        files = [
+            LabJobArtifactFile(
+                relative_path=relative_path,
+                media_type=media_type,
+                size=len(payload),
+                sha256=_sha256(payload),
+            )
+            for relative_path, (media_type, payload) in sorted(payloads.items())
+        ]
+        files.extend(inventory for _, inventory in parquet_payloads.values())
+        ordered_files = tuple(sorted(files, key=lambda item: item.relative_path))
+        identity = _complete_result_hash_payload(
+            job_id=request.job_id,
+            spec_hash=rebuilt_spec.spec_hash,
+            plan_hash=request.plan_hash,
+            adapter_id=request.adapter_id,
+            adapter_version=request.adapter_version,
+            result_contract_version=request.result_contract_version,
+            code_sha=rebuilt_spec.code_sha,
+            dataset_snapshot=rebuilt_spec.dataset_snapshot,
+            files=ordered_files,
+        )
+        manifest = LabJobArtifactManifest(
+            job_id=request.job_id,
+            spec_hash=rebuilt_spec.spec_hash,
+            plan_hash=request.plan_hash,
+            adapter_id=request.adapter_id,
+            adapter_version=request.adapter_version,
+            result_contract_version=request.result_contract_version,
+            code_sha=rebuilt_spec.code_sha,
+            dataset_snapshot=rebuilt_spec.dataset_snapshot,
+            files=ordered_files,
+            complete_result_hash=_sha256(canonical_json_bytes(identity)),
+        )
+        manifest_bytes = manifest.canonical_json_bytes()
+        sums = {item.relative_path: item.sha256 for item in manifest.files}
+        sums["manifest.json"] = _sha256(manifest_bytes)
+        sums_bytes = "".join(
+            f"{digest}  {relative_path}\n" for relative_path, digest in sorted(sums.items())
+        ).encode("ascii")
+        candidate_name = f"{request.job_id.hex}-{uuid4().hex}"
+        if re.fullmatch(r"[0-9a-f]{32}-[0-9a-f]{32}", candidate_name) is None:
+            raise LabArtifactIntegrityError("validated candidate name is not a safe segment")
         candidate_path = self.candidates_root / candidate_name
+        self._assert_managed_roots()
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         candidates_descriptor = self._managed_parent_descriptor(self.candidates_root)
         candidate_descriptor = -1
@@ -1952,14 +2066,7 @@ class LabJobArtifactStore:
             os.fchmod(tables_descriptor, 0o700)
             if stat.S_IMODE(os.fstat(tables_descriptor).st_mode) != 0o700:
                 raise LabArtifactIntegrityError("candidate tables permissions did not become 0700")
-            spec_bytes = spec.canonical_json().encode("utf-8")
-            payloads: dict[str, tuple[str, bytes]] = {
-                "spec.json": ("application/json", spec_bytes),
-                "metrics.json": ("application/json", metrics_bytes),
-                "report.md": ("text/markdown; charset=utf-8", report_bytes),
-            }
-            files: list[LabJobArtifactFile] = []
-            for relative_path, (media_type, payload) in sorted(payloads.items()):
+            for relative_path, (_media_type, payload) in sorted(payloads.items()):
                 self._assert_candidate_creation_binding(
                     candidates_descriptor=candidates_descriptor,
                     candidate_name=candidate_name,
@@ -1969,15 +2076,7 @@ class LabJobArtifactStore:
                     tables_identity=tables_identity,
                 )
                 _write_private_bytes_at(candidate_descriptor, relative_path, payload)
-                files.append(
-                    LabJobArtifactFile(
-                        relative_path=relative_path,
-                        media_type=media_type,
-                        size=len(payload),
-                        sha256=_sha256(payload),
-                    )
-                )
-            for table_name, (payload, inventory) in parquet_payloads.items():
+            for table_name, (payload, _inventory) in parquet_payloads.items():
                 self._assert_candidate_creation_binding(
                     candidates_descriptor=candidates_descriptor,
                     candidate_name=candidate_name,
@@ -1987,32 +2086,6 @@ class LabJobArtifactStore:
                     tables_identity=tables_identity,
                 )
                 _write_private_bytes_at(tables_descriptor, f"{table_name}.parquet", payload)
-                files.append(inventory)
-            ordered_files = tuple(sorted(files, key=lambda item: item.relative_path))
-            identity = _complete_result_hash_payload(
-                job_id=job_id,
-                spec_hash=spec.spec_hash,
-                plan_hash=plan_hash,
-                adapter_id=adapter_id,
-                adapter_version=adapter_version,
-                result_contract_version=result_contract_version,
-                code_sha=spec.code_sha,
-                dataset_snapshot=spec.dataset_snapshot,
-                files=ordered_files,
-            )
-            manifest = LabJobArtifactManifest(
-                job_id=job_id,
-                spec_hash=spec.spec_hash,
-                plan_hash=plan_hash,
-                adapter_id=adapter_id,
-                adapter_version=adapter_version,
-                result_contract_version=result_contract_version,
-                code_sha=spec.code_sha,
-                dataset_snapshot=spec.dataset_snapshot,
-                files=ordered_files,
-                complete_result_hash=_sha256(canonical_json_bytes(identity)),
-            )
-            manifest_bytes = manifest.canonical_json_bytes()
             self._assert_candidate_creation_binding(
                 candidates_descriptor=candidates_descriptor,
                 candidate_name=candidate_name,
@@ -2022,11 +2095,6 @@ class LabJobArtifactStore:
                 tables_identity=tables_identity,
             )
             _write_private_bytes_at(candidate_descriptor, "manifest.json", manifest_bytes)
-            sums = {item.relative_path: item.sha256 for item in manifest.files}
-            sums["manifest.json"] = _sha256(manifest_bytes)
-            sums_bytes = "".join(
-                f"{digest}  {relative_path}\n" for relative_path, digest in sorted(sums.items())
-            ).encode("ascii")
             self._assert_candidate_creation_binding(
                 candidates_descriptor=candidates_descriptor,
                 candidate_name=candidate_name,
@@ -3541,10 +3609,19 @@ class LabJobArtifactStore:
                 )
             else:
                 intent_state = self._seal_intent_state(candidate.job_id)
+                recovery_status: Literal[
+                    "recoverable",
+                    "needs_authority",
+                    "recoverable_torn",
+                ] = {
+                    "valid": "recoverable",
+                    "missing": "needs_authority",
+                    "torn": "recoverable_torn",
+                }[intent_state]
                 records.append(
                     LabArtifactRecoveryRecord(
                         path=path,
-                        status=("recoverable" if intent_state == "valid" else "needs_authority"),
+                        status=recovery_status,
                         job_id=candidate.job_id,
                         manifest_hash=candidate.manifest_hash,
                         device=candidate.device,
@@ -3631,7 +3708,7 @@ class LabJobArtifactStore:
         authority: LabArtifactRecoveryAuthority | None = None,
     ) -> LabSealedJobArtifact:
         record = self._defensively_validate_recovery_record(record)
-        if record.status not in {"recoverable", "needs_authority"}:
+        if record.status not in {"recoverable", "needs_authority", "recoverable_torn"}:
             raise LabArtifactIntegrityError("only candidate recovery records can be sealed")
         if record.device is None or record.inode is None:
             raise LabArtifactIntegrityError("candidate recovery identity is unavailable")
@@ -3650,7 +3727,11 @@ class LabJobArtifactStore:
         ):
             raise LabArtifactIntegrityError("candidate recovery evidence changed")
         intent_state = self._seal_intent_state(candidate.job_id)
-        if intent_state != "valid" or record.status == "needs_authority" or authority is not None:
+        if (
+            intent_state != "valid"
+            or record.status in {"needs_authority", "recoverable_torn"}
+            or authority is not None
+        ):
             self._authorize_recovery(candidate, authority)
         if intent_state == "torn":
             self._quarantine_seal_intent_entry(f"{candidate.job_id.hex}.json")
@@ -3833,6 +3914,31 @@ class LabJobArtifactStore:
             self.candidates_root,
             label="candidate recovery entry",
         )
+        try:
+            derived_candidate = self._candidate_from_path(
+                path,
+                allow_interrupted_seal=True,
+            )
+        except LabArtifactError:
+            derived_candidate = None
+        if derived_candidate is not None:
+            if (derived_candidate.device, derived_candidate.inode) != (
+                record.device,
+                record.inode,
+            ):
+                raise LabArtifactIntegrityError("candidate recovery identity changed")
+            if record.status != "invalid" and (
+                record.job_id != derived_candidate.job_id
+                or record.manifest_hash != derived_candidate.manifest_hash
+            ):
+                raise LabArtifactIntegrityError(
+                    "candidate recovery logical identity changed before quarantine"
+                )
+            derived_job_id = derived_candidate.job_id
+            derived_manifest_hash = derived_candidate.manifest_hash
+        else:
+            derived_job_id = None
+            derived_manifest_hash = None
         target = self.quarantine_root / f"{path.name}-recovery-{uuid4().hex}"
         with self._bind_quarantined_entry(
             source_name=path.name,
@@ -3843,8 +3949,8 @@ class LabJobArtifactStore:
             result = LabArtifactRecoveryRecord(
                 path=target,
                 status="quarantined",
-                job_id=record.job_id,
-                manifest_hash=record.manifest_hash,
+                job_id=derived_job_id,
+                manifest_hash=derived_manifest_hash,
                 device=observed.device,
                 inode=observed.inode,
                 reason=" ".join(reason.split()),

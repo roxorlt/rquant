@@ -26,6 +26,7 @@ import rquant.lab_artifacts as lab_artifacts_module
 from rquant.lab_artifacts import (
     LabArtifactAuthorizationError,
     LabArtifactConflictError,
+    LabArtifactError,
     LabArtifactIndexEvidence,
     LabArtifactIntegrityError,
     LabArtifactPathError,
@@ -126,6 +127,20 @@ def _prepare(
         report_markdown="# Full report\n\nNo rounded metrics.\n",
         tables=_tables(),
     )
+
+
+def _prepare_arguments() -> dict[str, object]:
+    return {
+        "job_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        "spec": _spec(),
+        "plan_hash": "6" * 64,
+        "adapter_id": "n-shape",
+        "adapter_version": "1",
+        "result_contract_version": "p14b1-v1",
+        "metrics": {},
+        "report_markdown": "# report\n",
+        "tables": {"result": pd.DataFrame({"value": [1]})},
+    }
 
 
 def _evidence(sealed):
@@ -291,6 +306,86 @@ def test_prepare_verify_seal_and_idempotently_reuse_complete_bundle(tmp_path: Pa
     assert store.verify_sealed(sealed.path).manifest == sealed.manifest
 
 
+def test_prepare_rejects_hex_traversal_job_id_before_any_filesystem_write(
+    tmp_path: Path,
+) -> None:
+    class ForgedJobId:
+        hex = "../../escaped"
+
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    arguments = _prepare_arguments()
+    arguments["job_id"] = ForgedJobId()
+    namespaces_before = _artifact_namespace_identity(store)
+    root_entries_before = tuple(sorted(item.name for item in tmp_path.iterdir()))
+
+    with pytest.raises((TypeError, ValueError, LabArtifactIntegrityError)):
+        store.prepare_candidate(**arguments)  # type: ignore[arg-type]
+
+    assert _artifact_namespace_identity(store) == namespaces_before
+    assert tuple(sorted(item.name for item in tmp_path.iterdir())) == root_entries_before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty_adapter_id",
+        "empty_adapter_version",
+        "empty_result_contract",
+        "invalid_spec",
+        "invalid_metrics_tag",
+        "metrics_not_mapping",
+        "report_not_text",
+        "unsafe_table_name",
+        "unsafe_table_dtype",
+    ],
+)
+def test_prepare_preflights_all_deterministic_input_errors_before_candidate_mkdir(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    arguments = _prepare_arguments()
+    if case == "empty_adapter_id":
+        arguments["adapter_id"] = " "
+    elif case == "empty_adapter_version":
+        arguments["adapter_version"] = ""
+    elif case == "empty_result_contract":
+        arguments["result_contract_version"] = "\t"
+    elif case == "invalid_spec":
+        spec_payload = _spec().model_dump(mode="python", round_trip=True)
+        spec_payload["resource_class"] = "not-a-resource-class"
+        arguments["spec"] = ResearchRunSpec.model_construct(**spec_payload)
+    elif case == "invalid_metrics_tag":
+        arguments["metrics"] = {"bad": {"$date": "not-a-date"}}
+    elif case == "metrics_not_mapping":
+        arguments["metrics"] = []
+    elif case == "report_not_text":
+        arguments["report_markdown"] = 7
+    elif case == "unsafe_table_name":
+        arguments["tables"] = {"../escape": pd.DataFrame({"value": [1]})}
+    else:
+        arguments["tables"] = {"result": pd.DataFrame({"value": [object()]})}
+    namespaces_before = _artifact_namespace_identity(store)
+
+    with pytest.raises((TypeError, ValueError, LabArtifactError)):
+        store.prepare_candidate(**arguments)  # type: ignore[arg-type]
+
+    assert _artifact_namespace_identity(store) == namespaces_before
+
+
+def test_prepare_valid_input_still_seals_after_rejected_preflight(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    invalid = _prepare_arguments()
+    invalid["adapter_id"] = ""
+
+    with pytest.raises((TypeError, ValueError, LabArtifactIntegrityError)):
+        store.prepare_candidate(**invalid)  # type: ignore[arg-type]
+
+    candidate = store.prepare_candidate(**_prepare_arguments())  # type: ignore[arg-type]
+    sealed = store.seal_candidate(candidate)
+    assert sealed.manifest.job_id == candidate.job_id
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -383,6 +478,16 @@ def test_forged_recovery_record_is_revalidated_before_any_recovery_side_effect(
     candidate = _prepare(store)
     record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
     forged_job_id = uuid4()
+    with pytest.raises(ValidationError):
+        LabArtifactRecoveryRecord(
+            path=record.path,
+            status="invalid",
+            job_id=forged_job_id,
+            manifest_hash="f" * 64,
+            device=record.device,
+            inode=record.inode,
+            reason="forged logical identity",
+        )
     forged = LabArtifactRecoveryRecord.model_construct(
         **{
             **record.model_dump(mode="python", round_trip=True),
@@ -916,6 +1021,56 @@ def test_invalid_crash_candidate_can_be_identity_bound_and_quarantined(
     assert not candidate.path.exists()
 
 
+def test_invalid_recovery_record_cannot_claim_job_b_or_move_candidate_a(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    (candidate.path / "partial.tmp").write_bytes(b"invalid candidate bytes")
+    record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
+    forged_job_id = uuid4()
+    forged = LabArtifactRecoveryRecord.model_construct(
+        **{
+            **record.model_dump(mode="python", round_trip=True),
+            "job_id": forged_job_id,
+            "manifest_hash": "f" * 64,
+        }
+    )
+    candidate_before = _tree_identity(candidate.path)
+    namespaces_before = _artifact_namespace_identity(store)
+
+    with pytest.raises(LabArtifactIntegrityError, match="recovery evidence"):
+        store.quarantine_recovery_record(forged, reason="forged B moves A")
+
+    assert _tree_identity(candidate.path) == candidate_before
+    assert _artifact_namespace_identity(store) == namespaces_before
+    quarantined = store.quarantine_recovery_record(record, reason="actual invalid candidate")
+    assert quarantined.job_id is None
+    assert quarantined.manifest_hash is None
+    assert (quarantined.path / "partial.tmp").read_bytes() == b"invalid candidate bytes"
+
+
+def test_invalid_recovery_record_rederives_parseable_candidate_identity_before_quarantine(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    record = LabArtifactRecoveryRecord(
+        path=candidate.path,
+        status="invalid",
+        device=candidate.device,
+        inode=candidate.inode,
+        reason="stale caller classification",
+    )
+
+    quarantined = store.quarantine_recovery_record(record, reason="operator isolation")
+
+    assert quarantined.job_id == candidate.job_id
+    assert quarantined.manifest_hash == candidate.manifest_hash
+    assert quarantined.device == candidate.device
+    assert quarantined.inode == candidate.inode
+
+
 @pytest.mark.parametrize(
     ("relative_path", "mode"),
     [(".", 0o755), ("tables", 0o755), ("report.md", 0o644)],
@@ -1139,7 +1294,7 @@ def test_torn_final_intent_requires_authority_then_is_quarantined_and_rebuilt(
     os.chmod(intent, 0o600)
     record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
 
-    assert record.status == "needs_authority"
+    assert record.status == "recoverable_torn"
     with pytest.raises(LabArtifactAuthorizationError, match="authority"):
         store.recover_candidate(record)
 
@@ -1167,7 +1322,7 @@ def test_torn_intent_with_partially_frozen_candidate_recovers_with_authority(
 
     record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
 
-    assert record.status == "needs_authority"
+    assert record.status == "recoverable_torn"
     assert "recoverable_torn" in (record.reason or "")
     with pytest.raises(LabArtifactAuthorizationError, match="authority"):
         store.recover_candidate(record)
