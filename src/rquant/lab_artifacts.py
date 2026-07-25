@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -35,6 +36,8 @@ _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_SHA_PATTERN = r"^[0-9a-f]{40}$"
 _TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_LEGACY_PROCESS_LOCKS_GUARD = threading.Lock()
+_LEGACY_PROCESS_LOCKS: dict[str, threading.RLock] = {}
 
 
 class LabArtifactError(RuntimeError):
@@ -453,6 +456,33 @@ class LabLegacyIndexResult(LabArtifactModel):
     record: LabLegacyArtifactRecord
 
 
+class LabLegacyAuthorityEvent(LabArtifactModel):
+    schema_version: Literal[1] = 1
+    event_type: Literal["staged", "published", "abandoned"]
+    logical_run_id: str = Field(min_length=1)
+    operation_id: UUID
+    generation: int = Field(ge=1)
+    record: LabLegacyArtifactRecord
+    occurred_at: datetime
+
+    @model_validator(mode="after")
+    def validate_event(self) -> LabLegacyAuthorityEvent:
+        if self.logical_run_id != self.record.logical_run_id:
+            raise ValueError("legacy authority event logical run does not match record")
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("legacy authority event time must be timezone-aware")
+        return self
+
+    def canonical_json_bytes(self) -> bytes:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+
 class _FileObservation(LabArtifactModel):
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
@@ -524,6 +554,21 @@ class _BoundReadonlyFile:
             os.close(self.parent_descriptor)
 
 
+@dataclass
+class _BoundSealIntent:
+    parent_descriptor: int
+    descriptor: int
+    name: str
+    identity: _FileObservation
+    intent: LabArtifactSealIntent
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
+        with suppress(OSError):
+            os.close(self.parent_descriptor)
+
+
 def _read_descriptor(descriptor: int) -> bytes:
     os.lseek(descriptor, 0, os.SEEK_SET)
     chunks: list[bytes] = []
@@ -555,6 +600,50 @@ def _matches_file_identity(
         else observed.ctime_ns >= expected.ctime_ns
     )
     return stable and ctime_matches and observed.mode == stat.S_IFREG and observed.nlink == 1
+
+
+def _secure_absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _secure_open_directory(
+    path: Path,
+    *,
+    create: bool,
+    create_mode: int = 0o700,
+) -> int:
+    """Open an absolute directory without following any ancestor symlink."""
+
+    absolute = _secure_absolute_path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open("/", flags)
+    try:
+        for component in absolute.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise LabArtifactPathError("managed path contains an unsafe component")
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=create_mode, dir_fd=descriptor)
+                child = os.open(component, flags, dir_fd=descriptor)
+            observed = _FileObservation.from_stat(os.fstat(child))
+            if observed.mode != stat.S_IFDIR:
+                os.close(child)
+                raise LabArtifactPathError("managed path component is not a directory")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except LabArtifactError:
+        os.close(descriptor)
+        raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise LabArtifactPathError(
+            f"managed path ancestor is missing or unsafe: {absolute}"
+        ) from exc
 
 
 def _write_private_bytes_at(parent_descriptor: int, name: str, payload: bytes) -> None:
@@ -590,33 +679,68 @@ def _write_private_bytes_at(parent_descriptor: int, name: str, payload: bytes) -
         os.close(descriptor)
 
 
-def _ensure_private_directory(path: Path, *, manage_existing: bool = True) -> None:
+def _open_or_create_private_regular_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    access_flags: int,
+) -> tuple[int, bool]:
+    if PurePosixPath(name).name != name or name in {"", ".", ".."}:
+        raise LabArtifactPathError("managed file name is unsafe")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     created = False
-    if os.path.lexists(path):
-        observed = path.lstat()
-        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
-            raise LabArtifactPathError(f"managed artifact directory is unsafe: {path}")
-    else:
-        path.mkdir(parents=True, mode=0o700)
-        created = True
-    if created or manage_existing:
+    try:
         descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            name,
+            access_flags | os.O_CREAT | os.O_EXCL | nofollow,
+            0o600,
+            dir_fd=parent_descriptor,
         )
-        try:
-            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-                raise LabArtifactPathError(f"managed artifact directory is unsafe: {path}")
+        created = True
+    except FileExistsError:
+        descriptor = os.open(name, access_flags | nofollow, dir_fd=parent_descriptor)
+    try:
+        observed = _FileObservation.from_stat(os.fstat(descriptor))
+        at_path = _FileObservation.from_stat(
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        )
+        if observed != at_path or observed.mode != stat.S_IFREG or observed.nlink != 1:
+            raise LabArtifactIntegrityError("managed file is not a private regular file")
+        os.fchmod(descriptor, 0o600)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+            raise LabArtifactIntegrityError("managed file permissions did not become 0600")
+        if created:
+            os.fsync(descriptor)
+            os.fsync(parent_descriptor)
+        return descriptor, created
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _ensure_private_directory(path: Path, *, manage_existing: bool = True) -> None:
+    existed = True
+    try:
+        descriptor = _secure_open_directory(path, create=False)
+    except LabArtifactPathError as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+        existed = False
+        descriptor = _secure_open_directory(path, create=True)
+    try:
+        if not existed or manage_existing:
             os.fchmod(descriptor, 0o700)
             os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _assert_bound_readonly_file(bound: _BoundReadonlyFile, *, label: str) -> None:
+    current_parent_descriptor = -1
     try:
         parent_fd = _FileObservation.from_stat(os.fstat(bound.parent_descriptor))
-        parent_path = _FileObservation.from_stat(bound.path.parent.lstat())
+        current_parent_descriptor = _secure_open_directory(bound.path.parent, create=False)
+        parent_path = _FileObservation.from_stat(os.fstat(current_parent_descriptor))
         file_fd = _FileObservation.from_stat(os.fstat(bound.descriptor))
         file_path = _FileObservation.from_stat(
             os.stat(
@@ -627,6 +751,9 @@ def _assert_bound_readonly_file(bound: _BoundReadonlyFile, *, label: str) -> Non
         )
     except OSError as exc:
         raise LabArtifactIntegrityError(f"{label} changed while bound") from exc
+    finally:
+        if current_parent_descriptor >= 0:
+            os.close(current_parent_descriptor)
     if parent_fd != parent_path or (
         parent_fd.device,
         parent_fd.inode,
@@ -648,8 +775,7 @@ def _open_bound_readonly_file(path: Path, *, label: str) -> Iterator[_BoundReado
     parent_descriptor = -1
     descriptor = -1
     try:
-        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        parent_descriptor = os.open(path.parent, parent_flags)
+        parent_descriptor = _secure_open_directory(path.parent, create=False)
         parent_identity = _FileObservation.from_stat(os.fstat(parent_descriptor))
         before = _FileObservation.from_stat(
             os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -871,7 +997,10 @@ class LabJobArtifactStore:
         self._root_descriptor = -1
         self._managed_descriptors: dict[Path, int] = {}
         try:
-            self._root_parent_descriptor = os.open(self.root.parent, directory_flags)
+            self._root_parent_descriptor = _secure_open_directory(
+                self.root.parent,
+                create=False,
+            )
             self._root_descriptor = os.open(
                 self.root.name,
                 directory_flags,
@@ -932,9 +1061,11 @@ class LabJobArtifactStore:
         )
 
     def _assert_managed_roots(self) -> None:
+        current_parent_descriptor = -1
         try:
             parent_fd = _FileObservation.from_stat(os.fstat(self._root_parent_descriptor))
-            parent_path = _FileObservation.from_stat(self.root.parent.lstat())
+            current_parent_descriptor = _secure_open_directory(self.root.parent, create=False)
+            parent_path = _FileObservation.from_stat(os.fstat(current_parent_descriptor))
             root_fd = _FileObservation.from_stat(os.fstat(self._root_descriptor))
             root_entry = _FileObservation.from_stat(
                 os.stat(
@@ -968,6 +1099,9 @@ class LabJobArtifactStore:
             raise
         except (AttributeError, OSError) as exc:
             raise LabArtifactIntegrityError("managed artifact root identity changed") from exc
+        finally:
+            if current_parent_descriptor >= 0:
+                os.close(current_parent_descriptor)
 
     def _managed_parent_descriptor(self, parent_root: Path) -> int:
         self._assert_managed_roots()
@@ -1790,11 +1924,11 @@ class LabJobArtifactStore:
         finally:
             os.close(descriptor)
 
-    def _write_seal_intent(
-        self,
+    @staticmethod
+    def _candidate_seal_intent(
         candidate: LabJobArtifactCandidate,
     ) -> LabArtifactSealIntent:
-        intent = LabArtifactSealIntent(
+        return LabArtifactSealIntent(
             job_id=candidate.job_id,
             candidate_name=candidate.path.name,
             manifest_hash=candidate.manifest_hash,
@@ -1806,32 +1940,122 @@ class LabJobArtifactStore:
             bundle_ctime_ns=candidate.ctime_ns,
             file_identities=candidate.file_identities,
         )
-        path = self._seal_intent_path(candidate.job_id)
-        if self._seal_intent_exists(candidate.job_id):
-            existing = self._load_seal_intent(candidate.job_id)
-            if not self._intent_matches_candidate(existing, candidate):
-                raise LabArtifactConflictError("job seal intent already binds different bytes")
-            return existing
-        descriptor = self._managed_parent_descriptor(self.seal_intents_root)
+
+    @staticmethod
+    def _after_seal_intent_bound(_bound: _BoundSealIntent) -> None:
+        """Fault-injection boundary while the seal intent fd remains open."""
+
+    def _assert_bound_seal_intent(self, bound: _BoundSealIntent) -> None:
         try:
-            try:
-                _write_private_bytes_at(
-                    descriptor,
-                    path.name,
-                    intent.canonical_json_bytes(),
+            opened = _FileObservation.from_stat(os.fstat(bound.descriptor))
+            at_path = _FileObservation.from_stat(
+                os.stat(
+                    bound.name,
+                    dir_fd=bound.parent_descriptor,
+                    follow_symlinks=False,
                 )
-            except FileExistsError:
-                existing = self._load_seal_intent(candidate.job_id)
-                if not self._intent_matches_candidate(existing, candidate):
-                    raise LabArtifactConflictError(
-                        "job seal intent already binds different bytes"
-                    ) from None
-                return existing
-            os.fsync(descriptor)
+            )
+            payload = _read_descriptor(bound.descriptor)
+            if opened != bound.identity or at_path != bound.identity:
+                raise LabArtifactIntegrityError("job artifact seal intent identity changed")
+            if opened.mode != stat.S_IFREG or opened.nlink != 1:
+                raise LabArtifactIntegrityError("job artifact seal intent is unsafe")
+            if stat.S_IMODE(os.fstat(bound.descriptor).st_mode) != 0o600:
+                raise LabArtifactIntegrityError("job artifact seal intent permissions conflict")
+            if payload != bound.intent.canonical_json_bytes():
+                raise LabArtifactIntegrityError("job artifact seal intent bytes changed")
             self._assert_managed_roots()
+        except LabArtifactError:
+            raise
+        except OSError as exc:
+            raise LabArtifactIntegrityError("job artifact seal intent identity changed") from exc
+
+    @contextmanager
+    def _bind_seal_intent(
+        self,
+        job_id: UUID,
+        *,
+        candidate: LabJobArtifactCandidate | None,
+        create: bool,
+    ) -> Iterator[_BoundSealIntent]:
+        parent_descriptor = self._managed_parent_descriptor(self.seal_intents_root)
+        descriptor = -1
+        name = f"{job_id.hex}.json"
+        expected = self._candidate_seal_intent(candidate) if candidate is not None else None
+        try:
+            if create and expected is not None:
+                try:
+                    descriptor = os.open(
+                        name,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileExistsError:
+                    descriptor = os.open(
+                        name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=parent_descriptor,
+                    )
+                else:
+                    payload = expected.canonical_json_bytes()
+                    offset = 0
+                    while offset < len(payload):
+                        written = os.write(descriptor, payload[offset:])
+                        if written <= 0:
+                            raise LabArtifactIntegrityError(
+                                "job artifact seal intent write made no progress"
+                            )
+                        offset += written
+                    os.fchmod(descriptor, 0o600)
+                    os.fsync(descriptor)
+                    os.fsync(parent_descriptor)
+            else:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
+            identity = _FileObservation.from_stat(os.fstat(descriptor))
+            payload = _read_descriptor(descriptor)
+            try:
+                intent = LabArtifactSealIntent.model_validate_json(payload)
+            except Exception as exc:
+                raise LabArtifactIntegrityError(f"invalid job artifact seal intent: {exc}") from exc
+            if payload != intent.canonical_json_bytes() or intent.job_id != job_id:
+                raise LabArtifactIntegrityError("job artifact seal intent identity conflicts")
+            if candidate is not None and not self._intent_matches_candidate(intent, candidate):
+                raise LabArtifactConflictError("job seal intent already binds different bytes")
+            bound = _BoundSealIntent(
+                parent_descriptor=parent_descriptor,
+                descriptor=descriptor,
+                name=name,
+                identity=identity,
+                intent=intent,
+            )
+            self._assert_bound_seal_intent(bound)
+            self._after_seal_intent_bound(bound)
+            self._assert_bound_seal_intent(bound)
+            try:
+                yield bound
+            except BaseException:
+                self._assert_bound_seal_intent(bound)
+                raise
+            else:
+                self._assert_bound_seal_intent(bound)
+        except LabArtifactError:
+            raise
+        except OSError as exc:
+            if "bound" in locals():
+                raise
+            raise LabArtifactIntegrityError("job artifact seal intent cannot be bound") from exc
         finally:
-            os.close(descriptor)
-        return intent
+            if "bound" in locals():
+                bound.close()
+            else:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                os.close(parent_descriptor)
 
     @staticmethod
     def _intent_matches_candidate(
@@ -1878,43 +2102,8 @@ class LabJobArtifactStore:
         )
 
     def _load_seal_intent(self, job_id: UUID) -> LabArtifactSealIntent:
-        parent_descriptor = self._managed_parent_descriptor(self.seal_intents_root)
-        descriptor = -1
-        try:
-            descriptor = os.open(
-                f"{job_id.hex}.json",
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=parent_descriptor,
-            )
-            observed = _FileObservation.from_stat(os.fstat(descriptor))
-            if observed.mode != stat.S_IFREG or observed.nlink != 1:
-                raise LabArtifactIntegrityError("job artifact seal intent is unsafe")
-            payload = _read_descriptor(descriptor)
-            at_path = _FileObservation.from_stat(
-                os.stat(
-                    f"{job_id.hex}.json",
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            )
-            if at_path != observed:
-                raise LabArtifactIntegrityError("job artifact seal intent identity changed")
-            self._assert_managed_roots()
-        except LabArtifactError:
-            raise
-        except OSError as exc:
-            raise LabArtifactIntegrityError("job artifact seal intent cannot be read") from exc
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            os.close(parent_descriptor)
-        try:
-            intent = LabArtifactSealIntent.model_validate_json(payload)
-        except Exception as exc:
-            raise LabArtifactIntegrityError(f"invalid job artifact seal intent: {exc}") from exc
-        if payload != intent.canonical_json_bytes() or intent.job_id != job_id:
-            raise LabArtifactIntegrityError("job artifact seal intent identity conflicts")
-        return intent
+        with self._bind_seal_intent(job_id, candidate=None, create=False) as bound:
+            return bound.intent
 
     @staticmethod
     def _validate_metadata_transition(
@@ -2127,6 +2316,52 @@ class LabJobArtifactStore:
         )
 
     @staticmethod
+    def _after_existing_sealed_bound(
+        _bound: _BoundArtifactBundle,
+        _sealed: LabSealedJobArtifact,
+    ) -> None:
+        """Fault-injection boundary while an existing sealed bundle remains bound."""
+
+    @contextmanager
+    def _bind_verified_sealed(
+        self,
+        path: Path,
+    ) -> Iterator[LabSealedJobArtifact]:
+        managed = self._assert_managed_child(path, self.sealed_root, label="sealed bundle")
+        observed, manifest, identities = self._probe_bundle(
+            managed,
+            parent_root=self.sealed_root,
+        )
+        with self._bind_bundle(
+            parent_root=self.sealed_root,
+            bundle_path=managed,
+            manifest=manifest,
+            expected_bundle=observed,
+            expected_files=identities,
+        ) as bound:
+            verified_identities = self._validate_bound_bundle(
+                bound,
+                manifest,
+                permission_profile="sealed",
+            )
+            if managed.name != manifest.job_id.hex:
+                raise LabArtifactIntegrityError("sealed path does not match job identity")
+            sealed = LabSealedJobArtifact(
+                path=managed,
+                manifest=manifest,
+                manifest_hash=manifest.manifest_hash,
+                device=bound.current.device,
+                inode=bound.current.inode,
+                file_identities=verified_identities,
+            )
+            self._after_existing_sealed_bound(bound, sealed)
+            self._assert_bound_paths(bound)
+            self._verify_bound_bytes(bound, manifest)
+            yield sealed
+            self._assert_bound_paths(bound)
+            self._verify_bound_bytes(bound, manifest)
+
+    @staticmethod
     def _atomic_publish_noreplace(
         source_parent: int,
         source_name: str,
@@ -2154,14 +2389,15 @@ class LabJobArtifactStore:
         finally:
             os.close(sealed_parent_probe)
         if target_exists:
-            existing = self.verify_sealed(target)
-            if (
-                existing.manifest_hash != candidate.manifest_hash
-                or existing.manifest.complete_result_hash != candidate.manifest.complete_result_hash
-            ):
-                raise LabArtifactConflictError("job already has a different sealed result")
-            self.quarantine_candidate(candidate, reason="idempotent sealed bundle reuse")
-            return existing.model_copy(update={"reused_existing": True})
+            with self._bind_verified_sealed(target) as existing:
+                if (
+                    existing.manifest_hash != candidate.manifest_hash
+                    or existing.manifest.complete_result_hash
+                    != candidate.manifest.complete_result_hash
+                ):
+                    raise LabArtifactConflictError("job already has a different sealed result")
+                self.quarantine_candidate(candidate, reason="idempotent sealed bundle reuse")
+                return existing.model_copy(update={"reused_existing": True})
         candidate_observed, preliminary_manifest, _ = self._probe_bundle(
             candidate.path,
             parent_root=self.candidates_root,
@@ -2186,89 +2422,90 @@ class LabJobArtifactStore:
                 permission_profile="interrupted" if has_intent else "candidate",
             )
             current_candidate = candidate.model_copy(update={"file_identities": identities})
-            if has_intent and not self._intent_matches_candidate(
-                self._load_seal_intent(candidate.job_id),
-                current_candidate,
-            ):
-                raise LabArtifactIntegrityError(
-                    "candidate seal intent does not bind the interrupted identity"
-                )
             manifest = candidate.manifest
             if self._bound_manifest(bound) != manifest:
                 raise LabArtifactIntegrityError("bound candidate manifest identity changed")
             self._assert_bound_paths(bound)
             self._verify_bound_bytes(bound, manifest)
-            self._write_seal_intent(candidate)
-            self._seal_bound_files(bound)
-            self._verify_bound_bytes(bound, manifest)
-            self._assert_bound_paths(bound)
-            sealed_parent = self._managed_parent_descriptor(self.sealed_root)
-            source_parent = bound.parent_descriptor
-            try:
-                self._atomic_publish_noreplace(
-                    source_parent,
-                    bound.bundle_name,
-                    sealed_parent,
-                    target.name,
-                )
-                os.fsync(source_parent)
-                os.fsync(sealed_parent)
+            with self._bind_seal_intent(
+                candidate.job_id,
+                candidate=current_candidate,
+                create=True,
+            ) as bound_intent:
+                self._assert_bound_seal_intent(bound_intent)
+                self._seal_bound_files(bound)
+                self._assert_bound_seal_intent(bound_intent)
+                self._verify_bound_bytes(bound, manifest)
+                self._assert_bound_paths(bound)
+                sealed_parent = self._managed_parent_descriptor(self.sealed_root)
+                source_parent = bound.parent_descriptor
                 try:
-                    os.stat(
+                    self._atomic_publish_noreplace(
+                        source_parent,
                         bound.bundle_name,
-                        dir_fd=source_parent,
-                        follow_symlinks=False,
+                        sealed_parent,
+                        target.name,
                     )
-                except FileNotFoundError:
-                    pass
-                else:
-                    raise LabArtifactIntegrityError(
-                        "candidate source path still exists after atomic rename"
-                    )
-            except LabArtifactIntegrityError:
-                os.close(sealed_parent)
-                raise
-            except LabArtifactPlatformError:
-                os.close(sealed_parent)
-                raise
-            except OSError as exc:
-                os.close(sealed_parent)
-                if exc.errno == errno.EEXIST:
+                    self._assert_bound_seal_intent(bound_intent)
+                    os.fsync(source_parent)
+                    os.fsync(sealed_parent)
                     try:
-                        existing = self.verify_sealed(target)
-                    except LabArtifactError:
+                        os.stat(
+                            bound.bundle_name,
+                            dir_fd=source_parent,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
                         pass
                     else:
-                        if (
-                            existing.manifest_hash == candidate.manifest_hash
-                            and existing.manifest.complete_result_hash
-                            == candidate.manifest.complete_result_hash
-                        ):
-                            self.quarantine_candidate(
-                                candidate,
-                                reason="idempotent racing sealed bundle reuse",
-                            )
-                            return existing.model_copy(update={"reused_existing": True})
-                raise LabArtifactConflictError("candidate could not be atomically sealed") from exc
-            with suppress(OSError):
-                os.close(source_parent)
-            bound.parent_descriptor = sealed_parent
-            bound.bundle_name = target.name
-            after_rename = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
-            self._validate_metadata_transition(
-                bound.current,
-                after_rename,
-                expected_mode=stat.S_IFDIR,
-                label="artifact bundle rename",
-            )
-            bound.current = after_rename
-            self._assert_bound_paths(bound)
-            self._verify_bound_bytes(bound, manifest)
-            if self._bound_manifest(bound) != candidate.manifest:
-                raise LabArtifactIntegrityError("published candidate manifest identity changed")
-            self._finalize_bound_directories(bound)
-            self._verify_bound_bytes(bound, manifest)
-        return self.verify_sealed(target)
+                        raise LabArtifactIntegrityError(
+                            "candidate source path still exists after atomic rename"
+                        )
+                except (LabArtifactIntegrityError, LabArtifactPlatformError):
+                    os.close(sealed_parent)
+                    raise
+                except OSError as exc:
+                    os.close(sealed_parent)
+                    if exc.errno == errno.EEXIST:
+                        try:
+                            with self._bind_verified_sealed(target) as existing:
+                                if (
+                                    existing.manifest_hash == candidate.manifest_hash
+                                    and existing.manifest.complete_result_hash
+                                    == candidate.manifest.complete_result_hash
+                                ):
+                                    self.quarantine_candidate(
+                                        candidate,
+                                        reason="idempotent racing sealed bundle reuse",
+                                    )
+                                    return existing.model_copy(update={"reused_existing": True})
+                        except LabArtifactError:
+                            pass
+                    raise LabArtifactConflictError(
+                        "candidate could not be atomically sealed"
+                    ) from exc
+                with suppress(OSError):
+                    os.close(source_parent)
+                bound.parent_descriptor = sealed_parent
+                bound.bundle_name = target.name
+                after_rename = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
+                self._validate_metadata_transition(
+                    bound.current,
+                    after_rename,
+                    expected_mode=stat.S_IFDIR,
+                    label="artifact bundle rename",
+                )
+                bound.current = after_rename
+                self._assert_bound_paths(bound)
+                self._verify_bound_bytes(bound, manifest)
+                if self._bound_manifest(bound) != candidate.manifest:
+                    raise LabArtifactIntegrityError("published candidate manifest identity changed")
+                self._finalize_bound_directories(bound)
+                self._assert_bound_seal_intent(bound_intent)
+                self._verify_bound_bytes(bound, manifest)
+                sealed = self.verify_sealed(target)
+                self._assert_bound_seal_intent(bound_intent)
+            return sealed
 
     def list_candidate_recovery(self) -> tuple[LabArtifactRecoveryRecord, ...]:
         records: list[LabArtifactRecoveryRecord] = []
@@ -2410,83 +2647,100 @@ class LabJobArtifactStore:
             path, self.sealed_root, label="interrupted sealed bundle"
         )
         try:
-            return self.verify_sealed(managed)
-        except LabArtifactIntegrityError:
-            pass
-        manifest, identities, observed = self._validate_bundle(
-            managed,
-            parent_root=self.sealed_root,
-            permission_profile="interrupted",
-        )
-        if managed.name != manifest.job_id.hex:
-            raise LabArtifactIntegrityError("interrupted sealed path does not match job identity")
-        intent = self._load_seal_intent(manifest.job_id)
-        if (
-            intent.manifest_hash != manifest.manifest_hash
-            or intent.complete_result_hash != manifest.complete_result_hash
-        ):
-            raise LabArtifactIntegrityError("seal intent manifest identity conflicts")
-        if (
-            observed.device,
-            observed.inode,
-            observed.size,
-            observed.mtime_ns,
-            observed.mode,
-        ) != (
-            intent.bundle_device,
-            intent.bundle_inode,
-            intent.bundle_size,
-            intent.bundle_mtime_ns,
-            stat.S_IFDIR,
-        ) or observed.ctime_ns < intent.bundle_ctime_ns:
-            raise LabArtifactIntegrityError("seal intent bundle identity changed")
-        intended_files = {item.relative_path: item for item in intent.file_identities}
-        current_files = {item.relative_path: item for item in identities}
-        if set(intended_files) != set(current_files) or any(
-            not _matches_file_identity(
-                _FileObservation(
-                    device=current.device,
-                    inode=current.inode,
-                    mode=stat.S_IFREG,
-                    nlink=1,
-                    size=current.size,
-                    mtime_ns=current.mtime_ns,
-                    ctime_ns=current.ctime_ns,
-                ),
-                intended_files[relative_path],
-                exact_ctime=False,
+            job_id = UUID(hex=managed.name)
+        except ValueError as exc:
+            raise LabArtifactIntegrityError(
+                "interrupted sealed path does not contain a job identity"
+            ) from exc
+        if job_id.hex != managed.name:
+            raise LabArtifactIntegrityError("interrupted sealed path is not canonical")
+        with self._bind_seal_intent(job_id, candidate=None, create=False) as bound_intent:
+            try:
+                return self.verify_sealed(managed)
+            except LabArtifactIntegrityError:
+                pass
+            manifest, identities, observed = self._validate_bundle(
+                managed,
+                parent_root=self.sealed_root,
+                permission_profile="interrupted",
             )
-            for relative_path, current in current_files.items()
-        ):
-            raise LabArtifactIntegrityError("seal intent file identity changed")
-        with self._bind_bundle(
-            parent_root=self.sealed_root,
-            bundle_path=managed,
-            manifest=manifest,
-            expected_bundle=observed,
-            expected_files=identities,
-        ) as bound:
-            allowed_file_modes = {0o400, 0o600}
-            if any(
-                stat.S_IMODE(os.fstat(item.descriptor).st_mode) not in allowed_file_modes
-                for item in bound.files.values()
+            if managed.name != manifest.job_id.hex:
+                raise LabArtifactIntegrityError(
+                    "interrupted sealed path does not match job identity"
+                )
+            intent = bound_intent.intent
+            if (
+                intent.manifest_hash != manifest.manifest_hash
+                or intent.complete_result_hash != manifest.complete_result_hash
             ):
-                raise LabArtifactIntegrityError(
-                    "interrupted seal contains unexpected file permissions"
+                raise LabArtifactIntegrityError("seal intent manifest identity conflicts")
+            if (
+                observed.device,
+                observed.inode,
+                observed.size,
+                observed.mtime_ns,
+                observed.mode,
+            ) != (
+                intent.bundle_device,
+                intent.bundle_inode,
+                intent.bundle_size,
+                intent.bundle_mtime_ns,
+                stat.S_IFDIR,
+            ) or observed.ctime_ns < intent.bundle_ctime_ns:
+                raise LabArtifactIntegrityError("seal intent bundle identity changed")
+            intended_files = {item.relative_path: item for item in intent.file_identities}
+            current_files = {item.relative_path: item for item in identities}
+            if set(intended_files) != set(current_files) or any(
+                not _matches_file_identity(
+                    _FileObservation(
+                        device=current.device,
+                        inode=current.inode,
+                        mode=stat.S_IFREG,
+                        nlink=1,
+                        size=current.size,
+                        mtime_ns=current.mtime_ns,
+                        ctime_ns=current.ctime_ns,
+                    ),
+                    intended_files[relative_path],
+                    exact_ctime=False,
                 )
-            if stat.S_IMODE(os.fstat(bound.bundle_descriptor).st_mode) not in {0o500, 0o700}:
-                raise LabArtifactIntegrityError(
-                    "interrupted seal contains unexpected bundle permissions"
-                )
-            if stat.S_IMODE(os.fstat(bound.tables_descriptor).st_mode) not in {0o500, 0o700}:
-                raise LabArtifactIntegrityError(
-                    "interrupted seal contains unexpected tables permissions"
-                )
-            self._verify_bound_bytes(bound, manifest)
-            self._seal_bound_files(bound)
-            self._finalize_bound_directories(bound)
-            self._verify_bound_bytes(bound, manifest)
-        return self.verify_sealed(managed)
+                for relative_path, current in current_files.items()
+            ):
+                raise LabArtifactIntegrityError("seal intent file identity changed")
+            self._assert_bound_seal_intent(bound_intent)
+            with self._bind_bundle(
+                parent_root=self.sealed_root,
+                bundle_path=managed,
+                manifest=manifest,
+                expected_bundle=observed,
+                expected_files=identities,
+            ) as bound:
+                allowed_file_modes = {0o400, 0o600}
+                if any(
+                    stat.S_IMODE(os.fstat(item.descriptor).st_mode) not in allowed_file_modes
+                    for item in bound.files.values()
+                ):
+                    raise LabArtifactIntegrityError(
+                        "interrupted seal contains unexpected file permissions"
+                    )
+                if stat.S_IMODE(os.fstat(bound.bundle_descriptor).st_mode) not in {0o500, 0o700}:
+                    raise LabArtifactIntegrityError(
+                        "interrupted seal contains unexpected bundle permissions"
+                    )
+                if stat.S_IMODE(os.fstat(bound.tables_descriptor).st_mode) not in {0o500, 0o700}:
+                    raise LabArtifactIntegrityError(
+                        "interrupted seal contains unexpected tables permissions"
+                    )
+                self._verify_bound_bytes(bound, manifest)
+                self._assert_bound_seal_intent(bound_intent)
+                self._seal_bound_files(bound)
+                self._assert_bound_seal_intent(bound_intent)
+                self._finalize_bound_directories(bound)
+                self._assert_bound_seal_intent(bound_intent)
+                self._verify_bound_bytes(bound, manifest)
+            sealed = self.verify_sealed(managed)
+            self._assert_bound_seal_intent(bound_intent)
+            return sealed
 
     def quarantine_candidate(
         self,
@@ -2702,17 +2956,8 @@ class LabJobArtifactStore:
         _ensure_private_directory(destination.parent, manage_existing=False)
         if destination.name in {"", ".", ".."}:
             raise LabArtifactPathError("ZIP destination name is unsafe")
-        destination_flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        )
-        destination_parent = os.open(destination.parent, destination_flags)
+        destination_parent = _secure_open_directory(destination.parent, create=True)
         destination_parent_identity = _FileObservation.from_stat(os.fstat(destination_parent))
-        if not self._same_directory_identity(
-            _FileObservation.from_stat(destination.parent.lstat()),
-            destination_parent_identity,
-        ):
-            os.close(destination_parent)
-            raise LabArtifactIntegrityError("ZIP destination parent identity changed")
         temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
         temporary_descriptor = -1
         try:
@@ -2811,7 +3056,16 @@ class LabJobArtifactStore:
                     label="ZIP destination",
                 )
                 os.fsync(destination_parent)
-                parent_at_path = _FileObservation.from_stat(destination.parent.lstat())
+                current_destination_parent = _secure_open_directory(
+                    destination.parent,
+                    create=False,
+                )
+                try:
+                    parent_at_path = _FileObservation.from_stat(
+                        os.fstat(current_destination_parent)
+                    )
+                finally:
+                    os.close(current_destination_parent)
                 if not self._same_directory_identity(
                     parent_at_path,
                     destination_parent_identity,
@@ -2826,8 +3080,14 @@ class LabJobArtifactStore:
             os.close(destination_parent)
 
 
+@dataclass(frozen=True)
+class _LegacyAuthorityState:
+    latest: dict[str, LabLegacyAuthorityEvent]
+    generations: dict[str, int]
+
+
 class LegacyArtifactIndex:
-    """Independent read-only source index for pre-Job-Center JSON/Markdown files."""
+    """Index legacy sources with an fd-bound append-only authority ledger."""
 
     def __init__(
         self,
@@ -2835,91 +3095,65 @@ class LegacyArtifactIndex:
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self.path = path.absolute()
+        self.path = _secure_absolute_path(path)
         self.clock = clock or (lambda: datetime.now(UTC))
-        self._lock = threading.RLock()
-        _ensure_private_directory(self.path.parent, manage_existing=False)
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        self._parent_descriptor = os.open(self.path.parent, directory_flags)
+        lock_key = os.fspath(self.path)
+        with _LEGACY_PROCESS_LOCKS_GUARD:
+            self._process_lock = _LEGACY_PROCESS_LOCKS.setdefault(
+                lock_key,
+                threading.RLock(),
+            )
+        self._parent_descriptor = -1
+        self._lock_descriptor = -1
+        self._authority_descriptor = -1
         self._database_descriptor = -1
         self._journal_descriptor = -1
+        _ensure_private_directory(self.path.parent, manage_existing=False)
+        self._parent_descriptor = _secure_open_directory(self.path.parent, create=False)
         try:
             self._parent_identity = _FileObservation.from_stat(os.fstat(self._parent_descriptor))
-            try:
-                created = os.open(
-                    self.path.name,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=self._parent_descriptor,
+            with self._process_lock:
+                self._lock_descriptor, _ = _open_or_create_private_regular_at(
+                    self._parent_descriptor,
+                    f"{self.path.name}.lock",
+                    access_flags=os.O_RDWR,
                 )
-            except FileExistsError:
-                pass
-            else:
-                os.fchmod(created, 0o600)
-                os.fsync(created)
-                os.close(created)
-                os.fsync(self._parent_descriptor)
-            journal_name = f"{self.path.name}-journal"
-            try:
-                journal_created = os.open(
-                    journal_name,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=self._parent_descriptor,
-                )
-            except FileExistsError:
-                pass
-            else:
-                os.fchmod(journal_created, 0o600)
-                os.fsync(journal_created)
-                os.close(journal_created)
-                os.fsync(self._parent_descriptor)
-            self._database_descriptor = os.open(
-                self.path.name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=self._parent_descriptor,
-            )
-            self._database_identity = _FileObservation.from_stat(
-                os.fstat(self._database_descriptor)
-            )
-            self._assert_index_identity()
-            with self._lock, self._connect() as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS legacy_artifact (
-                        logical_run_id TEXT PRIMARY KEY,
-                        source_path TEXT NOT NULL,
-                        device INTEGER NOT NULL,
-                        inode INTEGER NOT NULL,
-                        size INTEGER NOT NULL,
-                        mtime_ns INTEGER NOT NULL,
-                        sha256 TEXT NOT NULL,
-                        media_type TEXT NOT NULL,
-                        imported_at TEXT NOT NULL,
-                        publication_state TEXT NOT NULL DEFAULT 'published'
+                fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
+                try:
+                    self._authority_descriptor, _ = _open_or_create_private_regular_at(
+                        self._parent_descriptor,
+                        f"{self.path.name}.authority.jsonl",
+                        access_flags=os.O_RDWR,
                     )
-                    """
-                )
-                columns = {
-                    str(row[1])
-                    for row in connection.execute("PRAGMA table_info(legacy_artifact)").fetchall()
-                }
-                if "publication_state" not in columns:
-                    connection.execute(
-                        "ALTER TABLE legacy_artifact "
-                        "ADD COLUMN publication_state TEXT NOT NULL DEFAULT 'published'"
+                    self._database_descriptor, _ = _open_or_create_private_regular_at(
+                        self._parent_descriptor,
+                        self.path.name,
+                        access_flags=os.O_RDONLY,
                     )
-            self._journal_descriptor = os.open(
-                journal_name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=self._parent_descriptor,
-            )
-            self._journal_identity = _FileObservation.from_stat(os.fstat(self._journal_descriptor))
-            os.fchmod(self._database_descriptor, 0o600)
-            os.fsync(self._database_descriptor)
-            os.fchmod(self._journal_descriptor, 0o600)
-            os.fsync(self._journal_descriptor)
-            self._assert_index_identity()
+                    self._journal_descriptor, _ = _open_or_create_private_regular_at(
+                        self._parent_descriptor,
+                        f"{self.path.name}-journal",
+                        access_flags=os.O_RDONLY,
+                    )
+                    self._lock_identity = _FileObservation.from_stat(
+                        os.fstat(self._lock_descriptor)
+                    )
+                    self._authority_identity = _FileObservation.from_stat(
+                        os.fstat(self._authority_descriptor)
+                    )
+                    self._database_identity = _FileObservation.from_stat(
+                        os.fstat(self._database_descriptor)
+                    )
+                    self._journal_identity = _FileObservation.from_stat(
+                        os.fstat(self._journal_descriptor)
+                    )
+                    self._assert_index_identity()
+                    with self._connect() as connection:
+                        self._initialize_cache_schema(connection)
+                    self._read_authority_state()
+                    self._assert_index_identity()
+                finally:
+                    fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
         except Exception:
             self.close()
             raise
@@ -2928,6 +3162,8 @@ class LegacyArtifactIndex:
         for attribute in (
             "_journal_descriptor",
             "_database_descriptor",
+            "_authority_descriptor",
+            "_lock_descriptor",
             "_parent_descriptor",
         ):
             descriptor = getattr(self, attribute, -1)
@@ -2952,35 +3188,28 @@ class LegacyArtifactIndex:
             observed.mode,
         ) == (expected.device, expected.inode, mode)
 
-    def _assert_index_sidecars_safe(self) -> None:
-        if self._journal_descriptor >= 0:
-            journal_fd = _FileObservation.from_stat(os.fstat(self._journal_descriptor))
-            try:
-                journal_path = _FileObservation.from_stat(
-                    os.stat(
-                        f"{self.path.name}-journal",
-                        dir_fd=self._parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                )
-            except OSError as exc:
-                raise LabArtifactIntegrityError("legacy index journal identity changed") from exc
-            if not self._same_index_entry(
-                journal_fd,
-                self._journal_identity,
-                mode=stat.S_IFREG,
-            ) or not self._same_index_entry(
-                journal_path,
-                self._journal_identity,
-                mode=stat.S_IFREG,
-            ):
-                raise LabArtifactIntegrityError("legacy index journal identity changed")
-            if journal_fd.nlink != 1 or journal_path.nlink != 1:
-                raise LabArtifactIntegrityError("legacy index journal identity is unsafe")
-        suffixes = (
-            ("-wal", "-shm") if self._journal_descriptor >= 0 else ("-journal", "-wal", "-shm")
+    def _assert_bound_index_file(
+        self,
+        *,
+        descriptor: int,
+        expected: _FileObservation,
+        name: str,
+        label: str,
+    ) -> None:
+        opened = _FileObservation.from_stat(os.fstat(descriptor))
+        at_path = _FileObservation.from_stat(
+            os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
         )
-        for suffix in suffixes:
+        if (
+            not self._same_index_entry(opened, expected, mode=stat.S_IFREG)
+            or not self._same_index_entry(at_path, expected, mode=stat.S_IFREG)
+            or opened.nlink != 1
+            or at_path.nlink != 1
+        ):
+            raise LabArtifactIntegrityError(f"legacy index {label} identity changed")
+
+    def _assert_index_sidecars_safe(self) -> None:
+        for suffix in ("-wal", "-shm"):
             try:
                 observed = _FileObservation.from_stat(
                     os.stat(
@@ -2995,17 +3224,11 @@ class LegacyArtifactIndex:
                 raise LabArtifactIntegrityError("legacy index sidecar identity is unsafe")
 
     def _assert_index_identity(self) -> None:
+        current_parent_descriptor = -1
         try:
             parent_fd = _FileObservation.from_stat(os.fstat(self._parent_descriptor))
-            parent_path = _FileObservation.from_stat(self.path.parent.lstat())
-            database_fd = _FileObservation.from_stat(os.fstat(self._database_descriptor))
-            database_path = _FileObservation.from_stat(
-                os.stat(
-                    self.path.name,
-                    dir_fd=self._parent_descriptor,
-                    follow_symlinks=False,
-                )
-            )
+            current_parent_descriptor = _secure_open_directory(self.path.parent, create=False)
+            parent_path = _FileObservation.from_stat(os.fstat(current_parent_descriptor))
             if not self._same_index_entry(
                 parent_fd,
                 self._parent_identity,
@@ -3016,32 +3239,73 @@ class LegacyArtifactIndex:
                 mode=stat.S_IFDIR,
             ):
                 raise LabArtifactIntegrityError("legacy index parent identity changed")
-            if not self._same_index_entry(
-                database_fd,
-                self._database_identity,
-                mode=stat.S_IFREG,
-            ) or not self._same_index_entry(
-                database_path,
-                self._database_identity,
-                mode=stat.S_IFREG,
-            ):
-                raise LabArtifactIntegrityError("legacy index database identity changed")
-            if database_fd.nlink != 1 or database_path.nlink != 1:
-                raise LabArtifactIntegrityError("legacy index database identity is unsafe")
+            self._assert_bound_index_file(
+                descriptor=self._lock_descriptor,
+                expected=self._lock_identity,
+                name=f"{self.path.name}.lock",
+                label="lock",
+            )
+            self._assert_bound_index_file(
+                descriptor=self._authority_descriptor,
+                expected=self._authority_identity,
+                name=f"{self.path.name}.authority.jsonl",
+                label="authority",
+            )
+            self._assert_bound_index_file(
+                descriptor=self._database_descriptor,
+                expected=self._database_identity,
+                name=self.path.name,
+                label="database",
+            )
+            self._assert_bound_index_file(
+                descriptor=self._journal_descriptor,
+                expected=self._journal_identity,
+                name=f"{self.path.name}-journal",
+                label="journal",
+            )
             self._assert_index_sidecars_safe()
         except LabArtifactError:
             raise
         except (AttributeError, OSError) as exc:
             raise LabArtifactIntegrityError("legacy index database identity changed") from exc
+        finally:
+            if current_parent_descriptor >= 0:
+                os.close(current_parent_descriptor)
+
+    @contextmanager
+    def _exclusive_index_lock(self) -> Iterator[None]:
+        with self._process_lock:
+            fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
+            try:
+                self._assert_index_identity()
+                yield
+                self._assert_index_identity()
+            finally:
+                fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _before_sqlite_connect() -> None:
+        """Fault-injection boundary before SQLite opens its path."""
+
+    @staticmethod
+    def _after_sqlite_connect(_connection: sqlite3.Connection) -> None:
+        """Fault-injection boundary after SQLite opens its path."""
 
     def _connect(self) -> sqlite3.Connection:
         self._assert_index_identity()
+        self._before_sqlite_connect()
+        self._assert_index_identity()
         try:
             connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            self._after_sqlite_connect(connection)
             connection.execute("PRAGMA journal_mode=TRUNCATE")
             connection.execute("PRAGMA synchronous=FULL")
             database_rows = connection.execute("PRAGMA database_list").fetchall()
-            main_paths = [Path(str(row[2])).absolute() for row in database_rows if row[1] == "main"]
+            main_paths = [
+                _secure_absolute_path(Path(str(row[2])))
+                for row in database_rows
+                if row[1] == "main"
+            ]
             if main_paths != [self.path]:
                 raise LabArtifactIntegrityError("legacy index connection identity changed")
             self._assert_index_identity()
@@ -3052,6 +3316,101 @@ class LegacyArtifactIndex:
             raise
 
     @staticmethod
+    def _initialize_cache_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS legacy_artifact (
+                logical_run_id TEXT PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                publication_state TEXT NOT NULL DEFAULT 'cached',
+                operation_id TEXT,
+                generation INTEGER
+            )
+            """
+        )
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(legacy_artifact)").fetchall()
+        }
+        additions = {
+            "publication_state": "TEXT NOT NULL DEFAULT 'cached'",
+            "operation_id": "TEXT",
+            "generation": "INTEGER",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE legacy_artifact ADD COLUMN {name} {definition}")
+
+    def _read_authority_state(self) -> _LegacyAuthorityState:
+        self._assert_index_identity()
+        payload = _read_descriptor(self._authority_descriptor)
+        self._assert_index_identity()
+        if payload and not payload.endswith(b"\n"):
+            raise LabArtifactIntegrityError("legacy authority ledger has a partial record")
+        latest: dict[str, LabLegacyAuthorityEvent] = {}
+        generations: dict[str, int] = {}
+        for raw_line in payload.splitlines():
+            try:
+                event = LabLegacyAuthorityEvent.model_validate_json(raw_line)
+            except Exception as exc:
+                raise LabArtifactIntegrityError("legacy authority ledger is invalid") from exc
+            if raw_line != event.canonical_json_bytes():
+                raise LabArtifactIntegrityError("legacy authority ledger is not canonical")
+            previous = latest.get(event.logical_run_id)
+            prior_generation = generations.get(event.logical_run_id, 0)
+            if event.event_type == "staged":
+                if previous is not None and previous.event_type in {"staged", "published"}:
+                    raise LabArtifactIntegrityError("legacy authority transition is invalid")
+                if event.generation != prior_generation + 1:
+                    raise LabArtifactIntegrityError("legacy authority generation is invalid")
+                generations[event.logical_run_id] = event.generation
+            else:
+                if (
+                    previous is None
+                    or previous.event_type != "staged"
+                    or previous.operation_id != event.operation_id
+                    or previous.generation != event.generation
+                    or previous.record != event.record
+                ):
+                    raise LabArtifactIntegrityError("legacy authority transition is invalid")
+            latest[event.logical_run_id] = event
+        return _LegacyAuthorityState(latest=latest, generations=generations)
+
+    def _append_authority_event(self, event: LabLegacyAuthorityEvent) -> None:
+        self._read_authority_state()
+        payload = event.canonical_json_bytes() + b"\n"
+        os.lseek(self._authority_descriptor, 0, os.SEEK_END)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(self._authority_descriptor, payload[offset:])
+            if written <= 0:
+                raise LabArtifactIntegrityError("legacy authority append made no progress")
+            offset += written
+        os.fsync(self._authority_descriptor)
+        self._assert_index_identity()
+        self._read_authority_state()
+
+    def _clock_utc(self) -> datetime:
+        observed = self.clock()
+        try:
+            offset = observed.utcoffset()
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("legacy index clock is outside the UTC datetime range") from exc
+        if observed.tzinfo is None or offset is None:
+            raise ValueError("legacy index clock must return a timezone-aware datetime")
+        try:
+            return observed.astimezone(UTC)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("legacy index clock is outside the UTC datetime range") from exc
+
+    @staticmethod
     def _media_type(path: Path) -> Literal["application/json", "text/markdown; charset=utf-8"]:
         suffix = path.suffix.lower()
         if suffix == ".json":
@@ -3060,49 +3419,24 @@ class LegacyArtifactIndex:
             return "text/markdown; charset=utf-8"
         raise LabArtifactPathError("legacy source must be JSON or Markdown")
 
-    @staticmethod
-    def _row_to_record(row: tuple[object, ...]) -> LabLegacyArtifactRecord:
-        return LabLegacyArtifactRecord(
-            logical_run_id=str(row[0]),
-            source_path=Path(str(row[1])),
-            device=int(row[2]),
-            inode=int(row[3]),
-            size=int(row[4]),
-            mtime_ns=int(row[5]),
-            sha256=str(row[6]),
-            media_type=str(row[7]),  # type: ignore[arg-type]
-            imported_at=datetime.fromisoformat(str(row[8])),
-        )
-
     def get(self, logical_run_id: str) -> LabLegacyArtifactRecord | None:
-        with self._lock:
-            self._assert_index_identity()
-            with self._connect() as connection:
-                row = connection.execute(
-                    """
-                    SELECT logical_run_id, source_path, device, inode, size, mtime_ns,
-                           sha256, media_type, imported_at
-                    FROM legacy_artifact
-                    WHERE logical_run_id = ? AND publication_state = 'published'
-                    """,
-                    (logical_run_id,),
-                ).fetchone()
-            self._assert_index_identity()
-        if row is None:
-            return None
-        record = self._row_to_record(row)
-        try:
-            with _open_bound_readonly_file(
-                record.source_path,
-                label="published legacy artifact source",
-            ) as bound:
-                payload = _read_descriptor(bound.descriptor)
-                _assert_bound_readonly_file(bound, label="published legacy artifact source")
-                if not self._legacy_record_matches(record, bound.file_identity, payload):
-                    return None
-        except LabArtifactError:
-            return None
-        return record
+        with self._exclusive_index_lock():
+            event = self._read_authority_state().latest.get(logical_run_id)
+            if event is None or event.event_type != "published":
+                return None
+            record = event.record
+            try:
+                with _open_bound_readonly_file(
+                    record.source_path,
+                    label="published legacy artifact source",
+                ) as bound:
+                    payload = _read_descriptor(bound.descriptor)
+                    _assert_bound_readonly_file(bound, label="published legacy artifact source")
+                    if not self._legacy_record_matches(record, bound.file_identity, payload):
+                        return None
+            except LabArtifactError:
+                return None
+            return record
 
     @staticmethod
     def _legacy_record_matches(
@@ -3135,34 +3469,97 @@ class LegacyArtifactIndex:
 
     @staticmethod
     def _after_stage_commit(_record: LabLegacyArtifactRecord) -> None:
-        """Fault-injection boundary after a staged row becomes durable."""
+        """Fault-injection boundary after an authority stage becomes durable."""
 
-    @staticmethod
-    def _delete_owned_legacy_row(
-        connection: sqlite3.Connection,
-        record: LabLegacyArtifactRecord,
+    def _cache_stage(
+        self,
+        *,
+        event: LabLegacyAuthorityEvent,
+        previous: LabLegacyAuthorityEvent | None,
     ) -> None:
-        with suppress(sqlite3.Error):
-            connection.rollback()
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            DELETE FROM legacy_artifact
-            WHERE logical_run_id = ? AND source_path = ? AND device = ? AND inode = ?
-              AND size = ? AND mtime_ns = ? AND sha256 = ? AND imported_at = ?
-            """,
-            (
-                record.logical_run_id,
-                str(record.source_path),
-                record.device,
-                record.inode,
-                record.size,
-                record.mtime_ns,
-                record.sha256,
-                record.imported_at.isoformat(timespec="microseconds"),
-            ),
-        )
-        connection.commit()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if previous is not None and previous.event_type == "staged":
+                connection.execute(
+                    """
+                    DELETE FROM legacy_artifact
+                    WHERE logical_run_id = ? AND operation_id = ? AND generation = ?
+                      AND publication_state = 'staged'
+                    """,
+                    (
+                        previous.logical_run_id,
+                        str(previous.operation_id),
+                        previous.generation,
+                    ),
+                )
+            record = event.record
+            connection.execute(
+                """
+                INSERT INTO legacy_artifact (
+                    logical_run_id, source_path, device, inode, size, mtime_ns,
+                    sha256, media_type, imported_at, publication_state,
+                    operation_id, generation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?)
+                ON CONFLICT(logical_run_id) DO UPDATE SET
+                    source_path=excluded.source_path,
+                    device=excluded.device,
+                    inode=excluded.inode,
+                    size=excluded.size,
+                    mtime_ns=excluded.mtime_ns,
+                    sha256=excluded.sha256,
+                    media_type=excluded.media_type,
+                    imported_at=excluded.imported_at,
+                    publication_state='staged',
+                    operation_id=excluded.operation_id,
+                    generation=excluded.generation
+                """,
+                (
+                    record.logical_run_id,
+                    str(record.source_path),
+                    record.device,
+                    record.inode,
+                    record.size,
+                    record.mtime_ns,
+                    record.sha256,
+                    record.media_type,
+                    record.imported_at.isoformat(timespec="microseconds"),
+                    str(event.operation_id),
+                    event.generation,
+                ),
+            )
+            self._assert_index_identity()
+            connection.commit()
+            self._assert_index_identity()
+
+    def _cache_complete(self, event: LabLegacyAuthorityEvent) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE legacy_artifact SET publication_state = 'cached'
+                WHERE logical_run_id = ? AND operation_id = ? AND generation = ?
+                  AND publication_state = 'staged'
+                """,
+                (event.logical_run_id, str(event.operation_id), event.generation),
+            )
+            if cursor.rowcount != 1:
+                raise LabArtifactIntegrityError("legacy cache operation ownership changed")
+            self._assert_index_identity()
+            connection.commit()
+            self._assert_index_identity()
+
+    def _delete_cache_operation(self, event: LabLegacyAuthorityEvent) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                DELETE FROM legacy_artifact
+                WHERE logical_run_id = ? AND operation_id = ? AND generation = ?
+                  AND publication_state IN ('staged', 'cached')
+                """,
+                (event.logical_run_id, str(event.operation_id), event.generation),
+            )
+            connection.commit()
 
     def import_file(
         self,
@@ -3170,14 +3567,11 @@ class LegacyArtifactIndex:
         logical_run_id: str,
         source_path: Path,
     ) -> LabLegacyIndexResult:
-        with self._lock:
-            self._assert_index_identity()
-            result = self._import_file_locked(
+        with self._exclusive_index_lock():
+            return self._import_file_locked(
                 logical_run_id=logical_run_id,
                 source_path=source_path,
             )
-            self._assert_index_identity()
-            return result
 
     def _import_file_locked(
         self,
@@ -3188,15 +3582,13 @@ class LegacyArtifactIndex:
         logical_run_id = " ".join(logical_run_id.split())
         if not logical_run_id:
             raise ValueError("logical_run_id must not be empty")
-        source = source_path.absolute()
+        source = _secure_absolute_path(source_path)
         media_type = self._media_type(source)
         with _open_bound_readonly_file(source, label="legacy artifact source") as bound:
             payload = _read_descriptor(bound.descriptor)
             _assert_bound_readonly_file(bound, label="legacy artifact source")
             observation = bound.file_identity
-            imported_at = self.clock()
-            if imported_at.tzinfo is None or imported_at.utcoffset() is None:
-                raise ValueError("legacy index clock must return a timezone-aware datetime")
+            occurred_at = self._clock_utc()
             record = LabLegacyArtifactRecord(
                 logical_run_id=logical_run_id,
                 source_path=source,
@@ -3206,100 +3598,75 @@ class LegacyArtifactIndex:
                 mtime_ns=observation.mtime_ns,
                 sha256=_sha256(payload),
                 media_type=media_type,
-                imported_at=imported_at.astimezone(UTC),
+                imported_at=occurred_at,
             )
-            connection = self._connect()
-            owns_row = False
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    """
-                    SELECT logical_run_id, source_path, device, inode, size, mtime_ns,
-                           sha256, media_type, imported_at, publication_state
-                    FROM legacy_artifact WHERE logical_run_id = ?
-                    """,
-                    (logical_run_id,),
-                ).fetchone()
-                if row is not None:
-                    existing = self._row_to_record(row[:9])
-                    if existing.source_path != source or not self._legacy_record_matches(
-                        existing, observation, payload
-                    ):
-                        raise LabLegacyArtifactConflictError(
-                            "legacy logical run already references different source bytes"
-                        )
-                    if str(row[9]) == "published":
-                        self._before_commit_source_check(source, observation)
-                        _assert_bound_readonly_file(bound, label="legacy artifact source")
-                        connection.commit()
-                        _assert_bound_readonly_file(bound, label="legacy artifact source")
-                        return LabLegacyIndexResult(status="reused", record=existing)
-                    if str(row[9]) != "staged":
-                        raise LabArtifactIntegrityError(
-                            "legacy index contains an invalid publication state"
-                        )
-                    record = existing
-                    owns_row = True
-                else:
-                    connection.execute(
-                        """
-                        INSERT INTO legacy_artifact (
-                            logical_run_id, source_path, device, inode, size, mtime_ns,
-                            sha256, media_type, imported_at, publication_state
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged')
-                        """,
-                        (
-                            record.logical_run_id,
-                            str(record.source_path),
-                            record.device,
-                            record.inode,
-                            record.size,
-                            record.mtime_ns,
-                            record.sha256,
-                            record.media_type,
-                            record.imported_at.isoformat(timespec="microseconds"),
-                        ),
+            authority = self._read_authority_state()
+            previous = authority.latest.get(logical_run_id)
+            if previous is not None and previous.event_type == "published":
+                existing = previous.record
+                if existing.source_path != source or not self._legacy_record_matches(
+                    existing,
+                    observation,
+                    payload,
+                ):
+                    raise LabLegacyArtifactConflictError(
+                        "legacy logical run already references different source bytes"
                     )
-                    owns_row = True
                 self._before_commit_source_check(source, observation)
                 _assert_bound_readonly_file(bound, label="legacy artifact source")
-                connection.commit()
-                try:
-                    _assert_bound_readonly_file(bound, label="legacy artifact source")
-                except LabArtifactError:
-                    self._delete_owned_legacy_row(connection, record)
-                    raise
-                self._after_stage_commit(record)
-
-                connection.execute("BEGIN IMMEDIATE")
-                current_state = connection.execute(
-                    "SELECT publication_state FROM legacy_artifact WHERE logical_run_id = ?",
-                    (logical_run_id,),
-                ).fetchone()
-                if current_state != ("staged",):
-                    raise LabArtifactIntegrityError("legacy staged row changed before publication")
-                _assert_bound_readonly_file(bound, label="legacy artifact source")
-                connection.execute(
-                    """
-                    UPDATE legacy_artifact SET publication_state = 'published'
-                    WHERE logical_run_id = ? AND publication_state = 'staged'
-                    """,
-                    (logical_run_id,),
+                return LabLegacyIndexResult(status="reused", record=existing)
+            if previous is not None and previous.event_type == "staged":
+                abandoned = previous.model_copy(
+                    update={"event_type": "abandoned", "occurred_at": occurred_at}
                 )
+                self._append_authority_event(abandoned)
+            generation = authority.generations.get(logical_run_id, 0) + 1
+            operation_id = uuid4()
+            staged = LabLegacyAuthorityEvent(
+                event_type="staged",
+                logical_run_id=logical_run_id,
+                operation_id=operation_id,
+                generation=generation,
+                record=record,
+                occurred_at=occurred_at,
+            )
+            self._append_authority_event(staged)
+            published = False
+            try:
+                self._cache_stage(event=staged, previous=previous)
+                self._before_commit_source_check(source, observation)
                 _assert_bound_readonly_file(bound, label="legacy artifact source")
-                connection.commit()
-                try:
-                    _assert_bound_readonly_file(bound, label="legacy artifact source")
-                except LabArtifactError:
-                    self._delete_owned_legacy_row(connection, record)
-                    raise
+                self._after_stage_commit(record)
+                self._before_commit_source_check(source, observation)
+                _assert_bound_readonly_file(bound, label="legacy artifact source")
+                self._cache_complete(staged)
+                self._before_commit_source_check(source, observation)
+                _assert_bound_readonly_file(bound, label="legacy artifact source")
+                self._append_authority_event(
+                    staged.model_copy(
+                        update={"event_type": "published", "occurred_at": self._clock_utc()}
+                    )
+                )
+                published = True
             except Exception:
-                with suppress(sqlite3.Error):
-                    connection.rollback()
-                if owns_row:
-                    with suppress(sqlite3.Error):
-                        self._delete_owned_legacy_row(connection, record)
+                if not published:
+                    with suppress(LabArtifactError, OSError, ValueError):
+                        current = self._read_authority_state().latest.get(logical_run_id)
+                        if (
+                            current is not None
+                            and current.event_type == "staged"
+                            and current.operation_id == operation_id
+                            and current.generation == generation
+                        ):
+                            self._append_authority_event(
+                                staged.model_copy(
+                                    update={
+                                        "event_type": "abandoned",
+                                        "occurred_at": occurred_at,
+                                    }
+                                )
+                            )
+                    with suppress(LabArtifactError, sqlite3.Error, OSError):
+                        self._delete_cache_operation(staged)
                 raise
-            finally:
-                connection.close()
             return LabLegacyIndexResult(status="imported", record=record)

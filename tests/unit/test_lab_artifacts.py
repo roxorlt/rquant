@@ -4,10 +4,13 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -308,6 +311,18 @@ def test_artifact_root_swap_fails_closed_without_writing_external_tree(tmp_path:
     assert all(list((external / name).iterdir()) == [] for name in os.listdir(external))
 
 
+def test_artifact_root_rejects_ancestor_symlink_without_external_writes(tmp_path: Path) -> None:
+    external_container = tmp_path / "external" / "container"
+    external_container.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(external_container.parent, target_is_directory=True)
+
+    with pytest.raises((LabArtifactPathError, LabArtifactIntegrityError)):
+        LabJobArtifactStore(alias / "container" / "artifacts")
+
+    assert list(external_container.iterdir()) == []
+
+
 def test_same_job_with_different_result_conflicts_without_clobber(tmp_path: Path) -> None:
     store = LabJobArtifactStore(tmp_path / "artifacts")
     first = store.seal_candidate(_prepare(store))
@@ -328,6 +343,39 @@ def test_same_job_with_different_result_conflicts_without_clobber(tmp_path: Path
 
     assert store.verify_sealed(first.path).manifest_hash == first.manifest_hash
     assert changed.path.exists()
+
+
+def test_existing_sealed_inode_swap_does_not_return_stale_or_quarantine_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    candidate = _prepare(store)
+    replacement = tmp_path / "replacement-sealed"
+    displaced = tmp_path / "displaced-sealed"
+    shutil.copytree(sealed.path, replacement)
+    swapped = False
+
+    def swap_after_bound(_bound: object, _sealed: object) -> None:
+        nonlocal swapped
+        os.chmod(sealed.path, 0o700)
+        os.chmod(replacement, 0o700)
+        os.rename(sealed.path, displaced)
+        os.rename(replacement, sealed.path)
+        swapped = True
+
+    monkeypatch.setattr(store, "_after_existing_sealed_bound", swap_after_bound, raising=False)
+
+    with pytest.raises(LabArtifactIntegrityError, match="sealed.*identity|bound.*identity"):
+        store.seal_candidate(candidate)
+
+    assert swapped is True
+    assert candidate.path.exists()
+    assert not any(
+        item.status == "quarantined" and item.job_id == candidate.job_id
+        for item in store.list_candidate_recovery()
+    )
 
 
 def test_atomic_publish_never_replaces_racing_reservation(
@@ -773,6 +821,58 @@ def test_interrupted_seal_rejects_same_bytes_with_replaced_inode(
         LabJobArtifactStore(tmp_path / "artifacts").recover_interrupted_seal(published)
 
 
+def test_seal_intent_replacement_after_binding_never_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    displaced = tmp_path / "original-seal-intent.json"
+    swapped = False
+
+    def replace_bound_intent(_bound: object) -> None:
+        nonlocal swapped
+        path = store.seal_intents_root / f"{candidate.job_id.hex}.json"
+        os.rename(path, displaced)
+        path.write_text("{}", encoding="utf-8")
+        os.chmod(path, 0o600)
+        swapped = True
+
+    monkeypatch.setattr(store, "_after_seal_intent_bound", replace_bound_intent, raising=False)
+
+    with pytest.raises(LabArtifactIntegrityError, match="seal intent.*identity|bound.*identity"):
+        store.seal_candidate(candidate)
+
+    assert swapped is True
+    assert not (store.sealed_root / candidate.job_id.hex).exists()
+    assert candidate.path.exists()
+
+
+def test_seal_intent_replacement_during_freeze_never_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    original = store._seal_bound_files
+    displaced = tmp_path / "freeze-seal-intent.json"
+
+    def freeze_then_replace(bound: object) -> None:
+        original(bound)  # type: ignore[arg-type]
+        path = store.seal_intents_root / f"{candidate.job_id.hex}.json"
+        os.rename(path, displaced)
+        path.write_text("{}", encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    monkeypatch.setattr(store, "_seal_bound_files", freeze_then_replace)
+
+    with pytest.raises(LabArtifactIntegrityError, match="seal intent.*identity"):
+        store.seal_candidate(candidate)
+
+    assert not (store.sealed_root / candidate.job_id.hex).exists()
+    assert candidate.path.exists()
+
+
 @pytest.mark.parametrize(
     "boundary",
     ["before_directory_chmod", "after_tables_fsync", "before_bundle_fsync"],
@@ -1107,6 +1207,26 @@ def test_zip_destination_reservation_is_never_overwritten(
         store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
 
     assert destination.read_bytes() == b"reservation"
+
+
+def test_zip_destination_rejects_ancestor_symlink_without_external_writes(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    external_container = tmp_path / "zip-external" / "container"
+    external_container.mkdir(parents=True)
+    alias = tmp_path / "zip-alias"
+    alias.symlink_to(external_container.parent, target_is_directory=True)
+
+    with pytest.raises((LabArtifactPathError, LabArtifactIntegrityError, OSError)):
+        store.export_deterministic_zip(
+            sealed.path,
+            _evidence(sealed),
+            alias / "container" / "exports" / "result.zip",
+        )
+
+    assert list(external_container.iterdir()) == []
 
 
 def test_export_and_legacy_index_do_not_chmod_existing_caller_directories(
@@ -1516,6 +1636,223 @@ def test_legacy_process_crash_after_stage_commit_remains_invisible_and_resumable
     imported = restarted.import_file(logical_run_id="old-run", source_path=source)
     assert imported.status == "imported"
     assert restarted.get("old-run") == imported.record
+
+
+def test_legacy_parent_rejects_ancestor_symlink_without_external_writes(tmp_path: Path) -> None:
+    external_container = tmp_path / "legacy-external" / "container"
+    external_container.mkdir(parents=True)
+    alias = tmp_path / "legacy-alias"
+    alias.symlink_to(external_container.parent, target_is_directory=True)
+
+    with pytest.raises((LabArtifactPathError, LabArtifactIntegrityError, OSError)):
+        LegacyArtifactIndex(alias / "container" / "index" / "legacy.sqlite3")
+
+    assert list(external_container.iterdir()) == []
+
+
+def test_legacy_connect_inode_swap_never_publishes_to_original_or_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.json"
+    source.write_text('{"source":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    replacement = LegacyArtifactIndex(tmp_path / "replacement" / "legacy.sqlite3")
+    original_db = index.path.with_name("original.sqlite3")
+    swapped = False
+
+    def swap_before_connect() -> None:
+        nonlocal swapped
+        os.rename(index.path, original_db)
+        shutil.copy2(replacement.path, index.path)
+        swapped = True
+
+    monkeypatch.setattr(index, "_before_sqlite_connect", swap_before_connect, raising=False)
+
+    with pytest.raises(LabArtifactIntegrityError, match="index.*identity"):
+        index.import_file(logical_run_id="swapped-run", source_path=source)
+
+    assert swapped is True
+    for database in (original_db, index.path):
+        with sqlite3.connect(database) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM legacy_artifact "
+                "WHERE logical_run_id = ? AND publication_state = 'published'",
+                ("swapped-run",),
+            ).fetchone()[0]
+        assert count == 0
+
+
+def test_legacy_inode_swap_after_sqlite_connect_never_publishes_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.json"
+    source.write_text('{"source":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    replacement = LegacyArtifactIndex(tmp_path / "replacement" / "legacy.sqlite3")
+    original_db = index.path.with_name("opened-original.sqlite3")
+
+    def swap_after_connect(_connection: sqlite3.Connection) -> None:
+        os.rename(index.path, original_db)
+        shutil.copy2(replacement.path, index.path)
+
+    monkeypatch.setattr(index, "_after_sqlite_connect", swap_after_connect)
+
+    with pytest.raises(LabArtifactIntegrityError, match="index.*identity"):
+        index.import_file(logical_run_id="post-connect-swap", source_path=source)
+
+    authority = index.path.with_name(f"{index.path.name}.authority.jsonl")
+    assert b'"event_type":"published"' not in authority.read_bytes()
+    for database in (original_db, index.path):
+        with sqlite3.connect(database) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM legacy_artifact "
+                "WHERE logical_run_id = ? AND publication_state = 'published'",
+                ("post-connect-swap",),
+            ).fetchone()[0]
+        assert count == 0
+
+
+def test_legacy_multi_instance_stage_lock_prevents_takeover_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    first = LegacyArtifactIndex(path)
+    second = LegacyArtifactIndex(path)
+    staged = threading.Event()
+    release = threading.Event()
+    second_finished = threading.Event()
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def pause_after_stage(_record: object) -> None:
+        staged.set()
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(first, "_after_stage_commit", pause_after_stage)
+
+    def run(index: LegacyArtifactIndex, finished: threading.Event | None = None) -> None:
+        try:
+            results.append(
+                index.import_file(logical_run_id="shared-run", source_path=source).status
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if finished is not None:
+                finished.set()
+
+    first_thread = threading.Thread(target=run, args=(first,))
+    first_thread.start()
+    assert staged.wait(timeout=5)
+    second_thread = threading.Thread(target=run, args=(second, second_finished))
+    second_thread.start()
+    time.sleep(0.1)
+    assert second_finished.is_set() is False
+    release.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert errors == []
+    assert sorted(results) == ["imported", "reused"]
+    assert second.get("shared-run") is not None
+
+
+def test_legacy_process_lock_serializes_stage_and_publish(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    staged = tmp_path / "staged.marker"
+    release = tmp_path / "release.marker"
+    first_script = textwrap.dedent(
+        """
+        import sys
+        import time
+        from pathlib import Path
+        from rquant.lab_artifacts import LegacyArtifactIndex
+
+        index = LegacyArtifactIndex(Path(sys.argv[1]))
+        def pause(_record):
+            Path(sys.argv[3]).write_text("staged", encoding="utf-8")
+            while not Path(sys.argv[4]).exists():
+                time.sleep(0.01)
+        index._after_stage_commit = pause
+        result = index.import_file(logical_run_id="process-run", source_path=Path(sys.argv[2]))
+        print(result.status, flush=True)
+        """
+    )
+    second_script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LegacyArtifactIndex
+
+        index = LegacyArtifactIndex(Path(sys.argv[1]))
+        result = index.import_file(logical_run_id="process-run", source_path=Path(sys.argv[2]))
+        print(result.status, flush=True)
+        """
+    )
+    environment = os.environ.copy()
+    first = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            first_script,
+            str(path),
+            str(source),
+            str(staged),
+            str(release),
+        ],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second: subprocess.Popen[str] | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while not staged.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert staged.exists()
+        second = subprocess.Popen(
+            [sys.executable, "-c", second_script, str(path), str(source)],
+            cwd=Path(__file__).parents[2],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        assert second.poll() is None
+        release.write_text("release", encoding="utf-8")
+        first_stdout, first_stderr = first.communicate(timeout=5)
+        second_stdout, second_stderr = second.communicate(timeout=5)
+        assert first.returncode == 0, first_stderr
+        assert second.returncode == 0, second_stderr
+        assert [first_stdout.strip(), second_stdout.strip()] == ["imported", "reused"]
+    finally:
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def test_legacy_clock_utc_overflow_is_normalized_to_value_error(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text("{}", encoding="utf-8")
+    overflowing = datetime.min.replace(tzinfo=timezone(timedelta(hours=14)))
+    index = LegacyArtifactIndex(
+        tmp_path / "legacy.sqlite3",
+        clock=lambda: overflowing,
+    )
+
+    with pytest.raises(ValueError, match="outside the UTC datetime range"):
+        index.import_file(logical_run_id="overflow", source_path=source)
 
 
 def test_legacy_database_path_swap_fails_closed_without_touching_replacement(
