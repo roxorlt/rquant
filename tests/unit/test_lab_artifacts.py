@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import stat
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -14,12 +14,14 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+import rquant.lab_artifacts as lab_artifacts_module
 from rquant.lab_artifacts import (
     LabArtifactAuthorizationError,
     LabArtifactConflictError,
     LabArtifactIndexEvidence,
     LabArtifactIntegrityError,
     LabArtifactPathError,
+    LabJobArtifactCandidate,
     LabJobArtifactFile,
     LabJobArtifactManifest,
     LabJobArtifactStore,
@@ -90,7 +92,11 @@ def _tables() -> dict[str, pd.DataFrame]:
     }
 
 
-def _prepare(store: LabJobArtifactStore, *, job_id: UUID | None = None):
+def _prepare(
+    store: LabJobArtifactStore,
+    *,
+    job_id: UUID | None = None,
+) -> LabJobArtifactCandidate:
     return store.prepare_candidate(
         job_id=job_id or UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
         spec=_spec(),
@@ -130,6 +136,48 @@ def _allow_writes(path: Path) -> None:
             os.chmod(child, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         elif not child.is_symlink():
             os.chmod(child, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _persist_forged_manifest(
+    candidate: LabJobArtifactCandidate,
+    *,
+    files: tuple[LabJobArtifactFile, ...] | None = None,
+    spec_hash: str | None = None,
+    code_sha: str | None = None,
+) -> None:
+    selected_files = files or candidate.manifest.files
+    selected_spec_hash = spec_hash or candidate.manifest.spec_hash
+    selected_code_sha = code_sha or candidate.manifest.code_sha
+    identity = {
+        "job_id": candidate.manifest.job_id,
+        "spec_hash": selected_spec_hash,
+        "plan_hash": candidate.manifest.plan_hash,
+        "adapter_id": candidate.manifest.adapter_id,
+        "adapter_version": candidate.manifest.adapter_version,
+        "result_contract_version": candidate.manifest.result_contract_version,
+        "code_sha": selected_code_sha,
+        "dataset_snapshot": candidate.manifest.dataset_snapshot,
+        "files": selected_files,
+    }
+    raw = json.loads(candidate.manifest.canonical_json_bytes())
+    raw["spec_hash"] = selected_spec_hash
+    raw["code_sha"] = selected_code_sha
+    raw["files"] = [item.model_dump(mode="json") for item in selected_files]
+    raw["complete_result_hash"] = hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+    manifest_bytes = json.dumps(
+        raw,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    (candidate.path / "manifest.json").write_bytes(manifest_bytes)
+    sums = {entry.relative_path: entry.sha256 for entry in selected_files}
+    sums["manifest.json"] = hashlib.sha256(manifest_bytes).hexdigest()
+    (candidate.path / "SHA256SUMS").write_text(
+        "".join(f"{digest}  {relative_path}\n" for relative_path, digest in sorted(sums.items())),
+        encoding="ascii",
+    )
 
 
 def test_prepare_verify_seal_and_idempotently_reuse_complete_bundle(tmp_path: Path) -> None:
@@ -180,6 +228,89 @@ def test_same_job_with_different_result_conflicts_without_clobber(tmp_path: Path
 
     assert store.verify_sealed(first.path).manifest_hash == first.manifest_hash
     assert changed.path.exists()
+
+
+def test_seal_rejects_same_job_candidate_path_swap_after_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate_a = _prepare(store)
+    candidate_b = store.prepare_candidate(
+        job_id=candidate_a.job_id,
+        spec=_spec(),
+        plan_hash="6" * 64,
+        adapter_id="n-shape",
+        adapter_version="1",
+        result_contract_version="p14b1-v1",
+        metrics={"result": "candidate-b"},
+        report_markdown="# candidate B\n",
+        tables=_tables(),
+    )
+    displaced_a = tmp_path / "displaced-a"
+    original_verify = store.verify_candidate
+
+    def verify_then_swap(candidate: LabJobArtifactCandidate) -> LabJobArtifactManifest:
+        manifest = original_verify(candidate)
+        os.rename(candidate_a.path, displaced_a)
+        os.rename(candidate_b.path, candidate_a.path)
+        return manifest
+
+    monkeypatch.setattr(store, "verify_candidate", verify_then_swap)
+
+    with pytest.raises(LabArtifactIntegrityError, match="identity changed"):
+        store.seal_candidate(candidate_a)
+
+    assert not (store.sealed_root / candidate_a.job_id.hex).exists()
+    assert (candidate_a.path / "report.md").read_text() == "# candidate B\n"
+    assert (displaced_a / "report.md").read_text() != "# candidate B\n"
+
+
+def test_fd_bound_fchmod_race_never_changes_external_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    report = candidate.path / "report.md"
+    displaced = tmp_path / "original-report.md"
+    external = tmp_path / "external.md"
+    external.write_text("external", encoding="utf-8")
+    os.chmod(external, 0o640)
+    external_mode = stat.S_IMODE(external.stat().st_mode)
+    original_fchmod = lab_artifacts_module.os.fchmod
+    swapped = False
+
+    def swap_path_before_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal swapped
+        if mode == 0o400 and not swapped:
+            swapped = True
+            os.rename(report, displaced)
+            report.symlink_to(external)
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(lab_artifacts_module.os, "fchmod", swap_path_before_fchmod)
+
+    with pytest.raises(LabArtifactIntegrityError):
+        store.seal_candidate(candidate)
+
+    assert swapped is True
+    assert stat.S_IMODE(external.stat().st_mode) == external_mode
+
+
+def test_recover_candidate_rejects_recovery_record_inode_replacement(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate_a = _prepare(store)
+    record = store.list_candidate_recovery()[0]
+    candidate_b = _prepare(store)
+    displaced_a = tmp_path / "displaced-recovery-a"
+    os.rename(candidate_a.path, displaced_a)
+    os.rename(candidate_b.path, candidate_a.path)
+
+    with pytest.raises(LabArtifactIntegrityError, match="recovery.*identity"):
+        store.recover_candidate(record)
 
 
 @pytest.mark.parametrize("target", ["manifest.json", "SHA256SUMS", "tables/trades.parquet"])
@@ -283,12 +414,12 @@ def test_interrupted_seal_after_atomic_rename_can_be_explicitly_recovered(
 ) -> None:
     store = LabJobArtifactStore(tmp_path / "artifacts")
     candidate = _prepare(store)
-    original = store._make_directories_read_only
 
-    def crash_after_rename(_bundle: Path) -> None:
+    def crash_after_rename(_bound: object) -> None:
+        os.chmod(store.sealed_root / candidate.job_id.hex / "report.md", 0o600)
         raise OSError("simulated crash after rename")
 
-    monkeypatch.setattr(store, "_make_directories_read_only", crash_after_rename)
+    monkeypatch.setattr(store, "_finalize_bound_directories", crash_after_rename)
     with pytest.raises(OSError, match="simulated crash"):
         store.seal_candidate(candidate)
 
@@ -296,12 +427,108 @@ def test_interrupted_seal_after_atomic_rename_can_be_explicitly_recovered(
     assert published.exists()
     assert published.stat().st_mode & stat.S_IWUSR
     restarted = LabJobArtifactStore(tmp_path / "artifacts")
-    monkeypatch.setattr(restarted, "_make_directories_read_only", original)
 
     recovered = restarted.recover_interrupted_seal(published)
 
     assert recovered.path == published
     assert restarted.verify_sealed(published).manifest_hash == candidate.manifest_hash
+
+
+def test_interrupted_seal_rejects_same_bytes_with_replaced_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+
+    def crash_after_rename(_bound: object) -> None:
+        raise OSError("simulated directory metadata crash")
+
+    monkeypatch.setattr(store, "_finalize_bound_directories", crash_after_rename)
+    with pytest.raises(OSError):
+        store.seal_candidate(candidate)
+    published = store.sealed_root / candidate.job_id.hex
+    report = published / "report.md"
+    original_bytes = report.read_bytes()
+    displaced = tmp_path / "sealed-original-report.md"
+    os.rename(report, displaced)
+    report.write_bytes(original_bytes)
+    os.chmod(report, 0o400)
+
+    with pytest.raises(LabArtifactIntegrityError, match="seal intent.*identity"):
+        LabJobArtifactStore(tmp_path / "artifacts").recover_interrupted_seal(published)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["before_directory_chmod", "after_tables_fsync", "before_bundle_fsync"],
+)
+def test_interrupted_seal_recovers_distinct_directory_metadata_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+
+    def crash_at_boundary(bound: object) -> None:
+        if boundary in {"after_tables_fsync", "before_bundle_fsync"}:
+            os.fchmod(bound.tables_descriptor, 0o500)  # type: ignore[attr-defined]
+            os.fsync(bound.tables_descriptor)  # type: ignore[attr-defined]
+        if boundary == "before_bundle_fsync":
+            os.fchmod(bound.bundle_descriptor, 0o500)  # type: ignore[attr-defined]
+        raise OSError(boundary)
+
+    monkeypatch.setattr(store, "_finalize_bound_directories", crash_at_boundary)
+    with pytest.raises(OSError, match=boundary):
+        store.seal_candidate(candidate)
+
+    published = store.sealed_root / candidate.job_id.hex
+    recovered = LabJobArtifactStore(tmp_path / "artifacts").recover_interrupted_seal(published)
+
+    assert stat.S_IMODE(recovered.path.stat().st_mode) == 0o500
+    assert stat.S_IMODE((recovered.path / "tables").stat().st_mode) == 0o500
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o400
+        for path in recovered.path.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_seal_fsyncs_each_fd_after_fchmod_0400(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    events: list[tuple[str, int, int | None]] = []
+    original_fchmod = lab_artifacts_module.os.fchmod
+    original_fsync = lab_artifacts_module.os.fsync
+
+    def record_fchmod(descriptor: int, mode: int) -> None:
+        events.append(("fchmod", descriptor, mode))
+        original_fchmod(descriptor, mode)
+
+    def record_fsync(descriptor: int) -> None:
+        events.append(("fsync", descriptor, None))
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module.os, "fchmod", record_fchmod)
+    monkeypatch.setattr(lab_artifacts_module.os, "fsync", record_fsync)
+
+    store.seal_candidate(candidate)
+
+    file_chmods = [
+        (index, descriptor)
+        for index, (operation, descriptor, mode) in enumerate(events)
+        if operation == "fchmod" and mode == 0o400
+    ]
+    assert len(file_chmods) == len(candidate.file_identities)
+    for chmod_index, descriptor in file_chmods:
+        assert any(
+            operation == "fsync" and later_descriptor == descriptor
+            for operation, later_descriptor, _mode in events[chmod_index + 1 :]
+        )
 
 
 def test_zip_export_is_byte_identical_and_requires_matching_index_evidence(tmp_path: Path) -> None:
@@ -382,6 +609,17 @@ def test_canonical_json_is_exact_for_supported_values_and_rejects_invalid_values
     for invalid in (float("nan"), float("inf"), float("-inf"), object()):
         with pytest.raises((TypeError, ValueError)):
             canonical_json_bytes({"value": invalid})
+
+
+def test_canonical_datetime_handles_utc_limits_and_normalizes_offset_overflow() -> None:
+    assert canonical_json_bytes(datetime.min.replace(tzinfo=UTC))
+    assert canonical_json_bytes(datetime.max.replace(tzinfo=UTC))
+    underflow = datetime.min.replace(tzinfo=timezone(timedelta(hours=14)))
+    overflow = datetime.max.replace(tzinfo=timezone(-timedelta(hours=14)))
+
+    for value in (underflow, overflow):
+        with pytest.raises(ValueError, match="outside the UTC datetime range"):
+            canonical_json_bytes(value)
 
 
 def test_prepare_rejects_unsafe_paths_nan_and_infinite_metrics(tmp_path: Path) -> None:
@@ -472,6 +710,122 @@ def test_verify_cross_checks_manifest_snapshot_and_code_sha_against_spec_json(
 
     assert records[0].status == "invalid"
     assert "spec identity" in (records[0].reason or "")
+
+
+def test_invalid_research_run_spec_cannot_be_rehashed_and_sealed(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    spec_payload = json.loads((candidate.path / "spec.json").read_bytes())
+    spec_payload["resource_class"] = "not-a-resource-class"
+    spec_bytes = json.dumps(
+        spec_payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    (candidate.path / "spec.json").write_bytes(spec_bytes)
+    files = tuple(
+        item.model_copy(
+            update={
+                "size": len(spec_bytes),
+                "sha256": hashlib.sha256(spec_bytes).hexdigest(),
+            }
+        )
+        if item.relative_path == "spec.json"
+        else item
+        for item in candidate.manifest.files
+    )
+    _persist_forged_manifest(
+        candidate,
+        files=files,
+        spec_hash=hashlib.sha256(spec_bytes).hexdigest(),
+    )
+
+    record = LabJobArtifactStore(tmp_path / "artifacts").list_candidate_recovery()[0]
+
+    assert record.status == "invalid"
+    assert "ResearchRunSpec" in (record.reason or "")
+
+
+def test_v2_exploratory_snapshot_with_none_audit_id_is_valid(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    spec = _spec().model_copy(
+        update={
+            "research_status": "exploratory",
+            "dataset_snapshot": DatasetSnapshotIdentity(
+                snapshot_id="2" * 64,
+                binding_hash="3" * 64,
+                audit_run_id=None,
+            ),
+        }
+    )
+    candidate = store.prepare_candidate(
+        job_id=uuid4(),
+        spec=spec,
+        plan_hash="6" * 64,
+        adapter_id="n-shape",
+        adapter_version="1",
+        result_contract_version="p14b1-v1",
+        metrics={},
+        report_markdown="# valid exploratory\n",
+        tables={"result": pd.DataFrame({"value": [1]})},
+    )
+
+    sealed = store.seal_candidate(candidate)
+
+    assert sealed.manifest.dataset_snapshot == spec.dataset_snapshot
+
+
+@pytest.mark.parametrize(
+    ("case", "relative_path", "media_type"),
+    [
+        ("extra", "extra.txt", "text/plain"),
+        ("media", "spec.json", "text/plain"),
+    ],
+)
+def test_rehashed_manifest_cannot_expand_or_retype_exact_bundle(
+    tmp_path: Path,
+    case: str,
+    relative_path: str,
+    media_type: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    if case == "extra":
+        payload = b"not part of the exact result contract"
+        (candidate.path / relative_path).write_bytes(payload)
+        os.chmod(candidate.path / relative_path, 0o600)
+        changed = (
+            *candidate.manifest.files,
+            LabJobArtifactFile(
+                relative_path=relative_path,
+                media_type=media_type,
+                size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            ),
+        )
+    else:
+        changed = tuple(
+            item.model_copy(update={"media_type": media_type})
+            if item.relative_path == relative_path
+            else item
+            for item in candidate.manifest.files
+        )
+    _persist_forged_manifest(
+        candidate,
+        files=tuple(
+            sorted(
+                changed,
+                key=lambda item: item.relative_path,
+            )
+        ),
+    )
+
+    record = LabJobArtifactStore(tmp_path / "artifacts").list_candidate_recovery()[0]
+
+    assert record.status == "invalid"
+    assert "exact" in (record.reason or "") or "media" in (record.reason or "")
 
 
 def test_empty_table_and_dtypes_round_trip_exactly(tmp_path: Path) -> None:

@@ -11,8 +11,9 @@ import os
 import re
 import sqlite3
 import stat
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -113,9 +114,16 @@ def _canonical_value(value: object) -> object:
     if isinstance(value, Decimal):
         return {"$decimal": _canonical_decimal(value)}
     if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
+        try:
+            offset = value.utcoffset()
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("canonical datetime is outside the UTC datetime range") from exc
+        if value.tzinfo is None or offset is None:
             raise ValueError("canonical datetime values must be timezone-aware")
-        normalized = value.astimezone(UTC)
+        try:
+            normalized = value.astimezone(UTC)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("canonical datetime is outside the UTC datetime range") from exc
         return {"$datetime": normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")}
     if isinstance(value, date):
         return {"$date": value.isoformat()}
@@ -243,11 +251,34 @@ class LabJobArtifactManifest(LabArtifactModel):
         paths = tuple(item.relative_path for item in self.files)
         if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
             raise ValueError("manifest file inventory must be sorted and unique")
-        required = {"spec.json", "metrics.json", "report.md"}
-        if not required.issubset(paths):
-            raise ValueError("manifest is missing required result files")
-        if not any(path.startswith("tables/") for path in paths):
+        fixed_media_types = {
+            "spec.json": "application/json",
+            "metrics.json": "application/json",
+            "report.md": "text/markdown; charset=utf-8",
+        }
+        fixed_entries = {
+            item.relative_path: item
+            for item in self.files
+            if not item.relative_path.startswith("tables/")
+        }
+        if set(fixed_entries) != set(fixed_media_types):
+            raise ValueError("manifest exact result inventory contains extra or missing files")
+        for relative_path, media_type in fixed_media_types.items():
+            entry = fixed_entries[relative_path]
+            if entry.media_type != media_type or entry.parquet is not None:
+                raise ValueError(f"manifest fixed file media type conflicts: {relative_path}")
+        table_entries = tuple(
+            item for item in self.files if item.relative_path.startswith("tables/")
+        )
+        if not table_entries:
             raise ValueError("manifest requires at least one complete Parquet table")
+        if any(
+            item.parquet is None
+            or item.media_type != "application/vnd.apache.parquet"
+            or item.relative_path != f"tables/{item.parquet.table_name}.parquet"
+            for item in table_entries
+        ):
+            raise ValueError("manifest exact table inventory or media type conflicts")
         expected_hash = _sha256(
             canonical_json_bytes(
                 _complete_result_hash_payload(
@@ -297,7 +328,40 @@ class LabJobArtifactCandidate(LabArtifactModel):
     manifest_hash: str = Field(pattern=_HASH_PATTERN)
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
+    size: int = Field(ge=0)
+    mtime_ns: int = Field(ge=0)
+    ctime_ns: int = Field(ge=0)
     file_identities: tuple[LabArtifactFileIdentity, ...]
+
+
+class LabArtifactSealIntent(LabArtifactModel):
+    schema_version: Literal[1] = 1
+    job_id: UUID
+    candidate_name: str = Field(pattern=r"^[0-9a-f]{32}-[0-9a-f]{32}$")
+    manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    complete_result_hash: str = Field(pattern=_HASH_PATTERN)
+    bundle_device: int = Field(ge=0)
+    bundle_inode: int = Field(ge=1)
+    bundle_size: int = Field(ge=0)
+    bundle_mtime_ns: int = Field(ge=0)
+    bundle_ctime_ns: int = Field(ge=0)
+    file_identities: tuple[LabArtifactFileIdentity, ...]
+
+    @model_validator(mode="after")
+    def validate_file_identities(self) -> LabArtifactSealIntent:
+        paths = tuple(item.relative_path for item in self.file_identities)
+        if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise ValueError("seal intent file identities must be sorted and unique")
+        return self
+
+    def canonical_json_bytes(self) -> bytes:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
 
 
 class LabSealedJobArtifact(LabArtifactModel):
@@ -388,6 +452,73 @@ class _FileObservation(LabArtifactModel):
         )
 
 
+@dataclass
+class _BoundArtifactFile:
+    relative_path: str
+    descriptor: int
+    parent_descriptor: int
+    name: str
+    original: _FileObservation
+    current: _FileObservation
+
+
+@dataclass
+class _BoundArtifactBundle:
+    parent_descriptor: int
+    bundle_descriptor: int
+    tables_descriptor: int
+    bundle_name: str
+    original: _FileObservation
+    current: _FileObservation
+    tables_original: _FileObservation
+    tables_current: _FileObservation
+    files: dict[str, _BoundArtifactFile]
+
+    def close(self) -> None:
+        for item in self.files.values():
+            with suppress(OSError):
+                os.close(item.descriptor)
+        with suppress(OSError):
+            os.close(self.tables_descriptor)
+        with suppress(OSError):
+            os.close(self.bundle_descriptor)
+        with suppress(OSError):
+            os.close(self.parent_descriptor)
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _matches_file_identity(
+    observed: _FileObservation,
+    expected: LabArtifactFileIdentity,
+    *,
+    exact_ctime: bool,
+) -> bool:
+    stable = (
+        observed.device,
+        observed.inode,
+        observed.size,
+        observed.mtime_ns,
+    ) == (
+        expected.device,
+        expected.inode,
+        expected.size,
+        expected.mtime_ns,
+    )
+    ctime_matches = (
+        observed.ctime_ns == expected.ctime_ns
+        if exact_ctime
+        else observed.ctime_ns >= expected.ctime_ns
+    )
+    return stable and ctime_matches and observed.mode == stat.S_IFREG and observed.nlink == 1
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -406,7 +537,17 @@ def _ensure_private_directory(path: Path, *, manage_existing: bool = True) -> No
         path.mkdir(parents=True, mode=0o700)
         created = True
     if created or manage_existing:
-        os.chmod(path, 0o700)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise LabArtifactPathError(f"managed artifact directory is unsafe: {path}")
+            os.fchmod(descriptor, 0o700)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _write_private_bytes(path: Path, payload: bytes) -> None:
@@ -522,18 +663,46 @@ def _parse_canonical_json(payload: bytes, *, label: str) -> object:
     return parsed
 
 
-def _file_identity(path: Path, relative_path: str) -> LabArtifactFileIdentity:
-    observed = path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-        raise LabArtifactIntegrityError(f"unsafe artifact file: {relative_path}")
-    return LabArtifactFileIdentity(
-        relative_path=relative_path,
-        device=observed.st_dev,
-        inode=observed.st_ino,
-        size=observed.st_size,
-        mtime_ns=observed.st_mtime_ns,
-        ctime_ns=observed.st_ctime_ns,
-    )
+def _rebuild_canonical_value(value: object) -> object:
+    if isinstance(value, list):
+        return [_rebuild_canonical_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value) == {"$decimal"} and isinstance(value["$decimal"], str):
+        return Decimal(value["$decimal"])
+    if set(value) == {"$datetime"} and isinstance(value["$datetime"], str):
+        raw = value["$datetime"].replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(raw)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("canonical datetime cannot be rebuilt") from exc
+    if set(value) == {"$date"} and isinstance(value["$date"], str):
+        return date.fromisoformat(value["$date"])
+    if set(value) == {"$uuid"} and isinstance(value["$uuid"], str):
+        return UUID(value["$uuid"])
+    if set(value) == {"$path"} and isinstance(value["$path"], str):
+        return Path(value["$path"])
+    if set(value) == {"$float"} and isinstance(value["$float"], str):
+        rebuilt = float.fromhex(value["$float"])
+        if not math.isfinite(rebuilt):
+            raise ValueError("canonical numeric values must be finite")
+        return rebuilt
+    return {key: _rebuild_canonical_value(item) for key, item in value.items()}
+
+
+def _rebuild_research_run_spec(payload: bytes) -> ResearchRunSpec:
+    parsed = _parse_canonical_json(payload, label="spec.json")
+    if not isinstance(parsed, dict):
+        raise LabArtifactIntegrityError("spec.json must contain an object")
+    try:
+        spec = ResearchRunSpec.model_validate(_rebuild_canonical_value(parsed))
+    except Exception as exc:
+        raise LabArtifactIntegrityError(f"spec.json is not a valid ResearchRunSpec: {exc}") from exc
+    if spec.canonical_json().encode("utf-8") != payload:
+        raise LabArtifactIntegrityError(
+            "spec.json bytes do not match rebuilt ResearchRunSpec canonical JSON"
+        )
+    return spec
 
 
 class LabJobArtifactStore:
@@ -544,11 +713,13 @@ class LabJobArtifactStore:
         self.candidates_root = self.root / "candidates"
         self.sealed_root = self.root / "sealed"
         self.quarantine_root = self.root / "quarantine"
+        self.seal_intents_root = self.root / "seal-intents"
         for path in (
             self.root,
             self.candidates_root,
             self.sealed_root,
             self.quarantine_root,
+            self.seal_intents_root,
         ):
             _ensure_private_directory(path)
 
@@ -568,9 +739,9 @@ class LabJobArtifactStore:
     @staticmethod
     def _write_parquet(path: Path, table_name: str, frame: pd.DataFrame) -> LabJobArtifactFile:
         frame.to_parquet(path, index=False)
-        os.chmod(path, 0o600)
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
+            os.fchmod(descriptor, 0o600)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -822,19 +993,12 @@ class LabJobArtifactStore:
                     raise LabArtifactIntegrityError(
                         f"sealed artifact directory remains writable: {directory.name}"
                     )
-        spec_payload = _parse_canonical_json(observed_payloads["spec.json"], label="spec.json")
-        if _sha256(observed_payloads["spec.json"]) != manifest.spec_hash:
+        rebuilt_spec = _rebuild_research_run_spec(observed_payloads["spec.json"])
+        if rebuilt_spec.spec_hash != manifest.spec_hash:
             raise LabArtifactIntegrityError("spec.json does not match spec_hash")
-        if not isinstance(spec_payload, dict):
-            raise LabArtifactIntegrityError("spec.json must contain an object")
-        manifest_snapshot = (
-            manifest.dataset_snapshot.model_dump(mode="json", exclude_none=True)
-            if manifest.dataset_snapshot is not None
-            else None
-        )
         if (
-            spec_payload.get("code_sha") != manifest.code_sha
-            or spec_payload.get("dataset_snapshot") != manifest_snapshot
+            rebuilt_spec.code_sha != manifest.code_sha
+            or rebuilt_spec.dataset_snapshot != manifest.dataset_snapshot
         ):
             raise LabArtifactIntegrityError("manifest spec identity conflicts with spec.json")
         _parse_canonical_json(observed_payloads["metrics.json"], label="metrics.json")
@@ -898,6 +1062,363 @@ class LabJobArtifactStore:
             raise LabArtifactIntegrityError("job artifact bundle changed while verifying")
         return manifest, tuple(sorted(identities, key=lambda item: item.relative_path))
 
+    @staticmethod
+    def _same_bundle_identity(
+        observed: _FileObservation,
+        candidate: LabJobArtifactCandidate,
+    ) -> bool:
+        return (
+            observed.device,
+            observed.inode,
+            observed.size,
+            observed.mtime_ns,
+            observed.ctime_ns,
+            observed.mode,
+        ) == (
+            candidate.device,
+            candidate.inode,
+            candidate.size,
+            candidate.mtime_ns,
+            candidate.ctime_ns,
+            stat.S_IFDIR,
+        )
+
+    @contextmanager
+    def _bind_bundle(
+        self,
+        *,
+        parent_root: Path,
+        bundle_path: Path,
+        manifest: LabJobArtifactManifest,
+        expected_bundle: _FileObservation,
+        expected_files: tuple[LabArtifactFileIdentity, ...],
+    ) -> Iterator[_BoundArtifactBundle]:
+        parent_descriptor = -1
+        bundle_descriptor = -1
+        tables_descriptor = -1
+        opened_files: dict[str, _BoundArtifactFile] = {}
+        try:
+            managed = self._assert_managed_child(
+                bundle_path,
+                parent_root,
+                label="bound artifact bundle",
+            )
+            directory_flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            parent_descriptor = os.open(parent_root, directory_flags)
+            before = _FileObservation.from_stat(
+                os.stat(managed.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            )
+            if before != expected_bundle:
+                raise LabArtifactIntegrityError("bound artifact bundle identity changed")
+            bundle_descriptor = os.open(
+                managed.name,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            opened = _FileObservation.from_stat(os.fstat(bundle_descriptor))
+            if opened != before or opened.mode != stat.S_IFDIR:
+                raise LabArtifactIntegrityError("bound artifact bundle changed while opening")
+            tables_before = _FileObservation.from_stat(
+                os.stat("tables", dir_fd=bundle_descriptor, follow_symlinks=False)
+            )
+            tables_descriptor = os.open(
+                "tables",
+                directory_flags,
+                dir_fd=bundle_descriptor,
+            )
+            tables_opened = _FileObservation.from_stat(os.fstat(tables_descriptor))
+            if tables_opened != tables_before or tables_opened.mode != stat.S_IFDIR:
+                raise LabArtifactIntegrityError("bound tables directory changed while opening")
+            expected_by_path = {item.relative_path: item for item in expected_files}
+            if set(expected_by_path) != self._expected_paths(manifest):
+                raise LabArtifactIntegrityError("bound artifact file inventory changed")
+            for relative_path in sorted(expected_by_path):
+                pure = PurePosixPath(relative_path)
+                parent_fd = (
+                    tables_descriptor if pure.parent.as_posix() == "tables" else bundle_descriptor
+                )
+                name = pure.name
+                file_before = _FileObservation.from_stat(
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                )
+                if not _matches_file_identity(
+                    file_before,
+                    expected_by_path[relative_path],
+                    exact_ctime=True,
+                ):
+                    raise LabArtifactIntegrityError(
+                        f"bound artifact file identity changed: {relative_path}"
+                    )
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                file_opened = _FileObservation.from_stat(os.fstat(descriptor))
+                if file_opened != file_before:
+                    os.close(descriptor)
+                    raise LabArtifactIntegrityError(
+                        f"bound artifact file changed while opening: {relative_path}"
+                    )
+                opened_files[relative_path] = _BoundArtifactFile(
+                    relative_path=relative_path,
+                    descriptor=descriptor,
+                    parent_descriptor=parent_fd,
+                    name=name,
+                    original=file_opened,
+                    current=file_opened,
+                )
+            bound = _BoundArtifactBundle(
+                parent_descriptor=parent_descriptor,
+                bundle_descriptor=bundle_descriptor,
+                tables_descriptor=tables_descriptor,
+                bundle_name=managed.name,
+                original=opened,
+                current=opened,
+                tables_original=tables_opened,
+                tables_current=tables_opened,
+                files=opened_files,
+            )
+            self._assert_bound_paths(bound)
+            yield bound
+        except LabArtifactIntegrityError:
+            raise
+        except OSError as exc:
+            if "bound" in locals():
+                raise
+            raise LabArtifactIntegrityError(
+                "artifact changed while binding file descriptors"
+            ) from exc
+        finally:
+            if "bound" in locals():
+                bound.close()
+            else:
+                for item in opened_files.values():
+                    with suppress(OSError):
+                        os.close(item.descriptor)
+                for descriptor in (tables_descriptor, bundle_descriptor, parent_descriptor):
+                    if descriptor >= 0:
+                        with suppress(OSError):
+                            os.close(descriptor)
+
+    @staticmethod
+    def _assert_bound_paths(bound: _BoundArtifactBundle) -> None:
+        try:
+            bundle_fd = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
+            bundle_path = _FileObservation.from_stat(
+                os.stat(
+                    bound.bundle_name,
+                    dir_fd=bound.parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if bundle_fd != bound.current or bundle_path != bound.current:
+                raise LabArtifactIntegrityError("bound artifact bundle identity changed")
+            tables_fd = _FileObservation.from_stat(os.fstat(bound.tables_descriptor))
+            tables_path = _FileObservation.from_stat(
+                os.stat("tables", dir_fd=bound.bundle_descriptor, follow_symlinks=False)
+            )
+            if tables_fd != bound.tables_current or tables_path != bound.tables_current:
+                raise LabArtifactIntegrityError("bound tables directory identity changed")
+            for item in bound.files.values():
+                opened = _FileObservation.from_stat(os.fstat(item.descriptor))
+                at_path = _FileObservation.from_stat(
+                    os.stat(
+                        item.name,
+                        dir_fd=item.parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                if opened != item.current or at_path != item.current:
+                    raise LabArtifactIntegrityError(
+                        f"bound artifact file identity changed: {item.relative_path}"
+                    )
+        except LabArtifactIntegrityError:
+            raise
+        except OSError as exc:
+            raise LabArtifactIntegrityError("bound artifact path identity changed") from exc
+
+    @staticmethod
+    def _expected_bound_hashes(manifest: LabJobArtifactManifest) -> dict[str, str]:
+        expected = {item.relative_path: item.sha256 for item in manifest.files}
+        expected["manifest.json"] = manifest.manifest_hash
+        sums = "".join(
+            f"{digest}  {relative_path}\n" for relative_path, digest in sorted(expected.items())
+        ).encode("ascii")
+        expected["SHA256SUMS"] = _sha256(sums)
+        return expected
+
+    def _verify_bound_bytes(
+        self,
+        bound: _BoundArtifactBundle,
+        manifest: LabJobArtifactManifest,
+    ) -> None:
+        expected = self._expected_bound_hashes(manifest)
+        for relative_path, item in bound.files.items():
+            payload = _read_descriptor(item.descriptor)
+            if len(payload) != item.current.size or _sha256(payload) != expected[relative_path]:
+                raise LabArtifactIntegrityError(f"bound artifact bytes changed: {relative_path}")
+        if _read_descriptor(bound.files["manifest.json"].descriptor) != (
+            manifest.canonical_json_bytes()
+        ):
+            raise LabArtifactIntegrityError("bound candidate manifest changed")
+        self._assert_bound_paths(bound)
+
+    def _seal_intent_path(self, job_id: UUID) -> Path:
+        return self.seal_intents_root / f"{job_id.hex}.json"
+
+    def _write_seal_intent(
+        self,
+        candidate: LabJobArtifactCandidate,
+    ) -> LabArtifactSealIntent:
+        intent = LabArtifactSealIntent(
+            job_id=candidate.job_id,
+            candidate_name=candidate.path.name,
+            manifest_hash=candidate.manifest_hash,
+            complete_result_hash=candidate.manifest.complete_result_hash,
+            bundle_device=candidate.device,
+            bundle_inode=candidate.inode,
+            bundle_size=candidate.size,
+            bundle_mtime_ns=candidate.mtime_ns,
+            bundle_ctime_ns=candidate.ctime_ns,
+            file_identities=candidate.file_identities,
+        )
+        path = self._seal_intent_path(candidate.job_id)
+        if os.path.lexists(path):
+            existing = self._load_seal_intent(candidate.job_id)
+            if existing != intent:
+                raise LabArtifactConflictError("job seal intent already binds different bytes")
+            return existing
+        _write_private_bytes(path, intent.canonical_json_bytes())
+        _fsync_directory(self.seal_intents_root)
+        return intent
+
+    def _load_seal_intent(self, job_id: UUID) -> LabArtifactSealIntent:
+        payload, _ = _read_regular_file(
+            self._seal_intent_path(job_id),
+            label="job artifact seal intent",
+        )
+        try:
+            intent = LabArtifactSealIntent.model_validate_json(payload)
+        except Exception as exc:
+            raise LabArtifactIntegrityError(f"invalid job artifact seal intent: {exc}") from exc
+        if payload != intent.canonical_json_bytes() or intent.job_id != job_id:
+            raise LabArtifactIntegrityError("job artifact seal intent identity conflicts")
+        return intent
+
+    @staticmethod
+    def _validate_metadata_transition(
+        before: _FileObservation,
+        after: _FileObservation,
+        *,
+        expected_mode: int,
+        label: str,
+    ) -> None:
+        if (
+            after.device,
+            after.inode,
+            after.nlink,
+            after.size,
+            after.mtime_ns,
+            after.mode,
+        ) != (
+            before.device,
+            before.inode,
+            before.nlink,
+            before.size,
+            before.mtime_ns,
+            expected_mode,
+        ) or after.ctime_ns < before.ctime_ns:
+            raise LabArtifactIntegrityError(f"{label} identity changed during metadata update")
+
+    def _seal_bound_files(self, bound: _BoundArtifactBundle) -> None:
+        self._assert_bound_paths(bound)
+        for relative_path in sorted(bound.files):
+            item = bound.files[relative_path]
+            before = _FileObservation.from_stat(os.fstat(item.descriptor))
+            if before != item.current:
+                raise LabArtifactIntegrityError(
+                    f"bound artifact file identity changed before chmod: {relative_path}"
+                )
+            try:
+                os.fchmod(item.descriptor, 0o400)
+                after_chmod = _FileObservation.from_stat(os.fstat(item.descriptor))
+                self._validate_metadata_transition(
+                    before,
+                    after_chmod,
+                    expected_mode=stat.S_IFREG,
+                    label=f"artifact file {relative_path}",
+                )
+                if stat.S_IMODE(os.fstat(item.descriptor).st_mode) != 0o400:
+                    raise LabArtifactIntegrityError(
+                        f"artifact file permissions did not become 0400: {relative_path}"
+                    )
+                item.current = after_chmod
+                os.fsync(item.descriptor)
+                after_fsync = _FileObservation.from_stat(os.fstat(item.descriptor))
+            except LabArtifactIntegrityError:
+                raise
+            except OSError as exc:
+                raise LabArtifactIntegrityError(
+                    f"artifact file metadata could not be sealed: {relative_path}"
+                ) from exc
+            if after_fsync != item.current:
+                raise LabArtifactIntegrityError(
+                    f"artifact file identity changed during fsync: {relative_path}"
+                )
+            self._assert_bound_paths(bound)
+        self._verify_bound_bytes(bound, self._bound_manifest(bound))
+
+    @staticmethod
+    def _bound_manifest(bound: _BoundArtifactBundle) -> LabJobArtifactManifest:
+        payload = _read_descriptor(bound.files["manifest.json"].descriptor)
+        try:
+            manifest = LabJobArtifactManifest.model_validate_json(payload)
+        except Exception as exc:
+            raise LabArtifactIntegrityError("bound candidate manifest is invalid") from exc
+        if payload != manifest.canonical_json_bytes():
+            raise LabArtifactIntegrityError("bound candidate manifest is not canonical")
+        return manifest
+
+    def _finalize_bound_directories(self, bound: _BoundArtifactBundle) -> None:
+        self._assert_bound_paths(bound)
+        before_tables = _FileObservation.from_stat(os.fstat(bound.tables_descriptor))
+        os.fchmod(bound.tables_descriptor, 0o500)
+        after_tables = _FileObservation.from_stat(os.fstat(bound.tables_descriptor))
+        self._validate_metadata_transition(
+            before_tables,
+            after_tables,
+            expected_mode=stat.S_IFDIR,
+            label="artifact tables directory",
+        )
+        if stat.S_IMODE(os.fstat(bound.tables_descriptor).st_mode) != 0o500:
+            raise LabArtifactIntegrityError("artifact tables permissions did not become 0500")
+        bound.tables_current = after_tables
+        os.fsync(bound.tables_descriptor)
+        if _FileObservation.from_stat(os.fstat(bound.tables_descriptor)) != after_tables:
+            raise LabArtifactIntegrityError("artifact tables identity changed during fsync")
+        self._assert_bound_paths(bound)
+
+        before_bundle = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
+        os.fchmod(bound.bundle_descriptor, 0o500)
+        after_bundle = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
+        self._validate_metadata_transition(
+            before_bundle,
+            after_bundle,
+            expected_mode=stat.S_IFDIR,
+            label="artifact bundle directory",
+        )
+        if stat.S_IMODE(os.fstat(bound.bundle_descriptor).st_mode) != 0o500:
+            raise LabArtifactIntegrityError("artifact bundle permissions did not become 0500")
+        bound.current = after_bundle
+        os.fsync(bound.bundle_descriptor)
+        if _FileObservation.from_stat(os.fstat(bound.bundle_descriptor)) != after_bundle:
+            raise LabArtifactIntegrityError("artifact bundle identity changed during fsync")
+        self._assert_bound_paths(bound)
+        os.fsync(bound.parent_descriptor)
+
     def _candidate_from_path(self, path: Path) -> LabJobArtifactCandidate:
         managed = self._assert_managed_child(path, self.candidates_root, label="candidate")
         observed = self._directory_observation(managed, label="job artifact candidate")
@@ -910,6 +1431,9 @@ class LabJobArtifactStore:
             manifest_hash=manifest.manifest_hash,
             device=observed.device,
             inode=observed.inode,
+            size=observed.size,
+            mtime_ns=observed.mtime_ns,
+            ctime_ns=observed.ctime_ns,
             file_identities=identities,
         )
 
@@ -927,7 +1451,7 @@ class LabJobArtifactStore:
     def verify_candidate(self, candidate: LabJobArtifactCandidate) -> LabJobArtifactManifest:
         path = self._assert_managed_child(candidate.path, self.candidates_root, label="candidate")
         observed = self._directory_observation(path, label="job artifact candidate")
-        if (observed.device, observed.inode) != (candidate.device, candidate.inode):
+        if not self._same_bundle_identity(observed, candidate):
             raise LabArtifactIntegrityError("candidate bundle identity changed")
         manifest, identities = self._validate_bundle(path, require_sealed_permissions=False)
         if (
@@ -937,26 +1461,6 @@ class LabJobArtifactStore:
         ):
             raise LabArtifactIntegrityError("candidate bundle identity or files changed")
         return manifest
-
-    @staticmethod
-    def _make_files_read_only(bundle: Path) -> None:
-        for child in sorted(bundle.rglob("*")):
-            if child.is_symlink():
-                raise LabArtifactIntegrityError("candidate contains a symlink")
-            if child.is_file():
-                os.chmod(child, 0o400)
-
-    @staticmethod
-    def _make_directories_read_only(bundle: Path) -> None:
-        for child in sorted(
-            (path for path in bundle.rglob("*") if path.is_dir()),
-            key=lambda path: len(path.parts),
-            reverse=True,
-        ):
-            os.chmod(child, 0o500)
-        os.chmod(bundle, 0o500)
-        _fsync_directory(bundle / "tables")
-        _fsync_directory(bundle)
 
     def verify_sealed(self, path: Path) -> LabSealedJobArtifact:
         managed = self._assert_managed_child(path, self.sealed_root, label="sealed bundle")
@@ -973,32 +1477,95 @@ class LabJobArtifactStore:
         )
 
     def seal_candidate(self, candidate: LabJobArtifactCandidate) -> LabSealedJobArtifact:
-        manifest = self.verify_candidate(candidate)
-        target = self.sealed_root / manifest.job_id.hex
+        target = self.sealed_root / candidate.job_id.hex
         if os.path.lexists(target):
             existing = self.verify_sealed(target)
             if (
-                existing.manifest_hash != manifest.manifest_hash
-                or existing.manifest.complete_result_hash != manifest.complete_result_hash
+                existing.manifest_hash != candidate.manifest_hash
+                or existing.manifest.complete_result_hash != candidate.manifest.complete_result_hash
             ):
                 raise LabArtifactConflictError("job already has a different sealed result")
             self.quarantine_candidate(candidate, reason="idempotent sealed bundle reuse")
             return existing.model_copy(update={"reused_existing": True})
-        # macOS denies rename(2) for a source directory without owner-write.
-        # Seal bytes before publication, atomically rename, then lock directories.
-        self._make_files_read_only(candidate.path)
-        try:
-            os.rename(candidate.path, target)
-        except OSError as exc:
-            if not os.path.lexists(target):
+        candidate_observed = self._directory_observation(
+            candidate.path,
+            label="job artifact candidate",
+        )
+        if not self._same_bundle_identity(candidate_observed, candidate):
+            raise LabArtifactIntegrityError("candidate bundle identity changed before seal")
+        with self._bind_bundle(
+            parent_root=self.candidates_root,
+            bundle_path=candidate.path,
+            manifest=candidate.manifest,
+            expected_bundle=candidate_observed,
+            expected_files=candidate.file_identities,
+        ) as bound:
+            manifest = self.verify_candidate(candidate)
+            if manifest != candidate.manifest or self._bound_manifest(bound) != manifest:
+                raise LabArtifactIntegrityError("bound candidate manifest identity changed")
+            self._assert_bound_paths(bound)
+            self._verify_bound_bytes(bound, manifest)
+            self._write_seal_intent(candidate)
+            self._seal_bound_files(bound)
+            self._verify_bound_bytes(bound, manifest)
+            self._assert_bound_paths(bound)
+            sealed_parent = os.open(
+                self.sealed_root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            source_parent = bound.parent_descriptor
+            try:
+                os.stat(target.name, dir_fd=sealed_parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                os.close(sealed_parent)
+                raise LabArtifactConflictError("sealed job path appeared during publication")
+            try:
+                os.rename(
+                    bound.bundle_name,
+                    target.name,
+                    src_dir_fd=source_parent,
+                    dst_dir_fd=sealed_parent,
+                )
+                os.fsync(source_parent)
+                os.fsync(sealed_parent)
+                try:
+                    os.stat(
+                        bound.bundle_name,
+                        dir_fd=source_parent,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise LabArtifactIntegrityError(
+                        "candidate source path still exists after atomic rename"
+                    )
+            except LabArtifactIntegrityError:
+                os.close(sealed_parent)
+                raise
+            except OSError as exc:
+                os.close(sealed_parent)
                 raise LabArtifactConflictError("candidate could not be atomically sealed") from exc
-            existing = self.verify_sealed(target)
-            if existing.manifest_hash != manifest.manifest_hash:
-                raise LabArtifactConflictError("job already has a different sealed result") from exc
-            self.quarantine_candidate(candidate, reason="concurrent sealed bundle reuse")
-            return existing.model_copy(update={"reused_existing": True})
-        self._make_directories_read_only(target)
-        _fsync_directory(self.sealed_root)
+            with suppress(OSError):
+                os.close(source_parent)
+            bound.parent_descriptor = sealed_parent
+            bound.bundle_name = target.name
+            after_rename = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
+            self._validate_metadata_transition(
+                bound.current,
+                after_rename,
+                expected_mode=stat.S_IFDIR,
+                label="artifact bundle rename",
+            )
+            bound.current = after_rename
+            self._assert_bound_paths(bound)
+            self._verify_bound_bytes(bound, manifest)
+            if self._bound_manifest(bound) != candidate.manifest:
+                raise LabArtifactIntegrityError("published candidate manifest identity changed")
+            self._finalize_bound_directories(bound)
+            self._verify_bound_bytes(bound, manifest)
         return self.verify_sealed(target)
 
     def list_candidate_recovery(self) -> tuple[LabArtifactRecoveryRecord, ...]:
@@ -1053,13 +1620,22 @@ class LabJobArtifactStore:
     def recover_candidate(self, record: LabArtifactRecoveryRecord) -> LabSealedJobArtifact:
         if record.status != "recoverable":
             raise LabArtifactIntegrityError("only recoverable candidates can be sealed")
+        if record.device is None or record.inode is None:
+            raise LabArtifactIntegrityError("candidate recovery identity is unavailable")
+        observed = self._directory_observation(record.path, label="candidate recovery entry")
+        if (observed.device, observed.inode) != (record.device, record.inode):
+            raise LabArtifactIntegrityError("candidate recovery record identity changed")
         candidate = self._candidate_from_path(record.path)
-        if record.job_id != candidate.job_id or record.manifest_hash != candidate.manifest_hash:
+        if (
+            record.job_id != candidate.job_id
+            or record.manifest_hash != candidate.manifest_hash
+            or (candidate.device, candidate.inode) != (record.device, record.inode)
+        ):
             raise LabArtifactIntegrityError("candidate recovery evidence changed")
         return self.seal_candidate(candidate)
 
     def recover_interrupted_seal(self, path: Path) -> LabSealedJobArtifact:
-        """Finish the chmod/fsync tail after a candidate was already renamed."""
+        """Finish a durable seal intent after rename without trusting path identity."""
 
         managed = self._assert_managed_child(
             path, self.sealed_root, label="interrupted sealed bundle"
@@ -1068,14 +1644,80 @@ class LabJobArtifactStore:
             return self.verify_sealed(managed)
         except LabArtifactIntegrityError:
             pass
-        manifest, _ = self._validate_bundle(managed, require_sealed_permissions=False)
+        manifest, identities = self._validate_bundle(
+            managed,
+            require_sealed_permissions=False,
+        )
         if managed.name != manifest.job_id.hex:
             raise LabArtifactIntegrityError("interrupted sealed path does not match job identity")
-        for relative_path in self._expected_paths(manifest):
-            if (managed / relative_path).stat().st_mode & 0o222:
-                raise LabArtifactIntegrityError("interrupted seal contains writable result bytes")
-        self._make_directories_read_only(managed)
-        _fsync_directory(self.sealed_root)
+        intent = self._load_seal_intent(manifest.job_id)
+        if (
+            intent.manifest_hash != manifest.manifest_hash
+            or intent.complete_result_hash != manifest.complete_result_hash
+        ):
+            raise LabArtifactIntegrityError("seal intent manifest identity conflicts")
+        observed = self._directory_observation(managed, label="interrupted sealed bundle")
+        if (
+            observed.device,
+            observed.inode,
+            observed.size,
+            observed.mtime_ns,
+            observed.mode,
+        ) != (
+            intent.bundle_device,
+            intent.bundle_inode,
+            intent.bundle_size,
+            intent.bundle_mtime_ns,
+            stat.S_IFDIR,
+        ) or observed.ctime_ns < intent.bundle_ctime_ns:
+            raise LabArtifactIntegrityError("seal intent bundle identity changed")
+        intended_files = {item.relative_path: item for item in intent.file_identities}
+        current_files = {item.relative_path: item for item in identities}
+        if set(intended_files) != set(current_files) or any(
+            not _matches_file_identity(
+                _FileObservation(
+                    device=current.device,
+                    inode=current.inode,
+                    mode=stat.S_IFREG,
+                    nlink=1,
+                    size=current.size,
+                    mtime_ns=current.mtime_ns,
+                    ctime_ns=current.ctime_ns,
+                ),
+                intended_files[relative_path],
+                exact_ctime=False,
+            )
+            for relative_path, current in current_files.items()
+        ):
+            raise LabArtifactIntegrityError("seal intent file identity changed")
+        with self._bind_bundle(
+            parent_root=self.sealed_root,
+            bundle_path=managed,
+            manifest=manifest,
+            expected_bundle=observed,
+            expected_files=identities,
+        ) as bound:
+            allowed_file_modes = {0o400, 0o600}
+            if any(
+                stat.S_IMODE(os.fstat(item.descriptor).st_mode) not in allowed_file_modes
+                for item in bound.files.values()
+            ):
+                raise LabArtifactIntegrityError(
+                    "interrupted seal contains unexpected file permissions"
+                )
+            if stat.S_IMODE(os.fstat(bound.bundle_descriptor).st_mode) not in {0o500, 0o700}:
+                raise LabArtifactIntegrityError(
+                    "interrupted seal contains unexpected bundle permissions"
+                )
+            if stat.S_IMODE(os.fstat(bound.tables_descriptor).st_mode) not in {0o500, 0o700}:
+                raise LabArtifactIntegrityError(
+                    "interrupted seal contains unexpected tables permissions"
+                )
+            self._verify_bound_bytes(bound, manifest)
+            self._seal_bound_files(bound)
+            self._finalize_bound_directories(bound)
+            self._verify_bound_bytes(bound, manifest)
+        _fsync_directory(self.candidates_root)
         return self.verify_sealed(managed)
 
     def quarantine_candidate(
@@ -1174,6 +1816,8 @@ class LabJobArtifactStore:
         evidence: LabArtifactIndexEvidence,
         destination: Path,
     ) -> Path:
+        """Export stable bytes for this Python/ZIP runtime, not a cross-platform guarantee."""
+
         try:
             sealed = self.verify_sealed(sealed_path)
         except (LabArtifactPathError, LabArtifactIntegrityError) as exc:
@@ -1215,9 +1859,12 @@ class LabJobArtifactStore:
                     info.external_attr = (stat.S_IFREG | 0o400) << 16
                     info.flag_bits = 0
                     archive.writestr(info, payload, compress_type=ZIP_DEFLATED, compresslevel=9)
-            os.chmod(temporary, 0o600)
-            descriptor = os.open(temporary, os.O_RDONLY)
+            descriptor = os.open(
+                temporary,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
+                os.fchmod(descriptor, 0o600)
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -1265,7 +1912,15 @@ class LegacyArtifactIndex:
                 )
                 """
             )
-        os.chmod(self.path, 0o600)
+        descriptor = os.open(
+            self.path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
