@@ -3819,7 +3819,7 @@ def test_linux_candidate_namespace_fallback_blocks_rename_and_restores_modes(
         "_assert_candidate_creation_binding",
         try_move_while_guarded,
     )
-    monkeypatch.setattr(lab_artifacts_module.sys, "platform", "linux")
+    monkeypatch.setattr(store, "_namespace_guard_platform", lambda: "linux")
 
     candidate = store.prepare_candidate(**_prepare_arguments())
 
@@ -3935,3 +3935,415 @@ def test_legacy_logical_run_normalization_is_shared_by_import_and_get(tmp_path: 
     assert imported.record.logical_run_id == "run one"
     assert index.get("  run   one  ") == imported.record
     assert index.get("run one") == imported.record
+
+
+def test_namespace_guard_intent_is_canonical_and_archived_after_prepare(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+
+    candidate = _prepare(store)
+
+    assert list(store.namespace_guard_active_root.iterdir()) == []
+    history = list(store.namespace_guard_history_root.glob("*.json"))
+    assert len(history) == 1
+    payload = history[0].read_bytes()
+    intent = lab_artifacts_module.LabCandidateNamespaceGuardIntent.model_validate_json(payload)
+    assert payload == intent.canonical_json_bytes()
+    assert intent.candidate_name == candidate.path.name
+    assert intent.phase == "armed"
+    assert stat.S_IMODE(store.candidates_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(candidate.path.stat().st_mode) == 0o700
+    assert stat.S_IMODE((candidate.path / "tables").stat().st_mode) == 0o700
+    if sys.platform == "darwin":
+        assert candidate.path.stat().st_flags & stat.UF_IMMUTABLE == 0
+        assert (candidate.path / "tables").stat().st_flags & stat.UF_IMMUTABLE == 0
+
+
+def test_namespace_guard_intent_is_durable_before_namespace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    activate = store._activate_candidate_namespace_guard
+
+    def inspect_then_activate(
+        intent: lab_artifacts_module.LabCandidateNamespaceGuardIntent,
+        **descriptors: int,
+    ) -> None:
+        active = store.namespace_guard_active_root / f"{intent.candidate_name}.json"
+        payload = active.read_bytes()
+        assert payload == intent.canonical_json_bytes()
+        assert active.stat().st_size == len(payload)
+        activate(intent, **descriptors)
+
+    monkeypatch.setattr(
+        store,
+        "_activate_candidate_namespace_guard",
+        inspect_then_activate,
+    )
+
+    assert _prepare(store).path.is_dir()
+
+
+def test_namespace_guard_publish_failure_quarantines_complete_temp_on_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "artifacts"
+    store = LabJobArtifactStore(root)
+
+    def fail_publish(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected guard publish failure")
+
+    monkeypatch.setattr(lab_artifacts_module, "_rename_noreplace", fail_publish)
+
+    with pytest.raises(OSError, match="injected guard publish failure"):
+        _prepare(store)
+
+    temporary = list(store.namespace_guard_active_root.glob(".*.tmp"))
+    assert len(temporary) == 1
+    intent = lab_artifacts_module.LabCandidateNamespaceGuardIntent.model_validate_json(
+        temporary[0].read_bytes()
+    )
+    assert temporary[0].read_bytes() == intent.canonical_json_bytes()
+
+    monkeypatch.undo()
+    store.close()
+    restarted = LabJobArtifactStore(root)
+    assert list(restarted.namespace_guard_active_root.iterdir()) == []
+    assert len(list(restarted.namespace_guard_quarantine_root.iterdir())) == 1
+    restarted.close()
+
+
+@pytest.mark.parametrize("guard_platform", ["darwin", "linux"])
+def test_process_crash_namespace_guard_is_recovered_before_exact_mode_validation(
+    tmp_path: Path,
+    guard_platform: str,
+) -> None:
+    if guard_platform == "darwin" and sys.platform != "darwin":
+        pytest.skip("Darwin immutable inode flags require a Darwin filesystem")
+    root = tmp_path / f"artifacts-{guard_platform}"
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LabJobArtifactStore
+        from tests.unit.test_lab_artifacts import _prepare_arguments
+
+        store = LabJobArtifactStore(Path(sys.argv[1]))
+        store._namespace_guard_platform = lambda: sys.argv[2]
+        store._after_candidate_namespace_guarded = lambda _intent: os._exit(91)
+        store.prepare_candidate(**_prepare_arguments())
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root), guard_platform],
+        check=False,
+        cwd=Path(__file__).parents[2],
+        env=os.environ.copy(),
+    )
+
+    assert completed.returncode == 91
+    active = list((root / "namespace-guard-active").glob("*.json"))
+    assert len(active) == 1
+    candidate_path = next((root / "candidates").iterdir())
+    if guard_platform == "darwin":
+        assert candidate_path.stat().st_flags & stat.UF_IMMUTABLE
+        assert (candidate_path / "tables").stat().st_flags & stat.UF_IMMUTABLE
+    else:
+        assert stat.S_IMODE((root / "candidates").stat().st_mode) == 0o500
+        assert stat.S_IMODE(candidate_path.stat().st_mode) == 0o500
+        assert stat.S_IMODE((candidate_path / "tables").stat().st_mode) == 0o500
+
+    restarted = LabJobArtifactStore(root)
+
+    assert stat.S_IMODE((root / "candidates").stat().st_mode) == 0o700
+    assert stat.S_IMODE(candidate_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE((candidate_path / "tables").stat().st_mode) == 0o700
+    if guard_platform == "darwin":
+        assert candidate_path.stat().st_flags & stat.UF_IMMUTABLE == 0
+        assert (candidate_path / "tables").stat().st_flags & stat.UF_IMMUTABLE == 0
+    assert list(restarted.namespace_guard_active_root.iterdir()) == []
+    assert list(restarted.namespace_guard_history_root.glob("*.json"))
+    recovery = next(
+        item for item in restarted.list_candidate_recovery() if item.path == candidate_path
+    )
+    assert recovery.status == "invalid"
+    quarantined = restarted.quarantine_recovery_record(
+        recovery,
+        reason="crashed candidate",
+    )
+    assert quarantined.status == "quarantined"
+    assert _prepare(restarted, job_id=uuid4()).path.is_dir()
+
+
+def test_namespace_guard_cleanup_failure_poison_store_and_preserves_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise OSError("restore failed")
+
+    monkeypatch.setattr(
+        store,
+        "_restore_candidate_namespace_guard",
+        fail_restore,
+        raising=False,
+    )
+
+    with pytest.raises(BaseException, match="restore failed|namespace guard"):
+        _prepare(store)
+
+    assert store.poisoned is True
+    assert list(store.namespace_guard_active_root.glob("*.json"))
+    with pytest.raises(LabArtifactIntegrityError, match="poisoned"):
+        _prepare(store, job_id=uuid4())
+
+    monkeypatch.undo()
+    store.close()
+    recovered = LabJobArtifactStore(store.root)
+    assert list(recovered.namespace_guard_active_root.iterdir()) == []
+    recovered.close()
+
+
+def test_namespace_guard_lock_path_swap_fails_before_candidate_side_effect(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    lock_path = store.root / "namespace-guard.lock"
+    displaced = tmp_path / "original-namespace-guard.lock"
+    os.rename(lock_path, displaced)
+    lock_path.write_bytes(b"")
+    os.chmod(lock_path, 0o600)
+    before = tuple(store.candidates_root.iterdir())
+
+    with pytest.raises(LabArtifactIntegrityError, match="guard lock.*identity|lock.*changed"):
+        _prepare(store)
+
+    assert tuple(store.candidates_root.iterdir()) == before
+
+
+def test_namespace_guard_recovery_identity_mismatch_preserves_active_evidence(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LabJobArtifactStore
+        from tests.unit.test_lab_artifacts import _prepare_arguments
+
+        store = LabJobArtifactStore(Path(sys.argv[1]))
+        store._namespace_guard_platform = lambda: "linux"
+        store._after_candidate_namespace_guarded = lambda _intent: os._exit(92)
+        store.prepare_candidate(**_prepare_arguments())
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        check=False,
+        cwd=Path(__file__).parents[2],
+        env=os.environ.copy(),
+    )
+    assert completed.returncode == 92
+    active = next((root / "namespace-guard-active").glob("*.json"))
+    active_before = active.read_bytes()
+    candidate = next((root / "candidates").iterdir())
+    displaced = tmp_path / "guarded-original-candidate"
+    os.chmod(root / "candidates", 0o700)
+    os.chmod(candidate, 0o700)
+    os.chmod(candidate / "tables", 0o700)
+    os.rename(candidate, displaced)
+    shutil.copytree(displaced, candidate, copy_function=shutil.copy2)
+
+    with pytest.raises(LabArtifactIntegrityError, match="namespace guard.*identity"):
+        LabJobArtifactStore(root)
+
+    assert active.read_bytes() == active_before
+    assert active.exists()
+
+
+def test_namespace_guard_serializes_prepare_across_store_instances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "artifacts"
+    first = LabJobArtifactStore(root)
+    second = LabJobArtifactStore(root)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_first(_intent: object) -> None:
+        first_entered.set()
+        if not release_first.wait(timeout=10):
+            raise TimeoutError("first prepare was not released")
+
+    monkeypatch.setattr(first, "_after_candidate_namespace_guarded", hold_first, raising=False)
+    monkeypatch.setattr(
+        second,
+        "_after_candidate_namespace_guarded",
+        lambda _intent: second_entered.set(),
+        raising=False,
+    )
+
+    def run(store: LabJobArtifactStore, job_id: UUID) -> None:
+        try:
+            _prepare(store, job_id=job_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=run, args=(first, uuid4()))
+    thread_b = threading.Thread(target=run, args=(second, uuid4()))
+    thread_a.start()
+    assert first_entered.wait(timeout=10)
+    thread_b.start()
+    time.sleep(0.25)
+    assert second_entered.is_set() is False
+    release_first.set()
+    thread_a.join(timeout=10)
+    thread_b.join(timeout=10)
+
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert errors == []
+    assert second_entered.is_set() is True
+
+
+def test_store_close_waits_for_inflight_namespace_guard_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    guarded = threading.Event()
+    release = threading.Event()
+    close_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_prepare(_intent: object) -> None:
+        guarded.set()
+        if not release.wait(timeout=10):
+            raise TimeoutError("prepare was not released")
+
+    monkeypatch.setattr(store, "_after_candidate_namespace_guarded", hold_prepare)
+
+    def prepare() -> None:
+        try:
+            _prepare(store)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close() -> None:
+        try:
+            store.close()
+            close_finished.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    prepare_thread = threading.Thread(target=prepare)
+    close_thread = threading.Thread(target=close)
+    prepare_thread.start()
+    assert guarded.wait(timeout=10)
+    close_thread.start()
+    time.sleep(0.25)
+    assert close_finished.is_set() is False
+    release.set()
+    prepare_thread.join(timeout=10)
+    close_thread.join(timeout=10)
+
+    assert not prepare_thread.is_alive() and not close_thread.is_alive()
+    assert close_finished.is_set() is True
+    assert errors == []
+
+
+def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    first_marker = tmp_path / "first-entered"
+    second_marker = tmp_path / "second-entered"
+    release = tmp_path / "release-first"
+    script = textwrap.dedent(
+        """
+        import sys
+        import time
+        from pathlib import Path
+        from uuid import UUID
+        from rquant.lab_artifacts import LabJobArtifactStore
+        from tests.unit.test_lab_artifacts import _prepare_arguments
+
+        root, marker, release, job_id, should_wait = map(Path, sys.argv[1:6])
+        store = LabJobArtifactStore(root)
+        def guarded(_intent):
+            marker.write_text("entered", encoding="utf-8")
+            if should_wait.name == "yes":
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("release marker missing")
+                    time.sleep(0.02)
+        store._after_candidate_namespace_guarded = guarded
+        arguments = _prepare_arguments()
+        arguments["job_id"] = UUID(job_id.name)
+        store.prepare_candidate(**arguments)
+        """
+    )
+    env = os.environ.copy()
+    process_a = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(root),
+            str(first_marker),
+            str(release),
+            str(uuid4()),
+            "yes",
+        ],
+        cwd=Path(__file__).parents[2],
+        env=env,
+    )
+    deadline = time.monotonic() + 10
+    while not first_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert first_marker.exists()
+    process_b = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(root),
+            str(second_marker),
+            str(release),
+            str(uuid4()),
+            "no",
+        ],
+        cwd=Path(__file__).parents[2],
+        env=env,
+    )
+    time.sleep(0.3)
+    assert second_marker.exists() is False
+    release.write_text("go", encoding="utf-8")
+
+    assert process_a.wait(timeout=15) == 0
+    assert process_b.wait(timeout=15) == 0
+    assert second_marker.exists() is True
+
+
+def test_fifo_candidate_entry_is_quarantined_without_open_or_io(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    fifo = store.candidates_root / "invalid-fifo"
+    os.mkfifo(fifo, 0o600)
+    observed = fifo.lstat()
+
+    record = next(item for item in store.list_candidate_recovery() if item.path == fifo)
+    assert record.file_type == "other"
+    quarantined = store.quarantine_recovery_record(record, reason="invalid fifo")
+
+    assert quarantined.file_type == "other"
+    assert (quarantined.device, quarantined.inode) == (observed.st_dev, observed.st_ino)
+    assert stat.S_ISFIFO(quarantined.path.lstat().st_mode)
+    assert not fifo.exists()

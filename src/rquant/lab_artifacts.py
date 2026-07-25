@@ -39,6 +39,7 @@ _TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _LEGACY_GENESIS_HASH = "0" * 64
 _LEGACY_PROCESS_LOCKS_GUARD = threading.Lock()
+_ARTIFACT_PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass
@@ -48,6 +49,15 @@ class _LegacyProcessLockEntry:
 
 
 _LEGACY_PROCESS_LOCKS: dict[str, _LegacyProcessLockEntry] = {}
+
+
+@dataclass
+class _ArtifactProcessLockEntry:
+    lock: threading.RLock
+    references: int
+
+
+_ARTIFACT_PROCESS_LOCKS: dict[str, _ArtifactProcessLockEntry] = {}
 
 
 class LabArtifactError(RuntimeError):
@@ -95,6 +105,27 @@ def _normalize_logical_run_id(logical_run_id: str) -> str:
     if not normalized:
         raise ValueError("logical_run_id must not be empty")
     return normalized
+
+
+def _matches_rename_identity(
+    before: _FileObservation,
+    after: _FileObservation,
+) -> bool:
+    return (
+        after.device,
+        after.inode,
+        after.mode,
+        after.nlink,
+        after.size,
+        after.mtime_ns,
+    ) == (
+        before.device,
+        before.inode,
+        before.mode,
+        before.nlink,
+        before.size,
+        before.mtime_ns,
+    ) and after.ctime_ns >= before.ctime_ns
 
 
 class LabArtifactModel(BaseModel):
@@ -607,6 +638,62 @@ class LabPrepareCandidateRequest(LabArtifactModel):
         ):
             raise ValueError("adapter and result contract identities must not be empty")
         return self
+
+
+class LabCandidateNamespaceIdentity(LabArtifactModel):
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    size: int = Field(ge=0)
+    mtime_ns: int = Field(ge=0)
+    ctime_ns: int = Field(ge=0)
+
+
+class LabCandidateNamespaceGuardIntent(LabArtifactModel):
+    schema_version: Literal[1] = 1
+    operation_id: UUID
+    candidate_name: str = Field(pattern=r"^[0-9a-f]{32}-[0-9a-f]{32}$")
+    platform: Literal["darwin", "linux"]
+    phase: Literal["armed"] = "armed"
+    candidates_identity: LabCandidateNamespaceIdentity
+    candidate_identity: LabCandidateNamespaceIdentity
+    tables_identity: LabCandidateNamespaceIdentity
+    candidates_original_mode: int = Field(ge=0, le=0o777)
+    candidate_original_mode: int = Field(ge=0, le=0o777)
+    tables_original_mode: int = Field(ge=0, le=0o777)
+    candidates_original_flags: int | None = Field(default=None, ge=0)
+    candidate_original_flags: int | None = Field(default=None, ge=0)
+    tables_original_flags: int | None = Field(default=None, ge=0)
+    created_at: datetime
+
+    @model_validator(mode="after")
+    def validate_guard_contract(self) -> LabCandidateNamespaceGuardIntent:
+        if (
+            self.candidates_original_mode,
+            self.candidate_original_mode,
+            self.tables_original_mode,
+        ) != (0o700, 0o700, 0o700):
+            raise ValueError("namespace guard requires exact original 0700 modes")
+        flags = (
+            self.candidates_original_flags,
+            self.candidate_original_flags,
+            self.tables_original_flags,
+        )
+        if self.platform == "darwin" and any(value is None for value in flags):
+            raise ValueError("Darwin namespace guard requires original inode flags")
+        if self.platform == "linux" and any(value is not None for value in flags):
+            raise ValueError("Linux namespace guard must not claim Darwin inode flags")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("namespace guard creation time must be timezone-aware")
+        return self
+
+    def canonical_json_bytes(self) -> bytes:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
 
 
 class LabArtifactRecoveryRecord(LabArtifactModel):
@@ -1750,23 +1837,48 @@ class LabJobArtifactStore:
         self.quarantine_root = self.root / "quarantine"
         self.seal_intents_root = self.root / "seal-intents"
         self.seal_intents_quarantine_root = self.root / "seal-intents-quarantine"
-        for path in (
+        self.namespace_guard_active_root = self.root / "namespace-guard-active"
+        self.namespace_guard_history_root = self.root / "namespace-guard-history"
+        self.namespace_guard_quarantine_root = self.root / "namespace-guard-quarantine"
+        self._poisoned = False
+        self._guard_lock_depth = 0
+        self._guard_lock_descriptor = -1
+        self._guard_lock_identity: _FileObservation | None = None
+        self._root_parent_descriptor = -1
+        self._root_descriptor = -1
+        self._managed_descriptors: dict[Path, int] = {}
+        lock_key = os.fspath(self.root)
+        self._process_lock_key = lock_key
+        self._process_lock_registered = False
+        _ensure_private_directory(
             self.root,
+            manage_existing=False,
+            require_private_existing=True,
+        )
+        for path in (
             self.candidates_root,
             self.sealed_root,
             self.quarantine_root,
             self.seal_intents_root,
             self.seal_intents_quarantine_root,
+            self.namespace_guard_active_root,
+            self.namespace_guard_history_root,
+            self.namespace_guard_quarantine_root,
         ):
             _ensure_private_directory(
                 path,
                 manage_existing=False,
-                require_private_existing=True,
+                require_private_existing=(path != self.candidates_root),
             )
+        with _ARTIFACT_PROCESS_LOCKS_GUARD:
+            entry = _ARTIFACT_PROCESS_LOCKS.get(lock_key)
+            if entry is None:
+                entry = _ArtifactProcessLockEntry(lock=threading.RLock(), references=0)
+                _ARTIFACT_PROCESS_LOCKS[lock_key] = entry
+            entry.references += 1
+            self._process_lock = entry.lock
+            self._process_lock_registered = True
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        self._root_parent_descriptor = -1
-        self._root_descriptor = -1
-        self._managed_descriptors: dict[Path, int] = {}
         try:
             self._root_parent_descriptor = _secure_open_directory(
                 self.root.parent,
@@ -1783,6 +1895,9 @@ class LabJobArtifactStore:
                 self.quarantine_root,
                 self.seal_intents_root,
                 self.seal_intents_quarantine_root,
+                self.namespace_guard_active_root,
+                self.namespace_guard_history_root,
+                self.namespace_guard_quarantine_root,
             ):
                 self._managed_descriptors[child] = os.open(
                     child.name,
@@ -1797,25 +1912,544 @@ class LabJobArtifactStore:
                 path: _FileObservation.from_stat(os.fstat(descriptor))
                 for path, descriptor in self._managed_descriptors.items()
             }
+            self._guard_lock_descriptor, _ = _open_or_create_private_regular_at(
+                self._root_descriptor,
+                "namespace-guard.lock",
+                access_flags=os.O_RDWR,
+                require_private_existing=True,
+            )
+            self._guard_lock_identity = _FileObservation.from_stat(
+                os.fstat(self._guard_lock_descriptor)
+            )
+            with self._exclusive_namespace_guard(allow_poisoned=True):
+                self._recover_active_namespace_guards()
             self._assert_managed_roots()
         except Exception:
             self.close()
             raise
 
     def close(self) -> None:
-        for descriptor in getattr(self, "_managed_descriptors", {}).values():
-            with suppress(OSError):
-                os.close(descriptor)
-        self._managed_descriptors = {}
-        for attribute in ("_root_descriptor", "_root_parent_descriptor"):
-            descriptor = getattr(self, attribute, -1)
-            if descriptor >= 0:
+        process_lock = getattr(self, "_process_lock", None)
+        if process_lock is None:
+            return
+        with process_lock:
+            if getattr(self, "_guard_lock_depth", 0) > 0:
+                raise LabArtifactIntegrityError(
+                    "artifact store cannot close during namespace guard transaction"
+                )
+            for descriptor in getattr(self, "_managed_descriptors", {}).values():
                 with suppress(OSError):
                     os.close(descriptor)
-                setattr(self, attribute, -1)
+            self._managed_descriptors = {}
+            for attribute in (
+                "_guard_lock_descriptor",
+                "_root_descriptor",
+                "_root_parent_descriptor",
+            ):
+                descriptor = getattr(self, attribute, -1)
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    setattr(self, attribute, -1)
+            if getattr(self, "_process_lock_registered", False):
+                with _ARTIFACT_PROCESS_LOCKS_GUARD:
+                    entry = _ARTIFACT_PROCESS_LOCKS.get(self._process_lock_key)
+                    if entry is not None and entry.lock is self._process_lock:
+                        entry.references -= 1
+                        if entry.references == 0:
+                            del _ARTIFACT_PROCESS_LOCKS[self._process_lock_key]
+                self._process_lock_registered = False
 
     def __del__(self) -> None:
-        self.close()
+        with suppress(Exception):
+            self.close()
+
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    def _assert_namespace_guard_lock_identity(self) -> None:
+        if self._guard_lock_descriptor < 0 or self._guard_lock_identity is None:
+            raise LabArtifactIntegrityError("namespace guard lock is unavailable")
+        try:
+            opened_stat = os.fstat(self._guard_lock_descriptor)
+            path_stat = os.stat(
+                "namespace-guard.lock",
+                dir_fd=self._root_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise LabArtifactIntegrityError("namespace guard lock identity is unavailable") from exc
+        opened = _FileObservation.from_stat(opened_stat)
+        at_path = _FileObservation.from_stat(path_stat)
+        if (
+            opened != self._guard_lock_identity
+            or at_path != opened
+            or opened.mode != stat.S_IFREG
+            or opened.nlink != 1
+            or stat.S_IMODE(opened_stat.st_mode) != 0o600
+            or stat.S_IMODE(path_stat.st_mode) != 0o600
+        ):
+            raise LabArtifactIntegrityError("namespace guard lock identity changed")
+
+    @contextmanager
+    def _exclusive_namespace_guard(
+        self,
+        *,
+        allow_poisoned: bool = False,
+    ) -> Iterator[None]:
+        with self._process_lock:
+            if self._poisoned and not allow_poisoned:
+                raise LabArtifactIntegrityError("artifact store is poisoned")
+            if self._guard_lock_descriptor < 0:
+                raise LabArtifactIntegrityError("namespace guard lock is unavailable")
+            outermost = self._guard_lock_depth == 0
+            if outermost:
+                self._assert_namespace_guard_lock_identity()
+                fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                try:
+                    self._assert_namespace_guard_lock_identity()
+                except BaseException:
+                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                    raise
+            self._guard_lock_depth += 1
+            operation_error: BaseException | None = None
+            try:
+                yield
+            except BaseException as exc:
+                operation_error = exc
+            finally:
+                self._guard_lock_depth -= 1
+                if outermost:
+                    integrity_error: BaseException | None = None
+                    try:
+                        self._assert_namespace_guard_lock_identity()
+                    except BaseException as exc:
+                        self._poisoned = True
+                        integrity_error = exc
+                    finally:
+                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                    if operation_error is not None and integrity_error is not None:
+                        raise BaseExceptionGroup(
+                            "namespace guard operation and final identity check both failed",
+                            [operation_error, integrity_error],
+                        ) from None
+                    if integrity_error is not None:
+                        raise integrity_error
+            if operation_error is not None:
+                raise operation_error
+
+    @staticmethod
+    def _namespace_identity(observed: _FileObservation) -> LabCandidateNamespaceIdentity:
+        if observed.mode != stat.S_IFDIR:
+            raise LabArtifactIntegrityError("namespace guard identity is not a directory")
+        return LabCandidateNamespaceIdentity(
+            device=observed.device,
+            inode=observed.inode,
+            size=observed.size,
+            mtime_ns=observed.mtime_ns,
+            ctime_ns=observed.ctime_ns,
+        )
+
+    @staticmethod
+    def _matches_namespace_identity(
+        observed: _FileObservation,
+        expected: LabCandidateNamespaceIdentity,
+    ) -> bool:
+        return (
+            observed.device,
+            observed.inode,
+            observed.mode,
+            observed.size,
+            observed.mtime_ns,
+        ) == (
+            expected.device,
+            expected.inode,
+            stat.S_IFDIR,
+            expected.size,
+            expected.mtime_ns,
+        ) and observed.ctime_ns >= expected.ctime_ns
+
+    def _create_namespace_guard_intent(
+        self,
+        *,
+        candidate_name: str,
+        candidates_descriptor: int,
+        candidate_descriptor: int,
+        tables_descriptor: int,
+    ) -> LabCandidateNamespaceGuardIntent:
+        candidates = _FileObservation.from_stat(os.fstat(candidates_descriptor))
+        candidate = _FileObservation.from_stat(os.fstat(candidate_descriptor))
+        tables = _FileObservation.from_stat(os.fstat(tables_descriptor))
+        modes = tuple(
+            stat.S_IMODE(os.fstat(descriptor).st_mode)
+            for descriptor in (
+                candidates_descriptor,
+                candidate_descriptor,
+                tables_descriptor,
+            )
+        )
+        if modes != (0o700, 0o700, 0o700):
+            raise LabArtifactIntegrityError(
+                "namespace guard can only arm from exact 0700 directory modes"
+            )
+        platform = self._namespace_guard_platform()
+        if platform == "darwin":
+            flags: tuple[int | None, int | None, int | None] = (
+                _candidate_namespace_flag(candidates_descriptor)[0],
+                _candidate_namespace_flag(candidate_descriptor)[0],
+                _candidate_namespace_flag(tables_descriptor)[0],
+            )
+        else:
+            flags = (None, None, None)
+        return LabCandidateNamespaceGuardIntent(
+            operation_id=uuid4(),
+            candidate_name=candidate_name,
+            platform=platform,
+            candidates_identity=self._namespace_identity(candidates),
+            candidate_identity=self._namespace_identity(candidate),
+            tables_identity=self._namespace_identity(tables),
+            candidates_original_mode=modes[0],
+            candidate_original_mode=modes[1],
+            tables_original_mode=modes[2],
+            candidates_original_flags=flags[0],
+            candidate_original_flags=flags[1],
+            tables_original_flags=flags[2],
+            created_at=datetime.now(UTC),
+        )
+
+    @staticmethod
+    def _namespace_guard_platform() -> Literal["darwin", "linux"]:
+        if sys.platform == "darwin":
+            return "darwin"
+        if sys.platform.startswith("linux"):
+            return "linux"
+        raise LabArtifactPlatformError("candidate creation requires a durable namespace guard")
+
+    @staticmethod
+    def _guard_intent_name(intent: LabCandidateNamespaceGuardIntent) -> str:
+        return f"{intent.candidate_name}.json"
+
+    def _publish_namespace_guard_intent(
+        self,
+        intent: LabCandidateNamespaceGuardIntent,
+    ) -> None:
+        active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
+        temporary_name = f".{intent.candidate_name}.{intent.operation_id.hex}.tmp"
+        final_name = self._guard_intent_name(intent)
+        payload = intent.canonical_json_bytes()
+        _write_private_bytes_at(active_descriptor, temporary_name, payload)
+        temporary_descriptor = os.open(
+            temporary_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=active_descriptor,
+        )
+        try:
+            observed = _FileObservation.from_stat(os.fstat(temporary_descriptor))
+            if observed.mode != stat.S_IFREG or observed.nlink != 1:
+                raise LabArtifactIntegrityError("namespace guard temp is unsafe")
+            rebuilt = LabCandidateNamespaceGuardIntent.model_validate_json(
+                _read_descriptor(temporary_descriptor)
+            )
+            if rebuilt != intent or _read_descriptor(temporary_descriptor) != payload:
+                raise LabArtifactIntegrityError("namespace guard temp is not canonical")
+            try:
+                _rename_noreplace(
+                    active_descriptor,
+                    temporary_name,
+                    active_descriptor,
+                    final_name,
+                )
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise LabArtifactConflictError("namespace guard intent already exists") from exc
+                raise
+            at_final = _FileObservation.from_stat(
+                os.stat(final_name, dir_fd=active_descriptor, follow_symlinks=False)
+            )
+            if at_final != _FileObservation.from_stat(os.fstat(temporary_descriptor)):
+                raise LabArtifactIntegrityError(
+                    "namespace guard intent identity changed during publication"
+                )
+            os.fsync(active_descriptor)
+        finally:
+            os.close(temporary_descriptor)
+
+    def _load_namespace_guard_intent(
+        self,
+        name: str,
+    ) -> LabCandidateNamespaceGuardIntent:
+        active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=active_descriptor,
+        )
+        try:
+            observed = _FileObservation.from_stat(os.fstat(descriptor))
+            if (
+                observed.mode != stat.S_IFREG
+                or observed.nlink != 1
+                or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
+            ):
+                raise LabArtifactIntegrityError("namespace guard intent is unsafe")
+            payload = _read_descriptor(descriptor)
+            try:
+                intent = LabCandidateNamespaceGuardIntent.model_validate_json(payload)
+            except Exception as exc:
+                raise LabArtifactIntegrityError("namespace guard intent is invalid") from exc
+            if payload != intent.canonical_json_bytes() or name != self._guard_intent_name(intent):
+                raise LabArtifactIntegrityError("namespace guard intent is not canonical")
+            return intent
+        finally:
+            os.close(descriptor)
+
+    def _assert_namespace_guard_identities(
+        self,
+        intent: LabCandidateNamespaceGuardIntent,
+        *,
+        candidates_descriptor: int,
+        candidate_descriptor: int,
+        tables_descriptor: int,
+    ) -> None:
+        try:
+            candidates_fd = _FileObservation.from_stat(os.fstat(candidates_descriptor))
+            candidates_path = _FileObservation.from_stat(
+                os.stat(
+                    self.candidates_root.name,
+                    dir_fd=self._root_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            candidate_fd = _FileObservation.from_stat(os.fstat(candidate_descriptor))
+            candidate_path = _FileObservation.from_stat(
+                os.stat(
+                    intent.candidate_name,
+                    dir_fd=candidates_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            tables_fd = _FileObservation.from_stat(os.fstat(tables_descriptor))
+            tables_path = _FileObservation.from_stat(
+                os.stat("tables", dir_fd=candidate_descriptor, follow_symlinks=False)
+            )
+        except OSError as exc:
+            raise LabArtifactIntegrityError(
+                "namespace guard directory identity is unavailable"
+            ) from exc
+        checks = (
+            (candidates_fd, candidates_path, intent.candidates_identity),
+            (candidate_fd, candidate_path, intent.candidate_identity),
+            (tables_fd, tables_path, intent.tables_identity),
+        )
+        if any(
+            opened != at_path or not self._matches_namespace_identity(opened, expected)
+            for opened, at_path, expected in checks
+        ):
+            raise LabArtifactIntegrityError("namespace guard directory identity changed")
+
+    def _activate_candidate_namespace_guard(
+        self,
+        intent: LabCandidateNamespaceGuardIntent,
+        *,
+        candidates_descriptor: int,
+        candidate_descriptor: int,
+        tables_descriptor: int,
+    ) -> None:
+        self._assert_namespace_guard_identities(
+            intent,
+            candidates_descriptor=candidates_descriptor,
+            candidate_descriptor=candidate_descriptor,
+            tables_descriptor=tables_descriptor,
+        )
+        if intent.platform == "darwin":
+            assert intent.tables_original_flags is not None
+            assert intent.candidate_original_flags is not None
+            _set_candidate_namespace_flags(
+                tables_descriptor,
+                intent.tables_original_flags | stat.UF_IMMUTABLE,
+            )
+            _set_candidate_namespace_flags(
+                candidate_descriptor,
+                intent.candidate_original_flags | stat.UF_IMMUTABLE,
+            )
+        else:
+            os.fchmod(tables_descriptor, 0o500)
+            os.fsync(tables_descriptor)
+            os.fchmod(candidate_descriptor, 0o500)
+            os.fsync(candidate_descriptor)
+            os.fchmod(candidates_descriptor, 0o500)
+            os.fsync(candidates_descriptor)
+
+    def _restore_candidate_namespace_guard(
+        self,
+        intent: LabCandidateNamespaceGuardIntent,
+        *,
+        candidates_descriptor: int,
+        candidate_descriptor: int,
+        tables_descriptor: int,
+    ) -> None:
+        self._assert_namespace_guard_identities(
+            intent,
+            candidates_descriptor=candidates_descriptor,
+            candidate_descriptor=candidate_descriptor,
+            tables_descriptor=tables_descriptor,
+        )
+        if intent.platform == "darwin":
+            assert intent.tables_original_flags is not None
+            assert intent.candidate_original_flags is not None
+            assert intent.candidates_original_flags is not None
+            _set_candidate_namespace_flags(
+                tables_descriptor,
+                intent.tables_original_flags,
+            )
+            _set_candidate_namespace_flags(
+                candidate_descriptor,
+                intent.candidate_original_flags,
+            )
+            _set_candidate_namespace_flags(
+                candidates_descriptor,
+                intent.candidates_original_flags,
+            )
+        os.fchmod(tables_descriptor, intent.tables_original_mode)
+        os.fsync(tables_descriptor)
+        os.fchmod(candidate_descriptor, intent.candidate_original_mode)
+        os.fsync(candidate_descriptor)
+        os.fchmod(candidates_descriptor, intent.candidates_original_mode)
+        os.fsync(candidates_descriptor)
+        if any(
+            stat.S_IMODE(os.fstat(descriptor).st_mode) != expected
+            for descriptor, expected in (
+                (candidates_descriptor, intent.candidates_original_mode),
+                (candidate_descriptor, intent.candidate_original_mode),
+                (tables_descriptor, intent.tables_original_mode),
+            )
+        ):
+            raise LabArtifactIntegrityError("namespace guard modes were not restored")
+        self._assert_namespace_guard_identities(
+            intent,
+            candidates_descriptor=candidates_descriptor,
+            candidate_descriptor=candidate_descriptor,
+            tables_descriptor=tables_descriptor,
+        )
+
+    def _archive_namespace_guard_intent(
+        self,
+        intent: LabCandidateNamespaceGuardIntent,
+    ) -> None:
+        active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
+        history_descriptor = self._managed_descriptors[self.namespace_guard_history_root]
+        source_name = self._guard_intent_name(intent)
+        target_name = f"{intent.candidate_name}.{intent.operation_id.hex}.json"
+        source_descriptor = os.open(
+            source_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=active_descriptor,
+        )
+        try:
+            source = _FileObservation.from_stat(os.fstat(source_descriptor))
+            payload = _read_descriptor(source_descriptor)
+            if payload != intent.canonical_json_bytes():
+                raise LabArtifactIntegrityError("namespace guard intent changed before archive")
+            _rename_noreplace(
+                active_descriptor,
+                source_name,
+                history_descriptor,
+                target_name,
+            )
+            target = _FileObservation.from_stat(
+                os.stat(target_name, dir_fd=history_descriptor, follow_symlinks=False)
+            )
+            source_after = _FileObservation.from_stat(os.fstat(source_descriptor))
+            if target != source_after or not _matches_rename_identity(source, source_after):
+                raise LabArtifactIntegrityError("namespace guard history identity changed")
+            os.fsync(active_descriptor)
+            os.fsync(history_descriptor)
+        finally:
+            os.close(source_descriptor)
+
+    def _quarantine_namespace_guard_temp(self, name: str) -> None:
+        active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
+        quarantine_descriptor = self._managed_descriptors[self.namespace_guard_quarantine_root]
+        observed_stat = os.stat(name, dir_fd=active_descriptor, follow_symlinks=False)
+        observed = _FileObservation.from_stat(observed_stat)
+        if (
+            observed.mode != stat.S_IFREG
+            or observed.nlink != 1
+            or stat.S_IMODE(observed_stat.st_mode) != 0o600
+        ):
+            raise LabArtifactIntegrityError("namespace guard temp is unsafe")
+        target_name = f"{name}.{uuid4().hex}.quarantined"
+        _rename_noreplace(
+            active_descriptor,
+            name,
+            quarantine_descriptor,
+            target_name,
+        )
+        target = _FileObservation.from_stat(
+            os.stat(target_name, dir_fd=quarantine_descriptor, follow_symlinks=False)
+        )
+        if not _matches_rename_identity(observed, target):
+            raise LabArtifactIntegrityError("namespace guard temp quarantine changed identity")
+        os.fsync(active_descriptor)
+        os.fsync(quarantine_descriptor)
+
+    def _recover_active_namespace_guards(self) -> None:
+        active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
+        names = sorted(os.listdir(active_descriptor))
+        final_names = [name for name in names if name.endswith(".json")]
+        if len(final_names) > 1:
+            raise LabArtifactIntegrityError("multiple active namespace guard intents exist")
+        for name in names:
+            if name.endswith(".json"):
+                continue
+            if name.startswith(".") and name.endswith(".tmp"):
+                self._quarantine_namespace_guard_temp(name)
+                continue
+            raise LabArtifactIntegrityError("unknown namespace guard ledger entry")
+        for name in final_names:
+            intent = self._load_namespace_guard_intent(name)
+            candidates_descriptor = os.dup(self._managed_descriptors[self.candidates_root])
+            candidate_descriptor = -1
+            tables_descriptor = -1
+            try:
+                directory_flags = (
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                )
+                candidate_descriptor = os.open(
+                    intent.candidate_name,
+                    directory_flags,
+                    dir_fd=candidates_descriptor,
+                )
+                tables_descriptor = os.open(
+                    "tables",
+                    directory_flags,
+                    dir_fd=candidate_descriptor,
+                )
+                self._restore_candidate_namespace_guard(
+                    intent,
+                    candidates_descriptor=candidates_descriptor,
+                    candidate_descriptor=candidate_descriptor,
+                    tables_descriptor=tables_descriptor,
+                )
+                self._archive_namespace_guard_intent(intent)
+            except Exception:
+                self._poisoned = True
+                raise
+            finally:
+                for descriptor in (
+                    tables_descriptor,
+                    candidate_descriptor,
+                    candidates_descriptor,
+                ):
+                    if descriptor >= 0:
+                        os.close(descriptor)
+
+    @staticmethod
+    def _after_candidate_namespace_guarded(
+        _intent: LabCandidateNamespaceGuardIntent,
+    ) -> None:
+        """Fault-injection boundary after durable namespace protection is active."""
 
     @staticmethod
     def _same_directory_identity(
@@ -2160,205 +2794,169 @@ class LabJobArtifactStore:
         if re.fullmatch(r"[0-9a-f]{32}-[0-9a-f]{32}", candidate_name) is None:
             raise LabArtifactIntegrityError("validated candidate name is not a safe segment")
         candidate_path = self.candidates_root / candidate_name
-        self._assert_managed_roots()
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        candidates_descriptor = self._managed_parent_descriptor(self.candidates_root)
-        candidate_descriptor = -1
-        tables_descriptor = -1
-        payload_descriptors: dict[str, int] = {}
-        candidate_flags: int | None = None
-        tables_flags: int | None = None
-        candidate_protected = False
-        tables_protected = False
-        linux_parent_guarded = False
-        linux_candidate_guarded = False
-        linux_tables_guarded = False
-        try:
-            if sys.platform == "darwin":
-                parent_flags, parent_immutable = _candidate_namespace_flag(candidates_descriptor)
-                try:
-                    _set_candidate_namespace_flags(
-                        candidates_descriptor,
-                        parent_flags | parent_immutable,
-                    )
-                finally:
-                    _set_candidate_namespace_flags(candidates_descriptor, parent_flags)
-            elif not sys.platform.startswith("linux"):
-                raise LabArtifactPlatformError(
-                    "candidate creation requires an inode or directory namespace guard"
-                )
-            os.mkdir(candidate_name, mode=0o700, dir_fd=candidates_descriptor)
-            candidate_descriptor = os.open(
-                candidate_name,
-                directory_flags,
-                dir_fd=candidates_descriptor,
+        with self._exclusive_namespace_guard():
+            self._recover_active_namespace_guards()
+            self._assert_managed_roots()
+            directory_flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
             )
-            candidate_identity = _FileObservation.from_stat(os.fstat(candidate_descriptor))
-            if candidate_identity.mode != stat.S_IFDIR:
-                raise LabArtifactIntegrityError("candidate output is not a directory")
-            os.fchmod(candidate_descriptor, 0o700)
-            if stat.S_IMODE(os.fstat(candidate_descriptor).st_mode) != 0o700:
-                raise LabArtifactIntegrityError("candidate permissions did not become 0700")
-            self._after_candidate_directory_bound(candidate_name, candidate_descriptor)
-            self._assert_candidate_creation_binding(
-                candidates_descriptor=candidates_descriptor,
-                candidate_name=candidate_name,
-                candidate_descriptor=candidate_descriptor,
-                candidate_identity=candidate_identity,
-            )
-            os.mkdir("tables", mode=0o700, dir_fd=candidate_descriptor)
-            tables_descriptor = os.open("tables", directory_flags, dir_fd=candidate_descriptor)
-            tables_identity = _FileObservation.from_stat(os.fstat(tables_descriptor))
-            if tables_identity.mode != stat.S_IFDIR:
-                raise LabArtifactIntegrityError("candidate tables output is not a directory")
-            os.fchmod(tables_descriptor, 0o700)
-            if stat.S_IMODE(os.fstat(tables_descriptor).st_mode) != 0o700:
-                raise LabArtifactIntegrityError("candidate tables permissions did not become 0700")
-            for relative_path in sorted(bundle_payloads):
-                pure = PurePosixPath(relative_path)
-                parent_descriptor = (
-                    tables_descriptor
-                    if pure.parent.as_posix() == "tables"
-                    else candidate_descriptor
-                )
-                payload_descriptors[relative_path] = _open_empty_private_file_at(
-                    parent_descriptor,
-                    pure.name,
-                )
-            os.fsync(tables_descriptor)
-            os.fsync(candidate_descriptor)
-            os.fsync(candidates_descriptor)
-            if sys.platform == "darwin":
-                tables_flags, tables_immutable = _candidate_namespace_flag(tables_descriptor)
-                candidate_flags, candidate_immutable = _candidate_namespace_flag(
-                    candidate_descriptor
-                )
-                tables_protected = True
-                _set_candidate_namespace_flags(
-                    tables_descriptor,
-                    tables_flags | tables_immutable,
-                )
-                candidate_protected = True
-                _set_candidate_namespace_flags(
-                    candidate_descriptor,
-                    candidate_flags | candidate_immutable,
-                )
-                guarded_candidates_permissions = 0o700
-            else:
-                os.fchmod(tables_descriptor, 0o500)
-                linux_tables_guarded = True
-                os.fsync(tables_descriptor)
-                os.fchmod(candidate_descriptor, 0o500)
-                linux_candidate_guarded = True
-                os.fsync(candidate_descriptor)
-                os.fchmod(candidates_descriptor, 0o500)
-                linux_parent_guarded = True
-                os.fsync(candidates_descriptor)
-                guarded_candidates_permissions = 0o500
-            self._assert_candidate_creation_binding(
-                candidates_descriptor=candidates_descriptor,
-                candidate_name=candidate_name,
-                candidate_descriptor=candidate_descriptor,
-                candidate_identity=candidate_identity,
-                tables_descriptor=tables_descriptor,
-                tables_identity=tables_identity,
-                candidates_permissions=guarded_candidates_permissions,
-            )
-            for relative_path in sorted(bundle_payloads):
-                pure = PurePosixPath(relative_path)
-                parent_descriptor = (
-                    tables_descriptor
-                    if pure.parent.as_posix() == "tables"
-                    else candidate_descriptor
-                )
-                _write_bound_payload(
-                    payload_descriptors[relative_path],
-                    parent_descriptor,
-                    pure.name,
-                    bundle_payloads[relative_path],
-                )
-            os.fsync(tables_descriptor)
-            os.fsync(candidate_descriptor)
-            os.fsync(candidates_descriptor)
-            if sys.platform == "darwin":
-                if tables_flags is None or candidate_flags is None:
-                    raise LabArtifactIntegrityError(
-                        "candidate namespace guard state is unavailable"
-                    )
-                _set_candidate_namespace_flags(tables_descriptor, tables_flags)
-                tables_protected = False
-                _set_candidate_namespace_flags(candidate_descriptor, candidate_flags)
-                candidate_protected = False
-            else:
-                os.fchmod(tables_descriptor, 0o700)
-                linux_tables_guarded = False
-                os.fsync(tables_descriptor)
-                os.fchmod(candidate_descriptor, 0o700)
-                linux_candidate_guarded = False
-                os.fsync(candidate_descriptor)
-                os.fchmod(candidates_descriptor, 0o700)
-                linux_parent_guarded = False
-                os.fsync(candidates_descriptor)
-            self._assert_candidate_creation_binding(
-                candidates_descriptor=candidates_descriptor,
-                candidate_name=candidate_name,
-                candidate_descriptor=candidate_descriptor,
-                candidate_identity=candidate_identity,
-                tables_descriptor=tables_descriptor,
-                tables_identity=tables_identity,
-            )
-            for descriptor in payload_descriptors.values():
-                os.close(descriptor)
-            payload_descriptors.clear()
-            os.close(tables_descriptor)
-            tables_descriptor = -1
-            os.close(candidate_descriptor)
+            candidates_descriptor = self._managed_parent_descriptor(self.candidates_root)
             candidate_descriptor = -1
-            os.close(candidates_descriptor)
-            candidates_descriptor = -1
-            candidate = self._candidate_from_path(candidate_path)
-            return self._finalize_public_candidate(candidate)
-        except Exception:
-            # A failed candidate remains isolated for explicit operator recovery.
-            for descriptor in (
-                tables_descriptor,
-                candidate_descriptor,
-                candidates_descriptor,
-            ):
-                if descriptor >= 0:
-                    with suppress(OSError):
-                        os.fsync(descriptor)
-            raise
-        finally:
-            if tables_protected and tables_descriptor >= 0 and tables_flags is not None:
-                with suppress(LabArtifactError, OSError):
-                    _set_candidate_namespace_flags(tables_descriptor, tables_flags)
-            if candidate_protected and candidate_descriptor >= 0 and candidate_flags is not None:
-                with suppress(LabArtifactError, OSError):
-                    _set_candidate_namespace_flags(candidate_descriptor, candidate_flags)
-            if linux_tables_guarded and tables_descriptor >= 0:
-                with suppress(OSError):
-                    os.fchmod(tables_descriptor, 0o700)
+            tables_descriptor = -1
+            payload_descriptors: dict[str, int] = {}
+            guard_intent: LabCandidateNamespaceGuardIntent | None = None
+            guard_archived = False
+            try:
+                os.mkdir(candidate_name, mode=0o700, dir_fd=candidates_descriptor)
+                candidate_descriptor = os.open(
+                    candidate_name,
+                    directory_flags,
+                    dir_fd=candidates_descriptor,
+                )
+                candidate_identity = _FileObservation.from_stat(os.fstat(candidate_descriptor))
+                if candidate_identity.mode != stat.S_IFDIR:
+                    raise LabArtifactIntegrityError("candidate output is not a directory")
+                os.fchmod(candidate_descriptor, 0o700)
+                if stat.S_IMODE(os.fstat(candidate_descriptor).st_mode) != 0o700:
+                    raise LabArtifactIntegrityError("candidate permissions did not become 0700")
+                self._after_candidate_directory_bound(
+                    candidate_name,
+                    candidate_descriptor,
+                )
+                self._assert_candidate_creation_binding(
+                    candidates_descriptor=candidates_descriptor,
+                    candidate_name=candidate_name,
+                    candidate_descriptor=candidate_descriptor,
+                    candidate_identity=candidate_identity,
+                )
+                os.mkdir("tables", mode=0o700, dir_fd=candidate_descriptor)
+                tables_descriptor = os.open(
+                    "tables",
+                    directory_flags,
+                    dir_fd=candidate_descriptor,
+                )
+                tables_identity = _FileObservation.from_stat(os.fstat(tables_descriptor))
+                if tables_identity.mode != stat.S_IFDIR:
+                    raise LabArtifactIntegrityError("candidate tables output is not a directory")
+                os.fchmod(tables_descriptor, 0o700)
+                if stat.S_IMODE(os.fstat(tables_descriptor).st_mode) != 0o700:
+                    raise LabArtifactIntegrityError(
+                        "candidate tables permissions did not become 0700"
+                    )
+                for relative_path in sorted(bundle_payloads):
+                    pure = PurePosixPath(relative_path)
+                    parent_descriptor = (
+                        tables_descriptor
+                        if pure.parent.as_posix() == "tables"
+                        else candidate_descriptor
+                    )
+                    payload_descriptors[relative_path] = _open_empty_private_file_at(
+                        parent_descriptor,
+                        pure.name,
+                    )
+                os.fsync(tables_descriptor)
+                os.fsync(candidate_descriptor)
+                os.fsync(candidates_descriptor)
+                guard_intent = self._create_namespace_guard_intent(
+                    candidate_name=candidate_name,
+                    candidates_descriptor=candidates_descriptor,
+                    candidate_descriptor=candidate_descriptor,
+                    tables_descriptor=tables_descriptor,
+                )
+                self._publish_namespace_guard_intent(guard_intent)
+                try:
+                    self._activate_candidate_namespace_guard(
+                        guard_intent,
+                        candidates_descriptor=candidates_descriptor,
+                        candidate_descriptor=candidate_descriptor,
+                        tables_descriptor=tables_descriptor,
+                    )
+                    self._after_candidate_namespace_guarded(guard_intent)
+                    guarded_candidates_permissions = (
+                        0o700 if guard_intent.platform == "darwin" else 0o500
+                    )
+                    self._assert_candidate_creation_binding(
+                        candidates_descriptor=candidates_descriptor,
+                        candidate_name=candidate_name,
+                        candidate_descriptor=candidate_descriptor,
+                        candidate_identity=candidate_identity,
+                        tables_descriptor=tables_descriptor,
+                        tables_identity=tables_identity,
+                        candidates_permissions=guarded_candidates_permissions,
+                    )
+                    for relative_path in sorted(bundle_payloads):
+                        pure = PurePosixPath(relative_path)
+                        parent_descriptor = (
+                            tables_descriptor
+                            if pure.parent.as_posix() == "tables"
+                            else candidate_descriptor
+                        )
+                        _write_bound_payload(
+                            payload_descriptors[relative_path],
+                            parent_descriptor,
+                            pure.name,
+                            bundle_payloads[relative_path],
+                        )
                     os.fsync(tables_descriptor)
-            if linux_candidate_guarded and candidate_descriptor >= 0:
-                with suppress(OSError):
-                    os.fchmod(candidate_descriptor, 0o700)
                     os.fsync(candidate_descriptor)
-            if linux_parent_guarded and candidates_descriptor >= 0:
-                with suppress(OSError):
-                    os.fchmod(candidates_descriptor, 0o700)
                     os.fsync(candidates_descriptor)
-            for descriptor in payload_descriptors.values():
-                with suppress(OSError):
+                    self._restore_candidate_namespace_guard(
+                        guard_intent,
+                        candidates_descriptor=candidates_descriptor,
+                        candidate_descriptor=candidate_descriptor,
+                        tables_descriptor=tables_descriptor,
+                    )
+                    self._archive_namespace_guard_intent(guard_intent)
+                    guard_archived = True
+                except BaseException as operation_error:
+                    if not guard_archived:
+                        try:
+                            self._restore_candidate_namespace_guard(
+                                guard_intent,
+                                candidates_descriptor=candidates_descriptor,
+                                candidate_descriptor=candidate_descriptor,
+                                tables_descriptor=tables_descriptor,
+                            )
+                            self._archive_namespace_guard_intent(guard_intent)
+                            guard_archived = True
+                        except BaseException as cleanup_error:
+                            self._poisoned = True
+                            raise BaseExceptionGroup(
+                                "candidate operation and namespace guard cleanup both failed",
+                                [operation_error, cleanup_error],
+                            ) from None
+                    raise
+                self._assert_candidate_creation_binding(
+                    candidates_descriptor=candidates_descriptor,
+                    candidate_name=candidate_name,
+                    candidate_descriptor=candidate_descriptor,
+                    candidate_identity=candidate_identity,
+                    tables_descriptor=tables_descriptor,
+                    tables_identity=tables_identity,
+                )
+                for descriptor in payload_descriptors.values():
                     os.close(descriptor)
-            for descriptor in (
-                tables_descriptor,
-                candidate_descriptor,
-                candidates_descriptor,
-            ):
-                if descriptor >= 0:
+                payload_descriptors.clear()
+                os.close(tables_descriptor)
+                tables_descriptor = -1
+                os.close(candidate_descriptor)
+                candidate_descriptor = -1
+                os.close(candidates_descriptor)
+                candidates_descriptor = -1
+                candidate = self._candidate_from_path(candidate_path)
+                return self._finalize_public_candidate(candidate)
+            finally:
+                for descriptor in payload_descriptors.values():
                     with suppress(OSError):
                         os.close(descriptor)
+                for descriptor in (
+                    tables_descriptor,
+                    candidate_descriptor,
+                    candidates_descriptor,
+                ):
+                    if descriptor >= 0:
+                        with suppress(OSError):
+                            os.close(descriptor)
 
     def _assert_managed_child(self, path: Path, parent: Path, *, label: str) -> Path:
         self._assert_managed_roots()
@@ -4339,14 +4937,15 @@ class LabJobArtifactStore:
                 }.get(expected_file_type, before.mode),
             ) or _entry_file_type(before.mode) != expected_file_type:
                 raise LabArtifactIntegrityError("candidate quarantine identity changed")
-            source_descriptor = self._open_quarantine_entry_descriptor(
-                source_parent,
-                source_name,
-                expected_file_type,
-            )
-            opened = _FileObservation.from_stat(os.fstat(source_descriptor))
-            if opened != before:
-                raise LabArtifactIntegrityError("candidate quarantine identity changed")
+            if expected_file_type != "other":
+                source_descriptor = self._open_quarantine_entry_descriptor(
+                    source_parent,
+                    source_name,
+                    expected_file_type,
+                )
+                opened = _FileObservation.from_stat(os.fstat(source_descriptor))
+                if opened != before:
+                    raise LabArtifactIntegrityError("candidate quarantine identity changed")
             try:
                 self._atomic_quarantine_noreplace(
                     source_parent,
@@ -4361,11 +4960,20 @@ class LabJobArtifactStore:
             target = _FileObservation.from_stat(
                 os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
             )
-            still_open = _FileObservation.from_stat(os.fstat(source_descriptor))
-            if target != still_open or (
+            still_open = (
+                _FileObservation.from_stat(os.fstat(source_descriptor))
+                if source_descriptor >= 0
+                else before
+            )
+            if not _matches_rename_identity(before, target) or (
                 target.device,
                 target.inode,
-            ) != (expected_device, expected_inode):
+            ) != (
+                expected_device,
+                expected_inode,
+            ):
+                raise LabArtifactIntegrityError("candidate quarantine target identity changed")
+            if source_descriptor >= 0 and target != still_open:
                 raise LabArtifactIntegrityError("candidate quarantine target identity changed")
             try:
                 os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
@@ -4373,16 +4981,17 @@ class LabJobArtifactStore:
                 pass
             else:
                 raise LabArtifactIntegrityError("candidate quarantine source identity changed")
-            target_descriptor = self._open_quarantine_entry_descriptor(
-                target_parent,
-                target_name,
-                expected_file_type,
-            )
-            target_opened = _FileObservation.from_stat(os.fstat(target_descriptor))
-            if target_opened != target or target_opened != still_open:
-                raise LabArtifactIntegrityError(
-                    "candidate quarantine target identity changed while binding"
+            if expected_file_type != "other":
+                target_descriptor = self._open_quarantine_entry_descriptor(
+                    target_parent,
+                    target_name,
+                    expected_file_type,
                 )
+                target_opened = _FileObservation.from_stat(os.fstat(target_descriptor))
+                if target_opened != target or target_opened != still_open:
+                    raise LabArtifactIntegrityError(
+                        "candidate quarantine target identity changed while binding"
+                    )
             os.fsync(source_parent)
             os.fsync(target_parent)
             self._assert_managed_roots()
@@ -4396,8 +5005,16 @@ class LabJobArtifactStore:
                 target_at_return = _FileObservation.from_stat(
                     os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
                 )
-                target_fd_at_return = _FileObservation.from_stat(os.fstat(target_descriptor))
-                source_fd_at_return = _FileObservation.from_stat(os.fstat(source_descriptor))
+                target_fd_at_return = (
+                    _FileObservation.from_stat(os.fstat(target_descriptor))
+                    if target_descriptor >= 0
+                    else target
+                )
+                source_fd_at_return = (
+                    _FileObservation.from_stat(os.fstat(source_descriptor))
+                    if source_descriptor >= 0
+                    else target
+                )
                 if not (target_at_return == target_fd_at_return == source_fd_at_return == target):
                     raise LabArtifactIntegrityError(
                         "candidate quarantine target identity changed before return"
