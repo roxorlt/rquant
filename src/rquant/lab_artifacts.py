@@ -3995,7 +3995,7 @@ class LabJobArtifactStore:
         except LabArtifactError:
             raise
         except OSError as exc:
-            if "bound" in locals() or fault_boundary_reached:
+            if bound is not None or fault_boundary_reached:
                 raise
             raise LabArtifactIntegrityError("job artifact seal intent cannot be bound") from exc
         finally:
@@ -6728,8 +6728,33 @@ class LegacyArtifactIndex:
                 self._refresh_cache_bindings_if_authoritative(authority)
                 self._assert_index_identity()
                 self._ensure_cache_ready(authority)
-                yield
-                self._assert_index_identity()
+                caller_error: BaseException | None = None
+                try:
+                    yield
+                except BaseException as exc:
+                    caller_error = exc
+                integrity_error: BaseException | None = None
+                try:
+                    self._assert_index_identity()
+                except BaseException as exc:
+                    integrity_error = exc
+                if caller_error is not None and integrity_error is not None:
+                    if isinstance(caller_error, Exception) and isinstance(
+                        integrity_error,
+                        Exception,
+                    ):
+                        raise ExceptionGroup(
+                            "legacy index operation and final identity check both failed",
+                            [caller_error, integrity_error],
+                        ) from None
+                    raise BaseExceptionGroup(
+                        "legacy index operation and final identity check both failed",
+                        [caller_error, integrity_error],
+                    ) from None
+                if integrity_error is not None:
+                    raise integrity_error
+                if caller_error is not None:
+                    raise caller_error
             finally:
                 self._authority_lock_depth -= 1
                 fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
@@ -7534,14 +7559,11 @@ class LegacyArtifactIndex:
                 return result
         except BaseException as error:
             cleanup_error: BaseException | None = None
-            if published is not None and not self._published_source_matches(published):
-                try:
+            try:
+                if published is not None and not self._published_source_matches(published):
                     self._invalidate_published_event(published)
                     self._ensure_cache_ready(self._read_authority_state())
-                except BaseException as exc:
-                    cleanup_error = exc
-            elif staged is not None and occurred_at is not None:
-                try:
+                elif staged is not None and occurred_at is not None:
                     current = self._read_authority_state().latest.get(logical_run_id)
                     if (
                         current is not None
@@ -7557,9 +7579,14 @@ class LegacyArtifactIndex:
                             record=staged.record,
                             occurred_at=occurred_at,
                         )
-                except BaseException as exc:
-                    cleanup_error = exc
+            except BaseException as exc:
+                cleanup_error = exc
             if cleanup_error is not None:
+                if isinstance(error, Exception) and isinstance(cleanup_error, Exception):
+                    raise ExceptionGroup(
+                        "legacy import and authority cleanup both failed",
+                        [error, cleanup_error],
+                    ) from None
                 raise BaseExceptionGroup(
                     "legacy import and authority cleanup both failed",
                     [error, cleanup_error],

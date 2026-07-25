@@ -1146,6 +1146,25 @@ def test_interrupted_seal_rejects_same_bytes_with_replaced_inode(
         LabJobArtifactStore(tmp_path / "artifacts").recover_interrupted_seal(published)
 
 
+def test_recover_interrupted_seal_normalizes_missing_intent_oserror(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    intent = store.seal_intents_root / f"{sealed.manifest.job_id.hex}.json"
+    os.rename(intent, tmp_path / "missing-seal-intent.json")
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    with pytest.raises(
+        LabArtifactIntegrityError,
+        match="seal intent cannot be bound",
+    ) as captured:
+        store.recover_interrupted_seal(sealed.path)
+
+    assert isinstance(captured.value.__cause__, FileNotFoundError)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
 def test_seal_intent_replacement_after_binding_never_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3271,6 +3290,58 @@ def test_legacy_source_swap_after_published_fsync_is_invalidated_and_reimportabl
     assert index.get("source-swap") == imported.record
 
 
+def test_legacy_lock_preserves_caller_and_exit_identity_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"source":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    displaced = tmp_path / "displaced-legacy-cache.sqlite3"
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    def replace_cache_and_fail(_record: object) -> None:
+        os.rename(index.path, displaced)
+        index.path.write_bytes(b"replacement cache")
+        os.chmod(index.path, 0o600)
+        raise RuntimeError("caller failed after publication")
+
+    monkeypatch.setattr(index, "_after_import_cache_sync", replace_cache_and_fail)
+
+    with pytest.raises(ExceptionGroup) as captured:
+        index.import_file(logical_run_id="caller-and-identity", source_path=source)
+
+    assert any(isinstance(item, RuntimeError) for item in captured.value.exceptions)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_legacy_import_preserves_main_and_cleanup_probe_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"source":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    def fail_after_publish(_record: object) -> None:
+        raise RuntimeError("main import failure")
+
+    def fail_cleanup_probe(_event: object) -> bool:
+        raise OSError("cleanup probe failure")
+
+    monkeypatch.setattr(index, "_after_published_authority_commit", fail_after_publish)
+    monkeypatch.setattr(index, "_published_source_matches", fail_cleanup_probe)
+
+    with pytest.raises(ExceptionGroup) as captured:
+        index.import_file(logical_run_id="main-and-probe", source_path=source)
+
+    assert any(isinstance(item, RuntimeError) for item in captured.value.exceptions)
+    assert any(isinstance(item, OSError) for item in captured.value.exceptions)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
 def test_legacy_restart_reconciles_crash_after_publish_before_source_recheck(
     tmp_path: Path,
 ) -> None:
@@ -3887,9 +3958,11 @@ def test_legacy_generation_head_reservation_is_preserved(
         raising=False,
     )
 
-    with pytest.raises(LabArtifactConflictError, match="head.*exists|reservation|conflict"):
+    with pytest.raises(ExceptionGroup) as captured:
         index.import_file(logical_run_id="reserved-head", source_path=source)
 
+    assert any(isinstance(item, LabArtifactConflictError) for item in captured.value.exceptions)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
     reserved = index.path.parent / index._authority_heads_name / reservation["name"]
     assert reserved.read_bytes() == b"reservation"
 
