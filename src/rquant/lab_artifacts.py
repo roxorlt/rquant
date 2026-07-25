@@ -27,6 +27,7 @@ from typing import Literal, Self
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -1070,8 +1071,16 @@ def _rename_noreplace(
 
 
 def _canonical_table_value(value: object) -> object:
-    if value is pd.NA or value is pd.NaT or value is None:
-        return {"$null": True}
+    if value is None:
+        return {"$none": True}
+    if value is pd.NA:
+        return {"$pd_na": True}
+    if value is pd.NaT:
+        return {"$pd_nat": True}
+    if isinstance(value, np.datetime64) and np.isnat(value):
+        return {"$datetime_nat": str(value.dtype)}
+    if isinstance(value, np.timedelta64) and np.isnat(value):
+        return {"$timedelta_nat": str(value.dtype)}
     if isinstance(value, pd.Period):
         return {
             "$period": {
@@ -1092,7 +1101,7 @@ def _canonical_table_value(value: object) -> object:
             value = value.item()  # type: ignore[union-attr]
     if isinstance(value, float):
         if math.isnan(value):
-            return {"$null": True}
+            return {"$nan": True}
         if not math.isfinite(value):
             return {"$float": value.hex()}
         return {"$float": value.hex()}
@@ -1217,6 +1226,32 @@ def _rebuild_canonical_dtype_token(token: str) -> object:
         return pd.Timedelta(int(value["$timedelta_ns"]), unit="ns")
     if isinstance(value, dict) and set(value) == {"$bytes"}:
         return base64.b64decode(value["$bytes"], validate=True)
+    if isinstance(value, dict) and set(value) == {"$none"}:
+        return None
+    if isinstance(value, dict) and set(value) == {"$pd_na"}:
+        return pd.NA
+    if isinstance(value, dict) and set(value) == {"$pd_nat"}:
+        return pd.NaT
+    if isinstance(value, dict) and set(value) == {"$datetime_nat"}:
+        dtype = value["$datetime_nat"]
+        if (
+            not isinstance(dtype, str)
+            or re.fullmatch(r"datetime64(?:\[[A-Za-z]+\])?", dtype) is None
+        ):
+            raise LabArtifactIntegrityError("numpy datetime NaT metadata is invalid")
+        unit = dtype.removeprefix("datetime64[").removesuffix("]")
+        return np.datetime64("NaT", unit) if dtype != "datetime64" else np.datetime64("NaT")
+    if isinstance(value, dict) and set(value) == {"$timedelta_nat"}:
+        dtype = value["$timedelta_nat"]
+        if (
+            not isinstance(dtype, str)
+            or re.fullmatch(r"timedelta64(?:\[[A-Za-z]+\])?", dtype) is None
+        ):
+            raise LabArtifactIntegrityError("numpy timedelta NaT metadata is invalid")
+        unit = dtype.removeprefix("timedelta64[").removesuffix("]")
+        return np.timedelta64("NaT", unit) if dtype != "timedelta64" else np.timedelta64("NaT")
+    if isinstance(value, dict) and set(value) == {"$nan"}:
+        return float("nan")
     if isinstance(value, dict) and set(value) == {"$period"}:
         period = value["$period"]
         if not isinstance(period, dict) or set(period) != {"frequency", "ordinal"}:
@@ -3605,21 +3640,23 @@ class LabJobArtifactStore:
         target = self.quarantine_root / (
             f"{path.name}-{candidate.manifest_hash[:16]}-{uuid4().hex}"
         )
-        observed = self._quarantine_bound_entry(
+        with self._bind_quarantined_entry(
             source_name=path.name,
             target_name=target.name,
             expected_device=candidate.device,
             expected_inode=candidate.inode,
-        )
-        return LabArtifactRecoveryRecord(
-            path=target,
-            status="quarantined",
-            job_id=candidate.job_id,
-            manifest_hash=candidate.manifest_hash,
-            device=observed.device,
-            inode=observed.inode,
-            reason=" ".join(reason.split()),
-        )
+        ) as observed:
+            result = LabArtifactRecoveryRecord(
+                path=target,
+                status="quarantined",
+                job_id=candidate.job_id,
+                manifest_hash=candidate.manifest_hash,
+                device=observed.device,
+                inode=observed.inode,
+                reason=" ".join(reason.split()),
+            )
+            self._after_quarantine_record_finalized(result)
+            return result
 
     def quarantine_recovery_record(
         self,
@@ -3641,21 +3678,27 @@ class LabJobArtifactStore:
             label="candidate recovery entry",
         )
         target = self.quarantine_root / f"{path.name}-recovery-{uuid4().hex}"
-        observed = self._quarantine_bound_entry(
+        with self._bind_quarantined_entry(
             source_name=path.name,
             target_name=target.name,
             expected_device=record.device,
             expected_inode=record.inode,
-        )
-        return LabArtifactRecoveryRecord(
-            path=target,
-            status="quarantined",
-            job_id=record.job_id,
-            manifest_hash=record.manifest_hash,
-            device=observed.device,
-            inode=observed.inode,
-            reason=" ".join(reason.split()),
-        )
+        ) as observed:
+            result = LabArtifactRecoveryRecord(
+                path=target,
+                status="quarantined",
+                job_id=record.job_id,
+                manifest_hash=record.manifest_hash,
+                device=observed.device,
+                inode=observed.inode,
+                reason=" ".join(reason.split()),
+            )
+            self._after_quarantine_record_finalized(result)
+            return result
+
+    @staticmethod
+    def _after_quarantine_record_finalized(_record: LabArtifactRecoveryRecord) -> None:
+        """Fault-injection boundary before a quarantine record returns."""
 
     @staticmethod
     def _atomic_quarantine_noreplace(
@@ -3671,17 +3714,19 @@ class LabJobArtifactStore:
             destination_name,
         )
 
-    def _quarantine_bound_entry(
+    @contextmanager
+    def _bind_quarantined_entry(
         self,
         *,
         source_name: str,
         target_name: str,
         expected_device: int,
         expected_inode: int,
-    ) -> _FileObservation:
+    ) -> Iterator[_FileObservation]:
         source_parent = self._managed_parent_descriptor(self.candidates_root)
         target_parent = self._managed_parent_descriptor(self.quarantine_root)
         source_descriptor = -1
+        target_descriptor = -1
         try:
             directory_flags = (
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -3729,15 +3774,62 @@ class LabJobArtifactStore:
                 pass
             else:
                 raise LabArtifactIntegrityError("candidate quarantine source identity changed")
+            target_descriptor = os.open(
+                target_name,
+                directory_flags,
+                dir_fd=target_parent,
+            )
+            target_opened = _FileObservation.from_stat(os.fstat(target_descriptor))
+            if target_opened != target or target_opened != still_open:
+                raise LabArtifactIntegrityError(
+                    "candidate quarantine target identity changed while binding"
+                )
             os.fsync(source_parent)
             os.fsync(target_parent)
             self._assert_managed_roots()
-            return target
+            caller_error: BaseException | None = None
+            try:
+                yield target
+            except BaseException as exc:
+                caller_error = exc
+            integrity_error: BaseException | None = None
+            try:
+                target_at_return = _FileObservation.from_stat(
+                    os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
+                )
+                target_fd_at_return = _FileObservation.from_stat(os.fstat(target_descriptor))
+                source_fd_at_return = _FileObservation.from_stat(os.fstat(source_descriptor))
+                if not (target_at_return == target_fd_at_return == source_fd_at_return == target):
+                    raise LabArtifactIntegrityError(
+                        "candidate quarantine target identity changed before return"
+                    )
+                try:
+                    os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise LabArtifactIntegrityError(
+                        "candidate quarantine source identity changed before return"
+                    )
+                self._assert_managed_roots()
+            except BaseException as exc:
+                integrity_error = exc
+            if caller_error is not None and integrity_error is not None:
+                raise BaseExceptionGroup(
+                    "quarantine operation and final identity checks both failed",
+                    [caller_error, integrity_error],
+                ) from None
+            if integrity_error is not None:
+                raise integrity_error
+            if caller_error is not None:
+                raise caller_error
         except LabArtifactError:
             raise
         except OSError as exc:
             raise LabArtifactIntegrityError("candidate quarantine identity changed") from exc
         finally:
+            if target_descriptor >= 0:
+                os.close(target_descriptor)
             if source_descriptor >= 0:
                 os.close(source_descriptor)
             os.close(source_parent)
@@ -3785,6 +3877,10 @@ class LabJobArtifactStore:
             destination_name,
         )
 
+    @staticmethod
+    def _after_zip_final_checks(_destination: Path) -> None:
+        """Fault-injection boundary before a published ZIP path returns."""
+
     def export_deterministic_zip(
         self,
         sealed_path: Path,
@@ -3811,6 +3907,7 @@ class LabJobArtifactStore:
         destination_parent_identity = _FileObservation.from_stat(os.fstat(destination_parent))
         temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
         temporary_descriptor = -1
+        destination_descriptor = -1
         try:
             observed, manifest, identities = self._probe_bundle(
                 managed,
@@ -3906,6 +4003,42 @@ class LabJobArtifactStore:
                     expected_mode=stat.S_IFREG,
                     label="ZIP destination",
                 )
+                destination_descriptor = os.open(
+                    destination.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=destination_parent,
+                )
+                destination_opened = _FileObservation.from_stat(os.fstat(destination_descriptor))
+                if destination_opened != published or (
+                    destination_opened.device,
+                    destination_opened.inode,
+                    destination_opened.mode,
+                    destination_opened.nlink,
+                    destination_opened.size,
+                    destination_opened.mtime_ns,
+                ) != (
+                    final_temporary.device,
+                    final_temporary.inode,
+                    final_temporary.mode,
+                    final_temporary.nlink,
+                    final_temporary.size,
+                    final_temporary.mtime_ns,
+                ):
+                    raise LabArtifactIntegrityError(
+                        "ZIP destination identity changed after publication"
+                    )
+                destination_bound = _BoundReadonlyFile(
+                    path=destination,
+                    parent_descriptor=destination_parent,
+                    descriptor=destination_descriptor,
+                    parent_identity=destination_parent_identity,
+                    file_identity=destination_opened,
+                )
+                expected_zip_hash = _sha256(_read_descriptor(temporary_descriptor))
+                if _sha256(_read_descriptor(destination_descriptor)) != expected_zip_hash:
+                    raise LabArtifactIntegrityError(
+                        "ZIP destination bytes changed after publication"
+                    )
                 os.fsync(destination_parent)
                 current_destination_parent = _secure_open_directory(
                     destination.parent,
@@ -3924,8 +4057,17 @@ class LabJobArtifactStore:
                     raise LabArtifactIntegrityError("ZIP destination parent identity changed")
                 self._assert_bound_paths(bound)
                 self._assert_managed_roots()
+                _assert_bound_readonly_file(destination_bound, label="ZIP destination")
+                self._after_zip_final_checks(destination)
+                _assert_bound_readonly_file(destination_bound, label="ZIP destination")
+                if _sha256(_read_descriptor(destination_descriptor)) != expected_zip_hash:
+                    raise LabArtifactIntegrityError("ZIP destination bytes changed before return")
+                self._assert_bound_paths(bound)
+                self._assert_managed_roots()
             return destination
         finally:
+            if destination_descriptor >= 0:
+                os.close(destination_descriptor)
             if temporary_descriptor >= 0:
                 os.close(temporary_descriptor)
             os.close(destination_parent)
@@ -3966,7 +4108,9 @@ class LegacyArtifactIndex:
         self._parent_descriptor = -1
         self._lock_descriptor = -1
         self._authority_descriptor = -1
+        self._heads_descriptor = -1
         self._head_descriptor = -1
+        self._head_name = ""
         self._database_descriptor = -1
         self._journal_descriptor = -1
         self._cache_quarantine_descriptor = -1
@@ -3974,6 +4118,7 @@ class LegacyArtifactIndex:
         self._authority_lock_depth = 0
         self._cache_quarantine_path = self.path.parent / ".legacy-cache-quarantine"
         self._authority_quarantine_path = self.path.parent / ".legacy-authority-quarantine"
+        self._authority_heads_path = self.path.parent / self._authority_heads_name
         _ensure_private_directory(
             self.path.parent,
             manage_existing=False,
@@ -3986,6 +4131,11 @@ class LegacyArtifactIndex:
         )
         _ensure_private_directory(
             self._authority_quarantine_path,
+            manage_existing=False,
+            require_private_existing=True,
+        )
+        _ensure_private_directory(
+            self._authority_heads_path,
             manage_existing=False,
             require_private_existing=True,
         )
@@ -4018,11 +4168,19 @@ class LegacyArtifactIndex:
                         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                         dir_fd=self._parent_descriptor,
                     )
+                    self._heads_descriptor = os.open(
+                        self._authority_heads_path.name,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=self._parent_descriptor,
+                    )
                     self._cache_quarantine_identity = _FileObservation.from_stat(
                         os.fstat(self._cache_quarantine_descriptor)
                     )
                     self._authority_quarantine_identity = _FileObservation.from_stat(
                         os.fstat(self._authority_quarantine_descriptor)
+                    )
+                    self._heads_identity = _FileObservation.from_stat(
+                        os.fstat(self._heads_descriptor)
                     )
                     self._bind_or_create_authority_head()
                     self._database_descriptor, _ = _open_or_create_private_regular_at(
@@ -4071,6 +4229,7 @@ class LegacyArtifactIndex:
             "_journal_descriptor",
             "_database_descriptor",
             "_head_descriptor",
+            "_heads_descriptor",
             "_authority_descriptor",
             "_lock_descriptor",
             "_parent_descriptor",
@@ -4093,19 +4252,62 @@ class LegacyArtifactIndex:
         self.close()
 
     @property
-    def _authority_head_name(self) -> str:
+    def _authority_heads_name(self) -> str:
+        return f"{self.path.name}.authority.heads"
+
+    @property
+    def _legacy_authority_head_name(self) -> str:
         return f"{self.path.name}.authority.head.json"
 
-    def _quarantine_authority_entry(self, name: str) -> None:
+    @staticmethod
+    def _authority_head_file_name(head: LabLegacyAuthorityHead) -> str:
+        return f"{head.sequence:020d}-{head.final_hash}-{head.ledger_size:020d}.json"
+
+    @staticmethod
+    def _complete_authority_payload(payload: bytes) -> bytes:
+        if not payload or payload.endswith(b"\n"):
+            return payload
+        final_newline = payload.rfind(b"\n")
+        return payload[: final_newline + 1] if final_newline >= 0 else b""
+
+    @classmethod
+    def _authority_heads_for_state(
+        cls,
+        state: _LegacyAuthorityState,
+    ) -> tuple[LabLegacyAuthorityHead, ...]:
+        heads = [
+            LabLegacyAuthorityHead(
+                sequence=0,
+                final_hash=_LEGACY_GENESIS_HASH,
+                ledger_size=0,
+            )
+        ]
+        ledger_size = 0
+        for event in state.events:
+            ledger_size += len(event.canonical_json_bytes()) + 1
+            heads.append(
+                LabLegacyAuthorityHead(
+                    sequence=event.sequence,
+                    final_hash=event.event_hash,
+                    ledger_size=ledger_size,
+                )
+            )
+        if heads[-1] != cls._authority_head_for_state(state):
+            raise LabArtifactIntegrityError(
+                "legacy authority generation heads conflict with ledger state"
+            )
+        return tuple(heads)
+
+    def _quarantine_authority_entry(self, name: str, *, source_parent: int) -> None:
         descriptor = os.open(
             name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=self._parent_descriptor,
+            dir_fd=source_parent,
         )
         try:
             opened = _FileObservation.from_stat(os.fstat(descriptor))
             at_path = _FileObservation.from_stat(
-                os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
+                os.stat(name, dir_fd=source_parent, follow_symlinks=False)
             )
             if (
                 opened != at_path
@@ -4116,7 +4318,7 @@ class LegacyArtifactIndex:
                 raise LabArtifactIntegrityError("legacy authority recovery entry is unsafe")
             target = f"{name.lstrip('.')}.{uuid4().hex}.quarantined"
             _rename_noreplace(
-                self._parent_descriptor,
+                source_parent,
                 name,
                 self._authority_quarantine_descriptor,
                 target,
@@ -4130,45 +4332,167 @@ class LegacyArtifactIndex:
             )
             if moved != _FileObservation.from_stat(os.fstat(descriptor)):
                 raise LabArtifactIntegrityError("legacy authority quarantine identity changed")
-            os.fsync(self._parent_descriptor)
+            os.fsync(source_parent)
             os.fsync(self._authority_quarantine_descriptor)
+            if source_parent == self._heads_descriptor:
+                self._heads_identity = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
         finally:
             os.close(descriptor)
 
     def _quarantine_orphaned_authority_head_temps(self) -> None:
-        prefix = f".{self._authority_head_name}."
         names = sorted(
             name
-            for name in os.listdir(self._parent_descriptor)
-            if name.startswith(prefix) and name.endswith(".tmp")
+            for name in os.listdir(self._heads_descriptor)
+            if name.startswith(".head.") and name.endswith(".tmp")
         )
         for name in names:
-            self._quarantine_authority_entry(name)
+            self._quarantine_authority_entry(
+                name,
+                source_parent=self._heads_descriptor,
+            )
+
+    @staticmethod
+    def _read_authority_head_descriptor(
+        descriptor: int,
+        *,
+        expected_name: str,
+    ) -> LabLegacyAuthorityHead:
+        opened = _FileObservation.from_stat(os.fstat(descriptor))
+        if (
+            opened.mode != stat.S_IFREG
+            or opened.nlink != 1
+            or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
+        ):
+            raise LabArtifactIntegrityError(
+                "legacy authority generation head is not a private regular file"
+            )
+        payload = _read_descriptor(descriptor)
+        try:
+            head = LabLegacyAuthorityHead.model_validate_json(payload)
+        except Exception as exc:
+            raise LabArtifactIntegrityError("legacy authority generation head is invalid") from exc
+        if payload != head.canonical_json_bytes():
+            raise LabArtifactIntegrityError("legacy authority generation head is not canonical")
+        if expected_name != LegacyArtifactIndex._authority_head_file_name(head):
+            raise LabArtifactIntegrityError(
+                "legacy authority generation head filename conflicts with content"
+            )
+        return head
 
     def _read_bound_authority_head(self) -> LabLegacyAuthorityHead:
         opened = _FileObservation.from_stat(os.fstat(self._head_descriptor))
         at_path = _FileObservation.from_stat(
             os.stat(
-                self._authority_head_name,
-                dir_fd=self._parent_descriptor,
+                self._head_name,
+                dir_fd=self._heads_descriptor,
                 follow_symlinks=False,
             )
         )
         if (
             opened != at_path
+            or opened != self._head_identity
             or opened.mode != stat.S_IFREG
             or opened.nlink != 1
             or stat.S_IMODE(os.fstat(self._head_descriptor).st_mode) != 0o600
         ):
             raise LabArtifactIntegrityError("legacy authority head identity or permissions changed")
-        payload = _read_descriptor(self._head_descriptor)
-        try:
-            head = LabLegacyAuthorityHead.model_validate_json(payload)
-        except Exception as exc:
-            raise LabArtifactIntegrityError("legacy authority head is invalid") from exc
-        if payload != head.canonical_json_bytes():
-            raise LabArtifactIntegrityError("legacy authority head is not canonical")
-        return head
+        return self._read_authority_head_descriptor(
+            self._head_descriptor,
+            expected_name=self._head_name,
+        )
+
+    def _scan_authority_heads(
+        self,
+        state: _LegacyAuthorityState,
+    ) -> tuple[str, int, _FileObservation, LabLegacyAuthorityHead] | None:
+        self._quarantine_orphaned_authority_head_temps()
+        expected = self._authority_heads_for_state(state)
+        observed_by_sequence: dict[int, tuple[str, _FileObservation, LabLegacyAuthorityHead]] = {}
+        for name in sorted(os.listdir(self._heads_descriptor)):
+            if re.fullmatch(r"[0-9]{20}-[0-9a-f]{64}-[0-9]{20}\.json", name) is None:
+                raise LabArtifactIntegrityError(
+                    "legacy authority heads directory contains an unknown entry"
+                )
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._heads_descriptor,
+            )
+            try:
+                before = _FileObservation.from_stat(
+                    os.stat(name, dir_fd=self._heads_descriptor, follow_symlinks=False)
+                )
+                opened = _FileObservation.from_stat(os.fstat(descriptor))
+                if opened != before:
+                    raise LabArtifactIntegrityError(
+                        "legacy authority generation head changed while scanning"
+                    )
+                head = self._read_authority_head_descriptor(
+                    descriptor,
+                    expected_name=name,
+                )
+                if head.sequence >= len(expected) or head != expected[head.sequence]:
+                    raise LabArtifactIntegrityError(
+                        "legacy authority generation head conflicts with ledger"
+                    )
+                if head.sequence in observed_by_sequence:
+                    raise LabArtifactConflictError(
+                        "legacy authority generation has conflicting heads"
+                    )
+                observed_by_sequence[head.sequence] = (name, opened, head)
+            finally:
+                os.close(descriptor)
+        if not observed_by_sequence:
+            self._heads_identity = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
+            return None
+        highest = max(observed_by_sequence)
+        if set(observed_by_sequence) != set(range(highest + 1)):
+            raise LabArtifactIntegrityError("legacy authority generation heads are not continuous")
+        selected_name, selected_identity, selected_head = observed_by_sequence[highest]
+        selected_descriptor = os.open(
+            selected_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=self._heads_descriptor,
+        )
+        selected_opened = _FileObservation.from_stat(os.fstat(selected_descriptor))
+        selected_at_path = _FileObservation.from_stat(
+            os.stat(
+                selected_name,
+                dir_fd=self._heads_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if selected_opened != selected_identity or selected_at_path != selected_identity:
+            os.close(selected_descriptor)
+            raise LabArtifactIntegrityError("legacy authority selected head changed while binding")
+        self._heads_identity = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
+        return selected_name, selected_descriptor, selected_opened, selected_head
+
+    def _set_head_binding(
+        self,
+        selection: tuple[str, int, _FileObservation, LabLegacyAuthorityHead],
+    ) -> None:
+        name, descriptor, identity, _ = selection
+        previous = self._head_descriptor
+        self._head_name = name
+        self._head_descriptor = descriptor
+        self._head_identity = identity
+        if previous >= 0:
+            os.close(previous)
+
+    @staticmethod
+    def _atomic_authority_head_publish_noreplace(
+        source_parent: int,
+        source_name: str,
+        destination_parent: int,
+        destination_name: str,
+    ) -> None:
+        _rename_noreplace(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
 
     def _publish_authority_head(
         self,
@@ -4177,12 +4501,13 @@ class LegacyArtifactIndex:
         expected_current: LabLegacyAuthorityHead | None,
     ) -> None:
         self._quarantine_orphaned_authority_head_temps()
-        temporary_name = f".{self._authority_head_name}.{uuid4().hex}.tmp"
+        destination_name = self._authority_head_file_name(head)
+        temporary_name = f".head.{uuid4().hex}.tmp"
         descriptor = os.open(
             temporary_name,
             os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
-            dir_fd=self._parent_descriptor,
+            dir_fd=self._heads_descriptor,
         )
         published = False
         try:
@@ -4199,7 +4524,7 @@ class LegacyArtifactIndex:
             temporary_at_path = _FileObservation.from_stat(
                 os.stat(
                     temporary_name,
-                    dir_fd=self._parent_descriptor,
+                    dir_fd=self._heads_descriptor,
                     follow_symlinks=False,
                 )
             )
@@ -4219,28 +4544,37 @@ class LegacyArtifactIndex:
             ):
                 raise LabArtifactIntegrityError("legacy authority head candidate identity changed")
             if expected_current is None:
-                _rename_noreplace(
-                    self._parent_descriptor,
-                    temporary_name,
-                    self._parent_descriptor,
-                    self._authority_head_name,
-                )
+                if head.sequence != 0:
+                    raise LabArtifactIntegrityError(
+                        "legacy authority first generation head must be genesis"
+                    )
             else:
                 if self._read_bound_authority_head() != expected_current:
                     raise LabArtifactIntegrityError(
                         "legacy authority head changed before publication"
                     )
-                os.replace(
+                if head.sequence != expected_current.sequence + 1:
+                    raise LabArtifactIntegrityError(
+                        "legacy authority head generations must be sequential"
+                    )
+            try:
+                self._atomic_authority_head_publish_noreplace(
+                    self._heads_descriptor,
                     temporary_name,
-                    self._authority_head_name,
-                    src_dir_fd=self._parent_descriptor,
-                    dst_dir_fd=self._parent_descriptor,
+                    self._heads_descriptor,
+                    destination_name,
                 )
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise LabArtifactConflictError(
+                        "legacy authority generation head already exists"
+                    ) from exc
+                raise
             published = True
             published_at_path = _FileObservation.from_stat(
                 os.stat(
-                    self._authority_head_name,
-                    dir_fd=self._parent_descriptor,
+                    destination_name,
+                    dir_fd=self._heads_descriptor,
                     follow_symlinks=False,
                 )
             )
@@ -4249,8 +4583,10 @@ class LegacyArtifactIndex:
                 raise LabArtifactIntegrityError(
                     "legacy authority head publication identity changed"
                 )
-            os.fsync(self._parent_descriptor)
+            os.fsync(self._heads_descriptor)
+            self._heads_identity = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
             previous_descriptor = self._head_descriptor
+            self._head_name = destination_name
             self._head_descriptor = descriptor
             self._head_identity = published_fd
             descriptor = -1
@@ -4258,82 +4594,103 @@ class LegacyArtifactIndex:
                 os.close(previous_descriptor)
         except Exception:
             if published:
-                os.fsync(self._parent_descriptor)
+                os.fsync(self._heads_descriptor)
             raise
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
 
-    def _bind_or_create_authority_head(self) -> None:
-        self._quarantine_orphaned_authority_head_temps()
+    def _read_legacy_authority_head(self) -> LabLegacyAuthorityHead | None:
         try:
-            self._head_descriptor = os.open(
-                self._authority_head_name,
+            descriptor = os.open(
+                self._legacy_authority_head_name,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=self._parent_descriptor,
             )
         except FileNotFoundError:
-            if os.fstat(self._authority_descriptor).st_size != 0:
-                raise LabArtifactIntegrityError(
-                    "legacy authority head is missing for a non-empty ledger"
-                ) from None
-            self._publish_authority_head(
-                LabLegacyAuthorityHead(
-                    sequence=0,
-                    final_hash=_LEGACY_GENESIS_HASH,
-                    ledger_size=0,
-                ),
-                expected_current=None,
-            )
-        else:
-            self._head_identity = _FileObservation.from_stat(os.fstat(self._head_descriptor))
-            self._read_bound_authority_head()
-
-    def _refresh_authority_head_binding(self) -> bool:
-        at_path = _FileObservation.from_stat(
-            os.stat(
-                self._authority_head_name,
-                dir_fd=self._parent_descriptor,
-                follow_symlinks=False,
-            )
-        )
-        current = _FileObservation.from_stat(os.fstat(self._head_descriptor))
-        if at_path == current:
-            return False
-        descriptor = os.open(
-            self._authority_head_name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=self._parent_descriptor,
-        )
+            return None
         try:
+            before = _FileObservation.from_stat(
+                os.stat(
+                    self._legacy_authority_head_name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
             opened = _FileObservation.from_stat(os.fstat(descriptor))
-            if (
-                opened != at_path
-                or opened.mode != stat.S_IFREG
-                or opened.nlink != 1
-                or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
-            ):
-                raise LabArtifactIntegrityError("legacy authority head changed while rebinding")
+            if opened != before:
+                raise LabArtifactIntegrityError(
+                    "legacy single authority head changed while opening"
+                )
             payload = _read_descriptor(descriptor)
             try:
                 head = LabLegacyAuthorityHead.model_validate_json(payload)
             except Exception as exc:
-                raise LabArtifactIntegrityError(
-                    "legacy authority replacement head is invalid"
-                ) from exc
-            if payload != head.canonical_json_bytes():
-                raise LabArtifactIntegrityError(
-                    "legacy authority replacement head is not canonical"
-                )
-            previous = self._head_descriptor
-            self._head_descriptor = descriptor
-            self._head_identity = opened
-            descriptor = -1
-            os.close(previous)
-            return True
+                raise LabArtifactIntegrityError("legacy single authority head is invalid") from exc
+            if (
+                payload != head.canonical_json_bytes()
+                or opened.mode != stat.S_IFREG
+                or opened.nlink != 1
+                or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
+            ):
+                raise LabArtifactIntegrityError("legacy single authority head is unsafe")
+            return head
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            os.close(descriptor)
+
+    def _bind_or_create_authority_head(self) -> None:
+        payload = _read_descriptor(self._authority_descriptor)
+        complete = self._complete_authority_payload(payload)
+        state = self._parse_authority_payload(complete)
+        selection = self._scan_authority_heads(state)
+        if selection is not None:
+            self._set_head_binding(selection)
+        legacy_head = self._read_legacy_authority_head()
+        expected_heads = self._authority_heads_for_state(state)
+        if legacy_head is not None:
+            if (
+                legacy_head.sequence >= len(expected_heads)
+                or legacy_head != expected_heads[legacy_head.sequence]
+            ):
+                raise LabArtifactIntegrityError(
+                    "legacy single authority head conflicts with ledger"
+                )
+            current_sequence = (
+                self._read_bound_authority_head().sequence if self._head_descriptor >= 0 else -1
+            )
+            for sequence in range(current_sequence + 1, legacy_head.sequence + 1):
+                expected_current = expected_heads[sequence - 1] if sequence > 0 else None
+                self._publish_authority_head(
+                    expected_heads[sequence],
+                    expected_current=expected_current,
+                )
+            self._quarantine_authority_entry(
+                self._legacy_authority_head_name,
+                source_parent=self._parent_descriptor,
+            )
+        elif self._head_descriptor < 0:
+            if state.sequence != 0:
+                raise LabArtifactIntegrityError(
+                    "legacy authority generation heads are missing for a non-empty ledger"
+                )
+            self._publish_authority_head(expected_heads[0], expected_current=None)
+
+    def _refresh_authority_head_binding(self) -> bool:
+        payload = _read_descriptor(self._authority_descriptor)
+        state = self._parse_authority_payload(self._complete_authority_payload(payload))
+        selection = self._scan_authority_heads(state)
+        if selection is None:
+            raise LabArtifactIntegrityError("legacy authority generation heads are missing")
+        name, descriptor, identity, head = selection
+        current = self._read_bound_authority_head()
+        if head.sequence < current.sequence:
+            os.close(descriptor)
+            raise LabArtifactIntegrityError("legacy authority head rollback detected")
+        if name == self._head_name and identity == self._head_identity:
+            os.close(descriptor)
+            return False
+        self._set_head_binding((name, descriptor, identity, head))
+        return True
 
     def _refresh_cache_bindings_if_authoritative(
         self,
@@ -4526,12 +4883,22 @@ class LegacyArtifactIndex:
                 name=f"{self.path.name}.authority.jsonl",
                 label="authority",
             )
-            self._assert_bound_index_file(
-                descriptor=self._head_descriptor,
-                expected=self._head_identity,
-                name=self._authority_head_name,
-                label="authority head",
+            heads_fd = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
+            heads_path = _FileObservation.from_stat(
+                os.stat(
+                    self._authority_heads_path.name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
             )
+            if (
+                heads_fd != self._heads_identity
+                or heads_path != self._heads_identity
+                or heads_fd.mode != stat.S_IFDIR
+                or stat.S_IMODE(os.fstat(self._heads_descriptor).st_mode) != 0o700
+            ):
+                raise LabArtifactIntegrityError("legacy authority heads directory identity changed")
+            self._read_bound_authority_head()
             quarantine_fd = _FileObservation.from_stat(os.fstat(self._cache_quarantine_descriptor))
             quarantine_path = _FileObservation.from_stat(
                 os.stat(
@@ -5112,12 +5479,18 @@ class LegacyArtifactIndex:
         ):
             raise LabArtifactIntegrityError("legacy authority ledger conflicts with durable head")
         if complete_state.sequence > head.sequence:
-            recovered_head = self._authority_head_for_state(complete_state)
-            self._publish_authority_head(
-                recovered_head,
-                expected_current=head,
-            )
-            head = recovered_head
+            if complete_state.sequence != head.sequence + 1:
+                raise LabArtifactIntegrityError(
+                    "legacy authority audit heads are missing beyond one crash-recovery event"
+                )
+            recovered_heads = self._authority_heads_for_state(complete_state)
+            for sequence in range(head.sequence + 1, complete_state.sequence + 1):
+                recovered_head = recovered_heads[sequence]
+                self._publish_authority_head(
+                    recovered_head,
+                    expected_current=head,
+                )
+                head = recovered_head
         if has_partial_tail:
             if not self._head_matches_state(head, complete_state):
                 raise LabArtifactIntegrityError(
@@ -5319,6 +5692,10 @@ class LegacyArtifactIndex:
     def _after_published_authority_commit(_record: LabLegacyArtifactRecord) -> None:
         """Fault-injection boundary after published ledger and head fsync."""
 
+    @staticmethod
+    def _after_import_cache_sync(_record: LabLegacyArtifactRecord) -> None:
+        """Fault-injection boundary before the bound source can be returned."""
+
     def import_file(
         self,
         *,
@@ -5417,8 +5794,11 @@ class LegacyArtifactIndex:
                     self._before_commit_source_check(source, observation)
                     _assert_bound_readonly_file(bound, label="legacy artifact source")
                     result = LabLegacyIndexResult(status="imported", record=record)
-            self._ensure_cache_ready(self._read_authority_state())
-            return result
+                self._ensure_cache_ready(self._read_authority_state())
+                self._after_import_cache_sync(result.record)
+                self._before_commit_source_check(source, observation)
+                _assert_bound_readonly_file(bound, label="legacy artifact source")
+                return result
         except BaseException as error:
             cleanup_error: BaseException | None = None
             if published is not None and not self._published_source_matches(published):

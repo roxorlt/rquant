@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 from zipfile import ZipFile
 
+import numpy as np
 import pandas as pd
 import pytest
 from pydantic import ValidationError
@@ -2010,9 +2011,9 @@ def test_legacy_head_detects_ledger_rollback_to_valid_prefix(
     index.import_file(logical_run_id="published-run", source_path=source)
     index.close()
     authority = path.with_name(f"{path.name}.authority.jsonl")
-    head = path.with_name(f"{path.name}.authority.head.json")
+    heads = path.with_name(f"{path.name}.authority.heads")
 
-    assert head.is_file()
+    assert len(tuple(heads.glob("*.json"))) == 3
     payload = authority.read_bytes()
     first_newline = payload.index(b"\n") + 1
     authority.write_bytes(b"" if truncate_to == "empty" else payload[:first_newline])
@@ -2239,7 +2240,7 @@ def test_legacy_process_lock_registry_releases_last_closed_instance(tmp_path: Pa
 
 @pytest.mark.parametrize(
     "target",
-    ["parent", "lock", "ledger", "head", "cache", "journal", "quarantine"],
+    ["parent", "lock", "ledger", "heads", "head", "cache", "journal", "quarantine"],
 )
 def test_legacy_managed_paths_require_exact_private_permissions(
     tmp_path: Path,
@@ -2248,11 +2249,14 @@ def test_legacy_managed_paths_require_exact_private_permissions(
     path = tmp_path / "index" / "legacy.sqlite3"
     index = LegacyArtifactIndex(path)
     index.close()
+    heads = path.with_name(f"{path.name}.authority.heads")
+    latest_head = sorted(heads.glob("*.json"))[-1]
     targets = {
         "parent": path.parent,
         "lock": path.with_name(f"{path.name}.lock"),
         "ledger": path.with_name(f"{path.name}.authority.jsonl"),
-        "head": path.with_name(f"{path.name}.authority.head.json"),
+        "heads": heads,
+        "head": latest_head,
         "cache": path,
         "journal": path.with_name(f"{path.name}-journal"),
         "quarantine": path.parent / ".legacy-cache-quarantine",
@@ -3152,14 +3156,268 @@ def test_legacy_instance_rebinds_valid_cache_rebuilt_without_head_change(tmp_pat
     imported = first.import_file(logical_run_id="stable-run", source_path=source)
     assert second.get("stable-run") == imported.record
     original_inode = os.fstat(first._database_descriptor).st_ino
-    head_before = path.with_name(f"{path.name}.authority.head.json").read_bytes()
+    heads = path.with_name(f"{path.name}.authority.heads")
+    heads_before = {item.name: item.read_bytes() for item in sorted(heads.glob("*.json"))}
 
     path.write_bytes(os.urandom(257))
 
     assert second.get("stable-run") == imported.record
     rebuilt_inode = os.fstat(second._database_descriptor).st_ino
     assert rebuilt_inode != original_inode
-    assert path.with_name(f"{path.name}.authority.head.json").read_bytes() == head_before
+    assert {item.name: item.read_bytes() for item in sorted(heads.glob("*.json"))} == heads_before
 
     assert first.get("stable-run") == imported.record
     assert os.fstat(first._database_descriptor).st_ino == rebuilt_inode
+
+
+def test_legacy_generation_head_reservation_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    reservation: dict[str, str] = {}
+
+    def reserve_head(
+        source_parent: int,
+        source_name: str,
+        destination_parent: int,
+        destination_name: str,
+    ) -> None:
+        descriptor = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=destination_parent,
+        )
+        os.write(descriptor, b"reservation")
+        os.close(descriptor)
+        reservation["name"] = destination_name
+        lab_artifacts_module._rename_noreplace(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        index,
+        "_atomic_authority_head_publish_noreplace",
+        reserve_head,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactConflictError, match="head.*exists|reservation|conflict"):
+        index.import_file(logical_run_id="reserved-head", source_path=source)
+
+    reserved = index.path.parent / index._authority_heads_name / reservation["name"]
+    assert reserved.read_bytes() == b"reservation"
+
+
+def test_legacy_selected_generation_head_inode_swap_is_a_conflict(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    index.import_file(logical_run_id="head-swap", source_path=source)
+    selected = index._authority_heads_path / index._head_name
+    displaced = tmp_path / "original-generation-head.json"
+    payload = selected.read_bytes()
+
+    os.rename(selected, displaced)
+    selected.write_bytes(payload)
+    os.chmod(selected, 0o600)
+
+    with pytest.raises(
+        (LabArtifactConflictError, LabArtifactIntegrityError),
+        match="head.*changed|generation.*conflict|identity",
+    ):
+        index.get("head-swap")
+
+
+def test_legacy_missing_multiple_generation_heads_is_not_crash_recovery(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    index.import_file(logical_run_id="head-loss", source_path=source)
+    index.close()
+    heads = sorted(path.with_name(f"{path.name}.authority.heads").glob("*.json"))
+    assert len(heads) == 3
+
+    heads[-1].unlink()
+    heads[-2].unlink()
+
+    with pytest.raises(LabArtifactIntegrityError, match="head.*missing|audit|recovery"):
+        LegacyArtifactIndex(path)
+
+
+def test_legacy_single_head_migrates_to_immutable_generations_from_ledger(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    original = LegacyArtifactIndex(path)
+    imported = original.import_file(logical_run_id="migrated-head", source_path=source)
+    original.close()
+    heads = path.with_name(f"{path.name}.authority.heads")
+    generation_files = sorted(heads.glob("*.json"))
+    latest_payload = generation_files[-1].read_bytes()
+    for item in generation_files:
+        item.unlink()
+    heads.rmdir()
+    legacy_head = path.with_name(f"{path.name}.authority.head.json")
+    legacy_head.write_bytes(latest_payload)
+    os.chmod(legacy_head, 0o600)
+
+    migrated = LegacyArtifactIndex(path)
+
+    assert migrated.get("migrated-head") == imported.record
+    assert len(tuple(heads.glob("*.json"))) == 3
+    assert not legacy_head.exists()
+    assert any(
+        item.name.startswith(f"{legacy_head.name}.")
+        for item in (path.parent / ".legacy-authority-quarantine").iterdir()
+    )
+
+
+def test_object_null_kinds_have_distinct_hashes_and_cannot_be_folded_by_parquet(
+    tmp_path: Path,
+) -> None:
+    values = (None, float("nan"), pd.NA, pd.NaT)
+    hashes = {
+        lab_artifacts_module._table_content_hash(
+            pd.DataFrame({"value": pd.Series([value], dtype=object)})
+        )
+        for value in values
+    }
+
+    assert len(hashes) == len(values)
+    assert lab_artifacts_module._canonical_table_value(np.datetime64("NaT")) == {
+        "$datetime_nat": "datetime64"
+    }
+
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    frame = pd.DataFrame({"value": pd.Series(list(values), dtype=object)})
+    with pytest.raises(
+        LabArtifactIntegrityError,
+        match="round-trip changed canonical content semantics|unsupported semantic",
+    ):
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="object-null-review",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"object_nulls": frame},
+        )
+
+
+def test_legacy_import_keeps_source_bound_through_cache_sync_and_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    displaced = tmp_path / "legacy.original.json"
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    swapped = False
+
+    def replace_after_cache_sync(_record: object) -> None:
+        nonlocal swapped
+        os.rename(source, displaced)
+        source.write_text('{"replacement":true}', encoding="utf-8")
+        swapped = True
+
+    monkeypatch.setattr(
+        index,
+        "_after_import_cache_sync",
+        replace_after_cache_sync,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="source.*changed|publication"):
+        index.import_file(logical_run_id="cache-race", source_path=source)
+
+    assert swapped is True
+    assert index.get("cache-race") is None
+
+    source.unlink()
+    os.rename(displaced, source)
+    monkeypatch.setattr(index, "_after_import_cache_sync", lambda _record: None, raising=False)
+    retried = index.import_file(logical_run_id="cache-race", source_path=source)
+    assert retried.status == "imported"
+
+
+def test_zip_destination_inode_swap_before_return_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    destination = tmp_path / "exports" / "bundle.zip"
+    displaced = tmp_path / "published-original.zip"
+    swapped = False
+
+    def replace_zip(path: Path) -> None:
+        nonlocal swapped
+        os.rename(path, displaced)
+        path.write_bytes(displaced.read_bytes())
+        os.chmod(path, 0o600)
+        swapped = True
+
+    monkeypatch.setattr(
+        store,
+        "_after_zip_final_checks",
+        replace_zip,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="ZIP.*identity|destination.*changed"):
+        store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
+
+    assert swapped is True
+
+
+@pytest.mark.parametrize("operation", ["candidate", "recovery"])
+def test_quarantine_target_inode_swap_before_return_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    displaced = tmp_path / f"quarantine-original-{operation}"
+    swapped = False
+
+    def replace_quarantine(record: object) -> None:
+        nonlocal swapped
+        path = record.path  # type: ignore[attr-defined]
+        os.chmod(path, 0o700)
+        os.rename(path, displaced)
+        shutil.copytree(displaced, path, copy_function=shutil.copy2)
+        swapped = True
+
+    monkeypatch.setattr(
+        store,
+        "_after_quarantine_record_finalized",
+        replace_quarantine,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="quarantine.*identity|target.*changed"):
+        if operation == "candidate":
+            store.quarantine_candidate(candidate, reason="review race")
+        else:
+            recovery = next(
+                item for item in store.list_candidate_recovery() if item.path == candidate.path
+            )
+            store.quarantine_recovery_record(recovery, reason="review race")
+
+    assert swapped is True
