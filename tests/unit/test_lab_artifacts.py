@@ -1191,9 +1191,11 @@ def test_seal_intent_replacement_during_freeze_never_publishes(
 
     monkeypatch.setattr(store, "_seal_bound_files", freeze_then_replace)
 
-    with pytest.raises(LabArtifactIntegrityError, match="seal intent.*identity"):
+    with pytest.raises(ExceptionGroup) as captured:
         store.seal_candidate(candidate)
 
+    assert len(captured.value.exceptions) == 2
+    assert all(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
     assert not (store.sealed_root / candidate.job_id.hex).exists()
     assert candidate.path.exists()
 
@@ -1737,9 +1739,11 @@ def test_zip_temp_cleanup_never_removes_replacement_inode(
         replace_temp_then_conflict,
     )
 
-    with pytest.raises(BaseException, match="temporary.*identity|cleanup.*changed"):
+    with pytest.raises(ExceptionGroup) as captured:
         store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
 
+    assert any(isinstance(item, LabArtifactConflictError) for item in captured.value.exceptions)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
     assert replaced_temp is not None
     assert replaced_temp.read_bytes() == replacement_payload
 
@@ -1778,12 +1782,37 @@ def test_zip_discard_cleanup_never_unlinks_replacement_inode(
         raising=False,
     )
 
-    with pytest.raises(LabArtifactIntegrityError, match="cleanup.*identity"):
+    with pytest.raises(ExceptionGroup) as captured:
         store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
 
+    assert any(isinstance(item, LabArtifactConflictError) for item in captured.value.exceptions)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
     assert destination.read_bytes() == b"reservation"
     assert replacement_path is not None
     assert replacement_path.read_bytes() == replacement_payload
+
+
+def test_zip_publication_and_cleanup_failures_are_both_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    destination = tmp_path / "reserved.zip"
+    destination.write_bytes(b"reservation")
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected ZIP cleanup failure")
+
+    monkeypatch.setattr(store, "_quarantine_failed_zip_temporary", fail_cleanup)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
+
+    assert any(isinstance(item, LabArtifactConflictError) for item in captured.value.exceptions)
+    assert any(isinstance(item, OSError) for item in captured.value.exceptions)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
 
 
 def test_public_verified_sealed_binding_keeps_transaction_evidence_bound(
@@ -1798,6 +1827,98 @@ def test_public_verified_sealed_binding_keeps_transaction_evidence_bound(
         assert binding.sealed.manifest_hash == sealed.manifest_hash
         assert binding.evidence == _evidence(sealed).model_copy(update={"indexed_at": indexed_at})
         assert all("descriptor" not in name for name in type(binding).model_fields)
+
+
+def test_seal_intent_preserves_caller_and_final_identity_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    def fail_final_identity(_bound: object) -> None:
+        raise LabArtifactIntegrityError("injected final intent failure")
+
+    with (
+        pytest.raises(BaseExceptionGroup) as captured,
+        store._bind_seal_intent(
+            candidate.job_id,
+            candidate=candidate,
+            create=True,
+        ),
+    ):
+        monkeypatch.setattr(
+            store,
+            "_assert_bound_seal_intent",
+            fail_final_identity,
+        )
+        raise RuntimeError("injected caller failure")
+
+    assert any(isinstance(item, RuntimeError) for item in captured.value.exceptions)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_public_verified_sealed_binding_reads_small_payloads_seven_times(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    read_descriptor = lab_artifacts_module._read_descriptor
+    read_sizes: list[int] = []
+
+    def count_read(descriptor: int) -> bytes:
+        payload = read_descriptor(descriptor)
+        read_sizes.append(len(payload))
+        return payload
+
+    monkeypatch.setattr(lab_artifacts_module, "_read_descriptor", count_read)
+
+    with store.bind_verified_sealed(
+        sealed.path,
+        indexed_at=datetime(2026, 7, 25, 9, tzinfo=UTC),
+    ):
+        pass
+
+    assert len(read_sizes) == 7
+
+
+def test_public_verified_sealed_binding_streams_large_parquet_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    arguments = _prepare_arguments()
+    arguments["tables"] = {
+        "large": pd.DataFrame(
+            {
+                "sequence": np.arange(250_000, dtype=np.int64),
+                "value": np.linspace(-1.0, 1.0, 250_000, dtype=np.float64),
+            }
+        )
+    }
+    sealed = store.seal_candidate(store.prepare_candidate(**arguments))
+    parquet_size = (sealed.path / "tables" / "large.parquet").stat().st_size
+    read_descriptor = lab_artifacts_module._read_descriptor
+    read_sizes: list[int] = []
+
+    def record_small_read(descriptor: int) -> bytes:
+        payload = read_descriptor(descriptor)
+        read_sizes.append(len(payload))
+        return payload
+
+    monkeypatch.setattr(lab_artifacts_module, "_read_descriptor", record_small_read)
+
+    with store.bind_verified_sealed(
+        sealed.path,
+        indexed_at=datetime(2026, 7, 25, 9, tzinfo=UTC),
+    ):
+        pass
+
+    assert len(read_sizes) == 7
+    assert parquet_size > max(read_sizes)
 
 
 def test_public_verified_sealed_binding_rechecks_every_inode_on_exit(
@@ -2279,6 +2400,22 @@ def test_legacy_import_is_read_only_idempotent_and_records_fd_identity(tmp_path:
         before.st_size,
         before.st_mtime_ns,
     )
+
+
+def test_legacy_missing_source_failures_do_not_leak_parent_descriptors(tmp_path: Path) -> None:
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    missing = tmp_path / "sources" / "missing.json"
+    missing.parent.mkdir(mode=0o700)
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    for sequence in range(20):
+        with pytest.raises(LabArtifactIntegrityError, match="cannot be opened safely"):
+            index.import_file(
+                logical_run_id=f"missing-{sequence}",
+                source_path=missing,
+            )
+
+    assert len(os.listdir("/dev/fd")) == before_descriptors
 
 
 def test_legacy_invalidated_source_can_publish_a_new_generation(tmp_path: Path) -> None:
@@ -4867,6 +5004,82 @@ def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> 
     assert process_a.wait(timeout=15) == 0
     assert process_b.wait(timeout=15) == 0
     assert second_marker.exists() is True
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="real 0500 namespace fallback is Linux-specific",
+)
+def test_linux_namespace_guard_blocks_rename_and_recovers_after_process_crash(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory write permissions")
+    root = tmp_path / "artifacts"
+    marker = tmp_path / "linux-guard.json"
+    escaped = tmp_path / "escaped-candidate"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import stat
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LabJobArtifactStore
+        from tests.unit.test_lab_artifacts import _prepare_arguments
+
+        root, marker, escaped = map(Path, sys.argv[1:4])
+        store = LabJobArtifactStore(root)
+        def crash_while_guarded(intent):
+            candidate = store.candidates_root / intent.candidate_name
+            tables = candidate / "tables"
+            modes = [
+                stat.S_IMODE(path.stat().st_mode)
+                for path in (store.candidates_root, candidate, tables)
+            ]
+            blocked = False
+            try:
+                os.rename(candidate, escaped)
+            except PermissionError:
+                blocked = True
+            marker.write_text(
+                json.dumps(
+                    {
+                        "blocked": blocked,
+                        "candidate_name": intent.candidate_name,
+                        "modes": modes,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os._exit(87)
+        store._after_candidate_namespace_guarded = crash_while_guarded
+        store.prepare_candidate(**_prepare_arguments())
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root), str(marker), str(escaped)],
+        check=False,
+        cwd=Path(__file__).parents[2],
+        env=os.environ.copy(),
+    )
+
+    assert completed.returncode == 87
+    observed = json.loads(marker.read_text(encoding="utf-8"))
+    assert observed["blocked"] is True
+    assert observed["modes"] == [0o500, 0o500, 0o500]
+    candidate = root / "candidates" / observed["candidate_name"]
+    assert escaped.exists() is False
+    assert stat.S_IMODE((root / "candidates").stat().st_mode) == 0o500
+
+    recovered = LabJobArtifactStore(root)
+
+    assert stat.S_IMODE(recovered.candidates_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(candidate.stat().st_mode) == 0o700
+    assert stat.S_IMODE((candidate / "tables").stat().st_mode) == 0o700
+    assert list(recovered.namespace_guard_active_root.iterdir()) == []
+    assert list(recovered.namespace_guard_history_root.glob("*.json"))
 
 
 def test_durable_poison_blocks_export_from_an_already_open_process(tmp_path: Path) -> None:

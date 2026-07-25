@@ -1021,6 +1021,14 @@ def _read_descriptor(descriptor: int) -> bytes:
     return b"".join(chunks)
 
 
+def _sha256_descriptor(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _matches_file_identity(
     observed: _FileObservation,
     expected: LabArtifactFileIdentity,
@@ -1321,36 +1329,37 @@ def _assert_bound_readonly_file(bound: _BoundReadonlyFile, *, label: str) -> Non
 def _open_bound_readonly_file(path: Path, *, label: str) -> Iterator[_BoundReadonlyFile]:
     parent_descriptor = -1
     descriptor = -1
+    bound: _BoundReadonlyFile | None = None
     try:
-        parent_descriptor = _secure_open_directory(path.parent, create=False)
-        parent_identity = _FileObservation.from_stat(os.fstat(parent_descriptor))
-        before = _FileObservation.from_stat(
-            os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        )
-        if before.mode != stat.S_IFREG or before.nlink != 1:
-            raise LabArtifactIntegrityError(f"{label} is not a private regular file")
-        descriptor = os.open(
-            path.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_descriptor,
-        )
-        opened = _FileObservation.from_stat(os.fstat(descriptor))
-        if opened != before:
-            raise LabArtifactIntegrityError(f"{label} changed while opening")
-        bound = _BoundReadonlyFile(
-            path=path,
-            parent_descriptor=parent_descriptor,
-            descriptor=descriptor,
-            parent_identity=parent_identity,
-            file_identity=opened,
-        )
-        _assert_bound_readonly_file(bound, label=label)
-    except LabArtifactError:
-        raise
-    except OSError as exc:
-        raise LabArtifactIntegrityError(f"{label} cannot be opened safely") from exc
-    caller_error: BaseException | None = None
-    try:
+        try:
+            parent_descriptor = _secure_open_directory(path.parent, create=False)
+            parent_identity = _FileObservation.from_stat(os.fstat(parent_descriptor))
+            before = _FileObservation.from_stat(
+                os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            )
+            if before.mode != stat.S_IFREG or before.nlink != 1:
+                raise LabArtifactIntegrityError(f"{label} is not a private regular file")
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = _FileObservation.from_stat(os.fstat(descriptor))
+            if opened != before:
+                raise LabArtifactIntegrityError(f"{label} changed while opening")
+            bound = _BoundReadonlyFile(
+                path=path,
+                parent_descriptor=parent_descriptor,
+                descriptor=descriptor,
+                parent_identity=parent_identity,
+                file_identity=opened,
+            )
+            _assert_bound_readonly_file(bound, label=label)
+        except LabArtifactError:
+            raise
+        except OSError as exc:
+            raise LabArtifactIntegrityError(f"{label} cannot be opened safely") from exc
+        caller_error: BaseException | None = None
         try:
             yield bound
         except BaseException as exc:
@@ -1367,7 +1376,7 @@ def _open_bound_readonly_file(path: Path, *, label: str) -> Iterator[_BoundReado
         if caller_error is not None:
             raise caller_error
     finally:
-        if "bound" in locals():
+        if bound is not None:
             bound.close()
         else:
             if descriptor >= 0:
@@ -3272,17 +3281,29 @@ class LabJobArtifactStore:
         permission_profile: Literal["candidate", "interrupted", "sealed"],
     ) -> tuple[LabArtifactFileIdentity, ...]:
         self._assert_bound_paths(bound)
-        payloads: dict[str, bytes] = {}
         identities: list[LabArtifactFileIdentity] = []
         expected_hashes = self._expected_bound_hashes(manifest)
+        manifest_files = {item.relative_path: item for item in manifest.files}
+        expected_sums = {item.relative_path: item.sha256 for item in manifest.files}
+        expected_sums["manifest.json"] = manifest.manifest_hash
+        canonical_sums = "".join(
+            f"{digest}  {relative_path}\n"
+            for relative_path, digest in sorted(expected_sums.items())
+        ).encode("ascii")
         for relative_path in sorted(bound.files):
             item = bound.files[relative_path]
             observed = _FileObservation.from_stat(os.fstat(item.descriptor))
-            payload = _read_descriptor(item.descriptor)
+            manifest_file = manifest_files.get(relative_path)
+            parquet = manifest_file.parquet if manifest_file is not None else None
+            if parquet is None:
+                payload = _read_descriptor(item.descriptor)
+                digest = _sha256(payload)
+            else:
+                payload = None
+                digest = _sha256_descriptor(item.descriptor)
             self._after_bound_file_read(relative_path, bound)
-            if len(payload) != observed.size or _sha256(payload) != expected_hashes[relative_path]:
+            if observed.size != item.current.size or digest != expected_hashes[relative_path]:
                 raise LabArtifactIntegrityError(f"job artifact bytes conflict: {relative_path}")
-            payloads[relative_path] = payload
             identities.append(self._artifact_identity(relative_path, observed))
             mode = stat.S_IMODE(os.fstat(item.descriptor).st_mode)
             allowed = {0o400} if permission_profile == "sealed" else {0o600}
@@ -3292,6 +3313,75 @@ class LabJobArtifactStore:
                 raise LabArtifactIntegrityError(
                     f"{permission_profile} artifact file permissions conflict: {relative_path}"
                 )
+            if relative_path == "manifest.json":
+                if payload is None:
+                    raise LabArtifactIntegrityError("manifest.json payload was not loaded")
+                if payload != manifest.canonical_json_bytes():
+                    raise LabArtifactIntegrityError("job artifact manifest bytes conflict")
+            elif relative_path == "spec.json":
+                if payload is None:
+                    raise LabArtifactIntegrityError("spec.json payload was not loaded")
+                rebuilt_spec = _rebuild_research_run_spec(payload)
+                if rebuilt_spec.spec_hash != manifest.spec_hash:
+                    raise LabArtifactIntegrityError("spec.json does not match spec_hash")
+                if (
+                    rebuilt_spec.code_sha != manifest.code_sha
+                    or rebuilt_spec.dataset_snapshot != manifest.dataset_snapshot
+                ):
+                    raise LabArtifactIntegrityError(
+                        "manifest spec identity conflicts with spec.json"
+                    )
+            elif relative_path == "metrics.json":
+                if payload is None:
+                    raise LabArtifactIntegrityError("metrics.json payload was not loaded")
+                _validate_metrics_payload(payload)
+            elif relative_path == "report.md":
+                if payload is None:
+                    raise LabArtifactIntegrityError("report.md payload was not loaded")
+                try:
+                    payload.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise LabArtifactIntegrityError("report.md is not valid UTF-8") from exc
+            elif relative_path == "SHA256SUMS":
+                if payload is None:
+                    raise LabArtifactIntegrityError("SHA256SUMS payload was not loaded")
+                if payload != canonical_sums:
+                    raise LabArtifactIntegrityError("SHA256SUMS is not canonical or does not match")
+            elif parquet is not None:
+                try:
+                    os.lseek(item.descriptor, 0, os.SEEK_SET)
+                    with os.fdopen(os.dup(item.descriptor), "rb") as stream:
+                        frame = pd.read_parquet(stream)
+                    frame = _restore_manifest_dtypes(frame, parquet.dtype_identities)
+                except Exception as exc:
+                    raise LabArtifactIntegrityError(
+                        f"Parquet artifact cannot be read: {relative_path}"
+                    ) from exc
+                actual = (
+                    len(frame),
+                    tuple(frame.columns),
+                    tuple(str(dtype) for dtype in frame.dtypes),
+                    _frame_dtype_identities(frame),
+                    _table_content_hash(frame),
+                )
+                expected = (
+                    parquet.row_count,
+                    parquet.columns,
+                    parquet.dtypes,
+                    parquet.dtype_identities,
+                    parquet.content_sha256,
+                )
+                del frame
+                if actual != expected:
+                    raise LabArtifactIntegrityError(
+                        f"Parquet artifact content conflicts: {relative_path}"
+                    )
+            else:
+                raise LabArtifactIntegrityError(
+                    f"job artifact file has no validation contract: {relative_path}"
+                )
+            if payload is not None:
+                del payload
         directory_modes = (
             {0o500}
             if permission_profile == "sealed"
@@ -3305,59 +3395,6 @@ class LabJobArtifactStore:
             raise LabArtifactIntegrityError(
                 f"{permission_profile} artifact tables permissions conflict"
             )
-        if payloads["manifest.json"] != manifest.canonical_json_bytes():
-            raise LabArtifactIntegrityError("job artifact manifest bytes conflict")
-        rebuilt_spec = _rebuild_research_run_spec(payloads["spec.json"])
-        if rebuilt_spec.spec_hash != manifest.spec_hash:
-            raise LabArtifactIntegrityError("spec.json does not match spec_hash")
-        if (
-            rebuilt_spec.code_sha != manifest.code_sha
-            or rebuilt_spec.dataset_snapshot != manifest.dataset_snapshot
-        ):
-            raise LabArtifactIntegrityError("manifest spec identity conflicts with spec.json")
-        _validate_metrics_payload(payloads["metrics.json"])
-        try:
-            payloads["report.md"].decode("utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            raise LabArtifactIntegrityError("report.md is not valid UTF-8") from exc
-        for relative_path, entry in sorted(
-            ((item.relative_path, item) for item in manifest.files),
-        ):
-            if entry.parquet is None:
-                continue
-            try:
-                frame = pd.read_parquet(io.BytesIO(payloads[relative_path]))
-                frame = _restore_manifest_dtypes(frame, entry.parquet.dtype_identities)
-            except Exception as exc:
-                raise LabArtifactIntegrityError(
-                    f"Parquet artifact cannot be read: {relative_path}"
-                ) from exc
-            actual = (
-                len(frame),
-                tuple(frame.columns),
-                tuple(str(item) for item in frame.dtypes),
-                _frame_dtype_identities(frame),
-                _table_content_hash(frame),
-            )
-            expected = (
-                entry.parquet.row_count,
-                entry.parquet.columns,
-                entry.parquet.dtypes,
-                entry.parquet.dtype_identities,
-                entry.parquet.content_sha256,
-            )
-            if actual != expected:
-                raise LabArtifactIntegrityError(
-                    f"Parquet artifact content conflicts: {relative_path}"
-                )
-        expected_sums = {item.relative_path: item.sha256 for item in manifest.files}
-        expected_sums["manifest.json"] = manifest.manifest_hash
-        sums = "".join(
-            f"{digest}  {relative_path}\n"
-            for relative_path, digest in sorted(expected_sums.items())
-        ).encode("ascii")
-        if payloads["SHA256SUMS"] != sums:
-            raise LabArtifactIntegrityError("SHA256SUMS is not canonical or does not match")
         if manifest.complete_result_hash != _sha256(
             canonical_json_bytes(
                 _complete_result_hash_payload(
@@ -3613,13 +3650,16 @@ class LabJobArtifactStore:
     ) -> None:
         expected = self._expected_bound_hashes(manifest)
         for relative_path, item in bound.files.items():
-            payload = _read_descriptor(item.descriptor)
-            if len(payload) != item.current.size or _sha256(payload) != expected[relative_path]:
+            observed = _FileObservation.from_stat(os.fstat(item.descriptor))
+            if relative_path == "manifest.json":
+                payload = _read_descriptor(item.descriptor)
+                digest = _sha256(payload)
+                if payload != manifest.canonical_json_bytes():
+                    raise LabArtifactIntegrityError("bound candidate manifest changed")
+            else:
+                digest = _sha256_descriptor(item.descriptor)
+            if observed.size != item.current.size or digest != expected[relative_path]:
                 raise LabArtifactIntegrityError(f"bound artifact bytes changed: {relative_path}")
-        if _read_descriptor(bound.files["manifest.json"].descriptor) != (
-            manifest.canonical_json_bytes()
-        ):
-            raise LabArtifactIntegrityError("bound candidate manifest changed")
         self._assert_bound_paths(bound)
 
     def _seal_intent_path(self, job_id: UUID) -> Path:
@@ -3810,13 +3850,15 @@ class LabJobArtifactStore:
         candidate: LabJobArtifactCandidate | None,
         create: bool,
     ) -> Iterator[_BoundSealIntent]:
-        parent_descriptor = self._managed_parent_descriptor(self.seal_intents_root)
+        parent_descriptor = -1
         descriptor = -1
-        name = f"{job_id.hex}.json"
-        expected = self._candidate_seal_intent(candidate) if candidate is not None else None
+        bound: _BoundSealIntent | None = None
         fault_boundary_reached = False
         published_here = False
         try:
+            parent_descriptor = self._managed_parent_descriptor(self.seal_intents_root)
+            name = f"{job_id.hex}.json"
+            expected = self._candidate_seal_intent(candidate) if candidate is not None else None
             if create and expected is not None:
                 self._quarantine_orphaned_seal_intent_temps(job_id)
                 state = self._seal_intent_state(job_id)
@@ -3923,13 +3965,33 @@ class LabJobArtifactStore:
                 self._assert_bound_seal_intent(bound)
             self._after_seal_intent_bound(bound)
             self._assert_bound_seal_intent(bound)
+            caller_error: BaseException | None = None
             try:
                 yield bound
-            except BaseException:
+            except BaseException as exc:
+                caller_error = exc
+            integrity_error: BaseException | None = None
+            try:
                 self._assert_bound_seal_intent(bound)
-                raise
-            else:
-                self._assert_bound_seal_intent(bound)
+            except BaseException as exc:
+                integrity_error = exc
+            if caller_error is not None and integrity_error is not None:
+                if isinstance(caller_error, Exception) and isinstance(
+                    integrity_error,
+                    Exception,
+                ):
+                    raise ExceptionGroup(
+                        "seal intent caller and final identity checks both failed",
+                        [caller_error, integrity_error],
+                    ) from None
+                raise BaseExceptionGroup(
+                    "seal intent caller and final identity checks both failed",
+                    [caller_error, integrity_error],
+                ) from None
+            if integrity_error is not None:
+                raise integrity_error
+            if caller_error is not None:
+                raise caller_error
         except LabArtifactError:
             raise
         except OSError as exc:
@@ -3937,12 +3999,13 @@ class LabJobArtifactStore:
                 raise
             raise LabArtifactIntegrityError("job artifact seal intent cannot be bound") from exc
         finally:
-            if "bound" in locals():
+            if bound is not None:
                 bound.close()
             else:
                 if descriptor >= 0:
                     os.close(descriptor)
-                os.close(parent_descriptor)
+                if parent_descriptor >= 0:
+                    os.close(parent_descriptor)
 
     @staticmethod
     def _intent_matches_candidate(
@@ -4415,6 +4478,15 @@ class LabJobArtifactStore:
             expected_bundle=observed,
             expected_files=identities,
         ) as bound:
+            sealed = LabSealedJobArtifact(
+                path=managed,
+                manifest=manifest,
+                manifest_hash=manifest.manifest_hash,
+                device=bound.current.device,
+                inode=bound.current.inode,
+                file_identities=identities,
+            )
+            self._after_existing_sealed_bound(bound, sealed)
             verified_identities = self._validate_bound_bundle(
                 bound,
                 manifest,
@@ -4422,17 +4494,10 @@ class LabJobArtifactStore:
             )
             if managed.name != manifest.job_id.hex:
                 raise LabArtifactIntegrityError("sealed path does not match job identity")
-            sealed = LabSealedJobArtifact(
-                path=managed,
-                manifest=manifest,
-                manifest_hash=manifest.manifest_hash,
-                device=bound.current.device,
-                inode=bound.current.inode,
-                file_identities=verified_identities,
+            sealed = sealed.model_copy(
+                update={"file_identities": verified_identities},
             )
-            self._after_existing_sealed_bound(bound, sealed)
             self._assert_bound_paths(bound)
-            self._verify_bound_bytes(bound, manifest)
             caller_error: BaseException | None = None
             try:
                 try:
@@ -5114,11 +5179,13 @@ class LabJobArtifactStore:
         expected_inode: int,
         expected_file_type: Literal["directory", "regular", "symlink", "other"] = "directory",
     ) -> Iterator[_FileObservation]:
-        source_parent = self._managed_parent_descriptor(self.candidates_root)
-        target_parent = self._managed_parent_descriptor(self.quarantine_root)
+        source_parent = -1
+        target_parent = -1
         source_descriptor = -1
         target_descriptor = -1
         try:
+            source_parent = self._managed_parent_descriptor(self.candidates_root)
+            target_parent = self._managed_parent_descriptor(self.quarantine_root)
             before = _FileObservation.from_stat(
                 os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
             )
@@ -5247,8 +5314,10 @@ class LabJobArtifactStore:
                 os.close(target_descriptor)
             if source_descriptor >= 0:
                 os.close(source_descriptor)
-            os.close(source_parent)
-            os.close(target_parent)
+            if source_parent >= 0:
+                os.close(source_parent)
+            if target_parent >= 0:
+                os.close(target_parent)
 
     @staticmethod
     def _authorize_export(
@@ -5467,6 +5536,8 @@ class LabJobArtifactStore:
         temporary_descriptor = -1
         temporary_published = False
         destination_descriptor = -1
+        result: Path | None = None
+        main_error: BaseException | None = None
         try:
             observed, manifest, identities = self._probe_bundle(
                 managed,
@@ -5629,7 +5700,9 @@ class LabJobArtifactStore:
                     raise LabArtifactIntegrityError("ZIP destination bytes changed before return")
                 self._assert_bound_paths(bound)
                 self._assert_managed_roots()
-            return destination
+            result = destination
+        except BaseException as exc:
+            main_error = exc
         finally:
             cleanup_error: BaseException | None = None
             if temporary_descriptor >= 0 and not temporary_published:
@@ -5650,8 +5723,23 @@ class LabJobArtifactStore:
                 if descriptor >= 0:
                     with suppress(OSError):
                         os.close(descriptor)
+            if main_error is not None and cleanup_error is not None:
+                if isinstance(main_error, Exception) and isinstance(cleanup_error, Exception):
+                    raise ExceptionGroup(
+                        "ZIP publication and cleanup both failed",
+                        [main_error, cleanup_error],
+                    ) from None
+                raise BaseExceptionGroup(
+                    "ZIP publication and cleanup both failed",
+                    [main_error, cleanup_error],
+                ) from None
             if cleanup_error is not None:
                 raise cleanup_error
+        if main_error is not None:
+            raise main_error
+        if result is None:
+            raise LabArtifactIntegrityError("ZIP export completed without a result")
+        return result
 
 
 @dataclass(frozen=True)
@@ -6684,11 +6772,13 @@ class LegacyArtifactIndex:
 
     @contextmanager
     def _cache_connection(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self._connect()
             yield connection
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     @staticmethod
     def _initialize_cache_schema(connection: sqlite3.Connection) -> None:
