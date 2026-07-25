@@ -207,6 +207,27 @@ def _persist_forged_manifest(
     )
 
 
+def _resign_candidate_file(
+    candidate: LabJobArtifactCandidate,
+    *,
+    relative_path: str,
+    payload: bytes,
+) -> None:
+    (candidate.path / relative_path).write_bytes(payload)
+    changed_files = tuple(
+        item.model_copy(
+            update={
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        if item.relative_path == relative_path
+        else item
+        for item in candidate.manifest.files
+    )
+    _persist_forged_manifest(candidate, files=changed_files)
+
+
 def test_prepare_verify_seal_and_idempotently_reuse_complete_bundle(tmp_path: Path) -> None:
     store = LabJobArtifactStore(tmp_path / "artifacts")
     candidate = _prepare(store)
@@ -873,6 +894,105 @@ def test_seal_intent_replacement_during_freeze_never_publishes(
     assert candidate.path.exists()
 
 
+@pytest.mark.parametrize("payload", [b"", b"{", b'{"partial":true}'])
+def test_orphaned_seal_intent_temp_is_logically_isolated_before_retry(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    temporary = store.seal_intents_root / (f".{candidate.job_id.hex}.{uuid4().hex}.intent.tmp")
+    temporary.write_bytes(payload)
+    os.chmod(temporary, 0o600)
+
+    sealed = store.seal_candidate(candidate)
+
+    assert sealed.manifest_hash == candidate.manifest_hash
+    assert not temporary.exists()
+    intent_quarantine = store.root / "seal-intents-quarantine"
+    assert any(item.read_bytes() == payload for item in intent_quarantine.iterdir())
+
+
+def test_crash_before_seal_intent_publish_leaves_recoverable_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+
+    def crash_before_publish(_descriptor: int, _name: str) -> None:
+        raise OSError("crash before intent publish")
+
+    monkeypatch.setattr(store, "_after_seal_intent_temp_fsync", crash_before_publish)
+
+    with pytest.raises(OSError, match="before intent publish"):
+        store.seal_candidate(candidate)
+
+    assert not (store.seal_intents_root / f"{candidate.job_id.hex}.json").exists()
+    assert candidate.path.exists()
+    assert any(
+        item.name.startswith(f".{candidate.job_id.hex}.")
+        for item in store.seal_intents_root.iterdir()
+    )
+
+    restarted = LabJobArtifactStore(store.root)
+    recovered = restarted.seal_candidate(restarted._candidate_from_path(candidate.path))
+    assert recovered.manifest_hash == candidate.manifest_hash
+
+
+def test_crash_after_seal_intent_publish_reuses_complete_final_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+
+    def crash_after_publish(_bound: object) -> None:
+        raise OSError("crash after intent publish")
+
+    monkeypatch.setattr(store, "_after_seal_intent_publish", crash_after_publish)
+
+    with pytest.raises(OSError, match="after intent publish"):
+        store.seal_candidate(candidate)
+
+    final_intent = store.seal_intents_root / f"{candidate.job_id.hex}.json"
+    assert final_intent.is_file()
+    assert candidate.path.exists()
+
+    restarted = LabJobArtifactStore(store.root)
+    recovered = restarted.seal_candidate(
+        restarted._candidate_from_path(candidate.path, allow_interrupted_seal=True)
+    )
+    assert recovered.manifest_hash == candidate.manifest_hash
+
+
+@pytest.mark.parametrize("payload", [b"", b"{", b'{"schema_version":1'])
+def test_torn_final_intent_requires_authority_then_is_quarantined_and_rebuilt(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    intent = store.seal_intents_root / f"{candidate.job_id.hex}.json"
+    intent.write_bytes(payload)
+    os.chmod(intent, 0o600)
+    record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
+
+    assert record.status == "needs_authority"
+    with pytest.raises(LabArtifactAuthorizationError, match="authority"):
+        store.recover_candidate(record)
+
+    sealed = store.recover_candidate(
+        record,
+        authority=_recovery_authority(candidate),
+    )
+
+    assert sealed.manifest_hash == candidate.manifest_hash
+    assert any(
+        item.read_bytes() == payload for item in (store.root / "seal-intents-quarantine").iterdir()
+    )
+
+
 @pytest.mark.parametrize(
     "boundary",
     ["before_directory_chmod", "after_tables_fsync", "before_bundle_fsync"],
@@ -1209,6 +1329,41 @@ def test_zip_destination_reservation_is_never_overwritten(
     assert destination.read_bytes() == b"reservation"
 
 
+def test_public_verified_sealed_binding_keeps_transaction_evidence_bound(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    indexed_at = datetime(2026, 7, 25, 10, tzinfo=UTC)
+
+    with store.bind_verified_sealed(sealed.path, indexed_at=indexed_at) as binding:
+        assert isinstance(binding, lab_artifacts_module.LabVerifiedSealedBinding)
+        assert binding.sealed.manifest_hash == sealed.manifest_hash
+        assert binding.evidence == _evidence(sealed).model_copy(update={"indexed_at": indexed_at})
+        assert all("descriptor" not in name for name in type(binding).model_fields)
+
+
+def test_public_verified_sealed_binding_rechecks_every_inode_on_exit(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    report = sealed.path / "report.md"
+    displaced = tmp_path / "bound-report.md"
+
+    with (
+        pytest.raises(LabArtifactIntegrityError, match="identity|changed"),
+        store.bind_verified_sealed(
+            sealed.path,
+            indexed_at=datetime(2026, 7, 25, 10, tzinfo=UTC),
+        ),
+    ):
+        os.chmod(sealed.path, 0o700)
+        os.rename(report, displaced)
+        report.write_bytes(displaced.read_bytes())
+        os.chmod(report, 0o400)
+
+
 def test_zip_destination_rejects_ancestor_symlink_without_external_writes(
     tmp_path: Path,
 ) -> None:
@@ -1305,6 +1460,37 @@ def test_prepare_rejects_unsafe_paths_nan_and_infinite_metrics(tmp_path: Path) -
                 report_markdown="ok",
                 tables={"result": pd.DataFrame({"x": [1]})},
             )
+
+
+@pytest.mark.parametrize(
+    "forged_value",
+    [
+        {"$datetime": "not-a-datetime"},
+        {"$float": "nan"},
+        {"$decimal": "NaN"},
+        {"$uuid": "not-a-uuid"},
+        {"$path": 7},
+        {"$date": "2026-99-99"},
+        {"$date": "2026-07-25", "extra": True},
+    ],
+)
+def test_resigned_metrics_with_invalid_or_ambiguous_reserved_tag_is_rejected(
+    tmp_path: Path,
+    forged_value: object,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    metrics_bytes = canonical_json_bytes({"forged": forged_value})
+    _resign_candidate_file(
+        candidate,
+        relative_path="metrics.json",
+        payload=metrics_bytes,
+    )
+
+    records = LabJobArtifactStore(store.root).list_candidate_recovery()
+
+    assert records[0].status == "invalid"
+    assert "metrics.json" in (records[0].reason or "")
 
 
 def test_inventory_model_is_strict_frozen_and_forbids_extra_fields() -> None:
@@ -1638,6 +1824,173 @@ def test_legacy_process_crash_after_stage_commit_remains_invisible_and_resumable
     assert restarted.get("old-run") == imported.record
 
 
+def test_legacy_partial_tail_is_truncated_without_losing_published_generation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "legacy-index.sqlite3"
+    index = LegacyArtifactIndex(path)
+    imported = index.import_file(logical_run_id="published-run", source_path=source)
+    index.close()
+    authority = path.with_name(f"{path.name}.authority.jsonl")
+    complete = authority.read_bytes()
+    with authority.open("ab") as stream:
+        stream.write(b'{"event_type":"staged"')
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    restarted = LegacyArtifactIndex(path)
+
+    assert restarted.get("published-run") == imported.record
+    assert authority.read_bytes() == complete
+
+
+@pytest.mark.parametrize("damage", ["deleted", "random", "schema", "replacement"])
+def test_legacy_cache_is_rebuilt_from_authority_after_damage(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    imported = index.import_file(logical_run_id="published-run", source_path=source)
+    index.close()
+    journal = path.with_name(f"{path.name}-journal")
+
+    if damage == "deleted":
+        path.unlink()
+        journal.unlink()
+    elif damage == "random":
+        path.write_bytes(os.urandom(257))
+    elif damage == "schema":
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("DROP TABLE legacy_artifact")
+            connection.commit()
+        finally:
+            connection.close()
+    else:
+        replacement_path = tmp_path / "replacement" / "legacy.sqlite3"
+        replacement_source = tmp_path / "replacement.json"
+        replacement_source.write_text('{"replacement":true}', encoding="utf-8")
+        replacement = LegacyArtifactIndex(replacement_path)
+        replacement.import_file(
+            logical_run_id="replacement-run",
+            source_path=replacement_source,
+        )
+        replacement.close()
+        shutil.copy2(replacement_path, path)
+
+    restarted = LegacyArtifactIndex(path)
+    assert restarted.get("published-run") == imported.record
+    connection = sqlite3.connect(path)
+    try:
+        cached = connection.execute(
+            "SELECT publication_state, operation_id, generation "
+            "FROM legacy_artifact WHERE logical_run_id = ?",
+            ("published-run",),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert cached is not None
+    assert cached[0] == "cached"
+    if damage != "deleted":
+        quarantine = path.parent / ".legacy-cache-quarantine"
+        assert any(item.name.startswith(path.name) for item in quarantine.iterdir())
+
+
+def test_legacy_cache_validation_is_readonly_before_damaged_cache_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    index.close()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE legacy_artifact")
+        connection.commit()
+    finally:
+        connection.close()
+    real_connect = sqlite3.connect
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    def recording_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        calls.append((args[0], dict(kwargs)))
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", recording_connect)
+
+    restarted = LegacyArtifactIndex(path)
+    restarted.close()
+
+    assert calls
+    database, options = calls[0]
+    assert isinstance(database, str)
+    assert database.endswith("?mode=ro")
+    assert options["uri"] is True
+
+
+def test_legacy_sqlite_connections_are_explicitly_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+    explicitly_closed: set[int] = set()
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self) -> None:
+            explicitly_closed.add(id(self))
+            super().close()
+
+    def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = TrackingConnection
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", tracking_connect)
+    indexes = [
+        LegacyArtifactIndex(tmp_path / f"index-{number}" / "legacy.sqlite3") for number in range(30)
+    ]
+    for index in indexes:
+        index.close()
+
+    assert opened
+    assert explicitly_closed == {id(connection) for connection in opened}
+
+
+def test_closing_thirty_legacy_indexes_has_no_file_descriptor_growth(tmp_path: Path) -> None:
+    descriptor_root = Path("/proc/self/fd")
+    if not descriptor_root.exists():
+        descriptor_root = Path("/dev/fd")
+    before = len(os.listdir(descriptor_root))
+
+    for number in range(30):
+        index = LegacyArtifactIndex(tmp_path / f"fd-index-{number}" / "legacy.sqlite3")
+        index.close()
+
+    after = len(os.listdir(descriptor_root))
+    assert after <= before + 1
+
+
+def test_legacy_process_lock_registry_releases_last_closed_instance(tmp_path: Path) -> None:
+    path = tmp_path / "index" / "legacy.sqlite3"
+    key = os.fspath(path.absolute())
+    first = LegacyArtifactIndex(path)
+    second = LegacyArtifactIndex(path)
+
+    entry = lab_artifacts_module._LEGACY_PROCESS_LOCKS[key]
+    assert entry.references == 2
+    first.close()
+    assert lab_artifacts_module._LEGACY_PROCESS_LOCKS[key].references == 1
+    second.close()
+    assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+
+
 def test_legacy_parent_rejects_ancestor_symlink_without_external_writes(tmp_path: Path) -> None:
     external_container = tmp_path / "legacy-external" / "container"
     external_container.mkdir(parents=True)
@@ -1674,12 +2027,15 @@ def test_legacy_connect_inode_swap_never_publishes_to_original_or_replacement(
 
     assert swapped is True
     for database in (original_db, index.path):
-        with sqlite3.connect(database) as connection:
+        connection = sqlite3.connect(database)
+        try:
             count = connection.execute(
                 "SELECT COUNT(*) FROM legacy_artifact "
                 "WHERE logical_run_id = ? AND publication_state = 'published'",
                 ("swapped-run",),
             ).fetchone()[0]
+        finally:
+            connection.close()
         assert count == 0
 
 
@@ -1705,12 +2061,15 @@ def test_legacy_inode_swap_after_sqlite_connect_never_publishes_authority(
     authority = index.path.with_name(f"{index.path.name}.authority.jsonl")
     assert b'"event_type":"published"' not in authority.read_bytes()
     for database in (original_db, index.path):
-        with sqlite3.connect(database) as connection:
+        connection = sqlite3.connect(database)
+        try:
             count = connection.execute(
                 "SELECT COUNT(*) FROM legacy_artifact "
                 "WHERE logical_run_id = ? AND publication_state = 'published'",
                 ("post-connect-swap",),
             ).fetchone()[0]
+        finally:
+            connection.close()
         assert count == 0
 
 
