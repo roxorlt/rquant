@@ -1678,9 +1678,25 @@ def test_zip_destination_reservation_is_never_overwritten(
 
     assert destination.read_bytes() == b"reservation"
     assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
-    discarded = list(tmp_path.glob(f".{destination.name}.*.discarded"))
-    assert len(discarded) == 1
-    assert discarded[0].read_bytes() == b""
+    assert list(tmp_path.glob(f".{destination.name}.*.discarded")) == []
+
+
+def test_repeated_zip_conflicts_leave_no_temporary_files_or_descriptors(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    for sequence in range(32):
+        destination = tmp_path / f"reserved-{sequence}.zip"
+        destination.write_bytes(b"reservation")
+        with pytest.raises(LabArtifactConflictError, match="already exists"):
+            store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
+
+    assert list(tmp_path.glob(".*.tmp")) == []
+    assert list(tmp_path.glob(".*.discarded")) == []
+    assert len(os.listdir("/dev/fd")) == before_descriptors
 
 
 def test_zip_temp_cleanup_never_removes_replacement_inode(
@@ -1726,6 +1742,48 @@ def test_zip_temp_cleanup_never_removes_replacement_inode(
 
     assert replaced_temp is not None
     assert replaced_temp.read_bytes() == replacement_payload
+
+
+def test_zip_discard_cleanup_never_unlinks_replacement_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    destination = tmp_path / "reserved.zip"
+    destination.write_bytes(b"reservation")
+    replacement_payload = b"replacement isolation evidence"
+    replacement_path: Path | None = None
+
+    def replace_discard_before_unlink(parent_descriptor: int, name: str) -> None:
+        nonlocal replacement_path
+        os.unlink(name, dir_fd=parent_descriptor)
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            os.write(descriptor, replacement_payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        replacement_path = tmp_path / name
+
+    monkeypatch.setattr(
+        store,
+        "_before_zip_temporary_unlink",
+        replace_discard_before_unlink,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="cleanup.*identity"):
+        store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
+
+    assert destination.read_bytes() == b"reservation"
+    assert replacement_path is not None
+    assert replacement_path.read_bytes() == replacement_payload
 
 
 def test_public_verified_sealed_binding_keeps_transaction_evidence_bound(
@@ -2761,6 +2819,126 @@ def test_legacy_multi_instance_stage_lock_prevents_takeover_and_cleanup(
     assert errors == []
     assert sorted(results) == ["imported", "reused"]
     assert second.get("shared-run") is not None
+
+
+def test_legacy_close_waits_for_same_instance_import_and_rejects_new_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before_descriptors = len(os.listdir("/dev/fd"))
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    staged = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def pause_after_stage(_record: object) -> None:
+        staged.set()
+        if not release.wait(timeout=10):
+            raise TimeoutError("legacy import was not released")
+
+    def run_import() -> None:
+        try:
+            results.append(index.import_file(logical_run_id="close-run", source_path=source).status)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_index() -> None:
+        close_started.set()
+        try:
+            index.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_finished.set()
+
+    monkeypatch.setattr(index, "_after_stage_commit", pause_after_stage)
+    import_thread = threading.Thread(target=run_import)
+    close_thread = threading.Thread(target=close_index)
+    import_thread.start()
+    assert staged.wait(timeout=10)
+    close_thread.start()
+    assert close_started.wait(timeout=10)
+    time.sleep(0.25)
+
+    assert close_finished.is_set() is False
+    with pytest.raises(LabArtifactIntegrityError, match="closing|closed"):
+        index.get("close-run")
+
+    release.set()
+    import_thread.join(timeout=10)
+    close_thread.join(timeout=10)
+
+    assert not import_thread.is_alive() and not close_thread.is_alive()
+    assert results == ["imported"]
+    assert errors == []
+    assert close_finished.is_set() is True
+    index.close()
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_legacy_close_waits_for_second_instance_staged_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    closing = LegacyArtifactIndex(path)
+    importing = LegacyArtifactIndex(path)
+    staged = threading.Event()
+    release = threading.Event()
+    close_finished = threading.Event()
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def pause_after_stage(_record: object) -> None:
+        staged.set()
+        if not release.wait(timeout=10):
+            raise TimeoutError("legacy import was not released")
+
+    def run_import() -> None:
+        try:
+            results.append(
+                importing.import_file(
+                    logical_run_id="second-instance-close",
+                    source_path=source,
+                ).status
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_first() -> None:
+        try:
+            closing.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_finished.set()
+
+    monkeypatch.setattr(importing, "_after_stage_commit", pause_after_stage)
+    import_thread = threading.Thread(target=run_import)
+    close_thread = threading.Thread(target=close_first)
+    import_thread.start()
+    assert staged.wait(timeout=10)
+    close_thread.start()
+    time.sleep(0.25)
+
+    assert close_finished.is_set() is False
+    release.set()
+    import_thread.join(timeout=10)
+    close_thread.join(timeout=10)
+
+    assert not import_thread.is_alive() and not close_thread.is_alive()
+    assert results == ["imported"]
+    assert errors == []
+    assert importing.get("second-instance-close") is not None
+    closing.close()
+    importing.close()
 
 
 def test_legacy_process_lock_serializes_stage_and_publish(tmp_path: Path) -> None:
@@ -4689,6 +4867,280 @@ def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> 
     assert process_a.wait(timeout=15) == 0
     assert process_b.wait(timeout=15) == 0
     assert second_marker.exists() is True
+
+
+def test_durable_poison_blocks_export_from_an_already_open_process(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    store = LabJobArtifactStore(root)
+    sealed = store.seal_candidate(_prepare(store))
+    store.close()
+    ready = tmp_path / "export-ready"
+    release = tmp_path / "export-release"
+    poison_complete = tmp_path / "poison-complete"
+    export_result = tmp_path / "export-result"
+    destination = tmp_path / "blocked-export" / "bundle.zip"
+    exporter_script = textwrap.dedent(
+        """
+        import sys
+        import time
+        from datetime import UTC, datetime
+        from pathlib import Path
+        from rquant.lab_artifacts import LabArtifactIndexEvidence, LabJobArtifactStore
+
+        root, sealed_path, ready, release, result, destination = map(Path, sys.argv[1:7])
+        store = LabJobArtifactStore(root)
+        sealed = store.verify_sealed(sealed_path)
+        evidence = LabArtifactIndexEvidence(
+            job_id=sealed.manifest.job_id,
+            sealed_path=sealed.path,
+            manifest_hash=sealed.manifest_hash,
+            complete_result_hash=sealed.manifest.complete_result_hash,
+            bundle_device=sealed.device,
+            bundle_inode=sealed.inode,
+            file_identities=sealed.file_identities,
+            indexed_at=datetime(2026, 7, 25, 9, tzinfo=UTC),
+        )
+        ready.write_text("ready", encoding="utf-8")
+        deadline = time.monotonic() + 15
+        while not release.exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("export release missing")
+            time.sleep(0.02)
+        try:
+            store.export_deterministic_zip(sealed.path, evidence, destination)
+        except BaseException as exc:
+            result.write_text(f"blocked:{type(exc).__name__}:{exc}", encoding="utf-8")
+        else:
+            result.write_text("published", encoding="utf-8")
+        """
+    )
+    poison_script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from uuid import uuid4
+        from rquant.lab_artifacts import LabJobArtifactStore
+        from tests.unit.test_lab_artifacts import _prepare_arguments
+
+        root, marker = map(Path, sys.argv[1:3])
+        store = LabJobArtifactStore(root)
+        def fail_restore(*_args, **_kwargs):
+            raise OSError("injected guard restore failure")
+        store._restore_candidate_namespace_guard = fail_restore
+        arguments = _prepare_arguments()
+        arguments["job_id"] = uuid4()
+        try:
+            store.prepare_candidate(**arguments)
+        except BaseException as exc:
+            marker.write_text(f"{type(exc).__name__}:{exc}", encoding="utf-8")
+        else:
+            marker.write_text("unexpected-success", encoding="utf-8")
+        """
+    )
+    environment = os.environ.copy()
+    exporter = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            exporter_script,
+            str(root),
+            str(sealed.path),
+            str(ready),
+            str(release),
+            str(export_result),
+            str(destination),
+        ],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+    )
+    poisoner: subprocess.Popen[bytes] | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        poisoner = subprocess.Popen(
+            [sys.executable, "-c", poison_script, str(root), str(poison_complete)],
+            cwd=Path(__file__).parents[2],
+            env=environment,
+        )
+        assert poisoner.wait(timeout=15) == 0
+        assert poison_complete.read_text(encoding="utf-8") != "unexpected-success"
+        release.write_text("go", encoding="utf-8")
+        assert exporter.wait(timeout=15) == 0
+    finally:
+        if exporter.poll() is None:
+            exporter.kill()
+            exporter.wait(timeout=5)
+        if poisoner is not None and poisoner.poll() is None:
+            poisoner.kill()
+            poisoner.wait(timeout=5)
+
+    assert export_result.read_text(encoding="utf-8").startswith("blocked:")
+    assert destination.parent.exists() is False
+    recovered = LabJobArtifactStore(root)
+    recovered.close()
+
+
+def test_cross_process_export_finishes_before_poison_transition(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    store = LabJobArtifactStore(root)
+    sealed = store.seal_candidate(_prepare(store))
+    store.close()
+    export_entered = tmp_path / "export-entered"
+    export_release = tmp_path / "export-release"
+    export_result = tmp_path / "export-result"
+    poison_started = tmp_path / "poison-started"
+    poison_complete = tmp_path / "poison-complete"
+    destination = tmp_path / "ordered-export" / "bundle.zip"
+    exporter_script = textwrap.dedent(
+        """
+        import sys
+        import time
+        from datetime import UTC, datetime
+        from pathlib import Path
+        from rquant.lab_artifacts import LabArtifactIndexEvidence, LabJobArtifactStore
+
+        root, sealed_path, entered, release, result, destination = map(Path, sys.argv[1:7])
+        store = LabJobArtifactStore(root)
+        sealed = store.verify_sealed(sealed_path)
+        evidence = LabArtifactIndexEvidence(
+            job_id=sealed.manifest.job_id,
+            sealed_path=sealed.path,
+            manifest_hash=sealed.manifest_hash,
+            complete_result_hash=sealed.manifest.complete_result_hash,
+            bundle_device=sealed.device,
+            bundle_inode=sealed.inode,
+            file_identities=sealed.file_identities,
+            indexed_at=datetime(2026, 7, 25, 9, tzinfo=UTC),
+        )
+        authorize = store._authorize_export
+        def pause(verified, supplied):
+            authorize(verified, supplied)
+            entered.write_text("entered", encoding="utf-8")
+            deadline = time.monotonic() + 15
+            while not release.exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("export release missing")
+                time.sleep(0.02)
+        store._authorize_export = pause
+        store.export_deterministic_zip(sealed.path, evidence, destination)
+        result.write_text("published", encoding="utf-8")
+        """
+    )
+    poison_script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from uuid import uuid4
+        from rquant.lab_artifacts import LabJobArtifactStore
+        from tests.unit.test_lab_artifacts import _prepare_arguments
+
+        root, started, complete = map(Path, sys.argv[1:4])
+        started.write_text("started", encoding="utf-8")
+        store = LabJobArtifactStore(root)
+        def fail_restore(*_args, **_kwargs):
+            raise OSError("injected guard restore failure")
+        store._restore_candidate_namespace_guard = fail_restore
+        arguments = _prepare_arguments()
+        arguments["job_id"] = uuid4()
+        try:
+            store.prepare_candidate(**arguments)
+        except BaseException as exc:
+            complete.write_text(f"{type(exc).__name__}:{exc}", encoding="utf-8")
+        else:
+            complete.write_text("unexpected-success", encoding="utf-8")
+        """
+    )
+    environment = os.environ.copy()
+    exporter = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            exporter_script,
+            str(root),
+            str(sealed.path),
+            str(export_entered),
+            str(export_release),
+            str(export_result),
+            str(destination),
+        ],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+    )
+    poisoner: subprocess.Popen[bytes] | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not export_entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert export_entered.exists()
+        poisoner = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                poison_script,
+                str(root),
+                str(poison_started),
+                str(poison_complete),
+            ],
+            cwd=Path(__file__).parents[2],
+            env=environment,
+        )
+        deadline = time.monotonic() + 5
+        while not poison_started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert poison_started.exists()
+        time.sleep(0.3)
+        assert poison_complete.exists() is False
+        export_release.write_text("go", encoding="utf-8")
+        assert exporter.wait(timeout=15) == 0
+        assert poisoner.wait(timeout=15) == 0
+    finally:
+        if exporter.poll() is None:
+            exporter.kill()
+            exporter.wait(timeout=5)
+        if poisoner is not None and poisoner.poll() is None:
+            poisoner.kill()
+            poisoner.wait(timeout=5)
+
+    assert export_result.read_text(encoding="utf-8") == "published"
+    assert destination.is_file()
+    assert poison_complete.read_text(encoding="utf-8") != "unexpected-success"
+    recovered = LabJobArtifactStore(root)
+    recovered.close()
+
+
+def test_case_alias_same_inode_rejects_prepare_reentry_before_flock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_root = tmp_path / "Artifacts"
+    outer_store = LabJobArtifactStore(canonical_root)
+    alias_root = tmp_path / "artifacts"
+    if not alias_root.exists() or alias_root.stat().st_ino != canonical_root.stat().st_ino:
+        outer_store.close()
+        pytest.skip("filesystem is case-sensitive")
+    inner_store = LabJobArtifactStore(alias_root)
+    serialize = outer_store._serialize_parquet
+    attempted = False
+
+    def attempt_reentry_then_serialize(
+        table_name: str,
+        frame: pd.DataFrame,
+    ) -> tuple[bytes, LabJobArtifactFile]:
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            with pytest.raises(LabArtifactIntegrityError, match="reentrant"):
+                _prepare(inner_store, job_id=uuid4())
+        return serialize(table_name, frame)
+
+    monkeypatch.setattr(outer_store, "_serialize_parquet", attempt_reentry_then_serialize)
+    candidate = _prepare(outer_store)
+
+    assert attempted is True
+    assert outer_store._process_lock_entry is inner_store._process_lock_entry
+    assert [path.name for path in outer_store.candidates_root.iterdir()] == [candidate.path.name]
 
 
 def test_fifo_candidate_entry_is_quarantined_without_open_or_io(tmp_path: Path) -> None:

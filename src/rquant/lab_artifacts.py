@@ -63,7 +63,7 @@ class _ArtifactProcessLockEntry:
     poisoned: bool = False
 
 
-_ARTIFACT_PROCESS_LOCKS: dict[str, _ArtifactProcessLockEntry] = {}
+_ARTIFACT_PROCESS_LOCKS: dict[tuple[int, int], _ArtifactProcessLockEntry] = {}
 _ArtifactOperationParams = ParamSpec("_ArtifactOperationParams")
 _ArtifactOperationResult = TypeVar("_ArtifactOperationResult")
 
@@ -128,6 +128,10 @@ class LabArtifactAuthorizationError(LabArtifactError):
 
 class LabArtifactPlatformError(LabArtifactError):
     """The host cannot provide a required fail-closed filesystem primitive."""
+
+
+class _LabArtifactActiveGuardError(LabArtifactIntegrityError):
+    """Durable guard authority requires explicit startup recovery."""
 
 
 class LabLegacyArtifactConflictError(LabArtifactError):
@@ -1877,7 +1881,7 @@ class LabJobArtifactStore:
     """Create and verify complete job artifacts without touching scheduler state."""
 
     def __init__(self, root: Path) -> None:
-        self.root = root.absolute()
+        self.root = _secure_absolute_path(root)
         self.candidates_root = self.root / "candidates"
         self.sealed_root = self.root / "sealed"
         self.quarantine_root = self.root / "quarantine"
@@ -1894,9 +1898,10 @@ class LabJobArtifactStore:
         self._root_parent_descriptor = -1
         self._root_descriptor = -1
         self._managed_descriptors: dict[Path, int] = {}
-        lock_key = os.fspath(self.root)
-        self._process_lock_key = lock_key
+        self._process_lock_key: tuple[int, int] | None = None
         self._process_lock_registered = False
+        self._process_lock: threading.RLock | None = None
+        self._process_lock_entry: _ArtifactProcessLockEntry | None = None
         _ensure_private_directory(
             self.root,
             manage_existing=False,
@@ -1917,15 +1922,6 @@ class LabJobArtifactStore:
                 manage_existing=False,
                 require_private_existing=(path != self.candidates_root),
             )
-        with _ARTIFACT_PROCESS_LOCKS_GUARD:
-            entry = _ARTIFACT_PROCESS_LOCKS.get(lock_key)
-            if entry is None:
-                entry = _ArtifactProcessLockEntry(lock=threading.RLock(), references=0)
-                _ARTIFACT_PROCESS_LOCKS[lock_key] = entry
-            entry.references += 1
-            self._process_lock = entry.lock
-            self._process_lock_entry = entry
-            self._process_lock_registered = True
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             self._root_parent_descriptor = _secure_open_directory(
@@ -1937,6 +1933,21 @@ class LabJobArtifactStore:
                 directory_flags,
                 dir_fd=self._root_parent_descriptor,
             )
+            self._root_parent_identity = _FileObservation.from_stat(
+                os.fstat(self._root_parent_descriptor)
+            )
+            self._root_identity = _FileObservation.from_stat(os.fstat(self._root_descriptor))
+            lock_key = (self._root_identity.device, self._root_identity.inode)
+            with _ARTIFACT_PROCESS_LOCKS_GUARD:
+                entry = _ARTIFACT_PROCESS_LOCKS.get(lock_key)
+                if entry is None:
+                    entry = _ArtifactProcessLockEntry(lock=threading.RLock(), references=0)
+                    _ARTIFACT_PROCESS_LOCKS[lock_key] = entry
+                entry.references += 1
+                self._process_lock = entry.lock
+                self._process_lock_entry = entry
+                self._process_lock_key = lock_key
+                self._process_lock_registered = True
             for child in (
                 self.candidates_root,
                 self.sealed_root,
@@ -1952,10 +1963,6 @@ class LabJobArtifactStore:
                     directory_flags,
                     dir_fd=self._root_descriptor,
                 )
-            self._root_parent_identity = _FileObservation.from_stat(
-                os.fstat(self._root_parent_descriptor)
-            )
-            self._root_identity = _FileObservation.from_stat(os.fstat(self._root_descriptor))
             self._managed_identities = {
                 path: _FileObservation.from_stat(os.fstat(descriptor))
                 for path, descriptor in self._managed_descriptors.items()
@@ -1981,6 +1988,16 @@ class LabJobArtifactStore:
     def close(self) -> None:
         process_lock = getattr(self, "_process_lock", None)
         if process_lock is None:
+            for descriptor in getattr(self, "_managed_descriptors", {}).values():
+                with suppress(OSError):
+                    os.close(descriptor)
+            self._managed_descriptors = {}
+            for attribute in ("_root_descriptor", "_root_parent_descriptor"):
+                descriptor = getattr(self, attribute, -1)
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    setattr(self, attribute, -1)
             return
         with process_lock:
             if (
@@ -2019,15 +2036,29 @@ class LabJobArtifactStore:
 
     @property
     def poisoned(self) -> bool:
-        return self._poisoned or self._process_lock_entry.poisoned
+        entry = self._process_lock_entry
+        return self._poisoned or (entry is not None and entry.poisoned)
 
     def _assert_store_operational(self) -> None:
-        if self._poisoned or self._process_lock_entry.poisoned:
+        entry = self._process_lock_entry
+        if self._poisoned or entry is None or entry.poisoned:
             raise LabArtifactIntegrityError("artifact store is poisoned")
 
     def _mark_store_poisoned(self) -> None:
         self._poisoned = True
-        self._process_lock_entry.poisoned = True
+        if self._process_lock_entry is not None:
+            self._process_lock_entry.poisoned = True
+
+    def _assert_no_active_namespace_guard_authority(self) -> None:
+        active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
+        try:
+            entries = os.listdir(active_descriptor)
+        except OSError as exc:
+            raise LabArtifactIntegrityError("namespace guard authority is unavailable") from exc
+        if entries:
+            raise _LabArtifactActiveGuardError(
+                "artifact store has active durable namespace guard authority"
+            )
 
     @contextmanager
     def _artifact_operation_lifecycle(
@@ -2035,30 +2066,70 @@ class LabJobArtifactStore:
         *,
         prepare: bool,
     ) -> Iterator[None]:
-        with self._process_lock:
+        process_lock = self._process_lock
+        entry = self._process_lock_entry
+        if process_lock is None or entry is None:
+            raise LabArtifactIntegrityError("artifact store is closed")
+        with process_lock:
             self._assert_store_operational()
             current_thread_id = threading.get_ident()
-            if prepare and self._process_lock_entry.lifecycle_owner_thread_id == current_thread_id:
+            if prepare and entry.lifecycle_owner_thread_id == current_thread_id:
                 raise LabArtifactIntegrityError("reentrant prepare operation is forbidden")
-            if prepare and self._process_lock_entry.prepare_owner_thread_id is not None:
+            if prepare and entry.prepare_owner_thread_id is not None:
                 raise LabArtifactIntegrityError("prepare lifecycle ownership is inconsistent")
-            if self._process_lock_entry.lifecycle_depth == 0:
-                self._process_lock_entry.lifecycle_owner_thread_id = current_thread_id
-            elif self._process_lock_entry.lifecycle_owner_thread_id != current_thread_id:
+            outermost = entry.lifecycle_depth == 0
+            if outermost:
+                entry.lifecycle_owner_thread_id = current_thread_id
+                self._assert_namespace_guard_lock_identity()
+                fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                try:
+                    self._assert_namespace_guard_lock_identity()
+                    self._assert_store_operational()
+                    self._assert_no_active_namespace_guard_authority()
+                except BaseException:
+                    entry.lifecycle_owner_thread_id = None
+                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                    raise
+            elif entry.lifecycle_owner_thread_id != current_thread_id:
                 raise LabArtifactIntegrityError("artifact lifecycle ownership is inconsistent")
             if prepare:
-                self._process_lock_entry.prepare_owner_thread_id = current_thread_id
-            self._process_lock_entry.lifecycle_depth += 1
+                entry.prepare_owner_thread_id = current_thread_id
+            entry.lifecycle_depth += 1
             self._operation_depth += 1
+            operation_error: BaseException | None = None
             try:
                 yield
+            except BaseException as exc:
+                operation_error = exc
             finally:
                 self._operation_depth -= 1
-                self._process_lock_entry.lifecycle_depth -= 1
+                entry.lifecycle_depth -= 1
                 if prepare:
-                    self._process_lock_entry.prepare_owner_thread_id = None
-                if self._process_lock_entry.lifecycle_depth == 0:
-                    self._process_lock_entry.lifecycle_owner_thread_id = None
+                    entry.prepare_owner_thread_id = None
+                integrity_error: BaseException | None = None
+                if outermost:
+                    try:
+                        self._assert_namespace_guard_lock_identity()
+                        self._assert_no_active_namespace_guard_authority()
+                    except BaseException as exc:
+                        self._mark_store_poisoned()
+                        if operation_error is None or not isinstance(
+                            exc,
+                            _LabArtifactActiveGuardError,
+                        ):
+                            integrity_error = exc
+                    finally:
+                        entry.lifecycle_owner_thread_id = None
+                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                if operation_error is not None and integrity_error is not None:
+                    raise BaseExceptionGroup(
+                        "artifact operation and durable authority check both failed",
+                        [operation_error, integrity_error],
+                    ) from None
+                if integrity_error is not None:
+                    raise integrity_error
+            if operation_error is not None:
+                raise operation_error
 
     def _assert_namespace_guard_lock_identity(self) -> None:
         if self._guard_lock_descriptor < 0 or self._guard_lock_identity is None:
@@ -2090,26 +2161,34 @@ class LabJobArtifactStore:
         *,
         allow_poisoned: bool = False,
     ) -> Iterator[None]:
-        with self._process_lock:
-            if (self._poisoned or self._process_lock_entry.poisoned) and not allow_poisoned:
+        process_lock = self._process_lock
+        entry = self._process_lock_entry
+        if process_lock is None or entry is None:
+            raise LabArtifactIntegrityError("artifact store is closed")
+        with process_lock:
+            if (self._poisoned or entry.poisoned) and not allow_poisoned:
                 raise LabArtifactIntegrityError("artifact store is poisoned")
             current_thread_id = threading.get_ident()
-            if self._process_lock_entry.owner_thread_id == current_thread_id:
+            if entry.owner_thread_id == current_thread_id:
                 raise LabArtifactIntegrityError("reentrant namespace guard operation is forbidden")
             if self._guard_lock_descriptor < 0:
                 raise LabArtifactIntegrityError("namespace guard lock is unavailable")
             outermost = self._guard_lock_depth == 0
             if not outermost:
                 raise LabArtifactIntegrityError("namespace guard depth is inconsistent")
+            lifecycle_owned = (
+                entry.lifecycle_depth > 0 and entry.lifecycle_owner_thread_id == current_thread_id
+            )
             if outermost:
                 self._assert_namespace_guard_lock_identity()
-                fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
-                try:
-                    self._assert_namespace_guard_lock_identity()
-                except BaseException:
-                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
-                    raise
-                self._process_lock_entry.owner_thread_id = current_thread_id
+                if not lifecycle_owned:
+                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                    try:
+                        self._assert_namespace_guard_lock_identity()
+                    except BaseException:
+                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                        raise
+                entry.owner_thread_id = current_thread_id
             self._guard_lock_depth += 1
             operation_error: BaseException | None = None
             try:
@@ -2126,8 +2205,9 @@ class LabJobArtifactStore:
                         self._mark_store_poisoned()
                         integrity_error = exc
                     finally:
-                        self._process_lock_entry.owner_thread_id = None
-                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                        entry.owner_thread_id = None
+                        if not lifecycle_owned:
+                            fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
                     if operation_error is not None and integrity_error is not None:
                         raise BaseExceptionGroup(
                             "namespace guard operation and final identity check both failed",
@@ -5226,13 +5306,13 @@ class LabJobArtifactStore:
             destination_name,
         )
 
-    @staticmethod
     def _quarantine_failed_zip_temporary(
+        self,
         parent_descriptor: int,
         temporary_name: str,
         temporary_descriptor: int,
         destination_name: str,
-    ) -> str:
+    ) -> None:
         try:
             opened_before = _FileObservation.from_stat(os.fstat(temporary_descriptor))
             at_path_before = _FileObservation.from_stat(
@@ -5294,8 +5374,64 @@ class LabJobArtifactStore:
             opened_after,
         ):
             raise LabArtifactIntegrityError("ZIP temporary cleanup changed bound identity")
+        self._before_zip_temporary_unlink(
+            parent_descriptor,
+            quarantine_name,
+        )
+        try:
+            before_unlink = _FileObservation.from_stat(
+                os.stat(
+                    quarantine_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except OSError as exc:
+            raise LabArtifactIntegrityError(
+                "ZIP temporary cleanup identity changed before unlink"
+            ) from exc
+        opened_before_unlink = _FileObservation.from_stat(os.fstat(temporary_descriptor))
+        if before_unlink != opened_before_unlink or before_unlink != target:
+            raise LabArtifactIntegrityError("ZIP temporary cleanup identity changed before unlink")
+        os.unlink(quarantine_name, dir_fd=parent_descriptor)
+        opened_unlinked = _FileObservation.from_stat(os.fstat(temporary_descriptor))
+        if (
+            opened_unlinked.nlink != 0
+            or (
+                opened_unlinked.device,
+                opened_unlinked.inode,
+                opened_unlinked.mode,
+                opened_unlinked.size,
+                opened_unlinked.mtime_ns,
+            )
+            != (
+                opened_before_unlink.device,
+                opened_before_unlink.inode,
+                opened_before_unlink.mode,
+                opened_before_unlink.size,
+                opened_before_unlink.mtime_ns,
+            )
+            or opened_unlinked.ctime_ns < opened_before_unlink.ctime_ns
+        ):
+            raise LabArtifactIntegrityError("ZIP temporary cleanup unlink was not bound")
+        try:
+            os.stat(
+                quarantine_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise LabArtifactIntegrityError("ZIP temporary cleanup path still exists")
         os.fsync(parent_descriptor)
-        return quarantine_name
+
+    @staticmethod
+    def _before_zip_temporary_unlink(
+        _parent_descriptor: int,
+        _name: str,
+    ) -> None:
+        """Fault-injection boundary before an identity-bound ZIP cleanup unlink."""
 
     @staticmethod
     def _after_zip_final_checks(_destination: Path) -> None:
@@ -5539,6 +5675,11 @@ class LegacyArtifactIndex:
     ) -> None:
         self.path = _secure_absolute_path(path)
         self.clock = clock or (lambda: datetime.now(UTC))
+        self._lifecycle_condition = threading.Condition(threading.Lock())
+        self._active_operations = 0
+        self._operation_threads: dict[int, int] = {}
+        self._closing = False
+        self._closed = False
         lock_key = os.fspath(self.path)
         self._process_lock_key = lock_key
         self._process_lock_registered = False
@@ -5668,33 +5809,59 @@ class LegacyArtifactIndex:
             raise
 
     def close(self) -> None:
-        for attribute in (
-            "_authority_quarantine_descriptor",
-            "_cache_quarantine_descriptor",
-            "_journal_descriptor",
-            "_database_descriptor",
-            "_head_descriptor",
-            "_heads_descriptor",
-            "_authority_descriptor",
-            "_lock_descriptor",
-            "_parent_descriptor",
-        ):
-            descriptor = getattr(self, attribute, -1)
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-                setattr(self, attribute, -1)
-        if getattr(self, "_process_lock_registered", False):
-            with _LEGACY_PROCESS_LOCKS_GUARD:
-                entry = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
-                if entry is not None and entry.lock is self._process_lock:
-                    entry.references -= 1
-                    if entry.references == 0:
-                        del _LEGACY_PROCESS_LOCKS[self._process_lock_key]
-            self._process_lock_registered = False
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is None:
+            return
+        current_thread_id = threading.get_ident()
+        with condition:
+            if self._closed:
+                return
+            if self._operation_threads.get(current_thread_id, 0) > 0:
+                raise LabArtifactIntegrityError(
+                    "legacy index cannot close from an active operation"
+                )
+            if self._closing:
+                while not self._closed:
+                    condition.wait()
+                return
+            self._closing = True
+            while self._active_operations > 0:
+                condition.wait()
+        try:
+            with self._process_lock:
+                for attribute in (
+                    "_authority_quarantine_descriptor",
+                    "_cache_quarantine_descriptor",
+                    "_journal_descriptor",
+                    "_database_descriptor",
+                    "_head_descriptor",
+                    "_heads_descriptor",
+                    "_authority_descriptor",
+                    "_lock_descriptor",
+                    "_parent_descriptor",
+                ):
+                    descriptor = getattr(self, attribute, -1)
+                    if descriptor >= 0:
+                        with suppress(OSError):
+                            os.close(descriptor)
+                        setattr(self, attribute, -1)
+                if getattr(self, "_process_lock_registered", False):
+                    with _LEGACY_PROCESS_LOCKS_GUARD:
+                        entry = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
+                        if entry is not None and entry.lock is self._process_lock:
+                            entry.references -= 1
+                            if entry.references == 0:
+                                del _LEGACY_PROCESS_LOCKS[self._process_lock_key]
+                    self._process_lock_registered = False
+        finally:
+            with condition:
+                self._closed = True
+                self._closing = False
+                condition.notify_all()
 
     def __del__(self) -> None:
-        self.close()
+        with suppress(Exception):
+            self.close()
 
     @property
     def _authority_heads_name(self) -> str:
@@ -6437,8 +6604,33 @@ class LegacyArtifactIndex:
             raise LabArtifactIntegrityError("legacy index database identity changed") from exc
 
     @contextmanager
+    def _legacy_operation_lifecycle(self) -> Iterator[None]:
+        current_thread_id = threading.get_ident()
+        with self._lifecycle_condition:
+            if self._closing or self._closed:
+                raise LabArtifactIntegrityError("legacy index is closing or closed")
+            self._active_operations += 1
+            self._operation_threads[current_thread_id] = (
+                self._operation_threads.get(current_thread_id, 0) + 1
+            )
+        try:
+            with self._process_lock:
+                if self._closed:
+                    raise LabArtifactIntegrityError("legacy index is closed")
+                yield
+        finally:
+            with self._lifecycle_condition:
+                self._active_operations -= 1
+                remaining = self._operation_threads[current_thread_id] - 1
+                if remaining == 0:
+                    del self._operation_threads[current_thread_id]
+                else:
+                    self._operation_threads[current_thread_id] = remaining
+                self._lifecycle_condition.notify_all()
+
+    @contextmanager
     def _exclusive_index_lock(self) -> Iterator[None]:
-        with self._process_lock:
+        with self._legacy_operation_lifecycle():
             fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
             self._authority_lock_depth += 1
             try:
