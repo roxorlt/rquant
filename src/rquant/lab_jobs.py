@@ -305,9 +305,18 @@ _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
 
 
 def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
+    if value.tzinfo is None:
         raise ValueError("ledger timestamps must be timezone-aware")
-    return value.astimezone(UTC)
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("ledger timestamp is outside the UTC datetime domain") from exc
+    if offset is None:
+        raise ValueError("ledger timestamps must be timezone-aware")
+    try:
+        return value.astimezone(UTC)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("ledger timestamp is outside the UTC datetime domain") from exc
 
 
 def _dump_time(value: datetime) -> str:

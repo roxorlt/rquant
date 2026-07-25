@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from rquant.lab_eta import (
     LabEtaCompletedShard,
+    LabEtaFinishWindow,
     LabEtaInput,
     LabEtaProjectionError,
     LabEtaRemainingShard,
@@ -21,6 +22,28 @@ from rquant.lab_shard_protocol import LabShardTelemetry, LabShardWorkPlan
 from .test_lab_jobs import _lease, _submit_job
 
 AS_OF = datetime(2026, 7, 24, 4, 0, tzinfo=UTC)
+_EXTREME_OFFSET_TIMES = (
+    pytest.param(
+        datetime.min.replace(tzinfo=timezone(timedelta(hours=14))),
+        id="datetime-min-plus-14",
+    ),
+    pytest.param(
+        datetime.max.replace(tzinfo=timezone(-timedelta(hours=12))),
+        id="datetime-max-minus-12",
+    ),
+)
+_NEAR_BOUND_OFFSET_TIMES = (
+    pytest.param(
+        (datetime.min + timedelta(hours=14)).replace(tzinfo=timezone(timedelta(hours=14))),
+        datetime.min.replace(tzinfo=UTC),
+        id="utc-min",
+    ),
+    pytest.param(
+        (datetime.max - timedelta(hours=12)).replace(tzinfo=timezone(-timedelta(hours=12))),
+        datetime.max.replace(tzinfo=UTC),
+        id="utc-max",
+    ),
+)
 
 
 def _plan(
@@ -235,6 +258,9 @@ def test_legacy_remaining_without_work_plan_is_deterministically_unknown() -> No
 def test_eta_requires_aware_as_of_and_normalizes_an_offset_timezone() -> None:
     with pytest.raises(ValidationError, match="timezone-aware"):
         _input(as_of=datetime(2026, 7, 24, 4, 0))
+    with pytest.raises(ValidationError, match="ETA finish timestamps must be timezone-aware"):
+        naive = datetime(2026, 7, 24, 4, 0)
+        LabEtaFinishWindow(low=naive, center=naive, high=naive)
 
     offset = timezone(timedelta(hours=8))
     estimate = estimate_lab_eta(_input(as_of=datetime(2026, 7, 24, 12, 0, tzinfo=offset)))
@@ -242,6 +268,71 @@ def test_eta_requires_aware_as_of_and_normalizes_an_offset_timezone() -> None:
     assert estimate.as_of == AS_OF
     assert estimate.finish_at is not None
     assert estimate.finish_at.center.tzinfo is UTC
+
+
+@pytest.mark.parametrize("as_of", _EXTREME_OFFSET_TIMES)
+def test_eta_input_extreme_offset_raises_typed_validation_error(as_of: datetime) -> None:
+    with pytest.raises(ValidationError, match="outside the UTC datetime domain"):
+        _input(as_of=as_of)
+
+
+@pytest.mark.parametrize("as_of", _EXTREME_OFFSET_TIMES)
+def test_estimate_revalidation_extreme_offset_raises_typed_error(as_of: datetime) -> None:
+    unvalidated = LabEtaInput.model_construct(
+        job_id=UUID(int=999),
+        status="running",
+        as_of=as_of,
+        completed=(),
+        remaining=(),
+    )
+
+    with pytest.raises(ValidationError, match="outside the UTC datetime domain"):
+        estimate_lab_eta(unvalidated)
+
+
+@pytest.mark.parametrize("value", _EXTREME_OFFSET_TIMES)
+def test_finish_window_extreme_offset_raises_typed_validation_error(value: datetime) -> None:
+    with pytest.raises(ValidationError, match="outside the UTC datetime domain"):
+        LabEtaFinishWindow(low=value, center=value, high=value)
+
+
+@pytest.mark.parametrize("as_of", _EXTREME_OFFSET_TIMES)
+def test_eta_reader_rejects_extreme_offset_before_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    as_of: datetime,
+) -> None:
+    reader = LabJobReader(tmp_path / "lab_jobs.sqlite3")
+
+    def fail_if_sql_is_opened() -> None:
+        raise AssertionError("UTC normalization must happen before SQL")
+
+    monkeypatch.setattr(reader, "_connect", fail_if_sql_is_opened)
+
+    with pytest.raises(ValueError, match="outside the UTC datetime domain"):
+        reader.get_eta_input(UUID(int=1), as_of=as_of)
+
+
+@pytest.mark.parametrize(("value", "expected"), _NEAR_BOUND_OFFSET_TIMES)
+def test_near_bound_offsets_normalize_across_eta_models_and_reader(
+    tmp_path: Path,
+    value: datetime,
+    expected: datetime,
+) -> None:
+    eta_input = _input(status="paused", remaining=(), as_of=value)
+    estimate = estimate_lab_eta(eta_input)
+    finish = LabEtaFinishWindow(low=value, center=value, high=value)
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    projection = LabJobReader(store.path).get_eta_input(job.job_id, as_of=value)
+
+    assert eta_input.as_of == expected
+    assert estimate.as_of == expected
+    assert finish.low == finish.center == finish.high == expected
+    assert projection is not None
+    assert projection.as_of == expected
 
 
 def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(

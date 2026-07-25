@@ -41,6 +41,26 @@ class LabEtaModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
 
+def _normalize_utc_datetime(
+    value: datetime,
+    *,
+    naive_message: str,
+    range_message: str,
+) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError(naive_message)
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(range_message) from exc
+    if offset is None:
+        raise ValueError(naive_message)
+    try:
+        return value.astimezone(UTC)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(range_message) from exc
+
+
 class LabEtaCompletedShard(LabEtaModel):
     shard_id: UUID
     completion_sequence: int = Field(strict=True, ge=1)
@@ -61,8 +81,11 @@ class LabEtaInput(LabEtaModel):
 
     @model_validator(mode="after")
     def validate_input(self) -> LabEtaInput:
-        if self.as_of.tzinfo is None or self.as_of.utcoffset() is None:
-            raise ValueError("as_of must be timezone-aware")
+        normalized_as_of = _normalize_utc_datetime(
+            self.as_of,
+            naive_message="as_of must be timezone-aware",
+            range_message="as_of is outside the UTC datetime domain",
+        )
         sequences = tuple(item.completion_sequence for item in self.completed)
         if len(sequences) != len(set(sequences)):
             raise ValueError("completion_sequence must be unique within a job")
@@ -72,7 +95,7 @@ class LabEtaInput(LabEtaModel):
             raise ValueError("ETA shard identities must be unique")
         if completed_ids & remaining_ids:
             raise ValueError("completed and remaining ETA shards must be disjoint")
-        object.__setattr__(self, "as_of", self.as_of.astimezone(UTC))
+        object.__setattr__(self, "as_of", normalized_as_of)
         return self
 
 
@@ -96,9 +119,14 @@ class LabEtaFinishWindow(LabEtaModel):
     @model_validator(mode="after")
     def validate_window(self) -> LabEtaFinishWindow:
         values = (self.low, self.center, self.high)
-        if any(value.tzinfo is None or value.utcoffset() is None for value in values):
-            raise ValueError("ETA finish timestamps must be timezone-aware")
-        normalized = tuple(value.astimezone(UTC) for value in values)
+        normalized = tuple(
+            _normalize_utc_datetime(
+                value,
+                naive_message="ETA finish timestamps must be timezone-aware",
+                range_message="ETA finish timestamp is outside the UTC datetime domain",
+            )
+            for value in values
+        )
         if not normalized[0] <= normalized[1] <= normalized[2]:
             raise ValueError("ETA finish bounds must contain the center")
         object.__setattr__(self, "low", normalized[0])
