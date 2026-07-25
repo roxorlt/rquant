@@ -2822,3 +2822,344 @@ def test_parquet_empty_nullable_and_timezone_dtypes_have_stable_identity(
     assert identities["observed_at"].family == "datetime_tz"
     assert identities["observed_at"].timezone == "Asia/Shanghai"
     assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def _prepare_other_sealed_bundle(
+    root: Path,
+    *,
+    job_id: UUID,
+) -> lab_artifacts_module.LabSealedJobArtifact:
+    store = LabJobArtifactStore(root)
+    candidate = store.prepare_candidate(
+        job_id=job_id,
+        spec=_spec(),
+        plan_hash="6" * 64,
+        adapter_id="n-shape",
+        adapter_version="1",
+        result_contract_version="p14b1-v1",
+        metrics={"replacement": True},
+        report_markdown="# Replacement bundle\n",
+        tables=_tables(),
+    )
+    return store.seal_candidate(candidate)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["seal_candidate", "idempotent_seal_candidate", "recover_candidate"],
+)
+def test_public_new_sealed_return_fails_if_path_is_replaced_after_final_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    if operation == "idempotent_seal_candidate":
+        store.seal_candidate(candidate)
+        candidate = _prepare(store)
+    replacement = _prepare_other_sealed_bundle(
+        tmp_path / "replacement-artifacts",
+        job_id=candidate.job_id,
+    )
+    displaced = tmp_path / f"displaced-{operation}"
+    swapped = False
+
+    def replace_after_final_validation(sealed: object) -> None:
+        nonlocal swapped
+        path = sealed.path  # type: ignore[attr-defined]
+        parent_mode = stat.S_IMODE(path.parent.stat().st_mode)
+        os.chmod(path.parent, 0o700)
+        try:
+            os.chmod(path, 0o700)
+            os.rename(path, displaced)
+            os.chmod(displaced, 0o500)
+            shutil.copytree(replacement.path, path, copy_function=shutil.copy2)
+        finally:
+            os.chmod(path.parent, parent_mode)
+        swapped = True
+
+    monkeypatch.setattr(
+        store,
+        "_after_public_sealed_finalized",
+        replace_after_final_validation,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="sealed|bound|identity"):
+        if operation in {"seal_candidate", "idempotent_seal_candidate"}:
+            store.seal_candidate(candidate)
+        else:
+            record = next(
+                item for item in store.list_candidate_recovery() if item.path == candidate.path
+            )
+            store.recover_candidate(record, authority=_recovery_authority(candidate))
+
+    assert swapped is True
+
+
+@pytest.mark.parametrize("branch", ["interrupted", "already_sealed"])
+def test_public_interrupted_recovery_return_keeps_final_bundle_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    branch: str,
+) -> None:
+    root = tmp_path / "artifacts"
+    store = LabJobArtifactStore(root)
+    candidate = _prepare(store)
+
+    def crash_after_rename(_bound: object) -> None:
+        raise OSError("leave recoverable sealed bundle")
+
+    monkeypatch.setattr(store, "_finalize_bound_directories", crash_after_rename)
+    with pytest.raises(OSError, match="recoverable"):
+        store.seal_candidate(candidate)
+
+    restarted = LabJobArtifactStore(root)
+    published = restarted.sealed_root / candidate.job_id.hex
+    if branch == "already_sealed":
+        restarted.recover_interrupted_seal(published)
+    replacement = _prepare_other_sealed_bundle(
+        tmp_path / f"replacement-{branch}",
+        job_id=candidate.job_id,
+    )
+    displaced = tmp_path / f"displaced-{branch}"
+    swapped = False
+
+    def replace_after_final_validation(sealed: object) -> None:
+        nonlocal swapped
+        path = sealed.path  # type: ignore[attr-defined]
+        parent_mode = stat.S_IMODE(path.parent.stat().st_mode)
+        os.chmod(path.parent, 0o700)
+        try:
+            os.chmod(path, 0o700)
+            os.rename(path, displaced)
+            os.chmod(displaced, 0o500)
+            shutil.copytree(replacement.path, path, copy_function=shutil.copy2)
+        finally:
+            os.chmod(path.parent, parent_mode)
+        swapped = True
+
+    monkeypatch.setattr(
+        restarted,
+        "_after_public_sealed_finalized",
+        replace_after_final_validation,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="sealed|bound|identity"):
+        restarted.recover_interrupted_seal(published)
+
+    assert swapped is True
+
+
+def test_public_sealed_finalizer_rejects_same_manifest_swap_before_rebinding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    replacement_store = LabJobArtifactStore(tmp_path / "replacement-artifacts")
+    replacement = replacement_store.seal_candidate(
+        _prepare(replacement_store, job_id=candidate.job_id)
+    )
+    displaced = tmp_path / "displaced-before-final-bind"
+    swapped = False
+
+    def replace_before_final_bind(path: Path) -> None:
+        nonlocal swapped
+        parent_mode = stat.S_IMODE(path.parent.stat().st_mode)
+        os.chmod(path.parent, 0o700)
+        try:
+            os.chmod(path, 0o700)
+            os.rename(path, displaced)
+            os.chmod(displaced, 0o500)
+            shutil.copytree(replacement.path, path, copy_function=shutil.copy2)
+        finally:
+            os.chmod(path.parent, parent_mode)
+        swapped = True
+
+    monkeypatch.setattr(
+        store,
+        "_before_public_sealed_bind",
+        replace_before_final_bind,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="expected.*identity|identity.*expected"):
+        store.seal_candidate(candidate)
+
+    assert swapped is True
+
+
+def test_parquet_restores_python_string_storage_for_empty_and_nonempty_columns(
+    tmp_path: Path,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "empty": pd.Series([], dtype=pd.StringDtype(storage="python")),
+            "value": pd.Series(["alpha", pd.NA], dtype=pd.StringDtype(storage="python")),
+        }
+    )
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="dtype-review",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"strings": frame},
+        )
+    )
+    parquet = sealed.manifest.files[-1].parquet
+
+    assert parquet is not None
+    assert [item.storage for item in parquet.dtype_identities] == ["python", "python"]
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def test_parquet_restores_pyarrow_string_and_nullable_extension_dtypes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "label": pd.Series(["alpha", pd.NA], dtype=pd.StringDtype(storage="pyarrow")),
+            "count": pd.Series([1, pd.NA], dtype="Int64"),
+            "ratio": pd.Series([1.5, pd.NA], dtype="Float64"),
+            "enabled": pd.Series([True, pd.NA], dtype="boolean"),
+        }
+    )
+    original_read = lab_artifacts_module.pd.read_parquet
+
+    def lossy_read(*args: object, **kwargs: object) -> pd.DataFrame:
+        restored = original_read(*args, **kwargs)  # type: ignore[arg-type]
+        for column in restored.columns:
+            restored[column] = restored[column].astype(object)
+        return restored
+
+    monkeypatch.setattr(lab_artifacts_module.pd, "read_parquet", lossy_read)
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="dtype-review",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"nullable": frame},
+        )
+    )
+
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def test_parquet_restores_categorical_category_extension_dtypes(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "string_bucket": pd.Series(
+                pd.Categorical(
+                    ["high"],
+                    categories=pd.Index(
+                        ["low", "high"],
+                        dtype=pd.StringDtype(storage="python"),
+                    ),
+                    ordered=True,
+                )
+            ),
+            "integer_bucket": pd.Series(
+                pd.Categorical(
+                    [1],
+                    categories=pd.Index([1, 2], dtype="Int64"),
+                    ordered=False,
+                )
+            ),
+        }
+    )
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="dtype-review",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"categories": frame},
+        )
+    )
+    parquet = sealed.manifest.files[-1].parquet
+
+    assert parquet is not None
+    category_dtypes = [item.categories_dtype_identity for item in parquet.dtype_identities]
+    assert category_dtypes[0] is not None and category_dtypes[0].storage == "python"
+    assert category_dtypes[1] is not None
+    assert category_dtypes[1].pandas_dtype == "Int64"
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def test_parquet_restores_timezone_period_and_interval_dtypes(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "observed_at": pd.Series(
+                pd.to_datetime(["2026-01-01 09:30", None]).tz_localize("Asia/Shanghai")
+            ),
+            "period": pd.Series([pd.Period("2026-01", freq="M"), pd.NaT]),
+            "interval": pd.Series(
+                pd.arrays.IntervalArray.from_tuples([(0, 1), None], closed="right")
+            ),
+        }
+    )
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="dtype-review",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"temporal": frame},
+        )
+    )
+    parquet = sealed.manifest.files[-1].parquet
+
+    assert parquet is not None
+    identities = dict(zip(parquet.columns, parquet.dtype_identities, strict=True))
+    assert identities["period"].period_frequency == "M"
+    assert identities["interval"].interval_closed == "right"
+    assert identities["interval"].interval_subtype_identity is not None
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def test_legacy_instance_rebinds_valid_cache_rebuilt_without_head_change(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    first = LegacyArtifactIndex(path)
+    second = LegacyArtifactIndex(path)
+    imported = first.import_file(logical_run_id="stable-run", source_path=source)
+    assert second.get("stable-run") == imported.record
+    original_inode = os.fstat(first._database_descriptor).st_ino
+    head_before = path.with_name(f"{path.name}.authority.head.json").read_bytes()
+
+    path.write_bytes(os.urandom(257))
+
+    assert second.get("stable-run") == imported.record
+    rebuilt_inode = os.fstat(second._database_descriptor).st_ino
+    assert rebuilt_inode != original_inode
+    assert path.with_name(f"{path.name}.authority.head.json").read_bytes() == head_before
+
+    assert first.get("stable-run") == imported.record
+    assert os.fstat(first._database_descriptor).st_ino == rebuilt_inode

@@ -190,7 +190,14 @@ def _safe_relative_path(value: str) -> str:
 
 
 class LabPandasDtypeIdentity(LabArtifactModel):
-    family: Literal["numpy", "extension", "categorical", "datetime_tz"]
+    family: Literal[
+        "numpy",
+        "extension",
+        "categorical",
+        "datetime_tz",
+        "period",
+        "interval",
+    ]
     pandas_dtype: str = Field(min_length=1)
     dtype_repr: str = Field(min_length=1)
     dtype_class: str = Field(min_length=1)
@@ -198,11 +205,16 @@ class LabPandasDtypeIdentity(LabArtifactModel):
     categories: tuple[str, ...] | None = None
     categories_dtype: str | None = None
     categories_dtype_class: str | None = None
+    categories_dtype_identity: LabPandasDtypeIdentity | None = None
     ordered: bool | None = None
     timezone: str | None = None
     unit: str | None = None
     storage: str | None = None
     na_value: str | None = None
+    na_value_kind: Literal["pd.NA", "NaT", "nan", "none", "canonical"] | None = None
+    period_frequency: str | None = None
+    interval_subtype_identity: LabPandasDtypeIdentity | None = None
+    interval_closed: Literal["left", "right", "both", "neither"] | None = None
 
     @model_validator(mode="after")
     def validate_family_metadata(self) -> LabPandasDtypeIdentity:
@@ -211,6 +223,7 @@ class LabPandasDtypeIdentity(LabArtifactModel):
                 self.categories is None
                 or self.categories_dtype is None
                 or self.categories_dtype_class is None
+                or self.categories_dtype_identity is None
                 or self.ordered is None
             ):
                 raise ValueError("categorical dtype identity is incomplete")
@@ -220,6 +233,7 @@ class LabPandasDtypeIdentity(LabArtifactModel):
                 self.categories,
                 self.categories_dtype,
                 self.categories_dtype_class,
+                self.categories_dtype_identity,
                 self.ordered,
             )
         ):
@@ -229,6 +243,20 @@ class LabPandasDtypeIdentity(LabArtifactModel):
                 raise ValueError("timezone dtype identity is incomplete")
         elif self.timezone is not None:
             raise ValueError("timezone metadata is only valid for timezone dtypes")
+        if self.family == "period":
+            if self.period_frequency is None:
+                raise ValueError("period dtype identity is incomplete")
+        elif self.period_frequency is not None:
+            raise ValueError("period metadata is only valid for period dtypes")
+        if self.family == "interval":
+            if self.interval_subtype_identity is None or self.interval_closed is None:
+                raise ValueError("interval dtype identity is incomplete")
+        elif self.interval_subtype_identity is not None or self.interval_closed is not None:
+            raise ValueError("interval metadata is only valid for interval dtypes")
+        if self.family != "extension" and any(
+            value is not None for value in (self.storage, self.na_value, self.na_value_kind)
+        ):
+            raise ValueError("extension metadata is only valid for extension dtypes")
         return self
 
 
@@ -1044,6 +1072,21 @@ def _rename_noreplace(
 def _canonical_table_value(value: object) -> object:
     if value is pd.NA or value is pd.NaT or value is None:
         return {"$null": True}
+    if isinstance(value, pd.Period):
+        return {
+            "$period": {
+                "frequency": value.freqstr,
+                "ordinal": str(value.ordinal),
+            }
+        }
+    if isinstance(value, pd.Interval):
+        return {
+            "$interval": {
+                "closed": value.closed,
+                "left": _canonical_table_value(value.left),
+                "right": _canonical_table_value(value.right),
+            }
+        }
     if hasattr(value, "item") and not isinstance(value, (str, bytes, Decimal)):
         with suppress(ValueError, TypeError, AttributeError):
             value = value.item()  # type: ignore[union-attr]
@@ -1087,6 +1130,7 @@ def _pandas_dtype_identity(dtype: object) -> LabPandasDtypeIdentity:
             categories=tuple(_canonical_dtype_token(value) for value in categories),
             categories_dtype=str(categories.dtype),
             categories_dtype_class=_dtype_class_name(categories.dtype),
+            categories_dtype_identity=_pandas_dtype_identity(categories.dtype),
             ordered=dtype.ordered,
         )
     if isinstance(dtype, pd.DatetimeTZDtype):
@@ -1096,7 +1140,47 @@ def _pandas_dtype_identity(dtype: object) -> LabPandasDtypeIdentity:
             timezone=str(dtype.tz),
             unit=dtype.unit,
         )
+    if isinstance(dtype, pd.PeriodDtype):
+        return LabPandasDtypeIdentity(
+            family="period",
+            **common,
+            period_frequency=dtype._freqstr,
+        )
+    if isinstance(dtype, pd.IntervalDtype):
+        return LabPandasDtypeIdentity(
+            family="interval",
+            **common,
+            interval_subtype_identity=_pandas_dtype_identity(dtype.subtype),
+            interval_closed=dtype.closed,
+        )
+    if isinstance(dtype, pd.StringDtype):
+        na_value = dtype.na_value
+        if na_value is pd.NA:
+            na_value_kind = "pd.NA"
+        elif na_value is pd.NaT:
+            na_value_kind = "NaT"
+        elif isinstance(na_value, float) and math.isnan(na_value):
+            na_value_kind = "nan"
+        elif na_value is None:
+            na_value_kind = "none"
+        else:
+            na_value_kind = "canonical"
+        return LabPandasDtypeIdentity(
+            family="extension",
+            **common,
+            storage=dtype.storage,
+            na_value=_canonical_dtype_token(na_value),
+            na_value_kind=na_value_kind,
+        )
     if isinstance(dtype, pd.api.extensions.ExtensionDtype):
+        if (
+            re.fullmatch(
+                r"(?:U?Int(?:8|16|32|64)|Float(?:32|64)|boolean)",
+                str(dtype),
+            )
+            is None
+        ):
+            raise TypeError(f"unsupported pandas extension dtype: {dtype!r}")
         storage = getattr(dtype, "storage", None)
         na_value = getattr(dtype, "na_value", None)
         return LabPandasDtypeIdentity(
@@ -1104,6 +1188,7 @@ def _pandas_dtype_identity(dtype: object) -> LabPandasDtypeIdentity:
             **common,
             storage=str(storage) if storage is not None else None,
             na_value=_canonical_dtype_token(na_value) if na_value is not None else None,
+            na_value_kind="pd.NA" if na_value is pd.NA else None,
         )
     numpy_kind = getattr(dtype, "kind", None)
     return LabPandasDtypeIdentity(
@@ -1132,9 +1217,99 @@ def _rebuild_canonical_dtype_token(token: str) -> object:
         return pd.Timedelta(int(value["$timedelta_ns"]), unit="ns")
     if isinstance(value, dict) and set(value) == {"$bytes"}:
         return base64.b64decode(value["$bytes"], validate=True)
+    if isinstance(value, dict) and set(value) == {"$period"}:
+        period = value["$period"]
+        if not isinstance(period, dict) or set(period) != {"frequency", "ordinal"}:
+            raise LabArtifactIntegrityError("pandas period dtype metadata is invalid")
+        try:
+            return pd.Period(ordinal=int(period["ordinal"]), freq=str(period["frequency"]))
+        except (TypeError, ValueError) as exc:
+            raise LabArtifactIntegrityError("pandas period dtype metadata is invalid") from exc
+    if isinstance(value, dict) and set(value) == {"$interval"}:
+        interval = value["$interval"]
+        if not isinstance(interval, dict) or set(interval) != {"closed", "left", "right"}:
+            raise LabArtifactIntegrityError("pandas interval dtype metadata is invalid")
+        closed = interval["closed"]
+        if closed not in {"left", "right", "both", "neither"}:
+            raise LabArtifactIntegrityError("pandas interval closure is invalid")
+        try:
+            return pd.Interval(
+                _rebuild_canonical_dtype_token(
+                    canonical_json_bytes(interval["left"]).decode("ascii")
+                ),
+                _rebuild_canonical_dtype_token(
+                    canonical_json_bytes(interval["right"]).decode("ascii")
+                ),
+                closed=closed,
+            )
+        except (TypeError, ValueError) as exc:
+            raise LabArtifactIntegrityError("pandas interval dtype metadata is invalid") from exc
     if isinstance(value, dict) and set(value) == {"$null"}:
         return None
     return _rebuild_canonical_value(value)
+
+
+def _pandas_dtype_from_identity(identity: LabPandasDtypeIdentity) -> object:
+    try:
+        if identity.family == "numpy":
+            rebuilt: object = pd.api.types.pandas_dtype(identity.pandas_dtype)
+        elif identity.family == "datetime_tz":
+            if identity.timezone is None or identity.unit is None:
+                raise LabArtifactIntegrityError("timezone dtype identity is incomplete")
+            rebuilt = pd.DatetimeTZDtype(unit=identity.unit, tz=identity.timezone)
+        elif identity.family == "period":
+            if identity.period_frequency is None:
+                raise LabArtifactIntegrityError("period dtype identity is incomplete")
+            rebuilt = pd.PeriodDtype(identity.period_frequency)
+        elif identity.family == "interval":
+            if identity.interval_subtype_identity is None or identity.interval_closed is None:
+                raise LabArtifactIntegrityError("interval dtype identity is incomplete")
+            rebuilt = pd.IntervalDtype(
+                subtype=_pandas_dtype_from_identity(identity.interval_subtype_identity),
+                closed=identity.interval_closed,
+            )
+        elif identity.family == "categorical":
+            if (
+                identity.categories is None
+                or identity.categories_dtype_identity is None
+                or identity.ordered is None
+            ):
+                raise LabArtifactIntegrityError("categorical dtype identity is incomplete")
+            category_dtype = _pandas_dtype_from_identity(identity.categories_dtype_identity)
+            category_values = [_rebuild_canonical_dtype_token(item) for item in identity.categories]
+            categories = pd.Index(pd.array(category_values, dtype=category_dtype))
+            rebuilt = pd.CategoricalDtype(categories=categories, ordered=identity.ordered)
+        elif identity.dtype_class == _dtype_class_name(pd.StringDtype()):
+            if identity.storage is None or identity.na_value_kind is None:
+                raise LabArtifactIntegrityError("string dtype identity is incomplete")
+            if identity.na_value_kind == "pd.NA":
+                na_value: object = pd.NA
+            elif identity.na_value_kind == "NaT":
+                na_value = pd.NaT
+            elif identity.na_value_kind == "nan":
+                na_value = float("nan")
+            elif identity.na_value_kind == "none":
+                na_value = None
+            else:
+                if identity.na_value is None:
+                    raise LabArtifactIntegrityError("string NA metadata is incomplete")
+                na_value = _rebuild_canonical_dtype_token(identity.na_value)
+            rebuilt = pd.StringDtype(storage=identity.storage, na_value=na_value)
+        elif identity.family == "extension":
+            rebuilt = pd.api.types.pandas_dtype(identity.pandas_dtype)
+        else:
+            raise LabArtifactIntegrityError("unsupported pandas dtype identity")
+    except LabArtifactError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise LabArtifactIntegrityError(
+            f"pandas dtype cannot be reconstructed: {identity.pandas_dtype}"
+        ) from exc
+    if _pandas_dtype_identity(rebuilt) != identity:
+        raise LabArtifactIntegrityError(
+            f"pandas dtype identity cannot be reconstructed exactly: {identity.pandas_dtype}"
+        )
+    return rebuilt
 
 
 def _restore_manifest_dtypes(
@@ -1145,24 +1320,20 @@ def _restore_manifest_dtypes(
         raise LabArtifactIntegrityError("Parquet dtype identity shape changed")
     restored = frame.copy(deep=False)
     for position, identity in enumerate(identities):
-        if identity.family != "categorical":
-            continue
-        if identity.categories is None or identity.ordered is None:
-            raise LabArtifactIntegrityError("categorical dtype identity is incomplete")
-        categories = [_rebuild_canonical_dtype_token(item) for item in identity.categories]
-        categorical_dtype = pd.CategoricalDtype(
-            categories=categories,
-            ordered=identity.ordered,
-        )
         column = restored.columns[position]
         try:
-            restored[column] = pd.Series(
-                pd.Categorical(restored.iloc[:, position], dtype=categorical_dtype),
-                index=restored.index,
-            )
+            target_dtype = _pandas_dtype_from_identity(identity)
+            if identity.family == "categorical":
+                values: object = pd.Categorical(
+                    restored.iloc[:, position],
+                    dtype=target_dtype,
+                )
+            else:
+                values = pd.array(restored.iloc[:, position], dtype=target_dtype)
+            restored[column] = pd.Series(values, index=restored.index)
         except (TypeError, ValueError) as exc:
             raise LabArtifactIntegrityError(
-                f"Parquet categorical dtype cannot be reconstructed: {column}"
+                f"Parquet pandas dtype cannot be reconstructed: {column}"
             ) from exc
     if _frame_dtype_identities(restored) != identities:
         raise LabArtifactIntegrityError("Parquet pandas dtype metadata changed")
@@ -2854,22 +3025,7 @@ class LabJobArtifactStore:
         return manifest
 
     def verify_sealed(self, path: Path) -> LabSealedJobArtifact:
-        managed = self._assert_managed_child(path, self.sealed_root, label="sealed bundle")
-        manifest, identities, observed = self._validate_bundle(
-            managed,
-            parent_root=self.sealed_root,
-            permission_profile="sealed",
-        )
-        if managed.name != manifest.job_id.hex:
-            raise LabArtifactIntegrityError("sealed path does not match job identity")
-        return LabSealedJobArtifact(
-            path=managed,
-            manifest=manifest,
-            manifest_hash=manifest.manifest_hash,
-            device=observed.device,
-            inode=observed.inode,
-            file_identities=identities,
-        )
+        return self._finalize_public_sealed(path)
 
     @staticmethod
     def _after_existing_sealed_bound(
@@ -2877,6 +3033,60 @@ class LabJobArtifactStore:
         _sealed: LabSealedJobArtifact,
     ) -> None:
         """Fault-injection boundary while an existing sealed bundle remains bound."""
+
+    @staticmethod
+    def _after_public_sealed_finalized(_sealed: LabSealedJobArtifact) -> None:
+        """Fault-injection boundary before a public sealed identity returns."""
+
+    @staticmethod
+    def _before_public_sealed_bind(_path: Path) -> None:
+        """Fault-injection boundary before the final public bundle binding."""
+
+    def _finalize_public_sealed(
+        self,
+        path: Path,
+        *,
+        expected_manifest: LabJobArtifactManifest | None = None,
+        expected_bundle_identity: tuple[int, int] | None = None,
+        expected_file_identities: tuple[LabArtifactFileIdentity, ...] | None = None,
+        reused_existing: bool = False,
+    ) -> LabSealedJobArtifact:
+        self._before_public_sealed_bind(path)
+        with self._bind_verified_sealed(path) as sealed:
+            if expected_manifest is not None and sealed.manifest != expected_manifest:
+                raise LabArtifactIntegrityError(
+                    "public sealed result conflicts with expected manifest identity"
+                )
+            if (
+                expected_bundle_identity is not None
+                and (
+                    sealed.device,
+                    sealed.inode,
+                )
+                != expected_bundle_identity
+            ):
+                raise LabArtifactIntegrityError(
+                    "public sealed result conflicts with expected bundle identity"
+                )
+            if (
+                expected_file_identities is not None
+                and sealed.file_identities != expected_file_identities
+            ):
+                raise LabArtifactIntegrityError(
+                    "public sealed result conflicts with expected file identities"
+                )
+            result = sealed.model_copy(update={"reused_existing": reused_existing})
+            self._after_public_sealed_finalized(result)
+            return result
+
+    def _bound_file_identities(
+        self,
+        bound: _BoundArtifactBundle,
+    ) -> tuple[LabArtifactFileIdentity, ...]:
+        return tuple(
+            self._artifact_identity(relative_path, bound.files[relative_path].current)
+            for relative_path in sorted(bound.files)
+        )
 
     @contextmanager
     def _bind_verified_sealed(
@@ -3001,7 +3211,9 @@ class LabJobArtifactStore:
                 ):
                     raise LabArtifactConflictError("job already has a different sealed result")
                 self.quarantine_candidate(candidate, reason="idempotent sealed bundle reuse")
-                return existing.model_copy(update={"reused_existing": True})
+                result = existing.model_copy(update={"reused_existing": True})
+                self._after_public_sealed_finalized(result)
+                return result
         candidate_observed, preliminary_manifest, _ = self._probe_bundle(
             candidate.path,
             parent_root=self.candidates_root,
@@ -3082,7 +3294,9 @@ class LabJobArtifactStore:
                                         candidate,
                                         reason="idempotent racing sealed bundle reuse",
                                     )
-                                    return existing.model_copy(update={"reused_existing": True})
+                                    result = existing.model_copy(update={"reused_existing": True})
+                                    self._after_public_sealed_finalized(result)
+                                    return result
                         except LabArtifactError:
                             pass
                     raise LabArtifactConflictError(
@@ -3107,9 +3321,13 @@ class LabJobArtifactStore:
                 self._finalize_bound_directories(bound)
                 self._assert_bound_seal_intent(bound_intent)
                 self._verify_bound_bytes(bound, manifest)
-                sealed = self.verify_sealed(target)
                 self._assert_bound_seal_intent(bound_intent)
-            return sealed
+                return self._finalize_public_sealed(
+                    target,
+                    expected_manifest=candidate.manifest,
+                    expected_bundle_identity=(bound.current.device, bound.current.inode),
+                    expected_file_identities=self._bound_file_identities(bound),
+                )
 
     def list_candidate_recovery(self) -> tuple[LabArtifactRecoveryRecord, ...]:
         records: list[LabArtifactRecoveryRecord] = []
@@ -3332,13 +3550,11 @@ class LabJobArtifactStore:
                 raise LabArtifactIntegrityError("seal intent file identity changed")
             self._assert_bound_seal_intent(bound_intent)
             if already_sealed:
-                return LabSealedJobArtifact(
-                    path=managed,
-                    manifest=manifest,
-                    manifest_hash=manifest.manifest_hash,
-                    device=observed.device,
-                    inode=observed.inode,
-                    file_identities=identities,
+                return self._finalize_public_sealed(
+                    managed,
+                    expected_manifest=manifest,
+                    expected_bundle_identity=(observed.device, observed.inode),
+                    expected_file_identities=identities,
                 )
             with self._bind_bundle(
                 parent_root=self.sealed_root,
@@ -3370,9 +3586,12 @@ class LabJobArtifactStore:
                 self._finalize_bound_directories(bound)
                 self._assert_bound_seal_intent(bound_intent)
                 self._verify_bound_bytes(bound, manifest)
-            sealed = self.verify_sealed(managed)
-            self._assert_bound_seal_intent(bound_intent)
-            return sealed
+                return self._finalize_public_sealed(
+                    managed,
+                    expected_manifest=manifest,
+                    expected_bundle_identity=(bound.current.device, bound.current.inode),
+                    expected_file_identities=self._bound_file_identities(bound),
+                )
 
     def quarantine_candidate(
         self,
@@ -4116,18 +4335,49 @@ class LegacyArtifactIndex:
             if descriptor >= 0:
                 os.close(descriptor)
 
-    def _refresh_cache_bindings_after_authority_change(self) -> None:
+    def _refresh_cache_bindings_if_authoritative(
+        self,
+        authority: _LegacyAuthorityState,
+    ) -> bool:
+        try:
+            database_at_path = _FileObservation.from_stat(
+                os.stat(
+                    self.path.name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            journal_at_path = _FileObservation.from_stat(
+                os.stat(
+                    f"{self.path.name}-journal",
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            database_opened = _FileObservation.from_stat(os.fstat(self._database_descriptor))
+            journal_opened = _FileObservation.from_stat(os.fstat(self._journal_descriptor))
+        except OSError as exc:
+            raise LabArtifactIntegrityError("legacy cache path identity changed") from exc
+        if database_at_path == database_opened and journal_at_path == journal_opened:
+            return False
+
         replacements: list[tuple[str, int, _FileObservation]] = []
         try:
             for name in (self.path.name, f"{self.path.name}-journal"):
-                at_path = _FileObservation.from_stat(
-                    os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
-                )
-                descriptor = os.open(
-                    name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=self._parent_descriptor,
-                )
+                label = "database" if name == self.path.name else "journal"
+                try:
+                    at_path = _FileObservation.from_stat(
+                        os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
+                    )
+                    descriptor = os.open(
+                        name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=self._parent_descriptor,
+                    )
+                except OSError as exc:
+                    raise LabArtifactIntegrityError(
+                        f"legacy index {label} identity changed"
+                    ) from exc
                 try:
                     opened = _FileObservation.from_stat(os.fstat(descriptor))
                     if (
@@ -4136,14 +4386,32 @@ class LegacyArtifactIndex:
                         or opened.nlink != 1
                         or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
                     ):
-                        raise LabArtifactIntegrityError(
-                            "legacy cache replacement is not a private regular file"
-                        )
+                        raise LabArtifactIntegrityError(f"legacy index {label} identity changed")
                     replacements.append((name, descriptor, opened))
                     descriptor = -1
                 finally:
                     if descriptor >= 0:
                         os.close(descriptor)
+            database_payload = _read_descriptor(replacements[0][1])
+            journal_payload = _read_descriptor(replacements[1][1])
+            if journal_payload:
+                raise LabArtifactIntegrityError("legacy cache replacement journal is not empty")
+            self._validate_serialized_cache(database_payload, authority)
+            canonical_payload = self._build_serialized_cache(authority)
+            if database_payload != canonical_payload:
+                raise LabArtifactIntegrityError(
+                    "legacy cache replacement was not a canonical authority rebuild"
+                )
+            for name, descriptor, opened in replacements:
+                final_path = _FileObservation.from_stat(
+                    os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
+                )
+                final_opened = _FileObservation.from_stat(os.fstat(descriptor))
+                if final_path != opened or final_opened != opened:
+                    raise LabArtifactIntegrityError(
+                        "legacy cache replacement changed while validating"
+                    )
+            self._assert_authority_identity()
         except BaseException:
             for _, descriptor, _ in replacements:
                 os.close(descriptor)
@@ -4157,6 +4425,7 @@ class LegacyArtifactIndex:
         os.close(previous_database)
         os.close(previous_journal)
         self._assert_index_identity()
+        return True
 
     @staticmethod
     def _same_index_entry(
@@ -4361,12 +4630,12 @@ class LegacyArtifactIndex:
             fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
             self._authority_lock_depth += 1
             try:
-                authority_changed = self._refresh_authority_head_binding()
-                if authority_changed:
-                    self._assert_authority_identity()
-                    self._refresh_cache_bindings_after_authority_change()
+                self._refresh_authority_head_binding()
+                self._assert_authority_identity()
+                authority = self._read_authority_state()
+                self._refresh_cache_bindings_if_authoritative(authority)
                 self._assert_index_identity()
-                self._ensure_cache_ready(self._read_authority_state())
+                self._ensure_cache_ready(authority)
                 yield
                 self._assert_index_identity()
             finally:
@@ -4709,6 +4978,7 @@ class LegacyArtifactIndex:
         self._assert_index_identity()
 
     def _ensure_cache_ready(self, authority: _LegacyAuthorityState) -> None:
+        self._refresh_cache_bindings_if_authoritative(authority)
         try:
             with self._cache_connection() as connection:
                 if self._cache_matches_authority(connection, authority):
@@ -4808,10 +5078,10 @@ class LegacyArtifactIndex:
     def _read_authority_state(self) -> _LegacyAuthorityState:
         if self._authority_lock_depth <= 0:
             raise LabArtifactIntegrityError("legacy authority ledger requires the exclusive lock")
-        self._assert_index_identity()
+        self._assert_authority_identity()
         payload = _read_descriptor(self._authority_descriptor)
         head = self._read_bound_authority_head()
-        self._assert_index_identity()
+        self._assert_authority_identity()
         if head.ledger_size > len(payload):
             raise LabArtifactIntegrityError(
                 "legacy authority ledger rollback detected by durable head"
@@ -4855,7 +5125,7 @@ class LegacyArtifactIndex:
                 )
             os.ftruncate(self._authority_descriptor, len(complete))
             os.fsync(self._authority_descriptor)
-            self._assert_index_identity()
+            self._assert_authority_identity()
             payload = _read_descriptor(self._authority_descriptor)
             if payload != complete:
                 raise LabArtifactIntegrityError("legacy authority tail repair was not durable")
