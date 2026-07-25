@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -1676,6 +1677,55 @@ def test_zip_destination_reservation_is_never_overwritten(
         store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
 
     assert destination.read_bytes() == b"reservation"
+    assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+    discarded = list(tmp_path.glob(f".{destination.name}.*.discarded"))
+    assert len(discarded) == 1
+    assert discarded[0].read_bytes() == b""
+
+
+def test_zip_temp_cleanup_never_removes_replacement_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    destination = tmp_path / "raced.zip"
+    replacement_payload = b"attacker replacement"
+    replaced_temp: Path | None = None
+
+    def replace_temp_then_conflict(
+        source_parent: int,
+        source_name: str,
+        _destination_parent: int,
+        _destination_name: str,
+    ) -> None:
+        nonlocal replaced_temp
+        os.unlink(source_name, dir_fd=source_parent)
+        descriptor = os.open(
+            source_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=source_parent,
+        )
+        try:
+            os.write(descriptor, replacement_payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        replaced_temp = tmp_path / source_name
+        raise OSError(errno.EEXIST, "injected destination conflict")
+
+    monkeypatch.setattr(
+        store,
+        "_atomic_zip_publish_noreplace",
+        replace_temp_then_conflict,
+    )
+
+    with pytest.raises(BaseException, match="temporary.*identity|cleanup.*changed"):
+        store.export_deterministic_zip(sealed.path, _evidence(sealed), destination)
+
+    assert replaced_temp is not None
+    assert replaced_temp.read_bytes() == replacement_payload
 
 
 def test_public_verified_sealed_binding_keeps_transaction_evidence_bound(
@@ -4243,6 +4293,148 @@ def test_poisoned_store_rejects_all_public_artifact_operations_without_side_effe
         store.close()
         recovered = LabJobArtifactStore(store.root)
         recovered.close()
+
+
+def test_inflight_export_completes_before_concurrent_poison_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    evidence = _evidence(sealed)
+    destination = tmp_path / "concurrent-export" / "bundle.zip"
+    authorized = threading.Event()
+    release_export = threading.Event()
+    poison_started = threading.Event()
+    poison_finished = threading.Event()
+    export_errors: list[BaseException] = []
+    poison_errors: list[BaseException] = []
+    authorize = store._authorize_export
+
+    def pause_after_authorization(
+        verified: LabSealedJobArtifact,
+        supplied: LabArtifactIndexEvidence,
+    ) -> None:
+        authorize(verified, supplied)
+        authorized.set()
+        if not release_export.wait(timeout=10):
+            raise TimeoutError("export was not released")
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise OSError("restore failed")
+
+    def run_export() -> None:
+        try:
+            store.export_deterministic_zip(sealed.path, evidence, destination)
+        except BaseException as exc:
+            export_errors.append(exc)
+
+    def poison_store() -> None:
+        poison_started.set()
+        try:
+            _prepare(store, job_id=uuid4())
+        except BaseException as exc:
+            poison_errors.append(exc)
+        finally:
+            poison_finished.set()
+
+    monkeypatch.setattr(store, "_authorize_export", pause_after_authorization)
+    monkeypatch.setattr(store, "_restore_candidate_namespace_guard", fail_restore)
+    export_thread = threading.Thread(target=run_export)
+    poison_thread = threading.Thread(target=poison_store)
+    export_thread.start()
+    assert authorized.wait(timeout=10)
+    poison_thread.start()
+    assert poison_started.wait(timeout=10)
+    try:
+        time.sleep(0.25)
+        assert poison_finished.is_set() is False
+        assert store.poisoned is False
+    finally:
+        release_export.set()
+        export_thread.join(timeout=10)
+        poison_thread.join(timeout=10)
+
+    assert not export_thread.is_alive() and not poison_thread.is_alive()
+    assert export_errors == []
+    assert len(poison_errors) == 1
+    assert destination.is_file()
+    assert store.poisoned is True
+    assert len(list(store.namespace_guard_active_root.glob("*.json"))) == 1
+
+    monkeypatch.undo()
+    store.close()
+    recovered = LabJobArtifactStore(store.root)
+    recovered.close()
+
+
+def test_poison_is_shared_until_a_new_store_recovers_the_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "artifacts"
+    poisoned_store = LabJobArtifactStore(root)
+    peer_store = LabJobArtifactStore(root)
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise OSError("restore failed")
+
+    monkeypatch.setattr(
+        poisoned_store,
+        "_restore_candidate_namespace_guard",
+        fail_restore,
+    )
+    with pytest.raises(BaseException, match="restore failed|namespace guard"):
+        _prepare(poisoned_store)
+
+    assert poisoned_store.poisoned is True
+    assert peer_store.poisoned is True
+    with pytest.raises(LabArtifactIntegrityError, match="poisoned"):
+        peer_store.list_candidate_recovery()
+
+    monkeypatch.undo()
+    recovered_store = LabJobArtifactStore(root)
+
+    assert poisoned_store.poisoned is True
+    assert peer_store.poisoned is False
+    assert recovered_store.poisoned is False
+    assert peer_store.list_candidate_recovery()
+
+    poisoned_store.close()
+    peer_store.close()
+    recovered_store.close()
+
+
+@pytest.mark.parametrize("use_second_store", [False, True])
+def test_prepare_reentry_during_serialization_is_rejected_before_inner_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_second_store: bool,
+) -> None:
+    root = tmp_path / "artifacts"
+    outer_store = LabJobArtifactStore(root)
+    inner_store = LabJobArtifactStore(root) if use_second_store else outer_store
+    serialize = outer_store._serialize_parquet
+    attempted = False
+
+    def attempt_reentry_then_serialize(
+        table_name: str,
+        frame: pd.DataFrame,
+    ) -> tuple[bytes, LabJobArtifactFile]:
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            with pytest.raises(LabArtifactIntegrityError, match="reentrant"):
+                _prepare(inner_store, job_id=uuid4())
+        return serialize(table_name, frame)
+
+    monkeypatch.setattr(outer_store, "_serialize_parquet", attempt_reentry_then_serialize)
+
+    candidate = _prepare(outer_store)
+
+    assert attempted is True
+    assert outer_store.poisoned is False
+    assert [path.name for path in outer_store.candidates_root.iterdir()] == [candidate.path.name]
 
 
 def test_same_thread_reentrant_prepare_fails_without_recovering_outer_guard(
