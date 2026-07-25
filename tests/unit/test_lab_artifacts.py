@@ -2552,3 +2552,273 @@ def test_legacy_journal_inode_swap_fails_closed_without_touching_replacement(
         before.st_size,
         before.st_mtime_ns,
     )
+
+
+def test_legacy_source_swap_after_published_fsync_is_invalidated_and_reimportable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"generation":1}', encoding="utf-8")
+    index_path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(index_path)
+    displaced = tmp_path / "legacy-generation-1.json"
+
+    def replace_after_publish(_record: object) -> None:
+        os.rename(source, displaced)
+        source.write_text('{"generation":2}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        index,
+        "_after_published_authority_commit",
+        replace_after_publish,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="changed"):
+        index.import_file(logical_run_id="source-swap", source_path=source)
+
+    authority = index_path.with_name(f"{index_path.name}.authority.jsonl")
+    assert b'"event_type":"invalidated"' in authority.read_bytes()
+    assert index.get("source-swap") is None
+
+    monkeypatch.setattr(index, "_after_published_authority_commit", lambda _record: None)
+    imported = index.import_file(logical_run_id="source-swap", source_path=source)
+    assert imported.status == "imported"
+    assert index.get("source-swap") == imported.record
+
+
+def test_legacy_restart_reconciles_crash_after_publish_before_source_recheck(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"generation":1}', encoding="utf-8")
+    index_path = tmp_path / "index" / "legacy.sqlite3"
+    script = textwrap.dedent(
+        """
+        import os
+        import sys
+        from pathlib import Path
+        from rquant.lab_artifacts import LegacyArtifactIndex
+
+        index = LegacyArtifactIndex(Path(sys.argv[1]))
+        source = Path(sys.argv[2])
+        def replace_and_crash(_record):
+            displaced = source.with_name("legacy-before-crash.json")
+            os.rename(source, displaced)
+            source.write_text('{"generation":2}', encoding="utf-8")
+            os._exit(89)
+        index._after_published_authority_commit = replace_and_crash
+        index.import_file(logical_run_id="crashed-source-swap", source_path=source)
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(index_path), str(source)],
+        check=False,
+        cwd=Path(__file__).parents[2],
+        env=os.environ.copy(),
+    )
+
+    assert completed.returncode == 89
+    restarted = LegacyArtifactIndex(index_path)
+    authority = index_path.with_name(f"{index_path.name}.authority.jsonl")
+    assert b'"event_type":"invalidated"' in authority.read_bytes()
+    assert restarted.get("crashed-source-swap") is None
+    imported = restarted.import_file(
+        logical_run_id="crashed-source-swap",
+        source_path=source,
+    )
+    assert imported.status == "imported"
+    assert restarted.get("crashed-source-swap") == imported.record
+
+
+def test_bound_legacy_source_preserves_caller_and_identity_failures(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text("{}", encoding="utf-8")
+
+    with (
+        pytest.raises(ExceptionGroup) as captured,
+        lab_artifacts_module._open_bound_readonly_file(
+            source,
+            label="legacy reviewer source",
+        ),
+    ):
+        replacement = tmp_path / "replacement.json"
+        replacement.write_text('{"changed":true}', encoding="utf-8")
+        os.replace(replacement, source)
+        raise RuntimeError("caller failed")
+
+    assert any(isinstance(item, RuntimeError) for item in captured.value.exceptions)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in captured.value.exceptions)
+
+
+def test_interrupted_seal_rejects_valid_same_job_bundle_not_bound_to_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts-a")
+    candidate_a = _prepare(store)
+
+    def crash_after_rename(_bound: object) -> None:
+        raise OSError("intent A remains durable")
+
+    monkeypatch.setattr(store, "_finalize_bound_directories", crash_after_rename)
+    with pytest.raises(OSError, match="intent A"):
+        store.seal_candidate(candidate_a)
+
+    other = LabJobArtifactStore(tmp_path / "artifacts-b")
+    candidate_b = other.prepare_candidate(
+        job_id=candidate_a.job_id,
+        spec=_spec(),
+        plan_hash="6" * 64,
+        adapter_id="n-shape",
+        adapter_version="1",
+        result_contract_version="p14b1-v1",
+        metrics={"bundle": "B"},
+        report_markdown="# Bundle B\n",
+        tables=_tables(),
+    )
+    sealed_b = other.seal_candidate(candidate_b)
+    published = store.sealed_root / candidate_a.job_id.hex
+    os.rename(published, tmp_path / "displaced-bundle-a")
+    shutil.copytree(sealed_b.path, published, copy_function=shutil.copy2)
+
+    with pytest.raises(LabArtifactIntegrityError, match="seal intent"):
+        LabJobArtifactStore(tmp_path / "artifacts-a").recover_interrupted_seal(published)
+
+
+def test_legacy_import_never_opens_disk_sqlite_for_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text("{}", encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    real_connect = sqlite3.connect
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    def recording_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        calls.append((args[0], dict(kwargs)))
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", recording_connect)
+
+    imported = index.import_file(logical_run_id="memory-cache-only", source_path=source)
+
+    assert imported.status == "imported"
+    assert calls
+    assert all(
+        database == ":memory:"
+        or (
+            isinstance(database, str)
+            and database.endswith("?mode=ro")
+            and options.get("uri") is True
+        )
+        for database, options in calls
+    )
+
+
+def test_parquet_empty_categorical_dtype_round_trips_with_full_identity(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    frame = pd.DataFrame({"bucket": pd.Series(pd.Categorical([], categories=[], ordered=False))})
+    candidate = store.prepare_candidate(
+        job_id=uuid4(),
+        spec=_spec(),
+        plan_hash="6" * 64,
+        adapter_id="n-shape",
+        adapter_version="1",
+        result_contract_version="p14b1-v1",
+        metrics={},
+        report_markdown="ok",
+        tables={"categories": frame},
+    )
+    sealed = store.seal_candidate(candidate)
+    parquet = sealed.manifest.files[-1].parquet
+
+    assert parquet is not None
+    dtype = parquet.dtype_identities[0]
+    assert dtype.family == "categorical"
+    assert dtype.categories == ()
+    assert dtype.ordered is False
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def test_parquet_ordered_unused_categories_are_part_of_dtype_identity(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    frame = pd.DataFrame(
+        {
+            "bucket": pd.Series(
+                pd.Categorical(
+                    ["high"],
+                    categories=["low", "mid", "high"],
+                    ordered=True,
+                )
+            )
+        }
+    )
+    sealed = store.seal_candidate(
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="n-shape",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"categories": frame},
+        )
+    )
+    parquet = sealed.manifest.files[-1].parquet
+
+    assert parquet is not None
+    dtype = parquet.dtype_identities[0]
+    assert dtype.family == "categorical"
+    assert dtype.categories == ('"low"', '"mid"', '"high"')
+    assert dtype.ordered is True
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash
+
+
+def test_parquet_empty_nullable_and_timezone_dtypes_have_stable_identity(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    frame = pd.DataFrame(
+        {
+            "count": pd.Series([], dtype="Int64"),
+            "enabled": pd.Series([], dtype="boolean"),
+            "label": pd.Series([], dtype="string"),
+            "observed_at": pd.Series([], dtype="datetime64[ns, Asia/Shanghai]"),
+        }
+    )
+    sealed = store.seal_candidate(
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="n-shape",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"nullable": frame},
+        )
+    )
+    parquet = sealed.manifest.files[-1].parquet
+
+    assert parquet is not None
+    identities = {
+        column: dtype
+        for column, dtype in zip(
+            parquet.columns,
+            parquet.dtype_identities,
+            strict=True,
+        )
+    }
+    assert identities["count"].family == "extension"
+    assert identities["enabled"].family == "extension"
+    assert identities["label"].family == "extension"
+    assert identities["observed_at"].family == "datetime_tz"
+    assert identities["observed_at"].timezone == "Asia/Shanghai"
+    assert store.verify_sealed(sealed.path).manifest_hash == sealed.manifest_hash

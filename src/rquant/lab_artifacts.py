@@ -189,17 +189,63 @@ def _safe_relative_path(value: str) -> str:
     return value
 
 
+class LabPandasDtypeIdentity(LabArtifactModel):
+    family: Literal["numpy", "extension", "categorical", "datetime_tz"]
+    pandas_dtype: str = Field(min_length=1)
+    dtype_repr: str = Field(min_length=1)
+    dtype_class: str = Field(min_length=1)
+    numpy_kind: str | None = None
+    categories: tuple[str, ...] | None = None
+    categories_dtype: str | None = None
+    categories_dtype_class: str | None = None
+    ordered: bool | None = None
+    timezone: str | None = None
+    unit: str | None = None
+    storage: str | None = None
+    na_value: str | None = None
+
+    @model_validator(mode="after")
+    def validate_family_metadata(self) -> LabPandasDtypeIdentity:
+        if self.family == "categorical":
+            if (
+                self.categories is None
+                or self.categories_dtype is None
+                or self.categories_dtype_class is None
+                or self.ordered is None
+            ):
+                raise ValueError("categorical dtype identity is incomplete")
+        elif any(
+            value is not None
+            for value in (
+                self.categories,
+                self.categories_dtype,
+                self.categories_dtype_class,
+                self.ordered,
+            )
+        ):
+            raise ValueError("category metadata is only valid for categorical dtypes")
+        if self.family == "datetime_tz":
+            if self.timezone is None or self.unit is None:
+                raise ValueError("timezone dtype identity is incomplete")
+        elif self.timezone is not None:
+            raise ValueError("timezone metadata is only valid for timezone dtypes")
+        return self
+
+
 class LabParquetIdentity(LabArtifactModel):
     table_name: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     row_count: int = Field(ge=0)
     columns: tuple[str, ...]
     dtypes: tuple[str, ...]
+    dtype_identities: tuple[LabPandasDtypeIdentity, ...]
     content_sha256: str = Field(pattern=_HASH_PATTERN)
 
     @model_validator(mode="after")
     def validate_shape(self) -> LabParquetIdentity:
-        if len(self.columns) != len(self.dtypes):
-            raise ValueError("Parquet columns and dtypes must have equal length")
+        if len(self.columns) != len(self.dtypes) or len(self.columns) != len(self.dtype_identities):
+            raise ValueError("Parquet columns and dtype identities must have equal length")
+        if self.dtypes != tuple(item.pandas_dtype for item in self.dtype_identities):
+            raise ValueError("Parquet dtype strings conflict with typed identities")
         if len(self.columns) != len(set(self.columns)):
             raise ValueError("Parquet columns must be unique")
         return self
@@ -472,7 +518,7 @@ class LabLegacyIndexResult(LabArtifactModel):
 
 class _LabLegacyAuthorityEventPayload(LabArtifactModel):
     schema_version: Literal[2] = 2
-    event_type: Literal["staged", "published", "abandoned"]
+    event_type: Literal["staged", "published", "abandoned", "invalidated"]
     sequence: int = Field(ge=1)
     previous_hash: str = Field(pattern=_HASH_PATTERN)
     logical_run_id: str = Field(min_length=1)
@@ -506,7 +552,7 @@ class LabLegacyAuthorityEvent(_LabLegacyAuthorityEventPayload):
     def create(
         cls,
         *,
-        event_type: Literal["staged", "published", "abandoned"],
+        event_type: Literal["staged", "published", "abandoned", "invalidated"],
         sequence: int,
         previous_hash: str,
         logical_run_id: str,
@@ -900,12 +946,27 @@ def _open_bound_readonly_file(path: Path, *, label: str) -> Iterator[_BoundReado
             file_identity=opened,
         )
         _assert_bound_readonly_file(bound, label=label)
-        yield bound
-        _assert_bound_readonly_file(bound, label=label)
     except LabArtifactError:
         raise
     except OSError as exc:
         raise LabArtifactIntegrityError(f"{label} cannot be opened safely") from exc
+    caller_error: BaseException | None = None
+    try:
+        try:
+            yield bound
+        except BaseException as exc:
+            caller_error = exc
+        try:
+            _assert_bound_readonly_file(bound, label=label)
+        except BaseException as integrity_error:
+            if caller_error is not None:
+                raise BaseExceptionGroup(
+                    f"{label} caller and identity checks both failed",
+                    [caller_error, integrity_error],
+                ) from None
+            raise
+        if caller_error is not None:
+            raise caller_error
     finally:
         if "bound" in locals():
             bound.close()
@@ -1003,10 +1064,116 @@ def _canonical_table_value(value: object) -> object:
     return _canonical_value(value)
 
 
+def _dtype_class_name(value: object) -> str:
+    dtype_type = type(value)
+    return f"{dtype_type.__module__}.{dtype_type.__qualname__}"
+
+
+def _canonical_dtype_token(value: object) -> str:
+    return canonical_json_bytes(_canonical_table_value(value)).decode("ascii")
+
+
+def _pandas_dtype_identity(dtype: object) -> LabPandasDtypeIdentity:
+    common = {
+        "pandas_dtype": str(dtype),
+        "dtype_repr": repr(dtype),
+        "dtype_class": _dtype_class_name(dtype),
+    }
+    if isinstance(dtype, pd.CategoricalDtype):
+        categories = dtype.categories
+        return LabPandasDtypeIdentity(
+            family="categorical",
+            **common,
+            categories=tuple(_canonical_dtype_token(value) for value in categories),
+            categories_dtype=str(categories.dtype),
+            categories_dtype_class=_dtype_class_name(categories.dtype),
+            ordered=dtype.ordered,
+        )
+    if isinstance(dtype, pd.DatetimeTZDtype):
+        return LabPandasDtypeIdentity(
+            family="datetime_tz",
+            **common,
+            timezone=str(dtype.tz),
+            unit=dtype.unit,
+        )
+    if isinstance(dtype, pd.api.extensions.ExtensionDtype):
+        storage = getattr(dtype, "storage", None)
+        na_value = getattr(dtype, "na_value", None)
+        return LabPandasDtypeIdentity(
+            family="extension",
+            **common,
+            storage=str(storage) if storage is not None else None,
+            na_value=_canonical_dtype_token(na_value) if na_value is not None else None,
+        )
+    numpy_kind = getattr(dtype, "kind", None)
+    return LabPandasDtypeIdentity(
+        family="numpy",
+        **common,
+        numpy_kind=str(numpy_kind) if numpy_kind is not None else None,
+    )
+
+
+def _frame_dtype_identities(frame: pd.DataFrame) -> tuple[LabPandasDtypeIdentity, ...]:
+    return tuple(_pandas_dtype_identity(dtype) for dtype in frame.dtypes)
+
+
+def _rebuild_canonical_dtype_token(token: str) -> object:
+    try:
+        value = json.loads(token)
+    except json.JSONDecodeError as exc:
+        raise LabArtifactIntegrityError("pandas dtype metadata is not canonical JSON") from exc
+    if canonical_json_bytes(value).decode("ascii") != token:
+        raise LabArtifactIntegrityError("pandas dtype metadata is not canonical JSON")
+    if isinstance(value, dict) and set(value) == {"$timestamp_ns"}:
+        return pd.Timestamp(int(value["$timestamp_ns"]))
+    if isinstance(value, dict) and set(value) == {"$timestamp_utc_ns"}:
+        return pd.Timestamp(int(value["$timestamp_utc_ns"]), tz=UTC)
+    if isinstance(value, dict) and set(value) == {"$timedelta_ns"}:
+        return pd.Timedelta(int(value["$timedelta_ns"]), unit="ns")
+    if isinstance(value, dict) and set(value) == {"$bytes"}:
+        return base64.b64decode(value["$bytes"], validate=True)
+    if isinstance(value, dict) and set(value) == {"$null"}:
+        return None
+    return _rebuild_canonical_value(value)
+
+
+def _restore_manifest_dtypes(
+    frame: pd.DataFrame,
+    identities: tuple[LabPandasDtypeIdentity, ...],
+) -> pd.DataFrame:
+    if len(frame.columns) != len(identities):
+        raise LabArtifactIntegrityError("Parquet dtype identity shape changed")
+    restored = frame.copy(deep=False)
+    for position, identity in enumerate(identities):
+        if identity.family != "categorical":
+            continue
+        if identity.categories is None or identity.ordered is None:
+            raise LabArtifactIntegrityError("categorical dtype identity is incomplete")
+        categories = [_rebuild_canonical_dtype_token(item) for item in identity.categories]
+        categorical_dtype = pd.CategoricalDtype(
+            categories=categories,
+            ordered=identity.ordered,
+        )
+        column = restored.columns[position]
+        try:
+            restored[column] = pd.Series(
+                pd.Categorical(restored.iloc[:, position], dtype=categorical_dtype),
+                index=restored.index,
+            )
+        except (TypeError, ValueError) as exc:
+            raise LabArtifactIntegrityError(
+                f"Parquet categorical dtype cannot be reconstructed: {column}"
+            ) from exc
+    if _frame_dtype_identities(restored) != identities:
+        raise LabArtifactIntegrityError("Parquet pandas dtype metadata changed")
+    return restored
+
+
 def _table_content_hash(frame: pd.DataFrame) -> str:
     payload = {
         "columns": list(frame.columns),
         "dtypes": [str(dtype) for dtype in frame.dtypes],
+        "dtype_identities": _frame_dtype_identities(frame),
         "rows": [
             [_canonical_table_value(value) for value in row]
             for row in frame.itertuples(index=False, name=None)
@@ -1323,6 +1490,7 @@ class LabJobArtifactStore:
         frame: pd.DataFrame,
     ) -> tuple[bytes, LabJobArtifactFile]:
         try:
+            original_dtype_identities = _frame_dtype_identities(frame)
             original_content_hash = _table_content_hash(frame)
         except (TypeError, ValueError) as exc:
             raise LabArtifactIntegrityError(
@@ -1333,6 +1501,7 @@ class LabJobArtifactStore:
         payload = output.getvalue()
         try:
             persisted = pd.read_parquet(io.BytesIO(payload))
+            persisted = _restore_manifest_dtypes(persisted, original_dtype_identities)
         except Exception as exc:
             raise LabArtifactIntegrityError(
                 f"candidate table cannot be read: {table_name}"
@@ -1340,12 +1509,12 @@ class LabJobArtifactStore:
         original_shape = (
             len(frame),
             tuple(frame.columns),
-            tuple(str(item) for item in frame.dtypes),
+            original_dtype_identities,
         )
         persisted_shape = (
             len(persisted),
             tuple(persisted.columns),
-            tuple(str(item) for item in persisted.dtypes),
+            _frame_dtype_identities(persisted),
         )
         if persisted_shape != original_shape:
             raise LabArtifactIntegrityError(
@@ -1372,7 +1541,8 @@ class LabJobArtifactStore:
                     table_name=table_name,
                     row_count=len(persisted),
                     columns=tuple(persisted.columns),
-                    dtypes=tuple(str(item) for item in persisted.dtypes),
+                    dtypes=tuple(item.pandas_dtype for item in original_dtype_identities),
+                    dtype_identities=original_dtype_identities,
                     content_sha256=original_content_hash,
                 ),
             ),
@@ -1822,6 +1992,7 @@ class LabJobArtifactStore:
                 continue
             try:
                 frame = pd.read_parquet(io.BytesIO(payloads[relative_path]))
+                frame = _restore_manifest_dtypes(frame, entry.parquet.dtype_identities)
             except Exception as exc:
                 raise LabArtifactIntegrityError(
                     f"Parquet artifact cannot be read: {relative_path}"
@@ -1830,12 +2001,14 @@ class LabJobArtifactStore:
                 len(frame),
                 tuple(frame.columns),
                 tuple(str(item) for item in frame.dtypes),
+                _frame_dtype_identities(frame),
                 _table_content_hash(frame),
             )
             expected = (
                 entry.parquet.row_count,
                 entry.parquet.columns,
                 entry.parquet.dtypes,
+                entry.parquet.dtype_identities,
                 entry.parquet.content_sha256,
             )
             if actual != expected:
@@ -3100,14 +3273,20 @@ class LabJobArtifactStore:
             raise LabArtifactIntegrityError("interrupted sealed path is not canonical")
         with self._bind_seal_intent(job_id, candidate=None, create=False) as bound_intent:
             try:
-                return self.verify_sealed(managed)
+                manifest, identities, observed = self._validate_bundle(
+                    managed,
+                    parent_root=self.sealed_root,
+                    permission_profile="sealed",
+                )
             except LabArtifactIntegrityError:
-                pass
-            manifest, identities, observed = self._validate_bundle(
-                managed,
-                parent_root=self.sealed_root,
-                permission_profile="interrupted",
-            )
+                manifest, identities, observed = self._validate_bundle(
+                    managed,
+                    parent_root=self.sealed_root,
+                    permission_profile="interrupted",
+                )
+                already_sealed = False
+            else:
+                already_sealed = True
             if managed.name != manifest.job_id.hex:
                 raise LabArtifactIntegrityError(
                     "interrupted sealed path does not match job identity"
@@ -3152,6 +3331,15 @@ class LabJobArtifactStore:
             ):
                 raise LabArtifactIntegrityError("seal intent file identity changed")
             self._assert_bound_seal_intent(bound_intent)
+            if already_sealed:
+                return LabSealedJobArtifact(
+                    path=managed,
+                    manifest=manifest,
+                    manifest_hash=manifest.manifest_hash,
+                    device=observed.device,
+                    inode=observed.inode,
+                    file_identities=identities,
+                )
             with self._bind_bundle(
                 parent_root=self.sealed_root,
                 bundle_path=managed,
@@ -3647,6 +3835,7 @@ class LegacyArtifactIndex:
                     )
                     self._assert_index_identity()
                     authority = self._read_authority_state()
+                    authority = self._reconcile_published_sources(authority)
                     self._ensure_cache_ready(authority)
                     self._assert_index_identity()
                 finally:
@@ -3881,7 +4070,7 @@ class LegacyArtifactIndex:
             self._head_identity = _FileObservation.from_stat(os.fstat(self._head_descriptor))
             self._read_bound_authority_head()
 
-    def _refresh_authority_head_binding(self) -> None:
+    def _refresh_authority_head_binding(self) -> bool:
         at_path = _FileObservation.from_stat(
             os.stat(
                 self._authority_head_name,
@@ -3891,7 +4080,7 @@ class LegacyArtifactIndex:
         )
         current = _FileObservation.from_stat(os.fstat(self._head_descriptor))
         if at_path == current:
-            return
+            return False
         descriptor = os.open(
             self._authority_head_name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -3922,9 +4111,52 @@ class LegacyArtifactIndex:
             self._head_identity = opened
             descriptor = -1
             os.close(previous)
+            return True
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+
+    def _refresh_cache_bindings_after_authority_change(self) -> None:
+        replacements: list[tuple[str, int, _FileObservation]] = []
+        try:
+            for name in (self.path.name, f"{self.path.name}-journal"):
+                at_path = _FileObservation.from_stat(
+                    os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
+                )
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=self._parent_descriptor,
+                )
+                try:
+                    opened = _FileObservation.from_stat(os.fstat(descriptor))
+                    if (
+                        opened != at_path
+                        or opened.mode != stat.S_IFREG
+                        or opened.nlink != 1
+                        or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600
+                    ):
+                        raise LabArtifactIntegrityError(
+                            "legacy cache replacement is not a private regular file"
+                        )
+                    replacements.append((name, descriptor, opened))
+                    descriptor = -1
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+        except BaseException:
+            for _, descriptor, _ in replacements:
+                os.close(descriptor)
+            raise
+        previous_database = self._database_descriptor
+        previous_journal = self._journal_descriptor
+        self._database_descriptor = replacements[0][1]
+        self._database_identity = replacements[0][2]
+        self._journal_descriptor = replacements[1][1]
+        self._journal_identity = replacements[1][2]
+        os.close(previous_database)
+        os.close(previous_journal)
+        self._assert_index_identity()
 
     @staticmethod
     def _same_index_entry(
@@ -4129,7 +4361,10 @@ class LegacyArtifactIndex:
             fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
             self._authority_lock_depth += 1
             try:
-                self._refresh_authority_head_binding()
+                authority_changed = self._refresh_authority_head_binding()
+                if authority_changed:
+                    self._assert_authority_identity()
+                    self._refresh_cache_bindings_after_authority_change()
                 self._assert_index_identity()
                 self._ensure_cache_ready(self._read_authority_state())
                 yield
@@ -4146,22 +4381,19 @@ class LegacyArtifactIndex:
     def _after_sqlite_connect(_connection: sqlite3.Connection) -> None:
         """Fault-injection boundary after SQLite opens its path."""
 
-    def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
+    def _connect(self) -> sqlite3.Connection:
         self._assert_index_identity()
         self._before_sqlite_connect()
         self._assert_index_identity()
         try:
-            database: str | Path = f"{self.path.as_uri()}?mode=ro" if read_only else self.path
+            database = f"{self.path.as_uri()}?mode=ro"
             connection = sqlite3.connect(
                 database,
                 timeout=30,
                 isolation_level=None,
-                uri=read_only,
+                uri=True,
             )
             self._after_sqlite_connect(connection)
-            if not read_only:
-                connection.execute("PRAGMA journal_mode=TRUNCATE")
-                connection.execute("PRAGMA synchronous=FULL")
             database_rows = connection.execute("PRAGMA database_list").fetchall()
             main_paths = [
                 _secure_absolute_path(Path(str(row[2])))
@@ -4178,12 +4410,8 @@ class LegacyArtifactIndex:
             raise
 
     @contextmanager
-    def _cache_connection(
-        self,
-        *,
-        read_only: bool = False,
-    ) -> Iterator[sqlite3.Connection]:
-        connection = self._connect(read_only=read_only)
+    def _cache_connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
         try:
             yield connection
         finally:
@@ -4482,7 +4710,7 @@ class LegacyArtifactIndex:
 
     def _ensure_cache_ready(self, authority: _LegacyAuthorityState) -> None:
         try:
-            with self._cache_connection(read_only=True) as connection:
+            with self._cache_connection() as connection:
                 if self._cache_matches_authority(connection, authority):
                     return
         except sqlite3.Error:
@@ -4522,10 +4750,19 @@ class LegacyArtifactIndex:
                 if event.generation != prior_generation + 1:
                     raise LabArtifactIntegrityError("legacy authority generation is invalid")
                 generations[event.logical_run_id] = event.generation
-            else:
+            elif event.event_type in {"published", "abandoned"}:
                 if (
                     previous is None
                     or previous.event_type != "staged"
+                    or previous.operation_id != event.operation_id
+                    or previous.generation != event.generation
+                    or previous.record != event.record
+                ):
+                    raise LabArtifactIntegrityError("legacy authority transition is invalid")
+            else:
+                if (
+                    previous is None
+                    or previous.event_type != "published"
                     or previous.operation_id != event.operation_id
                     or previous.generation != event.generation
                     or previous.record != event.record
@@ -4631,7 +4868,7 @@ class LegacyArtifactIndex:
     def _append_authority_event(
         self,
         *,
-        event_type: Literal["staged", "published", "abandoned"],
+        event_type: Literal["staged", "published", "abandoned", "invalidated"],
         logical_run_id: str,
         operation_id: UUID,
         generation: int,
@@ -4699,9 +4936,62 @@ class LegacyArtifactIndex:
             return "text/markdown; charset=utf-8"
         raise LabArtifactPathError("legacy source must be JSON or Markdown")
 
+    def _published_source_matches(self, event: LabLegacyAuthorityEvent) -> bool:
+        record = event.record
+        try:
+            with _open_bound_readonly_file(
+                record.source_path,
+                label="published legacy artifact source",
+            ) as bound:
+                payload = _read_descriptor(bound.descriptor)
+                _assert_bound_readonly_file(bound, label="published legacy artifact source")
+                return self._legacy_record_matches(record, bound.file_identity, payload)
+        except (LabArtifactError, OSError):
+            return False
+
+    def _invalidate_published_event(
+        self,
+        event: LabLegacyAuthorityEvent,
+    ) -> LabLegacyAuthorityEvent:
+        current = self._read_authority_state().latest.get(event.logical_run_id)
+        if (
+            current is not None
+            and current.event_type == "invalidated"
+            and current.operation_id == event.operation_id
+            and current.generation == event.generation
+            and current.record == event.record
+        ):
+            return current
+        if current != event or event.event_type != "published":
+            raise LabArtifactIntegrityError(
+                "legacy published source authority changed before invalidation"
+            )
+        return self._append_authority_event(
+            event_type="invalidated",
+            logical_run_id=event.logical_run_id,
+            operation_id=event.operation_id,
+            generation=event.generation,
+            record=event.record,
+            occurred_at=self._clock_utc(),
+        )
+
+    def _reconcile_published_sources(
+        self,
+        authority: _LegacyAuthorityState,
+    ) -> _LegacyAuthorityState:
+        changed = False
+        for event in self._published_authority_events(authority):
+            if self._published_source_matches(event):
+                continue
+            self._invalidate_published_event(event)
+            changed = True
+        return self._read_authority_state() if changed else authority
+
     def get(self, logical_run_id: str) -> LabLegacyArtifactRecord | None:
         with self._exclusive_index_lock():
-            event = self._read_authority_state().latest.get(logical_run_id)
+            authority = self._reconcile_published_sources(self._read_authority_state())
+            self._ensure_cache_ready(authority)
+            event = authority.latest.get(logical_run_id)
             if event is None or event.event_type != "published":
                 return None
             record = event.record
@@ -4713,8 +5003,12 @@ class LegacyArtifactIndex:
                     payload = _read_descriptor(bound.descriptor)
                     _assert_bound_readonly_file(bound, label="published legacy artifact source")
                     if not self._legacy_record_matches(record, bound.file_identity, payload):
+                        self._invalidate_published_event(event)
+                        self._ensure_cache_ready(self._read_authority_state())
                         return None
             except LabArtifactError:
+                self._invalidate_published_event(event)
+                self._ensure_cache_ready(self._read_authority_state())
                 return None
             return record
 
@@ -4751,95 +5045,9 @@ class LegacyArtifactIndex:
     def _after_stage_commit(_record: LabLegacyArtifactRecord) -> None:
         """Fault-injection boundary after an authority stage becomes durable."""
 
-    def _cache_stage(
-        self,
-        *,
-        event: LabLegacyAuthorityEvent,
-        previous: LabLegacyAuthorityEvent | None,
-    ) -> None:
-        with self._cache_connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if previous is not None and previous.event_type == "staged":
-                connection.execute(
-                    """
-                    DELETE FROM legacy_artifact
-                    WHERE logical_run_id = ? AND operation_id = ? AND generation = ?
-                      AND publication_state = 'staged'
-                    """,
-                    (
-                        previous.logical_run_id,
-                        str(previous.operation_id),
-                        previous.generation,
-                    ),
-                )
-            record = event.record
-            connection.execute(
-                """
-                INSERT INTO legacy_artifact (
-                    logical_run_id, source_path, device, inode, size, mtime_ns,
-                    sha256, media_type, imported_at, publication_state,
-                    operation_id, generation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?)
-                ON CONFLICT(logical_run_id) DO UPDATE SET
-                    source_path=excluded.source_path,
-                    device=excluded.device,
-                    inode=excluded.inode,
-                    size=excluded.size,
-                    mtime_ns=excluded.mtime_ns,
-                    sha256=excluded.sha256,
-                    media_type=excluded.media_type,
-                    imported_at=excluded.imported_at,
-                    publication_state='staged',
-                    operation_id=excluded.operation_id,
-                    generation=excluded.generation
-                """,
-                (
-                    record.logical_run_id,
-                    str(record.source_path),
-                    record.device,
-                    record.inode,
-                    record.size,
-                    record.mtime_ns,
-                    record.sha256,
-                    record.media_type,
-                    record.imported_at.isoformat(timespec="microseconds"),
-                    str(event.operation_id),
-                    event.generation,
-                ),
-            )
-            self._assert_index_identity()
-            connection.commit()
-            self._assert_index_identity()
-
-    def _cache_complete(self, event: LabLegacyAuthorityEvent) -> None:
-        with self._cache_connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """
-                UPDATE legacy_artifact SET publication_state = 'cached'
-                WHERE logical_run_id = ? AND operation_id = ? AND generation = ?
-                  AND publication_state = 'staged'
-                """,
-                (event.logical_run_id, str(event.operation_id), event.generation),
-            )
-            if cursor.rowcount != 1:
-                raise LabArtifactIntegrityError("legacy cache operation ownership changed")
-            self._assert_index_identity()
-            connection.commit()
-            self._assert_index_identity()
-
-    def _delete_cache_operation(self, event: LabLegacyAuthorityEvent) -> None:
-        with self._cache_connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                DELETE FROM legacy_artifact
-                WHERE logical_run_id = ? AND operation_id = ? AND generation = ?
-                  AND publication_state IN ('staged', 'cached')
-                """,
-                (event.logical_run_id, str(event.operation_id), event.generation),
-            )
-            connection.commit()
+    @staticmethod
+    def _after_published_authority_commit(_record: LabLegacyArtifactRecord) -> None:
+        """Fault-injection boundary after published ledger and head fsync."""
 
     def import_file(
         self,
@@ -4864,95 +5072,119 @@ class LegacyArtifactIndex:
             raise ValueError("logical_run_id must not be empty")
         source = _secure_absolute_path(source_path)
         media_type = self._media_type(source)
-        with _open_bound_readonly_file(source, label="legacy artifact source") as bound:
-            payload = _read_descriptor(bound.descriptor)
-            _assert_bound_readonly_file(bound, label="legacy artifact source")
-            observation = bound.file_identity
-            occurred_at = self._clock_utc()
-            record = LabLegacyArtifactRecord(
-                logical_run_id=logical_run_id,
-                source_path=source,
-                device=observation.device,
-                inode=observation.inode,
-                size=observation.size,
-                mtime_ns=observation.mtime_ns,
-                sha256=_sha256(payload),
-                media_type=media_type,
-                imported_at=occurred_at,
-            )
-            authority = self._read_authority_state()
-            previous = authority.latest.get(logical_run_id)
-            if previous is not None and previous.event_type == "published":
-                existing = previous.record
-                if existing.source_path != source or not self._legacy_record_matches(
-                    existing,
-                    observation,
-                    payload,
-                ):
-                    raise LabLegacyArtifactConflictError(
-                        "legacy logical run already references different source bytes"
+        staged: LabLegacyAuthorityEvent | None = None
+        published: LabLegacyAuthorityEvent | None = None
+        occurred_at: datetime | None = None
+        try:
+            with _open_bound_readonly_file(source, label="legacy artifact source") as bound:
+                payload = _read_descriptor(bound.descriptor)
+                _assert_bound_readonly_file(bound, label="legacy artifact source")
+                observation = bound.file_identity
+                occurred_at = self._clock_utc()
+                record = LabLegacyArtifactRecord(
+                    logical_run_id=logical_run_id,
+                    source_path=source,
+                    device=observation.device,
+                    inode=observation.inode,
+                    size=observation.size,
+                    mtime_ns=observation.mtime_ns,
+                    sha256=_sha256(payload),
+                    media_type=media_type,
+                    imported_at=occurred_at,
+                )
+                authority = self._read_authority_state()
+                previous = authority.latest.get(logical_run_id)
+                if previous is not None and previous.event_type == "published":
+                    existing = previous.record
+                    if existing.source_path != source or not self._legacy_record_matches(
+                        existing,
+                        observation,
+                        payload,
+                    ):
+                        self._invalidate_published_event(previous)
+                        self._ensure_cache_ready(self._read_authority_state())
+                        raise LabLegacyArtifactConflictError(
+                            "legacy logical run already references different source bytes"
+                        )
+                    self._before_commit_source_check(source, observation)
+                    _assert_bound_readonly_file(bound, label="legacy artifact source")
+                    published = previous
+                    result = LabLegacyIndexResult(status="reused", record=existing)
+                else:
+                    if previous is not None and previous.event_type == "staged":
+                        self._append_authority_event(
+                            event_type="abandoned",
+                            logical_run_id=previous.logical_run_id,
+                            operation_id=previous.operation_id,
+                            generation=previous.generation,
+                            record=previous.record,
+                            occurred_at=occurred_at,
+                        )
+                    generation = authority.generations.get(logical_run_id, 0) + 1
+                    operation_id = uuid4()
+                    staged = self._append_authority_event(
+                        event_type="staged",
+                        logical_run_id=logical_run_id,
+                        operation_id=operation_id,
+                        generation=generation,
+                        record=record,
+                        occurred_at=occurred_at,
                     )
-                self._before_commit_source_check(source, observation)
-                _assert_bound_readonly_file(bound, label="legacy artifact source")
-                return LabLegacyIndexResult(status="reused", record=existing)
-            if previous is not None and previous.event_type == "staged":
-                self._append_authority_event(
-                    event_type="abandoned",
-                    logical_run_id=previous.logical_run_id,
-                    operation_id=previous.operation_id,
-                    generation=previous.generation,
-                    record=previous.record,
-                    occurred_at=occurred_at,
-                )
-            generation = authority.generations.get(logical_run_id, 0) + 1
-            operation_id = uuid4()
-            staged = self._append_authority_event(
-                event_type="staged",
-                logical_run_id=logical_run_id,
-                operation_id=operation_id,
-                generation=generation,
-                record=record,
-                occurred_at=occurred_at,
-            )
-            published = False
-            try:
-                self._cache_stage(event=staged, previous=previous)
-                self._before_commit_source_check(source, observation)
-                _assert_bound_readonly_file(bound, label="legacy artifact source")
-                self._after_stage_commit(record)
-                self._before_commit_source_check(source, observation)
-                _assert_bound_readonly_file(bound, label="legacy artifact source")
-                self._cache_complete(staged)
-                self._before_commit_source_check(source, observation)
-                _assert_bound_readonly_file(bound, label="legacy artifact source")
-                self._append_authority_event(
-                    event_type="published",
-                    logical_run_id=staged.logical_run_id,
-                    operation_id=staged.operation_id,
-                    generation=staged.generation,
-                    record=staged.record,
-                    occurred_at=self._clock_utc(),
-                )
-                published = True
-            except Exception:
-                if not published:
-                    with suppress(LabArtifactError, OSError, ValueError):
-                        current = self._read_authority_state().latest.get(logical_run_id)
-                        if (
-                            current is not None
-                            and current.event_type == "staged"
-                            and current.operation_id == operation_id
-                            and current.generation == generation
-                        ):
-                            self._append_authority_event(
-                                event_type="abandoned",
-                                logical_run_id=staged.logical_run_id,
-                                operation_id=staged.operation_id,
-                                generation=staged.generation,
-                                record=staged.record,
-                                occurred_at=occurred_at,
-                            )
-                    with suppress(LabArtifactError, sqlite3.Error, OSError):
-                        self._delete_cache_operation(staged)
-                raise
-            return LabLegacyIndexResult(status="imported", record=record)
+                    self._before_commit_source_check(source, observation)
+                    _assert_bound_readonly_file(bound, label="legacy artifact source")
+                    self._after_stage_commit(record)
+                    self._before_commit_source_check(source, observation)
+                    _assert_bound_readonly_file(bound, label="legacy artifact source")
+                    published = self._append_authority_event(
+                        event_type="published",
+                        logical_run_id=staged.logical_run_id,
+                        operation_id=staged.operation_id,
+                        generation=staged.generation,
+                        record=staged.record,
+                        occurred_at=self._clock_utc(),
+                    )
+                    self._after_published_authority_commit(record)
+                    self._before_commit_source_check(source, observation)
+                    _assert_bound_readonly_file(bound, label="legacy artifact source")
+                    result = LabLegacyIndexResult(status="imported", record=record)
+            self._ensure_cache_ready(self._read_authority_state())
+            return result
+        except BaseException as error:
+            cleanup_error: BaseException | None = None
+            if published is not None and not self._published_source_matches(published):
+                try:
+                    self._invalidate_published_event(published)
+                    self._ensure_cache_ready(self._read_authority_state())
+                except BaseException as exc:
+                    cleanup_error = exc
+            elif staged is not None and occurred_at is not None:
+                try:
+                    current = self._read_authority_state().latest.get(logical_run_id)
+                    if (
+                        current is not None
+                        and current.event_type == "staged"
+                        and current.operation_id == staged.operation_id
+                        and current.generation == staged.generation
+                    ):
+                        self._append_authority_event(
+                            event_type="abandoned",
+                            logical_run_id=staged.logical_run_id,
+                            operation_id=staged.operation_id,
+                            generation=staged.generation,
+                            record=staged.record,
+                            occurred_at=occurred_at,
+                        )
+                except BaseException as exc:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                raise BaseExceptionGroup(
+                    "legacy import and authority cleanup both failed",
+                    [error, cleanup_error],
+                ) from None
+            if isinstance(error, BaseExceptionGroup) and all(
+                isinstance(item, LabArtifactIntegrityError) for item in error.exceptions
+            ):
+                raise LabArtifactIntegrityError(
+                    "legacy source changed during index publication"
+                ) from error
+            raise
