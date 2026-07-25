@@ -913,6 +913,22 @@ def test_orphaned_seal_intent_temp_is_logically_isolated_before_retry(
     assert any(item.read_bytes() == payload for item in intent_quarantine.iterdir())
 
 
+def test_orphaned_seal_intent_temp_requires_exact_private_permissions(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    temporary = store.seal_intents_root / (f".{candidate.job_id.hex}.{uuid4().hex}.intent.tmp")
+    temporary.write_bytes(b"{")
+    os.chmod(temporary, 0o644)
+
+    with pytest.raises(LabArtifactIntegrityError, match="permissions|unsafe"):
+        store.seal_candidate(candidate)
+
+    assert candidate.path.exists()
+    assert temporary.exists()
+
+
 def test_crash_before_seal_intent_publish_leaves_recoverable_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -991,6 +1007,30 @@ def test_torn_final_intent_requires_authority_then_is_quarantined_and_rebuilt(
     assert any(
         item.read_bytes() == payload for item in (store.root / "seal-intents-quarantine").iterdir()
     )
+
+
+def test_torn_intent_with_partially_frozen_candidate_recovers_with_authority(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    frozen = candidate.path / "report.md"
+    os.chmod(frozen, 0o400)
+    intent = store.seal_intents_root / f"{candidate.job_id.hex}.json"
+    intent.write_bytes(b"{")
+    os.chmod(intent, 0o600)
+
+    record = next(item for item in store.list_candidate_recovery() if item.path == candidate.path)
+
+    assert record.status == "needs_authority"
+    assert "recoverable_torn" in (record.reason or "")
+    with pytest.raises(LabArtifactAuthorizationError, match="authority"):
+        store.recover_candidate(record)
+
+    sealed = store.recover_candidate(record, authority=_recovery_authority(candidate))
+
+    assert sealed.manifest_hash == candidate.manifest_hash
+    assert stat.S_IMODE((sealed.path / "report.md").stat().st_mode) == 0o400
 
 
 @pytest.mark.parametrize(
@@ -1364,6 +1404,32 @@ def test_public_verified_sealed_binding_rechecks_every_inode_on_exit(
         os.chmod(report, 0o400)
 
 
+def test_public_verified_binding_preserves_caller_and_integrity_errors(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    report = sealed.path / "report.md"
+    displaced = tmp_path / "caller-error-report.md"
+
+    with (
+        pytest.raises(ExceptionGroup) as captured,
+        store.bind_verified_sealed(
+            sealed.path,
+            indexed_at=datetime(2026, 7, 25, 10, tzinfo=UTC),
+        ),
+    ):
+        os.chmod(sealed.path, 0o700)
+        os.rename(report, displaced)
+        report.write_bytes(displaced.read_bytes())
+        os.chmod(report, 0o400)
+        raise RuntimeError("caller transaction failed")
+
+    flattened = list(captured.value.exceptions)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in flattened)
+
+
 def test_zip_destination_rejects_ancestor_symlink_without_external_writes(
     tmp_path: Path,
 ) -> None:
@@ -1384,7 +1450,7 @@ def test_zip_destination_rejects_ancestor_symlink_without_external_writes(
     assert list(external_container.iterdir()) == []
 
 
-def test_export_and_legacy_index_do_not_chmod_existing_caller_directories(
+def test_export_does_not_chmod_existing_caller_directory(
     tmp_path: Path,
 ) -> None:
     store = LabJobArtifactStore(tmp_path / "artifacts")
@@ -1393,7 +1459,6 @@ def test_export_and_legacy_index_do_not_chmod_existing_caller_directories(
     output.mkdir(mode=0o755)
     before_mode = stat.S_IMODE(output.stat().st_mode)
 
-    LegacyArtifactIndex(output / "legacy.sqlite3")
     store.export_deterministic_zip(
         sealed.path,
         _evidence(sealed),
@@ -1401,6 +1466,68 @@ def test_export_and_legacy_index_do_not_chmod_existing_caller_directories(
     )
 
     assert stat.S_IMODE(output.stat().st_mode) == before_mode
+
+
+def test_managed_artifact_directories_require_exact_private_permissions(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    os.chmod(store.sealed_root, 0o777)
+
+    with pytest.raises(LabArtifactIntegrityError, match="permissions"):
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="n-shape",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"result": pd.DataFrame({"x": [1]})},
+        )
+
+
+def test_secure_directory_creation_fsyncs_parent_then_new_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "durable" / "nested"
+    events: list[tuple[str, tuple[int, int]]] = []
+    real_mkdir = lab_artifacts_module.os.mkdir
+    real_fsync = lab_artifacts_module.os.fsync
+
+    def record_mkdir(
+        name: str,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        assert dir_fd is not None
+        parent = os.fstat(dir_fd)
+        real_mkdir(name, mode=mode, dir_fd=dir_fd)
+        child = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        events.append(("mkdir", (parent.st_dev, parent.st_ino)))
+        events.append(("child", (child.st_dev, child.st_ino)))
+
+    def record_fsync(descriptor: int) -> None:
+        observed = os.fstat(descriptor)
+        events.append(("fsync", (observed.st_dev, observed.st_ino)))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module.os, "mkdir", record_mkdir)
+    monkeypatch.setattr(lab_artifacts_module.os, "fsync", record_fsync)
+
+    descriptor = lab_artifacts_module._secure_open_directory(target, create=True)
+    os.close(descriptor)
+
+    mkdir_indexes = [index for index, event in enumerate(events) if event[0] == "mkdir"]
+    assert mkdir_indexes
+    for index in mkdir_indexes:
+        parent_identity = events[index][1]
+        child_identity = events[index + 1][1]
+        subsequent_fsyncs = [event[1] for event in events[index + 2 :] if event[0] == "fsync"]
+        assert subsequent_fsyncs[:2] == [parent_identity, child_identity]
 
 
 def test_canonical_json_is_exact_for_supported_values_and_rejects_invalid_values() -> None:
@@ -1684,6 +1811,31 @@ def test_empty_table_and_dtypes_round_trip_exactly(tmp_path: Path) -> None:
     assert len(empty.parquet.content_sha256) == 64
 
 
+def test_parquet_rejects_arrow_object_dictionary_semantic_changes(tmp_path: Path) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    frame = pd.DataFrame(
+        {
+            "payload": pd.Series(
+                [{"left": 1}, {"right": 2}],
+                dtype="object",
+            )
+        }
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="content|semantic"):
+        store.prepare_candidate(
+            job_id=uuid4(),
+            spec=_spec(),
+            plan_hash="6" * 64,
+            adapter_id="n-shape",
+            adapter_version="1",
+            result_contract_version="p14b1-v1",
+            metrics={},
+            report_markdown="ok",
+            tables={"object_values": frame},
+        )
+
+
 def test_legacy_import_is_read_only_idempotent_and_records_fd_identity(tmp_path: Path) -> None:
     source = tmp_path / "legacy.json"
     source.write_bytes(b'{"run":"old"}\n')
@@ -1846,6 +1998,62 @@ def test_legacy_partial_tail_is_truncated_without_losing_published_generation(
     assert authority.read_bytes() == complete
 
 
+@pytest.mark.parametrize("truncate_to", ["empty", "first_event"])
+def test_legacy_head_detects_ledger_rollback_to_valid_prefix(
+    tmp_path: Path,
+    truncate_to: str,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    index.import_file(logical_run_id="published-run", source_path=source)
+    index.close()
+    authority = path.with_name(f"{path.name}.authority.jsonl")
+    head = path.with_name(f"{path.name}.authority.head.json")
+
+    assert head.is_file()
+    payload = authority.read_bytes()
+    first_newline = payload.index(b"\n") + 1
+    authority.write_bytes(b"" if truncate_to == "empty" else payload[:first_newline])
+
+    with pytest.raises(LabArtifactIntegrityError, match="rollback|head|cursor"):
+        LegacyArtifactIndex(path)
+
+
+def test_legacy_recovers_head_after_crash_between_ledger_and_head_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    crashed = False
+
+    def crash_before_head_publish() -> None:
+        nonlocal crashed
+        crashed = True
+        raise OSError("crash before authority head publish")
+
+    monkeypatch.setattr(
+        index,
+        "_after_ledger_fsync_before_head_publish",
+        crash_before_head_publish,
+        raising=False,
+    )
+
+    with pytest.raises((OSError, LabArtifactIntegrityError)):
+        index.import_file(logical_run_id="published-run", source_path=source)
+
+    assert crashed is True
+    index.close()
+    restarted = LegacyArtifactIndex(path)
+    imported = restarted.import_file(logical_run_id="published-run", source_path=source)
+    assert imported.status == "imported"
+    assert restarted.get("published-run") == imported.record
+
+
 @pytest.mark.parametrize("damage", ["deleted", "random", "schema", "replacement"])
 def test_legacy_cache_is_rebuilt_from_authority_after_damage(
     tmp_path: Path,
@@ -1899,6 +2107,44 @@ def test_legacy_cache_is_rebuilt_from_authority_after_damage(
     if damage != "deleted":
         quarantine = path.parent / ".legacy-cache-quarantine"
         assert any(item.name.startswith(path.name) for item in quarantine.iterdir())
+
+
+def test_legacy_cache_rebuild_temp_symlink_never_writes_external_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"old":true}', encoding="utf-8")
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    index.import_file(logical_run_id="published-run", source_path=source)
+    index.close()
+    path.write_bytes(os.urandom(257))
+    external = tmp_path / "external.sqlite3"
+    external.write_bytes(b"external sentinel")
+    external_before = external.read_bytes()
+    swapped = False
+
+    def replace_temp_with_external_symlink(name: str, _descriptor: int) -> None:
+        nonlocal swapped
+        temporary = path.parent / name
+        temporary.unlink()
+        temporary.symlink_to(external)
+        swapped = True
+
+    monkeypatch.setattr(
+        LegacyArtifactIndex,
+        "_after_cache_temp_bound",
+        staticmethod(replace_temp_with_external_symlink),
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="cache.*identity|candidate"):
+        LegacyArtifactIndex(path)
+
+    assert swapped is True
+    assert external.read_bytes() == external_before
+    assert external.stat().st_size == len(external_before)
 
 
 def test_legacy_cache_validation_is_readonly_before_damaged_cache_quarantine(
@@ -1989,6 +2235,34 @@ def test_legacy_process_lock_registry_releases_last_closed_instance(tmp_path: Pa
     assert lab_artifacts_module._LEGACY_PROCESS_LOCKS[key].references == 1
     second.close()
     assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["parent", "lock", "ledger", "head", "cache", "journal", "quarantine"],
+)
+def test_legacy_managed_paths_require_exact_private_permissions(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    path = tmp_path / "index" / "legacy.sqlite3"
+    index = LegacyArtifactIndex(path)
+    index.close()
+    targets = {
+        "parent": path.parent,
+        "lock": path.with_name(f"{path.name}.lock"),
+        "ledger": path.with_name(f"{path.name}.authority.jsonl"),
+        "head": path.with_name(f"{path.name}.authority.head.json"),
+        "cache": path,
+        "journal": path.with_name(f"{path.name}-journal"),
+        "quarantine": path.parent / ".legacy-cache-quarantine",
+    }
+    selected = targets[target]
+    assert selected.exists(), f"managed legacy path is missing: {target}"
+    os.chmod(selected, 0o777)
+
+    with pytest.raises(LabArtifactIntegrityError, match="permissions|private"):
+        LegacyArtifactIndex(path)
 
 
 def test_legacy_parent_rejects_ancestor_symlink_without_external_writes(tmp_path: Path) -> None:
