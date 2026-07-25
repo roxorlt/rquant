@@ -1060,6 +1060,7 @@ def test_invalid_recovery_record_rederives_parseable_candidate_identity_before_q
         status="invalid",
         device=candidate.device,
         inode=candidate.inode,
+        file_type="directory",
         reason="stale caller classification",
     )
 
@@ -2164,15 +2165,18 @@ def test_legacy_import_is_read_only_idempotent_and_records_fd_identity(tmp_path:
     )
 
 
-def test_legacy_same_logical_run_different_hash_conflicts(tmp_path: Path) -> None:
+def test_legacy_invalidated_source_can_publish_a_new_generation(tmp_path: Path) -> None:
     source = tmp_path / "legacy.md"
     source.write_text("first", encoding="utf-8")
     index = LegacyArtifactIndex(tmp_path / "legacy-index.sqlite3")
-    index.import_file(logical_run_id="old-run", source_path=source)
+    original = index.import_file(logical_run_id="old-run", source_path=source)
     source.write_text("second", encoding="utf-8")
 
-    with pytest.raises(LabLegacyArtifactConflictError):
-        index.import_file(logical_run_id="old-run", source_path=source)
+    replacement = index.import_file(logical_run_id="old-run", source_path=source)
+
+    assert replacement.status == "imported"
+    assert replacement.record.sha256 != original.record.sha256
+    assert index.get("old-run") == replacement.record
 
 
 @pytest.mark.parametrize("case", ["symlink", "hardlink", "directory"])
@@ -3720,3 +3724,214 @@ def test_quarantine_target_inode_swap_before_return_fails_closed(
             store.quarantine_recovery_record(recovery, reason="review race")
 
     assert swapped is True
+
+
+def test_legacy_different_source_conflict_preserves_valid_published_authority(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original.json"
+    replacement = tmp_path / "replacement.json"
+    original.write_text('{"source":"original"}', encoding="utf-8")
+    replacement.write_text('{"source":"replacement"}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    imported = index.import_file(logical_run_id="stable-run", source_path=original)
+    ledger = index.path.with_name(f"{index.path.name}.authority.jsonl")
+    heads = index._authority_heads_path
+    ledger_before = ledger.read_bytes()
+    heads_before = {
+        item.name: (item.read_bytes(), item.stat().st_ino) for item in sorted(heads.glob("*.json"))
+    }
+
+    for _ in range(2):
+        with pytest.raises(
+            LabLegacyArtifactConflictError,
+            match="different source|already references",
+        ):
+            index.import_file(logical_run_id="stable-run", source_path=replacement)
+
+        assert ledger.read_bytes() == ledger_before
+        assert {
+            item.name: (item.read_bytes(), item.stat().st_ino)
+            for item in sorted(heads.glob("*.json"))
+        } == heads_before
+        assert index.get("stable-run") == imported.record
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin namespace guard review")
+def test_candidate_payload_never_follows_directory_moved_after_binding_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    displaced = tmp_path / "displaced-candidate"
+    original_assert = store._assert_candidate_creation_binding
+    calls = 0
+    move_blocked = False
+
+    def try_move_after_binding_check(**kwargs: object) -> None:
+        nonlocal calls, move_blocked
+        original_assert(**kwargs)  # type: ignore[arg-type]
+        calls += 1
+        if calls != 2:
+            return
+        candidate_name = str(kwargs["candidate_name"])
+        try:
+            os.rename(store.candidates_root / candidate_name, displaced)
+        except PermissionError:
+            move_blocked = True
+
+    monkeypatch.setattr(
+        store,
+        "_assert_candidate_creation_binding",
+        try_move_after_binding_check,
+    )
+
+    candidate = store.prepare_candidate(**_prepare_arguments())
+
+    assert calls >= 2
+    assert move_blocked is True
+    assert not displaced.exists()
+    assert candidate.path.is_dir()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Linux fallback simulated on Darwin")
+def test_linux_candidate_namespace_fallback_blocks_rename_and_restores_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    original_assert = store._assert_candidate_creation_binding
+    move_blocked = False
+
+    def try_move_while_guarded(**kwargs: object) -> None:
+        nonlocal move_blocked
+        original_assert(**kwargs)  # type: ignore[arg-type]
+        if kwargs.get("candidates_permissions") != 0o500:
+            return
+        candidate_name = str(kwargs["candidate_name"])
+        try:
+            os.rename(store.candidates_root / candidate_name, tmp_path / "linux-displaced")
+        except PermissionError:
+            move_blocked = True
+
+    monkeypatch.setattr(
+        store,
+        "_assert_candidate_creation_binding",
+        try_move_while_guarded,
+    )
+    monkeypatch.setattr(lab_artifacts_module.sys, "platform", "linux")
+
+    candidate = store.prepare_candidate(**_prepare_arguments())
+
+    assert move_blocked is True
+    assert stat.S_IMODE(store.candidates_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(candidate.path.stat().st_mode) == 0o700
+    assert stat.S_IMODE((candidate.path / "tables").stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"schema_version": 999}, "evidence"),
+        ({"indexed_at": datetime(2026, 7, 25, 9)}, "evidence"),
+    ],
+)
+def test_zip_revalidates_forged_evidence_before_creating_destination_parent(
+    tmp_path: Path,
+    update: dict[str, object],
+    message: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    valid = _evidence(sealed)
+    forged = LabArtifactIndexEvidence.model_construct(**(valid.model_dump(mode="python") | update))
+    destination = tmp_path / "must-not-exist" / "nested" / "bundle.zip"
+
+    with pytest.raises(LabArtifactAuthorizationError, match=message):
+        store.export_deterministic_zip(sealed.path, forged, destination)
+
+    assert not destination.parent.exists()
+
+
+@pytest.mark.parametrize("operation", ["verify", "prepare"])
+def test_candidate_public_return_rechecks_last_moment_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    prepared = _prepare(store) if operation == "verify" else None
+    displaced = tmp_path / f"candidate-original-{operation}"
+    invoked = False
+
+    def swap_candidate(candidate: LabJobArtifactCandidate) -> None:
+        nonlocal invoked
+        invoked = True
+        replacement = tmp_path / f"candidate-copy-{operation}"
+        shutil.copytree(candidate.path, replacement, copy_function=shutil.copy2)
+        os.rename(candidate.path, displaced)
+        os.rename(replacement, candidate.path)
+
+    monkeypatch.setattr(
+        store,
+        "_after_public_candidate_finalized",
+        swap_candidate,
+        raising=False,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="candidate.*identity|bundle.*changed"):
+        if operation == "verify":
+            assert prepared is not None
+            store.verify_candidate(prepared)
+        else:
+            store.prepare_candidate(**_prepare_arguments())
+
+    assert invoked is True
+
+
+@pytest.mark.parametrize("entry_kind", ["regular", "symlink"])
+def test_invalid_candidate_entry_can_be_bound_and_quarantined(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    entry = store.candidates_root / f"invalid-{entry_kind}"
+    external = tmp_path / "external-source.txt"
+    external.write_text("external remains unchanged", encoding="utf-8")
+    if entry_kind == "regular":
+        entry.write_text("invalid candidate", encoding="utf-8")
+        os.chmod(entry, 0o600)
+    else:
+        entry.symlink_to(external)
+    observed = entry.lstat()
+
+    record = next(item for item in store.list_candidate_recovery() if item.path == entry)
+
+    assert record.status == "invalid"
+    assert record.device == observed.st_dev
+    assert record.inode == observed.st_ino
+    assert record.file_type == entry_kind
+    quarantined = store.quarantine_recovery_record(record, reason="invalid namespace entry")
+    assert quarantined.status == "quarantined"
+    assert quarantined.device == observed.st_dev
+    assert quarantined.inode == observed.st_ino
+    assert quarantined.file_type == entry_kind
+    assert not entry.exists() and not entry.is_symlink()
+    assert external.read_text(encoding="utf-8") == "external remains unchanged"
+    if entry_kind == "symlink":
+        assert quarantined.path.is_symlink()
+        assert quarantined.path.readlink() == external
+    else:
+        assert quarantined.path.read_text(encoding="utf-8") == "invalid candidate"
+
+
+def test_legacy_logical_run_normalization_is_shared_by_import_and_get(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"stable":true}', encoding="utf-8")
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+
+    imported = index.import_file(logical_run_id="  run   one  ", source_path=source)
+
+    assert imported.record.logical_run_id == "run one"
+    assert index.get("  run   one  ") == imported.record
+    assert index.get("run one") == imported.record
