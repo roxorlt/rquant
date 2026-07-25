@@ -47,6 +47,7 @@ _ARTIFACT_PROCESS_LOCKS_GUARD = threading.Lock()
 class _LegacyProcessLockEntry:
     lock: threading.RLock
     references: int
+    owner_thread_id: int | None = None
 
 
 _LEGACY_PROCESS_LOCKS: dict[str, _LegacyProcessLockEntry] = {}
@@ -5567,12 +5568,6 @@ class LabJobArtifactStore:
                     raise LabArtifactIntegrityError("sealed path does not match job identity")
                 self._authorize_export(sealed, evidence)
                 expected_hashes = self._expected_bound_hashes(manifest)
-                export_payloads: dict[str, bytes] = {}
-                for relative_path in sorted(bound.files):
-                    payload = _read_descriptor(bound.files[relative_path].descriptor)
-                    if _sha256(payload) != expected_hashes[relative_path]:
-                        raise LabArtifactIntegrityError(f"export bytes conflict: {relative_path}")
-                    export_payloads[relative_path] = payload
                 self._assert_bound_paths(bound)
                 self._assert_managed_roots()
                 _ensure_private_directory(destination.parent, manage_existing=False)
@@ -5599,7 +5594,12 @@ class LabJobArtifactStore:
                         strict_timestamps=True,
                     ) as archive,
                 ):
-                    for relative_path in sorted(export_payloads):
+                    for relative_path in sorted(expected_hashes):
+                        payload = _read_descriptor(bound.files[relative_path].descriptor)
+                        if _sha256(payload) != expected_hashes[relative_path]:
+                            raise LabArtifactIntegrityError(
+                                f"export bytes conflict: {relative_path}"
+                            )
                         info = ZipInfo(relative_path, date_time=_ZIP_TIMESTAMP)
                         info.compress_type = ZIP_DEFLATED
                         info.create_system = 3
@@ -5607,10 +5607,11 @@ class LabJobArtifactStore:
                         info.flag_bits = 0
                         archive.writestr(
                             info,
-                            export_payloads[relative_path],
+                            payload,
                             compress_type=ZIP_DEFLATED,
                             compresslevel=9,
                         )
+                        del payload
                 os.fchmod(temporary_descriptor, 0o600)
                 os.fsync(temporary_descriptor)
                 final_temporary = _FileObservation.from_stat(os.fstat(temporary_descriptor))
@@ -5771,14 +5772,8 @@ class LegacyArtifactIndex:
         lock_key = os.fspath(self.path)
         self._process_lock_key = lock_key
         self._process_lock_registered = False
-        with _LEGACY_PROCESS_LOCKS_GUARD:
-            entry = _LEGACY_PROCESS_LOCKS.get(lock_key)
-            if entry is None:
-                entry = _LegacyProcessLockEntry(lock=threading.RLock(), references=0)
-                _LEGACY_PROCESS_LOCKS[lock_key] = entry
-            entry.references += 1
-            self._process_lock = entry.lock
-            self._process_lock_registered = True
+        self._process_lock = threading.RLock()
+        self._process_lock_entry: _LegacyProcessLockEntry | None = None
         self._parent_descriptor = -1
         self._lock_descriptor = -1
         self._authority_descriptor = -1
@@ -5793,27 +5788,57 @@ class LegacyArtifactIndex:
         self._cache_quarantine_path = self.path.parent / ".legacy-cache-quarantine"
         self._authority_quarantine_path = self.path.parent / ".legacy-authority-quarantine"
         self._authority_heads_path = self.path.parent / self._authority_heads_name
-        _ensure_private_directory(
-            self.path.parent,
-            manage_existing=False,
-            require_private_existing=True,
-        )
-        _ensure_private_directory(
-            self._cache_quarantine_path,
-            manage_existing=False,
-            require_private_existing=True,
-        )
-        _ensure_private_directory(
-            self._authority_quarantine_path,
-            manage_existing=False,
-            require_private_existing=True,
-        )
-        _ensure_private_directory(
-            self._authority_heads_path,
-            manage_existing=False,
-            require_private_existing=True,
-        )
-        self._parent_descriptor = _secure_open_directory(self.path.parent, create=False)
+        try:
+            with _LEGACY_PROCESS_LOCKS_GUARD:
+                entry = _LEGACY_PROCESS_LOCKS.get(lock_key)
+                if entry is None:
+                    entry = _LegacyProcessLockEntry(lock=threading.RLock(), references=0)
+                    _LEGACY_PROCESS_LOCKS[lock_key] = entry
+                entry.references += 1
+                try:
+                    self._process_lock = entry.lock
+                    self._process_lock_entry = entry
+                    self._process_lock_registered = True
+                except BaseException:
+                    entry.references -= 1
+                    if entry.references == 0:
+                        del _LEGACY_PROCESS_LOCKS[lock_key]
+                    raise
+            _ensure_private_directory(
+                self.path.parent,
+                manage_existing=False,
+                require_private_existing=True,
+            )
+            _ensure_private_directory(
+                self._cache_quarantine_path,
+                manage_existing=False,
+                require_private_existing=True,
+            )
+            _ensure_private_directory(
+                self._authority_quarantine_path,
+                manage_existing=False,
+                require_private_existing=True,
+            )
+            _ensure_private_directory(
+                self._authority_heads_path,
+                manage_existing=False,
+                require_private_existing=True,
+            )
+            self._parent_descriptor = _secure_open_directory(self.path.parent, create=False)
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                if isinstance(error, Exception) and isinstance(cleanup_error, Exception):
+                    raise ExceptionGroup(
+                        "legacy index initialization and cleanup both failed",
+                        [error, cleanup_error],
+                    ) from None
+                raise BaseExceptionGroup(
+                    "legacy index initialization and cleanup both failed",
+                    [error, cleanup_error],
+                ) from None
+            raise
         try:
             self._parent_identity = _FileObservation.from_stat(os.fstat(self._parent_descriptor))
             with self._process_lock:
@@ -5892,8 +5917,19 @@ class LegacyArtifactIndex:
                 finally:
                     self._authority_lock_depth -= 1
                     fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
-        except Exception:
-            self.close()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                if isinstance(error, Exception) and isinstance(cleanup_error, Exception):
+                    raise ExceptionGroup(
+                        "legacy index initialization and cleanup both failed",
+                        [error, cleanup_error],
+                    ) from None
+                raise BaseExceptionGroup(
+                    "legacy index initialization and cleanup both failed",
+                    [error, cleanup_error],
+                ) from None
             raise
 
     def close(self) -> None:
@@ -6694,6 +6730,15 @@ class LegacyArtifactIndex:
     @contextmanager
     def _legacy_operation_lifecycle(self) -> Iterator[None]:
         current_thread_id = threading.get_ident()
+        entry = self._process_lock_entry
+        if entry is None:
+            raise LabArtifactIntegrityError("legacy index process lock is unavailable")
+        with _LEGACY_PROCESS_LOCKS_GUARD:
+            registered = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
+            if registered is not entry or registered.lock is not self._process_lock:
+                raise LabArtifactIntegrityError("legacy index process lock identity changed")
+            if entry.owner_thread_id == current_thread_id:
+                raise LabArtifactIntegrityError("reentrant legacy index operation is not allowed")
         with self._lifecycle_condition:
             if self._closing or self._closed:
                 raise LabArtifactIntegrityError("legacy index is closing or closed")
@@ -6703,9 +6748,26 @@ class LegacyArtifactIndex:
             )
         try:
             with self._process_lock:
-                if self._closed:
-                    raise LabArtifactIntegrityError("legacy index is closed")
-                yield
+                with _LEGACY_PROCESS_LOCKS_GUARD:
+                    registered = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
+                    if registered is not entry or registered.lock is not self._process_lock:
+                        raise LabArtifactIntegrityError(
+                            "legacy index process lock identity changed"
+                        )
+                    if entry.owner_thread_id is not None:
+                        raise LabArtifactIntegrityError("legacy index process lock owner changed")
+                    entry.owner_thread_id = current_thread_id
+                try:
+                    if self._closed:
+                        raise LabArtifactIntegrityError("legacy index is closed")
+                    yield
+                finally:
+                    with _LEGACY_PROCESS_LOCKS_GUARD:
+                        if entry.owner_thread_id != current_thread_id:
+                            raise LabArtifactIntegrityError(
+                                "legacy index process lock owner changed"
+                            )
+                        entry.owner_thread_id = None
         finally:
             with self._lifecycle_condition:
                 self._active_operations -= 1
