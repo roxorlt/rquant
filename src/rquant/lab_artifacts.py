@@ -38,6 +38,7 @@ _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_SHA_PATTERN = r"^[0-9a-f]{40}$"
 _TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_ZIP_STREAM_CHUNK_SIZE = 1024 * 1024
 _LEGACY_GENESIS_HASH = "0" * 64
 _LEGACY_PROCESS_LOCKS_GUARD = threading.Lock()
 _ARTIFACT_PROCESS_LOCKS_GUARD = threading.Lock()
@@ -153,6 +154,43 @@ def _raise_collected_errors(
             [error for error in errors if isinstance(error, Exception)],
         )
     raise BaseExceptionGroup(message, errors)
+
+
+def _acquire_exclusive_flock(descriptor: int, *, label: str) -> None:
+    """Acquire flock while treating an acquisition exception as unknown state."""
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException as acquire_error:
+        errors = [acquire_error]
+        for _attempt in range(2):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                break
+            except BaseException as unlock_error:
+                errors.append(unlock_error)
+        _raise_collected_errors(
+            f"{label} acquisition and unknown-state rollback both failed",
+            errors,
+        )
+
+
+def _close_descriptor_fail_closed(descriptor: int, *, label: str) -> None:
+    """Close an fd, retrying when a wrapper may have raised before close(2)."""
+
+    try:
+        os.close(descriptor)
+        return
+    except BaseException as close_error:
+        errors = [close_error]
+    try:
+        os.close(descriptor)
+    except OSError as retry_error:
+        if retry_error.errno != errno.EBADF:
+            errors.append(retry_error)
+    except BaseException as retry_error:
+        errors.append(retry_error)
+    _raise_collected_errors(f"{label} close failed", errors)
 
 
 def _entry_file_type(mode: int) -> Literal["directory", "regular", "symlink", "other"]:
@@ -1085,14 +1123,18 @@ def _secure_open_directory(
 
     absolute = _secure_absolute_path(path)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open("/", flags)
+    descriptor = -1
+    child_descriptor = -1
+    result = -1
+    main_error: BaseException | None = None
     try:
+        descriptor = os.open("/", flags)
         for component in absolute.parts[1:]:
             if component in {"", ".", ".."}:
                 raise LabArtifactPathError("managed path contains an unsafe component")
             created_or_observed_missing = False
             try:
-                child = os.open(component, flags, dir_fd=descriptor)
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
             except FileNotFoundError:
                 if not create:
                     raise
@@ -1100,32 +1142,57 @@ def _secure_open_directory(
                 with suppress(FileExistsError):
                     os.mkdir(component, mode=create_mode, dir_fd=descriptor)
                 os.fsync(descriptor)
-                child = os.open(component, flags, dir_fd=descriptor)
-            observed = _FileObservation.from_stat(os.fstat(child))
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            observed = _FileObservation.from_stat(os.fstat(child_descriptor))
             if observed.mode != stat.S_IFDIR:
-                os.close(child)
                 raise LabArtifactPathError("managed path component is not a directory")
             if created_or_observed_missing:
-                os.fsync(child)
-            os.close(descriptor)
-            descriptor = child
-        return descriptor
-    except LabArtifactError:
-        os.close(descriptor)
-        raise
+                os.fsync(child_descriptor)
+            previous_descriptor = descriptor
+            descriptor = child_descriptor
+            child_descriptor = -1
+            _close_descriptor_fail_closed(
+                previous_descriptor,
+                label="secure directory ancestor descriptor",
+            )
+        result = descriptor
+        descriptor = -1
+    except LabArtifactError as exc:
+        main_error = exc
     except OSError as exc:
-        os.close(descriptor)
-        raise LabArtifactPathError(
-            f"managed path ancestor is missing or unsafe: {absolute}"
-        ) from exc
+        main_error = LabArtifactPathError(f"managed path ancestor is missing or unsafe: {absolute}")
+        main_error.__cause__ = exc
+    except BaseException as exc:
+        main_error = exc
+    finally:
+        cleanup_errors: list[BaseException] = []
+        for opened_descriptor in (child_descriptor, descriptor):
+            if opened_descriptor >= 0:
+                try:
+                    _close_descriptor_fail_closed(
+                        opened_descriptor,
+                        label="secure directory descriptor",
+                    )
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+        errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+        _raise_collected_errors(
+            "secure directory operation and descriptor cleanup failed",
+            errors,
+        )
+    if result < 0:
+        raise LabArtifactIntegrityError("secure directory open completed without a descriptor")
+    return result
 
 
 def _write_private_bytes_at(parent_descriptor: int, name: str, payload: bytes) -> None:
     if PurePosixPath(name).name != name or name in {"", ".", ".."}:
         raise LabArtifactPathError("artifact file name is unsafe")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
+    descriptor = -1
+    main_error: BaseException | None = None
     try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
         opened = _FileObservation.from_stat(os.fstat(descriptor))
         if opened.mode != stat.S_IFREG or opened.nlink != 1:
             raise LabArtifactIntegrityError("artifact output is not a private regular file")
@@ -1145,12 +1212,28 @@ def _write_private_bytes_at(parent_descriptor: int, name: str, payload: bytes) -
         )
         if after != at_path or after.mode != stat.S_IFREG or after.nlink != 1:
             raise LabArtifactIntegrityError("artifact output identity changed while writing")
-    except LabArtifactError:
-        raise
+    except LabArtifactError as exc:
+        main_error = exc
     except OSError as exc:
-        raise LabArtifactIntegrityError("artifact output could not be written safely") from exc
+        main_error = LabArtifactIntegrityError("artifact output could not be written safely")
+        main_error.__cause__ = exc
+    except BaseException as exc:
+        main_error = exc
     finally:
-        os.close(descriptor)
+        cleanup_errors: list[BaseException] = []
+        if descriptor >= 0:
+            try:
+                _close_descriptor_fail_closed(
+                    descriptor,
+                    label="private artifact output descriptor",
+                )
+            except BaseException as close_error:
+                cleanup_errors.append(close_error)
+        errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+        _raise_collected_errors(
+            "private artifact write and descriptor cleanup failed",
+            errors,
+        )
 
 
 def _candidate_namespace_flag(descriptor: int) -> tuple[int, int]:
@@ -1309,14 +1392,16 @@ def _ensure_private_directory(
     require_private_existing: bool = False,
 ) -> None:
     existed = True
+    descriptor = -1
+    main_error: BaseException | None = None
     try:
-        descriptor = _secure_open_directory(path, create=False)
-    except LabArtifactPathError as exc:
-        if not isinstance(exc.__cause__, FileNotFoundError):
-            raise
-        existed = False
-        descriptor = _secure_open_directory(path, create=True)
-    try:
+        try:
+            descriptor = _secure_open_directory(path, create=False)
+        except LabArtifactPathError as exc:
+            if not isinstance(exc.__cause__, FileNotFoundError):
+                raise
+            existed = False
+            descriptor = _secure_open_directory(path, create=True)
         if existed and require_private_existing:
             if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
                 raise LabArtifactIntegrityError(
@@ -1325,12 +1410,28 @@ def _ensure_private_directory(
         elif not existed or manage_existing:
             os.fchmod(descriptor, 0o700)
             os.fsync(descriptor)
+    except BaseException as exc:
+        main_error = exc
     finally:
-        os.close(descriptor)
+        cleanup_errors: list[BaseException] = []
+        if descriptor >= 0:
+            try:
+                _close_descriptor_fail_closed(
+                    descriptor,
+                    label="private directory descriptor",
+                )
+            except BaseException as close_error:
+                cleanup_errors.append(close_error)
+        errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+        _raise_collected_errors(
+            "private directory operation and descriptor cleanup failed",
+            errors,
+        )
 
 
 def _assert_bound_readonly_file(bound: _BoundReadonlyFile, *, label: str) -> None:
     current_parent_descriptor = -1
+    main_error: BaseException | None = None
     try:
         parent_fd = _FileObservation.from_stat(os.fstat(bound.parent_descriptor))
         current_parent_descriptor = _secure_open_directory(bound.path.parent, create=False)
@@ -1343,25 +1444,42 @@ def _assert_bound_readonly_file(bound: _BoundReadonlyFile, *, label: str) -> Non
                 follow_symlinks=False,
             )
         )
+        if parent_fd != parent_path or (
+            parent_fd.device,
+            parent_fd.inode,
+            parent_fd.mode,
+        ) != (
+            bound.parent_identity.device,
+            bound.parent_identity.inode,
+            stat.S_IFDIR,
+        ):
+            raise LabArtifactIntegrityError(f"{label} parent changed while bound")
+        if file_fd != bound.file_identity or file_path != bound.file_identity:
+            raise LabArtifactIntegrityError(f"{label} changed while bound")
+        if file_fd.mode != stat.S_IFREG or file_fd.nlink != 1:
+            raise LabArtifactIntegrityError(f"{label} is not a private regular file")
+    except LabArtifactError as exc:
+        main_error = exc
     except OSError as exc:
-        raise LabArtifactIntegrityError(f"{label} changed while bound") from exc
+        main_error = LabArtifactIntegrityError(f"{label} changed while bound")
+        main_error.__cause__ = exc
+    except BaseException as exc:
+        main_error = exc
     finally:
+        cleanup_errors: list[BaseException] = []
         if current_parent_descriptor >= 0:
-            os.close(current_parent_descriptor)
-    if parent_fd != parent_path or (
-        parent_fd.device,
-        parent_fd.inode,
-        parent_fd.mode,
-    ) != (
-        bound.parent_identity.device,
-        bound.parent_identity.inode,
-        stat.S_IFDIR,
-    ):
-        raise LabArtifactIntegrityError(f"{label} parent changed while bound")
-    if file_fd != bound.file_identity or file_path != bound.file_identity:
-        raise LabArtifactIntegrityError(f"{label} changed while bound")
-    if file_fd.mode != stat.S_IFREG or file_fd.nlink != 1:
-        raise LabArtifactIntegrityError(f"{label} is not a private regular file")
+            try:
+                _close_descriptor_fail_closed(
+                    current_parent_descriptor,
+                    label=f"{label} current parent descriptor",
+                )
+            except BaseException as close_error:
+                cleanup_errors.append(close_error)
+        errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+        _raise_collected_errors(
+            f"{label} identity check and parent cleanup failed",
+            errors,
+        )
 
 
 @contextmanager
@@ -2193,7 +2311,10 @@ class LabJobArtifactStore:
             if outermost:
                 try:
                     self._assert_namespace_guard_lock_identity()
-                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                    _acquire_exclusive_flock(
+                        self._guard_lock_descriptor,
+                        label="artifact lifecycle lock",
+                    )
                     lifecycle_lock_acquired = True
                     self._assert_namespace_guard_lock_identity()
                     self._assert_store_operational()
@@ -2308,7 +2429,10 @@ class LabJobArtifactStore:
                 try:
                     self._assert_namespace_guard_lock_identity()
                     if not lifecycle_owned:
-                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                        _acquire_exclusive_flock(
+                            self._guard_lock_descriptor,
+                            label="namespace guard lock",
+                        )
                         guard_lock_acquired = True
                         self._assert_namespace_guard_lock_identity()
                 except BaseException as acquire_error:
@@ -2781,6 +2905,7 @@ class LabJobArtifactStore:
 
     def _assert_managed_roots(self, *, candidates_permissions: int = 0o700) -> None:
         current_parent_descriptor = -1
+        main_error: BaseException | None = None
         try:
             parent_fd = _FileObservation.from_stat(os.fstat(self._root_parent_descriptor))
             current_parent_descriptor = _secure_open_directory(self.root.parent, create=False)
@@ -2845,13 +2970,28 @@ class LabJobArtifactStore:
                     raise LabArtifactIntegrityError(
                         f"managed artifact directory permissions must be exactly 0700: {path.name}"
                     )
-        except LabArtifactError:
-            raise
+        except LabArtifactError as exc:
+            main_error = exc
         except (AttributeError, OSError) as exc:
-            raise LabArtifactIntegrityError("managed artifact root identity changed") from exc
+            main_error = LabArtifactIntegrityError("managed artifact root identity changed")
+            main_error.__cause__ = exc
+        except BaseException as exc:
+            main_error = exc
         finally:
+            cleanup_errors: list[BaseException] = []
             if current_parent_descriptor >= 0:
-                os.close(current_parent_descriptor)
+                try:
+                    _close_descriptor_fail_closed(
+                        current_parent_descriptor,
+                        label="managed root parent descriptor",
+                    )
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+            errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+            _raise_collected_errors(
+                "managed root identity check and descriptor cleanup failed",
+                errors,
+            )
 
     def _managed_parent_descriptor(self, parent_root: Path) -> int:
         self._assert_managed_roots()
@@ -5767,23 +5907,42 @@ class LabJobArtifactStore:
                     ) as archive,
                 ):
                     for relative_path in sorted(expected_hashes):
-                        payload = _read_descriptor(bound.files[relative_path].descriptor)
-                        if _sha256(payload) != expected_hashes[relative_path]:
+                        source = bound.files[relative_path]
+                        before_stream = _FileObservation.from_stat(os.fstat(source.descriptor))
+                        if before_stream != source.current:
                             raise LabArtifactIntegrityError(
-                                f"export bytes conflict: {relative_path}"
+                                f"export source identity changed: {relative_path}"
                             )
                         info = ZipInfo(relative_path, date_time=_ZIP_TIMESTAMP)
                         info.compress_type = ZIP_DEFLATED
                         info.create_system = 3
                         info.external_attr = (stat.S_IFREG | 0o400) << 16
                         info.flag_bits = 0
-                        archive.writestr(
-                            info,
-                            payload,
-                            compress_type=ZIP_DEFLATED,
-                            compresslevel=9,
-                        )
-                        del payload
+                        info._compresslevel = 9
+                        digest = hashlib.sha256()
+                        streamed_size = 0
+                        os.lseek(source.descriptor, 0, os.SEEK_SET)
+                        with archive.open(info, mode="w", force_zip64=True) as entry:
+                            while chunk := os.read(
+                                source.descriptor,
+                                _ZIP_STREAM_CHUNK_SIZE,
+                            ):
+                                digest.update(chunk)
+                                streamed_size += len(chunk)
+                                written = entry.write(chunk)
+                                if written != len(chunk):
+                                    raise LabArtifactIntegrityError(
+                                        f"ZIP entry write made partial progress: {relative_path}"
+                                    )
+                        after_stream = _FileObservation.from_stat(os.fstat(source.descriptor))
+                        if before_stream != after_stream or streamed_size != before_stream.size:
+                            raise LabArtifactIntegrityError(
+                                f"export source changed while streaming: {relative_path}"
+                            )
+                        if digest.hexdigest() != expected_hashes[relative_path]:
+                            raise LabArtifactIntegrityError(
+                                f"export bytes conflict: {relative_path}"
+                            )
                 os.fchmod(temporary_descriptor, 0o600)
                 os.fsync(temporary_descriptor)
                 final_temporary = _FileObservation.from_stat(os.fstat(temporary_descriptor))
@@ -6022,7 +6181,10 @@ class LegacyArtifactIndex:
             raise
         try:
             with self._legacy_process_operation_lock():
-                fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
+                _acquire_exclusive_flock(
+                    self._lock_descriptor,
+                    label="legacy index initialization lock",
+                )
                 self._authority_lock_depth += 1
                 operation_error: BaseException | None = None
                 try:
@@ -6871,6 +7033,7 @@ class LegacyArtifactIndex:
 
     def _assert_authority_identity(self) -> None:
         current_parent_descriptor = -1
+        main_error: BaseException | None = None
         try:
             parent_fd = _FileObservation.from_stat(os.fstat(self._parent_descriptor))
             current_parent_descriptor = _secure_open_directory(self.path.parent, create=False)
@@ -6983,13 +7146,28 @@ class LegacyArtifactIndex:
                 raise LabArtifactIntegrityError(
                     "legacy index quarantine permissions must be exactly 0700"
                 )
-        except LabArtifactError:
-            raise
+        except LabArtifactError as exc:
+            main_error = exc
         except (AttributeError, OSError) as exc:
-            raise LabArtifactIntegrityError("legacy index authority identity changed") from exc
+            main_error = LabArtifactIntegrityError("legacy index authority identity changed")
+            main_error.__cause__ = exc
+        except BaseException as exc:
+            main_error = exc
         finally:
+            cleanup_errors: list[BaseException] = []
             if current_parent_descriptor >= 0:
-                os.close(current_parent_descriptor)
+                try:
+                    _close_descriptor_fail_closed(
+                        current_parent_descriptor,
+                        label="legacy index current parent descriptor",
+                    )
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+            errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+            _raise_collected_errors(
+                "legacy authority identity check and descriptor cleanup failed",
+                errors,
+            )
 
     def _assert_index_identity(self) -> None:
         self._assert_authority_identity()
@@ -7044,7 +7222,10 @@ class LegacyArtifactIndex:
             depth_incremented = False
             operation_error: BaseException | None = None
             try:
-                fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
+                _acquire_exclusive_flock(
+                    self._lock_descriptor,
+                    label="legacy index operation lock",
+                )
                 lock_acquired = True
                 self._authority_lock_depth += 1
                 depth_incremented = True

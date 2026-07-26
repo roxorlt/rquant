@@ -15,6 +15,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -165,6 +166,19 @@ def _flatten_exception_group(error: BaseException) -> list[BaseException]:
     if isinstance(error, BaseExceptionGroup):
         return [nested for child in error.exceptions for nested in _flatten_exception_group(child)]
     return [error]
+
+
+def _descriptor_is_closed(
+    descriptor: int,
+    fstat: Callable[[int], os.stat_result] = os.fstat,
+) -> bool:
+    try:
+        fstat(descriptor)
+    except OSError as exc:
+        if exc.errno == errno.EBADF:
+            return True
+        raise
+    return False
 
 
 def _recovery_authority(candidate: LabJobArtifactCandidate) -> LabArtifactRecoveryAuthority:
@@ -1645,34 +1659,90 @@ def test_zip_export_interleaves_large_file_reads_and_archive_writes(
         for path in (sealed.path / "tables").glob("*.parquet")
     }
     original_read = lab_artifacts_module._read_descriptor
-    events: list[tuple[str, str]] = []
-    large_payload_threshold = 100_000
+    original_os_read = lab_artifacts_module.os.read
+    source_read_sizes: list[int] = []
+    archive_write_sizes: list[int] = []
+    full_read_identities: list[tuple[int, int]] = []
+    stream_events: list[tuple[str, int]] = []
+    archive_streaming = False
 
-    def record_large_read(descriptor: int) -> bytes:
-        payload = original_read(descriptor)
+    def reject_full_source_read(descriptor: int) -> bytes:
         observed = os.fstat(descriptor)
-        if (observed.st_dev, observed.st_ino) in source_identities:
-            events.append(("read", hashlib.sha256(payload).hexdigest()))
-        return payload
+        identity = (observed.st_dev, observed.st_ino)
+        full_read_identities.append(identity)
+        if identity in source_identities:
+            raise AssertionError("Parquet source reached full descriptor read")
+        return original_read(descriptor)
+
+    def record_chunk_read(descriptor: int, size: int) -> bytes:
+        observed = os.fstat(descriptor)
+        chunk = original_os_read(descriptor, size)
+        if archive_streaming and (observed.st_dev, observed.st_ino) in source_identities:
+            source_read_sizes.append(size)
+            if chunk:
+                stream_events.append(("read", len(chunk)))
+        return chunk
+
+    class RecordingArchiveWriter:
+        def __init__(self, raw: object) -> None:
+            self._raw = raw
+
+        def __enter__(self) -> RecordingArchiveWriter:
+            self._raw.__enter__()  # type: ignore[attr-defined]
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: object | None,
+        ) -> bool | None:
+            return self._raw.__exit__(exc_type, exc_value, traceback)  # type: ignore[attr-defined]
+
+        def write(self, data: bytes) -> int:
+            archive_write_sizes.append(len(data))
+            stream_events.append(("write", len(data)))
+            return int(self._raw.write(data))  # type: ignore[attr-defined]
 
     class RecordingZipFile(ZipFile):
-        def writestr(
-            self,
-            zinfo_or_arcname: str | ZipInfo,
-            data: bytes | str,
-            compress_type: int | None = None,
-            compresslevel: int | None = None,
-        ) -> None:
-            if isinstance(data, bytes) and len(data) > large_payload_threshold:
-                events.append(("write", hashlib.sha256(data).hexdigest()))
-            super().writestr(
-                zinfo_or_arcname,
-                data,
-                compress_type=compress_type,
-                compresslevel=compresslevel,
-            )
+        def __enter__(self) -> RecordingZipFile:
+            nonlocal archive_streaming
+            super().__enter__()
+            archive_streaming = True
+            return self
 
-    monkeypatch.setattr(lab_artifacts_module, "_read_descriptor", record_large_read)
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: object | None,
+        ) -> None:
+            nonlocal archive_streaming
+            try:
+                super().__exit__(exc_type, exc_value, traceback)
+            finally:
+                archive_streaming = False
+
+        def open(
+            self,
+            name: str | ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> object:
+            opened = super().open(
+                name,
+                mode=mode,
+                pwd=pwd,
+                force_zip64=force_zip64,
+            )
+            if mode == "w":
+                return RecordingArchiveWriter(opened)
+            return opened
+
+    monkeypatch.setattr(lab_artifacts_module, "_read_descriptor", reject_full_source_read)
+    monkeypatch.setattr(lab_artifacts_module.os, "read", record_chunk_read)
     monkeypatch.setattr(lab_artifacts_module, "ZipFile", RecordingZipFile)
 
     destination = store.export_deterministic_zip(
@@ -1682,9 +1752,22 @@ def test_zip_export_interleaves_large_file_reads_and_archive_writes(
     )
 
     assert destination.is_file()
-    assert [kind for kind, _digest in events] == ["read", "write", "read", "write"]
-    assert events[0][1] == events[1][1]
-    assert events[2][1] == events[3][1]
+    assert not source_identities.intersection(full_read_identities)
+    assert len(source_read_sizes) > 4
+    assert max(source_read_sizes) <= 1024 * 1024
+    assert len(archive_write_sizes) > 4
+    assert max(archive_write_sizes) <= 1024 * 1024
+    first_source_read = next(
+        index for index, event in enumerate(stream_events) if event[0] == "read"
+    )
+    source_stream = stream_events[first_source_read:]
+    assert [kind for kind, _size in source_stream] == [
+        kind for _ in range(len(source_read_sizes) - 2) for kind in ("read", "write")
+    ]
+    assert all(
+        source_stream[index][1] == source_stream[index + 1][1]
+        for index in range(0, len(source_stream), 2)
+    )
 
 
 def test_zip_export_hashes_published_output_without_full_descriptor_reads(
@@ -6366,3 +6449,383 @@ def test_fifo_candidate_entry_is_quarantined_without_open_or_io(tmp_path: Path) 
     assert (quarantined.device, quarantined.inode) == (observed.st_dev, observed.st_ino)
     assert stat.S_ISFIFO(quarantined.path.lstat().st_mode)
     assert not fifo.exists()
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("lock_kind", ["lifecycle", "namespace", "legacy"])
+def test_flock_acquire_interrupt_rolls_back_unknown_os_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+    lock_kind: str,
+) -> None:
+    store: LabJobArtifactStore | None = None
+    index: LegacyArtifactIndex | None = None
+    if lock_kind == "legacy":
+        index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+        lock_descriptor = index._lock_descriptor
+        lock_path = index.path.with_name(f"{index.path.name}.lock")
+    else:
+        store = LabJobArtifactStore(tmp_path / "artifacts")
+        lock_descriptor = store._guard_lock_descriptor
+        lock_path = store.root / "namespace-guard.lock"
+    probe_descriptor = os.open(lock_path, os.O_RDWR)
+    original_flock = lab_artifacts_module.fcntl.flock
+    interrupted = False
+
+    def acquire_then_interrupt(descriptor: int, operation: int) -> None:
+        nonlocal interrupted
+        original_flock(descriptor, operation)
+        if descriptor == lock_descriptor and operation == fcntl.LOCK_EX and not interrupted:
+            interrupted = True
+            raise failure_type("flock returned through an interrupting wrapper")
+
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", acquire_then_interrupt)
+    try:
+        with pytest.raises(failure_type, match="interrupting wrapper"):
+            if lock_kind == "lifecycle":
+                assert store is not None
+                store.list_candidate_recovery()
+            elif lock_kind == "namespace":
+                assert store is not None
+                with store._exclusive_namespace_guard():
+                    pass
+            else:
+                assert index is not None
+                with index._exclusive_index_lock():
+                    pass
+        monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", original_flock)
+        original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original_flock(probe_descriptor, fcntl.LOCK_UN)
+        if store is not None:
+            entry = store._process_lock_entry
+            assert entry is not None
+            assert entry.lifecycle_owner_thread_id is None
+            assert entry.owner_thread_id is None
+            assert entry.lifecycle_depth == 0
+            assert store._operation_depth == 0
+            assert store._guard_lock_depth == 0
+        if index is not None:
+            assert index._authority_lock_depth == 0
+    finally:
+        monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", original_flock)
+        os.close(probe_descriptor)
+        if index is not None:
+            index.close()
+        if store is not None:
+            store.close()
+
+
+@pytest.mark.parametrize("lock_kind", ["lifecycle", "namespace", "legacy"])
+def test_flock_acquire_interrupt_and_rollback_failure_are_grouped_and_unlocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lock_kind: str,
+) -> None:
+    store: LabJobArtifactStore | None = None
+    index: LegacyArtifactIndex | None = None
+    if lock_kind == "legacy":
+        index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+        lock_descriptor = index._lock_descriptor
+        lock_path = index.path.with_name(f"{index.path.name}.lock")
+    else:
+        store = LabJobArtifactStore(tmp_path / "artifacts")
+        lock_descriptor = store._guard_lock_descriptor
+        lock_path = store.root / "namespace-guard.lock"
+    probe_descriptor = os.open(lock_path, os.O_RDWR)
+    original_flock = lab_artifacts_module.fcntl.flock
+    interrupted = False
+    rollback_failed = False
+
+    def interrupt_and_fail_rollback(descriptor: int, operation: int) -> None:
+        nonlocal interrupted, rollback_failed
+        if descriptor != lock_descriptor:
+            original_flock(descriptor, operation)
+            return
+        if operation == fcntl.LOCK_EX and not interrupted:
+            original_flock(descriptor, operation)
+            interrupted = True
+            raise KeyboardInterrupt("flock acquire interrupt")
+        if operation == fcntl.LOCK_UN and interrupted and not rollback_failed:
+            rollback_failed = True
+            raise OSError("flock rollback failure")
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(
+        lab_artifacts_module.fcntl,
+        "flock",
+        interrupt_and_fail_rollback,
+    )
+    try:
+        captured: BaseException | None = None
+        try:
+            if lock_kind == "lifecycle":
+                assert store is not None
+                store.list_candidate_recovery()
+            elif lock_kind == "namespace":
+                assert store is not None
+                with store._exclusive_namespace_guard():
+                    pass
+            else:
+                assert index is not None
+                with index._exclusive_index_lock():
+                    pass
+        except BaseException as error:
+            captured = error
+        assert isinstance(captured, BaseExceptionGroup)
+        flattened = _flatten_exception_group(captured)
+        assert any(isinstance(item, KeyboardInterrupt) for item in flattened)
+        assert any(isinstance(item, OSError) and "rollback" in str(item) for item in flattened)
+        monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", original_flock)
+        original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original_flock(probe_descriptor, fcntl.LOCK_UN)
+    finally:
+        monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", original_flock)
+        os.close(probe_descriptor)
+        if index is not None:
+            index.close()
+        if store is not None:
+            store.close()
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_secure_directory_open_closes_all_fds_on_early_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    target = tmp_path / "private"
+    target.mkdir(mode=0o700)
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_fstat = lab_artifacts_module.os.fstat
+    original_open = lab_artifacts_module.os.open
+    interrupted = False
+    opened_descriptors: list[int] = []
+
+    def record_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def interrupt_first_observation(descriptor: int) -> os.stat_result:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise failure_type("directory observation interrupted")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module.os, "open", record_open)
+    monkeypatch.setattr(lab_artifacts_module.os, "fstat", interrupt_first_observation)
+    try:
+        with pytest.raises(failure_type, match="directory observation interrupted"):
+            lab_artifacts_module._secure_open_directory(target, create=False)
+        assert all(
+            _descriptor_is_closed(descriptor, original_fstat) for descriptor in opened_descriptors
+        )
+    finally:
+        monkeypatch.setattr(lab_artifacts_module.os, "open", original_open)
+        monkeypatch.setattr(lab_artifacts_module.os, "fstat", original_fstat)
+        for descriptor in opened_descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_secure_directory_open_preserves_interrupt_and_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "private"
+    target.mkdir(mode=0o700)
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_fstat = lab_artifacts_module.os.fstat
+    original_open = lab_artifacts_module.os.open
+    original_close = lab_artifacts_module.os.close
+    interrupted = False
+    close_failed = False
+    opened_descriptors: list[int] = []
+
+    def record_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def interrupt_first_observation(descriptor: int) -> os.stat_result:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("directory observation interrupted")
+        return original_fstat(descriptor)
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_failed
+        original_close(descriptor)
+        if not close_failed:
+            close_failed = True
+            raise OSError("directory descriptor close failure")
+
+    monkeypatch.setattr(lab_artifacts_module.os, "open", record_open)
+    monkeypatch.setattr(lab_artifacts_module.os, "fstat", interrupt_first_observation)
+    monkeypatch.setattr(lab_artifacts_module.os, "close", close_then_fail)
+    try:
+        captured: BaseException | None = None
+        try:
+            lab_artifacts_module._secure_open_directory(target, create=False)
+        except BaseException as error:
+            captured = error
+        assert isinstance(captured, BaseExceptionGroup)
+        flattened = _flatten_exception_group(captured)
+        assert any(isinstance(item, KeyboardInterrupt) for item in flattened)
+        assert any(isinstance(item, OSError) and "close" in str(item) for item in flattened)
+    finally:
+        monkeypatch.setattr(lab_artifacts_module.os, "open", original_open)
+        monkeypatch.setattr(lab_artifacts_module.os, "fstat", original_fstat)
+        monkeypatch.setattr(lab_artifacts_module.os, "close", original_close)
+        for descriptor in opened_descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_ensure_private_directory_preserves_interrupt_and_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "private"
+    target.mkdir(mode=0o700)
+    original_fchmod = lab_artifacts_module.os.fchmod
+    original_close = lab_artifacts_module.os.close
+    target_descriptor = -1
+    close_failed = False
+
+    def interrupt_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal target_descriptor
+        target_descriptor = descriptor
+        raise SystemExit(f"directory chmod interrupted at {mode:o}")
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_failed
+        original_close(descriptor)
+        if descriptor == target_descriptor and not close_failed:
+            close_failed = True
+            raise OSError("private directory close failure")
+
+    monkeypatch.setattr(lab_artifacts_module.os, "fchmod", interrupt_fchmod)
+    monkeypatch.setattr(lab_artifacts_module.os, "close", close_then_fail)
+    captured: BaseException | None = None
+    try:
+        lab_artifacts_module._ensure_private_directory(target, manage_existing=True)
+    except BaseException as error:
+        captured = error
+    finally:
+        monkeypatch.setattr(lab_artifacts_module.os, "fchmod", original_fchmod)
+        monkeypatch.setattr(lab_artifacts_module.os, "close", original_close)
+
+    assert isinstance(captured, BaseExceptionGroup)
+    flattened = _flatten_exception_group(captured)
+    assert any(isinstance(item, SystemExit) for item in flattened)
+    assert any(isinstance(item, OSError) and "close" in str(item) for item in flattened)
+    assert _descriptor_is_closed(target_descriptor)
+
+
+@pytest.mark.parametrize("constructor", ["artifact", "legacy"])
+def test_public_constructor_early_directory_interrupt_rolls_back_fds_and_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constructor: str,
+) -> None:
+    artifact_registry_before = dict(lab_artifacts_module._ARTIFACT_PROCESS_LOCKS)
+    legacy_registry_before = dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS)
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_fstat = lab_artifacts_module.os.fstat
+    original_open = lab_artifacts_module.os.open
+    interrupted = False
+    opened_descriptors: list[int] = []
+
+    def record_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def interrupt_first_observation(descriptor: int) -> os.stat_result:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("constructor directory interrupt")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module.os, "open", record_open)
+    monkeypatch.setattr(lab_artifacts_module.os, "fstat", interrupt_first_observation)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="constructor directory interrupt"):
+            if constructor == "artifact":
+                LabJobArtifactStore(tmp_path / "artifacts")
+            else:
+                LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+        assert all(
+            _descriptor_is_closed(descriptor, original_fstat) for descriptor in opened_descriptors
+        )
+    finally:
+        monkeypatch.setattr(lab_artifacts_module.os, "open", original_open)
+        monkeypatch.setattr(lab_artifacts_module.os, "fstat", original_fstat)
+        for descriptor in opened_descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    assert dict(lab_artifacts_module._ARTIFACT_PROCESS_LOCKS) == artifact_registry_before
+    assert dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS) == legacy_registry_before
+
+
+def test_bound_readonly_file_preserves_caller_identity_and_parent_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "legacy.json"
+    source.write_text('{"generation":1}', encoding="utf-8")
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text('{"generation":2}', encoding="utf-8")
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_secure_open = lab_artifacts_module._secure_open_directory
+    original_close = lab_artifacts_module.os.close
+    final_check_started = False
+    final_parent_descriptors: set[int] = set()
+
+    def record_final_parent(
+        path: Path,
+        *,
+        create: bool,
+        create_mode: int = 0o700,
+    ) -> int:
+        descriptor = original_secure_open(
+            path,
+            create=create,
+            create_mode=create_mode,
+        )
+        if final_check_started:
+            final_parent_descriptors.add(descriptor)
+        return descriptor
+
+    def close_final_parent_then_fail(descriptor: int) -> None:
+        original_close(descriptor)
+        if descriptor in final_parent_descriptors:
+            final_parent_descriptors.remove(descriptor)
+            raise OSError("readonly parent close failure")
+
+    monkeypatch.setattr(lab_artifacts_module, "_secure_open_directory", record_final_parent)
+    monkeypatch.setattr(lab_artifacts_module.os, "close", close_final_parent_then_fail)
+
+    with (
+        pytest.raises(BaseExceptionGroup) as captured,
+        lab_artifacts_module._open_bound_readonly_file(source, label="legacy source"),
+    ):
+        final_check_started = True
+        os.replace(replacement, source)
+        raise RuntimeError("readonly caller failure")
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(isinstance(item, LabArtifactIntegrityError) for item in flattened)
+    assert any(
+        isinstance(item, OSError) and "readonly parent close" in str(item) for item in flattened
+    )
+    assert len(os.listdir("/dev/fd")) == before_descriptors
