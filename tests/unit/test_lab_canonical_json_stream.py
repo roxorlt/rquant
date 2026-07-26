@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import tracemalloc
+
+import pandas as pd
+import pyarrow as pa
 
 
 def _encoded_string(value: str, *, escape_forward_slash: bool = False) -> bytes:
@@ -99,3 +103,38 @@ def test_pandas_bytes_scalar_streams_utf8_with_bounded_scratch() -> None:
 
     assert consumed == len(large) + 2
     assert peak <= 2 * 1024 * 1024
+
+
+def test_arrow_string_accessor_streams_highly_fragmented_chunks_with_constant_memory() -> None:
+    from rquant.canonical_json_stream import (
+        CanonicalJsonStreamWriter,
+        PandasJsonColumnAccessor,
+    )
+
+    values = [f"value-{index:05d}" for index in range(20_000)]
+    chunked = pa.chunked_array([pa.array([value], type=pa.string()) for value in values])
+    series = pd.Series(pd.arrays.ArrowStringArray(chunked), name="value")
+    expected = hashlib.sha256(
+        json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    digest = hashlib.sha256()
+    writer = CanonicalJsonStreamWriter(digest.update)
+
+    tracemalloc.start()
+    accessor = PandasJsonColumnAccessor(series)
+    writer.write_ascii(b"[")
+    for row_index in range(len(series)):
+        if row_index:
+            writer.write_ascii(b",")
+        accessor.write_pandas_value(
+            writer,
+            row_index,
+            escape_forward_slash=False,
+            sort_mapping_keys=True,
+        )
+    writer.write_ascii(b"]")
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert digest.hexdigest() == expected
+    assert peak <= 512 * 1024

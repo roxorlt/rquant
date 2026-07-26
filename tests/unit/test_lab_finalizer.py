@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import tracemalloc
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -1141,6 +1142,46 @@ def test_finalizer_recovers_idempotently_after_each_crash_boundary(
     )
 
 
+def test_finalizer_reuses_verified_transition_key_pending_after_signing_rotation(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    old_key = LabFinalizerAuthorityKey(key_id="finalizer-old", secret=b"o" * 32)
+    new_key = LabFinalizerAuthorityKey(key_id="finalizer-new", secret=b"n" * 32)
+    active = [old_key]
+    keyring = {old_key.key_id: old_key, new_key.key_id: new_key}
+
+    def signing_key() -> LabFinalizerAuthorityKey:
+        return active[0]
+
+    def finalizer() -> LabFinalizer:
+        return LabFinalizer(
+            reader=LabJobReader(scenario.store.path),
+            shard_artifact_root=tmp_path / "artifacts",
+            artifact_store=scenario.artifact_store,
+            commit_spool=scenario.commit_spool,
+            adapter_registry=default_strategy_job_adapter_registry(),
+            verified_code_sha_provider=lambda: "1" * 40,
+            finalizer_authority_key_provider=signing_key,
+            finalizer_authority_verification_key_provider=keyring.get,
+        )
+
+    first = finalizer().finalize(scenario.job_id)
+    first_pending = scenario.commit_spool.pending()
+    assert len(first_pending) == 1
+    first_proof = first_pending[0].envelope.authority_proof
+    assert first_proof is not None and first_proof.key_id == old_key.key_id
+
+    active[0] = new_key
+    replay = finalizer().finalize(scenario.job_id)
+    pending = scenario.commit_spool.pending()
+
+    assert replay.status == "published"
+    assert replay.request_id == first.request_id
+    assert len(pending) == 1
+    assert pending[0].envelope == first_pending[0].envelope
+
+
 def test_finalizer_recovers_rename_completed_interrupted_seal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2045,6 +2086,160 @@ def test_finalizer_rejects_roundtrip_peak_before_artifact_serialization(
         LabFinalizationResourceLimitError,
         match="artifact roundtrip peak resident bytes",
     ):
+        finalizer.finalize(scenario.job_id)
+
+
+def test_finalizer_rejects_oversized_manifest_before_read_or_model_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    changed = LabShardResultManifest.model_validate(
+        manifest.model_copy(
+            update={"metrics": (LabShardMetric(name="oversized", value="x" * (2 * 1024 * 1024)),)}
+        )
+    )
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+    tampered = snapshot.model_copy(update={"shards": (accepted,)})
+    finalizer = LabFinalizer(
+        reader=_TamperedBundleSnapshotReader(tampered),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=_authority_key_provider,
+        job_limits=LabFinalizerJobLimits(max_peak_resident_bytes=512 * 1024),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("oversized manifest reached Pydantic model parsing")
+
+    monkeypatch.setattr(LabShardResultManifest, "model_validate_json", forbidden)
+    tracemalloc.start()
+    with pytest.raises(LabFinalizationResourceLimitError, match="manifest.*peak"):
+        finalizer.finalize(scenario.job_id)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert peak <= 1024 * 1024
+
+
+@pytest.mark.parametrize("resource", ["count", "value"])
+def test_bundle_reader_preflights_metric_resources_before_model_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    if resource == "count":
+        metrics = (
+            LabShardMetric(name="first", value=1),
+            LabShardMetric(name="second", value=2),
+        )
+        limits = LabShardBundleLimits(max_metric_count=1)
+        message = "metric count"
+    else:
+        metrics = (LabShardMetric(name="wide", value="x" * 4096),)
+        limits = LabShardBundleLimits(max_metric_value_bytes=128)
+        message = "metric value"
+    changed = LabShardResultManifest.model_validate(
+        manifest.model_copy(update={"metrics": metrics})
+    )
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("oversized metrics reached Pydantic model parsing")
+
+    monkeypatch.setattr(LabShardResultManifest, "model_validate_json", forbidden)
+    with pytest.raises(LabFinalizationResourceLimitError, match=message):
+        LabSealedShardBundleReader(
+            tmp_path / "artifacts",
+            limits=limits,
+        ).inspect(accepted)
+
+
+def test_finalizer_budgets_snapshot_control_before_bundle_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    changed_shard = evidence.shard.model_copy(update={"payload_json": "x" * (1024 * 1024)})
+    tampered = snapshot.model_copy(
+        update={"shards": (evidence.model_copy(update={"shard": changed_shard}),)}
+    )
+    finalizer = LabFinalizer(
+        reader=_TamperedBundleSnapshotReader(tampered),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=_authority_key_provider,
+        job_limits=LabFinalizerJobLimits(max_peak_resident_bytes=512 * 1024),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("oversized snapshot reached bundle inspection")
+
+    monkeypatch.setattr(finalizer.bundle_reader, "inspect", forbidden)
+    with pytest.raises(LabFinalizationResourceLimitError, match="snapshot control"):
+        finalizer.finalize(scenario.job_id)
+
+
+def test_finalizer_reserves_snapshot_bytes_during_manifest_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    changed_manifest = LabShardResultManifest.model_validate(
+        manifest.model_copy(
+            update={"metrics": (LabShardMetric(name="wide", value="x" * (128 * 1024)),)}
+        )
+    )
+    _persist_attempt_manifest(attempt, changed_manifest)
+    accepted = _evidence_for_manifest(evidence, changed_manifest)
+    changed_shard = accepted.shard.model_copy(update={"payload_json": "x" * (1024 * 1024)})
+    tampered = snapshot.model_copy(
+        update={"shards": (accepted.model_copy(update={"shard": changed_shard}),)}
+    )
+    finalizer = LabFinalizer(
+        reader=_TamperedBundleSnapshotReader(tampered),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=_authority_key_provider,
+        bundle_limits=LabShardBundleLimits(max_metric_value_bytes=256 * 1024),
+        job_limits=LabFinalizerJobLimits(max_peak_resident_bytes=2 * 1024 * 1024),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("combined snapshot and manifest peak reached model parsing")
+
+    monkeypatch.setattr(LabShardResultManifest, "model_validate_json", forbidden)
+    with pytest.raises(LabFinalizationResourceLimitError, match="manifest.*peak"):
         finalizer.finalize(scenario.job_id)
 
 

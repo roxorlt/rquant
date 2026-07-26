@@ -114,6 +114,61 @@ def test_job_result_hash_bounds_wide_string_scratch() -> None:
     assert peak <= 8 * 1024 * 1024
 
 
+@pytest.mark.parametrize(
+    "categorical",
+    [
+        pd.Categorical(pd.Series([1, 2, 1], dtype="Int64")),
+        pd.Categorical(pd.Series([True, False, True], dtype="boolean")),
+        pd.Categorical(pd.Series([1.25, 2.5, 1.25], dtype="Float64")),
+        pd.Categorical(pd.to_datetime(["2026-01-01", "2026-01-02"])),
+    ],
+    ids=["integer", "boolean", "float", "timestamp"],
+)
+def test_job_result_hash_preserves_categorical_scalar_semantics(
+    categorical: pd.Categorical,
+) -> None:
+    from rquant.strategy_job_adapters import LabJobExecutionResult, LabShardTable
+
+    frame = pd.DataFrame({"value": categorical})
+    result = LabJobExecutionResult(
+        spec_hash="1" * 64,
+        plan_hash="2" * 64,
+        adapter_id="categorical-streaming-test",
+        adapter_version="1",
+        tables=(LabShardTable(name="trades", frame=frame),),
+    )
+    legacy_payload = {
+        "adapter_id": result.adapter_id,
+        "adapter_version": result.adapter_version,
+        "plan_hash": result.plan_hash,
+        "spec_hash": result.spec_hash,
+        "tables": [
+            {
+                "frame": frame.to_json(
+                    orient="split",
+                    date_format="iso",
+                    date_unit="us",
+                    double_precision=15,
+                    force_ascii=True,
+                    index=False,
+                ),
+                "name": "trades",
+            }
+        ],
+    }
+    expected = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert result.result_hash == expected
+
+
 def _p13_frozen_claim() -> LabShardClaim:
     return LabShardClaim.model_validate_json(_P13_CLAIM_JSON)
 

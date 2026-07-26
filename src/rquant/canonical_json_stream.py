@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import codecs
 import json
 import math
 import struct
-from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from enum import Enum
@@ -16,6 +17,7 @@ from pandas._libs.json import ujson_dumps
 
 CANONICAL_JSON_STRING_CHUNK_CHARACTERS = 1024
 CANONICAL_JSON_STREAM_SCRATCH_BYTES = 128 * 1024
+CANONICAL_JSON_BASE64_INPUT_CHUNK_BYTES = 12 * 1024
 _MAX_SCALAR_TOKEN_BYTES = 64 * 1024
 
 
@@ -64,8 +66,6 @@ class CanonicalJsonStreamWriter:
         *,
         escape_forward_slash: bool = False,
     ) -> None:
-        import codecs
-
         self._update(b'"')
         decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         for start in range(0, len(value), 4096):
@@ -79,6 +79,16 @@ class CanonicalJsonStreamWriter:
             tail,
             escape_forward_slash=escape_forward_slash,
         )
+        self._update(b'"')
+
+    def write_base64_bytes(self, value: bytes | bytearray | memoryview) -> None:
+        """Write one canonical base64 JSON string with 3-byte-aligned chunks."""
+
+        payload = memoryview(value).cast("B")
+        self._update(b'"')
+        for start in range(0, len(payload), CANONICAL_JSON_BASE64_INPUT_CHUNK_BYTES):
+            chunk = payload[start : start + CANONICAL_JSON_BASE64_INPUT_CHUNK_BYTES]
+            self._update(base64.b64encode(chunk))
         self._update(b'"')
 
     def write_value(self, value: object, *, sort_keys: bool = True) -> None:
@@ -174,35 +184,49 @@ class PandasJsonColumnAccessor:
 
     def __init__(self, series: pd.Series) -> None:
         self._array = series.array
-        self._arrow_chunks: tuple[pa.Array, ...] = ()
-        self._chunk_ends: tuple[int, ...] = ()
+        self._arrow_chunked: pa.ChunkedArray | None = None
+        self._arrow_chunk: pa.Array | None = None
+        self._arrow_chunk_index = 0
+        self._arrow_chunk_start = 0
+        self._arrow_chunk_end = 0
         dtype = series.dtype
         if isinstance(dtype, pd.StringDtype) and dtype.storage == "pyarrow":
             chunked = self._array.__arrow_array__()
             if not isinstance(chunked, pa.ChunkedArray):
                 chunked = pa.chunked_array((chunked,))
-            if not all(
-                pa.types.is_string(chunk.type) or pa.types.is_large_string(chunk.type)
-                for chunk in chunked.chunks
-            ):
-                raise TypeError("Arrow-backed pandas string column has invalid storage")
-            ends: list[int] = []
-            total = 0
-            for chunk in chunked.chunks:
-                total += len(chunk)
-                ends.append(total)
-            self._arrow_chunks = tuple(chunked.chunks)
-            self._chunk_ends = tuple(ends)
+            for chunk_index in range(chunked.num_chunks):
+                chunk = chunked.chunk(chunk_index)
+                if not (pa.types.is_string(chunk.type) or pa.types.is_large_string(chunk.type)):
+                    raise TypeError("Arrow-backed pandas string column has invalid storage")
+            self._arrow_chunked = chunked
+
+    def _select_arrow_chunk(self, chunk_index: int, chunk_start: int) -> None:
+        if self._arrow_chunked is None or chunk_index >= self._arrow_chunked.num_chunks:
+            self._arrow_chunk = None
+            self._arrow_chunk_index = chunk_index
+            self._arrow_chunk_start = chunk_start
+            self._arrow_chunk_end = chunk_start
+            return
+        chunk = self._arrow_chunked.chunk(chunk_index)
+        self._arrow_chunk = chunk
+        self._arrow_chunk_index = chunk_index
+        self._arrow_chunk_start = chunk_start
+        self._arrow_chunk_end = chunk_start + len(chunk)
 
     def _arrow_utf8_buffer(self, row_index: int) -> tuple[bool, memoryview | None]:
-        if not self._arrow_chunks:
+        if self._arrow_chunked is None:
             return False, None
-        if row_index < 0 or row_index >= self._chunk_ends[-1]:
+        if row_index < 0 or row_index >= len(self._arrow_chunked):
             raise IndexError("pandas row index is outside the column")
-        chunk_index = bisect_right(self._chunk_ends, row_index)
-        previous_end = self._chunk_ends[chunk_index - 1] if chunk_index else 0
-        local_index = row_index - previous_end
-        chunk = self._arrow_chunks[chunk_index]
+        if self._arrow_chunk is None or row_index < self._arrow_chunk_start:
+            self._select_arrow_chunk(0, 0)
+        while self._arrow_chunk is None or row_index >= self._arrow_chunk_end:
+            self._select_arrow_chunk(
+                self._arrow_chunk_index + 1,
+                self._arrow_chunk_end,
+            )
+        chunk = self._arrow_chunk
+        local_index = row_index - self._arrow_chunk_start
         scalar = chunk[local_index]
         if not scalar.is_valid:
             return True, None

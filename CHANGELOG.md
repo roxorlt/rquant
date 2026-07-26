@@ -50,6 +50,13 @@
 
 ### Fixed
 
+- **Strategy Lab finalizer 资源与认证复审加固**：bytes 单元格改为三字节对齐的固定块流式
+  Base64，Arrow 高碎片字符串列改为 O(1) 顺序游标；manifest、metrics、spec、report 与控制
+  对象统一进入 typed 峰值预算，并在 Pydantic/Parquet/final artifact 物化前执行预检。数值与
+  时间 categorical 保持旧 canonical hash 语义；finalizer 在 active key 轮换后复用已验证的
+  transition-key pending envelope，scheduler 则在 artifact 绑定前预认证 HMAC、在 SQLite
+  事务内再次核验权威 key 与 ready graph，避免未认证提交触发大制品 I/O。
+
 - **Strategy Lab finalizer 宽值内存与认证隔离**：三条结果 hash 共用标量级 canonical
   JSON 流式 encoder，字符串按固定小块用标准库转义并直接读取 Arrow string buffer，保持旧
   hash 字节语义的同时移除宽行/巨型 Unicode 单元格的整值 JSON 副本；统一峰值预算显式计入

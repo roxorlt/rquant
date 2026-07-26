@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import os
+import random
 import shutil
 import sqlite3
 import stat
@@ -5112,6 +5113,38 @@ def test_table_content_hash_bounds_single_large_cjk_cell_scratch() -> None:
 
     assert len(digest) == 64
     assert peak <= 8 * 1024 * 1024
+
+
+def test_table_content_hash_streams_bytes_with_legacy_base64_semantics() -> None:
+    rng = random.Random(20260728)
+    for size in (0, 1, 2, 3, 4, 5, 3071, 3072, 3073, 6143, 6144, 6145):
+        value = rng.randbytes(size)
+        frame = pd.DataFrame({"value": pd.Series([value], dtype=object)})
+        legacy_payload = {
+            "columns": list(frame.columns),
+            "dtypes": [str(dtype) for dtype in frame.dtypes],
+            "dtype_identities": lab_artifacts_module._frame_dtype_identities(frame),
+            "rows": [[lab_artifacts_module._canonical_table_value(value)]],
+        }
+        expected = hashlib.sha256(
+            lab_artifacts_module.canonical_json_bytes(legacy_payload)
+        ).hexdigest()
+
+        assert lab_artifacts_module._table_content_hash(frame) == expected
+
+
+def test_table_content_hash_bounds_single_large_bytes_cell_scratch() -> None:
+    size = 64 * 1024 * 1024
+    value = (b"\x00\xffabc" * ((size + 4) // 5))[:size]
+    frame = pd.DataFrame({"value": pd.Series([value], dtype=object)})
+
+    tracemalloc.start()
+    digest = lab_artifacts_module._table_content_hash(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest) == 64
+    assert peak <= 2 * 1024 * 1024
 
 
 def test_legacy_import_keeps_source_bound_through_cache_sync_and_return(

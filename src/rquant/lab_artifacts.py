@@ -2032,7 +2032,13 @@ def _table_content_hash(frame: pd.DataFrame) -> str:
                 row_index,
                 escape_forward_slash=False,
             ):
-                writer.write_value(_canonical_table_value(accessor.value(row_index)))
+                value = accessor.value(row_index)
+                if isinstance(value, bytes):
+                    writer.write_ascii(b'{"$bytes":')
+                    writer.write_base64_bytes(value)
+                    writer.write_ascii(b"}")
+                else:
+                    writer.write_value(_canonical_table_value(value))
         digest.update(b"]")
     digest.update(b"]}")
     return digest.hexdigest()

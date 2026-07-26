@@ -7,7 +7,8 @@ import json
 import os
 import re
 import stat
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Literal, TypeVar
@@ -26,10 +27,14 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitReceipt,
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
+    LabFinalizerAuthorityAuthenticationError,
     LabFinalizerAuthorityClaims,
+    LabFinalizerAuthorityKey,
     LabFinalizerAuthorityShardEvidence,
     LabFinalizerAuthoritySigningKeyProvider,
+    LabFinalizerAuthorityVerificationKeyProvider,
     sign_finalizer_authority,
+    verify_finalizer_authority,
 )
 from rquant.lab_artifacts import (
     LabArtifactError,
@@ -156,7 +161,13 @@ class LabFinalizerResult(LabFinalizerModel):
 
 class LabShardBundleLimits(LabFinalizerModel):
     max_manifest_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    max_manifest_peak_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    manifest_model_expansion_factor: int = Field(default=8, ge=1, le=64)
     max_artifact_count: int = Field(default=256, ge=1)
+    max_metric_count: int = Field(default=256, ge=0)
+    max_metric_name_bytes: int = Field(default=128, ge=1)
+    max_metric_value_bytes: int = Field(default=64 * 1024, ge=1)
+    max_metrics_encoded_bytes: int = Field(default=1024 * 1024, ge=2)
     max_single_file_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
     max_bundle_total_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     max_row_count: int = Field(default=5_000_000, ge=1)
@@ -180,6 +191,11 @@ class LabFinalizerJobLimits(LabFinalizerModel):
     max_total_declared_uncompressed_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
     max_total_arrow_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     max_total_shard_dataframe_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+    max_total_shard_metric_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    max_snapshot_control_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    max_spec_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+    max_final_metrics_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
+    max_report_markdown_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
     max_aggregate_rows: int = Field(default=5_000_000, ge=1)
     max_aggregate_dataframe_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     max_final_artifact_payload_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
@@ -204,6 +220,7 @@ class LabArtifactRoundtripPeakUsage(LabFinalizerModel):
     payload_bytes: int = Field(ge=0)
     payload_copy_bytes: int = Field(ge=0)
     hash_scratch_bytes: int = Field(ge=0)
+    control_bytes: int = Field(default=0, ge=0)
 
     @property
     def peak_resident_bytes(self) -> int:
@@ -214,6 +231,7 @@ class LabArtifactRoundtripPeakUsage(LabFinalizerModel):
             + self.payload_bytes
             + self.payload_copy_bytes
             + self.hash_scratch_bytes
+            + self.control_bytes
         )
 
     @classmethod
@@ -222,6 +240,7 @@ class LabArtifactRoundtripPeakUsage(LabFinalizerModel):
         *,
         aggregate_dataframe_bytes: int,
         payload_bytes: int,
+        control_bytes: int = 0,
     ) -> LabArtifactRoundtripPeakUsage:
         return cls(
             source_dataframe_bytes=aggregate_dataframe_bytes,
@@ -230,6 +249,39 @@ class LabArtifactRoundtripPeakUsage(LabFinalizerModel):
             payload_bytes=payload_bytes,
             payload_copy_bytes=payload_bytes,
             hash_scratch_bytes=CANONICAL_JSON_STREAM_SCRATCH_BYTES,
+            control_bytes=control_bytes,
+        )
+
+
+class LabManifestResourceUsage(LabFinalizerModel):
+    raw_bytes: int = Field(ge=0)
+    estimated_model_bytes: int = Field(ge=0)
+    validation_scratch_bytes: int = Field(ge=0)
+    metric_count: int = Field(ge=0)
+    max_metric_value_bytes: int = Field(ge=0)
+    metrics_encoded_bytes: int = Field(ge=0)
+    retained_metric_bytes: int = Field(ge=0)
+
+    @property
+    def peak_resident_bytes(self) -> int:
+        return self.raw_bytes + self.estimated_model_bytes + self.validation_scratch_bytes
+
+
+class LabFinalizerControlUsage(LabFinalizerModel):
+    snapshot_control_bytes: int = Field(ge=0)
+    spec_bytes: int = Field(ge=0)
+    retained_shard_metric_bytes: int = Field(default=0, ge=0)
+    final_metrics_bytes: int = Field(default=0, ge=0)
+    report_bytes: int = Field(default=0, ge=0)
+
+    @property
+    def resident_bytes(self) -> int:
+        return (
+            self.snapshot_control_bytes
+            + self.spec_bytes
+            + self.retained_shard_metric_bytes
+            + self.final_metrics_bytes
+            + self.report_bytes
         )
 
 
@@ -239,6 +291,8 @@ class LabShardBundleUsage(LabFinalizerModel):
     declared_uncompressed_bytes: int = Field(ge=0)
     arrow_bytes: int = Field(ge=0)
     materialized_dataframe_bytes: int = Field(ge=0)
+    manifest_peak_bytes: int = Field(ge=0)
+    retained_metric_bytes: int = Field(ge=0)
 
 
 class LabShardBundleInspection(LabFinalizerModel):
@@ -248,6 +302,7 @@ class LabShardBundleInspection(LabFinalizerModel):
     declared_uncompressed_bytes: int = Field(ge=0)
     estimated_arrow_bytes: int = Field(ge=0)
     estimated_pandas_bytes: int = Field(ge=0)
+    manifest_usage: LabManifestResourceUsage
 
 
 class LabParquetResourceSummary(LabFinalizerModel):
@@ -283,6 +338,137 @@ def _observation(value: os.stat_result) -> tuple[int, int, int, int, int, int, i
         value.st_size,
         value.st_mtime_ns,
         value.st_ctime_ns,
+    )
+
+
+def _resident_object_bytes(value: object, *, _seen: set[int] | None = None) -> int:
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, BaseModel):
+        return size + sum(
+            _resident_object_bytes(getattr(value, name), _seen=seen)
+            for name in type(value).model_fields
+        )
+    if isinstance(value, Mapping):
+        return size + sum(
+            _resident_object_bytes(key, _seen=seen) + _resident_object_bytes(item, _seen=seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return size + sum(_resident_object_bytes(item, _seen=seen) for item in value)
+    return size
+
+
+def _scan_json_string_end(payload: bytes, start: int, *, label: str) -> int:
+    if start >= len(payload) or payload[start] != ord('"'):
+        raise LabFinalizationIntegrityError(f"accepted shard {label} is not a JSON string")
+    index = start + 1
+    while index < len(payload):
+        value = payload[index]
+        if value == ord('"'):
+            return index + 1
+        if value == ord("\\"):
+            index += 1
+            if index >= len(payload):
+                break
+            escape = payload[index]
+            if escape == ord("u"):
+                end = index + 5
+                if end > len(payload) or any(
+                    character not in b"0123456789abcdefABCDEF"
+                    for character in payload[index + 1 : end]
+                ):
+                    raise LabFinalizationIntegrityError(
+                        f"accepted shard {label} has an invalid Unicode escape"
+                    )
+                index = end
+                continue
+            if escape not in b'"\\/bfnrt':
+                raise LabFinalizationIntegrityError(
+                    f"accepted shard {label} has an invalid JSON escape"
+                )
+        elif value < 0x20 or value > 0x7F:
+            raise LabFinalizationIntegrityError(
+                f"accepted shard {label} is not canonical ASCII JSON"
+            )
+        index += 1
+    raise LabFinalizationIntegrityError(f"accepted shard {label} is unterminated")
+
+
+def _preflight_manifest_metrics(
+    payload: bytes,
+    *,
+    limits: LabShardBundleLimits,
+) -> LabManifestResourceUsage:
+    marker = b'"metrics":['
+    if payload.count(marker) != 1:
+        raise LabFinalizationIntegrityError("accepted shard manifest metrics are ambiguous")
+    array_start = payload.index(marker) + len(marker) - 1
+    index = array_start + 1
+    count = 0
+    maximum_value_bytes = 0
+    if index >= len(payload):
+        raise LabFinalizationIntegrityError("accepted shard manifest metrics are truncated")
+    while payload[index] != ord("]"):
+        if not payload.startswith(b'{"name":', index):
+            raise LabFinalizationIntegrityError("accepted shard manifest metric is not canonical")
+        name_start = index + len(b'{"name":')
+        name_end = _scan_json_string_end(payload, name_start, label="metric name")
+        name_bytes = name_end - name_start - 2
+        if name_bytes > limits.max_metric_name_bytes:
+            raise LabFinalizationResourceLimitError(
+                "accepted shard metric name exceeds configured byte limit"
+            )
+        if not payload.startswith(b',"value":', name_end):
+            raise LabFinalizationIntegrityError("accepted shard manifest metric is not canonical")
+        value_start = name_end + len(b',"value":')
+        if value_start >= len(payload):
+            raise LabFinalizationIntegrityError("accepted shard metric value is truncated")
+        if payload[value_start] == ord('"'):
+            value_end = _scan_json_string_end(payload, value_start, label="metric value")
+            value_bytes = value_end - value_start - 2
+        else:
+            value_end = payload.find(b"}", value_start)
+            if value_end < 0:
+                raise LabFinalizationIntegrityError("accepted shard metric value is truncated")
+            value_bytes = value_end - value_start
+        if value_bytes > limits.max_metric_value_bytes:
+            raise LabFinalizationResourceLimitError(
+                "accepted shard metric value exceeds configured byte limit"
+            )
+        if value_end >= len(payload) or payload[value_end] != ord("}"):
+            raise LabFinalizationIntegrityError("accepted shard manifest metric is not canonical")
+        count += 1
+        if count > limits.max_metric_count:
+            raise LabFinalizationResourceLimitError(
+                "accepted shard metric count exceeds configured limit"
+            )
+        maximum_value_bytes = max(maximum_value_bytes, value_bytes)
+        index = value_end + 1
+        if index >= len(payload):
+            raise LabFinalizationIntegrityError("accepted shard manifest metrics are truncated")
+        if payload[index] == ord(","):
+            index += 1
+        elif payload[index] != ord("]"):
+            raise LabFinalizationIntegrityError("accepted shard manifest metrics are not canonical")
+    metrics_encoded_bytes = index - array_start + 1
+    if metrics_encoded_bytes > limits.max_metrics_encoded_bytes:
+        raise LabFinalizationResourceLimitError(
+            "accepted shard metrics exceed configured encoded byte limit"
+        )
+    raw_bytes = len(payload)
+    return LabManifestResourceUsage(
+        raw_bytes=raw_bytes,
+        estimated_model_bytes=raw_bytes * limits.manifest_model_expansion_factor,
+        validation_scratch_bytes=CANONICAL_JSON_STREAM_SCRATCH_BYTES,
+        metric_count=count,
+        max_metric_value_bytes=maximum_value_bytes,
+        metrics_encoded_bytes=metrics_encoded_bytes,
+        retained_metric_bytes=(metrics_encoded_bytes * 4) + (count * 256),
     )
 
 
@@ -415,9 +601,28 @@ class LabSealedShardBundleReader:
         artifact_root: Path,
         *,
         limits: LabShardBundleLimits | None = None,
+        max_peak_resident_bytes: int | None = None,
     ) -> None:
         self.artifact_root = Path(artifact_root).resolve()
         self.limits = limits or LabShardBundleLimits()
+        if max_peak_resident_bytes is not None and max_peak_resident_bytes < 1:
+            raise ValueError("bundle reader peak resident byte limit must be positive")
+        self.max_peak_resident_bytes = min(
+            self.limits.max_manifest_peak_bytes,
+            max_peak_resident_bytes or self.limits.max_manifest_peak_bytes,
+        )
+
+    def _preflight_manifest_size(self, size: int, *, resident_bytes: int) -> None:
+        estimated_peak = (
+            resident_bytes
+            + size
+            + (size * self.limits.manifest_model_expansion_factor)
+            + CANONICAL_JSON_STREAM_SCRATCH_BYTES
+        )
+        if estimated_peak > self.max_peak_resident_bytes:
+            raise LabFinalizationResourceLimitError(
+                "accepted shard manifest parsing peak exceeds configured memory limit"
+            )
 
     @staticmethod
     def _after_file_read(_name: str) -> None:
@@ -737,6 +942,7 @@ class LabSealedShardBundleReader:
         observe_usage: Callable[[LabShardBundleUsage], None] | None,
         materialize: bool,
         expected_inspection: LabShardBundleInspection | None,
+        resident_bytes: int,
     ) -> LabShardExecutionResult | LabShardBundleInspection:
         report = evidence.accepted_success.report
         body = report.body
@@ -789,6 +995,10 @@ class LabSealedShardBundleReader:
                 manifest_descriptor,
                 manifest_observed,
             )
+            self._preflight_manifest_size(
+                manifest_observed[4],
+                resident_bytes=resident_bytes,
+            )
             manifest_bytes = _read_descriptor_bounded(
                 manifest_descriptor,
                 expected_size=manifest_observed[4],
@@ -796,6 +1006,19 @@ class LabSealedShardBundleReader:
                 max_consecutive_interrupted_reads=(self.limits.max_consecutive_interrupted_reads),
             )
             self._after_file_read("manifest.json")
+            try:
+                manifest_usage = _preflight_manifest_metrics(
+                    manifest_bytes,
+                    limits=self.limits,
+                )
+            except LabFinalizationResourceLimitError:
+                raise
+            except LabFinalizationIntegrityError as exc:
+                raise LabFinalizationIntegrityError("accepted shard manifest is invalid") from exc
+            if resident_bytes + manifest_usage.peak_resident_bytes > self.max_peak_resident_bytes:
+                raise LabFinalizationResourceLimitError(
+                    "accepted shard manifest parsing peak exceeds configured memory limit"
+                )
             try:
                 manifest = LabShardResultManifest.model_validate_json(manifest_bytes)
             except Exception as exc:
@@ -806,6 +1029,10 @@ class LabSealedShardBundleReader:
                 manifest,
                 manifest_size=len(manifest_bytes),
             )
+            if len(manifest.metrics) != manifest_usage.metric_count:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard manifest metric preflight changed during parsing"
+                )
             expected_manifest_identity = (
                 report.job_id,
                 report.shard_id,
@@ -925,6 +1152,7 @@ class LabSealedShardBundleReader:
                 declared_uncompressed_bytes=total_uncompressed_bytes,
                 estimated_arrow_bytes=total_estimated_arrow_bytes,
                 estimated_pandas_bytes=total_estimated_pandas_bytes,
+                manifest_usage=manifest_usage,
             )
             if expected_inspection is not None and inspection != expected_inspection:
                 raise LabFinalizationIntegrityError(
@@ -940,6 +1168,8 @@ class LabSealedShardBundleReader:
                         declared_uncompressed_bytes=total_uncompressed_bytes,
                         arrow_bytes=total_arrow_bytes,
                         materialized_dataframe_bytes=total_materialized_bytes,
+                        manifest_peak_bytes=manifest_usage.peak_resident_bytes,
+                        retained_metric_bytes=manifest_usage.retained_metric_bytes,
                     )
                 )
 
@@ -993,6 +1223,7 @@ class LabSealedShardBundleReader:
         *,
         observe_usage: Callable[[LabShardBundleUsage], None] | None = None,
         expected_inspection: LabShardBundleInspection | None = None,
+        resident_bytes: int = 0,
     ) -> LabShardExecutionResult:
         descriptors: list[int] = []
         result: LabShardExecutionResult | None = None
@@ -1004,6 +1235,7 @@ class LabSealedShardBundleReader:
                 observe_usage=observe_usage,
                 materialize=True,
                 expected_inspection=expected_inspection,
+                resident_bytes=resident_bytes,
             )
         except BaseException as exc:
             errors.append(exc)
@@ -1025,7 +1257,12 @@ class LabSealedShardBundleReader:
             raise AssertionError("bundle materialization returned an inspection")
         return result
 
-    def inspect(self, evidence: LabFinalizationShardEvidence) -> LabShardBundleInspection:
+    def inspect(
+        self,
+        evidence: LabFinalizationShardEvidence,
+        *,
+        resident_bytes: int = 0,
+    ) -> LabShardBundleInspection:
         descriptors: list[int] = []
         result: LabShardExecutionResult | LabShardBundleInspection | None = None
         errors: list[BaseException] = []
@@ -1036,6 +1273,7 @@ class LabSealedShardBundleReader:
                 observe_usage=None,
                 materialize=False,
                 expected_inspection=None,
+                resident_bytes=resident_bytes,
             )
         except BaseException as exc:
             errors.append(exc)
@@ -1068,20 +1306,39 @@ class LabFinalizer:
         commit_spool: LabArtifactCommitSpool,
         verified_code_sha_provider: Callable[[], str | None],
         finalizer_authority_key_provider: LabFinalizerAuthoritySigningKeyProvider,
+        finalizer_authority_verification_key_provider: (
+            LabFinalizerAuthorityVerificationKeyProvider | None
+        ) = None,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
     ) -> None:
         self.reader = reader
+        self.job_limits = job_limits or LabFinalizerJobLimits()
         self.bundle_reader = LabSealedShardBundleReader(
             shard_artifact_root,
             limits=bundle_limits,
+            max_peak_resident_bytes=self.job_limits.max_peak_resident_bytes,
         )
         self.artifact_store = artifact_store
         self.commit_spool = commit_spool
         self.verified_code_sha_provider = verified_code_sha_provider
         self.finalizer_authority_key_provider = finalizer_authority_key_provider
-        self.job_limits = job_limits or LabFinalizerJobLimits()
+        if finalizer_authority_verification_key_provider is None:
+
+            def verify_active_key(key_id: str) -> LabFinalizerAuthorityKey | None:
+                key = self.finalizer_authority_key_provider()
+                return (
+                    key
+                    if isinstance(key, LabFinalizerAuthorityKey) and key.key_id == key_id
+                    else None
+                )
+
+            self.finalizer_authority_verification_key_provider = verify_active_key
+        else:
+            self.finalizer_authority_verification_key_provider = (
+                finalizer_authority_verification_key_provider
+            )
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
 
     @staticmethod
@@ -1450,6 +1707,33 @@ class LabFinalizer:
             authority_proof=proof,
         )
 
+    def _verified_pending_for_envelope(
+        self,
+        envelope: LabArtifactCommitEnvelope,
+    ) -> LabArtifactCommitSpoolEntry | None:
+        durable = self.commit_spool.inspect(envelope.request_id)
+        if not isinstance(durable, LabArtifactCommitSpoolEntry):
+            return None
+        try:
+            claims = verify_finalizer_authority(
+                durable.envelope,
+                key_provider=self.finalizer_authority_verification_key_provider,
+            )
+        except LabFinalizerAuthorityAuthenticationError as exc:
+            raise LabFinalizationIntegrityError(
+                "existing deterministic pending commit is not authenticated"
+            ) from exc
+        expected_proof = envelope.authority_proof
+        if (
+            expected_proof is None
+            or durable.envelope.commit != envelope.commit
+            or claims != expected_proof.claims
+        ):
+            raise LabFinalizationIntegrityError(
+                "existing deterministic pending commit conflicts with finalization identity"
+            )
+        return durable
+
     @staticmethod
     def _sealed_matches_snapshot(
         sealed: LabSealedJobArtifact,
@@ -1620,6 +1904,33 @@ class LabFinalizer:
                 expected=snapshot.job.spec.code_sha,
                 actual=runtime_code_sha,
             )
+        snapshot_control_bytes = _resident_object_bytes(snapshot)
+        self._require_within_limit(
+            actual=snapshot_control_bytes,
+            maximum=self.job_limits.max_snapshot_control_bytes,
+            label="snapshot control bytes",
+        )
+        self._require_within_limit(
+            actual=snapshot_control_bytes + CANONICAL_JSON_STREAM_SCRATCH_BYTES,
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="snapshot control peak resident bytes",
+        )
+        resident_spec_bytes = _resident_object_bytes(snapshot.job.spec)
+        self._require_within_limit(
+            actual=resident_spec_bytes,
+            maximum=self.job_limits.max_spec_bytes,
+            label="spec resident bytes",
+        )
+        spec_bytes = len(snapshot.job.spec.canonical_json().encode("utf-8"))
+        self._require_within_limit(
+            actual=spec_bytes,
+            maximum=self.job_limits.max_spec_bytes,
+            label="spec canonical bytes",
+        )
+        control_usage = LabFinalizerControlUsage(
+            snapshot_control_bytes=snapshot_control_bytes,
+            spec_bytes=spec_bytes,
+        )
         self._require_within_limit(
             actual=len(snapshot.shards),
             maximum=self.job_limits.max_shards,
@@ -1628,12 +1939,29 @@ class LabFinalizer:
         replay = self._fast_replay(snapshot, finalizer_code_sha=runtime_code_sha)
         if replay is not None:
             return replay
-        inspections = tuple(self.bundle_reader.inspect(evidence) for evidence in snapshot.shards)
+        inspections = tuple(
+            self.bundle_reader.inspect(
+                evidence,
+                resident_bytes=control_usage.resident_bytes,
+            )
+            for evidence in snapshot.shards
+        )
         estimated_rows = sum(item.row_count for item in inspections)
         estimated_compressed_bytes = sum(item.compressed_bytes for item in inspections)
         estimated_uncompressed_bytes = sum(item.declared_uncompressed_bytes for item in inspections)
         estimated_arrow_bytes = sum(item.estimated_arrow_bytes for item in inspections)
         estimated_dataframe_bytes = sum(item.estimated_pandas_bytes for item in inspections)
+        retained_metric_bytes = sum(
+            item.manifest_usage.retained_metric_bytes for item in inspections
+        )
+        self._require_within_limit(
+            actual=retained_metric_bytes,
+            maximum=self.job_limits.max_total_shard_metric_bytes,
+            label="total shard metric bytes",
+        )
+        control_usage = control_usage.model_copy(
+            update={"retained_shard_metric_bytes": retained_metric_bytes}
+        )
         for actual, maximum, label in (
             (
                 estimated_rows,
@@ -1668,10 +1996,18 @@ class LabFinalizer:
             max(estimated_dataframe_bytes * 2, 1),
         )
         preflight_peak = max(
-            estimated_dataframe_bytes
+            control_usage.resident_bytes
+            + estimated_dataframe_bytes
             + max((item.estimated_arrow_bytes for item in inspections), default=0)
+            + max(
+                (item.manifest_usage.peak_resident_bytes for item in inspections),
+                default=0,
+            )
             + hash_scratch_bytes,
-            estimated_dataframe_bytes + estimated_aggregate_bytes + hash_scratch_bytes,
+            control_usage.resident_bytes
+            + estimated_dataframe_bytes
+            + estimated_aggregate_bytes
+            + hash_scratch_bytes,
         )
         self._require_within_limit(
             actual=preflight_peak,
@@ -1685,6 +2021,7 @@ class LabFinalizer:
             total_declared_uncompressed_bytes = 0
             total_arrow_bytes = 0
             total_dataframe_bytes = 0
+            total_retained_metric_bytes = 0
             for evidence, inspection in zip(snapshot.shards, inspections, strict=True):
                 usages: list[LabShardBundleUsage] = []
                 shard_result_items.append(
@@ -1692,6 +2029,11 @@ class LabFinalizer:
                         evidence,
                         observe_usage=usages.append,
                         expected_inspection=inspection,
+                        resident_bytes=(
+                            control_usage.resident_bytes
+                            + total_dataframe_bytes
+                            + total_retained_metric_bytes
+                        ),
                     )
                 )
                 if len(usages) != 1:
@@ -1704,6 +2046,7 @@ class LabFinalizer:
                 total_declared_uncompressed_bytes += usage.declared_uncompressed_bytes
                 total_arrow_bytes += usage.arrow_bytes
                 total_dataframe_bytes += usage.materialized_dataframe_bytes
+                total_retained_metric_bytes += usage.retained_metric_bytes
                 self._require_within_limit(
                     actual=total_rows,
                     maximum=self.job_limits.max_total_shard_rows,
@@ -1729,10 +2072,16 @@ class LabFinalizer:
                     maximum=self.job_limits.max_total_shard_dataframe_bytes,
                     label="total shard DataFrame bytes",
                 )
+                self._require_within_limit(
+                    actual=total_retained_metric_bytes,
+                    maximum=self.job_limits.max_total_shard_metric_bytes,
+                    label="total shard metric bytes",
+                )
             shard_results = tuple(shard_result_items)
             self._require_within_limit(
                 actual=(
-                    total_dataframe_bytes
+                    control_usage.resident_bytes
+                    + total_dataframe_bytes
                     + min(
                         self.job_limits.max_aggregate_dataframe_bytes,
                         max(total_dataframe_bytes * 2, 1),
@@ -1762,7 +2111,12 @@ class LabFinalizer:
             label="aggregate DataFrame bytes",
         )
         self._require_within_limit(
-            actual=total_dataframe_bytes + aggregate_dataframe_bytes + hash_scratch_bytes,
+            actual=(
+                control_usage.resident_bytes
+                + total_dataframe_bytes
+                + aggregate_dataframe_bytes
+                + hash_scratch_bytes
+            ),
             maximum=self.job_limits.max_peak_resident_bytes,
             label="aggregate peak resident bytes",
         )
@@ -1771,9 +2125,36 @@ class LabFinalizer:
             maximum=self.job_limits.max_final_artifact_table_count,
             label="final artifact table count",
         )
+        metadata_characters = sum(
+            len(str(column)) for table in result.tables for column in table.frame.columns
+        ) + sum(len(table.name) for table in result.tables)
+        estimated_final_metrics_bytes = (
+            4096
+            + (retained_metric_bytes * 2)
+            + (metadata_characters * 12)
+            + (len(snapshot.shards) * 512)
+        )
+        self._require_within_limit(
+            actual=estimated_final_metrics_bytes,
+            maximum=self.job_limits.max_final_metrics_bytes,
+            label="final metrics estimated bytes",
+        )
+        estimated_report_bytes = (estimated_final_metrics_bytes * 2) + 4096
+        self._require_within_limit(
+            actual=estimated_report_bytes,
+            maximum=self.job_limits.max_report_markdown_bytes,
+            label="report estimated bytes",
+        )
+        estimated_control_usage = control_usage.model_copy(
+            update={
+                "final_metrics_bytes": estimated_final_metrics_bytes,
+                "report_bytes": estimated_report_bytes,
+            }
+        )
         estimated_roundtrip_usage = LabArtifactRoundtripPeakUsage.conservative(
             aggregate_dataframe_bytes=aggregate_dataframe_bytes,
             payload_bytes=self.job_limits.max_final_artifact_payload_bytes,
+            control_bytes=estimated_control_usage.resident_bytes,
         )
         self._require_within_limit(
             actual=estimated_roundtrip_usage.peak_resident_bytes,
@@ -1786,6 +2167,39 @@ class LabFinalizer:
             shard_results,
             finalizer_code_sha=runtime_code_sha,
         )
+        metrics_payload = metrics.model_dump(mode="json")
+        metrics_bytes = len(
+            json.dumps(
+                metrics_payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii")
+        )
+        self._require_within_limit(
+            actual=metrics_bytes,
+            maximum=self.job_limits.max_final_metrics_bytes,
+            label="final metrics canonical bytes",
+        )
+        report_markdown = self._report(metrics)
+        report_bytes = len(report_markdown.encode("utf-8"))
+        self._require_within_limit(
+            actual=report_bytes,
+            maximum=self.job_limits.max_report_markdown_bytes,
+            label="report Markdown bytes",
+        )
+        control_usage = control_usage.model_copy(
+            update={
+                "final_metrics_bytes": max(_resident_object_bytes(metrics), metrics_bytes * 2),
+                "report_bytes": max(sys.getsizeof(report_markdown), report_bytes),
+            }
+        )
+        self._require_within_limit(
+            actual=control_usage.resident_bytes + hash_scratch_bytes,
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="final control peak resident bytes",
+        )
         del shard_result_items, shard_results
         first = snapshot.shards[0].shard
         try:
@@ -1796,8 +2210,8 @@ class LabFinalizer:
                 adapter_id=first.adapter_id,
                 adapter_version=first.adapter_version,
                 result_contract_version=COMPLETE_RESULT_CONTRACT_VERSION,
-                metrics=metrics.model_dump(mode="json"),
-                report_markdown=self._report(metrics),
+                metrics=metrics_payload,
+                report_markdown=report_markdown,
                 tables={table.name: table.frame for table in result.tables},
                 payload_budget=LabArtifactPayloadBudget(
                     max_single_payload_bytes=(
@@ -1819,6 +2233,7 @@ class LabFinalizer:
         actual_roundtrip_usage = LabArtifactRoundtripPeakUsage.conservative(
             aggregate_dataframe_bytes=aggregate_dataframe_bytes,
             payload_bytes=planned_payload_bytes,
+            control_bytes=control_usage.resident_bytes,
         )
         self._require_within_limit(
             actual=actual_roundtrip_usage.peak_resident_bytes,
@@ -1845,7 +2260,9 @@ class LabFinalizer:
             snapshot,
             finalizer_code_sha=runtime_code_sha,
         )
-        published = self.commit_spool.publish(envelope)
+        published = self._verified_pending_for_envelope(envelope)
+        if published is None:
+            published = self.commit_spool.publish(envelope)
         self._after_commit_published(published)
         if isinstance(published, LabAcknowledgedArtifactCommit):
             return self._validate_acknowledgement(sealed, envelope, published)

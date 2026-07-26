@@ -16,6 +16,7 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpoolEntry,
     LabFinalizerAuthorityAuthenticationError,
     LabFinalizerAuthorityVerificationKeyProvider,
+    verify_finalizer_authority,
 )
 from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore, LabVerifiedSealedBinding
 from rquant.lab_job_protocol import (
@@ -559,6 +560,19 @@ class LabScheduler:
                     artifact_isolated = self._quarantine_artifact_commit(
                         exc.file_identity or path,
                         reason=f"invalid_artifact_commit:{exc}",
+                    )
+                    artifact_commits_quarantined += int(artifact_isolated)
+                    artifact_commit_quarantine_failures += int(not artifact_isolated)
+                    continue
+                try:
+                    verify_finalizer_authority(
+                        entry.envelope,
+                        key_provider=self.finalizer_authority_key_provider,
+                    )
+                except LabFinalizerAuthorityAuthenticationError as exc:
+                    artifact_isolated = self._quarantine_artifact_commit(
+                        entry,
+                        reason=(f"artifact_authority_unauthenticated:{_safe_error_message(exc)}"),
                     )
                     artifact_commits_quarantined += int(artifact_isolated)
                     artifact_commit_quarantine_failures += int(not artifact_isolated)

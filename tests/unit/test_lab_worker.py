@@ -119,6 +119,43 @@ def test_canonical_shard_frame_digest_bounds_wide_string_scratch() -> None:
     assert peak <= 8 * 1024 * 1024
 
 
+@pytest.mark.parametrize(
+    "categorical",
+    [
+        pd.Categorical(pd.Series([1, 2, 1], dtype="Int64")),
+        pd.Categorical(pd.Series([True, False, True], dtype="boolean")),
+        pd.Categorical(pd.Series([1.25, 2.5, 1.25], dtype="Float64")),
+        pd.Categorical(pd.to_datetime(["2026-01-01", "2026-01-02"])),
+    ],
+    ids=["integer", "boolean", "float", "timestamp"],
+)
+def test_canonical_shard_frame_digest_preserves_categorical_scalar_semantics(
+    categorical: pd.Categorical,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"value": categorical})
+    raw = frame.to_json(
+        orient="table",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+        force_ascii=True,
+        index=False,
+    )
+    expected = hashlib.sha256(
+        json.dumps(
+            json.loads(raw),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert canonical_shard_frame_digest(frame) == expected
+
+
 @contextmanager
 def _raising_loguru_sink() -> Iterator[None]:
     from loguru import logger

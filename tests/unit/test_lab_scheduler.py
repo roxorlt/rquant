@@ -423,6 +423,72 @@ def test_scheduler_quarantines_bad_mac_for_known_key_without_ledger_or_ack(
     assert current is not None and current.result_state is LabResultState.READY
 
 
+def test_scheduler_rejects_bad_mac_before_artifact_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    proof = envelope.authority_proof
+    assert proof is not None
+    forged = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=proof.model_copy(update={"mac_sha256": "0" * 64}),
+    )
+    spool.publish(forged)
+    clock[0] = NOW + timedelta(seconds=5)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unauthenticated commit reached artifact binding")
+
+    monkeypatch.setattr(artifacts, "bind_verified_sealed", forbidden)
+    tick = scheduler.run_once()
+
+    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commits_rejected == 0
+    assert LabJobReader(store.path).get_artifact_commit(forged.request_id) is None
+    assert not (spool.ack_dir / f"{forged.request_id}.json").exists()
+    current = LabJobReader(store.path).get_job(job.job_id)
+    assert current is not None and current.result_state is LabResultState.READY
+
+
+def test_scheduler_reverifies_authority_inside_sqlite_transaction(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def rotating_provider(key_id: str) -> LabFinalizerAuthorityKey | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1 and key_id == AUTHORITY_KEY.key_id:
+            return AUTHORITY_KEY
+        return None
+
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            publish=False,
+            authority_key_provider=rotating_provider,
+        )
+    )
+    spool.publish(envelope)
+    clock[0] = NOW + timedelta(seconds=5)
+
+    tick = scheduler.run_once()
+
+    assert calls == 2
+    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commits_accepted == 0
+    assert tick.artifact_commits_rejected == 0
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
+    assert not (spool.ack_dir / f"{envelope.request_id}.json").exists()
+    current = LabJobReader(store.path).get_job(job.job_id)
+    assert current is not None and current.result_state is LabResultState.READY
+
+
 def test_scheduler_accepts_transition_key_from_verification_keyring(
     tmp_path: Path,
 ) -> None:

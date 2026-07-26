@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rquant.canonical_json_stream import (
     CanonicalJsonStreamWriter,
     PandasJsonColumnAccessor,
+    write_pandas_json_value,
 )
 from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
@@ -154,7 +155,12 @@ def canonical_shard_frame_digest(
             )
         digest.update(b"}")
     digest.update(b'],"schema":')
-    writer.write_value(pd.io.json.build_table_schema(frame, index=False))
+    write_pandas_json_value(
+        writer,
+        pd.io.json.build_table_schema(frame, index=False),
+        escape_forward_slash=False,
+        sort_mapping_keys=True,
+    )
     digest.update(b"}")
     return digest.hexdigest()
 
