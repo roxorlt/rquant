@@ -146,6 +146,37 @@ def test_commit_spool_is_exactly_once_through_ack(tmp_path: Path) -> None:
     assert spool.publish(envelope) == acknowledged
 
 
+def test_commit_spool_readonly_inspection_reports_exact_pending_ack_or_missing(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "commits")
+    envelope = _envelope(tmp_path)
+    before = tuple(sorted(path.relative_to(spool.root) for path in spool.root.rglob("*")))
+
+    assert spool.inspect(envelope.request_id) is None
+    assert tuple(sorted(path.relative_to(spool.root) for path in spool.root.rglob("*"))) == before
+    pending = spool.publish(envelope)
+    assert isinstance(pending, LabArtifactCommitSpoolEntry)
+    pending_tree = tuple(sorted(path.relative_to(spool.root) for path in spool.root.rglob("*")))
+    assert spool.inspect(envelope.request_id) == pending
+    assert (
+        tuple(sorted(path.relative_to(spool.root) for path in spool.root.rglob("*")))
+        == pending_tree
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="rejected",
+        reason="test rejection",
+        accepted_at=datetime(2026, 7, 26, tzinfo=UTC),
+        job_version=3,
+    )
+    acknowledged = spool.ack(pending, receipt)
+    ack_tree = tuple(sorted(path.relative_to(spool.root) for path in spool.root.rglob("*")))
+
+    assert spool.inspect(envelope.request_id) == acknowledged
+    assert tuple(sorted(path.relative_to(spool.root) for path in spool.root.rglob("*"))) == ack_tree
+
+
 def test_commit_spool_fair_scan_reaches_tail_across_restarts_and_queue_changes(
     tmp_path: Path,
 ) -> None:

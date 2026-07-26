@@ -50,6 +50,15 @@
 
 ### Fixed
 
+- **Strategy Lab finalizer 权威重放与资源边界**：artifact ACK 现在必须与 SQLite 权威
+  commit envelope/receipt 精确交叉核验；可信 pending/ACK/ledger 可跳过 shard 重读与
+  Parquet 重序列化，无 durable commit 证据的 sealed artifact 仍执行完整聚合。accepted
+  shard reader 新增可配置的 manifest、文件、bundle、行列、Parquet 解压与 DataFrame 内存
+  上限，在分配或解压前完成文件身份、声明尺寸和 metadata 检查，并保留主错误与
+  close/rollback 错误。artifact preview 不再持 lifecycle lock；sealed 快路会重试隔离精确
+  匹配的冗余 candidate，同时保留冲突证据；Markdown 报告的动态内容统一编码为确定性的
+  缩进 canonical JSON。
+
 - **Strategy Lab finalizer 确定性预览与 ready 结果语义**：artifact store 新增零写入的 typed
   plan，一次生成 exact canonical payload/manifest，`prepare_candidate` 与 finalizer 共同消费
   同一份序列化实现。finalizer 先验证 sealed，再按 preview authority 恢复 candidate，仅在两者

@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import stat
-from contextlib import suppress
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pandas as pd
+import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
     LabArtifactCommitEnvelope,
+    LabArtifactCommitReceipt,
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
 )
@@ -125,6 +126,30 @@ class LabFinalizerResult(LabFinalizerModel):
         return self
 
 
+class LabShardBundleLimits(LabFinalizerModel):
+    max_manifest_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    max_artifact_count: int = Field(default=256, ge=1)
+    max_single_file_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_bundle_total_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1)
+    max_row_count: int = Field(default=5_000_000, ge=1)
+    max_column_count: int = Field(default=512, ge=1)
+    max_parquet_uncompressed_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+    max_materialized_dataframe_bytes: int = Field(default=4 * 1024 * 1024 * 1024, ge=1)
+
+    @model_validator(mode="after")
+    def validate_bundle_limits(self) -> LabShardBundleLimits:
+        if self.max_single_file_bytes > self.max_bundle_total_bytes:
+            raise ValueError("single file limit cannot exceed bundle total limit")
+        return self
+
+
+class LabParquetResourceSummary(LabFinalizerModel):
+    row_count: int = Field(ge=0)
+    column_count: int = Field(ge=0)
+    columns: tuple[str, ...]
+    declared_uncompressed_bytes: int = Field(ge=0)
+
+
 @dataclass(frozen=True)
 class _PathBinding:
     parent_descriptor: int
@@ -145,21 +170,108 @@ def _observation(value: os.stat_result) -> tuple[int, int, int, int, int, int, i
     )
 
 
-def _read_descriptor(descriptor: int) -> bytes:
+def _read_descriptor_bounded(
+    descriptor: int,
+    *,
+    expected_size: int,
+    max_bytes: int,
+) -> bytes:
+    if expected_size > max_bytes:
+        raise LabFinalizationIntegrityError("accepted shard file exceeds configured byte limit")
     os.lseek(descriptor, 0, os.SEEK_SET)
-    chunks: list[bytes] = []
-    while True:
-        chunk = os.read(descriptor, 1024 * 1024)
+    payload = bytearray()
+    while len(payload) < expected_size:
+        try:
+            chunk = os.read(descriptor, min(1024 * 1024, expected_size - len(payload)))
+        except InterruptedError:
+            continue
         if not chunk:
-            return b"".join(chunks)
-        chunks.append(chunk)
+            raise LabFinalizationIntegrityError("accepted shard file ended before declared size")
+        payload.extend(chunk)
+    while True:
+        try:
+            extra = os.read(descriptor, 1)
+            break
+        except InterruptedError:
+            continue
+    if extra:
+        raise LabFinalizationIntegrityError("accepted shard file exceeds declared size")
+    return bytes(payload)
+
+
+def _sha256_descriptor_bounded(descriptor: int, *, expected_size: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    consumed = 0
+    while consumed < expected_size:
+        try:
+            chunk = os.read(descriptor, min(1024 * 1024, expected_size - consumed))
+        except InterruptedError:
+            continue
+        if not chunk:
+            raise LabFinalizationIntegrityError("accepted shard file ended before declared size")
+        digest.update(chunk)
+        consumed += len(chunk)
+    while True:
+        try:
+            extra = os.read(descriptor, 1)
+            break
+        except InterruptedError:
+            continue
+    if extra:
+        raise LabFinalizationIntegrityError("accepted shard file exceeds declared size")
+    return digest.hexdigest()
+
+
+_StreamResult = TypeVar("_StreamResult")
+
+
+def _run_with_descriptor_stream(
+    descriptor: int,
+    operation: Callable[[BinaryIO], _StreamResult],
+    *,
+    label: str,
+) -> _StreamResult:
+    duplicate = -1
+    stream: BinaryIO | None = None
+    result: _StreamResult | None = None
+    errors: list[BaseException] = []
+    try:
+        duplicate = os.dup(descriptor)
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        stream = os.fdopen(duplicate, "rb")
+        duplicate = -1
+        result = operation(stream)
+    except BaseException as exc:
+        errors.append(exc)
+    if stream is not None:
+        try:
+            stream.close()
+        except BaseException as exc:
+            errors.append(exc)
+    elif duplicate >= 0:
+        try:
+            os.close(duplicate)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors:
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup(f"{label} and stream cleanup failed", errors)
+    return result  # type: ignore[return-value]
 
 
 class LabSealedShardBundleReader:
     """Load one exact accepted worker attempt without trusting mutable paths."""
 
-    def __init__(self, artifact_root: Path) -> None:
+    def __init__(
+        self,
+        artifact_root: Path,
+        *,
+        limits: LabShardBundleLimits | None = None,
+    ) -> None:
         self.artifact_root = Path(artifact_root).resolve()
+        self.limits = limits or LabShardBundleLimits()
 
     @staticmethod
     def _after_file_read(_name: str) -> None:
@@ -178,6 +290,7 @@ class LabSealedShardBundleReader:
         if not name or name in {".", ".."} or "/" in name or "\x00" in name:
             raise LabFinalizationIntegrityError("unsafe shard artifact path segment")
         descriptor = -1
+        errors: list[BaseException] = []
         try:
             before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode):
@@ -188,35 +301,53 @@ class LabSealedShardBundleReader:
                 dir_fd=parent_descriptor,
             )
             opened = os.fstat(descriptor)
-        except LabFinalizationIntegrityError:
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-            raise
+            if _observation(before) != _observation(opened):
+                raise LabFinalizationIntegrityError("shard artifact ancestor changed while opening")
+            return descriptor, _observation(opened)
+        except LabFinalizationIntegrityError as exc:
+            errors.append(exc)
         except OSError as exc:
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-            raise LabFinalizationIntegrityError(
-                "accepted shard artifact path is unavailable"
-            ) from exc
-        if _observation(before) != _observation(opened):
-            os.close(descriptor)
-            raise LabFinalizationIntegrityError("shard artifact ancestor changed while opening")
-        return descriptor, _observation(opened)
+            error = LabFinalizationIntegrityError("accepted shard artifact path is unavailable")
+            error.__cause__ = exc
+            errors.append(error)
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                "shard artifact path validation and cleanup failed",
+                errors,
+            )
+        raise AssertionError("directory validation failed without an error")
 
     @staticmethod
-    def _read_regular_file(
+    def _open_regular_file(
         bundle_descriptor: int,
         name: str,
-    ) -> tuple[bytes, tuple[int, int, int, int, int, int, int]]:
+        *,
+        max_bytes: int,
+        expected_size: int | None = None,
+    ) -> tuple[int, tuple[int, int, int, int, int, int, int]]:
         if not name or name in {".", ".."} or "/" in name or "\x00" in name:
             raise LabFinalizationIntegrityError("unsafe shard artifact file name")
         descriptor = -1
+        errors: list[BaseException] = []
         try:
             before = os.stat(name, dir_fd=bundle_descriptor, follow_symlinks=False)
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise LabFinalizationIntegrityError("shard artifact is not a private regular file")
+            if before.st_size > max_bytes:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard file exceeds configured single file byte limit"
+                )
+            if expected_size is not None and before.st_size != expected_size:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard artifact size conflicts with manifest"
+                )
             descriptor = os.open(
                 name,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -225,26 +356,143 @@ class LabSealedShardBundleReader:
             opened = os.fstat(descriptor)
             if _observation(before) != _observation(opened):
                 raise LabFinalizationIntegrityError("shard artifact changed while opening")
-            payload = _read_descriptor(descriptor)
-            after = os.fstat(descriptor)
-            linked = os.stat(name, dir_fd=bundle_descriptor, follow_symlinks=False)
-            if not (
-                _observation(opened) == _observation(after) == _observation(linked)
-                and len(payload) == opened.st_size
-            ):
-                raise LabFinalizationIntegrityError("shard artifact changed while reading")
-            return payload, _observation(opened)
-        except LabFinalizationIntegrityError:
+            return descriptor, _observation(opened)
+        except LabFinalizationIntegrityError as exc:
+            errors.append(exc)
+        except OSError as exc:
+            error = LabFinalizationIntegrityError("accepted shard artifact file is unavailable")
+            error.__cause__ = exc
+            errors.append(error)
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                "shard artifact file validation and cleanup failed",
+                errors,
+            )
+        raise AssertionError("file validation failed without an error")
+
+    def _validate_manifest_resources(
+        self,
+        manifest: LabShardResultManifest,
+        *,
+        manifest_size: int,
+    ) -> None:
+        if len(manifest.artifacts) > self.limits.max_artifact_count:
+            raise LabFinalizationIntegrityError(
+                "accepted shard artifact count exceeds configured limit"
+            )
+        total_size = manifest_size
+        total_rows = 0
+        for artifact in manifest.artifacts:
+            if artifact.file_size > self.limits.max_single_file_bytes:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard single file exceeds configured byte limit"
+                )
+            total_size += artifact.file_size
+            if total_size > self.limits.max_bundle_total_bytes:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard bundle exceeds configured total byte limit"
+                )
+            total_rows += artifact.row_count
+            if total_rows > self.limits.max_row_count:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard row count exceeds configured limit"
+                )
+            if len(artifact.columns) > self.limits.max_column_count:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard column count exceeds configured limit"
+                )
+
+    def _parquet_resource_summary(self, descriptor: int) -> LabParquetResourceSummary:
+        def inspect(stream: BinaryIO) -> LabParquetResourceSummary:
+            parquet = pq.ParquetFile(stream)
+            metadata = parquet.metadata
+            declared_uncompressed_bytes = 0
+            for row_group_index in range(metadata.num_row_groups):
+                row_group = metadata.row_group(row_group_index)
+                for column_index in range(row_group.num_columns):
+                    declared = row_group.column(column_index).total_uncompressed_size
+                    if declared is None or declared < 0:
+                        raise LabFinalizationIntegrityError(
+                            "accepted shard Parquet has invalid uncompressed size metadata"
+                        )
+                    declared_uncompressed_bytes += declared
+                    if declared_uncompressed_bytes > self.limits.max_parquet_uncompressed_bytes:
+                        raise LabFinalizationIntegrityError(
+                            "accepted shard Parquet uncompressed size exceeds configured limit"
+                        )
+            return LabParquetResourceSummary(
+                row_count=metadata.num_rows,
+                column_count=metadata.num_columns,
+                columns=tuple(parquet.schema_arrow.names),
+                declared_uncompressed_bytes=declared_uncompressed_bytes,
+            )
+
+        try:
+            return _run_with_descriptor_stream(
+                descriptor,
+                inspect,
+                label="Parquet metadata inspection",
+            )
+        except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise
+        except Exception as exc:
+            raise LabFinalizationIntegrityError(
+                "accepted shard Parquet metadata is invalid"
+            ) from exc
+
+    @staticmethod
+    def _read_parquet(descriptor: int) -> pd.DataFrame:
+        def materialize(stream: BinaryIO) -> pd.DataFrame:
+            frame = pd.read_parquet(stream, engine="pyarrow")
+            if not isinstance(frame, pd.DataFrame):
+                raise LabFinalizationIntegrityError(
+                    "accepted shard Parquet did not materialize as a DataFrame"
+                )
+            return frame
+
+        try:
+            return _run_with_descriptor_stream(
+                descriptor,
+                materialize,
+                label="Parquet materialization",
+            )
+        except (LabFinalizationIntegrityError, BaseExceptionGroup):
+            raise
+        except Exception as exc:
+            raise LabFinalizationIntegrityError("accepted shard Parquet is invalid") from exc
+
+    @staticmethod
+    def _assert_file_binding(
+        bundle_descriptor: int,
+        name: str,
+        descriptor: int,
+        observed: tuple[int, int, int, int, int, int, int],
+    ) -> None:
+        try:
+            linked = os.stat(name, dir_fd=bundle_descriptor, follow_symlinks=False)
+            opened = os.fstat(descriptor)
         except OSError as exc:
             raise LabFinalizationIntegrityError(
-                "accepted shard artifact file is unavailable"
+                "accepted shard file identity changed while reading"
             ) from exc
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+        if _observation(linked) != observed or _observation(opened) != observed:
+            raise LabFinalizationIntegrityError(
+                "accepted shard file identity changed while reading"
+            )
 
-    def read(self, evidence: LabFinalizationShardEvidence) -> LabShardExecutionResult:
+    def _read_bound_bundle(
+        self,
+        evidence: LabFinalizationShardEvidence,
+        *,
+        descriptors: list[int],
+    ) -> LabShardExecutionResult:
         report = evidence.accepted_success.report
         body = report.body
         if not isinstance(body, LabShardSucceeded):
@@ -257,9 +505,11 @@ class LabSealedShardBundleReader:
             "attempts",
             self._attempt_name(evidence),
         )
-        descriptors: list[int] = []
         bindings: list[_PathBinding] = []
-        file_observations: dict[str, tuple[int, int, int, int, int, int, int]] = {}
+        file_bindings: dict[
+            str,
+            tuple[int, tuple[int, int, int, int, int, int, int]],
+        ] = {}
         try:
             try:
                 root_descriptor = os.open(
@@ -284,11 +534,21 @@ class LabSealedShardBundleReader:
                 )
                 parent = child
             bundle_descriptor = descriptors[-1]
-            manifest_bytes, manifest_observed = self._read_regular_file(
+            manifest_descriptor, manifest_observed = self._open_regular_file(
                 bundle_descriptor,
                 "manifest.json",
+                max_bytes=self.limits.max_manifest_bytes,
             )
-            file_observations["manifest.json"] = manifest_observed
+            descriptors.append(manifest_descriptor)
+            file_bindings["manifest.json"] = (
+                manifest_descriptor,
+                manifest_observed,
+            )
+            manifest_bytes = _read_descriptor_bounded(
+                manifest_descriptor,
+                expected_size=manifest_observed[4],
+                max_bytes=self.limits.max_manifest_bytes,
+            )
             self._after_file_read("manifest.json")
             try:
                 manifest = LabShardResultManifest.model_validate_json(manifest_bytes)
@@ -296,6 +556,10 @@ class LabSealedShardBundleReader:
                 raise LabFinalizationIntegrityError("accepted shard manifest is invalid") from exc
             if manifest_bytes != manifest.canonical_json().encode("utf-8"):
                 raise LabFinalizationIntegrityError("accepted shard manifest is not canonical JSON")
+            self._validate_manifest_resources(
+                manifest,
+                manifest_size=len(manifest_bytes),
+            )
             expected_manifest_identity = (
                 report.job_id,
                 report.shard_id,
@@ -341,27 +605,47 @@ class LabSealedShardBundleReader:
                 raise LabFinalizationIntegrityError("accepted shard bundle inventory conflicts")
 
             tables: list[LabShardTable] = []
+            total_uncompressed_bytes = 0
+            total_materialized_bytes = 0
             for index, artifact in enumerate(manifest.artifacts):
                 if artifact.file_name != f"{index:03d}-{artifact.name}.parquet":
                     raise LabFinalizationIntegrityError("accepted shard artifact order is invalid")
-                payload, observed = self._read_regular_file(
+                descriptor, observed = self._open_regular_file(
                     bundle_descriptor,
                     artifact.file_name,
+                    max_bytes=self.limits.max_single_file_bytes,
+                    expected_size=artifact.file_size,
                 )
-                file_observations[artifact.file_name] = observed
-                self._after_file_read(artifact.file_name)
+                descriptors.append(descriptor)
+                file_bindings[artifact.file_name] = (descriptor, observed)
                 if (
-                    len(payload) != artifact.file_size
-                    or observed[4] != artifact.file_size
-                    or hashlib.sha256(payload).hexdigest() != artifact.file_sha256
+                    _sha256_descriptor_bounded(
+                        descriptor,
+                        expected_size=artifact.file_size,
+                    )
+                    != artifact.file_sha256
                 ):
                     raise LabFinalizationIntegrityError("accepted shard artifact bytes conflict")
-                try:
-                    frame = pd.read_parquet(io.BytesIO(payload))
-                except Exception as exc:
+                self._after_file_read(artifact.file_name)
+                parquet_summary = self._parquet_resource_summary(descriptor)
+                total_uncompressed_bytes += parquet_summary.declared_uncompressed_bytes
+                if total_uncompressed_bytes > self.limits.max_parquet_uncompressed_bytes:
                     raise LabFinalizationIntegrityError(
-                        "accepted shard Parquet is invalid"
-                    ) from exc
+                        "accepted shard Parquet uncompressed size exceeds configured limit"
+                    )
+                if (
+                    parquet_summary.row_count != artifact.row_count
+                    or parquet_summary.column_count != len(artifact.columns)
+                    or parquet_summary.columns != artifact.columns
+                ):
+                    raise LabFinalizationIntegrityError("accepted shard Parquet shape conflicts")
+                frame = self._read_parquet(descriptor)
+                materialized_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+                total_materialized_bytes += materialized_bytes
+                if total_materialized_bytes > self.limits.max_materialized_dataframe_bytes:
+                    raise LabFinalizationIntegrityError(
+                        "accepted shard materialized DataFrame exceeds configured memory limit"
+                    )
                 if len(frame) != artifact.row_count or tuple(frame.columns) != artifact.columns:
                     raise LabFinalizationIntegrityError("accepted shard Parquet shape conflicts")
                 content_hash = hashlib.sha256(
@@ -375,21 +659,13 @@ class LabSealedShardBundleReader:
                 raise LabFinalizationIntegrityError(
                     "accepted shard inventory changed while reading"
                 )
-            for name in sorted(expected_names):
-                try:
-                    linked = os.stat(
-                        name,
-                        dir_fd=bundle_descriptor,
-                        follow_symlinks=False,
-                    )
-                except OSError as exc:
-                    raise LabFinalizationIntegrityError(
-                        "accepted shard file identity changed while reading"
-                    ) from exc
-                if _observation(linked) != file_observations[name]:
-                    raise LabFinalizationIntegrityError(
-                        "accepted shard file identity changed while reading"
-                    )
+            for name, (descriptor, observed) in sorted(file_bindings.items()):
+                self._assert_file_binding(
+                    bundle_descriptor,
+                    name,
+                    descriptor,
+                    observed,
+                )
             root_path = os.lstat(self.artifact_root)
             if _observation(root_path) != root_observation:
                 raise LabFinalizationIntegrityError("shard artifact root changed while reading")
@@ -414,16 +690,36 @@ class LabSealedShardBundleReader:
                 tables=tuple(tables),
                 metrics=manifest.metrics,
             )
-        except LabFinalizationIntegrityError:
+        except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise
         except Exception as exc:
             raise LabFinalizationIntegrityError(
                 "accepted shard bundle could not be safely reconstructed"
             ) from exc
-        finally:
-            for descriptor in reversed(descriptors):
-                with suppress(OSError):
-                    os.close(descriptor)
+
+    def read(self, evidence: LabFinalizationShardEvidence) -> LabShardExecutionResult:
+        descriptors: list[int] = []
+        result: LabShardExecutionResult | None = None
+        errors: list[BaseException] = []
+        try:
+            result = self._read_bound_bundle(evidence, descriptors=descriptors)
+        except BaseException as exc:
+            errors.append(exc)
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                "accepted shard bundle validation and cleanup failed",
+                errors,
+            )
+        if result is None:
+            raise AssertionError("bundle validation completed without a result")
+        return result
 
 
 class LabFinalizer:
@@ -437,9 +733,13 @@ class LabFinalizer:
         artifact_store: LabJobArtifactStore,
         commit_spool: LabArtifactCommitSpool,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        bundle_limits: LabShardBundleLimits | None = None,
     ) -> None:
         self.reader = reader
-        self.bundle_reader = LabSealedShardBundleReader(shard_artifact_root)
+        self.bundle_reader = LabSealedShardBundleReader(
+            shard_artifact_root,
+            limits=bundle_limits,
+        )
         self.artifact_store = artifact_store
         self.commit_spool = commit_spool
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
@@ -499,38 +799,44 @@ class LabFinalizer:
 
     @staticmethod
     def _report(metrics: LabFinalizerMetrics) -> str:
-        lines = [
-            "# Strategy Lab Complete Result",
-            "",
-            f"- Job: `{metrics.job_id}`",
-            f"- Spec: `{metrics.spec_hash}`",
-            f"- Plan: `{metrics.plan_hash}`",
-            f"- Adapter: `{metrics.adapter_id}@{metrics.adapter_version}`",
-            f"- Result contract: `{metrics.result_contract_version}`",
-            f"- Result hash: `{metrics.result_hash}`",
-            f"- Shards: {metrics.shard_count}",
-            "",
-            "## Tables",
-            "",
-        ]
-        lines.extend(
-            f"- `{table.name}`: {table.row_count} rows; columns="
-            f"{json.dumps(table.columns, ensure_ascii=True, separators=(',', ':'))}"
-            for table in metrics.tables
-        )
-        lines.extend(["", "## Shard Metrics", ""])
-        for shard in metrics.shards:
-            rendered = json.dumps(
-                [metric.model_dump(mode="json") for metric in shard.metrics],
+        def canonical_json(value: object) -> str:
+            return json.dumps(
+                value,
                 ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),
                 allow_nan=False,
             )
-            lines.append(
-                f"- {shard.shard_index} `{shard.shard_id}` "
-                f"manifest=`{shard.result_manifest_hash}` metrics={rendered}"
-            )
+
+        summary = canonical_json(
+            {
+                "adapter_id": metrics.adapter_id,
+                "adapter_version": metrics.adapter_version,
+                "job_id": str(metrics.job_id),
+                "plan_hash": metrics.plan_hash,
+                "result_contract_version": metrics.result_contract_version,
+                "result_hash": metrics.result_hash,
+                "shard_count": metrics.shard_count,
+                "spec_hash": metrics.spec_hash,
+            }
+        )
+        tables = canonical_json([table.model_dump(mode="json") for table in metrics.tables])
+        shards = canonical_json([shard.model_dump(mode="json") for shard in metrics.shards])
+        lines = [
+            "# Strategy Lab Complete Result",
+            "",
+            "## Summary",
+            "",
+            f"    {summary}",
+            "",
+            "## Tables",
+            "",
+            f"    {tables}",
+            "",
+            "## Shards",
+            "",
+            f"    {shards}",
+        ]
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -598,7 +904,33 @@ class LabFinalizer:
             raise LabFinalizationIntegrityError(
                 "existing sealed artifact conflicts with deterministic finalization output"
             )
+        self._cleanup_redundant_candidates(sealed)
         return sealed
+
+    def _cleanup_redundant_candidates(self, sealed: LabSealedJobArtifact) -> None:
+        try:
+            records = self.artifact_store.list_candidate_recovery()
+        except LabArtifactError as exc:
+            raise LabFinalizationIntegrityError(
+                "redundant matching candidates could not be inspected"
+            ) from exc
+        matching = tuple(
+            record
+            for record in records
+            if record.status in {"recoverable", "needs_authority", "recoverable_torn"}
+            and record.job_id == sealed.manifest.job_id
+            and record.manifest_hash == sealed.manifest_hash
+        )
+        for record in matching:
+            try:
+                self.artifact_store.quarantine_recovery_record(
+                    record,
+                    reason="redundant deterministic candidate after sealed publication",
+                )
+            except LabArtifactError as exc:
+                raise LabFinalizationIntegrityError(
+                    "redundant matching candidate could not be safely isolated"
+                ) from exc
 
     def _recover_candidate_from_plan(
         self,
@@ -732,14 +1064,124 @@ class LabFinalizer:
         )
         return LabArtifactCommitEnvelope(request_id=request_id, commit=commit)
 
+    @staticmethod
+    def _sealed_matches_snapshot(
+        sealed: LabSealedJobArtifact,
+        snapshot: LabFinalizationSnapshot,
+    ) -> bool:
+        manifest = sealed.manifest
+        first = snapshot.shards[0].shard
+        return (
+            manifest.job_id,
+            manifest.spec_hash,
+            manifest.plan_hash,
+            manifest.adapter_id,
+            manifest.adapter_version,
+            manifest.result_contract_version,
+            manifest.code_sha,
+            manifest.dataset_snapshot,
+        ) == (
+            snapshot.job.job_id,
+            snapshot.job.spec_hash,
+            first.plan_hash,
+            first.adapter_id,
+            first.adapter_version,
+            COMPLETE_RESULT_CONTRACT_VERSION,
+            snapshot.job.spec.code_sha,
+            snapshot.job.spec.dataset_snapshot,
+        )
+
+    @staticmethod
+    def _result_from_receipt(
+        sealed: LabSealedJobArtifact,
+        envelope: LabArtifactCommitEnvelope,
+        receipt: LabArtifactCommitReceipt,
+    ) -> LabFinalizerResult:
+        rejected = receipt.status == "rejected"
+        return LabFinalizerResult(
+            status="rejected" if rejected else "acknowledged",
+            job_id=sealed.manifest.job_id,
+            request_id=envelope.request_id,
+            manifest_hash=sealed.manifest_hash,
+            complete_result_hash=sealed.manifest.complete_result_hash,
+            rejection_reason=receipt.reason if rejected else None,
+        )
+
+    def _validate_acknowledgement(
+        self,
+        sealed: LabSealedJobArtifact,
+        envelope: LabArtifactCommitEnvelope,
+        acknowledged: LabAcknowledgedArtifactCommit,
+    ) -> LabFinalizerResult:
+        ledger = self.reader.get_artifact_commit(envelope.request_id)
+        if ledger is None or ledger.envelope != envelope or ledger.receipt != acknowledged.receipt:
+            raise LabFinalizationIntegrityError(
+                "artifact acknowledgement conflicts with authoritative SQLite ledger"
+            )
+        return self._result_from_receipt(sealed, envelope, ledger.receipt)
+
+    def _fast_replay(
+        self,
+        snapshot: LabFinalizationSnapshot,
+    ) -> LabFinalizerResult | None:
+        target = self.artifact_store.sealed_root / snapshot.job.job_id.hex
+        if not os.path.lexists(target):
+            return None
+        try:
+            sealed = self.artifact_store.verify_sealed(target)
+        except LabArtifactError:
+            return None
+        if not self._sealed_matches_snapshot(sealed, snapshot):
+            return None
+        envelope = self._envelope(sealed, snapshot.ready_epoch)
+        durable = self.commit_spool.inspect(envelope.request_id)
+        if isinstance(durable, LabAcknowledgedArtifactCommit):
+            result = self._validate_acknowledgement(sealed, envelope, durable)
+            self._cleanup_redundant_candidates(sealed)
+            return result
+        ledger = self.reader.get_artifact_commit(envelope.request_id)
+        if isinstance(durable, LabArtifactCommitSpoolEntry):
+            if durable.envelope != envelope:
+                raise LabFinalizationIntegrityError(
+                    "pending artifact commit conflicts with sealed replay identity"
+                )
+            if ledger is not None:
+                if ledger.envelope != envelope:
+                    raise LabFinalizationIntegrityError(
+                        "pending artifact commit conflicts with authoritative SQLite ledger"
+                    )
+                result = self._result_from_receipt(sealed, envelope, ledger.receipt)
+            else:
+                result = LabFinalizerResult(
+                    status="published",
+                    job_id=snapshot.job.job_id,
+                    request_id=envelope.request_id,
+                    manifest_hash=sealed.manifest_hash,
+                    complete_result_hash=sealed.manifest.complete_result_hash,
+                )
+            self._cleanup_redundant_candidates(sealed)
+            return result
+        if ledger is None:
+            return None
+        if ledger.envelope != envelope:
+            raise LabFinalizationIntegrityError(
+                "sealed replay conflicts with authoritative SQLite ledger"
+            )
+        result = self._result_from_receipt(sealed, envelope, ledger.receipt)
+        self._cleanup_redundant_candidates(sealed)
+        return result
+
     def finalize(self, job_id: UUID) -> LabFinalizerResult:
         snapshot = self.reader.get_finalization_snapshot(job_id)
         if snapshot is None:
             return LabFinalizerResult(status="not_ready", job_id=job_id)
+        replay = self._fast_replay(snapshot)
+        if replay is not None:
+            return replay
         try:
             shard_results = tuple(self.bundle_reader.read(evidence) for evidence in snapshot.shards)
             result = self.adapter_registry.aggregate_results(snapshot.job.spec, shard_results)
-        except LabFinalizationIntegrityError:
+        except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise
         except Exception as exc:
             raise LabFinalizationIntegrityError(
@@ -768,23 +1210,12 @@ class LabFinalizer:
         envelope = self._envelope(sealed, snapshot.ready_epoch)
         published = self.commit_spool.publish(envelope)
         self._after_commit_published(published)
-        rejected = (
-            isinstance(published, LabAcknowledgedArtifactCommit)
-            and published.receipt.status == "rejected"
-        )
+        if isinstance(published, LabAcknowledgedArtifactCommit):
+            return self._validate_acknowledgement(sealed, envelope, published)
         return LabFinalizerResult(
-            status=(
-                "rejected"
-                if rejected
-                else (
-                    "acknowledged"
-                    if isinstance(published, LabAcknowledgedArtifactCommit)
-                    else "published"
-                )
-            ),
+            status="published",
             job_id=job_id,
             request_id=envelope.request_id,
             manifest_hash=sealed.manifest_hash,
             complete_result_hash=sealed.manifest.complete_result_hash,
-            rejection_reason=published.receipt.reason if rejected else None,
         )

@@ -1015,6 +1015,31 @@ class LabArtifactCommitSpool(LabCommandSpool):
     ) -> tuple[LabArtifactCommitSpoolEntry, ...]:
         return tuple(self.load(path) for path in self.pending_paths(limit=limit))
 
+    def inspect(
+        self,
+        request_id: UUID,
+    ) -> LabArtifactCommitSpoolEntry | LabAcknowledgedArtifactCommit | None:
+        """Read one exact durable request state without publishing or acknowledging it."""
+
+        with self._exclusive_lock():
+            ack_path = self.ack_dir / f"{request_id}.json"
+            pending_path = self._pending_for_request_locked(request_id)
+            if os.path.lexists(ack_path):
+                receipt = self.load_receipt(ack_path)
+                if pending_path is not None:
+                    pending = self.load(pending_path)
+                    if (
+                        pending.envelope.content_hash != receipt.content_hash
+                        or pending.envelope.commit.job_id != receipt.job_id
+                    ):
+                        raise InvalidCommandEnvelopeError(
+                            f"request_id {request_id} has conflicting ack and pending"
+                        )
+                return LabAcknowledgedArtifactCommit(path=ack_path, receipt=receipt)
+            if pending_path is not None:
+                return self.load(pending_path)
+            return None
+
     def ack(
         self,
         entry: LabArtifactCommitSpoolEntry,

@@ -3296,6 +3296,7 @@ class LabJobReader:
         """Return one validated ready-result graph from a single read transaction."""
 
         connection = self._connect()
+        lifecycle_errors: list[BaseException] = []
         try:
             connection.execute("BEGIN")
             job_row = connection.execute(
@@ -3392,12 +3393,25 @@ class LabJobReader:
                 ) from exc
             connection.execute("COMMIT")
             return snapshot
-        except BaseException:
+        except BaseException as exc:
+            lifecycle_errors.append(exc)
             if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
+                try:
+                    connection.rollback()
+                except BaseException as rollback_error:
+                    lifecycle_errors.append(rollback_error)
         finally:
-            connection.close()
+            try:
+                connection.close()
+            except BaseException as close_error:
+                lifecycle_errors.append(close_error)
+            if len(lifecycle_errors) == 1:
+                raise lifecycle_errors[0]
+            if lifecycle_errors:
+                raise BaseExceptionGroup(
+                    "finalization snapshot query and cleanup failed",
+                    lifecycle_errors,
+                )
 
     def get_command(self, request_id: UUID) -> LabCommandRecord | None:
         with self._connect() as connection:

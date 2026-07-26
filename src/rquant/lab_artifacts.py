@@ -3303,7 +3303,6 @@ class LabJobArtifactStore:
             ),
         )
 
-    @_artifact_public_operation()
     def preview_candidate(
         self,
         *,

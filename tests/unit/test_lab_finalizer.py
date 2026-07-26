@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -11,6 +12,7 @@ from uuid import UUID, uuid4
 import pandas as pd
 import pytest
 
+import rquant.lab_finalizer as lab_finalizer_module
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommitReceipt,
@@ -21,8 +23,12 @@ from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore
 from rquant.lab_finalizer import (
     LabFinalizationIntegrityError,
     LabFinalizer,
+    LabFinalizerMetrics,
     LabFinalizerResult,
+    LabFinalizerShardSummary,
+    LabFinalizerTableSummary,
     LabSealedShardBundleReader,
+    LabShardBundleLimits,
 )
 from rquant.lab_job_protocol import (
     LabCommandEnvelope,
@@ -34,6 +40,7 @@ from rquant.lab_jobs import (
     ControlIntent,
     InvalidStoredJobError,
     JobStatus,
+    LabArtifactCommitRecord,
     LabFinalizationShardEvidence,
     LabFinalizationSnapshot,
     LabJobReader,
@@ -50,7 +57,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
 )
 from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_json
-from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+from rquant.strategy_job_adapters import LabShardMetric, default_strategy_job_adapter_registry
 
 from .test_lab_jobs import _create_v4_job_fixture
 from .test_lab_worker import NOW, RecordingRegistry, _nshape_compare_spec, _worker
@@ -108,6 +115,23 @@ class _TamperedBundleSnapshotReader:
 
     def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
         return self.snapshot if self.snapshot.job.job_id == job_id else None
+
+
+class _CallbackSnapshotReader:
+    def __init__(self, reader: LabJobReader, callback: Callable[[], None]) -> None:
+        self.reader = reader
+        self.callback = callback
+        self.called = False
+
+    def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
+        snapshot = self.reader.get_finalization_snapshot(job_id)
+        if snapshot is not None and not self.called:
+            self.called = True
+            self.callback()
+        return snapshot
+
+    def get_artifact_commit(self, request_id: UUID) -> LabArtifactCommitRecord | None:
+        return self.reader.get_artifact_commit(request_id)
 
 
 def _ready_scenario(
@@ -214,6 +238,12 @@ def _candidate_evidence_counts(store: LabJobArtifactStore) -> tuple[int, int]:
         len(tuple(store.candidates_root.iterdir())),
         len(tuple(store.quarantine_root.iterdir())),
     )
+
+
+def _flatten_errors(error: BaseException) -> tuple[str, ...]:
+    if isinstance(error, BaseExceptionGroup):
+        return tuple(message for nested in error.exceptions for message in _flatten_errors(nested))
+    return (str(error),)
 
 
 def _insert_duplicate_accepted_success(path: Path, snapshot: LabFinalizationSnapshot) -> None:
@@ -489,26 +519,330 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
     assert (sealed.path / "report.md").read_bytes() == report_before
 
 
-def test_finalizer_reports_rejected_ack_as_rejected_not_acknowledged(tmp_path: Path) -> None:
+def test_finalizer_markdown_encodes_all_dynamic_text_as_indented_canonical_json() -> None:
+    dangerous = "`fence` <script>alert(1)</script>\nnext|cell"
+    metrics = LabFinalizerMetrics(
+        job_id=uuid4(),
+        spec_hash="1" * 64,
+        plan_hash="2" * 64,
+        adapter_id="adapter`<unsafe>",
+        adapter_version="v1|next\nline",
+        result_contract_version="contract`value",
+        result_hash="3" * 64,
+        shard_count=1,
+        shards=(
+            LabFinalizerShardSummary(
+                shard_index=0,
+                shard_id=uuid4(),
+                result_manifest_hash="4" * 64,
+                metrics=(LabShardMetric(name="note", value=dangerous),),
+            ),
+        ),
+        tables=(
+            LabFinalizerTableSummary(
+                name="trades",
+                row_count=1,
+                columns=(dangerous,),
+            ),
+        ),
+    )
+
+    first = LabFinalizer._report(metrics)
+    second = LabFinalizer._report(metrics)
+    dynamic_lines = [line for line in first.splitlines() if line and not line.startswith("#")]
+
+    assert first == second
+    assert all(line.startswith("    ") for line in dynamic_lines)
+    assert all(json.loads(line[4:]) for line in dynamic_lines)
+    assert dangerous not in first
+
+
+def test_bundle_reader_preserves_primary_and_descriptor_close_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest_path = attempt / "manifest.json"
+    os.chmod(attempt, 0o700)
+    os.chmod(manifest_path, 0o600)
+    manifest_path.write_bytes(b"{}")
+    os.chmod(manifest_path, 0o400)
+    os.chmod(attempt, 0o500)
+    original_close = lab_finalizer_module.os.close
+    injected = False
+
+    def close_with_fault(descriptor: int) -> None:
+        nonlocal injected
+        original_close(descriptor)
+        if not injected:
+            injected = True
+            raise OSError("descriptor close failed")
+
+    monkeypatch.setattr(lab_finalizer_module.os, "close", close_with_fault)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        LabSealedShardBundleReader(tmp_path / "artifacts").read(evidence)
+
+    messages = _flatten_errors(raised.value)
+    assert any("manifest is invalid" in message for message in messages)
+    assert any("descriptor close failed" in message for message in messages)
+
+
+def test_bounded_descriptor_read_retries_eintr_and_rejects_short_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "bounded.bin"
+    path.write_bytes(b"abc")
+    descriptor = os.open(path, os.O_RDONLY)
+    original_read = lab_finalizer_module.os.read
+    interrupted = False
+
+    def read_with_eintr(fd: int, size: int) -> bytes:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise InterruptedError
+        return original_read(fd, size)
+
+    monkeypatch.setattr(lab_finalizer_module.os, "read", read_with_eintr)
+    try:
+        assert (
+            lab_finalizer_module._read_descriptor_bounded(
+                descriptor,
+                expected_size=3,
+                max_bytes=3,
+            )
+            == b"abc"
+        )
+        with pytest.raises(LabFinalizationIntegrityError, match="ended before"):
+            lab_finalizer_module._read_descriptor_bounded(
+                descriptor,
+                expected_size=4,
+                max_bytes=4,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def test_descriptor_stream_preserves_operation_and_stream_close_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "stream.bin"
+    path.write_bytes(b"abc")
+    descriptor = os.open(path, os.O_RDONLY)
+    original_close = lab_finalizer_module.os.close
+
+    class FaultyStream:
+        def __init__(self, owned_descriptor: int) -> None:
+            self.owned_descriptor = owned_descriptor
+
+        def close(self) -> None:
+            original_close(self.owned_descriptor)
+            raise OSError("stream close failed")
+
+    def faulty_fdopen(owned_descriptor: int, _mode: str) -> object:
+        return FaultyStream(owned_descriptor)
+
+    def operation(_stream: object) -> object:
+        raise RuntimeError("stream operation failed")
+
+    monkeypatch.setattr(lab_finalizer_module.os, "fdopen", faulty_fdopen)
+    try:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            lab_finalizer_module._run_with_descriptor_stream(
+                descriptor,
+                operation,
+                label="faulted stream",
+            )
+    finally:
+        original_close(descriptor)
+
+    assert _flatten_errors(raised.value) == (
+        "stream operation failed",
+        "stream close failed",
+    )
+
+
+def test_finalizer_rejects_spool_ack_without_authoritative_ledger_commit(
+    tmp_path: Path,
+) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
     first = scenario.finalizer().finalize(scenario.job_id)
     receipt = _ack_artifact_commit(
         scenario,
-        status="rejected",
-        reason="synthetic_rejection",
+        status="accepted",
+        reason="not_committed",
     )
 
-    replay = scenario.finalizer().finalize(scenario.job_id)
-    repeated = scenario.finalizer().finalize(scenario.job_id)
+    with pytest.raises(
+        LabFinalizationIntegrityError,
+        match="acknowledgement.*ledger|ledger.*acknowledgement",
+    ):
+        scenario.finalizer().finalize(scenario.job_id)
 
     assert first.status == "published"
-    assert receipt.status == "rejected"
-    assert replay.status == "rejected"
-    assert replay.rejection_reason == "synthetic_rejection"
-    assert repeated == replay
-    assert replay.request_id == first.request_id
+    assert receipt.status == "accepted"
+    assert receipt.job_version is None
     assert not scenario.commit_spool.pending()
     assert _candidate_evidence_counts(scenario.artifact_store) == (0, 0)
+
+
+def test_pending_commit_fast_replay_skips_shards_aggregate_and_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    first = scenario.finalizer().finalize(scenario.job_id)
+    replay = scenario.finalizer()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("fast replay entered expensive finalization")
+
+    monkeypatch.setattr(replay.bundle_reader, "read", forbidden)
+    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", forbidden)
+    monkeypatch.setattr(replay.artifact_store, "preview_candidate", forbidden)
+
+    second = replay.finalize(scenario.job_id)
+
+    assert second.status == "published"
+    assert second.request_id == first.request_id
+
+
+def test_sealed_without_durable_commit_evidence_rebuilds_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    crashing = scenario.finalizer()
+
+    def crash(_sealed: object) -> None:
+        raise RuntimeError("sealed before publish")
+
+    monkeypatch.setattr(crashing, "_after_artifact_sealed", crash)
+    with pytest.raises(RuntimeError, match="sealed before publish"):
+        crashing.finalize(scenario.job_id)
+    assert scenario.commit_spool.pending() == ()
+
+    replay = scenario.finalizer()
+    calls = {"read": 0, "aggregate": 0, "preview": 0}
+    original_read = replay.bundle_reader.read
+    original_aggregate = replay.adapter_registry.aggregate_results
+    original_preview = replay.artifact_store.preview_candidate
+
+    def read(*args: object, **kwargs: object) -> object:
+        calls["read"] += 1
+        return original_read(*args, **kwargs)  # type: ignore[arg-type]
+
+    def aggregate(*args: object, **kwargs: object) -> object:
+        calls["aggregate"] += 1
+        return original_aggregate(*args, **kwargs)  # type: ignore[arg-type]
+
+    def preview(*args: object, **kwargs: object) -> object:
+        calls["preview"] += 1
+        return original_preview(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(replay.bundle_reader, "read", read)
+    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", aggregate)
+    monkeypatch.setattr(replay.artifact_store, "preview_candidate", preview)
+
+    result = replay.finalize(scenario.job_id)
+
+    assert result.status == "published"
+    assert calls == {"read": 1, "aggregate": 1, "preview": 1}
+
+
+def test_accepted_ack_fast_replay_requires_exact_scheduler_ledger_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    first = scenario.finalizer().finalize(scenario.job_id)
+    scheduler_result = None
+
+    def commit() -> None:
+        nonlocal scheduler_result
+        scheduler_result = scenario.scheduler.run_once()
+
+    reader = _CallbackSnapshotReader(LabJobReader(scenario.store.path), commit)
+    replay = LabFinalizer(
+        reader=reader,  # type: ignore[arg-type]
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("accepted ACK replay entered expensive finalization")
+
+    monkeypatch.setattr(replay.bundle_reader, "read", forbidden)
+    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", forbidden)
+    monkeypatch.setattr(replay.artifact_store, "preview_candidate", forbidden)
+
+    result = replay.finalize(scenario.job_id)
+    ledger = LabJobReader(scenario.store.path).get_artifact_commit(first.request_id)
+    acknowledged = scenario.commit_spool.inspect(first.request_id)
+
+    assert scheduler_result is not None and scheduler_result.artifact_commits_accepted == 1
+    assert isinstance(acknowledged, LabAcknowledgedArtifactCommit)
+    assert ledger is not None
+    assert ledger.envelope.request_id == result.request_id == first.request_id
+    assert ledger.receipt == acknowledged.receipt
+    assert result.status == "acknowledged"
+
+
+def test_rejected_ack_fast_replay_requires_exact_scheduler_ledger_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    first = scenario.finalizer().finalize(scenario.job_id)
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    scenario.scheduler.clock = lambda: snapshot.job.deadline + timedelta(seconds=1)
+    scenario.scheduler.lease = None
+    monkeypatch.setattr(scenario.store, "expire_deadline_jobs", lambda **_kwargs: ())
+    scheduler_result = None
+
+    def reject() -> None:
+        nonlocal scheduler_result
+        scheduler_result = scenario.scheduler.run_once()
+
+    reader = _CallbackSnapshotReader(LabJobReader(scenario.store.path), reject)
+    replay = LabFinalizer(
+        reader=reader,  # type: ignore[arg-type]
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("rejected ACK replay entered expensive finalization")
+
+    monkeypatch.setattr(replay.bundle_reader, "read", forbidden)
+    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", forbidden)
+    monkeypatch.setattr(replay.artifact_store, "preview_candidate", forbidden)
+
+    results = [replay.finalize(scenario.job_id) for _ in range(3)]
+    result = results[0]
+    ledger = LabJobReader(scenario.store.path).get_artifact_commit(first.request_id)
+    acknowledged = scenario.commit_spool.inspect(first.request_id)
+
+    assert scheduler_result is not None and scheduler_result.artifact_commits_rejected == 1
+    assert isinstance(acknowledged, LabAcknowledgedArtifactCommit)
+    assert ledger is not None
+    assert ledger.envelope.request_id == result.request_id == first.request_id
+    assert ledger.receipt == acknowledged.receipt
+    assert all(item.request_id == first.request_id for item in results)
+    assert all(item.status == "rejected" for item in results)
+    assert all(item.rejection_reason == "deadline_expired" for item in results)
 
 
 def test_finalizer_never_writes_the_sqlite_ledger(tmp_path: Path) -> None:
@@ -744,6 +1078,76 @@ def test_matching_sealed_artifact_bypasses_conflicting_candidate_without_mutatio
     assert (conflict.path.stat().st_dev, conflict.path.stat().st_ino) == conflict_identity
 
 
+def test_matching_sealed_replay_retries_exact_redundant_candidate_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    finalizer = scenario.finalizer()
+    plans = []
+    original_prepare = scenario.artifact_store.prepare_candidate_from_plan
+
+    def capture(plan: object) -> object:
+        plans.append(plan)
+        return original_prepare(plan)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "prepare_candidate_from_plan",
+        capture,
+    )
+    published = finalizer.finalize(scenario.job_id)
+    assert len(plans) == 1
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "prepare_candidate_from_plan",
+        original_prepare,
+    )
+    seal_intent = scenario.artifact_store.seal_intents_root / f"{scenario.job_id.hex}.json"
+    os.chmod(scenario.artifact_store.seal_intents_root, 0o700)
+    seal_intent.unlink()
+    redundant = scenario.artifact_store.prepare_candidate_from_plan(plans[0])
+    redundant_record = next(
+        record
+        for record in scenario.artifact_store.list_candidate_recovery()
+        if record.path == redundant.path
+    )
+    assert redundant_record.status in {"recoverable", "needs_authority", "recoverable_torn"}
+    assert redundant_record.job_id == scenario.job_id
+    assert redundant_record.manifest_hash == published.manifest_hash
+    original_quarantine = scenario.artifact_store.quarantine_recovery_record
+    failed = False
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise LabArtifactError("redundant cleanup failed")
+        return original_quarantine(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "quarantine_recovery_record",
+        fail_once,
+    )
+
+    with pytest.raises(
+        LabFinalizationIntegrityError,
+        match="redundant matching candidate.*isolated",
+    ):
+        scenario.finalizer().finalize(scenario.job_id)
+    assert _candidate_evidence_counts(scenario.artifact_store) == (1, 0)
+    assert redundant.path.exists()
+
+    recovered = scenario.finalizer().finalize(scenario.job_id)
+    after_recovery = _candidate_evidence_counts(scenario.artifact_store)
+    replay = scenario.finalizer().finalize(scenario.job_id)
+
+    assert recovered.request_id == replay.request_id == published.request_id
+    assert after_recovery == (0, 1)
+    assert _candidate_evidence_counts(scenario.artifact_store) == after_recovery
+
+
 def test_owned_candidate_cleanup_failure_preserves_primary_and_cleanup_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -940,6 +1344,163 @@ def test_bundle_reader_rejects_hardlinked_parquet_from_accepted_attempt(
         match="not a private regular file",
     ):
         LabSealedShardBundleReader(tmp_path / "artifacts").read(evidence)
+
+
+def test_bundle_reader_rejects_sparse_oversized_file_before_read_or_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0]
+    parquet = attempt / artifact.file_name
+    oversized = 8 * 1024 * 1024
+    os.chmod(attempt, 0o700)
+    os.chmod(parquet, 0o600)
+    with parquet.open("r+b") as stream:
+        stream.truncate(oversized)
+    changed = manifest.model_copy(
+        update={"artifacts": (artifact.model_copy(update={"file_size": oversized}),)}
+    )
+    os.chmod(parquet, 0o400)
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("oversized Parquet reached pandas")
+
+    monkeypatch.setattr(lab_finalizer_module.pd, "read_parquet", forbidden)
+    reader = LabSealedShardBundleReader(
+        tmp_path / "artifacts",
+        limits=LabShardBundleLimits(
+            max_single_file_bytes=1024,
+            max_bundle_total_bytes=16 * 1024 * 1024,
+        ),
+    )
+
+    with pytest.raises(LabFinalizationIntegrityError, match="single file.*limit"):
+        reader.read(accepted)
+
+
+def test_bundle_reader_rejects_parquet_decompression_amplification_before_pandas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0]
+    parquet = attempt / artifact.file_name
+    frame = pd.DataFrame(
+        {
+            "hold_days": pd.Series(range(5_000), dtype="int64"),
+            "ret_pct": pd.Series(
+                [f"{index:08d}-" + ("x" * 1_000) for index in range(5_000)],
+                dtype="string",
+            ),
+        }
+    )
+    os.chmod(attempt, 0o700)
+    os.chmod(parquet, 0o600)
+    frame.to_parquet(parquet, index=False)
+    persisted = pd.read_parquet(parquet)
+    payload = parquet.read_bytes()
+    changed_artifact = artifact.model_copy(
+        update={
+            "row_count": len(persisted),
+            "columns": tuple(persisted.columns),
+            "file_size": len(payload),
+            "file_sha256": hashlib.sha256(payload).hexdigest(),
+            "content_sha256": hashlib.sha256(
+                canonical_shard_frame_json(persisted).encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    changed = manifest.model_copy(update={"artifacts": (changed_artifact,)})
+    os.chmod(parquet, 0o400)
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("amplified Parquet reached pandas")
+
+    monkeypatch.setattr(lab_finalizer_module.pd, "read_parquet", forbidden)
+    reader = LabSealedShardBundleReader(
+        tmp_path / "artifacts",
+        limits=LabShardBundleLimits(max_parquet_uncompressed_bytes=64 * 1024),
+    )
+
+    with pytest.raises(LabFinalizationIntegrityError, match="uncompressed.*limit"):
+        reader.read(accepted)
+
+
+@pytest.mark.parametrize("resource", ["rows", "columns"])
+def test_bundle_reader_rejects_manifest_shape_limits_before_parquet_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0]
+    if resource == "rows":
+        changed_artifact = artifact.model_copy(update={"row_count": 2})
+        limits = LabShardBundleLimits(max_row_count=1)
+        message = "row count.*limit"
+    else:
+        changed_artifact = artifact.model_copy(
+            update={"columns": (*artifact.columns, "unsafe_extra_column")}
+        )
+        limits = LabShardBundleLimits(max_column_count=len(artifact.columns))
+        message = "column count.*limit"
+    changed = LabShardResultManifest.model_validate(
+        manifest.model_copy(update={"artifacts": (changed_artifact,)})
+    )
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("manifest shape limit reached Parquet metadata")
+
+    monkeypatch.setattr(lab_finalizer_module.pq, "ParquetFile", forbidden)
+
+    with pytest.raises(LabFinalizationIntegrityError, match=message):
+        LabSealedShardBundleReader(
+            tmp_path / "artifacts",
+            limits=limits,
+        ).read(accepted)
+
+
+def test_bundle_reader_rejects_materialized_dataframe_memory_before_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+
+    def forbidden(_frame: pd.DataFrame) -> str:
+        raise AssertionError("oversized DataFrame reached canonical content hashing")
+
+    monkeypatch.setattr(lab_finalizer_module, "canonical_shard_frame_json", forbidden)
+
+    with pytest.raises(LabFinalizationIntegrityError, match="DataFrame.*memory limit"):
+        LabSealedShardBundleReader(
+            tmp_path / "artifacts",
+            limits=LabShardBundleLimits(max_materialized_dataframe_bytes=1),
+        ).read(evidence)
 
 
 @pytest.mark.parametrize(

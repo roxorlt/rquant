@@ -352,6 +352,60 @@ def test_preview_candidate_is_readonly_and_prepare_materializes_the_exact_plan(
         assert (candidate.path / planned.relative_path).read_bytes() == planned.payload
 
 
+def test_blocked_preview_serialization_does_not_hold_artifact_lifecycle_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    entered = threading.Event()
+    release = threading.Event()
+    listed = threading.Event()
+    errors: list[BaseException] = []
+    original = store._serialize_parquet
+
+    def blocked(table_name: str, frame: pd.DataFrame) -> object:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("preview serializer was not released")
+        return original(table_name, frame)
+
+    def preview() -> None:
+        try:
+            store.preview_candidate(**_prepare_arguments())  # type: ignore[arg-type]
+        except BaseException as exc:
+            errors.append(exc)
+
+    def list_recovery() -> None:
+        try:
+            store.list_candidate_recovery()
+            listed.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(store, "_serialize_parquet", blocked)
+    preview_thread = threading.Thread(target=preview)
+    list_thread = threading.Thread(target=list_recovery)
+    preview_thread.start()
+    assert entered.wait(timeout=2)
+    list_thread.start()
+    try:
+        assert listed.wait(timeout=1), "preview held the artifact lifecycle lock"
+    finally:
+        release.set()
+        preview_thread.join(timeout=5)
+        list_thread.join(timeout=5)
+
+    assert not preview_thread.is_alive() and not list_thread.is_alive()
+    assert errors == []
+    assert _artifact_namespace_identity(store) == {
+        "candidates": (),
+        "sealed": (),
+        "quarantine": (),
+        "seal-intents": (),
+        "seal-intents-quarantine": (),
+    }
+
+
 def test_prepare_rejects_hex_traversal_job_id_before_any_filesystem_write(
     tmp_path: Path,
 ) -> None:

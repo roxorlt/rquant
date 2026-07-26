@@ -102,6 +102,57 @@ class _StagedLifecycleConnection:
             raise self.close_error
 
 
+class _FinalizationSnapshotFaultCursor:
+    def __init__(self, row: object | None) -> None:
+        self.row = row
+
+    def fetchone(self) -> object | None:
+        return self.row
+
+
+class _FinalizationSnapshotFaultConnection:
+    def __init__(
+        self,
+        *,
+        query_error: BaseException | None = None,
+        rollback_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.query_error = query_error
+        self.rollback_error = rollback_error
+        self.close_error = close_error
+        self.in_transaction = False
+        self.calls: list[str] = []
+
+    def execute(self, statement: str, _parameters: object = ()) -> object:
+        normalized = " ".join(statement.split())
+        if normalized == "BEGIN":
+            self.calls.append("begin")
+            self.in_transaction = True
+            return _FinalizationSnapshotFaultCursor(None)
+        if normalized.startswith("SELECT * FROM lab_job"):
+            self.calls.append("query")
+            if self.query_error is not None:
+                raise self.query_error
+            return _FinalizationSnapshotFaultCursor(None)
+        if normalized == "COMMIT":
+            self.calls.append("commit")
+            self.in_transaction = False
+            return _FinalizationSnapshotFaultCursor(None)
+        raise AssertionError(f"unexpected SQL: {normalized}")
+
+    def rollback(self) -> None:
+        self.calls.append("rollback")
+        if self.rollback_error is not None:
+            raise self.rollback_error
+        self.in_transaction = False
+
+    def close(self) -> None:
+        self.calls.append("close")
+        if self.close_error is not None:
+            raise self.close_error
+
+
 def _staged_receipt() -> LabArtifactCommitReceipt:
     return LabArtifactCommitReceipt(
         request_id=uuid4(),
@@ -323,6 +374,45 @@ def test_staged_commit_reports_close_error_after_successful_commit(tmp_path: Pat
         staged.commit(lease=lease, now=NOW)
 
     assert connection.calls == ["commit", "close"]
+
+
+def test_finalization_snapshot_preserves_query_rollback_and_close_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FinalizationSnapshotFaultConnection(
+        query_error=OSError("snapshot query failed"),
+        rollback_error=OSError("snapshot rollback failed"),
+        close_error=OSError("snapshot close failed"),
+    )
+    reader = LabJobReader(tmp_path / "lab.sqlite3")
+    monkeypatch.setattr(reader, "_connect", lambda: connection)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        reader.get_finalization_snapshot(uuid4())
+
+    assert connection.calls == ["begin", "query", "rollback", "close"]
+    assert _flatten_exception_messages(raised.value) == (
+        "snapshot query failed",
+        "snapshot rollback failed",
+        "snapshot close failed",
+    )
+
+
+def test_finalization_snapshot_reports_close_error_after_successful_missing_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FinalizationSnapshotFaultConnection(
+        close_error=OSError("snapshot close failed"),
+    )
+    reader = LabJobReader(tmp_path / "lab.sqlite3")
+    monkeypatch.setattr(reader, "_connect", lambda: connection)
+
+    with pytest.raises(OSError, match="snapshot close failed"):
+        reader.get_finalization_snapshot(uuid4())
+
+    assert connection.calls == ["begin", "query", "commit", "close"]
 
 
 def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> None:
