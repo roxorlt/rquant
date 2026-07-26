@@ -34,6 +34,7 @@ _LabSpoolFileType = Literal[
     "char_device",
     "other",
 ]
+_RENAME_NOREPLACE_MAX_ATTEMPTS = 8
 
 
 def _rename_noreplace(
@@ -64,16 +65,20 @@ def _rename_noreplace(
         ctypes.c_uint,
     )
     function.restype = ctypes.c_int
-    result = function(
-        source_dir_fd,
-        os.fsencode(source_name),
-        destination_dir_fd,
-        os.fsencode(destination_name),
-        flags,
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
+    error_number = 0
+    for _attempt in range(_RENAME_NOREPLACE_MAX_ATTEMPTS):
+        result = function(
+            source_dir_fd,
+            os.fsencode(source_name),
+            destination_dir_fd,
+            os.fsencode(destination_name),
+            flags,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number != errno.EINTR:
+            break
     if error_number == errno.EEXIST:
         raise FileExistsError(
             error_number,
@@ -594,6 +599,25 @@ class LabCommandSpool:
         self._fsync_directory(self.quarantine_dir)
         return container / destination_name
 
+    def _discard_interrupted_isolation_attempt_locked(
+        self,
+        source: Path,
+        container: Path,
+        observed: os.stat_result,
+    ) -> None:
+        try:
+            current = source.lstat()
+        except FileNotFoundError:
+            return
+        if not self._stat_matches_bound_entry(current, observed) or os.path.lexists(
+            container / "entry"
+        ):
+            return
+        for record in self._owned_isolation_records_locked():
+            if record.container == container:
+                self._remove_owned_isolation_record_locked(record)
+                return
+
     def _isolate_owned_entry_locked(
         self,
         source: Path,
@@ -661,6 +685,15 @@ class LabCommandSpool:
             )
             self._after_owned_entry_isolation_stage("entry_moved", source, container)
             return LabQuarantinedCommand(path=destination, reason=reason)
+        except InterruptedError:
+            with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
+                self._discard_interrupted_isolation_attempt_locked(
+                    source,
+                    container,
+                    observed,
+                )
+            self._fsync_directory(self.quarantine_dir)
+            raise
         except BaseException:
             # A prepared bundle is intentionally retained. Startup either resumes the
             # identity-bound move or prunes an incomplete record within configured limits.

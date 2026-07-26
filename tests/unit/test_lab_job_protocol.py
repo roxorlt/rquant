@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import stat
 import subprocess
@@ -38,6 +40,36 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
+
+
+class _FakeRenameFunction:
+    def __init__(self, errors: list[int], *, repeated_error: int = 0) -> None:
+        self._errors = list(errors)
+        self._repeated_error = repeated_error
+        self.calls: list[tuple[object, ...]] = []
+        self.argtypes: tuple[object, ...] = ()
+        self.restype: object | None = None
+
+    def __call__(self, *args: object) -> int:
+        self.calls.append(args)
+        error_number = self._errors.pop(0) if self._errors else self._repeated_error
+        if error_number == 0:
+            return 0
+        ctypes.set_errno(error_number)
+        return -1
+
+
+class _FakeRenameLibc:
+    def __init__(
+        self,
+        *,
+        darwin: _FakeRenameFunction | None = None,
+        linux: _FakeRenameFunction | None = None,
+    ) -> None:
+        if darwin is not None:
+            self.renameatx_np = darwin
+        if linux is not None:
+            self.renameat2 = linux
 
 
 def _spec(
@@ -123,6 +155,103 @@ def _hidden_audit_v1_spec() -> ResearchRunSpec:
         **values,
         _fields_set=set(base.model_fields_set),
     )
+
+
+@pytest.mark.parametrize("interruption_count", [1, 3])
+def test_rename_noreplace_retries_eintr_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_count: int,
+) -> None:
+    function = _FakeRenameFunction([errno.EINTR] * interruption_count + [0])
+    libc = _FakeRenameLibc(darwin=function)
+    monkeypatch.setattr(lab_job_protocol.sys, "platform", "darwin")
+    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    lab_job_protocol._rename_noreplace(11, "source", 12, "entry")
+
+    assert len(function.calls) == interruption_count + 1
+    assert all(call[-1] == 0x00000004 for call in function.calls)
+
+
+def test_rename_noreplace_linux_branch_uses_noreplace_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function = _FakeRenameFunction([errno.EINTR, 0])
+    libc = _FakeRenameLibc(linux=function)
+    monkeypatch.setattr(lab_job_protocol.sys, "platform", "linux")
+    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    lab_job_protocol._rename_noreplace(21, "source", 22, "entry")
+
+    assert len(function.calls) == 2
+    assert all(call[-1] == 0x00000001 for call in function.calls)
+
+
+def test_rename_noreplace_linux_without_renameat2_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _FakeRenameLibc()
+    monkeypatch.setattr(lab_job_protocol.sys, "platform", "linux")
+    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    with pytest.raises(OSError) as captured:
+        lab_job_protocol._rename_noreplace(21, "source", 22, "entry")
+
+    assert captured.value.errno == errno.ENOTSUP
+
+
+@pytest.mark.parametrize("error_number", [errno.EEXIST, errno.ENOENT, errno.EXDEV])
+def test_rename_noreplace_preserves_non_eintr_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    function = _FakeRenameFunction([error_number])
+    libc = _FakeRenameLibc(darwin=function)
+    monkeypatch.setattr(lab_job_protocol.sys, "platform", "darwin")
+    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+
+    with pytest.raises(OSError) as captured:
+        lab_job_protocol._rename_noreplace(11, "source", 12, "entry")
+
+    assert captured.value.errno == error_number
+    assert isinstance(captured.value, FileExistsError) is (error_number == errno.EEXIST)
+    assert len(function.calls) == 1
+
+
+def test_rename_noreplace_unsupported_platform_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lab_job_protocol.sys, "platform", "unsupported")
+
+    with pytest.raises(OSError) as captured:
+        lab_job_protocol._rename_noreplace(11, "source", 12, "entry")
+
+    assert captured.value.errno == errno.ENOTSUP
+
+
+def test_persistent_rename_eintr_is_bounded_without_prepared_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function = _FakeRenameFunction([], repeated_error=errno.EINTR)
+    libc = _FakeRenameLibc(darwin=function)
+    monkeypatch.setattr(lab_job_protocol.sys, "platform", "darwin")
+    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    spool = LabCommandSpool(tmp_path / "commands")
+    source = spool.pending_dir / f"{uuid4()}.json"
+    source.write_text("{broken", encoding="utf-8")
+    observed = source.lstat()
+
+    for attempt in range(2):
+        with pytest.raises(InterruptedError) as captured:
+            spool._isolate_owned_entry_locked(source, observed, reason="persistent_eintr")
+
+        assert captured.value.errno == errno.EINTR
+        assert len(function.calls) == (attempt + 1) * (
+            lab_job_protocol._RENAME_NOREPLACE_MAX_ATTEMPTS
+        )
+        assert source.read_text(encoding="utf-8") == "{broken"
+        assert tuple(spool.quarantine_dir.glob("owned-entry-*.dead")) == ()
 
 
 def test_command_receipt_rejects_boolean_job_version() -> None:
