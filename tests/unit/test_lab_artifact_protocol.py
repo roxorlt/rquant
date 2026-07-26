@@ -61,12 +61,41 @@ class _ConflictPublishCrash(BaseException):
     pass
 
 
+class _CursorWriteCrash(BaseException):
+    pass
+
+
+class _ConflictCleanupCrash(BaseException):
+    pass
+
+
 class _CrashableConflictSpool(LabArtifactCommitSpool):
     crash_stage: str | None = None
 
     def _after_conflict_evidence_stage(self, stage: str, _path: Path) -> None:
         if stage == self.crash_stage:
             raise _ConflictPublishCrash(stage)
+
+
+class _CrashableCursorSpool(LabArtifactCommitSpool):
+    crash_stage: str | None = None
+
+    def _after_scan_cursor_stage(self, stage: str, _path: Path) -> None:
+        if stage == self.crash_stage:
+            raise _CursorWriteCrash(stage)
+
+
+class _CrashableConflictCleanupSpool(LabArtifactCommitSpool):
+    crash_stage: str | None = None
+
+    def _after_corrupt_conflict_stage(
+        self,
+        stage: str,
+        _raw_path: Path,
+        _target_path: Path,
+    ) -> None:
+        if stage == self.crash_stage:
+            raise _ConflictCleanupCrash(stage)
 
 
 def test_commit_envelope_hashes_canonical_typed_content(tmp_path: Path) -> None:
@@ -146,6 +175,90 @@ def test_commit_spool_fair_scan_reaches_tail_across_restarts_and_queue_changes(
     assert valid.path.name in observed
     assert added_later is not None and added_later.name in observed
     assert len(observed) == 1_002
+
+
+@pytest.mark.parametrize(
+    "cursor_kind",
+    ["malformed", "truncated", "symlink", "hardlink", "directory"],
+)
+def test_commit_spool_corrupt_advisory_cursor_isolated_and_queue_remains_reachable(
+    tmp_path: Path,
+    cursor_kind: str,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    valid = spool.publish(_envelope(tmp_path))
+    assert isinstance(valid, LabArtifactCommitSpoolEntry)
+    cursor = spool._scan_cursor_path
+    outside = tmp_path / "outside-cursor"
+    outside.write_text("outside cursor", encoding="utf-8")
+    if cursor_kind == "malformed":
+        cursor.write_text("{}", encoding="utf-8")
+    elif cursor_kind == "truncated":
+        cursor.write_text('{"schema_version":', encoding="utf-8")
+    elif cursor_kind == "symlink":
+        os.symlink(outside, cursor)
+    elif cursor_kind == "hardlink":
+        os.link(outside, cursor)
+    else:
+        cursor.mkdir()
+        (cursor / "operator.txt").write_text("preserve", encoding="utf-8")
+
+    restarted = LabArtifactCommitSpool(root)
+    selected = restarted.fair_pending_paths(limit=1)
+
+    assert selected == (valid.path,)
+    assert restarted._scan_cursor_path.is_file()
+    assert restarted._scan_cursor_path.stat().st_nlink == 1
+    isolated = tuple(restarted.quarantine_dir.glob("artifact-commit-scan-cursor.*.bad"))
+    assert len(isolated) == 1
+    if cursor_kind in {"symlink", "hardlink"}:
+        assert outside.read_text(encoding="utf-8") == "outside cursor"
+    if cursor_kind == "directory":
+        assert (isolated[0] / "operator.txt").read_text(encoding="utf-8") == "preserve"
+    assert LabArtifactCommitSpool(root).fair_pending_paths(limit=1) == (valid.path,)
+
+
+def test_commit_spool_cursor_write_crash_is_advisory_across_restart(tmp_path: Path) -> None:
+    root = tmp_path / "commits"
+    spool = _CrashableCursorSpool(root)
+    valid = spool.publish(_envelope(tmp_path))
+    assert isinstance(valid, LabArtifactCommitSpoolEntry)
+    spool.crash_stage = "temporary_written"
+
+    with pytest.raises(_CursorWriteCrash, match="temporary_written"):
+        spool.fair_pending_paths(limit=1)
+
+    restarted = LabArtifactCommitSpool(root)
+    assert restarted.fair_pending_paths(limit=1) == (valid.path,)
+    assert tuple(root.glob(".*scan-cursor*.tmp")) == ()
+
+
+@pytest.mark.parametrize("failure", ["isolation", "replace", "fsync"])
+def test_commit_spool_cursor_io_failure_never_blocks_pending_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    valid = spool.publish(_envelope(tmp_path))
+    assert isinstance(valid, LabArtifactCommitSpoolEntry)
+    spool._scan_cursor_path.write_text("{}", encoding="utf-8")
+
+    def fail_io(*_args: object, **_kwargs: object) -> None:
+        raise OSError(f"{failure} failed")
+
+    with monkeypatch.context() as scoped:
+        if failure == "isolation":
+            scoped.setattr(spool, "_isolate_scan_cursor_locked", fail_io)
+        elif failure == "replace":
+            scoped.setattr(artifact_protocol.os, "replace", fail_io)
+        else:
+            scoped.setattr(spool, "_fsync_directory", fail_io)
+        assert spool.fair_pending_paths(limit=1) == (valid.path,)
+
+    assert LabArtifactCommitSpool(root).fair_pending_paths(limit=1) == (valid.path,)
 
 
 def test_commit_spool_fails_closed_on_request_content_conflict(tmp_path: Path) -> None:
@@ -697,6 +810,130 @@ def test_commit_conflict_recovery_does_not_touch_temp_lookalikes_symlinks_or_har
     assert temporaries[1].stat().st_ino == outside_hardlink.stat().st_ino
     assert outside_hardlink.read_text(encoding="utf-8") == "outside hardlink"
     assert lookalike.read_text(encoding="utf-8") == "lookalike"
+
+
+@pytest.mark.parametrize(
+    "target_kind",
+    ["different_inode", "symlink", "swapped_inode", "appeared_inode"],
+)
+def test_commit_conflict_recovery_preserves_mismatched_target_and_isolates_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    evidence = LabArtifactConflictEvidence.from_conflict(
+        conflict,
+        reason="request_id already pending with different content",
+    )
+    temporary = spool._conflict_temporary_path(evidence)
+    temporary.write_bytes(evidence.model_dump_json().encode("utf-8"))
+    target = spool._conflict_evidence_path(evidence)
+    outside = tmp_path / "outside-target"
+    outside.write_bytes(evidence.model_dump_json().encode("utf-8"))
+    if target_kind == "different_inode":
+        os.link(outside, target)
+    elif target_kind == "symlink":
+        os.symlink(outside, target)
+    elif target_kind == "swapped_inode":
+        os.link(temporary, target)
+
+        def swap_target(*_args: object) -> None:
+            target.unlink()
+            os.link(outside, target)
+
+        monkeypatch.setattr(
+            spool,
+            "_before_conflict_temp_unlink",
+            swap_target,
+            raising=False,
+        )
+    else:
+        original_link = artifact_protocol.os.link
+
+        def appear_before_link(
+            source: str | bytes | Path,
+            destination: str | bytes | Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if Path(source) == Path(temporary.name) and Path(destination) == Path(target.name):
+                original_link(outside, target)
+            original_link(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(artifact_protocol.os, "link", appear_before_link)
+
+    spool._recover_conflict_evidence_locked()
+
+    assert outside.read_bytes() == evidence.model_dump_json().encode("utf-8")
+    if target_kind == "symlink":
+        assert os.path.islink(target)
+    else:
+        assert target.stat().st_ino == outside.stat().st_ino
+    assert not os.path.lexists(temporary)
+    raw = tuple(spool.quarantine_dir.glob("*.corrupt-conflict-temp.raw.bad"))
+    assert len(raw) == 1
+    assert raw[0].read_bytes() == evidence.model_dump_json().encode("utf-8")
+
+
+@pytest.mark.parametrize("with_outside_link", [False, True])
+@pytest.mark.parametrize(
+    "crash_stage",
+    [None, "raw_moved", "evidence_written", "before_target_unlink", "target_unlinked"],
+)
+def test_commit_conflict_corrupt_dual_link_cleanup_restarts_and_republish_converges(
+    tmp_path: Path,
+    with_outside_link: bool,
+    crash_stage: str | None,
+) -> None:
+    root = tmp_path / "commits"
+    spool = _CrashableConflictCleanupSpool(root)
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    evidence = LabArtifactConflictEvidence.from_conflict(
+        conflict,
+        reason="request_id already pending with different content",
+    )
+    temporary = spool._conflict_temporary_path(evidence)
+    target = spool._conflict_evidence_path(evidence)
+    payload = b'{"truncated":'
+    temporary.write_bytes(payload)
+    os.link(temporary, target)
+    outside = tmp_path / "outside-third-link"
+    if with_outside_link:
+        os.link(temporary, outside)
+    spool.crash_stage = crash_stage
+
+    if crash_stage is None:
+        spool._recover_conflict_evidence_locked()
+    else:
+        with pytest.raises(_ConflictCleanupCrash, match=crash_stage):
+            spool._recover_conflict_evidence_locked()
+
+    restarted = LabArtifactCommitSpool(root)
+    assert not os.path.lexists(temporary)
+    assert not os.path.lexists(target)
+    raw = tuple(restarted.quarantine_dir.glob("*.corrupt-conflict-temp.raw.bad"))
+    metadata = tuple(restarted.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json"))
+    assert len(raw) == len(metadata) == 1
+    assert raw[0].read_bytes() == payload
+    if with_outside_link:
+        assert outside.read_bytes() == payload
+        assert outside.stat().st_ino == raw[0].stat().st_ino
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        restarted.publish(conflict)
+    assert len(restarted.conflict_evidence()) == 1
 
 
 def test_commit_conflict_concurrent_republish_after_truncated_temp_is_idempotent(

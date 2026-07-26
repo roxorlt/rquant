@@ -53,6 +53,16 @@ from .test_strategy_job_adapters import _p13_frozen_claim
 PLAN_HASH = "4" * 64
 
 
+def _noncanonical_uuid(value: UUID, style: str) -> str:
+    canonical = str(value)
+    return {
+        "uppercase": canonical.upper(),
+        "braces": f"{{{canonical}}}",
+        "urn": f"urn:uuid:{canonical}",
+        "whitespace": f" {canonical}",
+    }[style]
+
+
 def _register_unprivileged_job_functions(connection: sqlite3.Connection) -> None:
     connection.create_function(
         lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
@@ -423,6 +433,37 @@ def test_two_workers_can_claim_only_one_shard(tmp_path: Path) -> None:
     claimed = [item for item in claims if item is not None]
     assert len(claimed) == 1
     assert claimed[0].claim_generation == 1
+
+
+@pytest.mark.parametrize("uuid_style", ["uppercase", "braces", "urn", "whitespace"])
+def test_claim_readers_reject_noncanonical_persisted_claim_tokens(
+    tmp_path: Path,
+    uuid_style: str,
+) -> None:
+    store, lease, job_id = _setup(tmp_path)
+    claim = _claim(store, lease)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_shard SET claim_token = ? WHERE job_id = ? AND shard_id = ?",
+            (
+                _noncanonical_uuid(claim.claim_token, uuid_style),
+                str(job_id),
+                str(claim.shard_id),
+            ),
+        )
+
+    reader = LabJobReader(store.path)
+    with pytest.raises(InvalidStoredJobError):
+        reader.get_job(job_id)
+    with pytest.raises(InvalidStoredJobError):
+        reader.list_shards(job_id)
+    with pytest.raises(InvalidStoredJobError):
+        store.list_active_claims(
+            lease,
+            now=NOW + timedelta(seconds=3),
+            initial_lease_seconds=30,
+        )
 
 
 def test_cross_process_restart_claim_is_still_exactly_once(tmp_path: Path) -> None:
@@ -1005,6 +1046,61 @@ def test_report_commit_replay_is_exactly_once_and_conflict_is_rejected(tmp_path:
     )
     with pytest.raises(RequestContentConflictError):
         store.apply_worker_report(conflict, lease=lease, now=NOW + timedelta(seconds=5))
+
+
+@pytest.mark.parametrize("uuid_style", ["uppercase", "braces", "urn", "whitespace"])
+@pytest.mark.parametrize("uuid_field", ["report_id", "job_id", "shard_id", "report_json"])
+def test_report_readers_reject_noncanonical_persisted_uuid_text(
+    tmp_path: Path,
+    uuid_style: str,
+    uuid_field: str,
+) -> None:
+    store, lease, _job_id = _setup(tmp_path)
+    claim = _claim(store, lease)
+    report = _report(
+        claim,
+        LabShardSucceeded(result_manifest_hash="6" * 64),
+    )
+    receipt = store.apply_worker_report(
+        report,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert receipt.status == "accepted"
+    values = {
+        "report_id": report.report_id,
+        "job_id": report.job_id,
+        "shard_id": report.shard_id,
+        "report_json": report.report_id,
+    }
+    malformed = _noncanonical_uuid(values[uuid_field], uuid_style)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        if uuid_field == "report_json":
+            connection.execute(
+                "UPDATE lab_worker_report SET report_json = replace(report_json, ?, ?)",
+                (str(report.report_id), malformed),
+            )
+        else:
+            update_sql = {
+                "report_id": "UPDATE lab_worker_report SET report_id = ?",
+                "job_id": "UPDATE lab_worker_report SET job_id = ?",
+                "shard_id": "UPDATE lab_worker_report SET shard_id = ?",
+            }[uuid_field]
+            connection.execute(
+                update_sql,
+                (malformed,),
+            )
+
+    if uuid_field == "report_id":
+        with pytest.raises(InvalidStoredJobError):
+            store.list_accepted_success_claim_tokens(
+                lease,
+                now=NOW + timedelta(seconds=4),
+            )
+    else:
+        with pytest.raises(InvalidStoredJobError):
+            LabJobReader(store.path).get_worker_report(report.report_id)
 
 
 def test_telemetry_completion_sequence_is_acceptance_ordered_exactly_once_and_restart_safe(

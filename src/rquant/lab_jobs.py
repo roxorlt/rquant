@@ -929,6 +929,20 @@ def _strict_sqlite_bool(value: object, *, field: str) -> bool:
     return bool(integer)
 
 
+def _canonical_uuid_text(value: object, *, field: str) -> UUID:
+    if type(value) is not str:
+        raise InvalidStoredJobError(
+            f"{field} must be canonical UUID text, found {type(value).__name__}"
+        )
+    try:
+        parsed = UUID(value)
+    except (AttributeError, ValueError) as exc:
+        raise InvalidStoredJobError(f"{field} is not UUID text") from exc
+    if value != str(parsed):
+        raise InvalidStoredJobError(f"{field} is not canonical lowercase UUID text")
+    return parsed
+
+
 _SHARD_ROW_VALID_FUNCTION = "rquant_lab_shard_row_valid"
 _SHARD_HASH_RE = re.compile(r"[0-9a-f]{64}")
 _SHARD_PLAN_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
@@ -992,10 +1006,10 @@ def _sqlite_shard_row_valid(
     completion_sequence_value: object,
 ) -> int:
     try:
-        shard_id = UUID(str(shard_id_value))
+        shard_id = _canonical_uuid_text(shard_id_value, field="lab_shard.shard_id")
         if not shard_id.int:
             raise ValueError("persisted shard_id cannot use the constructor sentinel")
-        UUID(str(job_id_value))
+        _canonical_uuid_text(job_id_value, field="lab_shard.job_id")
         shard_index = _strict_sqlite_int(
             shard_index_value,
             field="lab_shard.shard_index",
@@ -1029,7 +1043,11 @@ def _sqlite_shard_row_valid(
             field="lab_shard.scheduler_fencing_token",
             minimum=1,
         )
-        claim_token = UUID(str(claim_token_value)) if claim_token_value is not None else None
+        claim_token = (
+            _canonical_uuid_text(claim_token_value, field="lab_shard.claim_token")
+            if claim_token_value is not None
+            else None
+        )
         _strict_sqlite_int(
             claim_generation_value,
             field="lab_shard.claim_generation",
@@ -1216,12 +1234,15 @@ def _command_record_from_row(
 ) -> LabCommandRecord:
     stored_request = str(row["request_id"])
     try:
-        request_id = UUID(stored_request)
+        request_id = _canonical_uuid_text(
+            row["request_id"],
+            field="lab_command.request_id",
+        )
         envelope = LabCommandEnvelope.model_validate_json(str(row["command_json"]))
         receipt = LabCommandReceipt.model_validate_json(str(row["receipt_json"]))
         content_hash = str(row["content_hash"])
         command_type = str(row["command_type"])
-        job_id = UUID(str(row["job_id"]))
+        job_id = _canonical_uuid_text(row["job_id"], field="lab_command.job_id")
         status = str(row["status"])
         reason = str(row["reason"])
         receipt_job_version = _strict_nullable_sqlite_int(
@@ -1245,6 +1266,10 @@ def _command_record_from_row(
             raise ValueError("receipt reason mismatch")
         if receipt.job_version != receipt_job_version:
             raise ValueError("receipt job version mismatch")
+        if envelope.model_dump_json() != str(row["command_json"]):
+            raise ValueError("command JSON is not canonical")
+        if receipt.model_dump_json() != str(row["receipt_json"]):
+            raise ValueError("command receipt JSON is not canonical")
         return LabCommandRecord(
             request_id=request_id,
             content_hash=content_hash,
@@ -1273,10 +1298,16 @@ def _worker_report_record_from_row(
     try:
         report = LabWorkerReport.model_validate_json(str(row["report_json"]))
         receipt = LabReportReceipt.model_validate_json(str(row["receipt_json"]))
-        report_id = UUID(stored_id)
+        report_id = _canonical_uuid_text(
+            row["report_id"],
+            field="lab_worker_report.report_id",
+        )
         content_hash = str(row["content_hash"])
-        job_id = UUID(str(row["job_id"]))
-        shard_id = UUID(str(row["shard_id"]))
+        job_id = _canonical_uuid_text(row["job_id"], field="lab_worker_report.job_id")
+        shard_id = _canonical_uuid_text(
+            row["shard_id"],
+            field="lab_worker_report.shard_id",
+        )
         report_type = str(row["report_type"])
         claim_generation = _strict_sqlite_int(
             row["claim_generation"],
@@ -1308,6 +1339,10 @@ def _worker_report_record_from_row(
             raise ValueError("receipt status mismatch")
         if receipt.reason != str(row["reason"]):
             raise ValueError("receipt reason mismatch")
+        if report.model_dump_json() != str(row["report_json"]):
+            raise ValueError("worker report JSON is not canonical")
+        if receipt.model_dump_json() != str(row["receipt_json"]):
+            raise ValueError("worker report receipt JSON is not canonical")
         return LabWorkerReportRecord(
             report=report,
             receipt=receipt,
@@ -1339,7 +1374,10 @@ def _artifact_commit_record_from_row(
 ) -> LabArtifactCommitRecord:
     stored_id = str(row["request_id"])
     try:
-        request_id = UUID(stored_id)
+        request_id = _canonical_uuid_text(
+            row["request_id"],
+            field="lab_artifact_commit.request_id",
+        )
         envelope = LabArtifactCommitEnvelope.model_validate_json(str(row["commit_json"]))
         receipt = LabArtifactCommitReceipt.model_validate_json(str(row["receipt_json"]))
         if expected_request_id is not None and request_id != expected_request_id:
@@ -1348,7 +1386,8 @@ def _artifact_commit_record_from_row(
             raise ValueError("artifact commit request id mismatch")
         if not (envelope.content_hash == receipt.content_hash == str(row["content_hash"])):
             raise ValueError("artifact commit content hash mismatch")
-        if not (envelope.commit.job_id == receipt.job_id == UUID(str(row["job_id"]))):
+        job_id = _canonical_uuid_text(row["job_id"], field="lab_artifact_commit.job_id")
+        if not (envelope.commit.job_id == receipt.job_id == job_id):
             raise ValueError("artifact commit job id mismatch")
         if receipt.status != str(row["status"]):
             raise ValueError("artifact commit receipt status mismatch")
@@ -2600,7 +2639,7 @@ class LabJobReader:
             if spec.deadline != stored_deadline:
                 raise ValueError("deadline does not match spec")
             record = LabJobRecord(
-                job_id=UUID(str(row["job_id"])),
+                job_id=_canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
                 spec=spec,
                 spec_hash=stored_hash,
                 job_type=stored_job_type,
@@ -2666,7 +2705,7 @@ class LabJobReader:
                 lease_id=_strict_sqlite_int(row["lease_id"], field="lab_lease.lease_id", minimum=1),
                 lease_name=str(row["lease_name"]),
                 owner_id=str(row["owner_id"]),
-                token=UUID(str(row["token"])),
+                token=_canonical_uuid_text(row["token"], field="lab_lease.token"),
                 fencing_token=_strict_sqlite_int(
                     row["fencing_token"], field="lab_lease.fencing_token", minimum=1
                 ),
@@ -2689,9 +2728,11 @@ class LabJobReader:
         try:
             return LabEventRecord(
                 event_id=_strict_sqlite_int(row["event_id"], field="lab_event.event_id", minimum=1),
-                job_id=UUID(str(row["job_id"])),
+                job_id=_canonical_uuid_text(row["job_id"], field="lab_event.job_id"),
                 request_id=(
-                    UUID(str(row["request_id"])) if row["request_id"] is not None else None
+                    _canonical_uuid_text(row["request_id"], field="lab_event.request_id")
+                    if row["request_id"] is not None
+                    else None
                 ),
                 event_type=str(row["event_type"]),
                 prior_status=(
@@ -2720,8 +2761,8 @@ class LabJobReader:
     def _shard_from_row(row: sqlite3.Row) -> LabShardRecord:
         try:
             record = LabShardRecord(
-                shard_id=UUID(str(row["shard_id"])),
-                job_id=UUID(str(row["job_id"])),
+                shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+                job_id=_canonical_uuid_text(row["job_id"], field="lab_shard.job_id"),
                 shard_index=_strict_sqlite_int(
                     row["shard_index"], field="lab_shard.shard_index", minimum=0
                 ),
@@ -2782,7 +2823,9 @@ class LabJobReader:
                     minimum=1,
                 ),
                 claim_token=(
-                    UUID(str(row["claim_token"])) if row["claim_token"] is not None else None
+                    _canonical_uuid_text(row["claim_token"], field="lab_shard.claim_token")
+                    if row["claim_token"] is not None
+                    else None
                 ),
                 claim_generation=_strict_sqlite_int(
                     row["claim_generation"],
@@ -3036,7 +3079,10 @@ class LabJobReader:
             index_row,
             expected_job_id=job.job_id,
         )
-        request_id = UUID(str(index_row["commit_request_id"]))
+        request_id = _canonical_uuid_text(
+            index_row["commit_request_id"],
+            field="lab_job_result_artifact.commit_request_id",
+        )
         commit_row = connection.execute(
             "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
             (str(request_id),),
@@ -3229,7 +3275,10 @@ class LabJobReader:
             )
             completed.append(
                 LabEtaCompletedShard(
-                    shard_id=UUID(str(row["shard_id"])),
+                    shard_id=_canonical_uuid_text(
+                        row["shard_id"],
+                        field="lab_shard.shard_id",
+                    ),
                     completion_sequence=_strict_sqlite_int(
                         row["completion_sequence"],
                         field="lab_shard.completion_sequence",
@@ -3273,7 +3322,10 @@ class LabJobReader:
                 )
             remaining.append(
                 LabEtaRemainingShard(
-                    shard_id=UUID(str(row["shard_id"])),
+                    shard_id=_canonical_uuid_text(
+                        row["shard_id"],
+                        field="lab_shard.shard_id",
+                    ),
                     work_plan=plan,
                 )
             )
@@ -3309,9 +3361,16 @@ class LabJobReader:
             ).fetchall()
         return tuple(
             LabArtifactRecord(
-                artifact_id=UUID(str(row["artifact_id"])),
-                job_id=UUID(str(row["job_id"])),
-                shard_id=(UUID(str(row["shard_id"])) if row["shard_id"] is not None else None),
+                artifact_id=_canonical_uuid_text(
+                    row["artifact_id"],
+                    field="lab_artifact.artifact_id",
+                ),
+                job_id=_canonical_uuid_text(row["job_id"], field="lab_artifact.job_id"),
+                shard_id=(
+                    _canonical_uuid_text(row["shard_id"], field="lab_artifact.shard_id")
+                    if row["shard_id"] is not None
+                    else None
+                ),
                 artifact_type=str(row["artifact_type"]),
                 uri=str(row["uri"]),
                 content_hash=str(row["content_hash"]),
@@ -3359,7 +3418,10 @@ class LabJobReader:
                 (str(job.job_id),),
             ).fetchone()
             assert index_row is not None
-            primary_request_id = UUID(str(index_row["commit_request_id"]))
+            primary_request_id = _canonical_uuid_text(
+                index_row["commit_request_id"],
+                field="lab_job_result_artifact.commit_request_id",
+            )
             commit = record.envelope.commit
             shard_identity = {
                 (str(shard[0]), str(shard[1]), str(shard[2]))
@@ -4372,7 +4434,7 @@ class LabJobStore:
         now: datetime,
         reason: str,
     ) -> sqlite3.Row:
-        job_id = UUID(str(job_row["job_id"]))
+        job_id = _canonical_uuid_text(job_row["job_id"], field="lab_job.job_id")
         exhausted_candidate = connection.execute(
             """
             SELECT 1 FROM lab_shard
@@ -4520,7 +4582,7 @@ class LabJobStore:
         )
         if current_fence == lease.fencing_token:
             return row
-        job_id = UUID(str(row["job_id"]))
+        job_id = _canonical_uuid_text(row["job_id"], field="lab_job.job_id")
         version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
         cursor = connection.execute(
             """
@@ -4619,7 +4681,7 @@ class LabJobStore:
         ready_terminal_scope = nullcontext()
         if LabResultState(str(row["result_state"])) is LabResultState.READY:
             ready_terminal_scope = _write_authorization(connection).authorize_ready_terminal(
-                UUID(str(row["job_id"])),
+                _canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
                 target_status,
                 stored_version,
                 version,
@@ -4650,7 +4712,7 @@ class LabJobStore:
             )
         self._insert_event(
             connection,
-            job_id=UUID(str(row["job_id"])),
+            job_id=_canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
             request_id=request_id,
             event_type=event_type,
             prior_status=source,
@@ -4660,7 +4722,10 @@ class LabJobStore:
             fencing_token=lease.fencing_token,
             now=now,
         )
-        updated = self._load_job_row(connection, UUID(str(row["job_id"])))
+        updated = self._load_job_row(
+            connection,
+            _canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
+        )
         assert updated is not None
         return updated
 
@@ -4701,7 +4766,7 @@ class LabJobStore:
         )
         self._insert_event(
             connection,
-            job_id=UUID(str(row["job_id"])),
+            job_id=_canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
             request_id=request_id,
             event_type="control_intent_changed",
             prior_status=status,
@@ -4711,7 +4776,10 @@ class LabJobStore:
             fencing_token=lease.fencing_token,
             now=now,
         )
-        updated = self._load_job_row(connection, UUID(str(row["job_id"])))
+        updated = self._load_job_row(
+            connection,
+            _canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
+        )
         assert updated is not None
         return updated
 
@@ -5677,7 +5745,7 @@ class LabJobStore:
                 ),
             ).fetchall()
             for row in rows:
-                job_id = UUID(str(row["job_id"]))
+                job_id = _canonical_uuid_text(row["job_id"], field="lab_job.job_id")
                 source = JobStatus(str(row["status"]))
                 version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
                 connection.execute(
@@ -5775,7 +5843,7 @@ class LabJobStore:
     @staticmethod
     def _definition_from_shard_row(row: sqlite3.Row) -> LabShardDefinition:
         return LabShardDefinition(
-            shard_id=UUID(str(row["shard_id"])),
+            shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
             shard_index=_strict_sqlite_int(
                 row["shard_index"], field="lab_shard.shard_index", minimum=0
             ),
@@ -5858,11 +5926,11 @@ class LabJobStore:
         failed_job_causes: dict[UUID, UUID] = {}
         for exhausted in exhausted_rows:
             failed_job_causes.setdefault(
-                UUID(str(exhausted["job_id"])),
-                UUID(str(exhausted["shard_id"])),
+                _canonical_uuid_text(exhausted["job_id"], field="lab_shard.job_id"),
+                _canonical_uuid_text(exhausted["shard_id"], field="lab_shard.shard_id"),
             )
         for stale in stale_rows:
-            job_id = UUID(str(stale["job_id"]))
+            job_id = _canonical_uuid_text(stale["job_id"], field="lab_shard.job_id")
             job_row = self._load_job_row(connection, job_id)
             assert job_row is not None
             attempt_count = _strict_sqlite_int(
@@ -5875,9 +5943,12 @@ class LabJobStore:
                 ControlIntent(str(job_row["control_intent"])) is not ControlIntent.CANCEL_REQUESTED
                 and attempt_count >= max_attempts
             ):
-                failed_job_causes.setdefault(job_id, UUID(str(stale["shard_id"])))
+                failed_job_causes.setdefault(
+                    job_id,
+                    _canonical_uuid_text(stale["shard_id"], field="lab_shard.shard_id"),
+                )
         for stale in stale_rows:
-            job_id = UUID(str(stale["job_id"]))
+            job_id = _canonical_uuid_text(stale["job_id"], field="lab_shard.job_id")
             if job_id in failed_job_causes:
                 continue
             job_row = self._load_job_row(connection, job_id)
@@ -5935,7 +6006,7 @@ class LabJobStore:
             ),
         ).fetchall()
         for row in idle_control_rows:
-            job_id = UUID(str(row["job_id"]))
+            job_id = _canonical_uuid_text(row["job_id"], field="lab_job.job_id")
             if ControlIntent(str(row["control_intent"])) is ControlIntent.PAUSE_REQUESTED:
                 paused_job_ids.add(job_id)
             else:
@@ -6099,7 +6170,10 @@ class LabJobStore:
             else:
                 try:
                     cursor_created_at = _load_time(str(claim_cursor["claim_cursor_created_at"]))
-                    cursor_job_id = UUID(str(claim_cursor["claim_cursor_job_id"]))
+                    cursor_job_id = _canonical_uuid_text(
+                        claim_cursor["claim_cursor_job_id"],
+                        field="lab_scheduler_state.claim_cursor_job_id",
+                    )
                 except (TypeError, ValueError) as exc:
                     raise InvalidStoredJobError("invalid persisted claim job cursor") from exc
                 cursor_created_at_dump = _dump_time(cursor_created_at)
@@ -6137,7 +6211,10 @@ class LabJobStore:
             if job_candidate is None:
                 return None
             try:
-                job_id = UUID(str(job_candidate["job_id"]))
+                job_id = _canonical_uuid_text(
+                    job_candidate["job_id"],
+                    field="lab_job.job_id",
+                )
                 job_created_at = _load_time(str(job_candidate["created_at"]))
             except (TypeError, ValueError) as exc:
                 raise InvalidStoredJobError("invalid claimable job identity") from exc
@@ -6289,11 +6366,17 @@ class LabJobStore:
                     claimed_at = _load_time(str(row["claimed_at"]))
                     claims.append(
                         LabShardClaim(
-                            job_id=UUID(str(row["job_id"])),
+                            job_id=_canonical_uuid_text(
+                                row["job_id"],
+                                field="lab_shard.job_id",
+                            ),
                             spec_hash=str(row["job_spec_hash"]),
                             definition=self._definition_from_shard_row(row),
                             worker_id=str(row["worker_id"]),
-                            claim_token=UUID(str(row["claim_token"])),
+                            claim_token=_canonical_uuid_text(
+                                row["claim_token"],
+                                field="lab_shard.claim_token",
+                            ),
                             claim_generation=_strict_sqlite_int(
                                 row["claim_generation"],
                                 field="lab_shard.claim_generation",
@@ -6333,7 +6416,10 @@ class LabJobStore:
             ).fetchall()
             tokens: set[UUID] = set()
             for row in rows:
-                report_id = UUID(str(row["report_id"]))
+                report_id = _canonical_uuid_text(
+                    row["report_id"],
+                    field="lab_worker_report.report_id",
+                )
                 record = _worker_report_record_from_row(
                     row,
                     expected_report_id=report_id,
@@ -6377,7 +6463,10 @@ class LabJobStore:
                     ),
                 ).fetchall()
                 for row in rows:
-                    report_id = UUID(str(row["report_id"]))
+                    report_id = _canonical_uuid_text(
+                        row["report_id"],
+                        field="lab_worker_report.report_id",
+                    )
                     record = _worker_report_record_from_row(
                         row,
                         expected_report_id=report_id,
@@ -7016,7 +7105,7 @@ class LabJobStore:
                 )
                 self._insert_event(
                     connection,
-                    job_id=UUID(str(row["job_id"])),
+                    job_id=_canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
                     request_id=None,
                     event_type="lease_recovered",
                     prior_status=JobStatus.RUNNING,
@@ -7032,7 +7121,7 @@ class LabJobStore:
                 )
                 updated = self._load_job_row(
                     connection,
-                    UUID(str(row["job_id"])),
+                    _canonical_uuid_text(row["job_id"], field="lab_job.job_id"),
                 )
                 assert updated is not None
                 recovered.append(LabJobReader._job_from_row(updated))
