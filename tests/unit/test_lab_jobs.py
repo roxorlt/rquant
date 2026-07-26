@@ -449,6 +449,46 @@ def test_connection_authority_cannot_revive_after_implicit_conflict_rollback(
             connection.rollback()
 
 
+@pytest.mark.parametrize(
+    "executor",
+    ["connection-execute", "connection-executemany", "cursor-execute", "cursor-executemany"],
+)
+def test_connection_authority_expires_after_statement_abort(
+    tmp_path: Path,
+    executor: str,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with store._connect() as connection:
+        connection.execute("CREATE TEMP TABLE auth_probe (value INTEGER PRIMARY KEY)")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("INSERT INTO auth_probe VALUES (1)")
+        authority = connection.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            with pytest.raises(sqlite3.IntegrityError):
+                if executor == "connection-execute":
+                    connection.execute("INSERT OR ABORT INTO auth_probe VALUES (1)")
+                elif executor == "connection-executemany":
+                    connection.executemany(
+                        "INSERT OR ABORT INTO auth_probe VALUES (?)",
+                        [(1,)],
+                    )
+                elif executor == "cursor-execute":
+                    connection.cursor().execute(
+                        "INSERT OR ABORT INTO auth_probe VALUES (1)"
+                    )
+                else:
+                    connection.cursor().executemany(
+                        "INSERT OR ABORT INTO auth_probe VALUES (?)",
+                        [(1,)],
+                    )
+            assert connection.in_transaction is True
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+        connection.rollback()
+
+
 def test_connection_authority_requires_active_transaction(tmp_path: Path) -> None:
     store = _store(tmp_path)
     with (

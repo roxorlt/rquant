@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -391,8 +391,74 @@ class _LabWriteAuthorization:
         )
 
 
+_SqlParameters = Iterable[object] | Mapping[str, object]
+
+
+class _LabJobStoreCursor(sqlite3.Cursor):
+    def _expire_authorization(self) -> None:
+        connection = self.connection
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._expire_write_authorization()
+
+    def execute(
+        self,
+        sql: str,
+        parameters: _SqlParameters = (),
+        /,
+    ) -> sqlite3.Cursor:
+        try:
+            return super().execute(sql, parameters)
+        except sqlite3.Error:
+            self._expire_authorization()
+            raise
+
+    def executemany(
+        self,
+        sql: str,
+        seq_of_parameters: Iterable[_SqlParameters],
+        /,
+    ) -> sqlite3.Cursor:
+        try:
+            return super().executemany(sql, seq_of_parameters)
+        except sqlite3.Error:
+            self._expire_authorization()
+            raise
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        try:
+            return super().executescript(sql_script)
+        except sqlite3.Error:
+            self._expire_authorization()
+            raise
+
+
 class _LabJobStoreConnection(sqlite3.Connection):
     write_authorization: _LabWriteAuthorization
+
+    def cursor(
+        self,
+        factory: type[sqlite3.Cursor] | None = None,
+    ) -> sqlite3.Cursor:
+        return super().cursor(factory or _LabJobStoreCursor)
+
+    def execute(
+        self,
+        sql: str,
+        parameters: _SqlParameters = (),
+        /,
+    ) -> sqlite3.Cursor:
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(
+        self,
+        sql: str,
+        seq_of_parameters: Iterable[_SqlParameters],
+        /,
+    ) -> sqlite3.Cursor:
+        return self.cursor().executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        return self.cursor().executescript(sql_script)
 
     def _expire_write_authorization(self) -> None:
         authorization = getattr(self, "write_authorization", None)
