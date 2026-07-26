@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import heapq
@@ -9,6 +11,7 @@ import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -31,6 +34,53 @@ _LabSpoolFileType = Literal[
     "char_device",
     "other",
 ]
+
+
+def _rename_noreplace(
+    source_dir_fd: int,
+    source_name: str,
+    destination_dir_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically move one directory entry and fail if the destination exists."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = libc.renameatx_np
+        flags = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        try:
+            function = libc.renameat2
+        except AttributeError as exc:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from exc
+        flags = 0x00000001  # RENAME_NOREPLACE
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-clobber rename is unsupported")
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    result = function(
+        source_dir_fd,
+        os.fsencode(source_name),
+        destination_dir_fd,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+    raise OSError(error_number, os.strerror(error_number), source_name)
 
 
 class RequestContentConflictError(RuntimeError):
@@ -190,6 +240,45 @@ class LabDisappearedQuarantineArtifact(LabProtocolModel):
     reason: str = Field(min_length=1)
 
 
+class _LabOwnedInvalidEvidenceIdentity(LabProtocolModel):
+    name: str = Field(min_length=1)
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    mode: int = Field(ge=0)
+    link_count: int = Field(ge=1)
+    file_type: _LabSpoolFileType
+    byte_count: int = Field(ge=0)
+    content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    link_target: str | None = None
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> _LabOwnedInvalidEvidenceIdentity:
+        match = LabCommandSpool._OWNED_INVALID_EVIDENCE_NAME.fullmatch(self.name)
+        if match is None or (
+            int(match["device"], 16),
+            int(match["inode"], 16),
+            int(match["mode"], 16),
+            int(match["link_count"]),
+            int(match["byte_count"]),
+            match["content_hash"],
+        ) != (
+            self.device,
+            self.inode,
+            self.mode,
+            self.link_count,
+            self.byte_count,
+            self.content_hash or "unread",
+        ):
+            raise ValueError("invalid evidence basename does not match its identity")
+        if LabCommandSpool._spool_file_type(self.mode) != self.file_type:
+            raise ValueError("invalid evidence file_type does not match mode")
+        if (self.file_type == "symlink") != (self.link_target is not None):
+            raise ValueError("invalid evidence symlink identity requires link_target")
+        if self.content_hash is not None and (self.file_type != "regular" or self.link_count != 1):
+            raise ValueError("only a singly-linked regular entry may bind a content hash")
+        return self
+
+
 class _LabOwnedEntryIsolationEvidence(LabProtocolModel):
     schema_version: Literal[1] = 1
     isolation_id: UUID
@@ -205,6 +294,7 @@ class _LabOwnedEntryIsolationEvidence(LabProtocolModel):
     byte_count: int = Field(ge=0)
     link_target: str | None = None
     manual_retention: bool = False
+    invalid_evidence: _LabOwnedInvalidEvidenceIdentity | None = None
 
     @model_validator(mode="after")
     def validate_identity(self) -> _LabOwnedEntryIsolationEvidence:
@@ -215,6 +305,10 @@ class _LabOwnedEntryIsolationEvidence(LabProtocolModel):
         if (self.file_type == "symlink") != (self.link_target is not None):
             raise ValueError("isolated symlink identity requires link_target")
         return self
+
+    def canonical_json_bytes(self) -> bytes:
+        excluded = {"invalid_evidence"} if self.invalid_evidence is None else set()
+        return self.model_dump_json(exclude=excluded).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -240,6 +334,11 @@ class LabCommandSpool:
     _OWNED_ISOLATION_NAME = re.compile(
         r"owned-entry-(?P<isolation_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
         r"[0-9a-f]{4}-[0-9a-f]{12})\.dead"
+    )
+    _OWNED_INVALID_EVIDENCE_NAME = re.compile(
+        r"invalid-evidence-d(?P<device>[0-9a-f]+)-i(?P<inode>[0-9a-f]+)-"
+        r"m(?P<mode>[0-9a-f]+)-n(?P<link_count>[1-9][0-9]*)-"
+        r"s(?P<byte_count>[0-9]+)-h(?P<content_hash>[0-9a-f]{64}|unread)\.raw"
     )
 
     def __init__(
@@ -409,6 +508,10 @@ class LabCommandSpool:
     ) -> None:
         """Fault-injection boundary for the common owned-entry isolation primitive."""
 
+    @staticmethod
+    def _before_owned_entry_move(_source: Path, _container: Path) -> None:
+        """Fault-injection boundary immediately before atomic no-clobber move."""
+
     def _move_bound_entry_into_container_locked(
         self,
         source: Path,
@@ -416,6 +519,7 @@ class LabCommandSpool:
         observed: os.stat_result,
         *,
         expected_link_target: str | None,
+        destination_name: str = "entry",
     ) -> Path:
         source_name = self._direct_child_name(source, source.parent)
         source_fd = os.open(
@@ -448,7 +552,7 @@ class LabCommandSpool:
                     f"owned symlink target changed before isolation: {source.name}"
                 )
             try:
-                os.stat("entry", dir_fd=container_fd, follow_symlinks=False)
+                os.stat(destination_name, dir_fd=container_fd, follow_symlinks=False)
             except FileNotFoundError:
                 pass
             else:
@@ -458,15 +562,26 @@ class LabCommandSpool:
             # The private 0700 container is newly created by the sole application writer.
             # This application capability is an integrity boundary, not protection against
             # a process that can arbitrarily rewrite the spool directory itself.
-            os.rename(source_name, "entry", src_dir_fd=source_fd, dst_dir_fd=container_fd)
-            destination = os.stat("entry", dir_fd=container_fd, follow_symlinks=False)
+            if destination_name == "entry":
+                self._before_owned_entry_move(source, container)
+            _rename_noreplace(
+                source_fd,
+                source_name,
+                container_fd,
+                destination_name,
+            )
+            destination = os.stat(
+                destination_name,
+                dir_fd=container_fd,
+                follow_symlinks=False,
+            )
             if not self._stat_matches_bound_entry(destination, observed):
                 raise InvalidCommandEnvelopeError(
                     f"owned entry identity changed during isolation: {source.name}"
                 )
             if expected_link_target is not None and (
                 not stat.S_ISLNK(destination.st_mode)
-                or os.readlink("entry", dir_fd=container_fd) != expected_link_target
+                or os.readlink(destination_name, dir_fd=container_fd) != expected_link_target
             ):
                 raise InvalidCommandEnvelopeError(
                     f"owned symlink target changed during isolation: {source.name}"
@@ -477,7 +592,7 @@ class LabCommandSpool:
             os.close(container_fd)
             os.close(source_fd)
         self._fsync_directory(self.quarantine_dir)
-        return container / "entry"
+        return container / destination_name
 
     def _isolate_owned_entry_locked(
         self,
@@ -521,7 +636,7 @@ class LabCommandSpool:
         try:
             if not self._publish_no_clobber(
                 evidence_path,
-                evidence.model_dump_json().encode("utf-8"),
+                evidence.canonical_json_bytes(),
             ):
                 raise RequestContentConflictError(
                     f"owned isolation evidence already exists: {container.name}"
@@ -552,21 +667,21 @@ class LabCommandSpool:
             self._fsync_directory(self.quarantine_dir)
             raise
 
-    def _load_owned_isolation_evidence(
+    def _load_owned_isolation_evidence_with_stat(
         self,
         container: Path,
-    ) -> _LabOwnedEntryIsolationEvidence:
+    ) -> tuple[_LabOwnedEntryIsolationEvidence, os.stat_result]:
         match = self._OWNED_ISOLATION_NAME.fullmatch(container.name)
         if match is None:
             raise InvalidCommandEnvelopeError(
                 f"invalid owned isolation container: {container.name}"
             )
-        _path, payload, _file_stat = self._read_regular_child(
+        _path, payload, file_stat = self._read_regular_child(
             container / "evidence.json",
             container,
         )
         evidence = _LabOwnedEntryIsolationEvidence.model_validate_json(payload)
-        if evidence.model_dump_json().encode("utf-8") != payload:
+        if evidence.canonical_json_bytes() != payload:
             raise InvalidCommandEnvelopeError(
                 f"owned isolation evidence is not canonical: {container.name}"
             )
@@ -574,13 +689,61 @@ class LabCommandSpool:
             raise InvalidCommandEnvelopeError(
                 f"owned isolation evidence id mismatch: {container.name}"
             )
+        return evidence, file_stat
+
+    def _load_owned_isolation_evidence(
+        self,
+        container: Path,
+    ) -> _LabOwnedEntryIsolationEvidence:
+        evidence, _file_stat = self._load_owned_isolation_evidence_with_stat(container)
         return evidence
+
+    @classmethod
+    def _invalid_evidence_name(
+        cls,
+        observed: os.stat_result,
+        *,
+        content_hash: str | None,
+    ) -> str:
+        return (
+            f"invalid-evidence-d{observed.st_dev:x}-i{observed.st_ino:x}-"
+            f"m{observed.st_mode:x}-n{observed.st_nlink}-s{max(0, observed.st_size)}-"
+            f"h{content_hash or 'unread'}.raw"
+        )
+
+    def _invalid_evidence_identity_locked(
+        self,
+        path: Path,
+        observed: os.stat_result,
+    ) -> _LabOwnedInvalidEvidenceIdentity:
+        content_hash: str | None = None
+        if stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1:
+            _candidate, payload, file_stat = self._read_regular_child(path, path.parent)
+            if not self._stat_matches_bound_entry(file_stat, observed):
+                raise InvalidCommandEnvelopeError(
+                    f"invalid identity evidence changed while reading: {path.name}"
+                )
+            content_hash = hashlib.sha256(payload).hexdigest()
+        link_target = os.readlink(path) if stat.S_ISLNK(observed.st_mode) else None
+        return _LabOwnedInvalidEvidenceIdentity(
+            name=self._invalid_evidence_name(observed, content_hash=content_hash),
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=observed.st_mode,
+            link_count=observed.st_nlink,
+            file_type=self._spool_file_type(observed.st_mode),
+            byte_count=max(0, observed.st_size),
+            content_hash=content_hash,
+            link_target=link_target,
+        )
 
     def _write_recovered_isolation_evidence_locked(
         self,
         container: Path,
         isolation_id: UUID,
         entry_stat: os.stat_result,
+        *,
+        invalid_evidence: _LabOwnedInvalidEvidenceIdentity | None,
     ) -> _LabOwnedEntryIsolationEvidence:
         link_target = os.readlink(container / "entry") if stat.S_ISLNK(entry_stat.st_mode) else None
         evidence = _LabOwnedEntryIsolationEvidence(
@@ -596,11 +759,12 @@ class LabCommandSpool:
             byte_count=max(0, entry_stat.st_size),
             link_target=link_target,
             manual_retention=stat.S_ISDIR(entry_stat.st_mode),
+            invalid_evidence=invalid_evidence,
         )
         evidence_path = container / "evidence.json"
         if not self._publish_no_clobber(
             evidence_path,
-            evidence.model_dump_json().encode("utf-8"),
+            evidence.canonical_json_bytes(),
         ):
             raise InvalidCommandEnvelopeError(
                 f"cannot replace invalid isolation evidence: {container.name}"
@@ -633,14 +797,25 @@ class LabCommandSpool:
             if entry_stat is None:
                 return
             evidence_path = container / "evidence.json"
+            invalid_evidence: _LabOwnedInvalidEvidenceIdentity | None = None
             if os.path.lexists(evidence_path):
-                invalid_path = container / f"invalid-evidence-{uuid4().hex}.raw"
-                os.rename(evidence_path, invalid_path)
-                self._fsync_directory(container)
+                invalid_stat = evidence_path.lstat()
+                invalid_evidence = self._invalid_evidence_identity_locked(
+                    evidence_path,
+                    invalid_stat,
+                )
+                self._move_bound_entry_into_container_locked(
+                    evidence_path,
+                    container,
+                    invalid_stat,
+                    expected_link_target=invalid_evidence.link_target,
+                    destination_name=invalid_evidence.name,
+                )
             evidence = self._write_recovered_isolation_evidence_locked(
                 container,
                 UUID(match["isolation_id"]),
                 entry_stat,
+                invalid_evidence=invalid_evidence,
             )
         if entry_stat is not None:
             if not self._stat_matches_isolation(entry_stat, evidence):
@@ -771,17 +946,89 @@ class LabCommandSpool:
         )
         try:
             names = os.listdir(container_fd)
-            if any(
-                name not in {"entry", "evidence.json"} and not name.startswith("invalid-evidence-")
-                for name in names
-            ):
+            try:
+                evidence, evidence_stat = self._load_owned_isolation_evidence_with_stat(
+                    record.container
+                )
+            except (InvalidCommandEnvelopeError, ValueError, OSError):
                 return False
+            if evidence.manual_retention:
+                return False
+            allowed_names = {"entry", "evidence.json"}
+            if evidence.invalid_evidence is not None:
+                allowed_names.add(evidence.invalid_evidence.name)
+            if any(name not in allowed_names for name in names):
+                return False
+            observed_children: dict[str, os.stat_result] = {"evidence.json": evidence_stat}
             for name in names:
+                if name == "evidence.json":
+                    continue
                 try:
                     child_stat = os.stat(name, dir_fd=container_fd, follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                if not self._remove_bound_directory_entry(container_fd, name, child_stat):
+                if name == "entry":
+                    if not self._stat_matches_isolation(child_stat, evidence):
+                        return False
+                    if evidence.link_target is not None and (
+                        not stat.S_ISLNK(child_stat.st_mode)
+                        or os.readlink(name, dir_fd=container_fd) != evidence.link_target
+                    ):
+                        return False
+                else:
+                    invalid = evidence.invalid_evidence
+                    if (
+                        invalid is None
+                        or name != invalid.name
+                        or (
+                            child_stat.st_dev,
+                            child_stat.st_ino,
+                            child_stat.st_mode,
+                            child_stat.st_nlink,
+                            max(0, child_stat.st_size),
+                        )
+                        != (
+                            invalid.device,
+                            invalid.inode,
+                            invalid.mode,
+                            invalid.link_count,
+                            invalid.byte_count,
+                        )
+                    ):
+                        return False
+                    if invalid.link_target is not None and (
+                        not stat.S_ISLNK(child_stat.st_mode)
+                        or os.readlink(name, dir_fd=container_fd) != invalid.link_target
+                    ):
+                        return False
+                    if invalid.content_hash is not None:
+                        try:
+                            _path, payload, opened_stat = self._read_regular_child(
+                                record.container / name,
+                                record.container,
+                            )
+                        except InvalidCommandEnvelopeError:
+                            return False
+                        if not self._stat_matches_bound_entry(opened_stat, child_stat) or (
+                            hashlib.sha256(payload).hexdigest() != invalid.content_hash
+                        ):
+                            return False
+                observed_children[name] = child_stat
+            removal_order = [
+                name
+                for name in (
+                    "entry",
+                    evidence.invalid_evidence.name if evidence.invalid_evidence else None,
+                )
+                if name is not None and name in observed_children
+            ]
+            removal_order.append("evidence.json")
+            for name in removal_order:
+                if not self._remove_bound_directory_entry(
+                    container_fd,
+                    name,
+                    observed_children[name],
+                ):
                     return False
         finally:
             os.close(container_fd)
@@ -826,6 +1073,9 @@ class LabCommandSpool:
                 break
             if not removed:
                 break
+
+    def _prune_quarantine_locked(self) -> None:
+        self._prune_owned_isolations_locked()
 
     @staticmethod
     def _read_regular_child(
@@ -1220,7 +1470,7 @@ class LabCommandSpool:
                 reason=reason,
                 expected_link_target=expected_link_target,
             )
-            self._prune_owned_isolations_locked()
+            self._prune_quarantine_locked()
             return isolated
 
     def _record_disappeared_locked(

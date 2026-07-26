@@ -23,6 +23,7 @@ from rquant.lab_job_protocol import (
     LabQuarantinedCommand,
     LabSpoolFileIdentity,
     RequestContentConflictError,
+    _LabOwnedIsolationRecord,
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity
 
@@ -195,8 +196,17 @@ class _ConflictEvidenceRecord:
     files: tuple[tuple[Path, os.stat_result], ...]
 
 
+@dataclass(frozen=True)
+class _ArtifactQuarantineRecord:
+    modified_at_ns: int
+    identity: str
+    size: int
+    conflict: _ConflictEvidenceRecord | None = None
+    isolation: _LabOwnedIsolationRecord | None = None
+
+
 class LabArtifactCommitSpool(LabCommandSpool):
-    """Atomic commit inbox; conflict evidence defaults to 256 bundles or 64 MiB.
+    """Atomic commit inbox; all owned quarantine evidence shares one bounded budget.
 
     Cleanup removes only validated complete or owned-incomplete records, oldest
     first. A single newest record survives even when it exceeds the byte budget.
@@ -245,7 +255,6 @@ class LabArtifactCommitSpool(LabCommandSpool):
             self._recover_scan_cursor_temporaries_locked()
             self._recover_conflict_evidence_locked()
             self._prune_conflicts_locked()
-            self._prune_owned_isolations_locked()
 
     @staticmethod
     def _after_conflict_evidence_stage(
@@ -283,7 +292,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         except (InvalidCommandEnvelopeError, ValueError) as exc:
             with suppress(OSError, InvalidCommandEnvelopeError):
                 self._isolate_scan_cursor_locked(observed, reason=str(exc))
-                self._prune_owned_isolations_locked()
+                self._prune_quarantine_locked()
             return None
 
     def _recover_scan_cursor_temporaries_locked(self) -> None:
@@ -835,23 +844,76 @@ class LabArtifactCommitSpool(LabCommandSpool):
             )
         return records
 
-    def _prune_conflicts_locked(self) -> None:
-        self._recover_conflict_evidence_locked()
-        records = self._new_conflict_records_locked() + self._legacy_conflict_records_locked()
-        records.sort(key=lambda record: (record.modified_at_ns, record.name))
-        total_bytes = sum(record.size for record in records)
-        while len(records) > self.max_conflict_records or (
-            total_bytes > self.max_conflict_bytes and len(records) > 1
-        ):
-            record = records.pop(0)
-            total_bytes -= record.size
-            for path, file_stat in record.files:
+    def _artifact_quarantine_records_locked(self) -> list[_ArtifactQuarantineRecord]:
+        records = [
+            _ArtifactQuarantineRecord(
+                modified_at_ns=record.modified_at_ns,
+                identity=f"conflict:{record.name}",
+                size=record.size,
+                conflict=record,
+            )
+            for record in self._new_conflict_records_locked()
+            + self._legacy_conflict_records_locked()
+        ]
+        records.extend(
+            _ArtifactQuarantineRecord(
+                modified_at_ns=record.modified_at_ns,
+                identity=f"isolation:{record.container.name}",
+                size=record.byte_count,
+                isolation=record,
+            )
+            for record in self._owned_isolation_records_locked()
+        )
+        return records
+
+    def _remove_artifact_quarantine_record_locked(
+        self,
+        record: _ArtifactQuarantineRecord,
+    ) -> bool:
+        if record.isolation is not None:
+            return self._remove_owned_isolation_record_locked(record.isolation)
+        conflict = record.conflict
+        if conflict is None:
+            return False
+        try:
+            for path, file_stat in conflict.files:
                 self._unlink_regular_identity(
                     path,
                     file_stat,
                     allowed_link_counts=frozenset({file_stat.st_nlink}),
                 )
-        self._prune_owned_isolations_locked()
+        except (InvalidCommandEnvelopeError, OSError):
+            return False
+        return True
+
+    def _prune_artifact_quarantine_locked(self) -> None:
+        self._recover_conflict_evidence_locked()
+        self._reconcile_owned_isolations_locked()
+        records = self._artifact_quarantine_records_locked()
+        records.sort(key=lambda record: (record.modified_at_ns, record.identity))
+        total_bytes = sum(record.size for record in records)
+        while len(records) > self.max_conflict_records or (
+            total_bytes > self.max_conflict_bytes and len(records) > 1
+        ):
+            removed = False
+            for index, record in enumerate(records):
+                if not self._remove_artifact_quarantine_record_locked(record):
+                    continue
+                total_bytes -= record.size
+                records.pop(index)
+                removed = True
+                break
+            if not removed:
+                # Non-empty directories and ownership mismatches remain observable manual
+                # dead letters. They still consume the shared budget, so newer removable
+                # evidence is evicted when necessary rather than silently exceeding it.
+                break
+
+    def _prune_conflicts_locked(self) -> None:
+        self._prune_artifact_quarantine_locked()
+
+    def _prune_quarantine_locked(self) -> None:
+        self._prune_artifact_quarantine_locked()
 
     def conflict_evidence(self) -> tuple[LabArtifactConflictEvidence, ...]:
         with self._exclusive_lock():

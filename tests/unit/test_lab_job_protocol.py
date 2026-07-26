@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Thread
 from uuid import UUID, uuid4
 
 import pytest
@@ -453,8 +454,239 @@ def test_owned_entry_isolation_startup_rebuilds_corrupt_identity_evidence(
         observed.st_nlink,
     )
     assert isolated.path.read_text(encoding="utf-8") == "{broken"
-    assert len(tuple(isolated.path.parent.glob("invalid-evidence-*.raw"))) == 1
+    raw_evidence = tuple(isolated.path.parent.glob("invalid-evidence-*.raw"))
+    assert len(raw_evidence) == 1
+    assert rebuilt.invalid_evidence is not None
+    assert rebuilt.invalid_evidence.name == raw_evidence[0].name
+    assert lab_job_protocol.LabCommandSpool._OWNED_INVALID_EVIDENCE_NAME.fullmatch(
+        raw_evidence[0].name
+    )
+    raw_stat = raw_evidence[0].lstat()
+    assert (
+        rebuilt.invalid_evidence.device,
+        rebuilt.invalid_evidence.inode,
+        rebuilt.invalid_evidence.mode,
+        rebuilt.invalid_evidence.link_count,
+    ) == (raw_stat.st_dev, raw_stat.st_ino, raw_stat.st_mode, raw_stat.st_nlink)
     assert restarted.pending() == ()
+
+
+def test_owned_entry_isolation_move_is_atomic_no_clobber_when_destination_appears(
+    tmp_path: Path,
+) -> None:
+    class DestinationInjectingSpool(LabCommandSpool):
+        def _before_owned_entry_move(self, _source: Path, container: Path) -> None:
+            (container / "entry").write_text("injected", encoding="utf-8")
+
+    spool = DestinationInjectingSpool(tmp_path / "commands")
+    source = spool.pending_dir / f"{uuid4()}.json"
+    source.write_text("original", encoding="utf-8")
+    observed = source.lstat()
+
+    with pytest.raises((FileExistsError, InvalidCommandEnvelopeError)):
+        spool._isolate_owned_entry_locked(source, observed, reason="race")
+
+    assert source.read_text(encoding="utf-8") == "original"
+    containers = tuple(spool.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(containers) == 1
+    assert (containers[0] / "entry").read_text(encoding="utf-8") == "injected"
+    LabCommandSpool(spool.root, max_isolation_records=1, max_isolation_bytes=1)
+    assert source.read_text(encoding="utf-8") == "original"
+    assert (containers[0] / "entry").read_text(encoding="utf-8") == "injected"
+
+
+def test_owned_entry_isolation_concurrent_movers_never_overwrite_an_entry(
+    tmp_path: Path,
+) -> None:
+    move_barrier = Barrier(2)
+
+    class RacingSpool(LabCommandSpool):
+        def _before_owned_entry_move(self, _source: Path, _container: Path) -> None:
+            move_barrier.wait(timeout=2)
+
+    spool = RacingSpool(tmp_path / "commands")
+    first = spool.pending_dir / f"{uuid4()}.json"
+    second = spool.pending_dir / f"{uuid4()}.json"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    first_stat = first.lstat()
+    second_stat = second.lstat()
+    container = spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    container.mkdir(mode=0o700)
+    failures: list[BaseException] = []
+
+    def move(source: Path, observed: os.stat_result) -> None:
+        try:
+            spool._move_bound_entry_into_container_locked(
+                source,
+                container,
+                observed,
+                expected_link_target=None,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [
+        Thread(target=move, args=(first, first_stat)),
+        Thread(target=move, args=(second, second_stat)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    surviving = [path for path in (first, second, container / "entry") if path.exists()]
+    assert sorted(path.read_text(encoding="utf-8") for path in surviving) == ["first", "second"]
+    assert len(failures) == 1
+    assert isinstance(failures[0], (FileExistsError, InvalidCommandEnvelopeError))
+
+
+@pytest.mark.parametrize("lookalike_kind", ["regular", "symlink", "hardlink"])
+def test_owned_entry_retention_never_claims_invalid_evidence_lookalikes(
+    tmp_path: Path,
+    lookalike_kind: str,
+) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root, max_isolation_records=1, max_isolation_bytes=1024 * 1024)
+    source = spool.pending_dir / f"{uuid4()}.json"
+    source.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(source)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    container = isolated.path.parent
+    outside = tmp_path / "operator-note"
+    outside.write_text("operator", encoding="utf-8")
+    lookalike = container / "invalid-evidence-operator-note.raw"
+    if lookalike_kind == "regular":
+        lookalike.write_text("operator", encoding="utf-8")
+    elif lookalike_kind == "symlink":
+        lookalike.symlink_to(outside)
+    else:
+        os.link(outside, lookalike)
+    exact_temporary = container / "operator-exact-name.tmp"
+    os.link(outside, exact_temporary)
+    exact_stat = exact_temporary.lstat()
+    exact_lookalike = container / LabCommandSpool._invalid_evidence_name(
+        exact_stat,
+        content_hash=None,
+    )
+    exact_temporary.rename(exact_lookalike)
+    assert LabCommandSpool._OWNED_INVALID_EVIDENCE_NAME.fullmatch(exact_lookalike.name)
+    prefix_miss = container / "operator-invalid-evidence-deadbeef.raw"
+    suffix_miss = container / "invalid-evidence-deadbeef.raw.note"
+    prefix_miss.write_text("prefix", encoding="utf-8")
+    suffix_miss.write_text("suffix", encoding="utf-8")
+    for path in (container, container / "evidence.json", isolated.path):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    later = spool.pending_dir / f"{uuid4()}.json"
+    later.write_text("{later", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as later_error:
+        spool.load(later)
+    assert later_error.value.file_identity is not None
+    spool.quarantine(later_error.value.file_identity, reason="later")
+
+    assert os.path.lexists(lookalike)
+    assert prefix_miss.read_text(encoding="utf-8") == "prefix"
+    assert suffix_miss.read_text(encoding="utf-8") == "suffix"
+    assert exact_lookalike.read_text(encoding="utf-8") == "operator"
+    assert outside.read_text(encoding="utf-8") == "operator"
+    assert container.exists()
+
+
+@pytest.mark.parametrize("invalid_kind", ["regular", "symlink", "hardlink"])
+def test_owned_entry_retention_removes_only_typed_exact_invalid_evidence(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root)
+    source = spool.pending_dir / f"{uuid4()}.json"
+    source.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(source)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    container = isolated.path.parent
+    evidence_path = container / "evidence.json"
+    evidence_path.unlink()
+    outside = tmp_path / "outside-invalid-evidence"
+    outside.write_text("outside", encoding="utf-8")
+    if invalid_kind == "regular":
+        evidence_path.write_text("{truncated", encoding="utf-8")
+    elif invalid_kind == "symlink":
+        evidence_path.symlink_to(outside)
+    else:
+        os.link(outside, evidence_path)
+
+    LabCommandSpool(root)
+    evidence = lab_job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        evidence_path.read_bytes()
+    )
+    assert evidence.invalid_evidence is not None
+    raw_path = container / evidence.invalid_evidence.name
+    raw_stat = raw_path.lstat()
+    assert LabCommandSpool._OWNED_INVALID_EVIDENCE_NAME.fullmatch(raw_path.name)
+    assert (raw_stat.st_dev, raw_stat.st_ino, raw_stat.st_mode, raw_stat.st_nlink) == (
+        evidence.invalid_evidence.device,
+        evidence.invalid_evidence.inode,
+        evidence.invalid_evidence.mode,
+        evidence.invalid_evidence.link_count,
+    )
+    for path in (container, evidence_path, isolated.path, raw_path):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    bounded = LabCommandSpool(root, max_isolation_records=1, max_isolation_bytes=1024 * 1024)
+    later = bounded.pending_dir / f"{uuid4()}.json"
+    later.write_text("{later", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as later_error:
+        bounded.load(later)
+    assert later_error.value.file_identity is not None
+    bounded.quarantine(later_error.value.file_identity, reason="later")
+
+    assert not container.exists()
+    assert outside.read_text(encoding="utf-8") == "outside"
+    assert outside.stat().st_nlink == 1
+
+
+def test_owned_entry_retention_rejects_typed_invalid_evidence_content_change(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root)
+    source = spool.pending_dir / f"{uuid4()}.json"
+    source.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(source)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    container = isolated.path.parent
+    evidence_path = container / "evidence.json"
+    evidence_path.write_text("{truncated", encoding="utf-8")
+    LabCommandSpool(root)
+    evidence = lab_job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        evidence_path.read_bytes()
+    )
+    assert evidence.invalid_evidence is not None
+    assert evidence.invalid_evidence.content_hash is not None
+    raw_path = container / evidence.invalid_evidence.name
+    raw_path.write_text("0123456789", encoding="utf-8")
+    assert raw_path.stat().st_size == evidence.invalid_evidence.byte_count
+    for path in (container, evidence_path, isolated.path, raw_path):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    bounded = LabCommandSpool(root, max_isolation_records=1, max_isolation_bytes=1024 * 1024)
+    later = bounded.pending_dir / f"{uuid4()}.json"
+    later.write_text("{later", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as later_error:
+        bounded.load(later)
+    assert later_error.value.file_identity is not None
+    bounded.quarantine(later_error.value.file_identity, reason="later")
+
+    assert container.exists()
+    assert raw_path.read_text(encoding="utf-8") == "0123456789"
 
 
 def test_owned_entry_isolation_retention_unlinks_only_the_owned_hardlink_name(

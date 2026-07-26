@@ -734,6 +734,207 @@ def test_commit_conflict_retention_enforces_byte_budget(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("max_records", "max_bytes"),
+    [(1, 1024 * 1024), (10, 1)],
+)
+def test_artifact_quarantine_uses_one_budget_for_conflict_and_isolation_records(
+    tmp_path: Path,
+    max_records: int,
+    max_bytes: int,
+) -> None:
+    spool = LabArtifactCommitSpool(
+        tmp_path / "commits",
+        max_conflict_records=max_records,
+        max_conflict_bytes=max_bytes,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    malformed = spool.pending_dir / f"{uuid4()}.json"
+    malformed.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    for path in (isolated.path.parent, isolated.path.parent / "evidence.json", isolated.path):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
+
+    conflicts = tuple(spool.quarantine_dir.glob("*.conflict.evidence.json"))
+    isolations = tuple(spool.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(conflicts) + len(isolations) == 1
+    assert len(conflicts) == 1
+
+
+def test_artifact_quarantine_aggregate_count_budget_has_no_category_off_by_one(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(
+        tmp_path / "commits",
+        max_conflict_records=2,
+        max_conflict_bytes=1024 * 1024,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    malformed = spool.pending_dir / f"{uuid4()}.json"
+    malformed.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    for path in (isolated.path.parent, isolated.path.parent / "evidence.json", isolated.path):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    for digit in ("8", "9"):
+        conflict = LabArtifactCommitEnvelope(
+            request_id=original.request_id,
+            commit=original.commit.model_copy(update={"manifest_hash": digit * 64}),
+        )
+        with pytest.raises(RequestContentConflictError, match="different content"):
+            spool.publish(conflict)
+
+    conflicts = tuple(spool.quarantine_dir.glob("*.conflict.evidence.json"))
+    isolations = tuple(spool.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(conflicts) + len(isolations) == 2
+    assert len(conflicts) == 2
+
+
+def test_artifact_quarantine_aggregate_byte_budget_is_exact_at_boundary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=10,
+        max_conflict_bytes=1024 * 1024,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    malformed = spool.pending_dir / f"{uuid4()}.json"
+    malformed.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    for path in (isolated.path.parent, isolated.path.parent / "evidence.json", isolated.path):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
+    with spool._exclusive_lock():
+        exact_bytes = sum(record.size for record in spool._artifact_quarantine_records_locked())
+
+    exact = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=10,
+        max_conflict_bytes=exact_bytes,
+    )
+    assert len(exact._artifact_quarantine_records_locked()) == 2
+    below = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=10,
+        max_conflict_bytes=exact_bytes - 1,
+    )
+    assert len(below._artifact_quarantine_records_locked()) == 1
+    assert len(tuple(below.quarantine_dir.glob("*.conflict.evidence.json"))) == 1
+
+
+def test_artifact_quarantine_manual_dead_letter_counts_against_shared_budget(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(
+        tmp_path / "commits",
+        max_conflict_records=1,
+        max_conflict_bytes=1024 * 1024,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    malformed = spool.pending_dir / f"{uuid4()}.json"
+    malformed.mkdir()
+    (malformed / "operator.txt").write_text("retain", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    assert captured.value.file_identity is not None
+    isolated = spool.quarantine(captured.value.file_identity, reason="manual_directory")
+    for path in (isolated.path.parent, isolated.path.parent / "evidence.json"):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
+
+    assert isolated.path.is_dir()
+    assert (isolated.path / "operator.txt").read_text(encoding="utf-8") == "retain"
+    assert tuple(spool.quarantine_dir.glob("*.conflict.evidence.json")) == ()
+
+
+def test_artifact_quarantine_concurrent_additions_stay_within_shared_budget(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=2,
+        max_conflict_bytes=1024 * 1024,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    malformed = spool.pending_dir / f"{uuid4()}.json"
+    malformed.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    assert captured.value.file_identity is not None
+    spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    barrier = Barrier(5)
+    outcomes: list[type[BaseException]] = []
+
+    def add_conflict(digit: str) -> None:
+        local = LabArtifactCommitSpool(
+            root,
+            max_conflict_records=2,
+            max_conflict_bytes=1024 * 1024,
+        )
+        conflict = LabArtifactCommitEnvelope(
+            request_id=original.request_id,
+            commit=original.commit.model_copy(update={"manifest_hash": digit * 64}),
+        )
+        barrier.wait()
+        try:
+            local.publish(conflict)
+        except BaseException as exc:
+            outcomes.append(type(exc))
+
+    threads = [Thread(target=add_conflict, args=(digit,)) for digit in "4568"]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes == [RequestContentConflictError] * 4
+    restarted = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=2,
+        max_conflict_bytes=1024 * 1024,
+    )
+    conflicts = tuple(restarted.quarantine_dir.glob("*.conflict.evidence.json"))
+    isolations = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(conflicts) + len(isolations) <= 2
+
+
 def test_commit_conflict_retention_ignores_lookalike_operator_evidence(
     tmp_path: Path,
 ) -> None:
