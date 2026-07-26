@@ -453,6 +453,74 @@ def test_canonical_shard_frame_digest_matches_legacy_bytes_tokens(
     assert canonical_shard_frame_digest(frame) == legacy_digest
 
 
+@pytest.mark.parametrize("input_chunk_bytes", (1, 2, 3, 4, 4095, 4096, 4097, 64 * 1024))
+@pytest.mark.parametrize("boundary_offset", (-1, 0), ids=("lead-before", "lead-at"))
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        b"\xd0",
+        b"\xe2\x82",
+        b"\xf0\x90\x80",
+        b"\xd0\x80",
+        b"\xe2\x82\xac",
+        b"\xf0\x9f\x98\x80",
+    ),
+    ids=(
+        "truncated-two-byte",
+        "truncated-three-byte",
+        "truncated-four-byte",
+        "valid-two-byte",
+        "valid-three-byte",
+        "valid-four-byte",
+    ),
+)
+def test_legacy_pandas_bytes_stream_is_input_chunk_invariant(
+    input_chunk_bytes: int,
+    boundary_offset: int,
+    suffix: bytes,
+) -> None:
+    from rquant.canonical_json_stream import CanonicalJsonStreamWriter
+
+    prefix = b"x" * max(0, input_chunk_bytes + boundary_offset)
+    value = prefix + suffix
+    truncated = suffix in (b"\xd0", b"\xe2\x82", b"\xf0\x90\x80")
+    legacy_value = value + (b"\x00" if truncated else b"")
+    legacy_frame = pd.DataFrame({"v": pd.Series([legacy_value], dtype=object)})
+    legacy_raw = legacy_frame.to_json(
+        orient="table",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+        force_ascii=True,
+        index=False,
+    )
+    legacy_token = json.dumps(
+        json.loads(legacy_raw)["data"][0]["v"],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    expected_digest = hashlib.sha256()
+    expected_digest.update(legacy_token)
+    actual_digest = hashlib.sha256()
+    CanonicalJsonStreamWriter(actual_digest.update).write_legacy_pandas_bytes(
+        value,
+        input_chunk_bytes=input_chunk_bytes,
+    )
+
+    assert actual_digest.hexdigest() == expected_digest.hexdigest()
+
+
+def test_canonical_shard_frame_digest_stabilizes_truncated_byte_at_4096_boundary() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": pd.Series([b"x" * 4096 + bytes.fromhex("d0")], dtype=object)})
+
+    assert (
+        canonical_shard_frame_digest(frame)
+        == "c186ddb315d79a62279ada7f238325366c4717ca24b32789108fa0956015b380"
+    )
+
+
 @pytest.mark.parametrize(
     ("value", "error_type"),
     [
@@ -600,6 +668,25 @@ def test_canonical_shard_frame_digest_bounds_large_bytes_scratch() -> None:
     tracemalloc.stop()
 
     assert len(digest) == 64
+    assert peak <= 2 * 1024 * 1024
+
+
+def test_legacy_pandas_bytes_stream_bounds_truncated_64_mib_scratch() -> None:
+    from rquant.canonical_json_stream import CanonicalJsonStreamWriter
+
+    size = 64 * 1024 * 1024
+    value = (b"x" * (size - 1)) + b"\xd0"
+    digest = hashlib.sha256()
+
+    tracemalloc.start()
+    CanonicalJsonStreamWriter(digest.update).write_legacy_pandas_bytes(
+        value,
+        input_chunk_bytes=64 * 1024,
+    )
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest.hexdigest()) == 64
     assert peak <= 2 * 1024 * 1024
 
 

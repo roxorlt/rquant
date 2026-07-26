@@ -51,9 +51,11 @@
 ### Fixed
 
 - **Strategy Lab shard hash legacy bytes 兼容**：为 table bytes 单元格新增有界增量 decoder，
-  精确复现 pandas ujson 对截断多字节、低六位 continuation、surrogate、NUL 与非法序列的
-  历史 token/拒绝语义；旧 scheduler accepted 非法 UTF-8 bundle 可由新 finalizer 恢复，
-  同时保持 64 MiB bytes 单元格的固定小内存峰值。
+  以输入决定的虚拟终止 NUL 复现 pandas ujson 对截断多字节、低六位 continuation、surrogate、
+  NUL 与非法序列的历史 token/拒绝语义，结果不再受内部流式分块边界影响。旧 ujson 在 EOF
+  截断字符后可能越过 C 字符串终止符产生非确定 hash；finalizer 仅在 accepted manifest、精确
+  Parquet file hash、shape/schema 均已验证且确认存在该 EOF 截断时兼容恢复，不复制越界读取。
+  64 MiB bytes 单元格仍保持固定小内存峰值。
 
 - **Strategy Lab shard hash pandas table 上下文兼容**：集中实现有界流式的 legacy
   `orient="table"` 兼容层；浮点 token 由 dtype 保真的单标量 pandas writer 以显式 15 位

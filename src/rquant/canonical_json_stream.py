@@ -103,6 +103,10 @@ class _LegacyPandasUtf8Decoder:
             raise self._invalid_start(self._invalid_start_byte)
         return text
 
+    @property
+    def requires_virtual_terminator(self) -> bool:
+        return self._remaining == 1
+
 
 class CanonicalJsonStreamWriter:
     """Write canonical ASCII JSON directly to a bounded downstream sink."""
@@ -174,14 +178,21 @@ class CanonicalJsonStreamWriter:
             self._update(base64.b64encode(chunk))
         self._update(b'"')
 
-    def write_legacy_pandas_bytes(self, value: bytes | memoryview) -> None:
+    def write_legacy_pandas_bytes(
+        self,
+        value: bytes | memoryview,
+        *,
+        input_chunk_bytes: int = 4096,
+    ) -> None:
         """Stream bytes with pandas ujson's legacy UTF-8 compatibility semantics."""
 
+        if input_chunk_bytes < 1 or input_chunk_bytes > CANONICAL_JSON_STREAM_SCRATCH_BYTES:
+            raise ValueError("legacy pandas bytes chunk is outside the scratch bound")
         payload = memoryview(value).cast("B")
         decoder = _LegacyPandasUtf8Decoder()
         self._update(b'"')
-        for start in range(0, len(payload), 4096):
-            for text in decoder.feed(payload[start : start + 4096]):
+        for start in range(0, len(payload), input_chunk_bytes):
+            for text in decoder.feed(payload[start : start + input_chunk_bytes]):
                 self.write_string_content(text)
         tail = decoder.finish()
         if tail:
@@ -228,6 +239,25 @@ class CanonicalJsonStreamWriter:
             self._update(b"]")
             return
         raise TypeError(f"unsupported canonical JSON value: {type(value).__name__}")
+
+
+def legacy_pandas_bytes_requires_virtual_terminator(
+    value: bytes | memoryview,
+    *,
+    input_chunk_bytes: int = 4096,
+) -> bool:
+    """Return whether pandas ujson would consume its trailing C-string NUL."""
+
+    if input_chunk_bytes < 1 or input_chunk_bytes > CANONICAL_JSON_STREAM_SCRATCH_BYTES:
+        raise ValueError("legacy pandas bytes chunk is outside the scratch bound")
+    payload = memoryview(value).cast("B")
+    decoder = _LegacyPandasUtf8Decoder()
+    for start in range(0, len(payload), input_chunk_bytes):
+        for _text in decoder.feed(payload[start : start + input_chunk_bytes]):
+            pass
+    requires_virtual_terminator = decoder.requires_virtual_terminator
+    decoder.finish()
+    return requires_virtual_terminator
 
 
 class CanonicalJsonEscapedStringSink:

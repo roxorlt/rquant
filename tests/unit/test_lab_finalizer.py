@@ -297,6 +297,24 @@ class _LegacyTableContextRegistry(RecordingRegistry):
         return self.delegate.aggregate_results(spec, normalized)
 
 
+class _LegacyBoundaryBytesRegistry(_LegacyTableContextRegistry):
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        result = RecordingRegistry.execute_shard(self, validated, store)
+        frame = pd.DataFrame(
+            {
+                "legacy_bytes": pd.Series(
+                    [b"x" * 4096 + bytes.fromhex("d0")],
+                    dtype=object,
+                )
+            }
+        )
+        return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
+
+
 def _ack_artifact_commit(
     scenario: _Scenario,
     *,
@@ -686,6 +704,55 @@ def test_finalizer_recovers_accepted_legacy_table_context_bundle(
     )
     assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
     assert evidence.accepted_success.receipt.status == "accepted"
+
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=scenario.root / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=registry,
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+    result = finalizer.finalize(scenario.job_id)
+
+    assert result.status == "published"
+    assert len(scenario.commit_spool.pending()) == 1
+
+
+def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+
+    observed_legacy_digest = "0103274351e3ced582911b8718b7df4506c3bd70418c6ac907fb582f80c6dab8"
+
+    def legacy_boundary_digest(frame: pd.DataFrame) -> str:
+        if tuple(frame.columns) == ("legacy_bytes",):
+            assert frame.iloc[0, 0] == b"x" * 4096 + bytes.fromhex("d0")
+            return observed_legacy_digest
+        return _legacy_canonical_shard_frame_digest(frame)
+
+    registry = _LegacyBoundaryBytesRegistry()
+    with monkeypatch.context() as legacy_worker:
+        legacy_worker.setattr(
+            lab_worker_module,
+            "canonical_shard_frame_digest",
+            legacy_boundary_digest,
+        )
+        scenario = _ready_scenario(
+            tmp_path,
+            hold_days=(1,),
+            worker_registry=registry,
+        )
+
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    assert manifest.artifacts[0].content_sha256 == observed_legacy_digest
 
     finalizer = LabFinalizer(
         reader=LabJobReader(scenario.store.path),

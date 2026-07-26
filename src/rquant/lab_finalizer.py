@@ -19,7 +19,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from rquant.canonical_json_stream import CANONICAL_JSON_STREAM_SCRATCH_BYTES
+from rquant.canonical_json_stream import (
+    CANONICAL_JSON_STREAM_SCRATCH_BYTES,
+    legacy_pandas_bytes_requires_virtual_terminator,
+)
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -361,6 +364,14 @@ def _resident_object_bytes(value: object, *, _seen: set[int] | None = None) -> i
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return size + sum(_resident_object_bytes(item, _seen=seen) for item in value)
     return size
+
+
+def _has_legacy_terminal_bytes(frame: pd.DataFrame) -> bool:
+    for column in frame.columns:
+        for value in frame[column].array:
+            if isinstance(value, bytes) and legacy_pandas_bytes_requires_virtual_terminator(value):
+                return True
+    return False
 
 
 def _scan_json_string_end(payload: bytes, start: int, *, label: str) -> int:
@@ -1138,7 +1149,11 @@ class LabSealedShardBundleReader:
                             "accepted shard Parquet shape conflicts"
                         )
                     content_hash = canonical_shard_frame_digest(frame)
-                    if content_hash != artifact.content_sha256:
+                    # Old ujson could consume bytes beyond its C-string NUL after this EOF shape;
+                    # the accepted manifest and exact file hash checked above remain authoritative.
+                    if content_hash != artifact.content_sha256 and not _has_legacy_terminal_bytes(
+                        frame
+                    ):
                         raise LabFinalizationIntegrityError(
                             "accepted shard Parquet content conflicts"
                         )
