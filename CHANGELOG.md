@@ -50,6 +50,11 @@
 
 ### Fixed
 
+- **Strategy Lab shard hash uint64 旧制品兼容**：流式 table-data encoder 将 NumPy/pandas
+  unsigned scalar 安全归一为 Python `int`，避免 `2**63` 至 `2**64-1` 被 ujson 有符号回绕；
+  schema 的历史语义与含缺失 unsigned categorical 的浮点提升保持不变。边界、随机差分及
+  scheduler 已接受的旧 bundle finalizer 恢复测试覆盖 `uint64`、`UInt64` 与 unsigned category。
+
 - **Strategy Lab shard hash 旧制品兼容**：流式 `orient="table"` hash 增加 pandas 列上下文
   语义，普通 timedelta 缺失值继续编码为旧版 `"NaT"`，含缺失值的整数 categorical 继续
   按浮点列提升，float32 NaN/Inf 继续写为 `null`。固定向量与随机混合帧覆盖 schema/data、

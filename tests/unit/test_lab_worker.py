@@ -128,6 +128,50 @@ def test_canonical_shard_frame_digest_matches_legacy_context_fixed_vectors(
     assert canonical_shard_frame_digest(frame) == expected
 
 
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        (
+            pd.DataFrame({"v": pd.Series([0, 2**63, 2**64 - 1], dtype="uint64")}),
+            "dd4738d19023d905d86161cac1756b829316bfd6a452c02df488c0697ef3cff2",
+        ),
+        (
+            pd.DataFrame({"v": pd.Series([0, None, 2**63, 2**64 - 1], dtype="UInt64")}),
+            "034ddd9774438dcd5af3b94ba4f2023ae6fb6110f33cc5d820929d36c4ba675c",
+        ),
+        (
+            pd.DataFrame({"v": pd.Categorical(pd.Series([0, 2**63, 2**64 - 1], dtype="UInt64"))}),
+            "807457ac947b02abb6fbd67a920b8bd1d41a216c597ce310651d94e0f8dc92c0",
+        ),
+        (
+            pd.DataFrame(
+                {"v": pd.Categorical(pd.Series([0, None, 2**63, 2**64 - 1], dtype="UInt64"))}
+            ),
+            "3e55fb177e3ca66c033b30a3aa01332d18da11ac92b453b06c722194f20b5031",
+        ),
+    ],
+    ids=["uint64", "nullable-uint64", "unsigned-category", "unsigned-category-na"],
+)
+def test_canonical_shard_frame_digest_matches_legacy_unsigned_fixed_vectors(
+    frame: pd.DataFrame,
+    expected: str,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    assert _legacy_canonical_shard_frame_digest(frame) == expected
+    assert canonical_shard_frame_digest(frame) == expected
+
+
+def test_canonical_shard_frame_digest_matches_random_unsigned_legacy_values() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    rng = random.Random(20260729)
+    values = [0, 2**63, 2**64 - 1, *(rng.getrandbits(64) for _ in range(257))]
+    frame = pd.DataFrame({"v": pd.Series(values, dtype="uint64")})
+
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
 def test_canonical_shard_frame_digest_matches_legacy_mixed_frame() -> None:
     from rquant.lab_worker import canonical_shard_frame_digest
 

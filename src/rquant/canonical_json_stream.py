@@ -187,11 +187,19 @@ class PandasJsonColumnAccessor:
         self._table_context = table_context
         self._table_timedelta = table_context and pd.api.types.is_timedelta64_dtype(series.dtype)
         self._table_float = table_context and pd.api.types.is_float_dtype(series.dtype)
+        categorical_dtype = series.dtype if isinstance(series.dtype, pd.CategoricalDtype) else None
+        self._table_unsigned = table_context and (
+            pd.api.types.is_unsigned_integer_dtype(series.dtype)
+            or (
+                categorical_dtype is not None
+                and pd.api.types.is_unsigned_integer_dtype(categorical_dtype.categories.dtype)
+            )
+        )
         self._table_integer_categorical_with_missing = (
             table_context
-            and isinstance(series.dtype, pd.CategoricalDtype)
-            and pd.api.types.is_integer_dtype(series.dtype.categories.dtype)
-            and not pd.api.types.is_bool_dtype(series.dtype.categories.dtype)
+            and categorical_dtype is not None
+            and pd.api.types.is_integer_dtype(categorical_dtype.categories.dtype)
+            and not pd.api.types.is_bool_dtype(categorical_dtype.categories.dtype)
             and series.hasnans
         )
         self._arrow_chunked: pa.ChunkedArray | None = None
@@ -333,6 +341,8 @@ class PandasJsonColumnAccessor:
             return
         if self._table_integer_categorical_with_missing and not pd.isna(value):
             value = float(value)
+        elif self._table_unsigned and not pd.isna(value):
+            value = int(value)
         write_pandas_json_value(
             writer,
             value,

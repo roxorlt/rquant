@@ -68,13 +68,21 @@ from rquant.lab_shard_protocol import (
 from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_digest
 from rquant.strategy_job_adapters import (
     LabJobExecutionResult,
+    LabShardExecutionResult,
     LabShardMetric,
     LabShardTable,
+    ValidatedStrategyShard,
     default_strategy_job_adapter_registry,
 )
 
 from .test_lab_jobs import _create_v4_job_fixture
-from .test_lab_worker import NOW, RecordingRegistry, _nshape_compare_spec, _worker
+from .test_lab_worker import (
+    NOW,
+    RecordingRegistry,
+    _legacy_canonical_shard_frame_digest,
+    _nshape_compare_spec,
+    _worker,
+)
 
 TEST_AUTHORITY_KEY = LabFinalizerAuthorityKey(
     key_id="finalizer-test-key",
@@ -170,6 +178,7 @@ def _ready_scenario(
     *,
     hold_days: tuple[int, ...] = (1, 2),
     commit_spool_type: type[LabArtifactCommitSpool] = LabArtifactCommitSpool,
+    worker_registry: RecordingRegistry | None = None,
 ) -> _Scenario:
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -209,7 +218,7 @@ def _ready_scenario(
     scheduler.run_once()
     worker = _worker(
         tmp_path,
-        registry=RecordingRegistry(),
+        registry=worker_registry or RecordingRegistry(),
         claims=claims,
         reports=reports,
     )
@@ -228,6 +237,18 @@ def _ready_scenario(
         artifact_store=artifact_store,
         commit_spool=commit_spool,
     )
+
+
+class _LegacyUnsignedRegistry(RecordingRegistry):
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        result = super().execute_shard(validated, store)
+        frame = result.tables[0].frame.copy()
+        frame["hold_days"] = pd.Series([2**64 - 1], dtype="uint64")
+        return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
 
 
 def _ack_artifact_commit(
@@ -548,6 +569,41 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
     assert replay_counts == [(0, 0)] * 5
     assert (sealed.path / "metrics.json").read_bytes() == metrics_before
     assert (sealed.path / "report.md").read_bytes() == report_before
+
+
+def test_finalizer_recovers_accepted_legacy_uint64_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+
+    with monkeypatch.context() as legacy_worker:
+        legacy_worker.setattr(
+            lab_worker_module,
+            "canonical_shard_frame_digest",
+            _legacy_canonical_shard_frame_digest,
+        )
+        scenario = _ready_scenario(
+            tmp_path,
+            hold_days=(1,),
+            worker_registry=_LegacyUnsignedRegistry(),
+        )
+
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0]
+    persisted = pd.read_parquet(attempt / artifact.file_name)
+    assert str(persisted["hold_days"].dtype) == "uint64"
+    assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
+    assert evidence.accepted_success.receipt.status == "accepted"
+
+    result = scenario.finalizer().finalize(scenario.job_id)
+
+    assert result.status == "published"
+    assert len(scenario.commit_spool.pending()) == 1
 
 
 def test_finalizer_markdown_encodes_all_dynamic_text_as_indented_canonical_json() -> None:
