@@ -7954,6 +7954,15 @@ BEGIN
 END
 """
 
+_V5_JOB_ID_IMMUTABLE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_id_immutable
+BEFORE UPDATE OF job_id ON lab_job
+WHEN NEW.job_id IS NOT OLD.job_id
+BEGIN
+    SELECT RAISE(ABORT, 'lab job_id is immutable');
+END
+"""
+
 # A ready row has no in-place lifecycle updates. Cancellation/deadline handling
 # uses the narrow terminal capability below; successful completion uses only the
 # artifact capability and may change the fence as part of that same transaction.
@@ -8315,6 +8324,7 @@ END
 _V5_EXPECTED_TRIGGER_SQL = {
     "trg_lab_complete_result_job_no_delete": _V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER,
     "trg_lab_job_existing_key_no_insert": _V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER,
+    "trg_lab_job_id_immutable": _V5_JOB_ID_IMMUTABLE_TRIGGER,
     "trg_lab_complete_result_ready_job_update": _V5_COMPLETE_RESULT_READY_JOB_UPDATE_TRIGGER,
     "trg_lab_complete_result_sealed_job_no_update": (
         _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER
@@ -8374,4 +8384,5 @@ _SCHEMA_STATEMENTS = tuple(
     _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
     _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
     _V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER,
+    _V5_JOB_ID_IMMUTABLE_TRIGGER,
 )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -324,10 +326,169 @@ def test_bad_json_can_be_quarantined_without_bare_dict(tmp_path: Path) -> None:
         spool.load(bad_path)
 
     quarantined = spool.quarantine(bad_path, reason="invalid_json")
-    assert quarantined.path.parent == spool.quarantine_dir
+    assert quarantined.path.parent.parent == spool.quarantine_dir
     assert quarantined.reason == "invalid_json"
     assert not bad_path.exists()
     assert quarantined.path.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize(
+    "entry_kind",
+    ["regular", "symlink", "hardlink", "fifo", "empty_directory", "nonempty_directory"],
+)
+def test_owned_entry_isolation_primitive_moves_only_bound_directory_entry(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    if entry_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+    spool = LabCommandSpool(tmp_path / "commands")
+    source = spool.pending_dir / f"{uuid4()}.json"
+    outside = tmp_path / "outside"
+    outside.write_text("outside", encoding="utf-8")
+    if entry_kind == "regular":
+        source.write_text("{broken", encoding="utf-8")
+    elif entry_kind == "symlink":
+        os.symlink(outside, source)
+    elif entry_kind == "hardlink":
+        os.link(outside, source)
+    elif entry_kind == "fifo":
+        os.mkfifo(source)
+    else:
+        source.mkdir()
+        if entry_kind == "nonempty_directory":
+            (source / "manual.txt").write_text("retain manually", encoding="utf-8")
+    observed = source.lstat()
+
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(source)
+    identity = captured.value.file_identity
+    assert identity is not None
+    isolated = spool.quarantine(identity, reason=f"invalid:{entry_kind}")
+
+    assert not os.path.lexists(source)
+    assert isolated.path.parent.parent == spool.quarantine_dir
+    evidence_path = isolated.path.parent / "evidence.json"
+    evidence = lab_job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        evidence_path.read_bytes()
+    )
+    destination = isolated.path.lstat()
+    assert (evidence.device, evidence.inode, evidence.mode, evidence.link_count) == (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_nlink,
+    )
+    assert (destination.st_dev, destination.st_ino, destination.st_mode) == (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+    )
+    if entry_kind == "symlink":
+        assert os.readlink(isolated.path) == str(outside)
+    if entry_kind == "hardlink":
+        assert outside.read_text(encoding="utf-8") == "outside"
+        assert outside.stat().st_ino == destination.st_ino
+        assert outside.stat().st_nlink == 2
+    if entry_kind == "fifo":
+        assert stat.S_ISFIFO(destination.st_mode)
+    if entry_kind == "nonempty_directory":
+        assert (isolated.path / "manual.txt").read_text(encoding="utf-8") == "retain manually"
+        assert evidence.manual_retention is True
+
+    restarted = LabCommandSpool(spool.root)
+    reconciled = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert reconciled == (evidence_path,)
+
+
+def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root, max_isolation_records=8, max_isolation_bytes=1024 * 1024)
+    for index in range(7):
+        source = spool.pending_dir / f"{UUID(int=index + 1)}.json"
+        source.write_text("{broken", encoding="utf-8")
+        with pytest.raises(InvalidCommandEnvelopeError) as captured:
+            spool.load(source)
+        assert captured.value.file_identity is not None
+        spool.quarantine(captured.value.file_identity, reason="invalid_json")
+    incomplete = spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    incomplete.mkdir()
+    (incomplete / "evidence.json").write_text("{truncated", encoding="utf-8")
+
+    bounded = LabCommandSpool(root, max_isolation_records=1, max_isolation_bytes=1)
+
+    bundles = tuple(bounded.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(bundles) <= 1
+    assert all(path.is_dir() for path in bundles)
+
+
+def test_owned_entry_isolation_startup_rebuilds_corrupt_identity_evidence(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root)
+    source = spool.pending_dir / f"{uuid4()}.json"
+    source.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(source)
+    identity = captured.value.file_identity
+    assert identity is not None
+    isolated = spool.quarantine(identity, reason="invalid_json")
+    observed = isolated.path.lstat()
+    evidence_path = isolated.path.parent / "evidence.json"
+    evidence_path.write_text("{truncated", encoding="utf-8")
+
+    restarted = LabCommandSpool(root)
+
+    rebuilt = lab_job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        evidence_path.read_bytes()
+    )
+    assert rebuilt.source_area == "recovered"
+    assert (rebuilt.device, rebuilt.inode, rebuilt.mode, rebuilt.link_count) == (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_nlink,
+    )
+    assert isolated.path.read_text(encoding="utf-8") == "{broken"
+    assert len(tuple(isolated.path.parent.glob("invalid-evidence-*.raw"))) == 1
+    assert restarted.pending() == ()
+
+
+def test_owned_entry_isolation_retention_unlinks_only_the_owned_hardlink_name(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+    spool = LabCommandSpool(root, max_isolation_records=1, max_isolation_bytes=1024 * 1024)
+    outside = tmp_path / "outside-hardlink"
+    outside.write_text("outside", encoding="utf-8")
+    original = outside.stat()
+    source = spool.pending_dir / f"{uuid4()}.json"
+    os.link(outside, source)
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(source)
+    identity = captured.value.file_identity
+    assert identity is not None
+    isolated = spool.quarantine(identity, reason="invalid_hardlink")
+    os.utime(isolated.path.parent, ns=(1, 1), follow_symlinks=False)
+    os.utime(isolated.path.parent / "evidence.json", ns=(1, 1), follow_symlinks=False)
+
+    later = spool.pending_dir / f"{uuid4()}.json"
+    later.write_text("{later", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as later_error:
+        spool.load(later)
+    assert later_error.value.file_identity is not None
+    spool.quarantine(later_error.value.file_identity, reason="invalid_json")
+
+    assert not isolated.path.parent.exists()
+    assert outside.read_text(encoding="utf-8") == "outside"
+    assert (outside.stat().st_dev, outside.stat().st_ino) == (
+        original.st_dev,
+        original.st_ino,
+    )
+    assert outside.stat().st_nlink == 1
 
 
 def test_pending_order_is_fifo_across_reverse_request_ids_and_restart(tmp_path: Path) -> None:

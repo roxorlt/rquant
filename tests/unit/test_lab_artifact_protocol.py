@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier, Thread
@@ -12,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 import rquant.lab_artifact_protocol as artifact_protocol
+import rquant.lab_job_protocol as job_protocol
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -24,7 +27,6 @@ from rquant.lab_artifact_protocol import (
 )
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
-    LabHardLinkQuarantineArtifact,
     RequestContentConflictError,
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity
@@ -88,11 +90,11 @@ class _CrashableCursorSpool(LabArtifactCommitSpool):
 class _CrashableConflictCleanupSpool(LabArtifactCommitSpool):
     crash_stage: str | None = None
 
-    def _after_corrupt_conflict_stage(
+    def _after_owned_entry_isolation_stage(
         self,
         stage: str,
-        _raw_path: Path,
-        _target_path: Path,
+        _source: Path,
+        _container: Path,
     ) -> None:
         if stage == self.crash_stage:
             raise _ConflictCleanupCrash(stage)
@@ -210,12 +212,18 @@ def test_commit_spool_corrupt_advisory_cursor_isolated_and_queue_remains_reachab
     assert selected == (valid.path,)
     assert restarted._scan_cursor_path.is_file()
     assert restarted._scan_cursor_path.stat().st_nlink == 1
-    isolated = tuple(restarted.quarantine_dir.glob("artifact-commit-scan-cursor.*.bad"))
+    isolated = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
     assert len(isolated) == 1
+    evidence = job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        isolated[0].read_bytes()
+    )
+    assert evidence.source_name == cursor.name
     if cursor_kind in {"symlink", "hardlink"}:
         assert outside.read_text(encoding="utf-8") == "outside cursor"
     if cursor_kind == "directory":
-        assert (isolated[0] / "operator.txt").read_text(encoding="utf-8") == "preserve"
+        assert (isolated[0].parent / "entry" / "operator.txt").read_text(
+            encoding="utf-8"
+        ) == "preserve"
     assert LabArtifactCommitSpool(root).fair_pending_paths(limit=1) == (valid.path,)
 
 
@@ -232,6 +240,98 @@ def test_commit_spool_cursor_write_crash_is_advisory_across_restart(tmp_path: Pa
     restarted = LabArtifactCommitSpool(root)
     assert restarted.fair_pending_paths(limit=1) == (valid.path,)
     assert tuple(root.glob(".*scan-cursor*.tmp")) == ()
+
+
+@pytest.mark.parametrize("crash_stage", ["temporary_written", "cursor_replaced"])
+def test_commit_spool_real_process_cursor_crash_reconciles_owned_temporary(
+    tmp_path: Path,
+    crash_stage: str,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    valid = spool.publish(_envelope(tmp_path))
+    assert isinstance(valid, LabArtifactCommitSpoolEntry)
+    script = """
+import os
+import sys
+from pathlib import Path
+from rquant.lab_artifact_protocol import LabArtifactCommitSpool
+
+class CrashSpool(LabArtifactCommitSpool):
+    def _after_scan_cursor_stage(self, stage, path):
+        if stage == sys.argv[2]:
+            os._exit(73)
+
+CrashSpool(Path(sys.argv[1])).fair_pending_paths(limit=1)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root), crash_stage],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 73, completed.stderr
+    crash_temporaries = tuple(root.glob("..artifact-commit-scan-cursor.json.*.tmp"))
+    assert len(crash_temporaries) == int(crash_stage == "temporary_written")
+
+    restarted = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=1,
+        max_conflict_bytes=1,
+    )
+    assert restarted.fair_pending_paths(limit=1) == (valid.path,)
+    assert tuple(root.glob("..artifact-commit-scan-cursor.json.*.tmp")) == ()
+    isolated = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(isolated) == int(crash_stage == "temporary_written")
+
+
+@pytest.mark.parametrize(
+    "entry_kind",
+    ["regular", "symlink", "hardlink", "fifo", "empty_directory", "nonempty_directory"],
+)
+def test_commit_spool_startup_isolates_every_owned_cursor_temporary_inode(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    if entry_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    valid = spool.publish(_envelope(tmp_path))
+    assert isinstance(valid, LabArtifactCommitSpoolEntry)
+    temporary = root / f"..artifact-commit-scan-cursor.json.{uuid4().hex}.tmp"
+    outside = tmp_path / "outside-cursor-temp"
+    outside.write_text("outside", encoding="utf-8")
+    if entry_kind == "regular":
+        temporary.write_text("truncated", encoding="utf-8")
+    elif entry_kind == "symlink":
+        os.symlink(outside, temporary)
+    elif entry_kind == "hardlink":
+        os.link(outside, temporary)
+    elif entry_kind == "fifo":
+        os.mkfifo(temporary)
+    else:
+        temporary.mkdir()
+        if entry_kind == "nonempty_directory":
+            (temporary / "manual.txt").write_text("manual", encoding="utf-8")
+
+    restarted = LabArtifactCommitSpool(root)
+
+    assert restarted.fair_pending_paths(limit=1) == (valid.path,)
+    assert not os.path.lexists(temporary)
+    evidence_paths = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(evidence_paths) == 1
+    evidence = job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        evidence_paths[0].read_bytes()
+    )
+    assert evidence.source_name == temporary.name
+    if entry_kind in {"symlink", "hardlink"}:
+        assert outside.read_text(encoding="utf-8") == "outside"
+    if entry_kind == "nonempty_directory":
+        assert (evidence_paths[0].parent / "entry" / "manual.txt").read_text(
+            encoding="utf-8"
+        ) == "manual"
 
 
 @pytest.mark.parametrize("failure", ["isolation", "replace", "fsync"])
@@ -300,7 +400,7 @@ def test_commit_spool_rejects_traversal_and_quarantines_symlink(tmp_path: Path) 
         reason="invalid_envelope:symlink",
     )
 
-    assert quarantined.path.parent == spool.quarantine_dir
+    assert quarantined.path.parent.parent == spool.quarantine_dir
     assert not os.path.lexists(symlink)
     assert outside.read_text(encoding="utf-8") == "{}"
 
@@ -358,16 +458,18 @@ def test_commit_spool_neutralizes_hardlinked_pending_without_touching_external_n
 
     quarantined = spool.quarantine(identity, reason="invalid_inode:hardlink")
 
-    evidence = LabHardLinkQuarantineArtifact.model_validate_json(quarantined.path.read_bytes())
+    evidence = job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        (quarantined.path.parent / "evidence.json").read_bytes()
+    )
     assert not os.path.lexists(pending)
     assert external.read_text(encoding="utf-8") == "external evidence"
     assert (external.stat().st_dev, external.stat().st_ino) == (
         original_identity.st_dev,
         original_identity.st_ino,
     )
-    assert external.stat().st_nlink == 1
-    assert evidence.original_name == pending.name
-    assert (evidence.device, evidence.inode, evidence.observed_link_count) == (
+    assert external.stat().st_nlink == 2
+    assert evidence.source_name == pending.name
+    assert (evidence.device, evidence.inode, evidence.link_count) == (
         original_identity.st_dev,
         original_identity.st_ino,
         2,
@@ -390,7 +492,7 @@ def test_commit_spool_hardlink_quarantine_rejects_swapped_pending_inode(
     pending.write_text("replacement", encoding="utf-8")
     replacement_identity = pending.stat()
 
-    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
         spool.quarantine(identity, reason="invalid_inode:hardlink")
 
     assert pending.read_text(encoding="utf-8") == "replacement"
@@ -421,7 +523,7 @@ def test_commit_spool_hardlink_evidence_is_idempotent_per_inode(
         evidence_paths.append(quarantined.path)
         assert not os.path.lexists(pending)
         assert external.read_text(encoding="utf-8") == f"external evidence {index}"
-        assert external.stat().st_nlink == 1
+        assert external.stat().st_nlink == 2
 
     assert evidence_paths[0] != evidence_paths[1]
     assert all(path.is_file() for path in evidence_paths)
@@ -640,7 +742,7 @@ def test_commit_conflict_retention_ignores_lookalike_operator_evidence(
         max_conflict_records=1,
         max_conflict_bytes=1024 * 1024,
     )
-    lookalike = spool.quarantine_dir / (f"{uuid4()}.{'f' * 64}.{'e' * 16}.conflict.evidence.json")
+    lookalike = spool.quarantine_dir / f"{uuid4()}.conflict.evidence.json"
     lookalike.write_text("operator evidence", encoding="utf-8")
     os.utime(lookalike, ns=(1, 1), follow_symlinks=False)
 
@@ -759,21 +861,21 @@ def test_commit_conflict_restart_bounds_truncated_owned_temps_and_allows_republi
             max_conflict_bytes=1,
         )
         assert not os.path.lexists(temporary)
-        corrupt = tuple(spool.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json"))
-        assert len(corrupt) == 1
-        record = artifact_protocol.LabCorruptConflictTempEvidence.model_validate_json(
-            corrupt[0].read_bytes()
+        isolated = tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+        assert len(isolated) == 1
+        record = job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+            isolated[0].read_bytes()
         )
-        assert record.temporary_name == temporary.name
+        assert record.source_name == temporary.name
         assert record.byte_count == len(truncation)
 
     with pytest.raises(RequestContentConflictError, match="different content"):
         spool.publish(conflict)
     assert len(spool.conflict_evidence()) == 1
-    assert tuple(spool.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json")) == ()
+    assert len(tuple(spool.quarantine_dir.glob("owned-entry-*.dead"))) <= 1
 
 
-def test_commit_conflict_recovery_does_not_touch_temp_lookalikes_symlinks_or_hardlinks(
+def test_commit_conflict_recovery_isolates_exact_owned_temps_but_not_lookalikes(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "commits"
@@ -805,11 +907,159 @@ def test_commit_conflict_recovery_does_not_touch_temp_lookalikes_symlinks_or_har
 
     LabArtifactCommitSpool(root, max_conflict_records=1, max_conflict_bytes=1)
 
-    assert os.path.islink(temporaries[0])
+    assert not os.path.lexists(temporaries[0])
     assert outside_symlink.read_text(encoding="utf-8") == "outside symlink"
-    assert temporaries[1].stat().st_ino == outside_hardlink.stat().st_ino
+    assert not os.path.lexists(temporaries[1])
     assert outside_hardlink.read_text(encoding="utf-8") == "outside hardlink"
     assert lookalike.read_text(encoding="utf-8") == "lookalike"
+    isolated = tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(isolated) <= 1
+
+
+@pytest.mark.parametrize(
+    "entry_kind",
+    ["symlink", "directory", "hardlink", "fifo", "different_regular"],
+)
+def test_commit_conflict_exact_temporary_abnormal_entry_isolated_then_republished(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    if entry_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=8,
+        max_conflict_bytes=1024 * 1024,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    evidence = LabArtifactConflictEvidence.from_conflict(
+        conflict,
+        reason="request_id already pending with different content",
+    )
+    temporary = spool._conflict_temporary_path(evidence)
+    outside = tmp_path / "outside-conflict-temp"
+    outside.write_text("outside", encoding="utf-8")
+    if entry_kind == "symlink":
+        os.symlink(outside, temporary)
+    elif entry_kind == "directory":
+        temporary.mkdir()
+        (temporary / "manual.txt").write_text("manual", encoding="utf-8")
+    elif entry_kind == "hardlink":
+        os.link(outside, temporary)
+    elif entry_kind == "fifo":
+        os.mkfifo(temporary)
+    else:
+        temporary.write_text("not typed conflict evidence", encoding="utf-8")
+
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
+
+    assert not os.path.lexists(temporary)
+    completed = spool._conflict_evidence_path(evidence)
+    assert LabArtifactConflictEvidence.model_validate_json(completed.read_bytes()) == evidence
+    isolated = tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(isolated) == 1
+    isolation = job_protocol._LabOwnedEntryIsolationEvidence.model_validate_json(
+        isolated[0].read_bytes()
+    )
+    assert isolation.source_name == temporary.name
+    if entry_kind in {"symlink", "hardlink"}:
+        assert outside.read_text(encoding="utf-8") == "outside"
+    if entry_kind == "directory":
+        assert (isolated[0].parent / "entry" / "manual.txt").read_text(encoding="utf-8") == "manual"
+        assert isolation.manual_retention is True
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
+    assert tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json")) == isolated
+
+
+def test_commit_conflict_temporary_inode_swap_never_moves_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    conflict = LabArtifactCommitEnvelope(
+        request_id=original.request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    evidence = LabArtifactConflictEvidence.from_conflict(
+        conflict,
+        reason="request_id already pending with different content",
+    )
+    temporary = spool._conflict_temporary_path(evidence)
+    temporary.write_text("corrupt", encoding="utf-8")
+    replacement_inode: int | None = None
+
+    def swap_after_evidence(stage: str, source: Path, _container: Path) -> None:
+        nonlocal replacement_inode
+        if stage == "evidence_written" and source == temporary:
+            temporary.unlink()
+            temporary.write_text("replacement", encoding="utf-8")
+            replacement_inode = temporary.stat().st_ino
+
+    monkeypatch.setattr(spool, "_after_owned_entry_isolation_stage", swap_after_evidence)
+    spool._recover_conflict_evidence_locked()
+
+    assert replacement_inode is not None
+    assert temporary.read_text(encoding="utf-8") == "replacement"
+    assert temporary.stat().st_ino == replacement_inode
+    monkeypatch.undo()
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
+    assert (
+        LabArtifactConflictEvidence.model_validate_json(
+            spool._conflict_evidence_path(evidence).read_bytes()
+        )
+        == evidence
+    )
+
+
+def test_commit_conflict_corrupt_deterministic_targets_share_bounded_isolation_retention(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=1,
+        max_conflict_bytes=1,
+    )
+    original = _envelope(tmp_path)
+    spool.publish(original)
+    lookalike = spool.quarantine_dir / f"{uuid4()}.conflict.evidence.json"
+    lookalike.write_text("operator evidence", encoding="utf-8")
+
+    for digit in "0123456":
+        conflict = LabArtifactCommitEnvelope(
+            request_id=original.request_id,
+            commit=original.commit.model_copy(update={"manifest_hash": digit * 64}),
+        )
+        evidence = LabArtifactConflictEvidence.from_conflict(
+            conflict,
+            reason="request_id already pending with different content",
+        )
+        target = spool._conflict_evidence_path(evidence)
+        target.write_text(f"corrupt-{digit}", encoding="utf-8")
+        with pytest.raises(RequestContentConflictError, match="different content"):
+            spool.publish(conflict)
+        assert LabArtifactConflictEvidence.model_validate_json(target.read_bytes()) == evidence
+
+    restarted = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=1,
+        max_conflict_bytes=1,
+    )
+    assert len(tuple(restarted.quarantine_dir.glob("owned-entry-*.dead"))) <= 1
+    assert len(restarted.conflict_evidence()) == 1
+    assert lookalike.read_text(encoding="utf-8") == "operator evidence"
 
 
 @pytest.mark.parametrize(
@@ -871,22 +1121,22 @@ def test_commit_conflict_recovery_preserves_mismatched_target_and_isolates_temp(
         monkeypatch.setattr(artifact_protocol.os, "link", appear_before_link)
 
     spool._recover_conflict_evidence_locked()
+    monkeypatch.undo()
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        spool.publish(conflict)
 
     assert outside.read_bytes() == evidence.model_dump_json().encode("utf-8")
-    if target_kind == "symlink":
-        assert os.path.islink(target)
-    else:
-        assert target.stat().st_ino == outside.stat().st_ino
+    assert LabArtifactConflictEvidence.model_validate_json(target.read_bytes()) == evidence
+    assert target.stat().st_ino != outside.stat().st_ino
     assert not os.path.lexists(temporary)
-    raw = tuple(spool.quarantine_dir.glob("*.corrupt-conflict-temp.raw.bad"))
-    assert len(raw) == 1
-    assert raw[0].read_bytes() == evidence.model_dump_json().encode("utf-8")
+    isolated = tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert isolated
 
 
 @pytest.mark.parametrize("with_outside_link", [False, True])
 @pytest.mark.parametrize(
     "crash_stage",
-    [None, "raw_moved", "evidence_written", "before_target_unlink", "target_unlinked"],
+    [None, "evidence_written", "entry_moved"],
 )
 def test_commit_conflict_corrupt_dual_link_cleanup_restarts_and_republish_converges(
     tmp_path: Path,
@@ -924,13 +1174,13 @@ def test_commit_conflict_corrupt_dual_link_cleanup_restarts_and_republish_conver
     restarted = LabArtifactCommitSpool(root)
     assert not os.path.lexists(temporary)
     assert not os.path.lexists(target)
-    raw = tuple(restarted.quarantine_dir.glob("*.corrupt-conflict-temp.raw.bad"))
-    metadata = tuple(restarted.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json"))
-    assert len(raw) == len(metadata) == 1
-    assert raw[0].read_bytes() == payload
+    raw = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/entry"))
+    metadata = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(raw) == len(metadata) == 2
+    assert all(path.read_bytes() == payload for path in raw)
     if with_outside_link:
         assert outside.read_bytes() == payload
-        assert outside.stat().st_ino == raw[0].stat().st_ino
+        assert outside.stat().st_ino == raw[0].stat().st_ino == raw[1].stat().st_ino
     with pytest.raises(RequestContentConflictError, match="different content"):
         restarted.publish(conflict)
     assert len(restarted.conflict_evidence()) == 1
@@ -974,7 +1224,7 @@ def test_commit_conflict_concurrent_republish_after_truncated_temp_is_idempotent
     assert outcomes == ["conflict", "conflict"]
     restarted = LabArtifactCommitSpool(root)
     assert len(restarted.conflict_evidence()) == 1
-    assert len(tuple(restarted.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json"))) == 1
+    assert len(tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))) == 1
 
 
 def test_commit_conflict_retention_bounds_legacy_partial_files_without_touching_lookalikes(

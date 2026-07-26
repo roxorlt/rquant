@@ -1810,7 +1810,7 @@ def test_hardlinked_pending_does_not_starve_valid_commit_at_tick_limit_one(
     assert completed is not None and completed.result_state is LabResultState.SEALED
     assert not os.path.lexists(bad)
     assert external.read_text(encoding="utf-8") == "external evidence"
-    assert external.stat().st_nlink == 1
+    assert external.stat().st_nlink == 2
 
 
 def test_artifact_quarantine_failure_does_not_block_later_valid_commit(
@@ -2452,7 +2452,7 @@ def test_bad_json_is_quarantined_and_does_not_block_valid_command(
     assert result.quarantined == 1
     assert result.applied == 1
     assert not bad.exists()
-    assert len(tuple(spool.quarantine_dir.glob("*.bad"))) == 1
+    assert len(tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))) == 1
     assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
 
 
@@ -2473,7 +2473,9 @@ def test_malformed_filename_is_quarantined_across_restart_without_blocking(
     assert result.applied == 1
     assert restarted.pending() == ()
     assert not bad.exists()
-    assert len(tuple(restarted.quarantine_dir.glob("not-a-command.json*.bad"))) == 1
+    evidence = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(evidence) == 1
+    assert json.loads(evidence[0].read_text(encoding="utf-8"))["source_name"] == bad.name
     assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
     assert LabCommandSpool(spool.root).pending() == ()
 
@@ -2498,12 +2500,12 @@ def test_pending_symlink_is_recorded_without_touching_target_or_blocking_after_r
     assert not symlink.exists()
     assert not symlink.is_symlink()
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
-    artifacts = tuple(restarted.quarantine_dir.glob("not-a-command.json*.symlink.bad.json"))
+    artifacts = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
     assert len(artifacts) == 1
     assert artifacts[0].is_file()
     assert not artifacts[0].is_symlink()
     metadata = json.loads(artifacts[0].read_text(encoding="utf-8"))
-    assert metadata["original_name"] == "not-a-command.json"
+    assert metadata["source_name"] == "not-a-command.json"
     assert metadata["link_target"] == str(victim)
     assert "invalid_envelope" in metadata["reason"]
     assert LabJobReader(store.path).get_job(valid.command.job_id) is not None
@@ -2537,7 +2539,7 @@ def test_semantic_request_conflict_is_quarantined_and_does_not_block_next_comman
     assert result.processed == 1
     assert result.applied == 1
     assert spool.pending() == ()
-    quarantine_records = tuple(spool.quarantine_dir.glob("*.bad.json"))
+    quarantine_records = tuple(spool.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
     assert len(quarantine_records) == 1
     assert "request_content_conflict" in quarantine_records[0].read_text(encoding="utf-8")
     assert LabJobReader(store.path).get_job(valid.command.job_id) is not None

@@ -11,6 +11,7 @@ import re
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Literal
@@ -183,38 +184,45 @@ class LabQuarantinedCommand(LabProtocolModel):
     reason: str = Field(min_length=1)
 
 
-class LabSymlinkQuarantineArtifact(LabProtocolModel):
-    schema_version: Literal[1] = 1
-    original_name: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-    link_target: str
-    device: int = Field(ge=0)
-    inode: int = Field(ge=1)
-
-
-class LabNonRegularQuarantineArtifact(LabProtocolModel):
-    schema_version: Literal[1] = 1
-    original_name: str = Field(min_length=1)
-    quarantined_name: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-    file_type: _LabSpoolFileType
-    device: int = Field(ge=0)
-    inode: int = Field(ge=1)
-
-
 class LabDisappearedQuarantineArtifact(LabProtocolModel):
     schema_version: Literal[1] = 1
     original_name: str = Field(min_length=1)
     reason: str = Field(min_length=1)
 
 
-class LabHardLinkQuarantineArtifact(LabProtocolModel):
+class _LabOwnedEntryIsolationEvidence(LabProtocolModel):
     schema_version: Literal[1] = 1
-    original_name: str = Field(min_length=1)
+    isolation_id: UUID
+    source_area: Literal["root", "pending", "quarantine", "recovered"]
+    source_name: str = Field(min_length=1)
+    destination_name: Literal["entry"] = "entry"
     reason: str = Field(min_length=1)
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
-    observed_link_count: int = Field(ge=1)
+    mode: int = Field(ge=0)
+    link_count: int = Field(ge=1)
+    file_type: _LabSpoolFileType
+    byte_count: int = Field(ge=0)
+    link_target: str | None = None
+    manual_retention: bool = False
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> _LabOwnedEntryIsolationEvidence:
+        if Path(self.source_name).name != self.source_name:
+            raise ValueError("isolated source_name must be a basename")
+        if LabCommandSpool._spool_file_type(self.mode) != self.file_type:
+            raise ValueError("isolated file_type does not match mode")
+        if (self.file_type == "symlink") != (self.link_target is not None):
+            raise ValueError("isolated symlink identity requires link_target")
+        return self
+
+
+@dataclass(frozen=True)
+class _LabOwnedIsolationRecord:
+    container: Path
+    container_stat: os.stat_result
+    modified_at_ns: int
+    byte_count: int
 
 
 class LabCommandSpool:
@@ -229,8 +237,22 @@ class LabCommandSpool:
         r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
         r"[0-9a-f]{4}-[0-9a-f]{12})\.json"
     )
+    _OWNED_ISOLATION_NAME = re.compile(
+        r"owned-entry-(?P<isolation_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})\.dead"
+    )
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_isolation_records: int = 256,
+        max_isolation_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
+        if max_isolation_records < 1:
+            raise ValueError("max_isolation_records must be positive")
+        if max_isolation_bytes < 1:
+            raise ValueError("max_isolation_bytes must be positive")
         self.root = Path(os.path.abspath(root))
         self.pending_dir = self.root / "pending"
         self.ack_dir = self.root / "ack"
@@ -238,8 +260,13 @@ class LabCommandSpool:
         self._lock_path = self.root / ".spool.lock"
         self._sequence_path = self.root / ".delivery-sequence"
         self._thread_lock = RLock()
+        self.max_isolation_records = max_isolation_records
+        self.max_isolation_bytes = max_isolation_bytes
         for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
             path.mkdir(parents=True, exist_ok=True)
+        with self._exclusive_lock():
+            self._reconcile_owned_isolations_locked()
+            self._prune_owned_isolations_locked()
 
     @contextmanager
     def _exclusive_lock(self) -> Iterator[None]:
@@ -328,6 +355,478 @@ class LabCommandSpool:
             return "char_device"
         return "other"
 
+    def _owned_source_area(self, parent: Path) -> Literal["root", "pending", "quarantine"]:
+        normalized = Path(os.path.abspath(parent))
+        if normalized == self.root:
+            return "root"
+        if normalized == self.pending_dir:
+            return "pending"
+        if normalized == self.quarantine_dir:
+            return "quarantine"
+        raise InvalidCommandEnvelopeError(f"unsafe isolation source parent: {parent}")
+
+    def _owned_source_path(
+        self,
+        evidence: _LabOwnedEntryIsolationEvidence,
+    ) -> Path | None:
+        parents = {
+            "root": self.root,
+            "pending": self.pending_dir,
+            "quarantine": self.quarantine_dir,
+        }
+        parent = parents.get(evidence.source_area)
+        return None if parent is None else parent / evidence.source_name
+
+    @staticmethod
+    def _stat_matches_isolation(
+        observed: os.stat_result,
+        evidence: _LabOwnedEntryIsolationEvidence,
+    ) -> bool:
+        return (
+            observed.st_dev == evidence.device
+            and observed.st_ino == evidence.inode
+            and observed.st_mode == evidence.mode
+            and observed.st_nlink == evidence.link_count
+        )
+
+    @staticmethod
+    def _stat_matches_bound_entry(
+        current: os.stat_result,
+        observed: os.stat_result,
+    ) -> bool:
+        return (
+            current.st_dev == observed.st_dev
+            and current.st_ino == observed.st_ino
+            and current.st_mode == observed.st_mode
+            and current.st_nlink == observed.st_nlink
+        )
+
+    @staticmethod
+    def _after_owned_entry_isolation_stage(
+        _stage: Literal["evidence_written", "entry_moved"],
+        _source: Path,
+        _container: Path,
+    ) -> None:
+        """Fault-injection boundary for the common owned-entry isolation primitive."""
+
+    def _move_bound_entry_into_container_locked(
+        self,
+        source: Path,
+        container: Path,
+        observed: os.stat_result,
+        *,
+        expected_link_target: str | None,
+    ) -> Path:
+        source_name = self._direct_child_name(source, source.parent)
+        source_fd = os.open(
+            source.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        container_fd = os.open(
+            container,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+            if not self._stat_matches_bound_entry(current, observed):
+                if (
+                    current.st_dev == observed.st_dev
+                    and current.st_ino == observed.st_ino
+                    and current.st_nlink != observed.st_nlink
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        f"owned entry link count changed before isolation: {source.name}"
+                    )
+                raise InvalidCommandEnvelopeError(
+                    f"owned entry changed before isolation: {source.name}"
+                )
+            if expected_link_target is not None and (
+                not stat.S_ISLNK(current.st_mode)
+                or os.readlink(source_name, dir_fd=source_fd) != expected_link_target
+            ):
+                raise InvalidCommandEnvelopeError(
+                    f"owned symlink target changed before isolation: {source.name}"
+                )
+            try:
+                os.stat("entry", dir_fd=container_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise InvalidCommandEnvelopeError(
+                    f"owned isolation destination already exists: {container.name}"
+                )
+            # The private 0700 container is newly created by the sole application writer.
+            # This application capability is an integrity boundary, not protection against
+            # a process that can arbitrarily rewrite the spool directory itself.
+            os.rename(source_name, "entry", src_dir_fd=source_fd, dst_dir_fd=container_fd)
+            destination = os.stat("entry", dir_fd=container_fd, follow_symlinks=False)
+            if not self._stat_matches_bound_entry(destination, observed):
+                raise InvalidCommandEnvelopeError(
+                    f"owned entry identity changed during isolation: {source.name}"
+                )
+            if expected_link_target is not None and (
+                not stat.S_ISLNK(destination.st_mode)
+                or os.readlink("entry", dir_fd=container_fd) != expected_link_target
+            ):
+                raise InvalidCommandEnvelopeError(
+                    f"owned symlink target changed during isolation: {source.name}"
+                )
+            os.fsync(source_fd)
+            os.fsync(container_fd)
+        finally:
+            os.close(container_fd)
+            os.close(source_fd)
+        self._fsync_directory(self.quarantine_dir)
+        return container / "entry"
+
+    def _isolate_owned_entry_locked(
+        self,
+        source: Path,
+        observed: os.stat_result,
+        *,
+        reason: str,
+        expected_link_target: str | None = None,
+    ) -> LabQuarantinedCommand:
+        source = Path(os.path.abspath(source))
+        source_name = self._direct_child_name(source, source.parent)
+        source_area = self._owned_source_area(source.parent)
+        file_type = self._spool_file_type(observed.st_mode)
+        if file_type == "symlink" and expected_link_target is None:
+            source_fd = os.open(
+                source.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                expected_link_target = os.readlink(source_name, dir_fd=source_fd)
+            finally:
+                os.close(source_fd)
+        isolation_id = uuid4()
+        container = self.quarantine_dir / f"owned-entry-{isolation_id}.dead"
+        os.mkdir(container, mode=0o700)
+        evidence = _LabOwnedEntryIsolationEvidence(
+            isolation_id=isolation_id,
+            source_area=source_area,
+            source_name=source_name,
+            reason=reason,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=observed.st_mode,
+            link_count=observed.st_nlink,
+            file_type=file_type,
+            byte_count=max(0, observed.st_size),
+            link_target=expected_link_target,
+            manual_retention=file_type == "directory",
+        )
+        evidence_path = container / "evidence.json"
+        try:
+            if not self._publish_no_clobber(
+                evidence_path,
+                evidence.model_dump_json().encode("utf-8"),
+            ):
+                raise RequestContentConflictError(
+                    f"owned isolation evidence already exists: {container.name}"
+                )
+            self._fsync_directory(self.quarantine_dir)
+            self._after_owned_entry_isolation_stage("evidence_written", source, container)
+            if stat.S_ISREG(observed.st_mode) and observed.st_nlink != 1:
+                self._after_hardlink_quarantine_evidence(
+                    LabSpoolFileIdentity(
+                        path=source,
+                        device=observed.st_dev,
+                        inode=observed.st_ino,
+                        link_count=observed.st_nlink,
+                    ),
+                    evidence_path,
+                )
+            destination = self._move_bound_entry_into_container_locked(
+                source,
+                container,
+                observed,
+                expected_link_target=expected_link_target,
+            )
+            self._after_owned_entry_isolation_stage("entry_moved", source, container)
+            return LabQuarantinedCommand(path=destination, reason=reason)
+        except BaseException:
+            # A prepared bundle is intentionally retained. Startup either resumes the
+            # identity-bound move or prunes an incomplete record within configured limits.
+            self._fsync_directory(self.quarantine_dir)
+            raise
+
+    def _load_owned_isolation_evidence(
+        self,
+        container: Path,
+    ) -> _LabOwnedEntryIsolationEvidence:
+        match = self._OWNED_ISOLATION_NAME.fullmatch(container.name)
+        if match is None:
+            raise InvalidCommandEnvelopeError(
+                f"invalid owned isolation container: {container.name}"
+            )
+        _path, payload, _file_stat = self._read_regular_child(
+            container / "evidence.json",
+            container,
+        )
+        evidence = _LabOwnedEntryIsolationEvidence.model_validate_json(payload)
+        if evidence.model_dump_json().encode("utf-8") != payload:
+            raise InvalidCommandEnvelopeError(
+                f"owned isolation evidence is not canonical: {container.name}"
+            )
+        if str(evidence.isolation_id) != match["isolation_id"]:
+            raise InvalidCommandEnvelopeError(
+                f"owned isolation evidence id mismatch: {container.name}"
+            )
+        return evidence
+
+    def _write_recovered_isolation_evidence_locked(
+        self,
+        container: Path,
+        isolation_id: UUID,
+        entry_stat: os.stat_result,
+    ) -> _LabOwnedEntryIsolationEvidence:
+        link_target = os.readlink(container / "entry") if stat.S_ISLNK(entry_stat.st_mode) else None
+        evidence = _LabOwnedEntryIsolationEvidence(
+            isolation_id=isolation_id,
+            source_area="recovered",
+            source_name=container.name,
+            reason="startup recovered moved entry with missing or invalid identity evidence",
+            device=entry_stat.st_dev,
+            inode=entry_stat.st_ino,
+            mode=entry_stat.st_mode,
+            link_count=entry_stat.st_nlink,
+            file_type=self._spool_file_type(entry_stat.st_mode),
+            byte_count=max(0, entry_stat.st_size),
+            link_target=link_target,
+            manual_retention=stat.S_ISDIR(entry_stat.st_mode),
+        )
+        evidence_path = container / "evidence.json"
+        if not self._publish_no_clobber(
+            evidence_path,
+            evidence.model_dump_json().encode("utf-8"),
+        ):
+            raise InvalidCommandEnvelopeError(
+                f"cannot replace invalid isolation evidence: {container.name}"
+            )
+        return evidence
+
+    def _reconcile_owned_isolation_container_locked(self, container: Path) -> None:
+        match = self._OWNED_ISOLATION_NAME.fullmatch(container.name)
+        if match is None:
+            return
+        try:
+            container_stat = container.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(container_stat.st_mode):
+            self._isolate_owned_entry_locked(
+                container,
+                container_stat,
+                reason="owned isolation namespace occupied by a non-directory entry",
+            )
+            return
+        entry = container / "entry"
+        try:
+            entry_stat = entry.lstat()
+        except FileNotFoundError:
+            entry_stat = None
+        try:
+            evidence = self._load_owned_isolation_evidence(container)
+        except (InvalidCommandEnvelopeError, ValueError):
+            if entry_stat is None:
+                return
+            evidence_path = container / "evidence.json"
+            if os.path.lexists(evidence_path):
+                invalid_path = container / f"invalid-evidence-{uuid4().hex}.raw"
+                os.rename(evidence_path, invalid_path)
+                self._fsync_directory(container)
+            evidence = self._write_recovered_isolation_evidence_locked(
+                container,
+                UUID(match["isolation_id"]),
+                entry_stat,
+            )
+        if entry_stat is not None:
+            if not self._stat_matches_isolation(entry_stat, evidence):
+                return
+            if evidence.link_target is not None and os.readlink(entry) != evidence.link_target:
+                return
+            return
+        source = self._owned_source_path(evidence)
+        if source is None:
+            return
+        try:
+            source_stat = source.lstat()
+        except FileNotFoundError:
+            return
+        if not self._stat_matches_isolation(source_stat, evidence):
+            return
+        self._move_bound_entry_into_container_locked(
+            source,
+            container,
+            source_stat,
+            expected_link_target=evidence.link_target,
+        )
+
+    def _reconcile_owned_isolations_locked(self) -> None:
+        for container in sorted(self.quarantine_dir.glob("owned-entry-*.dead")):
+            if self._OWNED_ISOLATION_NAME.fullmatch(container.name) is None:
+                continue
+            with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
+                self._reconcile_owned_isolation_container_locked(container)
+
+    def _owned_isolation_records_locked(self) -> list[_LabOwnedIsolationRecord]:
+        records: list[_LabOwnedIsolationRecord] = []
+        for container in self.quarantine_dir.glob("owned-entry-*.dead"):
+            if self._OWNED_ISOLATION_NAME.fullmatch(container.name) is None:
+                continue
+            try:
+                container_stat = container.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(container_stat.st_mode):
+                records.append(
+                    _LabOwnedIsolationRecord(
+                        container=container,
+                        container_stat=container_stat,
+                        modified_at_ns=container_stat.st_mtime_ns,
+                        byte_count=max(0, container_stat.st_size),
+                    )
+                )
+                continue
+            modified_at_ns = container_stat.st_mtime_ns
+            byte_count = 0
+            try:
+                names = os.listdir(container)
+            except OSError:
+                names = []
+            for name in names:
+                try:
+                    child_stat = (container / name).lstat()
+                except FileNotFoundError:
+                    continue
+                modified_at_ns = max(modified_at_ns, child_stat.st_mtime_ns)
+                byte_count += max(0, child_stat.st_size)
+            records.append(
+                _LabOwnedIsolationRecord(
+                    container=container,
+                    container_stat=container_stat,
+                    modified_at_ns=modified_at_ns,
+                    byte_count=byte_count,
+                )
+            )
+        return records
+
+    @classmethod
+    def _remove_bound_directory_entry(
+        cls,
+        parent_fd: int,
+        name: str,
+        observed: os.stat_result,
+    ) -> bool:
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        if not cls._stat_matches_bound_entry(current, observed):
+            return False
+        try:
+            if stat.S_ISDIR(current.st_mode):
+                os.rmdir(name, dir_fd=parent_fd)
+            else:
+                os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            # Non-empty directories are never traversed or recursively deleted. They stay
+            # as observable manual dead letters while other queue entries keep progressing.
+            return False
+        os.fsync(parent_fd)
+        return True
+
+    def _remove_owned_isolation_record_locked(
+        self,
+        record: _LabOwnedIsolationRecord,
+    ) -> bool:
+        try:
+            current_container = record.container.lstat()
+        except FileNotFoundError:
+            return True
+        if (
+            current_container.st_dev != record.container_stat.st_dev
+            or current_container.st_ino != record.container_stat.st_ino
+            or current_container.st_mode != record.container_stat.st_mode
+        ):
+            return False
+        if not stat.S_ISDIR(current_container.st_mode):
+            quarantine_fd = os.open(
+                self.quarantine_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                return self._remove_bound_directory_entry(
+                    quarantine_fd,
+                    record.container.name,
+                    current_container,
+                )
+            finally:
+                os.close(quarantine_fd)
+        container_fd = os.open(
+            record.container,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            names = os.listdir(container_fd)
+            if any(
+                name not in {"entry", "evidence.json"} and not name.startswith("invalid-evidence-")
+                for name in names
+            ):
+                return False
+            for name in names:
+                try:
+                    child_stat = os.stat(name, dir_fd=container_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not self._remove_bound_directory_entry(container_fd, name, child_stat):
+                    return False
+        finally:
+            os.close(container_fd)
+        quarantine_fd = os.open(
+            self.quarantine_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            current_container = os.stat(
+                record.container.name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(current_container.st_mode)
+                or current_container.st_dev != record.container_stat.st_dev
+                or current_container.st_ino != record.container_stat.st_ino
+            ):
+                return False
+            os.rmdir(record.container.name, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(quarantine_fd)
+
+    def _prune_owned_isolations_locked(self) -> None:
+        records = self._owned_isolation_records_locked()
+        records.sort(key=lambda item: (item.modified_at_ns, item.container.name))
+        total_bytes = sum(record.byte_count for record in records)
+        while len(records) > self.max_isolation_records or (
+            total_bytes > self.max_isolation_bytes and len(records) > 1
+        ):
+            removed = False
+            for index, record in enumerate(records[:-1] or records):
+                if not self._remove_owned_isolation_record_locked(record):
+                    continue
+                total_bytes -= record.byte_count
+                records.pop(index)
+                removed = True
+                break
+            if not removed:
+                break
+
     @staticmethod
     def _read_regular_child(
         path: Path,
@@ -352,6 +851,7 @@ class LabCommandSpool:
                     device=path_stat.st_dev,
                     inode=path_stat.st_ino,
                     file_type="symlink",
+                    link_count=path_stat.st_nlink,
                     link_target=link_target,
                 )
                 raise InvalidCommandEnvelopeError(
@@ -364,6 +864,7 @@ class LabCommandSpool:
                     device=path_stat.st_dev,
                     inode=path_stat.st_ino,
                     file_type=LabCommandSpool._spool_file_type(path_stat.st_mode),
+                    link_count=path_stat.st_nlink,
                 )
                 raise InvalidCommandEnvelopeError(
                     f"spool file {name} is not regular",
@@ -664,99 +1165,63 @@ class LabCommandSpool:
             else Path(entry_or_path)
         )
         with self._exclusive_lock():
-            if (
-                isinstance(entry_or_path, LabSpoolFileIdentity)
-                and entry_or_path.file_type == "symlink"
-            ):
-                return self._quarantine_symlink_locked(entry_or_path, reason=reason)
-            if (
-                isinstance(entry_or_path, LabSpoolFileIdentity)
-                and entry_or_path.file_type != "regular"
-            ):
-                return self._quarantine_nonregular_locked(entry_or_path, reason=reason)
-            if isinstance(entry_or_path, LabSpoolFileIdentity) and entry_or_path.link_count != 1:
-                return self._quarantine_hardlink_locked(entry_or_path, reason=reason)
+            source = Path(os.path.abspath(source))
+            self._direct_child_name(source, self.pending_dir)
             try:
-                normalized, payload, source_stat = self._read_regular_child(
-                    source,
-                    self.pending_dir,
-                )
-            except InvalidCommandEnvelopeError:
-                name = self._direct_child_name(source, self.pending_dir)
-                directory_fd = os.open(
-                    self.pending_dir,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                )
-                try:
-                    try:
-                        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        return self._record_disappeared_locked(source, reason=reason)
-                finally:
-                    os.close(directory_fd)
-                raise
-            try:
-                _sequence, filename_request_id = self._pending_name_parts(normalized.name)
-            except InvalidCommandEnvelopeError:
-                filename_request_id = None
-            try:
-                envelope = LabCommandEnvelope.model_validate_json(payload)
-            except Exception:
-                envelope = None
-            if (
-                envelope is not None
-                and filename_request_id is not None
-                and envelope.request_id != filename_request_id
-            ):
-                raise InvalidCommandEnvelopeError(
-                    f"command request_id does not match basename {normalized.name}"
-                )
-            if isinstance(entry_or_path, LabSpoolEntry | LabSpoolFileIdentity):
-                if (source_stat.st_dev, source_stat.st_ino) != (
-                    entry_or_path.device,
-                    entry_or_path.inode,
+                observed = source.lstat()
+            except FileNotFoundError:
+                return self._record_disappeared_locked(source, reason=reason)
+            expected_link_target: str | None = None
+            if isinstance(entry_or_path, LabSpoolFileIdentity):
+                expected_type = entry_or_path.file_type
+                if (
+                    observed.st_dev != entry_or_path.device
+                    or observed.st_ino != entry_or_path.inode
+                    or self._spool_file_type(observed.st_mode) != expected_type
                 ):
                     raise InvalidCommandEnvelopeError(
                         "pending command was replaced before quarantine"
                     )
-                if isinstance(entry_or_path, LabSpoolEntry) and envelope != entry_or_path.envelope:
+                if observed.st_nlink != entry_or_path.link_count:
+                    raise InvalidCommandEnvelopeError(
+                        "pending command link count changed before quarantine"
+                    )
+                expected_link_target = entry_or_path.link_target
+            elif isinstance(entry_or_path, LabSpoolEntry):
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_dev != entry_or_path.device
+                    or observed.st_ino != entry_or_path.inode
+                    or observed.st_nlink != 1
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        "pending command was replaced before quarantine"
+                    )
+                if self.load(source).envelope != entry_or_path.envelope:
                     raise InvalidCommandEnvelopeError("pending command changed before quarantine")
-            target = self.quarantine_dir / f"{normalized.name}.bad"
-            while os.path.lexists(target):
-                target = self.quarantine_dir / f"{normalized.name}.{uuid4().hex}.bad"
-            source_fd = os.open(
-                self.pending_dir,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            target_fd = os.open(
-                self.quarantine_dir,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            try:
-                os.link(
-                    normalized.name,
-                    target.name,
-                    src_dir_fd=source_fd,
-                    dst_dir_fd=target_fd,
-                    follow_symlinks=False,
+            else:
+                normalized, payload, observed = self._read_regular_child(
+                    source,
+                    self.pending_dir,
                 )
-                os.fsync(target_fd)
-            finally:
-                os.close(target_fd)
-                os.close(source_fd)
-            quarantined = LabQuarantinedCommand(path=target, reason=reason)
-            metadata = self.quarantine_dir / f"{target.name}.json"
-            self._publish_no_clobber(
-                metadata,
-                quarantined.model_dump_json().encode("utf-8"),
+                try:
+                    _sequence, filename_request_id = self._pending_name_parts(normalized.name)
+                    envelope = LabCommandEnvelope.model_validate_json(payload)
+                except (InvalidCommandEnvelopeError, ValueError):
+                    envelope = None
+                    filename_request_id = None
+                if envelope is not None and envelope.request_id != filename_request_id:
+                    raise InvalidCommandEnvelopeError(
+                        f"command request_id does not match basename {normalized.name}"
+                    )
+            isolated = self._isolate_owned_entry_locked(
+                source,
+                observed,
+                reason=reason,
+                expected_link_target=expected_link_target,
             )
-            self._unlink_pending(
-                normalized,
-                device=source_stat.st_dev,
-                inode=source_stat.st_ino,
-                expected_link_count=2,
-            )
-            return quarantined
+            self._prune_owned_isolations_locked()
+            return isolated
 
     def _record_disappeared_locked(
         self,
@@ -783,210 +1248,9 @@ class LabCommandSpool:
                 )
         return LabQuarantinedCommand(path=target, reason=reason)
 
-    def _quarantine_hardlink_locked(
-        self,
-        identity: LabSpoolFileIdentity,
-        *,
-        reason: str,
-    ) -> LabQuarantinedCommand:
-        name = self._direct_child_name(identity.path, self.pending_dir)
-        directory_fd = os.open(
-            self.pending_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            try:
-                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return self._record_disappeared_locked(identity.path, reason=reason)
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or current.st_dev != identity.device
-                or current.st_ino != identity.inode
-                or current.st_nlink != identity.link_count
-            ):
-                raise InvalidCommandEnvelopeError(
-                    "pending hard-linked inode identity or link count changed before quarantine"
-                )
-            reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
-            target = self.quarantine_dir / (
-                f"{name}.{current.st_dev}.{current.st_ino}.{current.st_nlink}."
-                f"{reason_hash}.hardlink.bad.json"
-            )
-            artifact = LabHardLinkQuarantineArtifact(
-                original_name=name,
-                reason=reason,
-                device=current.st_dev,
-                inode=current.st_ino,
-                observed_link_count=current.st_nlink,
-            )
-            payload = artifact.model_dump_json().encode("utf-8")
-            if not self._publish_no_clobber(target, payload):
-                _candidate, existing, _file_stat = self._read_regular_child(
-                    target,
-                    self.quarantine_dir,
-                )
-                if existing != payload:
-                    raise RequestContentConflictError(
-                        f"hard-link quarantine evidence conflicts: {target.name}"
-                    )
-            self._after_hardlink_quarantine_evidence(identity, target)
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or current.st_dev != identity.device
-                or current.st_ino != identity.inode
-                or current.st_nlink != identity.link_count
-            ):
-                raise InvalidCommandEnvelopeError(
-                    "pending hard-linked inode identity or link count changed before unlink"
-                )
-            os.unlink(name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-            return LabQuarantinedCommand(path=target, reason=reason)
-        finally:
-            os.close(directory_fd)
-
     @staticmethod
     def _after_hardlink_quarantine_evidence(
         _identity: LabSpoolFileIdentity,
         _evidence_path: Path,
     ) -> None:
         """Fault-injection boundary before the final hard-link identity check."""
-
-    def _quarantine_nonregular_locked(
-        self,
-        identity: LabSpoolFileIdentity,
-        *,
-        reason: str,
-    ) -> LabQuarantinedCommand:
-        name = self._direct_child_name(identity.path, self.pending_dir)
-        source_fd = os.open(
-            self.pending_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        quarantine_fd = os.open(
-            self.quarantine_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        container_name = f"{name}.{uuid4().hex}.inode.bad"
-        container_fd = -1
-        moved = False
-        try:
-            try:
-                current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return self._record_disappeared_locked(identity.path, reason=reason)
-            if (
-                current.st_dev != identity.device
-                or current.st_ino != identity.inode
-                or self._spool_file_type(current.st_mode) != identity.file_type
-            ):
-                raise InvalidCommandEnvelopeError(
-                    "pending nonregular inode was replaced before quarantine"
-                )
-            os.mkdir(container_name, mode=0o700, dir_fd=quarantine_fd)
-            container_fd = os.open(
-                container_name,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                dir_fd=quarantine_fd,
-            )
-            os.rename(
-                name,
-                "entry",
-                src_dir_fd=source_fd,
-                dst_dir_fd=container_fd,
-            )
-            moved = True
-            observed = os.stat("entry", dir_fd=container_fd, follow_symlinks=False)
-            if (
-                observed.st_dev != identity.device
-                or observed.st_ino != identity.inode
-                or self._spool_file_type(observed.st_mode) != identity.file_type
-            ):
-                raise InvalidCommandEnvelopeError(
-                    "quarantined nonregular inode identity changed during move"
-                )
-            os.fsync(source_fd)
-            os.fsync(container_fd)
-            os.fsync(quarantine_fd)
-        finally:
-            if container_fd >= 0:
-                os.close(container_fd)
-            os.close(quarantine_fd)
-            os.close(source_fd)
-            if not moved:
-                with suppress(OSError):
-                    os.rmdir(self.quarantine_dir / container_name)
-        target = self.quarantine_dir / container_name / "entry"
-        artifact = LabNonRegularQuarantineArtifact(
-            original_name=name,
-            quarantined_name=target.name,
-            reason=reason,
-            file_type=identity.file_type,
-            device=identity.device,
-            inode=identity.inode,
-        )
-        metadata = target.parent / "evidence.json"
-        if not self._publish_no_clobber(
-            metadata,
-            artifact.model_dump_json().encode("utf-8"),
-        ):
-            raise RequestContentConflictError(
-                f"nonregular quarantine metadata already exists: {metadata}"
-            )
-        return LabQuarantinedCommand(path=target, reason=reason)
-
-    def _quarantine_symlink_locked(
-        self,
-        identity: LabSpoolFileIdentity,
-        *,
-        reason: str,
-    ) -> LabQuarantinedCommand:
-        name = self._direct_child_name(identity.path, self.pending_dir)
-        directory_fd = os.open(
-            self.pending_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISLNK(current.st_mode)
-                or current.st_dev != identity.device
-                or current.st_ino != identity.inode
-            ):
-                raise InvalidCommandEnvelopeError("pending symlink was replaced before quarantine")
-            link_target = os.readlink(name, dir_fd=directory_fd)
-            if link_target != identity.link_target:
-                raise InvalidCommandEnvelopeError(
-                    "pending symlink target changed before quarantine"
-                )
-            target = self.quarantine_dir / f"{name}.symlink.bad.json"
-            while os.path.lexists(target):
-                target = self.quarantine_dir / f"{name}.{uuid4().hex}.symlink.bad.json"
-            artifact = LabSymlinkQuarantineArtifact(
-                original_name=name,
-                reason=reason,
-                link_target=link_target,
-                device=identity.device,
-                inode=identity.inode,
-            )
-            if not self._publish_no_clobber(
-                target,
-                artifact.model_dump_json().encode("utf-8"),
-            ):
-                raise RequestContentConflictError(
-                    f"symlink quarantine artifact already exists: {target.name}"
-                )
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISLNK(current.st_mode)
-                or current.st_dev != identity.device
-                or current.st_ino != identity.inode
-            ):
-                raise InvalidCommandEnvelopeError("pending symlink was replaced before unlink")
-            os.unlink(name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-            return LabQuarantinedCommand(path=target, reason=reason)
-        finally:
-            os.close(directory_fd)

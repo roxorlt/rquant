@@ -964,6 +964,7 @@ def test_v5_schema_rejects_missing_persistent_trigger(tmp_path: Path) -> None:
     [
         "trg_lab_complete_result_job_no_delete",
         "trg_lab_job_existing_key_no_insert",
+        "trg_lab_job_id_immutable",
         "trg_lab_complete_result_ready_job_update",
         "trg_lab_complete_result_sealed_job_no_update",
     ],
@@ -1001,6 +1002,80 @@ def test_v5_schema_requires_exact_complete_result_parent_guards(
         LabJobReader(store.path).get_job(uuid4())
     with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
         store.connection_pragmas()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.QUEUED,
+        JobStatus.RUNNING,
+        JobStatus.CHECKPOINTED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    ],
+)
+@pytest.mark.parametrize("uuid_style", ["uppercase", "braces", "urn", "whitespace", "other"])
+def test_v5_job_id_is_immutable_in_every_application_state_with_foreign_keys_off(
+    tmp_path: Path,
+    status: JobStatus,
+    uuid_style: str,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _transition_to(store, lease, status)
+    canonical = str(job.job_id)
+    replacement = {
+        "uppercase": canonical.upper(),
+        "braces": f"{{{canonical}}}",
+        "urn": f"urn:uuid:{canonical}",
+        "whitespace": f" {canonical}",
+        "other": str(UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")),
+    }[uuid_style]
+    if replacement == canonical:
+        replacement = f"{{{canonical}}}"
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        _register_unprivileged_job_functions(connection)
+        with pytest.raises(sqlite3.IntegrityError, match="job_id.*immutable"):
+            connection.execute(
+                "UPDATE lab_job SET job_id = ? WHERE job_id = ?",
+                (replacement, canonical),
+            )
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert persisted is not None and persisted.status is status
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lab_event WHERE job_id <> ?",
+            (canonical,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lab_shard WHERE job_id <> ?",
+            (canonical,),
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.QUEUED,
+        JobStatus.RUNNING,
+        JobStatus.CHECKPOINTED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    ],
+)
+def test_v5_job_id_guard_preserves_legitimate_lifecycle_transitions(
+    tmp_path: Path,
+    status: JobStatus,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+
+    transitioned = _transition_to(store, lease, status)
+
+    assert transitioned.status is status
+    assert LabJobReader(store.path).get_job(transitioned.job_id) == transitioned
 
 
 def test_existing_job_key_insert_guard_does_not_depend_on_authorization_udf(

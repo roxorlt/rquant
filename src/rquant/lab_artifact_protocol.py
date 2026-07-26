@@ -187,19 +187,6 @@ class LabArtifactCommitScanCursor(LabArtifactCommitProtocolModel):
         return self
 
 
-class LabCorruptConflictTempEvidence(LabArtifactCommitProtocolModel):
-    schema_version: Literal[1] = 1
-    state: Literal["corrupt_temporary"] = "corrupt_temporary"
-    temporary_name: str = Field(min_length=1)
-    target_name: str = Field(min_length=1)
-    raw_name: str | None = Field(default=None, min_length=1)
-    device: int = Field(ge=0)
-    inode: int = Field(ge=1)
-    byte_count: int = Field(ge=0)
-    content_hash: str = Field(pattern=_HASH_PATTERN)
-    reason: Literal["invalid_typed_conflict_temporary"] = "invalid_typed_conflict_temporary"
-
-
 @dataclass(frozen=True)
 class _ConflictEvidenceRecord:
     modified_at_ns: int
@@ -227,23 +214,12 @@ class LabArtifactCommitSpool(LabCommandSpool):
         r"[0-9a-f]{64}\.[0-9a-f]{16}\.conflict\.evidence\.json"
         r")\.publishing\.tmp"
     )
+    _SCAN_CURSOR_TEMP_NAME = re.compile(r"\.\.artifact-commit-scan-cursor\.json\.[0-9a-f]{32}\.tmp")
     _LEGACY_CONFLICT_NAME = re.compile(
         r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
         r"[0-9a-f]{4}-[0-9a-f]{12})\."
         r"(?P<content_hash>[0-9a-f]{64})\."
         r"(?P<reason_hash>[0-9a-f]{16})\.conflict\.bad"
-    )
-    _CORRUPT_TEMP_NAME = re.compile(
-        r"(?P<temporary_hash>[0-9a-f]{16})\."
-        r"(?P<device>[0-9a-f]+)\.(?P<inode>[0-9a-f]+)\."
-        r"(?P<content_hash>[0-9a-f]{16})\.corrupt-conflict-temp\.bad\.json"
-    )
-    _CORRUPT_TEMP_RAW_NAME = re.compile(
-        r"(?P<target>"
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\."
-        r"[0-9a-f]{64}\.[0-9a-f]{16}\.conflict\.evidence\.json"
-        r")\.(?P<device>[0-9a-f]+)\.(?P<inode>[0-9a-f]+)\."
-        r"corrupt-conflict-temp\.raw\.bad"
     )
 
     def __init__(
@@ -257,13 +233,19 @@ class LabArtifactCommitSpool(LabCommandSpool):
             raise ValueError("max_conflict_records must be positive")
         if max_conflict_bytes < 1:
             raise ValueError("max_conflict_bytes must be positive")
-        super().__init__(root)
+        super().__init__(
+            root,
+            max_isolation_records=max_conflict_records,
+            max_isolation_bytes=max_conflict_bytes,
+        )
         self._scan_cursor_path = self.root / ".artifact-commit-scan-cursor.json"
         self.max_conflict_records = max_conflict_records
         self.max_conflict_bytes = max_conflict_bytes
         with self._exclusive_lock():
+            self._recover_scan_cursor_temporaries_locked()
             self._recover_conflict_evidence_locked()
             self._prune_conflicts_locked()
+            self._prune_owned_isolations_locked()
 
     @staticmethod
     def _after_conflict_evidence_stage(
@@ -299,9 +281,25 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 raise ValueError("artifact scan cursor JSON is not canonical")
             return cursor
         except (InvalidCommandEnvelopeError, ValueError) as exc:
-            with suppress(OSError):
+            with suppress(OSError, InvalidCommandEnvelopeError):
                 self._isolate_scan_cursor_locked(observed, reason=str(exc))
+                self._prune_owned_isolations_locked()
             return None
+
+    def _recover_scan_cursor_temporaries_locked(self) -> None:
+        for temporary in sorted(self.root.glob("..artifact-commit-scan-cursor.json.*.tmp")):
+            if self._SCAN_CURSOR_TEMP_NAME.fullmatch(temporary.name) is None:
+                continue
+            try:
+                observed = temporary.lstat()
+            except FileNotFoundError:
+                continue
+            with suppress(OSError, InvalidCommandEnvelopeError):
+                self._isolate_owned_entry_locked(
+                    temporary,
+                    observed,
+                    reason="orphaned artifact scan cursor temporary",
+                )
 
     def _isolate_scan_cursor_locked(
         self,
@@ -309,50 +307,15 @@ class LabArtifactCommitSpool(LabCommandSpool):
         *,
         reason: str,
     ) -> bool:
-        file_type = self._spool_file_type(observed.st_mode)
-        reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
-        target = self.quarantine_dir / (
-            f"artifact-commit-scan-cursor.{observed.st_dev:x}.{observed.st_ino:x}."
-            f"{observed.st_nlink}.{file_type}.{reason_hash}.bad"
-        )
-        while os.path.lexists(target):
-            target = self.quarantine_dir / (
-                f"artifact-commit-scan-cursor.{observed.st_dev:x}.{observed.st_ino:x}."
-                f"{observed.st_nlink}.{file_type}.{reason_hash}.{uuid4().hex}.bad"
-            )
-        root_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        quarantine_fd = os.open(
-            self.quarantine_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
         try:
-            try:
-                current = os.stat(
-                    self._scan_cursor_path.name,
-                    dir_fd=root_fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                return True
-            if (
-                stat.S_IFMT(current.st_mode) != stat.S_IFMT(observed.st_mode)
-                or current.st_dev != observed.st_dev
-                or current.st_ino != observed.st_ino
-                or current.st_nlink != observed.st_nlink
-            ):
-                return False
-            os.rename(
-                self._scan_cursor_path.name,
-                target.name,
-                src_dir_fd=root_fd,
-                dst_dir_fd=quarantine_fd,
+            self._isolate_owned_entry_locked(
+                self._scan_cursor_path,
+                observed,
+                reason=reason,
             )
-            os.fsync(root_fd)
-            os.fsync(quarantine_fd)
             return True
-        finally:
-            os.close(quarantine_fd)
-            os.close(root_fd)
+        except (FileNotFoundError, InvalidCommandEnvelopeError):
+            return False
 
     @staticmethod
     def _after_scan_cursor_stage(
@@ -430,161 +393,170 @@ class LabArtifactCommitSpool(LabCommandSpool):
             allowed_link_counts=allowed_link_counts,
         )
         evidence = LabArtifactConflictEvidence.model_validate_json(payload)
+        if evidence.model_dump_json().encode("utf-8") != payload:
+            raise InvalidCommandEnvelopeError(
+                f"artifact conflict evidence is not canonical: {path.name}"
+            )
         return evidence, payload, file_stat
 
-    @staticmethod
-    def _corrupt_temp_evidence_name(evidence: LabCorruptConflictTempEvidence) -> str:
-        temporary_hash = hashlib.sha256(evidence.temporary_name.encode("utf-8")).hexdigest()[:16]
-        return (
-            f"{temporary_hash}.{evidence.device:x}.{evidence.inode:x}."
-            f"{evidence.content_hash[:16]}.corrupt-conflict-temp.bad.json"
-        )
-
-    def _load_corrupt_temp_evidence_file(
+    def _load_conflict_target_locked(
         self,
         path: Path,
-    ) -> tuple[LabCorruptConflictTempEvidence, os.stat_result]:
-        _candidate, payload, file_stat = self._read_regular_child(path, self.quarantine_dir)
-        evidence = LabCorruptConflictTempEvidence.model_validate_json(payload)
-        temporary_match = self._CONFLICT_TEMP_NAME.fullmatch(evidence.temporary_name)
-        if temporary_match is None or temporary_match["target"] != evidence.target_name:
+    ) -> tuple[LabArtifactConflictEvidence, bytes, os.stat_result]:
+        evidence, payload, file_stat = self._load_conflict_evidence_file(path)
+        if not self._evidence_matches_name(evidence, path.name):
             raise InvalidCommandEnvelopeError(
-                f"corrupt conflict temp identity mismatch: {path.name}"
+                f"artifact conflict evidence basename mismatch: {path.name}"
             )
-        if evidence.raw_name is not None:
-            raw_match = self._CORRUPT_TEMP_RAW_NAME.fullmatch(evidence.raw_name)
-            if raw_match is None or (
-                raw_match["target"] != evidence.target_name
-                or int(raw_match["device"], 16) != evidence.device
-                or int(raw_match["inode"], 16) != evidence.inode
-            ):
-                raise InvalidCommandEnvelopeError(
-                    f"corrupt conflict raw identity mismatch: {path.name}"
-                )
-        if path.name != self._corrupt_temp_evidence_name(evidence):
-            raise InvalidCommandEnvelopeError(
-                f"corrupt conflict temp evidence name mismatch: {path.name}"
-            )
-        return evidence, file_stat
+        return evidence, payload, file_stat
 
-    @classmethod
-    def _corrupt_temp_raw_name(
-        cls,
+    def _isolate_conflict_entry_locked(
+        self,
+        path: Path,
+        observed: os.stat_result,
         *,
-        target_name: str,
-        file_stat: os.stat_result,
-    ) -> str:
-        if cls._CONFLICT_NAME.fullmatch(target_name) is None:
-            raise InvalidCommandEnvelopeError(
-                f"invalid corrupt conflict target name: {target_name}"
-            )
-        return (
-            f"{target_name}.{file_stat.st_dev:x}.{file_stat.st_ino:x}.corrupt-conflict-temp.raw.bad"
-        )
-
-    @staticmethod
-    def _after_corrupt_conflict_stage(
-        _stage: Literal[
-            "raw_moved",
-            "evidence_written",
-            "before_target_unlink",
-            "target_unlinked",
-        ],
-        _raw_path: Path,
-        _target_path: Path,
+        reason: str,
     ) -> None:
-        """Fault-injection boundary for corrupt conflict evidence recovery."""
+        self._isolate_owned_entry_locked(path, observed, reason=reason)
 
-    @staticmethod
-    def _before_conflict_temp_unlink(*_args: object) -> None:
-        """Fault-injection boundary immediately before final link verification."""
-
-    def _move_conflict_temp_to_raw_locked(
+    def _recover_one_conflict_temporary_locked(
         self,
         temporary: Path,
-        *,
         target_name: str,
-        file_stat: os.stat_result,
-    ) -> Path:
-        raw = self.quarantine_dir / self._corrupt_temp_raw_name(
-            target_name=target_name,
-            file_stat=file_stat,
-        )
-        directory_fd = os.open(
-            self.quarantine_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        linked_raw = False
+    ) -> None:
         try:
-            current = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or stat.S_IFMT(current.st_mode) != stat.S_IFMT(file_stat.st_mode)
-                or current.st_dev != file_stat.st_dev
-                or current.st_ino != file_stat.st_ino
-                or current.st_nlink != file_stat.st_nlink
-            ):
-                raise InvalidCommandEnvelopeError(
-                    f"conflict temporary changed before raw isolation: {temporary.name}"
-                )
-            try:
-                os.link(
-                    temporary.name,
-                    raw.name,
-                    src_dir_fd=directory_fd,
-                    dst_dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-                linked_raw = True
-            except FileExistsError:
-                raw_stat = os.stat(raw.name, dir_fd=directory_fd, follow_symlinks=False)
-                if (
-                    not stat.S_ISREG(raw_stat.st_mode)
-                    or raw_stat.st_dev != file_stat.st_dev
-                    or raw_stat.st_ino != file_stat.st_ino
-                    or raw_stat.st_nlink != current.st_nlink
-                ):
-                    raise InvalidCommandEnvelopeError(
-                        f"corrupt conflict raw target conflicts: {raw.name}"
-                    ) from None
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        relation = self._matching_regular_entries(temporary, raw)
-        if relation is None:
-            raise InvalidCommandEnvelopeError(
-                f"conflict temporary/raw relation changed: {temporary.name}"
+            observed = temporary.lstat()
+        except FileNotFoundError:
+            return
+        target = self.quarantine_dir / target_name
+        relation = self._matching_regular_entries(temporary, target)
+        if not stat.S_ISREG(observed.st_mode) or (observed.st_nlink != 1 and relation is None):
+            self._isolate_conflict_entry_locked(
+                temporary,
+                observed,
+                reason="abnormal artifact conflict publication temporary",
             )
-        temporary_current, _raw_current = relation
+            return
+        try:
+            evidence, payload, temporary_stat = self._load_conflict_evidence_file(
+                temporary,
+                allowed_link_counts=frozenset({observed.st_nlink}),
+            )
+        except (InvalidCommandEnvelopeError, ValueError):
+            self._isolate_conflict_entry_locked(
+                temporary,
+                observed,
+                reason="invalid typed artifact conflict publication temporary",
+            )
+            if relation is not None:
+                try:
+                    target_stat = target.lstat()
+                except FileNotFoundError:
+                    return
+                self._isolate_conflict_entry_locked(
+                    target,
+                    target_stat,
+                    reason="corrupt artifact conflict target linked to invalid temporary",
+                )
+            return
+        expected_temporary = self._conflict_temporary_path(evidence)
+        if temporary != expected_temporary:
+            self._isolate_conflict_entry_locked(
+                temporary,
+                temporary_stat,
+                reason="artifact conflict temporary basename does not match typed evidence",
+            )
+            return
+        if os.path.lexists(target) and relation is None:
+            try:
+                existing, existing_payload, _target_stat = self._load_conflict_target_locked(target)
+            except (InvalidCommandEnvelopeError, ValueError):
+                target_stat = target.lstat()
+                self._isolate_conflict_entry_locked(
+                    target,
+                    target_stat,
+                    reason="invalid deterministic artifact conflict evidence target",
+                )
+            else:
+                if existing == evidence and existing_payload == payload:
+                    self._isolate_conflict_entry_locked(
+                        temporary,
+                        temporary_stat,
+                        reason="duplicate artifact conflict publication temporary",
+                    )
+                    return
+                target_stat = target.lstat()
+                self._isolate_conflict_entry_locked(
+                    target,
+                    target_stat,
+                    reason="conflicting deterministic artifact conflict evidence target",
+                )
+        if not os.path.lexists(target):
+            directory_fd = os.open(
+                self.quarantine_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                try:
+                    os.link(
+                        temporary.name,
+                        target.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    return
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        relation = self._matching_regular_entries(temporary, target)
+        if relation is None:
+            current = temporary.lstat()
+            self._isolate_conflict_entry_locked(
+                temporary,
+                current,
+                reason="artifact conflict temporary lost target identity relation",
+            )
+            return
+        self._before_conflict_temp_unlink(temporary, target)
+        relation = self._matching_regular_entries(temporary, target)
+        if relation is None:
+            current = temporary.lstat()
+            self._isolate_conflict_entry_locked(
+                temporary,
+                current,
+                reason="artifact conflict temporary changed before completion",
+            )
+            return
+        temporary_current, _target_current = relation
         self._unlink_regular_identity(
             temporary,
             temporary_current,
             allowed_link_counts=frozenset({temporary_current.st_nlink}),
         )
-        if linked_raw:
-            self._fsync_directory(self.quarantine_dir)
-        self._after_corrupt_conflict_stage(
-            "raw_moved",
-            raw,
-            self.quarantine_dir / target_name,
-        )
-        raw_stat = raw.lstat()
-        if (
-            not stat.S_ISREG(raw_stat.st_mode)
-            or raw_stat.st_dev != file_stat.st_dev
-            or raw_stat.st_ino != file_stat.st_ino
-        ):
-            raise InvalidCommandEnvelopeError(
-                f"corrupt conflict raw changed after isolation: {raw.name}"
-            )
-        _target_name, raw_payload, raw_stat = self._load_corrupt_raw_locked(raw)
-        self._record_corrupt_raw_locked(
-            raw,
-            target_name=target_name,
-            payload=raw_payload,
-            file_stat=raw_stat,
-        )
-        return raw
+
+    def _isolate_invalid_conflict_targets_locked(self) -> None:
+        for target in sorted(self.quarantine_dir.glob("*.conflict.evidence.json")):
+            if self._CONFLICT_NAME.fullmatch(target.name) is None:
+                continue
+            try:
+                self._load_conflict_target_locked(target)
+            except (InvalidCommandEnvelopeError, ValueError, OSError):
+                try:
+                    observed = target.lstat()
+                except FileNotFoundError:
+                    continue
+                with suppress(InvalidCommandEnvelopeError, OSError):
+                    self._isolate_conflict_entry_locked(
+                        target,
+                        observed,
+                        reason="invalid deterministic artifact conflict evidence",
+                    )
+
+    @staticmethod
+    def _before_conflict_temp_unlink(*_args: object) -> None:
+        """Fault-injection boundary immediately before final link verification."""
 
     def _publish_conflict_evidence_locked(
         self,
@@ -594,23 +566,39 @@ class LabArtifactCommitSpool(LabCommandSpool):
         target = self._conflict_evidence_path(evidence)
         payload = evidence.model_dump_json().encode("utf-8")
         if os.path.lexists(target):
-            existing, existing_payload, _file_stat = self._load_conflict_evidence_file(target)
-            if existing != evidence or existing_payload != payload:
-                raise InvalidCommandEnvelopeError(
-                    "artifact conflict evidence target has different content"
+            try:
+                existing, existing_payload, _file_stat = self._load_conflict_target_locked(target)
+            except (InvalidCommandEnvelopeError, ValueError):
+                observed = target.lstat()
+                self._isolate_conflict_entry_locked(
+                    target,
+                    observed,
+                    reason="invalid deterministic artifact conflict evidence before publish",
                 )
-            return
+            else:
+                if existing == evidence and existing_payload == payload:
+                    return
+                observed = target.lstat()
+                self._isolate_conflict_entry_locked(
+                    target,
+                    observed,
+                    reason="conflicting deterministic artifact conflict evidence before publish",
+                )
 
         temporary = self._conflict_temporary_path(evidence)
         if os.path.lexists(temporary):
             self._recover_conflict_evidence_locked()
             if os.path.lexists(target):
-                existing, existing_payload, _file_stat = self._load_conflict_evidence_file(target)
+                existing, existing_payload, _file_stat = self._load_conflict_target_locked(target)
                 if existing == evidence and existing_payload == payload:
                     return
-            raise InvalidCommandEnvelopeError(
-                "artifact conflict evidence temporary cannot be recovered"
-            )
+            if os.path.lexists(temporary):
+                observed = temporary.lstat()
+                self._isolate_conflict_entry_locked(
+                    temporary,
+                    observed,
+                    reason="unrecoverable artifact conflict publication temporary",
+                )
 
         with temporary.open("xb") as stream:
             stream.write(payload)
@@ -624,13 +612,22 @@ class LabArtifactCommitSpool(LabCommandSpool):
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
         )
         try:
-            os.link(
-                temporary.name,
-                target.name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
+            try:
+                os.link(
+                    temporary.name,
+                    target.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                self._recover_conflict_evidence_locked()
+                existing, existing_payload, _file_stat = self._load_conflict_target_locked(target)
+                if existing == evidence and existing_payload == payload:
+                    return
+                raise InvalidCommandEnvelopeError(
+                    "artifact conflict target appeared with different content"
+                ) from None
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
@@ -710,203 +707,17 @@ class LabArtifactCommitSpool(LabCommandSpool):
             return None
         return first_stat, second_stat
 
-    def _unlink_matching_conflict_target_locked(
-        self,
-        owned: Path,
-        target: Path,
-    ) -> bool:
-        if self._matching_regular_entries(owned, target) is None:
-            return False
-        self._before_conflict_temp_unlink(owned, target)
-        self._after_corrupt_conflict_stage("before_target_unlink", owned, target)
-        matched = self._matching_regular_entries(owned, target)
-        if matched is None:
-            return False
-        _owned_stat, target_stat = matched
-        self._unlink_regular_identity(
-            target,
-            target_stat,
-            allowed_link_counts=frozenset({target_stat.st_nlink}),
-        )
-        self._after_corrupt_conflict_stage("target_unlinked", owned, target)
-        return True
-
-    def _load_corrupt_raw_locked(
-        self,
-        raw: Path,
-    ) -> tuple[str, bytes, os.stat_result]:
-        match = self._CORRUPT_TEMP_RAW_NAME.fullmatch(raw.name)
-        if match is None:
-            raise InvalidCommandEnvelopeError(f"invalid corrupt conflict raw name: {raw.name}")
-        try:
-            observed = raw.lstat()
-        except FileNotFoundError as exc:
-            raise InvalidCommandEnvelopeError(
-                f"corrupt conflict raw disappeared: {raw.name}"
-            ) from exc
-        if (
-            not stat.S_ISREG(observed.st_mode)
-            or observed.st_dev != int(match["device"], 16)
-            or observed.st_ino != int(match["inode"], 16)
-        ):
-            raise InvalidCommandEnvelopeError(f"corrupt conflict raw identity mismatch: {raw.name}")
-        _candidate, payload, file_stat = self._read_regular_child(
-            raw,
-            self.quarantine_dir,
-            allowed_link_counts=frozenset({observed.st_nlink}),
-        )
-        return match["target"], payload, file_stat
-
-    def _record_corrupt_raw_locked(
-        self,
-        raw: Path,
-        *,
-        target_name: str,
-        payload: bytes,
-        file_stat: os.stat_result,
-    ) -> None:
-        temporary_name = f".{target_name}.publishing.tmp"
-        evidence = LabCorruptConflictTempEvidence(
-            temporary_name=temporary_name,
-            target_name=target_name,
-            raw_name=raw.name,
-            device=file_stat.st_dev,
-            inode=file_stat.st_ino,
-            byte_count=len(payload),
-            content_hash=hashlib.sha256(payload).hexdigest(),
-        )
-        metadata = self.quarantine_dir / self._corrupt_temp_evidence_name(evidence)
-        evidence_payload = evidence.model_dump_json().encode("utf-8")
-        if not self._publish_no_clobber(metadata, evidence_payload):
-            existing, _existing_stat = self._load_corrupt_temp_evidence_file(metadata)
-            if existing != evidence:
-                raise InvalidCommandEnvelopeError(
-                    f"corrupt conflict temp evidence conflicts: {metadata.name}"
-                )
-        self._after_corrupt_conflict_stage(
-            "evidence_written",
-            raw,
-            self.quarantine_dir / target_name,
-        )
-
-    def _recover_corrupt_raw_locked(self) -> None:
-        for raw in sorted(self.quarantine_dir.glob("*.corrupt-conflict-temp.raw.bad")):
-            try:
-                target_name, payload, file_stat = self._load_corrupt_raw_locked(raw)
-            except InvalidCommandEnvelopeError:
-                continue
-            self._record_corrupt_raw_locked(
-                raw,
-                target_name=target_name,
-                payload=payload,
-                file_stat=file_stat,
-            )
-            temporary = self.quarantine_dir / f".{target_name}.publishing.tmp"
-            relation = self._matching_regular_entries(raw, temporary)
-            if relation is not None:
-                _raw_stat, temporary_stat = relation
-                self._unlink_regular_identity(
-                    temporary,
-                    temporary_stat,
-                    allowed_link_counts=frozenset({temporary_stat.st_nlink}),
-                )
-            target = self.quarantine_dir / target_name
-            self._unlink_matching_conflict_target_locked(raw, target)
-
     def _recover_conflict_evidence_locked(self) -> None:
-        self._recover_corrupt_raw_locked()
         for temporary in sorted(self.quarantine_dir.glob(".*.publishing.tmp")):
             match = self._CONFLICT_TEMP_NAME.fullmatch(temporary.name)
             if match is None:
                 continue
-            try:
-                observed = temporary.lstat()
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(observed.st_mode):
-                continue
-            target_by_name = self.quarantine_dir / match["target"]
-            target_relation = self._matching_regular_entries(temporary, target_by_name)
-            if observed.st_nlink != 1 and target_relation is None:
-                continue
-            try:
-                _candidate, payload, temporary_stat = self._read_regular_child(
+            with suppress(InvalidCommandEnvelopeError, OSError, ValueError):
+                self._recover_one_conflict_temporary_locked(
                     temporary,
-                    self.quarantine_dir,
-                    allowed_link_counts=frozenset({observed.st_nlink}),
+                    match["target"],
                 )
-            except InvalidCommandEnvelopeError:
-                continue
-            try:
-                evidence = LabArtifactConflictEvidence.model_validate_json(payload)
-            except ValueError:
-                raw = self._move_conflict_temp_to_raw_locked(
-                    temporary,
-                    target_name=match["target"],
-                    file_stat=temporary_stat,
-                )
-                self._unlink_matching_conflict_target_locked(raw, target_by_name)
-                continue
-            target = self._conflict_evidence_path(evidence)
-            if temporary.name != f".{target.name}.publishing.tmp":
-                raw = self._move_conflict_temp_to_raw_locked(
-                    temporary,
-                    target_name=match["target"],
-                    file_stat=temporary_stat,
-                )
-                self._unlink_matching_conflict_target_locked(raw, target_by_name)
-                continue
-            if not os.path.lexists(target):
-                if temporary_stat.st_nlink != 1:
-                    raw = self._move_conflict_temp_to_raw_locked(
-                        temporary,
-                        target_name=match["target"],
-                        file_stat=temporary_stat,
-                    )
-                    self._unlink_matching_conflict_target_locked(raw, target)
-                    continue
-                directory_fd = os.open(
-                    self.quarantine_dir,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                )
-                try:
-                    with suppress(FileExistsError):
-                        os.link(
-                            temporary.name,
-                            target.name,
-                            src_dir_fd=directory_fd,
-                            dst_dir_fd=directory_fd,
-                            follow_symlinks=False,
-                        )
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            relation = self._matching_regular_entries(temporary, target)
-            if relation is None:
-                raw = self._move_conflict_temp_to_raw_locked(
-                    temporary,
-                    target_name=match["target"],
-                    file_stat=temporary.lstat(),
-                )
-                self._unlink_matching_conflict_target_locked(raw, target)
-                continue
-            self._before_conflict_temp_unlink(temporary, target)
-            relation = self._matching_regular_entries(temporary, target)
-            if relation is None:
-                current = temporary.lstat()
-                raw = self._move_conflict_temp_to_raw_locked(
-                    temporary,
-                    target_name=match["target"],
-                    file_stat=current,
-                )
-                self._unlink_matching_conflict_target_locked(raw, target)
-                continue
-            temporary_current, _target_current = relation
-            self._unlink_regular_identity(
-                temporary,
-                temporary_current,
-                allowed_link_counts=frozenset({temporary_current.st_nlink}),
-            )
+        self._isolate_invalid_conflict_targets_locked()
 
     def _new_conflict_records_locked(self) -> list[_ConflictEvidenceRecord]:
         records: list[_ConflictEvidenceRecord] = []
@@ -1024,66 +835,9 @@ class LabArtifactCommitSpool(LabCommandSpool):
             )
         return records
 
-    def _corrupt_temp_records_locked(self) -> list[_ConflictEvidenceRecord]:
-        records: list[_ConflictEvidenceRecord] = []
-        owned_raw: set[Path] = set()
-        for path in self.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json"):
-            if self._CORRUPT_TEMP_NAME.fullmatch(path.name) is None:
-                continue
-            try:
-                evidence, file_stat = self._load_corrupt_temp_evidence_file(path)
-            except (InvalidCommandEnvelopeError, ValueError):
-                continue
-            files: list[tuple[Path, os.stat_result]] = [(path, file_stat)]
-            if evidence.raw_name is not None:
-                raw = self.quarantine_dir / evidence.raw_name
-                try:
-                    target_name, payload, raw_stat = self._load_corrupt_raw_locked(raw)
-                except InvalidCommandEnvelopeError:
-                    pass
-                else:
-                    raw_mismatch = (
-                        target_name != evidence.target_name
-                        or raw_stat.st_dev != evidence.device
-                        or raw_stat.st_ino != evidence.inode
-                        or len(payload) != evidence.byte_count
-                        or hashlib.sha256(payload).hexdigest() != evidence.content_hash
-                    )
-                    if not raw_mismatch:
-                        files.append((raw, raw_stat))
-                        owned_raw.add(raw)
-            records.append(
-                _ConflictEvidenceRecord(
-                    modified_at_ns=max(item[1].st_mtime_ns for item in files),
-                    name=path.name,
-                    size=sum(item[1].st_size for item in files),
-                    files=tuple(files),
-                )
-            )
-        for raw in self.quarantine_dir.glob("*.corrupt-conflict-temp.raw.bad"):
-            if raw in owned_raw:
-                continue
-            try:
-                _target_name, _payload, raw_stat = self._load_corrupt_raw_locked(raw)
-            except InvalidCommandEnvelopeError:
-                continue
-            records.append(
-                _ConflictEvidenceRecord(
-                    modified_at_ns=raw_stat.st_mtime_ns,
-                    name=raw.name,
-                    size=raw_stat.st_size,
-                    files=((raw, raw_stat),),
-                )
-            )
-        return records
-
     def _prune_conflicts_locked(self) -> None:
         self._recover_conflict_evidence_locked()
-        records = (
-            self._new_conflict_records_locked()
-            + self._legacy_conflict_records_locked()
-            + self._corrupt_temp_records_locked()
-        )
+        records = self._new_conflict_records_locked() + self._legacy_conflict_records_locked()
         records.sort(key=lambda record: (record.modified_at_ns, record.name))
         total_bytes = sum(record.size for record in records)
         while len(records) > self.max_conflict_records or (
@@ -1097,6 +851,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     file_stat,
                     allowed_link_counts=frozenset({file_stat.st_nlink}),
                 )
+        self._prune_owned_isolations_locked()
 
     def conflict_evidence(self) -> tuple[LabArtifactConflictEvidence, ...]:
         with self._exclusive_lock():

@@ -2204,7 +2204,7 @@ def test_worker_skips_superseded_claim_without_consuming_it(tmp_path: Path) -> N
     worker.run_once()
 
     assert claims.pending() == ()
-    assert len(tuple(claims.quarantine_dir.glob("*.json"))) == 1
+    assert len(tuple(claims.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))) == 1
     assert registry.executions == 1
     assert _reports(reports)[-1].claim_token == fresh.claim_token
 
@@ -2230,7 +2230,7 @@ def test_consumed_new_generation_prevents_old_claim_resurrection(tmp_path: Path)
     assert registry.executions == 0
     assert reports.pending() == ()
     assert claims.pending() == ()
-    assert len(tuple(claims.quarantine_dir.glob("*.json"))) == 1
+    assert len(tuple(claims.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))) == 1
     assert LabClaimSpool(claims.root).current(stale.job_id, stale.shard_id).claim == fresh
 
 
