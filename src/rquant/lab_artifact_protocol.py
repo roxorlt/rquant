@@ -7,11 +7,12 @@ import json
 import os
 import re
 import stat
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -173,6 +174,30 @@ class LabArtifactConflictEvidence(LabArtifactCommitProtocolModel):
         )
 
 
+class LabArtifactCommitScanCursor(LabArtifactCommitProtocolModel):
+    schema_version: Literal[1] = 1
+    last_pending_name: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_pending_name(self) -> LabArtifactCommitScanCursor:
+        is_basename = Path(self.last_pending_name).name == self.last_pending_name
+        if not is_basename or not self.last_pending_name.endswith(".json"):
+            raise ValueError("artifact scan cursor must contain a pending JSON basename")
+        return self
+
+
+class LabCorruptConflictTempEvidence(LabArtifactCommitProtocolModel):
+    schema_version: Literal[1] = 1
+    state: Literal["corrupt_temporary"] = "corrupt_temporary"
+    temporary_name: str = Field(min_length=1)
+    target_name: str = Field(min_length=1)
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    byte_count: int = Field(ge=0)
+    content_hash: str = Field(pattern=_HASH_PATTERN)
+    reason: Literal["invalid_typed_conflict_temporary"] = "invalid_typed_conflict_temporary"
+
+
 @dataclass(frozen=True)
 class _ConflictEvidenceRecord:
     modified_at_ns: int
@@ -206,6 +231,11 @@ class LabArtifactCommitSpool(LabCommandSpool):
         r"(?P<content_hash>[0-9a-f]{64})\."
         r"(?P<reason_hash>[0-9a-f]{16})\.conflict\.bad"
     )
+    _CORRUPT_TEMP_NAME = re.compile(
+        r"(?P<temporary_hash>[0-9a-f]{16})\."
+        r"(?P<device>[0-9a-f]+)\.(?P<inode>[0-9a-f]+)\."
+        r"(?P<content_hash>[0-9a-f]{16})\.corrupt-conflict-temp\.bad\.json"
+    )
 
     def __init__(
         self,
@@ -219,6 +249,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         if max_conflict_bytes < 1:
             raise ValueError("max_conflict_bytes must be positive")
         super().__init__(root)
+        self._scan_cursor_path = self.root / ".artifact-commit-scan-cursor.json"
         self.max_conflict_records = max_conflict_records
         self.max_conflict_bytes = max_conflict_bytes
         with self._exclusive_lock():
@@ -241,6 +272,51 @@ class LabArtifactCommitSpool(LabCommandSpool):
     def _conflict_temporary_path(self, evidence: LabArtifactConflictEvidence) -> Path:
         target = self._conflict_evidence_path(evidence)
         return self.quarantine_dir / f".{target.name}.publishing.tmp"
+
+    def _load_scan_cursor_locked(self) -> LabArtifactCommitScanCursor | None:
+        if not os.path.lexists(self._scan_cursor_path):
+            return None
+        _candidate, payload, _file_stat = self._read_regular_child(
+            self._scan_cursor_path,
+            self.root,
+        )
+        try:
+            return LabArtifactCommitScanCursor.model_validate_json(payload)
+        except ValueError as exc:
+            raise InvalidCommandEnvelopeError(f"invalid artifact scan cursor: {exc}") from exc
+
+    def _write_scan_cursor_locked(self, cursor: LabArtifactCommitScanCursor) -> None:
+        temporary = self.root / f".{self._scan_cursor_path.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(cursor.model_dump_json().encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._scan_cursor_path)
+            self._fsync_directory(self.root)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def fair_pending_paths(self, *, limit: int) -> tuple[Path, ...]:
+        if limit < 1:
+            raise ValueError("artifact fair scan limit must be positive")
+        with self._exclusive_lock():
+            paths = tuple(sorted(self.pending_dir.glob("*.json"), key=self._delivery_key))
+            if not paths:
+                return ()
+            cursor = self._load_scan_cursor_locked()
+            start = 0
+            if cursor is not None:
+                keys = tuple(self._delivery_key(path) for path in paths)
+                start = bisect_right(keys, self._delivery_key(Path(cursor.last_pending_name)))
+                if start == len(paths):
+                    start = 0
+            rotated = paths[start:] + paths[:start]
+            selected = rotated[:limit]
+            self._write_scan_cursor_locked(
+                LabArtifactCommitScanCursor(last_pending_name=selected[-1].name)
+            )
+            return selected
 
     @classmethod
     def _evidence_matches_name(
@@ -272,6 +348,59 @@ class LabArtifactCommitSpool(LabCommandSpool):
         )
         evidence = LabArtifactConflictEvidence.model_validate_json(payload)
         return evidence, payload, file_stat
+
+    @staticmethod
+    def _corrupt_temp_evidence_name(evidence: LabCorruptConflictTempEvidence) -> str:
+        temporary_hash = hashlib.sha256(evidence.temporary_name.encode("utf-8")).hexdigest()[:16]
+        return (
+            f"{temporary_hash}.{evidence.device:x}.{evidence.inode:x}."
+            f"{evidence.content_hash[:16]}.corrupt-conflict-temp.bad.json"
+        )
+
+    def _load_corrupt_temp_evidence_file(
+        self,
+        path: Path,
+    ) -> tuple[LabCorruptConflictTempEvidence, os.stat_result]:
+        _candidate, payload, file_stat = self._read_regular_child(path, self.quarantine_dir)
+        evidence = LabCorruptConflictTempEvidence.model_validate_json(payload)
+        temporary_match = self._CONFLICT_TEMP_NAME.fullmatch(evidence.temporary_name)
+        if temporary_match is None or temporary_match["target"] != evidence.target_name:
+            raise InvalidCommandEnvelopeError(
+                f"corrupt conflict temp identity mismatch: {path.name}"
+            )
+        if path.name != self._corrupt_temp_evidence_name(evidence):
+            raise InvalidCommandEnvelopeError(
+                f"corrupt conflict temp evidence name mismatch: {path.name}"
+            )
+        return evidence, file_stat
+
+    def _quarantine_corrupt_conflict_temp_locked(
+        self,
+        temporary: Path,
+        *,
+        target_name: str,
+        payload: bytes,
+        file_stat: os.stat_result,
+    ) -> None:
+        if file_stat.st_nlink != 1:
+            return
+        evidence = LabCorruptConflictTempEvidence(
+            temporary_name=temporary.name,
+            target_name=target_name,
+            device=file_stat.st_dev,
+            inode=file_stat.st_ino,
+            byte_count=file_stat.st_size,
+            content_hash=hashlib.sha256(payload).hexdigest(),
+        )
+        target = self.quarantine_dir / self._corrupt_temp_evidence_name(evidence)
+        evidence_payload = evidence.model_dump_json().encode("utf-8")
+        if not self._publish_no_clobber(target, evidence_payload):
+            existing, _existing_stat = self._load_corrupt_temp_evidence_file(target)
+            if existing != evidence:
+                raise InvalidCommandEnvelopeError(
+                    f"corrupt conflict temp evidence conflicts: {target.name}"
+                )
+        self._unlink_regular_identity(temporary, file_stat)
 
     def _publish_conflict_evidence_locked(
         self,
@@ -382,14 +511,31 @@ class LabArtifactCommitSpool(LabCommandSpool):
             if match is None:
                 continue
             try:
-                evidence, payload, temporary_stat = self._load_conflict_evidence_file(
+                _candidate, payload, temporary_stat = self._read_regular_child(
                     temporary,
+                    self.quarantine_dir,
                     allowed_link_counts=frozenset({1, 2}),
                 )
-            except (InvalidCommandEnvelopeError, ValueError):
+            except InvalidCommandEnvelopeError:
+                continue
+            try:
+                evidence = LabArtifactConflictEvidence.model_validate_json(payload)
+            except ValueError:
+                self._quarantine_corrupt_conflict_temp_locked(
+                    temporary,
+                    target_name=match["target"],
+                    payload=payload,
+                    file_stat=temporary_stat,
+                )
                 continue
             target = self._conflict_evidence_path(evidence)
             if temporary.name != f".{target.name}.publishing.tmp":
+                self._quarantine_corrupt_conflict_temp_locked(
+                    temporary,
+                    target_name=match["target"],
+                    payload=payload,
+                    file_stat=temporary_stat,
+                )
                 continue
             if not os.path.lexists(target):
                 if temporary_stat.st_nlink != 1:
@@ -540,9 +686,32 @@ class LabArtifactCommitSpool(LabCommandSpool):
             )
         return records
 
+    def _corrupt_temp_records_locked(self) -> list[_ConflictEvidenceRecord]:
+        records: list[_ConflictEvidenceRecord] = []
+        for path in self.quarantine_dir.glob("*.corrupt-conflict-temp.bad.json"):
+            if self._CORRUPT_TEMP_NAME.fullmatch(path.name) is None:
+                continue
+            try:
+                _evidence, file_stat = self._load_corrupt_temp_evidence_file(path)
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            records.append(
+                _ConflictEvidenceRecord(
+                    modified_at_ns=file_stat.st_mtime_ns,
+                    name=path.name,
+                    size=file_stat.st_size,
+                    files=((path, file_stat),),
+                )
+            )
+        return records
+
     def _prune_conflicts_locked(self) -> None:
         self._recover_conflict_evidence_locked()
-        records = self._new_conflict_records_locked() + self._legacy_conflict_records_locked()
+        records = (
+            self._new_conflict_records_locked()
+            + self._legacy_conflict_records_locked()
+            + self._corrupt_temp_records_locked()
+        )
         records.sort(key=lambda record: (record.modified_at_ns, record.name))
         total_bytes = sum(record.size for record in records)
         while len(records) > self.max_conflict_records or (

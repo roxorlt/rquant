@@ -803,13 +803,15 @@ class LabCommandSpool:
                 not stat.S_ISREG(current.st_mode)
                 or current.st_dev != identity.device
                 or current.st_ino != identity.inode
+                or current.st_nlink != identity.link_count
             ):
                 raise InvalidCommandEnvelopeError(
-                    "pending hard-linked inode was replaced before quarantine"
+                    "pending hard-linked inode identity or link count changed before quarantine"
                 )
             reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
             target = self.quarantine_dir / (
-                f"{name}.{current.st_dev}.{current.st_ino}.{reason_hash}.hardlink.bad.json"
+                f"{name}.{current.st_dev}.{current.st_ino}.{current.st_nlink}."
+                f"{reason_hash}.hardlink.bad.json"
             )
             artifact = LabHardLinkQuarantineArtifact(
                 original_name=name,
@@ -828,20 +830,29 @@ class LabCommandSpool:
                     raise RequestContentConflictError(
                         f"hard-link quarantine evidence conflicts: {target.name}"
                     )
+            self._after_hardlink_quarantine_evidence(identity, target)
             current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if (
                 not stat.S_ISREG(current.st_mode)
                 or current.st_dev != identity.device
                 or current.st_ino != identity.inode
+                or current.st_nlink != identity.link_count
             ):
                 raise InvalidCommandEnvelopeError(
-                    "pending hard-linked inode was replaced before unlink"
+                    "pending hard-linked inode identity or link count changed before unlink"
                 )
             os.unlink(name, dir_fd=directory_fd)
             os.fsync(directory_fd)
             return LabQuarantinedCommand(path=target, reason=reason)
         finally:
             os.close(directory_fd)
+
+    @staticmethod
+    def _after_hardlink_quarantine_evidence(
+        _identity: LabSpoolFileIdentity,
+        _evidence_path: Path,
+    ) -> None:
+        """Fault-injection boundary before the final hard-link identity check."""
 
     def _quarantine_nonregular_locked(
         self,

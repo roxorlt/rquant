@@ -1846,6 +1846,80 @@ def test_artifact_quarantine_failure_does_not_block_later_valid_commit(
     assert bad.exists()
 
 
+def test_command_and_artifact_quarantine_metrics_do_not_collide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, artifact_spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    bad_command = scheduler.spool.pending_dir / f"{uuid4()}.json"
+    bad_command.write_text("{}", encoding="utf-8")
+    bad_artifact = artifact_spool.pending_dir / f"{uuid4()}.json"
+    bad_artifact.write_text("{}", encoding="utf-8")
+    original_quarantine = artifact_spool.quarantine
+
+    def fail_bad_artifact_quarantine(
+        entry_or_path: LabArtifactCommitSpoolEntry | LabSpoolFileIdentity | Path,
+        *,
+        reason: str,
+    ) -> object:
+        source = entry_or_path.path if hasattr(entry_or_path, "path") else Path(entry_or_path)
+        if source == bad_artifact:
+            raise OSError("simulated artifact isolation failure")
+        return original_quarantine(entry_or_path, reason=reason)
+
+    monkeypatch.setattr(artifact_spool, "quarantine", fail_bad_artifact_quarantine)
+
+    tick = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.quarantined == 1
+    assert tick.artifact_commits_quarantined == 0
+    assert tick.artifact_commit_quarantine_failures == 1
+    assert tick.artifact_commits_accepted == 1
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+
+
+def test_artifact_fair_scan_reaches_valid_commit_after_persistent_failures_and_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.max_artifact_commits_per_tick = 1
+    bad_paths = tuple(spool.pending_dir / f"{uuid4()}.json" for _index in range(66))
+    for path in bad_paths:
+        path.write_text("{}", encoding="utf-8")
+    original_quarantine = spool.quarantine
+
+    def persist_bad_artifact(
+        entry_or_path: LabArtifactCommitSpoolEntry | LabSpoolFileIdentity | Path,
+        *,
+        reason: str,
+    ) -> object:
+        source = entry_or_path.path if hasattr(entry_or_path, "path") else Path(entry_or_path)
+        if source in bad_paths:
+            raise OSError("persistent isolation failure")
+        return original_quarantine(entry_or_path, reason=reason)
+
+    monkeypatch.setattr(spool, "quarantine", persist_bad_artifact)
+    first = scheduler.run_once()
+    assert first.artifact_commits_accepted == 0
+    assert first.artifact_commit_quarantine_failures == 65
+
+    restarted_spool = LabArtifactCommitSpool(spool.root)
+    monkeypatch.setattr(restarted_spool, "quarantine", persist_bad_artifact)
+    scheduler.artifact_commit_spool = restarted_spool
+    second = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    assert second.artifact_commit_quarantine_failures == 1
+    assert second.artifact_commits_accepted == 1
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+
+
 def test_cancel_wins_ready_artifact_commit_race_without_reviving_job(tmp_path: Path) -> None:
     store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
         _ready_artifact_commit_scenario(tmp_path)

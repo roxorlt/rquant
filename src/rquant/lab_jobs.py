@@ -993,6 +993,8 @@ def _sqlite_shard_row_valid(
 ) -> int:
     try:
         shard_id = UUID(str(shard_id_value))
+        if not shard_id.int:
+            raise ValueError("persisted shard_id cannot use the constructor sentinel")
         UUID(str(job_id_value))
         shard_index = _strict_sqlite_int(
             shard_index_value,
@@ -1141,7 +1143,7 @@ def _sqlite_shard_row_valid(
                 NAMESPACE_URL,
                 f"rquant:lab-shard:{shard_name}",
             )
-            if shard_id.int and shard_id != expected_shard_id:
+            if shard_id != expected_shard_id:
                 raise ValueError("shard id does not match deterministic definition")
 
         telemetry_values = (duration_ms, throughput, completion_sequence)
@@ -2814,6 +2816,8 @@ class LabJobReader:
                 created_at=_load_time(str(row["created_at"])),
                 updated_at=_load_time(str(row["updated_at"])),
             )
+            if not record.shard_id.int:
+                raise ValueError("persisted shard_id cannot use the constructor sentinel")
             is_legacy = record.adapter_id == "legacy-v2"
             if is_legacy:
                 if (

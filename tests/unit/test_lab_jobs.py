@@ -1860,6 +1860,7 @@ def test_get_job_uses_shard_aggregates_without_loading_twenty_thousand_models(
     ("mutation", "parameters"),
     [
         ("shard_id = ?", ("not-a-uuid",)),
+        ("shard_id = ?", (str(UUID(int=0)),)),
         ("shard_id = ?", ("00000000-0000-4000-8000-000000000001",)),
         ("payload_json = ?", ('{"fraction":1.5}',)),
         ("payload_hash = ?", ("f" * 64,)),
