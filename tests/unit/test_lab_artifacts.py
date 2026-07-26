@@ -161,6 +161,12 @@ def _evidence(sealed: LabSealedJobArtifact) -> LabArtifactIndexEvidence:
     )
 
 
+def _flatten_exception_group(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        return [nested for child in error.exceptions for nested in _flatten_exception_group(child)]
+    return [error]
+
+
 def _recovery_authority(candidate: LabJobArtifactCandidate) -> LabArtifactRecoveryAuthority:
     return LabArtifactRecoveryAuthority(
         job_id=candidate.job_id,
@@ -1681,6 +1687,50 @@ def test_zip_export_interleaves_large_file_reads_and_archive_writes(
     assert events[2][1] == events[3][1]
 
 
+def test_zip_export_hashes_published_output_without_full_descriptor_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    arguments = _prepare_arguments()
+    arguments["tables"] = {
+        "large": pd.DataFrame(
+            {
+                "sequence": np.arange(100_000, dtype=np.int64),
+                "value": np.linspace(-5.0, 5.0, 100_000, dtype=np.float64),
+            }
+        )
+    }
+    sealed = store.seal_candidate(store.prepare_candidate(**arguments))
+    original_read = lab_artifacts_module._read_descriptor
+    original_stream_hash = lab_artifacts_module._sha256_descriptor
+    full_read_identities: list[tuple[int, int]] = []
+    stream_hash_identities: list[tuple[int, int]] = []
+
+    def record_full_read(descriptor: int) -> bytes:
+        observed = os.fstat(descriptor)
+        full_read_identities.append((observed.st_dev, observed.st_ino))
+        return original_read(descriptor)
+
+    def record_stream_hash(descriptor: int) -> str:
+        observed = os.fstat(descriptor)
+        stream_hash_identities.append((observed.st_dev, observed.st_ino))
+        return original_stream_hash(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module, "_read_descriptor", record_full_read)
+    monkeypatch.setattr(lab_artifacts_module, "_sha256_descriptor", record_stream_hash)
+
+    destination = store.export_deterministic_zip(
+        sealed.path,
+        _evidence(sealed),
+        tmp_path / "large-output.zip",
+    )
+
+    output_identity = (destination.stat().st_dev, destination.stat().st_ino)
+    assert output_identity not in full_read_identities
+    assert stream_hash_identities.count(output_identity) >= 3
+
+
 def test_zip_export_rechecks_bytes_after_authorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2799,6 +2849,190 @@ def test_legacy_cache_rebuild_temp_symlink_never_writes_external_database(
     assert external.stat().st_size == len(external_before)
 
 
+def test_legacy_cache_rebuild_parent_fsync_failure_closes_published_cache_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gc.collect()
+    before_descriptors = len(os.listdir("/dev/fd"))
+    registry_before = dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS)
+    path = tmp_path / "index" / "legacy.sqlite3"
+    failed = LegacyArtifactIndex.__new__(LegacyArtifactIndex)
+    original_rename = lab_artifacts_module._rename_noreplace
+    original_fsync = lab_artifacts_module.os.fsync
+    cache_published = False
+
+    def publish_then_mark(
+        source_parent: int,
+        source_name: str,
+        destination_parent: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal cache_published
+        original_rename(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+        if source_name.endswith(".cache.tmp") and destination_name == path.name:
+            cache_published = True
+
+    def fail_parent_fsync_after_cache_publish(descriptor: int) -> None:
+        nonlocal cache_published
+        if cache_published and descriptor == failed._parent_descriptor:
+            cache_published = False
+            raise OSError("injected parent fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module, "_rename_noreplace", publish_then_mark)
+    monkeypatch.setattr(lab_artifacts_module.os, "fsync", fail_parent_fsync_after_cache_publish)
+
+    with pytest.raises(OSError, match="parent fsync"):
+        failed.__init__(path)
+
+    assert dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS) == registry_before
+    gc.collect()
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    monkeypatch.setattr(lab_artifacts_module, "_rename_noreplace", original_rename)
+    monkeypatch.setattr(lab_artifacts_module.os, "fsync", original_fsync)
+    recovered = LegacyArtifactIndex(path)
+    recovered.close()
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_private_file_open_closes_descriptor_on_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_fsync = lab_artifacts_module.os.fsync
+
+    def interrupt_file_fsync(descriptor: int) -> None:
+        if descriptor != parent_descriptor:
+            raise failure_type("injected base exception")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(lab_artifacts_module.os, "fsync", interrupt_file_fsync)
+
+    with pytest.raises(failure_type, match="base exception"):
+        lab_artifacts_module._open_or_create_private_regular_at(
+            parent_descriptor,
+            "legacy.sqlite3.lock",
+            access_flags=os.O_RDWR,
+            require_private_existing=True,
+        )
+
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    os.close(parent_descriptor)
+
+
+def test_private_file_open_preserves_primary_and_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_fsync = lab_artifacts_module.os.fsync
+    original_close = lab_artifacts_module.os.close
+    interrupted_descriptor = -1
+
+    def interrupt_file_fsync(descriptor: int) -> None:
+        nonlocal interrupted_descriptor
+        if descriptor != parent_descriptor:
+            interrupted_descriptor = descriptor
+            raise KeyboardInterrupt("primary open failure")
+        original_fsync(descriptor)
+
+    def close_then_fail(descriptor: int) -> None:
+        original_close(descriptor)
+        if descriptor == interrupted_descriptor:
+            raise OSError("descriptor close failure")
+
+    monkeypatch.setattr(lab_artifacts_module.os, "fsync", interrupt_file_fsync)
+    monkeypatch.setattr(lab_artifacts_module.os, "close", close_then_fail)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        lab_artifacts_module._open_or_create_private_regular_at(
+            parent_descriptor,
+            "legacy.sqlite3.lock",
+            access_flags=os.O_RDWR,
+            require_private_existing=True,
+        )
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, KeyboardInterrupt) for item in flattened)
+    assert any(isinstance(item, OSError) and "close" in str(item) for item in flattened)
+    monkeypatch.setattr(lab_artifacts_module.os, "close", original_close)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    os.close(parent_descriptor)
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_legacy_sqlite_connect_closes_connection_on_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    process_lock_key = index._process_lock_key
+    before_descriptors = len(os.listdir("/dev/fd"))
+
+    def interrupt_after_connect(_connection: sqlite3.Connection) -> None:
+        raise failure_type("injected post-connect base exception")
+
+    monkeypatch.setattr(index, "_after_sqlite_connect", interrupt_after_connect)
+
+    with pytest.raises(failure_type, match="post-connect"):
+        index.get("missing-run")
+
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    assert index._process_lock_entry is not None
+    assert index._process_lock_entry.owner_thread_id is None
+    index.close()
+    assert process_lock_key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+
+
+def test_legacy_sqlite_connect_preserves_primary_and_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    before_descriptors = len(os.listdir("/dev/fd"))
+    real_connect = sqlite3.connect
+
+    class FailingCloseConnection(sqlite3.Connection):
+        def close(self) -> None:
+            super().close()
+            raise OSError("SQLite close failure")
+
+    def failing_close_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = FailingCloseConnection
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    def fail_after_connect(_connection: sqlite3.Connection) -> None:
+        raise RuntimeError("post-connect primary failure")
+
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", failing_close_connect)
+    monkeypatch.setattr(index, "_after_sqlite_connect", fail_after_connect)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        index.get("missing-run")
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(isinstance(item, OSError) and "SQLite close" in str(item) for item in flattened)
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", real_connect)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    index.close()
+
+
 def test_legacy_cache_validation_is_readonly_before_damaged_cache_quarantine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2882,19 +3116,20 @@ def test_legacy_constructor_private_parent_failure_rolls_back_registry_and_fds(
     parent.mkdir(mode=0o755)
     os.chmod(parent, 0o755)
     path = parent / "legacy.sqlite3"
-    key = os.fspath(path.absolute())
+    registry_before = dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS)
     before_descriptors = len(os.listdir("/dev/fd"))
     failed = LegacyArtifactIndex.__new__(LegacyArtifactIndex)
 
     with pytest.raises(LabArtifactIntegrityError, match="permissions.*0700"):
         failed.__init__(path)
 
-    assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+    assert dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS) == registry_before
     assert len(os.listdir("/dev/fd")) == before_descriptors
     os.chmod(parent, 0o700)
     recovered = LegacyArtifactIndex(path)
+    process_lock_key = recovered._process_lock_key
     recovered.close()
-    assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+    assert process_lock_key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
 
 
 @pytest.mark.parametrize("failure_point", ["lock", "authority", "head"])
@@ -2904,7 +3139,7 @@ def test_legacy_constructor_injected_failure_rolls_back_registry_and_fds(
     failure_point: str,
 ) -> None:
     path = tmp_path / "index" / "legacy.sqlite3"
-    key = os.fspath(path.absolute())
+    registry_before = dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS)
     before_descriptors = len(os.listdir("/dev/fd"))
     original_open = lab_artifacts_module._open_or_create_private_regular_at
     original_bind_head = LegacyArtifactIndex._bind_or_create_authority_head
@@ -2948,7 +3183,7 @@ def test_legacy_constructor_injected_failure_rolls_back_registry_and_fds(
     with pytest.raises(OSError, match=failure_point):
         failed.__init__(path)
 
-    assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+    assert dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS) == registry_before
     assert len(os.listdir("/dev/fd")) == before_descriptors
     monkeypatch.setattr(
         lab_artifacts_module,
@@ -2961,15 +3196,95 @@ def test_legacy_constructor_injected_failure_rolls_back_registry_and_fds(
         original_bind_head,
     )
     recovered = LegacyArtifactIndex(path)
+    process_lock_key = recovered._process_lock_key
     recovered.close()
-    assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+    assert process_lock_key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+
+
+def test_legacy_constructor_preserves_primary_and_unlock_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gc.collect()
+    before_descriptors = len(os.listdir("/dev/fd"))
+    registry_before = dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS)
+    path = tmp_path / "index" / "legacy.sqlite3"
+    failed = LegacyArtifactIndex.__new__(LegacyArtifactIndex)
+    original_flock = lab_artifacts_module.fcntl.flock
+    unlock_failed = False
+
+    def fail_head(_index: LegacyArtifactIndex) -> None:
+        raise RuntimeError("primary head failure")
+
+    def fail_first_unlock(descriptor: int, operation: int) -> None:
+        nonlocal unlock_failed
+        if operation == fcntl.LOCK_UN and not unlock_failed:
+            unlock_failed = True
+            raise OSError("unlock cleanup failure")
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(LegacyArtifactIndex, "_bind_or_create_authority_head", fail_head)
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", fail_first_unlock)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        failed.__init__(path)
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(isinstance(item, OSError) and "unlock" in str(item) for item in flattened)
+    assert unlock_failed is True
+    assert failed._closed is True
+    assert dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS) == registry_before
+    gc.collect()
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_legacy_constructor_preserves_primary_and_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gc.collect()
+    before_descriptors = len(os.listdir("/dev/fd"))
+    registry_before = dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS)
+    path = tmp_path / "index" / "legacy.sqlite3"
+    failed = LegacyArtifactIndex.__new__(LegacyArtifactIndex)
+    original_close = lab_artifacts_module.os.close
+    close_failed = False
+
+    def fail_head(_index: LegacyArtifactIndex) -> None:
+        raise RuntimeError("primary head failure")
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_failed
+        should_fail = descriptor == failed._lock_descriptor and not close_failed
+        original_close(descriptor)
+        if should_fail:
+            close_failed = True
+            raise OSError("close cleanup failure")
+
+    monkeypatch.setattr(LegacyArtifactIndex, "_bind_or_create_authority_head", fail_head)
+    monkeypatch.setattr(lab_artifacts_module.os, "close", close_then_fail)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        failed.__init__(path)
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(isinstance(item, OSError) and "close" in str(item) for item in flattened)
+    assert close_failed is True
+    assert failed._closed is True
+    assert dict(lab_artifacts_module._LEGACY_PROCESS_LOCKS) == registry_before
+    monkeypatch.setattr(lab_artifacts_module.os, "close", original_close)
+    gc.collect()
+    assert len(os.listdir("/dev/fd")) == before_descriptors
 
 
 def test_legacy_process_lock_registry_releases_last_closed_instance(tmp_path: Path) -> None:
     path = tmp_path / "index" / "legacy.sqlite3"
-    key = os.fspath(path.absolute())
     first = LegacyArtifactIndex(path)
     second = LegacyArtifactIndex(path)
+    key = first._process_lock_key
+    assert key is not None
 
     entry = lab_artifacts_module._LEGACY_PROCESS_LOCKS[key]
     assert entry.references == 2
@@ -2992,7 +3307,8 @@ def test_legacy_same_thread_reentry_is_rejected_without_unlocking_outer_flock(
     first = LegacyArtifactIndex(path)
     second = LegacyArtifactIndex(path)
     target = first if nested_instance == "same" else second
-    key = os.fspath(path.absolute())
+    key = first._process_lock_key
+    assert key is not None
     probe_descriptor = os.open(path.with_name(f"{path.name}.lock"), os.O_RDWR)
     operation_descriptors = len(os.listdir("/dev/fd"))
     original_flock = lab_artifacts_module.fcntl.flock
@@ -3038,6 +3354,87 @@ def test_legacy_same_thread_reentry_is_rejected_without_unlocking_outer_flock(
     first.close()
     second.close()
     assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+@pytest.mark.parametrize("path_variant", ["same", "case_alias"])
+def test_legacy_constructor_reentry_uses_lock_inode_before_flock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path_variant: str,
+) -> None:
+    gc.collect()
+    before_descriptors = len(os.listdir("/dev/fd"))
+    canonical_path = tmp_path / "Index" / "legacy.sqlite3"
+    source = tmp_path / "legacy.json"
+    source.write_text('{"source":true}', encoding="utf-8")
+    first = LegacyArtifactIndex(canonical_path)
+    nested_path = canonical_path
+    if path_variant == "case_alias":
+        alias_parent = tmp_path / "index"
+        if (
+            not alias_parent.exists()
+            or alias_parent.stat().st_ino != canonical_path.parent.stat().st_ino
+        ):
+            first.close()
+            pytest.skip("filesystem is case-sensitive")
+        nested_path = alias_parent / canonical_path.name
+    lock_path = canonical_path.with_name(f"{canonical_path.name}.lock")
+    lock_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+    probe_descriptor = os.open(lock_path, os.O_RDWR)
+    operation_descriptors = len(os.listdir("/dev/fd"))
+    original_flock = lab_artifacts_module.fcntl.flock
+    callback_active = False
+    callback_count = 0
+    inner_flock_calls: list[int] = []
+
+    def reject_pre_fix_inner_flock(descriptor: int, operation: int) -> None:
+        observed = os.fstat(descriptor)
+        if (
+            callback_active
+            and descriptor != first._lock_descriptor
+            and operation & fcntl.LOCK_EX
+            and (observed.st_dev, observed.st_ino) == lock_identity
+        ):
+            inner_flock_calls.append(descriptor)
+            raise AssertionError("nested constructor reached flock")
+        original_flock(descriptor, operation)
+
+    def construct_from_clock() -> datetime:
+        nonlocal callback_active, callback_count
+        if callback_count == 0:
+            callback_count += 1
+            callback_active = True
+            started = time.monotonic()
+            try:
+                with pytest.raises(LabArtifactIntegrityError, match="reentrant"):
+                    LegacyArtifactIndex(nested_path)
+                assert time.monotonic() - started < 0.5
+                with pytest.raises(OSError) as blocked:
+                    original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                assert blocked.value.errno in {errno.EACCES, errno.EAGAIN}
+            finally:
+                callback_active = False
+        return datetime(2026, 7, 26, 9, tzinfo=UTC)
+
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", reject_pre_fix_inner_flock)
+    first.clock = construct_from_clock
+
+    imported = first.import_file(logical_run_id="constructor-reentry", source_path=source)
+
+    assert imported.status == "imported"
+    assert callback_count == 1
+    assert inner_flock_calls == []
+    assert first._process_lock_entry is not None
+    assert first._process_lock_entry.references == 1
+    original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    original_flock(probe_descriptor, fcntl.LOCK_UN)
+    assert len(os.listdir("/dev/fd")) == operation_descriptors
+    os.close(probe_descriptor)
+    process_lock_key = first._process_lock_key
+    first.close()
+    assert process_lock_key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
+    gc.collect()
     assert len(os.listdir("/dev/fd")) == before_descriptors
 
 

@@ -50,7 +50,7 @@ class _LegacyProcessLockEntry:
     owner_thread_id: int | None = None
 
 
-_LEGACY_PROCESS_LOCKS: dict[str, _LegacyProcessLockEntry] = {}
+_LEGACY_PROCESS_LOCKS: dict[tuple[int, int], _LegacyProcessLockEntry] = {}
 
 
 @dataclass
@@ -1186,8 +1186,19 @@ def _open_empty_private_file_at(parent_descriptor: int, name: str) -> int:
         ):
             raise LabArtifactIntegrityError("artifact placeholder is not a private empty file")
         return descriptor
-    except Exception:
-        os.close(descriptor)
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except BaseException as cleanup_error:
+            if isinstance(error, Exception) and isinstance(cleanup_error, Exception):
+                raise ExceptionGroup(
+                    "artifact placeholder validation and close both failed",
+                    [error, cleanup_error],
+                ) from None
+            raise BaseExceptionGroup(
+                "artifact placeholder validation and close both failed",
+                [error, cleanup_error],
+            ) from None
         raise
 
 
@@ -1259,8 +1270,19 @@ def _open_or_create_private_regular_at(
             os.fsync(descriptor)
             os.fsync(parent_descriptor)
         return descriptor, created
-    except Exception:
-        os.close(descriptor)
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except BaseException as cleanup_error:
+            if isinstance(error, Exception) and isinstance(cleanup_error, Exception):
+                raise ExceptionGroup(
+                    "managed file validation and close both failed",
+                    [error, cleanup_error],
+                ) from None
+            raise BaseExceptionGroup(
+                "managed file validation and close both failed",
+                [error, cleanup_error],
+            ) from None
         raise
 
 
@@ -5671,8 +5693,8 @@ class LabJobArtifactStore:
                     parent_identity=destination_parent_identity,
                     file_identity=destination_opened,
                 )
-                expected_zip_hash = _sha256(_read_descriptor(temporary_descriptor))
-                if _sha256(_read_descriptor(destination_descriptor)) != expected_zip_hash:
+                expected_zip_hash = _sha256_descriptor(temporary_descriptor)
+                if _sha256_descriptor(destination_descriptor) != expected_zip_hash:
                     raise LabArtifactIntegrityError(
                         "ZIP destination bytes changed after publication"
                     )
@@ -5697,7 +5719,7 @@ class LabJobArtifactStore:
                 _assert_bound_readonly_file(destination_bound, label="ZIP destination")
                 self._after_zip_final_checks(destination)
                 _assert_bound_readonly_file(destination_bound, label="ZIP destination")
-                if _sha256(_read_descriptor(destination_descriptor)) != expected_zip_hash:
+                if _sha256_descriptor(destination_descriptor) != expected_zip_hash:
                     raise LabArtifactIntegrityError("ZIP destination bytes changed before return")
                 self._assert_bound_paths(bound)
                 self._assert_managed_roots()
@@ -5769,8 +5791,7 @@ class LegacyArtifactIndex:
         self._operation_threads: dict[int, int] = {}
         self._closing = False
         self._closed = False
-        lock_key = os.fspath(self.path)
-        self._process_lock_key = lock_key
+        self._process_lock_key: tuple[int, int] | None = None
         self._process_lock_registered = False
         self._process_lock = threading.RLock()
         self._process_lock_entry: _LegacyProcessLockEntry | None = None
@@ -5789,21 +5810,6 @@ class LegacyArtifactIndex:
         self._authority_quarantine_path = self.path.parent / ".legacy-authority-quarantine"
         self._authority_heads_path = self.path.parent / self._authority_heads_name
         try:
-            with _LEGACY_PROCESS_LOCKS_GUARD:
-                entry = _LEGACY_PROCESS_LOCKS.get(lock_key)
-                if entry is None:
-                    entry = _LegacyProcessLockEntry(lock=threading.RLock(), references=0)
-                    _LEGACY_PROCESS_LOCKS[lock_key] = entry
-                entry.references += 1
-                try:
-                    self._process_lock = entry.lock
-                    self._process_lock_entry = entry
-                    self._process_lock_registered = True
-                except BaseException:
-                    entry.references -= 1
-                    if entry.references == 0:
-                        del _LEGACY_PROCESS_LOCKS[lock_key]
-                    raise
             _ensure_private_directory(
                 self.path.parent,
                 manage_existing=False,
@@ -5825,6 +5831,31 @@ class LegacyArtifactIndex:
                 require_private_existing=True,
             )
             self._parent_descriptor = _secure_open_directory(self.path.parent, create=False)
+            self._parent_identity = _FileObservation.from_stat(os.fstat(self._parent_descriptor))
+            self._lock_descriptor, _ = _open_or_create_private_regular_at(
+                self._parent_descriptor,
+                f"{self.path.name}.lock",
+                access_flags=os.O_RDWR,
+                require_private_existing=True,
+            )
+            self._lock_identity = _FileObservation.from_stat(os.fstat(self._lock_descriptor))
+            lock_key = (self._lock_identity.device, self._lock_identity.inode)
+            with _LEGACY_PROCESS_LOCKS_GUARD:
+                entry = _LEGACY_PROCESS_LOCKS.get(lock_key)
+                if entry is None:
+                    entry = _LegacyProcessLockEntry(lock=threading.RLock(), references=0)
+                    _LEGACY_PROCESS_LOCKS[lock_key] = entry
+                entry.references += 1
+                try:
+                    self._process_lock = entry.lock
+                    self._process_lock_entry = entry
+                    self._process_lock_key = lock_key
+                    self._process_lock_registered = True
+                except BaseException:
+                    entry.references -= 1
+                    if entry.references == 0:
+                        del _LEGACY_PROCESS_LOCKS[lock_key]
+                    raise
         except BaseException as error:
             try:
                 self.close()
@@ -5840,16 +5871,10 @@ class LegacyArtifactIndex:
                 ) from None
             raise
         try:
-            self._parent_identity = _FileObservation.from_stat(os.fstat(self._parent_descriptor))
-            with self._process_lock:
-                self._lock_descriptor, _ = _open_or_create_private_regular_at(
-                    self._parent_descriptor,
-                    f"{self.path.name}.lock",
-                    access_flags=os.O_RDWR,
-                    require_private_existing=True,
-                )
+            with self._legacy_process_operation_lock():
                 fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
                 self._authority_lock_depth += 1
+                operation_error: BaseException | None = None
                 try:
                     self._authority_descriptor, _ = _open_or_create_private_regular_at(
                         self._parent_descriptor,
@@ -5914,9 +5939,32 @@ class LegacyArtifactIndex:
                     authority = self._reconcile_published_sources(authority)
                     self._ensure_cache_ready(authority)
                     self._assert_index_identity()
+                except BaseException as exc:
+                    operation_error = exc
+                unlock_error: BaseException | None = None
+                try:
+                    fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+                except BaseException as exc:
+                    unlock_error = exc
                 finally:
                     self._authority_lock_depth -= 1
-                    fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+                if operation_error is not None and unlock_error is not None:
+                    if isinstance(operation_error, Exception) and isinstance(
+                        unlock_error,
+                        Exception,
+                    ):
+                        raise ExceptionGroup(
+                            "legacy index initialization and unlock both failed",
+                            [operation_error, unlock_error],
+                        ) from None
+                    raise BaseExceptionGroup(
+                        "legacy index initialization and unlock both failed",
+                        [operation_error, unlock_error],
+                    ) from None
+                if unlock_error is not None:
+                    raise unlock_error
+                if operation_error is not None:
+                    raise operation_error
         except BaseException as error:
             try:
                 self.close()
@@ -5951,6 +5999,7 @@ class LegacyArtifactIndex:
             self._closing = True
             while self._active_operations > 0:
                 condition.wait()
+        cleanup_errors: list[BaseException] = []
         try:
             with self._process_lock:
                 for attribute in (
@@ -5966,26 +6015,105 @@ class LegacyArtifactIndex:
                 ):
                     descriptor = getattr(self, attribute, -1)
                     if descriptor >= 0:
-                        with suppress(OSError):
+                        try:
                             os.close(descriptor)
-                        setattr(self, attribute, -1)
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                        finally:
+                            setattr(self, attribute, -1)
                 if getattr(self, "_process_lock_registered", False):
                     with _LEGACY_PROCESS_LOCKS_GUARD:
-                        entry = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
-                        if entry is not None and entry.lock is self._process_lock:
+                        key = self._process_lock_key
+                        entry = _LEGACY_PROCESS_LOCKS.get(key) if key is not None else None
+                        if (
+                            entry is not None
+                            and entry is self._process_lock_entry
+                            and entry.lock is self._process_lock
+                        ):
                             entry.references -= 1
-                            if entry.references == 0:
-                                del _LEGACY_PROCESS_LOCKS[self._process_lock_key]
+                            if entry.references == 0 and key is not None:
+                                del _LEGACY_PROCESS_LOCKS[key]
+                        else:
+                            cleanup_errors.append(
+                                LabArtifactIntegrityError(
+                                    "legacy index process lock registry changed before close"
+                                )
+                            )
                     self._process_lock_registered = False
+                    self._process_lock_entry = None
+                    self._process_lock_key = None
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         finally:
             with condition:
                 self._closed = True
                 self._closing = False
                 condition.notify_all()
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            if all(isinstance(error, Exception) for error in cleanup_errors):
+                raise ExceptionGroup(
+                    "legacy index close encountered multiple failures",
+                    [error for error in cleanup_errors if isinstance(error, Exception)],
+                )
+            raise BaseExceptionGroup(
+                "legacy index close encountered multiple failures",
+                cleanup_errors,
+            )
 
     def __del__(self) -> None:
-        with suppress(Exception):
+        with suppress(BaseException):
             self.close()
+
+    @contextmanager
+    def _legacy_process_operation_lock(self) -> Iterator[None]:
+        entry = self._process_lock_entry
+        key = self._process_lock_key
+        if entry is None or key is None:
+            raise LabArtifactIntegrityError("legacy index process lock is unavailable")
+        current_thread_id = threading.get_ident()
+        with _LEGACY_PROCESS_LOCKS_GUARD:
+            registered = _LEGACY_PROCESS_LOCKS.get(key)
+            if registered is not entry or registered.lock is not self._process_lock:
+                raise LabArtifactIntegrityError("legacy index process lock identity changed")
+            if entry.owner_thread_id == current_thread_id:
+                raise LabArtifactIntegrityError("reentrant legacy index operation is not allowed")
+        with self._process_lock:
+            with _LEGACY_PROCESS_LOCKS_GUARD:
+                registered = _LEGACY_PROCESS_LOCKS.get(key)
+                if registered is not entry or registered.lock is not self._process_lock:
+                    raise LabArtifactIntegrityError("legacy index process lock identity changed")
+                if entry.owner_thread_id is not None:
+                    raise LabArtifactIntegrityError("legacy index process lock owner changed")
+                entry.owner_thread_id = current_thread_id
+            caller_error: BaseException | None = None
+            try:
+                yield
+            except BaseException as exc:
+                caller_error = exc
+            integrity_error: BaseException | None = None
+            with _LEGACY_PROCESS_LOCKS_GUARD:
+                if entry.owner_thread_id != current_thread_id:
+                    integrity_error = LabArtifactIntegrityError(
+                        "legacy index process lock owner changed"
+                    )
+                else:
+                    entry.owner_thread_id = None
+            if caller_error is not None and integrity_error is not None:
+                if isinstance(caller_error, Exception):
+                    raise ExceptionGroup(
+                        "legacy operation and process lock cleanup both failed",
+                        [caller_error, integrity_error],
+                    ) from None
+                raise BaseExceptionGroup(
+                    "legacy operation and process lock cleanup both failed",
+                    [caller_error, integrity_error],
+                ) from None
+            if integrity_error is not None:
+                raise integrity_error
+            if caller_error is not None:
+                raise caller_error
 
     @property
     def _authority_heads_name(self) -> str:
@@ -6190,19 +6318,26 @@ class LegacyArtifactIndex:
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=self._heads_descriptor,
         )
-        selected_opened = _FileObservation.from_stat(os.fstat(selected_descriptor))
-        selected_at_path = _FileObservation.from_stat(
-            os.stat(
-                selected_name,
-                dir_fd=self._heads_descriptor,
-                follow_symlinks=False,
+        try:
+            selected_opened = _FileObservation.from_stat(os.fstat(selected_descriptor))
+            selected_at_path = _FileObservation.from_stat(
+                os.stat(
+                    selected_name,
+                    dir_fd=self._heads_descriptor,
+                    follow_symlinks=False,
+                )
             )
-        )
-        if selected_opened != selected_identity or selected_at_path != selected_identity:
-            os.close(selected_descriptor)
-            raise LabArtifactIntegrityError("legacy authority selected head changed while binding")
-        self._heads_identity = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
-        return selected_name, selected_descriptor, selected_opened, selected_head
+            if selected_opened != selected_identity or selected_at_path != selected_identity:
+                raise LabArtifactIntegrityError(
+                    "legacy authority selected head changed while binding"
+                )
+            self._heads_identity = _FileObservation.from_stat(os.fstat(self._heads_descriptor))
+            result = selected_name, selected_descriptor, selected_opened, selected_head
+            selected_descriptor = -1
+            return result
+        finally:
+            if selected_descriptor >= 0:
+                os.close(selected_descriptor)
 
     def _set_head_binding(
         self,
@@ -6328,7 +6463,7 @@ class LegacyArtifactIndex:
             descriptor = -1
             if previous_descriptor >= 0:
                 os.close(previous_descriptor)
-        except Exception:
+        except BaseException:
             if published:
                 os.fsync(self._heads_descriptor)
             raise
@@ -6730,15 +6865,6 @@ class LegacyArtifactIndex:
     @contextmanager
     def _legacy_operation_lifecycle(self) -> Iterator[None]:
         current_thread_id = threading.get_ident()
-        entry = self._process_lock_entry
-        if entry is None:
-            raise LabArtifactIntegrityError("legacy index process lock is unavailable")
-        with _LEGACY_PROCESS_LOCKS_GUARD:
-            registered = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
-            if registered is not entry or registered.lock is not self._process_lock:
-                raise LabArtifactIntegrityError("legacy index process lock identity changed")
-            if entry.owner_thread_id == current_thread_id:
-                raise LabArtifactIntegrityError("reentrant legacy index operation is not allowed")
         with self._lifecycle_condition:
             if self._closing or self._closed:
                 raise LabArtifactIntegrityError("legacy index is closing or closed")
@@ -6747,27 +6873,10 @@ class LegacyArtifactIndex:
                 self._operation_threads.get(current_thread_id, 0) + 1
             )
         try:
-            with self._process_lock:
-                with _LEGACY_PROCESS_LOCKS_GUARD:
-                    registered = _LEGACY_PROCESS_LOCKS.get(self._process_lock_key)
-                    if registered is not entry or registered.lock is not self._process_lock:
-                        raise LabArtifactIntegrityError(
-                            "legacy index process lock identity changed"
-                        )
-                    if entry.owner_thread_id is not None:
-                        raise LabArtifactIntegrityError("legacy index process lock owner changed")
-                    entry.owner_thread_id = current_thread_id
-                try:
-                    if self._closed:
-                        raise LabArtifactIntegrityError("legacy index is closed")
-                    yield
-                finally:
-                    with _LEGACY_PROCESS_LOCKS_GUARD:
-                        if entry.owner_thread_id != current_thread_id:
-                            raise LabArtifactIntegrityError(
-                                "legacy index process lock owner changed"
-                            )
-                        entry.owner_thread_id = None
+            with self._legacy_process_operation_lock():
+                if self._closed:
+                    raise LabArtifactIntegrityError("legacy index is closed")
+                yield
         finally:
             with self._lifecycle_condition:
                 self._active_operations -= 1
@@ -6852,9 +6961,23 @@ class LegacyArtifactIndex:
                 raise LabArtifactIntegrityError("legacy index connection identity changed")
             self._assert_index_identity()
             return connection
-        except Exception:
+        except BaseException as error:
             if "connection" in locals():
-                connection.close()
+                try:
+                    connection.close()
+                except BaseException as cleanup_error:
+                    if isinstance(error, Exception) and isinstance(
+                        cleanup_error,
+                        Exception,
+                    ):
+                        raise ExceptionGroup(
+                            "legacy SQLite connection and close both failed",
+                            [error, cleanup_error],
+                        ) from None
+                    raise BaseExceptionGroup(
+                        "legacy SQLite connection and close both failed",
+                        [error, cleanup_error],
+                    ) from None
             raise
 
     @contextmanager
@@ -7101,6 +7224,7 @@ class LegacyArtifactIndex:
             0o600,
             dir_fd=self._parent_descriptor,
         )
+        operation_error: BaseException | None = None
         try:
             initial_identity = _FileObservation.from_stat(os.fstat(temporary_descriptor))
             if initial_identity.mode != stat.S_IFREG or initial_identity.nlink != 1:
@@ -7144,11 +7268,35 @@ class LegacyArtifactIndex:
                 self._parent_descriptor,
                 self.path.name,
             )
-        except Exception:
-            os.close(temporary_descriptor)
-            raise
-        os.fsync(self._parent_descriptor)
-        self._database_descriptor = temporary_descriptor
+            os.fsync(self._parent_descriptor)
+            self._database_descriptor = temporary_descriptor
+            temporary_descriptor = -1
+        except BaseException as exc:
+            operation_error = exc
+        finally:
+            cleanup_error: BaseException | None = None
+            if temporary_descriptor >= 0:
+                try:
+                    os.close(temporary_descriptor)
+                except BaseException as exc:
+                    cleanup_error = exc
+            if operation_error is not None and cleanup_error is not None:
+                if isinstance(operation_error, Exception) and isinstance(
+                    cleanup_error,
+                    Exception,
+                ):
+                    raise ExceptionGroup(
+                        "legacy cache rebuild and descriptor close both failed",
+                        [operation_error, cleanup_error],
+                    ) from None
+                raise BaseExceptionGroup(
+                    "legacy cache rebuild and descriptor close both failed",
+                    [operation_error, cleanup_error],
+                ) from None
+            if cleanup_error is not None:
+                raise cleanup_error
+        if operation_error is not None:
+            raise operation_error
         self._database_identity = _FileObservation.from_stat(os.fstat(self._database_descriptor))
         self._journal_descriptor, _ = _open_or_create_private_regular_at(
             self._parent_descriptor,
