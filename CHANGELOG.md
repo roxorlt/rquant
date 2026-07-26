@@ -51,10 +51,12 @@
 ### Fixed
 
 - **Strategy Lab shard hash pandas table 上下文兼容**：集中实现有界流式的 legacy
-  `orient="table"` 兼容层，精确保留 float16/32/64、nullable/categorical 非有限值、纳秒
-  timedelta 尾零、NUL 列名截断及零列有行帧的历史 digest 语义；NUL 截断后重名改为
-  fail closed。固定向量、差分矩阵和 scheduler 已接受旧 bundle 的 finalizer 恢复测试覆盖
-  上述边界，同时保持 bytes 与高碎片 Arrow string 的既有内存上界。
+  `orient="table"` 兼容层；浮点 token 由 dtype 保真的单标量 pandas writer 以显式 15 位
+  精度生成，再按旧 canonical JSON 规则有界重编码，精确保留 float16/32/64、科学计数法、
+  nullable/categorical 与非有限值语义。普通和 categorical timedelta 分别匹配旧 writer 的
+  尾零规则，同时兼容 NUL 列名截断及零列有行帧；NUL 截断后重名改为 fail closed。固定
+  向量、随机差分和 scheduler 已接受旧 bundle 的 finalizer 恢复测试覆盖上述边界，并保持
+  bytes 与高碎片 Arrow string 的既有内存上界。
 
 - **Strategy Lab shard hash uint64 旧制品兼容**：流式 table-data encoder 将 NumPy/pandas
   unsigned scalar 安全归一为 Python `int`，避免 `2**63` 至 `2**64-1` 被 ujson 有符号回绕；

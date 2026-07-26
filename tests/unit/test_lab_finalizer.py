@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -261,7 +262,11 @@ class _LegacyTableContextRegistry(RecordingRegistry):
         result = super().execute_shard(validated, store)
         frame = pd.DataFrame(
             {
-                "a\x00b": pd.Series([float("inf")], dtype="float16"),
+                "a\x00b": pd.Series([np.finfo(np.float16).tiny], dtype="float16"),
+                "float32_rounding": pd.Series(
+                    [np.float32(-394.478118896484375)],
+                    dtype="float32",
+                ),
                 "duration": pd.Series(
                     [pd.Timedelta("-1 days 23:56:21.971770440")],
                     dtype="timedelta64[ns]",
@@ -672,7 +677,7 @@ def test_finalizer_recovers_accepted_legacy_table_context_bundle(
     manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
     artifact = manifest.artifacts[0]
     persisted = pd.read_parquet(attempt / artifact.file_name)
-    assert tuple(persisted.columns) == ("a\x00b", "duration")
+    assert tuple(persisted.columns) == ("a\x00b", "float32_rounding", "duration")
     assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
     assert evidence.accepted_success.receipt.status == "accepted"
 

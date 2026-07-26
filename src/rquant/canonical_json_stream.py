@@ -301,11 +301,14 @@ def write_pandas_json_value(
     escape_forward_slash: bool,
     sort_mapping_keys: bool,
     scalar_normalizer: Callable[[object], object] | None = None,
+    scalar_writer: Callable[[CanonicalJsonStreamWriter, object], bool] | None = None,
 ) -> None:
     """Write one pandas-to_json-compatible scalar without materializing strings."""
 
     if scalar_normalizer is not None:
         value = scalar_normalizer(value)
+    if scalar_writer is not None and scalar_writer(writer, value):
+        return
     if isinstance(value, Enum):
         write_pandas_json_value(
             writer,
@@ -313,6 +316,7 @@ def write_pandas_json_value(
             escape_forward_slash=escape_forward_slash,
             sort_mapping_keys=sort_mapping_keys,
             scalar_normalizer=scalar_normalizer,
+            scalar_writer=scalar_writer,
         )
         return
     if isinstance(value, str):
@@ -340,6 +344,7 @@ def write_pandas_json_value(
                 escape_forward_slash=escape_forward_slash,
                 sort_mapping_keys=sort_mapping_keys,
                 scalar_normalizer=scalar_normalizer,
+                scalar_writer=scalar_writer,
             )
         writer.write_ascii(b"}")
         return
@@ -354,6 +359,7 @@ def write_pandas_json_value(
                 escape_forward_slash=escape_forward_slash,
                 sort_mapping_keys=sort_mapping_keys,
                 scalar_normalizer=scalar_normalizer,
+                scalar_writer=scalar_writer,
             )
         writer.write_ascii(b"]")
         return
@@ -380,7 +386,65 @@ def _legacy_table_schema_scalar(value: object) -> object:
     return value
 
 
-def _legacy_table_timedelta_iso(value: object) -> str:
+def _legacy_table_float_token(
+    value: object,
+    *,
+    dtype: np.dtype[np.floating],
+) -> bytes:
+    probe = np.empty(1, dtype=dtype)
+    probe[0] = value
+    pandas_token = ujson_dumps(
+        probe,
+        ensure_ascii=True,
+        double_precision=15,
+        iso_dates=True,
+        date_unit="us",
+    )
+    if len(pandas_token) > _MAX_SCALAR_TOKEN_BYTES:
+        raise TypeError("legacy pandas float token exceeds bounded JSON token size")
+    decoded = json.loads(pandas_token)
+    if not isinstance(decoded, list) or len(decoded) != 1:
+        raise TypeError("legacy pandas float token has an invalid shape")
+    canonical = json.dumps(
+        decoded[0],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    if len(canonical) > _MAX_SCALAR_TOKEN_BYTES:
+        raise TypeError("legacy canonical float token exceeds bounded JSON token size")
+    return canonical
+
+
+def _write_legacy_table_schema_scalar(
+    writer: CanonicalJsonStreamWriter,
+    value: object,
+) -> bool:
+    if not isinstance(value, float):
+        return False
+    writer.write_ascii(_legacy_table_float_token(value, dtype=np.dtype("float64")))
+    return True
+
+
+def _legacy_table_timedelta_iso(
+    value: object,
+    *,
+    trim_fractional_zeros: bool,
+) -> str:
+    if not trim_fractional_zeros:
+        pandas_token = ujson_dumps(
+            value,
+            ensure_ascii=True,
+            double_precision=15,
+            iso_dates=True,
+            date_unit="us",
+        )
+        if len(pandas_token) > _MAX_SCALAR_TOKEN_BYTES:
+            raise TypeError("legacy pandas timedelta token exceeds bounded JSON token size")
+        decoded = json.loads(pandas_token)
+        if not isinstance(decoded, str):
+            raise TypeError("legacy pandas timedelta token is not a string")
+        return decoded
     encoded = pd.Timedelta(value).isoformat()
     prefix, separator, suffix = encoded.partition(".")
     if not separator or not suffix.endswith("S"):
@@ -402,6 +466,9 @@ class LegacyPandasTableColumnAccessor:
         self._duration = pd.api.types.is_timedelta64_dtype(value_dtype)
         self._duration_missing_as_nat = categorical_dtype is None and self._duration
         self._floating = pd.api.types.is_float_dtype(value_dtype)
+        self._float_dtype = (
+            np.dtype(getattr(value_dtype, "numpy_dtype", value_dtype)) if self._floating else None
+        )
         self._unsigned = pd.api.types.is_unsigned_integer_dtype(value_dtype)
         self._integer_categorical_with_missing = (
             categorical_dtype is not None
@@ -429,21 +496,33 @@ class LegacyPandasTableColumnAccessor:
                 else:
                     writer.write_ascii(b"null")
             else:
-                writer.write_string(_legacy_table_timedelta_iso(value))
+                writer.write_string(
+                    _legacy_table_timedelta_iso(
+                        value,
+                        trim_fractional_zeros=self._duration_missing_as_nat,
+                    )
+                )
             return
         if self._floating:
-            if bool(pd.isna(value)):
+            if self._float_dtype is None:
+                raise RuntimeError("legacy floating column dtype is unavailable")
+            if value is pd.NA:
                 writer.write_ascii(b"null")
                 return
-            normalized = float(value)
-            if not math.isfinite(normalized):
-                writer.write_ascii(b"null")
-                return
-            value = normalized
+            writer.write_ascii(_legacy_table_float_token(value, dtype=self._float_dtype))
+            return
         elif self._integer_categorical_with_missing and not pd.isna(value):
             value = float(value)
         elif self._unsigned and not pd.isna(value):
             value = int(value)
+        if isinstance(value, (float, np.floating)):
+            writer.write_ascii(
+                _legacy_table_float_token(
+                    value,
+                    dtype=np.asarray(value).dtype,
+                )
+            )
+            return
         write_pandas_json_value(
             writer,
             value,
@@ -494,6 +573,7 @@ class LegacyPandasTableCompatibility:
             escape_forward_slash=False,
             sort_mapping_keys=True,
             scalar_normalizer=_legacy_table_schema_scalar,
+            scalar_writer=_write_legacy_table_schema_scalar,
         )
         writer.write_ascii(b"}")
 

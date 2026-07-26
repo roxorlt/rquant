@@ -241,6 +241,172 @@ def test_canonical_shard_frame_digest_matches_legacy_float_matrix(
     assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "seed"),
+    [
+        (np.dtype("float16"), 2026073001),
+        (np.dtype("float32"), 2026073002),
+        (np.dtype("float64"), 2026073003),
+    ],
+    ids=["float16", "float32", "float64"],
+)
+def test_canonical_shard_frame_digest_matches_legacy_float_tokens(
+    dtype: np.dtype[np.floating],
+    seed: int,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    bit_dtype = {
+        2: np.dtype("uint16"),
+        4: np.dtype("uint32"),
+        8: np.dtype("uint64"),
+    }[dtype.itemsize]
+    rng = np.random.default_rng(seed)
+    random_bits = rng.integers(
+        0,
+        np.iinfo(bit_dtype).max,
+        size=513,
+        dtype=bit_dtype,
+        endpoint=True,
+    )
+    random_values = random_bits.view(dtype)
+    if dtype == np.dtype("float64"):
+        random_values = random_values[
+            ~np.isfinite(random_values) | (np.abs(random_values) <= 1e300)
+        ]
+    info = np.finfo(dtype)
+    max_value = info.max if dtype != np.dtype("float64") else dtype.type(info.max / 2)
+    boundaries = np.array(
+        [
+            dtype.type(0.0),
+            dtype.type(-0.0),
+            np.nextafter(dtype.type(0), dtype.type(1), dtype=dtype),
+            np.nextafter(dtype.type(0), dtype.type(-1), dtype=dtype),
+            info.tiny,
+            -info.tiny,
+            max_value,
+            -max_value,
+            dtype.type(np.nan),
+            dtype.type(np.inf),
+            dtype.type(-np.inf),
+        ],
+        dtype=dtype,
+    )
+    frame = pd.DataFrame({"v": np.concatenate((boundaries, random_values))})
+
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+def test_canonical_shard_frame_digest_matches_legacy_float_review_vectors() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame(
+        {
+            "float16_tiny": np.array(
+                [np.finfo(np.float16).tiny, -np.finfo(np.float16).tiny],
+                dtype=np.float16,
+            ),
+            "float32_rounding": np.array(
+                [-394.478118896484375, 394.478118896484375],
+                dtype=np.float32,
+            ),
+        }
+    )
+
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pd.Series(
+            [np.float32(-394.478118896484375), None, np.inf, -np.inf],
+            dtype="Float32",
+        ),
+        pd.Series(
+            [np.float64(np.finfo(np.float64).tiny), None, np.inf, -np.inf],
+            dtype="Float64",
+        ),
+        pd.Categorical(np.array([-394.478118896484375, np.inf, np.nan], dtype=np.float32)),
+        pd.Categorical(np.array([np.finfo(np.float64).tiny, np.inf, np.nan], dtype=np.float64)),
+    ],
+    ids=["Float32", "Float64", "category32", "category64"],
+)
+def test_canonical_shard_frame_digest_matches_legacy_nullable_and_categorical_float_tokens(
+    values: object,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": values})
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+def test_canonical_shard_frame_digest_matches_legacy_float64_max_failure() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": np.array([np.finfo(np.float64).max], dtype=np.float64)})
+
+    with pytest.raises(ValueError, match="Out of range float"):
+        _legacy_canonical_shard_frame_digest(frame)
+    with pytest.raises(ValueError, match="Out of range float"):
+        canonical_shard_frame_digest(frame)
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (
+            pd.Series(
+                pd.to_timedelta([0, 1, 10, 1000, -1, -10, -1000, None]),
+                dtype="timedelta64[ns]",
+            ),
+            [
+                "P0DT0H0M0S",
+                "P0DT0H0M0.000000001S",
+                "P0DT0H0M0.00000001S",
+                "P0DT0H0M0.000001S",
+                "P-1DT23H59M59.999999999S",
+                "P-1DT23H59M59.99999999S",
+                "P-1DT23H59M59.999999S",
+                "NaT",
+            ],
+        ),
+        (
+            pd.Categorical(pd.to_timedelta([0, 1, 10, 1000, -1, -10, -1000, None])),
+            [
+                "P0DT0H0M0S",
+                "P0DT0H0M0.000000001S",
+                "P0DT0H0M0.000000010S",
+                "P0DT0H0M0.000001S",
+                "P-1DT23H59M59.999999999S",
+                "P-1DT23H59M59.999999990S",
+                "P-1DT23H59M59.999999S",
+                None,
+            ],
+        ),
+    ],
+    ids=["duration", "categorical-duration"],
+)
+def test_canonical_shard_frame_digest_matches_legacy_timedelta_column_context(
+    values: object,
+    expected: list[str | None],
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": values})
+    raw = frame.to_json(
+        orient="table",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+        force_ascii=True,
+        index=False,
+    )
+
+    assert [item["v"] for item in json.loads(raw)["data"]] == expected
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
 def test_canonical_shard_frame_digest_rejects_nul_truncated_column_collision() -> None:
     from rquant.lab_worker import canonical_shard_frame_digest
 
