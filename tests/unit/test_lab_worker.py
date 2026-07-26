@@ -3693,7 +3693,8 @@ def test_success_receipt_timeout_stays_pending_without_failed_report(
     assert second.status == "succeeded"
     assert second.report_id == first.report_id
     assert registry.executions == 1
-    assert job is not None and job.status is JobStatus.SUCCEEDED
+    assert job is not None and job.status is JobStatus.RUNNING
+    assert job.result_state.value == "ready"
 
 
 def test_success_receipt_transport_error_is_unknown_without_failed_report(
@@ -3981,7 +3982,8 @@ def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Pa
     assert worker.sealed_bundle_path(claim).is_dir()
     job = LabJobReader(store.path).get_job(job_id)
     assert job is not None
-    assert job.status is JobStatus.SUCCEEDED
+    assert job.status is JobStatus.RUNNING
+    assert job.result_state.value == "ready"
     receipts = tuple(reports.load_receipt(path) for path in sorted(reports.ack_dir.glob("*.json")))
     assert len(receipts) == 2
     assert all(receipt.status == "accepted" for receipt in receipts)
@@ -4132,7 +4134,8 @@ def test_hard_crash_after_rename_is_reclaimed_before_generation_two_runs(
     assert not thread.is_alive()
     assert outcomes[0].status == "succeeded"
     assert worker.sealed_bundle_path(generation_two).is_dir()
-    assert job is not None and job.status is JobStatus.SUCCEEDED
+    assert job is not None and job.status is JobStatus.RUNNING
+    assert job.result_state.value == "ready"
 
 
 def test_stale_pending_success_does_not_block_obsolete_sealed_reclamation(
@@ -4332,7 +4335,8 @@ def test_unread_accepted_success_receipt_preserves_terminal_artifact(
     job = LabJobReader(store.path).get_job(job_id)
 
     assert pending.status == "awaiting_receipt"
-    assert job is not None and job.status is JobStatus.SUCCEEDED
+    assert job is not None and job.status is JobStatus.RUNNING
+    assert job.result_state.value == "ready"
     assert reports.ack_dir.joinpath(f"{pending.report_id}.json").is_file()
     generation_two = _retry_claim(generation_one)
     claims.publish(generation_two)

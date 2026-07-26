@@ -77,7 +77,7 @@ def _create_real_v2_fixture(path: Path) -> tuple[str, str]:
     return job_id, shard_id
 
 
-def test_initialize_creates_v4_telemetry_columns(tmp_path: Path) -> None:
+def test_initialize_creates_v5_result_and_telemetry_columns(tmp_path: Path) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
 
@@ -93,10 +93,11 @@ def test_initialize_creates_v4_telemetry_columns(tmp_path: Path) -> None:
             str(row[1]) for row in connection.execute("PRAGMA table_info(lab_worker_report)")
         }
 
-    assert version == 4
+    assert version == 5
     assert "lab_worker_report" in tables
     assert "lab_scheduler_state" in tables
     assert "result_contract_version" in job_columns
+    assert "result_state" in job_columns
     assert {
         "plan_hash",
         "adapter_id",
@@ -388,7 +389,7 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     assert shard.result_manifest_hash is None
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT COUNT(*) FROM lab_command").fetchone()[0] == 2
 
 
@@ -823,7 +824,7 @@ def test_initialize_migrates_v3_additively_without_inventing_legacy_telemetry(
 
     with sqlite3.connect(path) as connection:
         connection.row_factory = sqlite3.Row
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         migrated_job = connection.execute(
             "SELECT * FROM lab_job WHERE job_id = ?", (job_id,)
         ).fetchone()

@@ -1,30 +1,50 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import Thread
 from uuid import uuid4
 
+import pandas as pd
 import pytest
 
+from rquant.lab_artifact_protocol import (
+    LabAcknowledgedArtifactCommit,
+    LabArtifactCommit,
+    LabArtifactCommitEnvelope,
+    LabArtifactCommitReceipt,
+    LabArtifactCommitSpool,
+    LabArtifactCommitSpoolEntry,
+)
+from rquant.lab_artifacts import LabJobArtifactStore, LabSealedJobArtifact
 from rquant.lab_job_protocol import (
+    CancelJobCommand,
     LabAcknowledgedCommand,
     LabCommandEnvelope,
     LabCommandReceipt,
     LabCommandSpool,
     LabSpoolEntry,
+    PauseJobCommand,
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
+    COMPLETE_RESULT_CONTRACT_VERSION,
     JobStatus,
     LabJobReader,
+    LabJobRecord,
     LabJobStore,
+    LabResultState,
     SchedulerLeaseFencedError,
     SchedulerLeaseUnavailableError,
 )
 from rquant.lab_scheduler import LabScheduler, SchedulerTickResult
+from rquant.lab_shard_protocol import LabShardSucceeded, LabWorkerReport
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
     ExecutionCostSpec,
@@ -35,10 +55,12 @@ from rquant.research_run_spec import (
     ResourceClass,
 )
 
+from .test_lab_shard_control_plane import PLAN_HASH, _definition
+
 NOW = datetime(2026, 7, 24, 1, 0, tzinfo=UTC)
 
 
-def _spec() -> ResearchRunSpec:
+def _spec(*, deadline: datetime | None = None) -> ResearchRunSpec:
     return ResearchRunSpec(
         job_type=ResearchJobType.STRATEGY_REPLAY,
         parameters=ResearchRunParameters(
@@ -65,15 +87,15 @@ def _spec() -> ResearchRunSpec:
         ),
         random_seed=20260724,
         resource_class=ResourceClass.STANDARD,
-        deadline=datetime(2026, 7, 25, 2, tzinfo=UTC),
+        deadline=deadline or datetime(2026, 7, 25, 2, tzinfo=UTC),
         research_status="comparable",
     )
 
 
-def _envelope() -> LabCommandEnvelope:
+def _envelope(*, spec: ResearchRunSpec | None = None) -> LabCommandEnvelope:
     return LabCommandEnvelope(
         request_id=uuid4(),
-        command=SubmitJobCommand(job_id=uuid4(), spec=_spec(), max_attempts=3),
+        command=SubmitJobCommand(job_id=uuid4(), spec=spec or _spec(), max_attempts=3),
     )
 
 
@@ -123,6 +145,607 @@ def test_run_once_consumes_submit_but_keeps_job_queued_without_adapter(
     assert result.recovered == 0
     assert job is not None
     assert job.status is JobStatus.QUEUED
+    assert spool.pending() == ()
+
+
+def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -> None:
+    store, command_spool = _components(tmp_path)
+    commit_spool = LabArtifactCommitSpool(tmp_path / "artifact-commits")
+    artifact_store = LabJobArtifactStore(tmp_path / "artifacts")
+    clock = [NOW]
+    scheduler = LabScheduler(
+        store=store,
+        spool=command_spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        artifact_commit_spool=commit_spool,
+        artifact_store=artifact_store,
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    assert scheduler.lease is not None
+    envelope = _envelope()
+    assert store.apply_command(envelope, lease=scheduler.lease, now=NOW).status == "applied"
+    store.plan_job(
+        envelope.command.job_id,
+        (_definition(0),),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    report = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardSucceeded(result_manifest_hash="9" * 64),
+    )
+    assert store.apply_worker_report(
+        report,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=3),
+    ).status == "accepted"
+    job = LabJobReader(store.path).get_job(envelope.command.job_id)
+    assert job is not None and job.result_state is LabResultState.READY
+    sealed = artifact_store.seal_candidate(
+        artifact_store.prepare_candidate(
+            job_id=job.job_id,
+            spec=job.spec,
+            plan_hash=PLAN_HASH,
+            adapter_id="n-shape-replay",
+            adapter_version="v1",
+            result_contract_version=COMPLETE_RESULT_CONTRACT_VERSION,
+            metrics={"shards": 1},
+            report_markdown="# Complete result\n",
+            tables={"result": pd.DataFrame({"value": [1]})},
+        )
+    )
+    commit = LabArtifactCommit(
+        job_id=job.job_id,
+        spec_hash=sealed.manifest.spec_hash,
+        plan_hash=sealed.manifest.plan_hash,
+        adapter_id=sealed.manifest.adapter_id,
+        adapter_version=sealed.manifest.adapter_version,
+        result_contract_version=sealed.manifest.result_contract_version,
+        code_sha=sealed.manifest.code_sha,
+        dataset_snapshot=sealed.manifest.dataset_snapshot,
+        manifest_hash=sealed.manifest_hash,
+        complete_result_hash=sealed.manifest.complete_result_hash,
+        sealed_path=sealed.path,
+    )
+    published = commit_spool.publish(
+        LabArtifactCommitEnvelope(request_id=uuid4(), commit=commit)
+    )
+    clock[0] = NOW + timedelta(seconds=4)
+
+    tick = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    evidence = LabJobReader(store.path).get_result_artifact(job.job_id)
+    assert tick.artifact_commits_processed == 1
+    assert tick.artifact_commits_accepted == 1
+    assert tick.artifact_commits_rejected == 0
+    assert tick.artifact_commits_quarantined == 0
+    assert completed is not None and completed.status is JobStatus.SUCCEEDED
+    assert completed.result_state is LabResultState.SEALED
+    assert evidence is not None
+    assert evidence.manifest_hash == sealed.manifest_hash
+    assert evidence.complete_result_hash == sealed.manifest.complete_result_hash
+    assert commit_spool.pending() == ()
+    assert commit_spool.load_receipt(
+        commit_spool.ack_dir / f"{published.envelope.request_id}.json"
+    ).status == "accepted"
+    with sqlite3.connect(store.path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE lab_job_result_artifact SET sealed_path = sealed_path WHERE job_id = ?",
+                (str(job.job_id),),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "DELETE FROM lab_job_result_artifact WHERE job_id = ?",
+                (str(job.job_id),),
+            )
+
+
+def _ready_artifact_commit_scenario(
+    tmp_path: Path,
+    *,
+    scheduler_type: type[LabScheduler] = LabScheduler,
+    commit_spool_type: type[LabArtifactCommitSpool] = LabArtifactCommitSpool,
+    publish: bool = True,
+    deadline: datetime | None = None,
+) -> tuple[
+    LabJobStore,
+    LabScheduler,
+    LabArtifactCommitSpool,
+    LabJobArtifactStore,
+    LabJobRecord,
+    LabSealedJobArtifact,
+    LabArtifactCommitEnvelope,
+    list[datetime],
+]:
+    store, command_spool = _components(tmp_path)
+    commit_spool = commit_spool_type(tmp_path / "artifact-commits")
+    artifact_store = LabJobArtifactStore(tmp_path / "artifacts")
+    clock = [NOW]
+    scheduler = scheduler_type(
+        store=store,
+        spool=command_spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        artifact_commit_spool=commit_spool,
+        artifact_store=artifact_store,
+        clock=lambda: clock[0],
+    )
+    scheduler.run_once()
+    assert scheduler.lease is not None
+    submit = _envelope(spec=_spec(deadline=deadline))
+    assert store.apply_command(submit, lease=scheduler.lease, now=NOW).status == "applied"
+    store.plan_job(
+        submit.command.job_id,
+        (_definition(0),),
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = store.claim_next_shard(
+        worker_id="worker-a",
+        shard_lease_seconds=30,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert claim is not None
+    success = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardSucceeded(result_manifest_hash="9" * 64),
+    )
+    assert store.apply_worker_report(
+        success,
+        lease=scheduler.lease,
+        now=NOW + timedelta(seconds=3),
+    ).status == "accepted"
+    job = LabJobReader(store.path).get_job(submit.command.job_id)
+    assert job is not None and job.result_state is LabResultState.READY
+    sealed = artifact_store.seal_candidate(
+        artifact_store.prepare_candidate(
+            job_id=job.job_id,
+            spec=job.spec,
+            plan_hash=PLAN_HASH,
+            adapter_id="n-shape-replay",
+            adapter_version="v1",
+            result_contract_version=COMPLETE_RESULT_CONTRACT_VERSION,
+            metrics={"shards": 1},
+            report_markdown="# Complete result\n",
+            tables={"result": pd.DataFrame({"value": [1]})},
+        )
+    )
+    envelope = LabArtifactCommitEnvelope(
+        request_id=uuid4(),
+        commit=LabArtifactCommit(
+            job_id=job.job_id,
+            spec_hash=sealed.manifest.spec_hash,
+            plan_hash=sealed.manifest.plan_hash,
+            adapter_id=sealed.manifest.adapter_id,
+            adapter_version=sealed.manifest.adapter_version,
+            result_contract_version=sealed.manifest.result_contract_version,
+            code_sha=sealed.manifest.code_sha,
+            dataset_snapshot=sealed.manifest.dataset_snapshot,
+            manifest_hash=sealed.manifest_hash,
+            complete_result_hash=sealed.manifest.complete_result_hash,
+            sealed_path=sealed.path,
+        ),
+    )
+    if publish:
+        commit_spool.publish(envelope)
+    clock[0] = NOW + timedelta(seconds=4)
+    return store, scheduler, commit_spool, artifact_store, job, sealed, envelope, clock
+
+
+class _CrashBeforeArtifactCommitScheduler(LabScheduler):
+    @staticmethod
+    def _after_artifact_commit_staged(
+        _entry: LabArtifactCommitSpoolEntry,
+        _binding: object,
+    ) -> None:
+        raise RuntimeError("simulated crash before SQLite commit")
+
+
+def test_artifact_commit_crash_before_sqlite_commit_rolls_back_and_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            scheduler_type=_CrashBeforeArtifactCommitScheduler,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="before SQLite commit"):
+        scheduler.run_once()
+
+    pending = LabJobReader(store.path).get_job(job.job_id)
+    assert pending is not None and pending.result_state is LabResultState.READY
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert len(spool.pending()) == 1
+
+    monkeypatch.setattr(
+        scheduler,
+        "_after_artifact_commit_staged",
+        lambda _entry, _binding: None,
+    )
+    replay = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    assert replay.artifact_commits_accepted == 1
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+    assert spool.pending() == ()
+
+
+class _ReplaceBoundArtifactScheduler(LabScheduler):
+    @staticmethod
+    def _after_artifact_commit_staged(
+        entry: LabArtifactCommitSpoolEntry,
+        _binding: object,
+    ) -> None:
+        bundle = entry.envelope.commit.sealed_path
+        report = bundle / "report.md"
+        displaced = bundle.parent.parent / "displaced-report.md"
+        os.chmod(bundle, 0o700)
+        os.rename(report, displaced)
+        report.write_bytes(displaced.read_bytes())
+        os.chmod(report, 0o400)
+        os.chmod(bundle, 0o500)
+
+
+def test_artifact_final_check_failure_rolls_back_sqlite_and_quarantines(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            scheduler_type=_ReplaceBoundArtifactScheduler,
+        )
+    )
+
+    tick = scheduler.run_once()
+
+    pending = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_quarantined == 1
+    assert pending is not None and pending.result_state is LabResultState.READY
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert spool.pending() == ()
+
+
+class _CrashBeforeArtifactAckSpool(LabArtifactCommitSpool):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.crash = True
+
+    def ack(
+        self,
+        entry: LabArtifactCommitSpoolEntry,
+        receipt: LabArtifactCommitReceipt,
+    ) -> LabAcknowledgedArtifactCommit:
+        if self.crash:
+            self.crash = False
+            raise RuntimeError("simulated crash after artifact SQLite commit")
+        return super().ack(entry, receipt)
+
+
+def test_artifact_commit_after_sqlite_before_ack_replays_same_receipt(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            commit_spool_type=_CrashBeforeArtifactAckSpool,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="after artifact SQLite commit"):
+        scheduler.run_once()
+    committed = LabJobReader(store.path).get_job(job.job_id)
+    first = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert committed is not None and committed.result_state is LabResultState.SEALED
+    assert first is not None and first.receipt.status == "accepted"
+    assert len(spool.pending()) == 1
+
+    replay = scheduler.run_once()
+
+    assert replay.artifact_commits_accepted == 1
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) == first
+    assert len(
+        [
+            event
+            for event in LabJobReader(store.path).list_events(job.job_id)
+            if event.event_type == "job_result_sealed"
+        ]
+    ) == 1
+    assert spool.pending() == ()
+
+
+def test_same_artifact_index_is_idempotent_across_distinct_requests(tmp_path: Path) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    first_tick = scheduler.run_once()
+    replay = LabArtifactCommitEnvelope(request_id=uuid4(), commit=envelope.commit)
+    spool.publish(replay)
+
+    second_tick = scheduler.run_once()
+
+    second = LabJobReader(store.path).get_artifact_commit(replay.request_id)
+    assert first_tick.artifact_commits_accepted == 1
+    assert second_tick.artifact_commits_accepted == 1
+    assert second is not None and second.receipt.reason == "artifact_already_committed"
+    assert len(
+        [
+            event
+            for event in LabJobReader(store.path).list_events(job.job_id)
+            if event.event_type == "job_result_sealed"
+        ]
+    ) == 1
+
+
+def test_sealed_candidate_without_commit_keeps_job_ready(tmp_path: Path) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+
+    tick = scheduler.run_once()
+
+    unchanged = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_processed == 0
+    assert unchanged is not None and unchanged.result_state is LabResultState.READY
+    assert spool.pending() == ()
+
+
+def test_artifact_commit_identity_mismatch_is_rejected_without_index(tmp_path: Path) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    mismatched = LabArtifactCommitEnvelope(
+        request_id=envelope.request_id,
+        commit=LabArtifactCommit.model_validate(
+            {
+                **envelope.commit.model_dump(),
+                "manifest_hash": "0" * 64,
+            }
+        ),
+    )
+    spool.publish(mismatched)
+
+    tick = scheduler.run_once()
+
+    unchanged = LabJobReader(store.path).get_job(job.job_id)
+    record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert tick.artifact_commits_rejected == 1
+    assert unchanged is not None and unchanged.result_state is LabResultState.READY
+    assert record is not None and record.receipt.reason == "artifact_identity_mismatch"
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert spool.pending() == ()
+
+
+def test_cancel_wins_ready_artifact_commit_race_without_reviving_job(tmp_path: Path) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    assert scheduler.lease is not None
+    cancel = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=job.job_id,
+            expected_version=job.version,
+            reason="cancel before artifact commit",
+        ),
+    )
+    assert store.apply_command(
+        cancel,
+        lease=scheduler.lease,
+        now=clock[0],
+    ).status == "applied"
+
+    tick = scheduler.run_once()
+
+    cancelled = LabJobReader(store.path).get_job(job.job_id)
+    record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert tick.artifact_commits_rejected == 1
+    assert cancelled is not None and cancelled.status is JobStatus.CANCELLED
+    assert cancelled.result_state is LabResultState.PENDING
+    assert record is not None and record.receipt.reason == "invalid_state:cancelled"
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert spool.pending() == ()
+
+
+def test_pause_is_rejected_after_complete_result_becomes_ready(tmp_path: Path) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    assert scheduler.lease is not None
+    pause = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=PauseJobCommand(
+            job_id=job.job_id,
+            expected_version=job.version,
+            reason="pause after shards completed",
+        ),
+    )
+
+    receipt = store.apply_command(
+        pause,
+        lease=scheduler.lease,
+        now=clock[0],
+    )
+
+    unchanged = LabJobReader(store.path).get_job(job.job_id)
+    assert receipt.status == "rejected"
+    assert receipt.reason == "invalid_result_state:ready"
+    assert unchanged == job
+
+
+def test_deadline_wins_ready_artifact_commit_race(tmp_path: Path) -> None:
+    deadline = NOW + timedelta(seconds=4)
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, deadline=deadline)
+    )
+
+    tick = scheduler.run_once()
+
+    expired = LabJobReader(store.path).get_job(job.job_id)
+    record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert tick.deadlines_expired == 1
+    assert tick.artifact_commits_rejected == 1
+    assert expired is not None and expired.status is JobStatus.FAILED
+    assert expired.result_state is LabResultState.PENDING
+    assert record is not None and record.receipt.reason == "invalid_state:failed"
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert spool.pending() == ()
+
+
+def test_deadline_crossed_during_artifact_verification_wins_commit_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline = NOW + timedelta(seconds=5)
+    store, scheduler, spool, artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, deadline=deadline)
+    )
+    original_bind = artifacts.bind_verified_sealed
+
+    @contextmanager
+    def advance_clock_during_verification(
+        path: Path,
+        *,
+        indexed_at: datetime,
+    ) -> Iterator[object]:
+        with original_bind(path, indexed_at=indexed_at) as binding:
+            clock[0] = deadline + timedelta(seconds=1)
+            yield binding
+
+    monkeypatch.setattr(
+        artifacts,
+        "bind_verified_sealed",
+        advance_clock_during_verification,
+    )
+
+    tick = scheduler.run_once()
+
+    expired = LabJobReader(store.path).get_job(job.job_id)
+    record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert tick.deadlines_expired == 1
+    assert tick.artifact_commits_rejected == 1
+    assert expired is not None and expired.status is JobStatus.FAILED
+    assert expired.result_state is LabResultState.PENDING
+    assert record is not None and record.receipt.reason == "invalid_state:failed"
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert spool.pending() == ()
+
+
+def test_new_scheduler_recovers_ready_job_fence_before_commit(tmp_path: Path) -> None:
+    store, scheduler, spool, artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.release()
+    clock[0] = NOW + timedelta(seconds=5)
+    replacement = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "replacement-commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        artifact_commit_spool=spool,
+        artifact_store=artifacts,
+        clock=lambda: clock[0],
+    )
+
+    tick = replacement.run_once()
+
+    committed = LabJobReader(store.path).get_job(job.job_id)
+    record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert replacement.lease is not None
+    assert tick.recovered == 1
+    assert tick.artifact_commits_accepted == 1
+    assert committed is not None and committed.result_state is LabResultState.SEALED
+    assert committed.scheduler_fencing_token == replacement.lease.fencing_token
+    assert record is not None
+    assert record.receipt.reason == "artifact_committed"
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is not None
+
+
+def test_stale_scheduler_lease_cannot_stage_ready_artifact_commit(tmp_path: Path) -> None:
+    store, scheduler, _spool, artifacts, job, sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    assert scheduler.lease is not None
+    stale_lease = scheduler.lease
+    scheduler.release()
+    clock[0] = NOW + timedelta(seconds=5)
+    store.acquire_scheduler_lease(
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        now=clock[0],
+    )
+
+    with (
+        artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
+        pytest.raises(SchedulerLeaseFencedError, match="lease"),
+    ):
+        store.stage_artifact_commit(
+            envelope,
+            binding,
+            lease=stale_lease,
+            now=clock[0],
+        )
+
+    unchanged = LabJobReader(store.path).get_job(job.job_id)
+    assert unchanged == job
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+
+
+def test_replayed_request_with_changed_content_is_quarantined(tmp_path: Path) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            commit_spool_type=_CrashBeforeArtifactAckSpool,
+        )
+    )
+    with pytest.raises(RuntimeError, match="after artifact SQLite commit"):
+        scheduler.run_once()
+    pending = spool.pending()[0]
+    changed = LabArtifactCommitEnvelope(
+        request_id=envelope.request_id,
+        commit=LabArtifactCommit.model_validate(
+            {
+                **envelope.commit.model_dump(),
+                "manifest_hash": "0" * 64,
+            }
+        ),
+    )
+    pending.path.write_text(changed.model_dump_json(), encoding="utf-8")
+
+    tick = scheduler.run_once()
+
+    committed = LabJobReader(store.path).get_job(job.job_id)
+    original = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert tick.artifact_commits_quarantined == 1
+    assert committed is not None and committed.result_state is LabResultState.SEALED
+    assert original is not None and original.envelope == envelope
     assert spool.pending() == ()
 
 

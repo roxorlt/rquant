@@ -9,6 +9,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.lab_artifact_protocol import (
+    LabArtifactCommitSpool,
+    LabArtifactCommitSpoolEntry,
+)
+from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore, LabVerifiedSealedBinding
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
     LabCommandSpool,
@@ -37,6 +42,10 @@ class SchedulerTickResult(BaseModel):
     reports_accepted: int = Field(default=0, ge=0)
     reports_rejected: int = Field(default=0, ge=0)
     reports_quarantined: int = Field(default=0, ge=0)
+    artifact_commits_processed: int = Field(default=0, ge=0)
+    artifact_commits_accepted: int = Field(default=0, ge=0)
+    artifact_commits_rejected: int = Field(default=0, ge=0)
+    artifact_commits_quarantined: int = Field(default=0, ge=0)
     deadlines_expired: int = Field(default=0, ge=0)
     plans_created: int = Field(default=0, ge=0)
     plans_failed: int = Field(default=0, ge=0)
@@ -98,6 +107,9 @@ class LabScheduler:
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         max_claim_authority_per_tick: int = 128,
+        artifact_commit_spool: LabArtifactCommitSpool | None = None,
+        artifact_store: LabJobArtifactStore | None = None,
+        max_artifact_commits_per_tick: int = 64,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
         if not owner_id.strip():
@@ -120,6 +132,10 @@ class LabScheduler:
             raise ValueError("max_claims_per_tick must be positive")
         if max_claim_authority_per_tick < 1:
             raise ValueError("max_claim_authority_per_tick must be positive")
+        if max_artifact_commits_per_tick < 1:
+            raise ValueError("max_artifact_commits_per_tick must be positive")
+        if (artifact_commit_spool is None) != (artifact_store is None):
+            raise ValueError("artifact commit spool and artifact store must be configured together")
         normalized_workers = tuple(worker.strip() for worker in claim_worker_ids)
         if any(not worker for worker in normalized_workers):
             raise ValueError("claim_worker_ids must not contain empty values")
@@ -141,11 +157,38 @@ class LabScheduler:
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
+        self.artifact_commit_spool = artifact_commit_spool
+        self.artifact_store = artifact_store
+        self.max_artifact_commits_per_tick = max_artifact_commits_per_tick
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
         self._claim_cursor = 0
         self._claim_cursor_fence: int | None = None
         self._stop = Event()
+
+    @staticmethod
+    def _after_artifact_commit_staged(
+        _entry: LabArtifactCommitSpoolEntry,
+        _binding: LabVerifiedSealedBinding,
+    ) -> None:
+        """Fault-injection boundary before the bound artifact exit verification."""
+
+    @staticmethod
+    def _after_artifact_commit_sqlite_commit(
+        _entry: LabArtifactCommitSpoolEntry,
+    ) -> None:
+        """Fault-injection boundary after SQLite commit and before spool ack."""
+
+    @staticmethod
+    def _is_artifact_verification_error(exc: BaseException) -> bool:
+        if isinstance(exc, LabArtifactError):
+            return True
+        if isinstance(exc, BaseExceptionGroup):
+            return any(
+                LabScheduler._is_artifact_verification_error(item)
+                for item in exc.exceptions
+            )
+        return False
 
     def _seed_claim_cursor(self, lease: LabLeaseRecord) -> None:
         if self._claim_cursor_fence == lease.fencing_token:
@@ -463,6 +506,77 @@ class LabScheduler:
                         report_type=entry.report.body.report_type,
                     )
                 self.report_spool.ack(entry, receipt)
+        artifact_commits_processed = 0
+        artifact_commits_accepted = 0
+        artifact_commits_rejected = 0
+        artifact_commits_quarantined = 0
+        if self.artifact_commit_spool is not None and self.artifact_store is not None:
+            for path in self.artifact_commit_spool.pending_paths(
+                limit=self.max_artifact_commits_per_tick
+            ):
+                try:
+                    entry = self.artifact_commit_spool.load(path)
+                except InvalidCommandEnvelopeError as exc:
+                    self.artifact_commit_spool.quarantine(
+                        exc.file_identity or path,
+                        reason=f"invalid_artifact_commit:{exc}",
+                    )
+                    artifact_commits_quarantined += 1
+                    continue
+                _lease, verification_now = self._mutation_context()
+                authority_now = verification_now
+                staged = None
+                try:
+                    with self.artifact_store.bind_verified_sealed(
+                        entry.envelope.commit.sealed_path,
+                        indexed_at=verification_now,
+                    ) as binding:
+                        lease, mutation_now = self._mutation_context()
+                        authority_now = mutation_now
+                        deadlines_expired += len(
+                            self.store.expire_deadline_jobs(
+                                lease=lease,
+                                now=mutation_now,
+                            )
+                        )
+                        staged = self.store.stage_artifact_commit(
+                            entry.envelope,
+                            binding,
+                            lease=lease,
+                            now=mutation_now,
+                        )
+                        self._after_artifact_commit_staged(entry, binding)
+                except RequestContentConflictError as exc:
+                    if staged is not None:
+                        staged.rollback()
+                    self.artifact_commit_spool.quarantine(
+                        entry,
+                        reason=f"artifact_commit_content_conflict:{exc}",
+                    )
+                    artifact_commits_quarantined += 1
+                    continue
+                except BaseException as exc:
+                    if staged is not None:
+                        staged.rollback()
+                    if not isinstance(exc, Exception) or not self._is_artifact_verification_error(
+                        exc
+                    ):
+                        raise
+                    self.artifact_commit_spool.quarantine(
+                        entry,
+                        reason=f"artifact_verification_failed:{_safe_error_message(exc)}",
+                    )
+                    artifact_commits_quarantined += 1
+                    continue
+                assert staged is not None
+                receipt = staged.commit()
+                self._after_artifact_commit_sqlite_commit(entry)
+                artifact_commits_processed += 1
+                if receipt.status == "accepted":
+                    artifact_commits_accepted += 1
+                else:
+                    artifact_commits_rejected += 1
+                self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
         if self.adapter_registry is not None:
@@ -542,6 +656,10 @@ class LabScheduler:
             reports_accepted=reports_accepted,
             reports_rejected=reports_rejected,
             reports_quarantined=reports_quarantined,
+            artifact_commits_processed=artifact_commits_processed,
+            artifact_commits_accepted=artifact_commits_accepted,
+            artifact_commits_rejected=artifact_commits_rejected,
+            artifact_commits_quarantined=artifact_commits_quarantined,
             deadlines_expired=deadlines_expired,
             plans_created=plans_created,
             plans_failed=plans_failed,
@@ -584,6 +702,8 @@ class LabScheduler:
                 "quarantined": result.quarantined,
                 "reports_rejected": result.reports_rejected,
                 "reports_quarantined": result.reports_quarantined,
+                "artifact_commits_rejected": result.artifact_commits_rejected,
+                "artifact_commits_quarantined": result.artifact_commits_quarantined,
                 "plans_failed": result.plans_failed,
                 "claim_delivery_failures": result.claim_delivery_failures,
                 "claim_reconcile_failures": result.claim_reconcile_failures,

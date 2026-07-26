@@ -228,7 +228,7 @@ def _assert_control_plane_invariants(
         for shard in shards
     )
     if job.control_intent is ControlIntent.NONE:
-        assert active or claimable
+        assert active or claimable or job.result_state.value == "ready"
     else:
         assert active, f"{job.control_intent.value} must converge when no live claim remains"
 
@@ -972,7 +972,9 @@ def test_report_commit_replay_is_exactly_once_and_conflict_is_rejected(tmp_path:
     replay = store.apply_worker_report(report, lease=lease, now=NOW + timedelta(seconds=4))
     assert replay == first
     assert LabJobReader(store.path).get_worker_report(report_id).receipt == first
-    assert LabJobReader(store.path).get_job(job_id).status is JobStatus.SUCCEEDED
+    replayed_job = LabJobReader(store.path).get_job(job_id)
+    assert replayed_job is not None and replayed_job.status is JobStatus.RUNNING
+    assert replayed_job.result_state.value == "ready"
 
     conflict = _report(
         claim,
@@ -1018,7 +1020,9 @@ def test_telemetry_completion_sequence_is_acceptance_ordered_exactly_once_and_re
     assert shards[0].throughput_units_per_second == pytest.approx(2)
     assert shards[1].throughput_units_per_second == pytest.approx(1)
     assert job is not None
-    assert job.result_contract_version == "p1.4a-telemetry-v1"
+    assert job.result_contract_version == "p1.4b-complete-result-v1"
+    assert job.status is JobStatus.RUNNING
+    assert job.result_state.value == "ready"
 
 
 def test_p13_inflight_success_keeps_legacy_telemetry_columns_null(tmp_path: Path) -> None:
@@ -1035,6 +1039,11 @@ def test_p13_inflight_success_keeps_legacy_telemetry_columns_null(tmp_path: Path
         lease=lease,
         now=NOW + timedelta(seconds=1),
     )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE lab_job SET result_contract_version = NULL WHERE job_id = ?",
+            (str(frozen.job_id),),
+        )
     claim = store.claim_next_shard(
         worker_id=frozen.worker_id,
         shard_lease_seconds=30,
@@ -1061,6 +1070,8 @@ def test_p13_inflight_success_keeps_legacy_telemetry_columns_null(tmp_path: Path
     assert shard.throughput_units_per_second is None
     assert shard.completion_sequence is None
     assert job is not None and job.result_contract_version is None
+    assert job.status is JobStatus.SUCCEEDED
+    assert job.result_state.value == "legacy_unsealed"
 
 
 @pytest.mark.parametrize(
@@ -1416,7 +1427,9 @@ def test_pause_waits_for_every_already_running_shard_before_checkpoint(
     assert paused is not None and paused.status is JobStatus.CHECKPOINTED
 
 
-def test_final_shard_success_wins_even_when_pause_was_requested(tmp_path: Path) -> None:
+def test_final_shard_success_marks_complete_result_ready_and_clears_pause(
+    tmp_path: Path,
+) -> None:
     store, lease, job_id = _setup(tmp_path)
     claim = _claim(store, lease)
     _pause(store, lease, job_id, offset=3)
@@ -1427,8 +1440,30 @@ def test_final_shard_success_wins_even_when_pause_was_requested(tmp_path: Path) 
     )
     job = LabJobReader(store.path).get_job(job_id)
     assert receipt.status == "accepted"
-    assert job is not None and job.status is JobStatus.SUCCEEDED
+    assert job is not None and job.status is JobStatus.RUNNING
+    assert job.result_state.value == "ready"
+    assert job.result_contract_version == "p1.4b-complete-result-v1"
     assert job.control_intent is ControlIntent.NONE
+    assert store.claim_next_shard(
+        worker_id="worker-b",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=5),
+    ) is None
+    assert LabJobReader(store.path).list_events(job_id)[-1].event_type == "job_result_ready"
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="indexed sealed artifact"),
+    ):
+        connection.execute(
+            """
+            UPDATE lab_job SET status = 'succeeded', result_state = 'sealed'
+            WHERE job_id = ?
+            """,
+            (str(job_id),),
+        )
+    unchanged = LabJobReader(store.path).get_job(job_id)
+    assert unchanged is not None and unchanged.result_state.value == "ready"
 
 
 def test_cancel_at_idle_shard_boundary_terminalizes_immediately(tmp_path: Path) -> None:
@@ -2074,7 +2109,7 @@ def test_running_job_keeps_an_active_or_claimable_progress_path(tmp_path: Path) 
     _assert_control_plane_invariants(store, job_id, lease=lease, now_offset=4)
 
 
-def test_success_first_makes_later_cancel_a_terminal_rejection(tmp_path: Path) -> None:
+def test_ready_result_can_still_be_cancelled_before_artifact_commit(tmp_path: Path) -> None:
     store, lease, job_id = _setup(tmp_path)
     claim = _claim(store, lease)
     success = store.apply_worker_report(
@@ -2084,8 +2119,11 @@ def test_success_first_makes_later_cancel_a_terminal_rejection(tmp_path: Path) -
     )
     assert success.status == "accepted"
     cancel = _cancel(store, lease, job_id, offset=4)
-    assert cancel.status == "rejected"
-    assert cancel.reason == "invalid_state:succeeded"
+    assert cancel.status == "applied"
+    assert cancel.reason == "cancelled"
+    cancelled = LabJobReader(store.path).get_job(job_id)
+    assert cancelled is not None and cancelled.status is JobStatus.CANCELLED
+    assert cancelled.result_state.value == "pending"
 
 
 def test_reader_fails_closed_on_worker_report_tamper(tmp_path: Path) -> None:

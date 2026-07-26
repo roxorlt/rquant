@@ -22,6 +22,7 @@ from rquant.lab_job_protocol import (
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
+    COMPLETE_RESULT_CONTRACT_VERSION,
     CancelConfirmationRequiredError,
     ControlIntent,
     InvalidJobTransitionError,
@@ -35,6 +36,7 @@ from rquant.lab_jobs import (
     LabJobRecord,
     LabJobStore,
     LabLeaseRecord,
+    LabResultState,
     LabShardRecord,
     SchedulerLeaseFencedError,
     SchedulerLeaseUnavailableError,
@@ -313,7 +315,7 @@ def _create_609c599_v1_fixture(
     return rows
 
 
-def test_initialize_creates_v4_schema_and_required_pragmas(
+def test_initialize_creates_v5_schema_and_required_pragmas(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -338,12 +340,14 @@ def test_initialize_creates_v4_schema_and_required_pragmas(
         "lab_event",
         "lab_lease",
         "lab_artifact",
+        "lab_artifact_commit",
+        "lab_job_result_artifact",
     } <= tables
     assert application_id == LabJobStore.APPLICATION_ID
-    assert user_version == 4
+    assert user_version == 5
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
-    assert "STRICT" not in schema_sql
+    assert ") STRICT" not in schema_sql
     assert "TYPEOF(RECEIPT_JOB_VERSION) = 'INTEGER'" in " ".join(schema_sql.split())
 
     pragmas = store.connection_pragmas()
@@ -395,6 +399,49 @@ def test_store_and_reader_fail_closed_on_unknown_schema_version(
         LabJobReader(store.path).get_job(uuid4())
 
 
+def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER trg_lab_result_artifact_no_delete")
+        connection.execute(
+            """
+            CREATE TRIGGER trg_lab_result_artifact_no_delete
+            BEFORE DELETE ON lab_job_result_artifact
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        LabJobReader(store.path).get_job(uuid4())
+
+
+def test_complete_result_contract_cannot_enter_legacy_unsealed_state(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="indexed sealed artifact"),
+    ):
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET result_contract_version = ?, result_state = ?
+            WHERE job_id = ?
+            """,
+            (
+                COMPLETE_RESULT_CONTRACT_VERSION,
+                LabResultState.LEGACY_UNSEALED.value,
+                str(job.job_id),
+            ),
+        )
+
+
 def test_reader_refuses_wrong_application_id(tmp_path: Path) -> None:
     path = tmp_path / "other.sqlite3"
     with sqlite3.connect(path) as connection:
@@ -434,7 +481,7 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
         migrated_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lab_command'"
         ).fetchone()[0]
-    assert user_version == 4
+    assert user_version == 5
     assert "receipt_job_version" in columns
     assert migrated == (
         (
@@ -508,6 +555,70 @@ def test_v1_migration_fault_rolls_back_schema_rows_and_version(
     )
 
 
+def _create_v4_job_fixture(path: Path, *, status: JobStatus) -> UUID:
+    job_id = uuid4()
+    spec = _spec()
+    timestamp = NOW.isoformat(timespec="microseconds")
+    with sqlite3.connect(path) as connection:
+        for statement in lab_jobs._V4_SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO lab_job (
+                job_id, spec_json, spec_hash, job_type, resource_class,
+                deadline, status, control_intent, version, attempt_count,
+                max_attempts, recoverable, scheduler_fencing_token,
+                created_at, updated_at, result_contract_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, 1, 3, 0, ?, ?, ?, ?)
+            """,
+            (
+                str(job_id),
+                spec.model_dump_json(round_trip=True),
+                spec.spec_hash,
+                spec.job_type.value,
+                spec.resource_class.value,
+                spec.deadline.isoformat(timespec="microseconds"),
+                status.value,
+                ControlIntent.NONE.value,
+                1 if status is JobStatus.RUNNING else None,
+                timestamp,
+                timestamp,
+                lab_jobs.RESULT_CONTRACT_VERSION,
+            ),
+        )
+        connection.execute(f"PRAGMA application_id = {LabJobStore.APPLICATION_ID}")
+        connection.execute("PRAGMA user_version = 4")
+    return job_id
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_result_state"),
+    [
+        (JobStatus.SUCCEEDED, "legacy_unsealed"),
+        (JobStatus.RUNNING, "pending"),
+        (JobStatus.FAILED, "pending"),
+    ],
+)
+def test_v4_migration_preserves_legacy_contract_without_faking_sealed_result(
+    tmp_path: Path,
+    status: JobStatus,
+    expected_result_state: str,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    job_id = _create_v4_job_fixture(path, status=status)
+
+    LabJobStore(path).initialize()
+
+    migrated = LabJobReader(path).get_job(job_id)
+    assert migrated is not None
+    assert migrated.status is status
+    assert migrated.result_contract_version == lab_jobs.RESULT_CONTRACT_VERSION
+    assert migrated.result_state.value == expected_result_state
+    assert LabJobReader(path).get_result_artifact(job_id) is None
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+
+
 def test_reader_is_readonly_does_not_create_missing_database(tmp_path: Path) -> None:
     path = tmp_path / "missing.sqlite3"
     reader = LabJobReader(path)
@@ -538,6 +649,7 @@ def test_submit_roundtrips_validated_spec_and_typed_empty_rows(tmp_path: Path) -
     assert job.spec == spec
     assert job.spec.spec_hash == spec.spec_hash
     assert job.job_type is ResearchJobType.ABLATION
+    assert job.result_state.value == "pending"
     assert job.resource_class is ResourceClass.HEAVY
     assert job.status is JobStatus.QUEUED
     assert job.control_intent is ControlIntent.NONE

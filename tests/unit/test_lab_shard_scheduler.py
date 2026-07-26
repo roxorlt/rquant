@@ -812,7 +812,9 @@ def test_scheduler_does_not_revoke_consumed_claim_after_accepted_success(
     assert result.claims_revoked == 0
     assert consumed_path.read_bytes() == consumed_payload
     assert not claims.is_revoked(claim)
-    assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.SUCCEEDED
+    completed_shards = LabJobReader(store.path).get_job(job.job_id)
+    assert completed_shards is not None and completed_shards.status is JobStatus.RUNNING
+    assert completed_shards.result_state.value == "ready"
 
 
 def test_scheduler_report_commit_before_ack_replay_does_not_duplicate_telemetry(

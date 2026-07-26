@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from collections.abc import Iterator
@@ -15,6 +16,10 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.lab_artifact_protocol import (
+    LabArtifactCommitEnvelope,
+    LabArtifactCommitReceipt,
+)
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
@@ -48,6 +53,7 @@ from rquant.research_run_spec import (
 )
 
 if TYPE_CHECKING:
+    from rquant.lab_artifacts import LabArtifactIndexEvidence, LabVerifiedSealedBinding
     from rquant.lab_eta import LabEtaEstimate, LabEtaInput
 
 
@@ -86,9 +92,11 @@ class ShardPlanConflictError(RuntimeError):
 _APPLICATION_ID = 0x52514A42
 _LEGACY_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
-_PREVIOUS_SCHEMA_VERSION = 3
-_SCHEMA_VERSION = 4
+_V3_SCHEMA_VERSION = 3
+_PREVIOUS_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
+COMPLETE_RESULT_CONTRACT_VERSION = "p1.4b-complete-result-v1"
 LAB_ETA_COMPLETED_LIMIT_MAX = 256
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
@@ -112,6 +120,13 @@ class ControlIntent(StrEnum):
     NONE = "none"
     PAUSE_REQUESTED = "pause_requested"
     CANCEL_REQUESTED = "cancel_requested"
+
+
+class LabResultState(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    SEALED = "sealed"
+    LEGACY_UNSEALED = "legacy_unsealed"
 
 
 class ShardStatus(StrEnum):
@@ -173,6 +188,7 @@ class LabJobRecord(LabRecordModel):
     recoverable: bool
     scheduler_fencing_token: int | None = Field(default=None, ge=1)
     result_contract_version: str | None = Field(default=None, min_length=1)
+    result_state: LabResultState
     created_at: datetime
     updated_at: datetime
 
@@ -285,6 +301,50 @@ class LabWorkerReportRecord(LabRecordModel):
     scheduler_fencing_token: int = Field(ge=1)
     received_at: datetime
     applied_at: datetime
+
+
+class LabArtifactCommitRecord(LabRecordModel):
+    envelope: LabArtifactCommitEnvelope
+    receipt: LabArtifactCommitReceipt
+    received_at: datetime
+    applied_at: datetime
+
+
+class LabStagedArtifactCommit:
+    """A closed-surface SQLite transaction awaiting artifact exit verification."""
+
+    __slots__ = ("_connection", "_closed", "receipt")
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        receipt: LabArtifactCommitReceipt,
+    ) -> None:
+        self._connection = connection
+        self._closed = False
+        self.receipt = receipt
+
+    def commit(self) -> LabArtifactCommitReceipt:
+        if self._closed:
+            raise RuntimeError("artifact commit stage is already closed")
+        try:
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
+        finally:
+            self._connection.close()
+            self._closed = True
+        return self.receipt
+
+    def rollback(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._connection.rollback()
+        finally:
+            self._connection.close()
+            self._closed = True
 
 
 _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
@@ -499,6 +559,65 @@ def _worker_report_record_from_row(
         if isinstance(exc, InvalidStoredJobError):
             raise
         raise InvalidStoredJobError(f"invalid stored worker report {stored_id}: {exc}") from exc
+
+
+def _canonical_model_json(model: BaseModel) -> str:
+    return json.dumps(
+        model.model_dump(mode="json"),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _artifact_commit_record_from_row(
+    row: sqlite3.Row,
+    *,
+    expected_request_id: UUID | None = None,
+) -> LabArtifactCommitRecord:
+    stored_id = str(row["request_id"])
+    try:
+        request_id = UUID(stored_id)
+        envelope = LabArtifactCommitEnvelope.model_validate_json(str(row["commit_json"]))
+        receipt = LabArtifactCommitReceipt.model_validate_json(str(row["receipt_json"]))
+        if expected_request_id is not None and request_id != expected_request_id:
+            raise ValueError("artifact commit request id does not match lookup key")
+        if not (envelope.request_id == receipt.request_id == request_id):
+            raise ValueError("artifact commit request id mismatch")
+        if not (
+            envelope.content_hash == receipt.content_hash == str(row["content_hash"])
+        ):
+            raise ValueError("artifact commit content hash mismatch")
+        if not (envelope.commit.job_id == receipt.job_id == UUID(str(row["job_id"]))):
+            raise ValueError("artifact commit job id mismatch")
+        if receipt.status != str(row["status"]):
+            raise ValueError("artifact commit receipt status mismatch")
+        if receipt.reason != str(row["reason"]):
+            raise ValueError("artifact commit receipt reason mismatch")
+        version = _strict_nullable_sqlite_int(
+            row["receipt_job_version"],
+            field="lab_artifact_commit.receipt_job_version",
+            minimum=0,
+        )
+        if receipt.job_version != version:
+            raise ValueError("artifact commit receipt version mismatch")
+        if _canonical_model_json(envelope) != str(row["commit_json"]):
+            raise ValueError("artifact commit JSON is not canonical")
+        if _canonical_model_json(receipt) != str(row["receipt_json"]):
+            raise ValueError("artifact commit receipt JSON is not canonical")
+        return LabArtifactCommitRecord(
+            envelope=envelope,
+            receipt=receipt,
+            received_at=_load_time(str(row["received_at"])),
+            applied_at=_load_time(str(row["applied_at"])),
+        )
+    except Exception as exc:
+        if isinstance(exc, InvalidStoredJobError):
+            raise
+        raise InvalidStoredJobError(
+            f"invalid stored artifact commit {stored_id}: {exc}"
+        ) from exc
 
 
 def _validate_v2_schema(connection: sqlite3.Connection) -> None:
@@ -727,6 +846,111 @@ def _validate_v4_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _validate_v5_schema(connection: sqlite3.Connection) -> None:
+    _validate_v4_schema(connection)
+    job_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()
+    }
+    if "result_state" not in job_columns:
+        raise LabDatabaseIdentityError("lab jobs SQLite v5 is missing lab_job.result_state")
+    required_tables = {"lab_artifact_commit", "lab_job_result_artifact"}
+    existing_tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = sorted(required_tables - existing_tables)
+    if missing:
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v5 is missing tables: {', '.join(missing)}"
+        )
+    required_commit_columns = {
+        "request_id",
+        "content_hash",
+        "job_id",
+        "commit_json",
+        "status",
+        "reason",
+        "receipt_json",
+        "receipt_job_version",
+        "received_at",
+        "applied_at",
+    }
+    commit_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(lab_artifact_commit)").fetchall()
+    }
+    if commit_columns != required_commit_columns:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v5 lab_artifact_commit has invalid columns"
+        )
+    required_result_columns = {
+        "job_id",
+        "commit_request_id",
+        "sealed_path",
+        "manifest_hash",
+        "complete_result_hash",
+        "bundle_device",
+        "bundle_inode",
+        "evidence_json",
+        "indexed_at",
+    }
+    result_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(lab_job_result_artifact)"
+        ).fetchall()
+    }
+    if result_columns != required_result_columns:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v5 lab_job_result_artifact has invalid columns"
+        )
+    required_triggers = {
+        "trg_lab_job_complete_result_insert",
+        "trg_lab_job_complete_result_update",
+        "trg_lab_result_artifact_insert",
+        "trg_lab_result_artifact_no_update",
+        "trg_lab_result_artifact_no_delete",
+        "trg_lab_artifact_commit_no_update",
+        "trg_lab_artifact_commit_no_delete",
+    }
+    existing_triggers = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+    }
+    missing_triggers = sorted(required_triggers - existing_triggers)
+    if missing_triggers:
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v5 is missing triggers: {', '.join(missing_triggers)}"
+        )
+    expected_trigger_sql = {
+        "trg_lab_job_complete_result_insert": _V5_JOB_RESULT_INSERT_TRIGGER,
+        "trg_lab_job_complete_result_update": _V5_JOB_RESULT_UPDATE_TRIGGER,
+        "trg_lab_result_artifact_insert": _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
+        "trg_lab_result_artifact_no_update": _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
+        "trg_lab_result_artifact_no_delete": _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
+        "trg_lab_artifact_commit_no_update": _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
+        "trg_lab_artifact_commit_no_delete": _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
+    }
+    for name, expected_sql in expected_trigger_sql.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        assert row is not None
+        actual = " ".join(str(row[0]).strip().rstrip(";").split()).upper()
+        expected = " ".join(expected_sql.strip().rstrip(";").split()).upper()
+        actual = actual.replace(" IF NOT EXISTS ", " ")
+        expected = expected.replace(" IF NOT EXISTS ", " ")
+        if actual != expected:
+            raise LabDatabaseIdentityError(
+                f"lab jobs SQLite v5 trigger {name} has invalid structure"
+            )
+
+
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
     columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
@@ -885,6 +1109,30 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     connection.execute(_V4_COMPLETION_INDEX_STATEMENT)
     connection.execute(_V4_STATUS_INDEX_STATEMENT)
     _validate_v4_schema(connection)
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    _validate_v4_schema(connection)
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()
+    }
+    if "result_state" in columns:
+        raise LabDatabaseIdentityError("lab jobs SQLite v4 unexpectedly has result_state")
+    result_values = ",".join(f"'{state.value}'" for state in LabResultState)
+    connection.execute(
+        f"""
+        ALTER TABLE lab_job ADD COLUMN result_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (result_state IN ({result_values}))
+        """
+    )
+    connection.execute(
+        """
+        UPDATE lab_job
+        SET result_state = ?
+        WHERE status = ?
+        """,
+        (LabResultState.LEGACY_UNSEALED.value, JobStatus.SUCCEEDED.value),
+    )
 
 
 def _normalize_legacy_terminal_shards(connection: sqlite3.Connection) -> None:
@@ -1242,7 +1490,7 @@ class LabJobReader:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v4_schema(connection)
+            _validate_v5_schema(connection)
         except BaseException:
             connection.close()
             raise
@@ -1264,7 +1512,7 @@ class LabJobReader:
                 raise ValueError("resource_class does not match spec")
             if spec.deadline != stored_deadline:
                 raise ValueError("deadline does not match spec")
-            return LabJobRecord(
+            record = LabJobRecord(
                 job_id=UUID(str(row["job_id"])),
                 spec=spec,
                 spec_hash=stored_hash,
@@ -1291,9 +1539,31 @@ class LabJobReader:
                     if row["result_contract_version"] is not None
                     else None
                 ),
+                result_state=LabResultState(str(row["result_state"])),
                 created_at=_load_time(str(row["created_at"])),
                 updated_at=_load_time(str(row["updated_at"])),
             )
+            if record.result_state is LabResultState.READY and (
+                record.status is not JobStatus.RUNNING
+                or record.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+            ):
+                raise ValueError("ready result state requires a running complete-result job")
+            if record.result_state is LabResultState.SEALED and (
+                record.status is not JobStatus.SUCCEEDED
+                or record.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+            ):
+                raise ValueError("sealed result state requires a succeeded complete-result job")
+            if record.status is JobStatus.SUCCEEDED and record.result_state not in {
+                LabResultState.SEALED,
+                LabResultState.LEGACY_UNSEALED,
+            }:
+                raise ValueError("succeeded job has no authoritative result state")
+            if record.result_state is LabResultState.LEGACY_UNSEALED and (
+                record.status is not JobStatus.SUCCEEDED
+                or record.result_contract_version == COMPLETE_RESULT_CONTRACT_VERSION
+            ):
+                raise ValueError("legacy_unsealed is only valid for legacy succeeded jobs")
+            return record
         except Exception as exc:
             if isinstance(exc, InvalidStoredJobError):
                 raise
@@ -1800,6 +2070,64 @@ class LabJobReader:
             return None
         return _worker_report_record_from_row(row, expected_report_id=report_id)
 
+    def get_artifact_commit(self, request_id: UUID) -> LabArtifactCommitRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
+                (str(request_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return _artifact_commit_record_from_row(row, expected_request_id=request_id)
+
+    def get_result_artifact(self, job_id: UUID) -> LabArtifactIndexEvidence | None:
+        from rquant.lab_artifacts import LabArtifactIndexEvidence
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lab_job_result_artifact WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            evidence = LabArtifactIndexEvidence.model_validate_json(str(row["evidence_json"]))
+            if evidence.job_id != job_id:
+                raise ValueError("artifact evidence job id mismatch")
+            if (
+                str(evidence.sealed_path),
+                evidence.manifest_hash,
+                evidence.complete_result_hash,
+                evidence.bundle_device,
+                evidence.bundle_inode,
+                _dump_time(evidence.indexed_at),
+            ) != (
+                str(row["sealed_path"]),
+                str(row["manifest_hash"]),
+                str(row["complete_result_hash"]),
+                _strict_sqlite_int(
+                    row["bundle_device"],
+                    field="lab_job_result_artifact.bundle_device",
+                    minimum=0,
+                ),
+                _strict_sqlite_int(
+                    row["bundle_inode"],
+                    field="lab_job_result_artifact.bundle_inode",
+                    minimum=1,
+                ),
+                str(row["indexed_at"]),
+            ):
+                raise ValueError("artifact evidence conflicts with indexed columns")
+            if _canonical_model_json(evidence) != str(row["evidence_json"]):
+                raise ValueError("artifact evidence JSON is not canonical")
+            return evidence
+        except Exception as exc:
+            if isinstance(exc, InvalidStoredJobError):
+                raise
+            raise InvalidStoredJobError(
+                f"invalid stored result artifact {job_id}: {exc}"
+            ) from exc
+
     def execute_for_test(self, statement: str) -> None:
         with self._connect() as connection:
             connection.execute(statement)
@@ -1832,7 +2160,7 @@ class LabJobStore:
                     connection,
                     allow_unclaimed_empty=False,
                 )
-                _validate_v4_schema(connection)
+                _validate_v5_schema(connection)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
         except BaseException:
@@ -1849,7 +2177,7 @@ class LabJobStore:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v4_schema(connection)
+            _validate_v5_schema(connection)
             yield connection
             connection.commit()
         except BaseException:
@@ -1870,6 +2198,7 @@ class LabJobStore:
                     {
                         _LEGACY_SCHEMA_VERSION,
                         _V2_SCHEMA_VERSION,
+                        _V3_SCHEMA_VERSION,
                         _PREVIOUS_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
                     }
@@ -1888,10 +2217,12 @@ class LabJobStore:
                     connection.execute(statement)
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
             elif starting_version == _V2_SCHEMA_VERSION:
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
-            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
+                _migrate_v4_to_v5(connection)
+            elif starting_version == _V3_SCHEMA_VERSION:
                 shard_primary_key = _shard_primary_key_columns(connection)
                 if shard_primary_key == ("shard_id",):
                     _migrate_global_shard_primary_key(
@@ -1903,10 +2234,13 @@ class LabJobStore:
                         "lab jobs SQLite v3 has an unsupported lab_shard primary key"
                     )
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
+            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
+                _migrate_v4_to_v5(connection)
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
             _normalize_legacy_terminal_shards(connection)
-            _validate_v4_schema(connection)
+            _validate_v5_schema(connection)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
@@ -1936,6 +2270,424 @@ class LabJobStore:
                     minimum=0,
                 ),
             )
+
+    @staticmethod
+    def _artifact_binding_identity(
+        evidence: LabArtifactIndexEvidence,
+    ) -> tuple[object, ...]:
+        return (
+            evidence.job_id,
+            evidence.sealed_path,
+            evidence.manifest_hash,
+            evidence.complete_result_hash,
+            evidence.bundle_device,
+            evidence.bundle_inode,
+            evidence.file_identities,
+        )
+
+    @staticmethod
+    def _result_artifact_from_row(
+        row: sqlite3.Row,
+    ) -> LabArtifactIndexEvidence:
+        from rquant.lab_artifacts import LabArtifactIndexEvidence
+
+        evidence = LabArtifactIndexEvidence.model_validate_json(str(row["evidence_json"]))
+        if (
+            str(evidence.job_id),
+            str(evidence.sealed_path),
+            evidence.manifest_hash,
+            evidence.complete_result_hash,
+            evidence.bundle_device,
+            evidence.bundle_inode,
+            _dump_time(evidence.indexed_at),
+            _canonical_model_json(evidence),
+        ) != (
+            str(row["job_id"]),
+            str(row["sealed_path"]),
+            str(row["manifest_hash"]),
+            str(row["complete_result_hash"]),
+            _strict_sqlite_int(
+                row["bundle_device"],
+                field="lab_job_result_artifact.bundle_device",
+                minimum=0,
+            ),
+            _strict_sqlite_int(
+                row["bundle_inode"],
+                field="lab_job_result_artifact.bundle_inode",
+                minimum=1,
+            ),
+            str(row["indexed_at"]),
+            str(row["evidence_json"]),
+        ):
+            raise InvalidStoredJobError("stored result artifact evidence is inconsistent")
+        return evidence
+
+    @staticmethod
+    def _record_artifact_commit(
+        connection: sqlite3.Connection,
+        envelope: LabArtifactCommitEnvelope,
+        receipt: LabArtifactCommitReceipt,
+        *,
+        now: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO lab_artifact_commit (
+                request_id, content_hash, job_id, commit_json, status, reason,
+                receipt_json, receipt_job_version, received_at, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(envelope.request_id),
+                envelope.content_hash,
+                str(envelope.commit.job_id),
+                _canonical_model_json(envelope),
+                receipt.status,
+                receipt.reason,
+                _canonical_model_json(receipt),
+                receipt.job_version,
+                _dump_time(now),
+                _dump_time(now),
+            ),
+        )
+
+    def _reject_artifact_commit(
+        self,
+        connection: sqlite3.Connection,
+        envelope: LabArtifactCommitEnvelope,
+        *,
+        reason: str,
+        job_version: int | None,
+        now: datetime,
+    ) -> LabArtifactCommitReceipt:
+        receipt = LabArtifactCommitReceipt.from_envelope(
+            envelope,
+            status="rejected",
+            reason=reason,
+            accepted_at=now,
+            job_version=job_version,
+        )
+        self._record_artifact_commit(connection, envelope, receipt, now=now)
+        return receipt
+
+    def _apply_artifact_commit_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        envelope: LabArtifactCommitEnvelope,
+        binding: LabVerifiedSealedBinding,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabArtifactCommitReceipt:
+        from rquant.lab_artifacts import LabArtifactIndexEvidence
+
+        existing_commit = connection.execute(
+            "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
+            (str(envelope.request_id),),
+        ).fetchone()
+        if existing_commit is not None:
+            record = _artifact_commit_record_from_row(
+                existing_commit,
+                expected_request_id=envelope.request_id,
+            )
+            if record.envelope != envelope:
+                raise RequestContentConflictError(
+                    f"request_id {envelope.request_id} already has different artifact content"
+                )
+            if record.receipt.status == "accepted":
+                indexed_row = connection.execute(
+                    "SELECT * FROM lab_job_result_artifact WHERE job_id = ?",
+                    (str(envelope.commit.job_id),),
+                ).fetchone()
+                if indexed_row is None:
+                    raise InvalidStoredJobError(
+                        "accepted artifact commit is missing its result index"
+                    )
+                indexed = self._result_artifact_from_row(indexed_row)
+                if self._artifact_binding_identity(indexed) != self._artifact_binding_identity(
+                    binding.evidence
+                ):
+                    raise InvalidStoredJobError(
+                        "accepted artifact commit no longer matches bound index evidence"
+                    )
+            return record.receipt
+
+        commit = envelope.commit
+        manifest = binding.sealed.manifest
+        expected_claim = (
+            manifest.job_id,
+            manifest.spec_hash,
+            manifest.plan_hash,
+            manifest.adapter_id,
+            manifest.adapter_version,
+            manifest.result_contract_version,
+            manifest.code_sha,
+            manifest.dataset_snapshot,
+            binding.sealed.manifest_hash,
+            manifest.complete_result_hash,
+            binding.sealed.path,
+        )
+        actual_claim = (
+            commit.job_id,
+            commit.spec_hash,
+            commit.plan_hash,
+            commit.adapter_id,
+            commit.adapter_version,
+            commit.result_contract_version,
+            commit.code_sha,
+            commit.dataset_snapshot,
+            commit.manifest_hash,
+            commit.complete_result_hash,
+            commit.sealed_path,
+        )
+        if actual_claim != expected_claim:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="artifact_identity_mismatch",
+                job_version=None,
+                now=now,
+            )
+        if binding.evidence != LabArtifactIndexEvidence(
+            job_id=manifest.job_id,
+            sealed_path=binding.sealed.path,
+            manifest_hash=binding.sealed.manifest_hash,
+            complete_result_hash=manifest.complete_result_hash,
+            bundle_device=binding.sealed.device,
+            bundle_inode=binding.sealed.inode,
+            file_identities=binding.sealed.file_identities,
+            indexed_at=binding.evidence.indexed_at,
+        ):
+            raise InvalidStoredJobError("artifact binding evidence is internally inconsistent")
+
+        job_row = self._load_job_row(connection, commit.job_id)
+        if job_row is None:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="job_not_found",
+                job_version=None,
+                now=now,
+            )
+        job = LabJobReader._job_from_row(job_row)
+        indexed_row = connection.execute(
+            "SELECT * FROM lab_job_result_artifact WHERE job_id = ?",
+            (str(commit.job_id),),
+        ).fetchone()
+        if indexed_row is not None:
+            indexed = self._result_artifact_from_row(indexed_row)
+            if self._artifact_binding_identity(indexed) != self._artifact_binding_identity(
+                binding.evidence
+            ):
+                return self._reject_artifact_commit(
+                    connection,
+                    envelope,
+                    reason="artifact_index_conflict",
+                    job_version=job.version,
+                    now=now,
+                )
+            if (
+                job.status is not JobStatus.SUCCEEDED
+                or job.result_state is not LabResultState.SEALED
+            ):
+                raise InvalidStoredJobError("result index exists for a non-sealed job")
+            receipt = LabArtifactCommitReceipt.from_envelope(
+                envelope,
+                status="accepted",
+                reason="artifact_already_committed",
+                accepted_at=now,
+                job_version=job.version,
+            )
+            self._record_artifact_commit(connection, envelope, receipt, now=now)
+            return receipt
+
+        if job.status is not JobStatus.RUNNING:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason=f"invalid_state:{job.status.value}",
+                job_version=job.version,
+                now=now,
+            )
+        if job.result_state is not LabResultState.READY:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason=f"invalid_result_state:{job.result_state.value}",
+                job_version=job.version,
+                now=now,
+            )
+        if job.control_intent is not ControlIntent.NONE:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason=f"control_intent:{job.control_intent.value}",
+                job_version=job.version,
+                now=now,
+            )
+        if job.deadline <= now:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="deadline_expired",
+                job_version=job.version,
+                now=now,
+            )
+        if (
+            job.scheduler_fencing_token != lease.fencing_token
+            or job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+        ):
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="job_fence_or_contract_mismatch",
+                job_version=job.version,
+                now=now,
+            )
+        if (
+            job.spec_hash,
+            job.spec.code_sha,
+            job.spec.dataset_snapshot,
+            job.result_contract_version,
+        ) != (
+            commit.spec_hash,
+            commit.code_sha,
+            commit.dataset_snapshot,
+            commit.result_contract_version,
+        ):
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="job_identity_mismatch",
+                job_version=job.version,
+                now=now,
+            )
+        shard_rows = connection.execute(
+            "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
+            (str(commit.job_id),),
+        ).fetchall()
+        if not shard_rows or any(
+            ShardStatus(str(row["status"])) is not ShardStatus.SUCCEEDED
+            for row in shard_rows
+        ):
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="shards_not_succeeded",
+                job_version=job.version,
+                now=now,
+            )
+        shard_identity = {
+            (str(row["plan_hash"]), str(row["adapter_id"]), str(row["adapter_version"]))
+            for row in shard_rows
+        }
+        if shard_identity != {(commit.plan_hash, commit.adapter_id, commit.adapter_version)}:
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="shard_plan_identity_mismatch",
+                job_version=job.version,
+                now=now,
+            )
+
+        next_version = job.version + 1
+        receipt = LabArtifactCommitReceipt.from_envelope(
+            envelope,
+            status="accepted",
+            reason="artifact_committed",
+            accepted_at=now,
+            job_version=next_version,
+        )
+        self._record_artifact_commit(connection, envelope, receipt, now=now)
+        evidence_json = _canonical_model_json(binding.evidence)
+        connection.execute(
+            """
+            INSERT INTO lab_job_result_artifact (
+                job_id, commit_request_id, sealed_path, manifest_hash,
+                complete_result_hash, bundle_device, bundle_inode,
+                evidence_json, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(commit.job_id),
+                str(envelope.request_id),
+                str(binding.evidence.sealed_path),
+                binding.evidence.manifest_hash,
+                binding.evidence.complete_result_hash,
+                binding.evidence.bundle_device,
+                binding.evidence.bundle_inode,
+                evidence_json,
+                _dump_time(binding.evidence.indexed_at),
+            ),
+        )
+        cursor = connection.execute(
+            """
+            UPDATE lab_job
+            SET status = ?, result_state = ?, version = ?, updated_at = ?
+            WHERE job_id = ? AND version = ? AND status = ?
+              AND result_state = ? AND control_intent = ?
+              AND scheduler_fencing_token = ?
+            """,
+            (
+                JobStatus.SUCCEEDED.value,
+                LabResultState.SEALED.value,
+                next_version,
+                _dump_time(now),
+                str(commit.job_id),
+                job.version,
+                JobStatus.RUNNING.value,
+                LabResultState.READY.value,
+                ControlIntent.NONE.value,
+                lease.fencing_token,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise StaleJobVersionError("job changed while committing complete result artifact")
+        self._insert_event(
+            connection,
+            job_id=commit.job_id,
+            request_id=envelope.request_id,
+            event_type="job_result_sealed",
+            prior_status=JobStatus.RUNNING,
+            new_status=JobStatus.SUCCEEDED,
+            job_version=next_version,
+            reason="verified complete result artifact indexed",
+            fencing_token=lease.fencing_token,
+            now=now,
+        )
+        return receipt
+
+    def stage_artifact_commit(
+        self,
+        envelope: LabArtifactCommitEnvelope,
+        binding: LabVerifiedSealedBinding,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabStagedArtifactCommit:
+        from rquant.lab_artifacts import LabVerifiedSealedBinding
+
+        validated = LabArtifactCommitEnvelope.model_validate(envelope)
+        verified_binding = LabVerifiedSealedBinding.model_validate(binding)
+        current = _utc(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _validate_database_identity(connection, allow_unclaimed_empty=False)
+            _validate_v5_schema(connection)
+            self._validate_lease(connection, lease, now=current)
+            receipt = self._apply_artifact_commit_in_transaction(
+                connection,
+                validated,
+                verified_binding,
+                lease=lease,
+                now=current,
+            )
+            return LabStagedArtifactCommit(connection, receipt)
+        except BaseException:
+            connection.rollback()
+            connection.close()
+            raise
 
     def acquire_scheduler_lease(
         self,
@@ -2301,7 +3053,7 @@ class LabJobStore:
                 """
                 UPDATE lab_job
                 SET status = ?, control_intent = ?, version = ?, recoverable = ?,
-                    scheduler_fencing_token = NULL, updated_at = ?
+                    scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
                 WHERE job_id = ? AND version = ? AND status = ?
                 """,
                 (
@@ -2309,6 +3061,7 @@ class LabJobStore:
                     ControlIntent.NONE.value,
                     version,
                     int(tree_recoverable),
+                    LabResultState.PENDING.value,
                     _dump_time(now),
                     str(job_id),
                     stored_version,
@@ -2375,6 +3128,8 @@ class LabJobStore:
         *,
         lease: LabLeaseRecord,
         now: datetime,
+        event_type: str = "scheduler_takeover",
+        reason: str = "running shards fenced and reclaimed",
     ) -> sqlite3.Row:
         if JobStatus(str(row["status"])) is not JobStatus.RUNNING:
             return row
@@ -2408,11 +3163,11 @@ class LabJobStore:
             connection,
             job_id=job_id,
             request_id=None,
-            event_type="scheduler_takeover",
+            event_type=event_type,
             prior_status=JobStatus.RUNNING,
             new_status=JobStatus.RUNNING,
             job_version=version + 1,
-            reason="running shards fenced and reclaimed",
+            reason=reason,
             fencing_token=lease.fencing_token,
             now=now,
         )
@@ -2471,11 +3226,21 @@ class LabJobStore:
         next_fence = row_fence
         if target_status is JobStatus.RUNNING:
             next_fence = lease.fencing_token
+        result_state = LabResultState(str(row["result_state"]))
+        if target_status is JobStatus.SUCCEEDED:
+            if row["result_contract_version"] == COMPLETE_RESULT_CONTRACT_VERSION:
+                raise InvalidJobTransitionError(
+                    "complete-result jobs require a verified artifact commit"
+                )
+            result_state = LabResultState.LEGACY_UNSEALED
+        elif target_status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            result_state = LabResultState.PENDING
         connection.execute(
             """
             UPDATE lab_job
             SET status = ?, control_intent = ?, version = ?, attempt_count = ?,
-                recoverable = ?, scheduler_fencing_token = ?, updated_at = ?
+                recoverable = ?, scheduler_fencing_token = ?, result_state = ?,
+                updated_at = ?
             WHERE job_id = ? AND version = ?
             """,
             (
@@ -2485,6 +3250,7 @@ class LabJobStore:
                 attempt_count,
                 int(next_recoverable),
                 next_fence,
+                result_state.value,
                 _dump_time(now),
                 str(row["job_id"]),
                 stored_version,
@@ -2849,8 +3615,8 @@ class LabJobStore:
                 job_id, spec_json, spec_hash, job_type, resource_class,
                 deadline, status, control_intent, version, attempt_count,
                 max_attempts, recoverable, scheduler_fencing_token,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, ?, ?)
+                created_at, updated_at, result_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, ?, ?, ?)
             """,
             (
                 str(command.job_id),
@@ -2864,6 +3630,7 @@ class LabJobStore:
                 command.max_attempts,
                 _dump_time(now),
                 _dump_time(now),
+                LabResultState.PENDING.value,
             ),
         )
         self._insert_event(
@@ -3014,6 +3781,13 @@ class LabJobStore:
             return self._receipt_for_rejection(
                 envelope,
                 reason=f"invalid_state:{source.value}",
+                job_version=version,
+            )
+        result_state = LabResultState(str(row["result_state"]))
+        if result_state is LabResultState.READY:
+            return self._receipt_for_rejection(
+                envelope,
+                reason=f"invalid_result_state:{result_state.value}",
                 job_version=version,
             )
         if control_intent is not ControlIntent.NONE:
@@ -3242,13 +4016,14 @@ class LabJobStore:
             """
             UPDATE lab_job
             SET status = ?, control_intent = ?, version = ?, recoverable = 0,
-                scheduler_fencing_token = NULL, updated_at = ?
+                scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
             WHERE job_id = ? AND version = ?
             """,
             (
                 JobStatus.QUEUED.value,
                 ControlIntent.NONE.value,
                 next_version,
+                LabResultState.PENDING.value,
                 _dump_time(now),
                 str(command.job_id),
                 version,
@@ -3295,7 +4070,7 @@ class LabJobStore:
         work_plan_presence = tuple(item.work_plan is not None for item in ordered)
         if any(work_plan_presence) and not all(work_plan_presence):
             raise ValueError("a shard plan cannot mix telemetry and legacy definitions")
-        result_contract_version = RESULT_CONTRACT_VERSION if all(work_plan_presence) else None
+        result_contract_version = COMPLETE_RESULT_CONTRACT_VERSION
         current = _utc(now)
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
@@ -3343,7 +4118,11 @@ class LabJobStore:
                     if job_row["result_contract_version"] is not None
                     else None
                 )
-                if stored_contract != result_contract_version:
+                if stored_contract not in {
+                    None,
+                    RESULT_CONTRACT_VERSION,
+                    COMPLETE_RESULT_CONTRACT_VERSION,
+                }:
                     raise ShardPlanConflictError(
                         f"job {job_id} result contract does not match its shard plan"
                     )
@@ -3356,11 +4135,10 @@ class LabJobStore:
             max_attempts = _strict_sqlite_int(
                 job_row["max_attempts"], field="lab_job.max_attempts", minimum=1
             )
-            if result_contract_version is not None:
-                connection.execute(
-                    "UPDATE lab_job SET result_contract_version = ? WHERE job_id = ?",
-                    (result_contract_version, str(job_id)),
-                )
+            connection.execute(
+                "UPDATE lab_job SET result_contract_version = ? WHERE job_id = ?",
+                (result_contract_version, str(job_id)),
+            )
             for item in ordered:
                 work_plan = item.work_plan
                 connection.execute(
@@ -3443,13 +4221,14 @@ class LabJobStore:
                 """
                 UPDATE lab_job
                 SET status = ?, control_intent = ?, version = ?, recoverable = 0,
-                    scheduler_fencing_token = NULL, updated_at = ?
+                    scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
                 WHERE job_id = ? AND version = ? AND status = ?
                 """,
                 (
                     JobStatus.FAILED.value,
                     ControlIntent.NONE.value,
                     version + 1,
+                    LabResultState.PENDING.value,
                     _dump_time(current),
                     str(job_id),
                     version,
@@ -3526,13 +4305,14 @@ class LabJobStore:
                     """
                     UPDATE lab_job
                     SET status = ?, control_intent = ?, version = ?, recoverable = 0,
-                        scheduler_fencing_token = NULL, updated_at = ?
+                        scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
                     WHERE job_id = ? AND version = ? AND status = ?
                     """,
                     (
                         JobStatus.FAILED.value,
                         ControlIntent.NONE.value,
                         version + 1,
+                        LabResultState.PENDING.value,
                         _dump_time(current),
                         str(job_id),
                         version,
@@ -4405,17 +5185,62 @@ class LabJobStore:
             remaining, field="lab_shard.remaining_count", minimum=0
         )
         if remaining_count == 0:
-            self._transition_in_transaction(
-                connection,
-                job_row,
-                target_status=JobStatus.SUCCEEDED,
-                lease=lease,
-                reason="all shards succeeded",
-                now=now,
-                request_id=None,
-                recoverable=None,
-                event_type="job_succeeded",
-            )
+            if job_row["result_contract_version"] == COMPLETE_RESULT_CONTRACT_VERSION:
+                stored_version = _strict_sqlite_int(
+                    job_row["version"], field="lab_job.version", minimum=0
+                )
+                row_fence = _strict_nullable_sqlite_int(
+                    job_row["scheduler_fencing_token"],
+                    field="lab_job.scheduler_fencing_token",
+                    minimum=1,
+                )
+                if row_fence != lease.fencing_token:
+                    raise SchedulerLeaseFencedError(
+                        "running job belongs to a different scheduler fence"
+                    )
+                next_version = stored_version + 1
+                cursor = connection.execute(
+                    """
+                    UPDATE lab_job
+                    SET control_intent = ?, result_state = ?, version = ?, updated_at = ?
+                    WHERE job_id = ? AND version = ? AND status = ?
+                    """,
+                    (
+                        ControlIntent.NONE.value,
+                        LabResultState.READY.value,
+                        next_version,
+                        _dump_time(now),
+                        str(report.job_id),
+                        stored_version,
+                        JobStatus.RUNNING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StaleJobVersionError("job changed while marking result ready")
+                self._insert_event(
+                    connection,
+                    job_id=report.job_id,
+                    request_id=None,
+                    event_type="job_result_ready",
+                    prior_status=JobStatus.RUNNING,
+                    new_status=JobStatus.RUNNING,
+                    job_version=next_version,
+                    reason="all shards succeeded; complete result artifact required",
+                    fencing_token=lease.fencing_token,
+                    now=now,
+                )
+            else:
+                self._transition_in_transaction(
+                    connection,
+                    job_row,
+                    target_status=JobStatus.SUCCEEDED,
+                    lease=lease,
+                    reason="all shards succeeded under legacy result contract",
+                    now=now,
+                    request_id=None,
+                    recoverable=None,
+                    event_type="job_succeeded_legacy_unsealed",
+                )
         elif ControlIntent(str(job_row["control_intent"])) is ControlIntent.PAUSE_REQUESTED:
             active_count = connection.execute(
                 "SELECT COUNT(*) FROM lab_shard WHERE job_id = ? AND status = ?",
@@ -4758,7 +5583,7 @@ class LabJobStore:
                     """
                     UPDATE lab_job
                     SET status = ?, control_intent = ?, version = ?,
-                        scheduler_fencing_token = ?, updated_at = ?
+                        scheduler_fencing_token = ?, result_state = ?, updated_at = ?
                     WHERE job_id = ? AND version = ?
                     """,
                     (
@@ -4766,6 +5591,7 @@ class LabJobStore:
                         ControlIntent.NONE.value,
                         version,
                         lease.fencing_token,
+                        LabResultState.PENDING.value,
                         _dump_time(current),
                         str(row["job_id"]),
                         stored_version,
@@ -4792,6 +5618,42 @@ class LabJobStore:
                     UUID(str(row["job_id"])),
                 )
                 assert updated is not None
+                recovered.append(LabJobReader._job_from_row(updated))
+            ready_rows = connection.execute(
+                """
+                SELECT * FROM lab_job AS job
+                WHERE job.status = ? AND job.result_state = ?
+                  AND job.result_contract_version = ?
+                  AND job.control_intent = ?
+                  AND job.scheduler_fencing_token <> ?
+                  AND EXISTS (
+                    SELECT 1 FROM lab_shard AS shard
+                    WHERE shard.job_id = job.job_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM lab_shard AS shard
+                    WHERE shard.job_id = job.job_id AND shard.status <> ?
+                  )
+                ORDER BY job.created_at, job.job_id
+                """,
+                (
+                    JobStatus.RUNNING.value,
+                    LabResultState.READY.value,
+                    COMPLETE_RESULT_CONTRACT_VERSION,
+                    ControlIntent.NONE.value,
+                    lease.fencing_token,
+                    ShardStatus.SUCCEEDED.value,
+                ),
+            ).fetchall()
+            for row in ready_rows:
+                updated = self._adopt_running_job_fence(
+                    connection,
+                    row,
+                    lease=lease,
+                    now=current,
+                    event_type="job_result_ready_recovered",
+                    reason="ready result adopted by replacement scheduler",
+                )
                 recovered.append(LabJobReader._job_from_row(updated))
         return tuple(recovered)
 
@@ -4973,6 +5835,36 @@ CREATE TABLE IF NOT EXISTS lab_job (
 )
 """
 
+_RESULT_STATE_VALUES = ",".join(f"'{state.value}'" for state in LabResultState)
+_V5_JOB_TABLE_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS lab_job (
+    job_id TEXT PRIMARY KEY,
+    spec_json TEXT NOT NULL,
+    spec_hash TEXT NOT NULL,
+    job_type TEXT NOT NULL,
+    resource_class TEXT NOT NULL,
+    deadline TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ({_STATUS_VALUES})),
+    control_intent TEXT NOT NULL CHECK (
+        control_intent IN ({_CONTROL_INTENT_VALUES})
+    ),
+    version INTEGER NOT NULL CHECK (version >= 0),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+    recoverable INTEGER NOT NULL CHECK (recoverable IN (0, 1)),
+    scheduler_fencing_token INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    result_contract_version TEXT CHECK (
+        result_contract_version IS NULL
+        OR (typeof(result_contract_version) = 'text'
+            AND length(result_contract_version) > 0)
+    ),
+    result_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (result_state IN ({_RESULT_STATE_VALUES}))
+)
+"""
+
 _V4_SHARD_TABLE_STATEMENT = f"""
 CREATE TABLE IF NOT EXISTS lab_shard (
     shard_id TEXT NOT NULL,
@@ -5128,7 +6020,137 @@ CREATE TABLE IF NOT EXISTS lab_scheduler_state (
 )
 """
 
-_SCHEMA_STATEMENTS = tuple(
+_V5_ARTIFACT_COMMIT_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_artifact_commit (
+    request_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL CHECK (
+        typeof(content_hash) = 'text' AND length(content_hash) = 64
+    ),
+    job_id TEXT NOT NULL,
+    commit_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
+    reason TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_job_version INTEGER CHECK (
+        receipt_job_version IS NULL
+        OR (typeof(receipt_job_version) = 'integer' AND receipt_job_version >= 0)
+    ),
+    received_at TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+)
+"""
+
+_V5_RESULT_ARTIFACT_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_job_result_artifact (
+    job_id TEXT PRIMARY KEY REFERENCES lab_job(job_id) ON DELETE RESTRICT,
+    commit_request_id TEXT NOT NULL UNIQUE
+        REFERENCES lab_artifact_commit(request_id) ON DELETE RESTRICT,
+    sealed_path TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL CHECK (
+        typeof(manifest_hash) = 'text' AND length(manifest_hash) = 64
+    ),
+    complete_result_hash TEXT NOT NULL CHECK (
+        typeof(complete_result_hash) = 'text' AND length(complete_result_hash) = 64
+    ),
+    bundle_device INTEGER NOT NULL CHECK (
+        typeof(bundle_device) = 'integer' AND bundle_device >= 0
+    ),
+    bundle_inode INTEGER NOT NULL CHECK (
+        typeof(bundle_inode) = 'integer' AND bundle_inode >= 1
+    ),
+    evidence_json TEXT NOT NULL,
+    indexed_at TEXT NOT NULL
+)
+"""
+
+_V5_JOB_RESULT_UPDATE_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_update
+BEFORE UPDATE OF status, result_state, result_contract_version ON lab_job
+WHEN NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+ AND (
+    (NEW.status = 'succeeded' AND (
+        NEW.result_state <> 'sealed'
+        OR NOT EXISTS (
+            SELECT 1 FROM lab_job_result_artifact artifact
+            WHERE artifact.job_id = NEW.job_id
+        )
+    ))
+    OR (NEW.result_state = 'sealed' AND NEW.status <> 'succeeded')
+    OR NEW.result_state = 'legacy_unsealed'
+    OR (NEW.result_state = 'ready' AND (
+        NEW.status <> 'running'
+        OR NOT EXISTS (
+            SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
+        )
+        OR EXISTS (
+            SELECT 1 FROM lab_shard shard
+            WHERE shard.job_id = NEW.job_id AND shard.status <> 'succeeded'
+        )
+    ))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'complete-result success requires indexed sealed artifact');
+END
+"""
+
+_V5_JOB_RESULT_INSERT_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_insert
+BEFORE INSERT ON lab_job
+WHEN NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+ AND (NEW.status = 'succeeded'
+      OR NEW.result_state IN ('ready', 'sealed', 'legacy_unsealed'))
+BEGIN
+    SELECT RAISE(ABORT, 'complete-result job must enter through pending state');
+END
+"""
+
+_V5_RESULT_ARTIFACT_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_result_artifact_insert
+BEFORE INSERT ON lab_job_result_artifact
+WHEN NOT EXISTS (
+    SELECT 1 FROM lab_artifact_commit artifact_commit
+    WHERE artifact_commit.request_id = NEW.commit_request_id
+      AND artifact_commit.job_id = NEW.job_id
+      AND artifact_commit.status = 'accepted'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'result artifact requires accepted commit receipt');
+END
+"""
+
+_V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_result_artifact_no_update
+BEFORE UPDATE ON lab_job_result_artifact
+BEGIN
+    SELECT RAISE(ABORT, 'complete result artifact index is immutable');
+END
+"""
+
+_V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_result_artifact_no_delete
+BEFORE DELETE ON lab_job_result_artifact
+BEGIN
+    SELECT RAISE(ABORT, 'complete result artifact index is immutable');
+END
+"""
+
+_V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_artifact_commit_no_update
+BEFORE UPDATE ON lab_artifact_commit
+BEGIN
+    SELECT RAISE(ABORT, 'artifact commit receipt is immutable');
+END
+"""
+
+_V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_artifact_commit_no_delete
+BEFORE DELETE ON lab_artifact_commit
+BEGIN
+    SELECT RAISE(ABORT, 'artifact commit receipt is immutable');
+END
+"""
+
+_V4_SCHEMA_STATEMENTS = tuple(
     (
         _V4_JOB_TABLE_STATEMENT
         if "CREATE TABLE IF NOT EXISTS lab_job" in statement
@@ -5145,4 +6167,21 @@ _SCHEMA_STATEMENTS = tuple(
     _V3_SCHEDULER_STATE_TABLE_STATEMENT,
     _V4_COMPLETION_INDEX_STATEMENT,
     _V4_STATUS_INDEX_STATEMENT,
+)
+
+_SCHEMA_STATEMENTS = tuple(
+    _V5_JOB_TABLE_STATEMENT
+    if statement == _V4_JOB_TABLE_STATEMENT
+    else statement
+    for statement in _V4_SCHEMA_STATEMENTS
+) + (
+    _V5_ARTIFACT_COMMIT_TABLE_STATEMENT,
+    _V5_RESULT_ARTIFACT_TABLE_STATEMENT,
+    _V5_JOB_RESULT_INSERT_TRIGGER,
+    _V5_JOB_RESULT_UPDATE_TRIGGER,
+    _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
+    _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
+    _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
+    _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
+    _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
 )
