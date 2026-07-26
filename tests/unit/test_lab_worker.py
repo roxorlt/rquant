@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -21,6 +22,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
@@ -54,6 +56,25 @@ from tests.unit.test_strategy_job_adapters import (
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
 
 
+def _legacy_canonical_shard_frame_digest(frame: pd.DataFrame) -> str:
+    raw = frame.to_json(
+        orient="table",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+        force_ascii=True,
+        index=False,
+    )
+    canonical = json.dumps(
+        json.loads(raw),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def test_canonical_shard_frame_digest_matches_legacy_small_fixture() -> None:
     from rquant.lab_worker import canonical_shard_frame_digest
 
@@ -81,6 +102,116 @@ def test_canonical_shard_frame_digest_matches_legacy_small_fixture() -> None:
     ).encode("utf-8")
 
     assert canonical_shard_frame_digest(frame) == hashlib.sha256(legacy).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        (
+            pd.DataFrame({"v": pd.to_timedelta(["1 days 01:02:03.123456", None])}),
+            "fb7349beeeb2d0c907eda458e203cd7ddc01f5ab6677db383daa67e3545679d7",
+        ),
+        (
+            pd.DataFrame({"v": pd.Categorical(pd.Series([1, None, 2], dtype="Int64"))}),
+            "4b3be4ac9e133429202e5a7c2d6b6943395355b156ad35c9842797b0ee2cb9f2",
+        ),
+    ],
+    ids=["timedelta-nat", "nullable-integer-categorical"],
+)
+def test_canonical_shard_frame_digest_matches_legacy_context_fixed_vectors(
+    frame: pd.DataFrame,
+    expected: str,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    assert _legacy_canonical_shard_frame_digest(frame) == expected
+    assert canonical_shard_frame_digest(frame) == expected
+
+
+def test_canonical_shard_frame_digest_matches_legacy_mixed_frame() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    rng = random.Random(20260728)
+    size = 257
+    integer_categories = [1, 2, None, 3]
+    boolean_categories = [True, False, None]
+    float_categories = [1.25, 2.5, None]
+    timestamp_categories = [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02"), None]
+    arrow_values = ["alpha", None, "\u4e2d|`<b>", "omega"]
+    byte_values = [b"ascii", "\u4e2d".encode(), b'quote"\\slash']
+    arrow_chunked = pa.chunked_array(
+        [
+            pa.array(
+                [arrow_values[rng.randrange(len(arrow_values))]],
+                type=pa.string(),
+            )
+            for _ in range(size)
+        ]
+    )
+    frame = pd.DataFrame(
+        {
+            "arrow": pd.Series(pd.arrays.ArrowStringArray(arrow_chunked)),
+            "blob": pd.Series(
+                [byte_values[rng.randrange(len(byte_values))] for _ in range(size)],
+                dtype=object,
+            ),
+            "bool_category": pd.Categorical(
+                [boolean_categories[rng.randrange(len(boolean_categories))] for _ in range(size)]
+            ),
+            "float": [rng.random() if index % 11 else float("nan") for index in range(size)],
+            "float32": pd.Series(
+                [
+                    float("nan")
+                    if index % 17 == 0
+                    else float("inf")
+                    if index % 19 == 0
+                    else rng.random()
+                    for index in range(size)
+                ],
+                dtype="float32",
+            ),
+            "float_category": pd.Categorical(
+                [float_categories[rng.randrange(len(float_categories))] for _ in range(size)]
+            ),
+            "int_category": pd.Categorical(
+                [integer_categories[rng.randrange(len(integer_categories))] for _ in range(size)]
+            ),
+            "nullable_int": pd.Series(
+                [index if index % 13 else None for index in range(size)],
+                dtype="Int64",
+            ),
+            "time_category": pd.Categorical(
+                [
+                    timestamp_categories[rng.randrange(len(timestamp_categories))]
+                    for _ in range(size)
+                ]
+            ),
+            "timedelta": pd.to_timedelta(
+                [
+                    f"{index % 7} days {index % 24}:00:00" if index % 9 else None
+                    for index in range(size)
+                ]
+            ),
+        }
+    )
+
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+def test_canonical_shard_frame_digest_bounds_large_bytes_scratch() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    size = 64 * 1024 * 1024
+    value = (b"ascii-bytes" * ((size + 10) // 11))[:size]
+    frame = pd.DataFrame({"blob": pd.Series([value], dtype=object)})
+
+    tracemalloc.start()
+    digest = canonical_shard_frame_digest(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest) == 64
+    assert peak <= 2 * 1024 * 1024
 
 
 def test_canonical_shard_frame_digest_has_bounded_python_memory() -> None:

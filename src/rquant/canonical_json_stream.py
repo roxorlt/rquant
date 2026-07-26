@@ -182,8 +182,18 @@ class CanonicalJsonEscapedStringSink:
 class PandasJsonColumnAccessor:
     """Read frame cells while keeping Arrow string values descriptor-bound."""
 
-    def __init__(self, series: pd.Series) -> None:
+    def __init__(self, series: pd.Series, *, table_context: bool = False) -> None:
         self._array = series.array
+        self._table_context = table_context
+        self._table_timedelta = table_context and pd.api.types.is_timedelta64_dtype(series.dtype)
+        self._table_float = table_context and pd.api.types.is_float_dtype(series.dtype)
+        self._table_integer_categorical_with_missing = (
+            table_context
+            and isinstance(series.dtype, pd.CategoricalDtype)
+            and pd.api.types.is_integer_dtype(series.dtype.categories.dtype)
+            and not pd.api.types.is_bool_dtype(series.dtype.categories.dtype)
+            and series.hasnans
+        )
         self._arrow_chunked: pa.ChunkedArray | None = None
         self._arrow_chunk: pa.Array | None = None
         self._arrow_chunk_index = 0
@@ -288,6 +298,44 @@ class PandasJsonColumnAccessor:
         write_pandas_json_value(
             writer,
             self.value(row_index),
+            escape_forward_slash=escape_forward_slash,
+            sort_mapping_keys=sort_mapping_keys,
+        )
+
+    def write_pandas_table_value(
+        self,
+        writer: CanonicalJsonStreamWriter,
+        row_index: int,
+        *,
+        escape_forward_slash: bool,
+        sort_mapping_keys: bool,
+    ) -> None:
+        """Preserve pandas orient=table column-context scalar semantics."""
+
+        if not self._table_context:
+            raise RuntimeError("table-context scalar encoding was not enabled")
+        handled, value = self._arrow_utf8_buffer(row_index)
+        if handled:
+            if value is None:
+                writer.write_ascii(b"null")
+            else:
+                writer.write_utf8_string_buffer(
+                    value,
+                    escape_forward_slash=escape_forward_slash,
+                )
+            return
+        value = self.value(row_index)
+        if self._table_timedelta and value is pd.NaT:
+            writer.write_string("NaT", escape_forward_slash=escape_forward_slash)
+            return
+        if self._table_float and (bool(pd.isna(value)) or not math.isfinite(float(value))):
+            writer.write_ascii(b"null")
+            return
+        if self._table_integer_categorical_with_missing and not pd.isna(value):
+            value = float(value)
+        write_pandas_json_value(
+            writer,
+            value,
             escape_forward_slash=escape_forward_slash,
             sort_mapping_keys=sort_mapping_keys,
         )

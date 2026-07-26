@@ -50,6 +50,11 @@
 
 ### Fixed
 
+- **Strategy Lab shard hash 旧制品兼容**：流式 `orient="table"` hash 增加 pandas 列上下文
+  语义，普通 timedelta 缺失值继续编码为旧版 `"NaT"`，含缺失值的整数 categorical 继续
+  按浮点列提升，float32 NaN/Inf 继续写为 `null`。固定向量与随机混合帧覆盖 schema/data、
+  numeric/bool/time categorical、bytes 和高碎片 Arrow string，同时保留大值有界流式处理。
+
 - **Strategy Lab finalizer 资源与认证复审加固**：bytes 单元格改为三字节对齐的固定块流式
   Base64，Arrow 高碎片字符串列改为 O(1) 顺序游标；manifest、metrics、spec、report 与控制
   对象统一进入 typed 峰值预算，并在 Pydantic/Parquet/final artifact 物化前执行预检。数值与

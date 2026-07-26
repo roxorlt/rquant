@@ -133,7 +133,8 @@ def canonical_shard_frame_digest(
     writer = CanonicalJsonStreamWriter(digest.update)
     columns = tuple(frame.columns)
     accessors = tuple(
-        PandasJsonColumnAccessor(frame.iloc[:, position]) for position in range(len(columns))
+        PandasJsonColumnAccessor(frame.iloc[:, position], table_context=True)
+        for position in range(len(columns))
     )
     positions = tuple(sorted(range(len(columns)), key=columns.__getitem__))
 
@@ -147,7 +148,7 @@ def canonical_shard_frame_digest(
                 digest.update(b",")
             writer.write_string(columns[position])
             digest.update(b":")
-            accessors[position].write_pandas_value(
+            accessors[position].write_pandas_table_value(
                 writer,
                 row_index,
                 escape_forward_slash=False,
