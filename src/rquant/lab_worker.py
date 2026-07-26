@@ -119,25 +119,50 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def canonical_shard_frame_json(frame: pd.DataFrame) -> str:
+def canonical_shard_frame_digest(
+    frame: pd.DataFrame,
+    *,
+    batch_rows: int = 1024,
+) -> str:
     if any(not isinstance(column, str) for column in frame.columns):
         raise ValueError("artifact DataFrame columns must be strings")
-    raw = frame.to_json(
-        orient="table",
-        date_format="iso",
-        date_unit="us",
-        double_precision=15,
-        force_ascii=True,
-        index=False,
-    )
-    payload = json.loads(raw)
-    return json.dumps(
-        payload,
+    if batch_rows < 1:
+        raise ValueError("canonical shard digest batch_rows must be positive")
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     )
+
+    def update_json(value: object) -> None:
+        for chunk in encoder.iterencode(value):
+            digest.update(chunk.encode("utf-8"))
+
+    digest.update(b'{"data":[')
+    first = True
+    for start in range(0, len(frame), batch_rows):
+        raw = frame.iloc[start : start + batch_rows].to_json(
+            orient="records",
+            date_format="iso",
+            date_unit="us",
+            double_precision=15,
+            force_ascii=True,
+            index=False,
+        )
+        records = json.loads(raw)
+        if not isinstance(records, list):  # pragma: no cover - pandas contract guard
+            raise ValueError("pandas records JSON is not a list")
+        for record in records:
+            if not first:
+                digest.update(b",")
+            update_json(record)
+            first = False
+    digest.update(b'],"schema":')
+    update_json(pd.io.json.build_table_schema(frame, index=False))
+    digest.update(b"}")
+    return digest.hexdigest()
 
 
 class LabWorkerModel(BaseModel):
@@ -1606,7 +1631,6 @@ class LabWorker:
                 table.frame.columns
             ):
                 raise ValueError(f"artifact round-trip shape changed: {table.name}")
-            canonical_frame = canonical_shard_frame_json(persisted)
             artifacts.append(
                 LabShardArtifactManifest(
                     name=table.name,
@@ -1615,7 +1639,7 @@ class LabWorker:
                     columns=tuple(persisted.columns),
                     file_size=path.stat().st_size,
                     file_sha256=_file_sha256(path),
-                    content_sha256=_sha256_bytes(canonical_frame.encode("utf-8")),
+                    content_sha256=canonical_shard_frame_digest(persisted),
                 )
             )
         manifest = LabShardResultManifest(
@@ -1738,7 +1762,7 @@ class LabWorker:
                 raise LabArtifactConflictError(
                     f"sealed artifact shape conflicts: {artifact.file_name}"
                 )
-            content_hash = _sha256_bytes(canonical_shard_frame_json(frame).encode("utf-8"))
+            content_hash = canonical_shard_frame_digest(frame)
             if content_hash != artifact.content_sha256:
                 raise LabArtifactConflictError(
                     f"sealed artifact content conflicts: {artifact.file_name}"

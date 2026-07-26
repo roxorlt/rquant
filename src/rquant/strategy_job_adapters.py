@@ -355,34 +355,67 @@ class LabJobExecutionResult(BaseModel):
 
     @property
     def result_hash(self) -> str:
-        payload = {
-            "adapter_id": self.adapter_id,
-            "adapter_version": self.adapter_version,
-            "plan_hash": self.plan_hash,
-            "spec_hash": self.spec_hash,
-            "tables": [
-                {
-                    "frame": table.frame.to_json(
-                        orient="split",
-                        date_format="iso",
-                        date_unit="us",
-                        double_precision=15,
-                        force_ascii=True,
-                        index=False,
-                    ),
-                    "name": table.name,
-                }
-                for table in self.tables
-            ],
-        }
-        canonical = json.dumps(
-            payload,
+        digest = hashlib.sha256()
+        encoder = json.JSONEncoder(
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
         )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+        def update_json(value: object) -> None:
+            for chunk in encoder.iterencode(value):
+                digest.update(chunk.encode("utf-8"))
+
+        def update_escaped_text(value: str) -> None:
+            encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+            digest.update(encoded[1:-1].encode("utf-8"))
+
+        digest.update(b'{"adapter_id":')
+        update_json(self.adapter_id)
+        digest.update(b',"adapter_version":')
+        update_json(self.adapter_version)
+        digest.update(b',"plan_hash":')
+        update_json(self.plan_hash)
+        digest.update(b',"spec_hash":')
+        update_json(self.spec_hash)
+        digest.update(b',"tables":[')
+        for table_index, table in enumerate(self.tables):
+            if table_index:
+                digest.update(b",")
+            digest.update(b'{"frame":"')
+            update_escaped_text('{"columns":')
+            update_escaped_text(
+                json.dumps(
+                    list(table.frame.columns),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+            update_escaped_text(',"data":[')
+            first_batch = True
+            for start in range(0, len(table.frame), 1024):
+                batch = table.frame.iloc[start : start + 1024].to_json(
+                    orient="values",
+                    date_format="iso",
+                    date_unit="us",
+                    double_precision=15,
+                    force_ascii=True,
+                    index=False,
+                )
+                payload = batch[1:-1]
+                if payload:
+                    if not first_batch:
+                        update_escaped_text(",")
+                    update_escaped_text(payload)
+                    first_batch = False
+            update_escaped_text("]}")
+            digest.update(b'","name":')
+            update_json(table.name)
+            digest.update(b"}")
+        digest.update(b"]}")
+        return digest.hexdigest()
 
 
 class StrategyJobAdapter(Protocol):

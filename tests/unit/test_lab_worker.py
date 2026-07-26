@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -51,6 +52,54 @@ from tests.unit.test_strategy_job_adapters import (
 )
 
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
+
+
+def test_canonical_shard_frame_digest_matches_legacy_small_fixture() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame(
+        {
+            "code": ["000001.SZ", "\u6d66\u53d1|`<b>"],
+            "ret_pct": [1.25, float("nan")],
+            "trade_time": pd.to_datetime(["2026-07-20 09:31:00", "2026-07-20 09:32:00"]),
+        }
+    )
+    raw = frame.to_json(
+        orient="table",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+        force_ascii=True,
+        index=False,
+    )
+    legacy = json.dumps(
+        json.loads(raw),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    assert canonical_shard_frame_digest(frame) == hashlib.sha256(legacy).hexdigest()
+
+
+def test_canonical_shard_frame_digest_has_bounded_python_memory() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame(
+        {
+            "code": [f"{index:06d}.SZ" for index in range(100_000)],
+            "value": range(100_000),
+        }
+    )
+    frame_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+
+    tracemalloc.start()
+    canonical_shard_frame_digest(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert peak <= max(16 * 1024 * 1024, frame_bytes * 6)
 
 
 @contextmanager

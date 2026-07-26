@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import tracemalloc
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -29,6 +32,64 @@ _P13_PLAN_HASH = "dbab9770704e67d6ca06c73cc59e02fc7fd1430ce6ea26be00eff4e624543a
 _P13_SHARD_ID = UUID("688270f0-2359-5276-b9f3-7338a0c3254e")
 _P13_ENVELOPE_HASH = "723899d882f2f4bfda6b335d17b4a16c62a920f985cb8ecd72177686c8ac6cb1"
 _P13_CLAIM_JSON = r"""{"schema_version":1,"job_id":"11111111-2222-3333-4444-555555555555","spec_hash":"452390fb85bd62aac6b02eb89b45fe1773c0b916cdd992b20ef5750d322bef7c","definition":{"schema_version":1,"shard_id":"688270f0-2359-5276-b9f3-7338a0c3254e","shard_index":0,"adapter_id":"nshape-compare","adapter_version":"1","plan_hash":"dbab9770704e67d6ca06c73cc59e02fc7fd1430ce6ea26be00eff4e624543a49","payload_json":"{\"adapter_id\":\"nshape-compare\",\"adapter_version\":\"1\",\"schema_version\":1,\"shard\":{\"hold_days\":1,\"kind\":\"hold_days\"},\"spec\":{\"code_sha\":\"1111111111111111111111111111111111111111\",\"dataset_snapshot\":null,\"deadline\":\"2026-08-01T00:00:00Z\",\"execution_costs\":{\"commission_bps\":\"0\",\"slippage_bps\":\"0\",\"stamp_duty_bps\":\"0\",\"transfer_fee_bps\":\"0\"},\"feature_contract\":{\"contract_hash\":\"ae9dfef2a24213b119b3b71e1a63b05b62bf0df1083660e8ea52edfd42095daf\",\"contract_id\":\"strategy-adapter-execution\",\"contract_version\":\"p13b-adapter-v1\"},\"job_type\":\"strategy_replay\",\"parameters\":{\"arguments\":[{\"kind\":\"text_list\",\"name\":\"entry_modes\",\"value\":[\"first_break\",\"late_confirm\"]},{\"kind\":\"integer_list\",\"name\":\"hold_days\",\"value\":[1]},{\"kind\":\"text_list\",\"name\":\"profile_variants\",\"value\":[\"baseline\"]}],\"end_date\":\"2026-02-10\",\"start_date\":\"2026-01-01\",\"strategy_name\":\"n_shape\"},\"random_seed\":20260724,\"research_status\":\"exploratory\",\"resource_class\":\"standard\",\"schema_version\":2}}","payload_hash":"054ccf2d5b6423c8791553d7e16de6b948ffe792e6ddee8a73936f1a18f3c45c"},"worker_id":"worker-legacy","claim_token":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","claim_generation":1,"scheduler_fencing_token":7,"claimed_at":"2026-07-24T00:00:00Z","lease_expires_at":"2026-07-24T00:05:00Z"}"""  # noqa: E501
+
+
+def test_job_result_hash_streaming_matches_legacy_bytes_and_bounds_memory() -> None:
+    from rquant.strategy_job_adapters import LabJobExecutionResult, LabShardTable
+
+    frame = pd.DataFrame(
+        {
+            "code": [f"{index:06d}.SZ" for index in range(100_000)],
+            "ret_pct": [index / 1000 for index in range(100_000)],
+        }
+    )
+    result = LabJobExecutionResult(
+        spec_hash="1" * 64,
+        plan_hash="2" * 64,
+        adapter_id="streaming-test",
+        adapter_version="1",
+        tables=(LabShardTable(name="trades", frame=frame),),
+    )
+    small = frame.iloc[:3]
+    small_result = result.model_copy(
+        update={"tables": (LabShardTable(name="trades", frame=small),)}
+    )
+    legacy_payload = {
+        "adapter_id": small_result.adapter_id,
+        "adapter_version": small_result.adapter_version,
+        "plan_hash": small_result.plan_hash,
+        "spec_hash": small_result.spec_hash,
+        "tables": [
+            {
+                "frame": small.to_json(
+                    orient="split",
+                    date_format="iso",
+                    date_unit="us",
+                    double_precision=15,
+                    force_ascii=True,
+                    index=False,
+                ),
+                "name": "trades",
+            }
+        ],
+    }
+    expected = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert small_result.result_hash == expected
+
+    frame_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+    tracemalloc.start()
+    _ = result.result_hash
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak <= max(8 * 1024 * 1024, int(frame_bytes * 1.75))
 
 
 def _p13_frozen_claim() -> LabShardClaim:

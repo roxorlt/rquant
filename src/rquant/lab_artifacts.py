@@ -2003,16 +2003,31 @@ def _restore_manifest_dtypes(
 
 
 def _table_content_hash(frame: pd.DataFrame) -> str:
-    payload = {
-        "columns": list(frame.columns),
-        "dtypes": [str(dtype) for dtype in frame.dtypes],
-        "dtype_identities": _frame_dtype_identities(frame),
-        "rows": [
-            [_canonical_table_value(value) for value in row]
-            for row in frame.itertuples(index=False, name=None)
-        ],
-    }
-    return _sha256(canonical_json_bytes(payload))
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+    def update_json(value: object) -> None:
+        for chunk in encoder.iterencode(_canonical_value(value)):
+            digest.update(chunk.encode("utf-8"))
+
+    digest.update(b'{"columns":')
+    update_json(list(frame.columns))
+    digest.update(b',"dtype_identities":')
+    update_json(_frame_dtype_identities(frame))
+    digest.update(b',"dtypes":')
+    update_json([str(dtype) for dtype in frame.dtypes])
+    digest.update(b',"rows":[')
+    for row_index, row in enumerate(frame.itertuples(index=False, name=None)):
+        if row_index:
+            digest.update(b",")
+        update_json([_canonical_table_value(value) for value in row])
+    digest.update(b"]}")
+    return digest.hexdigest()
 
 
 def _parse_canonical_json(payload: bytes, *, label: str) -> object:

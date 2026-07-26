@@ -23,6 +23,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rquant.lab_artifact_protocol import (
     LabArtifactCommitEnvelope,
     LabArtifactCommitReceipt,
+    LabFinalizerAuthorityClaims,
+    LabFinalizerAuthorityKeyProvider,
+    LabFinalizerAuthorityShardEvidence,
+    verify_finalizer_authority,
 )
 from rquant.lab_job_protocol import (
     CancelJobCommand,
@@ -4002,12 +4006,108 @@ class LabJobStore:
         self._record_artifact_commit(connection, envelope, receipt, now=now)
         return receipt
 
+    @staticmethod
+    def _finalizer_authority_matches_ready_graph(
+        connection: sqlite3.Connection,
+        envelope: LabArtifactCommitEnvelope,
+        job: LabJobRecord,
+        shard_rows: list[sqlite3.Row],
+        claims: LabFinalizerAuthorityClaims,
+    ) -> bool:
+        ready_rows = connection.execute(
+            """
+            SELECT * FROM lab_event
+            WHERE job_id = ? AND event_type = 'job_result_ready'
+              AND job_version = ?
+            ORDER BY event_id
+            """,
+            (str(job.job_id), job.version),
+        ).fetchall()
+        if len(ready_rows) != 1:
+            return False
+        ready_event = LabJobReader._event_from_row(ready_rows[0])
+        if ready_event.scheduler_fencing_token is None:
+            return False
+
+        report_rows = connection.execute(
+            """
+            SELECT * FROM lab_worker_report
+            WHERE job_id = ? AND status = 'accepted'
+              AND report_type = 'shard_succeeded'
+            ORDER BY shard_id, applied_at, report_id
+            """,
+            (str(job.job_id),),
+        ).fetchall()
+        reports_by_shard: dict[UUID, list[LabWorkerReportRecord]] = {}
+        for row in report_rows:
+            report_id = _canonical_uuid_text(
+                row["report_id"],
+                field="lab_worker_report.report_id",
+            )
+            record = _worker_report_record_from_row(row, expected_report_id=report_id)
+            reports_by_shard.setdefault(record.report.shard_id, []).append(record)
+
+        shards = tuple(LabJobReader._shard_from_row(row) for row in shard_rows)
+        if set(reports_by_shard) != {shard.shard_id for shard in shards} or any(
+            len(records) != 1 for records in reports_by_shard.values()
+        ):
+            return False
+        try:
+            snapshot = LabFinalizationSnapshot(
+                job=job,
+                ready_epoch=LabFinalizationReadyEpoch(
+                    job_version=job.version,
+                    event=ready_event,
+                ),
+                shards=tuple(
+                    LabFinalizationShardEvidence(
+                        shard=shard,
+                        accepted_success=reports_by_shard[shard.shard_id][0],
+                    )
+                    for shard in shards
+                ),
+            )
+        except ValueError as exc:
+            raise InvalidStoredJobError(
+                "artifact authority graph is internally inconsistent"
+            ) from exc
+        expected = LabFinalizerAuthorityClaims(
+            request_id=envelope.request_id,
+            commit_content_hash=hashlib.sha256(envelope.commit.canonical_json_bytes()).hexdigest(),
+            job_id=job.job_id,
+            ready_event_id=ready_event.event_id,
+            ready_job_version=job.version,
+            scheduler_fencing_token=ready_event.scheduler_fencing_token,
+            spec_hash=job.spec_hash,
+            finalizer_code_sha=job.spec.code_sha,
+            shards=tuple(
+                LabFinalizerAuthorityShardEvidence(
+                    shard_index=evidence.shard.shard_index,
+                    shard_id=evidence.shard.shard_id,
+                    payload_hash=evidence.shard.payload_hash,
+                    plan_hash=evidence.shard.plan_hash,
+                    result_manifest_hash=evidence.shard.result_manifest_hash or "",
+                    accepted_report_content_hash=(evidence.accepted_success.report.content_hash),
+                    claim_token=evidence.accepted_success.report.claim_token,
+                    claim_generation=evidence.accepted_success.report.claim_generation,
+                    scheduler_fencing_token=(
+                        evidence.accepted_success.report.scheduler_fencing_token
+                    ),
+                )
+                for evidence in snapshot.shards
+            ),
+            artifact_manifest_hash=envelope.commit.manifest_hash,
+            complete_result_hash=envelope.commit.complete_result_hash,
+        )
+        return claims == expected
+
     def _apply_artifact_commit_in_transaction(
         self,
         connection: sqlite3.Connection,
         envelope: LabArtifactCommitEnvelope,
         binding: LabVerifiedSealedBinding,
         *,
+        authority_key_provider: LabFinalizerAuthorityKeyProvider,
         lease: LabLeaseRecord,
         now: datetime,
     ) -> LabArtifactCommitReceipt:
@@ -4043,6 +4143,20 @@ class LabJobStore:
                         "accepted artifact commit no longer matches bound index evidence"
                     )
             return record.receipt
+
+        try:
+            authority_claims = verify_finalizer_authority(
+                envelope,
+                key_provider=authority_key_provider,
+            )
+        except (TypeError, ValueError):
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="finalizer_authority_invalid",
+                job_version=None,
+                now=now,
+            )
 
         commit = envelope.commit
         manifest = binding.sealed.manifest
@@ -4220,6 +4334,20 @@ class LabJobStore:
                 job_version=job.version,
                 now=now,
             )
+        if not self._finalizer_authority_matches_ready_graph(
+            connection,
+            envelope,
+            job,
+            shard_rows,
+            authority_claims,
+        ):
+            return self._reject_artifact_commit(
+                connection,
+                envelope,
+                reason="finalizer_authority_graph_mismatch",
+                job_version=job.version,
+                now=now,
+            )
 
         next_version = job.version + 1
         receipt = LabArtifactCommitReceipt.from_envelope(
@@ -4343,6 +4471,7 @@ class LabJobStore:
         envelope: LabArtifactCommitEnvelope,
         binding: LabVerifiedSealedBinding,
         *,
+        authority_key_provider: LabFinalizerAuthorityKeyProvider,
         lease: LabLeaseRecord,
         now: datetime,
     ) -> Iterator[_LabStagedArtifactCommit]:
@@ -4368,6 +4497,7 @@ class LabJobStore:
                 connection,
                 validated,
                 verified_binding,
+                authority_key_provider=authority_key_provider,
                 lease=lease,
                 now=current,
             )

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
+    LabFinalizerAuthorityKeyProvider,
 )
 from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore, LabVerifiedSealedBinding
 from rquant.lab_job_protocol import (
@@ -113,6 +114,7 @@ class LabScheduler:
         max_claim_authority_per_tick: int = 128,
         artifact_commit_spool: LabArtifactCommitSpool | None = None,
         artifact_store: LabJobArtifactStore | None = None,
+        finalizer_authority_key_provider: LabFinalizerAuthorityKeyProvider | None = None,
         max_artifact_commits_per_tick: int = 64,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
@@ -140,6 +142,8 @@ class LabScheduler:
             raise ValueError("max_artifact_commits_per_tick must be positive")
         if (artifact_commit_spool is None) != (artifact_store is None):
             raise ValueError("artifact commit spool and artifact store must be configured together")
+        if artifact_commit_spool is not None and finalizer_authority_key_provider is None:
+            raise ValueError("finalizer authority key provider is required for artifact commits")
         normalized_workers = tuple(worker.strip() for worker in claim_worker_ids)
         if any(not worker for worker in normalized_workers):
             raise ValueError("claim_worker_ids must not contain empty values")
@@ -163,6 +167,7 @@ class LabScheduler:
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
         self.artifact_commit_spool = artifact_commit_spool
         self.artifact_store = artifact_store
+        self.finalizer_authority_key_provider = finalizer_authority_key_provider
         self.max_artifact_commits_per_tick = max_artifact_commits_per_tick
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
@@ -580,6 +585,7 @@ class LabScheduler:
                                 self.store.stage_artifact_commit(
                                     entry.envelope,
                                     binding,
+                                    authority_key_provider=(self.finalizer_authority_key_provider),
                                     lease=lease,
                                     now=mutation_now,
                                 )

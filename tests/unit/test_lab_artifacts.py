@@ -14,6 +14,7 @@ import sys
 import textwrap
 import threading
 import time
+import tracemalloc
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -5065,6 +5066,39 @@ def test_object_null_kinds_have_distinct_hashes_and_cannot_be_folded_by_parquet(
             report_markdown="ok",
             tables={"object_nulls": frame},
         )
+
+
+def test_table_content_hash_streams_legacy_canonical_bytes_with_bounded_memory() -> None:
+    small = pd.DataFrame(
+        {
+            "code": ["000001.SZ", "600000.SH"],
+            "ret_pct": [1.25, float("nan")],
+        }
+    )
+    legacy_payload = {
+        "columns": list(small.columns),
+        "dtypes": [str(dtype) for dtype in small.dtypes],
+        "dtype_identities": lab_artifacts_module._frame_dtype_identities(small),
+        "rows": [
+            [lab_artifacts_module._canonical_table_value(value) for value in row]
+            for row in small.itertuples(index=False, name=None)
+        ],
+    }
+    expected = hashlib.sha256(lab_artifacts_module.canonical_json_bytes(legacy_payload)).hexdigest()
+    assert lab_artifacts_module._table_content_hash(small) == expected
+
+    frame = pd.DataFrame(
+        {
+            "code": [f"{index:06d}.SZ" for index in range(100_000)],
+            "value": range(100_000),
+        }
+    )
+    frame_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+    tracemalloc.start()
+    lab_artifacts_module._table_content_hash(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak <= max(16 * 1024 * 1024, frame_bytes * 3)
 
 
 def test_legacy_import_keeps_source_bound_through_cache_sync_and_return(

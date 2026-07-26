@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import stat
 from bisect import bisect_right
+from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -29,6 +31,7 @@ from rquant.research_run_spec import DatasetSnapshotIdentity
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_SHA_PATTERN = r"^[0-9a-f]{40}$"
+_KEY_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 
 
 class LabArtifactCommitProtocolModel(BaseModel):
@@ -71,15 +74,151 @@ class LabArtifactCommit(LabArtifactCommitProtocolModel):
         ).encode("utf-8")
 
 
-class LabArtifactCommitEnvelope(LabArtifactCommitProtocolModel):
+@dataclass(frozen=True)
+class LabFinalizerAuthorityKey:
+    """Ephemeral HMAC key material supplied by a trusted runtime provider."""
+
+    key_id: str
+    secret: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(_KEY_ID_PATTERN, self.key_id) is None:
+            raise ValueError("authority key_id is invalid")
+        if not isinstance(self.secret, bytes) or len(self.secret) < 32:
+            raise ValueError("authority secret must contain at least 32 bytes")
+
+
+LabFinalizerAuthorityKeyProvider = Callable[[], LabFinalizerAuthorityKey]
+
+
+class LabFinalizerAuthorityShardEvidence(LabArtifactCommitProtocolModel):
+    shard_index: int = Field(strict=True, ge=0)
+    shard_id: UUID
+    payload_hash: str = Field(pattern=_HASH_PATTERN)
+    plan_hash: str = Field(pattern=_HASH_PATTERN)
+    result_manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    accepted_report_content_hash: str = Field(pattern=_HASH_PATTERN)
+    claim_token: UUID
+    claim_generation: int = Field(strict=True, ge=1)
+    scheduler_fencing_token: int = Field(strict=True, ge=1)
+
+
+class LabFinalizerAuthorityClaims(LabArtifactCommitProtocolModel):
     schema_version: Literal[1] = 1
     request_id: UUID
+    commit_content_hash: str = Field(pattern=_HASH_PATTERN)
+    job_id: UUID
+    ready_event_id: int = Field(strict=True, ge=1)
+    ready_job_version: int = Field(strict=True, ge=0)
+    scheduler_fencing_token: int = Field(strict=True, ge=1)
+    spec_hash: str = Field(pattern=_HASH_PATTERN)
+    finalizer_code_sha: str = Field(pattern=_CODE_SHA_PATTERN)
+    shards: tuple[LabFinalizerAuthorityShardEvidence, ...]
+    artifact_manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    complete_result_hash: str = Field(pattern=_HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_ordered_shards(self) -> LabFinalizerAuthorityClaims:
+        if not self.shards:
+            raise ValueError("authority proof requires accepted shard evidence")
+        if tuple(item.shard_index for item in self.shards) != tuple(range(len(self.shards))):
+            raise ValueError("authority shard evidence must be complete and ordered")
+        if len({item.shard_id for item in self.shards}) != len(self.shards):
+            raise ValueError("authority shard evidence must be unique")
+        return self
+
+    def canonical_json_bytes(self) -> bytes:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+
+class LabFinalizerAuthorityProof(LabArtifactCommitProtocolModel):
+    schema_version: Literal[1] = 1
+    key_id: str = Field(pattern=_KEY_ID_PATTERN)
+    claims: LabFinalizerAuthorityClaims
+    mac_sha256: str = Field(pattern=_HASH_PATTERN)
+
+
+def sign_finalizer_authority(
+    claims: LabFinalizerAuthorityClaims,
+    *,
+    key_provider: LabFinalizerAuthorityKeyProvider,
+) -> LabFinalizerAuthorityProof:
+    key = key_provider()
+    if not isinstance(key, LabFinalizerAuthorityKey):
+        raise TypeError("authority key provider returned an invalid key")
+    mac = hmac.new(key.secret, claims.canonical_json_bytes(), hashlib.sha256).hexdigest()
+    return LabFinalizerAuthorityProof(key_id=key.key_id, claims=claims, mac_sha256=mac)
+
+
+def verify_finalizer_authority(
+    envelope: LabArtifactCommitEnvelope,
+    *,
+    key_provider: LabFinalizerAuthorityKeyProvider,
+) -> LabFinalizerAuthorityClaims:
+    key = key_provider()
+    if not isinstance(key, LabFinalizerAuthorityKey):
+        raise TypeError("authority key provider returned an invalid key")
+    proof = envelope.authority_proof
+    if proof is None:
+        raise ValueError("legacy unsigned artifact commit has no authority proof")
+    if proof.key_id != key.key_id:
+        raise ValueError("authority key_id does not match trusted rotation")
+    expected = hmac.new(
+        key.secret,
+        proof.claims.canonical_json_bytes(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(proof.mac_sha256, expected):
+        raise ValueError("authority proof MAC is invalid")
+    return proof.claims
+
+
+class LabArtifactCommitEnvelope(LabArtifactCommitProtocolModel):
+    schema_version: Literal[1, 2] = 1
+    request_id: UUID
     commit: LabArtifactCommit
+    authority_proof: LabFinalizerAuthorityProof | None = None
     content_hash: str = ""
 
     @model_validator(mode="after")
     def validate_content_hash(self) -> LabArtifactCommitEnvelope:
-        expected = hashlib.sha256(self.commit.canonical_json_bytes()).hexdigest()
+        commit_content_hash = hashlib.sha256(self.commit.canonical_json_bytes()).hexdigest()
+        if self.authority_proof is None:
+            if self.schema_version != 1:
+                raise ValueError("artifact commit v2 requires an authority proof")
+            expected = commit_content_hash
+            if self.content_hash and self.content_hash != expected:
+                raise ValueError("content_hash does not match canonical artifact commit content")
+            object.__setattr__(self, "content_hash", expected)
+            return self
+        if self.schema_version != 2:
+            raise ValueError("signed artifact commit must use protocol schema v2")
+        claims = self.authority_proof.claims
+        if (
+            claims.request_id != self.request_id
+            or claims.commit_content_hash != commit_content_hash
+            or claims.job_id != self.commit.job_id
+            or claims.spec_hash != self.commit.spec_hash
+            or claims.finalizer_code_sha != self.commit.code_sha
+            or claims.artifact_manifest_hash != self.commit.manifest_hash
+            or claims.complete_result_hash != self.commit.complete_result_hash
+        ):
+            raise ValueError("authority proof does not match artifact commit identity")
+        expected = hashlib.sha256(
+            json.dumps(
+                self.model_dump(mode="json", exclude={"content_hash"}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
         if self.content_hash and self.content_hash != expected:
             raise ValueError("content_hash does not match canonical artifact commit content")
         object.__setattr__(self, "content_hash", expected)

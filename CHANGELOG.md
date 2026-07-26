@@ -50,6 +50,15 @@
 
 ### Fixed
 
+- **Strategy Lab finalizer 提交权威与内存上界**：artifact commit 协议升级为 signed v2，
+  HMAC-SHA256 proof 绑定 ready event/version/fence、runtime code SHA、完整有序 accepted shard
+  图和 sealed result identity；scheduler 在同一 SQLite 写事务内用可信轮换 key provider 验证
+  MAC 与当前权威图，legacy unsigned、坏 MAC、旧 epoch 或伪 sealed/pending 只能得到 rejected
+  receipt。finalizer runtime SHA 改由每次调用的 verified provider 提供。shard、聚合结果和
+  artifact table 的 canonical hash 改为保持旧字节语义的增量 digest，避免构造整表 JSON；
+  bundle 先完成全 shard metadata/schema/resource preflight，再进入 pandas materialization，新增
+  nullable bool/null 保守估算、job 统一峰值预算和可配置的 EINTR 连续重试上限。
+
 - **Strategy Lab finalizer 权威重放与资源边界**：fast replay 只信任 SQLite 已入账且与
   sealed commit 精确一致的 envelope/receipt，spool pending 不再充当权威证据；未入账
   pending 必须重读 shard、聚合和 preview，伪 sealed 冲突会隔离对应 pending，不能被后续

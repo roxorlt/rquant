@@ -23,7 +23,12 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
     LabArtifactConflictEvidence,
+    LabFinalizerAuthorityClaims,
+    LabFinalizerAuthorityKey,
+    LabFinalizerAuthorityShardEvidence,
     LabQuarantinedArtifactCommit,
+    sign_finalizer_authority,
+    verify_finalizer_authority,
 )
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
@@ -53,10 +58,79 @@ def _commit(tmp_path: Path) -> LabArtifactCommit:
 
 
 def _envelope(tmp_path: Path, *, request_id: UUID | None = None) -> LabArtifactCommitEnvelope:
-    return LabArtifactCommitEnvelope(
-        request_id=request_id or uuid4(),
-        commit=_commit(tmp_path),
+    commit = _commit(tmp_path)
+    resolved_request_id = request_id or uuid4()
+    claims = LabFinalizerAuthorityClaims(
+        request_id=resolved_request_id,
+        commit_content_hash=hashlib.sha256(commit.canonical_json_bytes()).hexdigest(),
+        job_id=commit.job_id,
+        ready_event_id=17,
+        ready_job_version=4,
+        scheduler_fencing_token=3,
+        spec_hash=commit.spec_hash,
+        finalizer_code_sha=commit.code_sha,
+        shards=(
+            LabFinalizerAuthorityShardEvidence(
+                shard_index=0,
+                shard_id=UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+                payload_hash="9" * 64,
+                plan_hash=commit.plan_hash,
+                result_manifest_hash="a" * 64,
+                accepted_report_content_hash="b" * 64,
+                claim_token=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+                claim_generation=2,
+                scheduler_fencing_token=3,
+            ),
+        ),
+        artifact_manifest_hash=commit.manifest_hash,
+        complete_result_hash=commit.complete_result_hash,
     )
+    proof = sign_finalizer_authority(
+        claims,
+        key_provider=lambda: LabFinalizerAuthorityKey(
+            key_id="test-key-2026-07",
+            secret=b"k" * 32,
+        ),
+    )
+    return LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=resolved_request_id,
+        commit=commit,
+        authority_proof=proof,
+    )
+
+
+def test_finalizer_authority_key_is_validated_and_secret_is_not_serialized() -> None:
+    key = LabFinalizerAuthorityKey(key_id="rotation-a", secret=b"s" * 32)
+
+    assert "ssss" not in repr(key)
+    assert not hasattr(key, "model_dump")
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        LabFinalizerAuthorityKey(key_id="rotation-a", secret=b"short")
+
+
+def test_finalizer_authority_proof_verifies_mac_and_rejects_key_rotation(
+    tmp_path: Path,
+) -> None:
+    envelope = _envelope(tmp_path)
+
+    verified = verify_finalizer_authority(
+        envelope,
+        key_provider=lambda: LabFinalizerAuthorityKey(
+            key_id="test-key-2026-07",
+            secret=b"k" * 32,
+        ),
+    )
+
+    assert verified == envelope.authority_proof.claims
+    with pytest.raises(ValueError, match="key_id|MAC"):
+        verify_finalizer_authority(
+            envelope,
+            key_provider=lambda: LabFinalizerAuthorityKey(
+                key_id="test-key-2026-08",
+                secret=b"z" * 32,
+            ),
+        )
 
 
 class _ConflictPublishCrash(BaseException):

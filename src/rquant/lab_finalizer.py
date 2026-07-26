@@ -25,6 +25,10 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitReceipt,
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
+    LabFinalizerAuthorityClaims,
+    LabFinalizerAuthorityKeyProvider,
+    LabFinalizerAuthorityShardEvidence,
+    sign_finalizer_authority,
 )
 from rquant.lab_artifacts import (
     LabArtifactError,
@@ -39,13 +43,12 @@ from rquant.lab_artifacts import (
 )
 from rquant.lab_jobs import (
     COMPLETE_RESULT_CONTRACT_VERSION,
-    LabFinalizationReadyEpoch,
     LabFinalizationShardEvidence,
     LabFinalizationSnapshot,
     LabJobReader,
 )
 from rquant.lab_shard_protocol import LabShardSucceeded
-from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_json
+from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_digest
 from rquant.strategy_job_adapters import (
     LabJobExecutionResult,
     LabShardExecutionResult,
@@ -77,6 +80,10 @@ class LabFinalizationCodeMismatchError(LabFinalizationError):
         super().__init__(
             f"finalizer runtime code SHA {actual} does not match ready job code SHA {expected}"
         )
+
+
+class LabFinalizationCodeProviderError(LabFinalizationError):
+    """The trusted runtime code provider failed or returned an invalid SHA."""
 
 
 class LabFinalizerModel(BaseModel):
@@ -149,13 +156,14 @@ class LabFinalizerResult(LabFinalizerModel):
 class LabShardBundleLimits(LabFinalizerModel):
     max_manifest_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
     max_artifact_count: int = Field(default=256, ge=1)
-    max_single_file_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
-    max_bundle_total_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_single_file_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    max_bundle_total_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     max_row_count: int = Field(default=5_000_000, ge=1)
     max_column_count: int = Field(default=512, ge=1)
-    max_parquet_uncompressed_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
-    max_arrow_table_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
-    max_materialized_dataframe_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_parquet_uncompressed_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    max_arrow_table_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    max_materialized_dataframe_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+    max_consecutive_interrupted_reads: int = Field(default=8, ge=0, le=1024)
 
     @model_validator(mode="after")
     def validate_bundle_limits(self) -> LabShardBundleLimits:
@@ -167,18 +175,19 @@ class LabShardBundleLimits(LabFinalizerModel):
 class LabFinalizerJobLimits(LabFinalizerModel):
     max_shards: int = Field(default=128, ge=1)
     max_total_shard_rows: int = Field(default=5_000_000, ge=1)
-    max_total_compressed_bytes: int = Field(default=1024 * 1024 * 1024, ge=1)
-    max_total_declared_uncompressed_bytes: int = Field(default=1024 * 1024 * 1024, ge=1)
-    max_total_arrow_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
-    max_total_shard_dataframe_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_total_compressed_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_total_declared_uncompressed_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_total_arrow_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+    max_total_shard_dataframe_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     max_aggregate_rows: int = Field(default=5_000_000, ge=1)
-    max_aggregate_dataframe_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
-    max_final_artifact_payload_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
+    max_aggregate_dataframe_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+    max_final_artifact_payload_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
     max_final_artifact_single_payload_bytes: int = Field(
-        default=256 * 1024 * 1024,
+        default=64 * 1024 * 1024,
         ge=1,
     )
     max_final_artifact_table_count: int = Field(default=128, ge=1)
+    max_peak_resident_bytes: int = Field(default=640 * 1024 * 1024, ge=1)
 
     @model_validator(mode="after")
     def validate_job_limits(self) -> LabFinalizerJobLimits:
@@ -195,11 +204,22 @@ class LabShardBundleUsage(LabFinalizerModel):
     materialized_dataframe_bytes: int = Field(ge=0)
 
 
+class LabShardBundleInspection(LabFinalizerModel):
+    manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    row_count: int = Field(ge=0)
+    compressed_bytes: int = Field(ge=0)
+    declared_uncompressed_bytes: int = Field(ge=0)
+    estimated_arrow_bytes: int = Field(ge=0)
+    estimated_pandas_bytes: int = Field(ge=0)
+
+
 class LabParquetResourceSummary(LabFinalizerModel):
     row_count: int = Field(ge=0)
     column_count: int = Field(ge=0)
     columns: tuple[str, ...]
     declared_uncompressed_bytes: int = Field(ge=0)
+    estimated_arrow_bytes: int = Field(ge=0)
+    estimated_pandas_bytes: int = Field(ge=0)
 
 
 @dataclass(frozen=True)
@@ -234,16 +254,24 @@ def _read_descriptor_bounded(
     *,
     expected_size: int,
     max_bytes: int,
+    max_consecutive_interrupted_reads: int = 8,
 ) -> bytes:
     if expected_size > max_bytes:
         raise LabFinalizationIntegrityError("accepted shard file exceeds configured byte limit")
     os.lseek(descriptor, 0, os.SEEK_SET)
     payload = bytearray()
+    interrupted_reads = 0
     while len(payload) < expected_size:
         try:
             chunk = os.read(descriptor, min(1024 * 1024, expected_size - len(payload)))
         except InterruptedError:
+            interrupted_reads += 1
+            if interrupted_reads > max_consecutive_interrupted_reads:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard exceeded interrupted read limit"
+                ) from None
             continue
+        interrupted_reads = 0
         if not chunk:
             raise LabFinalizationIntegrityError("accepted shard file ended before declared size")
         payload.extend(chunk)
@@ -252,21 +280,38 @@ def _read_descriptor_bounded(
             extra = os.read(descriptor, 1)
             break
         except InterruptedError:
+            interrupted_reads += 1
+            if interrupted_reads > max_consecutive_interrupted_reads:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard exceeded interrupted read limit"
+                ) from None
             continue
     if extra:
         raise LabFinalizationIntegrityError("accepted shard file exceeds declared size")
     return bytes(payload)
 
 
-def _sha256_descriptor_bounded(descriptor: int, *, expected_size: int) -> str:
+def _sha256_descriptor_bounded(
+    descriptor: int,
+    *,
+    expected_size: int,
+    max_consecutive_interrupted_reads: int = 8,
+) -> str:
     os.lseek(descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
     consumed = 0
+    interrupted_reads = 0
     while consumed < expected_size:
         try:
             chunk = os.read(descriptor, min(1024 * 1024, expected_size - consumed))
         except InterruptedError:
+            interrupted_reads += 1
+            if interrupted_reads > max_consecutive_interrupted_reads:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard exceeded interrupted read limit"
+                ) from None
             continue
+        interrupted_reads = 0
         if not chunk:
             raise LabFinalizationIntegrityError("accepted shard file ended before declared size")
         digest.update(chunk)
@@ -276,6 +321,11 @@ def _sha256_descriptor_bounded(descriptor: int, *, expected_size: int) -> str:
             extra = os.read(descriptor, 1)
             break
         except InterruptedError:
+            interrupted_reads += 1
+            if interrupted_reads > max_consecutive_interrupted_reads:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard exceeded interrupted read limit"
+                ) from None
             continue
     if extra:
         raise LabFinalizationIntegrityError("accepted shard file exceeds declared size")
@@ -486,11 +536,29 @@ class LabSealedShardBundleReader:
                         raise LabFinalizationIntegrityError(
                             "accepted shard Parquet uncompressed size exceeds configured limit"
                         )
+            schema = parquet.schema_arrow
+            estimated_arrow_bytes = declared_uncompressed_bytes + (
+                metadata.num_rows * max(metadata.num_columns, 1) * 8
+            )
+            estimated_pandas_bytes = estimated_arrow_bytes + self._pandas_schema_overhead(
+                schema,
+                metadata.num_rows,
+            )
+            if estimated_arrow_bytes > self.limits.max_arrow_table_bytes:
+                raise LabFinalizationResourceLimitError(
+                    "accepted shard estimated Arrow table exceeds configured memory limit"
+                )
+            if estimated_pandas_bytes > self.limits.max_materialized_dataframe_bytes:
+                raise LabFinalizationResourceLimitError(
+                    "accepted shard estimated pandas DataFrame exceeds configured memory limit"
+                )
             return LabParquetResourceSummary(
                 row_count=metadata.num_rows,
                 column_count=metadata.num_columns,
-                columns=tuple(parquet.schema_arrow.names),
+                columns=tuple(schema.names),
                 declared_uncompressed_bytes=declared_uncompressed_bytes,
+                estimated_arrow_bytes=estimated_arrow_bytes,
+                estimated_pandas_bytes=estimated_pandas_bytes,
             )
 
         try:
@@ -511,9 +579,9 @@ class LabSealedShardBundleReader:
         """Fault hook after bounded Arrow loading and before pandas allocation."""
 
     @staticmethod
-    def _estimated_pandas_bytes(table: pa.Table) -> int:
-        estimate = int(table.nbytes) + max(table.num_rows, 1) * 8
-        for field in table.schema:
+    def _pandas_schema_overhead(schema: pa.Schema, row_count: int) -> int:
+        estimate = max(row_count, 1) * 8
+        for field in schema:
             data_type = field.type
             if isinstance(data_type, pa.ExtensionType):
                 raise LabFinalizationIntegrityError(
@@ -541,7 +609,9 @@ class LabSealedShardBundleReader:
                     "accepted shard Parquet uses an unsupported nested or logical type"
                 )
             object_backed = (
-                pa.types.is_decimal(data_type)
+                pa.types.is_null(data_type)
+                or pa.types.is_boolean(data_type)
+                or pa.types.is_decimal(data_type)
                 or pa.types.is_date(data_type)
                 or pa.types.is_time(data_type)
                 or pa.types.is_string(data_type)
@@ -552,8 +622,15 @@ class LabSealedShardBundleReader:
                 or pa.types.is_dictionary(data_type)
             )
             if object_backed:
-                estimate += table.num_rows * 80
+                estimate += row_count * 80
         return estimate
+
+    @classmethod
+    def _estimated_pandas_bytes(cls, table: pa.Table) -> int:
+        return int(table.nbytes) + cls._pandas_schema_overhead(
+            table.schema,
+            table.num_rows,
+        )
 
     def _read_parquet(self, descriptor: int) -> _ParquetMaterialization:
         def materialize(stream: BinaryIO) -> _ParquetMaterialization:
@@ -621,7 +698,9 @@ class LabSealedShardBundleReader:
         *,
         descriptors: list[int],
         observe_usage: Callable[[LabShardBundleUsage], None] | None,
-    ) -> LabShardExecutionResult:
+        materialize: bool,
+        expected_inspection: LabShardBundleInspection | None,
+    ) -> LabShardExecutionResult | LabShardBundleInspection:
         report = evidence.accepted_success.report
         body = report.body
         if not isinstance(body, LabShardSucceeded):
@@ -677,6 +756,7 @@ class LabSealedShardBundleReader:
                 manifest_descriptor,
                 expected_size=manifest_observed[4],
                 max_bytes=self.limits.max_manifest_bytes,
+                max_consecutive_interrupted_reads=(self.limits.max_consecutive_interrupted_reads),
             )
             self._after_file_read("manifest.json")
             try:
@@ -735,6 +815,8 @@ class LabSealedShardBundleReader:
 
             tables: list[LabShardTable] = []
             total_uncompressed_bytes = 0
+            total_estimated_arrow_bytes = 0
+            total_estimated_pandas_bytes = 0
             total_arrow_bytes = 0
             total_materialized_bytes = 0
             for index, artifact in enumerate(manifest.artifacts):
@@ -752,6 +834,9 @@ class LabSealedShardBundleReader:
                     _sha256_descriptor_bounded(
                         descriptor,
                         expected_size=artifact.file_size,
+                        max_consecutive_interrupted_reads=(
+                            self.limits.max_consecutive_interrupted_reads
+                        ),
                     )
                     != artifact.file_sha256
                 ):
@@ -759,6 +844,8 @@ class LabSealedShardBundleReader:
                 self._after_file_read(artifact.file_name)
                 parquet_summary = self._parquet_resource_summary(descriptor)
                 total_uncompressed_bytes += parquet_summary.declared_uncompressed_bytes
+                total_estimated_arrow_bytes += parquet_summary.estimated_arrow_bytes
+                total_estimated_pandas_bytes += parquet_summary.estimated_pandas_bytes
                 if total_uncompressed_bytes > self.limits.max_parquet_uncompressed_bytes:
                     raise LabFinalizationIntegrityError(
                         "accepted shard Parquet uncompressed size exceeds configured limit"
@@ -769,28 +856,45 @@ class LabSealedShardBundleReader:
                     or parquet_summary.columns != artifact.columns
                 ):
                     raise LabFinalizationIntegrityError("accepted shard Parquet shape conflicts")
-                materialization = self._read_parquet(descriptor)
-                frame = materialization.frame
-                total_arrow_bytes += materialization.arrow_bytes
-                if total_arrow_bytes > self.limits.max_arrow_table_bytes:
-                    raise LabFinalizationResourceLimitError(
-                        "accepted shard Arrow tables exceed configured memory limit"
-                    )
-                total_materialized_bytes += materialization.materialized_dataframe_bytes
-                if total_materialized_bytes > self.limits.max_materialized_dataframe_bytes:
-                    raise LabFinalizationResourceLimitError(
-                        "accepted shard materialized DataFrame exceeds configured memory limit"
-                    )
-                if len(frame) != artifact.row_count or tuple(frame.columns) != artifact.columns:
-                    raise LabFinalizationIntegrityError("accepted shard Parquet shape conflicts")
-                content_hash = hashlib.sha256(
-                    canonical_shard_frame_json(frame).encode("utf-8")
-                ).hexdigest()
-                if content_hash != artifact.content_sha256:
-                    raise LabFinalizationIntegrityError("accepted shard Parquet content conflicts")
-                tables.append(LabShardTable(name=artifact.name, frame=frame))
+                if materialize:
+                    materialization = self._read_parquet(descriptor)
+                    frame = materialization.frame
+                    total_arrow_bytes += materialization.arrow_bytes
+                    if total_arrow_bytes > self.limits.max_arrow_table_bytes:
+                        raise LabFinalizationResourceLimitError(
+                            "accepted shard Arrow tables exceed configured memory limit"
+                        )
+                    total_materialized_bytes += materialization.materialized_dataframe_bytes
+                    if total_materialized_bytes > self.limits.max_materialized_dataframe_bytes:
+                        raise LabFinalizationResourceLimitError(
+                            "accepted shard materialized DataFrame exceeds configured memory limit"
+                        )
+                    if len(frame) != artifact.row_count or tuple(frame.columns) != artifact.columns:
+                        raise LabFinalizationIntegrityError(
+                            "accepted shard Parquet shape conflicts"
+                        )
+                    content_hash = canonical_shard_frame_digest(frame)
+                    if content_hash != artifact.content_sha256:
+                        raise LabFinalizationIntegrityError(
+                            "accepted shard Parquet content conflicts"
+                        )
+                    tables.append(LabShardTable(name=artifact.name, frame=frame))
 
-            if observe_usage is not None:
+            inspection = LabShardBundleInspection(
+                manifest_hash=manifest.manifest_hash,
+                row_count=sum(artifact.row_count for artifact in manifest.artifacts),
+                compressed_bytes=len(manifest_bytes)
+                + sum(artifact.file_size for artifact in manifest.artifacts),
+                declared_uncompressed_bytes=total_uncompressed_bytes,
+                estimated_arrow_bytes=total_estimated_arrow_bytes,
+                estimated_pandas_bytes=total_estimated_pandas_bytes,
+            )
+            if expected_inspection is not None and inspection != expected_inspection:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard changed after resource preflight"
+                )
+
+            if materialize and observe_usage is not None:
                 observe_usage(
                     LabShardBundleUsage(
                         row_count=sum(artifact.row_count for artifact in manifest.artifacts),
@@ -827,6 +931,8 @@ class LabSealedShardBundleReader:
                     or _observation(os.fstat(binding.descriptor)) != binding.observation
                 ):
                     raise LabFinalizationIntegrityError("shard artifact path changed while reading")
+            if not materialize:
+                return inspection
             return LabShardExecutionResult(
                 shard_id=manifest.shard_id,
                 spec_hash=manifest.spec_hash,
@@ -849,6 +955,7 @@ class LabSealedShardBundleReader:
         evidence: LabFinalizationShardEvidence,
         *,
         observe_usage: Callable[[LabShardBundleUsage], None] | None = None,
+        expected_inspection: LabShardBundleInspection | None = None,
     ) -> LabShardExecutionResult:
         descriptors: list[int] = []
         result: LabShardExecutionResult | None = None
@@ -858,6 +965,8 @@ class LabSealedShardBundleReader:
                 evidence,
                 descriptors=descriptors,
                 observe_usage=observe_usage,
+                materialize=True,
+                expected_inspection=expected_inspection,
             )
         except BaseException as exc:
             errors.append(exc)
@@ -875,6 +984,38 @@ class LabSealedShardBundleReader:
             )
         if result is None:
             raise AssertionError("bundle validation completed without a result")
+        if not isinstance(result, LabShardExecutionResult):
+            raise AssertionError("bundle materialization returned an inspection")
+        return result
+
+    def inspect(self, evidence: LabFinalizationShardEvidence) -> LabShardBundleInspection:
+        descriptors: list[int] = []
+        result: LabShardExecutionResult | LabShardBundleInspection | None = None
+        errors: list[BaseException] = []
+        try:
+            result = self._read_bound_bundle(
+                evidence,
+                descriptors=descriptors,
+                observe_usage=None,
+                materialize=False,
+                expected_inspection=None,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                "accepted shard inspection and cleanup failed",
+                errors,
+            )
+        if not isinstance(result, LabShardBundleInspection):
+            raise AssertionError("bundle inspection did not return resource evidence")
         return result
 
 
@@ -888,13 +1029,12 @@ class LabFinalizer:
         shard_artifact_root: Path,
         artifact_store: LabJobArtifactStore,
         commit_spool: LabArtifactCommitSpool,
-        runtime_code_sha: str,
+        verified_code_sha_provider: Callable[[], str | None],
+        finalizer_authority_key_provider: LabFinalizerAuthorityKeyProvider,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
     ) -> None:
-        if re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None:
-            raise ValueError("runtime_code_sha must be exactly 40 lowercase hexadecimal characters")
         self.reader = reader
         self.bundle_reader = LabSealedShardBundleReader(
             shard_artifact_root,
@@ -902,7 +1042,8 @@ class LabFinalizer:
         )
         self.artifact_store = artifact_store
         self.commit_spool = commit_spool
-        self.runtime_code_sha = runtime_code_sha
+        self.verified_code_sha_provider = verified_code_sha_provider
+        self.finalizer_authority_key_provider = finalizer_authority_key_provider
         self.job_limits = job_limits or LabFinalizerJobLimits()
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
 
@@ -925,6 +1066,8 @@ class LabFinalizer:
         snapshot: LabFinalizationSnapshot,
         result: LabJobExecutionResult,
         shard_results: tuple[LabShardExecutionResult, ...],
+        *,
+        finalizer_code_sha: str,
     ) -> LabFinalizerMetrics:
         first = snapshot.shards[0].shard
         return LabFinalizerMetrics(
@@ -934,7 +1077,7 @@ class LabFinalizer:
             adapter_id=first.adapter_id,
             adapter_version=first.adapter_version,
             result_contract_version=COMPLETE_RESULT_CONTRACT_VERSION,
-            finalizer_code_sha=self.runtime_code_sha,
+            finalizer_code_sha=finalizer_code_sha,
             result_hash=result.result_hash,
             shard_count=len(snapshot.shards),
             shards=tuple(
@@ -1200,10 +1343,12 @@ class LabFinalizer:
             reason="owned candidate isolated after finalization conflict",
         )
 
-    @staticmethod
     def _envelope(
+        self,
         sealed: LabSealedJobArtifact,
-        ready_epoch: LabFinalizationReadyEpoch,
+        snapshot: LabFinalizationSnapshot,
+        *,
+        finalizer_code_sha: str,
     ) -> LabArtifactCommitEnvelope:
         manifest = sealed.manifest
         commit = LabArtifactCommit(
@@ -1223,10 +1368,50 @@ class LabFinalizer:
         request_id = uuid5(
             NAMESPACE_URL,
             "rquant:lab-artifact-commit:v2:"
-            f"{manifest.job_id}:{ready_epoch.job_version}:"
-            f"{ready_epoch.event.event_id}:{commit_identity}",
+            f"{manifest.job_id}:{snapshot.ready_epoch.job_version}:"
+            f"{snapshot.ready_epoch.event.event_id}:{commit_identity}",
         )
-        return LabArtifactCommitEnvelope(request_id=request_id, commit=commit)
+        ready_fence = snapshot.ready_epoch.event.scheduler_fencing_token
+        if ready_fence is None:
+            raise LabFinalizationIntegrityError("ready epoch is missing its scheduler fence")
+        claims = LabFinalizerAuthorityClaims(
+            request_id=request_id,
+            commit_content_hash=commit_identity,
+            job_id=manifest.job_id,
+            ready_event_id=snapshot.ready_epoch.event.event_id,
+            ready_job_version=snapshot.ready_epoch.job_version,
+            scheduler_fencing_token=ready_fence,
+            spec_hash=snapshot.job.spec_hash,
+            finalizer_code_sha=finalizer_code_sha,
+            shards=tuple(
+                LabFinalizerAuthorityShardEvidence(
+                    shard_index=evidence.shard.shard_index,
+                    shard_id=evidence.shard.shard_id,
+                    payload_hash=evidence.shard.payload_hash,
+                    plan_hash=evidence.shard.plan_hash,
+                    result_manifest_hash=evidence.shard.result_manifest_hash or "",
+                    accepted_report_content_hash=(evidence.accepted_success.report.content_hash),
+                    claim_token=evidence.accepted_success.report.claim_token,
+                    claim_generation=(evidence.accepted_success.report.claim_generation),
+                    scheduler_fencing_token=(
+                        evidence.accepted_success.report.scheduler_fencing_token
+                    ),
+                )
+                for evidence in snapshot.shards
+            ),
+            artifact_manifest_hash=sealed.manifest_hash,
+            complete_result_hash=manifest.complete_result_hash,
+        )
+        proof = sign_finalizer_authority(
+            claims,
+            key_provider=self.finalizer_authority_key_provider,
+        )
+        return LabArtifactCommitEnvelope(
+            schema_version=2,
+            request_id=request_id,
+            commit=commit,
+            authority_proof=proof,
+        )
 
     @staticmethod
     def _sealed_matches_snapshot(
@@ -1287,6 +1472,8 @@ class LabFinalizer:
     def _fast_replay(
         self,
         snapshot: LabFinalizationSnapshot,
+        *,
+        finalizer_code_sha: str,
     ) -> LabFinalizerResult | None:
         target = self.artifact_store.sealed_root / snapshot.job.job_id.hex
         if not os.path.lexists(target):
@@ -1297,7 +1484,11 @@ class LabFinalizer:
             return None
         if not self._sealed_matches_snapshot(sealed, snapshot):
             return None
-        envelope = self._envelope(sealed, snapshot.ready_epoch)
+        envelope = self._envelope(
+            sealed,
+            snapshot,
+            finalizer_code_sha=finalizer_code_sha,
+        )
         ledger = self.reader.get_artifact_commit(envelope.request_id)
         durable = self.commit_spool.inspect(envelope.request_id)
         if ledger is None:
@@ -1325,6 +1516,8 @@ class LabFinalizer:
     def _isolate_uncommitted_conflicting_replay(
         self,
         snapshot: LabFinalizationSnapshot,
+        *,
+        finalizer_code_sha: str,
     ) -> None:
         target = self.artifact_store.sealed_root / snapshot.job.job_id.hex
         if not os.path.lexists(target):
@@ -1335,7 +1528,11 @@ class LabFinalizer:
             return
         if not self._sealed_matches_snapshot(sealed, snapshot):
             return
-        envelope = self._envelope(sealed, snapshot.ready_epoch)
+        envelope = self._envelope(
+            sealed,
+            snapshot,
+            finalizer_code_sha=finalizer_code_sha,
+        )
         if self.reader.get_artifact_commit(envelope.request_id) is not None:
             return
         durable = self.commit_spool.inspect(envelope.request_id)
@@ -1370,19 +1567,77 @@ class LabFinalizer:
         snapshot = self.reader.get_finalization_snapshot(job_id)
         if snapshot is None:
             return LabFinalizerResult(status="not_ready", job_id=job_id)
-        if snapshot.job.spec.code_sha != self.runtime_code_sha:
+        try:
+            runtime_code_sha = self.verified_code_sha_provider()
+        except Exception as exc:
+            raise LabFinalizationCodeProviderError("verified code SHA provider failed") from exc
+        if runtime_code_sha is None or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None:
+            raise LabFinalizationCodeProviderError(
+                "verified code SHA provider returned an invalid commit"
+            )
+        if snapshot.job.spec.code_sha != runtime_code_sha:
             raise LabFinalizationCodeMismatchError(
                 expected=snapshot.job.spec.code_sha,
-                actual=self.runtime_code_sha,
+                actual=runtime_code_sha,
             )
         self._require_within_limit(
             actual=len(snapshot.shards),
             maximum=self.job_limits.max_shards,
             label="shard count",
         )
-        replay = self._fast_replay(snapshot)
+        replay = self._fast_replay(snapshot, finalizer_code_sha=runtime_code_sha)
         if replay is not None:
             return replay
+        inspections = tuple(self.bundle_reader.inspect(evidence) for evidence in snapshot.shards)
+        estimated_rows = sum(item.row_count for item in inspections)
+        estimated_compressed_bytes = sum(item.compressed_bytes for item in inspections)
+        estimated_uncompressed_bytes = sum(item.declared_uncompressed_bytes for item in inspections)
+        estimated_arrow_bytes = sum(item.estimated_arrow_bytes for item in inspections)
+        estimated_dataframe_bytes = sum(item.estimated_pandas_bytes for item in inspections)
+        for actual, maximum, label in (
+            (
+                estimated_rows,
+                self.job_limits.max_total_shard_rows,
+                "total shard row count",
+            ),
+            (
+                estimated_compressed_bytes,
+                self.job_limits.max_total_compressed_bytes,
+                "total compressed shard bytes",
+            ),
+            (
+                estimated_uncompressed_bytes,
+                self.job_limits.max_total_declared_uncompressed_bytes,
+                "total declared uncompressed shard bytes",
+            ),
+            (
+                estimated_arrow_bytes,
+                self.job_limits.max_total_arrow_bytes,
+                "total estimated Arrow shard bytes",
+            ),
+            (
+                estimated_dataframe_bytes,
+                self.job_limits.max_total_shard_dataframe_bytes,
+                "total estimated shard DataFrame bytes",
+            ),
+        ):
+            self._require_within_limit(actual=actual, maximum=maximum, label=label)
+        hash_scratch_bytes = 16 * 1024 * 1024
+        estimated_aggregate_bytes = min(
+            self.job_limits.max_aggregate_dataframe_bytes,
+            max(estimated_dataframe_bytes * 2, 1),
+        )
+        preflight_peak = max(
+            estimated_dataframe_bytes
+            + max((item.estimated_arrow_bytes for item in inspections), default=0)
+            + hash_scratch_bytes,
+            estimated_dataframe_bytes + estimated_aggregate_bytes + hash_scratch_bytes,
+        )
+        self._require_within_limit(
+            actual=preflight_peak,
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="preflight peak resident bytes",
+        )
         try:
             shard_result_items: list[LabShardExecutionResult] = []
             total_rows = 0
@@ -1390,10 +1645,14 @@ class LabFinalizer:
             total_declared_uncompressed_bytes = 0
             total_arrow_bytes = 0
             total_dataframe_bytes = 0
-            for evidence in snapshot.shards:
+            for evidence, inspection in zip(snapshot.shards, inspections, strict=True):
                 usages: list[LabShardBundleUsage] = []
                 shard_result_items.append(
-                    self.bundle_reader.read(evidence, observe_usage=usages.append)
+                    self.bundle_reader.read(
+                        evidence,
+                        observe_usage=usages.append,
+                        expected_inspection=inspection,
+                    )
                 )
                 if len(usages) != 1:
                     raise LabFinalizationIntegrityError(
@@ -1431,6 +1690,18 @@ class LabFinalizer:
                     label="total shard DataFrame bytes",
                 )
             shard_results = tuple(shard_result_items)
+            self._require_within_limit(
+                actual=(
+                    total_dataframe_bytes
+                    + min(
+                        self.job_limits.max_aggregate_dataframe_bytes,
+                        max(total_dataframe_bytes * 2, 1),
+                    )
+                    + hash_scratch_bytes
+                ),
+                maximum=self.job_limits.max_peak_resident_bytes,
+                label="aggregate preflight peak resident bytes",
+            )
             result = self.adapter_registry.aggregate_results(snapshot.job.spec, shard_results)
         except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise
@@ -1444,18 +1715,39 @@ class LabFinalizer:
             maximum=self.job_limits.max_aggregate_rows,
             label="aggregate row count",
         )
+        aggregate_dataframe_bytes = self._dataframe_bytes(aggregate_frames)
         self._require_within_limit(
-            actual=self._dataframe_bytes(aggregate_frames),
+            actual=aggregate_dataframe_bytes,
             maximum=self.job_limits.max_aggregate_dataframe_bytes,
             label="aggregate DataFrame bytes",
+        )
+        self._require_within_limit(
+            actual=total_dataframe_bytes + aggregate_dataframe_bytes + hash_scratch_bytes,
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="aggregate peak resident bytes",
         )
         self._require_within_limit(
             actual=len(result.tables),
             maximum=self.job_limits.max_final_artifact_table_count,
             label="final artifact table count",
         )
-        metrics = self._metrics(snapshot, result, shard_results)
+        metrics = self._metrics(
+            snapshot,
+            result,
+            shard_results,
+            finalizer_code_sha=runtime_code_sha,
+        )
+        del shard_result_items, shard_results
         first = snapshot.shards[0].shard
+        self._require_within_limit(
+            actual=(
+                aggregate_dataframe_bytes
+                + (2 * self.job_limits.max_final_artifact_payload_bytes)
+                + hash_scratch_bytes
+            ),
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="artifact planning peak resident bytes",
+        )
         try:
             plan = self.artifact_store.preview_candidate(
                 job_id=snapshot.job.job_id,
@@ -1483,11 +1775,20 @@ class LabFinalizer:
             raise LabFinalizationIntegrityError(
                 "complete result candidate could not be previewed"
             ) from exc
+        planned_payload_bytes = sum(len(item.payload) for item in plan.payloads)
+        self._require_within_limit(
+            actual=aggregate_dataframe_bytes + (2 * planned_payload_bytes) + hash_scratch_bytes,
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="materialized artifact plan peak resident bytes",
+        )
         try:
             sealed = self._recover_or_prepare(plan)
         except LabFinalizationIntegrityError as primary_error:
             try:
-                self._isolate_uncommitted_conflicting_replay(snapshot)
+                self._isolate_uncommitted_conflicting_replay(
+                    snapshot,
+                    finalizer_code_sha=runtime_code_sha,
+                )
             except BaseException as cleanup_error:
                 raise BaseExceptionGroup(
                     "finalization conflict and uncommitted replay isolation failed",
@@ -1495,7 +1796,11 @@ class LabFinalizer:
                 ) from None
             raise
         self._after_artifact_sealed(sealed)
-        envelope = self._envelope(sealed, snapshot.ready_epoch)
+        envelope = self._envelope(
+            sealed,
+            snapshot,
+            finalizer_code_sha=runtime_code_sha,
+        )
         published = self.commit_spool.publish(envelope)
         self._after_commit_published(published)
         if isinstance(published, LabAcknowledgedArtifactCommit):
