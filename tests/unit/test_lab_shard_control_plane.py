@@ -1025,7 +1025,9 @@ def test_telemetry_completion_sequence_is_acceptance_ordered_exactly_once_and_re
     assert job.result_state.value == "ready"
 
 
-def test_p13_inflight_success_keeps_legacy_telemetry_columns_null(tmp_path: Path) -> None:
+def test_p13_inflight_completion_fails_without_creating_legacy_result(
+    tmp_path: Path,
+) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
     lease = _lease(store)
@@ -1070,8 +1072,14 @@ def test_p13_inflight_success_keeps_legacy_telemetry_columns_null(tmp_path: Path
     assert shard.throughput_units_per_second is None
     assert shard.completion_sequence is None
     assert job is not None and job.result_contract_version is None
-    assert job.status is JobStatus.SUCCEEDED
-    assert job.result_state.value == "legacy_unsealed"
+    assert job.status is JobStatus.FAILED
+    assert job.result_state.value == "pending"
+    assert job.recoverable is False
+    events = LabJobReader(store.path).list_events(frozen.job_id)
+    assert events[-1].event_type == "job_failed_legacy_result_contract"
+    assert events[-1].reason == (
+        "all shards succeeded but the legacy result contract cannot produce a complete artifact"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1444,12 +1452,15 @@ def test_final_shard_success_marks_complete_result_ready_and_clears_pause(
     assert job.result_state.value == "ready"
     assert job.result_contract_version == "p1.4b-complete-result-v1"
     assert job.control_intent is ControlIntent.NONE
-    assert store.claim_next_shard(
-        worker_id="worker-b",
-        shard_lease_seconds=30,
-        lease=lease,
-        now=NOW + timedelta(seconds=5),
-    ) is None
+    assert (
+        store.claim_next_shard(
+            worker_id="worker-b",
+            shard_lease_seconds=30,
+            lease=lease,
+            now=NOW + timedelta(seconds=5),
+        )
+        is None
+    )
     assert LabJobReader(store.path).list_events(job_id)[-1].event_type == "job_result_ready"
     with (
         sqlite3.connect(store.path) as connection,

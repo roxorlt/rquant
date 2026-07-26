@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -87,6 +87,10 @@ class LabDatabaseIdentityError(RuntimeError):
 
 class ShardPlanConflictError(RuntimeError):
     """A job was already bound to a different immutable shard plan."""
+
+
+class ArtifactCommitDeadlineExpiredError(RuntimeError):
+    """A staged artifact success crossed its job deadline before commit."""
 
 
 _APPLICATION_ID = 0x52514A42
@@ -188,6 +192,7 @@ class LabJobRecord(LabRecordModel):
     recoverable: bool
     scheduler_fencing_token: int | None = Field(default=None, ge=1)
     result_contract_version: str | None = Field(default=None, min_length=1)
+    requires_complete_result: bool
     result_state: LabResultState
     created_at: datetime
     updated_at: datetime
@@ -313,38 +318,95 @@ class LabArtifactCommitRecord(LabRecordModel):
 class LabStagedArtifactCommit:
     """A closed-surface SQLite transaction awaiting artifact exit verification."""
 
-    __slots__ = ("_connection", "_closed", "receipt")
+    __slots__ = (
+        "_connection",
+        "_closed",
+        "_lease_identity",
+        "_precommit_validator",
+        "receipt",
+    )
 
     def __init__(
         self,
         connection: sqlite3.Connection,
         receipt: LabArtifactCommitReceipt,
+        *,
+        lease: LabLeaseRecord,
+        precommit_validator: Callable[[LabLeaseRecord, datetime], None],
     ) -> None:
         self._connection = connection
         self._closed = False
+        self._lease_identity = (
+            lease.lease_id,
+            lease.lease_name,
+            lease.owner_id,
+            lease.token,
+            lease.fencing_token,
+        )
+        self._precommit_validator = precommit_validator
         self.receipt = receipt
 
-    def commit(self) -> LabArtifactCommitReceipt:
+    @staticmethod
+    def _raise_lifecycle_errors(label: str, errors: list[BaseException]) -> None:
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup(label, errors)
+
+    def _rollback_and_close(self, primary: BaseException | None = None) -> None:
+        errors = [primary] if primary is not None else []
+        try:
+            self._connection.rollback()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            self._connection.close()
+        except BaseException as exc:
+            errors.append(exc)
+        self._closed = True
+        if errors:
+            self._raise_lifecycle_errors("staged artifact transaction rollback failed", errors)
+
+    def commit(
+        self,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabArtifactCommitReceipt:
         if self._closed:
             raise RuntimeError("artifact commit stage is already closed")
+        final_lease_identity = (
+            lease.lease_id,
+            lease.lease_name,
+            lease.owner_id,
+            lease.token,
+            lease.fencing_token,
+        )
+        if final_lease_identity != self._lease_identity:
+            self._rollback_and_close(
+                SchedulerLeaseFencedError(
+                    "staged artifact commit lease identity changed before commit"
+                )
+            )
+        try:
+            self._precommit_validator(lease, _utc(now))
+        except BaseException as exc:
+            self._rollback_and_close(exc)
         try:
             self._connection.commit()
-        except BaseException:
-            self._connection.rollback()
-            raise
-        finally:
+        except BaseException as exc:
+            self._rollback_and_close(exc)
+        try:
             self._connection.close()
+        except BaseException:
             self._closed = True
+            raise
+        self._closed = True
         return self.receipt
 
     def rollback(self) -> None:
         if self._closed:
             return
-        try:
-            self._connection.rollback()
-        finally:
-            self._connection.close()
-            self._closed = True
+        self._rollback_and_close()
 
 
 _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
@@ -585,9 +647,7 @@ def _artifact_commit_record_from_row(
             raise ValueError("artifact commit request id does not match lookup key")
         if not (envelope.request_id == receipt.request_id == request_id):
             raise ValueError("artifact commit request id mismatch")
-        if not (
-            envelope.content_hash == receipt.content_hash == str(row["content_hash"])
-        ):
+        if not (envelope.content_hash == receipt.content_hash == str(row["content_hash"])):
             raise ValueError("artifact commit content hash mismatch")
         if not (envelope.commit.job_id == receipt.job_id == UUID(str(row["job_id"]))):
             raise ValueError("artifact commit job id mismatch")
@@ -615,9 +675,7 @@ def _artifact_commit_record_from_row(
     except Exception as exc:
         if isinstance(exc, InvalidStoredJobError):
             raise
-        raise InvalidStoredJobError(
-            f"invalid stored artifact commit {stored_id}: {exc}"
-        ) from exc
+        raise InvalidStoredJobError(f"invalid stored artifact commit {stored_id}: {exc}") from exc
 
 
 def _validate_v2_schema(connection: sqlite3.Connection) -> None:
@@ -846,13 +904,162 @@ def _validate_v4_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _canonical_table_sql(sql: str) -> str:
+    canonical = "".join(sql.split()).lower()
+    return canonical.replace("ifnotexists", "")
+
+
+def _validate_v5_table_sql(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    expected: str,
+) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if (
+        row is None
+        or row[0] is None
+        or _canonical_table_sql(str(row[0])) != _canonical_table_sql(expected)
+    ):
+        raise LabDatabaseIdentityError(f"lab jobs SQLite v5 table {table} has invalid constraints")
+
+
+def _validate_v5_column_identity(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+    declared_type: str,
+    not_null: bool,
+    primary_key_position: int,
+    default: str | None,
+) -> None:
+    rows = {
+        str(row[1]): row for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+    }
+    row = rows.get(column)
+    if row is None:
+        raise LabDatabaseIdentityError(f"lab jobs SQLite v5 table {table} is missing {column}")
+    actual = (
+        str(row[2]).upper(),
+        _strict_sqlite_int(row[3], field=f"{table}.{column}.notnull", minimum=0),
+        _strict_sqlite_int(row[5], field=f"{table}.{column}.pk", minimum=0),
+        str(row[4]) if row[4] is not None else None,
+    )
+    expected = (
+        declared_type.upper(),
+        int(not_null),
+        primary_key_position,
+        default,
+    )
+    if actual != expected:
+        raise LabDatabaseIdentityError(
+            f"lab jobs SQLite v5 table {table} column {column} has invalid constraints"
+        )
+
+
+def _v5_index_identities(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+) -> set[tuple[bool, str, bool, tuple[str, ...]]]:
+    identities: set[tuple[bool, str, bool, tuple[str, ...]]] = set()
+    for row in connection.execute(f'PRAGMA index_list("{table}")').fetchall():
+        name = str(row[1])
+        columns = tuple(
+            str(info[2]) for info in connection.execute(f'PRAGMA index_info("{name}")').fetchall()
+        )
+        identities.add(
+            (
+                bool(_strict_sqlite_int(row[2], field=f"{name}.unique", minimum=0)),
+                str(row[3]),
+                bool(_strict_sqlite_int(row[4], field=f"{name}.partial", minimum=0)),
+                columns,
+            )
+        )
+    return identities
+
+
+def _validate_v5_key_and_foreign_key_constraints(
+    connection: sqlite3.Connection,
+) -> None:
+    commit_indexes = _v5_index_identities(connection, table="lab_artifact_commit")
+    if commit_indexes != {(True, "pk", False, ("request_id",))}:
+        raise LabDatabaseIdentityError("lab jobs SQLite v5 artifact commit primary key is invalid")
+    result_indexes = _v5_index_identities(
+        connection,
+        table="lab_job_result_artifact",
+    )
+    if result_indexes != {
+        (True, "pk", False, ("job_id",)),
+        (True, "u", False, ("commit_request_id",)),
+    }:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v5 result artifact primary/unique keys are invalid"
+        )
+    foreign_keys = {
+        (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]).upper(),
+            str(row[6]).upper(),
+            str(row[7]).upper(),
+        )
+        for row in connection.execute("PRAGMA foreign_key_list(lab_job_result_artifact)").fetchall()
+    }
+    if foreign_keys != {
+        (
+            "lab_job",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        ),
+        (
+            "lab_artifact_commit",
+            "commit_request_id",
+            "request_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        ),
+    }:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v5 result artifact foreign keys are invalid"
+        )
+
+
 def _validate_v5_schema(connection: sqlite3.Connection) -> None:
     _validate_v4_schema(connection)
+    _validate_v5_table_sql(
+        connection,
+        table="lab_job",
+        expected=_V5_JOB_TABLE_STATEMENT,
+    )
+    _validate_v5_table_sql(
+        connection,
+        table="lab_artifact_commit",
+        expected=_V5_ARTIFACT_COMMIT_TABLE_STATEMENT,
+    )
+    _validate_v5_table_sql(
+        connection,
+        table="lab_job_result_artifact",
+        expected=_V5_RESULT_ARTIFACT_TABLE_STATEMENT,
+    )
     job_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()
     }
-    if "result_state" not in job_columns:
-        raise LabDatabaseIdentityError("lab jobs SQLite v5 is missing lab_job.result_state")
+    required_job_columns = {"result_state", "requires_complete_result"}
+    missing_job_columns = sorted(required_job_columns - job_columns)
+    if missing_job_columns:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v5 is missing lab_job columns: " + ", ".join(missing_job_columns)
+        )
     required_tables = {"lab_artifact_commit", "lab_job_result_artifact"}
     existing_tables = {
         str(row[0])
@@ -882,9 +1089,7 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
         for row in connection.execute("PRAGMA table_info(lab_artifact_commit)").fetchall()
     }
     if commit_columns != required_commit_columns:
-        raise LabDatabaseIdentityError(
-            "lab jobs SQLite v5 lab_artifact_commit has invalid columns"
-        )
+        raise LabDatabaseIdentityError("lab jobs SQLite v5 lab_artifact_commit has invalid columns")
     required_result_columns = {
         "job_id",
         "commit_request_id",
@@ -898,17 +1103,62 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
     }
     result_columns = {
         str(row[1])
-        for row in connection.execute(
-            "PRAGMA table_info(lab_job_result_artifact)"
-        ).fetchall()
+        for row in connection.execute("PRAGMA table_info(lab_job_result_artifact)").fetchall()
     }
     if result_columns != required_result_columns:
         raise LabDatabaseIdentityError(
             "lab jobs SQLite v5 lab_job_result_artifact has invalid columns"
         )
+    _validate_v5_column_identity(
+        connection,
+        table="lab_job",
+        column="result_state",
+        declared_type="TEXT",
+        not_null=True,
+        primary_key_position=0,
+        default="'pending'",
+    )
+    _validate_v5_column_identity(
+        connection,
+        table="lab_job",
+        column="requires_complete_result",
+        declared_type="INTEGER",
+        not_null=True,
+        primary_key_position=0,
+        default="0",
+    )
+    _validate_v5_column_identity(
+        connection,
+        table="lab_artifact_commit",
+        column="request_id",
+        declared_type="TEXT",
+        not_null=False,
+        primary_key_position=1,
+        default=None,
+    )
+    _validate_v5_column_identity(
+        connection,
+        table="lab_job_result_artifact",
+        column="job_id",
+        declared_type="TEXT",
+        not_null=False,
+        primary_key_position=1,
+        default=None,
+    )
+    _validate_v5_column_identity(
+        connection,
+        table="lab_job_result_artifact",
+        column="commit_request_id",
+        declared_type="TEXT",
+        not_null=True,
+        primary_key_position=0,
+        default=None,
+    )
+    _validate_v5_key_and_foreign_key_constraints(connection)
     required_triggers = {
         "trg_lab_job_complete_result_insert",
         "trg_lab_job_complete_result_update",
+        "trg_lab_job_complete_result_marker_immutable",
         "trg_lab_result_artifact_insert",
         "trg_lab_result_artifact_no_update",
         "trg_lab_result_artifact_no_delete",
@@ -929,6 +1179,7 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
     expected_trigger_sql = {
         "trg_lab_job_complete_result_insert": _V5_JOB_RESULT_INSERT_TRIGGER,
         "trg_lab_job_complete_result_update": _V5_JOB_RESULT_UPDATE_TRIGGER,
+        "trg_lab_job_complete_result_marker_immutable": (_V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER),
         "trg_lab_result_artifact_insert": _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
         "trg_lab_result_artifact_no_update": _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
         "trg_lab_result_artifact_no_delete": _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
@@ -1113,9 +1364,7 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
 
 def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
     _validate_v4_schema(connection)
-    columns = {
-        str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()
-    }
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(lab_job)").fetchall()}
     if "result_state" in columns:
         raise LabDatabaseIdentityError("lab jobs SQLite v4 unexpectedly has result_state")
     result_values = ",".join(f"'{state.value}'" for state in LabResultState)
@@ -1123,6 +1372,15 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
         f"""
         ALTER TABLE lab_job ADD COLUMN result_state TEXT NOT NULL DEFAULT 'pending'
         CHECK (result_state IN ({result_values}))
+        """
+    )
+    connection.execute(
+        """
+        ALTER TABLE lab_job ADD COLUMN requires_complete_result INTEGER NOT NULL DEFAULT 0
+        CHECK (
+            typeof(requires_complete_result) = 'integer'
+            AND requires_complete_result IN (0, 1)
+        )
         """
     )
     connection.execute(
@@ -1539,6 +1797,10 @@ class LabJobReader:
                     if row["result_contract_version"] is not None
                     else None
                 ),
+                requires_complete_result=_strict_sqlite_bool(
+                    row["requires_complete_result"],
+                    field="lab_job.requires_complete_result",
+                ),
                 result_state=LabResultState(str(row["result_state"])),
                 created_at=_load_time(str(row["created_at"])),
                 updated_at=_load_time(str(row["updated_at"])),
@@ -1559,10 +1821,9 @@ class LabJobReader:
             }:
                 raise ValueError("succeeded job has no authoritative result state")
             if record.result_state is LabResultState.LEGACY_UNSEALED and (
-                record.status is not JobStatus.SUCCEEDED
-                or record.result_contract_version == COMPLETE_RESULT_CONTRACT_VERSION
+                record.status is not JobStatus.SUCCEEDED or record.requires_complete_result
             ):
-                raise ValueError("legacy_unsealed is only valid for legacy succeeded jobs")
+                raise ValueError("legacy_unsealed is only valid for migrated legacy succeeded jobs")
             return record
         except Exception as exc:
             if isinstance(exc, InvalidStoredJobError):
@@ -2124,9 +2385,7 @@ class LabJobReader:
         except Exception as exc:
             if isinstance(exc, InvalidStoredJobError):
                 raise
-            raise InvalidStoredJobError(
-                f"invalid stored result artifact {job_id}: {exc}"
-            ) from exc
+            raise InvalidStoredJobError(f"invalid stored result artifact {job_id}: {exc}") from exc
 
     def execute_for_test(self, statement: str) -> None:
         with self._connect() as connection:
@@ -2567,8 +2826,7 @@ class LabJobStore:
             (str(commit.job_id),),
         ).fetchall()
         if not shard_rows or any(
-            ShardStatus(str(row["status"])) is not ShardStatus.SUCCEEDED
-            for row in shard_rows
+            ShardStatus(str(row["status"])) is not ShardStatus.SUCCEEDED for row in shard_rows
         ):
             return self._reject_artifact_commit(
                 connection,
@@ -2657,6 +2915,42 @@ class LabJobStore:
         )
         return receipt
 
+    def _validate_staged_artifact_success(
+        self,
+        connection: sqlite3.Connection,
+        envelope: LabArtifactCommitEnvelope,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> None:
+        job_row = self._load_job_row(connection, envelope.commit.job_id)
+        if job_row is None:
+            raise InvalidStoredJobError("staged artifact success lost its job")
+        deadline = _load_time(str(job_row["deadline"]))
+        if deadline <= now:
+            raise ArtifactCommitDeadlineExpiredError(
+                "job deadline expired during artifact exit verification"
+            )
+        job_fence = _strict_nullable_sqlite_int(
+            job_row["scheduler_fencing_token"],
+            field="lab_job.scheduler_fencing_token",
+            minimum=1,
+        )
+        if job_fence != lease.fencing_token:
+            raise SchedulerLeaseFencedError("job fence changed during artifact exit verification")
+        if (
+            JobStatus(str(job_row["status"])) is not JobStatus.SUCCEEDED
+            or LabResultState(str(job_row["result_state"])) is not LabResultState.SEALED
+            or ControlIntent(str(job_row["control_intent"])) is not ControlIntent.NONE
+        ):
+            raise InvalidStoredJobError("staged artifact success changed before SQLite commit")
+        indexed = connection.execute(
+            "SELECT commit_request_id FROM lab_job_result_artifact WHERE job_id = ?",
+            (str(envelope.commit.job_id),),
+        ).fetchone()
+        if indexed is None or str(indexed["commit_request_id"]) != str(envelope.request_id):
+            raise InvalidStoredJobError("staged artifact success lost its result index")
+
     def stage_artifact_commit(
         self,
         envelope: LabArtifactCommitEnvelope,
@@ -2676,6 +2970,13 @@ class LabJobStore:
             _validate_database_identity(connection, allow_unclaimed_empty=False)
             _validate_v5_schema(connection)
             self._validate_lease(connection, lease, now=current)
+            existed_before_apply = (
+                connection.execute(
+                    "SELECT 1 FROM lab_artifact_commit WHERE request_id = ?",
+                    (str(validated.request_id),),
+                ).fetchone()
+                is not None
+            )
             receipt = self._apply_artifact_commit_in_transaction(
                 connection,
                 validated,
@@ -2683,7 +2984,31 @@ class LabJobStore:
                 lease=lease,
                 now=current,
             )
-            return LabStagedArtifactCommit(connection, receipt)
+            staged_new_success = (
+                not existed_before_apply
+                and receipt.status == "accepted"
+                and receipt.reason == "artifact_committed"
+            )
+
+            def validate_before_commit(
+                final_lease: LabLeaseRecord,
+                final_now: datetime,
+            ) -> None:
+                self._validate_lease(connection, final_lease, now=final_now)
+                if staged_new_success:
+                    self._validate_staged_artifact_success(
+                        connection,
+                        validated,
+                        lease=final_lease,
+                        now=final_now,
+                    )
+
+            return LabStagedArtifactCommit(
+                connection,
+                receipt,
+                lease=lease,
+                precommit_validator=validate_before_commit,
+            )
         except BaseException:
             connection.rollback()
             connection.close()
@@ -3228,11 +3553,7 @@ class LabJobStore:
             next_fence = lease.fencing_token
         result_state = LabResultState(str(row["result_state"]))
         if target_status is JobStatus.SUCCEEDED:
-            if row["result_contract_version"] == COMPLETE_RESULT_CONTRACT_VERSION:
-                raise InvalidJobTransitionError(
-                    "complete-result jobs require a verified artifact commit"
-                )
-            result_state = LabResultState.LEGACY_UNSEALED
+            raise InvalidJobTransitionError("job success requires a verified artifact commit")
         elif target_status in {JobStatus.FAILED, JobStatus.CANCELLED}:
             result_state = LabResultState.PENDING
         connection.execute(
@@ -3615,8 +3936,8 @@ class LabJobStore:
                 job_id, spec_json, spec_hash, job_type, resource_class,
                 deadline, status, control_intent, version, attempt_count,
                 max_attempts, recoverable, scheduler_fencing_token,
-                created_at, updated_at, result_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, ?, ?, ?)
+                created_at, updated_at, result_state, requires_complete_result
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, ?, ?, ?, 1)
             """,
             (
                 str(command.job_id),
@@ -5233,13 +5554,16 @@ class LabJobStore:
                 self._transition_in_transaction(
                     connection,
                     job_row,
-                    target_status=JobStatus.SUCCEEDED,
+                    target_status=JobStatus.FAILED,
                     lease=lease,
-                    reason="all shards succeeded under legacy result contract",
+                    reason=(
+                        "all shards succeeded but the legacy result contract cannot "
+                        "produce a complete artifact"
+                    ),
                     now=now,
                     request_id=None,
-                    recoverable=None,
-                    event_type="job_succeeded_legacy_unsealed",
+                    recoverable=False,
+                    event_type="job_failed_legacy_result_contract",
                 )
         elif ControlIntent(str(job_row["control_intent"])) is ControlIntent.PAUSE_REQUESTED:
             active_count = connection.execute(
@@ -5861,7 +6185,11 @@ CREATE TABLE IF NOT EXISTS lab_job (
             AND length(result_contract_version) > 0)
     ),
     result_state TEXT NOT NULL DEFAULT 'pending'
-        CHECK (result_state IN ({_RESULT_STATE_VALUES}))
+        CHECK (result_state IN ({_RESULT_STATE_VALUES})),
+    requires_complete_result INTEGER NOT NULL DEFAULT 0 CHECK (
+        typeof(requires_complete_result) = 'integer'
+        AND requires_complete_result IN (0, 1)
+    )
 )
 """
 
@@ -6022,21 +6350,36 @@ CREATE TABLE IF NOT EXISTS lab_scheduler_state (
 
 _V5_ARTIFACT_COMMIT_TABLE_STATEMENT = """
 CREATE TABLE IF NOT EXISTS lab_artifact_commit (
-    request_id TEXT PRIMARY KEY,
+    request_id TEXT PRIMARY KEY CHECK (
+        typeof(request_id) = 'text' AND length(request_id) = 36
+    ),
     content_hash TEXT NOT NULL CHECK (
         typeof(content_hash) = 'text' AND length(content_hash) = 64
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
     ),
-    job_id TEXT NOT NULL,
-    commit_json TEXT NOT NULL,
+    job_id TEXT NOT NULL CHECK (
+        typeof(job_id) = 'text' AND length(job_id) = 36
+    ),
+    commit_json TEXT NOT NULL CHECK (
+        typeof(commit_json) = 'text' AND length(commit_json) > 0
+        AND json_valid(commit_json)
+    ),
     status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
-    reason TEXT NOT NULL,
-    receipt_json TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (typeof(reason) = 'text' AND length(reason) > 0),
+    receipt_json TEXT NOT NULL CHECK (
+        typeof(receipt_json) = 'text' AND length(receipt_json) > 0
+        AND json_valid(receipt_json)
+    ),
     receipt_job_version INTEGER CHECK (
         receipt_job_version IS NULL
         OR (typeof(receipt_job_version) = 'integer' AND receipt_job_version >= 0)
     ),
-    received_at TEXT NOT NULL,
-    applied_at TEXT NOT NULL
+    received_at TEXT NOT NULL CHECK (
+        typeof(received_at) = 'text' AND length(received_at) > 0
+    ),
+    applied_at TEXT NOT NULL CHECK (
+        typeof(applied_at) = 'text' AND length(applied_at) > 0
+    )
 )
 """
 
@@ -6045,12 +6388,16 @@ CREATE TABLE IF NOT EXISTS lab_job_result_artifact (
     job_id TEXT PRIMARY KEY REFERENCES lab_job(job_id) ON DELETE RESTRICT,
     commit_request_id TEXT NOT NULL UNIQUE
         REFERENCES lab_artifact_commit(request_id) ON DELETE RESTRICT,
-    sealed_path TEXT NOT NULL,
+    sealed_path TEXT NOT NULL CHECK (
+        typeof(sealed_path) = 'text' AND length(sealed_path) > 0
+    ),
     manifest_hash TEXT NOT NULL CHECK (
         typeof(manifest_hash) = 'text' AND length(manifest_hash) = 64
+        AND manifest_hash NOT GLOB '*[^0-9a-f]*'
     ),
     complete_result_hash TEXT NOT NULL CHECK (
         typeof(complete_result_hash) = 'text' AND length(complete_result_hash) = 64
+        AND complete_result_hash NOT GLOB '*[^0-9a-f]*'
     ),
     bundle_device INTEGER NOT NULL CHECK (
         typeof(bundle_device) = 'integer' AND bundle_device >= 0
@@ -6058,26 +6405,42 @@ CREATE TABLE IF NOT EXISTS lab_job_result_artifact (
     bundle_inode INTEGER NOT NULL CHECK (
         typeof(bundle_inode) = 'integer' AND bundle_inode >= 1
     ),
-    evidence_json TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    evidence_json TEXT NOT NULL CHECK (
+        typeof(evidence_json) = 'text' AND length(evidence_json) > 0
+        AND json_valid(evidence_json)
+    ),
+    indexed_at TEXT NOT NULL CHECK (
+        typeof(indexed_at) = 'text' AND length(indexed_at) > 0
+    )
 )
 """
 
-_V5_JOB_RESULT_UPDATE_TRIGGER = f"""
+_V5_JOB_RESULT_UPDATE_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_update
-BEFORE UPDATE OF status, result_state, result_contract_version ON lab_job
-WHEN NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
- AND (
-    (NEW.status = 'succeeded' AND (
+BEFORE UPDATE OF status, result_state, result_contract_version,
+                 requires_complete_result ON lab_job
+WHEN (
+    NEW.result_state = 'legacy_unsealed'
+    AND NOT (
+        OLD.requires_complete_result = 0
+        AND OLD.status = 'succeeded'
+        AND OLD.result_state = 'legacy_unsealed'
+        AND NEW.requires_complete_result = 0
+        AND NEW.status = 'succeeded'
+    )
+ )
+ OR (
+    NEW.requires_complete_result = 1
+    AND (
+      (NEW.status = 'succeeded' AND (
         NEW.result_state <> 'sealed'
         OR NOT EXISTS (
             SELECT 1 FROM lab_job_result_artifact artifact
             WHERE artifact.job_id = NEW.job_id
         )
-    ))
-    OR (NEW.result_state = 'sealed' AND NEW.status <> 'succeeded')
-    OR NEW.result_state = 'legacy_unsealed'
-    OR (NEW.result_state = 'ready' AND (
+      ))
+      OR (NEW.result_state = 'sealed' AND NEW.status <> 'succeeded')
+      OR (NEW.result_state = 'ready' AND (
         NEW.status <> 'running'
         OR NOT EXISTS (
             SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
@@ -6086,21 +6449,31 @@ WHEN NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
             SELECT 1 FROM lab_shard shard
             WHERE shard.job_id = NEW.job_id AND shard.status <> 'succeeded'
         )
-    ))
+      ))
+    )
  )
 BEGIN
-    SELECT RAISE(ABORT, 'complete-result success requires indexed sealed artifact');
+    SELECT RAISE(ABORT, 'complete result marker requires indexed sealed artifact');
 END
 """
 
-_V5_JOB_RESULT_INSERT_TRIGGER = f"""
+_V5_JOB_RESULT_INSERT_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_insert
 BEFORE INSERT ON lab_job
-WHEN NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
- AND (NEW.status = 'succeeded'
-      OR NEW.result_state IN ('ready', 'sealed', 'legacy_unsealed'))
+WHEN NEW.requires_complete_result <> 1
+ OR NEW.status = 'succeeded'
+ OR NEW.result_state IN ('ready', 'sealed', 'legacy_unsealed')
 BEGIN
-    SELECT RAISE(ABORT, 'complete-result job must enter through pending state');
+    SELECT RAISE(ABORT, 'new jobs require complete result; legacy_unsealed cannot be inserted');
+END
+"""
+
+_V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_marker_immutable
+BEFORE UPDATE OF requires_complete_result ON lab_job
+WHEN NEW.requires_complete_result <> OLD.requires_complete_result
+BEGIN
+    SELECT RAISE(ABORT, 'requires_complete_result is immutable');
 END
 """
 
@@ -6170,15 +6543,14 @@ _V4_SCHEMA_STATEMENTS = tuple(
 )
 
 _SCHEMA_STATEMENTS = tuple(
-    _V5_JOB_TABLE_STATEMENT
-    if statement == _V4_JOB_TABLE_STATEMENT
-    else statement
+    _V5_JOB_TABLE_STATEMENT if statement == _V4_JOB_TABLE_STATEMENT else statement
     for statement in _V4_SCHEMA_STATEMENTS
 ) + (
     _V5_ARTIFACT_COMMIT_TABLE_STATEMENT,
     _V5_RESULT_ARTIFACT_TABLE_STATEMENT,
     _V5_JOB_RESULT_INSERT_TRIGGER,
     _V5_JOB_RESULT_UPDATE_TRIGGER,
+    _V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER,
     _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
     _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
     _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,

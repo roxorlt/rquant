@@ -185,8 +185,7 @@ class LabScheduler:
             return True
         if isinstance(exc, BaseExceptionGroup):
             return any(
-                LabScheduler._is_artifact_verification_error(item)
-                for item in exc.exceptions
+                LabScheduler._is_artifact_verification_error(item) for item in exc.exceptions
             )
         return False
 
@@ -569,7 +568,13 @@ class LabScheduler:
                     artifact_commits_quarantined += 1
                     continue
                 assert staged is not None
-                receipt = staged.commit()
+                if self.lease is None:  # pragma: no cover - active tick invariant
+                    staged.rollback()
+                    raise RuntimeError("scheduler lease disappeared before artifact commit")
+                receipt = staged.commit(
+                    lease=self.lease,
+                    now=self.clock(),
+                )
                 self._after_artifact_commit_sqlite_commit(entry)
                 artifact_commits_processed += 1
                 if receipt.status == "accepted":

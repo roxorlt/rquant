@@ -5,12 +5,14 @@ import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
 
 import rquant.lab_jobs as lab_jobs
+from rquant.lab_artifact_protocol import LabArtifactCommitReceipt
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
@@ -38,6 +40,7 @@ from rquant.lab_jobs import (
     LabLeaseRecord,
     LabResultState,
     LabShardRecord,
+    LabStagedArtifactCommit,
     SchedulerLeaseFencedError,
     SchedulerLeaseUnavailableError,
     StaleJobVersionError,
@@ -68,6 +71,55 @@ OLD_V1_SPEC_JSON = (
 )
 OLD_V1_SPEC_HASH = "bab8a079dd4cbad1a7e8343d2872d0f87707945f416af1e3eb088af13c367f3b"
 OLD_V1_COMMAND_HASH = "65c3859a9f38541641cf9b87093042ed863c451c5bb69a0bfd0053b07d86eace"
+
+
+class _StagedLifecycleConnection:
+    def __init__(
+        self,
+        *,
+        commit_error: BaseException | None = None,
+        rollback_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.commit_error = commit_error
+        self.rollback_error = rollback_error
+        self.close_error = close_error
+        self.calls: list[str] = []
+
+    def commit(self) -> None:
+        self.calls.append("commit")
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    def rollback(self) -> None:
+        self.calls.append("rollback")
+        if self.rollback_error is not None:
+            raise self.rollback_error
+
+    def close(self) -> None:
+        self.calls.append("close")
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _staged_receipt() -> LabArtifactCommitReceipt:
+    return LabArtifactCommitReceipt(
+        request_id=uuid4(),
+        content_hash="a" * 64,
+        job_id=uuid4(),
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=NOW,
+        job_version=1,
+    )
+
+
+def _flatten_exception_messages(exc: BaseException) -> tuple[str, ...]:
+    if isinstance(exc, BaseExceptionGroup):
+        return tuple(
+            message for nested in exc.exceptions for message in _flatten_exception_messages(nested)
+        )
+    return (str(exc),)
 
 
 def _spec(
@@ -161,6 +213,120 @@ def _lease(
         owner_id=owner,
         lease_seconds=seconds,
         now=now,
+    )
+
+
+def test_staged_commit_validation_failure_rolls_back_and_closes(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection()
+
+    def reject_precommit(_lease: LabLeaseRecord, _now: datetime) -> None:
+        raise RuntimeError("precommit failed")
+
+    staged = LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=reject_precommit,
+    )
+
+    with pytest.raises(RuntimeError, match="precommit failed"):
+        staged.commit(lease=lease, now=NOW)
+
+    assert connection.calls == ["rollback", "close"]
+    with pytest.raises(RuntimeError, match="already closed"):
+        staged.commit(lease=lease, now=NOW)
+
+
+def test_staged_commit_rejects_changed_lease_fence_before_validation(
+    tmp_path: Path,
+) -> None:
+    lease = _lease(_store(tmp_path))
+    replacement = lease.model_copy(
+        update={"fencing_token": lease.fencing_token + 1},
+    )
+    connection = _StagedLifecycleConnection()
+    validator_called = False
+
+    def validate(_lease: LabLeaseRecord, _now: datetime) -> None:
+        nonlocal validator_called
+        validator_called = True
+
+    staged = LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=validate,
+    )
+
+    with pytest.raises(SchedulerLeaseFencedError, match="identity changed"):
+        staged.commit(lease=replacement, now=NOW)
+
+    assert validator_called is False
+    assert connection.calls == ["rollback", "close"]
+
+
+def test_staged_commit_preserves_commit_rollback_and_close_errors(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection(
+        commit_error=OSError("commit failed"),
+        rollback_error=OSError("rollback failed"),
+        close_error=OSError("close failed"),
+    )
+    staged = LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=lambda _lease, _now: None,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        staged.commit(lease=lease, now=NOW)
+
+    assert connection.calls == ["commit", "rollback", "close"]
+    assert _flatten_exception_messages(raised.value) == (
+        "commit failed",
+        "rollback failed",
+        "close failed",
+    )
+
+
+def test_staged_commit_reports_close_error_after_successful_commit(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection(close_error=OSError("close failed"))
+    staged = LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=lambda _lease, _now: None,
+    )
+
+    with pytest.raises(OSError, match="close failed"):
+        staged.commit(lease=lease, now=NOW)
+
+    assert connection.calls == ["commit", "close"]
+
+
+def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection(
+        rollback_error=OSError("rollback failed"),
+        close_error=OSError("close failed"),
+    )
+    staged = LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=lambda _lease, _now: None,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        staged.rollback()
+
+    assert connection.calls == ["rollback", "close"]
+    assert _flatten_exception_messages(raised.value) == (
+        "rollback failed",
+        "close failed",
     )
 
 
@@ -417,6 +583,168 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
         LabJobReader(store.path).get_job(uuid4())
 
 
+def _replace_empty_v5_table_with_weakened_ddl(
+    path: Path,
+    *,
+    table: str,
+    old: str,
+    new: str,
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        original_sql = str(row[0])
+        assert old in original_sql
+        weakened_sql = original_sql.replace(old, new, 1)
+        trigger_sql = tuple(
+            str(trigger[0])
+            for trigger in connection.execute(
+                """
+                SELECT sql FROM sqlite_schema
+                WHERE type = 'trigger' AND tbl_name = ?
+                ORDER BY name
+                """,
+                (table,),
+            ).fetchall()
+        )
+        connection.execute(f'DROP TABLE "{table}"')
+        connection.execute(weakened_sql)
+        for statement in trigger_sql:
+            connection.execute(statement)
+
+
+@pytest.mark.parametrize(
+    ("table", "old", "new"),
+    [
+        (
+            "lab_job_result_artifact",
+            "job_id TEXT PRIMARY KEY REFERENCES lab_job(job_id) ON DELETE RESTRICT",
+            "job_id TEXT REFERENCES lab_job(job_id) ON DELETE RESTRICT",
+        ),
+        (
+            "lab_job_result_artifact",
+            "commit_request_id TEXT NOT NULL UNIQUE",
+            "commit_request_id TEXT NOT NULL",
+        ),
+        (
+            "lab_job_result_artifact",
+            "job_id TEXT PRIMARY KEY REFERENCES lab_job(job_id) ON DELETE RESTRICT",
+            "job_id TEXT PRIMARY KEY",
+        ),
+        (
+            "lab_job_result_artifact",
+            "REFERENCES lab_artifact_commit(request_id) ON DELETE RESTRICT",
+            "",
+        ),
+        (
+            "lab_job_result_artifact",
+            "AND manifest_hash NOT GLOB '*[^0-9a-f]*'",
+            "",
+        ),
+        (
+            "lab_job_result_artifact",
+            "AND json_valid(evidence_json)",
+            "",
+        ),
+        (
+            "lab_artifact_commit",
+            "request_id TEXT PRIMARY KEY CHECK",
+            "request_id TEXT CHECK",
+        ),
+        (
+            "lab_artifact_commit",
+            "AND content_hash NOT GLOB '*[^0-9a-f]*'",
+            "",
+        ),
+        (
+            "lab_artifact_commit",
+            "AND json_valid(commit_json)",
+            "",
+        ),
+    ],
+    ids=[
+        "result-job-primary-key",
+        "result-commit-unique",
+        "result-job-foreign-key",
+        "result-commit-foreign-key",
+        "result-hash-check",
+        "result-evidence-check",
+        "commit-request-primary-key",
+        "commit-content-hash-check",
+        "commit-envelope-check",
+    ],
+)
+def test_v5_reader_rejects_same_columns_with_weakened_table_constraints(
+    tmp_path: Path,
+    table: str,
+    old: str,
+    new: str,
+) -> None:
+    store = _store(tmp_path)
+    _replace_empty_v5_table_with_weakened_ddl(
+        store.path,
+        table=table,
+        old=old,
+        new=new,
+    )
+
+    with pytest.raises(LabDatabaseIdentityError, match="v5.*constraint|primary|unique|foreign"):
+        LabJobReader(store.path).get_job(uuid4())
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "CHECK (result_state IN ('pending','ready','sealed','legacy_unsealed'))",
+            "",
+        ),
+        (
+            "CHECK ( typeof(requires_complete_result) = 'integer' "
+            "AND requires_complete_result IN (0, 1) )",
+            "",
+        ),
+    ],
+    ids=["result-state-check", "complete-result-marker-check"],
+)
+def test_v5_reader_rejects_weakened_job_checks_in_sqlite_schema(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'lab_job'"
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        compact = " ".join(str(row[0]).split())
+        assert old in compact
+        weakened = compact.replace(old, new, 1)
+        schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'lab_job'",
+            (weakened,),
+        )
+        connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
+        connection.execute("PRAGMA writable_schema = OFF")
+
+    with pytest.raises(LabDatabaseIdentityError, match="v5.*constraint"):
+        LabJobReader(store.path).get_job(uuid4())
+
+
+def test_v5_store_and_reader_reopen_exact_schema(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+
+    assert LabJobReader(store.path).get_job(uuid4()) is None
+
+
 def test_complete_result_contract_cannot_enter_legacy_unsealed_state(
     tmp_path: Path,
 ) -> None:
@@ -438,6 +766,109 @@ def test_complete_result_contract_cannot_enter_legacy_unsealed_state(
                 COMPLETE_RESULT_CONTRACT_VERSION,
                 LabResultState.LEGACY_UNSEALED.value,
                 str(job.job_id),
+            ),
+        )
+
+
+def test_unplanned_v5_job_cannot_succeed_through_public_transition(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    queued = _submit_job(store, lease)
+    running = store.transition_job(
+        queued.job_id,
+        expected_version=queued.version,
+        target_status=JobStatus.RUNNING,
+        lease=lease,
+        reason="start without plan",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(InvalidJobTransitionError, match="artifact commit"):
+        store.transition_job(
+            running.job_id,
+            expected_version=running.version,
+            target_status=JobStatus.SUCCEEDED,
+            lease=lease,
+            reason="unsafe direct success",
+            now=NOW + timedelta(seconds=2),
+        )
+
+    unchanged = LabJobReader(store.path).get_job(running.job_id)
+    assert unchanged == running
+
+
+def test_combined_contract_downgrade_and_legacy_success_is_blocked(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    queued = _submit_job(store, lease)
+    running = store.transition_job(
+        queued.job_id,
+        expected_version=queued.version,
+        target_status=JobStatus.RUNNING,
+        lease=lease,
+        reason="start",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="complete result"),
+    ):
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET result_contract_version = NULL,
+                result_state = 'legacy_unsealed', status = 'succeeded'
+            WHERE job_id = ?
+            """,
+            (str(running.job_id),),
+        )
+
+
+def test_requires_complete_result_marker_cannot_be_downgraded(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="immutable"),
+    ):
+        connection.execute(
+            "UPDATE lab_job SET requires_complete_result = 0 WHERE job_id = ?",
+            (str(job.job_id),),
+        )
+
+
+def test_v5_schema_rejects_forged_legacy_success_insert(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    spec = _spec()
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="legacy_unsealed"),
+    ):
+        connection.execute(
+            """
+            INSERT INTO lab_job (
+                job_id, spec_json, spec_hash, job_type, resource_class,
+                deadline, status, control_intent, version, attempt_count,
+                max_attempts, recoverable, scheduler_fencing_token,
+                created_at, updated_at, result_contract_version,
+                result_state, requires_complete_result
+            ) VALUES (?, ?, ?, ?, ?, ?, 'succeeded', 'none', 0, 0, 3, 0,
+                      NULL, ?, ?, NULL, 'legacy_unsealed', 0)
+            """,
+            (
+                str(uuid4()),
+                spec.model_dump_json(round_trip=True),
+                spec.spec_hash,
+                spec.job_type.value,
+                spec.resource_class.value,
+                spec.deadline.isoformat(timespec="microseconds"),
+                timestamp,
+                timestamp,
             ),
         )
 
@@ -614,6 +1045,7 @@ def test_v4_migration_preserves_legacy_contract_without_faking_sealed_result(
     assert migrated.status is status
     assert migrated.result_contract_version == lab_jobs.RESULT_CONTRACT_VERSION
     assert migrated.result_state.value == expected_result_state
+    assert migrated.requires_complete_result is False
     assert LabJobReader(path).get_result_artifact(job_id) is None
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
@@ -648,6 +1080,7 @@ def test_submit_roundtrips_validated_spec_and_typed_empty_rows(tmp_path: Path) -
     assert job is not None
     assert job.spec == spec
     assert job.spec.spec_hash == spec.spec_hash
+    assert job.requires_complete_result is True
     assert job.job_type is ResearchJobType.ABLATION
     assert job.result_state.value == "pending"
     assert job.resource_class is ResourceClass.HEAVY
@@ -717,12 +1150,14 @@ def test_reader_and_exactly_once_replay_accept_real_legacy_v1_ledger(
     with sqlite3.connect(store.path) as connection:
         connection.execute(
             """
-            INSERT INTO lab_job (
-                job_id, spec_json, spec_hash, job_type, resource_class,
-                deadline, status, control_intent, version, attempt_count,
-                max_attempts, recoverable, scheduler_fencing_token,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 3, 0, NULL, ?, ?)
+                INSERT INTO lab_job (
+                    job_id, spec_json, spec_hash, job_type, resource_class,
+                    deadline, status, control_intent, version, attempt_count,
+                    max_attempts, recoverable, scheduler_fencing_token,
+                    created_at, updated_at, result_state,
+                    requires_complete_result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 3, 0, NULL, ?, ?,
+                          'pending', 1)
             """,
             (
                 str(job_id),
@@ -1122,7 +1557,7 @@ def test_reused_job_id_is_durably_rejected_and_replayed(tmp_path: Path) -> None:
 def test_illegal_cancel_is_durably_rejected(tmp_path: Path) -> None:
     store = _store(tmp_path)
     lease = _lease(store)
-    job = _transition_to(store, lease, JobStatus.SUCCEEDED)
+    job = _transition_to(store, lease, JobStatus.FAILED)
     command = LabCommandEnvelope(
         request_id=uuid4(),
         command=CancelJobCommand(
@@ -1136,9 +1571,9 @@ def test_illegal_cancel_is_durably_rejected(tmp_path: Path) -> None:
     replay = store.apply_command(command, lease=lease, now=NOW + timedelta(seconds=4))
 
     assert first.status == "rejected"
-    assert first.reason == "invalid_state:succeeded"
+    assert first.reason == "invalid_state:failed"
     assert replay == first
-    assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.SUCCEEDED
+    assert LabJobReader(store.path).get_job(job.job_id).status is JobStatus.FAILED
 
 
 def test_stale_command_version_is_durably_rejected(tmp_path: Path) -> None:
@@ -1386,23 +1821,26 @@ def test_cancel_requested_blocks_late_lifecycle_until_explicit_confirmation(
     assert confirmed.control_intent is ControlIntent.NONE
 
 
-def test_completion_committed_before_cancel_keeps_terminal_result(tmp_path: Path) -> None:
+def test_terminal_failure_committed_before_cancel_keeps_terminal_state(
+    tmp_path: Path,
+) -> None:
     store = _store(tmp_path)
     lease = _lease(store)
     running = _transition_to(store, lease, JobStatus.RUNNING)
-    succeeded = store.transition_job(
+    terminal = store.transition_job(
         running.job_id,
         expected_version=running.version,
-        target_status=JobStatus.SUCCEEDED,
+        target_status=JobStatus.FAILED,
         lease=lease,
-        reason="completion first",
+        reason="failure first",
+        recoverable=False,
         now=NOW + timedelta(seconds=3),
     )
     cancel = LabCommandEnvelope(
         request_id=uuid4(),
         command=CancelJobCommand(
-            job_id=succeeded.job_id,
-            expected_version=succeeded.version,
+            job_id=terminal.job_id,
+            expected_version=terminal.version,
             reason="late cancel",
         ),
     )
@@ -1414,10 +1852,10 @@ def test_completion_committed_before_cancel_keeps_terminal_result(tmp_path: Path
     )
 
     assert receipt.status == "rejected"
-    assert receipt.reason == "invalid_state:succeeded"
-    terminal = LabJobReader(store.path).get_job(succeeded.job_id)
-    assert terminal is not None
-    assert terminal.status is JobStatus.SUCCEEDED
+    assert receipt.reason == "invalid_state:failed"
+    stored = LabJobReader(store.path).get_job(terminal.job_id)
+    assert stored is not None
+    assert stored.status is JobStatus.FAILED
     assert terminal.control_intent is ControlIntent.NONE
 
 
@@ -1483,7 +1921,6 @@ def test_pause_in_wrong_state_is_durably_rejected(tmp_path: Path) -> None:
         (JobStatus.QUEUED, JobStatus.RUNNING),
         (JobStatus.QUEUED, JobStatus.CANCELLED),
         (JobStatus.RUNNING, JobStatus.CHECKPOINTED),
-        (JobStatus.RUNNING, JobStatus.SUCCEEDED),
         (JobStatus.RUNNING, JobStatus.FAILED),
         (JobStatus.CHECKPOINTED, JobStatus.RUNNING),
         (JobStatus.CHECKPOINTED, JobStatus.CANCELLED),
@@ -1518,9 +1955,9 @@ def test_complete_state_matrix_allows_only_documented_edges(
         (JobStatus.QUEUED, JobStatus.SUCCEEDED),
         (JobStatus.QUEUED, JobStatus.FAILED),
         (JobStatus.RUNNING, JobStatus.QUEUED),
+        (JobStatus.RUNNING, JobStatus.SUCCEEDED),
         (JobStatus.CHECKPOINTED, JobStatus.SUCCEEDED),
         (JobStatus.FAILED, JobStatus.RUNNING),
-        (JobStatus.SUCCEEDED, JobStatus.RUNNING),
         (JobStatus.CANCELLED, JobStatus.QUEUED),
     ],
 )
@@ -1652,7 +2089,9 @@ def test_expired_lease_is_released_before_fenced_takeover(tmp_path: Path) -> Non
     assert leases[1] == new
 
 
-def test_old_owner_cannot_complete_after_takeover_and_recovery(tmp_path: Path) -> None:
+def test_old_owner_and_public_api_cannot_complete_after_takeover(
+    tmp_path: Path,
+) -> None:
     store = _store(tmp_path)
     old = _lease(store, owner="scheduler-a", seconds=10)
     running = _transition_to(store, old, JobStatus.RUNNING)
@@ -1679,15 +2118,16 @@ def test_old_owner_cannot_complete_after_takeover_and_recovery(tmp_path: Path) -
         reason="resume",
         now=takeover_at + timedelta(seconds=1),
     )
-    completed = store.transition_job(
-        running.job_id,
-        expected_version=resumed.version,
-        target_status=JobStatus.SUCCEEDED,
-        lease=new,
-        reason="complete",
-        now=takeover_at + timedelta(seconds=2),
-    )
-    assert completed.status is JobStatus.SUCCEEDED
+    with pytest.raises(InvalidJobTransitionError, match="artifact commit"):
+        store.transition_job(
+            running.job_id,
+            expected_version=resumed.version,
+            target_status=JobStatus.SUCCEEDED,
+            lease=new,
+            reason="complete",
+            now=takeover_at + timedelta(seconds=2),
+        )
+    assert LabJobReader(store.path).get_job(running.job_id) == resumed
 
 
 def test_heartbeat_renews_without_appending_event(tmp_path: Path) -> None:

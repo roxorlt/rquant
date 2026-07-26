@@ -35,6 +35,7 @@ from rquant.lab_job_protocol import (
 )
 from rquant.lab_jobs import (
     COMPLETE_RESULT_CONTRACT_VERSION,
+    ArtifactCommitDeadlineExpiredError,
     JobStatus,
     LabJobReader,
     LabJobRecord,
@@ -187,11 +188,14 @@ def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -
         reported_at=NOW + timedelta(seconds=3),
         body=LabShardSucceeded(result_manifest_hash="9" * 64),
     )
-    assert store.apply_worker_report(
-        report,
-        lease=scheduler.lease,
-        now=NOW + timedelta(seconds=3),
-    ).status == "accepted"
+    assert (
+        store.apply_worker_report(
+            report,
+            lease=scheduler.lease,
+            now=NOW + timedelta(seconds=3),
+        ).status
+        == "accepted"
+    )
     job = LabJobReader(store.path).get_job(envelope.command.job_id)
     assert job is not None and job.result_state is LabResultState.READY
     sealed = artifact_store.seal_candidate(
@@ -220,9 +224,7 @@ def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -
         complete_result_hash=sealed.manifest.complete_result_hash,
         sealed_path=sealed.path,
     )
-    published = commit_spool.publish(
-        LabArtifactCommitEnvelope(request_id=uuid4(), commit=commit)
-    )
+    published = commit_spool.publish(LabArtifactCommitEnvelope(request_id=uuid4(), commit=commit))
     clock[0] = NOW + timedelta(seconds=4)
 
     tick = scheduler.run_once()
@@ -239,9 +241,12 @@ def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -
     assert evidence.manifest_hash == sealed.manifest_hash
     assert evidence.complete_result_hash == sealed.manifest.complete_result_hash
     assert commit_spool.pending() == ()
-    assert commit_spool.load_receipt(
-        commit_spool.ack_dir / f"{published.envelope.request_id}.json"
-    ).status == "accepted"
+    assert (
+        commit_spool.load_receipt(
+            commit_spool.ack_dir / f"{published.envelope.request_id}.json"
+        ).status
+        == "accepted"
+    )
     with sqlite3.connect(store.path) as connection:
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute(
@@ -310,11 +315,14 @@ def _ready_artifact_commit_scenario(
         reported_at=NOW + timedelta(seconds=3),
         body=LabShardSucceeded(result_manifest_hash="9" * 64),
     )
-    assert store.apply_worker_report(
-        success,
-        lease=scheduler.lease,
-        now=NOW + timedelta(seconds=3),
-    ).status == "accepted"
+    assert (
+        store.apply_worker_report(
+            success,
+            lease=scheduler.lease,
+            now=NOW + timedelta(seconds=3),
+        ).status
+        == "accepted"
+    )
     job = LabJobReader(store.path).get_job(submit.command.job_id)
     assert job is not None and job.result_state is LabResultState.READY
     sealed = artifact_store.seal_candidate(
@@ -468,13 +476,16 @@ def test_artifact_commit_after_sqlite_before_ack_replays_same_receipt(
 
     assert replay.artifact_commits_accepted == 1
     assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) == first
-    assert len(
-        [
-            event
-            for event in LabJobReader(store.path).list_events(job.job_id)
-            if event.event_type == "job_result_sealed"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in LabJobReader(store.path).list_events(job.job_id)
+                if event.event_type == "job_result_sealed"
+            ]
+        )
+        == 1
+    )
     assert spool.pending() == ()
 
 
@@ -492,13 +503,16 @@ def test_same_artifact_index_is_idempotent_across_distinct_requests(tmp_path: Pa
     assert first_tick.artifact_commits_accepted == 1
     assert second_tick.artifact_commits_accepted == 1
     assert second is not None and second.receipt.reason == "artifact_already_committed"
-    assert len(
-        [
-            event
-            for event in LabJobReader(store.path).list_events(job.job_id)
-            if event.event_type == "job_result_sealed"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in LabJobReader(store.path).list_events(job.job_id)
+                if event.event_type == "job_result_sealed"
+            ]
+        )
+        == 1
+    )
 
 
 def test_sealed_candidate_without_commit_keeps_job_ready(tmp_path: Path) -> None:
@@ -553,11 +567,14 @@ def test_cancel_wins_ready_artifact_commit_race_without_reviving_job(tmp_path: P
             reason="cancel before artifact commit",
         ),
     )
-    assert store.apply_command(
-        cancel,
-        lease=scheduler.lease,
-        now=clock[0],
-    ).status == "applied"
+    assert (
+        store.apply_command(
+            cancel,
+            lease=scheduler.lease,
+            now=clock[0],
+        ).status
+        == "applied"
+    )
 
     tick = scheduler.run_once()
 
@@ -652,6 +669,109 @@ def test_deadline_crossed_during_artifact_verification_wins_commit_race(
     assert expired.result_state is LabResultState.PENDING
     assert record is not None and record.receipt.reason == "invalid_state:failed"
     assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert spool.pending() == ()
+
+
+def test_deadline_crossed_during_artifact_exit_check_rolls_back_then_rejects_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline = NOW + timedelta(seconds=5)
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, deadline=deadline)
+    )
+
+    def cross_deadline_after_stage(
+        _entry: LabArtifactCommitSpoolEntry,
+        _binding: object,
+    ) -> None:
+        clock[0] = deadline + timedelta(seconds=1)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_after_artifact_commit_staged",
+        cross_deadline_after_stage,
+    )
+
+    with pytest.raises(ArtifactCommitDeadlineExpiredError, match="deadline"):
+        scheduler.run_once()
+
+    rolled_back = LabJobReader(store.path).get_job(job.job_id)
+    assert rolled_back == job
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert len(spool.pending()) == 1
+    assert not any(
+        event.event_type == "job_result_sealed"
+        for event in LabJobReader(store.path).list_events(job.job_id)
+    )
+
+    monkeypatch.setattr(
+        scheduler,
+        "_after_artifact_commit_staged",
+        lambda _entry, _binding: None,
+    )
+    replay = scheduler.run_once()
+
+    failed = LabJobReader(store.path).get_job(job.job_id)
+    receipt = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert replay.deadlines_expired == 1
+    assert replay.artifact_commits_rejected == 1
+    assert failed is not None and failed.status is JobStatus.FAILED
+    assert failed.result_state is LabResultState.PENDING
+    assert receipt is not None and receipt.receipt.status == "rejected"
+    assert receipt.receipt.reason == "invalid_state:failed"
+    assert spool.pending() == ()
+
+
+def test_lease_expired_during_artifact_exit_check_rolls_back_for_takeover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+
+    def expire_lease_after_stage(
+        _entry: LabArtifactCommitSpoolEntry,
+        _binding: object,
+    ) -> None:
+        clock[0] = NOW + timedelta(seconds=61)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_after_artifact_commit_staged",
+        expire_lease_after_stage,
+    )
+
+    with pytest.raises(SchedulerLeaseFencedError, match="expired"):
+        scheduler.run_once()
+
+    rolled_back = LabJobReader(store.path).get_job(job.job_id)
+    assert rolled_back == job
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
+    assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+    assert len(spool.pending()) == 1
+
+    replacement = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "replacement-final-check-commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        artifact_commit_spool=spool,
+        artifact_store=artifacts,
+        clock=lambda: clock[0],
+    )
+    replay = replacement.run_once()
+
+    committed = LabJobReader(store.path).get_job(job.job_id)
+    receipt = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert replay.recovered == 1
+    assert replay.artifact_commits_accepted == 1
+    assert committed is not None and committed.result_state is LabResultState.SEALED
+    assert receipt is not None and receipt.receipt.status == "accepted"
     assert spool.pending() == ()
 
 
