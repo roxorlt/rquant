@@ -66,6 +66,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
 )
 from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_digest
+from rquant.research_run_spec import ResearchRunSpec
 from rquant.strategy_job_adapters import (
     LabJobExecutionResult,
     LabShardExecutionResult,
@@ -249,6 +250,45 @@ class _LegacyUnsignedRegistry(RecordingRegistry):
         frame = result.tables[0].frame.copy()
         frame["hold_days"] = pd.Series([2**64 - 1], dtype="uint64")
         return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
+
+
+class _LegacyTableContextRegistry(RecordingRegistry):
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        result = super().execute_shard(validated, store)
+        frame = pd.DataFrame(
+            {
+                "a\x00b": pd.Series([float("inf")], dtype="float16"),
+                "duration": pd.Series(
+                    [pd.Timedelta("-1 days 23:56:21.971770440")],
+                    dtype="timedelta64[ns]",
+                ),
+            }
+        )
+        return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
+
+    def aggregate_results(
+        self,
+        spec: ResearchRunSpec,
+        results: tuple[LabShardExecutionResult, ...],
+    ) -> LabJobExecutionResult:
+        normalized = tuple(
+            result.model_copy(
+                update={
+                    "tables": (
+                        LabShardTable(
+                            name="trades",
+                            frame=pd.DataFrame([{"hold_days": index + 1, "ret_pct": 1.25}]),
+                        ),
+                    )
+                }
+            )
+            for index, result in enumerate(results)
+        )
+        return self.delegate.aggregate_results(spec, normalized)
 
 
 def _ack_artifact_commit(
@@ -601,6 +641,51 @@ def test_finalizer_recovers_accepted_legacy_uint64_bundle(
     assert evidence.accepted_success.receipt.status == "accepted"
 
     result = scenario.finalizer().finalize(scenario.job_id)
+
+    assert result.status == "published"
+    assert len(scenario.commit_spool.pending()) == 1
+
+
+def test_finalizer_recovers_accepted_legacy_table_context_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker_module
+
+    registry = _LegacyTableContextRegistry()
+    with monkeypatch.context() as legacy_worker:
+        legacy_worker.setattr(
+            lab_worker_module,
+            "canonical_shard_frame_digest",
+            _legacy_canonical_shard_frame_digest,
+        )
+        scenario = _ready_scenario(
+            tmp_path,
+            hold_days=(1,),
+            worker_registry=registry,
+        )
+
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0]
+    persisted = pd.read_parquet(attempt / artifact.file_name)
+    assert tuple(persisted.columns) == ("a\x00b", "duration")
+    assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
+    assert evidence.accepted_success.receipt.status == "accepted"
+
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=scenario.root / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=registry,
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+    result = finalizer.finalize(scenario.job_id)
 
     assert result.status == "published"
     assert len(scenario.commit_spool.pending()) == 1

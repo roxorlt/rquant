@@ -25,8 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.canonical_json_stream import (
     CanonicalJsonStreamWriter,
-    PandasJsonColumnAccessor,
-    write_pandas_json_value,
+    write_legacy_pandas_table_json,
 )
 from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
@@ -131,38 +130,7 @@ def canonical_shard_frame_digest(
         raise ValueError("artifact DataFrame columns must be strings")
     digest = hashlib.sha256()
     writer = CanonicalJsonStreamWriter(digest.update)
-    columns = tuple(frame.columns)
-    accessors = tuple(
-        PandasJsonColumnAccessor(frame.iloc[:, position], table_context=True)
-        for position in range(len(columns))
-    )
-    positions = tuple(sorted(range(len(columns)), key=columns.__getitem__))
-
-    digest.update(b'{"data":[')
-    for row_index in range(len(frame)):
-        if row_index:
-            digest.update(b",")
-        digest.update(b"{")
-        for field_index, position in enumerate(positions):
-            if field_index:
-                digest.update(b",")
-            writer.write_string(columns[position])
-            digest.update(b":")
-            accessors[position].write_pandas_table_value(
-                writer,
-                row_index,
-                escape_forward_slash=False,
-                sort_mapping_keys=True,
-            )
-        digest.update(b"}")
-    digest.update(b'],"schema":')
-    write_pandas_json_value(
-        writer,
-        pd.io.json.build_table_schema(frame, index=False),
-        escape_forward_slash=False,
-        sort_mapping_keys=True,
-    )
-    digest.update(b"}")
+    write_legacy_pandas_table_json(writer, frame)
     return digest.hexdigest()
 
 

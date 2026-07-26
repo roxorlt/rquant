@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from enum import Enum
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 from pandas._libs.json import ujson_dumps
@@ -182,26 +183,8 @@ class CanonicalJsonEscapedStringSink:
 class PandasJsonColumnAccessor:
     """Read frame cells while keeping Arrow string values descriptor-bound."""
 
-    def __init__(self, series: pd.Series, *, table_context: bool = False) -> None:
+    def __init__(self, series: pd.Series) -> None:
         self._array = series.array
-        self._table_context = table_context
-        self._table_timedelta = table_context and pd.api.types.is_timedelta64_dtype(series.dtype)
-        self._table_float = table_context and pd.api.types.is_float_dtype(series.dtype)
-        categorical_dtype = series.dtype if isinstance(series.dtype, pd.CategoricalDtype) else None
-        self._table_unsigned = table_context and (
-            pd.api.types.is_unsigned_integer_dtype(series.dtype)
-            or (
-                categorical_dtype is not None
-                and pd.api.types.is_unsigned_integer_dtype(categorical_dtype.categories.dtype)
-            )
-        )
-        self._table_integer_categorical_with_missing = (
-            table_context
-            and categorical_dtype is not None
-            and pd.api.types.is_integer_dtype(categorical_dtype.categories.dtype)
-            and not pd.api.types.is_bool_dtype(categorical_dtype.categories.dtype)
-            and series.hasnans
-        )
         self._arrow_chunked: pa.ChunkedArray | None = None
         self._arrow_chunk: pa.Array | None = None
         self._arrow_chunk_index = 0
@@ -310,46 +293,6 @@ class PandasJsonColumnAccessor:
             sort_mapping_keys=sort_mapping_keys,
         )
 
-    def write_pandas_table_value(
-        self,
-        writer: CanonicalJsonStreamWriter,
-        row_index: int,
-        *,
-        escape_forward_slash: bool,
-        sort_mapping_keys: bool,
-    ) -> None:
-        """Preserve pandas orient=table column-context scalar semantics."""
-
-        if not self._table_context:
-            raise RuntimeError("table-context scalar encoding was not enabled")
-        handled, value = self._arrow_utf8_buffer(row_index)
-        if handled:
-            if value is None:
-                writer.write_ascii(b"null")
-            else:
-                writer.write_utf8_string_buffer(
-                    value,
-                    escape_forward_slash=escape_forward_slash,
-                )
-            return
-        value = self.value(row_index)
-        if self._table_timedelta and value is pd.NaT:
-            writer.write_string("NaT", escape_forward_slash=escape_forward_slash)
-            return
-        if self._table_float and (bool(pd.isna(value)) or not math.isfinite(float(value))):
-            writer.write_ascii(b"null")
-            return
-        if self._table_integer_categorical_with_missing and not pd.isna(value):
-            value = float(value)
-        elif self._table_unsigned and not pd.isna(value):
-            value = int(value)
-        write_pandas_json_value(
-            writer,
-            value,
-            escape_forward_slash=escape_forward_slash,
-            sort_mapping_keys=sort_mapping_keys,
-        )
-
 
 def write_pandas_json_value(
     writer: CanonicalJsonStreamWriter,
@@ -357,15 +300,19 @@ def write_pandas_json_value(
     *,
     escape_forward_slash: bool,
     sort_mapping_keys: bool,
+    scalar_normalizer: Callable[[object], object] | None = None,
 ) -> None:
     """Write one pandas-to_json-compatible scalar without materializing strings."""
 
+    if scalar_normalizer is not None:
+        value = scalar_normalizer(value)
     if isinstance(value, Enum):
         write_pandas_json_value(
             writer,
             value.value,
             escape_forward_slash=escape_forward_slash,
             sort_mapping_keys=sort_mapping_keys,
+            scalar_normalizer=scalar_normalizer,
         )
         return
     if isinstance(value, str):
@@ -392,6 +339,7 @@ def write_pandas_json_value(
                 value[key],
                 escape_forward_slash=escape_forward_slash,
                 sort_mapping_keys=sort_mapping_keys,
+                scalar_normalizer=scalar_normalizer,
             )
         writer.write_ascii(b"}")
         return
@@ -405,6 +353,7 @@ def write_pandas_json_value(
                 item,
                 escape_forward_slash=escape_forward_slash,
                 sort_mapping_keys=sort_mapping_keys,
+                scalar_normalizer=scalar_normalizer,
             )
         writer.write_ascii(b"]")
         return
@@ -422,3 +371,135 @@ def write_pandas_json_value(
     if len(encoded) > _MAX_SCALAR_TOKEN_BYTES:
         raise TypeError("unsupported pandas scalar exceeds bounded JSON token size")
     writer.write_ascii(encoded)
+
+
+def _legacy_table_schema_scalar(value: object) -> object:
+    if isinstance(value, (float, np.floating)):
+        normalized = float(value)
+        return normalized if math.isfinite(normalized) else None
+    return value
+
+
+def _legacy_table_timedelta_iso(value: object) -> str:
+    encoded = pd.Timedelta(value).isoformat()
+    prefix, separator, suffix = encoded.partition(".")
+    if not separator or not suffix.endswith("S"):
+        return encoded
+    fraction = suffix[:-1].rstrip("0")
+    return f"{prefix}.{fraction}S" if fraction else f"{prefix}S"
+
+
+class LegacyPandasTableColumnAccessor:
+    """Encode one orient=table data column with pandas' legacy context rules."""
+
+    def __init__(self, series: pd.Series, *, data_key: str) -> None:
+        self.data_key = data_key
+        self._values = PandasJsonColumnAccessor(series)
+        categorical_dtype = series.dtype if isinstance(series.dtype, pd.CategoricalDtype) else None
+        value_dtype = (
+            categorical_dtype.categories.dtype if categorical_dtype is not None else series.dtype
+        )
+        self._duration = pd.api.types.is_timedelta64_dtype(value_dtype)
+        self._duration_missing_as_nat = categorical_dtype is None and self._duration
+        self._floating = pd.api.types.is_float_dtype(value_dtype)
+        self._unsigned = pd.api.types.is_unsigned_integer_dtype(value_dtype)
+        self._integer_categorical_with_missing = (
+            categorical_dtype is not None
+            and pd.api.types.is_integer_dtype(value_dtype)
+            and not pd.api.types.is_bool_dtype(value_dtype)
+            and series.hasnans
+        )
+
+    def write_value(
+        self,
+        writer: CanonicalJsonStreamWriter,
+        row_index: int,
+    ) -> None:
+        if self._values.write_valid_string(
+            writer,
+            row_index,
+            escape_forward_slash=False,
+        ):
+            return
+        value = self._values.value(row_index)
+        if self._duration:
+            if bool(pd.isna(value)):
+                if self._duration_missing_as_nat:
+                    writer.write_string("NaT")
+                else:
+                    writer.write_ascii(b"null")
+            else:
+                writer.write_string(_legacy_table_timedelta_iso(value))
+            return
+        if self._floating:
+            if bool(pd.isna(value)):
+                writer.write_ascii(b"null")
+                return
+            normalized = float(value)
+            if not math.isfinite(normalized):
+                writer.write_ascii(b"null")
+                return
+            value = normalized
+        elif self._integer_categorical_with_missing and not pd.isna(value):
+            value = float(value)
+        elif self._unsigned and not pd.isna(value):
+            value = int(value)
+        write_pandas_json_value(
+            writer,
+            value,
+            escape_forward_slash=False,
+            sort_mapping_keys=True,
+        )
+
+
+class LegacyPandasTableCompatibility:
+    """Stream the legacy canonical orient=table object without whole-frame JSON."""
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        columns = tuple(frame.columns)
+        if any(not isinstance(column, str) for column in columns):
+            raise ValueError("artifact DataFrame columns must be strings")
+        data_keys = tuple(column.split("\x00", 1)[0] for column in columns)
+        if len(data_keys) != len(set(data_keys)):
+            raise ValueError("legacy orient=table NUL-truncated column names collide")
+        self._frame = frame
+        self._columns = tuple(
+            LegacyPandasTableColumnAccessor(
+                frame.iloc[:, position],
+                data_key=data_keys[position],
+            )
+            for position in range(len(columns))
+        )
+        self._positions = tuple(sorted(range(len(columns)), key=data_keys.__getitem__))
+
+    def write(self, writer: CanonicalJsonStreamWriter) -> None:
+        writer.write_ascii(b'{"data":[')
+        if self._columns:
+            for row_index in range(len(self._frame)):
+                if row_index:
+                    writer.write_ascii(b",")
+                writer.write_ascii(b"{")
+                for field_index, position in enumerate(self._positions):
+                    if field_index:
+                        writer.write_ascii(b",")
+                    column = self._columns[position]
+                    writer.write_string(column.data_key)
+                    writer.write_ascii(b":")
+                    column.write_value(writer, row_index)
+                writer.write_ascii(b"}")
+        writer.write_ascii(b'],"schema":')
+        write_pandas_json_value(
+            writer,
+            pd.io.json.build_table_schema(self._frame, index=False),
+            escape_forward_slash=False,
+            sort_mapping_keys=True,
+            scalar_normalizer=_legacy_table_schema_scalar,
+        )
+        writer.write_ascii(b"}")
+
+
+def write_legacy_pandas_table_json(
+    writer: CanonicalJsonStreamWriter,
+    frame: pd.DataFrame,
+) -> None:
+    LegacyPandasTableCompatibility(frame).write(writer)

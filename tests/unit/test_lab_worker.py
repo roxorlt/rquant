@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Literal
 from uuid import UUID, uuid4
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
@@ -170,6 +171,83 @@ def test_canonical_shard_frame_digest_matches_random_unsigned_legacy_values() ->
     frame = pd.DataFrame({"v": pd.Series(values, dtype="uint64")})
 
     assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        (
+            pd.DataFrame({"v": np.array([0, 1.5, np.nan, np.inf, -np.inf], dtype=np.float16)}),
+            "1a5db50f4ab947d79bc1846f793a5881f33d82d037d310cd9101ac2071070bee",
+        ),
+        (
+            pd.DataFrame(
+                {
+                    "v": pd.Series(
+                        [
+                            pd.Timedelta("0 days 00:03:38.028229560"),
+                            pd.Timedelta("-1 days 23:56:21.971770440"),
+                            pd.Timedelta(seconds=1),
+                            pd.Timedelta(microseconds=123456),
+                            pd.Timedelta(nanoseconds=1),
+                            pd.NaT,
+                        ],
+                        dtype="timedelta64[ns]",
+                    )
+                }
+            ),
+            "ac9a327bd0aa824cdc0bbb383d4f9da4485228d00abd22515316b46d51171c5d",
+        ),
+        (
+            pd.DataFrame({"a\x00b": [1, 2], "z": [3, 4]}),
+            "850e90e5b6cab1ba470b6264362d5da712f03d0b285fcdc5e76dcfa850a039f0",
+        ),
+        (
+            pd.DataFrame(index=[1, 2, 3]),
+            "66de46f5a39d9742939c233fea94d7a305616b2a7e7f3a8a985ce5baa3fb8838",
+        ),
+    ],
+    ids=["float16", "timedelta-ns", "nul-column", "zero-columns-with-rows"],
+)
+def test_canonical_shard_frame_digest_matches_broad_legacy_fixed_vectors(
+    frame: pd.DataFrame,
+    expected: str,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    assert _legacy_canonical_shard_frame_digest(frame) == expected
+    assert canonical_shard_frame_digest(frame) == expected
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([0, 1.5, np.nan, np.inf, -np.inf], dtype=np.float16),
+        np.array([0, 1.5, np.nan, np.inf, -np.inf], dtype=np.float32),
+        np.array([0, 1.5, np.nan, np.inf, -np.inf], dtype=np.float64),
+        pd.Series([0, 1.5, None, np.inf, -np.inf], dtype="Float32"),
+        pd.Series([0, 1.5, None, np.inf, -np.inf], dtype="Float64"),
+        pd.Categorical(pd.Series(np.array([0, 1.5, np.nan, np.inf, -np.inf], dtype=np.float32))),
+        pd.Categorical(pd.Series(np.array([0, 1.5, np.nan, np.inf, -np.inf], dtype=np.float64))),
+    ],
+    ids=["float16", "float32", "float64", "Float32", "Float64", "cat32", "cat64"],
+)
+def test_canonical_shard_frame_digest_matches_legacy_float_matrix(
+    values: object,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": values})
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+def test_canonical_shard_frame_digest_rejects_nul_truncated_column_collision() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame([[1, 2]], columns=["a", "a\x00b"])
+
+    with pytest.raises(ValueError, match="NUL.*collide"):
+        canonical_shard_frame_digest(frame)
 
 
 def test_canonical_shard_frame_digest_matches_legacy_mixed_frame() -> None:
