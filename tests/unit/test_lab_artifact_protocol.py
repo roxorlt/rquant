@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from datetime import UTC, datetime
@@ -17,9 +18,12 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitReceipt,
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
+    LabArtifactConflictEvidence,
+    LabQuarantinedArtifactCommit,
 )
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
+    LabHardLinkQuarantineArtifact,
     RequestContentConflictError,
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity
@@ -50,6 +54,18 @@ def _envelope(tmp_path: Path, *, request_id: UUID | None = None) -> LabArtifactC
         request_id=request_id or uuid4(),
         commit=_commit(tmp_path),
     )
+
+
+class _ConflictPublishCrash(BaseException):
+    pass
+
+
+class _CrashableConflictSpool(LabArtifactCommitSpool):
+    crash_stage: str | None = None
+
+    def _after_conflict_evidence_stage(self, stage: str, _path: Path) -> None:
+        if stage == self.crash_stage:
+            raise _ConflictPublishCrash(stage)
 
 
 def test_commit_envelope_hashes_canonical_typed_content(tmp_path: Path) -> None:
@@ -112,9 +128,11 @@ def test_commit_spool_fails_closed_on_request_content_conflict(tmp_path: Path) -
         spool.publish(changed)
 
     assert spool.pending()[0].envelope == first
-    conflict_files = tuple(spool.quarantine_dir.glob("*.conflict.bad"))
+    conflict_files = tuple(spool.quarantine_dir.glob("*.conflict.evidence.json"))
     assert len(conflict_files) == 1
-    assert LabArtifactCommitEnvelope.model_validate_json(conflict_files[0].read_bytes()) == changed
+    evidence = LabArtifactConflictEvidence.model_validate_json(conflict_files[0].read_bytes())
+    assert evidence.envelope == changed
+    assert evidence.state == "complete"
 
 
 def test_commit_spool_rejects_traversal_and_quarantines_symlink(tmp_path: Path) -> None:
@@ -174,6 +192,94 @@ def test_commit_spool_quarantines_nonregular_pending_without_reading(
         assert stat.S_ISFIFO(quarantined.path.lstat().st_mode)
 
 
+def test_commit_spool_neutralizes_hardlinked_pending_without_touching_external_name(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "commits")
+    external = tmp_path / "external.json"
+    external.write_text("external evidence", encoding="utf-8")
+    pending = spool.pending_dir / f"00000000000000000001-{uuid4()}.json"
+    os.link(external, pending)
+    original_identity = external.stat()
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="hard link") as captured:
+        spool.load(pending)
+    identity = captured.value.file_identity
+    assert identity is not None
+    assert identity.file_type == "regular"
+    assert identity.link_count == 2
+
+    quarantined = spool.quarantine(identity, reason="invalid_inode:hardlink")
+
+    evidence = LabHardLinkQuarantineArtifact.model_validate_json(quarantined.path.read_bytes())
+    assert not os.path.lexists(pending)
+    assert external.read_text(encoding="utf-8") == "external evidence"
+    assert (external.stat().st_dev, external.stat().st_ino) == (
+        original_identity.st_dev,
+        original_identity.st_ino,
+    )
+    assert external.stat().st_nlink == 1
+    assert evidence.original_name == pending.name
+    assert (evidence.device, evidence.inode, evidence.observed_link_count) == (
+        original_identity.st_dev,
+        original_identity.st_ino,
+        2,
+    )
+
+
+def test_commit_spool_hardlink_quarantine_rejects_swapped_pending_inode(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "commits")
+    external = tmp_path / "external.json"
+    external.write_text("external evidence", encoding="utf-8")
+    pending = spool.pending_dir / f"00000000000000000001-{uuid4()}.json"
+    os.link(external, pending)
+    with pytest.raises(InvalidCommandEnvelopeError, match="hard link") as captured:
+        spool.load(pending)
+    identity = captured.value.file_identity
+    assert identity is not None
+    pending.unlink()
+    pending.write_text("replacement", encoding="utf-8")
+    replacement_identity = pending.stat()
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(identity, reason="invalid_inode:hardlink")
+
+    assert pending.read_text(encoding="utf-8") == "replacement"
+    assert pending.stat().st_ino == replacement_identity.st_ino
+    assert external.read_text(encoding="utf-8") == "external evidence"
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
+def test_commit_spool_hardlink_evidence_is_idempotent_per_inode(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "commits")
+    pending = spool.pending_dir / f"00000000000000000001-{uuid4()}.json"
+    reason = "invalid_inode:hardlink"
+    evidence_paths: list[Path] = []
+
+    for index in range(2):
+        external = tmp_path / f"external-{index}.json"
+        external.write_text(f"external evidence {index}", encoding="utf-8")
+        os.link(external, pending)
+        with pytest.raises(InvalidCommandEnvelopeError, match="hard link") as captured:
+            spool.load(pending)
+        identity = captured.value.file_identity
+        assert identity is not None
+
+        quarantined = spool.quarantine(identity, reason=reason)
+
+        evidence_paths.append(quarantined.path)
+        assert not os.path.lexists(pending)
+        assert external.read_text(encoding="utf-8") == f"external evidence {index}"
+        assert external.stat().st_nlink == 1
+
+    assert evidence_paths[0] != evidence_paths[1]
+    assert all(path.is_file() for path in evidence_paths)
+
+
 def test_commit_spool_records_disappeared_pending_race(tmp_path: Path) -> None:
     spool = LabArtifactCommitSpool(tmp_path / "commits")
     path = spool.pending_dir / f"00000000000000000001-{uuid4()}.json"
@@ -206,11 +312,11 @@ def test_commit_conflict_quarantine_is_idempotent(tmp_path: Path) -> None:
         with pytest.raises(RequestContentConflictError, match="different content"):
             spool.publish(conflict)
 
-    payloads = tuple(spool.quarantine_dir.glob("*.conflict.bad"))
-    metadata = tuple(spool.quarantine_dir.glob("*.conflict.bad.json"))
-    assert len(payloads) == 1
-    assert len(metadata) == 1
-    assert LabArtifactCommitEnvelope.model_validate_json(payloads[0].read_bytes()) == conflict
+    bundles = tuple(spool.quarantine_dir.glob("*.conflict.evidence.json"))
+    assert len(bundles) == 1
+    evidence = LabArtifactConflictEvidence.model_validate_json(bundles[0].read_bytes())
+    assert evidence.envelope == conflict
+    assert tuple(spool.quarantine_dir.glob("*.publishing.tmp")) == ()
 
 
 def test_commit_conflict_quarantine_is_concurrent_no_clobber(tmp_path: Path) -> None:
@@ -240,7 +346,8 @@ def test_commit_conflict_quarantine_is_concurrent_no_clobber(tmp_path: Path) -> 
 
     assert all(not thread.is_alive() for thread in threads)
     assert outcomes == [RequestContentConflictError] * 5
-    assert len(tuple(spool.quarantine_dir.glob("*.conflict.bad"))) == 1
+    assert len(tuple(spool.quarantine_dir.glob("*.conflict.evidence.json"))) == 1
+    assert tuple(spool.quarantine_dir.glob("*.publishing.tmp")) == ()
 
 
 def test_commit_conflict_retention_prunes_only_old_conflict_pairs(tmp_path: Path) -> None:
@@ -267,13 +374,13 @@ def test_commit_conflict_retention_prunes_only_old_conflict_pairs(tmp_path: Path
         with pytest.raises(RequestContentConflictError, match="different content"):
             spool.publish(conflict)
         for path in spool.quarantine_dir.glob(
-            f"{request_id}.{conflict.content_hash}.*.conflict.bad*"
+            f"{request_id}.{conflict.content_hash}.*.conflict.evidence.json"
         ):
             os.utime(path, ns=(index, index), follow_symlinks=False)
 
-    payloads = tuple(spool.quarantine_dir.glob("*.conflict.bad"))
+    payloads = tuple(spool.quarantine_dir.glob("*.conflict.evidence.json"))
     archived = {
-        LabArtifactCommitEnvelope.model_validate_json(path.read_bytes()).content_hash
+        LabArtifactConflictEvidence.model_validate_json(path.read_bytes()).envelope.content_hash
         for path in payloads
     }
     assert len(payloads) == 2
@@ -297,8 +404,8 @@ def test_commit_conflict_retention_enforces_byte_budget(tmp_path: Path) -> None:
     )
     with pytest.raises(RequestContentConflictError, match="different content"):
         spool.publish(first_conflict)
-    first_payload = next(spool.quarantine_dir.glob("*.conflict.bad"))
-    first_pair_bytes = first_payload.stat().st_size + Path(f"{first_payload}.json").stat().st_size
+    first_payload = next(spool.quarantine_dir.glob("*.conflict.evidence.json"))
+    first_pair_bytes = first_payload.stat().st_size
 
     bounded = LabArtifactCommitSpool(
         root,
@@ -312,10 +419,12 @@ def test_commit_conflict_retention_enforces_byte_budget(tmp_path: Path) -> None:
     with pytest.raises(RequestContentConflictError, match="different content"):
         bounded.publish(second_conflict)
 
-    retained = tuple(bounded.quarantine_dir.glob("*.conflict.bad"))
+    retained = tuple(bounded.quarantine_dir.glob("*.conflict.evidence.json"))
     assert len(retained) == 1
     assert (
-        LabArtifactCommitEnvelope.model_validate_json(retained[0].read_bytes()).content_hash
+        LabArtifactConflictEvidence.model_validate_json(
+            retained[0].read_bytes()
+        ).envelope.content_hash
         == second_conflict.content_hash
     )
 
@@ -328,12 +437,9 @@ def test_commit_conflict_retention_ignores_lookalike_operator_evidence(
         max_conflict_records=1,
         max_conflict_bytes=1024 * 1024,
     )
-    lookalike = spool.quarantine_dir / (f"{uuid4()}.{'f' * 64}.{'e' * 16}.conflict.bad")
-    lookalike_metadata = spool.quarantine_dir / f"{lookalike.name}.json"
+    lookalike = spool.quarantine_dir / (f"{uuid4()}.{'f' * 64}.{'e' * 16}.conflict.evidence.json")
     lookalike.write_text("operator evidence", encoding="utf-8")
-    lookalike_metadata.write_text("operator metadata", encoding="utf-8")
     os.utime(lookalike, ns=(1, 1), follow_symlinks=False)
-    os.utime(lookalike_metadata, ns=(1, 1), follow_symlinks=False)
 
     request_id = uuid4()
     original = _envelope(tmp_path, request_id=request_id)
@@ -349,5 +455,137 @@ def test_commit_conflict_retention_ignores_lookalike_operator_evidence(
             spool.publish(conflict)
 
     assert lookalike.read_text(encoding="utf-8") == "operator evidence"
-    assert lookalike_metadata.read_text(encoding="utf-8") == "operator metadata"
-    assert len(tuple(spool.quarantine_dir.glob(f"{request_id}.*.conflict.bad"))) == 1
+    assert len(tuple(spool.quarantine_dir.glob(f"{request_id}.*.conflict.evidence.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "crash_stage",
+    ["temporary_written", "target_linked", "temporary_unlinked"],
+)
+def test_commit_conflict_publish_crash_replays_to_one_atomic_bundle(
+    tmp_path: Path,
+    crash_stage: str,
+) -> None:
+    root = tmp_path / "commits"
+    spool = _CrashableConflictSpool(root)
+    request_id = uuid4()
+    original = _envelope(tmp_path, request_id=request_id)
+    spool.publish(original)
+    conflict = LabArtifactCommitEnvelope(
+        request_id=request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    spool.crash_stage = crash_stage
+
+    with pytest.raises(_ConflictPublishCrash, match=crash_stage):
+        spool.publish(conflict)
+
+    restarted = LabArtifactCommitSpool(root)
+    evidence = restarted.conflict_evidence()
+    assert len(evidence) == 1
+    assert evidence[0].envelope == conflict
+    assert tuple(restarted.quarantine_dir.glob("*.publishing.tmp")) == ()
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        restarted.publish(conflict)
+    assert restarted.conflict_evidence() == evidence
+
+
+def test_commit_conflict_restart_recovers_and_prunes_owned_incomplete_bundles(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    request_id = uuid4()
+    original = _envelope(tmp_path, request_id=request_id)
+    spool.publish(original)
+    conflicts = tuple(
+        LabArtifactCommitEnvelope(
+            request_id=request_id,
+            commit=original.commit.model_copy(update={"manifest_hash": digit * 64}),
+        )
+        for digit in ("7", "8", "9")
+    )
+    reason = "request_id already pending with different content"
+    for index, conflict in enumerate(conflicts):
+        evidence = LabArtifactConflictEvidence.from_conflict(conflict, reason=reason)
+        temporary = spool._conflict_temporary_path(evidence)
+        temporary.write_bytes(evidence.model_dump_json().encode("utf-8"))
+        os.utime(temporary, ns=(index + 1, index + 1), follow_symlinks=False)
+
+    restarted = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=2,
+        max_conflict_bytes=1024 * 1024,
+    )
+
+    retained = restarted.conflict_evidence()
+    assert len(retained) == 2
+    assert {item.envelope.content_hash for item in retained} == {
+        conflicts[1].content_hash,
+        conflicts[2].content_hash,
+    }
+    assert tuple(restarted.quarantine_dir.glob("*.publishing.tmp")) == ()
+
+
+def test_commit_conflict_retention_bounds_legacy_partial_files_without_touching_lookalikes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    request_id = uuid4()
+    original = _envelope(tmp_path, request_id=request_id)
+    spool.publish(original)
+    reason = "request_id already pending with different content"
+    reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
+    payload_only_conflict = LabArtifactCommitEnvelope(
+        request_id=request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "7" * 64}),
+    )
+    payload_only = spool.quarantine_dir / (
+        f"{request_id}.{payload_only_conflict.content_hash}.{reason_hash}.conflict.bad"
+    )
+    payload_only.write_bytes(payload_only_conflict.model_dump_json().encode("utf-8"))
+
+    metadata_only_conflict = LabArtifactCommitEnvelope(
+        request_id=request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "8" * 64}),
+    )
+    missing_payload = spool.quarantine_dir / (
+        f"{request_id}.{metadata_only_conflict.content_hash}.{reason_hash}.conflict.bad"
+    )
+    metadata_only = Path(f"{missing_payload}.json")
+    metadata_only.write_bytes(
+        LabQuarantinedArtifactCommit(
+            path=missing_payload,
+            reason=reason,
+        )
+        .model_dump_json()
+        .encode("utf-8")
+    )
+    outside = tmp_path / "outside-conflict-evidence"
+    outside.write_text("keep", encoding="utf-8")
+    symlink = spool.quarantine_dir / (f"{uuid4()}.{'e' * 64}.{'d' * 16}.conflict.bad")
+    os.symlink(outside, symlink)
+    lookalike = spool.quarantine_dir / (f"{uuid4()}.{'f' * 64}.{'c' * 16}.conflict.bad")
+    lookalike.write_text("unowned", encoding="utf-8")
+    for path in (payload_only, metadata_only):
+        os.utime(path, ns=(1, 1), follow_symlinks=False)
+
+    bounded = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=1,
+        max_conflict_bytes=1024 * 1024,
+    )
+    newest = LabArtifactCommitEnvelope(
+        request_id=request_id,
+        commit=original.commit.model_copy(update={"manifest_hash": "9" * 64}),
+    )
+    with pytest.raises(RequestContentConflictError, match="different content"):
+        bounded.publish(newest)
+
+    assert not payload_only.exists()
+    assert not metadata_only.exists()
+    assert os.path.lexists(symlink)
+    assert outside.read_text(encoding="utf-8") == "keep"
+    assert lookalike.read_text(encoding="utf-8") == "unowned"
+    assert len(bounded.conflict_evidence()) == 1

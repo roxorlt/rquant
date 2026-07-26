@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
@@ -13,7 +15,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Self
 from urllib.parse import quote
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from weakref import ReferenceType, ref
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -925,6 +927,284 @@ def _strict_sqlite_bool(value: object, *, field: str) -> bool:
     if integer not in {0, 1}:
         raise InvalidStoredJobError(f"{field} must be SQLite integer 0 or 1, found {integer}")
     return bool(integer)
+
+
+_SHARD_ROW_VALID_FUNCTION = "rquant_lab_shard_row_valid"
+_SHARD_HASH_RE = re.compile(r"[0-9a-f]{64}")
+_SHARD_PLAN_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _canonical_shard_payload(value: str) -> str:
+    def reject_float(_value: str) -> float:
+        raise ValueError("floating-point shard payload values are not allowed")
+
+    def reject_constant(_value: str) -> object:
+        raise ValueError("non-finite shard payload values are not allowed")
+
+    parsed = json.loads(
+        value,
+        parse_float=reject_float,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(parsed, dict):
+        raise ValueError("shard payload must encode a JSON object")
+    return json.dumps(
+        parsed,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _sqlite_shard_row_valid(
+    shard_id_value: object,
+    job_id_value: object,
+    shard_index_value: object,
+    status_value: object,
+    version_value: object,
+    attempt_count_value: object,
+    max_attempts_value: object,
+    plan_hash_value: object,
+    adapter_id_value: object,
+    adapter_version_value: object,
+    payload_json_value: object,
+    payload_hash_value: object,
+    worker_id_value: object,
+    scheduler_fencing_token_value: object,
+    claim_token_value: object,
+    claim_generation_value: object,
+    claimed_at_value: object,
+    heartbeat_at_value: object,
+    lease_expires_at_value: object,
+    result_manifest_hash_value: object,
+    failure_json_value: object,
+    finished_at_value: object,
+    checkpoint_json_value: object,
+    created_at_value: object,
+    updated_at_value: object,
+    phase_value: object,
+    work_unit_name_value: object,
+    work_units_value: object,
+    static_duration_ms_value: object,
+    duration_ms_value: object,
+    throughput_value: object,
+    completion_sequence_value: object,
+) -> int:
+    try:
+        shard_id = UUID(str(shard_id_value))
+        UUID(str(job_id_value))
+        shard_index = _strict_sqlite_int(
+            shard_index_value,
+            field="lab_shard.shard_index",
+            minimum=0,
+        )
+        status = ShardStatus(str(status_value))
+        _strict_sqlite_int(version_value, field="lab_shard.version", minimum=0)
+        attempt_count = _strict_sqlite_int(
+            attempt_count_value,
+            field="lab_shard.attempt_count",
+            minimum=0,
+        )
+        max_attempts = _strict_sqlite_int(
+            max_attempts_value,
+            field="lab_shard.max_attempts",
+            minimum=1,
+        )
+        plan_hash = str(plan_hash_value)
+        adapter_id = str(adapter_id_value)
+        adapter_version = str(adapter_version_value)
+        payload_json = str(payload_json_value)
+        payload_hash = str(payload_hash_value)
+        if _SHARD_HASH_RE.fullmatch(plan_hash) is None:
+            raise ValueError("invalid shard plan hash")
+        if _SHARD_HASH_RE.fullmatch(payload_hash) is None:
+            raise ValueError("invalid shard payload hash")
+
+        worker_id = str(worker_id_value) if worker_id_value else None
+        scheduler_fencing_token = _strict_nullable_sqlite_int(
+            scheduler_fencing_token_value,
+            field="lab_shard.scheduler_fencing_token",
+            minimum=1,
+        )
+        claim_token = UUID(str(claim_token_value)) if claim_token_value is not None else None
+        _strict_sqlite_int(
+            claim_generation_value,
+            field="lab_shard.claim_generation",
+            minimum=0,
+        )
+
+        def optional_time(value: object) -> datetime | None:
+            return _load_time(str(value)) if value is not None else None
+
+        claimed_at = optional_time(claimed_at_value)
+        heartbeat_at = optional_time(heartbeat_at_value)
+        lease_expires_at = optional_time(lease_expires_at_value)
+        finished_at = optional_time(finished_at_value)
+        _load_time(str(created_at_value))
+        _load_time(str(updated_at_value))
+        result_manifest_hash = (
+            str(result_manifest_hash_value) if result_manifest_hash_value is not None else None
+        )
+        if (
+            result_manifest_hash is not None
+            and _SHARD_HASH_RE.fullmatch(result_manifest_hash) is None
+        ):
+            raise ValueError("invalid shard result manifest hash")
+        failure_json = str(failure_json_value) if failure_json_value is not None else None
+        str(checkpoint_json_value) if checkpoint_json_value is not None else None
+
+        phase = str(phase_value) if phase_value is not None else None
+        work_unit_name = str(work_unit_name_value) if work_unit_name_value is not None else None
+        if phase is not None and _SHARD_PLAN_NAME_RE.fullmatch(phase) is None:
+            raise ValueError("invalid shard phase")
+        if work_unit_name is not None and _SHARD_PLAN_NAME_RE.fullmatch(work_unit_name) is None:
+            raise ValueError("invalid shard work unit name")
+        work_units = _strict_nullable_sqlite_int(
+            work_units_value,
+            field="lab_shard.work_units",
+            minimum=1,
+            maximum=SQLITE_SIGNED_INTEGER_MAX,
+        )
+        static_duration_ms = _strict_nullable_sqlite_int(
+            static_duration_ms_value,
+            field="lab_shard.static_duration_ms",
+            minimum=1,
+            maximum=SQLITE_SIGNED_INTEGER_MAX,
+        )
+        duration_ms = _strict_nullable_sqlite_real(
+            duration_ms_value,
+            field="lab_shard.duration_ms",
+            positive=True,
+            minimum_inclusive=LAB_SHARD_DURATION_MS_MIN,
+            maximum_exclusive=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
+        )
+        throughput = _strict_nullable_sqlite_real(
+            throughput_value,
+            field="lab_shard.throughput_units_per_second",
+            positive=True,
+            maximum_exclusive=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
+        )
+        completion_sequence = _strict_nullable_sqlite_int(
+            completion_sequence_value,
+            field="lab_shard.completion_sequence",
+            minimum=1,
+        )
+
+        plan_values = (phase, work_unit_name, work_units, static_duration_ms)
+        if not (
+            all(value is None for value in plan_values)
+            or all(value is not None for value in plan_values)
+        ):
+            raise ValueError("shard work plan must be entirely present or absent")
+        has_work_plan = phase is not None
+
+        is_legacy = adapter_id == "legacy-v2"
+        if is_legacy:
+            if (
+                adapter_version != "v0"
+                or plan_hash != _LEGACY_PLAN_HASH
+                or payload_json != _EMPTY_PAYLOAD_JSON
+                or payload_hash != _EMPTY_PAYLOAD_HASH
+            ):
+                raise ValueError("legacy shard identity mismatch")
+        else:
+            canonical_payload = _canonical_shard_payload(payload_json.strip())
+            canonical_payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+            if payload_hash != canonical_payload_hash:
+                raise ValueError("shard payload hash mismatch")
+            canonical_adapter_id = adapter_id.strip()
+            canonical_adapter_version = adapter_version.strip()
+            if not canonical_adapter_id or not canonical_adapter_version:
+                raise ValueError("shard adapter identity is empty")
+            shard_identity: dict[str, object] = {
+                "adapter_id": canonical_adapter_id,
+                "adapter_version": canonical_adapter_version,
+                "payload_hash": canonical_payload_hash,
+                "plan_hash": plan_hash,
+                "shard_index": shard_index,
+            }
+            if has_work_plan:
+                shard_identity["work_plan"] = {
+                    "phase": phase,
+                    "static_duration_ms": static_duration_ms,
+                    "work_unit_name": work_unit_name,
+                    "work_units": work_units,
+                }
+            shard_name = json.dumps(
+                shard_identity,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            expected_shard_id = uuid5(
+                NAMESPACE_URL,
+                f"rquant:lab-shard:{shard_name}",
+            )
+            if shard_id.int and shard_id != expected_shard_id:
+                raise ValueError("shard id does not match deterministic definition")
+
+        telemetry_values = (duration_ms, throughput, completion_sequence)
+        if not (
+            all(value is None for value in telemetry_values)
+            or all(value is not None for value in telemetry_values)
+        ):
+            raise ValueError("shard completion telemetry must be entirely present or absent")
+        if duration_ms is not None:
+            if not has_work_plan or work_units is None or throughput is None:
+                raise ValueError("shard telemetry is missing its work plan")
+            observed_work_units = throughput * (duration_ms * 0.001)
+            if not math.isclose(
+                observed_work_units,
+                float(work_units),
+                rel_tol=1e-12,
+                abs_tol=1e-9,
+            ):
+                raise ValueError("shard throughput does not match duration and work units")
+            if status is not ShardStatus.SUCCEEDED:
+                raise ValueError("non-succeeded shard retains completion telemetry")
+        if status is ShardStatus.SUCCEEDED and has_work_plan and duration_ms is None:
+            raise ValueError("telemetry-planned succeeded shard is missing telemetry")
+
+        claim_values = (
+            worker_id,
+            scheduler_fencing_token,
+            claim_token,
+            claimed_at,
+            heartbeat_at,
+            lease_expires_at,
+        )
+        if status is ShardStatus.RUNNING and any(value is None for value in claim_values):
+            raise ValueError("running shard is missing claim identity")
+        if status is ShardStatus.QUEUED and attempt_count >= max_attempts:
+            raise ValueError("queued shard exhausted attempts")
+        if claimed_at is not None and heartbeat_at is not None and heartbeat_at < claimed_at:
+            raise ValueError("shard heartbeat predates claim")
+        if (
+            claimed_at is not None
+            and lease_expires_at is not None
+            and lease_expires_at <= claimed_at
+        ):
+            raise ValueError("shard claim lease is not positive")
+        if status is ShardStatus.SUCCEEDED and (
+            finished_at is None or (not is_legacy and result_manifest_hash is None)
+        ):
+            raise ValueError("succeeded shard is missing result identity")
+        if status is ShardStatus.FAILED and (
+            finished_at is None or (not is_legacy and failure_json is None)
+        ):
+            raise ValueError("failed shard is missing failure identity")
+        if status is ShardStatus.CANCELLED and finished_at is None:
+            raise ValueError("cancelled shard is missing finished_at")
+        if status in {
+            ShardStatus.SUCCEEDED,
+            ShardStatus.FAILED,
+            ShardStatus.CANCELLED,
+        } and any(value is not None for value in claim_values):
+            raise ValueError("terminal shard retains claim identity")
+        return 1
+    except Exception:
+        return 0
 
 
 def _command_record_from_row(
@@ -2280,6 +2560,12 @@ class LabJobReader:
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
         )
+        connection.create_function(
+            _SHARD_ROW_VALID_FUNCTION,
+            32,
+            _sqlite_shard_row_valid,
+            deterministic=True,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA foreign_keys = ON")
@@ -2664,11 +2950,6 @@ class LabJobReader:
             (str(job.job_id),),
         ).fetchone()
 
-        if not job.requires_complete_result:
-            if index_row is not None:
-                raise InvalidStoredJobError("legacy job unexpectedly has a complete result index")
-            return None
-
         shard_aggregate = connection.execute(
             """
             SELECT COUNT(*) AS shard_count,
@@ -2679,7 +2960,19 @@ class LabJobReader:
                    COUNT(DISTINCT adapter_id) AS adapter_id_count,
                    MIN(adapter_id) AS adapter_id,
                    COUNT(DISTINCT adapter_version) AS adapter_version_count,
-                   MIN(adapter_version) AS adapter_version
+                   MIN(adapter_version) AS adapter_version,
+                   COALESCE(MIN(rquant_lab_shard_row_valid(
+                       shard_id, job_id, shard_index, status, version,
+                       attempt_count, max_attempts, plan_hash, adapter_id,
+                       adapter_version, payload_json, payload_hash, worker_id,
+                       scheduler_fencing_token, claim_token, claim_generation,
+                       claimed_at, heartbeat_at, lease_expires_at,
+                       result_manifest_hash, failure_json, finished_at,
+                       checkpoint_json, created_at, updated_at, phase,
+                       work_unit_name, work_units, static_duration_ms,
+                       duration_ms, throughput_units_per_second,
+                       completion_sequence
+                   )), 1) AS rows_valid
             FROM lab_shard
             WHERE job_id = ?
             """,
@@ -2696,6 +2989,19 @@ class LabJobReader:
             field="lab_shard.aggregate.succeeded_count",
             minimum=0,
         )
+        rows_valid = _strict_sqlite_int(
+            shard_aggregate["rows_valid"],
+            field="lab_shard.aggregate.rows_valid",
+            minimum=0,
+            maximum=1,
+        )
+        if rows_valid != 1:
+            raise InvalidStoredJobError("job contains an invalid stored lab shard")
+
+        if not job.requires_complete_result:
+            if index_row is not None:
+                raise InvalidStoredJobError("legacy job unexpectedly has a complete result index")
+            return None
 
         if job.result_state is LabResultState.PENDING:
             if index_row is not None:
@@ -3151,6 +3457,12 @@ class LabJobStore:
             _ARTIFACT_SUCCESS_AUTH_FUNCTION,
             5,
             authorization.artifact_success_authorized,
+        )
+        connection.create_function(
+            _SHARD_ROW_VALID_FUNCTION,
+            32,
+            _sqlite_shard_row_valid,
+            deterministic=True,
         )
         connection.row_factory = sqlite3.Row
         try:

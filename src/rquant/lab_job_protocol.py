@@ -50,6 +50,7 @@ class LabSpoolFileIdentity(LabProtocolModel):
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
     file_type: _LabSpoolFileType = "regular"
+    link_count: int = Field(default=1, ge=1)
     link_target: str | None = None
 
     @model_validator(mode="after")
@@ -207,6 +208,15 @@ class LabDisappearedQuarantineArtifact(LabProtocolModel):
     reason: str = Field(min_length=1)
 
 
+class LabHardLinkQuarantineArtifact(LabProtocolModel):
+    schema_version: Literal[1] = 1
+    original_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    observed_link_count: int = Field(ge=1)
+
+
 class LabCommandSpool:
     """Atomic filesystem inbox with durable receipts and quarantine."""
 
@@ -319,7 +329,12 @@ class LabCommandSpool:
         return "other"
 
     @staticmethod
-    def _read_regular_child(path: Path, parent: Path) -> tuple[Path, bytes, os.stat_result]:
+    def _read_regular_child(
+        path: Path,
+        parent: Path,
+        *,
+        allowed_link_counts: frozenset[int] = frozenset({1}),
+    ) -> tuple[Path, bytes, os.stat_result]:
         name = LabCommandSpool._direct_child_name(path, parent)
         normalized = Path(os.path.abspath(parent)) / name
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -354,8 +369,16 @@ class LabCommandSpool:
                     f"spool file {name} is not regular",
                     file_identity=identity,
                 )
-            if path_stat.st_nlink != 1:
-                raise InvalidCommandEnvelopeError(f"spool file {name} has an external hard link")
+            if path_stat.st_nlink not in allowed_link_counts:
+                raise InvalidCommandEnvelopeError(
+                    f"spool file {name} has an external hard link",
+                    file_identity=LabSpoolFileIdentity(
+                        path=normalized,
+                        device=path_stat.st_dev,
+                        inode=path_stat.st_ino,
+                        link_count=path_stat.st_nlink,
+                    ),
+                )
             try:
                 descriptor = os.open(name, file_flags, dir_fd=directory_fd)
             except OSError as exc:
@@ -366,7 +389,7 @@ class LabCommandSpool:
                     not stat.S_ISREG(file_stat.st_mode)
                     or file_stat.st_dev != path_stat.st_dev
                     or file_stat.st_ino != path_stat.st_ino
-                    or file_stat.st_nlink != 1
+                    or file_stat.st_nlink not in allowed_link_counts
                 ):
                     raise InvalidCommandEnvelopeError(
                         f"spool file {name} was replaced while opening",
@@ -374,6 +397,7 @@ class LabCommandSpool:
                             path=normalized,
                             device=path_stat.st_dev,
                             inode=path_stat.st_ino,
+                            link_count=path_stat.st_nlink,
                         ),
                     )
                 chunks: list[bytes] = []
@@ -650,6 +674,8 @@ class LabCommandSpool:
                 and entry_or_path.file_type != "regular"
             ):
                 return self._quarantine_nonregular_locked(entry_or_path, reason=reason)
+            if isinstance(entry_or_path, LabSpoolFileIdentity) and entry_or_path.link_count != 1:
+                return self._quarantine_hardlink_locked(entry_or_path, reason=reason)
             try:
                 normalized, payload, source_stat = self._read_regular_child(
                     source,
@@ -756,6 +782,66 @@ class LabCommandSpool:
                     f"disappeared quarantine evidence conflicts: {target.name}"
                 )
         return LabQuarantinedCommand(path=target, reason=reason)
+
+    def _quarantine_hardlink_locked(
+        self,
+        identity: LabSpoolFileIdentity,
+        *,
+        reason: str,
+    ) -> LabQuarantinedCommand:
+        name = self._direct_child_name(identity.path, self.pending_dir)
+        directory_fd = os.open(
+            self.pending_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return self._record_disappeared_locked(identity.path, reason=reason)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != identity.device
+                or current.st_ino != identity.inode
+            ):
+                raise InvalidCommandEnvelopeError(
+                    "pending hard-linked inode was replaced before quarantine"
+                )
+            reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
+            target = self.quarantine_dir / (
+                f"{name}.{current.st_dev}.{current.st_ino}.{reason_hash}.hardlink.bad.json"
+            )
+            artifact = LabHardLinkQuarantineArtifact(
+                original_name=name,
+                reason=reason,
+                device=current.st_dev,
+                inode=current.st_ino,
+                observed_link_count=current.st_nlink,
+            )
+            payload = artifact.model_dump_json().encode("utf-8")
+            if not self._publish_no_clobber(target, payload):
+                _candidate, existing, _file_stat = self._read_regular_child(
+                    target,
+                    self.quarantine_dir,
+                )
+                if existing != payload:
+                    raise RequestContentConflictError(
+                        f"hard-link quarantine evidence conflicts: {target.name}"
+                    )
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != identity.device
+                or current.st_ino != identity.inode
+            ):
+                raise InvalidCommandEnvelopeError(
+                    "pending hard-linked inode was replaced before unlink"
+                )
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            return LabQuarantinedCommand(path=target, reason=reason)
+        finally:
+            os.close(directory_fd)
 
     def _quarantine_nonregular_locked(
         self,

@@ -44,6 +44,7 @@ from rquant.lab_jobs import (
     SchedulerLeaseUnavailableError,
     StaleJobVersionError,
 )
+from rquant.lab_shard_protocol import LabShardDefinition, LabShardWorkPlan
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
     ExecutionCostSpec,
@@ -1849,8 +1850,79 @@ def test_get_job_uses_shard_aggregates_without_loading_twenty_thousand_models(
     ]
     assert len(shard_queries) == 1
     assert "count(" in shard_queries[0]
+    assert "rquant_lab_shard_row_valid" in shard_queries[0]
     assert "select *" not in shard_queries[0]
     with pytest.raises(AssertionError, match="must not construct"):
+        reader.list_shards(job.job_id)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "parameters"),
+    [
+        ("shard_id = ?", ("not-a-uuid",)),
+        ("shard_id = ?", ("00000000-0000-4000-8000-000000000001",)),
+        ("payload_json = ?", ('{"fraction":1.5}',)),
+        ("payload_hash = ?", ("f" * 64,)),
+        ("plan_hash = ?", ("g" * 64,)),
+        ("adapter_id = ?", ("",)),
+        ("phase = NULL", ()),
+        ("status = 'bogus'", ()),
+        ("status = 'running'", ()),
+        ("claimed_at = ?", ("not-a-time",)),
+        ("version = ?", (1.5,)),
+        ("result_manifest_hash = ?", ("not-a-hash",)),
+        ("attempt_count = max_attempts", ()),
+        (
+            "status = 'succeeded', duration_ms = 1000, "
+            "throughput_units_per_second = 999, completion_sequence = 1, "
+            "result_manifest_hash = ?, finished_at = ?",
+            ("9" * 64, NOW.isoformat(timespec="microseconds")),
+        ),
+        (
+            "status = 'cancelled', finished_at = ?, worker_id = 'stale-worker'",
+            (NOW.isoformat(timespec="microseconds"),),
+        ),
+    ],
+)
+def test_get_job_and_list_shards_reject_the_same_corrupt_shard_rows_without_models(
+    tmp_path: Path,
+    mutation: str,
+    parameters: tuple[object, ...],
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="n-shape-replay",
+        adapter_version="v1",
+        plan_hash="a" * 64,
+        payload_json='{"hold_days":1}',
+        work_plan=LabShardWorkPlan(
+            phase="strategy_replay",
+            work_unit_name="parameter_case",
+            work_units=1,
+            static_duration_ms=1_000,
+        ),
+    )
+    planned = store.plan_job(
+        job.job_id,
+        (definition,),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert len(planned) == 1
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE lab_shard SET {mutation} WHERE job_id = ? AND shard_id = ?",
+            (*parameters, str(job.job_id), str(planned[0].shard_id)),
+        )
+
+    reader = LabJobReader(store.path)
+    with pytest.raises(InvalidStoredJobError):
+        reader.get_job(job.job_id)
+    with pytest.raises(InvalidStoredJobError):
         reader.list_shards(job.job_id)
 
 

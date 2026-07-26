@@ -49,6 +49,7 @@ class SchedulerTickResult(BaseModel):
     artifact_commits_accepted: int = Field(default=0, ge=0)
     artifact_commits_rejected: int = Field(default=0, ge=0)
     artifact_commits_quarantined: int = Field(default=0, ge=0)
+    artifact_commit_quarantine_failures: int = Field(default=0, ge=0)
     deadlines_expired: int = Field(default=0, ge=0)
     plans_created: int = Field(default=0, ge=0)
     plans_failed: int = Field(default=0, ge=0)
@@ -197,7 +198,7 @@ class LabScheduler:
         entry_or_path: LabArtifactCommitSpoolEntry | LabSpoolFileIdentity | Path,
         *,
         reason: str,
-    ) -> None:
+    ) -> bool:
         if self.artifact_commit_spool is None:  # pragma: no cover - caller invariant
             raise RuntimeError("artifact commit spool is not configured")
         try:
@@ -214,6 +215,8 @@ class LabScheduler:
                 quarantine_reason=reason,
                 error_type=type(exc).__name__,
             )
+            return False
+        return True
 
     def _seed_claim_cursor(self, lease: LabLeaseRecord) -> None:
         if self._claim_cursor_fence == lease.fencing_token:
@@ -535,18 +538,22 @@ class LabScheduler:
         artifact_commits_accepted = 0
         artifact_commits_rejected = 0
         artifact_commits_quarantined = 0
+        artifact_commit_quarantine_failures = 0
         if self.artifact_commit_spool is not None and self.artifact_store is not None:
             for path in self.artifact_commit_spool.pending_paths(
-                limit=self.max_artifact_commits_per_tick
+                limit=self.max_artifact_commits_per_tick + 64
             ):
+                if artifact_commits_processed >= self.max_artifact_commits_per_tick:
+                    break
                 try:
                     entry = self.artifact_commit_spool.load(path)
                 except InvalidCommandEnvelopeError as exc:
-                    self._quarantine_artifact_commit(
+                    quarantined = self._quarantine_artifact_commit(
                         exc.file_identity or path,
                         reason=f"invalid_artifact_commit:{exc}",
                     )
-                    artifact_commits_quarantined += 1
+                    artifact_commits_quarantined += int(quarantined)
+                    artifact_commit_quarantine_failures += int(not quarantined)
                     continue
                 _lease, verification_now = self._mutation_context()
                 authority_now = verification_now
@@ -586,11 +593,12 @@ class LabScheduler:
                             now=self.clock(),
                         )
                 except RequestContentConflictError as exc:
-                    self._quarantine_artifact_commit(
+                    quarantined = self._quarantine_artifact_commit(
                         entry,
                         reason=f"artifact_commit_content_conflict:{exc}",
                     )
-                    artifact_commits_quarantined += 1
+                    artifact_commits_quarantined += int(quarantined)
+                    artifact_commit_quarantine_failures += int(not quarantined)
                     continue
                 except BaseException as exc:
                     if receipt is not None:
@@ -599,11 +607,12 @@ class LabScheduler:
                         exc
                     ):
                         raise
-                    self._quarantine_artifact_commit(
+                    quarantined = self._quarantine_artifact_commit(
                         entry,
                         reason=f"artifact_verification_failed:{_safe_error_message(exc)}",
                     )
-                    artifact_commits_quarantined += 1
+                    artifact_commits_quarantined += int(quarantined)
+                    artifact_commit_quarantine_failures += int(not quarantined)
                     continue
                 assert receipt is not None
                 self._after_artifact_commit_sqlite_commit(entry)
@@ -696,6 +705,7 @@ class LabScheduler:
             artifact_commits_accepted=artifact_commits_accepted,
             artifact_commits_rejected=artifact_commits_rejected,
             artifact_commits_quarantined=artifact_commits_quarantined,
+            artifact_commit_quarantine_failures=artifact_commit_quarantine_failures,
             deadlines_expired=deadlines_expired,
             plans_created=plans_created,
             plans_failed=plans_failed,
@@ -740,6 +750,7 @@ class LabScheduler:
                 "reports_quarantined": result.reports_quarantined,
                 "artifact_commits_rejected": result.artifact_commits_rejected,
                 "artifact_commits_quarantined": result.artifact_commits_quarantined,
+                "artifact_commit_quarantine_failures": (result.artifact_commit_quarantine_failures),
                 "plans_failed": result.plans_failed,
                 "claim_delivery_failures": result.claim_delivery_failures,
                 "claim_reconcile_failures": result.claim_reconcile_failures,

@@ -1789,6 +1789,30 @@ def test_bad_pending_inode_does_not_block_later_valid_artifact_commit(
     assert spool.pending() == ()
 
 
+def test_hardlinked_pending_does_not_starve_valid_commit_at_tick_limit_one(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.max_artifact_commits_per_tick = 1
+    external = tmp_path / "external-hardlink.json"
+    external.write_text("external evidence", encoding="utf-8")
+    bad = spool.pending_dir / f"00000000000000000000-{uuid4()}.json"
+    os.link(external, bad)
+
+    tick = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commit_quarantine_failures == 0
+    assert tick.artifact_commits_accepted == 1
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+    assert not os.path.lexists(bad)
+    assert external.read_text(encoding="utf-8") == "external evidence"
+    assert external.stat().st_nlink == 1
+
+
 def test_artifact_quarantine_failure_does_not_block_later_valid_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1815,7 +1839,8 @@ def test_artifact_quarantine_failure_does_not_block_later_valid_commit(
     tick = scheduler.run_once()
 
     completed = LabJobReader(store.path).get_job(job.job_id)
-    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commits_quarantined == 0
+    assert tick.artifact_commit_quarantine_failures == 1
     assert tick.artifact_commits_accepted == 1
     assert completed is not None and completed.result_state is LabResultState.SEALED
     assert bad.exists()

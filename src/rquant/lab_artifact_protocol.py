@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -136,14 +137,70 @@ class LabQuarantinedArtifactCommit(LabArtifactCommitProtocolModel):
     reason: str = Field(min_length=1)
 
 
-class LabArtifactCommitSpool(LabCommandSpool):
-    """Atomic commit inbox; conflict evidence defaults to 256 pairs or 64 MiB.
+class LabArtifactConflictEvidence(LabArtifactCommitProtocolModel):
+    schema_version: Literal[1] = 1
+    state: Literal["complete"] = "complete"
+    request_id: UUID
+    content_hash: str = Field(pattern=_HASH_PATTERN)
+    reason_hash: str = Field(pattern=r"^[0-9a-f]{16}$")
+    reason: str = Field(min_length=1)
+    envelope: LabArtifactCommitEnvelope
 
-    Cleanup removes only validated conflict pairs, oldest first. A single newest
-    pair is retained even when it alone exceeds the byte budget.
+    @model_validator(mode="after")
+    def validate_identity(self) -> LabArtifactConflictEvidence:
+        if self.request_id != self.envelope.request_id:
+            raise ValueError("conflict evidence request_id mismatch")
+        if self.content_hash != self.envelope.content_hash:
+            raise ValueError("conflict evidence content_hash mismatch")
+        expected_reason_hash = hashlib.sha256(self.reason.encode("utf-8")).hexdigest()[:16]
+        if self.reason_hash != expected_reason_hash:
+            raise ValueError("conflict evidence reason_hash mismatch")
+        return self
+
+    @classmethod
+    def from_conflict(
+        cls,
+        envelope: LabArtifactCommitEnvelope,
+        *,
+        reason: str,
+    ) -> LabArtifactConflictEvidence:
+        return cls(
+            request_id=envelope.request_id,
+            content_hash=envelope.content_hash,
+            reason_hash=hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16],
+            reason=reason,
+            envelope=envelope,
+        )
+
+
+@dataclass(frozen=True)
+class _ConflictEvidenceRecord:
+    modified_at_ns: int
+    name: str
+    size: int
+    files: tuple[tuple[Path, os.stat_result], ...]
+
+
+class LabArtifactCommitSpool(LabCommandSpool):
+    """Atomic commit inbox; conflict evidence defaults to 256 bundles or 64 MiB.
+
+    Cleanup removes only validated complete or owned-incomplete records, oldest
+    first. A single newest record survives even when it exceeds the byte budget.
     """
 
     _CONFLICT_NAME = re.compile(
+        r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})\."
+        r"(?P<content_hash>[0-9a-f]{64})\."
+        r"(?P<reason_hash>[0-9a-f]{16})\.conflict\.evidence\.json"
+    )
+    _CONFLICT_TEMP_NAME = re.compile(
+        r"\.(?P<target>"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\."
+        r"[0-9a-f]{64}\.[0-9a-f]{16}\.conflict\.evidence\.json"
+        r")\.publishing\.tmp"
+    )
+    _LEGACY_CONFLICT_NAME = re.compile(
         r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
         r"[0-9a-f]{4}-[0-9a-f]{12})\."
         r"(?P<content_hash>[0-9a-f]{64})\."
@@ -164,6 +221,120 @@ class LabArtifactCommitSpool(LabCommandSpool):
         super().__init__(root)
         self.max_conflict_records = max_conflict_records
         self.max_conflict_bytes = max_conflict_bytes
+        with self._exclusive_lock():
+            self._recover_conflict_evidence_locked()
+            self._prune_conflicts_locked()
+
+    @staticmethod
+    def _after_conflict_evidence_stage(
+        _stage: Literal["temporary_written", "target_linked", "temporary_unlinked"],
+        _path: Path,
+    ) -> None:
+        """Fault-injection boundary for atomic conflict evidence publication."""
+
+    def _conflict_evidence_path(self, evidence: LabArtifactConflictEvidence) -> Path:
+        return self.quarantine_dir / (
+            f"{evidence.request_id}.{evidence.content_hash}.{evidence.reason_hash}."
+            "conflict.evidence.json"
+        )
+
+    def _conflict_temporary_path(self, evidence: LabArtifactConflictEvidence) -> Path:
+        target = self._conflict_evidence_path(evidence)
+        return self.quarantine_dir / f".{target.name}.publishing.tmp"
+
+    @classmethod
+    def _evidence_matches_name(
+        cls,
+        evidence: LabArtifactConflictEvidence,
+        name: str,
+    ) -> bool:
+        match = cls._CONFLICT_NAME.fullmatch(name)
+        return match is not None and (
+            str(evidence.request_id),
+            evidence.content_hash,
+            evidence.reason_hash,
+        ) == (
+            match["request_id"],
+            match["content_hash"],
+            match["reason_hash"],
+        )
+
+    def _load_conflict_evidence_file(
+        self,
+        path: Path,
+        *,
+        allowed_link_counts: frozenset[int] = frozenset({1}),
+    ) -> tuple[LabArtifactConflictEvidence, bytes, os.stat_result]:
+        _candidate, payload, file_stat = self._read_regular_child(
+            path,
+            self.quarantine_dir,
+            allowed_link_counts=allowed_link_counts,
+        )
+        evidence = LabArtifactConflictEvidence.model_validate_json(payload)
+        return evidence, payload, file_stat
+
+    def _publish_conflict_evidence_locked(
+        self,
+        evidence: LabArtifactConflictEvidence,
+    ) -> None:
+        self._recover_conflict_evidence_locked()
+        target = self._conflict_evidence_path(evidence)
+        payload = evidence.model_dump_json().encode("utf-8")
+        if os.path.lexists(target):
+            existing, existing_payload, _file_stat = self._load_conflict_evidence_file(target)
+            if existing != evidence or existing_payload != payload:
+                raise InvalidCommandEnvelopeError(
+                    "artifact conflict evidence target has different content"
+                )
+            return
+
+        temporary = self._conflict_temporary_path(evidence)
+        if os.path.lexists(temporary):
+            self._recover_conflict_evidence_locked()
+            if os.path.lexists(target):
+                existing, existing_payload, _file_stat = self._load_conflict_evidence_file(target)
+                if existing == evidence and existing_payload == payload:
+                    return
+            raise InvalidCommandEnvelopeError(
+                "artifact conflict evidence temporary cannot be recovered"
+            )
+
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._fsync_directory(self.quarantine_dir)
+        self._after_conflict_evidence_stage("temporary_written", temporary)
+
+        directory_fd = os.open(
+            self.quarantine_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.link(
+                temporary.name,
+                target.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        self._after_conflict_evidence_stage("target_linked", target)
+
+        temporary_stat = temporary.lstat()
+        self._unlink_regular_identity(
+            temporary,
+            temporary_stat,
+            allowed_link_counts=frozenset({2}),
+        )
+        self._after_conflict_evidence_stage("temporary_unlinked", target)
+        completed, completed_payload, _file_stat = self._load_conflict_evidence_file(target)
+        if completed != evidence or completed_payload != payload:
+            raise InvalidCommandEnvelopeError(
+                "artifact conflict evidence changed during publication"
+            )
 
     def _quarantine_conflicting_publish_locked(
         self,
@@ -171,39 +342,17 @@ class LabArtifactCommitSpool(LabCommandSpool):
         *,
         reason: str,
     ) -> None:
-        reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
-        target = self.quarantine_dir / (
-            f"{envelope.request_id}.{envelope.content_hash}.{reason_hash}.conflict.bad"
-        )
-        payload = envelope.model_dump_json().encode("utf-8")
-        if not self._publish_no_clobber(target, payload):
-            _candidate, existing_payload, _file_stat = self._read_regular_child(
-                target,
-                self.quarantine_dir,
-            )
-            if existing_payload != payload:
-                raise InvalidCommandEnvelopeError(
-                    "artifact conflict quarantine target has different content"
-                )
-        record = LabQuarantinedArtifactCommit(path=target, reason=reason)
-        metadata = self.quarantine_dir / f"{target.name}.json"
-        metadata_payload = record.model_dump_json().encode("utf-8")
-        if not self._publish_no_clobber(
-            metadata,
-            metadata_payload,
-        ):
-            _candidate, existing_metadata, _file_stat = self._read_regular_child(
-                metadata,
-                self.quarantine_dir,
-            )
-            if existing_metadata != metadata_payload:
-                raise InvalidCommandEnvelopeError(
-                    "artifact conflict metadata has different content"
-                )
+        evidence = LabArtifactConflictEvidence.from_conflict(envelope, reason=reason)
+        self._publish_conflict_evidence_locked(evidence)
         self._prune_conflicts_locked()
 
     @staticmethod
-    def _unlink_regular_identity(path: Path, observed: os.stat_result) -> None:
+    def _unlink_regular_identity(
+        path: Path,
+        observed: os.stat_result,
+        *,
+        allowed_link_counts: frozenset[int] = frozenset({1}),
+    ) -> None:
         directory_fd = os.open(
             path.parent,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
@@ -215,7 +364,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 return
             if (
                 not stat.S_ISREG(current.st_mode)
-                or current.st_nlink != 1
+                or current.st_nlink not in allowed_link_counts
                 or current.st_dev != observed.st_dev
                 or current.st_ino != observed.st_ino
             ):
@@ -227,54 +376,200 @@ class LabArtifactCommitSpool(LabCommandSpool):
         finally:
             os.close(directory_fd)
 
-    def _prune_conflicts_locked(self) -> None:
-        records: list[tuple[int, str, int, Path, os.stat_result, Path, os.stat_result]] = []
-        for payload_path in self.quarantine_dir.glob("*.conflict.bad"):
-            name_match = self._CONFLICT_NAME.fullmatch(payload_path.name)
-            if name_match is None:
+    def _recover_conflict_evidence_locked(self) -> None:
+        for temporary in sorted(self.quarantine_dir.glob(".*.publishing.tmp")):
+            match = self._CONFLICT_TEMP_NAME.fullmatch(temporary.name)
+            if match is None:
                 continue
-            metadata_path = self.quarantine_dir / f"{payload_path.name}.json"
             try:
-                _payload, payload_bytes, payload_stat = self._read_regular_child(
+                evidence, payload, temporary_stat = self._load_conflict_evidence_file(
+                    temporary,
+                    allowed_link_counts=frozenset({1, 2}),
+                )
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            target = self._conflict_evidence_path(evidence)
+            if temporary.name != f".{target.name}.publishing.tmp":
+                continue
+            if not os.path.lexists(target):
+                if temporary_stat.st_nlink != 1:
+                    continue
+                directory_fd = os.open(
+                    self.quarantine_dir,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.link(
+                        temporary.name,
+                        target.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            try:
+                target_evidence, target_payload, _target_stat = self._load_conflict_evidence_file(
+                    target,
+                    allowed_link_counts=frozenset({1, 2}),
+                )
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            if target_evidence != evidence or target_payload != payload:
+                continue
+            self._unlink_regular_identity(
+                temporary,
+                temporary_stat,
+                allowed_link_counts=frozenset({1, 2}),
+            )
+
+    def _new_conflict_records_locked(self) -> list[_ConflictEvidenceRecord]:
+        records: list[_ConflictEvidenceRecord] = []
+        for path in self.quarantine_dir.glob("*.conflict.evidence.json"):
+            try:
+                evidence, _payload, file_stat = self._load_conflict_evidence_file(path)
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            if not self._evidence_matches_name(evidence, path.name):
+                continue
+            records.append(
+                _ConflictEvidenceRecord(
+                    modified_at_ns=file_stat.st_mtime_ns,
+                    name=path.name,
+                    size=file_stat.st_size,
+                    files=((path, file_stat),),
+                )
+            )
+        for path in self.quarantine_dir.glob(".*.publishing.tmp"):
+            if self._CONFLICT_TEMP_NAME.fullmatch(path.name) is None:
+                continue
+            try:
+                evidence, _payload, file_stat = self._load_conflict_evidence_file(
+                    path,
+                    allowed_link_counts=frozenset({1, 2}),
+                )
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            if path != self._conflict_temporary_path(evidence):
+                continue
+            records.append(
+                _ConflictEvidenceRecord(
+                    modified_at_ns=file_stat.st_mtime_ns,
+                    name=path.name,
+                    size=file_stat.st_size,
+                    files=((path, file_stat),),
+                )
+            )
+        return records
+
+    def _legacy_conflict_records_locked(self) -> list[_ConflictEvidenceRecord]:
+        records: list[_ConflictEvidenceRecord] = []
+        seen_metadata: set[Path] = set()
+        for payload_path in self.quarantine_dir.glob("*.conflict.bad"):
+            match = self._LEGACY_CONFLICT_NAME.fullmatch(payload_path.name)
+            if match is None:
+                continue
+            try:
+                _payload, payload, payload_stat = self._read_regular_child(
                     payload_path,
                     self.quarantine_dir,
                 )
-                _metadata, metadata_bytes, metadata_stat = self._read_regular_child(
+                envelope = LabArtifactCommitEnvelope.model_validate_json(payload)
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            if (str(envelope.request_id), envelope.content_hash) != (
+                match["request_id"],
+                match["content_hash"],
+            ):
+                continue
+            files: list[tuple[Path, os.stat_result]] = [(payload_path, payload_stat)]
+            metadata_path = Path(f"{payload_path}.json")
+            if os.path.lexists(metadata_path):
+                try:
+                    _metadata, metadata, metadata_stat = self._read_regular_child(
+                        metadata_path,
+                        self.quarantine_dir,
+                    )
+                    record = LabQuarantinedArtifactCommit.model_validate_json(metadata)
+                    if (
+                        record.path == payload_path
+                        and hashlib.sha256(record.reason.encode("utf-8")).hexdigest()[:16]
+                        == match["reason_hash"]
+                    ):
+                        files.insert(0, (metadata_path, metadata_stat))
+                        seen_metadata.add(metadata_path)
+                except (InvalidCommandEnvelopeError, ValueError):
+                    pass
+            records.append(
+                _ConflictEvidenceRecord(
+                    modified_at_ns=max(item[1].st_mtime_ns for item in files),
+                    name=payload_path.name,
+                    size=sum(item[1].st_size for item in files),
+                    files=tuple(files),
+                )
+            )
+        for metadata_path in self.quarantine_dir.glob("*.conflict.bad.json"):
+            if metadata_path in seen_metadata:
+                continue
+            payload_path = Path(str(metadata_path)[: -len(".json")])
+            match = self._LEGACY_CONFLICT_NAME.fullmatch(payload_path.name)
+            if match is None:
+                continue
+            try:
+                _metadata, metadata, metadata_stat = self._read_regular_child(
                     metadata_path,
                     self.quarantine_dir,
                 )
-                envelope = LabArtifactCommitEnvelope.model_validate_json(payload_bytes)
-                evidence = LabQuarantinedArtifactCommit.model_validate_json(metadata_bytes)
+                record = LabQuarantinedArtifactCommit.model_validate_json(metadata)
             except (InvalidCommandEnvelopeError, ValueError):
                 continue
             if (
-                str(envelope.request_id) != name_match["request_id"]
-                or envelope.content_hash != name_match["content_hash"]
-                or evidence.path != payload_path
-                or hashlib.sha256(evidence.reason.encode("utf-8")).hexdigest()[:16]
-                != name_match["reason_hash"]
+                record.path != payload_path
+                or hashlib.sha256(record.reason.encode("utf-8")).hexdigest()[:16]
+                != match["reason_hash"]
             ):
                 continue
             records.append(
-                (
-                    max(payload_stat.st_mtime_ns, metadata_stat.st_mtime_ns),
-                    payload_path.name,
-                    payload_stat.st_size + metadata_stat.st_size,
-                    payload_path,
-                    payload_stat,
-                    metadata_path,
-                    metadata_stat,
+                _ConflictEvidenceRecord(
+                    modified_at_ns=metadata_stat.st_mtime_ns,
+                    name=metadata_path.name,
+                    size=metadata_stat.st_size,
+                    files=((metadata_path, metadata_stat),),
                 )
             )
-        records.sort(key=lambda record: (record[0], record[1]))
-        total_bytes = sum(record[2] for record in records)
+        return records
+
+    def _prune_conflicts_locked(self) -> None:
+        self._recover_conflict_evidence_locked()
+        records = self._new_conflict_records_locked() + self._legacy_conflict_records_locked()
+        records.sort(key=lambda record: (record.modified_at_ns, record.name))
+        total_bytes = sum(record.size for record in records)
         while len(records) > self.max_conflict_records or (
             total_bytes > self.max_conflict_bytes and len(records) > 1
         ):
             record = records.pop(0)
-            total_bytes -= record[2]
-            self._unlink_regular_identity(record[5], record[6])
-            self._unlink_regular_identity(record[3], record[4])
+            total_bytes -= record.size
+            for path, file_stat in record.files:
+                self._unlink_regular_identity(
+                    path,
+                    file_stat,
+                    allowed_link_counts=frozenset({1, 2}),
+                )
+
+    def conflict_evidence(self) -> tuple[LabArtifactConflictEvidence, ...]:
+        with self._exclusive_lock():
+            self._recover_conflict_evidence_locked()
+            self._prune_conflicts_locked()
+            evidence: list[LabArtifactConflictEvidence] = []
+            for path in sorted(self.quarantine_dir.glob("*.conflict.evidence.json")):
+                try:
+                    item, _payload, _file_stat = self._load_conflict_evidence_file(path)
+                except (InvalidCommandEnvelopeError, ValueError):
+                    continue
+                if self._evidence_matches_name(item, path.name):
+                    evidence.append(item)
+            return tuple(evidence)
 
     def publish(
         self,
