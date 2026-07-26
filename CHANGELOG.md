@@ -50,14 +50,17 @@
 
 ### Fixed
 
-- **Strategy Lab finalizer 权威重放与资源边界**：artifact ACK 现在必须与 SQLite 权威
-  commit envelope/receipt 精确交叉核验；可信 pending/ACK/ledger 可跳过 shard 重读与
-  Parquet 重序列化，无 durable commit 证据的 sealed artifact 仍执行完整聚合。accepted
-  shard reader 新增可配置的 manifest、文件、bundle、行列、Parquet 解压与 DataFrame 内存
-  上限，在分配或解压前完成文件身份、声明尺寸和 metadata 检查，并保留主错误与
-  close/rollback 错误。artifact preview 不再持 lifecycle lock；sealed 快路会重试隔离精确
-  匹配的冗余 candidate，同时保留冲突证据；Markdown 报告的动态内容统一编码为确定性的
-  缩进 canonical JSON。
+- **Strategy Lab finalizer 权威重放与资源边界**：fast replay 只信任 SQLite 已入账且与
+  sealed commit 精确一致的 envelope/receipt，spool pending 不再充当权威证据；未入账
+  pending 必须重读 shard、聚合和 preview，伪 sealed 冲突会隔离对应 pending，不能被后续
+  scheduler 接受。finalizer 强制注入并核对 40 位 runtime code SHA，独立写入确定性
+  metrics/report。accepted shard 先校验 Parquet metadata，再受限读入 Arrow table，并在转
+  pandas 前按字符串、字典和对象开销做保守估算；单 shard 与整 job 的压缩量、声明解压量、
+  Arrow/DataFrame 内存、行数、聚合结果及最终 artifact payload 均有 typed 可配置预算，
+  Parquet 序列化通过有界缓冲区在写入时停止。preview 使用独立轻量 activity 计数，close
+  等待在途 preview 而不阻塞 recovery/list；ACK 查询显式关闭 readonly SQLite connection，
+  并同时保留查询、rollback 与 close 错误。sealed 快路仍会收敛精确匹配的冗余 candidate，
+  冲突证据保持可审计；Markdown 动态内容继续使用确定性的缩进 canonical JSON。
 
 - **Strategy Lab finalizer 确定性预览与 ready 结果语义**：artifact store 新增零写入的 typed
   plan，一次生成 exact canonical payload/manifest，`prepare_candidate` 与 finalizer 共同消费

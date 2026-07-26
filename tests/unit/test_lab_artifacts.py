@@ -35,6 +35,7 @@ from rquant.lab_artifacts import (
     LabArtifactIndexEvidence,
     LabArtifactIntegrityError,
     LabArtifactPathError,
+    LabArtifactPayloadBudget,
     LabArtifactPlatformError,
     LabArtifactRecoveryAuthority,
     LabArtifactRecoveryRecord,
@@ -341,15 +342,65 @@ def test_preview_candidate_is_readonly_and_prepare_materializes_the_exact_plan(
 
     first = store.preview_candidate(**arguments)  # type: ignore[arg-type]
     second = store.preview_candidate(**arguments)  # type: ignore[arg-type]
+    budgeted = store.preview_candidate(
+        **arguments,  # type: ignore[arg-type]
+        payload_budget=LabArtifactPayloadBudget(
+            max_single_payload_bytes=16 * 1024 * 1024,
+            max_total_payload_bytes=32 * 1024 * 1024,
+            max_table_count=8,
+        ),
+    )
 
     assert isinstance(first, LabJobArtifactPlan)
-    assert second == first
+    assert budgeted == second == first
     assert _artifact_namespace_identity(store) == namespaces_before
     candidate = store.prepare_candidate(**arguments)  # type: ignore[arg-type]
     assert candidate.manifest == first.manifest
     assert candidate.manifest_hash == first.manifest_hash
     for planned in first.payloads:
         assert (candidate.path / planned.relative_path).read_bytes() == planned.payload
+
+
+def test_preview_candidate_stops_parquet_serialization_at_payload_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    arguments = _prepare_arguments()
+    arguments["tables"] = {"trades": pd.DataFrame([{"value": 1}])}
+    getvalue_called = False
+
+    def amplified_to_parquet(
+        _frame: pd.DataFrame,
+        output: object,
+        *,
+        index: bool,
+    ) -> None:
+        assert index is False
+        output.write(b"x" * 2048)  # type: ignore[attr-defined]
+
+    original_getvalue = lab_artifacts_module._BoundedBytesIO.getvalue
+
+    def count_getvalue(buffer: object) -> bytes:
+        nonlocal getvalue_called
+        getvalue_called = True
+        return original_getvalue(buffer)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", amplified_to_parquet)
+    monkeypatch.setattr(lab_artifacts_module._BoundedBytesIO, "getvalue", count_getvalue)
+
+    with pytest.raises(LabArtifactIntegrityError, match="payload byte budget"):
+        store.preview_candidate(
+            **arguments,  # type: ignore[arg-type]
+            payload_budget=LabArtifactPayloadBudget(
+                max_single_payload_bytes=1024,
+                max_total_payload_bytes=64 * 1024,
+                max_table_count=1,
+            ),
+        )
+
+    assert getvalue_called is False
+    assert _artifact_namespace_identity(store)["candidates"] == ()
 
 
 def test_blocked_preview_serialization_does_not_hold_artifact_lifecycle_lock(
@@ -363,11 +414,20 @@ def test_blocked_preview_serialization_does_not_hold_artifact_lifecycle_lock(
     errors: list[BaseException] = []
     original = store._serialize_parquet
 
-    def blocked(table_name: str, frame: pd.DataFrame) -> object:
+    def blocked(
+        table_name: str,
+        frame: pd.DataFrame,
+        *,
+        max_payload_bytes: int | None = None,
+    ) -> object:
         entered.set()
         if not release.wait(timeout=5):
             raise TimeoutError("preview serializer was not released")
-        return original(table_name, frame)
+        return original(
+            table_name,
+            frame,
+            max_payload_bytes=max_payload_bytes,
+        )
 
     def preview() -> None:
         try:
@@ -404,6 +464,86 @@ def test_blocked_preview_serialization_does_not_hold_artifact_lifecycle_lock(
         "seal-intents": (),
         "seal-intents-quarantine": (),
     }
+
+
+def test_store_close_waits_for_preview_without_blocking_recovery_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    entered = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    listed = threading.Event()
+    errors: list[BaseException] = []
+    original = store._serialize_parquet
+
+    def blocked(
+        table_name: str,
+        frame: pd.DataFrame,
+        *,
+        max_payload_bytes: int | None = None,
+    ) -> object:
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("preview serializer was not released")
+        return original(
+            table_name,
+            frame,
+            max_payload_bytes=max_payload_bytes,
+        )
+
+    def preview() -> None:
+        try:
+            store.preview_candidate(**_prepare_arguments())  # type: ignore[arg-type]
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close() -> None:
+        close_started.set()
+        try:
+            store.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_finished.set()
+
+    def list_recovery() -> None:
+        try:
+            store.list_candidate_recovery()
+            listed.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(store, "_serialize_parquet", blocked)
+    preview_thread = threading.Thread(target=preview)
+    close_thread = threading.Thread(target=close)
+    list_thread = threading.Thread(target=list_recovery)
+    preview_thread.start()
+    assert entered.wait(timeout=2)
+    list_thread.start()
+    assert listed.wait(timeout=1), "preview activity blocked readonly recovery inspection"
+    close_thread.start()
+    assert close_started.wait(timeout=1)
+    deadline = time.monotonic() + 2
+    while not getattr(store, "_closing", False) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert store._closing is True
+    assert close_finished.is_set() is False
+    with pytest.raises(LabArtifactIntegrityError, match="closing|closed"):
+        store.preview_candidate(**_prepare_arguments())  # type: ignore[arg-type]
+
+    release.set()
+    preview_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+    list_thread.join(timeout=5)
+
+    assert not preview_thread.is_alive() and not close_thread.is_alive()
+    assert errors == []
+    assert close_finished.is_set() is True
+    with pytest.raises(LabArtifactIntegrityError, match="closed"):
+        store.preview_candidate(**_prepare_arguments())  # type: ignore[arg-type]
 
 
 def test_prepare_rejects_hex_traversal_job_id_before_any_filesystem_write(

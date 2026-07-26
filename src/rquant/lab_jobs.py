@@ -3638,70 +3638,96 @@ class LabJobReader:
         return _worker_report_record_from_row(row, expected_report_id=report_id)
 
     def get_artifact_commit(self, request_id: UUID) -> LabArtifactCommitRecord | None:
-        with self._connect() as connection:
+        connection = self._connect()
+        lifecycle_errors: list[BaseException] = []
+        result: LabArtifactCommitRecord | None = None
+        try:
+            connection.execute("BEGIN")
             row = connection.execute(
                 "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
                 (str(request_id),),
             ).fetchone()
-            if row is None:
-                return None
-            record = _artifact_commit_record_from_row(
-                row,
-                expected_request_id=request_id,
-            )
-            if record.receipt.status != "accepted":
-                return record
-            job_row = connection.execute(
-                "SELECT * FROM lab_job WHERE job_id = ?",
-                (str(record.receipt.job_id),),
-            ).fetchone()
-            if job_row is None:
-                raise InvalidStoredJobError("accepted artifact commit lost its job")
-            job = self._job_from_row(job_row)
-            evidence = self._validate_complete_result_graph(connection, job)
-            if evidence is None:
-                raise InvalidStoredJobError("accepted artifact commit lost its result index")
-            index_row = connection.execute(
-                "SELECT commit_request_id FROM lab_job_result_artifact WHERE job_id = ?",
-                (str(job.job_id),),
-            ).fetchone()
-            assert index_row is not None
-            primary_request_id = _canonical_uuid_text(
-                index_row["commit_request_id"],
-                field="lab_job_result_artifact.commit_request_id",
-            )
-            commit = record.envelope.commit
-            shard_identity = {
-                (str(shard[0]), str(shard[1]), str(shard[2]))
-                for shard in connection.execute(
-                    """
-                    SELECT plan_hash, adapter_id, adapter_version
-                    FROM lab_shard WHERE job_id = ?
-                    """,
-                    (str(job.job_id),),
-                ).fetchall()
-            }
-            if (
-                record.receipt.reason not in {"artifact_committed", "artifact_already_committed"}
-                or record.receipt.job_version != job.version
-                or (
-                    record.receipt.reason == "artifact_committed"
-                    and request_id != primary_request_id
+            if row is not None:
+                result = _artifact_commit_record_from_row(
+                    row,
+                    expected_request_id=request_id,
                 )
-                or commit.job_id != job.job_id
-                or commit.spec_hash != job.spec_hash
-                or commit.code_sha != job.spec.code_sha
-                or commit.dataset_snapshot != job.spec.dataset_snapshot
-                or commit.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
-                or commit.sealed_path != evidence.sealed_path
-                or commit.manifest_hash != evidence.manifest_hash
-                or commit.complete_result_hash != evidence.complete_result_hash
-                or shard_identity != {(commit.plan_hash, commit.adapter_id, commit.adapter_version)}
-            ):
-                raise InvalidStoredJobError(
-                    "accepted artifact commit conflicts with the sealed result graph"
+                if result.receipt.status == "accepted":
+                    job_row = connection.execute(
+                        "SELECT * FROM lab_job WHERE job_id = ?",
+                        (str(result.receipt.job_id),),
+                    ).fetchone()
+                    if job_row is None:
+                        raise InvalidStoredJobError("accepted artifact commit lost its job")
+                    job = self._job_from_row(job_row)
+                    evidence = self._validate_complete_result_graph(connection, job)
+                    if evidence is None:
+                        raise InvalidStoredJobError(
+                            "accepted artifact commit lost its result index"
+                        )
+                    index_row = connection.execute(
+                        "SELECT commit_request_id FROM lab_job_result_artifact WHERE job_id = ?",
+                        (str(job.job_id),),
+                    ).fetchone()
+                    assert index_row is not None
+                    primary_request_id = _canonical_uuid_text(
+                        index_row["commit_request_id"],
+                        field="lab_job_result_artifact.commit_request_id",
+                    )
+                    commit = result.envelope.commit
+                    shard_identity = {
+                        (str(shard[0]), str(shard[1]), str(shard[2]))
+                        for shard in connection.execute(
+                            """
+                            SELECT plan_hash, adapter_id, adapter_version
+                            FROM lab_shard WHERE job_id = ?
+                            """,
+                            (str(job.job_id),),
+                        ).fetchall()
+                    }
+                    if (
+                        result.receipt.reason
+                        not in {"artifact_committed", "artifact_already_committed"}
+                        or result.receipt.job_version != job.version
+                        or (
+                            result.receipt.reason == "artifact_committed"
+                            and request_id != primary_request_id
+                        )
+                        or commit.job_id != job.job_id
+                        or commit.spec_hash != job.spec_hash
+                        or commit.code_sha != job.spec.code_sha
+                        or commit.dataset_snapshot != job.spec.dataset_snapshot
+                        or commit.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+                        or commit.sealed_path != evidence.sealed_path
+                        or commit.manifest_hash != evidence.manifest_hash
+                        or commit.complete_result_hash != evidence.complete_result_hash
+                        or shard_identity
+                        != {(commit.plan_hash, commit.adapter_id, commit.adapter_version)}
+                    ):
+                        raise InvalidStoredJobError(
+                            "accepted artifact commit conflicts with the sealed result graph"
+                        )
+            connection.execute("COMMIT")
+            return result
+        except BaseException as exc:
+            lifecycle_errors.append(exc)
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except BaseException as rollback_error:
+                    lifecycle_errors.append(rollback_error)
+        finally:
+            try:
+                connection.close()
+            except BaseException as close_error:
+                lifecycle_errors.append(close_error)
+            if len(lifecycle_errors) == 1:
+                raise lifecycle_errors[0]
+            if lifecycle_errors:
+                raise BaseExceptionGroup(
+                    "artifact commit query and cleanup failed",
+                    lifecycle_errors,
                 )
-            return record
 
     def get_result_artifact(self, job_id: UUID) -> LabArtifactIndexEvidence | None:
         with self._connect() as connection:

@@ -153,6 +153,49 @@ class _FinalizationSnapshotFaultConnection:
             raise self.close_error
 
 
+class _ArtifactCommitFaultConnection:
+    def __init__(
+        self,
+        *,
+        query_error: BaseException | None = None,
+        rollback_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.query_error = query_error
+        self.rollback_error = rollback_error
+        self.close_error = close_error
+        self.in_transaction = False
+        self.calls: list[str] = []
+
+    def execute(self, statement: str, _parameters: object = ()) -> object:
+        normalized = " ".join(statement.split())
+        if normalized == "BEGIN":
+            self.calls.append("begin")
+            self.in_transaction = True
+            return _FinalizationSnapshotFaultCursor(None)
+        if normalized.startswith("SELECT * FROM lab_artifact_commit"):
+            self.calls.append("query")
+            if self.query_error is not None:
+                raise self.query_error
+            return _FinalizationSnapshotFaultCursor(None)
+        if normalized == "COMMIT":
+            self.calls.append("commit")
+            self.in_transaction = False
+            return _FinalizationSnapshotFaultCursor(None)
+        raise AssertionError(f"unexpected SQL: {normalized}")
+
+    def rollback(self) -> None:
+        self.calls.append("rollback")
+        if self.rollback_error is not None:
+            raise self.rollback_error
+        self.in_transaction = False
+
+    def close(self) -> None:
+        self.calls.append("close")
+        if self.close_error is not None:
+            raise self.close_error
+
+
 def _staged_receipt() -> LabArtifactCommitReceipt:
     return LabArtifactCommitReceipt(
         request_id=uuid4(),
@@ -413,6 +456,50 @@ def test_finalization_snapshot_reports_close_error_after_successful_missing_read
         reader.get_finalization_snapshot(uuid4())
 
     assert connection.calls == ["begin", "query", "commit", "close"]
+
+
+def test_artifact_commit_read_preserves_query_rollback_and_close_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ArtifactCommitFaultConnection(
+        query_error=OSError("artifact commit query failed"),
+        rollback_error=OSError("artifact commit rollback failed"),
+        close_error=OSError("artifact commit close failed"),
+    )
+    reader = LabJobReader(tmp_path / "lab.sqlite3")
+    monkeypatch.setattr(reader, "_connect", lambda: connection)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        reader.get_artifact_commit(uuid4())
+
+    assert connection.calls == ["begin", "query", "rollback", "close"]
+    assert _flatten_exception_messages(raised.value) == (
+        "artifact commit query failed",
+        "artifact commit rollback failed",
+        "artifact commit close failed",
+    )
+
+
+def test_artifact_commit_read_explicitly_closes_after_missing_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[_ArtifactCommitFaultConnection] = []
+    reader = LabJobReader(tmp_path / "lab.sqlite3")
+
+    def connect() -> _ArtifactCommitFaultConnection:
+        connection = _ArtifactCommitFaultConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(reader, "_connect", connect)
+
+    for _ in range(20):
+        assert reader.get_artifact_commit(uuid4()) is None
+
+    assert len(connections) == 20
+    assert all(item.calls == ["begin", "query", "commit", "close"] for item in connections)
 
 
 def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> None:

@@ -10,6 +10,8 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import rquant.lab_finalizer as lab_finalizer_module
@@ -21,8 +23,11 @@ from rquant.lab_artifact_protocol import (
 )
 from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore
 from rquant.lab_finalizer import (
+    LabFinalizationCodeMismatchError,
     LabFinalizationIntegrityError,
+    LabFinalizationResourceLimitError,
     LabFinalizer,
+    LabFinalizerJobLimits,
     LabFinalizerMetrics,
     LabFinalizerResult,
     LabFinalizerShardSummary,
@@ -104,6 +109,7 @@ class _Scenario:
             artifact_store=self.artifact_store,
             commit_spool=self.commit_spool,
             adapter_registry=default_strategy_job_adapter_registry(),
+            runtime_code_sha="1" * 40,
         )
 
 
@@ -495,6 +501,7 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
     report_before = (sealed.path / "report.md").read_bytes()
     metrics = json.loads(metrics_before)
     assert metrics["job_id"] == str(scenario.job_id)
+    assert metrics["finalizer_code_sha"] == "1" * 40
     assert metrics["result_hash"]
     assert metrics["shard_count"] == 2
     assert [item["shard_index"] for item in metrics["shards"]] == [0, 1]
@@ -528,6 +535,7 @@ def test_finalizer_markdown_encodes_all_dynamic_text_as_indented_canonical_json(
         adapter_id="adapter`<unsafe>",
         adapter_version="v1|next\nline",
         result_contract_version="contract`value",
+        finalizer_code_sha="1" * 40,
         result_hash="3" * 64,
         shard_count=1,
         shards=(
@@ -693,25 +701,150 @@ def test_finalizer_rejects_spool_ack_without_authoritative_ledger_commit(
     assert _candidate_evidence_counts(scenario.artifact_store) == (0, 0)
 
 
-def test_pending_commit_fast_replay_skips_shards_aggregate_and_preview(
+def test_pending_commit_without_ledger_runs_full_finalization_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
     first = scenario.finalizer().finalize(scenario.job_id)
     replay = scenario.finalizer()
+    calls = {"read": 0, "aggregate": 0, "preview": 0}
+    original_read = replay.bundle_reader.read
+    original_aggregate = replay.adapter_registry.aggregate_results
+    original_preview = replay.artifact_store.preview_candidate
 
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("fast replay entered expensive finalization")
+    def read(*args: object, **kwargs: object) -> object:
+        calls["read"] += 1
+        return original_read(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(replay.bundle_reader, "read", forbidden)
-    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", forbidden)
-    monkeypatch.setattr(replay.artifact_store, "preview_candidate", forbidden)
+    def aggregate(*args: object, **kwargs: object) -> object:
+        calls["aggregate"] += 1
+        return original_aggregate(*args, **kwargs)  # type: ignore[arg-type]
+
+    def preview(*args: object, **kwargs: object) -> object:
+        calls["preview"] += 1
+        return original_preview(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(replay.bundle_reader, "read", read)
+    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", aggregate)
+    monkeypatch.setattr(replay.artifact_store, "preview_candidate", preview)
 
     second = replay.finalize(scenario.job_id)
 
     assert second.status == "published"
     assert second.request_id == first.request_id
+    assert calls == {"read": 1, "aggregate": 1, "preview": 1}
+
+
+def test_forged_sealed_and_uncommitted_pending_cannot_bypass_aggregation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    reader = LabJobReader(scenario.store.path)
+    snapshot = reader.get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    shard = snapshot.shards[0].shard
+    forged = scenario.artifact_store.seal_candidate(
+        scenario.artifact_store.prepare_candidate(
+            job_id=scenario.job_id,
+            spec=snapshot.job.spec,
+            plan_hash=shard.plan_hash,
+            adapter_id=shard.adapter_id,
+            adapter_version=shard.adapter_version,
+            result_contract_version="p1.4b-complete-result-v1",
+            metrics={"schema_version": 1, "forged": True},
+            report_markdown="# Forged\n",
+            tables={"trades": pd.DataFrame([{"hold_days": 999, "ret_pct": 999.0}])},
+        )
+    )
+    forged_envelope = LabFinalizer._envelope(forged, snapshot.ready_epoch)
+    scenario.commit_spool.publish(forged_envelope)
+    finalizer = scenario.finalizer()
+    calls = {"read": 0, "aggregate": 0, "preview": 0}
+    original_read = finalizer.bundle_reader.read
+    original_aggregate = finalizer.adapter_registry.aggregate_results
+    original_preview = finalizer.artifact_store.preview_candidate
+
+    def read(*args: object, **kwargs: object) -> object:
+        calls["read"] += 1
+        return original_read(*args, **kwargs)  # type: ignore[arg-type]
+
+    def aggregate(*args: object, **kwargs: object) -> object:
+        calls["aggregate"] += 1
+        return original_aggregate(*args, **kwargs)  # type: ignore[arg-type]
+
+    def preview(*args: object, **kwargs: object) -> object:
+        calls["preview"] += 1
+        return original_preview(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(finalizer.bundle_reader, "read", read)
+    monkeypatch.setattr(finalizer.adapter_registry, "aggregate_results", aggregate)
+    monkeypatch.setattr(finalizer.artifact_store, "preview_candidate", preview)
+
+    with pytest.raises(
+        LabFinalizationIntegrityError,
+        match="sealed artifact conflicts|uncommitted artifact commit",
+    ):
+        finalizer.finalize(scenario.job_id)
+
+    scheduler_result = scenario.scheduler.run_once()
+    job = reader.get_job(scenario.job_id)
+    assert calls == {"read": 1, "aggregate": 1, "preview": 1}
+    assert scheduler_result.artifact_commits_accepted == 0
+    assert scenario.commit_spool.pending() == ()
+    assert job is not None and job.result_state is LabResultState.READY
+
+
+def test_runtime_code_sha_mismatch_fails_before_any_finalization_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="2" * 40,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("code mismatch reached finalization I/O")
+
+    monkeypatch.setattr(finalizer.bundle_reader, "read", forbidden)
+    monkeypatch.setattr(finalizer.artifact_store, "verify_sealed", forbidden)
+    monkeypatch.setattr(finalizer.artifact_store, "preview_candidate", forbidden)
+    monkeypatch.setattr(finalizer.commit_spool, "publish", forbidden)
+
+    with pytest.raises(LabFinalizationCodeMismatchError) as raised:
+        finalizer.finalize(scenario.job_id)
+
+    assert raised.value.expected == "1" * 40
+    assert raised.value.actual == "2" * 40
+    assert tuple(scenario.artifact_store.sealed_root.iterdir()) == ()
+    assert scenario.commit_spool.pending() == ()
+
+
+@pytest.mark.parametrize(
+    "runtime_code_sha",
+    ("1" * 39, "1" * 41, "G" * 40, "A" * 40),
+)
+def test_finalizer_requires_strict_runtime_code_sha(
+    tmp_path: Path,
+    runtime_code_sha: str,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+
+    with pytest.raises(ValueError, match="40 lowercase hexadecimal"):
+        LabFinalizer(
+            reader=LabJobReader(scenario.store.path),
+            shard_artifact_root=tmp_path / "artifacts",
+            artifact_store=scenario.artifact_store,
+            commit_spool=scenario.commit_spool,
+            runtime_code_sha=runtime_code_sha,
+        )
 
 
 def test_sealed_without_durable_commit_evidence_rebuilds_before_publish(
@@ -776,6 +909,7 @@ def test_accepted_ack_fast_replay_requires_exact_scheduler_ledger_record(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="1" * 40,
     )
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
@@ -821,6 +955,7 @@ def test_rejected_ack_fast_replay_requires_exact_scheduler_ledger_record(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="1" * 40,
     )
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
@@ -1209,6 +1344,47 @@ def test_scheduler_commit_before_ack_replays_without_duplicate_result(tmp_path: 
     assert scenario.commit_spool.pending() == ()
 
 
+def test_ledger_commit_before_spool_ack_is_authoritative_fast_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, commit_spool_type=_CrashBeforeArtifactAckSpool)
+    published = scenario.finalizer().finalize(scenario.job_id)
+
+    def commit_without_ack() -> None:
+        with pytest.raises(RuntimeError, match="after artifact SQLite commit"):
+            scenario.scheduler.run_once()
+
+    replay = LabFinalizer(
+        reader=_CallbackSnapshotReader(
+            LabJobReader(scenario.store.path),
+            commit_without_ack,
+        ),  # type: ignore[arg-type]
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="1" * 40,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("ledger-authoritative replay entered expensive finalization")
+
+    monkeypatch.setattr(replay.bundle_reader, "read", forbidden)
+    monkeypatch.setattr(replay.adapter_registry, "aggregate_results", forbidden)
+    monkeypatch.setattr(replay.artifact_store, "preview_candidate", forbidden)
+
+    result = replay.finalize(scenario.job_id)
+    ledger = LabJobReader(scenario.store.path).get_artifact_commit(published.request_id)
+
+    assert ledger is not None and ledger.receipt.status == "accepted"
+    assert result.status == "acknowledged"
+    assert result.request_id == published.request_id
+    assert len(scenario.commit_spool.pending()) == 1
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    assert scenario.commit_spool.pending() == ()
+
+
 def test_finalizer_skips_nonready_and_migrated_legacy_jobs(tmp_path: Path) -> None:
     store = LabJobStore(tmp_path / "queued.sqlite3")
     store.initialize()
@@ -1239,6 +1415,7 @@ def test_finalizer_skips_nonready_and_migrated_legacy_jobs(tmp_path: Path) -> No
         shard_artifact_root=tmp_path / "queued-shards",
         artifact_store=LabJobArtifactStore(tmp_path / "queued-artifacts"),
         commit_spool=LabArtifactCommitSpool(tmp_path / "queued-commits"),
+        runtime_code_sha="1" * 40,
     )
     assert finalizer.finalize(queued_id).status == "not_ready"
 
@@ -1250,6 +1427,7 @@ def test_finalizer_skips_nonready_and_migrated_legacy_jobs(tmp_path: Path) -> No
         shard_artifact_root=tmp_path / "legacy-shards",
         artifact_store=LabJobArtifactStore(tmp_path / "legacy-artifacts"),
         commit_spool=LabArtifactCommitSpool(tmp_path / "legacy-commits"),
+        runtime_code_sha="1" * 40,
     )
     assert legacy_finalizer.finalize(legacy_id).status == "not_ready"
     assert legacy_finalizer.commit_spool.pending() == ()
@@ -1262,6 +1440,7 @@ def test_finalizer_skips_nonready_and_migrated_legacy_jobs(tmp_path: Path) -> No
         shard_artifact_root=tmp_path / "failed-shards",
         artifact_store=LabJobArtifactStore(tmp_path / "failed-artifacts"),
         commit_spool=LabArtifactCommitSpool(tmp_path / "failed-commits"),
+        runtime_code_sha="1" * 40,
     )
     assert failed_finalizer.finalize(failed_id).status == "not_ready"
     assert failed_finalizer.commit_spool.pending() == ()
@@ -1441,6 +1620,126 @@ def test_bundle_reader_rejects_parquet_decompression_amplification_before_pandas
         reader.read(accepted)
 
 
+def test_bundle_reader_rejects_dictionary_string_pandas_amplification_before_conversion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0]
+    parquet = attempt / artifact.file_name
+    rows = 20_000
+    table = pa.table(
+        {
+            "hold_days": pa.array(range(rows), type=pa.int64()),
+            "ret_pct": pa.array(["repeated-value"] * rows).dictionary_encode(),
+        }
+    )
+    os.chmod(attempt, 0o700)
+    os.chmod(parquet, 0o600)
+    pq.write_table(table, parquet)
+    payload = parquet.read_bytes()
+    changed_artifact = artifact.model_copy(
+        update={
+            "row_count": rows,
+            "columns": tuple(table.column_names),
+            "file_size": len(payload),
+            "file_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    )
+    changed = LabShardResultManifest.model_validate(
+        manifest.model_copy(update={"artifacts": (changed_artifact,)})
+    )
+    os.chmod(parquet, 0o400)
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+    conversions = 0
+
+    def forbidden(_table: object) -> None:
+        nonlocal conversions
+        conversions += 1
+        raise AssertionError("oversized dictionary table reached pandas conversion")
+
+    reader = LabSealedShardBundleReader(
+        tmp_path / "artifacts",
+        limits=LabShardBundleLimits(
+            max_row_count=rows,
+            max_arrow_table_bytes=2 * 1024 * 1024,
+            max_materialized_dataframe_bytes=512 * 1024,
+        ),
+    )
+    monkeypatch.setattr(reader, "_before_arrow_to_pandas", forbidden)
+
+    with pytest.raises(
+        LabFinalizationIntegrityError,
+        match="estimated pandas.*memory limit",
+    ):
+        reader.read(accepted)
+
+    assert conversions == 0
+
+
+def test_finalizer_rejects_cumulative_shard_budget_before_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1, 2))
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="1" * 40,
+        job_limits=LabFinalizerJobLimits(max_total_shard_rows=1),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("cumulative shard overflow reached aggregate")
+
+    monkeypatch.setattr(finalizer.adapter_registry, "aggregate_results", forbidden)
+
+    with pytest.raises(
+        LabFinalizationResourceLimitError,
+        match="total shard row",
+    ):
+        finalizer.finalize(scenario.job_id)
+
+    assert tuple(scenario.artifact_store.sealed_root.iterdir()) == ()
+    assert scenario.commit_spool.pending() == ()
+
+
+def test_finalizer_applies_final_artifact_payload_budget(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="1" * 40,
+        job_limits=LabFinalizerJobLimits(
+            max_final_artifact_payload_bytes=512,
+            max_final_artifact_single_payload_bytes=512,
+        ),
+    )
+
+    with pytest.raises(
+        LabFinalizationResourceLimitError,
+        match="final artifact payload",
+    ):
+        finalizer.finalize(scenario.job_id)
+
+    assert tuple(scenario.artifact_store.candidates_root.iterdir()) == ()
+    assert scenario.commit_spool.pending() == ()
+
+
 @pytest.mark.parametrize("resource", ["rows", "columns"])
 def test_bundle_reader_rejects_manifest_shape_limits_before_parquet_metadata(
     tmp_path: Path,
@@ -1553,6 +1852,7 @@ def test_finalizer_rejects_cross_shard_dtype_tamper_after_real_bundle_reads(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=default_strategy_job_adapter_registry(),
+        runtime_code_sha="1" * 40,
     )
 
     with pytest.raises(

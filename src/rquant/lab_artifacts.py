@@ -120,6 +120,10 @@ class LabArtifactIntegrityError(LabArtifactError):
     """Artifact bytes, structure, identity, or permissions failed verification."""
 
 
+class LabArtifactPayloadLimitError(LabArtifactIntegrityError):
+    """A pure artifact plan exceeded its caller-supplied in-memory budget."""
+
+
 class LabArtifactConflictError(LabArtifactError):
     """A deterministic artifact identity already contains different content."""
 
@@ -130,6 +134,19 @@ class LabArtifactAuthorizationError(LabArtifactError):
 
 class LabArtifactPlatformError(LabArtifactError):
     """The host cannot provide a required fail-closed filesystem primitive."""
+
+
+class _BoundedBytesIO(io.BytesIO):
+    def __init__(self, *, max_payload_bytes: int) -> None:
+        super().__init__()
+        self._max_payload_bytes = max_payload_bytes
+
+    def write(self, payload: bytes | bytearray | memoryview, /) -> int:
+        current_size = self.getbuffer().nbytes
+        next_size = max(current_size, self.tell() + len(payload))
+        if next_size > self._max_payload_bytes:
+            raise LabArtifactPayloadLimitError("final artifact payload byte budget exceeded")
+        return super().write(payload)
 
 
 class _LabArtifactActiveGuardError(LabArtifactIntegrityError):
@@ -572,6 +589,20 @@ class LabArtifactPlannedPayload(LabArtifactModel):
             _safe_relative_path(self.relative_path)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+        return self
+
+
+class LabArtifactPayloadBudget(LabArtifactModel):
+    """In-memory planning limits supplied by the finalizer service boundary."""
+
+    max_single_payload_bytes: int = Field(ge=1)
+    max_total_payload_bytes: int = Field(ge=1)
+    max_table_count: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_payload_budget(self) -> LabArtifactPayloadBudget:
+        if self.max_single_payload_bytes > self.max_total_payload_bytes:
+            raise ValueError("single payload budget cannot exceed total payload budget")
         return self
 
 
@@ -2117,6 +2148,9 @@ class LabJobArtifactStore:
         self.namespace_guard_history_root = self.root / "namespace-guard-history"
         self.namespace_guard_quarantine_root = self.root / "namespace-guard-quarantine"
         self._closed = False
+        self._closing = False
+        self._preview_activity_count = 0
+        self._preview_condition = threading.Condition()
         self._poisoned = False
         self._operation_depth = 0
         self._guard_lock_depth = 0
@@ -2224,6 +2258,29 @@ class LabJobArtifactStore:
             raise
 
     def close(self) -> None:
+        condition = getattr(self, "_preview_condition", None)
+        if condition is None:
+            self._close_resources()
+            return
+        with condition:
+            while self._closing and not self._closed:
+                condition.wait()
+            if self._closed:
+                return
+            self._closing = True
+            while self._preview_activity_count:
+                condition.wait()
+        try:
+            self._close_resources()
+        except BaseException:
+            with condition:
+                self._closing = False
+                condition.notify_all()
+            raise
+        with condition:
+            condition.notify_all()
+
+    def _close_resources(self) -> None:
         if getattr(self, "_closed", False):
             return
         process_lock = getattr(self, "_process_lock", None)
@@ -2320,6 +2377,21 @@ class LabJobArtifactStore:
         entry = self._process_lock_entry
         if self._poisoned or entry is None or entry.poisoned:
             raise LabArtifactIntegrityError("artifact store is poisoned")
+
+    @contextmanager
+    def _preview_activity(self) -> Iterator[None]:
+        with self._preview_condition:
+            if self._closing or self._closed:
+                raise LabArtifactIntegrityError("artifact store is closing or closed")
+            self._assert_store_operational()
+            self._preview_activity_count += 1
+        try:
+            yield
+        finally:
+            with self._preview_condition:
+                self._preview_activity_count -= 1
+                if self._preview_activity_count == 0:
+                    self._preview_condition.notify_all()
 
     def _mark_store_poisoned(self) -> None:
         self._poisoned = True
@@ -3067,6 +3139,8 @@ class LabJobArtifactStore:
     def _serialize_parquet(
         table_name: str,
         frame: pd.DataFrame,
+        *,
+        max_payload_bytes: int | None = None,
     ) -> tuple[bytes, LabJobArtifactFile]:
         try:
             original_dtype_identities = _frame_dtype_identities(frame)
@@ -3075,7 +3149,11 @@ class LabJobArtifactStore:
             raise LabArtifactIntegrityError(
                 f"candidate table has unsupported semantic values: {table_name}"
             ) from exc
-        output = io.BytesIO()
+        output: io.BytesIO
+        if max_payload_bytes is None:
+            output = io.BytesIO()
+        else:
+            output = _BoundedBytesIO(max_payload_bytes=max_payload_bytes)
         frame.to_parquet(output, index=False)
         payload = output.getvalue()
         try:
@@ -3204,6 +3282,7 @@ class LabJobArtifactStore:
         metrics: Mapping[str, object],
         report_markdown: str,
         tables: Mapping[str, pd.DataFrame],
+        payload_budget: LabArtifactPayloadBudget | None = None,
     ) -> LabJobArtifactPlan:
         request = LabPrepareCandidateRequest.model_validate(
             {
@@ -3223,6 +3302,8 @@ class LabJobArtifactStore:
         if rebuilt_spec != request.spec:
             raise LabArtifactIntegrityError("prepare request spec canonical identity changed")
         validated_tables = dict(request.tables)
+        if payload_budget is not None and len(validated_tables) > payload_budget.max_table_count:
+            raise LabArtifactPayloadLimitError("final artifact table count exceeds payload budget")
         for table_name, frame in validated_tables.items():
             if not isinstance(frame, pd.DataFrame):
                 raise TypeError("artifact tables must be pandas DataFrames")
@@ -3233,15 +3314,50 @@ class LabJobArtifactStore:
             report_bytes = request.report_markdown.encode("utf-8", errors="strict")
         except UnicodeEncodeError as exc:
             raise ValueError("report_markdown must be valid UTF-8 text") from exc
-        parquet_payloads = {
-            table_name: self._serialize_parquet(table_name, validated_tables[table_name])
-            for table_name in sorted(validated_tables)
-        }
         payloads: dict[str, tuple[str, bytes]] = {
             "spec.json": ("application/json", spec_bytes),
             "metrics.json": ("application/json", metrics_bytes),
             "report.md": ("text/markdown; charset=utf-8", report_bytes),
         }
+        planned_bytes = sum(len(payload) for _media_type, payload in payloads.values())
+        if payload_budget is not None:
+            if any(
+                len(payload) > payload_budget.max_single_payload_bytes
+                for _media_type, payload in payloads.values()
+            ):
+                raise LabArtifactPayloadLimitError(
+                    "final artifact payload exceeds single payload byte budget"
+                )
+            if planned_bytes > payload_budget.max_total_payload_bytes:
+                raise LabArtifactPayloadLimitError(
+                    "final artifact payload exceeds total byte budget"
+                )
+        parquet_payloads: dict[str, tuple[bytes, LabJobArtifactFile]] = {}
+        for table_name in sorted(validated_tables):
+            max_payload_bytes = None
+            if payload_budget is not None:
+                remaining = payload_budget.max_total_payload_bytes - planned_bytes
+                if remaining < 1:
+                    raise LabArtifactPayloadLimitError(
+                        "final artifact payload exceeds total byte budget"
+                    )
+                max_payload_bytes = min(
+                    payload_budget.max_single_payload_bytes,
+                    remaining,
+                )
+            if max_payload_bytes is None:
+                serialized = self._serialize_parquet(
+                    table_name,
+                    validated_tables[table_name],
+                )
+            else:
+                serialized = self._serialize_parquet(
+                    table_name,
+                    validated_tables[table_name],
+                    max_payload_bytes=max_payload_bytes,
+                )
+            parquet_payloads[table_name] = serialized
+            planned_bytes += len(serialized[0])
         files = [
             LabJobArtifactFile(
                 relative_path=relative_path,
@@ -3293,6 +3409,18 @@ class LabJobArtifactStore:
         )
         bundle_payloads["manifest.json"] = manifest_bytes
         bundle_payloads["SHA256SUMS"] = sums_bytes
+        if payload_budget is not None:
+            if any(
+                len(payload) > payload_budget.max_single_payload_bytes
+                for payload in bundle_payloads.values()
+            ):
+                raise LabArtifactPayloadLimitError(
+                    "final artifact payload exceeds single payload byte budget"
+                )
+            if sum(map(len, bundle_payloads.values())) > payload_budget.max_total_payload_bytes:
+                raise LabArtifactPayloadLimitError(
+                    "final artifact payload exceeds total byte budget"
+                )
         return LabJobArtifactPlan(
             job_id=request.job_id,
             manifest=manifest,
@@ -3315,21 +3443,23 @@ class LabJobArtifactStore:
         metrics: Mapping[str, object],
         report_markdown: str,
         tables: Mapping[str, pd.DataFrame],
+        payload_budget: LabArtifactPayloadBudget | None = None,
     ) -> LabJobArtifactPlan:
         """Compute the exact candidate bytes and identity without filesystem writes."""
 
-        self._assert_store_operational()
-        return self._plan_candidate(
-            job_id=job_id,
-            spec=spec,
-            plan_hash=plan_hash,
-            adapter_id=adapter_id,
-            adapter_version=adapter_version,
-            result_contract_version=result_contract_version,
-            metrics=metrics,
-            report_markdown=report_markdown,
-            tables=tables,
-        )
+        with self._preview_activity():
+            return self._plan_candidate(
+                job_id=job_id,
+                spec=spec,
+                plan_hash=plan_hash,
+                adapter_id=adapter_id,
+                adapter_version=adapter_version,
+                result_contract_version=result_contract_version,
+                metrics=metrics,
+                report_markdown=report_markdown,
+                tables=tables,
+                payload_budget=payload_budget,
+            )
 
     @_artifact_public_operation(prepare=True)
     def prepare_candidate(
@@ -3344,6 +3474,7 @@ class LabJobArtifactStore:
         metrics: Mapping[str, object],
         report_markdown: str,
         tables: Mapping[str, pd.DataFrame],
+        payload_budget: LabArtifactPayloadBudget | None = None,
     ) -> LabJobArtifactCandidate:
         self._assert_store_operational()
         plan = self._plan_candidate(
@@ -3356,6 +3487,7 @@ class LabJobArtifactStore:
             metrics=metrics,
             report_markdown=report_markdown,
             tables=tables,
+            payload_budget=payload_budget,
         )
         return self._prepare_candidate_from_plan(plan)
 
