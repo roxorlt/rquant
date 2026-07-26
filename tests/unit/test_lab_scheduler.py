@@ -653,6 +653,188 @@ def test_existing_ready_or_sealed_job_key_rejects_insert_replacement_forms(
         ).fetchone() == (1,)
 
 
+_LAB_SHARD_MINIMAL_COLUMNS = """
+    shard_id, job_id, shard_index, status, version, attempt_count,
+    max_attempts, created_at, updated_at
+"""
+
+
+@pytest.mark.parametrize(
+    ("insert_prefix", "conflict_clause"),
+    [
+        ("INSERT INTO", ""),
+        ("REPLACE INTO", ""),
+        ("INSERT OR REPLACE INTO", ""),
+        (
+            "INSERT INTO",
+            "ON CONFLICT(job_id, shard_id) DO UPDATE SET updated_at = excluded.updated_at",
+        ),
+    ],
+    ids=["insert", "replace", "insert-or-replace", "upsert"],
+)
+def test_fk_off_connection_cannot_insert_orphan_shard(
+    tmp_path: Path,
+    insert_prefix: str,
+    conflict_clause: str,
+) -> None:
+    store, _spool = _components(tmp_path)
+    orphan_job_id = uuid4()
+    statement = (
+        f"{insert_prefix} lab_shard ({_LAB_SHARD_MINIMAL_COLUMNS}) "
+        "VALUES (?, ?, 0, 'queued', 0, 0, 3, ?, ?) "
+        f"{conflict_clause}"
+    )
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        with pytest.raises(sqlite3.DatabaseError, match="parent|orphan"):
+            connection.execute(
+                statement,
+                (str(uuid4()), str(orphan_job_id), timestamp, timestamp),
+            )
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lab_shard WHERE job_id = ?",
+            (str(orphan_job_id),),
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("result_state", ["ready", "sealed"])
+@pytest.mark.parametrize(
+    ("insert_prefix", "conflict_clause"),
+    [
+        ("INSERT INTO", ""),
+        ("REPLACE INTO", ""),
+        ("INSERT OR REPLACE INTO", ""),
+        (
+            "INSERT INTO",
+            "ON CONFLICT(job_id, shard_id) DO UPDATE SET updated_at = excluded.updated_at",
+        ),
+    ],
+    ids=["insert", "replace", "insert-or-replace", "upsert"],
+)
+def test_fk_off_connection_cannot_attach_new_shard_to_ready_or_sealed_job(
+    tmp_path: Path,
+    result_state: str,
+    insert_prefix: str,
+    conflict_clause: str,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    if result_state == "sealed":
+        spool.publish(envelope)
+        scheduler.run_once()
+    statement = (
+        f"{insert_prefix} lab_shard ({_LAB_SHARD_MINIMAL_COLUMNS}) "
+        "VALUES (?, ?, 99, 'queued', 0, 0, 3, ?, ?) "
+        f"{conflict_clause}"
+    )
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        with pytest.raises(sqlite3.DatabaseError, match="shard|immutable"):
+            connection.execute(
+                statement,
+                (str(uuid4()), str(job.job_id), timestamp, timestamp),
+            )
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert persisted is not None and persisted.result_state.value == result_state
+    assert len(LabJobReader(store.path).list_shards(job.job_id)) == 1
+
+
+@pytest.mark.parametrize("result_state", ["ready", "sealed"])
+def test_fk_off_connection_cannot_rehome_orphan_shard_to_complete_result_job(
+    tmp_path: Path,
+    result_state: str,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    if result_state == "sealed":
+        spool.publish(envelope)
+        scheduler.run_once()
+    orphan_job_id = uuid4()
+    orphan_shard_id = uuid4()
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        connection.execute("DROP TRIGGER trg_lab_complete_result_shard_no_insert")
+        connection.execute(
+            f"""
+            INSERT INTO lab_shard ({_LAB_SHARD_MINIMAL_COLUMNS})
+            VALUES (?, ?, 99, 'queued', 0, 0, 3, ?, ?)
+            """,
+            (str(orphan_shard_id), str(orphan_job_id), timestamp, timestamp),
+        )
+        connection.execute(lab_jobs._V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER)
+        with pytest.raises(sqlite3.DatabaseError, match="shard|parent|ownership|immutable"):
+            connection.execute(
+                "UPDATE lab_shard SET job_id = ? WHERE job_id = ? AND shard_id = ?",
+                (str(job.job_id), str(orphan_job_id), str(orphan_shard_id)),
+            )
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT job_id FROM lab_shard WHERE shard_id = ?",
+            (str(orphan_shard_id),),
+        ).fetchone() == (str(orphan_job_id),)
+    assert len(LabJobReader(store.path).list_shards(job.job_id)) == 1
+
+
+@pytest.mark.parametrize("result_state", ["ready", "sealed"])
+def test_fk_off_upsert_cannot_rehome_existing_shard_to_complete_result_job(
+    tmp_path: Path,
+    result_state: str,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    if result_state == "sealed":
+        spool.publish(envelope)
+        scheduler.run_once()
+    assert scheduler.lease is not None
+    donor_submit = _envelope()
+    assert (
+        store.apply_command(donor_submit, lease=scheduler.lease, now=clock[0]).status == "applied"
+    )
+    donor_definitions = (_definition(0), _definition(1))
+    store.plan_job(
+        donor_submit.command.job_id,
+        donor_definitions,
+        lease=scheduler.lease,
+        now=clock[0],
+    )
+    donor_shard = LabJobReader(store.path).list_shards(donor_submit.command.job_id)[1]
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        with pytest.raises(sqlite3.DatabaseError, match="shard|ownership|immutable"):
+            connection.execute(
+                """
+                INSERT INTO lab_shard
+                SELECT * FROM lab_shard
+                WHERE job_id = ? AND shard_id = ?
+                ON CONFLICT(job_id, shard_id) DO UPDATE
+                SET job_id = ?, shard_index = 99
+                """,
+                (
+                    str(donor_submit.command.job_id),
+                    str(donor_shard.shard_id),
+                    str(job.job_id),
+                ),
+            )
+
+    persisted_donor = LabJobReader(store.path).list_shards(donor_submit.command.job_id)
+    assert len(persisted_donor) == 2
+    assert len(LabJobReader(store.path).list_shards(job.job_id)) == 1
+
+
 def test_reader_rejects_persisted_sealed_job_without_any_shards(tmp_path: Path) -> None:
     store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
         _ready_artifact_commit_scenario(tmp_path)

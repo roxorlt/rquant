@@ -476,15 +476,32 @@ def test_connection_authority_expires_after_statement_abort(
                         [(1,)],
                     )
                 elif executor == "cursor-execute":
-                    connection.cursor().execute(
-                        "INSERT OR ABORT INTO auth_probe VALUES (1)"
-                    )
+                    connection.cursor().execute("INSERT OR ABORT INTO auth_probe VALUES (1)")
                 else:
                     connection.cursor().executemany(
                         "INSERT OR ABORT INTO auth_probe VALUES (?)",
                         [(1,)],
                     )
             assert connection.in_transaction is True
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+        connection.rollback()
+
+
+def test_connection_authority_cannot_bypass_statement_abort_with_bare_cursor_factory(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with store._connect() as connection:
+        connection.execute("CREATE TEMP TABLE auth_probe (value INTEGER PRIMARY KEY)")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("INSERT INTO auth_probe VALUES (1)")
+        authority = connection.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            with pytest.raises(TypeError, match="cursor factory"):
+                connection.cursor(sqlite3.Cursor)
             assert authority.submit_authorized(str(job_id), spec_json) == 0
         connection.rollback()
 
@@ -836,6 +853,37 @@ def test_existing_job_key_insert_guard_does_not_depend_on_authorization_udf(
     assert "EXISTS" in sql.upper()
     assert "lab_job" in sql
     assert "authorized" not in sql.lower()
+
+
+@pytest.mark.parametrize(
+    ("trigger", "operation"),
+    [
+        ("trg_lab_complete_result_shard_no_insert", "INSERT"),
+        ("trg_lab_complete_result_shard_no_update", "UPDATE"),
+    ],
+)
+def test_v5_schema_requires_exact_shard_parent_guards(
+    tmp_path: Path,
+    trigger: str,
+    operation: str,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        connection.execute(
+            f"""
+            CREATE TRIGGER "{trigger}"
+            BEFORE {operation} ON lab_shard
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        LabJobReader(store.path).get_job(uuid4())
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        store.connection_pragmas()
 
 
 @pytest.mark.parametrize(

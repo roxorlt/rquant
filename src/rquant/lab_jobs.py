@@ -439,7 +439,10 @@ class _LabJobStoreConnection(sqlite3.Connection):
         self,
         factory: type[sqlite3.Cursor] | None = None,
     ) -> sqlite3.Cursor:
-        return super().cursor(factory or _LabJobStoreCursor)
+        if factory is not None and factory is not _LabJobStoreCursor:
+            self._expire_write_authorization()
+            raise TypeError("lab job store cursor factory must preserve authorization cleanup")
+        return super().cursor(_LabJobStoreCursor)
 
     def execute(
         self,
@@ -7702,28 +7705,43 @@ END
 _V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_shard_no_insert
 BEFORE INSERT ON lab_shard
-WHEN EXISTS (
-    SELECT 1 FROM lab_job job
-    WHERE job.job_id = NEW.job_id
-      AND job.requires_complete_result = 1
-      AND job.result_state IN ('ready', 'sealed')
-)
+WHEN NOT EXISTS (
+        SELECT 1 FROM lab_job job
+        WHERE job.job_id = NEW.job_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM lab_job job
+        WHERE job.job_id = NEW.job_id
+          AND job.requires_complete_result = 1
+          AND job.result_state IN ('ready', 'sealed')
+    )
 BEGIN
-    SELECT RAISE(ABORT, 'complete result shard set is immutable');
+    SELECT RAISE(ABORT, 'lab shard parent is missing or immutable');
 END
 """
 
 _V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_shard_no_update
 BEFORE UPDATE ON lab_shard
-WHEN EXISTS (
-    SELECT 1 FROM lab_job job
-    WHERE job.job_id = OLD.job_id
-      AND job.requires_complete_result = 1
-      AND job.result_state IN ('ready', 'sealed')
-)
+WHEN NEW.job_id IS NOT OLD.job_id
+    OR NOT EXISTS (
+        SELECT 1 FROM lab_job job
+        WHERE job.job_id = NEW.job_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM lab_job job
+        WHERE job.job_id = OLD.job_id
+          AND job.requires_complete_result = 1
+          AND job.result_state IN ('ready', 'sealed')
+    )
+    OR EXISTS (
+        SELECT 1 FROM lab_job job
+        WHERE job.job_id = NEW.job_id
+          AND job.requires_complete_result = 1
+          AND job.result_state IN ('ready', 'sealed')
+    )
 BEGIN
-    SELECT RAISE(ABORT, 'complete result shard set is immutable');
+    SELECT RAISE(ABORT, 'lab shard ownership or complete result set is immutable');
 END
 """
 
