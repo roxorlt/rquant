@@ -139,6 +139,22 @@ class LabLegacyArtifactConflictError(LabArtifactError):
     """A legacy logical run is already indexed with different source bytes."""
 
 
+def _raise_collected_errors(
+    message: str,
+    errors: list[BaseException],
+) -> None:
+    if not errors:
+        return
+    if len(errors) == 1:
+        raise errors[0]
+    if all(isinstance(error, Exception) for error in errors):
+        raise ExceptionGroup(
+            message,
+            [error for error in errors if isinstance(error, Exception)],
+        )
+    raise BaseExceptionGroup(message, errors)
+
+
 def _entry_file_type(mode: int) -> Literal["directory", "regular", "symlink", "other"]:
     if stat.S_ISDIR(mode):
         return "directory"
@@ -1353,6 +1369,7 @@ def _open_bound_readonly_file(path: Path, *, label: str) -> Iterator[_BoundReado
     parent_descriptor = -1
     descriptor = -1
     bound: _BoundReadonlyFile | None = None
+    main_error: BaseException | None = None
     try:
         try:
             parent_descriptor = _secure_open_directory(path.parent, create=False)
@@ -1398,16 +1415,25 @@ def _open_bound_readonly_file(path: Path, *, label: str) -> Iterator[_BoundReado
             raise
         if caller_error is not None:
             raise caller_error
+    except BaseException as exc:
+        main_error = exc
     finally:
+        cleanup_errors: list[BaseException] = []
         if bound is not None:
-            bound.close()
+            descriptors = (bound.descriptor, bound.parent_descriptor)
         else:
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-            if parent_descriptor >= 0:
-                with suppress(OSError):
-                    os.close(parent_descriptor)
+            descriptors = (descriptor, parent_descriptor)
+        for opened_descriptor in descriptors:
+            if opened_descriptor >= 0:
+                try:
+                    os.close(opened_descriptor)
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+        errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+        _raise_collected_errors(
+            f"{label} operation and descriptor cleanup failed",
+            errors,
+        )
 
 
 def _rename_noreplace(
@@ -1922,6 +1948,7 @@ class LabJobArtifactStore:
         self.namespace_guard_active_root = self.root / "namespace-guard-active"
         self.namespace_guard_history_root = self.root / "namespace-guard-history"
         self.namespace_guard_quarantine_root = self.root / "namespace-guard-quarantine"
+        self._closed = False
         self._poisoned = False
         self._operation_depth = 0
         self._guard_lock_depth = 0
@@ -1934,28 +1961,30 @@ class LabJobArtifactStore:
         self._process_lock_registered = False
         self._process_lock: threading.RLock | None = None
         self._process_lock_entry: _ArtifactProcessLockEntry | None = None
-        _ensure_private_directory(
-            self.root,
-            manage_existing=False,
-            require_private_existing=True,
-        )
-        for path in (
-            self.candidates_root,
-            self.sealed_root,
-            self.quarantine_root,
-            self.seal_intents_root,
-            self.seal_intents_quarantine_root,
-            self.namespace_guard_active_root,
-            self.namespace_guard_history_root,
-            self.namespace_guard_quarantine_root,
-        ):
-            _ensure_private_directory(
-                path,
-                manage_existing=False,
-                require_private_existing=(path != self.candidates_root),
-            )
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
+            _ensure_private_directory(
+                self.root,
+                manage_existing=False,
+                require_private_existing=True,
+            )
+            for path in (
+                self.candidates_root,
+                self.sealed_root,
+                self.quarantine_root,
+                self.seal_intents_root,
+                self.seal_intents_quarantine_root,
+                self.namespace_guard_active_root,
+                self.namespace_guard_history_root,
+                self.namespace_guard_quarantine_root,
+            ):
+                _ensure_private_directory(
+                    path,
+                    manage_existing=False,
+                    require_private_existing=(path != self.candidates_root),
+                )
+            directory_flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
             self._root_parent_descriptor = _secure_open_directory(
                 self.root.parent,
                 create=False,
@@ -2013,35 +2042,30 @@ class LabJobArtifactStore:
             self._assert_managed_roots()
             with self._process_lock:
                 self._process_lock_entry.poisoned = False
-        except Exception:
-            self.close()
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                _raise_collected_errors(
+                    "artifact store initialization and cleanup both failed",
+                    [error, *cleanup_errors],
+                )
             raise
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
         process_lock = getattr(self, "_process_lock", None)
         if process_lock is None:
+            cleanup_errors: list[BaseException] = []
             for descriptor in getattr(self, "_managed_descriptors", {}).values():
-                with suppress(OSError):
+                try:
                     os.close(descriptor)
-            self._managed_descriptors = {}
-            for attribute in ("_root_descriptor", "_root_parent_descriptor"):
-                descriptor = getattr(self, attribute, -1)
-                if descriptor >= 0:
-                    with suppress(OSError):
-                        os.close(descriptor)
-                    setattr(self, attribute, -1)
-            return
-        with process_lock:
-            if (
-                getattr(self, "_operation_depth", 0) > 0
-                or getattr(self, "_guard_lock_depth", 0) > 0
-            ):
-                raise LabArtifactIntegrityError(
-                    "artifact store cannot close during an artifact transaction"
-                )
-            for descriptor in getattr(self, "_managed_descriptors", {}).values():
-                with suppress(OSError):
-                    os.close(descriptor)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
             self._managed_descriptors = {}
             for attribute in (
                 "_guard_lock_descriptor",
@@ -2050,20 +2074,71 @@ class LabJobArtifactStore:
             ):
                 descriptor = getattr(self, attribute, -1)
                 if descriptor >= 0:
-                    with suppress(OSError):
+                    try:
                         os.close(descriptor)
-                    setattr(self, attribute, -1)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                    finally:
+                        setattr(self, attribute, -1)
+            self._process_lock_entry = None
+            self._process_lock_key = None
+            self._process_lock_registered = False
+            self._closed = True
+            _raise_collected_errors("artifact store close failed", cleanup_errors)
+            return
+        cleanup_errors = []
+        with process_lock:
+            if self._closed:
+                return
+            if (
+                getattr(self, "_operation_depth", 0) > 0
+                or getattr(self, "_guard_lock_depth", 0) > 0
+            ):
+                raise LabArtifactIntegrityError(
+                    "artifact store cannot close during an artifact transaction"
+                )
+            for descriptor in getattr(self, "_managed_descriptors", {}).values():
+                try:
+                    os.close(descriptor)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            self._managed_descriptors = {}
+            for attribute in (
+                "_guard_lock_descriptor",
+                "_root_descriptor",
+                "_root_parent_descriptor",
+            ):
+                descriptor = getattr(self, attribute, -1)
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                    finally:
+                        setattr(self, attribute, -1)
             if getattr(self, "_process_lock_registered", False):
                 with _ARTIFACT_PROCESS_LOCKS_GUARD:
-                    entry = _ARTIFACT_PROCESS_LOCKS.get(self._process_lock_key)
-                    if entry is not None and entry.lock is self._process_lock:
+                    key = self._process_lock_key
+                    entry = _ARTIFACT_PROCESS_LOCKS.get(key) if key is not None else None
+                    if entry is self._process_lock_entry and entry is not None:
                         entry.references -= 1
-                        if entry.references == 0:
-                            del _ARTIFACT_PROCESS_LOCKS[self._process_lock_key]
+                        if entry.references == 0 and key is not None:
+                            del _ARTIFACT_PROCESS_LOCKS[key]
+                    else:
+                        cleanup_errors.append(
+                            LabArtifactIntegrityError(
+                                "artifact store process lock registry changed before close"
+                            )
+                        )
                 self._process_lock_registered = False
+            self._process_lock_entry = None
+            self._process_lock_key = None
+            self._process_lock = None
+            self._closed = True
+        _raise_collected_errors("artifact store close failed", cleanup_errors)
 
     def __del__(self) -> None:
-        with suppress(Exception):
+        with suppress(BaseException):
             self.close()
 
     @property
@@ -2072,6 +2147,8 @@ class LabJobArtifactStore:
         return self._poisoned or (entry is not None and entry.poisoned)
 
     def _assert_store_operational(self) -> None:
+        if self._closed:
+            raise LabArtifactIntegrityError("artifact store is closed")
         entry = self._process_lock_entry
         if self._poisoned or entry is None or entry.poisoned:
             raise LabArtifactIntegrityError("artifact store is poisoned")
@@ -2098,6 +2175,8 @@ class LabJobArtifactStore:
         *,
         prepare: bool,
     ) -> Iterator[None]:
+        if self._closed:
+            raise LabArtifactIntegrityError("artifact store is closed")
         process_lock = self._process_lock
         entry = self._process_lock_entry
         if process_lock is None or entry is None:
@@ -2110,18 +2189,31 @@ class LabJobArtifactStore:
             if prepare and entry.prepare_owner_thread_id is not None:
                 raise LabArtifactIntegrityError("prepare lifecycle ownership is inconsistent")
             outermost = entry.lifecycle_depth == 0
+            lifecycle_lock_acquired = False
             if outermost:
-                entry.lifecycle_owner_thread_id = current_thread_id
-                self._assert_namespace_guard_lock_identity()
-                fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
                 try:
+                    self._assert_namespace_guard_lock_identity()
+                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                    lifecycle_lock_acquired = True
                     self._assert_namespace_guard_lock_identity()
                     self._assert_store_operational()
                     self._assert_no_active_namespace_guard_authority()
-                except BaseException:
+                except BaseException as acquire_error:
+                    acquire_errors = [acquire_error]
+                    if lifecycle_lock_acquired:
+                        try:
+                            fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                        except BaseException as unlock_error:
+                            acquire_errors.append(unlock_error)
                     entry.lifecycle_owner_thread_id = None
-                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
-                    raise
+                    entry.prepare_owner_thread_id = None
+                    entry.lifecycle_depth = 0
+                    self._operation_depth = 0
+                    _raise_collected_errors(
+                        "artifact lifecycle acquisition and cleanup both failed",
+                        acquire_errors,
+                    )
+                entry.lifecycle_owner_thread_id = current_thread_id
             elif entry.lifecycle_owner_thread_id != current_thread_id:
                 raise LabArtifactIntegrityError("artifact lifecycle ownership is inconsistent")
             if prepare:
@@ -2133,35 +2225,33 @@ class LabJobArtifactStore:
                 yield
             except BaseException as exc:
                 operation_error = exc
-            finally:
-                self._operation_depth -= 1
-                entry.lifecycle_depth -= 1
-                if prepare:
-                    entry.prepare_owner_thread_id = None
-                integrity_error: BaseException | None = None
-                if outermost:
-                    try:
-                        self._assert_namespace_guard_lock_identity()
-                        self._assert_no_active_namespace_guard_authority()
-                    except BaseException as exc:
-                        self._mark_store_poisoned()
-                        if operation_error is None or not isinstance(
-                            exc,
-                            _LabArtifactActiveGuardError,
-                        ):
-                            integrity_error = exc
-                    finally:
-                        entry.lifecycle_owner_thread_id = None
-                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
-                if operation_error is not None and integrity_error is not None:
-                    raise BaseExceptionGroup(
-                        "artifact operation and durable authority check both failed",
-                        [operation_error, integrity_error],
-                    ) from None
-                if integrity_error is not None:
-                    raise integrity_error
+            self._operation_depth -= 1
+            entry.lifecycle_depth -= 1
+            if prepare:
+                entry.prepare_owner_thread_id = None
+            errors: list[BaseException] = []
             if operation_error is not None:
-                raise operation_error
+                errors.append(operation_error)
+            if outermost:
+                try:
+                    self._assert_namespace_guard_lock_identity()
+                    self._assert_no_active_namespace_guard_authority()
+                except BaseException as exc:
+                    self._mark_store_poisoned()
+                    if operation_error is None or not isinstance(
+                        exc,
+                        _LabArtifactActiveGuardError,
+                    ):
+                        errors.append(exc)
+                entry.lifecycle_owner_thread_id = None
+                try:
+                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                except BaseException as unlock_error:
+                    errors.append(unlock_error)
+            _raise_collected_errors(
+                "artifact operation and lifecycle cleanup failed",
+                errors,
+            )
 
     def _assert_namespace_guard_lock_identity(self) -> None:
         if self._guard_lock_descriptor < 0 or self._guard_lock_identity is None:
@@ -2193,6 +2283,8 @@ class LabJobArtifactStore:
         *,
         allow_poisoned: bool = False,
     ) -> Iterator[None]:
+        if self._closed:
+            raise LabArtifactIntegrityError("artifact store is closed")
         process_lock = self._process_lock
         entry = self._process_lock_entry
         if process_lock is None or entry is None:
@@ -2211,15 +2303,27 @@ class LabJobArtifactStore:
             lifecycle_owned = (
                 entry.lifecycle_depth > 0 and entry.lifecycle_owner_thread_id == current_thread_id
             )
+            guard_lock_acquired = False
             if outermost:
-                self._assert_namespace_guard_lock_identity()
-                if not lifecycle_owned:
-                    fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
-                    try:
+                try:
+                    self._assert_namespace_guard_lock_identity()
+                    if not lifecycle_owned:
+                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_EX)
+                        guard_lock_acquired = True
                         self._assert_namespace_guard_lock_identity()
-                    except BaseException:
-                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
-                        raise
+                except BaseException as acquire_error:
+                    acquire_errors = [acquire_error]
+                    if guard_lock_acquired:
+                        try:
+                            fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                        except BaseException as unlock_error:
+                            acquire_errors.append(unlock_error)
+                    entry.owner_thread_id = None
+                    self._guard_lock_depth = 0
+                    _raise_collected_errors(
+                        "namespace guard acquisition and cleanup both failed",
+                        acquire_errors,
+                    )
                 entry.owner_thread_id = current_thread_id
             self._guard_lock_depth += 1
             operation_error: BaseException | None = None
@@ -2227,28 +2331,26 @@ class LabJobArtifactStore:
                 yield
             except BaseException as exc:
                 operation_error = exc
-            finally:
-                self._guard_lock_depth -= 1
-                if outermost:
-                    integrity_error: BaseException | None = None
-                    try:
-                        self._assert_namespace_guard_lock_identity()
-                    except BaseException as exc:
-                        self._mark_store_poisoned()
-                        integrity_error = exc
-                    finally:
-                        entry.owner_thread_id = None
-                        if not lifecycle_owned:
-                            fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
-                    if operation_error is not None and integrity_error is not None:
-                        raise BaseExceptionGroup(
-                            "namespace guard operation and final identity check both failed",
-                            [operation_error, integrity_error],
-                        ) from None
-                    if integrity_error is not None:
-                        raise integrity_error
+            self._guard_lock_depth -= 1
+            errors: list[BaseException] = []
             if operation_error is not None:
-                raise operation_error
+                errors.append(operation_error)
+            if outermost:
+                try:
+                    self._assert_namespace_guard_lock_identity()
+                except BaseException as exc:
+                    self._mark_store_poisoned()
+                    errors.append(exc)
+                entry.owner_thread_id = None
+                if not lifecycle_owned:
+                    try:
+                        fcntl.flock(self._guard_lock_descriptor, fcntl.LOCK_UN)
+                    except BaseException as unlock_error:
+                        errors.append(unlock_error)
+            _raise_collected_errors(
+                "namespace guard operation and cleanup failed",
+                errors,
+            )
 
     @staticmethod
     def _namespace_identity(observed: _FileObservation) -> LabCandidateNamespaceIdentity:
@@ -3499,6 +3601,7 @@ class LabJobArtifactStore:
         bundle_descriptor = -1
         tables_descriptor = -1
         opened_files: dict[str, _BoundArtifactFile] = {}
+        main_error: BaseException | None = None
         try:
             managed = self._assert_managed_child(
                 bundle_path,
@@ -3585,25 +3688,45 @@ class LabJobArtifactStore:
             )
             self._assert_bound_paths(bound)
             yield bound
-        except LabArtifactIntegrityError:
-            raise
+        except LabArtifactIntegrityError as exc:
+            main_error = exc
         except OSError as exc:
             if "bound" in locals():
-                raise
-            raise LabArtifactIntegrityError(
-                "artifact changed while binding file descriptors"
-            ) from exc
-        finally:
-            if "bound" in locals():
-                bound.close()
+                main_error = exc
             else:
-                for item in opened_files.values():
-                    with suppress(OSError):
-                        os.close(item.descriptor)
-                for descriptor in (tables_descriptor, bundle_descriptor, parent_descriptor):
-                    if descriptor >= 0:
-                        with suppress(OSError):
-                            os.close(descriptor)
+                main_error = LabArtifactIntegrityError(
+                    "artifact changed while binding file descriptors"
+                )
+                main_error.__cause__ = exc
+        except BaseException as exc:
+            main_error = exc
+        finally:
+            cleanup_errors: list[BaseException] = []
+            if "bound" in locals():
+                descriptors = (
+                    *(item.descriptor for item in bound.files.values()),
+                    bound.tables_descriptor,
+                    bound.bundle_descriptor,
+                    bound.parent_descriptor,
+                )
+            else:
+                descriptors = (
+                    *(item.descriptor for item in opened_files.values()),
+                    tables_descriptor,
+                    bundle_descriptor,
+                    parent_descriptor,
+                )
+            for opened_descriptor in descriptors:
+                if opened_descriptor >= 0:
+                    try:
+                        os.close(opened_descriptor)
+                    except BaseException as close_error:
+                        cleanup_errors.append(close_error)
+            errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+            _raise_collected_errors(
+                "artifact bundle operation and descriptor cleanup failed",
+                errors,
+            )
 
     @staticmethod
     def _assert_bound_paths(bound: _BoundArtifactBundle) -> None:
@@ -3878,6 +4001,7 @@ class LabJobArtifactStore:
         bound: _BoundSealIntent | None = None
         fault_boundary_reached = False
         published_here = False
+        main_error: BaseException | None = None
         try:
             parent_descriptor = self._managed_parent_descriptor(self.seal_intents_root)
             name = f"{job_id.hex}.json"
@@ -4015,20 +4139,33 @@ class LabJobArtifactStore:
                 raise integrity_error
             if caller_error is not None:
                 raise caller_error
-        except LabArtifactError:
-            raise
+        except LabArtifactError as exc:
+            main_error = exc
         except OSError as exc:
             if bound is not None or fault_boundary_reached:
-                raise
-            raise LabArtifactIntegrityError("job artifact seal intent cannot be bound") from exc
-        finally:
-            if bound is not None:
-                bound.close()
+                main_error = exc
             else:
-                if descriptor >= 0:
-                    os.close(descriptor)
-                if parent_descriptor >= 0:
-                    os.close(parent_descriptor)
+                main_error = LabArtifactIntegrityError("job artifact seal intent cannot be bound")
+                main_error.__cause__ = exc
+        except BaseException as exc:
+            main_error = exc
+        finally:
+            cleanup_errors: list[BaseException] = []
+            if bound is not None:
+                descriptors = (bound.descriptor, bound.parent_descriptor)
+            else:
+                descriptors = (descriptor, parent_descriptor)
+            for opened_descriptor in descriptors:
+                if opened_descriptor >= 0:
+                    try:
+                        os.close(opened_descriptor)
+                    except BaseException as close_error:
+                        cleanup_errors.append(close_error)
+            errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+            _raise_collected_errors(
+                "seal intent operation and descriptor cleanup failed",
+                errors,
+            )
 
     @staticmethod
     def _intent_matches_candidate(
@@ -5206,6 +5343,7 @@ class LabJobArtifactStore:
         target_parent = -1
         source_descriptor = -1
         target_descriptor = -1
+        main_error: BaseException | None = None
         try:
             source_parent = self._managed_parent_descriptor(self.candidates_root)
             target_parent = self._managed_parent_descriptor(self.quarantine_root)
@@ -5328,19 +5466,31 @@ class LabJobArtifactStore:
                 raise integrity_error
             if caller_error is not None:
                 raise caller_error
-        except LabArtifactError:
-            raise
+        except LabArtifactError as exc:
+            main_error = exc
         except OSError as exc:
-            raise LabArtifactIntegrityError("candidate quarantine identity changed") from exc
+            main_error = LabArtifactIntegrityError("candidate quarantine identity changed")
+            main_error.__cause__ = exc
+        except BaseException as exc:
+            main_error = exc
         finally:
-            if target_descriptor >= 0:
-                os.close(target_descriptor)
-            if source_descriptor >= 0:
-                os.close(source_descriptor)
-            if source_parent >= 0:
-                os.close(source_parent)
-            if target_parent >= 0:
-                os.close(target_parent)
+            cleanup_errors: list[BaseException] = []
+            for descriptor in (
+                target_descriptor,
+                source_descriptor,
+                source_parent,
+                target_parent,
+            ):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except BaseException as close_error:
+                        cleanup_errors.append(close_error)
+            errors = [main_error, *cleanup_errors] if main_error is not None else cleanup_errors
+            _raise_collected_errors(
+                "candidate quarantine operation and descriptor cleanup failed",
+                errors,
+            )
 
     @staticmethod
     def _authorize_export(
@@ -6890,9 +7040,14 @@ class LegacyArtifactIndex:
     @contextmanager
     def _exclusive_index_lock(self) -> Iterator[None]:
         with self._legacy_operation_lifecycle():
-            fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
-            self._authority_lock_depth += 1
+            lock_acquired = False
+            depth_incremented = False
+            operation_error: BaseException | None = None
             try:
+                fcntl.flock(self._lock_descriptor, fcntl.LOCK_EX)
+                lock_acquired = True
+                self._authority_lock_depth += 1
+                depth_incremented = True
                 self._refresh_authority_head_binding()
                 self._assert_authority_identity()
                 authority = self._read_authority_state()
@@ -6926,9 +7081,26 @@ class LegacyArtifactIndex:
                     raise integrity_error
                 if caller_error is not None:
                     raise caller_error
+            except BaseException as exc:
+                operation_error = exc
             finally:
-                self._authority_lock_depth -= 1
-                fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+                cleanup_errors: list[BaseException] = []
+                if depth_incremented:
+                    self._authority_lock_depth -= 1
+                if lock_acquired:
+                    try:
+                        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+                    except BaseException as unlock_error:
+                        cleanup_errors.append(unlock_error)
+                errors = (
+                    [operation_error, *cleanup_errors]
+                    if operation_error is not None
+                    else cleanup_errors
+                )
+                _raise_collected_errors(
+                    "legacy index operation and lock cleanup failed",
+                    errors,
+                )
 
     @staticmethod
     def _before_sqlite_connect() -> None:
@@ -6983,12 +7155,28 @@ class LegacyArtifactIndex:
     @contextmanager
     def _cache_connection(self) -> Iterator[sqlite3.Connection]:
         connection: sqlite3.Connection | None = None
+        operation_error: BaseException | None = None
         try:
             connection = self._connect()
             yield connection
+        except BaseException as exc:
+            operation_error = exc
         finally:
+            cleanup_errors: list[BaseException] = []
             if connection is not None:
-                connection.close()
+                try:
+                    connection.close()
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+            errors = (
+                [operation_error, *cleanup_errors]
+                if operation_error is not None
+                else cleanup_errors
+            )
+            _raise_collected_errors(
+                "legacy cache operation and connection cleanup failed",
+                errors,
+            )
 
     @staticmethod
     def _initialize_cache_schema(connection: sqlite3.Connection) -> None:

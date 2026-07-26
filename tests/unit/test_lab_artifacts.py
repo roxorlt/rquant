@@ -3033,6 +3033,38 @@ def test_legacy_sqlite_connect_preserves_primary_and_close_failures(
     index.close()
 
 
+def test_legacy_cache_context_preserves_caller_and_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    before_descriptors = len(os.listdir("/dev/fd"))
+    real_connect = sqlite3.connect
+
+    class FailingCloseConnection(sqlite3.Connection):
+        def close(self) -> None:
+            super().close()
+            raise OSError("runtime SQLite close failure")
+
+    def failing_close_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = FailingCloseConnection
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", failing_close_connect)
+
+    with pytest.raises(BaseExceptionGroup) as captured, index._cache_connection():
+        raise RuntimeError("runtime SQLite caller failure")
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(
+        isinstance(item, OSError) and "runtime SQLite close" in str(item) for item in flattened
+    )
+    monkeypatch.setattr(lab_artifacts_module.sqlite3, "connect", real_connect)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    index.close()
+
+
 def test_legacy_cache_validation_is_readonly_before_damaged_cache_quarantine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3438,6 +3470,47 @@ def test_legacy_constructor_reentry_uses_lock_inode_before_flock(
     assert len(os.listdir("/dev/fd")) == before_descriptors
 
 
+def test_legacy_runtime_lock_preserves_caller_and_unlock_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = LegacyArtifactIndex(tmp_path / "index" / "legacy.sqlite3")
+    entry = index._process_lock_entry
+    assert entry is not None
+    lock_path = index.path.with_name(f"{index.path.name}.lock")
+    probe_descriptor = os.open(lock_path, os.O_RDWR)
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_flock = lab_artifacts_module.fcntl.flock
+    unlock_failed = False
+
+    def unlock_then_fail(descriptor: int, operation: int) -> None:
+        nonlocal unlock_failed
+        original_flock(descriptor, operation)
+        if operation == fcntl.LOCK_UN and not unlock_failed:
+            unlock_failed = True
+            raise OSError("runtime legacy unlock failure")
+
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", unlock_then_fail)
+
+    with pytest.raises(BaseExceptionGroup) as captured, index._exclusive_index_lock():
+        raise RuntimeError("runtime legacy caller failure")
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(
+        isinstance(item, OSError) and "runtime legacy unlock" in str(item) for item in flattened
+    )
+    assert unlock_failed is True
+    assert index._authority_lock_depth == 0
+    assert entry.owner_thread_id is None
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", original_flock)
+    original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    original_flock(probe_descriptor, fcntl.LOCK_UN)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    os.close(probe_descriptor)
+    index.close()
+
+
 @pytest.mark.parametrize(
     "target",
     ["parent", "lock", "ledger", "heads", "head", "cache", "journal", "quarantine"],
@@ -3603,6 +3676,7 @@ def test_legacy_close_waits_for_same_instance_import_and_rejects_new_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    gc.collect()
     before_descriptors = len(os.listdir("/dev/fd"))
     source = tmp_path / "legacy.json"
     source.write_text('{"old":true}', encoding="utf-8")
@@ -5585,6 +5659,82 @@ def test_namespace_guard_serializes_prepare_across_store_instances(
     assert second_entered.is_set() is True
 
 
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_artifact_store_constructor_base_exception_rolls_back_all_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    gc.collect()
+    before_descriptors = len(os.listdir("/dev/fd"))
+    registry_before = dict(lab_artifacts_module._ARTIFACT_PROCESS_LOCKS)
+    failed = LabJobArtifactStore.__new__(LabJobArtifactStore)
+
+    def interrupt_recovery(_store: LabJobArtifactStore) -> None:
+        raise failure_type("constructor recovery interrupted")
+
+    monkeypatch.setattr(
+        LabJobArtifactStore,
+        "_recover_active_namespace_guards",
+        interrupt_recovery,
+    )
+
+    with pytest.raises(failure_type, match="recovery interrupted"):
+        failed.__init__(tmp_path / "artifacts")
+
+    assert failed._closed is True
+    assert failed._process_lock is None
+    assert failed._process_lock_entry is None
+    assert dict(lab_artifacts_module._ARTIFACT_PROCESS_LOCKS) == registry_before
+    gc.collect()
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
+def test_artifact_store_constructor_preserves_primary_and_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gc.collect()
+    before_descriptors = len(os.listdir("/dev/fd"))
+    registry_before = dict(lab_artifacts_module._ARTIFACT_PROCESS_LOCKS)
+    failed = LabJobArtifactStore.__new__(LabJobArtifactStore)
+    original_close = lab_artifacts_module.os.close
+    close_failed = False
+
+    def fail_recovery(_store: LabJobArtifactStore) -> None:
+        raise RuntimeError("constructor recovery failure")
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_failed
+        should_fail = descriptor == failed._guard_lock_descriptor and not close_failed
+        original_close(descriptor)
+        if should_fail:
+            close_failed = True
+            raise OSError("constructor close failure")
+
+    monkeypatch.setattr(
+        LabJobArtifactStore,
+        "_recover_active_namespace_guards",
+        fail_recovery,
+    )
+    monkeypatch.setattr(lab_artifacts_module.os, "close", close_then_fail)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        failed.__init__(tmp_path / "artifacts")
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(isinstance(item, OSError) and "constructor close" in str(item) for item in flattened)
+    assert close_failed is True
+    assert failed._closed is True
+    assert failed._process_lock is None
+    assert failed._process_lock_entry is None
+    assert dict(lab_artifacts_module._ARTIFACT_PROCESS_LOCKS) == registry_before
+    monkeypatch.setattr(lab_artifacts_module.os, "close", original_close)
+    gc.collect()
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+
+
 def test_store_close_waits_for_inflight_namespace_guard_prepare(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5629,6 +5779,155 @@ def test_store_close_waits_for_inflight_namespace_guard_prepare(
     assert not prepare_thread.is_alive() and not close_thread.is_alive()
     assert close_finished.is_set() is True
     assert errors == []
+    assert store._closed is True
+    assert store._process_lock is None
+    assert store._process_lock_entry is None
+
+
+def test_closed_store_rejects_use_without_polluting_shared_lifecycle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    closed_store = LabJobArtifactStore(root)
+    peer_store = LabJobArtifactStore(root)
+    shared_entry = closed_store._process_lock_entry
+    assert shared_entry is not None
+    assert peer_store._process_lock_entry is shared_entry
+
+    closed_store.close()
+
+    assert closed_store._closed is True
+    assert closed_store._process_lock is None
+    assert closed_store._process_lock_entry is None
+    assert shared_entry.lifecycle_owner_thread_id is None
+    assert shared_entry.prepare_owner_thread_id is None
+    assert shared_entry.lifecycle_depth == 0
+    before = tuple(
+        sorted(
+            (
+                path.relative_to(root).as_posix(),
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+            )
+            for path in root.rglob("*")
+        )
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="closed"):
+        _prepare(closed_store, job_id=uuid4())
+
+    after = tuple(
+        sorted(
+            (
+                path.relative_to(root).as_posix(),
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+            )
+            for path in root.rglob("*")
+        )
+    )
+    assert after == before
+    candidate = _prepare(peer_store, job_id=uuid4())
+    assert candidate.path.is_dir()
+    assert shared_entry.lifecycle_owner_thread_id is None
+    assert shared_entry.prepare_owner_thread_id is None
+    assert shared_entry.lifecycle_depth == 0
+    closed_store.close()
+    peer_store.close()
+
+
+@pytest.mark.parametrize("failure_point", ["identity", "flock", "post_flock_identity"])
+def test_artifact_lifecycle_pre_yield_failure_rolls_back_shared_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    entry = store._process_lock_entry
+    assert entry is not None
+    original_identity = store._assert_namespace_guard_lock_identity
+    original_flock = lab_artifacts_module.fcntl.flock
+    identity_calls = 0
+
+    def fail_selected_identity() -> None:
+        nonlocal identity_calls
+        identity_calls += 1
+        if failure_point == "identity" and identity_calls == 1:
+            raise OSError("pre-yield identity failure")
+        if failure_point == "post_flock_identity" and identity_calls == 2:
+            raise OSError("post-flock identity failure")
+        original_identity()
+
+    def fail_selected_flock(descriptor: int, operation: int) -> None:
+        if failure_point == "flock" and operation & fcntl.LOCK_EX:
+            raise OSError("pre-yield flock failure")
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(store, "_assert_namespace_guard_lock_identity", fail_selected_identity)
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", fail_selected_flock)
+
+    with pytest.raises(OSError, match="pre-yield|post-flock"):
+        store.list_candidate_recovery()
+
+    assert store._operation_depth == 0
+    assert entry.lifecycle_owner_thread_id is None
+    assert entry.prepare_owner_thread_id is None
+    assert entry.lifecycle_depth == 0
+    monkeypatch.undo()
+    assert store.list_candidate_recovery() == ()
+    store.close()
+
+
+def test_artifact_lifecycle_preserves_caller_and_unlock_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    entry = store._process_lock_entry
+    assert entry is not None
+    lock_path = store.root / "namespace-guard.lock"
+    probe_descriptor = os.open(lock_path, os.O_RDWR)
+    before_descriptors = len(os.listdir("/dev/fd"))
+    original_flock = lab_artifacts_module.fcntl.flock
+    unlock_failed = False
+
+    def unlock_then_fail(descriptor: int, operation: int) -> None:
+        nonlocal unlock_failed
+        original_flock(descriptor, operation)
+        if operation == fcntl.LOCK_UN and not unlock_failed:
+            unlock_failed = True
+            raise OSError("runtime artifact unlock failure")
+
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", unlock_then_fail)
+
+    with (
+        pytest.raises(BaseExceptionGroup) as captured,
+        store._artifact_operation_lifecycle(prepare=False),
+    ):
+        raise RuntimeError("runtime artifact caller failure")
+
+    flattened = _flatten_exception_group(captured.value)
+    assert any(isinstance(item, RuntimeError) for item in flattened)
+    assert any(
+        isinstance(item, OSError) and "runtime artifact unlock" in str(item) for item in flattened
+    )
+    assert unlock_failed is True
+    assert store._operation_depth == 0
+    assert entry.lifecycle_owner_thread_id is None
+    assert entry.prepare_owner_thread_id is None
+    assert entry.lifecycle_depth == 0
+    monkeypatch.setattr(lab_artifacts_module.fcntl, "flock", original_flock)
+    original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    original_flock(probe_descriptor, fcntl.LOCK_UN)
+    assert len(os.listdir("/dev/fd")) == before_descriptors
+    os.close(probe_descriptor)
+    store.close()
 
 
 def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> None:
