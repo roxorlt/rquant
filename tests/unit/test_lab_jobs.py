@@ -792,6 +792,52 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
         LabJobReader(store.path).get_job(uuid4())
 
 
+def test_v5_schema_rejects_unexpected_persistent_trigger(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER trg_lab_unexpected_review_probe
+            AFTER INSERT ON lab_event
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="unexpected.*trigger|trigger.*set"):
+        LabJobReader(store.path).get_job(uuid4())
+    with pytest.raises(LabDatabaseIdentityError, match="unexpected.*trigger|trigger.*set"):
+        store.connection_pragmas()
+
+
+def test_v5_schema_identity_ignores_connection_local_temp_trigger(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            CREATE TEMP TRIGGER trg_lab_temp_review_probe
+            AFTER INSERT ON main.lab_event
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+        assert connection.execute(
+            "SELECT name FROM sqlite_temp_master WHERE type = 'trigger'"
+        ).fetchall() == [("trg_lab_temp_review_probe",)]
+        lab_jobs._validate_v5_schema(connection)
+
+
+def test_v5_schema_rejects_missing_persistent_trigger(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER trg_lab_result_artifact_no_delete")
+
+    with pytest.raises(LabDatabaseIdentityError, match="missing.*trigger"):
+        LabJobReader(store.path).get_job(uuid4())
+
+
 @pytest.mark.parametrize(
     "trigger",
     [
@@ -2730,19 +2776,20 @@ def test_writer_mutation_fails_closed_after_database_identity_tamper(
     assert persisted_pragma == tampered_value
 
 
-def test_submit_transaction_rolls_back_when_event_insert_fails(tmp_path: Path) -> None:
+def test_submit_transaction_rolls_back_when_event_insert_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _store(tmp_path)
     lease = _lease(store)
-    with sqlite3.connect(store.path) as connection:
-        connection.execute(
-            """
-            CREATE TRIGGER reject_lab_event
-            BEFORE INSERT ON lab_event
-            BEGIN
-                SELECT RAISE(ABORT, 'event rejected');
-            END
-            """
-        )
+
+    def reject_event(
+        _connection: sqlite3.Connection,
+        **_kwargs: object,
+    ) -> None:
+        raise sqlite3.IntegrityError("event rejected")
+
+    monkeypatch.setattr(store, "_insert_event", reject_event)
     envelope = _submit()
 
     with pytest.raises(sqlite3.IntegrityError, match="event rejected"):

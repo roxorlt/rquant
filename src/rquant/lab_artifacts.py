@@ -4852,6 +4852,14 @@ class LabJobArtifactStore:
                 )
                 yield LabVerifiedSealedBinding(sealed=sealed, evidence=evidence)
 
+    @contextmanager
+    def artifact_commit_lifecycle(self) -> Iterator[None]:
+        """Hold the root lifecycle beyond binding exit through a durable commit."""
+
+        with self._artifact_operation_lifecycle(prepare=False):
+            self._assert_store_operational()
+            yield
+
     @staticmethod
     def _atomic_publish_noreplace(
         source_parent: int,

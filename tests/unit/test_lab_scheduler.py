@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread, get_ident
 from uuid import uuid4
 
 import pandas as pd
@@ -26,6 +26,7 @@ from rquant.lab_artifact_protocol import (
 )
 from rquant.lab_artifacts import (
     LabArtifactIndexEvidence,
+    LabArtifactIntegrityError,
     LabJobArtifactStore,
     LabSealedJobArtifact,
 )
@@ -1451,6 +1452,73 @@ class _CrashBeforeArtifactCommitScheduler(LabScheduler):
         raise RuntimeError("simulated crash before SQLite commit")
 
 
+def test_artifact_lifecycle_remains_locked_through_sqlite_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, artifacts, job, sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    report_path = sealed.path / "report.md"
+    original_commit = lab_jobs._LabJobStoreConnection.commit
+    mutation_attempted = Event()
+    mutation_acquired = Event()
+    sqlite_commit_finished = Event()
+    lifecycle_active_at_commit: list[bool] = []
+    mutation_acquired_before_commit: list[bool] = []
+    mutation_threads: list[Thread] = []
+
+    def mutate_under_artifact_lifecycle() -> None:
+        mutation_attempted.set()
+        with artifacts._artifact_operation_lifecycle(prepare=False):
+            mutation_acquired_before_commit.append(not sqlite_commit_finished.is_set())
+            os.chmod(sealed.path, 0o700)
+            report_path.unlink()
+            mutation_acquired.set()
+
+    def observe_sqlite_commit(connection: sqlite3.Connection) -> None:
+        staged_row = connection.execute(
+            "SELECT 1 FROM lab_artifact_commit WHERE request_id = ?",
+            (str(envelope.request_id),),
+        ).fetchone()
+        if staged_row is None:
+            original_commit(connection)
+            return
+        lifecycle_entry = artifacts._process_lock_entry
+        lifecycle_active_at_commit.append(
+            lifecycle_entry is not None
+            and lifecycle_entry.lifecycle_owner_thread_id == get_ident()
+            and lifecycle_entry.lifecycle_depth > 0
+        )
+        mutation_thread = Thread(target=mutate_under_artifact_lifecycle)
+        mutation_threads.append(mutation_thread)
+        mutation_thread.start()
+        assert mutation_attempted.wait(timeout=2)
+        mutation_acquired.wait(timeout=0.25)
+        original_commit(connection)
+        sqlite_commit_finished.set()
+
+    monkeypatch.setattr(
+        lab_jobs._LabJobStoreConnection,
+        "commit",
+        observe_sqlite_commit,
+    )
+
+    tick = scheduler.run_once()
+    for mutation_thread in mutation_threads:
+        mutation_thread.join(timeout=2)
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_accepted == 1
+    assert persisted is not None and persisted.result_state is LabResultState.SEALED
+    assert lifecycle_active_at_commit == [True]
+    assert mutation_acquired_before_commit == [False]
+    assert mutation_acquired.is_set()
+    assert all(not mutation_thread.is_alive() for mutation_thread in mutation_threads)
+    assert not report_path.exists()
+    assert spool.pending() == ()
+
+
 def test_artifact_commit_crash_before_sqlite_commit_rolls_back_and_replays(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1502,12 +1570,30 @@ class _ReplaceBoundArtifactScheduler(LabScheduler):
 
 def test_artifact_final_check_failure_rolls_back_sqlite_and_quarantines(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store, scheduler, spool, _artifacts, job, _sealed, envelope, _clock = (
+    store, scheduler, spool, artifacts, job, _sealed, envelope, _clock = (
         _ready_artifact_commit_scenario(
             tmp_path,
             scheduler_type=_ReplaceBoundArtifactScheduler,
         )
+    )
+    original_rollback = lab_jobs.LabStagedArtifactCommit.rollback
+    rollback_held_lifecycle: list[bool] = []
+
+    def observe_rollback(staged: lab_jobs.LabStagedArtifactCommit) -> None:
+        lifecycle_entry = artifacts._process_lock_entry
+        rollback_held_lifecycle.append(
+            lifecycle_entry is not None
+            and lifecycle_entry.lifecycle_owner_thread_id == get_ident()
+            and lifecycle_entry.lifecycle_depth > 0
+        )
+        original_rollback(staged)
+
+    monkeypatch.setattr(
+        lab_jobs.LabStagedArtifactCommit,
+        "rollback",
+        observe_rollback,
     )
 
     tick = scheduler.run_once()
@@ -1518,6 +1604,11 @@ def test_artifact_final_check_failure_rolls_back_sqlite_and_quarantines(
     assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
     assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
     assert spool.pending() == ()
+    assert rollback_held_lifecycle == [True]
+    lifecycle_entry = artifacts._process_lock_entry
+    assert lifecycle_entry is not None
+    assert lifecycle_entry.lifecycle_owner_thread_id is None
+    assert lifecycle_entry.lifecycle_depth == 0
 
 
 class _CrashBeforeArtifactAckSpool(LabArtifactCommitSpool):
@@ -1568,6 +1659,48 @@ def test_artifact_commit_after_sqlite_before_ack_replays_same_receipt(
         )
         == 1
     )
+    assert spool.pending() == ()
+
+
+def test_artifact_lifecycle_exit_failure_after_sqlite_commit_remains_replayable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    original_lifecycle = artifacts.artifact_commit_lifecycle
+
+    @contextmanager
+    def fail_after_lifecycle_release() -> Iterator[None]:
+        with original_lifecycle():
+            yield
+        raise LabArtifactIntegrityError("simulated lifecycle release failure after commit")
+
+    monkeypatch.setattr(
+        artifacts,
+        "artifact_commit_lifecycle",
+        fail_after_lifecycle_release,
+    )
+
+    with pytest.raises(LabArtifactIntegrityError, match="release failure"):
+        scheduler.run_once()
+
+    committed = LabJobReader(store.path).get_job(job.job_id)
+    first = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert committed is not None and committed.result_state is LabResultState.SEALED
+    assert first is not None and first.receipt.status == "accepted"
+    assert len(spool.pending()) == 1
+
+    monkeypatch.setattr(
+        artifacts,
+        "artifact_commit_lifecycle",
+        original_lifecycle,
+    )
+    replay = scheduler.run_once()
+
+    assert replay.artifact_commits_accepted == 1
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) == first
     assert spool.pending() == ()
 
 

@@ -1591,56 +1591,27 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
         default=None,
     )
     _validate_v5_key_and_foreign_key_constraints(connection)
-    required_triggers = {
-        "trg_lab_complete_result_job_no_delete",
-        "trg_lab_job_existing_key_no_insert",
-        "trg_lab_complete_result_ready_job_update",
-        "trg_lab_complete_result_sealed_job_no_update",
-        "trg_lab_job_complete_result_insert",
-        "trg_lab_job_complete_result_update",
-        "trg_lab_job_complete_result_marker_immutable",
-        "trg_lab_artifact_commit_insert",
-        "trg_lab_result_artifact_insert",
-        "trg_lab_result_artifact_no_update",
-        "trg_lab_result_artifact_no_delete",
-        "trg_lab_complete_result_shard_no_insert",
-        "trg_lab_complete_result_shard_no_update",
-        "trg_lab_complete_result_shard_no_delete",
-        "trg_lab_artifact_commit_no_update",
-        "trg_lab_artifact_commit_no_delete",
-    }
+    # Ledger identity covers persistent main-schema triggers; TEMP triggers are
+    # connection-local instrumentation and do not alter the database file.
     existing_triggers = {
         str(row[0])
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger'"
         ).fetchall()
     }
-    missing_triggers = sorted(required_triggers - existing_triggers)
-    if missing_triggers:
+    expected_triggers = frozenset(_V5_EXPECTED_TRIGGER_SQL)
+    missing_triggers = sorted(expected_triggers - existing_triggers)
+    unexpected_triggers = sorted(existing_triggers - expected_triggers)
+    if missing_triggers or unexpected_triggers:
+        details: list[str] = []
+        if missing_triggers:
+            details.append(f"missing triggers: {', '.join(missing_triggers)}")
+        if unexpected_triggers:
+            details.append(f"unexpected triggers: {', '.join(unexpected_triggers)}")
         raise LabDatabaseIdentityError(
-            f"lab jobs SQLite v5 is missing triggers: {', '.join(missing_triggers)}"
+            f"lab jobs SQLite v5 trigger set is invalid: {'; '.join(details)}"
         )
-    expected_trigger_sql = {
-        "trg_lab_complete_result_job_no_delete": (_V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER),
-        "trg_lab_job_existing_key_no_insert": (_V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER),
-        "trg_lab_complete_result_ready_job_update": (_V5_COMPLETE_RESULT_READY_JOB_UPDATE_TRIGGER),
-        "trg_lab_complete_result_sealed_job_no_update": (
-            _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER
-        ),
-        "trg_lab_job_complete_result_insert": _V5_JOB_RESULT_INSERT_TRIGGER,
-        "trg_lab_job_complete_result_update": _V5_JOB_RESULT_UPDATE_TRIGGER,
-        "trg_lab_job_complete_result_marker_immutable": (_V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER),
-        "trg_lab_artifact_commit_insert": _V5_ARTIFACT_COMMIT_INSERT_TRIGGER,
-        "trg_lab_result_artifact_insert": _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
-        "trg_lab_result_artifact_no_update": _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
-        "trg_lab_result_artifact_no_delete": _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
-        "trg_lab_complete_result_shard_no_insert": (_V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER),
-        "trg_lab_complete_result_shard_no_update": (_V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER),
-        "trg_lab_complete_result_shard_no_delete": (_V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER),
-        "trg_lab_artifact_commit_no_update": _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
-        "trg_lab_artifact_commit_no_delete": _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
-    }
-    for name, expected_sql in expected_trigger_sql.items():
+    for name, expected_sql in _V5_EXPECTED_TRIGGER_SQL.items():
         row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
             (name,),
@@ -7774,6 +7745,27 @@ BEGIN
     SELECT RAISE(ABORT, 'artifact commit receipt is immutable');
 END
 """
+
+_V5_EXPECTED_TRIGGER_SQL = {
+    "trg_lab_complete_result_job_no_delete": _V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER,
+    "trg_lab_job_existing_key_no_insert": _V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER,
+    "trg_lab_complete_result_ready_job_update": _V5_COMPLETE_RESULT_READY_JOB_UPDATE_TRIGGER,
+    "trg_lab_complete_result_sealed_job_no_update": (
+        _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER
+    ),
+    "trg_lab_job_complete_result_insert": _V5_JOB_RESULT_INSERT_TRIGGER,
+    "trg_lab_job_complete_result_update": _V5_JOB_RESULT_UPDATE_TRIGGER,
+    "trg_lab_job_complete_result_marker_immutable": _V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER,
+    "trg_lab_artifact_commit_insert": _V5_ARTIFACT_COMMIT_INSERT_TRIGGER,
+    "trg_lab_result_artifact_insert": _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
+    "trg_lab_result_artifact_no_update": _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
+    "trg_lab_result_artifact_no_delete": _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
+    "trg_lab_complete_result_shard_no_insert": _V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER,
+    "trg_lab_complete_result_shard_no_update": _V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER,
+    "trg_lab_complete_result_shard_no_delete": _V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER,
+    "trg_lab_artifact_commit_no_update": _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
+    "trg_lab_artifact_commit_no_delete": _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
+}
 
 _V4_SCHEMA_STATEMENTS = tuple(
     (

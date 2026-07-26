@@ -525,29 +525,43 @@ class LabScheduler:
                 _lease, verification_now = self._mutation_context()
                 authority_now = verification_now
                 staged = None
+                receipt = None
                 try:
-                    with self.artifact_store.bind_verified_sealed(
-                        entry.envelope.commit.sealed_path,
-                        indexed_at=verification_now,
-                    ) as binding:
-                        lease, mutation_now = self._mutation_context()
-                        authority_now = mutation_now
-                        deadlines_expired += len(
-                            self.store.expire_deadline_jobs(
-                                lease=lease,
-                                now=mutation_now,
+                    with self.artifact_store.artifact_commit_lifecycle():
+                        try:
+                            with self.artifact_store.bind_verified_sealed(
+                                entry.envelope.commit.sealed_path,
+                                indexed_at=verification_now,
+                            ) as binding:
+                                lease, mutation_now = self._mutation_context()
+                                authority_now = mutation_now
+                                deadlines_expired += len(
+                                    self.store.expire_deadline_jobs(
+                                        lease=lease,
+                                        now=mutation_now,
+                                    )
+                                )
+                                staged = self.store.stage_artifact_commit(
+                                    entry.envelope,
+                                    binding,
+                                    lease=lease,
+                                    now=mutation_now,
+                                )
+                                self._after_artifact_commit_staged(entry, binding)
+                            assert staged is not None
+                            if self.lease is None:  # pragma: no cover - active tick invariant
+                                raise RuntimeError(
+                                    "scheduler lease disappeared before artifact commit"
+                                )
+                            receipt = staged.commit(
+                                lease=self.lease,
+                                now=self.clock(),
                             )
-                        )
-                        staged = self.store.stage_artifact_commit(
-                            entry.envelope,
-                            binding,
-                            lease=lease,
-                            now=mutation_now,
-                        )
-                        self._after_artifact_commit_staged(entry, binding)
+                        except BaseException:
+                            if staged is not None:
+                                staged.rollback()
+                            raise
                 except RequestContentConflictError as exc:
-                    if staged is not None:
-                        staged.rollback()
                     self.artifact_commit_spool.quarantine(
                         entry,
                         reason=f"artifact_commit_content_conflict:{exc}",
@@ -555,8 +569,8 @@ class LabScheduler:
                     artifact_commits_quarantined += 1
                     continue
                 except BaseException as exc:
-                    if staged is not None:
-                        staged.rollback()
+                    if receipt is not None:
+                        raise
                     if not isinstance(exc, Exception) or not self._is_artifact_verification_error(
                         exc
                     ):
@@ -567,14 +581,7 @@ class LabScheduler:
                     )
                     artifact_commits_quarantined += 1
                     continue
-                assert staged is not None
-                if self.lease is None:  # pragma: no cover - active tick invariant
-                    staged.rollback()
-                    raise RuntimeError("scheduler lease disappeared before artifact commit")
-                receipt = staged.commit(
-                    lease=self.lease,
-                    now=self.clock(),
-                )
+                assert receipt is not None
                 self._after_artifact_commit_sqlite_commit(entry)
                 artifact_commits_processed += 1
                 if receipt.status == "accepted":
