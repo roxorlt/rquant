@@ -41,6 +41,7 @@ from rquant.lab_artifacts import (
     LabJobArtifactCandidate,
     LabJobArtifactFile,
     LabJobArtifactManifest,
+    LabJobArtifactPlan,
     LabJobArtifactStore,
     LabLegacyArtifactConflictError,
     LabSealedJobArtifact,
@@ -329,6 +330,26 @@ def test_prepare_verify_seal_and_idempotently_reuse_complete_bundle(tmp_path: Pa
         not (child.stat().st_mode & 0o222) for child in sealed.path.rglob("*") if child.is_file()
     )
     assert store.verify_sealed(sealed.path).manifest == sealed.manifest
+
+
+def test_preview_candidate_is_readonly_and_prepare_materializes_the_exact_plan(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    arguments = _prepare_arguments()
+    namespaces_before = _artifact_namespace_identity(store)
+
+    first = store.preview_candidate(**arguments)  # type: ignore[arg-type]
+    second = store.preview_candidate(**arguments)  # type: ignore[arg-type]
+
+    assert isinstance(first, LabJobArtifactPlan)
+    assert second == first
+    assert _artifact_namespace_identity(store) == namespaces_before
+    candidate = store.prepare_candidate(**arguments)  # type: ignore[arg-type]
+    assert candidate.manifest == first.manifest
+    assert candidate.manifest_hash == first.manifest_hash
+    for planned in first.payloads:
+        assert (candidate.path / planned.relative_path).read_bytes() == planned.payload
 
 
 def test_prepare_rejects_hex_traversal_job_id_before_any_filesystem_write(

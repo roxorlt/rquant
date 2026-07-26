@@ -562,6 +562,56 @@ class LabJobArtifactManifest(LabArtifactModel):
         return _sha256(self.canonical_json_bytes())
 
 
+class LabArtifactPlannedPayload(LabArtifactModel):
+    relative_path: str
+    payload: bytes
+
+    @model_validator(mode="after")
+    def validate_relative_path(self) -> LabArtifactPlannedPayload:
+        try:
+            _safe_relative_path(self.relative_path)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+class LabJobArtifactPlan(LabArtifactModel):
+    job_id: UUID
+    manifest: LabJobArtifactManifest
+    manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    payloads: tuple[LabArtifactPlannedPayload, ...]
+
+    @model_validator(mode="after")
+    def validate_exact_payloads(self) -> LabJobArtifactPlan:
+        if self.job_id != self.manifest.job_id:
+            raise ValueError("artifact plan job_id conflicts with manifest")
+        if self.manifest_hash != self.manifest.manifest_hash:
+            raise ValueError("artifact plan manifest_hash conflicts with manifest")
+        paths = tuple(item.relative_path for item in self.payloads)
+        if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise ValueError("artifact plan payloads must be sorted and unique")
+        manifest_bytes = self.manifest.canonical_json_bytes()
+        sums = {item.relative_path: item.sha256 for item in self.manifest.files}
+        sums["manifest.json"] = self.manifest_hash
+        sums_bytes = "".join(
+            f"{digest}  {relative_path}\n" for relative_path, digest in sorted(sums.items())
+        ).encode("ascii")
+        expected = {item.relative_path: (item.size, item.sha256) for item in self.manifest.files}
+        expected["manifest.json"] = (len(manifest_bytes), self.manifest_hash)
+        expected["SHA256SUMS"] = (len(sums_bytes), _sha256(sums_bytes))
+        actual = {item.relative_path: item.payload for item in self.payloads}
+        if set(actual) != set(expected):
+            raise ValueError("artifact plan payload inventory conflicts with manifest")
+        if actual["manifest.json"] != manifest_bytes or actual["SHA256SUMS"] != sums_bytes:
+            raise ValueError("artifact plan authority payloads conflict with manifest")
+        if any(
+            (len(actual[path]), _sha256(actual[path])) != identity
+            for path, identity in expected.items()
+        ):
+            raise ValueError("artifact plan payload bytes conflict with manifest")
+        return self
+
+
 class LabArtifactFileIdentity(LabArtifactModel):
     relative_path: str
     device: int = Field(ge=0)
@@ -3142,8 +3192,7 @@ class LabJobArtifactStore:
         except OSError as exc:
             raise LabArtifactIntegrityError("candidate directory identity changed") from exc
 
-    @_artifact_public_operation(prepare=True)
-    def prepare_candidate(
+    def _plan_candidate(
         self,
         *,
         job_id: UUID,
@@ -3155,8 +3204,7 @@ class LabJobArtifactStore:
         metrics: Mapping[str, object],
         report_markdown: str,
         tables: Mapping[str, pd.DataFrame],
-    ) -> LabJobArtifactCandidate:
-        self._assert_store_operational()
+    ) -> LabJobArtifactPlan:
         request = LabPrepareCandidateRequest.model_validate(
             {
                 "job_id": job_id,
@@ -3245,7 +3293,88 @@ class LabJobArtifactStore:
         )
         bundle_payloads["manifest.json"] = manifest_bytes
         bundle_payloads["SHA256SUMS"] = sums_bytes
-        candidate_name = f"{request.job_id.hex}-{uuid4().hex}"
+        return LabJobArtifactPlan(
+            job_id=request.job_id,
+            manifest=manifest,
+            manifest_hash=manifest.manifest_hash,
+            payloads=tuple(
+                LabArtifactPlannedPayload(relative_path=relative_path, payload=payload)
+                for relative_path, payload in sorted(bundle_payloads.items())
+            ),
+        )
+
+    @_artifact_public_operation()
+    def preview_candidate(
+        self,
+        *,
+        job_id: UUID,
+        spec: ResearchRunSpec,
+        plan_hash: str,
+        adapter_id: str,
+        adapter_version: str,
+        result_contract_version: str,
+        metrics: Mapping[str, object],
+        report_markdown: str,
+        tables: Mapping[str, pd.DataFrame],
+    ) -> LabJobArtifactPlan:
+        """Compute the exact candidate bytes and identity without filesystem writes."""
+
+        self._assert_store_operational()
+        return self._plan_candidate(
+            job_id=job_id,
+            spec=spec,
+            plan_hash=plan_hash,
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            result_contract_version=result_contract_version,
+            metrics=metrics,
+            report_markdown=report_markdown,
+            tables=tables,
+        )
+
+    @_artifact_public_operation(prepare=True)
+    def prepare_candidate(
+        self,
+        *,
+        job_id: UUID,
+        spec: ResearchRunSpec,
+        plan_hash: str,
+        adapter_id: str,
+        adapter_version: str,
+        result_contract_version: str,
+        metrics: Mapping[str, object],
+        report_markdown: str,
+        tables: Mapping[str, pd.DataFrame],
+    ) -> LabJobArtifactCandidate:
+        self._assert_store_operational()
+        plan = self._plan_candidate(
+            job_id=job_id,
+            spec=spec,
+            plan_hash=plan_hash,
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            result_contract_version=result_contract_version,
+            metrics=metrics,
+            report_markdown=report_markdown,
+            tables=tables,
+        )
+        return self._prepare_candidate_from_plan(plan)
+
+    @_artifact_public_operation(prepare=True)
+    def prepare_candidate_from_plan(
+        self,
+        plan: LabJobArtifactPlan,
+    ) -> LabJobArtifactCandidate:
+        self._assert_store_operational()
+        validated = LabJobArtifactPlan.model_validate(plan)
+        return self._prepare_candidate_from_plan(validated)
+
+    def _prepare_candidate_from_plan(
+        self,
+        plan: LabJobArtifactPlan,
+    ) -> LabJobArtifactCandidate:
+        bundle_payloads = {item.relative_path: item.payload for item in plan.payloads}
+        candidate_name = f"{plan.job_id.hex}-{uuid4().hex}"
         if re.fullmatch(r"[0-9a-f]{32}-[0-9a-f]{32}", candidate_name) is None:
             raise LabArtifactIntegrityError("validated candidate name is not a safe segment")
         candidate_path = self.candidates_root / candidate_name

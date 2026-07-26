@@ -28,6 +28,7 @@ from rquant.lab_artifacts import (
     LabArtifactRecoveryAuthority,
     LabArtifactRecoveryRecord,
     LabJobArtifactCandidate,
+    LabJobArtifactPlan,
     LabJobArtifactStore,
     LabSealedJobArtifact,
 )
@@ -533,8 +534,8 @@ class LabFinalizer:
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _authority(candidate: LabJobArtifactCandidate) -> LabArtifactRecoveryAuthority:
-        manifest = candidate.manifest
+    def _authority(plan: LabJobArtifactPlan) -> LabArtifactRecoveryAuthority:
+        manifest = plan.manifest
         return LabArtifactRecoveryAuthority(
             job_id=manifest.job_id,
             spec_hash=manifest.spec_hash,
@@ -544,24 +545,24 @@ class LabFinalizer:
             result_contract_version=manifest.result_contract_version,
             code_sha=manifest.code_sha,
             dataset_snapshot=manifest.dataset_snapshot,
-            expected_manifest_hash=candidate.manifest_hash,
+            expected_manifest_hash=plan.manifest_hash,
         )
 
     @staticmethod
     def _related_recovery_records(
-        candidate: LabJobArtifactCandidate,
+        plan: LabJobArtifactPlan,
         records: tuple[LabArtifactRecoveryRecord, ...],
     ) -> tuple[LabArtifactRecoveryRecord, ...]:
-        prefix = f"{candidate.job_id.hex}-"
+        prefix = f"{plan.job_id.hex}-"
         related = tuple(
             record
             for record in records
             if record.status != "quarantined"
-            and (record.job_id == candidate.job_id or record.path.name.startswith(prefix))
+            and (record.job_id == plan.job_id or record.path.name.startswith(prefix))
         )
         for record in related:
             if record.status in {"recoverable", "needs_authority", "recoverable_torn"} and (
-                record.job_id != candidate.job_id or record.manifest_hash != candidate.manifest_hash
+                record.job_id != plan.job_id or record.manifest_hash != plan.manifest_hash
             ):
                 raise LabFinalizationIntegrityError(
                     "job candidate recovery conflicts with current aggregate result"
@@ -577,57 +578,37 @@ class LabFinalizer:
             )
         )
 
-    def _recover_or_seal(self, candidate: LabJobArtifactCandidate) -> LabSealedJobArtifact:
-        authority = self._authority(candidate)
+    def _verify_or_recover_sealed(self, plan: LabJobArtifactPlan) -> LabSealedJobArtifact | None:
+        target = self.artifact_store.sealed_root / plan.job_id.hex
+        if not os.path.lexists(target):
+            return None
+        try:
+            sealed = self.artifact_store.recover_interrupted_seal(target)
+        except LabArtifactError as interrupted_error:
+            try:
+                sealed = self.artifact_store.verify_sealed(target)
+            except LabArtifactError as verify_error:
+                raise LabFinalizationIntegrityError(
+                    "existing sealed job artifact is neither complete nor recoverable"
+                ) from ExceptionGroup(
+                    "sealed artifact recovery and verification failed",
+                    [interrupted_error, verify_error],
+                )
+        if sealed.manifest != plan.manifest or sealed.manifest_hash != plan.manifest_hash:
+            raise LabFinalizationIntegrityError(
+                "existing sealed artifact conflicts with deterministic finalization output"
+            )
+        return sealed
+
+    def _recover_candidate_from_plan(
+        self,
+        plan: LabJobArtifactPlan,
+    ) -> LabSealedJobArtifact | None:
+        authority = self._authority(plan)
         records = self._related_recovery_records(
-            candidate,
+            plan,
             self.artifact_store.list_candidate_recovery(),
         )
-        target = self.artifact_store.sealed_root / candidate.job_id.hex
-        sealed: LabSealedJobArtifact | None = None
-        if os.path.lexists(target):
-            try:
-                sealed = self.artifact_store.recover_interrupted_seal(target)
-            except LabArtifactError as interrupted_error:
-                try:
-                    sealed = self.artifact_store.verify_sealed(target)
-                except LabArtifactError as verify_error:
-                    raise LabFinalizationIntegrityError(
-                        "existing sealed job artifact is neither complete nor recoverable"
-                    ) from ExceptionGroup(
-                        "sealed artifact recovery and verification failed",
-                        [interrupted_error, verify_error],
-                    )
-            if sealed.manifest != candidate.manifest:
-                raise LabFinalizationIntegrityError(
-                    "existing sealed artifact conflicts with deterministic finalization output"
-                )
-            for record in records:
-                benign_current_intent_conflict = (
-                    record.path == candidate.path
-                    and record.status == "invalid"
-                    and record.reason
-                    == "candidate seal intent does not bind the interrupted identity"
-                )
-                proven_matching = (
-                    record.status in {"recoverable", "needs_authority", "recoverable_torn"}
-                    and record.job_id == candidate.job_id
-                    and record.manifest_hash == candidate.manifest_hash
-                )
-                if not (benign_current_intent_conflict or proven_matching):
-                    raise LabFinalizationIntegrityError(
-                        "job candidate recovery contains conflicting filesystem evidence"
-                    )
-                try:
-                    self.artifact_store.quarantine_recovery_record(
-                        record,
-                        reason="redundant deterministic candidate after sealed recovery",
-                    )
-                except LabArtifactError as exc:
-                    raise LabFinalizationIntegrityError(
-                        "redundant matching candidate could not be safely isolated"
-                    ) from exc
-            return sealed
 
         if any(record.status == "invalid" for record in records):
             raise LabFinalizationIntegrityError(
@@ -659,16 +640,48 @@ class LabFinalizer:
                     raise LabFinalizationIntegrityError(
                         "redundant matching candidate could not be safely isolated"
                     ) from exc
-        if sealed is None:
+            if sealed.manifest != plan.manifest or sealed.manifest_hash != plan.manifest_hash:
+                raise LabFinalizationIntegrityError(
+                    "recovered job artifact conflicts with deterministic finalization output"
+                )
+            return sealed
+        return None
+
+    def _prepare_and_seal(self, plan: LabJobArtifactPlan) -> LabSealedJobArtifact:
+        try:
+            candidate = self.artifact_store.prepare_candidate_from_plan(plan)
+        except LabArtifactError as exc:
+            raise LabFinalizationIntegrityError(
+                "complete result candidate could not be prepared"
+            ) from exc
+        self._after_candidate_prepared(candidate)
+        try:
+            sealed = self.artifact_store.seal_candidate(candidate)
+        except LabArtifactError as exc:
+            primary_error = LabFinalizationIntegrityError("job artifact could not be sealed")
+            primary_error.__cause__ = exc
             try:
-                sealed = self.artifact_store.seal_candidate(candidate)
-            except LabArtifactError as exc:
-                raise LabFinalizationIntegrityError("job artifact could not be sealed") from exc
-        if sealed.manifest != candidate.manifest:
+                self._isolate_owned_candidate(candidate)
+            except Exception as cleanup_error:
+                raise ExceptionGroup(
+                    "finalization failed and owned candidate isolation failed",
+                    [primary_error, cleanup_error],
+                ) from None
+            raise primary_error from exc
+        if sealed.manifest != plan.manifest or sealed.manifest_hash != plan.manifest_hash:
             raise LabFinalizationIntegrityError(
                 "sealed job artifact conflicts with deterministic finalization output"
             )
         return sealed
+
+    def _recover_or_prepare(self, plan: LabJobArtifactPlan) -> LabSealedJobArtifact:
+        sealed = self._verify_or_recover_sealed(plan)
+        if sealed is not None:
+            return sealed
+        sealed = self._recover_candidate_from_plan(plan)
+        if sealed is not None:
+            return sealed
+        return self._prepare_and_seal(plan)
 
     def _isolate_owned_candidate(self, candidate: LabJobArtifactCandidate) -> None:
         if not os.path.lexists(candidate.path):
@@ -735,7 +748,7 @@ class LabFinalizer:
         metrics = self._metrics(snapshot, result, shard_results)
         first = snapshot.shards[0].shard
         try:
-            candidate = self.artifact_store.prepare_candidate(
+            plan = self.artifact_store.preview_candidate(
                 job_id=snapshot.job.job_id,
                 spec=snapshot.job.spec,
                 plan_hash=first.plan_hash,
@@ -748,20 +761,9 @@ class LabFinalizer:
             )
         except LabArtifactError as exc:
             raise LabFinalizationIntegrityError(
-                "complete result candidate could not be prepared"
+                "complete result candidate could not be previewed"
             ) from exc
-        self._after_candidate_prepared(candidate)
-        try:
-            sealed = self._recover_or_seal(candidate)
-        except LabFinalizationIntegrityError as primary_error:
-            try:
-                self._isolate_owned_candidate(candidate)
-            except Exception as cleanup_error:
-                raise ExceptionGroup(
-                    "finalization failed and owned candidate isolation failed",
-                    [primary_error, cleanup_error],
-                ) from None
-            raise
+        sealed = self._recover_or_prepare(plan)
         self._after_artifact_sealed(sealed)
         envelope = self._envelope(sealed, snapshot.ready_epoch)
         published = self.commit_spool.publish(envelope)

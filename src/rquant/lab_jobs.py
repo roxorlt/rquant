@@ -756,6 +756,8 @@ class LabFinalizationShardEvidence(LabRecordModel):
 
 
 class LabFinalizationReadyEpoch(LabRecordModel):
+    """Stable identity of the ledger's currently observable ready result event."""
+
     job_version: int = Field(ge=0)
     event: LabEventRecord
 

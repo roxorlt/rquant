@@ -28,7 +28,6 @@ from rquant.lab_job_protocol import (
     LabCommandEnvelope,
     LabCommandSpool,
     PauseJobCommand,
-    ResumeJobCommand,
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
@@ -101,7 +100,9 @@ class _Scenario:
         )
 
 
-class _StaticSnapshotReader:
+class _TamperedBundleSnapshotReader:
+    """Inject typed bundle evidence only; never model job-state transitions."""
+
     def __init__(self, snapshot: LabFinalizationSnapshot) -> None:
         self.snapshot = snapshot
 
@@ -114,7 +115,6 @@ def _ready_scenario(
     *,
     hold_days: tuple[int, ...] = (1, 2),
     commit_spool_type: type[LabArtifactCommitSpool] = LabArtifactCommitSpool,
-    pause_resume_before_ready: bool = False,
 ) -> _Scenario:
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -151,35 +151,6 @@ def _ready_scenario(
         clock=lambda: NOW,
     )
     scheduler.run_once()
-    if pause_resume_before_ready:
-        running = LabJobReader(store.path).get_job(job_id)
-        assert running is not None and scheduler.lease is not None
-        commands.publish(
-            LabCommandEnvelope(
-                request_id=uuid4(),
-                command=PauseJobCommand(
-                    job_id=job_id,
-                    expected_version=running.version,
-                    reason="test pause before ready",
-                ),
-            )
-        )
-        scheduler.run_once()
-        paused = LabJobReader(store.path).get_job(job_id)
-        assert paused is not None and paused.control_intent is ControlIntent.PAUSE_REQUESTED
-        commands.publish(
-            LabCommandEnvelope(
-                request_id=uuid4(),
-                command=ResumeJobCommand(
-                    job_id=job_id,
-                    expected_version=paused.version,
-                    reason="test resume before ready",
-                ),
-            )
-        )
-        scheduler.run_once()
-        resumed = LabJobReader(store.path).get_job(job_id)
-        assert resumed is not None and resumed.control_intent is ControlIntent.NONE
     worker = _worker(
         tmp_path,
         registry=RecordingRegistry(),
@@ -236,6 +207,13 @@ def _leave_prepared_candidate(
     candidates = tuple(scenario.artifact_store.candidates_root.iterdir())
     assert len(candidates) == 1
     return candidates[0]
+
+
+def _candidate_evidence_counts(store: LabJobArtifactStore) -> tuple[int, int]:
+    return (
+        len(tuple(store.candidates_root.iterdir())),
+        len(tuple(store.quarantine_root.iterdir())),
+    )
 
 
 def _insert_duplicate_accepted_success(path: Path, snapshot: LabFinalizationSnapshot) -> None:
@@ -442,25 +420,35 @@ def test_finalization_snapshot_rejects_ready_event_from_a_different_fence(
         )
 
 
-def test_pause_resume_before_completion_produces_one_stable_ready_epoch(
+def test_ready_pause_is_rejected_and_same_ready_epoch_request_remains_stable(
     tmp_path: Path,
 ) -> None:
-    scenario = _ready_scenario(
-        tmp_path,
-        hold_days=(1,),
-        pause_resume_before_ready=True,
-    )
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
     reader = LabJobReader(scenario.store.path)
-    snapshot = reader.get_finalization_snapshot(scenario.job_id)
-    assert snapshot is not None
-    events = reader.list_events(scenario.job_id)
-
-    assert [event.event_type for event in events].count("control_intent_changed") == 2
-    assert [event.event_type for event in events].count("job_result_ready") == 1
-    assert snapshot.ready_epoch.job_version == snapshot.job.version
-    assert snapshot.ready_epoch.event == next(
-        event for event in events if event.event_type == "job_result_ready"
+    before = reader.get_finalization_snapshot(scenario.job_id)
+    assert before is not None and scenario.scheduler.lease is not None
+    published = scenario.finalizer().finalize(scenario.job_id)
+    pause = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=PauseJobCommand(
+            job_id=scenario.job_id,
+            expected_version=before.job.version,
+            reason="pause after complete result became ready",
+        ),
     )
+    receipt = scenario.store.apply_command(
+        pause,
+        lease=scenario.scheduler.lease,
+        now=NOW,
+    )
+    after = reader.get_finalization_snapshot(scenario.job_id)
+    replay = scenario.finalizer().finalize(scenario.job_id)
+
+    assert receipt.status == "rejected"
+    assert receipt.reason == "invalid_result_state:ready"
+    assert after == before
+    assert replay.request_id == published.request_id
+    assert _candidate_evidence_counts(scenario.artifact_store) == (0, 0)
 
 
 def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: Path) -> None:
@@ -483,8 +471,12 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
     assert [item["name"] for item in metrics["tables"]] == ["trades"]
     assert b"generated_at" not in metrics_before
 
-    second = scenario.finalizer().finalize(scenario.job_id)
-    third = scenario.finalizer().finalize(scenario.job_id)
+    replay_counts: list[tuple[int, int]] = []
+    replays = []
+    for _ in range(5):
+        replays.append(scenario.finalizer().finalize(scenario.job_id))
+        replay_counts.append(_candidate_evidence_counts(scenario.artifact_store))
+    second, third = replays[:2]
 
     assert isinstance(second, LabFinalizerResult)
     assert third.request_id == second.request_id == first.request_id == envelope.request_id
@@ -492,6 +484,7 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
         third.manifest_hash == second.manifest_hash == first.manifest_hash == sealed.manifest_hash
     )
     assert len(scenario.commit_spool.pending()) == 1
+    assert replay_counts == [(0, 0)] * 5
     assert (sealed.path / "metrics.json").read_bytes() == metrics_before
     assert (sealed.path / "report.md").read_bytes() == report_before
 
@@ -506,86 +499,16 @@ def test_finalizer_reports_rejected_ack_as_rejected_not_acknowledged(tmp_path: P
     )
 
     replay = scenario.finalizer().finalize(scenario.job_id)
+    repeated = scenario.finalizer().finalize(scenario.job_id)
 
     assert first.status == "published"
     assert receipt.status == "rejected"
     assert replay.status == "rejected"
     assert replay.rejection_reason == "synthetic_rejection"
+    assert repeated == replay
     assert replay.request_id == first.request_id
-
-
-def test_artifact_commit_request_identity_changes_only_for_new_ready_epoch(
-    tmp_path: Path,
-) -> None:
-    scenario = _ready_scenario(tmp_path, hold_days=(1,))
-    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
-    assert snapshot is not None
-    published = scenario.finalizer().finalize(scenario.job_id)
-    sealed = scenario.artifact_store.verify_sealed(
-        scenario.artifact_store.sealed_root / scenario.job_id.hex
-    )
-
-    same_epoch = LabFinalizer._envelope(sealed, snapshot.ready_epoch)
-    next_event = snapshot.ready_epoch.event.model_copy(
-        update={
-            "event_id": snapshot.ready_epoch.event.event_id + 1,
-            "job_version": snapshot.ready_epoch.job_version + 2,
-        }
-    )
-    next_epoch = snapshot.ready_epoch.model_copy(
-        update={
-            "job_version": snapshot.ready_epoch.job_version + 2,
-            "event": next_event,
-        }
-    )
-    after_pause_resume = LabFinalizer._envelope(sealed, next_epoch)
-
-    assert same_epoch.request_id == published.request_id
-    assert after_pause_resume.commit == same_epoch.commit
-    assert after_pause_resume.request_id != same_epoch.request_id
-
-
-def test_rejected_commit_is_not_reused_after_a_new_ready_epoch(tmp_path: Path) -> None:
-    scenario = _ready_scenario(tmp_path, hold_days=(1,))
-    original_snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
-    assert original_snapshot is not None
-    rejected = scenario.finalizer().finalize(scenario.job_id)
-    _ack_artifact_commit(
-        scenario,
-        status="rejected",
-        reason="synthetic_pause_race",
-    )
-    next_event = original_snapshot.ready_epoch.event.model_copy(
-        update={
-            "event_id": original_snapshot.ready_epoch.event.event_id + 1,
-            "job_version": original_snapshot.ready_epoch.job_version + 2,
-        }
-    )
-    next_epoch = original_snapshot.ready_epoch.model_copy(
-        update={
-            "job_version": original_snapshot.ready_epoch.job_version + 2,
-            "event": next_event,
-        }
-    )
-    next_job = original_snapshot.job.model_copy(update={"version": next_epoch.job_version})
-    next_snapshot = LabFinalizationSnapshot(
-        job=next_job,
-        ready_epoch=next_epoch,
-        shards=original_snapshot.shards,
-    )
-    finalizer = LabFinalizer(
-        reader=_StaticSnapshotReader(next_snapshot),  # type: ignore[arg-type]
-        shard_artifact_root=tmp_path / "artifacts",
-        artifact_store=scenario.artifact_store,
-        commit_spool=scenario.commit_spool,
-        adapter_registry=default_strategy_job_adapter_registry(),
-    )
-
-    republished = finalizer.finalize(scenario.job_id)
-
-    assert republished.status == "published"
-    assert republished.request_id != rejected.request_id
-    assert scenario.commit_spool.pending()[0].envelope.request_id == republished.request_id
+    assert not scenario.commit_spool.pending()
+    assert _candidate_evidence_counts(scenario.artifact_store) == (0, 0)
 
 
 def test_finalizer_never_writes_the_sqlite_ledger(tmp_path: Path) -> None:
@@ -633,6 +556,7 @@ def test_finalizer_recovers_idempotently_after_each_crash_boundary(
     assert recovered.status == "published"
     assert len(scenario.commit_spool.pending()) == 1
     assert not tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
     assert (
         scenario.artifact_store.verify_sealed(
             scenario.artifact_store.sealed_root / scenario.job_id.hex
@@ -710,16 +634,16 @@ def test_invalid_existing_candidate_retries_keep_active_evidence_bounded(
     os.chmod(report, 0o400)
     os.chmod(original, 0o500)
 
-    counts: list[int] = []
+    counts: list[tuple[int, int]] = []
     for _ in range(3):
         with pytest.raises(
             LabFinalizationIntegrityError,
             match="invalid filesystem evidence",
         ):
             scenario.finalizer().finalize(scenario.job_id)
-        counts.append(len(tuple(scenario.artifact_store.candidates_root.iterdir())))
+        counts.append(_candidate_evidence_counts(scenario.artifact_store))
 
-    assert counts == [1, 1, 1]
+    assert counts == [(1, 0)] * 3
     assert original.exists() and original.stat().st_ino == original_inode
     assert (original / "report.md").read_bytes() == b"corrupt preserved evidence\n"
 
@@ -744,16 +668,16 @@ def test_mismatched_existing_candidate_retries_keep_active_evidence_bounded(
     )
     original_inode = original.inode
 
-    counts: list[int] = []
+    counts: list[tuple[int, int]] = []
     for _ in range(3):
         with pytest.raises(
             LabFinalizationIntegrityError,
             match="conflicts with current aggregate result",
         ):
             scenario.finalizer().finalize(scenario.job_id)
-        counts.append(len(tuple(scenario.artifact_store.candidates_root.iterdir())))
+        counts.append(_candidate_evidence_counts(scenario.artifact_store))
 
-    assert counts == [1, 1, 1]
+    assert counts == [(1, 0)] * 3
     assert original.path.exists() and original.path.stat().st_ino == original_inode
     assert scenario.artifact_store.verify_candidate(original) == original.manifest
 
@@ -772,18 +696,52 @@ def test_broken_sealed_target_retries_do_not_accumulate_owned_candidates(
     os.chmod(report, 0o400)
     os.chmod(sealed, 0o500)
 
-    counts: list[int] = []
+    counts: list[tuple[int, int]] = []
     for _ in range(3):
         with pytest.raises(
             LabFinalizationIntegrityError,
             match="neither complete nor recoverable",
         ):
             scenario.finalizer().finalize(scenario.job_id)
-        counts.append(len(tuple(scenario.artifact_store.candidates_root.iterdir())))
+        counts.append(_candidate_evidence_counts(scenario.artifact_store))
 
-    assert counts == [0, 0, 0]
+    assert counts == [(0, 0)] * 3
     assert sealed.exists() and sealed.stat().st_ino == sealed_inode
     assert report.read_bytes() == b"broken sealed evidence\n"
+
+
+def test_matching_sealed_artifact_bypasses_conflicting_candidate_without_mutation(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    published = scenario.finalizer().finalize(scenario.job_id)
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    shard = snapshot.shards[0].shard
+    conflict = scenario.artifact_store.prepare_candidate(
+        job_id=scenario.job_id,
+        spec=snapshot.job.spec,
+        plan_hash=shard.plan_hash,
+        adapter_id=shard.adapter_id,
+        adapter_version=shard.adapter_version,
+        result_contract_version="p1.4b-complete-result-v1",
+        metrics={"schema_version": 1, "conflict": True},
+        report_markdown="# Preserved conflict\n",
+        tables={"trades": pd.DataFrame([{"hold_days": 99, "ret_pct": -99.0}])},
+    )
+    baseline = _candidate_evidence_counts(scenario.artifact_store)
+    conflict_identity = (conflict.path.stat().st_dev, conflict.path.stat().st_ino)
+
+    replays: list[LabFinalizerResult] = []
+    counts: list[tuple[int, int]] = []
+    for _ in range(3):
+        replays.append(scenario.finalizer().finalize(scenario.job_id))
+        counts.append(_candidate_evidence_counts(scenario.artifact_store))
+
+    assert all(item.request_id == published.request_id for item in replays)
+    assert counts == [baseline] * 3
+    assert baseline == (1, 0)
+    assert (conflict.path.stat().st_dev, conflict.path.stat().st_ino) == conflict_identity
 
 
 def test_owned_candidate_cleanup_failure_preserves_primary_and_cleanup_errors(
@@ -791,17 +749,18 @@ def test_owned_candidate_cleanup_failure_preserves_primary_and_cleanup_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
-    original = _leave_prepared_candidate(scenario, monkeypatch)
-    report = original / "report.md"
-    os.chmod(original, 0o700)
-    os.chmod(report, 0o600)
-    report.write_bytes(b"corrupt preserved evidence\n")
-    os.chmod(report, 0o400)
-    os.chmod(original, 0o500)
+
+    def fail_seal(*_args: object, **_kwargs: object) -> object:
+        raise LabArtifactError("seal failed")
 
     def fail_cleanup(*_args: object, **_kwargs: object) -> object:
         raise LabArtifactError("cleanup failed")
 
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "seal_candidate",
+        fail_seal,
+    )
     monkeypatch.setattr(
         scenario.artifact_store,
         "quarantine_recovery_record",
@@ -812,7 +771,7 @@ def test_owned_candidate_cleanup_failure_preserves_primary_and_cleanup_errors(
         scenario.finalizer().finalize(scenario.job_id)
 
     messages = tuple(str(error) for error in raised.value.exceptions)
-    assert any("invalid filesystem evidence" in message for message in messages)
+    assert any("job artifact could not be sealed" in message for message in messages)
     assert any("cleanup failed" in message for message in messages)
 
 
@@ -1028,7 +987,7 @@ def test_finalizer_rejects_cross_shard_dtype_tamper_after_real_bundle_reads(
         shards=(snapshot.shards[0], changed_evidence),
     )
     finalizer = LabFinalizer(
-        reader=_StaticSnapshotReader(changed_snapshot),  # type: ignore[arg-type]
+        reader=_TamperedBundleSnapshotReader(changed_snapshot),  # type: ignore[arg-type]
         shard_artifact_root=tmp_path / "artifacts",
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,

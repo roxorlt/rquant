@@ -50,13 +50,16 @@
 
 ### Fixed
 
-- **Strategy Lab finalizer ready epoch 与冲突恢复**：artifact commit request 现在同时绑定
-  不可变 commit identity 与单事务验证的 `job_result_ready` event/version，rejected ACK
-  以 typed `rejected` 结果返回，pause/resume 后的新 ready epoch 不会永久命中旧拒绝回执。
-  invalid/mismatched candidate 或损坏 sealed target 仍 fail closed，但每次失败只按
-  path/device/inode 隔离本次 finalizer 自有 candidate，原始冲突证据不被覆盖；隔离失败会与
-  主错误一并保留。accepted attempt reader 返回前逐文件重验 inode，并拒绝 hardlink、文件
-  hash、内容 hash 及跨 shard dtype/schema 篡改。
+- **Strategy Lab finalizer 确定性预览与 ready 结果语义**：artifact store 新增零写入的 typed
+  plan，一次生成 exact canonical payload/manifest，`prepare_candidate` 与 finalizer 共同消费
+  同一份序列化实现。finalizer 先验证 sealed，再按 preview authority 恢复 candidate，仅在两者
+  都不存在时落盘；正常重放、invalid/mismatched candidate 和损坏 sealed target 的 active 与
+  quarantine 证据数量均保持有界且不增长。artifact commit request 绑定不可变 commit identity
+  与单事务验证的 `job_result_ready` event/version；READY job 的 pause 会被真实状态机拒绝，同一
+  ready epoch 的 request 保持稳定。rejected ACK 是该 epoch 的 typed、终态可观察结果，需要新
+  job 或人工纠正，finalizer 不会把它误报为 acknowledged 或杜撰自动恢复路径。accepted attempt
+  reader 返回前逐文件重验 inode，并拒绝 hardlink、文件 hash、内容 hash 及跨 shard
+  dtype/schema 篡改。
 
 - **Strategy Lab worker 热路径与升级兼容**：scheduler claim authority 每 tick 只处理 SQLite
   active claims 和有 cursor/limit 的 pending/current 热集合，终态 claim 退役到持久 cold
