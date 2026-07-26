@@ -14,6 +14,7 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 
+import rquant.lab_jobs as lab_jobs
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -22,7 +23,11 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
 )
-from rquant.lab_artifacts import LabJobArtifactStore, LabSealedJobArtifact
+from rquant.lab_artifacts import (
+    LabArtifactIndexEvidence,
+    LabJobArtifactStore,
+    LabSealedJobArtifact,
+)
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabAcknowledgedCommand,
@@ -36,6 +41,7 @@ from rquant.lab_job_protocol import (
 from rquant.lab_jobs import (
     COMPLETE_RESULT_CONTRACT_VERSION,
     ArtifactCommitDeadlineExpiredError,
+    InvalidStoredJobError,
     JobStatus,
     LabJobReader,
     LabJobRecord,
@@ -59,6 +65,18 @@ from rquant.research_run_spec import (
 from .test_lab_shard_control_plane import PLAN_HASH, _definition
 
 NOW = datetime(2026, 7, 24, 1, 0, tzinfo=UTC)
+
+
+def _canonical_json(
+    model: LabArtifactCommitEnvelope | LabArtifactCommitReceipt | LabArtifactIndexEvidence,
+) -> str:
+    return json.dumps(
+        model.model_dump(mode="json"),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _spec(*, deadline: datetime | None = None) -> ResearchRunSpec:
@@ -358,6 +376,301 @@ def _ready_artifact_commit_scenario(
         commit_spool.publish(envelope)
     clock[0] = NOW + timedelta(seconds=4)
     return store, scheduler, commit_spool, artifact_store, job, sealed, envelope, clock
+
+
+def test_external_sql_cannot_revive_sealed_job_or_downgrade_contract(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="terminal|sealed|authorized|function"),
+    ):
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = 'running', result_state = 'ready',
+                result_contract_version = NULL
+            WHERE job_id = ?
+            """,
+            (str(job.job_id),),
+        )
+
+
+def test_reader_rejects_persisted_sealed_job_without_any_shards(tmp_path: Path) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER trg_lab_complete_result_shard_no_delete")
+        connection.execute("DELETE FROM lab_shard WHERE job_id = ?", (str(job.job_id),))
+        connection.execute(lab_jobs._V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER)
+
+    with pytest.raises(InvalidStoredJobError, match="shard"):
+        LabJobReader(store.path).get_job(job.job_id)
+
+
+def test_external_sql_cannot_delete_shard_from_sealed_job(tmp_path: Path) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="shard|immutable"),
+    ):
+        connection.execute("DELETE FROM lab_shard WHERE job_id = ?", (str(job.job_id),))
+
+
+def test_reader_rejects_accepted_commit_after_result_index_is_lost(tmp_path: Path) -> None:
+    store, scheduler, _spool, _artifacts, _job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER trg_lab_result_artifact_no_delete")
+        connection.execute(
+            "DELETE FROM lab_job_result_artifact WHERE commit_request_id = ?",
+            (str(envelope.request_id),),
+        )
+        connection.execute(lab_jobs._V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER)
+
+    with pytest.raises(InvalidStoredJobError, match="index"):
+        LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+
+
+@pytest.mark.parametrize(
+    ("commit_json_override", "receipt_json_override"),
+    [("{}", None), (None, "{}")],
+    ids=["empty-commit", "empty-receipt"],
+)
+def test_commit_json_shape_is_checked_even_with_spoofed_sql_authority(
+    tmp_path: Path,
+    commit_json_override: str | None,
+    receipt_json_override: str | None,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    commit_json = commit_json_override or _canonical_json(envelope)
+    receipt_json = receipt_json_override or _canonical_json(receipt)
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="CHECK|consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json,
+                    status, reason, receipt_json, receipt_job_version,
+                    received_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(job.job_id),
+                    commit_json,
+                    receipt_json,
+                    receipt.job_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+
+def test_accepted_commit_receipt_version_matches_ready_job_transition(
+    tmp_path: Path,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 2,
+    )
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json,
+                    status, reason, receipt_json, receipt_job_version,
+                    received_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(job.job_id),
+                    _canonical_json(envelope),
+                    _canonical_json(receipt),
+                    receipt.job_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+
+def test_accepted_commit_requires_at_least_one_succeeded_shard_even_with_sql_authority(
+    tmp_path: Path,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TRIGGER trg_lab_complete_result_shard_no_delete")
+        connection.execute("DELETE FROM lab_shard WHERE job_id = ?", (str(job.job_id),))
+        connection.execute(lab_jobs._V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER)
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json,
+                    status, reason, receipt_json, receipt_job_version,
+                    received_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(job.job_id),
+                    _canonical_json(envelope),
+                    _canonical_json(receipt),
+                    receipt.job_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["empty-evidence", "missing-path", "wrong-job", "wrong-request", "wrong-hash"],
+)
+def test_result_index_cross_fields_reject_spoofed_sql_authority(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    store, _scheduler, _spool, artifacts, job, sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    with artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding:
+        evidence = binding.evidence
+    request_id = envelope.request_id
+    indexed_job_id = job.job_id
+    if mutation == "missing-path":
+        evidence = evidence.model_copy(update={"sealed_path": Path("/does/not/exist")})
+    elif mutation == "wrong-job":
+        indexed_job_id = uuid4()
+        evidence = evidence.model_copy(update={"job_id": indexed_job_id})
+    elif mutation == "wrong-request":
+        request_id = uuid4()
+    elif mutation == "wrong-hash":
+        evidence = evidence.model_copy(update={"manifest_hash": "0" * 64})
+    evidence_json = "{}" if mutation == "empty-evidence" else _canonical_json(evidence)
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        connection.create_function(
+            lab_jobs._ARTIFACT_INDEX_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        connection.execute(
+            """
+            INSERT INTO lab_artifact_commit (
+                request_id, content_hash, job_id, commit_json,
+                status, reason, receipt_json, receipt_job_version,
+                received_at, applied_at
+            ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+            """,
+            (
+                str(envelope.request_id),
+                envelope.content_hash,
+                str(job.job_id),
+                _canonical_json(envelope),
+                _canonical_json(receipt),
+                receipt.job_version,
+                timestamp,
+                timestamp,
+            ),
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="CHECK|consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_job_result_artifact (
+                    job_id, commit_request_id, sealed_path, manifest_hash,
+                    complete_result_hash, bundle_device, bundle_inode,
+                    evidence_json, indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(indexed_job_id),
+                    str(request_id),
+                    str(evidence.sealed_path),
+                    evidence.manifest_hash,
+                    evidence.complete_result_hash,
+                    evidence.bundle_device,
+                    evidence.bundle_inode,
+                    evidence_json,
+                    timestamp,
+                ),
+            )
 
 
 class _CrashBeforeArtifactCommitScheduler(LabScheduler):

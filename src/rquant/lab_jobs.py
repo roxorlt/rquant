@@ -101,6 +101,11 @@ _PREVIOUS_SCHEMA_VERSION = 4
 _SCHEMA_VERSION = 5
 RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
 COMPLETE_RESULT_CONTRACT_VERSION = "p1.4b-complete-result-v1"
+_SUBMIT_AUTH_FUNCTION = "rquant_lab_submit_authorized"
+_RETRY_AUTH_FUNCTION = "rquant_lab_retry_authorized"
+_ARTIFACT_COMMIT_AUTH_FUNCTION = "rquant_lab_artifact_commit_authorized"
+_ARTIFACT_INDEX_AUTH_FUNCTION = "rquant_lab_artifact_index_authorized"
+_ARTIFACT_SUCCESS_AUTH_FUNCTION = "rquant_lab_artifact_success_authorized"
 LAB_ETA_COMPLETED_LIMIT_MAX = 256
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
@@ -109,6 +114,151 @@ _ATTEMPTS_EXHAUSTED_FAILURE_JSON = '{"reason":"attempts_exhausted"}'
 _PARENT_ATTEMPTS_EXHAUSTED_FAILURE_JSON = '{"reason":"parent_failed_attempts_exhausted"}'
 _PARENT_RECOVERABLE_FAILURE_JSON = '{"reason":"parent_failed_recoverable"}'
 _DEADLINE_EXCEEDED_FAILURE_JSON = '{"reason":"deadline_exceeded"}'
+
+
+class _LabWriteAuthorization:
+    __slots__ = ("_artifact_commit", "_artifact_index", "_artifact_success", "_retry", "_submit")
+
+    def __init__(self) -> None:
+        self._submit: tuple[str, str] | None = None
+        self._retry: tuple[str, int, int] | None = None
+        self._artifact_commit: tuple[str, str, str] | None = None
+        self._artifact_index: tuple[str, str, str] | None = None
+        self._artifact_success: tuple[str, str, str, int, int] | None = None
+
+    @contextmanager
+    def authorize_submit(self, job_id: UUID, spec_json: str) -> Iterator[None]:
+        if self._submit is not None:
+            raise RuntimeError("submit SQL authorization is already active")
+        self._submit = (str(job_id), spec_json)
+        try:
+            yield
+        finally:
+            self._submit = None
+
+    @contextmanager
+    def authorize_retry(
+        self,
+        job_id: UUID,
+        old_version: int,
+        new_version: int,
+    ) -> Iterator[None]:
+        if self._retry is not None:
+            raise RuntimeError("retry SQL authorization is already active")
+        self._retry = (str(job_id), old_version, new_version)
+        try:
+            yield
+        finally:
+            self._retry = None
+
+    @contextmanager
+    def authorize_artifact_commit(
+        self,
+        request_id: UUID,
+        commit_json: str,
+        receipt_json: str,
+    ) -> Iterator[None]:
+        if self._artifact_commit is not None:
+            raise RuntimeError("artifact commit SQL authorization is already active")
+        self._artifact_commit = (str(request_id), commit_json, receipt_json)
+        try:
+            yield
+        finally:
+            self._artifact_commit = None
+
+    @contextmanager
+    def authorize_artifact_index(
+        self,
+        job_id: UUID,
+        request_id: UUID,
+        evidence_json: str,
+    ) -> Iterator[None]:
+        if self._artifact_index is not None:
+            raise RuntimeError("artifact index SQL authorization is already active")
+        self._artifact_index = (str(job_id), str(request_id), evidence_json)
+        try:
+            yield
+        finally:
+            self._artifact_index = None
+
+    @contextmanager
+    def authorize_artifact_success(
+        self,
+        job_id: UUID,
+        request_id: UUID,
+        evidence_json: str,
+        old_version: int,
+        new_version: int,
+    ) -> Iterator[None]:
+        if self._artifact_success is not None:
+            raise RuntimeError("artifact success SQL authorization is already active")
+        self._artifact_success = (
+            str(job_id),
+            str(request_id),
+            evidence_json,
+            old_version,
+            new_version,
+        )
+        try:
+            yield
+        finally:
+            self._artifact_success = None
+
+    def submit_authorized(self, job_id: object, spec_json: object) -> int:
+        return int(self._submit == (str(job_id), str(spec_json)))
+
+    def retry_authorized(
+        self,
+        job_id: object,
+        old_version: object,
+        new_version: object,
+    ) -> int:
+        return int(self._retry == (str(job_id), old_version, new_version))
+
+    def artifact_commit_authorized(
+        self,
+        request_id: object,
+        commit_json: object,
+        receipt_json: object,
+    ) -> int:
+        return int(self._artifact_commit == (str(request_id), str(commit_json), str(receipt_json)))
+
+    def artifact_index_authorized(
+        self,
+        job_id: object,
+        request_id: object,
+        evidence_json: object,
+    ) -> int:
+        return int(self._artifact_index == (str(job_id), str(request_id), str(evidence_json)))
+
+    def artifact_success_authorized(
+        self,
+        job_id: object,
+        request_id: object,
+        evidence_json: object,
+        old_version: object,
+        new_version: object,
+    ) -> int:
+        return int(
+            self._artifact_success
+            == (
+                str(job_id),
+                str(request_id),
+                str(evidence_json),
+                old_version,
+                new_version,
+            )
+        )
+
+
+class _LabJobStoreConnection(sqlite3.Connection):
+    write_authorization: _LabWriteAuthorization
+
+
+def _write_authorization(connection: sqlite3.Connection) -> _LabWriteAuthorization:
+    if not isinstance(connection, _LabJobStoreConnection):
+        raise RuntimeError("lab write authorization requires a store-owned connection")
+    return connection.write_authorization
 
 
 class JobStatus(StrEnum):
@@ -678,6 +828,54 @@ def _artifact_commit_record_from_row(
         raise InvalidStoredJobError(f"invalid stored artifact commit {stored_id}: {exc}") from exc
 
 
+def _result_artifact_evidence_from_row(
+    row: sqlite3.Row,
+    *,
+    expected_job_id: UUID | None = None,
+) -> LabArtifactIndexEvidence:
+    from rquant.lab_artifacts import LabArtifactIndexEvidence
+
+    try:
+        evidence = LabArtifactIndexEvidence.model_validate_json(str(row["evidence_json"]))
+        if expected_job_id is not None and evidence.job_id != expected_job_id:
+            raise ValueError("artifact evidence job id mismatch")
+        if (
+            str(evidence.job_id),
+            str(evidence.sealed_path),
+            evidence.manifest_hash,
+            evidence.complete_result_hash,
+            evidence.bundle_device,
+            evidence.bundle_inode,
+            _dump_time(evidence.indexed_at),
+            _canonical_model_json(evidence),
+        ) != (
+            str(row["job_id"]),
+            str(row["sealed_path"]),
+            str(row["manifest_hash"]),
+            str(row["complete_result_hash"]),
+            _strict_sqlite_int(
+                row["bundle_device"],
+                field="lab_job_result_artifact.bundle_device",
+                minimum=0,
+            ),
+            _strict_sqlite_int(
+                row["bundle_inode"],
+                field="lab_job_result_artifact.bundle_inode",
+                minimum=1,
+            ),
+            str(row["indexed_at"]),
+            str(row["evidence_json"]),
+        ):
+            raise ValueError("artifact evidence conflicts with indexed columns")
+        return evidence
+    except Exception as exc:
+        if isinstance(exc, InvalidStoredJobError):
+            raise
+        raise InvalidStoredJobError(
+            f"invalid stored result artifact {row['job_id']}: {exc}"
+        ) from exc
+
+
 def _validate_v2_schema(connection: sqlite3.Connection) -> None:
     columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(lab_command)").fetchall()
@@ -1159,9 +1357,13 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
         "trg_lab_job_complete_result_insert",
         "trg_lab_job_complete_result_update",
         "trg_lab_job_complete_result_marker_immutable",
+        "trg_lab_artifact_commit_insert",
         "trg_lab_result_artifact_insert",
         "trg_lab_result_artifact_no_update",
         "trg_lab_result_artifact_no_delete",
+        "trg_lab_complete_result_shard_no_insert",
+        "trg_lab_complete_result_shard_no_update",
+        "trg_lab_complete_result_shard_no_delete",
         "trg_lab_artifact_commit_no_update",
         "trg_lab_artifact_commit_no_delete",
     }
@@ -1180,9 +1382,13 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
         "trg_lab_job_complete_result_insert": _V5_JOB_RESULT_INSERT_TRIGGER,
         "trg_lab_job_complete_result_update": _V5_JOB_RESULT_UPDATE_TRIGGER,
         "trg_lab_job_complete_result_marker_immutable": (_V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER),
+        "trg_lab_artifact_commit_insert": _V5_ARTIFACT_COMMIT_INSERT_TRIGGER,
         "trg_lab_result_artifact_insert": _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
         "trg_lab_result_artifact_no_update": _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
         "trg_lab_result_artifact_no_delete": _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
+        "trg_lab_complete_result_shard_no_insert": (_V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER),
+        "trg_lab_complete_result_shard_no_update": (_V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER),
+        "trg_lab_complete_result_shard_no_delete": (_V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER),
         "trg_lab_artifact_commit_no_update": _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
         "trg_lab_artifact_commit_no_delete": _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
     }
@@ -2112,13 +2318,114 @@ class LabJobReader:
                 f"invalid stored lab shard {row['shard_id']}: {exc}"
             ) from exc
 
+    @classmethod
+    def _validate_complete_result_graph(
+        cls,
+        connection: sqlite3.Connection,
+        job: LabJobRecord,
+    ) -> LabArtifactIndexEvidence | None:
+        index_row = connection.execute(
+            "SELECT * FROM lab_job_result_artifact WHERE job_id = ?",
+            (str(job.job_id),),
+        ).fetchone()
+        shard_rows = connection.execute(
+            "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
+            (str(job.job_id),),
+        ).fetchall()
+        shards = tuple(cls._shard_from_row(row) for row in shard_rows)
+
+        if not job.requires_complete_result:
+            if index_row is not None:
+                raise InvalidStoredJobError("legacy job unexpectedly has a complete result index")
+            return None
+
+        if job.result_state is LabResultState.PENDING:
+            if index_row is not None:
+                raise InvalidStoredJobError("pending job unexpectedly has a result index")
+            if (
+                job.status is JobStatus.RUNNING
+                and job.result_contract_version == COMPLETE_RESULT_CONTRACT_VERSION
+                and shards
+                and all(shard.status is ShardStatus.SUCCEEDED for shard in shards)
+            ):
+                raise InvalidStoredJobError(
+                    "running job with all shards succeeded must be result ready"
+                )
+            return None
+
+        if not shards or any(shard.status is not ShardStatus.SUCCEEDED for shard in shards):
+            raise InvalidStoredJobError(
+                "ready or sealed complete result job requires succeeded shards"
+            )
+        if job.result_state is LabResultState.READY:
+            if index_row is not None:
+                raise InvalidStoredJobError("ready job unexpectedly has a result index")
+            return None
+        if job.result_state is not LabResultState.SEALED or index_row is None:
+            raise InvalidStoredJobError("sealed job is missing its complete result index")
+
+        evidence = _result_artifact_evidence_from_row(
+            index_row,
+            expected_job_id=job.job_id,
+        )
+        request_id = UUID(str(index_row["commit_request_id"]))
+        commit_row = connection.execute(
+            "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
+            (str(request_id),),
+        ).fetchone()
+        if commit_row is None:
+            raise InvalidStoredJobError("result index is missing its accepted commit")
+        record = _artifact_commit_record_from_row(
+            commit_row,
+            expected_request_id=request_id,
+        )
+        commit = record.envelope.commit
+        if (
+            record.receipt.status,
+            record.receipt.reason,
+            record.receipt.job_version,
+            commit.job_id,
+            commit.spec_hash,
+            commit.code_sha,
+            commit.dataset_snapshot,
+            commit.result_contract_version,
+            commit.sealed_path,
+            commit.manifest_hash,
+            commit.complete_result_hash,
+        ) != (
+            "accepted",
+            "artifact_committed",
+            job.version,
+            job.job_id,
+            job.spec_hash,
+            job.spec.code_sha,
+            job.spec.dataset_snapshot,
+            COMPLETE_RESULT_CONTRACT_VERSION,
+            evidence.sealed_path,
+            evidence.manifest_hash,
+            evidence.complete_result_hash,
+        ):
+            raise InvalidStoredJobError(
+                "accepted commit, result index, and sealed job identities conflict"
+            )
+        shard_identity = {
+            (shard.plan_hash, shard.adapter_id, shard.adapter_version) for shard in shards
+        }
+        if shard_identity != {(commit.plan_hash, commit.adapter_id, commit.adapter_version)}:
+            raise InvalidStoredJobError("accepted commit identity conflicts with succeeded shards")
+        return evidence
+
     def get_job(self, job_id: UUID) -> LabJobRecord | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM lab_job WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return None if row is None else self._job_from_row(row)
+            if row is None:
+                return None
+            job = self._job_from_row(row)
+            self._validate_complete_result_graph(connection, job)
+            return job
 
     def get_command(self, request_id: UUID) -> LabCommandRecord | None:
         with self._connect() as connection:
@@ -2337,55 +2644,73 @@ class LabJobReader:
                 "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
                 (str(request_id),),
             ).fetchone()
-        if row is None:
-            return None
-        return _artifact_commit_record_from_row(row, expected_request_id=request_id)
+            if row is None:
+                return None
+            record = _artifact_commit_record_from_row(
+                row,
+                expected_request_id=request_id,
+            )
+            if record.receipt.status != "accepted":
+                return record
+            job_row = connection.execute(
+                "SELECT * FROM lab_job WHERE job_id = ?",
+                (str(record.receipt.job_id),),
+            ).fetchone()
+            if job_row is None:
+                raise InvalidStoredJobError("accepted artifact commit lost its job")
+            job = self._job_from_row(job_row)
+            evidence = self._validate_complete_result_graph(connection, job)
+            if evidence is None:
+                raise InvalidStoredJobError("accepted artifact commit lost its result index")
+            index_row = connection.execute(
+                "SELECT commit_request_id FROM lab_job_result_artifact WHERE job_id = ?",
+                (str(job.job_id),),
+            ).fetchone()
+            assert index_row is not None
+            primary_request_id = UUID(str(index_row["commit_request_id"]))
+            commit = record.envelope.commit
+            shard_identity = {
+                (str(shard[0]), str(shard[1]), str(shard[2]))
+                for shard in connection.execute(
+                    """
+                    SELECT plan_hash, adapter_id, adapter_version
+                    FROM lab_shard WHERE job_id = ?
+                    """,
+                    (str(job.job_id),),
+                ).fetchall()
+            }
+            if (
+                record.receipt.reason not in {"artifact_committed", "artifact_already_committed"}
+                or record.receipt.job_version != job.version
+                or (
+                    record.receipt.reason == "artifact_committed"
+                    and request_id != primary_request_id
+                )
+                or commit.job_id != job.job_id
+                or commit.spec_hash != job.spec_hash
+                or commit.code_sha != job.spec.code_sha
+                or commit.dataset_snapshot != job.spec.dataset_snapshot
+                or commit.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+                or commit.sealed_path != evidence.sealed_path
+                or commit.manifest_hash != evidence.manifest_hash
+                or commit.complete_result_hash != evidence.complete_result_hash
+                or shard_identity != {(commit.plan_hash, commit.adapter_id, commit.adapter_version)}
+            ):
+                raise InvalidStoredJobError(
+                    "accepted artifact commit conflicts with the sealed result graph"
+                )
+            return record
 
     def get_result_artifact(self, job_id: UUID) -> LabArtifactIndexEvidence | None:
-        from rquant.lab_artifacts import LabArtifactIndexEvidence
-
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM lab_job_result_artifact WHERE job_id = ?",
+            job_row = connection.execute(
+                "SELECT * FROM lab_job WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        if row is None:
-            return None
-        try:
-            evidence = LabArtifactIndexEvidence.model_validate_json(str(row["evidence_json"]))
-            if evidence.job_id != job_id:
-                raise ValueError("artifact evidence job id mismatch")
-            if (
-                str(evidence.sealed_path),
-                evidence.manifest_hash,
-                evidence.complete_result_hash,
-                evidence.bundle_device,
-                evidence.bundle_inode,
-                _dump_time(evidence.indexed_at),
-            ) != (
-                str(row["sealed_path"]),
-                str(row["manifest_hash"]),
-                str(row["complete_result_hash"]),
-                _strict_sqlite_int(
-                    row["bundle_device"],
-                    field="lab_job_result_artifact.bundle_device",
-                    minimum=0,
-                ),
-                _strict_sqlite_int(
-                    row["bundle_inode"],
-                    field="lab_job_result_artifact.bundle_inode",
-                    minimum=1,
-                ),
-                str(row["indexed_at"]),
-            ):
-                raise ValueError("artifact evidence conflicts with indexed columns")
-            if _canonical_model_json(evidence) != str(row["evidence_json"]):
-                raise ValueError("artifact evidence JSON is not canonical")
-            return evidence
-        except Exception as exc:
-            if isinstance(exc, InvalidStoredJobError):
-                raise
-            raise InvalidStoredJobError(f"invalid stored result artifact {job_id}: {exc}") from exc
+            if job_row is None:
+                return None
+            job = self._job_from_row(job_row)
+            return self._validate_complete_result_graph(connection, job)
 
     def execute_for_test(self, statement: str) -> None:
         with self._connect() as connection:
@@ -2405,11 +2730,39 @@ class LabJobStore:
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
 
-    def _connect(self, *, validate_identity: bool = True) -> sqlite3.Connection:
+    def _connect(self, *, validate_identity: bool = True) -> _LabJobStoreConnection:
         connection = sqlite3.connect(
             self.path,
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
+            factory=_LabJobStoreConnection,
+        )
+        authorization = _LabWriteAuthorization()
+        connection.write_authorization = authorization
+        connection.create_function(
+            _SUBMIT_AUTH_FUNCTION,
+            2,
+            authorization.submit_authorized,
+        )
+        connection.create_function(
+            _RETRY_AUTH_FUNCTION,
+            3,
+            authorization.retry_authorized,
+        )
+        connection.create_function(
+            _ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            authorization.artifact_commit_authorized,
+        )
+        connection.create_function(
+            _ARTIFACT_INDEX_AUTH_FUNCTION,
+            3,
+            authorization.artifact_index_authorized,
+        )
+        connection.create_function(
+            _ARTIFACT_SUCCESS_AUTH_FUNCTION,
+            5,
+            authorization.artifact_success_authorized,
         )
         connection.row_factory = sqlite3.Row
         try:
@@ -2426,6 +2779,10 @@ class LabJobStore:
             connection.close()
             raise
         return connection
+
+    def execute_for_test(self, statement: str) -> None:
+        with self._connect() as connection:
+            connection.execute(statement)
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -2548,38 +2905,7 @@ class LabJobStore:
     def _result_artifact_from_row(
         row: sqlite3.Row,
     ) -> LabArtifactIndexEvidence:
-        from rquant.lab_artifacts import LabArtifactIndexEvidence
-
-        evidence = LabArtifactIndexEvidence.model_validate_json(str(row["evidence_json"]))
-        if (
-            str(evidence.job_id),
-            str(evidence.sealed_path),
-            evidence.manifest_hash,
-            evidence.complete_result_hash,
-            evidence.bundle_device,
-            evidence.bundle_inode,
-            _dump_time(evidence.indexed_at),
-            _canonical_model_json(evidence),
-        ) != (
-            str(row["job_id"]),
-            str(row["sealed_path"]),
-            str(row["manifest_hash"]),
-            str(row["complete_result_hash"]),
-            _strict_sqlite_int(
-                row["bundle_device"],
-                field="lab_job_result_artifact.bundle_device",
-                minimum=0,
-            ),
-            _strict_sqlite_int(
-                row["bundle_inode"],
-                field="lab_job_result_artifact.bundle_inode",
-                minimum=1,
-            ),
-            str(row["indexed_at"]),
-            str(row["evidence_json"]),
-        ):
-            raise InvalidStoredJobError("stored result artifact evidence is inconsistent")
-        return evidence
+        return _result_artifact_evidence_from_row(row)
 
     @staticmethod
     def _record_artifact_commit(
@@ -2589,26 +2915,33 @@ class LabJobStore:
         *,
         now: datetime,
     ) -> None:
-        connection.execute(
-            """
-            INSERT INTO lab_artifact_commit (
-                request_id, content_hash, job_id, commit_json, status, reason,
-                receipt_json, receipt_job_version, received_at, applied_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(envelope.request_id),
-                envelope.content_hash,
-                str(envelope.commit.job_id),
-                _canonical_model_json(envelope),
-                receipt.status,
-                receipt.reason,
-                _canonical_model_json(receipt),
-                receipt.job_version,
-                _dump_time(now),
-                _dump_time(now),
-            ),
-        )
+        commit_json = _canonical_model_json(envelope)
+        receipt_json = _canonical_model_json(receipt)
+        with _write_authorization(connection).authorize_artifact_commit(
+            envelope.request_id,
+            commit_json,
+            receipt_json,
+        ):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json, status, reason,
+                    receipt_json, receipt_job_version, received_at, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(envelope.commit.job_id),
+                    commit_json,
+                    receipt.status,
+                    receipt.reason,
+                    receipt_json,
+                    receipt.job_version,
+                    _dump_time(now),
+                    _dump_time(now),
+                ),
+            )
 
     def _reject_artifact_commit(
         self,
@@ -2794,6 +3127,7 @@ class LabJobStore:
             )
         if (
             job.scheduler_fencing_token != lease.fencing_token
+            or not job.requires_complete_result
             or job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
         ):
             return self._reject_artifact_commit(
@@ -2858,47 +3192,60 @@ class LabJobStore:
         )
         self._record_artifact_commit(connection, envelope, receipt, now=now)
         evidence_json = _canonical_model_json(binding.evidence)
-        connection.execute(
-            """
-            INSERT INTO lab_job_result_artifact (
-                job_id, commit_request_id, sealed_path, manifest_hash,
-                complete_result_hash, bundle_device, bundle_inode,
-                evidence_json, indexed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(commit.job_id),
-                str(envelope.request_id),
-                str(binding.evidence.sealed_path),
-                binding.evidence.manifest_hash,
-                binding.evidence.complete_result_hash,
-                binding.evidence.bundle_device,
-                binding.evidence.bundle_inode,
-                evidence_json,
-                _dump_time(binding.evidence.indexed_at),
-            ),
-        )
-        cursor = connection.execute(
-            """
-            UPDATE lab_job
-            SET status = ?, result_state = ?, version = ?, updated_at = ?
-            WHERE job_id = ? AND version = ? AND status = ?
-              AND result_state = ? AND control_intent = ?
-              AND scheduler_fencing_token = ?
-            """,
-            (
-                JobStatus.SUCCEEDED.value,
-                LabResultState.SEALED.value,
-                next_version,
-                _dump_time(now),
-                str(commit.job_id),
-                job.version,
-                JobStatus.RUNNING.value,
-                LabResultState.READY.value,
-                ControlIntent.NONE.value,
-                lease.fencing_token,
-            ),
-        )
+        authorization = _write_authorization(connection)
+        with authorization.authorize_artifact_index(
+            commit.job_id,
+            envelope.request_id,
+            evidence_json,
+        ):
+            connection.execute(
+                """
+                INSERT INTO lab_job_result_artifact (
+                    job_id, commit_request_id, sealed_path, manifest_hash,
+                    complete_result_hash, bundle_device, bundle_inode,
+                    evidence_json, indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(commit.job_id),
+                    str(envelope.request_id),
+                    str(binding.evidence.sealed_path),
+                    binding.evidence.manifest_hash,
+                    binding.evidence.complete_result_hash,
+                    binding.evidence.bundle_device,
+                    binding.evidence.bundle_inode,
+                    evidence_json,
+                    _dump_time(binding.evidence.indexed_at),
+                ),
+            )
+        with authorization.authorize_artifact_success(
+            commit.job_id,
+            envelope.request_id,
+            evidence_json,
+            job.version,
+            next_version,
+        ):
+            cursor = connection.execute(
+                """
+                UPDATE lab_job
+                SET status = ?, result_state = ?, version = ?, updated_at = ?
+                WHERE job_id = ? AND version = ? AND status = ?
+                  AND result_state = ? AND control_intent = ?
+                  AND scheduler_fencing_token = ?
+                """,
+                (
+                    JobStatus.SUCCEEDED.value,
+                    LabResultState.SEALED.value,
+                    next_version,
+                    _dump_time(now),
+                    str(commit.job_id),
+                    job.version,
+                    JobStatus.RUNNING.value,
+                    LabResultState.READY.value,
+                    ControlIntent.NONE.value,
+                    lease.fencing_token,
+                ),
+            )
         if cursor.rowcount != 1:
             raise StaleJobVersionError("job changed while committing complete result artifact")
         self._insert_event(
@@ -3930,30 +4277,34 @@ class LabJobStore:
                 ),
             )
         spec_json = command.spec.model_dump_json(round_trip=True)
-        connection.execute(
-            """
-            INSERT INTO lab_job (
-                job_id, spec_json, spec_hash, job_type, resource_class,
-                deadline, status, control_intent, version, attempt_count,
-                max_attempts, recoverable, scheduler_fencing_token,
-                created_at, updated_at, result_state, requires_complete_result
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, ?, ?, ?, 1)
-            """,
-            (
-                str(command.job_id),
-                spec_json,
-                command.spec.spec_hash,
-                command.spec.job_type.value,
-                command.spec.resource_class.value,
-                _dump_time(command.spec.deadline),
-                JobStatus.QUEUED.value,
-                ControlIntent.NONE.value,
-                command.max_attempts,
-                _dump_time(now),
-                _dump_time(now),
-                LabResultState.PENDING.value,
-            ),
-        )
+        with _write_authorization(connection).authorize_submit(
+            command.job_id,
+            spec_json,
+        ):
+            connection.execute(
+                """
+                INSERT INTO lab_job (
+                    job_id, spec_json, spec_hash, job_type, resource_class,
+                    deadline, status, control_intent, version, attempt_count,
+                    max_attempts, recoverable, scheduler_fencing_token,
+                    created_at, updated_at, result_state, requires_complete_result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, ?, ?, ?, 1)
+                """,
+                (
+                    str(command.job_id),
+                    spec_json,
+                    command.spec.spec_hash,
+                    command.spec.job_type.value,
+                    command.spec.resource_class.value,
+                    _dump_time(command.spec.deadline),
+                    JobStatus.QUEUED.value,
+                    ControlIntent.NONE.value,
+                    command.max_attempts,
+                    _dump_time(now),
+                    _dump_time(now),
+                    LabResultState.PENDING.value,
+                ),
+            )
         self._insert_event(
             connection,
             job_id=command.job_id,
@@ -4333,23 +4684,28 @@ class LabJobStore:
                 ShardStatus.SUCCEEDED.value,
             ),
         )
-        connection.execute(
-            """
-            UPDATE lab_job
-            SET status = ?, control_intent = ?, version = ?, recoverable = 0,
-                scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
-            WHERE job_id = ? AND version = ?
-            """,
-            (
-                JobStatus.QUEUED.value,
-                ControlIntent.NONE.value,
-                next_version,
-                LabResultState.PENDING.value,
-                _dump_time(now),
-                str(command.job_id),
-                version,
-            ),
-        )
+        with _write_authorization(connection).authorize_retry(
+            command.job_id,
+            version,
+            next_version,
+        ):
+            connection.execute(
+                """
+                UPDATE lab_job
+                SET status = ?, control_intent = ?, version = ?, recoverable = 0,
+                    scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
+                WHERE job_id = ? AND version = ?
+                """,
+                (
+                    JobStatus.QUEUED.value,
+                    ControlIntent.NONE.value,
+                    next_version,
+                    LabResultState.PENDING.value,
+                    _dump_time(now),
+                    str(command.job_id),
+                    version,
+                ),
+            )
         self._insert_event(
             connection,
             job_id=command.job_id,
@@ -6363,12 +6719,50 @@ CREATE TABLE IF NOT EXISTS lab_artifact_commit (
     commit_json TEXT NOT NULL CHECK (
         typeof(commit_json) = 'text' AND length(commit_json) > 0
         AND json_valid(commit_json)
+        AND json_type(commit_json, '$') IS 'object'
+        AND json_type(commit_json, '$.request_id') IS 'text'
+        AND json_type(commit_json, '$.content_hash') IS 'text'
+        AND json_type(commit_json, '$.commit') IS 'object'
+        AND json_type(commit_json, '$.schema_version') IS 'integer'
+        AND json_type(commit_json, '$.commit.schema_version') IS 'integer'
+        AND json_type(commit_json, '$.commit.job_id') IS 'text'
+        AND json_type(commit_json, '$.commit.spec_hash') IS 'text'
+        AND json_type(commit_json, '$.commit.plan_hash') IS 'text'
+        AND json_type(commit_json, '$.commit.adapter_id') IS 'text'
+        AND json_type(commit_json, '$.commit.adapter_version') IS 'text'
+        AND json_type(
+            commit_json, '$.commit.result_contract_version'
+        ) IS 'text'
+        AND json_type(commit_json, '$.commit.code_sha') IS 'text'
+        AND json_type(commit_json, '$.commit.manifest_hash') IS 'text'
+        AND json_type(
+            commit_json, '$.commit.complete_result_hash'
+        ) IS 'text'
+        AND json_type(commit_json, '$.commit.sealed_path') IS 'text'
+        AND (
+            json_type(commit_json, '$.commit.dataset_snapshot') IS 'null'
+            OR json_type(
+                commit_json, '$.commit.dataset_snapshot'
+            ) IS 'object'
+        )
     ),
     status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
     reason TEXT NOT NULL CHECK (typeof(reason) = 'text' AND length(reason) > 0),
     receipt_json TEXT NOT NULL CHECK (
         typeof(receipt_json) = 'text' AND length(receipt_json) > 0
         AND json_valid(receipt_json)
+        AND json_type(receipt_json, '$') IS 'object'
+        AND json_type(receipt_json, '$.request_id') IS 'text'
+        AND json_type(receipt_json, '$.content_hash') IS 'text'
+        AND json_type(receipt_json, '$.job_id') IS 'text'
+        AND json_type(receipt_json, '$.status') IS 'text'
+        AND json_type(receipt_json, '$.schema_version') IS 'integer'
+        AND json_type(receipt_json, '$.reason') IS 'text'
+        AND json_type(receipt_json, '$.accepted_at') IS 'text'
+        AND (
+            json_type(receipt_json, '$.job_version') IS 'null'
+            OR json_type(receipt_json, '$.job_version') IS 'integer'
+        )
     ),
     receipt_job_version INTEGER CHECK (
         receipt_job_version IS NULL
@@ -6408,6 +6802,17 @@ CREATE TABLE IF NOT EXISTS lab_job_result_artifact (
     evidence_json TEXT NOT NULL CHECK (
         typeof(evidence_json) = 'text' AND length(evidence_json) > 0
         AND json_valid(evidence_json)
+        AND json_type(evidence_json, '$') IS 'object'
+        AND json_type(evidence_json, '$.job_id') IS 'text'
+        AND json_type(evidence_json, '$.sealed_path') IS 'text'
+        AND json_type(evidence_json, '$.manifest_hash') IS 'text'
+        AND json_type(evidence_json, '$.complete_result_hash') IS 'text'
+        AND json_type(evidence_json, '$.file_identities') IS 'array'
+        AND json_array_length(evidence_json, '$.file_identities') > 0
+        AND json_type(evidence_json, '$.schema_version') IS 'integer'
+        AND json_type(evidence_json, '$.bundle_device') IS 'integer'
+        AND json_type(evidence_json, '$.bundle_inode') IS 'integer'
+        AND json_type(evidence_json, '$.indexed_at') IS 'text'
     ),
     indexed_at TEXT NOT NULL CHECK (
         typeof(indexed_at) = 'text' AND length(indexed_at) > 0
@@ -6415,10 +6820,11 @@ CREATE TABLE IF NOT EXISTS lab_job_result_artifact (
 )
 """
 
-_V5_JOB_RESULT_UPDATE_TRIGGER = """
+_V5_JOB_RESULT_UPDATE_TRIGGER = f"""
 CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_update
-BEFORE UPDATE OF status, result_state, result_contract_version,
-                 requires_complete_result ON lab_job
+BEFORE UPDATE OF status, control_intent, version, recoverable,
+                 scheduler_fencing_token, result_state,
+                 result_contract_version, requires_complete_result ON lab_job
 WHEN (
     NEW.result_state = 'legacy_unsealed'
     AND NOT (
@@ -6432,16 +6838,32 @@ WHEN (
  OR (
     NEW.requires_complete_result = 1
     AND (
-      (NEW.status = 'succeeded' AND (
-        NEW.result_state <> 'sealed'
-        OR NOT EXISTS (
+      (NEW.result_state = 'pending' AND (
+        NEW.status = 'succeeded'
+        OR EXISTS (
             SELECT 1 FROM lab_job_result_artifact artifact
             WHERE artifact.job_id = NEW.job_id
         )
+        OR (
+            NEW.status = 'running'
+            AND NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+            AND EXISTS (
+                SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM lab_shard shard
+                WHERE shard.job_id = NEW.job_id AND shard.status <> 'succeeded'
+            )
+        )
       ))
-      OR (NEW.result_state = 'sealed' AND NEW.status <> 'succeeded')
       OR (NEW.result_state = 'ready' AND (
         NEW.status <> 'running'
+        OR NEW.control_intent <> 'none'
+        OR NEW.result_contract_version <> '{COMPLETE_RESULT_CONTRACT_VERSION}'
+        OR EXISTS (
+            SELECT 1 FROM lab_job_result_artifact artifact
+            WHERE artifact.job_id = NEW.job_id
+        )
         OR NOT EXISTS (
             SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
         )
@@ -6450,21 +6872,146 @@ WHEN (
             WHERE shard.job_id = NEW.job_id AND shard.status <> 'succeeded'
         )
       ))
+      OR (NEW.result_state = 'sealed' AND (
+        OLD.requires_complete_result <> 1
+        OR OLD.status <> 'running'
+        OR OLD.result_state <> 'ready'
+        OR OLD.control_intent <> 'none'
+        OR OLD.result_contract_version <> '{COMPLETE_RESULT_CONTRACT_VERSION}'
+        OR NEW.status <> 'succeeded'
+        OR NEW.control_intent <> 'none'
+        OR NEW.result_contract_version <> '{COMPLETE_RESULT_CONTRACT_VERSION}'
+        OR NEW.version <> OLD.version + 1
+        OR NEW.scheduler_fencing_token IS NOT OLD.scheduler_fencing_token
+        OR NOT EXISTS (
+            SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
+        )
+        OR EXISTS (
+            SELECT 1 FROM lab_shard shard
+            WHERE shard.job_id = NEW.job_id AND shard.status <> 'succeeded'
+        )
+        OR NOT EXISTS (
+            SELECT 1
+            FROM lab_job_result_artifact artifact
+            JOIN lab_artifact_commit artifact_commit
+              ON artifact_commit.request_id = artifact.commit_request_id
+            WHERE artifact.job_id = NEW.job_id
+              AND artifact_commit.job_id = NEW.job_id
+              AND artifact_commit.status = 'accepted'
+              AND artifact_commit.reason = 'artifact_committed'
+              AND artifact_commit.receipt_job_version = NEW.version
+              AND json_extract(
+                    artifact_commit.commit_json, '$.commit.spec_hash'
+                  ) = NEW.spec_hash
+              AND json_extract(
+                    artifact_commit.commit_json, '$.commit.code_sha'
+                  ) = json_extract(NEW.spec_json, '$.code_sha')
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.dataset_snapshot.snapshot_id'
+                  ) IS json_extract(
+                    NEW.spec_json, '$.dataset_snapshot.snapshot_id'
+                  )
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.dataset_snapshot.binding_hash'
+                  ) IS json_extract(
+                    NEW.spec_json, '$.dataset_snapshot.binding_hash'
+                  )
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.dataset_snapshot.audit_run_id'
+                  ) IS json_extract(
+                    NEW.spec_json, '$.dataset_snapshot.audit_run_id'
+                  )
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.result_contract_version'
+                  ) = NEW.result_contract_version
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.manifest_hash'
+                  ) = artifact.manifest_hash
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.complete_result_hash'
+                  ) = artifact.complete_result_hash
+              AND json_extract(
+                    artifact_commit.commit_json,
+                    '$.commit.sealed_path'
+                  ) = artifact.sealed_path
+              AND NOT EXISTS (
+                  SELECT 1 FROM lab_shard shard
+                  WHERE shard.job_id = NEW.job_id
+                    AND (
+                      shard.plan_hash <> json_extract(
+                          artifact_commit.commit_json, '$.commit.plan_hash'
+                      )
+                      OR shard.adapter_id <> json_extract(
+                          artifact_commit.commit_json, '$.commit.adapter_id'
+                      )
+                      OR shard.adapter_version <> json_extract(
+                          artifact_commit.commit_json, '$.commit.adapter_version'
+                      )
+                    )
+              )
+        )
+        OR {_ARTIFACT_SUCCESS_AUTH_FUNCTION}(
+            NEW.job_id,
+            (SELECT commit_request_id FROM lab_job_result_artifact
+             WHERE job_id = NEW.job_id),
+            (SELECT evidence_json FROM lab_job_result_artifact
+             WHERE job_id = NEW.job_id),
+            OLD.version,
+            NEW.version
+        ) <> 1
+      ))
+    )
+ )
+ OR (
+    OLD.status IN ('succeeded', 'cancelled')
+    AND NEW.status <> OLD.status
+ )
+ OR (
+    OLD.status = 'failed'
+    AND NEW.status NOT IN ('failed', 'queued')
+ )
+ OR (
+    OLD.status = 'failed'
+    AND NEW.status = 'queued'
+    AND (
+      {_RETRY_AUTH_FUNCTION}(NEW.job_id, OLD.version, NEW.version) <> 1
+      OR OLD.recoverable <> 1
+      OR NEW.control_intent <> 'none'
+      OR NEW.version <> OLD.version + 1
+      OR NEW.recoverable <> 0
+      OR NEW.scheduler_fencing_token IS NOT NULL
+      OR NEW.result_state <> 'pending'
+      OR NEW.requires_complete_result <> OLD.requires_complete_result
+      OR NEW.result_contract_version IS NOT OLD.result_contract_version
     )
  )
 BEGIN
-    SELECT RAISE(ABORT, 'complete result marker requires indexed sealed artifact');
+    SELECT RAISE(ABORT, 'lab job result transition is not authorized or consistent');
 END
 """
 
-_V5_JOB_RESULT_INSERT_TRIGGER = """
+_V5_JOB_RESULT_INSERT_TRIGGER = f"""
 CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_insert
 BEFORE INSERT ON lab_job
-WHEN NEW.requires_complete_result <> 1
- OR NEW.status = 'succeeded'
- OR NEW.result_state IN ('ready', 'sealed', 'legacy_unsealed')
+WHEN {_SUBMIT_AUTH_FUNCTION}(NEW.job_id, NEW.spec_json) <> 1
+ OR NEW.status <> 'queued'
+ OR NEW.control_intent <> 'none'
+ OR NEW.version <> 0
+ OR NEW.attempt_count <> 0
+ OR NEW.recoverable <> 0
+ OR NEW.scheduler_fencing_token IS NOT NULL
+ OR NEW.result_contract_version IS NOT NULL
+ OR NEW.result_state <> 'pending'
+ OR NEW.requires_complete_result <> 1
+ OR NEW.created_at <> NEW.updated_at
 BEGIN
-    SELECT RAISE(ABORT, 'new jobs require complete result; legacy_unsealed cannot be inserted');
+    SELECT RAISE(ABORT, 'lab job submit insert is not authorized');
 END
 """
 
@@ -6477,17 +7024,219 @@ BEGIN
 END
 """
 
-_V5_RESULT_ARTIFACT_INSERT_TRIGGER = """
+_V5_ARTIFACT_COMMIT_INSERT_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_artifact_commit_insert
+BEFORE INSERT ON lab_artifact_commit
+WHEN {_ARTIFACT_COMMIT_AUTH_FUNCTION}(
+        NEW.request_id, NEW.commit_json, NEW.receipt_json
+     ) <> 1
+ OR json_extract(NEW.commit_json, '$.request_id') <> NEW.request_id
+ OR json_extract(NEW.commit_json, '$.content_hash') <> NEW.content_hash
+ OR json_extract(NEW.commit_json, '$.commit.job_id') <> NEW.job_id
+ OR json_extract(NEW.receipt_json, '$.request_id') <> NEW.request_id
+ OR json_extract(NEW.receipt_json, '$.content_hash') <> NEW.content_hash
+ OR json_extract(NEW.receipt_json, '$.job_id') <> NEW.job_id
+ OR json_extract(NEW.receipt_json, '$.status') <> NEW.status
+ OR json_extract(NEW.receipt_json, '$.reason') <> NEW.reason
+ OR json_extract(NEW.receipt_json, '$.job_version') IS NOT NEW.receipt_job_version
+ OR (
+    NEW.status = 'accepted'
+    AND NOT (
+      (
+        NEW.reason = 'artifact_committed'
+        AND EXISTS (
+            SELECT 1 FROM lab_job job
+            WHERE job.job_id = NEW.job_id
+              AND NEW.receipt_job_version = job.version + 1
+              AND job.requires_complete_result = 1
+              AND job.status = 'running'
+              AND job.result_state = 'ready'
+              AND job.control_intent = 'none'
+              AND job.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+              AND json_extract(
+                    NEW.commit_json, '$.commit.spec_hash'
+                  ) = job.spec_hash
+              AND json_extract(
+                    NEW.commit_json, '$.commit.code_sha'
+                  ) = json_extract(job.spec_json, '$.code_sha')
+              AND json_extract(
+                    NEW.commit_json,
+                    '$.commit.dataset_snapshot.snapshot_id'
+                  ) IS json_extract(
+                    job.spec_json, '$.dataset_snapshot.snapshot_id'
+                  )
+              AND json_extract(
+                    NEW.commit_json,
+                    '$.commit.dataset_snapshot.binding_hash'
+                  ) IS json_extract(
+                    job.spec_json, '$.dataset_snapshot.binding_hash'
+                  )
+              AND json_extract(
+                    NEW.commit_json,
+                    '$.commit.dataset_snapshot.audit_run_id'
+                  ) IS json_extract(
+                    job.spec_json, '$.dataset_snapshot.audit_run_id'
+                  )
+              AND json_extract(
+                    NEW.commit_json, '$.commit.result_contract_version'
+                  ) = job.result_contract_version
+        )
+        AND EXISTS (
+            SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM lab_shard shard
+            WHERE shard.job_id = NEW.job_id
+              AND (
+                shard.status <> 'succeeded'
+                OR shard.plan_hash <> json_extract(
+                    NEW.commit_json, '$.commit.plan_hash'
+                )
+                OR shard.adapter_id <> json_extract(
+                    NEW.commit_json, '$.commit.adapter_id'
+                )
+                OR shard.adapter_version <> json_extract(
+                    NEW.commit_json, '$.commit.adapter_version'
+                )
+              )
+        )
+      )
+      OR (
+        NEW.reason = 'artifact_already_committed'
+        AND EXISTS (
+            SELECT 1
+            FROM lab_job job
+            JOIN lab_job_result_artifact artifact
+              ON artifact.job_id = job.job_id
+            WHERE job.job_id = NEW.job_id
+              AND NEW.receipt_job_version = job.version
+              AND job.requires_complete_result = 1
+              AND job.status = 'succeeded'
+              AND job.result_state = 'sealed'
+              AND job.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+              AND json_extract(
+                    NEW.commit_json, '$.commit.spec_hash'
+                  ) = job.spec_hash
+              AND json_extract(
+                    NEW.commit_json, '$.commit.code_sha'
+                  ) = json_extract(job.spec_json, '$.code_sha')
+              AND json_extract(
+                    NEW.commit_json,
+                    '$.commit.dataset_snapshot.snapshot_id'
+                  ) IS json_extract(
+                    job.spec_json, '$.dataset_snapshot.snapshot_id'
+                  )
+              AND json_extract(
+                    NEW.commit_json,
+                    '$.commit.dataset_snapshot.binding_hash'
+                  ) IS json_extract(
+                    job.spec_json, '$.dataset_snapshot.binding_hash'
+                  )
+              AND json_extract(
+                    NEW.commit_json,
+                    '$.commit.dataset_snapshot.audit_run_id'
+                  ) IS json_extract(
+                    job.spec_json, '$.dataset_snapshot.audit_run_id'
+                  )
+              AND json_extract(
+                    NEW.commit_json, '$.commit.result_contract_version'
+                  ) = job.result_contract_version
+              AND artifact.manifest_hash = json_extract(
+                    NEW.commit_json, '$.commit.manifest_hash'
+                  )
+              AND artifact.complete_result_hash = json_extract(
+                    NEW.commit_json, '$.commit.complete_result_hash'
+                  )
+              AND artifact.sealed_path = json_extract(
+                    NEW.commit_json, '$.commit.sealed_path'
+                  )
+              AND EXISTS (
+                  SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM lab_shard shard
+                  WHERE shard.job_id = NEW.job_id
+                    AND (
+                      shard.status <> 'succeeded'
+                      OR shard.plan_hash <> json_extract(
+                          NEW.commit_json, '$.commit.plan_hash'
+                      )
+                      OR shard.adapter_id <> json_extract(
+                          NEW.commit_json, '$.commit.adapter_id'
+                      )
+                      OR shard.adapter_version <> json_extract(
+                          NEW.commit_json, '$.commit.adapter_version'
+                      )
+                    )
+              )
+        )
+      )
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'artifact commit insert is not authorized or consistent');
+END
+"""
+
+_V5_RESULT_ARTIFACT_INSERT_TRIGGER = f"""
 CREATE TRIGGER IF NOT EXISTS trg_lab_result_artifact_insert
 BEFORE INSERT ON lab_job_result_artifact
-WHEN NOT EXISTS (
-    SELECT 1 FROM lab_artifact_commit artifact_commit
+WHEN {_ARTIFACT_INDEX_AUTH_FUNCTION}(
+        NEW.job_id, NEW.commit_request_id, NEW.evidence_json
+     ) <> 1
+ OR json_extract(NEW.evidence_json, '$.job_id') <> NEW.job_id
+ OR json_extract(NEW.evidence_json, '$.sealed_path') <> NEW.sealed_path
+ OR json_extract(NEW.evidence_json, '$.manifest_hash') <> NEW.manifest_hash
+ OR json_extract(
+        NEW.evidence_json, '$.complete_result_hash'
+    ) <> NEW.complete_result_hash
+ OR json_extract(NEW.evidence_json, '$.bundle_device') <> NEW.bundle_device
+ OR json_extract(NEW.evidence_json, '$.bundle_inode') <> NEW.bundle_inode
+ OR NOT EXISTS (
+    SELECT 1
+    FROM lab_artifact_commit artifact_commit
+    JOIN lab_job job ON job.job_id = artifact_commit.job_id
     WHERE artifact_commit.request_id = NEW.commit_request_id
       AND artifact_commit.job_id = NEW.job_id
       AND artifact_commit.status = 'accepted'
-)
+      AND artifact_commit.reason = 'artifact_committed'
+      AND artifact_commit.receipt_job_version = job.version + 1
+      AND job.requires_complete_result = 1
+      AND job.status = 'running'
+      AND job.result_state = 'ready'
+      AND job.control_intent = 'none'
+      AND job.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+      AND json_extract(
+            artifact_commit.commit_json, '$.commit.manifest_hash'
+          ) = NEW.manifest_hash
+      AND json_extract(
+            artifact_commit.commit_json, '$.commit.complete_result_hash'
+          ) = NEW.complete_result_hash
+      AND json_extract(
+            artifact_commit.commit_json, '$.commit.sealed_path'
+          ) = NEW.sealed_path
+      AND EXISTS (
+          SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM lab_shard shard
+          WHERE shard.job_id = NEW.job_id
+            AND (
+              shard.status <> 'succeeded'
+              OR shard.plan_hash <> json_extract(
+                  artifact_commit.commit_json, '$.commit.plan_hash'
+              )
+              OR shard.adapter_id <> json_extract(
+                  artifact_commit.commit_json, '$.commit.adapter_id'
+              )
+              OR shard.adapter_version <> json_extract(
+                  artifact_commit.commit_json, '$.commit.adapter_version'
+              )
+            )
+      )
+ )
 BEGIN
-    SELECT RAISE(ABORT, 'result artifact requires accepted commit receipt');
+    SELECT RAISE(ABORT, 'result artifact insert is not authorized or consistent');
 END
 """
 
@@ -6504,6 +7253,48 @@ CREATE TRIGGER IF NOT EXISTS trg_lab_result_artifact_no_delete
 BEFORE DELETE ON lab_job_result_artifact
 BEGIN
     SELECT RAISE(ABORT, 'complete result artifact index is immutable');
+END
+"""
+
+_V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_shard_no_insert
+BEFORE INSERT ON lab_shard
+WHEN EXISTS (
+    SELECT 1 FROM lab_job job
+    WHERE job.job_id = NEW.job_id
+      AND job.requires_complete_result = 1
+      AND job.result_state IN ('ready', 'sealed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'complete result shard set is immutable');
+END
+"""
+
+_V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_shard_no_update
+BEFORE UPDATE ON lab_shard
+WHEN EXISTS (
+    SELECT 1 FROM lab_job job
+    WHERE job.job_id = OLD.job_id
+      AND job.requires_complete_result = 1
+      AND job.result_state IN ('ready', 'sealed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'complete result shard set is immutable');
+END
+"""
+
+_V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_shard_no_delete
+BEFORE DELETE ON lab_shard
+WHEN EXISTS (
+    SELECT 1 FROM lab_job job
+    WHERE job.job_id = OLD.job_id
+      AND job.requires_complete_result = 1
+      AND job.result_state IN ('ready', 'sealed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'complete result shard set is immutable');
 END
 """
 
@@ -6551,9 +7342,13 @@ _SCHEMA_STATEMENTS = tuple(
     _V5_JOB_RESULT_INSERT_TRIGGER,
     _V5_JOB_RESULT_UPDATE_TRIGGER,
     _V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER,
+    _V5_ARTIFACT_COMMIT_INSERT_TRIGGER,
     _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
     _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
     _V5_RESULT_ARTIFACT_NO_DELETE_TRIGGER,
+    _V5_COMPLETE_RESULT_SHARD_NO_INSERT_TRIGGER,
+    _V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER,
+    _V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER,
     _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
     _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
 )

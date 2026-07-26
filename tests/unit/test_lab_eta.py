@@ -16,7 +16,7 @@ from rquant.lab_eta import (
     LabEtaRemainingShard,
     estimate_lab_eta,
 )
-from rquant.lab_jobs import LabJobReader, LabJobStore
+from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
 from rquant.lab_shard_protocol import LabShardTelemetry, LabShardWorkPlan
 
 from .test_lab_jobs import _lease, _submit_job
@@ -456,6 +456,35 @@ def _seed_eta_job_with_terminal_shards(
     store.initialize()
     lease = _lease(store)
     job = _submit_job(store, lease)
+    target = JobStatus(job_status)
+    if target is JobStatus.CANCELLED:
+        job = store.transition_job(
+            job.job_id,
+            expected_version=job.version,
+            target_status=target,
+            lease=lease,
+            reason="eta terminal fixture",
+            now=job.created_at,
+        )
+    else:
+        job = store.transition_job(
+            job.job_id,
+            expected_version=job.version,
+            target_status=JobStatus.RUNNING,
+            lease=lease,
+            reason="eta running fixture",
+            now=job.created_at,
+        )
+        if target is not JobStatus.RUNNING:
+            job = store.transition_job(
+                job.job_id,
+                expected_version=job.version,
+                target_status=target,
+                lease=lease,
+                reason="eta terminal fixture",
+                now=job.updated_at,
+                recoverable=False if target is JobStatus.FAILED else None,
+            )
     timestamp = AS_OF.isoformat(timespec="microseconds")
     shard_rows = tuple(
         (
@@ -473,10 +502,6 @@ def _seed_eta_job_with_terminal_shards(
         )
     )
     with sqlite3.connect(store.path) as connection:
-        connection.execute(
-            "UPDATE lab_job SET status = ? WHERE job_id = ?",
-            (job_status, str(job.job_id)),
-        )
         connection.executemany(
             """
             INSERT INTO lab_shard (

@@ -202,6 +202,19 @@ def _store(tmp_path: Path, *, timeout: int = 1_234) -> LabJobStore:
     return store
 
 
+def _register_unprivileged_job_functions(connection: sqlite3.Connection) -> None:
+    connection.create_function(
+        lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
+        5,
+        lambda *_args: 0,
+    )
+    connection.create_function(
+        lab_jobs._RETRY_AUTH_FUNCTION,
+        3,
+        lambda *_args: 0,
+    )
+
+
 def _lease(
     store: LabJobStore,
     *,
@@ -328,6 +341,23 @@ def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> 
         "rollback failed",
         "close failed",
     )
+
+
+def test_connection_authority_is_exact_and_cleared_after_exception() -> None:
+    authority = lab_jobs._LabWriteAuthorization()
+    job_id = uuid4()
+    other_job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with (
+        pytest.raises(RuntimeError, match="simulated write failure"),
+        authority.authorize_submit(job_id, spec_json),
+    ):
+        assert authority.submit_authorized(str(job_id), spec_json) == 1
+        assert authority.submit_authorized(str(other_job_id), spec_json) == 0
+        raise RuntimeError("simulated write failure")
+
+    assert authority.submit_authorized(str(job_id), spec_json) == 0
 
 
 def _submit_job(
@@ -583,6 +613,52 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
         LabJobReader(store.path).get_job(uuid4())
 
 
+@pytest.mark.parametrize(
+    ("trigger", "authorization_function"),
+    [
+        (
+            "trg_lab_job_complete_result_insert",
+            lab_jobs._SUBMIT_AUTH_FUNCTION,
+        ),
+        (
+            "trg_lab_job_complete_result_update",
+            lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
+        ),
+        (
+            "trg_lab_artifact_commit_insert",
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+        ),
+    ],
+)
+def test_v5_reader_rejects_trigger_with_replaced_authorization_udf(
+    tmp_path: Path,
+    trigger: str,
+    authorization_function: str,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?",
+            (trigger,),
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        original = str(row[0])
+        assert authorization_function in original
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        connection.execute(
+            original.replace(
+                authorization_function,
+                f"{authorization_function}_weakened",
+                1,
+            )
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        LabJobReader(store.path).get_job(uuid4())
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        store.connection_pragmas()
+
+
 def _replace_empty_v5_table_with_weakened_ddl(
     path: Path,
     *,
@@ -754,7 +830,7 @@ def test_complete_result_contract_cannot_enter_legacy_unsealed_state(
 
     with (
         sqlite3.connect(store.path) as connection,
-        pytest.raises(sqlite3.IntegrityError, match="indexed sealed artifact"),
+        pytest.raises(sqlite3.DatabaseError, match="authorized|function|consistent"),
     ):
         connection.execute(
             """
@@ -812,7 +888,7 @@ def test_combined_contract_downgrade_and_legacy_success_is_blocked(tmp_path: Pat
 
     with (
         sqlite3.connect(store.path) as connection,
-        pytest.raises(sqlite3.IntegrityError, match="complete result"),
+        pytest.raises(sqlite3.DatabaseError, match="authorized|function|consistent"),
     ):
         connection.execute(
             """
@@ -832,7 +908,7 @@ def test_requires_complete_result_marker_cannot_be_downgraded(tmp_path: Path) ->
 
     with (
         sqlite3.connect(store.path) as connection,
-        pytest.raises(sqlite3.IntegrityError, match="immutable"),
+        pytest.raises(sqlite3.DatabaseError, match="immutable|function|authorized"),
     ):
         connection.execute(
             "UPDATE lab_job SET requires_complete_result = 0 WHERE job_id = ?",
@@ -847,7 +923,7 @@ def test_v5_schema_rejects_forged_legacy_success_insert(tmp_path: Path) -> None:
 
     with (
         sqlite3.connect(store.path) as connection,
-        pytest.raises(sqlite3.IntegrityError, match="legacy_unsealed"),
+        pytest.raises(sqlite3.DatabaseError, match="submit|function|authorized"),
     ):
         connection.execute(
             """
@@ -870,6 +946,187 @@ def test_v5_schema_rejects_forged_legacy_success_insert(tmp_path: Path) -> None:
                 timestamp,
                 timestamp,
             ),
+        )
+
+
+def test_external_sql_cannot_forge_zero_shard_artifact_success(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    queued = _submit_job(store, lease)
+    running = store.transition_job(
+        queued.job_id,
+        expected_version=queued.version,
+        target_status=JobStatus.RUNNING,
+        lease=lease,
+        reason="start without a plan",
+        now=NOW + timedelta(seconds=1),
+    )
+    request_id = uuid4()
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="authorized|function|artifact"),
+    ):
+        connection.execute(
+            """
+            INSERT INTO lab_artifact_commit (
+                request_id, content_hash, job_id, commit_json, status, reason,
+                receipt_json, receipt_job_version, received_at, applied_at
+            ) VALUES (?, ?, ?, '{}', 'accepted', 'forged', '{}', ?, ?, ?)
+            """,
+            (
+                str(request_id),
+                "a" * 64,
+                str(running.job_id),
+                running.version + 1,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO lab_job_result_artifact (
+                job_id, commit_request_id, sealed_path, manifest_hash,
+                complete_result_hash, bundle_device, bundle_inode,
+                evidence_json, indexed_at
+            ) VALUES (?, ?, '/does/not/exist', ?, ?, 0, 1, '{}', ?)
+            """,
+            (
+                str(running.job_id),
+                str(request_id),
+                "b" * 64,
+                "c" * 64,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = 'succeeded', result_state = 'sealed',
+                result_contract_version = ?
+            WHERE job_id = ?
+            """,
+            (COMPLETE_RESULT_CONTRACT_VERSION, str(running.job_id)),
+        )
+
+
+def test_external_sql_cannot_insert_running_job_without_submit_authority(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    spec = _spec()
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="authorized|function|submit"),
+    ):
+        connection.execute(
+            """
+            INSERT INTO lab_job (
+                job_id, spec_json, spec_hash, job_type, resource_class,
+                deadline, status, control_intent, version, attempt_count,
+                max_attempts, recoverable, scheduler_fencing_token,
+                created_at, updated_at, result_contract_version,
+                result_state, requires_complete_result
+            ) VALUES (?, ?, ?, ?, ?, ?, 'running', 'none', 1, 1, 3, 0,
+                      1, ?, ?, NULL, 'pending', 1)
+            """,
+            (
+                str(uuid4()),
+                spec.model_dump_json(round_trip=True),
+                spec.spec_hash,
+                spec.job_type.value,
+                spec.resource_class.value,
+                spec.deadline.isoformat(timespec="microseconds"),
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+def test_external_sql_cannot_insert_legacy_source_even_in_submit_initial_state(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    spec = _spec()
+    timestamp = NOW.isoformat(timespec="microseconds")
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="submit|function|authorized"),
+    ):
+        connection.execute(
+            """
+            INSERT INTO lab_job (
+                job_id, spec_json, spec_hash, job_type, resource_class,
+                deadline, status, control_intent, version, attempt_count,
+                max_attempts, recoverable, scheduler_fencing_token,
+                created_at, updated_at, result_contract_version,
+                result_state, requires_complete_result
+            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'none', 0, 0, 3, 0,
+                      NULL, ?, ?, NULL, 'pending', 0)
+            """,
+            (
+                str(uuid4()),
+                spec.model_dump_json(round_trip=True),
+                spec.spec_hash,
+                spec.job_type.value,
+                spec.resource_class.value,
+                spec.deadline.isoformat(timespec="microseconds"),
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+def test_store_test_connection_has_no_submit_authority(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    spec = _spec()
+    timestamp = NOW.isoformat(timespec="microseconds")
+    statement = f"""
+        INSERT INTO lab_job (
+            job_id, spec_json, spec_hash, job_type, resource_class,
+            deadline, status, control_intent, version, attempt_count,
+            max_attempts, recoverable, scheduler_fencing_token,
+            created_at, updated_at, result_contract_version,
+            result_state, requires_complete_result
+        ) VALUES (
+            '{uuid4()}', '{spec.model_dump_json(round_trip=True)}',
+            '{spec.spec_hash}', '{spec.job_type.value}',
+            '{spec.resource_class.value}',
+            '{spec.deadline.isoformat(timespec="microseconds")}',
+            'queued', 'none', 0, 0, 3, 0, NULL,
+            '{timestamp}', '{timestamp}', NULL, 'pending', 1
+        )
+    """
+
+    with pytest.raises(sqlite3.DatabaseError, match="authorized|submit"):
+        store.execute_for_test(statement)
+
+
+def test_external_sql_cannot_retry_failed_job_without_retry_authority(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    failed = _transition_to(store, lease, JobStatus.FAILED)
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="authorized|function|retry"),
+    ):
+        connection.execute(
+            """
+            UPDATE lab_job
+            SET status = 'queued', control_intent = 'none',
+                version = version + 1, recoverable = 0,
+                scheduler_fencing_token = NULL, result_state = 'pending',
+                updated_at = ?
+            WHERE job_id = ?
+            """,
+            (NOW.isoformat(timespec="microseconds"), str(failed.job_id)),
         )
 
 
@@ -1148,6 +1405,13 @@ def test_reader_and_exactly_once_replay_accept_real_legacy_v1_ledger(
     timestamp = NOW.isoformat(timespec="microseconds")
     deadline = spec.deadline.isoformat(timespec="microseconds")
     with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._SUBMIT_AUTH_FUNCTION,
+            2,
+            lambda candidate_job_id, candidate_spec_json: int(
+                (candidate_job_id, candidate_spec_json) == (str(job_id), OLD_V1_SPEC_JSON)
+            ),
+        )
         connection.execute(
             """
                 INSERT INTO lab_job (
@@ -1454,6 +1718,7 @@ def test_typed_row_readers_reject_noninteger_version_count_and_fence_columns(
     )
     shard_id = uuid4()
     with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
         connection.execute(
             """
             INSERT INTO lab_shard (

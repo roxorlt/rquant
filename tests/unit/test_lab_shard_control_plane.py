@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import rquant.lab_jobs as lab_jobs
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
@@ -50,6 +51,19 @@ from .test_lab_jobs import NOW, _lease, _submit, _submit_job
 from .test_strategy_job_adapters import _p13_frozen_claim
 
 PLAN_HASH = "4" * 64
+
+
+def _register_unprivileged_job_functions(connection: sqlite3.Connection) -> None:
+    connection.create_function(
+        lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
+        5,
+        lambda *_args: 0,
+    )
+    connection.create_function(
+        lab_jobs._RETRY_AUTH_FUNCTION,
+        3,
+        lambda *_args: 0,
+    )
 
 
 def _definition(
@@ -872,6 +886,7 @@ def test_retry_converges_legacy_recoverable_exhausted_tree_without_restoring_sha
     store, lease, job_id = _setup(tmp_path, count=2, max_attempts=2)
     finished_at = (NOW + timedelta(seconds=2)).isoformat(timespec="microseconds")
     with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
         connection.execute(
             """
             UPDATE lab_job
@@ -929,6 +944,7 @@ def test_recovery_fails_tree_with_exhausted_queued_sibling(
     if parent_status is JobStatus.RUNNING:
         _claim(store, lease, worker="active-worker", duration=300)
     with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
         if parent_status is JobStatus.CHECKPOINTED:
             connection.execute(
                 """
@@ -1042,6 +1058,7 @@ def test_p13_inflight_completion_fails_without_creating_legacy_result(
         now=NOW + timedelta(seconds=1),
     )
     with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
         connection.execute(
             "UPDATE lab_job SET result_contract_version = NULL WHERE job_id = ?",
             (str(frozen.job_id),),
@@ -1464,7 +1481,7 @@ def test_final_shard_success_marks_complete_result_ready_and_clears_pause(
     assert LabJobReader(store.path).list_events(job_id)[-1].event_type == "job_result_ready"
     with (
         sqlite3.connect(store.path) as connection,
-        pytest.raises(sqlite3.IntegrityError, match="indexed sealed artifact"),
+        pytest.raises(sqlite3.DatabaseError, match="authorized|function|consistent"),
     ):
         connection.execute(
             """

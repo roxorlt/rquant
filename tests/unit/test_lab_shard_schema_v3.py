@@ -745,6 +745,16 @@ def test_reader_rejects_terminal_legacy_shard_with_claim_identity(tmp_path: Path
     LabJobStore(path).initialize()
     shard_id = str(LabJobReader(path).list_shards(lab_jobs.UUID(job_id))[0].shard_id)
     with sqlite3.connect(path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
+            5,
+            lambda *_args: 0,
+        )
+        connection.create_function(
+            lab_jobs._RETRY_AUTH_FUNCTION,
+            3,
+            lambda *_args: 0,
+        )
         connection.execute(
             """
             UPDATE lab_job SET status = 'cancelled', version = 1 WHERE job_id = ?
