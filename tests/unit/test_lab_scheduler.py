@@ -79,7 +79,20 @@ def _canonical_json(
     )
 
 
-def _spec(*, deadline: datetime | None = None) -> ResearchRunSpec:
+def _spec(
+    *,
+    deadline: datetime | None = None,
+    with_dataset_snapshot: bool = True,
+) -> ResearchRunSpec:
+    dataset_snapshot = (
+        DatasetSnapshotIdentity(
+            snapshot_id="a" * 64,
+            binding_hash="b" * 64,
+            audit_run_id="d" * 64,
+        )
+        if with_dataset_snapshot
+        else None
+    )
     return ResearchRunSpec(
         job_type=ResearchJobType.STRATEGY_REPLAY,
         parameters=ResearchRunParameters(
@@ -88,11 +101,7 @@ def _spec(*, deadline: datetime | None = None) -> ResearchRunSpec:
             end_date=date(2026, 7, 14),
         ),
         code_sha="1" * 40,
-        dataset_snapshot=DatasetSnapshotIdentity(
-            snapshot_id="a" * 64,
-            binding_hash="b" * 64,
-            audit_run_id="d" * 64,
-        ),
+        dataset_snapshot=dataset_snapshot,
         feature_contract=FeatureContractIdentity(
             contract_id="intraday-core",
             contract_version="v1",
@@ -107,7 +116,7 @@ def _spec(*, deadline: datetime | None = None) -> ResearchRunSpec:
         random_seed=20260724,
         resource_class=ResourceClass.STANDARD,
         deadline=deadline or datetime(2026, 7, 25, 2, tzinfo=UTC),
-        research_status="comparable",
+        research_status="comparable" if dataset_snapshot is not None else "exploratory",
     )
 
 
@@ -285,6 +294,7 @@ def _ready_artifact_commit_scenario(
     commit_spool_type: type[LabArtifactCommitSpool] = LabArtifactCommitSpool,
     publish: bool = True,
     deadline: datetime | None = None,
+    with_dataset_snapshot: bool = True,
 ) -> tuple[
     LabJobStore,
     LabScheduler,
@@ -312,7 +322,12 @@ def _ready_artifact_commit_scenario(
     )
     scheduler.run_once()
     assert scheduler.lease is not None
-    submit = _envelope(spec=_spec(deadline=deadline))
+    submit = _envelope(
+        spec=_spec(
+            deadline=deadline,
+            with_dataset_snapshot=with_dataset_snapshot,
+        )
+    )
     assert store.apply_command(submit, lease=scheduler.lease, now=NOW).status == "applied"
     store.plan_job(
         submit.command.job_id,
@@ -401,6 +416,47 @@ def test_external_sql_cannot_revive_sealed_job_or_downgrade_contract(
         )
 
 
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "result_contract_version = NULL",
+        "result_state = 'pending', result_contract_version = NULL",
+        ("status = 'running', result_state = 'pending', result_contract_version = NULL"),
+    ],
+    ids=["contract-null", "ready-to-pending-null", "multi-column-regression"],
+)
+def test_ready_complete_result_cannot_regress_through_null_contract(
+    tmp_path: Path,
+    assignment: str,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+
+    with (
+        store._connect() as connection,
+        pytest.raises(sqlite3.DatabaseError, match="consistent"),
+    ):
+        connection.execute(
+            f"UPDATE lab_job SET {assignment} WHERE job_id = ?",
+            (str(job.job_id),),
+        )
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert persisted is not None and persisted.result_state is LabResultState.READY
+    assert persisted.result_contract_version == COMPLETE_RESULT_CONTRACT_VERSION
+    assert scheduler.lease is not None
+    assert (
+        store.claim_next_shard(
+            worker_id="worker-after-null-regression",
+            shard_lease_seconds=30,
+            lease=scheduler.lease,
+            now=job.updated_at,
+        )
+        is None
+    )
+
+
 def test_reader_rejects_persisted_sealed_job_without_any_shards(tmp_path: Path) -> None:
     store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
         _ready_artifact_commit_scenario(tmp_path)
@@ -426,6 +482,52 @@ def test_external_sql_cannot_delete_shard_from_sealed_job(tmp_path: Path) -> Non
         pytest.raises(sqlite3.DatabaseError, match="shard|immutable"),
     ):
         connection.execute("DELETE FROM lab_shard WHERE job_id = ?", (str(job.job_id),))
+
+
+def test_external_fk_off_connection_cannot_delete_sealed_job_parent(tmp_path: Path) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        with pytest.raises(sqlite3.DatabaseError, match="job|sealed|delete"):
+            connection.execute("DELETE FROM lab_job WHERE job_id = ?", (str(job.job_id),))
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert persisted is not None and persisted.result_state is LabResultState.SEALED
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "created_at = '1999-01-01T00:00:00+00:00'",
+        "attempt_count = attempt_count + 1",
+        (
+            "created_at = '1999-01-01T00:00:00+00:00', "
+            "attempt_count = attempt_count + 1, spec_hash = 'f' || substr(spec_hash, 2)"
+        ),
+    ],
+    ids=["created-at", "attempt-count", "multi-column"],
+)
+def test_complete_sealed_job_row_is_immutable(
+    tmp_path: Path,
+    assignment: str,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="sealed|immutable"),
+    ):
+        connection.execute(
+            f"UPDATE lab_job SET {assignment} WHERE job_id = ?",
+            (str(job.job_id),),
+        )
 
 
 def test_reader_rejects_accepted_commit_after_result_index_is_lost(tmp_path: Path) -> None:
@@ -495,6 +597,145 @@ def test_commit_json_shape_is_checked_even_with_spoofed_sql_authority(
                     timestamp,
                 ),
             )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "dataset_snapshot"),
+    [
+        ("empty-object", {}),
+        (
+            "missing-required-key",
+            {"binding_hash": None, "audit_run_id": None},
+        ),
+        (
+            "required-json-null",
+            {"snapshot_id": None, "binding_hash": None, "audit_run_id": None},
+        ),
+        (
+            "malformed-required-value",
+            {"snapshot_id": 7, "binding_hash": "b" * 64, "audit_run_id": None},
+        ),
+    ],
+)
+def test_spoofed_authority_cannot_insert_malformed_dataset_snapshot(
+    tmp_path: Path,
+    mutation: str,
+    dataset_snapshot: object,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            publish=False,
+            with_dataset_snapshot=False,
+        )
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    raw_envelope = envelope.model_dump(mode="json")
+    raw_envelope["commit"]["dataset_snapshot"] = dataset_snapshot
+    commit_json = json.dumps(raw_envelope, sort_keys=True, separators=(",", ":"))
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="CHECK|consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json,
+                    status, reason, receipt_json, receipt_job_version,
+                    received_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(job.job_id),
+                    commit_json,
+                    _canonical_json(receipt),
+                    receipt.job_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+
+def test_spoofed_authority_cannot_omit_dataset_snapshot_field(tmp_path: Path) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            publish=False,
+            with_dataset_snapshot=False,
+        )
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    raw_envelope = envelope.model_dump(mode="json")
+    del raw_envelope["commit"]["dataset_snapshot"]
+    commit_json = json.dumps(raw_envelope, sort_keys=True, separators=(",", ":"))
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="CHECK|consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json,
+                    status, reason, receipt_json, receipt_job_version,
+                    received_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(job.job_id),
+                    commit_json,
+                    _canonical_json(receipt),
+                    receipt.job_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+
+@pytest.mark.parametrize("with_dataset_snapshot", [False, True], ids=["json-null", "complete"])
+def test_verified_commit_accepts_canonical_dataset_snapshot_shapes(
+    tmp_path: Path,
+    with_dataset_snapshot: bool,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, envelope, _clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            with_dataset_snapshot=with_dataset_snapshot,
+        )
+    )
+
+    scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+    assert record is not None and record.receipt.status == "accepted"
+    assert record.envelope.commit.dataset_snapshot == job.spec.dataset_snapshot
 
 
 def test_accepted_commit_receipt_version_matches_ready_job_transition(

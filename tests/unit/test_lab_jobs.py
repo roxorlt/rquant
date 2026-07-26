@@ -343,21 +343,138 @@ def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> 
     )
 
 
-def test_connection_authority_is_exact_and_cleared_after_exception() -> None:
-    authority = lab_jobs._LabWriteAuthorization()
+def test_connection_authority_is_exact_and_cleared_after_exception(tmp_path: Path) -> None:
+    store = _store(tmp_path)
     job_id = uuid4()
     other_job_id = uuid4()
     spec_json = '{"schema_version":2}'
 
-    with (
-        pytest.raises(RuntimeError, match="simulated write failure"),
-        authority.authorize_submit(job_id, spec_json),
-    ):
-        assert authority.submit_authorized(str(job_id), spec_json) == 1
-        assert authority.submit_authorized(str(other_job_id), spec_json) == 0
-        raise RuntimeError("simulated write failure")
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        authority = connection.write_authorization
+        with (
+            pytest.raises(RuntimeError, match="simulated write failure"),
+            authority.authorize_submit(job_id, spec_json),
+        ):
+            assert authority.submit_authorized(str(job_id), spec_json) == 1
+            assert authority.submit_authorized(str(other_job_id), spec_json) == 0
+            raise RuntimeError("simulated write failure")
 
-    assert authority.submit_authorized(str(job_id), spec_json) == 0
+        assert authority.submit_authorized(str(job_id), spec_json) == 0
+        connection.rollback()
+
+
+@pytest.mark.parametrize("boundary", ["commit", "rollback"])
+def test_connection_authority_expires_on_explicit_transaction_boundary(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        authority = connection.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            assert authority.submit_authorized(str(job_id), spec_json) == 1
+            getattr(connection, boundary)()
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+            connection.execute("BEGIN IMMEDIATE")
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+            connection.rollback()
+
+
+@pytest.mark.parametrize("statement", ["COMMIT", "ROLLBACK"])
+def test_connection_authority_expires_on_sql_transaction_boundary(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        authority = connection.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            assert authority.submit_authorized(str(job_id), spec_json) == 1
+            connection.execute(statement)
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+            connection.execute("BEGIN IMMEDIATE")
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+            connection.rollback()
+
+
+def test_connection_authority_expires_on_executescript_implicit_commit(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        authority = connection.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            assert authority.submit_authorized(str(job_id), spec_json) == 1
+            connection.executescript("SELECT 1;")
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+
+
+def test_connection_authority_cannot_revive_after_implicit_conflict_rollback(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+
+    with store._connect() as connection:
+        connection.execute("CREATE TEMP TABLE auth_probe (value INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_probe VALUES (1)")
+        connection.execute("BEGIN IMMEDIATE")
+        authority = connection.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute("INSERT OR ROLLBACK INTO auth_probe VALUES (1)")
+            assert connection.in_transaction is False
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+            connection.execute("BEGIN IMMEDIATE")
+            assert authority.submit_authorized(str(job_id), spec_json) == 0
+            connection.rollback()
+
+
+def test_connection_authority_requires_active_transaction(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with (
+        store._connect() as connection,
+        pytest.raises(RuntimeError, match="transaction"),
+        connection.write_authorization.authorize_submit(
+            uuid4(),
+            '{"schema_version":2}',
+        ),
+    ):
+        pass
+
+
+def test_connection_authority_isolated_by_connection_and_rejects_nesting(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job_id = uuid4()
+    spec_json = '{"schema_version":2}'
+    with store._connect() as first, store._connect() as second:
+        first.execute("BEGIN IMMEDIATE")
+        authority = first.write_authorization
+        with authority.authorize_submit(job_id, spec_json):
+            assert authority.submit_authorized(str(job_id), spec_json) == 1
+            assert second.write_authorization.submit_authorized(str(job_id), spec_json) == 0
+            with (
+                pytest.raises(RuntimeError, match="already active"),
+                authority.authorize_submit(job_id, spec_json),
+            ):
+                pass
+        first.rollback()
 
 
 def _submit_job(
@@ -611,6 +728,42 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
 
     with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
         LabJobReader(store.path).get_job(uuid4())
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "trg_lab_complete_result_job_no_delete",
+        "trg_lab_complete_result_sealed_job_no_update",
+    ],
+)
+def test_v5_schema_requires_exact_complete_result_parent_guards(
+    tmp_path: Path,
+    trigger: str,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?",
+            (trigger,),
+        ).fetchone()
+        assert row is not None and row[0] is not None, f"missing required trigger {trigger}"
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        operation = "DELETE" if trigger.endswith("no_delete") else "UPDATE"
+        connection.execute(
+            f"""
+            CREATE TRIGGER "{trigger}"
+            BEFORE {operation} ON lab_job
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        LabJobReader(store.path).get_job(uuid4())
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        store.connection_pragmas()
 
 
 @pytest.mark.parametrize(

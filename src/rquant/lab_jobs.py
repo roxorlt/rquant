@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
+from weakref import ReferenceType, ref
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -117,24 +118,64 @@ _DEADLINE_EXCEEDED_FAILURE_JSON = '{"reason":"deadline_exceeded"}'
 
 
 class _LabWriteAuthorization:
-    __slots__ = ("_artifact_commit", "_artifact_index", "_artifact_success", "_retry", "_submit")
+    __slots__ = (
+        "_artifact_commit",
+        "_artifact_index",
+        "_artifact_success",
+        "_connection_ref",
+        "_epoch",
+        "_retry",
+        "_submit",
+    )
 
-    def __init__(self) -> None:
-        self._submit: tuple[str, str] | None = None
-        self._retry: tuple[str, int, int] | None = None
-        self._artifact_commit: tuple[str, str, str] | None = None
-        self._artifact_index: tuple[str, str, str] | None = None
-        self._artifact_success: tuple[str, str, str, int, int] | None = None
+    def __init__(self, connection: _LabJobStoreConnection) -> None:
+        self._connection_ref: ReferenceType[_LabJobStoreConnection] = ref(connection)
+        self._epoch = 0
+        self._submit: tuple[int, str, str] | None = None
+        self._retry: tuple[int, str, int, int] | None = None
+        self._artifact_commit: tuple[int, str, str, str] | None = None
+        self._artifact_index: tuple[int, str, str, str] | None = None
+        self._artifact_success: tuple[int, str, str, str, int, int] | None = None
+
+    def _require_transaction(self) -> int:
+        connection = self._connection_ref()
+        if connection is None or not connection.in_transaction:
+            raise RuntimeError("lab SQL authorization requires an active transaction")
+        return self._epoch
+
+    def _is_current_transaction(self, epoch: int) -> bool:
+        connection = self._connection_ref()
+        return connection is not None and connection.in_transaction and epoch == self._epoch
+
+    def expire_transaction_boundary(self) -> None:
+        if any(
+            grant is not None
+            for grant in (
+                self._submit,
+                self._retry,
+                self._artifact_commit,
+                self._artifact_index,
+                self._artifact_success,
+            )
+        ):
+            self._epoch += 1
+        self._submit = None
+        self._retry = None
+        self._artifact_commit = None
+        self._artifact_index = None
+        self._artifact_success = None
 
     @contextmanager
     def authorize_submit(self, job_id: UUID, spec_json: str) -> Iterator[None]:
         if self._submit is not None:
             raise RuntimeError("submit SQL authorization is already active")
-        self._submit = (str(job_id), spec_json)
+        epoch = self._require_transaction()
+        self._submit = (epoch, str(job_id), spec_json)
         try:
             yield
         finally:
-            self._submit = None
+            if self._submit is not None and self._submit[0] == epoch:
+                self._submit = None
 
     @contextmanager
     def authorize_retry(
@@ -145,11 +186,13 @@ class _LabWriteAuthorization:
     ) -> Iterator[None]:
         if self._retry is not None:
             raise RuntimeError("retry SQL authorization is already active")
-        self._retry = (str(job_id), old_version, new_version)
+        epoch = self._require_transaction()
+        self._retry = (epoch, str(job_id), old_version, new_version)
         try:
             yield
         finally:
-            self._retry = None
+            if self._retry is not None and self._retry[0] == epoch:
+                self._retry = None
 
     @contextmanager
     def authorize_artifact_commit(
@@ -160,11 +203,13 @@ class _LabWriteAuthorization:
     ) -> Iterator[None]:
         if self._artifact_commit is not None:
             raise RuntimeError("artifact commit SQL authorization is already active")
-        self._artifact_commit = (str(request_id), commit_json, receipt_json)
+        epoch = self._require_transaction()
+        self._artifact_commit = (epoch, str(request_id), commit_json, receipt_json)
         try:
             yield
         finally:
-            self._artifact_commit = None
+            if self._artifact_commit is not None and self._artifact_commit[0] == epoch:
+                self._artifact_commit = None
 
     @contextmanager
     def authorize_artifact_index(
@@ -175,11 +220,13 @@ class _LabWriteAuthorization:
     ) -> Iterator[None]:
         if self._artifact_index is not None:
             raise RuntimeError("artifact index SQL authorization is already active")
-        self._artifact_index = (str(job_id), str(request_id), evidence_json)
+        epoch = self._require_transaction()
+        self._artifact_index = (epoch, str(job_id), str(request_id), evidence_json)
         try:
             yield
         finally:
-            self._artifact_index = None
+            if self._artifact_index is not None and self._artifact_index[0] == epoch:
+                self._artifact_index = None
 
     @contextmanager
     def authorize_artifact_success(
@@ -192,7 +239,9 @@ class _LabWriteAuthorization:
     ) -> Iterator[None]:
         if self._artifact_success is not None:
             raise RuntimeError("artifact success SQL authorization is already active")
+        epoch = self._require_transaction()
         self._artifact_success = (
+            epoch,
             str(job_id),
             str(request_id),
             evidence_json,
@@ -202,10 +251,16 @@ class _LabWriteAuthorization:
         try:
             yield
         finally:
-            self._artifact_success = None
+            if self._artifact_success is not None and self._artifact_success[0] == epoch:
+                self._artifact_success = None
 
     def submit_authorized(self, job_id: object, spec_json: object) -> int:
-        return int(self._submit == (str(job_id), str(spec_json)))
+        grant = self._submit
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:] == (str(job_id), str(spec_json))
+        )
 
     def retry_authorized(
         self,
@@ -213,7 +268,12 @@ class _LabWriteAuthorization:
         old_version: object,
         new_version: object,
     ) -> int:
-        return int(self._retry == (str(job_id), old_version, new_version))
+        grant = self._retry
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:] == (str(job_id), old_version, new_version)
+        )
 
     def artifact_commit_authorized(
         self,
@@ -221,7 +281,12 @@ class _LabWriteAuthorization:
         commit_json: object,
         receipt_json: object,
     ) -> int:
-        return int(self._artifact_commit == (str(request_id), str(commit_json), str(receipt_json)))
+        grant = self._artifact_commit
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:] == (str(request_id), str(commit_json), str(receipt_json))
+        )
 
     def artifact_index_authorized(
         self,
@@ -229,7 +294,12 @@ class _LabWriteAuthorization:
         request_id: object,
         evidence_json: object,
     ) -> int:
-        return int(self._artifact_index == (str(job_id), str(request_id), str(evidence_json)))
+        grant = self._artifact_index
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:] == (str(job_id), str(request_id), str(evidence_json))
+        )
 
     def artifact_success_authorized(
         self,
@@ -239,8 +309,11 @@ class _LabWriteAuthorization:
         old_version: object,
         new_version: object,
     ) -> int:
+        grant = self._artifact_success
         return int(
-            self._artifact_success
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:]
             == (
                 str(job_id),
                 str(request_id),
@@ -253,6 +326,35 @@ class _LabWriteAuthorization:
 
 class _LabJobStoreConnection(sqlite3.Connection):
     write_authorization: _LabWriteAuthorization
+
+    def _expire_write_authorization(self) -> None:
+        authorization = getattr(self, "write_authorization", None)
+        if authorization is not None:
+            authorization.expire_transaction_boundary()
+
+    def _trace_transaction_boundary(self, statement: str) -> None:
+        tokens = statement.lstrip().split(maxsplit=1)
+        keyword = tokens[0].upper() if tokens else ""
+        if (keyword in {"BEGIN", "SAVEPOINT"} and not self.in_transaction) or keyword in {
+            "COMMIT",
+            "END",
+            "RELEASE",
+            "ROLLBACK",
+        }:
+            self._expire_write_authorization()
+
+    def commit(self) -> None:
+        self._expire_write_authorization()
+        super().commit()
+
+    def rollback(self) -> None:
+        self._expire_write_authorization()
+        super().rollback()
+
+    def close(self) -> None:
+        self._expire_write_authorization()
+        self.set_trace_callback(None)
+        super().close()
 
 
 def _write_authorization(connection: sqlite3.Connection) -> _LabWriteAuthorization:
@@ -1354,6 +1456,8 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
     )
     _validate_v5_key_and_foreign_key_constraints(connection)
     required_triggers = {
+        "trg_lab_complete_result_job_no_delete",
+        "trg_lab_complete_result_sealed_job_no_update",
         "trg_lab_job_complete_result_insert",
         "trg_lab_job_complete_result_update",
         "trg_lab_job_complete_result_marker_immutable",
@@ -1379,6 +1483,10 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
             f"lab jobs SQLite v5 is missing triggers: {', '.join(missing_triggers)}"
         )
     expected_trigger_sql = {
+        "trg_lab_complete_result_job_no_delete": (_V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER),
+        "trg_lab_complete_result_sealed_job_no_update": (
+            _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER
+        ),
         "trg_lab_job_complete_result_insert": _V5_JOB_RESULT_INSERT_TRIGGER,
         "trg_lab_job_complete_result_update": _V5_JOB_RESULT_UPDATE_TRIGGER,
         "trg_lab_job_complete_result_marker_immutable": (_V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER),
@@ -2737,8 +2845,9 @@ class LabJobStore:
             isolation_level=None,
             factory=_LabJobStoreConnection,
         )
-        authorization = _LabWriteAuthorization()
+        authorization = _LabWriteAuthorization(connection)
         connection.write_authorization = authorization
+        connection.set_trace_callback(connection._trace_transaction_boundary)
         connection.create_function(
             _SUBMIT_AUTH_FUNCTION,
             2,
@@ -6741,9 +6850,45 @@ CREATE TABLE IF NOT EXISTS lab_artifact_commit (
         AND json_type(commit_json, '$.commit.sealed_path') IS 'text'
         AND (
             json_type(commit_json, '$.commit.dataset_snapshot') IS 'null'
-            OR json_type(
-                commit_json, '$.commit.dataset_snapshot'
-            ) IS 'object'
+            OR (
+                json_type(
+                    commit_json, '$.commit.dataset_snapshot'
+                ) IS 'object'
+                AND json_type(
+                    commit_json, '$.commit.dataset_snapshot.snapshot_id'
+                ) IS 'text'
+                AND length(json_extract(
+                    commit_json, '$.commit.dataset_snapshot.snapshot_id'
+                )) = 64
+                AND json_extract(
+                    commit_json, '$.commit.dataset_snapshot.snapshot_id'
+                ) NOT GLOB '*[^0-9a-f]*'
+                AND json_type(
+                    commit_json, '$.commit.dataset_snapshot.binding_hash'
+                ) IS 'text'
+                AND length(json_extract(
+                    commit_json, '$.commit.dataset_snapshot.binding_hash'
+                )) = 64
+                AND json_extract(
+                    commit_json, '$.commit.dataset_snapshot.binding_hash'
+                ) NOT GLOB '*[^0-9a-f]*'
+                AND (
+                    json_type(
+                        commit_json, '$.commit.dataset_snapshot.audit_run_id'
+                    ) IS 'null'
+                    OR (
+                        json_type(
+                            commit_json, '$.commit.dataset_snapshot.audit_run_id'
+                        ) IS 'text'
+                        AND length(json_extract(
+                            commit_json, '$.commit.dataset_snapshot.audit_run_id'
+                        )) = 64
+                        AND json_extract(
+                            commit_json, '$.commit.dataset_snapshot.audit_run_id'
+                        ) NOT GLOB '*[^0-9a-f]*'
+                    )
+                )
+            )
         )
     ),
     status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
@@ -6820,6 +6965,63 @@ CREATE TABLE IF NOT EXISTS lab_job_result_artifact (
 )
 """
 
+
+def _dataset_snapshot_match_sql(
+    commit_json_expression: str,
+    job_spec_expression: str,
+) -> str:
+    return f"""
+(
+    (
+        json_type(
+            {commit_json_expression}, '$.commit.dataset_snapshot'
+        ) IS 'null'
+        AND json_type({job_spec_expression}, '$.dataset_snapshot') IS 'null'
+    )
+    OR (
+        json_type(
+            {commit_json_expression}, '$.commit.dataset_snapshot'
+        ) IS 'object'
+        AND json_type({job_spec_expression}, '$.dataset_snapshot') IS 'object'
+        AND json_type(
+            {commit_json_expression}, '$.commit.dataset_snapshot.snapshot_id'
+        ) IS 'text'
+        AND json_type(
+            {job_spec_expression}, '$.dataset_snapshot.snapshot_id'
+        ) IS 'text'
+        AND json_extract(
+            {commit_json_expression}, '$.commit.dataset_snapshot.snapshot_id'
+        ) = json_extract({job_spec_expression}, '$.dataset_snapshot.snapshot_id')
+        AND json_type(
+            {commit_json_expression}, '$.commit.dataset_snapshot.binding_hash'
+        ) IS 'text'
+        AND json_type(
+            {job_spec_expression}, '$.dataset_snapshot.binding_hash'
+        ) IS 'text'
+        AND json_extract(
+            {commit_json_expression}, '$.commit.dataset_snapshot.binding_hash'
+        ) = json_extract({job_spec_expression}, '$.dataset_snapshot.binding_hash')
+        AND json_type(
+            {commit_json_expression}, '$.commit.dataset_snapshot.audit_run_id'
+        ) IS json_type({job_spec_expression}, '$.dataset_snapshot.audit_run_id')
+        AND json_extract(
+            {commit_json_expression}, '$.commit.dataset_snapshot.audit_run_id'
+        ) IS json_extract({job_spec_expression}, '$.dataset_snapshot.audit_run_id')
+    )
+)
+"""
+
+
+_NEW_COMMIT_DATASET_SNAPSHOT_MATCH = _dataset_snapshot_match_sql(
+    "NEW.commit_json",
+    "job.spec_json",
+)
+_STORED_COMMIT_DATASET_SNAPSHOT_MATCH = _dataset_snapshot_match_sql(
+    "artifact_commit.commit_json",
+    "NEW.spec_json",
+)
+
+
 _V5_JOB_RESULT_UPDATE_TRIGGER = f"""
 CREATE TRIGGER IF NOT EXISTS trg_lab_job_complete_result_update
 BEFORE UPDATE OF status, control_intent, version, recoverable,
@@ -6840,13 +7042,18 @@ WHEN (
     AND (
       (NEW.result_state = 'pending' AND (
         NEW.status = 'succeeded'
+        OR (
+            OLD.requires_complete_result = 1
+            AND OLD.result_state = 'ready'
+            AND NEW.status NOT IN ('failed', 'cancelled')
+        )
         OR EXISTS (
             SELECT 1 FROM lab_job_result_artifact artifact
             WHERE artifact.job_id = NEW.job_id
         )
         OR (
             NEW.status = 'running'
-            AND NEW.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+            AND NEW.result_contract_version IS '{COMPLETE_RESULT_CONTRACT_VERSION}'
             AND EXISTS (
                 SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
             )
@@ -6859,7 +7066,7 @@ WHEN (
       OR (NEW.result_state = 'ready' AND (
         NEW.status <> 'running'
         OR NEW.control_intent <> 'none'
-        OR NEW.result_contract_version <> '{COMPLETE_RESULT_CONTRACT_VERSION}'
+        OR NEW.result_contract_version IS NOT '{COMPLETE_RESULT_CONTRACT_VERSION}'
         OR EXISTS (
             SELECT 1 FROM lab_job_result_artifact artifact
             WHERE artifact.job_id = NEW.job_id
@@ -6877,10 +7084,10 @@ WHEN (
         OR OLD.status <> 'running'
         OR OLD.result_state <> 'ready'
         OR OLD.control_intent <> 'none'
-        OR OLD.result_contract_version <> '{COMPLETE_RESULT_CONTRACT_VERSION}'
+        OR OLD.result_contract_version IS NOT '{COMPLETE_RESULT_CONTRACT_VERSION}'
         OR NEW.status <> 'succeeded'
         OR NEW.control_intent <> 'none'
-        OR NEW.result_contract_version <> '{COMPLETE_RESULT_CONTRACT_VERSION}'
+        OR NEW.result_contract_version IS NOT '{COMPLETE_RESULT_CONTRACT_VERSION}'
         OR NEW.version <> OLD.version + 1
         OR NEW.scheduler_fencing_token IS NOT OLD.scheduler_fencing_token
         OR NOT EXISTS (
@@ -6906,24 +7113,7 @@ WHEN (
               AND json_extract(
                     artifact_commit.commit_json, '$.commit.code_sha'
                   ) = json_extract(NEW.spec_json, '$.code_sha')
-              AND json_extract(
-                    artifact_commit.commit_json,
-                    '$.commit.dataset_snapshot.snapshot_id'
-                  ) IS json_extract(
-                    NEW.spec_json, '$.dataset_snapshot.snapshot_id'
-                  )
-              AND json_extract(
-                    artifact_commit.commit_json,
-                    '$.commit.dataset_snapshot.binding_hash'
-                  ) IS json_extract(
-                    NEW.spec_json, '$.dataset_snapshot.binding_hash'
-                  )
-              AND json_extract(
-                    artifact_commit.commit_json,
-                    '$.commit.dataset_snapshot.audit_run_id'
-                  ) IS json_extract(
-                    NEW.spec_json, '$.dataset_snapshot.audit_run_id'
-                  )
+              AND {_STORED_COMMIT_DATASET_SNAPSHOT_MATCH}
               AND json_extract(
                     artifact_commit.commit_json,
                     '$.commit.result_contract_version'
@@ -7024,6 +7214,24 @@ BEGIN
 END
 """
 
+_V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_job_no_delete
+BEFORE DELETE ON lab_job
+WHEN OLD.requires_complete_result = 1
+BEGIN
+    SELECT RAISE(ABORT, 'complete result job ledger row cannot be deleted');
+END
+"""
+
+_V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_sealed_job_no_update
+BEFORE UPDATE ON lab_job
+WHEN OLD.requires_complete_result = 1 AND OLD.result_state = 'sealed'
+BEGIN
+    SELECT RAISE(ABORT, 'complete sealed job ledger row is immutable');
+END
+"""
+
 _V5_ARTIFACT_COMMIT_INSERT_TRIGGER = f"""
 CREATE TRIGGER IF NOT EXISTS trg_lab_artifact_commit_insert
 BEFORE INSERT ON lab_artifact_commit
@@ -7052,31 +7260,14 @@ WHEN {_ARTIFACT_COMMIT_AUTH_FUNCTION}(
               AND job.status = 'running'
               AND job.result_state = 'ready'
               AND job.control_intent = 'none'
-              AND job.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+              AND job.result_contract_version IS '{COMPLETE_RESULT_CONTRACT_VERSION}'
               AND json_extract(
                     NEW.commit_json, '$.commit.spec_hash'
                   ) = job.spec_hash
               AND json_extract(
                     NEW.commit_json, '$.commit.code_sha'
                   ) = json_extract(job.spec_json, '$.code_sha')
-              AND json_extract(
-                    NEW.commit_json,
-                    '$.commit.dataset_snapshot.snapshot_id'
-                  ) IS json_extract(
-                    job.spec_json, '$.dataset_snapshot.snapshot_id'
-                  )
-              AND json_extract(
-                    NEW.commit_json,
-                    '$.commit.dataset_snapshot.binding_hash'
-                  ) IS json_extract(
-                    job.spec_json, '$.dataset_snapshot.binding_hash'
-                  )
-              AND json_extract(
-                    NEW.commit_json,
-                    '$.commit.dataset_snapshot.audit_run_id'
-                  ) IS json_extract(
-                    job.spec_json, '$.dataset_snapshot.audit_run_id'
-                  )
+              AND {_NEW_COMMIT_DATASET_SNAPSHOT_MATCH}
               AND json_extract(
                     NEW.commit_json, '$.commit.result_contract_version'
                   ) = job.result_contract_version
@@ -7113,31 +7304,14 @@ WHEN {_ARTIFACT_COMMIT_AUTH_FUNCTION}(
               AND job.requires_complete_result = 1
               AND job.status = 'succeeded'
               AND job.result_state = 'sealed'
-              AND job.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+              AND job.result_contract_version IS '{COMPLETE_RESULT_CONTRACT_VERSION}'
               AND json_extract(
                     NEW.commit_json, '$.commit.spec_hash'
                   ) = job.spec_hash
               AND json_extract(
                     NEW.commit_json, '$.commit.code_sha'
                   ) = json_extract(job.spec_json, '$.code_sha')
-              AND json_extract(
-                    NEW.commit_json,
-                    '$.commit.dataset_snapshot.snapshot_id'
-                  ) IS json_extract(
-                    job.spec_json, '$.dataset_snapshot.snapshot_id'
-                  )
-              AND json_extract(
-                    NEW.commit_json,
-                    '$.commit.dataset_snapshot.binding_hash'
-                  ) IS json_extract(
-                    job.spec_json, '$.dataset_snapshot.binding_hash'
-                  )
-              AND json_extract(
-                    NEW.commit_json,
-                    '$.commit.dataset_snapshot.audit_run_id'
-                  ) IS json_extract(
-                    job.spec_json, '$.dataset_snapshot.audit_run_id'
-                  )
+              AND {_NEW_COMMIT_DATASET_SNAPSHOT_MATCH}
               AND json_extract(
                     NEW.commit_json, '$.commit.result_contract_version'
                   ) = job.result_contract_version
@@ -7205,7 +7379,7 @@ WHEN {_ARTIFACT_INDEX_AUTH_FUNCTION}(
       AND job.status = 'running'
       AND job.result_state = 'ready'
       AND job.control_intent = 'none'
-      AND job.result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'
+      AND job.result_contract_version IS '{COMPLETE_RESULT_CONTRACT_VERSION}'
       AND json_extract(
             artifact_commit.commit_json, '$.commit.manifest_hash'
           ) = NEW.manifest_hash
@@ -7342,6 +7516,8 @@ _SCHEMA_STATEMENTS = tuple(
     _V5_JOB_RESULT_INSERT_TRIGGER,
     _V5_JOB_RESULT_UPDATE_TRIGGER,
     _V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER,
+    _V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER,
+    _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER,
     _V5_ARTIFACT_COMMIT_INSERT_TRIGGER,
     _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
     _V5_RESULT_ARTIFACT_NO_UPDATE_TRIGGER,
