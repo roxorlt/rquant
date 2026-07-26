@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Event
 from uuid import UUID
 
@@ -17,6 +19,7 @@ from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore, LabVerif
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
     LabCommandSpool,
+    LabSpoolFileIdentity,
     RequestContentConflictError,
 )
 from rquant.lab_jobs import (
@@ -188,6 +191,29 @@ class LabScheduler:
                 LabScheduler._is_artifact_verification_error(item) for item in exc.exceptions
             )
         return False
+
+    def _quarantine_artifact_commit(
+        self,
+        entry_or_path: LabArtifactCommitSpoolEntry | LabSpoolFileIdentity | Path,
+        *,
+        reason: str,
+    ) -> None:
+        if self.artifact_commit_spool is None:  # pragma: no cover - caller invariant
+            raise RuntimeError("artifact commit spool is not configured")
+        try:
+            self.artifact_commit_spool.quarantine(entry_or_path, reason=reason)
+        except Exception as exc:
+            source = entry_or_path.path if hasattr(entry_or_path, "path") else entry_or_path
+            _safe_structured_log(
+                "error",
+                "artifact_commit_quarantine_failed",
+                message=_safe_error_message(exc),
+                component="lab_scheduler",
+                owner_id=self.owner_id,
+                pending_path=str(source),
+                quarantine_reason=reason,
+                error_type=type(exc).__name__,
+            )
 
     def _seed_claim_cursor(self, lease: LabLeaseRecord) -> None:
         if self._claim_cursor_fence == lease.fencing_token:
@@ -516,7 +542,7 @@ class LabScheduler:
                 try:
                     entry = self.artifact_commit_spool.load(path)
                 except InvalidCommandEnvelopeError as exc:
-                    self.artifact_commit_spool.quarantine(
+                    self._quarantine_artifact_commit(
                         exc.file_identity or path,
                         reason=f"invalid_artifact_commit:{exc}",
                     )
@@ -527,42 +553,40 @@ class LabScheduler:
                 staged = None
                 receipt = None
                 try:
-                    with self.artifact_store.artifact_commit_lifecycle():
-                        try:
-                            with self.artifact_store.bind_verified_sealed(
-                                entry.envelope.commit.sealed_path,
-                                indexed_at=verification_now,
-                            ) as binding:
-                                lease, mutation_now = self._mutation_context()
-                                authority_now = mutation_now
-                                deadlines_expired += len(
-                                    self.store.expire_deadline_jobs(
-                                        lease=lease,
-                                        now=mutation_now,
-                                    )
+                    with (
+                        self.artifact_store.artifact_commit_lifecycle(),
+                        ExitStack() as staged_scope,
+                    ):
+                        with self.artifact_store.bind_verified_sealed(
+                            entry.envelope.commit.sealed_path,
+                            indexed_at=verification_now,
+                        ) as binding:
+                            lease, mutation_now = self._mutation_context()
+                            authority_now = mutation_now
+                            deadlines_expired += len(
+                                self.store.expire_deadline_jobs(
+                                    lease=lease,
+                                    now=mutation_now,
                                 )
-                                staged = self.store.stage_artifact_commit(
+                            )
+                            staged = staged_scope.enter_context(
+                                self.store.stage_artifact_commit(
                                     entry.envelope,
                                     binding,
                                     lease=lease,
                                     now=mutation_now,
                                 )
-                                self._after_artifact_commit_staged(entry, binding)
-                            assert staged is not None
-                            if self.lease is None:  # pragma: no cover - active tick invariant
-                                raise RuntimeError(
-                                    "scheduler lease disappeared before artifact commit"
-                                )
-                            receipt = staged.commit(
-                                lease=self.lease,
-                                now=self.clock(),
                             )
-                        except BaseException:
-                            if staged is not None:
-                                staged.rollback()
-                            raise
+                            self._after_artifact_commit_staged(entry, binding)
+                        assert staged is not None
+                        if self.lease is None:  # pragma: no cover - active tick invariant
+                            raise RuntimeError("scheduler lease disappeared before artifact commit")
+                        receipt = staged.commit(
+                            lease=self.lease,
+                            now=self.clock(),
+                        )
                 except RequestContentConflictError as exc:
-                    self.artifact_commit_spool.quarantine(
+                    self._quarantine_artifact_commit(
                         entry,
                         reason=f"artifact_commit_content_conflict:{exc}",
                     )
@@ -575,7 +599,7 @@ class LabScheduler:
                         exc
                     ):
                         raise
-                    self.artifact_commit_spool.quarantine(
+                    self._quarantine_artifact_commit(
                         entry,
                         reason=f"artifact_verification_failed:{_safe_error_message(exc)}",
                     )

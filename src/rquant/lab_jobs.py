@@ -10,7 +10,8 @@ from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from types import TracebackType
+from typing import TYPE_CHECKING, Literal, Self
 from urllib.parse import quote
 from uuid import UUID, uuid4
 from weakref import ReferenceType, ref
@@ -703,8 +704,8 @@ class LabArtifactCommitRecord(LabRecordModel):
     applied_at: datetime
 
 
-class LabStagedArtifactCommit:
-    """A closed-surface SQLite transaction awaiting artifact exit verification."""
+class _LabStagedArtifactCommit:
+    """Internal staged transaction that rolls back unless explicitly committed."""
 
     __slots__ = (
         "_connection",
@@ -754,6 +755,31 @@ class LabStagedArtifactCommit:
         if errors:
             self._raise_lifecycle_errors("staged artifact transaction rollback failed", errors)
 
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise RuntimeError("artifact commit stage is already closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        del exc_type, traceback
+        if self._closed:
+            return False
+        try:
+            self.rollback()
+        except BaseException as cleanup_error:
+            if exc is not None:
+                self._raise_lifecycle_errors(
+                    "staged artifact transaction body and rollback failed",
+                    [exc, cleanup_error],
+                )
+            raise
+        return False
+
     def commit(
         self,
         *,
@@ -795,6 +821,9 @@ class LabStagedArtifactCommit:
         if self._closed:
             return
         self._rollback_and_close()
+
+    def close(self) -> None:
+        self.rollback()
 
 
 _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
@@ -1220,14 +1249,108 @@ def _validate_v3_schema(connection: sqlite3.Connection) -> None:
         )
 
 
-def _canonical_index_predicate(sql: str) -> str | None:
-    tokens = sql.strip().rstrip(";").split()
+_SQL_TWO_CHARACTER_OPERATORS = frozenset({"||", "<<", ">>", "<=", ">=", "==", "!=", "<>", "->"})
+
+
+def _normalized_sql_tokens(sql: str) -> tuple[tuple[str, str], ...]:
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while position < len(sql):
+        character = sql[position]
+        if character.isspace():
+            position += 1
+            continue
+        if sql.startswith("--", position):
+            line_endings = tuple(
+                ending
+                for ending in (
+                    sql.find("\n", position + 2),
+                    sql.find("\r", position + 2),
+                )
+                if ending >= 0
+            )
+            position = len(sql) if not line_endings else min(line_endings) + 1
+            continue
+        if sql.startswith("/*", position):
+            comment_end = sql.find("*/", position + 2)
+            if comment_end < 0:
+                raise ValueError("unterminated SQL block comment")
+            position = comment_end + 2
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+            end = position + 1
+            while end < len(sql):
+                if sql[end] != quote:
+                    end += 1
+                    continue
+                if end + 1 < len(sql) and sql[end + 1] == quote:
+                    end += 2
+                    continue
+                end += 1
+                break
+            else:
+                raise ValueError("unterminated quoted SQL token")
+            tokens.append(("quoted", sql[position:end]))
+            position = end
+            continue
+        if character == "[":
+            end = sql.find("]", position + 1)
+            if end < 0:
+                raise ValueError("unterminated bracketed SQL identifier")
+            tokens.append(("quoted", sql[position : end + 1]))
+            position = end + 1
+            continue
+        if character.isalnum() or character in {"_", "$"}:
+            end = position + 1
+            while end < len(sql) and (sql[end].isalnum() or sql[end] in {"_", "$"}):
+                end += 1
+            tokens.append(("word", sql[position:end].casefold()))
+            position = end
+            continue
+        operator = sql[position : position + 2]
+        if operator in _SQL_TWO_CHARACTER_OPERATORS:
+            tokens.append(("operator", operator))
+            position += 2
+            continue
+        tokens.append(("operator", character))
+        position += 1
+
+    if tokens and tokens[-1] == ("operator", ";"):
+        tokens.pop()
+    without_optional_exists: list[tuple[str, str]] = []
+    position = 0
+    while position < len(tokens):
+        if tokens[position : position + 3] == [
+            ("word", "if"),
+            ("word", "not"),
+            ("word", "exists"),
+        ]:
+            position += 3
+            continue
+        without_optional_exists.append(tokens[position])
+        position += 1
+    return tuple(without_optional_exists)
+
+
+def _sql_ddl_equivalent(expected: str, actual: str) -> bool:
+    try:
+        return _normalized_sql_tokens(expected) == _normalized_sql_tokens(actual)
+    except ValueError:
+        return False
+
+
+def _canonical_index_predicate(sql: str) -> tuple[tuple[str, str], ...] | None:
+    try:
+        tokens = _normalized_sql_tokens(sql)
+    except ValueError:
+        return None
     where_positions = tuple(
-        position for position, token in enumerate(tokens) if token.upper() == "WHERE"
+        position for position, token in enumerate(tokens) if token == ("word", "where")
     )
     if len(where_positions) != 1:
         return None
-    return "".join(tokens[where_positions[0] + 1 :])
+    return tokens[where_positions[0] + 1 :]
 
 
 def _validate_v4_index(
@@ -1290,7 +1413,8 @@ def _validate_v4_index(
         raise LabDatabaseIdentityError(
             f"lab jobs SQLite v4 telemetry index {name} has no explicit DDL"
         )
-    if _canonical_index_predicate(str(sql_row[0])) != predicate:
+    expected_predicate = None if predicate is None else _normalized_sql_tokens(predicate)
+    if _canonical_index_predicate(str(sql_row[0])) != expected_predicate:
         raise LabDatabaseIdentityError(
             f"lab jobs SQLite v4 telemetry index {name} has invalid partial predicate"
         )
@@ -1328,7 +1452,7 @@ def _validate_v4_schema(connection: sqlite3.Connection) -> None:
         unique=True,
         partial=True,
         key_columns=(("job_id", False), ("completion_sequence", True)),
-        predicate="status='succeeded'ANDcompletion_sequenceISNOTNULL",
+        predicate="status = 'succeeded' AND completion_sequence IS NOT NULL",
     )
     _validate_v4_index(
         connection,
@@ -1338,11 +1462,6 @@ def _validate_v4_schema(connection: sqlite3.Connection) -> None:
         key_columns=(("job_id", False), ("status", False), ("shard_index", False)),
         predicate=None,
     )
-
-
-def _canonical_table_sql(sql: str) -> str:
-    canonical = "".join(sql.split()).lower()
-    return canonical.replace("ifnotexists", "")
 
 
 def _validate_v5_table_sql(
@@ -1355,11 +1474,7 @@ def _validate_v5_table_sql(
         "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
         (table,),
     ).fetchone()
-    if (
-        row is None
-        or row[0] is None
-        or _canonical_table_sql(str(row[0])) != _canonical_table_sql(expected)
-    ):
+    if row is None or row[0] is None or not _sql_ddl_equivalent(expected, str(row[0])):
         raise LabDatabaseIdentityError(f"lab jobs SQLite v5 table {table} has invalid constraints")
 
 
@@ -1617,11 +1732,7 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
             (name,),
         ).fetchone()
         assert row is not None
-        actual = " ".join(str(row[0]).strip().rstrip(";").split()).upper()
-        expected = " ".join(expected_sql.strip().rstrip(";").split()).upper()
-        actual = actual.replace(" IF NOT EXISTS ", " ")
-        expected = expected.replace(" IF NOT EXISTS ", " ")
-        if actual != expected:
+        if row[0] is None or not _sql_ddl_equivalent(expected_sql, str(row[0])):
             raise LabDatabaseIdentityError(
                 f"lab jobs SQLite v5 trigger {name} has invalid structure"
             )
@@ -2552,16 +2663,39 @@ class LabJobReader:
             "SELECT * FROM lab_job_result_artifact WHERE job_id = ?",
             (str(job.job_id),),
         ).fetchone()
-        shard_rows = connection.execute(
-            "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
-            (str(job.job_id),),
-        ).fetchall()
-        shards = tuple(cls._shard_from_row(row) for row in shard_rows)
 
         if not job.requires_complete_result:
             if index_row is not None:
                 raise InvalidStoredJobError("legacy job unexpectedly has a complete result index")
             return None
+
+        shard_aggregate = connection.execute(
+            """
+            SELECT COUNT(*) AS shard_count,
+                   COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0)
+                       AS succeeded_count,
+                   COUNT(DISTINCT plan_hash) AS plan_hash_count,
+                   MIN(plan_hash) AS plan_hash,
+                   COUNT(DISTINCT adapter_id) AS adapter_id_count,
+                   MIN(adapter_id) AS adapter_id,
+                   COUNT(DISTINCT adapter_version) AS adapter_version_count,
+                   MIN(adapter_version) AS adapter_version
+            FROM lab_shard
+            WHERE job_id = ?
+            """,
+            (str(job.job_id),),
+        ).fetchone()
+        assert shard_aggregate is not None
+        shard_count = _strict_sqlite_int(
+            shard_aggregate["shard_count"],
+            field="lab_shard.aggregate.shard_count",
+            minimum=0,
+        )
+        succeeded_count = _strict_sqlite_int(
+            shard_aggregate["succeeded_count"],
+            field="lab_shard.aggregate.succeeded_count",
+            minimum=0,
+        )
 
         if job.result_state is LabResultState.PENDING:
             if index_row is not None:
@@ -2569,15 +2703,15 @@ class LabJobReader:
             if (
                 job.status is JobStatus.RUNNING
                 and job.result_contract_version == COMPLETE_RESULT_CONTRACT_VERSION
-                and shards
-                and all(shard.status is ShardStatus.SUCCEEDED for shard in shards)
+                and shard_count > 0
+                and succeeded_count == shard_count
             ):
                 raise InvalidStoredJobError(
                     "running job with all shards succeeded must be result ready"
                 )
             return None
 
-        if not shards or any(shard.status is not ShardStatus.SUCCEEDED for shard in shards):
+        if shard_count == 0 or succeeded_count != shard_count:
             raise InvalidStoredJobError(
                 "ready or sealed complete result job requires succeeded shards"
             )
@@ -2632,10 +2766,34 @@ class LabJobReader:
             raise InvalidStoredJobError(
                 "accepted commit, result index, and sealed job identities conflict"
             )
-        shard_identity = {
-            (shard.plan_hash, shard.adapter_id, shard.adapter_version) for shard in shards
-        }
-        if shard_identity != {(commit.plan_hash, commit.adapter_id, commit.adapter_version)}:
+        aggregate_identity = (
+            _strict_sqlite_int(
+                shard_aggregate["plan_hash_count"],
+                field="lab_shard.aggregate.plan_hash_count",
+                minimum=0,
+            ),
+            str(shard_aggregate["plan_hash"]),
+            _strict_sqlite_int(
+                shard_aggregate["adapter_id_count"],
+                field="lab_shard.aggregate.adapter_id_count",
+                minimum=0,
+            ),
+            str(shard_aggregate["adapter_id"]),
+            _strict_sqlite_int(
+                shard_aggregate["adapter_version_count"],
+                field="lab_shard.aggregate.adapter_version_count",
+                minimum=0,
+            ),
+            str(shard_aggregate["adapter_version"]),
+        )
+        if aggregate_identity != (
+            1,
+            commit.plan_hash,
+            1,
+            commit.adapter_id,
+            1,
+            commit.adapter_version,
+        ):
             raise InvalidStoredJobError("accepted commit identity conflicts with succeeded shards")
         return evidence
 
@@ -3527,6 +3685,7 @@ class LabJobStore:
         if indexed is None or str(indexed["commit_request_id"]) != str(envelope.request_id):
             raise InvalidStoredJobError("staged artifact success lost its result index")
 
+    @contextmanager
     def stage_artifact_commit(
         self,
         envelope: LabArtifactCommitEnvelope,
@@ -3534,7 +3693,7 @@ class LabJobStore:
         *,
         lease: LabLeaseRecord,
         now: datetime,
-    ) -> LabStagedArtifactCommit:
+    ) -> Iterator[_LabStagedArtifactCommit]:
         from rquant.lab_artifacts import LabVerifiedSealedBinding
 
         validated = LabArtifactCommitEnvelope.model_validate(envelope)
@@ -3579,7 +3738,7 @@ class LabJobStore:
                         now=final_now,
                     )
 
-            return LabStagedArtifactCommit(
+            staged = _LabStagedArtifactCommit(
                 connection,
                 receipt,
                 lease=lease,
@@ -3589,6 +3748,8 @@ class LabJobStore:
             connection.rollback()
             connection.close()
             raise
+        with staged:
+            yield staged
 
     def acquire_scheduler_lease(
         self,

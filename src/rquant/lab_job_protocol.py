@@ -10,7 +10,7 @@ import os
 import re
 import stat
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Literal
@@ -19,6 +19,17 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.research_run_spec import ResearchRunSpec
+
+_LabSpoolFileType = Literal[
+    "regular",
+    "symlink",
+    "directory",
+    "fifo",
+    "socket",
+    "block_device",
+    "char_device",
+    "other",
+]
 
 
 class RequestContentConflictError(RuntimeError):
@@ -38,15 +49,15 @@ class LabSpoolFileIdentity(LabProtocolModel):
     path: Path
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
-    file_type: Literal["regular", "symlink"] = "regular"
+    file_type: _LabSpoolFileType = "regular"
     link_target: str | None = None
 
     @model_validator(mode="after")
     def validate_link_target(self) -> LabSpoolFileIdentity:
         if self.file_type == "symlink" and self.link_target is None:
             raise ValueError("symlink identity requires link_target")
-        if self.file_type == "regular" and self.link_target is not None:
-            raise ValueError("regular identity must not have link_target")
+        if self.file_type != "symlink" and self.link_target is not None:
+            raise ValueError("only symlink identity may have link_target")
         return self
 
 
@@ -180,6 +191,22 @@ class LabSymlinkQuarantineArtifact(LabProtocolModel):
     inode: int = Field(ge=1)
 
 
+class LabNonRegularQuarantineArtifact(LabProtocolModel):
+    schema_version: Literal[1] = 1
+    original_name: str = Field(min_length=1)
+    quarantined_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    file_type: _LabSpoolFileType
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+
+
+class LabDisappearedQuarantineArtifact(LabProtocolModel):
+    schema_version: Literal[1] = 1
+    original_name: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class LabCommandSpool:
     """Atomic filesystem inbox with durable receipts and quarantine."""
 
@@ -274,6 +301,24 @@ class LabCommandSpool:
         return candidate.name
 
     @staticmethod
+    def _spool_file_type(mode: int) -> _LabSpoolFileType:
+        if stat.S_ISREG(mode):
+            return "regular"
+        if stat.S_ISLNK(mode):
+            return "symlink"
+        if stat.S_ISDIR(mode):
+            return "directory"
+        if stat.S_ISFIFO(mode):
+            return "fifo"
+        if stat.S_ISSOCK(mode):
+            return "socket"
+        if stat.S_ISBLK(mode):
+            return "block_device"
+        if stat.S_ISCHR(mode):
+            return "char_device"
+        return "other"
+
+    @staticmethod
     def _read_regular_child(path: Path, parent: Path) -> tuple[Path, bytes, os.stat_result]:
         name = LabCommandSpool._direct_child_name(path, parent)
         normalized = Path(os.path.abspath(parent)) / name
@@ -299,11 +344,18 @@ class LabCommandSpool:
                     file_identity=identity,
                 )
             if not stat.S_ISREG(path_stat.st_mode):
-                raise InvalidCommandEnvelopeError(f"spool file {name} is not regular")
-            if path_stat.st_nlink != 1:
-                raise InvalidCommandEnvelopeError(
-                    f"spool file {name} has an external hard link"
+                identity = LabSpoolFileIdentity(
+                    path=normalized,
+                    device=path_stat.st_dev,
+                    inode=path_stat.st_ino,
+                    file_type=LabCommandSpool._spool_file_type(path_stat.st_mode),
                 )
+                raise InvalidCommandEnvelopeError(
+                    f"spool file {name} is not regular",
+                    file_identity=identity,
+                )
+            if path_stat.st_nlink != 1:
+                raise InvalidCommandEnvelopeError(f"spool file {name} has an external hard link")
             try:
                 descriptor = os.open(name, file_flags, dir_fd=directory_fd)
             except OSError as exc:
@@ -593,7 +645,30 @@ class LabCommandSpool:
                 and entry_or_path.file_type == "symlink"
             ):
                 return self._quarantine_symlink_locked(entry_or_path, reason=reason)
-            normalized, payload, source_stat = self._read_regular_child(source, self.pending_dir)
+            if (
+                isinstance(entry_or_path, LabSpoolFileIdentity)
+                and entry_or_path.file_type != "regular"
+            ):
+                return self._quarantine_nonregular_locked(entry_or_path, reason=reason)
+            try:
+                normalized, payload, source_stat = self._read_regular_child(
+                    source,
+                    self.pending_dir,
+                )
+            except InvalidCommandEnvelopeError:
+                name = self._direct_child_name(source, self.pending_dir)
+                directory_fd = os.open(
+                    self.pending_dir,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    try:
+                        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        return self._record_disappeared_locked(source, reason=reason)
+                finally:
+                    os.close(directory_fd)
+                raise
             try:
                 _sequence, filename_request_id = self._pending_name_parts(normalized.name)
             except InvalidCommandEnvelopeError:
@@ -656,6 +731,114 @@ class LabCommandSpool:
                 expected_link_count=2,
             )
             return quarantined
+
+    def _record_disappeared_locked(
+        self,
+        path: Path,
+        *,
+        reason: str,
+    ) -> LabQuarantinedCommand:
+        name = self._direct_child_name(path, self.pending_dir)
+        reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
+        target = self.quarantine_dir / f"{name}.{reason_hash}.disappeared.bad.json"
+        artifact = LabDisappearedQuarantineArtifact(
+            original_name=name,
+            reason=reason,
+        )
+        payload = artifact.model_dump_json().encode("utf-8")
+        if not self._publish_no_clobber(target, payload):
+            _candidate, existing, _file_stat = self._read_regular_child(
+                target,
+                self.quarantine_dir,
+            )
+            if existing != payload:
+                raise RequestContentConflictError(
+                    f"disappeared quarantine evidence conflicts: {target.name}"
+                )
+        return LabQuarantinedCommand(path=target, reason=reason)
+
+    def _quarantine_nonregular_locked(
+        self,
+        identity: LabSpoolFileIdentity,
+        *,
+        reason: str,
+    ) -> LabQuarantinedCommand:
+        name = self._direct_child_name(identity.path, self.pending_dir)
+        source_fd = os.open(
+            self.pending_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        quarantine_fd = os.open(
+            self.quarantine_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        container_name = f"{name}.{uuid4().hex}.inode.bad"
+        container_fd = -1
+        moved = False
+        try:
+            try:
+                current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return self._record_disappeared_locked(identity.path, reason=reason)
+            if (
+                current.st_dev != identity.device
+                or current.st_ino != identity.inode
+                or self._spool_file_type(current.st_mode) != identity.file_type
+            ):
+                raise InvalidCommandEnvelopeError(
+                    "pending nonregular inode was replaced before quarantine"
+                )
+            os.mkdir(container_name, mode=0o700, dir_fd=quarantine_fd)
+            container_fd = os.open(
+                container_name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=quarantine_fd,
+            )
+            os.rename(
+                name,
+                "entry",
+                src_dir_fd=source_fd,
+                dst_dir_fd=container_fd,
+            )
+            moved = True
+            observed = os.stat("entry", dir_fd=container_fd, follow_symlinks=False)
+            if (
+                observed.st_dev != identity.device
+                or observed.st_ino != identity.inode
+                or self._spool_file_type(observed.st_mode) != identity.file_type
+            ):
+                raise InvalidCommandEnvelopeError(
+                    "quarantined nonregular inode identity changed during move"
+                )
+            os.fsync(source_fd)
+            os.fsync(container_fd)
+            os.fsync(quarantine_fd)
+        finally:
+            if container_fd >= 0:
+                os.close(container_fd)
+            os.close(quarantine_fd)
+            os.close(source_fd)
+            if not moved:
+                with suppress(OSError):
+                    os.rmdir(self.quarantine_dir / container_name)
+        target = self.quarantine_dir / container_name / "entry"
+        artifact = LabNonRegularQuarantineArtifact(
+            original_name=name,
+            quarantined_name=target.name,
+            reason=reason,
+            file_type=identity.file_type,
+            device=identity.device,
+            inode=identity.inode,
+        )
+        metadata = target.parent / "evidence.json"
+        if not self._publish_no_clobber(
+            metadata,
+            artifact.model_dump_json().encode("utf-8"),
+        ):
+            raise RequestContentConflictError(
+                f"nonregular quarantine metadata already exists: {metadata}"
+            )
+        return LabQuarantinedCommand(path=target, reason=reason)
 
     def _quarantine_symlink_locked(
         self,

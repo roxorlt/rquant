@@ -37,6 +37,7 @@ from rquant.lab_job_protocol import (
     LabCommandReceipt,
     LabCommandSpool,
     LabSpoolEntry,
+    LabSpoolFileIdentity,
     PauseJobCommand,
     SubmitJobCommand,
 )
@@ -1578,10 +1579,10 @@ def test_artifact_final_check_failure_rolls_back_sqlite_and_quarantines(
             scheduler_type=_ReplaceBoundArtifactScheduler,
         )
     )
-    original_rollback = lab_jobs.LabStagedArtifactCommit.rollback
+    original_rollback = lab_jobs._LabStagedArtifactCommit.rollback
     rollback_held_lifecycle: list[bool] = []
 
-    def observe_rollback(staged: lab_jobs.LabStagedArtifactCommit) -> None:
+    def observe_rollback(staged: lab_jobs._LabStagedArtifactCommit) -> None:
         lifecycle_entry = artifacts._process_lock_entry
         rollback_held_lifecycle.append(
             lifecycle_entry is not None
@@ -1591,7 +1592,7 @@ def test_artifact_final_check_failure_rolls_back_sqlite_and_quarantines(
         original_rollback(staged)
 
     monkeypatch.setattr(
-        lab_jobs.LabStagedArtifactCommit,
+        lab_jobs._LabStagedArtifactCommit,
         "rollback",
         observe_rollback,
     )
@@ -1767,6 +1768,57 @@ def test_artifact_commit_identity_mismatch_is_rejected_without_index(tmp_path: P
     assert record is not None and record.receipt.reason == "artifact_identity_mismatch"
     assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
     assert spool.pending() == ()
+
+
+def test_bad_pending_inode_does_not_block_later_valid_artifact_commit(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    bad = spool.pending_dir / f"00000000000000000000-{uuid4()}.json"
+    bad.mkdir()
+
+    tick = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commits_accepted == 1
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+    assert not bad.exists()
+    assert spool.pending() == ()
+
+
+def test_artifact_quarantine_failure_does_not_block_later_valid_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    bad = spool.pending_dir / f"00000000000000000000-{uuid4()}.json"
+    bad.write_text("{}", encoding="utf-8")
+    original_quarantine = spool.quarantine
+
+    def fail_bad_quarantine(
+        entry_or_path: LabArtifactCommitSpoolEntry | LabSpoolFileIdentity | Path,
+        *,
+        reason: str,
+    ) -> object:
+        source = entry_or_path.path if hasattr(entry_or_path, "path") else Path(entry_or_path)
+        if source == bad:
+            raise OSError("simulated quarantine failure")
+        return original_quarantine(entry_or_path, reason=reason)
+
+    monkeypatch.setattr(spool, "quarantine", fail_bad_quarantine)
+
+    tick = scheduler.run_once()
+
+    completed = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commits_accepted == 1
+    assert completed is not None and completed.result_state is LabResultState.SEALED
+    assert bad.exists()
 
 
 def test_cancel_wins_ready_artifact_commit_race_without_reviving_job(tmp_path: Path) -> None:
@@ -2082,18 +2134,53 @@ def test_stale_scheduler_lease_cannot_stage_ready_artifact_commit(tmp_path: Path
     with (
         artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
         pytest.raises(SchedulerLeaseFencedError, match="lease"),
-    ):
         store.stage_artifact_commit(
             envelope,
             binding,
             lease=stale_lease,
             now=clock[0],
-        )
+        ),
+    ):
+        pass
 
     unchanged = LabJobReader(store.path).get_job(job.job_id)
     assert unchanged == job
     assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
     assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
+
+
+def test_staged_artifact_commit_does_not_begin_until_context_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, _spool, artifacts, job, sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    assert scheduler.lease is not None
+    connect_calls = 0
+    original_connect = store._connect
+
+    def observe_connect() -> sqlite3.Connection:
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(store, "_connect", observe_connect)
+    with artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding:
+        stage_scope = store.stage_artifact_commit(
+            envelope,
+            binding,
+            lease=scheduler.lease,
+            now=clock[0],
+        )
+        assert connect_calls == 0
+        with stage_scope as staged:
+            assert connect_calls == 1
+            staged.rollback()
+
+    unchanged = LabJobReader(store.path).get_job(job.job_id)
+    assert unchanged == job
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) is None
 
 
 def test_replayed_request_with_changed_content_is_quarantined(tmp_path: Path) -> None:

@@ -40,7 +40,6 @@ from rquant.lab_jobs import (
     LabLeaseRecord,
     LabResultState,
     LabShardRecord,
-    LabStagedArtifactCommit,
     SchedulerLeaseFencedError,
     SchedulerLeaseUnavailableError,
     StaleJobVersionError,
@@ -241,7 +240,7 @@ def test_staged_commit_validation_failure_rolls_back_and_closes(tmp_path: Path) 
     def reject_precommit(_lease: LabLeaseRecord, _now: datetime) -> None:
         raise RuntimeError("precommit failed")
 
-    staged = LabStagedArtifactCommit(
+    staged = lab_jobs._LabStagedArtifactCommit(
         cast(sqlite3.Connection, connection),
         _staged_receipt(),
         lease=lease,
@@ -270,7 +269,7 @@ def test_staged_commit_rejects_changed_lease_fence_before_validation(
         nonlocal validator_called
         validator_called = True
 
-    staged = LabStagedArtifactCommit(
+    staged = lab_jobs._LabStagedArtifactCommit(
         cast(sqlite3.Connection, connection),
         _staged_receipt(),
         lease=lease,
@@ -291,7 +290,7 @@ def test_staged_commit_preserves_commit_rollback_and_close_errors(tmp_path: Path
         rollback_error=OSError("rollback failed"),
         close_error=OSError("close failed"),
     )
-    staged = LabStagedArtifactCommit(
+    staged = lab_jobs._LabStagedArtifactCommit(
         cast(sqlite3.Connection, connection),
         _staged_receipt(),
         lease=lease,
@@ -312,7 +311,7 @@ def test_staged_commit_preserves_commit_rollback_and_close_errors(tmp_path: Path
 def test_staged_commit_reports_close_error_after_successful_commit(tmp_path: Path) -> None:
     lease = _lease(_store(tmp_path))
     connection = _StagedLifecycleConnection(close_error=OSError("close failed"))
-    staged = LabStagedArtifactCommit(
+    staged = lab_jobs._LabStagedArtifactCommit(
         cast(sqlite3.Connection, connection),
         _staged_receipt(),
         lease=lease,
@@ -331,7 +330,7 @@ def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> 
         rollback_error=OSError("rollback failed"),
         close_error=OSError("close failed"),
     )
-    staged = LabStagedArtifactCommit(
+    staged = lab_jobs._LabStagedArtifactCommit(
         cast(sqlite3.Connection, connection),
         _staged_receipt(),
         lease=lease,
@@ -346,6 +345,65 @@ def test_staged_rollback_preserves_rollback_and_close_errors(tmp_path: Path) -> 
         "rollback failed",
         "close failed",
     )
+
+
+def test_staged_context_rolls_back_when_commit_is_forgotten(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection()
+    staged = lab_jobs._LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=lambda _lease, _now: None,
+    )
+
+    with staged as entered:
+        assert entered is staged
+
+    assert connection.calls == ["rollback", "close"]
+    staged.rollback()
+    staged.close()
+    assert connection.calls == ["rollback", "close"]
+    with pytest.raises(RuntimeError, match="already closed"):
+        staged.commit(lease=lease, now=NOW)
+
+
+def test_staged_context_rolls_back_on_caller_exception(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection()
+    staged = lab_jobs._LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=lambda _lease, _now: None,
+    )
+
+    with pytest.raises(RuntimeError, match="caller failed"), staged:
+        raise RuntimeError("caller failed")
+
+    assert connection.calls == ["rollback", "close"]
+
+
+def test_staged_context_commit_and_close_are_idempotently_closed(tmp_path: Path) -> None:
+    lease = _lease(_store(tmp_path))
+    connection = _StagedLifecycleConnection()
+    staged = lab_jobs._LabStagedArtifactCommit(
+        cast(sqlite3.Connection, connection),
+        _staged_receipt(),
+        lease=lease,
+        precommit_validator=lambda _lease, _now: None,
+    )
+
+    with staged:
+        receipt = staged.commit(lease=lease, now=NOW)
+
+    assert receipt == staged.receipt
+    assert connection.calls == ["commit", "close"]
+    staged.rollback()
+    staged.close()
+    assert connection.calls == ["commit", "close"]
+    with pytest.raises(RuntimeError, match="already closed"):
+        staged.commit(lease=lease, now=NOW)
 
 
 def test_connection_authority_is_exact_and_cleared_after_exception(tmp_path: Path) -> None:
@@ -787,6 +845,68 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
             END
             """
         )
+
+    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
+        LabJobReader(store.path).get_job(uuid4())
+
+
+def test_sql_ddl_equivalence_preserves_quoted_literal_bytes_and_escapes() -> None:
+    expected = "SELECT 'it''s ready', X'AB', \"MiXeD\" FROM jobs WHERE state = 'ready'"
+    equivalent = (
+        " select /* spacing */ 'it''s ready' , x'AB', \"MiXeD\" "
+        "from JOBS -- line comment\n where STATE='ready' "
+    )
+    carriage_return_comment = equivalent.replace(
+        "-- line comment\n",
+        "-- old-mac line comment\r",
+    )
+
+    assert lab_jobs._sql_ddl_equivalent(expected, equivalent)
+    assert lab_jobs._sql_ddl_equivalent(expected, carriage_return_comment)
+    assert not lab_jobs._sql_ddl_equivalent(
+        expected,
+        equivalent.replace("'it''s ready'", "'it''s READY'"),
+    )
+    assert not lab_jobs._sql_ddl_equivalent(
+        expected,
+        equivalent.replace("x'AB'", "x'ab'"),
+    )
+    assert not lab_jobs._sql_ddl_equivalent(
+        expected,
+        equivalent.replace('"MiXeD"', '"MIXED"'),
+    )
+
+
+def test_v5_trigger_validator_accepts_keyword_case_and_spacing(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    trigger = "trg_lab_result_artifact_no_delete"
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        connection.execute(
+            f"""
+            create   trigger if not exists {trigger}
+            before delete on lab_job_result_artifact
+            begin
+                select raise ( abort,
+                    'complete result artifact index is immutable' );
+            end
+            """
+        )
+
+    assert LabJobReader(store.path).get_job(uuid4()) is None
+
+
+def test_v5_trigger_validator_rejects_string_literal_case_change(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    trigger = "trg_lab_complete_result_shard_no_update"
+    changed = lab_jobs._V5_COMPLETE_RESULT_SHARD_NO_UPDATE_TRIGGER.replace(
+        "'ready'",
+        "'READY'",
+        1,
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        connection.execute(changed)
 
     with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
         LabJobReader(store.path).get_job(uuid4())
@@ -1674,6 +1794,64 @@ def test_submit_roundtrips_validated_spec_and_typed_empty_rows(tmp_path: Path) -
     assert isinstance(reader.list_leases()[0], LabLeaseRecord)
     assert LabShardRecord.model_fields
     assert LabArtifactRecord.model_fields
+
+
+def test_get_job_uses_shard_aggregates_without_loading_twenty_thousand_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    timestamp = NOW.isoformat(timespec="microseconds")
+    with sqlite3.connect(store.path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO lab_shard (
+                shard_id, job_id, shard_index, status, version,
+                attempt_count, max_attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', 0, 0, 3, ?, ?)
+            """,
+            (
+                (str(UUID(int=index + 1)), str(job.job_id), index, timestamp, timestamp)
+                for index in range(20_000)
+            ),
+        )
+
+    statements: list[str] = []
+
+    class TracingLabJobReader(LabJobReader):
+        def _connect(self) -> sqlite3.Connection:
+            connection = super()._connect()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+    def forbid_shard_model_construction(
+        _cls: type[LabJobReader],
+        _row: sqlite3.Row,
+    ) -> LabShardRecord:
+        raise AssertionError("get_job must not construct shard models")
+
+    monkeypatch.setattr(
+        LabJobReader,
+        "_shard_from_row",
+        classmethod(forbid_shard_model_construction),
+    )
+    reader = TracingLabJobReader(store.path)
+
+    persisted = reader.get_job(job.job_id)
+
+    assert persisted == job
+    shard_queries = [
+        " ".join(statement.split()).lower()
+        for statement in statements
+        if "from lab_shard" in statement.lower()
+    ]
+    assert len(shard_queries) == 1
+    assert "count(" in shard_queries[0]
+    assert "select *" not in shard_queries[0]
+    with pytest.raises(AssertionError, match="must not construct"):
+        reader.list_shards(job.job_id)
 
 
 def test_new_v1_submit_is_durably_rejected_and_replays_same_receipt(tmp_path: Path) -> None:

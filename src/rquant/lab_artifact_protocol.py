@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -135,7 +137,33 @@ class LabQuarantinedArtifactCommit(LabArtifactCommitProtocolModel):
 
 
 class LabArtifactCommitSpool(LabCommandSpool):
-    """Atomic finalizer-to-scheduler commit inbox with durable receipts."""
+    """Atomic commit inbox; conflict evidence defaults to 256 pairs or 64 MiB.
+
+    Cleanup removes only validated conflict pairs, oldest first. A single newest
+    pair is retained even when it alone exceeds the byte budget.
+    """
+
+    _CONFLICT_NAME = re.compile(
+        r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})\."
+        r"(?P<content_hash>[0-9a-f]{64})\."
+        r"(?P<reason_hash>[0-9a-f]{16})\.conflict\.bad"
+    )
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_conflict_records: int = 256,
+        max_conflict_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
+        if max_conflict_records < 1:
+            raise ValueError("max_conflict_records must be positive")
+        if max_conflict_bytes < 1:
+            raise ValueError("max_conflict_bytes must be positive")
+        super().__init__(root)
+        self.max_conflict_records = max_conflict_records
+        self.max_conflict_bytes = max_conflict_bytes
 
     def _quarantine_conflicting_publish_locked(
         self,
@@ -143,16 +171,110 @@ class LabArtifactCommitSpool(LabCommandSpool):
         *,
         reason: str,
     ) -> None:
-        target = self.quarantine_dir / (f"{envelope.request_id}.{uuid4().hex}.conflict.bad")
-        if not self._publish_no_clobber(target, envelope.model_dump_json().encode("utf-8")):
-            raise InvalidCommandEnvelopeError("artifact conflict quarantine target already exists")
+        reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
+        target = self.quarantine_dir / (
+            f"{envelope.request_id}.{envelope.content_hash}.{reason_hash}.conflict.bad"
+        )
+        payload = envelope.model_dump_json().encode("utf-8")
+        if not self._publish_no_clobber(target, payload):
+            _candidate, existing_payload, _file_stat = self._read_regular_child(
+                target,
+                self.quarantine_dir,
+            )
+            if existing_payload != payload:
+                raise InvalidCommandEnvelopeError(
+                    "artifact conflict quarantine target has different content"
+                )
         record = LabQuarantinedArtifactCommit(path=target, reason=reason)
         metadata = self.quarantine_dir / f"{target.name}.json"
+        metadata_payload = record.model_dump_json().encode("utf-8")
         if not self._publish_no_clobber(
             metadata,
-            record.model_dump_json().encode("utf-8"),
+            metadata_payload,
         ):
-            raise InvalidCommandEnvelopeError("artifact conflict metadata already exists")
+            _candidate, existing_metadata, _file_stat = self._read_regular_child(
+                metadata,
+                self.quarantine_dir,
+            )
+            if existing_metadata != metadata_payload:
+                raise InvalidCommandEnvelopeError(
+                    "artifact conflict metadata has different content"
+                )
+        self._prune_conflicts_locked()
+
+    @staticmethod
+    def _unlink_regular_identity(path: Path, observed: os.stat_result) -> None:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            try:
+                current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or current.st_dev != observed.st_dev
+                or current.st_ino != observed.st_ino
+            ):
+                raise InvalidCommandEnvelopeError(
+                    f"conflict evidence changed before retention cleanup: {path.name}"
+                )
+            os.unlink(path.name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _prune_conflicts_locked(self) -> None:
+        records: list[tuple[int, str, int, Path, os.stat_result, Path, os.stat_result]] = []
+        for payload_path in self.quarantine_dir.glob("*.conflict.bad"):
+            name_match = self._CONFLICT_NAME.fullmatch(payload_path.name)
+            if name_match is None:
+                continue
+            metadata_path = self.quarantine_dir / f"{payload_path.name}.json"
+            try:
+                _payload, payload_bytes, payload_stat = self._read_regular_child(
+                    payload_path,
+                    self.quarantine_dir,
+                )
+                _metadata, metadata_bytes, metadata_stat = self._read_regular_child(
+                    metadata_path,
+                    self.quarantine_dir,
+                )
+                envelope = LabArtifactCommitEnvelope.model_validate_json(payload_bytes)
+                evidence = LabQuarantinedArtifactCommit.model_validate_json(metadata_bytes)
+            except (InvalidCommandEnvelopeError, ValueError):
+                continue
+            if (
+                str(envelope.request_id) != name_match["request_id"]
+                or envelope.content_hash != name_match["content_hash"]
+                or evidence.path != payload_path
+                or hashlib.sha256(evidence.reason.encode("utf-8")).hexdigest()[:16]
+                != name_match["reason_hash"]
+            ):
+                continue
+            records.append(
+                (
+                    max(payload_stat.st_mtime_ns, metadata_stat.st_mtime_ns),
+                    payload_path.name,
+                    payload_stat.st_size + metadata_stat.st_size,
+                    payload_path,
+                    payload_stat,
+                    metadata_path,
+                    metadata_stat,
+                )
+            )
+        records.sort(key=lambda record: (record[0], record[1]))
+        total_bytes = sum(record[2] for record in records)
+        while len(records) > self.max_conflict_records or (
+            total_bytes > self.max_conflict_bytes and len(records) > 1
+        ):
+            record = records.pop(0)
+            total_bytes -= record[2]
+            self._unlink_regular_identity(record[5], record[6])
+            self._unlink_regular_identity(record[3], record[4])
 
     def publish(
         self,
