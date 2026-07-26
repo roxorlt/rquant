@@ -33,6 +33,7 @@ from rquant.lab_artifacts import (
 )
 from rquant.lab_jobs import (
     COMPLETE_RESULT_CONTRACT_VERSION,
+    LabFinalizationReadyEpoch,
     LabFinalizationShardEvidence,
     LabFinalizationSnapshot,
     LabJobReader,
@@ -104,11 +105,12 @@ class LabFinalizerMetrics(LabFinalizerModel):
 
 
 class LabFinalizerResult(LabFinalizerModel):
-    status: Literal["not_ready", "published", "acknowledged"]
+    status: Literal["not_ready", "published", "acknowledged", "rejected"]
     job_id: UUID
     request_id: UUID | None = None
     manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     complete_result_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    rejection_reason: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def validate_result_identity(self) -> LabFinalizerResult:
@@ -117,6 +119,8 @@ class LabFinalizerResult(LabFinalizerModel):
             raise ValueError("not_ready result cannot claim an artifact identity")
         if self.status != "not_ready" and any(value is None for value in identities):
             raise ValueError("published result requires a complete artifact identity")
+        if (self.status == "rejected") != (self.rejection_reason is not None):
+            raise ValueError("only rejected results may contain a rejection reason")
         return self
 
 
@@ -158,7 +162,7 @@ class LabSealedShardBundleReader:
 
     @staticmethod
     def _after_file_read(_name: str) -> None:
-        """Fault-injection boundary after a descriptor-bound file read."""
+        """Fault hook; every pathname is rebound to its read inode before return."""
 
     @staticmethod
     def _attempt_name(evidence: LabFinalizationShardEvidence) -> str:
@@ -254,6 +258,7 @@ class LabSealedShardBundleReader:
         )
         descriptors: list[int] = []
         bindings: list[_PathBinding] = []
+        file_observations: dict[str, tuple[int, int, int, int, int, int, int]] = {}
         try:
             try:
                 root_descriptor = os.open(
@@ -278,7 +283,11 @@ class LabSealedShardBundleReader:
                 )
                 parent = child
             bundle_descriptor = descriptors[-1]
-            manifest_bytes, _ = self._read_regular_file(bundle_descriptor, "manifest.json")
+            manifest_bytes, manifest_observed = self._read_regular_file(
+                bundle_descriptor,
+                "manifest.json",
+            )
+            file_observations["manifest.json"] = manifest_observed
             self._after_file_read("manifest.json")
             try:
                 manifest = LabShardResultManifest.model_validate_json(manifest_bytes)
@@ -338,6 +347,7 @@ class LabSealedShardBundleReader:
                     bundle_descriptor,
                     artifact.file_name,
                 )
+                file_observations[artifact.file_name] = observed
                 self._after_file_read(artifact.file_name)
                 if (
                     len(payload) != artifact.file_size
@@ -364,6 +374,21 @@ class LabSealedShardBundleReader:
                 raise LabFinalizationIntegrityError(
                     "accepted shard inventory changed while reading"
                 )
+            for name in sorted(expected_names):
+                try:
+                    linked = os.stat(
+                        name,
+                        dir_fd=bundle_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise LabFinalizationIntegrityError(
+                        "accepted shard file identity changed while reading"
+                    ) from exc
+                if _observation(linked) != file_observations[name]:
+                    raise LabFinalizationIntegrityError(
+                        "accepted shard file identity changed while reading"
+                    )
             root_path = os.lstat(self.artifact_root)
             if _observation(root_path) != root_observation:
                 raise LabFinalizationIntegrityError("shard artifact root changed while reading")
@@ -645,8 +670,32 @@ class LabFinalizer:
             )
         return sealed
 
+    def _isolate_owned_candidate(self, candidate: LabJobArtifactCandidate) -> None:
+        if not os.path.lexists(candidate.path):
+            return
+        matching = tuple(
+            record
+            for record in self.artifact_store.list_candidate_recovery()
+            if (
+                record.path == candidate.path
+                and record.device == candidate.device
+                and record.inode == candidate.inode
+            )
+        )
+        if len(matching) != 1:
+            raise LabFinalizationIntegrityError(
+                "owned finalization candidate cannot be uniquely bound for isolation"
+            )
+        self.artifact_store.quarantine_recovery_record(
+            matching[0],
+            reason="owned candidate isolated after finalization conflict",
+        )
+
     @staticmethod
-    def _envelope(sealed: LabSealedJobArtifact) -> LabArtifactCommitEnvelope:
+    def _envelope(
+        sealed: LabSealedJobArtifact,
+        ready_epoch: LabFinalizationReadyEpoch,
+    ) -> LabArtifactCommitEnvelope:
         manifest = sealed.manifest
         commit = LabArtifactCommit(
             job_id=manifest.job_id,
@@ -664,7 +713,9 @@ class LabFinalizer:
         commit_identity = hashlib.sha256(commit.canonical_json_bytes()).hexdigest()
         request_id = uuid5(
             NAMESPACE_URL,
-            f"rquant:lab-artifact-commit:v1:{manifest.job_id}:{commit_identity}",
+            "rquant:lab-artifact-commit:v2:"
+            f"{manifest.job_id}:{ready_epoch.job_version}:"
+            f"{ready_epoch.event.event_id}:{commit_identity}",
         )
         return LabArtifactCommitEnvelope(request_id=request_id, commit=commit)
 
@@ -700,19 +751,38 @@ class LabFinalizer:
                 "complete result candidate could not be prepared"
             ) from exc
         self._after_candidate_prepared(candidate)
-        sealed = self._recover_or_seal(candidate)
+        try:
+            sealed = self._recover_or_seal(candidate)
+        except LabFinalizationIntegrityError as primary_error:
+            try:
+                self._isolate_owned_candidate(candidate)
+            except Exception as cleanup_error:
+                raise ExceptionGroup(
+                    "finalization failed and owned candidate isolation failed",
+                    [primary_error, cleanup_error],
+                ) from None
+            raise
         self._after_artifact_sealed(sealed)
-        envelope = self._envelope(sealed)
+        envelope = self._envelope(sealed, snapshot.ready_epoch)
         published = self.commit_spool.publish(envelope)
         self._after_commit_published(published)
+        rejected = (
+            isinstance(published, LabAcknowledgedArtifactCommit)
+            and published.receipt.status == "rejected"
+        )
         return LabFinalizerResult(
             status=(
-                "acknowledged"
-                if isinstance(published, LabAcknowledgedArtifactCommit)
-                else "published"
+                "rejected"
+                if rejected
+                else (
+                    "acknowledged"
+                    if isinstance(published, LabAcknowledgedArtifactCommit)
+                    else "published"
+                )
             ),
             job_id=job_id,
             request_id=envelope.request_id,
             manifest_hash=sealed.manifest_hash,
             complete_result_hash=sealed.manifest.complete_result_hash,
+            rejection_reason=published.receipt.reason if rejected else None,
         )

@@ -755,8 +755,26 @@ class LabFinalizationShardEvidence(LabRecordModel):
         return self
 
 
+class LabFinalizationReadyEpoch(LabRecordModel):
+    job_version: int = Field(ge=0)
+    event: LabEventRecord
+
+    @model_validator(mode="after")
+    def validate_ready_event(self) -> LabFinalizationReadyEpoch:
+        if (
+            self.event.event_type != "job_result_ready"
+            or self.event.prior_status is not JobStatus.RUNNING
+            or self.event.new_status is not JobStatus.RUNNING
+            or self.event.request_id is not None
+            or self.event.job_version != self.job_version
+        ):
+            raise ValueError("ready epoch requires its exact job_result_ready event")
+        return self
+
+
 class LabFinalizationSnapshot(LabRecordModel):
     job: LabJobRecord
+    ready_epoch: LabFinalizationReadyEpoch
     shards: tuple[LabFinalizationShardEvidence, ...]
 
     @model_validator(mode="after")
@@ -769,6 +787,12 @@ class LabFinalizationSnapshot(LabRecordModel):
             or self.job.control_intent is not ControlIntent.NONE
         ):
             raise ValueError("finalization snapshot requires a ready complete-result job")
+        if (
+            self.ready_epoch.job_version != self.job.version
+            or self.ready_epoch.event.job_id != self.job.job_id
+            or self.ready_epoch.event.scheduler_fencing_token != self.job.scheduler_fencing_token
+        ):
+            raise ValueError("finalization ready epoch conflicts with the ready job")
         if not self.shards:
             raise ValueError("finalization snapshot requires at least one shard")
         indexes = tuple(item.shard.shard_index for item in self.shards)
@@ -3292,6 +3316,21 @@ class LabJobReader:
                 connection.execute("COMMIT")
                 return None
 
+            ready_event_rows = connection.execute(
+                """
+                SELECT * FROM lab_event
+                WHERE job_id = ? AND event_type = 'job_result_ready'
+                  AND job_version = ?
+                ORDER BY event_id
+                """,
+                (str(job_id), job.version),
+            ).fetchall()
+            if len(ready_event_rows) != 1:
+                raise InvalidStoredJobError(
+                    "ready finalization snapshot requires exactly one ready epoch event"
+                )
+            ready_event = self._event_from_row(ready_event_rows[0])
+
             shard_rows = connection.execute(
                 "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
                 (str(job_id),),
@@ -3333,6 +3372,10 @@ class LabJobReader:
             try:
                 snapshot = LabFinalizationSnapshot(
                     job=job,
+                    ready_epoch=LabFinalizationReadyEpoch(
+                        job_version=job.version,
+                        event=ready_event,
+                    ),
                     shards=tuple(
                         LabFinalizationShardEvidence(
                             shard=shard,
