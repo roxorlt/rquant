@@ -112,9 +112,7 @@ def test_commit_spool_fails_closed_on_request_content_conflict(tmp_path: Path) -
     assert spool.pending()[0].envelope == first
     conflict_files = tuple(spool.quarantine_dir.glob("*.conflict.bad"))
     assert len(conflict_files) == 1
-    assert LabArtifactCommitEnvelope.model_validate_json(
-        conflict_files[0].read_bytes()
-    ) == changed
+    assert LabArtifactCommitEnvelope.model_validate_json(conflict_files[0].read_bytes()) == changed
 
 
 def test_commit_spool_rejects_traversal_and_quarantines_symlink(tmp_path: Path) -> None:

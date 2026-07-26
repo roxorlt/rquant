@@ -143,9 +143,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         *,
         reason: str,
     ) -> None:
-        target = self.quarantine_dir / (
-            f"{envelope.request_id}.{uuid4().hex}.conflict.bad"
-        )
+        target = self.quarantine_dir / (f"{envelope.request_id}.{uuid4().hex}.conflict.bad")
         if not self._publish_no_clobber(target, envelope.model_dump_json().encode("utf-8")):
             raise InvalidCommandEnvelopeError("artifact conflict quarantine target already exists")
         record = LabQuarantinedArtifactCommit(path=target, reason=reason)
