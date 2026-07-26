@@ -18,7 +18,7 @@ from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from weakref import ReferenceType, ref
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.lab_artifact_protocol import (
     LabArtifactCommitEnvelope,
@@ -697,6 +697,103 @@ class LabWorkerReportRecord(LabRecordModel):
     scheduler_fencing_token: int = Field(ge=1)
     received_at: datetime
     applied_at: datetime
+
+
+class LabFinalizationShardEvidence(LabRecordModel):
+    shard: LabShardRecord
+    accepted_success: LabWorkerReportRecord
+
+    @model_validator(mode="after")
+    def validate_accepted_success(self) -> LabFinalizationShardEvidence:
+        report = self.accepted_success.report
+        receipt = self.accepted_success.receipt
+        body = report.body
+        if not isinstance(body, LabShardSucceeded):
+            raise ValueError("finalization evidence requires a shard_succeeded report")
+        if (
+            self.shard.status is not ShardStatus.SUCCEEDED
+            or self.accepted_success.receipt.status != "accepted"
+            or self.accepted_success.receipt.reason != "shard_succeeded"
+        ):
+            raise ValueError("finalization evidence requires an accepted succeeded shard")
+        if (
+            report.job_id,
+            report.shard_id,
+            report.payload_hash,
+            report.claim_generation,
+            body.result_manifest_hash,
+        ) != (
+            self.shard.job_id,
+            self.shard.shard_id,
+            self.shard.payload_hash,
+            self.shard.claim_generation,
+            self.shard.result_manifest_hash,
+        ):
+            raise ValueError("accepted success report conflicts with shard identity")
+        if (
+            receipt.job_id,
+            receipt.shard_id,
+            receipt.worker_id,
+            receipt.claim_token,
+            receipt.claim_generation,
+            receipt.scheduler_fencing_token,
+            receipt.report_type,
+            receipt.result_manifest_hash,
+        ) != (
+            report.job_id,
+            report.shard_id,
+            report.worker_id,
+            report.claim_token,
+            report.claim_generation,
+            report.scheduler_fencing_token,
+            "shard_succeeded",
+            body.result_manifest_hash,
+        ):
+            raise ValueError("accepted success receipt conflicts with attempt identity")
+        if self.shard.attempt_count != report.claim_generation:
+            raise ValueError("accepted success attempt conflicts with shard generation")
+        return self
+
+
+class LabFinalizationSnapshot(LabRecordModel):
+    job: LabJobRecord
+    shards: tuple[LabFinalizationShardEvidence, ...]
+
+    @model_validator(mode="after")
+    def validate_complete_graph(self) -> LabFinalizationSnapshot:
+        if (
+            self.job.status is not JobStatus.RUNNING
+            or self.job.result_state is not LabResultState.READY
+            or self.job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+            or not self.job.requires_complete_result
+            or self.job.control_intent is not ControlIntent.NONE
+        ):
+            raise ValueError("finalization snapshot requires a ready complete-result job")
+        if not self.shards:
+            raise ValueError("finalization snapshot requires at least one shard")
+        indexes = tuple(item.shard.shard_index for item in self.shards)
+        if indexes != tuple(range(len(self.shards))):
+            raise ValueError("finalization shards must be complete and ordered by shard_index")
+        if len({item.shard.shard_id for item in self.shards}) != len(self.shards):
+            raise ValueError("finalization shard identities must be unique")
+        for item in self.shards:
+            if (
+                item.shard.job_id != self.job.job_id
+                or item.accepted_success.report.job_id != self.job.job_id
+                or item.accepted_success.report.spec_hash != self.job.spec_hash
+            ):
+                raise ValueError("finalization shard graph conflicts with job identity")
+        aggregate_identity = {
+            (
+                item.shard.plan_hash,
+                item.shard.adapter_id,
+                item.shard.adapter_version,
+            )
+            for item in self.shards
+        }
+        if len(aggregate_identity) != 1:
+            raise ValueError("finalization shards do not share one aggregate identity")
+        return self
 
 
 class LabArtifactCommitRecord(LabRecordModel):
@@ -2623,6 +2720,10 @@ class LabJobReader:
         return connection
 
     @staticmethod
+    def _after_finalization_job_read(_job_id: UUID) -> None:
+        """Fault-injection boundary after the snapshot's first authoritative read."""
+
+    @staticmethod
     def _job_from_row(row: sqlite3.Row) -> LabJobRecord:
         try:
             spec = ResearchRunSpec.model_validate_json(str(row["spec_json"]))
@@ -3164,6 +3265,94 @@ class LabJobReader:
             job = self._job_from_row(row)
             self._validate_complete_result_graph(connection, job)
             return job
+
+    def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
+        """Return one validated ready-result graph from a single read transaction."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            job_row = connection.execute(
+                "SELECT * FROM lab_job WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if job_row is None:
+                connection.execute("COMMIT")
+                return None
+            job = self._job_from_row(job_row)
+            self._validate_complete_result_graph(connection, job)
+            self._after_finalization_job_read(job_id)
+            if (
+                job.status is not JobStatus.RUNNING
+                or job.result_state is not LabResultState.READY
+                or job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+                or not job.requires_complete_result
+                or job.control_intent is not ControlIntent.NONE
+            ):
+                connection.execute("COMMIT")
+                return None
+
+            shard_rows = connection.execute(
+                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
+                (str(job_id),),
+            ).fetchall()
+            shards = tuple(self._shard_from_row(row) for row in shard_rows)
+            if not shards or any(shard.status is not ShardStatus.SUCCEEDED for shard in shards):
+                raise InvalidStoredJobError(
+                    "ready finalization snapshot requires all and only succeeded shards"
+                )
+
+            report_rows = connection.execute(
+                """
+                SELECT * FROM lab_worker_report
+                WHERE job_id = ? AND status = 'accepted'
+                  AND report_type = 'shard_succeeded'
+                ORDER BY shard_id, applied_at, report_id
+                """,
+                (str(job_id),),
+            ).fetchall()
+            reports_by_shard: dict[UUID, list[LabWorkerReportRecord]] = {}
+            for row in report_rows:
+                report_id = _canonical_uuid_text(
+                    row["report_id"],
+                    field="lab_worker_report.report_id",
+                )
+                record = _worker_report_record_from_row(
+                    row,
+                    expected_report_id=report_id,
+                )
+                reports_by_shard.setdefault(record.report.shard_id, []).append(record)
+
+            shard_ids = {shard.shard_id for shard in shards}
+            if set(reports_by_shard) != shard_ids or any(
+                len(records) != 1 for records in reports_by_shard.values()
+            ):
+                raise InvalidStoredJobError(
+                    "each finalization shard requires exactly one accepted success report"
+                )
+            try:
+                snapshot = LabFinalizationSnapshot(
+                    job=job,
+                    shards=tuple(
+                        LabFinalizationShardEvidence(
+                            shard=shard,
+                            accepted_success=reports_by_shard[shard.shard_id][0],
+                        )
+                        for shard in shards
+                    ),
+                )
+            except Exception as exc:
+                raise InvalidStoredJobError(
+                    f"invalid finalization snapshot for job {job_id}: {exc}"
+                ) from exc
+            connection.execute("COMMIT")
+            return snapshot
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
 
     def get_command(self, request_id: UUID) -> LabCommandRecord | None:
         with self._connect() as connection:

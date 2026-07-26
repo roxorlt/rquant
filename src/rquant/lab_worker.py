@@ -119,7 +119,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _canonical_frame_json(frame: pd.DataFrame) -> str:
+def canonical_shard_frame_json(frame: pd.DataFrame) -> str:
     if any(not isinstance(column, str) for column in frame.columns):
         raise ValueError("artifact DataFrame columns must be strings")
     raw = frame.to_json(
@@ -1606,7 +1606,7 @@ class LabWorker:
                 table.frame.columns
             ):
                 raise ValueError(f"artifact round-trip shape changed: {table.name}")
-            canonical_frame = _canonical_frame_json(persisted)
+            canonical_frame = canonical_shard_frame_json(persisted)
             artifacts.append(
                 LabShardArtifactManifest(
                     name=table.name,
@@ -1738,7 +1738,7 @@ class LabWorker:
                 raise LabArtifactConflictError(
                     f"sealed artifact shape conflicts: {artifact.file_name}"
                 )
-            content_hash = _sha256_bytes(_canonical_frame_json(frame).encode("utf-8"))
+            content_hash = _sha256_bytes(canonical_shard_frame_json(frame).encode("utf-8"))
             if content_hash != artifact.content_sha256:
                 raise LabArtifactConflictError(
                     f"sealed artifact content conflicts: {artifact.file_name}"

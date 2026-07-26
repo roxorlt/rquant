@@ -6,6 +6,15 @@
 
 ### Added
 
+- **Strategy Lab 独立完整结果 finalizer 核心**：新增单次 readonly SQLite transaction 的
+  强类型 `LabFinalizationSnapshot`，原子校验 RUNNING/ready/complete contract、全部成功
+  shard 及每片唯一 accepted success report/receipt。finalizer 按 scheduler 已接受的 exact
+  claim token、generation 与 fencing token 以 descriptor-bound 方式读取 immutable attempt
+  bundle，校验 canonical manifest、路径、inode、文件 hash、Parquet schema/content 后复用
+  adapter registry 聚合；确定性生成完整 metrics/report/tables artifact，并以稳定 request id
+  发布 typed artifact commit。candidate、seal、rename 后 interrupted seal、spool publish 与
+  scheduler commit-before-ACK 崩溃均可幂等恢复，SQLite 仍只有 scheduler 可写。
+
 - **Strategy Lab 分片控制面**：新增确定性分片定义、带 scheduler fence 与租约代际的 claim、
   worker report/receipt typed protocol，以及独立的原子 claim/report spool。Lab ledger 升级到
   schema v3，支持幂等规划、过期重领、心跳续租、成功/失败/停止报告验收、暂停/恢复与
