@@ -7,7 +7,7 @@ import codecs
 import json
 import math
 import struct
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from enum import Enum
 
@@ -20,6 +20,88 @@ CANONICAL_JSON_STRING_CHUNK_CHARACTERS = 1024
 CANONICAL_JSON_STREAM_SCRATCH_BYTES = 128 * 1024
 CANONICAL_JSON_BASE64_INPUT_CHUNK_BYTES = 12 * 1024
 _MAX_SCALAR_TOKEN_BYTES = 64 * 1024
+
+
+class _LegacyPandasUtf8Decoder:
+    """Incrementally reproduce pandas ujson's historical bytes decoder."""
+
+    def __init__(self) -> None:
+        self._codepoint = 0
+        self._remaining = 0
+        self._minimum = 0
+        self._sequence_bytes = 0
+        self._invalid_start_byte: int | None = None
+
+    @staticmethod
+    def _invalid_start(byte: int) -> UnicodeDecodeError:
+        return UnicodeDecodeError("utf-8", bytes((byte,)), 0, 1, "invalid start byte")
+
+    def _finish_codepoint(self) -> str:
+        codepoint = self._codepoint
+        sequence_bytes = self._sequence_bytes
+        minimum = self._minimum
+        self._codepoint = 0
+        self._remaining = 0
+        self._minimum = 0
+        self._sequence_bytes = 0
+        if codepoint < minimum:
+            raise OverflowError(
+                f"Overlong {sequence_bytes} byte UTF-8 sequence detected when encoding string"
+            )
+        if codepoint <= 0xFFFF:
+            return chr(codepoint)
+        adjusted = codepoint - 0x10000
+        return chr(0xD800 + (adjusted >> 10)) + chr(0xDC00 + (adjusted & 0x3FF))
+
+    def feed(self, payload: memoryview) -> Iterator[str]:
+        chunk = payload.cast("B")
+        if not self._remaining:
+            copied = bytes(chunk)
+            if copied.isascii():
+                if copied:
+                    yield copied.decode("ascii")
+                return
+        for byte in chunk:
+            if self._remaining:
+                self._codepoint = (self._codepoint << 6) | (byte & 0x3F)
+                self._remaining -= 1
+                if not self._remaining:
+                    yield self._finish_codepoint()
+                continue
+            if byte < 0x80:
+                yield chr(byte)
+            elif byte < 0xC0 or byte >= 0xFE:
+                if self._invalid_start_byte is None:
+                    self._invalid_start_byte = byte
+            elif byte < 0xE0:
+                self._codepoint = byte & 0x1F
+                self._remaining = 1
+                self._minimum = 0x80
+                self._sequence_bytes = 2
+            elif byte < 0xF0:
+                self._codepoint = byte & 0x0F
+                self._remaining = 2
+                self._minimum = 0x800
+                self._sequence_bytes = 3
+            elif byte < 0xF8:
+                self._codepoint = byte & 0x07
+                self._remaining = 3
+                self._minimum = 0x10000
+                self._sequence_bytes = 4
+            else:
+                raise OverflowError("Unsupported UTF-8 sequence length when encoding string")
+
+    def finish(self) -> str:
+        text = ""
+        if self._remaining > 1:
+            raise OverflowError("Unterminated UTF-8 sequence when encoding string")
+        if self._remaining:
+            self._codepoint <<= 6
+            self._remaining = 0
+            text = self._finish_codepoint()
+        if self._invalid_start_byte is not None:
+            raise self._invalid_start(self._invalid_start_byte)
+        return text
 
 
 class CanonicalJsonStreamWriter:
@@ -90,6 +172,20 @@ class CanonicalJsonStreamWriter:
         for start in range(0, len(payload), CANONICAL_JSON_BASE64_INPUT_CHUNK_BYTES):
             chunk = payload[start : start + CANONICAL_JSON_BASE64_INPUT_CHUNK_BYTES]
             self._update(base64.b64encode(chunk))
+        self._update(b'"')
+
+    def write_legacy_pandas_bytes(self, value: bytes | memoryview) -> None:
+        """Stream bytes with pandas ujson's legacy UTF-8 compatibility semantics."""
+
+        payload = memoryview(value).cast("B")
+        decoder = _LegacyPandasUtf8Decoder()
+        self._update(b'"')
+        for start in range(0, len(payload), 4096):
+            for text in decoder.feed(payload[start : start + 4096]):
+                self.write_string_content(text)
+        tail = decoder.finish()
+        if tail:
+            self.write_string_content(tail)
         self._update(b'"')
 
     def write_value(self, value: object, *, sort_keys: bool = True) -> None:
@@ -489,6 +585,9 @@ class LegacyPandasTableColumnAccessor:
         ):
             return
         value = self._values.value(row_index)
+        if isinstance(value, bytes):
+            writer.write_legacy_pandas_bytes(value)
+            return
         if self._duration:
             if bool(pd.isna(value)):
                 if self._duration_missing_as_nat:

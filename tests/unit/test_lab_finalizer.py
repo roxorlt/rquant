@@ -267,6 +267,7 @@ class _LegacyTableContextRegistry(RecordingRegistry):
                     [np.float32(-394.478118896484375)],
                     dtype="float32",
                 ),
+                "legacy_bytes": pd.Series([b"\xc3"], dtype=object),
                 "duration": pd.Series(
                     [pd.Timedelta("-1 days 23:56:21.971770440")],
                     dtype="timedelta64[ns]",
@@ -677,7 +678,12 @@ def test_finalizer_recovers_accepted_legacy_table_context_bundle(
     manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
     artifact = manifest.artifacts[0]
     persisted = pd.read_parquet(attempt / artifact.file_name)
-    assert tuple(persisted.columns) == ("a\x00b", "float32_rounding", "duration")
+    assert tuple(persisted.columns) == (
+        "a\x00b",
+        "float32_rounding",
+        "legacy_bytes",
+        "duration",
+    )
     assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
     assert evidence.accepted_success.receipt.status == "accepted"
 

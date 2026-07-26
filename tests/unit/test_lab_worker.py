@@ -407,6 +407,107 @@ def test_canonical_shard_frame_digest_matches_legacy_timedelta_column_context(
     assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (b"\xc3", "\u00c0"),
+        (b"\xe2\x82", "\u2080"),
+        (b"x" * 4095 + b"\xe2\x82\xac", "x" * 4095 + "\u20ac"),
+        (b"x" * 4095 + b"\xe2\x82\x00", "x" * 4095 + "\u2080"),
+        (b"a\x00b", "a\x00b"),
+        ("\U0001f600".encode("utf-8"), "\U0001f600"),
+        (b"\xed\xa0\x80", "\ud800"),
+        (b"\xf4\x90\x80\x80", "\udc00\udc00"),
+    ],
+    ids=[
+        "truncated-two-byte",
+        "truncated-three-byte",
+        "valid-across-chunk",
+        "truncated-across-chunk",
+        "embedded-nul",
+        "valid-astral",
+        "surrogate",
+        "above-unicode-range",
+    ],
+)
+def test_canonical_shard_frame_digest_matches_legacy_bytes_tokens(
+    value: bytes,
+    expected: str,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": pd.Series([value], dtype=object)})
+    raw = frame.to_json(
+        orient="table",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+        force_ascii=True,
+        index=False,
+    )
+
+    assert json.loads(raw)["data"][0]["v"] == expected
+    legacy_digest = _legacy_canonical_shard_frame_digest(frame)
+    if value == b"\xc3":
+        assert legacy_digest == "c8708819a08439e8499de616b18df66df1c67d13eee1ee8b8728e8b89fc3c742"
+    assert canonical_shard_frame_digest(frame) == legacy_digest
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [
+        (b"\x80", UnicodeDecodeError),
+        (b"\xbf", UnicodeDecodeError),
+        (b"\xc0\xaf", OverflowError),
+        (b"\xe0\x80\xaf", OverflowError),
+        (b"\xf0\x80\x80\xaf", OverflowError),
+        (b"\xe0", OverflowError),
+        (b"\xf0\x90", OverflowError),
+        (b"\xf8\x88\x80\x80\x80", OverflowError),
+        (b"\xfe", UnicodeDecodeError),
+    ],
+    ids=[
+        "isolated-continuation-low",
+        "isolated-continuation-high",
+        "overlong-two-byte",
+        "overlong-three-byte",
+        "overlong-four-byte",
+        "unterminated-three-byte",
+        "unterminated-four-byte",
+        "unsupported-five-byte",
+        "invalid-lead",
+    ],
+)
+def test_canonical_shard_frame_digest_matches_legacy_bytes_rejections(
+    value: bytes,
+    error_type: type[Exception],
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": pd.Series([value], dtype=object)})
+
+    with pytest.raises(error_type):
+        _legacy_canonical_shard_frame_digest(frame)
+    with pytest.raises(error_type):
+        canonical_shard_frame_digest(frame)
+
+
+def test_canonical_shard_frame_digest_matches_random_legacy_bytes() -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    rng = random.Random(20260731)
+    for _ in range(1024):
+        value = bytes(rng.randrange(256) for _ in range(rng.randrange(0, 33))) + b"\x00\x00\x00"
+        frame = pd.DataFrame({"v": pd.Series([value], dtype=object)})
+        try:
+            expected = _legacy_canonical_shard_frame_digest(frame)
+        except (OverflowError, UnicodeDecodeError) as exc:
+            with pytest.raises(type(exc)):
+                canonical_shard_frame_digest(frame)
+        else:
+            assert canonical_shard_frame_digest(frame) == expected
+
+
 def test_canonical_shard_frame_digest_rejects_nul_truncated_column_collision() -> None:
     from rquant.lab_worker import canonical_shard_frame_digest
 
