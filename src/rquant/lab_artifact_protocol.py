@@ -88,7 +88,15 @@ class LabFinalizerAuthorityKey:
             raise ValueError("authority secret must contain at least 32 bytes")
 
 
-LabFinalizerAuthorityKeyProvider = Callable[[], LabFinalizerAuthorityKey]
+LabFinalizerAuthoritySigningKeyProvider = Callable[[], LabFinalizerAuthorityKey]
+LabFinalizerAuthorityVerificationKeyProvider = Callable[
+    [str],
+    LabFinalizerAuthorityKey | None,
+]
+
+
+class LabFinalizerAuthorityAuthenticationError(ValueError):
+    """An artifact commit cannot be authenticated by the trusted key ring."""
 
 
 class LabFinalizerAuthorityShardEvidence(LabArtifactCommitProtocolModel):
@@ -147,7 +155,7 @@ class LabFinalizerAuthorityProof(LabArtifactCommitProtocolModel):
 def sign_finalizer_authority(
     claims: LabFinalizerAuthorityClaims,
     *,
-    key_provider: LabFinalizerAuthorityKeyProvider,
+    key_provider: LabFinalizerAuthoritySigningKeyProvider,
 ) -> LabFinalizerAuthorityProof:
     key = key_provider()
     if not isinstance(key, LabFinalizerAuthorityKey):
@@ -159,23 +167,34 @@ def sign_finalizer_authority(
 def verify_finalizer_authority(
     envelope: LabArtifactCommitEnvelope,
     *,
-    key_provider: LabFinalizerAuthorityKeyProvider,
+    key_provider: LabFinalizerAuthorityVerificationKeyProvider,
 ) -> LabFinalizerAuthorityClaims:
-    key = key_provider()
-    if not isinstance(key, LabFinalizerAuthorityKey):
-        raise TypeError("authority key provider returned an invalid key")
     proof = envelope.authority_proof
     if proof is None:
-        raise ValueError("legacy unsigned artifact commit has no authority proof")
-    if proof.key_id != key.key_id:
-        raise ValueError("authority key_id does not match trusted rotation")
+        raise LabFinalizerAuthorityAuthenticationError(
+            "legacy unsigned artifact commit has no authority proof"
+        )
+    try:
+        key = key_provider(proof.key_id)
+    except Exception as exc:
+        raise LabFinalizerAuthorityAuthenticationError(
+            "authority verification key provider failed"
+        ) from exc
+    if key is None:
+        raise LabFinalizerAuthorityAuthenticationError(
+            "authority proof references an unknown key_id"
+        )
+    if not isinstance(key, LabFinalizerAuthorityKey) or key.key_id != proof.key_id:
+        raise LabFinalizerAuthorityAuthenticationError(
+            "authority verification key provider returned an invalid key"
+        )
     expected = hmac.new(
         key.secret,
         proof.claims.canonical_json_bytes(),
         hashlib.sha256,
     ).hexdigest()
     if not hmac.compare_digest(proof.mac_sha256, expected):
-        raise ValueError("authority proof MAC is invalid")
+        raise LabFinalizerAuthorityAuthenticationError("authority proof MAC is invalid")
     return proof.claims
 
 

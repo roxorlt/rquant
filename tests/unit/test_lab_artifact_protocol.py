@@ -23,6 +23,7 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
     LabArtifactConflictEvidence,
+    LabFinalizerAuthorityAuthenticationError,
     LabFinalizerAuthorityClaims,
     LabFinalizerAuthorityKey,
     LabFinalizerAuthorityShardEvidence,
@@ -116,21 +117,52 @@ def test_finalizer_authority_proof_verifies_mac_and_rejects_key_rotation(
 
     verified = verify_finalizer_authority(
         envelope,
-        key_provider=lambda: LabFinalizerAuthorityKey(
-            key_id="test-key-2026-07",
-            secret=b"k" * 32,
+        key_provider=lambda key_id: (
+            LabFinalizerAuthorityKey(key_id=key_id, secret=b"k" * 32)
+            if key_id == "test-key-2026-07"
+            else None
         ),
     )
 
     assert verified == envelope.authority_proof.claims
-    with pytest.raises(ValueError, match="key_id|MAC"):
+    with pytest.raises(LabFinalizerAuthorityAuthenticationError, match="unknown key"):
         verify_finalizer_authority(
             envelope,
-            key_provider=lambda: LabFinalizerAuthorityKey(
-                key_id="test-key-2026-08",
-                secret=b"z" * 32,
-            ),
+            key_provider=lambda _key_id: None,
         )
+
+
+def test_finalizer_authority_verifier_accepts_active_and_transition_keys(
+    tmp_path: Path,
+) -> None:
+    active = LabFinalizerAuthorityKey(key_id="test-key-2026-07", secret=b"k" * 32)
+    transition = LabFinalizerAuthorityKey(key_id="test-key-2026-06", secret=b"o" * 32)
+    envelope = _envelope(tmp_path)
+    old_envelope = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=sign_finalizer_authority(
+            envelope.authority_proof.claims,
+            key_provider=lambda: transition,
+        ),
+    )
+    keys = {active.key_id: active, transition.key_id: transition}
+
+    assert (
+        verify_finalizer_authority(
+            envelope,
+            key_provider=keys.get,
+        )
+        == envelope.authority_proof.claims
+    )
+    assert (
+        verify_finalizer_authority(
+            old_envelope,
+            key_provider=keys.get,
+        )
+        == old_envelope.authority_proof.claims
+    )
 
 
 class _ConflictPublishCrash(BaseException):

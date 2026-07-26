@@ -24,8 +24,8 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitEnvelope,
     LabArtifactCommitReceipt,
     LabFinalizerAuthorityClaims,
-    LabFinalizerAuthorityKeyProvider,
     LabFinalizerAuthorityShardEvidence,
+    LabFinalizerAuthorityVerificationKeyProvider,
     verify_finalizer_authority,
 )
 from rquant.lab_job_protocol import (
@@ -4107,7 +4107,7 @@ class LabJobStore:
         envelope: LabArtifactCommitEnvelope,
         binding: LabVerifiedSealedBinding,
         *,
-        authority_key_provider: LabFinalizerAuthorityKeyProvider,
+        authority_key_provider: LabFinalizerAuthorityVerificationKeyProvider,
         lease: LabLeaseRecord,
         now: datetime,
     ) -> LabArtifactCommitReceipt:
@@ -4144,19 +4144,10 @@ class LabJobStore:
                     )
             return record.receipt
 
-        try:
-            authority_claims = verify_finalizer_authority(
-                envelope,
-                key_provider=authority_key_provider,
-            )
-        except (TypeError, ValueError):
-            return self._reject_artifact_commit(
-                connection,
-                envelope,
-                reason="finalizer_authority_invalid",
-                job_version=None,
-                now=now,
-            )
+        authority_claims = verify_finalizer_authority(
+            envelope,
+            key_provider=authority_key_provider,
+        )
 
         commit = envelope.commit
         manifest = binding.sealed.manifest
@@ -4471,7 +4462,7 @@ class LabJobStore:
         envelope: LabArtifactCommitEnvelope,
         binding: LabVerifiedSealedBinding,
         *,
-        authority_key_provider: LabFinalizerAuthorityKeyProvider,
+        authority_key_provider: LabFinalizerAuthorityVerificationKeyProvider,
         lease: LabLeaseRecord,
         now: datetime,
     ) -> Iterator[_LabStagedArtifactCommit]:

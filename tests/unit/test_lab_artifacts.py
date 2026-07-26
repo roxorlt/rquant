@@ -5101,6 +5101,19 @@ def test_table_content_hash_streams_legacy_canonical_bytes_with_bounded_memory()
     assert peak <= max(16 * 1024 * 1024, frame_bytes * 3)
 
 
+def test_table_content_hash_bounds_single_large_cjk_cell_scratch() -> None:
+    value = "\u4e2d" * (32 * 1024 * 1024)
+    frame = pd.DataFrame({"value": [value]})
+
+    tracemalloc.start()
+    digest = lab_artifacts_module._table_content_hash(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest) == 64
+    assert peak <= 8 * 1024 * 1024
+
+
 def test_legacy_import_keeps_source_bound_through_cache_sync_and_return(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

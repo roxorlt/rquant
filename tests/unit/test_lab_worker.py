@@ -102,6 +102,23 @@ def test_canonical_shard_frame_digest_has_bounded_python_memory() -> None:
     assert peak <= max(16 * 1024 * 1024, frame_bytes * 6)
 
 
+def test_canonical_shard_frame_digest_bounds_wide_string_scratch() -> None:
+    from rquant.canonical_json_stream import CANONICAL_JSON_STREAM_SCRATCH_BYTES
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    value = "x" * (64 * 1024)
+    frame = pd.DataFrame({"wide": [value] * 1024})
+
+    tracemalloc.start()
+    digest = canonical_shard_frame_digest(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest) == 64
+    assert CANONICAL_JSON_STREAM_SCRATCH_BYTES <= 256 * 1024
+    assert peak <= 8 * 1024 * 1024
+
+
 @contextmanager
 def _raising_loguru_sink() -> Iterator[None]:
     from loguru import logger

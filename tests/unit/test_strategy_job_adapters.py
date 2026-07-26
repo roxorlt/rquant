@@ -92,6 +92,28 @@ def test_job_result_hash_streaming_matches_legacy_bytes_and_bounds_memory() -> N
     assert peak <= max(8 * 1024 * 1024, int(frame_bytes * 1.75))
 
 
+def test_job_result_hash_bounds_wide_string_scratch() -> None:
+    from rquant.strategy_job_adapters import LabJobExecutionResult, LabShardTable
+
+    value = "x" * (64 * 1024)
+    frame = pd.DataFrame({"wide": [value] * 1024})
+    result = LabJobExecutionResult(
+        spec_hash="1" * 64,
+        plan_hash="2" * 64,
+        adapter_id="wide-streaming-test",
+        adapter_version="1",
+        tables=(LabShardTable(name="trades", frame=frame),),
+    )
+
+    tracemalloc.start()
+    digest = result.result_hash
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest) == 64
+    assert peak <= 8 * 1024 * 1024
+
+
 def _p13_frozen_claim() -> LabShardClaim:
     return LabShardClaim.model_validate_json(_P13_CLAIM_JSON)
 

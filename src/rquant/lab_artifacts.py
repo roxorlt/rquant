@@ -32,6 +32,10 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.canonical_json_stream import (
+    CanonicalJsonStreamWriter,
+    PandasJsonColumnAccessor,
+)
 from rquant.research_run_spec import DatasetSnapshotIdentity, ResearchRunSpec
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -2004,28 +2008,32 @@ def _restore_manifest_dtypes(
 
 def _table_content_hash(frame: pd.DataFrame) -> str:
     digest = hashlib.sha256()
-    encoder = json.JSONEncoder(
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-    def update_json(value: object) -> None:
-        for chunk in encoder.iterencode(_canonical_value(value)):
-            digest.update(chunk.encode("utf-8"))
+    writer = CanonicalJsonStreamWriter(digest.update)
 
     digest.update(b'{"columns":')
-    update_json(list(frame.columns))
+    writer.write_value(_canonical_value(list(frame.columns)))
     digest.update(b',"dtype_identities":')
-    update_json(_frame_dtype_identities(frame))
+    writer.write_value(_canonical_value(_frame_dtype_identities(frame)))
     digest.update(b',"dtypes":')
-    update_json([str(dtype) for dtype in frame.dtypes])
+    writer.write_value([str(dtype) for dtype in frame.dtypes])
     digest.update(b',"rows":[')
-    for row_index, row in enumerate(frame.itertuples(index=False, name=None)):
+    accessors = tuple(
+        PandasJsonColumnAccessor(frame.iloc[:, position]) for position in range(len(frame.columns))
+    )
+    for row_index in range(len(frame)):
         if row_index:
             digest.update(b",")
-        update_json([_canonical_table_value(value) for value in row])
+        digest.update(b"[")
+        for value_index, accessor in enumerate(accessors):
+            if value_index:
+                digest.update(b",")
+            if not accessor.write_valid_string(
+                writer,
+                row_index,
+                escape_forward_slash=False,
+            ):
+                writer.write_value(_canonical_table_value(accessor.value(row_index)))
+        digest.update(b"]")
     digest.update(b"]}")
     return digest.hexdigest()
 

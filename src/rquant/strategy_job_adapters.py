@@ -15,6 +15,12 @@ import pandas as pd
 from pandas.api.types import is_dtype_equal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from rquant.canonical_json_stream import (
+    CanonicalJsonEscapedStringSink,
+    CanonicalJsonStreamWriter,
+    PandasJsonColumnAccessor,
+    write_pandas_json_value,
+)
 from rquant.lab_shard_protocol import LabShardClaim, LabShardDefinition, LabShardWorkPlan
 from rquant.research_run_spec import (
     FeatureContractIdentity,
@@ -356,63 +362,56 @@ class LabJobExecutionResult(BaseModel):
     @property
     def result_hash(self) -> str:
         digest = hashlib.sha256()
-        encoder = json.JSONEncoder(
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-
-        def update_json(value: object) -> None:
-            for chunk in encoder.iterencode(value):
-                digest.update(chunk.encode("utf-8"))
-
-        def update_escaped_text(value: str) -> None:
-            encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
-            digest.update(encoded[1:-1].encode("utf-8"))
+        writer = CanonicalJsonStreamWriter(digest.update)
 
         digest.update(b'{"adapter_id":')
-        update_json(self.adapter_id)
+        writer.write_string(self.adapter_id)
         digest.update(b',"adapter_version":')
-        update_json(self.adapter_version)
+        writer.write_string(self.adapter_version)
         digest.update(b',"plan_hash":')
-        update_json(self.plan_hash)
+        writer.write_string(self.plan_hash)
         digest.update(b',"spec_hash":')
-        update_json(self.spec_hash)
+        writer.write_string(self.spec_hash)
         digest.update(b',"tables":[')
         for table_index, table in enumerate(self.tables):
             if table_index:
                 digest.update(b",")
             digest.update(b'{"frame":"')
-            update_escaped_text('{"columns":')
-            update_escaped_text(
-                json.dumps(
-                    list(table.frame.columns),
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
+            escaped = CanonicalJsonEscapedStringSink(digest.update)
+            inner = CanonicalJsonStreamWriter(escaped.update)
+            accessors = tuple(
+                PandasJsonColumnAccessor(table.frame.iloc[:, position])
+                for position in range(len(table.frame.columns))
             )
-            update_escaped_text(',"data":[')
-            first_batch = True
-            for start in range(0, len(table.frame), 1024):
-                batch = table.frame.iloc[start : start + 1024].to_json(
-                    orient="values",
-                    date_format="iso",
-                    date_unit="us",
-                    double_precision=15,
-                    force_ascii=True,
-                    index=False,
+            inner.write_ascii(b'{"columns":[')
+            for column_index, column in enumerate(table.frame.columns):
+                if column_index:
+                    inner.write_ascii(b",")
+                write_pandas_json_value(
+                    inner,
+                    column,
+                    escape_forward_slash=True,
+                    sort_mapping_keys=False,
                 )
-                payload = batch[1:-1]
-                if payload:
-                    if not first_batch:
-                        update_escaped_text(",")
-                    update_escaped_text(payload)
-                    first_batch = False
-            update_escaped_text("]}")
+            inner.write_ascii(b'],"data":[')
+            for row_index in range(len(table.frame)):
+                if row_index:
+                    inner.write_ascii(b",")
+                inner.write_ascii(b"[")
+                for value_index, accessor in enumerate(accessors):
+                    if value_index:
+                        inner.write_ascii(b",")
+                    accessor.write_pandas_value(
+                        inner,
+                        row_index,
+                        escape_forward_slash=True,
+                        sort_mapping_keys=False,
+                    )
+                inner.write_ascii(b"]")
+            inner.write_ascii(b"]}")
+            escaped.finish()
             digest.update(b'","name":')
-            update_json(table.name)
+            writer.write_string(table.name)
             digest.update(b"}")
         digest.update(b"]}")
         return digest.hexdigest()

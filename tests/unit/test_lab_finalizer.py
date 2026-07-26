@@ -24,6 +24,7 @@ from rquant.lab_artifact_protocol import (
 )
 from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore
 from rquant.lab_finalizer import (
+    LabArtifactRoundtripPeakUsage,
     LabFinalizationCodeMismatchError,
     LabFinalizationCodeProviderError,
     LabFinalizationIntegrityError,
@@ -64,7 +65,12 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
 )
 from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_digest
-from rquant.strategy_job_adapters import LabShardMetric, default_strategy_job_adapter_registry
+from rquant.strategy_job_adapters import (
+    LabJobExecutionResult,
+    LabShardMetric,
+    LabShardTable,
+    default_strategy_job_adapter_registry,
+)
 
 from .test_lab_jobs import _create_v4_job_fixture
 from .test_lab_worker import NOW, RecordingRegistry, _nshape_compare_spec, _worker
@@ -77,6 +83,12 @@ TEST_AUTHORITY_KEY = LabFinalizerAuthorityKey(
 
 def _authority_key_provider() -> LabFinalizerAuthorityKey:
     return TEST_AUTHORITY_KEY
+
+
+def _authority_verification_key_provider(
+    key_id: str,
+) -> LabFinalizerAuthorityKey | None:
+    return TEST_AUTHORITY_KEY if key_id == TEST_AUTHORITY_KEY.key_id else None
 
 
 class _CrashBeforeArtifactAckSpool(LabArtifactCommitSpool):
@@ -190,7 +202,7 @@ def _ready_scenario(
         adapter_registry=default_strategy_job_adapter_registry(),
         artifact_commit_spool=commit_spool,
         artifact_store=artifact_store,
-        finalizer_authority_key_provider=_authority_key_provider,
+        finalizer_authority_key_provider=_authority_verification_key_provider,
         clock=lambda: NOW,
     )
     scheduler.run_once()
@@ -863,6 +875,31 @@ def test_finalizer_rejects_invalid_verified_runtime_code_sha_before_io(
 
     with pytest.raises(LabFinalizationCodeProviderError, match="invalid commit"):
         finalizer.finalize(scenario.job_id)
+
+
+@pytest.mark.parametrize(
+    "runtime_code_sha",
+    (None, 1, b"1" * 40, object()),
+    ids=("none", "integer", "bytes", "object"),
+)
+def test_finalizer_rejects_non_string_verified_runtime_code_sha_before_io(
+    tmp_path: Path,
+    runtime_code_sha: object,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        verified_code_sha_provider=lambda: runtime_code_sha,  # type: ignore[arg-type]
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+
+    with pytest.raises(LabFinalizationCodeProviderError, match="invalid commit"):
+        finalizer.finalize(scenario.job_id)
+    assert scenario.commit_spool.pending() == ()
+    assert tuple(scenario.artifact_store.sealed_root.iterdir()) == ()
 
 
 def test_finalizer_calls_verified_code_provider_for_every_finalize(
@@ -1946,6 +1983,69 @@ def test_finalizer_applies_final_artifact_payload_budget(
 
     assert tuple(scenario.artifact_store.candidates_root.iterdir()) == ()
     assert scenario.commit_spool.pending() == ()
+
+
+def test_artifact_roundtrip_peak_usage_accounts_for_all_live_copies() -> None:
+    usage = LabArtifactRoundtripPeakUsage(
+        source_dataframe_bytes=25 * 1024 * 1024,
+        roundtrip_dataframe_bytes=25 * 1024 * 1024,
+        arrow_working_bytes=25 * 1024 * 1024,
+        payload_bytes=4 * 1024 * 1024,
+        payload_copy_bytes=4 * 1024 * 1024,
+        hash_scratch_bytes=128 * 1024,
+    )
+
+    assert usage.peak_resident_bytes == (83 * 1024 * 1024) + (128 * 1024)
+
+
+def test_finalizer_rejects_roundtrip_peak_before_artifact_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    first = snapshot.shards[0].shard
+    value = "x" * (25 * 1024)
+    frame = pd.DataFrame({"wide": [value] * 1024})
+    result = LabJobExecutionResult(
+        spec_hash=snapshot.job.spec_hash,
+        plan_hash=first.plan_hash,
+        adapter_id=first.adapter_id,
+        adapter_version=first.adapter_version,
+        tables=(LabShardTable(name="trades", frame=frame),),
+    )
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=_authority_key_provider,
+        job_limits=LabFinalizerJobLimits(
+            max_aggregate_dataframe_bytes=30 * 1024 * 1024,
+            max_final_artifact_payload_bytes=4 * 1024 * 1024,
+            max_final_artifact_single_payload_bytes=4 * 1024 * 1024,
+            max_peak_resident_bytes=50 * 1024 * 1024,
+        ),
+    )
+    monkeypatch.setattr(
+        finalizer.adapter_registry,
+        "aggregate_results",
+        lambda _spec, _results: result,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("roundtrip peak overflow reached artifact serialization")
+
+    monkeypatch.setattr(finalizer.artifact_store, "preview_candidate", forbidden)
+
+    with pytest.raises(
+        LabFinalizationResourceLimitError,
+        match="artifact roundtrip peak resident bytes",
+    ):
+        finalizer.finalize(scenario.job_id)
 
 
 @pytest.mark.parametrize("resource", ["rows", "columns"])

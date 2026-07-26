@@ -80,6 +80,12 @@ def _authority_key_provider() -> LabFinalizerAuthorityKey:
     return AUTHORITY_KEY
 
 
+def _authority_verification_key_provider(
+    key_id: str,
+) -> LabFinalizerAuthorityKey | None:
+    return AUTHORITY_KEY if key_id == AUTHORITY_KEY.key_id else None
+
+
 def _signed_artifact_envelope(
     store: LabJobStore,
     commit: LabArtifactCommit,
@@ -253,7 +259,7 @@ def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -
         poll_interval_ms=10,
         artifact_commit_spool=commit_spool,
         artifact_store=artifact_store,
-        finalizer_authority_key_provider=_authority_key_provider,
+        finalizer_authority_key_provider=_authority_verification_key_provider,
         clock=lambda: clock[0],
     )
     scheduler.run_once()
@@ -351,7 +357,7 @@ def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -
             )
 
 
-def test_scheduler_first_rejects_forged_sealed_pending_with_untrusted_mac(
+def test_scheduler_quarantines_untrusted_mac_without_poisoning_request_id(
     tmp_path: Path,
 ) -> None:
     store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
@@ -375,13 +381,79 @@ def test_scheduler_first_rejects_forged_sealed_pending_with_untrusted_mac(
     current = LabJobReader(store.path).get_job(job.job_id)
     receipt = LabJobReader(store.path).get_artifact_commit(forged.request_id)
     assert tick.artifact_commits_accepted == 0
-    assert tick.artifact_commits_rejected == 1
+    assert tick.artifact_commits_rejected == 0
+    assert tick.artifact_commits_quarantined == 1
     assert current is not None and current.result_state is LabResultState.READY
-    assert receipt is not None and receipt.receipt.status == "rejected"
-    assert receipt.receipt.reason == "finalizer_authority_invalid"
+    assert receipt is None
+    assert not (spool.ack_dir / f"{forged.request_id}.json").exists()
+
+    spool.publish(envelope)
+    clock[0] = NOW + timedelta(seconds=10)
+    accepted = scheduler.run_once()
+
+    committed = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert accepted.artifact_commits_accepted == 1
+    assert committed is not None and committed.receipt.status == "accepted"
 
 
-def test_scheduler_rejects_legacy_unsigned_artifact_commit(tmp_path: Path) -> None:
+def test_scheduler_quarantines_bad_mac_for_known_key_without_ledger_or_ack(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    proof = envelope.authority_proof
+    assert proof is not None
+    forged = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=proof.model_copy(update={"mac_sha256": "0" * 64}),
+    )
+    spool.publish(forged)
+    clock[0] = NOW + timedelta(seconds=5)
+
+    tick = scheduler.run_once()
+
+    assert tick.artifact_commits_quarantined == 1
+    assert tick.artifact_commits_rejected == 0
+    assert LabJobReader(store.path).get_artifact_commit(forged.request_id) is None
+    assert not (spool.ack_dir / f"{forged.request_id}.json").exists()
+    current = LabJobReader(store.path).get_job(job.job_id)
+    assert current is not None and current.result_state is LabResultState.READY
+
+
+def test_scheduler_accepts_transition_key_from_verification_keyring(
+    tmp_path: Path,
+) -> None:
+    transition = LabFinalizerAuthorityKey(key_id="scheduler-old-key", secret=b"o" * 32)
+    keys = {AUTHORITY_KEY.key_id: AUTHORITY_KEY, transition.key_id: transition}
+    store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            publish=False,
+            authority_key_provider=keys.get,
+        )
+    )
+    old_envelope = _signed_artifact_envelope(
+        store,
+        envelope.commit,
+        request_id=envelope.request_id,
+        key=transition,
+    )
+    spool.publish(old_envelope)
+    clock[0] = NOW + timedelta(seconds=5)
+
+    tick = scheduler.run_once()
+
+    record = LabJobReader(store.path).get_artifact_commit(old_envelope.request_id)
+    current = LabJobReader(store.path).get_job(job.job_id)
+    assert tick.artifact_commits_accepted == 1
+    assert record is not None and record.receipt.status == "accepted"
+    assert current is not None and current.result_state is LabResultState.SEALED
+
+
+def test_scheduler_quarantines_legacy_unsigned_artifact_commit(tmp_path: Path) -> None:
     store, scheduler, spool, _artifacts, job, _sealed, envelope, clock = (
         _ready_artifact_commit_scenario(tmp_path, publish=False)
     )
@@ -397,12 +469,14 @@ def test_scheduler_rejects_legacy_unsigned_artifact_commit(tmp_path: Path) -> No
 
     record = LabJobReader(store.path).get_artifact_commit(unsigned.request_id)
     current = LabJobReader(store.path).get_job(job.job_id)
-    assert tick.artifact_commits_rejected == 1
-    assert record is not None and record.receipt.reason == "finalizer_authority_invalid"
+    assert tick.artifact_commits_rejected == 0
+    assert tick.artifact_commits_quarantined == 1
+    assert record is None
+    assert not (spool.ack_dir / f"{unsigned.request_id}.json").exists()
     assert current is not None and current.result_state is LabResultState.READY
 
 
-def test_scheduler_reloads_authority_key_and_rejects_rotation_mismatch(
+def test_scheduler_reloads_authority_key_and_quarantines_unknown_rotation(
     tmp_path: Path,
 ) -> None:
     current_key = LabFinalizerAuthorityKey(
@@ -411,7 +485,7 @@ def test_scheduler_reloads_authority_key_and_rejects_rotation_mismatch(
     )
     calls = 0
 
-    def provider() -> LabFinalizerAuthorityKey:
+    def provider(_key_id: str) -> LabFinalizerAuthorityKey | None:
         nonlocal calls
         calls += 1
         return current_key
@@ -428,8 +502,9 @@ def test_scheduler_reloads_authority_key_and_rejects_rotation_mismatch(
     record = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
     current = LabJobReader(store.path).get_job(job.job_id)
     assert calls == 1
-    assert tick.artifact_commits_rejected == 1
-    assert record is not None and record.receipt.reason == "finalizer_authority_invalid"
+    assert tick.artifact_commits_rejected == 0
+    assert tick.artifact_commits_quarantined == 1
+    assert record is None
     assert current is not None and current.result_state is LabResultState.READY
 
 
@@ -477,7 +552,9 @@ def _ready_artifact_commit_scenario(
     with_dataset_snapshot: bool = True,
     dataset_audit_run_id: str | None = "d" * 64,
     artifact_frame: pd.DataFrame | None = None,
-    authority_key_provider: Callable[[], LabFinalizerAuthorityKey] = (_authority_key_provider),
+    authority_key_provider: Callable[[str], LabFinalizerAuthorityKey | None] = (
+        _authority_verification_key_provider
+    ),
 ) -> tuple[
     LabJobStore,
     LabScheduler,
@@ -2351,7 +2428,7 @@ def test_lease_expired_during_artifact_exit_check_rolls_back_for_takeover(
         poll_interval_ms=10,
         artifact_commit_spool=spool,
         artifact_store=artifacts,
-        finalizer_authority_key_provider=_authority_key_provider,
+        finalizer_authority_key_provider=_authority_verification_key_provider,
         clock=lambda: clock[0],
     )
     replay = replacement.run_once()
@@ -2380,7 +2457,7 @@ def test_new_scheduler_recovers_ready_job_fence_before_commit(tmp_path: Path) ->
         poll_interval_ms=10,
         artifact_commit_spool=spool,
         artifact_store=artifacts,
-        finalizer_authority_key_provider=_authority_key_provider,
+        finalizer_authority_key_provider=_authority_verification_key_provider,
         clock=lambda: clock[0],
     )
 
@@ -2418,7 +2495,7 @@ def test_stale_scheduler_lease_cannot_stage_ready_artifact_commit(tmp_path: Path
         store.stage_artifact_commit(
             envelope,
             binding,
-            authority_key_provider=_authority_key_provider,
+            authority_key_provider=_authority_verification_key_provider,
             lease=stale_lease,
             now=clock[0],
         ),
@@ -2452,7 +2529,7 @@ def test_staged_artifact_commit_does_not_begin_until_context_entry(
         stage_scope = store.stage_artifact_commit(
             envelope,
             binding,
-            authority_key_provider=_authority_key_provider,
+            authority_key_provider=_authority_verification_key_provider,
             lease=scheduler.lease,
             now=clock[0],
         )

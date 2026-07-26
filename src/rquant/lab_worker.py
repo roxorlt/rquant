@@ -23,6 +23,10 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.canonical_json_stream import (
+    CanonicalJsonStreamWriter,
+    PandasJsonColumnAccessor,
+)
 from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_logging import _safe_structured_log
@@ -121,46 +125,36 @@ def _fsync_directory(path: Path) -> None:
 
 def canonical_shard_frame_digest(
     frame: pd.DataFrame,
-    *,
-    batch_rows: int = 1024,
 ) -> str:
     if any(not isinstance(column, str) for column in frame.columns):
         raise ValueError("artifact DataFrame columns must be strings")
-    if batch_rows < 1:
-        raise ValueError("canonical shard digest batch_rows must be positive")
     digest = hashlib.sha256()
-    encoder = json.JSONEncoder(
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
+    writer = CanonicalJsonStreamWriter(digest.update)
+    columns = tuple(frame.columns)
+    accessors = tuple(
+        PandasJsonColumnAccessor(frame.iloc[:, position]) for position in range(len(columns))
     )
-
-    def update_json(value: object) -> None:
-        for chunk in encoder.iterencode(value):
-            digest.update(chunk.encode("utf-8"))
+    positions = tuple(sorted(range(len(columns)), key=columns.__getitem__))
 
     digest.update(b'{"data":[')
-    first = True
-    for start in range(0, len(frame), batch_rows):
-        raw = frame.iloc[start : start + batch_rows].to_json(
-            orient="records",
-            date_format="iso",
-            date_unit="us",
-            double_precision=15,
-            force_ascii=True,
-            index=False,
-        )
-        records = json.loads(raw)
-        if not isinstance(records, list):  # pragma: no cover - pandas contract guard
-            raise ValueError("pandas records JSON is not a list")
-        for record in records:
-            if not first:
+    for row_index in range(len(frame)):
+        if row_index:
+            digest.update(b",")
+        digest.update(b"{")
+        for field_index, position in enumerate(positions):
+            if field_index:
                 digest.update(b",")
-            update_json(record)
-            first = False
+            writer.write_string(columns[position])
+            digest.update(b":")
+            accessors[position].write_pandas_value(
+                writer,
+                row_index,
+                escape_forward_slash=False,
+                sort_mapping_keys=True,
+            )
+        digest.update(b"}")
     digest.update(b'],"schema":')
-    update_json(pd.io.json.build_table_schema(frame, index=False))
+    writer.write_value(pd.io.json.build_table_schema(frame, index=False))
     digest.update(b"}")
     return digest.hexdigest()
 

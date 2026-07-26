@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.canonical_json_stream import CANONICAL_JSON_STREAM_SCRATCH_BYTES
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -26,8 +27,8 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
     LabFinalizerAuthorityClaims,
-    LabFinalizerAuthorityKeyProvider,
     LabFinalizerAuthorityShardEvidence,
+    LabFinalizerAuthoritySigningKeyProvider,
     sign_finalizer_authority,
 )
 from rquant.lab_artifacts import (
@@ -194,6 +195,42 @@ class LabFinalizerJobLimits(LabFinalizerModel):
         if self.max_final_artifact_single_payload_bytes > self.max_final_artifact_payload_bytes:
             raise ValueError("single final payload limit cannot exceed total payload limit")
         return self
+
+
+class LabArtifactRoundtripPeakUsage(LabFinalizerModel):
+    source_dataframe_bytes: int = Field(ge=0)
+    roundtrip_dataframe_bytes: int = Field(ge=0)
+    arrow_working_bytes: int = Field(ge=0)
+    payload_bytes: int = Field(ge=0)
+    payload_copy_bytes: int = Field(ge=0)
+    hash_scratch_bytes: int = Field(ge=0)
+
+    @property
+    def peak_resident_bytes(self) -> int:
+        return (
+            self.source_dataframe_bytes
+            + self.roundtrip_dataframe_bytes
+            + self.arrow_working_bytes
+            + self.payload_bytes
+            + self.payload_copy_bytes
+            + self.hash_scratch_bytes
+        )
+
+    @classmethod
+    def conservative(
+        cls,
+        *,
+        aggregate_dataframe_bytes: int,
+        payload_bytes: int,
+    ) -> LabArtifactRoundtripPeakUsage:
+        return cls(
+            source_dataframe_bytes=aggregate_dataframe_bytes,
+            roundtrip_dataframe_bytes=aggregate_dataframe_bytes,
+            arrow_working_bytes=aggregate_dataframe_bytes,
+            payload_bytes=payload_bytes,
+            payload_copy_bytes=payload_bytes,
+            hash_scratch_bytes=CANONICAL_JSON_STREAM_SCRATCH_BYTES,
+        )
 
 
 class LabShardBundleUsage(LabFinalizerModel):
@@ -1030,7 +1067,7 @@ class LabFinalizer:
         artifact_store: LabJobArtifactStore,
         commit_spool: LabArtifactCommitSpool,
         verified_code_sha_provider: Callable[[], str | None],
-        finalizer_authority_key_provider: LabFinalizerAuthorityKeyProvider,
+        finalizer_authority_key_provider: LabFinalizerAuthoritySigningKeyProvider,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
@@ -1571,7 +1608,10 @@ class LabFinalizer:
             runtime_code_sha = self.verified_code_sha_provider()
         except Exception as exc:
             raise LabFinalizationCodeProviderError("verified code SHA provider failed") from exc
-        if runtime_code_sha is None or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None:
+        if (
+            not isinstance(runtime_code_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None
+        ):
             raise LabFinalizationCodeProviderError(
                 "verified code SHA provider returned an invalid commit"
             )
@@ -1622,7 +1662,7 @@ class LabFinalizer:
             ),
         ):
             self._require_within_limit(actual=actual, maximum=maximum, label=label)
-        hash_scratch_bytes = 16 * 1024 * 1024
+        hash_scratch_bytes = CANONICAL_JSON_STREAM_SCRATCH_BYTES
         estimated_aggregate_bytes = min(
             self.job_limits.max_aggregate_dataframe_bytes,
             max(estimated_dataframe_bytes * 2, 1),
@@ -1731,6 +1771,15 @@ class LabFinalizer:
             maximum=self.job_limits.max_final_artifact_table_count,
             label="final artifact table count",
         )
+        estimated_roundtrip_usage = LabArtifactRoundtripPeakUsage.conservative(
+            aggregate_dataframe_bytes=aggregate_dataframe_bytes,
+            payload_bytes=self.job_limits.max_final_artifact_payload_bytes,
+        )
+        self._require_within_limit(
+            actual=estimated_roundtrip_usage.peak_resident_bytes,
+            maximum=self.job_limits.max_peak_resident_bytes,
+            label="artifact roundtrip peak resident bytes",
+        )
         metrics = self._metrics(
             snapshot,
             result,
@@ -1739,15 +1788,6 @@ class LabFinalizer:
         )
         del shard_result_items, shard_results
         first = snapshot.shards[0].shard
-        self._require_within_limit(
-            actual=(
-                aggregate_dataframe_bytes
-                + (2 * self.job_limits.max_final_artifact_payload_bytes)
-                + hash_scratch_bytes
-            ),
-            maximum=self.job_limits.max_peak_resident_bytes,
-            label="artifact planning peak resident bytes",
-        )
         try:
             plan = self.artifact_store.preview_candidate(
                 job_id=snapshot.job.job_id,
@@ -1776,10 +1816,14 @@ class LabFinalizer:
                 "complete result candidate could not be previewed"
             ) from exc
         planned_payload_bytes = sum(len(item.payload) for item in plan.payloads)
+        actual_roundtrip_usage = LabArtifactRoundtripPeakUsage.conservative(
+            aggregate_dataframe_bytes=aggregate_dataframe_bytes,
+            payload_bytes=planned_payload_bytes,
+        )
         self._require_within_limit(
-            actual=aggregate_dataframe_bytes + (2 * planned_payload_bytes) + hash_scratch_bytes,
+            actual=actual_roundtrip_usage.peak_resident_bytes,
             maximum=self.job_limits.max_peak_resident_bytes,
-            label="materialized artifact plan peak resident bytes",
+            label="materialized artifact roundtrip peak resident bytes",
         )
         try:
             sealed = self._recover_or_prepare(plan)

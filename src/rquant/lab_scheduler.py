@@ -14,7 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
-    LabFinalizerAuthorityKeyProvider,
+    LabFinalizerAuthorityAuthenticationError,
+    LabFinalizerAuthorityVerificationKeyProvider,
 )
 from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore, LabVerifiedSealedBinding
 from rquant.lab_job_protocol import (
@@ -114,7 +115,9 @@ class LabScheduler:
         max_claim_authority_per_tick: int = 128,
         artifact_commit_spool: LabArtifactCommitSpool | None = None,
         artifact_store: LabJobArtifactStore | None = None,
-        finalizer_authority_key_provider: LabFinalizerAuthorityKeyProvider | None = None,
+        finalizer_authority_key_provider: (
+            LabFinalizerAuthorityVerificationKeyProvider | None
+        ) = None,
         max_artifact_commits_per_tick: int = 64,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
@@ -602,6 +605,14 @@ class LabScheduler:
                     artifact_isolated = self._quarantine_artifact_commit(
                         entry,
                         reason=f"artifact_commit_content_conflict:{exc}",
+                    )
+                    artifact_commits_quarantined += int(artifact_isolated)
+                    artifact_commit_quarantine_failures += int(not artifact_isolated)
+                    continue
+                except LabFinalizerAuthorityAuthenticationError as exc:
+                    artifact_isolated = self._quarantine_artifact_commit(
+                        entry,
+                        reason=f"artifact_authority_unauthenticated:{_safe_error_message(exc)}",
                     )
                     artifact_commits_quarantined += int(artifact_isolated)
                     artifact_commit_quarantine_failures += int(not artifact_isolated)

@@ -50,6 +50,14 @@
 
 ### Fixed
 
+- **Strategy Lab finalizer 宽值内存与认证隔离**：三条结果 hash 共用标量级 canonical
+  JSON 流式 encoder，字符串按固定小块用标准库转义并直接读取 Arrow string buffer，保持旧
+  hash 字节语义的同时移除宽行/巨型 Unicode 单元格的整值 JSON 副本；统一峰值预算显式计入
+  原表、Parquet 回读表、Arrow 工作集、payload 双份和真实 128KiB encoder scratch。artifact
+  authority verifier 改为按 `key_id` 查询 active/transition keyring，unsigned、未知 key 或坏 MAC
+  在 SQLite 事务内回滚并由 scheduler 隔离，不再写 rejected ledger/ACK 或毒化 request ID；
+  verified code SHA 的非字符串返回也统一在副作用前 typed fail。
+
 - **Strategy Lab finalizer 提交权威与内存上界**：artifact commit 协议升级为 signed v2，
   HMAC-SHA256 proof 绑定 ready event/version/fence、runtime code SHA、完整有序 accepted shard
   图和 sealed result identity；scheduler 在同一 SQLite 写事务内用可信轮换 key provider 验证
