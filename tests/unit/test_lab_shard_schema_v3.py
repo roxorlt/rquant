@@ -755,6 +755,11 @@ def test_reader_rejects_terminal_legacy_shard_with_claim_identity(tmp_path: Path
             3,
             lambda *_args: 0,
         )
+        connection.create_function(
+            lab_jobs._READY_TERMINAL_AUTH_FUNCTION,
+            6,
+            lambda *_args: 0,
+        )
         connection.execute(
             """
             UPDATE lab_job SET status = 'cancelled', version = 1 WHERE job_id = ?

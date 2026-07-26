@@ -64,6 +64,11 @@ def _register_unprivileged_job_functions(connection: sqlite3.Connection) -> None
         3,
         lambda *_args: 0,
     )
+    connection.create_function(
+        lab_jobs._READY_TERMINAL_AUTH_FUNCTION,
+        6,
+        lambda *_args: 0,
+    )
 
 
 def _definition(

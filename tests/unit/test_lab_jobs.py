@@ -213,6 +213,11 @@ def _register_unprivileged_job_functions(connection: sqlite3.Connection) -> None
         3,
         lambda *_args: 0,
     )
+    connection.create_function(
+        lab_jobs._READY_TERMINAL_AUTH_FUNCTION,
+        6,
+        lambda *_args: 0,
+    )
 
 
 def _lease(
@@ -734,6 +739,8 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
     "trigger",
     [
         "trg_lab_complete_result_job_no_delete",
+        "trg_lab_job_existing_key_no_insert",
+        "trg_lab_complete_result_ready_job_update",
         "trg_lab_complete_result_sealed_job_no_update",
     ],
 )
@@ -749,7 +756,13 @@ def test_v5_schema_requires_exact_complete_result_parent_guards(
         ).fetchone()
         assert row is not None and row[0] is not None, f"missing required trigger {trigger}"
         connection.execute(f'DROP TRIGGER "{trigger}"')
-        operation = "DELETE" if trigger.endswith("no_delete") else "UPDATE"
+        operation = (
+            "DELETE"
+            if trigger.endswith("no_delete")
+            else "INSERT"
+            if trigger.endswith("no_insert")
+            else "UPDATE"
+        )
         connection.execute(
             f"""
             CREATE TRIGGER "{trigger}"
@@ -764,6 +777,25 @@ def test_v5_schema_requires_exact_complete_result_parent_guards(
         LabJobReader(store.path).get_job(uuid4())
     with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
         store.connection_pragmas()
+
+
+def test_existing_job_key_insert_guard_does_not_depend_on_authorization_udf(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            """
+            SELECT sql FROM sqlite_schema
+            WHERE type = 'trigger' AND name = 'trg_lab_job_existing_key_no_insert'
+            """
+        ).fetchone()
+
+    assert row is not None and row[0] is not None
+    sql = str(row[0])
+    assert "EXISTS" in sql.upper()
+    assert "lab_job" in sql
+    assert "authorized" not in sql.lower()
 
 
 @pytest.mark.parametrize(
@@ -2732,6 +2764,7 @@ def test_reader_fails_closed_on_tampered_spec_or_denormalized_columns(
         "deadline": "2030-01-01T00:00:00+00:00",
     }
     with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
         connection.execute(
             f"UPDATE lab_job SET {column} = ? WHERE job_id = ?",
             (replacements[column], str(job.job_id)),

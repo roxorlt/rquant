@@ -6,7 +6,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -104,6 +104,7 @@ RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
 COMPLETE_RESULT_CONTRACT_VERSION = "p1.4b-complete-result-v1"
 _SUBMIT_AUTH_FUNCTION = "rquant_lab_submit_authorized"
 _RETRY_AUTH_FUNCTION = "rquant_lab_retry_authorized"
+_READY_TERMINAL_AUTH_FUNCTION = "rquant_lab_ready_terminal_authorized"
 _ARTIFACT_COMMIT_AUTH_FUNCTION = "rquant_lab_artifact_commit_authorized"
 _ARTIFACT_INDEX_AUTH_FUNCTION = "rquant_lab_artifact_index_authorized"
 _ARTIFACT_SUCCESS_AUTH_FUNCTION = "rquant_lab_artifact_success_authorized"
@@ -118,12 +119,23 @@ _DEADLINE_EXCEEDED_FAILURE_JSON = '{"reason":"deadline_exceeded"}'
 
 
 class _LabWriteAuthorization:
+    """Transaction-scoped application integrity capabilities for ledger triggers.
+
+    These fixed-name SQLite UDFs are not a process-identity or cryptographic
+    security boundary. A process with physical write access to the database can
+    replace the database, its triggers, or the UDF implementations. The security
+    boundary is filesystem/process ownership enforcing the scheduler as the sole
+    application writer; these grants constrain accidental or unapproved SQL on a
+    store-owned connection to the exact transaction currently being applied.
+    """
+
     __slots__ = (
         "_artifact_commit",
         "_artifact_index",
         "_artifact_success",
         "_connection_ref",
         "_epoch",
+        "_ready_terminal",
         "_retry",
         "_submit",
     )
@@ -133,6 +145,7 @@ class _LabWriteAuthorization:
         self._epoch = 0
         self._submit: tuple[int, str, str] | None = None
         self._retry: tuple[int, str, int, int] | None = None
+        self._ready_terminal: tuple[int, str, str, int, int, int, int | None] | None = None
         self._artifact_commit: tuple[int, str, str, str] | None = None
         self._artifact_index: tuple[int, str, str, str] | None = None
         self._artifact_success: tuple[int, str, str, str, int, int] | None = None
@@ -153,6 +166,7 @@ class _LabWriteAuthorization:
             for grant in (
                 self._submit,
                 self._retry,
+                self._ready_terminal,
                 self._artifact_commit,
                 self._artifact_index,
                 self._artifact_success,
@@ -161,6 +175,7 @@ class _LabWriteAuthorization:
             self._epoch += 1
         self._submit = None
         self._retry = None
+        self._ready_terminal = None
         self._artifact_commit = None
         self._artifact_index = None
         self._artifact_success = None
@@ -210,6 +225,34 @@ class _LabWriteAuthorization:
         finally:
             if self._artifact_commit is not None and self._artifact_commit[0] == epoch:
                 self._artifact_commit = None
+
+    @contextmanager
+    def authorize_ready_terminal(
+        self,
+        job_id: UUID,
+        target_status: JobStatus,
+        old_version: int,
+        new_version: int,
+        recoverable: int,
+        scheduler_fencing_token: int | None,
+    ) -> Iterator[None]:
+        if self._ready_terminal is not None:
+            raise RuntimeError("ready terminal SQL authorization is already active")
+        epoch = self._require_transaction()
+        self._ready_terminal = (
+            epoch,
+            str(job_id),
+            target_status.value,
+            old_version,
+            new_version,
+            recoverable,
+            scheduler_fencing_token,
+        )
+        try:
+            yield
+        finally:
+            if self._ready_terminal is not None and self._ready_terminal[0] == epoch:
+                self._ready_terminal = None
 
     @contextmanager
     def authorize_artifact_index(
@@ -286,6 +329,30 @@ class _LabWriteAuthorization:
             grant is not None
             and self._is_current_transaction(grant[0])
             and grant[1:] == (str(request_id), str(commit_json), str(receipt_json))
+        )
+
+    def ready_terminal_authorized(
+        self,
+        job_id: object,
+        target_status: object,
+        old_version: object,
+        new_version: object,
+        recoverable: object,
+        scheduler_fencing_token: object,
+    ) -> int:
+        grant = self._ready_terminal
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:]
+            == (
+                str(job_id),
+                str(target_status),
+                old_version,
+                new_version,
+                recoverable,
+                scheduler_fencing_token,
+            )
         )
 
     def artifact_index_authorized(
@@ -1457,6 +1524,8 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
     _validate_v5_key_and_foreign_key_constraints(connection)
     required_triggers = {
         "trg_lab_complete_result_job_no_delete",
+        "trg_lab_job_existing_key_no_insert",
+        "trg_lab_complete_result_ready_job_update",
         "trg_lab_complete_result_sealed_job_no_update",
         "trg_lab_job_complete_result_insert",
         "trg_lab_job_complete_result_update",
@@ -1484,6 +1553,8 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
         )
     expected_trigger_sql = {
         "trg_lab_complete_result_job_no_delete": (_V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER),
+        "trg_lab_job_existing_key_no_insert": (_V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER),
+        "trg_lab_complete_result_ready_job_update": (_V5_COMPLETE_RESULT_READY_JOB_UPDATE_TRIGGER),
         "trg_lab_complete_result_sealed_job_no_update": (
             _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER
         ),
@@ -2037,7 +2108,12 @@ def _validate_database_identity(
 
 
 class LabJobReader:
-    """Read-only view of committed WAL state; never creates the database."""
+    """Read and validate committed ledger state without filesystem artifact I/O.
+
+    Sealed bundle liveness is reverified only by the explicit artifact-store
+    binding APIs. Reader validation proves persisted graph consistency, not the
+    current identity or availability of paths recorded by that graph.
+    """
 
     def __init__(self, path: Path, *, busy_timeout_ms: int = 5_000) -> None:
         if busy_timeout_ms < 1:
@@ -2859,6 +2935,11 @@ class LabJobStore:
             authorization.retry_authorized,
         )
         connection.create_function(
+            _READY_TERMINAL_AUTH_FUNCTION,
+            6,
+            authorization.ready_terminal_authorized,
+        )
+        connection.create_function(
             _ARTIFACT_COMMIT_AUTH_FUNCTION,
             3,
             authorization.artifact_commit_authorized,
@@ -3235,14 +3316,13 @@ class LabJobStore:
                 now=now,
             )
         if (
-            job.scheduler_fencing_token != lease.fencing_token
-            or not job.requires_complete_result
+            not job.requires_complete_result
             or job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
         ):
             return self._reject_artifact_commit(
                 connection,
                 envelope,
-                reason="job_fence_or_contract_mismatch",
+                reason="job_contract_mismatch",
                 job_version=job.version,
                 now=now,
             )
@@ -3337,22 +3417,22 @@ class LabJobStore:
             cursor = connection.execute(
                 """
                 UPDATE lab_job
-                SET status = ?, result_state = ?, version = ?, updated_at = ?
+                SET status = ?, result_state = ?, version = ?,
+                    scheduler_fencing_token = ?, updated_at = ?
                 WHERE job_id = ? AND version = ? AND status = ?
                   AND result_state = ? AND control_intent = ?
-                  AND scheduler_fencing_token = ?
                 """,
                 (
                     JobStatus.SUCCEEDED.value,
                     LabResultState.SEALED.value,
                     next_version,
+                    lease.fencing_token,
                     _dump_time(now),
                     str(commit.job_id),
                     job.version,
                     JobStatus.RUNNING.value,
                     LabResultState.READY.value,
                     ControlIntent.NONE.value,
-                    lease.fencing_token,
                 ),
             )
         if cursor.rowcount != 1:
@@ -3914,6 +3994,8 @@ class LabJobStore:
     ) -> sqlite3.Row:
         if JobStatus(str(row["status"])) is not JobStatus.RUNNING:
             return row
+        if LabResultState(str(row["result_state"])) is LabResultState.READY:
+            return row
         current_fence = _strict_nullable_sqlite_int(
             row["scheduler_fencing_token"],
             field="lab_job.scheduler_fencing_token",
@@ -3992,7 +4074,12 @@ class LabJobStore:
             field="lab_job.scheduler_fencing_token",
             minimum=1,
         )
-        if source is JobStatus.RUNNING and (row_fence is None or row_fence != lease.fencing_token):
+        source_result_state = LabResultState(str(row["result_state"]))
+        if (
+            source is JobStatus.RUNNING
+            and source_result_state is not LabResultState.READY
+            and (row_fence is None or row_fence != lease.fencing_token)
+        ):
             raise SchedulerLeaseFencedError("running job belongs to a different scheduler fence")
         stored_version = _strict_sqlite_int(row["version"], field="lab_job.version", minimum=0)
         version = stored_version + 1
@@ -4005,34 +4092,45 @@ class LabJobStore:
         if target_status is JobStatus.FAILED:
             next_recoverable = bool(recoverable)
         next_fence = row_fence
-        if target_status is JobStatus.RUNNING:
+        if target_status is JobStatus.RUNNING or source_result_state is LabResultState.READY:
             next_fence = lease.fencing_token
-        result_state = LabResultState(str(row["result_state"]))
+        result_state = source_result_state
         if target_status is JobStatus.SUCCEEDED:
             raise InvalidJobTransitionError("job success requires a verified artifact commit")
         elif target_status in {JobStatus.FAILED, JobStatus.CANCELLED}:
             result_state = LabResultState.PENDING
-        connection.execute(
-            """
-            UPDATE lab_job
-            SET status = ?, control_intent = ?, version = ?, attempt_count = ?,
-                recoverable = ?, scheduler_fencing_token = ?, result_state = ?,
-                updated_at = ?
-            WHERE job_id = ? AND version = ?
-            """,
-            (
-                target_status.value,
-                ControlIntent.NONE.value,
+        ready_terminal_scope = nullcontext()
+        if LabResultState(str(row["result_state"])) is LabResultState.READY:
+            ready_terminal_scope = _write_authorization(connection).authorize_ready_terminal(
+                UUID(str(row["job_id"])),
+                target_status,
+                stored_version,
                 version,
-                attempt_count,
                 int(next_recoverable),
                 next_fence,
-                result_state.value,
-                _dump_time(now),
-                str(row["job_id"]),
-                stored_version,
-            ),
-        )
+            )
+        with ready_terminal_scope:
+            connection.execute(
+                """
+                UPDATE lab_job
+                SET status = ?, control_intent = ?, version = ?, attempt_count = ?,
+                    recoverable = ?, scheduler_fencing_token = ?, result_state = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND version = ?
+                """,
+                (
+                    target_status.value,
+                    ControlIntent.NONE.value,
+                    version,
+                    attempt_count,
+                    int(next_recoverable),
+                    next_fence,
+                    result_state.value,
+                    _dump_time(now),
+                    str(row["job_id"]),
+                    stored_version,
+                ),
+            )
         self._insert_event(
             connection,
             job_id=UUID(str(row["job_id"])),
@@ -5087,24 +5185,37 @@ class LabJobStore:
                         ShardStatus.CHECKPOINTED.value,
                     ),
                 )
-                cursor = connection.execute(
-                    """
-                    UPDATE lab_job
-                    SET status = ?, control_intent = ?, version = ?, recoverable = 0,
-                        scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
-                    WHERE job_id = ? AND version = ? AND status = ?
-                    """,
-                    (
-                        JobStatus.FAILED.value,
-                        ControlIntent.NONE.value,
-                        version + 1,
-                        LabResultState.PENDING.value,
-                        _dump_time(current),
-                        str(job_id),
+                ready_terminal_scope = nullcontext()
+                if LabResultState(str(row["result_state"])) is LabResultState.READY:
+                    ready_terminal_scope = _write_authorization(
+                        connection
+                    ).authorize_ready_terminal(
+                        job_id,
+                        JobStatus.FAILED,
                         version,
-                        source.value,
-                    ),
-                )
+                        version + 1,
+                        0,
+                        None,
+                    )
+                with ready_terminal_scope:
+                    cursor = connection.execute(
+                        """
+                        UPDATE lab_job
+                        SET status = ?, control_intent = ?, version = ?, recoverable = 0,
+                            scheduler_fencing_token = NULL, result_state = ?, updated_at = ?
+                        WHERE job_id = ? AND version = ? AND status = ?
+                        """,
+                        (
+                            JobStatus.FAILED.value,
+                            ControlIntent.NONE.value,
+                            version + 1,
+                            LabResultState.PENDING.value,
+                            _dump_time(current),
+                            str(job_id),
+                            version,
+                            source.value,
+                        ),
+                    )
                 if cursor.rowcount != 1:
                     raise StaleJobVersionError(
                         "job changed while applying ResearchRunSpec deadline"
@@ -6854,6 +6965,14 @@ CREATE TABLE IF NOT EXISTS lab_artifact_commit (
                 json_type(
                     commit_json, '$.commit.dataset_snapshot'
                 ) IS 'object'
+                AND json_remove(
+                    json_extract(
+                        commit_json, '$.commit.dataset_snapshot'
+                    ),
+                    '$.snapshot_id',
+                    '$.binding_hash',
+                    '$.audit_run_id'
+                ) = '{}'
                 AND json_type(
                     commit_json, '$.commit.dataset_snapshot.snapshot_id'
                 ) IS 'text'
@@ -6983,6 +7102,20 @@ def _dataset_snapshot_match_sql(
             {commit_json_expression}, '$.commit.dataset_snapshot'
         ) IS 'object'
         AND json_type({job_spec_expression}, '$.dataset_snapshot') IS 'object'
+        AND json_remove(
+            json_extract(
+                {commit_json_expression}, '$.commit.dataset_snapshot'
+            ),
+            '$.snapshot_id',
+            '$.binding_hash',
+            '$.audit_run_id'
+        ) = '{{}}'
+        AND json_remove(
+            json_extract({job_spec_expression}, '$.dataset_snapshot'),
+            '$.snapshot_id',
+            '$.binding_hash',
+            '$.audit_run_id'
+        ) = '{{}}'
         AND json_type(
             {commit_json_expression}, '$.commit.dataset_snapshot.snapshot_id'
         ) IS 'text'
@@ -7089,7 +7222,6 @@ WHEN (
         OR NEW.control_intent <> 'none'
         OR NEW.result_contract_version IS NOT '{COMPLETE_RESULT_CONTRACT_VERSION}'
         OR NEW.version <> OLD.version + 1
-        OR NEW.scheduler_fencing_token IS NOT OLD.scheduler_fencing_token
         OR NOT EXISTS (
             SELECT 1 FROM lab_shard shard WHERE shard.job_id = NEW.job_id
         )
@@ -7202,6 +7334,77 @@ WHEN {_SUBMIT_AUTH_FUNCTION}(NEW.job_id, NEW.spec_json) <> 1
  OR NEW.created_at <> NEW.updated_at
 BEGIN
     SELECT RAISE(ABORT, 'lab job submit insert is not authorized');
+END
+"""
+
+_V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_existing_key_no_insert
+BEFORE INSERT ON lab_job
+WHEN EXISTS (
+    SELECT 1 FROM lab_job existing WHERE existing.job_id = NEW.job_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'existing job key cannot be inserted or replaced');
+END
+"""
+
+# A ready row has no in-place lifecycle updates. Cancellation/deadline handling
+# uses the narrow terminal capability below; successful completion uses only the
+# artifact capability and may change the fence as part of that same transaction.
+_V5_COMPLETE_RESULT_READY_JOB_UPDATE_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_complete_result_ready_job_update
+BEFORE UPDATE ON lab_job
+WHEN OLD.requires_complete_result = 1
+ AND OLD.result_state = 'ready'
+ AND NOT (
+    NEW.job_id IS OLD.job_id
+    AND NEW.spec_json IS OLD.spec_json
+    AND NEW.spec_hash IS OLD.spec_hash
+    AND NEW.job_type IS OLD.job_type
+    AND NEW.resource_class IS OLD.resource_class
+    AND NEW.deadline IS OLD.deadline
+    AND NEW.attempt_count IS OLD.attempt_count
+    AND NEW.max_attempts IS OLD.max_attempts
+    AND NEW.created_at IS OLD.created_at
+    AND NEW.result_contract_version IS OLD.result_contract_version
+    AND NEW.requires_complete_result IS OLD.requires_complete_result
+    AND (
+      (
+        NEW.status = 'succeeded'
+        AND NEW.control_intent = 'none'
+        AND NEW.version = OLD.version + 1
+        AND NEW.recoverable IS OLD.recoverable
+        AND typeof(NEW.scheduler_fencing_token) = 'integer'
+        AND NEW.scheduler_fencing_token >= 1
+        AND NEW.result_state = 'sealed'
+        AND {_ARTIFACT_SUCCESS_AUTH_FUNCTION}(
+            NEW.job_id,
+            (SELECT commit_request_id FROM lab_job_result_artifact
+             WHERE job_id = NEW.job_id),
+            (SELECT evidence_json FROM lab_job_result_artifact
+             WHERE job_id = NEW.job_id),
+            OLD.version,
+            NEW.version
+        ) = 1
+      )
+      OR (
+        NEW.status IN ('failed', 'cancelled')
+        AND NEW.control_intent = 'none'
+        AND NEW.version = OLD.version + 1
+        AND NEW.result_state = 'pending'
+        AND {_READY_TERMINAL_AUTH_FUNCTION}(
+            NEW.job_id,
+            NEW.status,
+            OLD.version,
+            NEW.version,
+            NEW.recoverable,
+            NEW.scheduler_fencing_token
+        ) = 1
+      )
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'complete ready job ledger row is immutable');
 END
 """
 
@@ -7517,6 +7720,7 @@ _SCHEMA_STATEMENTS = tuple(
     _V5_JOB_RESULT_UPDATE_TRIGGER,
     _V5_JOB_RESULT_MARKER_IMMUTABLE_TRIGGER,
     _V5_COMPLETE_RESULT_JOB_NO_DELETE_TRIGGER,
+    _V5_COMPLETE_RESULT_READY_JOB_UPDATE_TRIGGER,
     _V5_COMPLETE_RESULT_SEALED_JOB_NO_UPDATE_TRIGGER,
     _V5_ARTIFACT_COMMIT_INSERT_TRIGGER,
     _V5_RESULT_ARTIFACT_INSERT_TRIGGER,
@@ -7527,4 +7731,5 @@ _SCHEMA_STATEMENTS = tuple(
     _V5_COMPLETE_RESULT_SHARD_NO_DELETE_TRIGGER,
     _V5_ARTIFACT_COMMIT_NO_UPDATE_TRIGGER,
     _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
+    _V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER,
 )

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 
 import rquant.lab_jobs as lab_jobs
 from rquant.lab_artifact_protocol import (
@@ -83,12 +84,13 @@ def _spec(
     *,
     deadline: datetime | None = None,
     with_dataset_snapshot: bool = True,
+    dataset_audit_run_id: str | None = "d" * 64,
 ) -> ResearchRunSpec:
     dataset_snapshot = (
         DatasetSnapshotIdentity(
             snapshot_id="a" * 64,
             binding_hash="b" * 64,
-            audit_run_id="d" * 64,
+            audit_run_id=dataset_audit_run_id,
         )
         if with_dataset_snapshot
         else None
@@ -116,7 +118,11 @@ def _spec(
         random_seed=20260724,
         resource_class=ResourceClass.STANDARD,
         deadline=deadline or datetime(2026, 7, 25, 2, tzinfo=UTC),
-        research_status="comparable" if dataset_snapshot is not None else "exploratory",
+        research_status=(
+            "comparable"
+            if dataset_snapshot is not None and dataset_snapshot.audit_run_id is not None
+            else "exploratory"
+        ),
     )
 
 
@@ -295,6 +301,7 @@ def _ready_artifact_commit_scenario(
     publish: bool = True,
     deadline: datetime | None = None,
     with_dataset_snapshot: bool = True,
+    dataset_audit_run_id: str | None = "d" * 64,
 ) -> tuple[
     LabJobStore,
     LabScheduler,
@@ -326,6 +333,7 @@ def _ready_artifact_commit_scenario(
         spec=_spec(
             deadline=deadline,
             with_dataset_snapshot=with_dataset_snapshot,
+            dataset_audit_run_id=dataset_audit_run_id,
         )
     )
     assert store.apply_command(submit, lease=scheduler.lease, now=NOW).status == "applied"
@@ -435,7 +443,7 @@ def test_ready_complete_result_cannot_regress_through_null_contract(
 
     with (
         store._connect() as connection,
-        pytest.raises(sqlite3.DatabaseError, match="consistent"),
+        pytest.raises(sqlite3.DatabaseError, match="consistent|immutable"),
     ):
         connection.execute(
             f"UPDATE lab_job SET {assignment} WHERE job_id = ?",
@@ -455,6 +463,194 @@ def test_ready_complete_result_cannot_regress_through_null_contract(
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "job_id = '00000000-0000-0000-0000-000000000001'",
+        "spec_json = json_set(spec_json, '$.random_seed', 999)",
+        f"spec_hash = '{'f' * 64}'",
+        "job_type = 'mutated-job-type'",
+        "resource_class = 'mutated-resource-class'",
+        "deadline = '2027-01-01T00:00:00.000000+00:00'",
+        "status = 'queued'",
+        "control_intent = 'cancel_requested'",
+        "version = version + 1",
+        "attempt_count = attempt_count + 1",
+        "max_attempts = max_attempts + 1",
+        "recoverable = 1",
+        "scheduler_fencing_token = scheduler_fencing_token + 1",
+        "created_at = '1999-01-01T00:00:00.000000+00:00'",
+        "updated_at = '2027-01-01T00:00:00.000000+00:00'",
+        "result_contract_version = 'mutated-contract'",
+        "result_state = 'pending'",
+        "requires_complete_result = 0",
+        (
+            "job_id = '00000000-0000-0000-0000-000000000001', "
+            "version = version + 5, attempt_count = attempt_count + 1, "
+            "created_at = '1999-01-01T00:00:00.000000+00:00'"
+        ),
+    ],
+    ids=[
+        "job-id",
+        "spec-json",
+        "spec-hash",
+        "job-type",
+        "resource-class",
+        "deadline",
+        "status",
+        "control-intent",
+        "version",
+        "attempt-count",
+        "max-attempts",
+        "recoverable",
+        "scheduler-fence",
+        "created-at",
+        "updated-at",
+        "result-contract",
+        "result-state",
+        "complete-result-marker",
+        "combined-with-job-id",
+    ],
+)
+def test_ready_complete_result_job_row_rejects_raw_sql_mutation(
+    tmp_path: Path,
+    assignment: str,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+
+    with store._connect() as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        with pytest.raises(sqlite3.DatabaseError, match="ready|immutable|consistent"):
+            connection.execute(
+                f"UPDATE lab_job SET {assignment} WHERE job_id = ?",
+                (str(job.job_id),),
+            )
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert persisted == job
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lab_shard WHERE job_id = ?",
+            (str(job.job_id),),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lab_job WHERE job_id = ?",
+            ("00000000-0000-0000-0000-000000000001",),
+        ).fetchone() == (0,)
+
+
+def test_external_sql_without_store_authorization_cannot_update_ready_job(
+    tmp_path: Path,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+
+    with (
+        sqlite3.connect(store.path) as connection,
+        pytest.raises(sqlite3.DatabaseError, match="function|authorized|immutable"),
+    ):
+        connection.execute(
+            "UPDATE lab_job SET created_at = updated_at WHERE job_id = ?",
+            (str(job.job_id),),
+        )
+
+
+_LAB_JOB_INSERT_COLUMNS = """
+    job_id, spec_json, spec_hash, job_type, resource_class, deadline,
+    status, control_intent, version, attempt_count, max_attempts,
+    recoverable, scheduler_fencing_token, created_at, updated_at,
+    result_contract_version, result_state, requires_complete_result
+"""
+
+_LAB_JOB_REPLACEMENT_SELECT = """
+    SELECT job_id, spec_json, spec_hash, job_type, resource_class, deadline,
+           'queued', 'none', 0, 0, max_attempts, 0, NULL,
+           created_at, created_at, NULL, 'pending', 1
+    FROM lab_job WHERE job_id = ?
+"""
+
+
+@pytest.mark.parametrize("result_state", ["ready", "sealed"])
+@pytest.mark.parametrize(
+    ("insert_prefix", "conflict_clause"),
+    [
+        ("REPLACE INTO", ""),
+        ("INSERT OR REPLACE INTO", ""),
+        (
+            "INSERT INTO",
+            "ON CONFLICT(job_id) DO UPDATE SET status = excluded.status, "
+            "result_state = excluded.result_state, version = excluded.version",
+        ),
+        (
+            "INSERT INTO",
+            "ON CONFLICT DO UPDATE SET status = excluded.status, "
+            "result_state = excluded.result_state, version = excluded.version",
+        ),
+        ("INSERT INTO", "ON CONFLICT(job_id) DO NOTHING"),
+    ],
+    ids=[
+        "replace",
+        "insert-or-replace",
+        "targeted-upsert",
+        "untargeted-upsert",
+        "do-nothing-upsert",
+    ],
+)
+def test_existing_ready_or_sealed_job_key_rejects_insert_replacement_forms(
+    tmp_path: Path,
+    result_state: str,
+    insert_prefix: str,
+    conflict_clause: str,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    if result_state == "sealed":
+        _spool.publish(_envelope)
+        scheduler.run_once()
+
+    statement = (
+        f"{insert_prefix} lab_job ({_LAB_JOB_INSERT_COLUMNS}) "
+        f"{_LAB_JOB_REPLACEMENT_SELECT} {conflict_clause}"
+    )
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        connection.create_function(
+            lab_jobs._SUBMIT_AUTH_FUNCTION,
+            2,
+            lambda _job_id, _spec_json: 1,
+        )
+        connection.create_function(
+            lab_jobs._RETRY_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        connection.create_function(
+            lab_jobs._READY_TERMINAL_AUTH_FUNCTION,
+            6,
+            lambda *_args: 1,
+        )
+        connection.create_function(
+            lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
+            5,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="existing job key"):
+            connection.execute(statement, (str(job.job_id),))
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    assert persisted is not None and persisted.result_state.value == result_state
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lab_shard WHERE job_id = ?",
+            (str(job.job_id),),
+        ).fetchone() == (1,)
 
 
 def test_reader_rejects_persisted_sealed_job_without_any_shards(tmp_path: Path) -> None:
@@ -521,13 +717,37 @@ def test_complete_sealed_job_row_is_immutable(
     scheduler.run_once()
 
     with (
-        sqlite3.connect(store.path) as connection,
+        store._connect() as connection,
         pytest.raises(sqlite3.DatabaseError, match="sealed|immutable"),
     ):
         connection.execute(
             f"UPDATE lab_job SET {assignment} WHERE job_id = ?",
             (str(job.job_id),),
         )
+
+
+def test_reader_checks_sealed_ledger_without_reopening_artifact_filesystem(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, sealed, _envelope, _clock = (
+        _ready_artifact_commit_scenario(tmp_path)
+    )
+    scheduler.run_once()
+    original_stat = Path.stat
+
+    def reject_artifact_stat(path: Path, *args: object, **kwargs: object) -> object:
+        if path == sealed.path or sealed.path in path.parents:
+            raise AssertionError("reader attempted live artifact filesystem verification")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", reject_artifact_stat)
+
+    persisted = LabJobReader(store.path).get_job(job.job_id)
+    evidence = LabJobReader(store.path).get_result_artifact(job.job_id)
+
+    assert persisted is not None and persisted.result_state is LabResultState.SEALED
+    assert evidence is not None and evidence.sealed_path == sealed.path
 
 
 def test_reader_rejects_accepted_commit_after_result_index_is_lost(tmp_path: Path) -> None:
@@ -669,6 +889,122 @@ def test_spoofed_authority_cannot_insert_malformed_dataset_snapshot(
             )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "extra_value"),
+    [
+        ("extra-key", True),
+        ("nested-extra-object", {"source": "review-probe"}),
+        ("alternate-snapshot-path", {"snapshot_id": "e" * 64}),
+        ("dotted-alternate-key", "e" * 64),
+    ],
+)
+def test_dataset_snapshot_extra_keys_are_rejected_by_protocol_and_sql(
+    tmp_path: Path,
+    mutation: str,
+    extra_value: object,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    raw_envelope = envelope.model_dump(mode="json")
+    snapshot = raw_envelope["commit"]["dataset_snapshot"]
+    assert isinstance(snapshot, dict)
+    extra_key = {
+        "extra-key": "unexpected",
+        "nested-extra-object": "metadata",
+        "alternate-snapshot-path": "snapshot",
+        "dotted-alternate-key": "snapshot_id.extra",
+    }[mutation]
+    snapshot[extra_key] = extra_value
+
+    with pytest.raises(ValidationError, match="extra"):
+        LabArtifactCommitEnvelope.model_validate(raw_envelope)
+
+    commit_json = json.dumps(raw_envelope, sort_keys=True, separators=(",", ":"))
+    timestamp = clock[0].isoformat(timespec="microseconds")
+    with sqlite3.connect(store.path) as connection:
+        connection.create_function(
+            lab_jobs._ARTIFACT_COMMIT_AUTH_FUNCTION,
+            3,
+            lambda *_args: 1,
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="CHECK|consistent"):
+            connection.execute(
+                """
+                INSERT INTO lab_artifact_commit (
+                    request_id, content_hash, job_id, commit_json,
+                    status, reason, receipt_json, receipt_job_version,
+                    received_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+                """,
+                (
+                    str(envelope.request_id),
+                    envelope.content_hash,
+                    str(job.job_id),
+                    commit_json,
+                    _canonical_json(receipt),
+                    receipt.job_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+
+def test_reader_rejects_stored_commit_with_dataset_snapshot_extra_key(
+    tmp_path: Path,
+) -> None:
+    store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    receipt = LabArtifactCommitReceipt.from_envelope(
+        envelope,
+        status="accepted",
+        reason="artifact_committed",
+        accepted_at=clock[0],
+        job_version=job.version + 1,
+    )
+    raw_envelope = envelope.model_dump(mode="json")
+    snapshot = raw_envelope["commit"]["dataset_snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["unexpected"] = {"alternate": {"snapshot_id": "e" * 64}}
+    commit_json = json.dumps(raw_envelope, sort_keys=True, separators=(",", ":"))
+    timestamp = clock[0].isoformat(timespec="microseconds")
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute("DROP TRIGGER trg_lab_artifact_commit_insert")
+        connection.execute(
+            """
+            INSERT INTO lab_artifact_commit (
+                request_id, content_hash, job_id, commit_json,
+                status, reason, receipt_json, receipt_job_version,
+                received_at, applied_at
+            ) VALUES (?, ?, ?, ?, 'accepted', 'artifact_committed', ?, ?, ?, ?)
+            """,
+            (
+                str(envelope.request_id),
+                envelope.content_hash,
+                str(job.job_id),
+                commit_json,
+                _canonical_json(receipt),
+                receipt.job_version,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(lab_jobs._V5_ARTIFACT_COMMIT_INSERT_TRIGGER)
+
+    with pytest.raises(InvalidStoredJobError, match="artifact commit|extra"):
+        LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+
+
 def test_spoofed_authority_cannot_omit_dataset_snapshot_field(tmp_path: Path) -> None:
     store, _scheduler, _spool, _artifacts, job, _sealed, envelope, clock = (
         _ready_artifact_commit_scenario(
@@ -717,15 +1053,25 @@ def test_spoofed_authority_cannot_omit_dataset_snapshot_field(tmp_path: Path) ->
             )
 
 
-@pytest.mark.parametrize("with_dataset_snapshot", [False, True], ids=["json-null", "complete"])
+@pytest.mark.parametrize(
+    ("with_dataset_snapshot", "dataset_audit_run_id"),
+    [
+        (False, None),
+        (True, None),
+        (True, "d" * 64),
+    ],
+    ids=["json-null", "full-object-audit-null", "full-object-audit-hash"],
+)
 def test_verified_commit_accepts_canonical_dataset_snapshot_shapes(
     tmp_path: Path,
     with_dataset_snapshot: bool,
+    dataset_audit_run_id: str | None,
 ) -> None:
     store, scheduler, _spool, _artifacts, job, _sealed, envelope, _clock = (
         _ready_artifact_commit_scenario(
             tmp_path,
             with_dataset_snapshot=with_dataset_snapshot,
+            dataset_audit_run_id=dataset_audit_run_id,
         )
     )
 
@@ -1140,6 +1486,49 @@ def test_cancel_wins_ready_artifact_commit_race_without_reviving_job(tmp_path: P
     assert record is not None and record.receipt.reason == "invalid_state:cancelled"
     assert LabJobReader(store.path).get_result_artifact(job.job_id) is None
     assert spool.pending() == ()
+
+
+def test_replacement_scheduler_can_cancel_ready_job_without_mutating_ready_first(
+    tmp_path: Path,
+) -> None:
+    store, scheduler, _spool, _artifacts, job, _sealed, _envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    scheduler.release()
+    clock[0] = NOW + timedelta(seconds=5)
+    replacement = LabScheduler(
+        store=store,
+        spool=LabCommandSpool(tmp_path / "replacement-cancel-commands"),
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        clock=lambda: clock[0],
+    )
+    replacement.run_once()
+    assert replacement.lease is not None
+    still_ready = LabJobReader(store.path).get_job(job.job_id)
+    assert still_ready == job
+
+    cancel = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=CancelJobCommand(
+            job_id=job.job_id,
+            expected_version=job.version,
+            reason="replacement scheduler cancellation",
+        ),
+    )
+    receipt = store.apply_command(
+        cancel,
+        lease=replacement.lease,
+        now=clock[0],
+    )
+
+    cancelled = LabJobReader(store.path).get_job(job.job_id)
+    assert receipt.status == "applied"
+    assert cancelled is not None and cancelled.status is JobStatus.CANCELLED
+    assert cancelled.result_state is LabResultState.PENDING
+    assert cancelled.scheduler_fencing_token == replacement.lease.fencing_token
 
 
 def test_pause_is_rejected_after_complete_result_becomes_ready(tmp_path: Path) -> None:
