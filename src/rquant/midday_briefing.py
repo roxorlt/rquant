@@ -889,6 +889,10 @@ def _delta(value: int | None) -> str:
     return f"({value:+d})" if value is not None else ""
 
 
+def _body_delta(value: int | None) -> str:
+    return f"（{value:+d}）" if value is not None else ""
+
+
 def render_pulse(view: PulseView) -> tuple[str, str]:
     """30 分钟脉搏报文（短，手机一屏）。返回 (title, body)。"""
     hhmm = view.slot_hhmm
@@ -902,26 +906,31 @@ def render_pulse(view: PulseView) -> tuple[str, str]:
     )
     lines = [
         f"# 脉搏 {hhmm}",
-        (
-            f"涨停 {view.limit_up_count}{_delta(view.limit_up_delta)} | "
-            f"炸板 {view.broken_count}{_delta(view.broken_delta)} | "
-            f"跌停 {view.limit_down_count} | 涨跌比 {view.up_count}/{view.down_count}"
-        ),
+        "",
+        "## 市场温度",
+        f"- 涨停：{view.limit_up_count}{_body_delta(view.limit_up_delta)}"
+        f" ｜ 炸板：{view.broken_count}{_body_delta(view.broken_delta)}"
+        f" ｜ 跌停：{view.limit_down_count}",
+        f"- 上涨：{view.up_count} ｜ 下跌：{view.down_count}",
     ]
     if view.has_prev and view.new_limit_ups:
-        parts = [f"{n.name}({n.theme})" if n.theme else n.name for n in view.new_limit_ups]
-        lines.append("新晋涨停：" + " ".join(parts))
-    if view.theme_heat:
-        heat = " | ".join(
-            f"{t.theme} {t.limit_up_count}板{_delta(t.delta)}" for t in view.theme_heat
+        lines.extend(["", "## 新晋涨停"])
+        lines.extend(
+            f"- {n.name} ｜ {n.theme}" if n.theme else f"- {n.name}"
+            for n in view.new_limit_ups
         )
-        lines.append("题材热度：" + heat)
+    if view.theme_heat:
+        lines.extend(["", "## 题材热度"])
+        lines.extend(
+            f"- {t.theme}：{t.limit_up_count}板{_body_delta(t.delta)}"
+            for t in view.theme_heat
+        )
     if view.new_anomalies:
-        anom = " ".join(f"{a.name}(量比{a.vol_ratio})" for a in view.new_anomalies)
-        prefix = "放量异动新增：" if view.has_prev else "放量异动："
-        lines.append(prefix + anom)
+        heading = "放量异动新增" if view.has_prev else "放量异动"
+        lines.extend(["", f"## {heading}"])
+        lines.extend(f"- {a.name}：量比 {a.vol_ratio}" for a in view.new_anomalies)
     if view.route.startswith("共享"):
-        lines.append(f"数据源：{view.route}")
+        lines.extend(["", f"> 数据源：{view.route}"])
     return title, "\n".join(lines)
 
 
