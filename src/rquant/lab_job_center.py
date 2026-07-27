@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from rquant.lab_job_protocol import (
     CancelJobCommand,
@@ -26,6 +26,7 @@ from rquant.lab_job_protocol import (
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
+    MAX_JOB_SHARDS,
     JobStatus,
     LabJobReader,
 )
@@ -47,9 +48,27 @@ from rquant.strategy_job_adapters import (
     NShapeCompareParameters,
     NShapeOptimizeParameters,
     build_adapter_execution_contract,
+    default_strategy_job_adapter_registry,
 )
 
 _CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
+_MAX_RESEARCH_DATE_SPAN_DAYS = 5 * 366
+_MAX_WALK_FORWARD_FOLDS = 64
+
+ResearchJobSubmissionErrorCode: TypeAlias = Literal[
+    "input_bounds",
+    "adapter_plan",
+    "shard_budget",
+    "resource_budget",
+]
+
+
+class ResearchJobSubmissionError(ValueError):
+    """Typed deterministic failure before a create command can be published."""
+
+    def __init__(self, code: ResearchJobSubmissionErrorCode, message: str) -> None:
+        self.code = code
+        super().__init__(f"research submission preflight [{code}]: {message}")
 
 
 class JobCenterModel(BaseModel):
@@ -111,6 +130,31 @@ class ResearchJobSubmission(JobCenterModel):
         if self.command.spec != self.spec:
             raise ValueError("create-job command does not contain the canonical run spec")
         return self
+
+
+class _ResearchPlanBudget(JobCenterModel):
+    max_shards: int = Field(ge=1, le=MAX_JOB_SHARDS)
+    max_work_units: int = Field(ge=1)
+    max_static_duration_ms: int = Field(ge=1)
+
+
+_RESEARCH_PLAN_BUDGETS: dict[ResourceClass, _ResearchPlanBudget] = {
+    ResourceClass.INTERACTIVE: _ResearchPlanBudget(
+        max_shards=16,
+        max_work_units=2_000,
+        max_static_duration_ms=60 * 60 * 1_000,
+    ),
+    ResourceClass.STANDARD: _ResearchPlanBudget(
+        max_shards=64,
+        max_work_units=100_000,
+        max_static_duration_ms=24 * 60 * 60 * 1_000,
+    ),
+    ResourceClass.HEAVY: _ResearchPlanBudget(
+        max_shards=MAX_JOB_SHARDS,
+        max_work_units=1_000_000,
+        max_static_duration_ms=7 * 24 * 60 * 60 * 1_000,
+    ),
+}
 
 
 def _research_parameter(name: str, value: object) -> ResearchParameter:
@@ -183,6 +227,84 @@ def _validate_gate_snapshot(
         raise ValueError("formal snapshot binding conflicts with the research gate")
 
 
+def _validate_run_input_bounds(run_input: ResearchRunInput) -> None:
+    span_days = (run_input.end_date - run_input.start_date).days + 1
+    if span_days > _MAX_RESEARCH_DATE_SPAN_DAYS:
+        raise ResearchJobSubmissionError(
+            "input_bounds",
+            f"research date span exceeds {_MAX_RESEARCH_DATE_SPAN_DAYS} days",
+        )
+    parameters = run_input.parameters
+    if isinstance(parameters, NShapeCompareParameters):
+        lengths = (
+            ("hold_days", len(parameters.hold_days), 20),
+            ("entry_modes", len(parameters.entry_modes), 6),
+            ("profile_variants", len(parameters.profile_variants), 3),
+        )
+    elif isinstance(parameters, NShapeOptimizeParameters):
+        lengths = (
+            ("hold_days", len(parameters.hold_days), 20),
+            ("entry_modes", len(parameters.entry_modes), 6),
+            ("profile_variants", len(parameters.profile_variants), 3),
+            ("top_n_options", len(parameters.top_n_options), 32),
+            ("score_profile_names", len(parameters.score_profile_names), 11),
+        )
+        if parameters.walk_forward_folds > _MAX_WALK_FORWARD_FOLDS:
+            raise ResearchJobSubmissionError(
+                "input_bounds",
+                f"walk_forward_folds exceeds {_MAX_WALK_FORWARD_FOLDS}",
+            )
+        if any(value > 1_000 for value in parameters.top_n_options):
+            raise ResearchJobSubmissionError(
+                "input_bounds",
+                "top_n_options values cannot exceed 1000",
+            )
+    elif isinstance(parameters, GrowthBoardSurgeParameters):
+        lengths = (("variants", len(parameters.variants), 5),)
+    else:
+        lengths = ()
+    for field_name, observed, maximum in lengths:
+        if observed > maximum:
+            raise ResearchJobSubmissionError(
+                "input_bounds",
+                f"{field_name} cannot contain more than {maximum} values",
+            )
+
+
+def _preflight_research_plan(spec: ResearchRunSpec) -> None:
+    try:
+        definitions = default_strategy_job_adapter_registry().plan(spec)
+    except (OverflowError, TypeError, ValueError, ValidationError) as exc:
+        raise ResearchJobSubmissionError("adapter_plan", str(exc)) from exc
+    if len(definitions) > MAX_JOB_SHARDS:
+        raise ResearchJobSubmissionError(
+            "shard_budget",
+            f"adapter plan exceeds authoritative {MAX_JOB_SHARDS} shard limit",
+        )
+    budget = _RESEARCH_PLAN_BUDGETS[spec.resource_class]
+    if len(definitions) > budget.max_shards:
+        raise ResearchJobSubmissionError(
+            "resource_budget",
+            f"{spec.resource_class.value} plan exceeds {budget.max_shards} shard budget",
+        )
+    work_units = 0
+    static_duration_ms = 0
+    for definition in definitions:
+        work_plan = definition.work_plan
+        if work_plan is None:
+            raise ResearchJobSubmissionError(
+                "adapter_plan",
+                "adapter preflight requires an explicit work plan for every shard",
+            )
+        work_units += work_plan.work_units
+        static_duration_ms += work_plan.static_duration_ms
+        if work_units > budget.max_work_units or static_duration_ms > budget.max_static_duration_ms:
+            raise ResearchJobSubmissionError(
+                "resource_budget",
+                f"{spec.resource_class.value} plan exceeds work-unit or duration budget",
+            )
+
+
 def build_research_job_submission(
     run_input: ResearchRunInput,
     *,
@@ -205,30 +327,35 @@ def build_research_job_submission(
         raise ValueError("code SHA must be an exact clean 40-character lowercase hex commit")
     _validate_gate_snapshot(decision, dataset_snapshot)
     strategy_name, job_type, adapter_id, typed_parameters = _run_identity(run_input)
+    _validate_run_input_bounds(run_input)
     expected_contract = build_adapter_execution_contract(adapter_id, "1", code_sha)
     if feature_contract != expected_contract:
         raise ValueError("feature contract does not match the typed adapter and code SHA")
-    arguments = tuple(
-        _research_parameter(name, getattr(typed_parameters, name))
-        for name in type(typed_parameters).model_fields
-    )
-    spec = ResearchRunSpec(
-        job_type=job_type,
-        parameters=ResearchRunParameters(
-            strategy_name=strategy_name,
-            start_date=run_input.start_date,
-            end_date=run_input.end_date,
-            arguments=arguments,
-        ),
-        code_sha=code_sha,
-        dataset_snapshot=dataset_snapshot,
-        feature_contract=feature_contract,
-        execution_costs=execution_costs,
-        random_seed=random_seed,
-        resource_class=resource_class,
-        deadline=deadline,
-        research_status=decision.research_status,
-    )
+    try:
+        arguments = tuple(
+            _research_parameter(name, getattr(typed_parameters, name))
+            for name in type(typed_parameters).model_fields
+        )
+        spec = ResearchRunSpec(
+            job_type=job_type,
+            parameters=ResearchRunParameters(
+                strategy_name=strategy_name,
+                start_date=run_input.start_date,
+                end_date=run_input.end_date,
+                arguments=arguments,
+            ),
+            code_sha=code_sha,
+            dataset_snapshot=dataset_snapshot,
+            feature_contract=feature_contract,
+            execution_costs=execution_costs,
+            random_seed=random_seed,
+            resource_class=resource_class,
+            deadline=deadline,
+            research_status=decision.research_status,
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
+    _preflight_research_plan(spec)
     command = SubmitJobCommand(
         job_id=job_id,
         spec=spec,

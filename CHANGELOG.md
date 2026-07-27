@@ -60,6 +60,15 @@
 
 ### Fixed
 
+- **Strategy Lab job center quality review 加固**：任务列表 cursor 改为绑定 filter identity 与
+  schema version 的 immutable `created_at + job_id` keyset，分页明确为 live query 而非
+  snapshot，job 状态更新不再导致初始序列漏项。Parquet preview 在 materialize 前校验全部
+  row-group uncompressed bytes，并累计 Arrow batch、单 cell 与 serialized output 预算，不再
+  整批 `to_pylist()`。typed research factory 现在以 canonical adapter registry 做无数据访问
+  plan preflight，统一拒绝超日期/cardinality/fold、128 shards 与 resource work-unit/duration
+  预算的 create command；ETA reader 则在读取任何 sample 前以 `MAX_JOB_SHARDS+1` 探针拒绝
+  损坏的 completed/remaining 总图。
+
 - **Strategy Lab job center 有界查询审查修复**：任务筛选 enum tuple 现在先限制原始长度，
   再 canonical 去重排序，并对过滤器与 cursor 的 SQLite 参数设总预算。ledger 统一采用
   `MAX_JOB_SHARDS=128`，规划在写入前拒绝超限，reader 的 remaining-shard 查询用 `MAX+1`

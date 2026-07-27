@@ -23,7 +23,9 @@ from rquant.lab_job_protocol import (
     ResumeJobCommand,
 )
 from rquant.lab_jobs import (
+    MAX_JOB_SHARDS,
     ControlIntent,
+    InvalidStoredJobError,
     JobStatus,
     LabJobReader,
     LabJobStore,
@@ -366,18 +368,12 @@ def test_near_bound_offsets_normalize_across_eta_models_and_reader(
     assert projection.as_of == expected
 
 
-def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
-    tmp_path: Path,
-) -> None:
-    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
-    store.initialize()
-    lease = _lease(store)
-    job = _submit_job(store, lease)
+def _insert_completed_eta_shards(store: LabJobStore, job_id: UUID, count: int) -> None:
     timestamp = AS_OF.isoformat(timespec="microseconds")
     rows = tuple(
         (
             str(UUID(int=index + 1)),
-            str(job.job_id),
+            str(job_id),
             index,
             "succeeded",
             1,
@@ -400,7 +396,7 @@ def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
             timestamp,
             timestamp,
         )
-        for index in range(10_000)
+        for index in range(count)
     )
     with sqlite3.connect(store.path) as connection:
         connection.executemany(
@@ -418,6 +414,43 @@ def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
             """,
             rows,
         )
+
+
+def test_eta_reader_rejects_10k_completed_graph_before_sampling(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job = _submit_job(store, _lease(store))
+    _insert_completed_eta_shards(store, job.job_id, 10_000)
+    reader = LabJobReader(store.path)
+    statements: list[str] = []
+    original_connect = reader._connect
+
+    def traced_connect():  # type: ignore[no-untyped-def]
+        connection = original_connect()
+        connection.set_trace_callback(
+            lambda statement: statements.append(" ".join(statement.split()))
+        )
+        return connection
+
+    reader._connect = traced_connect  # type: ignore[method-assign]
+
+    with pytest.raises(InvalidStoredJobError, match="shard count"):
+        reader.get_eta_input(job.job_id, as_of=AS_OF, completed_limit=128)
+
+    assert any(
+        "FROM lab_shard" in statement and "LIMIT 129" in statement for statement in statements
+    )
+    assert not any("completion_sequence FROM lab_shard" in statement for statement in statements)
+
+
+def test_eta_reader_bounds_valid_completed_history_and_uses_completion_index(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job = _submit_job(store, _lease(store))
+    _insert_completed_eta_shards(store, job.job_id, MAX_JOB_SHARDS)
+    with sqlite3.connect(store.path) as connection:
         query_plan = tuple(
             str(row[3])
             for row in connection.execute(
@@ -435,33 +468,6 @@ def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
                 (str(job.job_id), 128),
             )
         )
-        remaining_query_plan = tuple(
-            str(row[3])
-            for row in connection.execute(
-                """
-                EXPLAIN QUERY PLAN
-                SELECT shard_id, phase, work_unit_name, work_units,
-                       static_duration_ms
-                FROM lab_shard INDEXED BY ix_lab_shard_job_status_index
-                WHERE job_id = ?
-                  AND status IN ('queued', 'running', 'checkpointed')
-                ORDER BY shard_index, shard_id
-                """,
-                (str(job.job_id),),
-            )
-        )
-        sequence_query_plan = tuple(
-            str(row[3])
-            for row in connection.execute(
-                """
-                EXPLAIN QUERY PLAN
-                SELECT MAX(completion_sequence) FROM lab_shard
-                WHERE job_id = ? AND status = 'succeeded'
-                  AND completion_sequence IS NOT NULL
-                """,
-                (str(job.job_id),),
-            )
-        )
 
     projection = LabJobReader(store.path).get_eta_input(
         job.job_id,
@@ -470,12 +476,10 @@ def test_eta_reader_bounds_10k_completed_history_and_uses_completion_index(
     )
 
     assert projection is not None
-    assert len(projection.completed) == 128
-    assert projection.completed[0].completion_sequence == 9_873
-    assert projection.completed[-1].completion_sequence == 10_000
+    assert len(projection.completed) == MAX_JOB_SHARDS
+    assert projection.completed[0].completion_sequence == 1
+    assert projection.completed[-1].completion_sequence == MAX_JOB_SHARDS
     assert any("ix_lab_shard_job_completion_sequence" in step for step in query_plan)
-    assert any("ix_lab_shard_job_status_index" in step for step in remaining_query_plan)
-    assert any("ix_lab_shard_job_completion_sequence" in step for step in sequence_query_plan)
 
 
 def _seed_eta_job_with_terminal_shards(

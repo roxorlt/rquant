@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from rquant.lab_job_protocol import CancelJobCommand, LabCommandEnvelope
 from rquant.lab_jobs import (
     LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX,
     LAB_JOB_LIST_QUERY_PARAMETER_MAX,
@@ -95,6 +98,91 @@ def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(
         statement for statement in reader.statements if statement.startswith(("SELECT", "WITH"))
     ]
     assert len(selects) == 2 * 8
+    assert reader.statements.count("BEGIN") == 8
+    assert reader.statements.count("COMMIT") == 8
+
+
+def test_list_jobs_immutable_cursor_survives_updates_and_live_insert(
+    tmp_path: Path,
+) -> None:
+    store, initial_ids = _seed_jobs(tmp_path, 25)
+    reader = LabJobReader(store.path)
+    first = reader.list_jobs(limit=7)
+    assert first.next_cursor is not None
+    assert first.total_count == 25
+
+    leases = reader.list_leases()
+    assert len(leases) == 1
+    lease = leases[0]
+    unseen_id = initial_ids[0]
+    unseen = reader.get_job(unseen_id)
+    assert unseen is not None
+    cancelled = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=CancelJobCommand(
+                job_id=unseen_id,
+                expected_version=unseen.version,
+                reason="concurrent status update",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=200),
+    )
+    inserted_id = UUID(int=10_000)
+    inserted = store.apply_command(
+        _submit(job_id=inserted_id, spec=_spec()),
+        lease=lease,
+        now=NOW + timedelta(seconds=201),
+    )
+    assert cancelled.status == inserted.status == "applied"
+
+    observed = [item.job_id for item in first.items]
+    cursor = first.next_cursor
+    live_totals: list[int] = []
+    while cursor is not None:
+        page = reader.list_jobs(limit=7, cursor=cursor)
+        observed.extend(item.job_id for item in page.items)
+        live_totals.append(page.total_count)
+        assert page.has_more is (page.next_cursor is not None)
+        cursor = page.next_cursor
+
+    assert observed == list(reversed(initial_ids))
+    assert len(observed) == len(set(observed)) == len(initial_ids)
+    assert inserted_id not in observed
+    assert live_totals and set(live_totals) == {26}
+
+
+def test_list_jobs_cursor_is_versioned_and_bound_to_filter_identity(tmp_path: Path) -> None:
+    store, _ = _seed_jobs(tmp_path, 4)
+    reader = LabJobReader(store.path)
+    queued_filter = LabJobListFilters(statuses=(JobStatus.QUEUED,))
+    first = reader.list_jobs(filters=queued_filter, limit=2)
+    assert first.next_cursor is not None
+
+    padding = "=" * (-len(first.next_cursor) % 4)
+    payload = json.loads(urlsafe_b64decode(f"{first.next_cursor}{padding}"))
+    assert payload["cursor_type"] == "lab_job_list"
+    assert payload["schema_version"] == 1
+    assert payload["filter_identity"]
+
+    with pytest.raises(ValueError, match="cursor.*filter"):
+        reader.list_jobs(
+            filters=LabJobListFilters(job_types=(ResearchJobType.PARAMETER_SEARCH,)),
+            limit=2,
+            cursor=first.next_cursor,
+        )
+
+    payload["schema_version"] = 2
+    unsupported = (
+        urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    with pytest.raises(ValueError, match="cursor"):
+        reader.list_jobs(filters=queued_filter, limit=2, cursor=unsupported)
 
 
 def test_list_jobs_combines_status_type_resource_date_and_keyword_filters(
@@ -243,8 +331,9 @@ def test_eta_and_detail_fail_closed_on_damaged_oversized_remaining_shard_graph(
     eta_selects = [
         statement for statement in eta_reader.statements if statement.startswith("SELECT")
     ]
-    assert len(eta_selects) == 3
+    assert len(eta_selects) == 2
     assert any(f"LIMIT {MAX_JOB_SHARDS + 1}" in statement for statement in eta_selects)
+    assert not any("completion_sequence FROM lab_shard" in statement for statement in eta_selects)
     with pytest.raises(InvalidStoredJobError, match="shard limit"):
         eta_reader.list_shards(job_ids[0])
 

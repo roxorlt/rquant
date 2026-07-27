@@ -899,6 +899,19 @@ class LabJobListFilters(LabRecordModel):
         return self
 
 
+class _LabJobListCursor(LabRecordModel):
+    cursor_type: Literal["lab_job_list"] = "lab_job_list"
+    schema_version: Literal[1] = 1
+    filter_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime
+    job_id: UUID
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime) -> datetime:
+        return _utc(value)
+
+
 LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX = (
     len(JobStatus) + len(ResearchJobType) + len(ResourceClass) + 5
 )
@@ -954,6 +967,14 @@ class LabJobSummary(LabRecordModel):
 
 
 class LabJobPage(LabRecordModel):
+    """One live-query page, not a database snapshot.
+
+    ``total_count`` is recomputed for the current filters on every call.
+    ``has_more`` only reports whether the current live result has another row
+    after this page's immutable keyset boundary. Mutable filter membership,
+    including status, may change between page requests.
+    """
+
     items: tuple[LabJobSummary, ...]
     total_count: int = Field(ge=0)
     has_more: bool
@@ -3529,6 +3550,50 @@ class LabJobReader:
             raise ValueError("invalid opaque job cursor") from exc
 
     @staticmethod
+    def _job_list_filter_identity(filters: LabJobListFilters) -> str:
+        return hashlib.sha256(_canonical_model_json(filters).encode("ascii")).hexdigest()
+
+    @classmethod
+    def _encode_job_list_cursor(
+        cls,
+        *,
+        created_at: datetime,
+        job_id: UUID,
+        filters: LabJobListFilters,
+    ) -> str:
+        value = _LabJobListCursor(
+            filter_identity=cls._job_list_filter_identity(filters),
+            created_at=created_at,
+            job_id=job_id,
+        )
+        payload = _canonical_model_json(value).encode("ascii")
+        return urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @classmethod
+    def _decode_job_list_cursor(
+        cls,
+        cursor: str,
+        *,
+        filters: LabJobListFilters,
+    ) -> _LabJobListCursor:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = urlsafe_b64decode(f"{cursor}{padding}".encode("ascii"))
+            value = _LabJobListCursor.model_validate_json(payload)
+            canonical = (
+                urlsafe_b64encode(_canonical_model_json(value).encode("ascii"))
+                .decode("ascii")
+                .rstrip("=")
+            )
+            if canonical != cursor:
+                raise ValueError
+        except Exception as exc:
+            raise ValueError("invalid opaque job list cursor") from exc
+        if value.filter_identity != cls._job_list_filter_identity(filters):
+            raise ValueError("job list cursor filter identity does not match filters")
+        return value
+
+    @staticmethod
     def _progress_from_row(row: sqlite3.Row) -> LabJobProgress:
         total = _strict_sqlite_int(row["shard_count"], field="shard_count", minimum=0)
         if total > MAX_JOB_SHARDS:
@@ -3723,6 +3788,13 @@ class LabJobReader:
         limit: int = 50,
         cursor: str | None = None,
     ) -> LabJobPage:
+        """Return a live filtered page ordered by immutable job creation identity.
+
+        The cursor is filter-bound and protects keyset continuity for jobs that
+        existed in the initial ordering. It does not freeze mutable filter
+        membership or counts; callers needing snapshot semantics need a
+        separately versioned snapshot API.
+        """
         if not 1 <= limit <= LAB_JOB_LIST_LIMIT_MAX:
             raise ValueError(f"limit must be between 1 and {LAB_JOB_LIST_LIMIT_MAX}")
         selected_filters = LabJobListFilters.model_validate(filters or LabJobListFilters())
@@ -3731,13 +3803,15 @@ class LabJobReader:
         page_clauses = list(clauses)
         page_parameters = list(parameters)
         if cursor is not None:
-            cursor_time, cursor_id = self._decode_cursor(cursor)
-            page_clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
-            page_parameters.extend((cursor_time, cursor_time, str(cursor_id)))
+            decoded_cursor = self._decode_job_list_cursor(cursor, filters=selected_filters)
+            cursor_time = _dump_time(decoded_cursor.created_at)
+            page_clauses.append("(j.created_at < ? OR (j.created_at = ? AND j.job_id < ?))")
+            page_parameters.extend((cursor_time, cursor_time, str(decoded_cursor.job_id)))
         if len(page_parameters) + 1 > LAB_JOB_LIST_QUERY_PARAMETER_MAX:
             raise ValueError("job list query exceeds the SQL parameter budget")
         page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
         with self._connect() as connection:
+            connection.execute("BEGIN")
             total_row = connection.execute(
                 f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
                 parameters,
@@ -3746,16 +3820,21 @@ class LabJobReader:
                 f"{self._summary_stats_sql()} "
                 f"SELECT {self._summary_columns_sql()} FROM lab_job AS j "
                 f"LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id{page_where} "
-                "ORDER BY j.updated_at DESC, j.job_id DESC LIMIT ?",
+                "ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?",
                 (*page_parameters, limit + 1),
             ).fetchall()
+            connection.execute("COMMIT")
         assert total_row is not None
         total_count = _strict_sqlite_int(total_row["total_count"], field="total_count", minimum=0)
         has_more = len(rows) > limit
         visible = rows[:limit]
         items = tuple(self._summary_from_row(row) for row in visible)
         next_cursor = (
-            self._encode_cursor(items[-1].updated_at, items[-1].job_id)
+            self._encode_job_list_cursor(
+                created_at=items[-1].created_at,
+                job_id=items[-1].job_id,
+                filters=selected_filters,
+            )
             if has_more and items
             else None
         )
@@ -4346,6 +4425,14 @@ class LabJobReader:
             ).fetchone()
             if job_row is None:
                 return None
+            shard_count_probe = connection.execute(
+                "SELECT 1 FROM lab_shard WHERE job_id = ? LIMIT ?",
+                (str(job_id), MAX_JOB_SHARDS + 1),
+            ).fetchall()
+            if len(shard_count_probe) > MAX_JOB_SHARDS:
+                raise InvalidStoredJobError(
+                    f"job shard count exceeds authoritative shard limit {MAX_JOB_SHARDS}"
+                )
             completed_rows = connection.execute(
                 """
                 SELECT shard_id, phase, work_unit_name, work_units,

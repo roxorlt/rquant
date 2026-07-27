@@ -7,6 +7,7 @@ import json
 import math
 import os
 import stat
+import struct
 from contextlib import suppress
 from datetime import date, datetime
 from decimal import Decimal
@@ -14,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import TypeAlias
 from uuid import UUID
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -173,6 +175,10 @@ class ArtifactPreviewReader:
         max_manifest_bytes: int = 1024 * 1024,
         max_preview_rows: int = 100,
         max_preview_columns: int = 40,
+        max_parquet_uncompressed_bytes: int = 32 * 1024 * 1024,
+        max_preview_arrow_bytes: int = 8 * 1024 * 1024,
+        max_preview_cell_bytes: int = 1024 * 1024,
+        max_preview_serialized_bytes: int = 2 * 1024 * 1024,
     ) -> None:
         limits = (
             max_bundle_bytes,
@@ -181,6 +187,10 @@ class ArtifactPreviewReader:
             max_manifest_bytes,
             max_preview_rows,
             max_preview_columns,
+            max_parquet_uncompressed_bytes,
+            max_preview_arrow_bytes,
+            max_preview_cell_bytes,
+            max_preview_serialized_bytes,
         )
         if any(type(value) is not int or value < 1 for value in limits):
             raise ValueError("artifact preview limits must be positive integers")
@@ -192,6 +202,10 @@ class ArtifactPreviewReader:
         self.max_manifest_bytes = max_manifest_bytes
         self.max_preview_rows = max_preview_rows
         self.max_preview_columns = max_preview_columns
+        self.max_parquet_uncompressed_bytes = max_parquet_uncompressed_bytes
+        self.max_preview_arrow_bytes = max_preview_arrow_bytes
+        self.max_preview_cell_bytes = max_preview_cell_bytes
+        self.max_preview_serialized_bytes = max_preview_serialized_bytes
 
     @staticmethod
     def _open_directory(parent: int | Path, name: str | None = None) -> int:
@@ -248,6 +262,136 @@ class ArtifactPreviewReader:
             raise ArtifactPreviewIntegrityError(
                 "artifact manifest conflicts with scheduler result evidence"
             )
+
+    @staticmethod
+    def _variable_cell_bytes(array: pa.Array, index: int) -> int | None:
+        data_type = array.type
+        if not (
+            pa.types.is_string(data_type)
+            or pa.types.is_large_string(data_type)
+            or pa.types.is_binary(data_type)
+            or pa.types.is_large_binary(data_type)
+        ):
+            return None
+        if not array[index].is_valid:
+            return 0
+        buffers = array.buffers()
+        offsets = buffers[1]
+        if offsets is None:
+            raise ArtifactPreviewIntegrityError("Parquet variable cell has no offsets")
+        width = (
+            8 if pa.types.is_large_string(data_type) or pa.types.is_large_binary(data_type) else 4
+        )
+        format_code = "<q" if width == 8 else "<i"
+        offset_index = array.offset + index
+        view = memoryview(offsets)
+        start = struct.unpack_from(format_code, view, offset_index * width)[0]
+        end = struct.unpack_from(format_code, view, (offset_index + 1) * width)[0]
+        if start < 0 or end < start:
+            raise ArtifactPreviewIntegrityError("Parquet variable cell offsets are invalid")
+        return end - start
+
+    @staticmethod
+    def _arrow_preview_type_supported(data_type: pa.DataType) -> bool:
+        return any(
+            predicate(data_type)
+            for predicate in (
+                pa.types.is_boolean,
+                pa.types.is_integer,
+                pa.types.is_floating,
+                pa.types.is_decimal,
+                pa.types.is_date,
+                pa.types.is_timestamp,
+                pa.types.is_string,
+                pa.types.is_large_string,
+                pa.types.is_binary,
+                pa.types.is_large_binary,
+            )
+        )
+
+    def _read_parquet_preview_rows(
+        self,
+        descriptor: int,
+        *,
+        relative_path: str,
+        expected_rows: int,
+        expected_columns: tuple[str, ...],
+        selected_columns: tuple[str, ...],
+        row_limit: int,
+    ) -> tuple[tuple[ArtifactScalar, ...], ...]:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            parquet_file = pq.ParquetFile(stream)
+            metadata = parquet_file.metadata
+            if (
+                metadata.num_rows != expected_rows
+                or tuple(parquet_file.schema_arrow.names) != expected_columns
+            ):
+                raise ArtifactPreviewIntegrityError(f"Parquet metadata conflicts: {relative_path}")
+            uncompressed_bytes = 0
+            for row_group_index in range(metadata.num_row_groups):
+                row_group_bytes = metadata.row_group(row_group_index).total_byte_size
+                if type(row_group_bytes) is not int or row_group_bytes < 0:
+                    raise ArtifactPreviewIntegrityError(
+                        f"Parquet row-group metadata is invalid: {relative_path}"
+                    )
+                uncompressed_bytes += row_group_bytes
+                if uncompressed_bytes > self.max_parquet_uncompressed_bytes:
+                    raise ArtifactPreviewIntegrityError(
+                        f"Parquet uncompressed data exceeds preview budget: {relative_path}"
+                    )
+            for column_name in selected_columns:
+                data_type = parquet_file.schema_arrow.field(column_name).type
+                if not self._arrow_preview_type_supported(data_type):
+                    raise ArtifactPreviewIntegrityError(
+                        f"Parquet preview contains unsupported type {data_type}"
+                    )
+
+            rows: list[tuple[ArtifactScalar, ...]] = []
+            arrow_bytes = 0
+            serialized_bytes = 2
+            if not selected_columns or expected_rows == 0:
+                return ()
+            for batch in parquet_file.iter_batches(
+                batch_size=min(row_limit, self.max_preview_rows),
+                columns=list(selected_columns),
+            ):
+                arrow_bytes += batch.nbytes
+                if arrow_bytes > self.max_preview_arrow_bytes:
+                    raise ArtifactPreviewIntegrityError(
+                        f"Parquet materialized Arrow data exceeds preview budget: {relative_path}"
+                    )
+                for row_index in range(batch.num_rows):
+                    if len(rows) >= row_limit:
+                        return tuple(rows)
+                    row: list[ArtifactScalar] = []
+                    row_serialized_bytes = 2
+                    for column_index in range(batch.num_columns):
+                        array = batch.column(column_index)
+                        cell_bytes = self._variable_cell_bytes(array, row_index)
+                        if cell_bytes is not None and cell_bytes > self.max_preview_cell_bytes:
+                            raise ArtifactPreviewIntegrityError(
+                                f"Parquet preview cell exceeds byte budget: {relative_path}"
+                            )
+                        value = _preview_scalar(array[row_index].as_py())
+                        encoded = json.dumps(
+                            value,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode("utf-8")
+                        row_serialized_bytes += len(encoded) + (1 if row else 0)
+                        if (
+                            serialized_bytes + row_serialized_bytes + (1 if rows else 0)
+                            > self.max_preview_serialized_bytes
+                        ):
+                            raise ArtifactPreviewIntegrityError(
+                                f"Parquet serialized preview exceeds byte budget: {relative_path}"
+                            )
+                        row.append(value)
+                    serialized_bytes += row_serialized_bytes + (1 if rows else 0)
+                    rows.append(tuple(row))
+            return tuple(rows)
 
     def preview(
         self,
@@ -435,28 +579,14 @@ class ArtifactPreviewReader:
             parquet = selected.parquet
             columns = parquet.columns[:column_limit]
             parquet_fd = opened_files[selected.relative_path]
-            os.lseek(parquet_fd, 0, os.SEEK_SET)
-            with os.fdopen(os.dup(parquet_fd), "rb") as stream:
-                parquet_file = pq.ParquetFile(stream)
-                if (
-                    parquet_file.metadata.num_rows != parquet.row_count
-                    or tuple(parquet_file.schema_arrow.names) != parquet.columns
-                ):
-                    raise ArtifactPreviewIntegrityError(
-                        f"Parquet metadata conflicts: {selected.relative_path}"
-                    )
-                rows: tuple[tuple[ArtifactScalar, ...], ...] = ()
-                if columns and parquet.row_count:
-                    batches = parquet_file.iter_batches(
-                        batch_size=row_limit,
-                        columns=list(columns),
-                    )
-                    batch = next(batches, None)
-                    if batch is not None:
-                        rows = tuple(
-                            tuple(_preview_scalar(value) for value in row.values())
-                            for row in batch.to_pylist()
-                        )
+            rows = self._read_parquet_preview_rows(
+                parquet_fd,
+                relative_path=selected.relative_path,
+                expected_rows=parquet.row_count,
+                expected_columns=parquet.columns,
+                selected_columns=columns,
+                row_limit=row_limit,
+            )
             table = ArtifactTablePreview(
                 table_name=selected_name,
                 total_rows=parquet.row_count,

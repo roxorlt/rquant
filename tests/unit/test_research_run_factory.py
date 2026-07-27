@@ -106,6 +106,21 @@ RUN_INPUTS = (
 )
 
 
+def _build(run_input: object, *, resource_class: ResourceClass = ResourceClass.STANDARD):
+    return build_research_job_submission(
+        run_input,
+        gate_decision=_gate(formal=False),
+        code_sha="1" * 40,
+        dataset_snapshot=None,
+        feature_contract=_contract(run_input),
+        execution_costs=_costs(),
+        random_seed=7,
+        resource_class=resource_class,
+        deadline=datetime(2026, 8, 1, tzinfo=UTC),
+        job_id=UUID(int=99),
+    )
+
+
 @pytest.mark.parametrize("run_input", RUN_INPUTS)
 def test_factory_builds_canonical_adapter_compatible_spec_for_all_typed_inputs(
     run_input: object,
@@ -131,6 +146,116 @@ def test_factory_builds_canonical_adapter_compatible_spec_for_all_typed_inputs(
     assert built.spec.dataset_snapshot is None
     assert built.spec.spec_hash == built.command.spec.spec_hash
     assert default_strategy_job_adapter_registry().plan(built.spec)
+
+
+def test_factory_preflights_all_four_inputs_with_canonical_adapter_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = default_strategy_job_adapter_registry()
+    original_plan = registry.plan
+    planned_hashes: list[str] = []
+
+    def record_plan(spec):  # type: ignore[no-untyped-def]
+        planned_hashes.append(spec.spec_hash)
+        return original_plan(spec)
+
+    monkeypatch.setattr(registry, "plan", record_plan)
+
+    built = tuple(_build(run_input) for run_input in RUN_INPUTS)
+
+    assert planned_hashes == [item.spec.spec_hash for item in built]
+
+
+@pytest.mark.parametrize(
+    "run_input",
+    [
+        NShapeComparisonRunInput(
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 2, 1),
+            parameters=NShapeCompareParameters(
+                hold_days=(1,),
+                entry_modes=("first_break",) * 1_000,
+            ),
+        ),
+        NShapeOptimizationRunInput(
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 2, 1),
+            parameters=NShapeOptimizeParameters(
+                hold_days=(1,),
+                entry_modes=("first_break",),
+                profile_variants=("baseline",),
+                walk_forward_folds=2**63,
+            ),
+        ),
+        AuctionGapRunInput(
+            start_date=date(2010, 1, 1),
+            end_date=date(2026, 1, 1),
+            parameters=AuctionGapParameters(max_hold_days=2),
+        ),
+        GrowthBoardSurgeRunInput(
+            start_date=date(2024, 1, 1),
+            end_date=date(2026, 1, 1),
+            parameters=GrowthBoardSurgeParameters(
+                variants=("full", "no_vwap", "no_same_minute", "no_accel_5m", "cum_only"),
+                max_hold_days=2,
+            ),
+        ),
+    ],
+    ids=["comparison-cardinality", "optimization-folds", "auction-range", "growth-shards"],
+)
+def test_factory_rejects_unplannable_resource_inputs_with_typed_error(
+    run_input: object,
+) -> None:
+    with pytest.raises(ValueError, match="submission preflight") as exc_info:
+        _build(run_input, resource_class=ResourceClass.HEAVY)
+
+    assert type(exc_info.value).__name__ == "ResearchJobSubmissionError"
+    assert exc_info.value.code in {  # type: ignore[attr-defined]
+        "input_bounds",
+        "adapter_plan",
+        "shard_budget",
+        "resource_budget",
+    }
+
+
+def test_factory_rejects_plan_that_exceeds_resource_work_budget() -> None:
+    run_input = NShapeOptimizationRunInput(
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 2, 1),
+        parameters=NShapeOptimizeParameters(
+            hold_days=tuple(range(1, 21)),
+            entry_modes=(
+                "first_break",
+                "break_retest",
+                "late_confirm",
+                "vwap_confirm",
+                "amount_surge",
+                "factor_confirm",
+            ),
+            profile_variants=("baseline", "vp_risk_only", "vp_90"),
+            top_n_options=tuple(range(1, 33)),
+            score_profile_names=(
+                "v1",
+                "no_intraday",
+                "no_accumulation",
+                "no_position",
+                "no_market",
+                "intraday_heavy",
+                "accumulation_heavy",
+                "position_heavy",
+                "v2_low_position",
+                "v2_momentum",
+                "v2_env_gate",
+            ),
+            walk_forward_folds=64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="submission preflight") as exc_info:
+        _build(run_input, resource_class=ResourceClass.HEAVY)
+
+    assert type(exc_info.value).__name__ == "ResearchJobSubmissionError"
+    assert exc_info.value.code == "resource_budget"  # type: ignore[attr-defined]
 
 
 def test_factory_accepts_formal_only_with_exact_gate_snapshot_and_audit_evidence() -> None:
