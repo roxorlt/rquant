@@ -30,7 +30,7 @@ from rquant.lab_artifact_protocol import (
     authenticate_artifact_commit_identity,
 )
 from rquant.lab_artifacts import LabArtifactIndexEvidence
-from rquant.lab_eta import LabEtaEstimate, LabEtaInput
+from rquant.lab_eta import LabEtaEstimate, LabEtaInput, LabEtaStatus
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
@@ -532,6 +532,26 @@ class ControlIntent(StrEnum):
     NONE = "none"
     PAUSE_REQUESTED = "pause_requested"
     CANCEL_REQUESTED = "cancel_requested"
+
+
+_JOB_STATUS_TO_ETA_STATUS: dict[JobStatus, LabEtaStatus] = {
+    JobStatus.QUEUED: "queued",
+    JobStatus.RUNNING: "running",
+    JobStatus.CHECKPOINTED: "checkpointed",
+    JobStatus.SUCCEEDED: "succeeded",
+    JobStatus.FAILED: "failed",
+    JobStatus.CANCELLED: "cancelled",
+}
+
+
+def _effective_lab_eta_status(
+    *,
+    status: JobStatus,
+    control_intent: ControlIntent,
+) -> LabEtaStatus:
+    if control_intent is ControlIntent.PAUSE_REQUESTED:
+        return "paused"
+    return _JOB_STATUS_TO_ETA_STATUS[status]
 
 
 class LabResultState(StrEnum):
@@ -3973,7 +3993,11 @@ class LabJobReader:
                 (str(job_id), artifact_limit + 1),
             ).fetchall()
 
-            if job.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            if job.status in {
+                JobStatus.QUEUED,
+                JobStatus.RUNNING,
+                JobStatus.CHECKPOINTED,
+            }:
                 completed_rows = connection.execute(
                     "SELECT shard_id, phase, work_unit_name, work_units, "
                     "static_duration_ms, duration_ms, throughput_units_per_second, "
@@ -4058,7 +4082,10 @@ class LabJobReader:
         eta = estimate_lab_eta(
             self._eta_input_from_rows(
                 job_id=job_id,
-                status=job.status.value,
+                status=_effective_lab_eta_status(
+                    status=job.status,
+                    control_intent=job.control_intent,
+                ),
                 as_of=current,
                 completed_rows=completed_rows,
                 remaining_rows=remaining_rows,
@@ -4314,7 +4341,7 @@ class LabJobReader:
         current = _utc(as_of)
         with self._connect() as connection:
             job_row = connection.execute(
-                "SELECT status FROM lab_job WHERE job_id = ?",
+                "SELECT status, control_intent FROM lab_job WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
             if job_row is None:
@@ -4439,7 +4466,10 @@ class LabJobReader:
             )
         return LabEtaInput(
             job_id=job_id,
-            status=str(job_row["status"]),
+            status=_effective_lab_eta_status(
+                status=JobStatus(str(job_row["status"])),
+                control_intent=ControlIntent(str(job_row["control_intent"])),
+            ),
             as_of=current,
             completed=tuple(completed),
             remaining=tuple(remaining),

@@ -65,7 +65,8 @@
   `MAX_JOB_SHARDS=128`，规划在写入前拒绝超限，reader 的 remaining-shard 查询用 `MAX+1`
   探针检测损坏数据库并 fail closed；finalizer 不能配置成超过 ledger 权威上限。
   paused/checkpointed ETA 仅保留进度计数，不再返回 estimator 预测、remaining duration 或
-  finish window。
+  finish window；活动任务的 `PAUSE_REQUESTED` intent 在 detail 与独立 ETA reader 中均按
+  paused 投影，只有权威 intent 清除后才恢复 ETA，cancel intent 不会误判为暂停。
 
 - **Strategy Lab artifact store 生命周期防死锁**：preview/finalization activity 现在按线程记录
   可重入深度；activity 持有线程调用 `close()` 时在任何等待前返回 typed lifecycle error，

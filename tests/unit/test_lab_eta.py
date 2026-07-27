@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -16,10 +16,23 @@ from rquant.lab_eta import (
     LabEtaRemainingShard,
     estimate_lab_eta,
 )
-from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
-from rquant.lab_shard_protocol import LabShardTelemetry, LabShardWorkPlan
+from rquant.lab_job_protocol import (
+    CancelJobCommand,
+    LabCommandEnvelope,
+    PauseJobCommand,
+    ResumeJobCommand,
+)
+from rquant.lab_jobs import (
+    ControlIntent,
+    JobStatus,
+    LabJobReader,
+    LabJobStore,
+    ShardStatus,
+)
+from rquant.lab_shard_protocol import LabShardSucceeded, LabShardTelemetry, LabShardWorkPlan
 
-from .test_lab_jobs import _lease, _submit_job
+from .test_lab_jobs import NOW, _lease, _submit_job
+from .test_lab_shard_control_plane import _claim, _report, _setup
 
 AS_OF = datetime(2026, 7, 24, 4, 0, tzinfo=UTC)
 _EXTREME_OFFSET_TIMES = (
@@ -563,6 +576,172 @@ def test_running_and_checkpointed_eta_ignore_terminal_shards_without_paused_pred
         assert estimate.estimator == "unavailable"
         assert estimate.remaining_duration is None
         assert estimate.finish_at is None
+
+
+def test_active_pause_hides_eta_for_running_and_queued_shards_until_withdrawn(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, with_work_plan=True)
+    _claim(store, lease)
+    reader = LabJobReader(store.path)
+    running = reader.get_job(job_id)
+    assert running is not None
+    assert {shard.status for shard in reader.list_shards(job_id)} == {
+        ShardStatus.QUEUED,
+        ShardStatus.RUNNING,
+    }
+
+    pause = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=PauseJobCommand(
+                job_id=job_id,
+                expected_version=running.version,
+                reason="pause active job",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    paused = reader.get_job(job_id)
+    assert pause.status == "applied"
+    assert paused is not None
+    assert paused.status is JobStatus.RUNNING
+    assert paused.control_intent is ControlIntent.PAUSE_REQUESTED
+
+    projection = reader.get_eta_input(job_id, as_of=AS_OF)
+    estimate = reader.estimate_eta(job_id, as_of=AS_OF)
+    detail = reader.get_job_detail(job_id, as_of=AS_OF)
+
+    assert projection is not None
+    assert projection.status == "paused"
+    assert len(projection.remaining) == 2
+    assert estimate is not None
+    assert estimate.status == "paused"
+    assert estimate.estimator == "unavailable"
+    assert estimate.remaining_shards == 2
+    assert estimate.remaining_duration is None
+    assert estimate.finish_at is None
+    assert detail is not None
+    assert detail.progress.total_shards == 2
+    assert detail.progress.terminal_shards == 0
+    assert detail.eta == estimate
+
+    resume = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=ResumeJobCommand(
+                job_id=job_id,
+                expected_version=paused.version,
+                reason="withdraw pause",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    resumed = reader.get_job(job_id)
+    assert resume.status == "applied"
+    assert resume.reason == "pause_withdrawn"
+    assert resumed is not None
+    assert resumed.status is JobStatus.RUNNING
+    assert resumed.control_intent is ControlIntent.NONE
+
+    restored_projection = reader.get_eta_input(job_id, as_of=AS_OF)
+    restored_estimate = reader.estimate_eta(job_id, as_of=AS_OF)
+    restored_detail = reader.get_job_detail(job_id, as_of=AS_OF)
+    assert restored_projection is not None
+    assert restored_projection.status == "running"
+    assert restored_estimate is not None
+    assert restored_estimate.status == "running"
+    assert restored_estimate.remaining_duration is not None
+    assert restored_estimate.finish_at is not None
+    assert restored_detail is not None
+    assert restored_detail.eta == restored_estimate
+
+
+def test_checkpointed_job_has_no_eta_prediction_at_idle_boundary(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2)
+    first = _claim(store, lease)
+    success = store.apply_worker_report(
+        _report(first, LabShardSucceeded(result_manifest_hash="6" * 64), offset=3),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    reader = LabJobReader(store.path)
+    running = reader.get_job(job_id)
+    assert success.status == "accepted"
+    assert running is not None
+    assert running.status is JobStatus.RUNNING
+    pause = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=PauseJobCommand(
+                job_id=job_id,
+                expected_version=running.version,
+                reason="pause at idle boundary",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    projection = reader.get_eta_input(job_id, as_of=AS_OF)
+    estimate = reader.estimate_eta(job_id, as_of=AS_OF)
+    detail = reader.get_job_detail(job_id, as_of=AS_OF)
+
+    assert pause.status == "applied"
+    assert pause.reason == "checkpointed"
+    assert projection is not None
+    assert projection.status == "checkpointed"
+    assert len(projection.remaining) == 1
+    assert estimate is not None
+    assert estimate.estimator == "unavailable"
+    assert estimate.remaining_shards == 1
+    assert estimate.remaining_duration is None
+    assert estimate.finish_at is None
+    assert detail is not None
+    assert detail.progress.total_shards == 2
+    assert detail.progress.terminal_shards == 1
+    assert detail.eta == estimate
+
+
+def test_cancel_intent_does_not_masquerade_as_paused_eta(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=1, with_work_plan=True)
+    _claim(store, lease)
+    reader = LabJobReader(store.path)
+    running = reader.get_job(job_id)
+    assert running is not None
+    cancel = store.apply_command(
+        LabCommandEnvelope(
+            request_id=uuid4(),
+            command=CancelJobCommand(
+                job_id=job_id,
+                expected_version=running.version,
+                reason="cancel active job",
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    requested = reader.get_job(job_id)
+    assert cancel.status == "applied"
+    assert cancel.reason == "cancel_requested"
+    assert requested is not None
+    assert requested.status is JobStatus.RUNNING
+    assert requested.control_intent is ControlIntent.CANCEL_REQUESTED
+
+    projection = reader.get_eta_input(job_id, as_of=AS_OF)
+    estimate = reader.estimate_eta(job_id, as_of=AS_OF)
+    detail = reader.get_job_detail(job_id, as_of=AS_OF)
+
+    assert projection is not None
+    assert projection.status == "running"
+    assert estimate is not None
+    assert estimate.estimator == "static"
+    assert estimate.remaining_duration is not None
+    assert estimate.finish_at is not None
+    assert detail is not None
+    assert detail.eta == estimate
 
 
 @pytest.mark.parametrize("job_status", ["failed", "cancelled"])
