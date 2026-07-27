@@ -105,12 +105,14 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
             assert isinstance(identity_authority, _FakeSqliteAuthority)
 
     class FakeSpool:
-        def __init__(self, path: Path) -> None:
+        def __init__(self, path: Path, *, mutation_guard: object) -> None:
             calls.append(f"spool:{path.name}")
+            assert callable(mutation_guard)
 
     class FakeStore:
-        def __init__(self, path: Path) -> None:
+        def __init__(self, path: Path, *, mutation_guard: object) -> None:
             calls.append(f"store:{path.name}")
+            assert callable(mutation_guard)
 
         def close(self) -> None:
             calls.append("store_close")
@@ -219,12 +221,12 @@ def test_finalizer_forever_installs_both_stop_signals(
             assert isinstance(identity_authority, _FakeSqliteAuthority)
 
     class FakeSpool:
-        def __init__(self, _path: Path) -> None:
-            pass
+        def __init__(self, _path: Path, *, mutation_guard: object) -> None:
+            assert callable(mutation_guard)
 
     class FakeStore:
-        def __init__(self, _path: Path) -> None:
-            pass
+        def __init__(self, _path: Path, *, mutation_guard: object) -> None:
+            assert callable(mutation_guard)
 
         def close(self) -> None:
             calls.append("close")

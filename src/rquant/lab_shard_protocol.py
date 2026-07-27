@@ -800,8 +800,9 @@ class LabClaimSpool(_TypedSpoolBase):
         root: Path,
         *,
         claim_advance_hook: Callable[[LabShardClaim], None] | None = None,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> None:
-        super().__init__(root)
+        super().__init__(root, mutation_guard=mutation_guard)
         self.current_dir = self.root / "current"
         self.retired_dir = self.root / "archive" / "retired"
         self.revoked_dir = self.root / "revoked"
@@ -872,6 +873,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 stream.write(validated.model_dump_json().encode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._guard_mutation()
             os.replace(temporary, self.pending_cursor_path)
             self._fsync_directory(self.root)
         finally:
@@ -1057,6 +1059,7 @@ class LabClaimSpool(_TypedSpoolBase):
                         raise InvalidCommandEnvelopeError(
                             "execution admission temporary conflicts with marker"
                         )
+                self._guard_mutation()
                 os.unlink(temporary.name, dir_fd=directory_fd)
                 os.fsync(directory_fd)
         finally:
@@ -1076,6 +1079,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 stream.flush()
                 os.fsync(stream.fileno())
             try:
+                self._guard_mutation()
                 os.link(temporary, target)
             except FileExistsError:
                 existing = self._load_admission_locked(admission.claim.claim_token)
@@ -1146,6 +1150,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 raise InvalidCommandEnvelopeError(
                     f"current claim marker {name} is not a single-link regular file"
                 )
+            self._guard_mutation()
             os.unlink(name, dir_fd=directory_fd)
             os.fsync(directory_fd)
         finally:
@@ -1224,6 +1229,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 stream.write(marker.model_dump_json().encode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._guard_mutation()
             os.replace(temporary, target)
             self._fsync_directory(self.retired_dir)
         finally:
@@ -1283,6 +1289,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 stream.write(marker.model_dump_json().encode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._guard_mutation()
             os.replace(temporary, target)
             self._fsync_directory(self.current_dir)
         finally:
@@ -1531,6 +1538,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 f"claim_token {claim.claim_token} has conflicting archived revocation"
             )
         if created or archived.revocation == revoked.revocation:
+            self._guard_mutation()
             source.unlink()
             self._fsync_directory(self.revoked_dir)
 

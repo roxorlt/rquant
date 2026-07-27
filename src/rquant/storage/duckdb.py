@@ -105,8 +105,7 @@ _INTENTIONAL_STATUS_EXCLUSION_PREDICATE = (
     f"status.conflict_reason IN ({_INTENTIONAL_STATUS_EXCLUSION_SQL})"
 )
 _ACTIONABLE_UNKNOWN_STATUS_PREDICATE = (
-    "status.is_st IS NULL AND NOT coalesce("
-    f"{_INTENTIONAL_STATUS_EXCLUSION_PREDICATE}, FALSE)"
+    f"status.is_st IS NULL AND NOT coalesce({_INTENTIONAL_STATUS_EXCLUSION_PREDICATE}, FALSE)"
 )
 _ACTIONABLE_CONFLICT_STATUS_PREDICATE = (
     "status.conflict_reason IS NOT NULL AND NOT coalesce("
@@ -129,10 +128,7 @@ def _is_retryable_stock_status_upsert_error(error: BaseException) -> bool:
             "unique constraint",
         )
     )
-    transaction_conflict = (
-        isinstance(error, duckdb.TransactionException)
-        and "conflict" in message
-    )
+    transaction_conflict = isinstance(error, duckdb.TransactionException) and "conflict" in message
     return duplicate_or_unique or transaction_conflict
 
 
@@ -151,9 +147,7 @@ def _revalidate_for_write(model: ModelT) -> ModelT:
             type(model).model_validate(payload),
         )
     except ValueError as exc:
-        raise ValueError(
-            f"{type(model).__name__} failed write-boundary validation: {exc}"
-        ) from exc
+        raise ValueError(f"{type(model).__name__} failed write-boundary validation: {exc}") from exc
 
 
 def _validate_security_status_rows(
@@ -162,9 +156,7 @@ def _validate_security_status_rows(
     try:
         return _SECURITY_STATUS_ROWS_ADAPTER.validate_python(list(rows))
     except ValueError as exc:
-        raise ValueError(
-            f"SecurityStatusDaily failed write-boundary validation: {exc}"
-        ) from exc
+        raise ValueError(f"SecurityStatusDaily failed write-boundary validation: {exc}") from exc
 
 
 def _duckdb_transaction_is_active(
@@ -225,9 +217,7 @@ def _snapshot_from_row(row: tuple[object, ...]) -> DatasetSnapshot:
         table_watermarks=json.loads(str(row[7])),
         quality_issue_ids=tuple(json.loads(str(row[8]))),
         created_at=_utc_datetime_from_db(row[9]),
-        completed_at=(
-            None if row[10] is None else _utc_datetime_from_db(row[10])
-        ),
+        completed_at=(None if row[10] is None else _utc_datetime_from_db(row[10])),
     )
     stored_id = str(row[0])
     if snapshot.snapshot_id != stored_id:
@@ -301,15 +291,12 @@ def _quality_issue_from_row(row: tuple[object, ...]) -> DataQualityIssue:
         evidence=json.loads(str(row[7])),
         first_seen_at=_utc_datetime_from_db(row[8]),
         last_seen_at=_utc_datetime_from_db(row[9]),
-        resolved_at=(
-            None if row[10] is None else _utc_datetime_from_db(row[10])
-        ),
+        resolved_at=(None if row[10] is None else _utc_datetime_from_db(row[10])),
     )
     stored_id = str(row[0])
     if issue.issue_id != stored_id:
         raise ValueError(
-            "data_quality_issue stable id mismatch: "
-            f"stored={stored_id}, derived={issue.issue_id}"
+            f"data_quality_issue stable id mismatch: stored={stored_id}, derived={issue.issue_id}"
         )
     return issue
 
@@ -330,8 +317,7 @@ def _data_audit_run_from_row(row: tuple[object, ...]) -> DataAuditRun:
     stored_id = str(row[0])
     if run.audit_run_id != stored_id:
         raise ValueError(
-            "data_audit_run stable id mismatch: "
-            f"stored={stored_id}, derived={run.audit_run_id}"
+            f"data_audit_run stable id mismatch: stored={stored_id}, derived={run.audit_run_id}"
         )
     return run
 
@@ -410,9 +396,7 @@ def _security_status_from_row(row: tuple[object, ...]) -> SecurityStatusDaily:
         is_st=cast(bool | None, row[3]),
         name_source=str(row[4]),
         st_source=None if row[5] is None else str(row[5]),
-        available_at=(
-            None if row[6] is None else _utc_datetime_from_db(row[6])
-        ),
+        available_at=(None if row[6] is None else _utc_datetime_from_db(row[6])),
         ingested_at=_utc_datetime_from_db(row[7]),
         conflict_reason=None if row[8] is None else str(row[8]),
     )
@@ -561,9 +545,7 @@ class DuckDBStore:
         require_daily_keys: bool = False,
     ) -> int:
         if transaction_mode not in {"standalone", "existing"}:
-            raise ValueError(
-                "stock status transaction_mode must be 'standalone' or 'existing'"
-            )
+            raise ValueError("stock status transaction_mode must be 'standalone' or 'existing'")
         observations = _validate_security_status_rows(rows)
         if not observations:
             return 0
@@ -723,9 +705,7 @@ class DuckDBStore:
         ).fetchall()
         return [_security_status_from_row(row) for row in rows]
 
-    def missing_stock_status_keys(
-        self, start: date, end: date
-    ) -> list[DailySecurityKey]:
+    def missing_stock_status_keys(self, start: date, end: date) -> list[DailySecurityKey]:
         if start > end:
             raise ValueError("stock status gap start must not be after end")
         rows = self._conn.execute(
@@ -934,9 +914,7 @@ class DuckDBStore:
             raise
         return len(selected)
 
-    def get_trade_calendar_day(
-        self, exchange: str, cal_date: date
-    ) -> TradeCalendarDay | None:
+    def get_trade_calendar_day(self, exchange: str, cal_date: date) -> TradeCalendarDay | None:
         row = self._conn.execute(
             """
             SELECT exchange, cal_date, is_open, pretrade_date, source,
@@ -949,9 +927,7 @@ class DuckDBStore:
         ).fetchone()
         return None if row is None else _trade_calendar_from_row(row)
 
-    def list_trade_calendar(
-        self, exchange: str, start: date, end: date
-    ) -> list[TradeCalendarDay]:
+    def list_trade_calendar(self, exchange: str, start: date, end: date) -> list[TradeCalendarDay]:
         if start > end:
             return []
         rows = self._conn.execute(
@@ -967,14 +943,10 @@ class DuckDBStore:
         ).fetchall()
         return [_trade_calendar_from_row(row) for row in rows]
 
-    def missing_trade_calendar_dates(
-        self, exchange: str, start: date, end: date
-    ) -> list[date]:
+    def missing_trade_calendar_dates(self, exchange: str, start: date, end: date) -> list[date]:
         if start > end:
             raise ValueError("trade calendar range start must not be after end")
-        present = {
-            row.cal_date for row in self.list_trade_calendar(exchange, start, end)
-        }
+        present = {row.cal_date for row in self.list_trade_calendar(exchange, start, end)}
         return [
             start + timedelta(days=offset)
             for offset in range((end - start).days + 1)
@@ -987,9 +959,7 @@ class DuckDBStore:
             raise TradeCalendarGapError(exchange, [cal_date])
         return row.is_open
 
-    def _require_calendar_range(
-        self, exchange: str, start: date, end: date
-    ) -> None:
+    def _require_calendar_range(self, exchange: str, start: date, end: date) -> None:
         missing = self.missing_trade_calendar_dates(exchange, start, end)
         if missing:
             raise TradeCalendarGapError(exchange, missing)
@@ -998,9 +968,7 @@ class DuckDBStore:
         if self.get_trade_calendar_day(exchange, anchor) is None:
             raise TradeCalendarGapError(exchange, [anchor])
 
-    def previous_trading_day(
-        self, anchor: date, *, exchange: str = "SSE"
-    ) -> date:
+    def previous_trading_day(self, anchor: date, *, exchange: str = "SSE") -> date:
         self._require_calendar_anchor(exchange, anchor)
         row = self._conn.execute(
             "SELECT MAX(cal_date) FROM trade_calendar "
@@ -1016,9 +984,7 @@ class DuckDBStore:
         self._require_calendar_range(exchange, candidate, anchor)
         return candidate
 
-    def next_trading_day(
-        self, anchor: date, *, exchange: str = "SSE"
-    ) -> date:
+    def next_trading_day(self, anchor: date, *, exchange: str = "SSE") -> date:
         self._require_calendar_anchor(exchange, anchor)
         row = self._conn.execute(
             "SELECT MIN(cal_date) FROM trade_calendar "
@@ -1034,9 +1000,7 @@ class DuckDBStore:
         self._require_calendar_range(exchange, anchor, candidate)
         return candidate
 
-    def latest_trading_day(
-        self, anchor: date, *, exchange: str = "SSE"
-    ) -> date:
+    def latest_trading_day(self, anchor: date, *, exchange: str = "SSE") -> date:
         self._require_calendar_anchor(exchange, anchor)
         row = self._conn.execute(
             "SELECT MAX(cal_date) FROM trade_calendar "
@@ -1239,9 +1203,7 @@ class DuckDBStore:
         ).fetchall()
         return {(str(ts_code), cast(date, trade_date)) for ts_code, trade_date in rows}
 
-    def begin_dataset_snapshot(
-        self, snapshot: DatasetSnapshot
-    ) -> DatasetSnapshot:
+    def begin_dataset_snapshot(self, snapshot: DatasetSnapshot) -> DatasetSnapshot:
         snapshot = _revalidate_for_write(snapshot)
         if snapshot.status != "building":
             raise ValueError("begin_dataset_snapshot requires a building snapshot")
@@ -1264,9 +1226,7 @@ class DuckDBStore:
                     snapshot.origin,
                 )
                 if existing_identity != requested_identity:
-                    raise ValueError(
-                        f"dataset snapshot id conflict: {snapshot.snapshot_id}"
-                    )
+                    raise ValueError(f"dataset snapshot id conflict: {snapshot.snapshot_id}")
                 self._conn.execute("COMMIT")
                 return existing
             self._conn.execute(
@@ -1294,8 +1254,7 @@ class DuckDBStore:
             stored = self.get_dataset_snapshot(snapshot.snapshot_id)
             if stored is None:
                 raise RuntimeError(
-                    "dataset snapshot insert was not persisted: "
-                    f"{snapshot.snapshot_id}"
+                    f"dataset snapshot insert was not persisted: {snapshot.snapshot_id}"
                 )
             self._conn.execute("COMMIT")
             return stored
@@ -1315,24 +1274,18 @@ class DuckDBStore:
             existing = self.get_dataset_snapshot(snapshot_id)
             if existing is None:
                 raise KeyError(f"dataset snapshot not found: {snapshot_id}")
-            missing_issue_ids = self._missing_quality_issue_ids(
-                finalization.quality_issue_ids
-            )
+            missing_issue_ids = self._missing_quality_issue_ids(finalization.quality_issue_ids)
             if missing_issue_ids:
                 missing = ", ".join(missing_issue_ids)
-                raise KeyError(
-                    f"dataset snapshot quality issue references missing: {missing}"
-                )
+                raise KeyError(f"dataset snapshot quality issue references missing: {missing}")
             if finalization.completed_at < existing.created_at:
                 raise ValueError(
-                    "snapshot completed_at cannot be earlier than created_at: "
-                    f"{snapshot_id}"
+                    f"snapshot completed_at cannot be earlier than created_at: {snapshot_id}"
                 )
             if existing.status == "ready":
                 if not _snapshot_finalization_matches(existing, finalization):
                     raise ValueError(
-                        "dataset snapshot already finalized with different data: "
-                        f"{snapshot_id}"
+                        f"dataset snapshot already finalized with different data: {snapshot_id}"
                     )
                 self._conn.execute("COMMIT")
                 transaction_open = False
@@ -1369,9 +1322,7 @@ class DuckDBStore:
                 return self._snapshot_after_cas_loss(snapshot_id, finalization)
             finalized = self.get_dataset_snapshot(snapshot_id)
             if finalized is None:
-                raise RuntimeError(
-                    f"dataset snapshot finalize was not persisted: {snapshot_id}"
-                )
+                raise RuntimeError(f"dataset snapshot finalize was not persisted: {snapshot_id}")
             self._conn.execute("COMMIT")
             transaction_open = False
             return finalized
@@ -1388,32 +1339,25 @@ class DuckDBStore:
         conflict_cause: Exception | None = None,
     ) -> DatasetSnapshot:
         current = self.get_dataset_snapshot(snapshot_id)
-        if current is not None and _snapshot_finalization_matches(
-            current, finalization
-        ):
+        if current is not None and _snapshot_finalization_matches(current, finalization):
             return current
         if current is None or current.status == "building":
             conflict = DatasetSnapshotWriteConflictError(
-                "dataset snapshot write conflict; retry finalization: "
-                f"{snapshot_id}"
+                f"dataset snapshot write conflict; retry finalization: {snapshot_id}"
             )
             if conflict_cause is not None:
                 raise conflict from conflict_cause
             raise conflict
         raise ValueError(
-            "concurrent dataset snapshot finalization committed different data: "
-            f"{snapshot_id}"
+            f"concurrent dataset snapshot finalization committed different data: {snapshot_id}"
         )
 
-    def _missing_quality_issue_ids(
-        self, issue_ids: tuple[str, ...]
-    ) -> list[str]:
+    def _missing_quality_issue_ids(self, issue_ids: tuple[str, ...]) -> list[str]:
         if not issue_ids:
             return []
         placeholders = ",".join("?" for _ in issue_ids)
         rows = self._conn.execute(
-            f"SELECT issue_id FROM data_quality_issue "
-            f"WHERE issue_id IN ({placeholders})",
+            f"SELECT issue_id FROM data_quality_issue WHERE issue_id IN ({placeholders})",
             list(issue_ids),
         ).fetchall()
         existing = {str(row[0]) for row in rows}
@@ -1446,9 +1390,7 @@ class DuckDBStore:
     ) -> DatasetSnapshotBinding:
         binding = _revalidate_for_write(binding)
         if binding.status != "building":
-            raise ValueError(
-                "begin_dataset_snapshot_binding requires a building binding"
-            )
+            raise ValueError("begin_dataset_snapshot_binding requires a building binding")
         self._conn.execute("BEGIN")
         try:
             touched = self._conn.execute(
@@ -1457,14 +1399,11 @@ class DuckDBStore:
                 [binding.snapshot_id],
             ).fetchone()
             if touched is None:
-                raise KeyError(
-                    f"dataset snapshot not found: {binding.snapshot_id}"
-                )
+                raise KeyError(f"dataset snapshot not found: {binding.snapshot_id}")
             snapshot = self.get_dataset_snapshot(binding.snapshot_id)
             if snapshot is None or snapshot.status != "ready":
                 raise ValueError(
-                    "execution binding requires a ready dataset snapshot: "
-                    f"{binding.snapshot_id}"
+                    f"execution binding requires a ready dataset snapshot: {binding.snapshot_id}"
                 )
             manifest = binding.manifest
             if (
@@ -1479,9 +1418,7 @@ class DuckDBStore:
 
             existing = self.get_dataset_snapshot_binding(binding.snapshot_id)
             if existing is not None:
-                if _snapshot_binding_identity(existing) != _snapshot_binding_identity(
-                    binding
-                ):
+                if _snapshot_binding_identity(existing) != _snapshot_binding_identity(binding):
                     raise ValueError(
                         "dataset snapshot already bound to different immutable "
                         f"execution data: {binding.snapshot_id}"
@@ -1502,9 +1439,7 @@ class DuckDBStore:
                     binding.binding_version,
                     binding.binding_hash,
                     binding.manifest_hash,
-                    binding.manifest.model_dump_json(
-                        exclude_computed_fields=True
-                    ),
+                    binding.manifest.model_dump_json(exclude_computed_fields=True),
                     binding.artifact_root,
                     binding.manifest_relative_path,
                     binding.status,
@@ -1515,8 +1450,7 @@ class DuckDBStore:
             stored = self.get_dataset_snapshot_binding(binding.snapshot_id)
             if stored is None:
                 raise RuntimeError(
-                    "dataset snapshot binding insert was not persisted: "
-                    f"{binding.snapshot_id}"
+                    f"dataset snapshot binding insert was not persisted: {binding.snapshot_id}"
                 )
             self._conn.execute("COMMIT")
             return stored
@@ -1534,19 +1468,13 @@ class DuckDBStore:
         try:
             existing = self.get_dataset_snapshot_binding(snapshot_id)
             if existing is None:
-                raise KeyError(
-                    f"dataset snapshot binding not found: {snapshot_id}"
-                )
+                raise KeyError(f"dataset snapshot binding not found: {snapshot_id}")
             if finalization.completed_at < existing.created_at:
-                raise ValueError(
-                    "binding completed_at cannot precede created_at: "
-                    f"{snapshot_id}"
-                )
+                raise ValueError(f"binding completed_at cannot precede created_at: {snapshot_id}")
             if existing.status == "ready":
                 if existing.completed_at != finalization.completed_at:
                     raise ValueError(
-                        "dataset snapshot binding is immutable after ready: "
-                        f"{snapshot_id}"
+                        f"dataset snapshot binding is immutable after ready: {snapshot_id}"
                     )
                 self._conn.execute("COMMIT")
                 return existing
@@ -1563,14 +1491,12 @@ class DuckDBStore:
             ).fetchone()
             if updated is None:
                 raise DatasetSnapshotWriteConflictError(
-                    "dataset snapshot binding write conflict; retry finalization: "
-                    f"{snapshot_id}"
+                    f"dataset snapshot binding write conflict; retry finalization: {snapshot_id}"
                 )
             stored = self.get_dataset_snapshot_binding(snapshot_id)
             if stored is None:
                 raise RuntimeError(
-                    "dataset snapshot binding finalize was not persisted: "
-                    f"{snapshot_id}"
+                    f"dataset snapshot binding finalize was not persisted: {snapshot_id}"
                 )
             self._conn.execute("COMMIT")
             return stored
@@ -1599,9 +1525,7 @@ class DuckDBStore:
         ).fetchone()
         return None if row is None else _snapshot_binding_from_row(row)
 
-    def upsert_dataset_coverage(
-        self, coverage: DatasetCoverage
-    ) -> DatasetCoverage:
+    def upsert_dataset_coverage(self, coverage: DatasetCoverage) -> DatasetCoverage:
         coverage = _revalidate_for_write(coverage)
         transaction_open = True
         self._conn.execute("BEGIN")
@@ -1613,14 +1537,10 @@ class DuckDBStore:
                 [coverage.snapshot_id],
             ).fetchone()
             if touched is None:
-                raise KeyError(
-                    f"dataset snapshot not found: {coverage.snapshot_id}"
-                )
+                raise KeyError(f"dataset snapshot not found: {coverage.snapshot_id}")
             snapshot = self.get_dataset_snapshot(coverage.snapshot_id)
             if snapshot is None:
-                raise KeyError(
-                    f"dataset snapshot not found: {coverage.snapshot_id}"
-                )
+                raise KeyError(f"dataset snapshot not found: {coverage.snapshot_id}")
             if snapshot.status == "ready":
                 stored = self._conn.execute(
                     """
@@ -1639,9 +1559,7 @@ class DuckDBStore:
                     ],
                 ).fetchone()
                 existing = None if stored is None else _coverage_from_row(stored)
-                if existing is None or not _coverage_payload_matches(
-                    existing, coverage
-                ):
+                if existing is None or not _coverage_payload_matches(existing, coverage):
                     raise ValueError(
                         "finalized dataset snapshot coverage is immutable: "
                         f"{coverage.snapshot_id}/{coverage.dataset_id}/"
@@ -1709,8 +1627,7 @@ class DuckDBStore:
                 self._conn.execute("ROLLBACK")
                 transaction_open = False
             raise DatasetSnapshotWriteConflictError(
-                "dataset snapshot write conflict; retry coverage upsert: "
-                f"{coverage.snapshot_id}"
+                f"dataset snapshot write conflict; retry coverage upsert: {coverage.snapshot_id}"
             ) from exc
         except Exception:
             if transaction_open:
@@ -1733,9 +1650,7 @@ class DuckDBStore:
         ).fetchall()
         return [_coverage_from_row(row) for row in rows]
 
-    def record_data_quality_issue(
-        self, issue: DataQualityIssue
-    ) -> DataQualityIssue:
+    def record_data_quality_issue(self, issue: DataQualityIssue) -> DataQualityIssue:
         issue = _revalidate_for_write(issue)
         if issue.status != "open":
             raise ValueError("record_data_quality_issue requires an open issue")
@@ -1747,12 +1662,8 @@ class DuckDBStore:
                 existing.dataset_id,
                 existing.scope_key,
             ) != (issue.rule_id, issue.dataset_id, issue.scope_key):
-                raise ValueError(
-                    f"data quality issue id conflict: {issue.issue_id}"
-                )
-            if existing is not None and issue.last_seen_at <= _issue_effective_time(
-                existing
-            ):
+                raise ValueError(f"data quality issue id conflict: {issue.issue_id}")
+            if existing is not None and issue.last_seen_at <= _issue_effective_time(existing):
                 self._conn.execute("COMMIT")
                 return existing
             if existing is None:
@@ -1799,10 +1710,7 @@ class DuckDBStore:
                 )
             stored = self.get_data_quality_issue(issue.issue_id)
             if stored is None:
-                raise RuntimeError(
-                    "data quality issue upsert was not persisted: "
-                    f"{issue.issue_id}"
-                )
+                raise RuntimeError(f"data quality issue upsert was not persisted: {issue.issue_id}")
             self._conn.execute("COMMIT")
             return stored
         except Exception:
@@ -1836,9 +1744,7 @@ class DuckDBStore:
         resolved_at: datetime | None = None,
     ) -> DataQualityIssue:
         timestamp_omitted = resolved_at is None
-        resolution_time = normalize_utc_datetime(
-            utc_now() if timestamp_omitted else resolved_at
-        )
+        resolution_time = normalize_utc_datetime(utc_now() if timestamp_omitted else resolved_at)
         existing = self.get_data_quality_issue(issue_id)
         if existing is None:
             raise KeyError(f"data quality issue not found: {issue_id}")
@@ -1846,13 +1752,11 @@ class DuckDBStore:
             if timestamp_omitted or existing.resolved_at == resolution_time:
                 return existing
             raise ValueError(
-                "data quality issue already resolved with different timestamp: "
-                f"{issue_id}"
+                f"data quality issue already resolved with different timestamp: {issue_id}"
             )
         if resolution_time < existing.last_seen_at:
             raise ValueError(
-                "data quality issue resolved_at cannot be earlier than "
-                f"last_seen_at: {issue_id}"
+                f"data quality issue resolved_at cannot be earlier than last_seen_at: {issue_id}"
             )
         for attempt in range(2):
             self._conn.execute("BEGIN")
@@ -1888,8 +1792,7 @@ class DuckDBStore:
                 resolved = self.get_data_quality_issue(issue_id)
                 if resolved is None:
                     raise RuntimeError(
-                        "data quality issue resolution was not persisted: "
-                        f"{issue_id}"
+                        f"data quality issue resolution was not persisted: {issue_id}"
                     )
                 self._conn.execute("COMMIT")
                 transaction_open = False
@@ -1908,8 +1811,7 @@ class DuckDBStore:
                 if attempt == 0:
                     continue
                 raise RuntimeError(
-                    "data quality issue resolution lost repeated concurrent "
-                    f"updates: {issue_id}"
+                    f"data quality issue resolution lost repeated concurrent updates: {issue_id}"
                 ) from exc
             except Exception:
                 if transaction_open:
@@ -1931,8 +1833,7 @@ class DuckDBStore:
             if timestamp_omitted or current.resolved_at == resolution_time:
                 return current
             raise ValueError(
-                "data quality issue already resolved with different timestamp: "
-                f"{issue_id}"
+                f"data quality issue already resolved with different timestamp: {issue_id}"
             )
         if resolution_time < current.last_seen_at:
             raise ValueError(
@@ -1941,9 +1842,7 @@ class DuckDBStore:
             )
         return None
 
-    def list_snapshot_quality_issues(
-        self, snapshot_id: str
-    ) -> list[DataQualityIssue]:
+    def list_snapshot_quality_issues(self, snapshot_id: str) -> list[DataQualityIssue]:
         snapshot = self.get_dataset_snapshot(snapshot_id)
         if snapshot is None or not snapshot.quality_issue_ids:
             return []
@@ -1961,23 +1860,14 @@ class DuckDBStore:
             f"FROM data_quality_issue WHERE issue_id IN ({placeholders})",
             list(snapshot.quality_issue_ids),
         ).fetchall()
-        issues_by_id = {
-            issue.issue_id: issue for issue in map(_quality_issue_from_row, rows)
-        }
+        issues_by_id = {issue.issue_id: issue for issue in map(_quality_issue_from_row, rows)}
         missing_issue_ids = [
-            issue_id
-            for issue_id in snapshot.quality_issue_ids
-            if issue_id not in issues_by_id
+            issue_id for issue_id in snapshot.quality_issue_ids if issue_id not in issues_by_id
         ]
         if missing_issue_ids:
             missing = ", ".join(missing_issue_ids)
-            raise RuntimeError(
-                f"dataset snapshot references missing quality issue ids: {missing}"
-            )
-        return [
-            issues_by_id[issue_id]
-            for issue_id in snapshot.quality_issue_ids
-        ]
+            raise RuntimeError(f"dataset snapshot references missing quality issue ids: {missing}")
+        return [issues_by_id[issue_id] for issue_id in snapshot.quality_issue_ids]
 
     def list_open_data_quality_issues(
         self,
@@ -1991,17 +1881,13 @@ class DuckDBStore:
             selected_severities = tuple(dict.fromkeys(severities))
             if not selected_severities:
                 return []
-            predicates.append(
-                "severity IN (" + ",".join("?" for _ in selected_severities) + ")"
-            )
+            predicates.append("severity IN (" + ",".join("?" for _ in selected_severities) + ")")
             parameters.extend(selected_severities)
         if rule_ids is not None:
             selected_rule_ids = tuple(dict.fromkeys(rule_ids))
             if not selected_rule_ids:
                 return []
-            predicates.append(
-                "rule_id IN (" + ",".join("?" for _ in selected_rule_ids) + ")"
-            )
+            predicates.append("rule_id IN (" + ",".join("?" for _ in selected_rule_ids) + ")")
             parameters.extend(selected_rule_ids)
         rows = self._conn.execute(
             "SELECT issue_id, rule_id, dataset_id, severity, status, scope_key, "
@@ -2221,11 +2107,7 @@ class DuckDBStore:
                 if isinstance(raw_reference_date, pd.Timestamp)
                 else raw_reference_date
             )
-            reference_factor = (
-                None
-                if raw_reference_factor is None
-                else float(raw_reference_factor)
-            )
+            reference_factor = None if raw_reference_factor is None else float(raw_reference_factor)
             factor_by_date[reference_date_value] = reference_factor
             basis = resolve_price_factor_basis(
                 required_dates=daily_dates,
@@ -2239,9 +2121,7 @@ class DuckDBStore:
 
         daily["ref_factor"] = reference_factor
         daily["ref_trade_date"] = (
-            reference_date_value.isoformat()
-            if reference_date_value is not None
-            else None
+            reference_date_value.isoformat() if reference_date_value is not None else None
         )
         daily["price_basis_available"] = basis_available
         daily["price_basis_reason"] = unavailable_reason
@@ -2255,9 +2135,7 @@ class DuckDBStore:
             qfq_columns,
             strict=True,
         ):
-            daily[qfq_column] = (
-                pd.to_numeric(daily[raw_column], errors="coerce") * ratio_series
-            )
+            daily[qfq_column] = pd.to_numeric(daily[raw_column], errors="coerce") * ratio_series
         daily["trade_date"] = [trade_date.isoformat() for trade_date in daily_dates]
         return daily
 
@@ -2455,9 +2333,7 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert screen_result: {count} 行")
         return count
 
-    def query_screen_result(
-        self, trade_date: str, preset_name: str
-    ) -> pd.DataFrame:
+    def query_screen_result(self, trade_date: str, preset_name: str) -> pd.DataFrame:
         return self._conn.execute(
             """
             SELECT ts_code, name, close, pct_chg, extra
@@ -2507,9 +2383,7 @@ class DuckDBStore:
             """
         ).fetchdf()
 
-    def update_pool2_exit(
-        self, ts_code: str, exit_date: date, exit_reason: str
-    ) -> None:
+    def update_pool2_exit(self, ts_code: str, exit_date: date, exit_reason: str) -> None:
         self._conn.execute(
             """
             UPDATE pool2_watch
@@ -2520,9 +2394,7 @@ class DuckDBStore:
         )
 
     def remove_pool2(self, ts_code: str) -> None:
-        self._conn.execute(
-            "DELETE FROM pool2_watch WHERE ts_code = ?", [ts_code]
-        )
+        self._conn.execute("DELETE FROM pool2_watch WHERE ts_code = ?", [ts_code])
 
     def query_pool2_all(self) -> pd.DataFrame:
         return self._conn.execute(
@@ -2558,9 +2430,7 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert monitor_event: {count} 行")
         return count
 
-    def query_monitor_events(
-        self, trade_date: str, ts_code: str | None = None
-    ) -> pd.DataFrame:
+    def query_monitor_events(self, trade_date: str, ts_code: str | None = None) -> pd.DataFrame:
         if ts_code:
             return self._conn.execute(
                 """
@@ -2713,10 +2583,19 @@ class DuckDBStore:
             return 0
         payload = df.copy()
         optional_cols = [
-            "exit_time", "exit_price", "exit_reason", "holding_trading_days",
-            "pnl_pct", "trailing_stop_price", "max_drawdown_pct",
-            "take_profit_basis", "feature_snapshot_id", "param_payload",
-            "strategy_name", "signal_factors", "run_id",
+            "exit_time",
+            "exit_price",
+            "exit_reason",
+            "holding_trading_days",
+            "pnl_pct",
+            "trailing_stop_price",
+            "max_drawdown_pct",
+            "take_profit_basis",
+            "feature_snapshot_id",
+            "param_payload",
+            "strategy_name",
+            "signal_factors",
+            "run_id",
         ]
         for col in optional_cols:
             if col not in payload.columns:
@@ -2839,8 +2718,7 @@ class DuckDBStore:
                 raise ValueError(msg)
 
         dims = ",\n                   ".join(
-            f"json_extract_string(signal_factors, '$.factors.{factor}.hit')"
-            f' AS "{factor}"'
+            f"json_extract_string(signal_factors, '$.factors.{factor}.hit') AS \"{factor}\""
             for factor in factors
         )
         group_by = ", ".join(str(i + 1) for i in range(len(factors)))
@@ -2937,18 +2815,12 @@ class DuckDBStore:
         if df.empty:
             return 0
         if transaction_mode not in {"auto", "standalone", "existing"}:
-            raise ValueError(
-                "limit-up-pool transaction_mode must be auto, standalone, or existing"
-            )
+            raise ValueError("limit-up-pool transaction_mode must be auto, standalone, or existing")
         active_transaction = _duckdb_transaction_is_active(self._conn)
         if transaction_mode == "standalone" and active_transaction:
-            raise ValueError(
-                "standalone limit-up-pool upsert cannot join an existing transaction"
-            )
+            raise ValueError("standalone limit-up-pool upsert cannot join an existing transaction")
         if transaction_mode == "existing" and not active_transaction:
-            raise ValueError(
-                "existing limit-up-pool upsert requires an active transaction"
-            )
+            raise ValueError("existing limit-up-pool upsert requires an active transaction")
         owns_transaction = transaction_mode == "standalone" or (
             transaction_mode == "auto" and not active_transaction
         )
@@ -3011,9 +2883,7 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert limit_up_pool_daily: {count} 行")
         return count
 
-    def query_limit_up_pool(
-        self, trade_date: str | date | pd.Timestamp
-    ) -> pd.DataFrame:
+    def query_limit_up_pool(self, trade_date: str | date | pd.Timestamp) -> pd.DataFrame:
         return self._conn.execute(
             """
             SELECT ts_code, trade_date, name, pct_chg, close, amount,
@@ -3200,8 +3070,7 @@ class DuckDBStore:
         quoted = ", ".join(f'"{c}"' for c in use)
         self._conn.register("dataset_tmp", payload)
         self._conn.execute(
-            f'INSERT OR REPLACE INTO "{table}" ({quoted}) '
-            f"SELECT {quoted} FROM dataset_tmp"
+            f'INSERT OR REPLACE INTO "{table}" ({quoted}) SELECT {quoted} FROM dataset_tmp'
         )
         self._conn.unregister("dataset_tmp")
         count = len(payload)
@@ -3223,10 +3092,7 @@ class DuckDBStore:
         try:
             self._conn.execute("BEGIN")
             self._conn.execute(f'DELETE FROM "{table}"')
-            self._conn.execute(
-                f'INSERT INTO "{table}" ({quoted}) '
-                f"SELECT {quoted} FROM dataset_tmp"
-            )
+            self._conn.execute(f'INSERT INTO "{table}" ({quoted}) SELECT {quoted} FROM dataset_tmp')
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -3267,6 +3133,7 @@ class DuckDBStore:
 #
 # 副本不存在（首次部署 / sync 还没跑过）→ 降级主库 read_only（可能撞锁）
 # 副本损坏（cp 时撞 monitor fsync）→ 降级主库 read_only
+
 
 def _readonly_candidate_paths() -> list[Path]:
     """返回 read_only 打开的候选路径列表，按优先级排序（副本在前）。"""
@@ -3321,9 +3188,7 @@ def open_readonly_store(
     store = DuckDBStore(paths[-1], read_only=True)
     if not _store_has_required_tables(store, required_tables):
         store.close()
-        raise duckdb.CatalogException(
-            f"required tables missing: {list(required_tables or [])}"
-        )
+        raise duckdb.CatalogException(f"required tables missing: {list(required_tables or [])}")
     return store
 
 

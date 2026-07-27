@@ -2555,9 +2555,11 @@ class LabArtifactReclaimer:
         *,
         artifact_root: Path,
         report_spool: LabReportSpool,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> None:
         self.artifact_root = Path(artifact_root).resolve()
         self.report_spool = report_spool
+        self.mutation_guard = mutation_guard
         self.garbage_root = self.artifact_root / ".garbage-v1"
         garbage_namespace_was_missing = not os.path.lexists(self.garbage_root)
         self.garbage_intent_dir = self.garbage_root / "prepared_intents"
@@ -2608,6 +2610,8 @@ class LabArtifactReclaimer:
         self.garbage_deferred_dir = self.garbage_root / "deferred_gc"
         self.garbage_legacy_complete_path = self.garbage_root / "legacy-complete-v1.json"
         self.garbage_pending_dir = self.garbage_deferred_dir
+        if self.mutation_guard is not None:
+            self.mutation_guard()
         for directory in (
             self.garbage_intent_dir,
             self.garbage_active_intent_dir,
@@ -2639,6 +2643,8 @@ class LabArtifactReclaimer:
             if stat.S_IMODE(directory.lstat().st_mode) != 0o700:
                 directory.chmod(0o700)
         if garbage_namespace_was_missing:
+            if self.mutation_guard is not None:
+                self.mutation_guard()
             self._write_migration_complete_locked()
             directories = self._migration_directory_identities()
             cycle = self._ensure_queue_migration_cycle_locked((), directories)
@@ -6372,7 +6378,13 @@ class LabArtifactReclaimer:
         if attempts_root.exists():
             self._preflight(validated, attempts_root)
         with self.report_spool.evidence_lock():
+            if self.mutation_guard is not None:
+                self.mutation_guard()
             self._cleanup_ledger_temporaries(ledger_dir)
             if attempts_root.exists():
+                if self.mutation_guard is not None:
+                    self.mutation_guard()
                 self._reclaim_locked(validated, attempts_root)
+            if self.mutation_guard is not None:
+                self.mutation_guard()
             self._reconcile_orphan_ledgers(validated)

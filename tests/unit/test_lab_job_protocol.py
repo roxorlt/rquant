@@ -986,6 +986,47 @@ def test_publish_after_ack_returns_existing_receipt_and_rejects_conflict(
     assert spool.pending() == ()
 
 
+def test_command_spool_internal_mutation_fence_prevents_quarantine_and_ack(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+    setup = LabCommandSpool(root)
+    envelope = _submit_envelope()
+    entry = setup.publish(envelope)
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise RuntimeError("runtime drifted inside spool lock")
+        return "1" * 40
+
+    spool = LabCommandSpool(root, mutation_guard=mutation_guard)
+    mutation_guard()
+    with pytest.raises(RuntimeError, match="inside spool lock"):
+        spool.quarantine(entry, reason="invalid command")
+
+    assert entry.path.exists()
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+    calls = 0
+    receipt = LabCommandReceipt(
+        request_id=envelope.request_id,
+        content_hash=envelope.content_hash,
+        job_id=envelope.command.job_id,
+        status="applied",
+        reason="submitted",
+        job_version=0,
+    )
+    mutation_guard()
+    with pytest.raises(RuntimeError, match="inside spool lock"):
+        spool.ack(entry, receipt)
+
+    assert entry.path.exists()
+    assert tuple(spool.ack_dir.iterdir()) == ()
+
+
 def test_load_and_quarantine_reject_external_symlink_and_mismatched_basename(
     tmp_path: Path,
 ) -> None:

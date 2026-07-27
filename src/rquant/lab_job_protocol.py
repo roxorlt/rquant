@@ -12,7 +12,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -352,6 +352,7 @@ class LabCommandSpool:
         *,
         max_isolation_records: int = 256,
         max_isolation_bytes: int = 64 * 1024 * 1024,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> None:
         if max_isolation_records < 1:
             raise ValueError("max_isolation_records must be positive")
@@ -364,6 +365,7 @@ class LabCommandSpool:
         self._lock_path = self.root / ".spool.lock"
         self._sequence_path = self.root / ".delivery-sequence"
         self._thread_lock = RLock()
+        self.mutation_guard = mutation_guard
         self.max_isolation_records = max_isolation_records
         self.max_isolation_bytes = max_isolation_bytes
         for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
@@ -391,8 +393,11 @@ class LabCommandSpool:
         finally:
             os.close(descriptor)
 
-    @classmethod
-    def _publish_no_clobber(cls, target: Path, payload: bytes) -> bool:
+    def _guard_mutation(self) -> None:
+        if self.mutation_guard is not None:
+            self.mutation_guard()
+
+    def _publish_no_clobber(self, target: Path, payload: bytes) -> bool:
         temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
         try:
             with temporary.open("xb") as stream:
@@ -400,10 +405,11 @@ class LabCommandSpool:
                 stream.flush()
                 os.fsync(stream.fileno())
             try:
+                self._guard_mutation()
                 os.link(temporary, target)
             except FileExistsError:
                 return False
-            cls._fsync_directory(target.parent)
+            self._fsync_directory(target.parent)
             return True
         finally:
             temporary.unlink(missing_ok=True)
@@ -423,6 +429,7 @@ class LabCommandSpool:
                 stream.write(f"{sequence}\n".encode("ascii"))
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._guard_mutation()
             os.replace(temporary, self._sequence_path)
             self._fsync_directory(self.root)
         finally:
@@ -569,6 +576,7 @@ class LabCommandSpool:
             # a process that can arbitrarily rewrite the spool directory itself.
             if destination_name == "entry":
                 self._before_owned_entry_move(source, container)
+            self._guard_mutation()
             _rename_noreplace(
                 source_fd,
                 source_name,
@@ -641,6 +649,7 @@ class LabCommandSpool:
                 os.close(source_fd)
         isolation_id = uuid4()
         container = self.quarantine_dir / f"owned-entry-{isolation_id}.dead"
+        self._guard_mutation()
         os.mkdir(container, mode=0o700)
         evidence = _LabOwnedEntryIsolationEvidence(
             isolation_id=isolation_id,
@@ -921,9 +930,8 @@ class LabCommandSpool:
             )
         return records
 
-    @classmethod
     def _remove_bound_directory_entry(
-        cls,
+        self,
         parent_fd: int,
         name: str,
         observed: os.stat_result,
@@ -932,9 +940,10 @@ class LabCommandSpool:
             current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             return True
-        if not cls._stat_matches_bound_entry(current, observed):
+        if not self._stat_matches_bound_entry(current, observed):
             return False
         try:
+            self._guard_mutation()
             if stat.S_ISDIR(current.st_mode):
                 os.rmdir(name, dir_fd=parent_fd)
             else:
@@ -1081,6 +1090,7 @@ class LabCommandSpool:
                 or current_container.st_ino != record.container_stat.st_ino
             ):
                 return False
+            self._guard_mutation()
             os.rmdir(record.container.name, dir_fd=quarantine_fd)
             os.fsync(quarantine_fd)
             return True
@@ -1451,6 +1461,7 @@ class LabCommandSpool:
                 or current.st_nlink != expected_link_count
             ):
                 raise InvalidCommandEnvelopeError("pending command was replaced before unlink")
+            self._guard_mutation()
             os.unlink(name, dir_fd=directory_fd)
             os.fsync(directory_fd)
         finally:
@@ -1468,6 +1479,7 @@ class LabCommandSpool:
             else Path(entry_or_path)
         )
         with self._exclusive_lock():
+            self._guard_mutation()
             source = Path(os.path.abspath(source))
             self._direct_child_name(source, self.pending_dir)
             try:

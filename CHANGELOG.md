@@ -112,11 +112,18 @@
 
 - **Strategy Lab daemon 第六轮 runtime mutation 加固**：正式 runtime 现在拒绝
   `src/rquant` 下全部 ignored `.pyc/.pyo`，三份 launchd contract 禁止生成 bytecode；新增
-  默认只审计、仅在显式参数下安全清理 owner regular bytecode 的部署前 preflight。scheduler、
+  只审计且不具备删除能力的部署前 preflight。scheduler、
   worker 与 finalizer 在 quarantine、seal/publish、ACK、claim 和 daemon state 等最终副作用
   紧前重新验证启动 SHA 绑定，runtime 漂移不再移动 pending、candidate 或 acknowledgement。
   finalizer state 的首次读取会二次确认仍不存在，首次发布使用原子 no-clobber，拒绝覆盖并发
   创建的状态。
+
+- **Strategy Lab daemon 第七轮持久化边界加固**：runtime preflight 彻底移除自动清理参数，
+  对 bytecode 或 package symlink 仅检测并失败，目录在扫描期间被替换也不会删除仓库外文件。
+  动态 runtime guard 下沉到 spool、SQLite transaction、artifact store、claim/reclaim 和 finalizer
+  state 的锁内最终 mutation 边界，漂移时 rollback 且不 ACK、quarantine、seal 或 publish。
+  finalizer state 以私有 writer lock 串行保存，并在最终替换前复验既有完整 inode 身份，拒绝覆盖
+  并发创建或更新的状态。
 
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，

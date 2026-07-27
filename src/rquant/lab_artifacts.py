@@ -2188,8 +2188,14 @@ def _rebuild_research_run_spec(payload: bytes) -> ResearchRunSpec:
 class LabJobArtifactStore:
     """Create and verify complete job artifacts without touching scheduler state."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        mutation_guard: Callable[[], object] | None = None,
+    ) -> None:
         self.root = _secure_absolute_path(root)
+        self.mutation_guard = mutation_guard
         self.candidates_root = self.root / "candidates"
         self.sealed_root = self.root / "sealed"
         self.quarantine_root = self.root / "quarantine"
@@ -2295,6 +2301,7 @@ class LabJobArtifactStore:
                 os.fstat(self._guard_lock_descriptor)
             )
             with self._exclusive_namespace_guard(allow_poisoned=True):
+                self._guard_mutation()
                 self._recover_active_namespace_guards()
             self._assert_managed_roots()
             with self._process_lock:
@@ -2311,6 +2318,10 @@ class LabJobArtifactStore:
                     [error, *cleanup_errors],
                 )
             raise
+
+    def _guard_mutation(self) -> None:
+        if self.mutation_guard is not None:
+            self.mutation_guard()
 
     def close(self) -> None:
         condition = getattr(self, "_preview_condition", None)
@@ -3856,6 +3867,7 @@ class LabJobArtifactStore:
             guard_intent: LabCandidateNamespaceGuardIntent | None = None
             guard_archived = False
             try:
+                self._guard_mutation()
                 os.mkdir(candidate_name, mode=0o700, dir_fd=candidates_descriptor)
                 candidate_descriptor = os.open(
                     candidate_name,
@@ -5471,6 +5483,7 @@ class LabJobArtifactStore:
     @_artifact_public_operation()
     def seal_candidate(self, candidate: LabJobArtifactCandidate) -> LabSealedJobArtifact:
         self._assert_store_operational()
+        self._guard_mutation()
         candidate = self._defensively_validate_candidate(candidate)
         if self.verify_candidate(candidate, allow_interrupted_seal=True) != candidate.manifest:
             raise LabArtifactIntegrityError("candidate manifest changed before seal")
@@ -5540,6 +5553,7 @@ class LabJobArtifactStore:
                 sealed_parent = self._managed_parent_descriptor(self.sealed_root)
                 source_parent = bound.parent_descriptor
                 try:
+                    self._guard_mutation()
                     self._atomic_publish_noreplace(
                         source_parent,
                         bound.bundle_name,
@@ -6116,6 +6130,7 @@ class LabJobArtifactStore:
                 if opened != before:
                     raise LabArtifactIntegrityError("candidate quarantine identity changed")
             try:
+                self._guard_mutation()
                 self._atomic_quarantine_noreplace(
                     source_parent,
                     source_name,

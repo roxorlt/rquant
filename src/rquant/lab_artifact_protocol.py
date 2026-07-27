@@ -418,6 +418,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         *,
         max_conflict_records: int = 256,
         max_conflict_bytes: int = 64 * 1024 * 1024,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> None:
         if max_conflict_records < 1:
             raise ValueError("max_conflict_records must be positive")
@@ -427,6 +428,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             root,
             max_isolation_records=max_conflict_records,
             max_isolation_bytes=max_conflict_bytes,
+            mutation_guard=mutation_guard,
         )
         self._scan_cursor_path = self.root / ".artifact-commit-scan-cursor.json"
         self.max_conflict_records = max_conflict_records
@@ -523,6 +525,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     os.fsync(stream.fileno())
                 self._fsync_directory(self.root)
                 self._after_scan_cursor_stage("temporary_written", temporary)
+                self._guard_mutation()
                 os.replace(temporary, self._scan_cursor_path)
                 self._fsync_directory(self.root)
                 self._after_scan_cursor_stage("cursor_replaced", self._scan_cursor_path)
@@ -687,6 +690,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             )
             try:
                 try:
+                    self._guard_mutation()
                     os.link(
                         temporary.name,
                         target.name,
@@ -802,6 +806,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         )
         try:
             try:
+                self._guard_mutation()
                 os.link(
                     temporary.name,
                     target.name,
@@ -845,8 +850,8 @@ class LabArtifactCommitSpool(LabCommandSpool):
         self._publish_conflict_evidence_locked(evidence)
         self._prune_conflicts_locked()
 
-    @staticmethod
     def _unlink_regular_identity(
+        self,
         path: Path,
         observed: os.stat_result,
         *,
@@ -870,6 +875,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 raise InvalidCommandEnvelopeError(
                     f"conflict evidence changed before retention cleanup: {path.name}"
                 )
+            self._guard_mutation()
             os.unlink(path.name, dir_fd=directory_fd)
             os.fsync(directory_fd)
         finally:

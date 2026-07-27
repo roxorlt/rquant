@@ -1495,6 +1495,64 @@ def test_finalizer_state_save_does_not_overwrite_concurrent_absent_state_creatio
     assert store.path.read_bytes() == concurrent
 
 
+def test_finalizer_state_internal_mutation_fence_preserves_existing_state(
+    tmp_path: Path,
+) -> None:
+    store = LabFinalizerStateStore(_private_state_dir(tmp_path))
+    original = LabFinalizerDaemonState(cycle=7)
+    store.save(original)
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise LabDaemonConfigurationError("runtime drifted inside state lock")
+        return "1" * 40
+
+    mutation_guard()
+    with pytest.raises(LabDaemonConfigurationError, match="inside state lock"):
+        store.save(LabFinalizerDaemonState(cycle=8), mutation_guard=mutation_guard)
+
+    assert store.load() == original
+
+
+def test_finalizer_state_existing_concurrent_replacement_is_not_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabFinalizerStateStore(_private_state_dir(tmp_path))
+    store.save(LabFinalizerDaemonState(cycle=1))
+    concurrent = LabFinalizerDaemonState(cycle=99).model_dump_json().encode("utf-8")
+
+    def replace_before_exchange(root_descriptor: int) -> None:
+        replacement_name = ".concurrent-state.tmp"
+        descriptor = os.open(
+            replacement_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        try:
+            os.write(descriptor, concurrent)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(
+            replacement_name,
+            store.path.name,
+            src_dir_fd=root_descriptor,
+            dst_dir_fd=root_descriptor,
+        )
+
+    monkeypatch.setattr(store, "_before_state_exchange", replace_before_exchange, raising=False)
+
+    with pytest.raises(LabDaemonConfigurationError, match="concurrent|changed"):
+        store.save(LabFinalizerDaemonState(cycle=2))
+
+    assert store.path.read_bytes() == concurrent
+
+
 def test_finalizer_state_save_rejects_same_size_replacement_and_restores_previous(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

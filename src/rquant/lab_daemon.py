@@ -969,6 +969,7 @@ class LabFinalizerStateStore:
 
     _MAX_BYTES = 1_048_576
     _MAX_FAILURES = 4_096
+    _WRITER_LOCK_NAME = ".state.writer.lock"
 
     def __init__(self, root: Path) -> None:
         self.root = _canonical_absolute_path(root, label="lab finalizer state")
@@ -997,6 +998,13 @@ class LabFinalizerStateStore:
         descriptor: int,
         expected: os.stat_result,
     ) -> None:
+        self._assert_root_binding(descriptor, expected)
+
+    def _assert_root_binding(
+        self,
+        descriptor: int,
+        expected: os.stat_result,
+    ) -> None:
         try:
             observed = os.fstat(descriptor)
             path_observed = self.root.lstat()
@@ -1016,6 +1024,80 @@ class LabFinalizerStateStore:
             path_observed.st_ino,
         ) != (expected.st_dev, expected.st_ino):
             raise LabDaemonConfigurationError("lab finalizer state directory identity changed")
+
+    @staticmethod
+    def _state_identity(observed: os.stat_result) -> tuple[int, ...]:
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_uid,
+            observed.st_nlink,
+            observed.st_size,
+            observed.st_mtime_ns,
+        )
+
+    def _open_writer_lock(
+        self,
+        root_descriptor: int,
+        root_identity: os.stat_result,
+    ) -> int:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        created = False
+        try:
+            descriptor = os.open(
+                self._WRITER_LOCK_NAME,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=root_descriptor,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                self._WRITER_LOCK_NAME,
+                flags,
+                dir_fd=root_descriptor,
+            )
+        try:
+            if created:
+                os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            _validate_private_regular_identity(
+                opened,
+                label="lab finalizer state writer lock",
+            )
+            active = os.stat(
+                self._WRITER_LOCK_NAME,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            _validate_private_regular_identity(
+                active,
+                label="lab finalizer state writer lock",
+            )
+            if self._state_identity(active) != self._state_identity(opened):
+                raise LabDaemonConfigurationError(
+                    "lab finalizer state writer lock identity changed"
+                )
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            self._assert_root_binding(root_descriptor, root_identity)
+            active = os.stat(
+                self._WRITER_LOCK_NAME,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if self._state_identity(active) != self._state_identity(opened):
+                raise LabDaemonConfigurationError(
+                    "lab finalizer state writer lock identity changed"
+                )
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _before_state_exchange(_root_descriptor: int) -> None:
+        """Fault-injection boundary before final state publication."""
 
     def load(self) -> LabFinalizerDaemonState:
         root_descriptor, root_identity = self._open_root()
@@ -1119,7 +1201,12 @@ class LabFinalizerStateStore:
                 os.close(descriptor)
             os.close(root_descriptor)
 
-    def save(self, state: LabFinalizerDaemonState) -> None:
+    def save(
+        self,
+        state: LabFinalizerDaemonState,
+        *,
+        mutation_guard: Callable[[], object] | None = None,
+    ) -> None:
         state = LabFinalizerDaemonState.model_validate(state.model_dump())
         if len(state.failures) > self._MAX_FAILURES:
             raise LabDaemonConfigurationError("lab finalizer state has too many failures")
@@ -1130,8 +1217,13 @@ class LabFinalizerStateStore:
         temporary_name = f".state.{os.getpid()}.{uuid4().hex}.tmp"
         descriptor = -1
         existing_descriptor = -1
+        writer_lock_descriptor = -1
         replaced = False
         try:
+            writer_lock_descriptor = self._open_writer_lock(
+                root_descriptor,
+                root_identity,
+            )
             try:
                 existing = os.stat(
                     self.path.name,
@@ -1188,6 +1280,8 @@ class LabFinalizerStateStore:
                     )
             if existing is None:
                 try:
+                    if mutation_guard is not None:
+                        mutation_guard()
                     os.link(
                         temporary_name,
                         self.path.name,
@@ -1202,6 +1296,23 @@ class LabFinalizerStateStore:
                 replaced = True
                 os.unlink(temporary_name, dir_fd=root_descriptor)
             else:
+                self._before_state_exchange(root_descriptor)
+                self._assert_root_current(root_descriptor, root_identity)
+                active = os.stat(
+                    self.path.name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                _validate_private_regular_identity(
+                    active,
+                    label="lab finalizer state file",
+                )
+                if self._state_identity(active) != self._state_identity(existing):
+                    raise LabDaemonConfigurationError(
+                        "lab finalizer state changed concurrently before commit"
+                    )
+                if mutation_guard is not None:
+                    mutation_guard()
                 os.replace(
                     temporary_name,
                     self.path.name,
@@ -1328,6 +1439,9 @@ class LabFinalizerStateStore:
                 os.close(descriptor)
             if existing_descriptor >= 0:
                 os.close(existing_descriptor)
+            if writer_lock_descriptor >= 0:
+                fcntl.flock(writer_lock_descriptor, fcntl.LOCK_UN)
+                os.close(writer_lock_descriptor)
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=root_descriptor)
             os.close(root_descriptor)
@@ -1487,7 +1601,7 @@ class LabFinalizerDaemon:
                     last_seen_cycle=state.cycle,
                 )
                 self._verify_runtime()
-                self.state_store.save(state)
+                self.state_store.save(state, mutation_guard=self.runtime_guard)
                 if first_error_type is None:
                     first_error_type = type(exc).__name__
                     first_error_message = " ".join((str(exc) or type(exc).__name__).split())[:400]
@@ -1512,7 +1626,7 @@ class LabFinalizerDaemon:
                 }
                 state.cycle += 1
         self._verify_runtime()
-        self.state_store.save(state)
+        self.state_store.save(state, mutation_guard=self.runtime_guard)
         return LabFinalizerTickResult(
             candidates=len(page.items),
             failed=failed,

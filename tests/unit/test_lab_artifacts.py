@@ -141,6 +141,30 @@ def _prepare(
     )
 
 
+def test_artifact_store_internal_mutation_fence_prevents_seal_publish(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    candidate = _prepare(store)
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise RuntimeError("runtime drifted before artifact publish")
+        return "1" * 40
+
+    store.mutation_guard = mutation_guard
+    mutation_guard()
+
+    with pytest.raises(RuntimeError, match="before artifact publish"):
+        store.seal_candidate(candidate)
+
+    assert candidate.path.is_dir()
+    assert not (store.sealed_root / candidate.job_id.hex).exists()
+
+
 def _prepare_arguments() -> dict[str, object]:
     return {
         "job_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),

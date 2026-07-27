@@ -1222,6 +1222,7 @@ class _LabStagedArtifactCommit:
         "_connection",
         "_closed",
         "_lease_identity",
+        "_mutation_guard",
         "_precommit_validator",
         "receipt",
     )
@@ -1233,6 +1234,7 @@ class _LabStagedArtifactCommit:
         *,
         lease: LabLeaseRecord,
         precommit_validator: Callable[[LabLeaseRecord, datetime], None],
+        mutation_guard: Callable[[], object] | None = None,
     ) -> None:
         self._connection = connection
         self._closed = False
@@ -1244,6 +1246,7 @@ class _LabStagedArtifactCommit:
             lease.fencing_token,
         )
         self._precommit_validator = precommit_validator
+        self._mutation_guard = mutation_guard
         self.receipt = receipt
 
     @staticmethod
@@ -1314,6 +1317,8 @@ class _LabStagedArtifactCommit:
             )
         try:
             self._precommit_validator(lease, _utc(now))
+            if self._mutation_guard is not None:
+                self._mutation_guard()
         except BaseException as exc:
             self._rollback_and_close(exc)
         try:
@@ -4861,12 +4866,14 @@ class LabJobStore:
         *,
         busy_timeout_ms: int = 5_000,
         identity_authority: LabSqliteIdentityAuthority | None = None,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
         self.identity_authority = identity_authority
+        self.mutation_guard = mutation_guard
         if identity_authority is not None and identity_authority.path != self.path:
             raise ValueError("SQLite identity authority path mismatch")
 
@@ -4964,6 +4971,8 @@ class LabJobStore:
             )
             _validate_v5_schema(connection)
             yield connection
+            if self.mutation_guard is not None:
+                self.mutation_guard()
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -5028,6 +5037,8 @@ class LabJobStore:
             _normalize_legacy_terminal_shards(connection)
             _validate_v5_schema(connection)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+            if self.mutation_guard is not None:
+                self.mutation_guard()
             connection.commit()
             connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
@@ -5648,6 +5659,7 @@ class LabJobStore:
                 receipt,
                 lease=lease,
                 precommit_validator=validate_before_commit,
+                mutation_guard=self.mutation_guard,
             )
         except BaseException:
             connection.rollback()

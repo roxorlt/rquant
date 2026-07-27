@@ -146,9 +146,7 @@ class Settings(BaseSettings):
     # nginx 只认这一个字面值（不验 hmac 签名），所有已登录用户共用同一 cookie 值。
     # 显式配置优先；为空时从 cookie_secret 确定性派生（见 panorama_gate_token_resolved），
     # 免得再单独配一份、且重启后稳定不变。
-    panorama_gate_token: str = Field(
-        default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN"
-    )
+    panorama_gate_token: str = Field(default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN")
 
     @property
     def deepseek_enabled(self) -> bool:
@@ -170,9 +168,7 @@ class Settings(BaseSettings):
         if not normalized:
             return "tushare"
         if normalized not in ("tushare", "akshare"):
-            raise ValueError(
-                f"intraday_quote_source 只允许 'tushare' 或 'akshare'，收到 {v!r}"
-            )
+            raise ValueError(f"intraday_quote_source 只允许 'tushare' 或 'akshare'，收到 {v!r}")
         return normalized
 
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="before")
@@ -301,9 +297,7 @@ class Settings(BaseSettings):
             readonly_path,
         }
         if state_path in operational_paths:
-            raise ValueError(
-                "backfill state path must differ from DuckDB main and readonly paths"
-            )
+            raise ValueError("backfill state path must differ from DuckDB main and readonly paths")
         research_paths = {
             _canonical_absolute_path(
                 self.research_db_path or self.data_dir / "research.duckdb",
@@ -323,26 +317,17 @@ class Settings(BaseSettings):
             ),
         }
         if research_paths & operational_paths:
-            raise ValueError(
-                "research paths must differ from DuckDB main and readonly paths"
-            )
+            raise ValueError("research paths must differ from DuckDB main and readonly paths")
         if len(research_paths) != 4:
             raise ValueError("research paths must differ from each other")
         return self
 
     @model_validator(mode="after")
     def validate_lab_scheduler_storage(self) -> "Settings":
-        if (
-            self.lab_scheduler_lease_seconds
-            < 3 * self.lab_scheduler_heartbeat_seconds
-        ):
-            raise ValueError(
-                "lab scheduler lease must be >= 3 * heartbeat interval"
-            )
+        if self.lab_scheduler_lease_seconds < 3 * self.lab_scheduler_heartbeat_seconds:
+            raise ValueError("lab scheduler lease must be >= 3 * heartbeat interval")
         if self.lab_worker_heartbeat_seconds >= self.lab_scheduler_shard_lease_seconds:
-            raise ValueError(
-                "lab worker heartbeat must precede scheduler shard lease expiry"
-            )
+            raise ValueError("lab worker heartbeat must precede scheduler shard lease expiry")
         if self.lab_worker_heartbeat_seconds >= self.lab_worker_lease_extension_seconds:
             raise ValueError("lab worker heartbeat must precede lease extension")
         if (
@@ -383,9 +368,7 @@ class Settings(BaseSettings):
             ),
         )
         if lab_path in existing_database_paths:
-            raise ValueError(
-                "lab jobs path must differ from all existing database paths"
-            )
+            raise ValueError("lab jobs path must differ from all existing database paths")
         managed_dirs = (
             _canonical_absolute_path(
                 self.lab_job_command_dir or self.data_dir / "lab_job_commands",
@@ -441,11 +424,7 @@ class Settings(BaseSettings):
             if path is not None
         )
         isolated_paths = (
-            existing_database_paths
-            + existing_managed_dirs
-            + (lab_path,)
-            + managed_dirs
-            + key_paths
+            existing_database_paths + existing_managed_dirs + (lab_path,) + managed_dirs + key_paths
         )
         for index, left in enumerate(isolated_paths):
             for right in isolated_paths[index + 1 :]:
@@ -527,9 +506,7 @@ class Settings(BaseSettings):
     @property
     def lab_scheduler_worker_id_list(self) -> tuple[str, ...]:
         return tuple(
-            worker.strip()
-            for worker in self.lab_scheduler_worker_ids.split(",")
-            if worker.strip()
+            worker.strip() for worker in self.lab_scheduler_worker_ids.split(",") if worker.strip()
         )
 
     @property

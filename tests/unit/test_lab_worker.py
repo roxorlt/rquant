@@ -1015,6 +1015,40 @@ def _crash_after_atomic_rename_child(root_value: str) -> None:
     os._exit(78)
 
 
+def test_artifact_reclaimer_checks_runtime_inside_evidence_lock(tmp_path: Path) -> None:
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    calls = 0
+    armed = False
+
+    def mutation_guard() -> str:
+        nonlocal calls, armed
+        if not armed:
+            return "1" * 40
+        calls += 1
+        if calls >= 2:
+            raise LabDaemonConfigurationError("runtime drifted inside reclaim lock")
+        return "1" * 40
+
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+        mutation_guard=mutation_guard,
+    )
+    armed = True
+    calls = 0
+    claim = _claim(_nshape_compare_spec())
+    ledger_dir = reclaimer._ledger_dir(claim)
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+
+    mutation_guard()
+    with pytest.raises(LabDaemonConfigurationError, match="inside reclaim lock"):
+        reclaimer.reclaim(claim)
+
+    assert ledger_dir.is_dir()
+
+
 def _crash_reclaimer_after_tombstone_rename_child(
     root_value: str,
     claim_payload: str,

@@ -328,6 +328,30 @@ def _lease(
     )
 
 
+def test_store_internal_mutation_fence_rolls_back_before_sqlite_commit(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise RuntimeError("runtime drifted before SQLite commit")
+        return "1" * 40
+
+    store.mutation_guard = mutation_guard
+    mutation_guard()
+
+    with pytest.raises(RuntimeError, match="before SQLite commit"):
+        store.apply_command(envelope, lease=lease, now=NOW)
+
+    assert LabJobReader(store.path).get_job(envelope.command.job_id) is None
+
+
 def test_staged_commit_validation_failure_rolls_back_and_closes(tmp_path: Path) -> None:
     lease = _lease(_store(tmp_path))
     connection = _StagedLifecycleConnection()
