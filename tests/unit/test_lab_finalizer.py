@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tracemalloc
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -187,6 +188,22 @@ class _CallbackSnapshotReader:
         return self.reader.get_artifact_commit(request_id)
 
 
+class _PinnedSnapshotLedgerReader:
+    def __init__(
+        self,
+        snapshot: LabFinalizationSnapshot,
+        reader: LabJobReader,
+    ) -> None:
+        self.snapshot = snapshot
+        self.reader = reader
+
+    def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
+        return self.snapshot if self.snapshot.job.job_id == job_id else None
+
+    def get_artifact_commit(self, request_id: UUID) -> LabArtifactCommitRecord | None:
+        return self.reader.get_artifact_commit(request_id)
+
+
 def _literal_json_object(fields: tuple[tuple[str, bytes], ...]) -> bytes:
     return (
         b"{"
@@ -297,6 +314,9 @@ def _ready_scenario(
     result_digest_policy: LabResultDigestPolicy | None = None,
     rewrite_pending_as_legacy_v1: bool = False,
     forged_current_content_hash: str | None = None,
+    authority_verification_key_provider: Callable[
+        [str], LabFinalizerAuthorityKey | None
+    ] = _authority_verification_key_provider,
 ) -> _Scenario:
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -332,7 +352,7 @@ def _ready_scenario(
         adapter_registry=default_strategy_job_adapter_registry(),
         artifact_commit_spool=commit_spool,
         artifact_store=artifact_store,
-        finalizer_authority_key_provider=_authority_verification_key_provider,
+        finalizer_authority_key_provider=authority_verification_key_provider,
         result_digest_policy=result_digest_policy,
         clock=lambda: NOW,
     )
@@ -1742,6 +1762,75 @@ def test_finalizer_reuses_verified_transition_key_pending_after_signing_rotation
     assert pending[0].envelope == first_pending[0].envelope
 
 
+def test_finalizer_replays_old_key_ledger_commit_after_signing_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_key = LabFinalizerAuthorityKey(key_id="finalizer-old", secret=b"o" * 32)
+    new_key = LabFinalizerAuthorityKey(key_id="finalizer-new", secret=b"n" * 32)
+    keyring = {old_key.key_id: old_key, new_key.key_id: new_key}
+    scenario = _ready_scenario(
+        tmp_path,
+        hold_days=(1,),
+        commit_spool_type=_CrashBeforeArtifactAckSpool,
+        authority_verification_key_provider=keyring.get,
+    )
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+
+    old_finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=lambda: old_key,
+        finalizer_authority_verification_key_provider=keyring.get,
+    )
+    published = old_finalizer.finalize(scenario.job_id)
+    with pytest.raises(RuntimeError, match="after artifact SQLite commit"):
+        scenario.scheduler.run_once()
+
+    rotated = LabFinalizer(
+        reader=_PinnedSnapshotLedgerReader(
+            snapshot,
+            LabJobReader(scenario.store.path),
+        ),  # type: ignore[arg-type]
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: "1" * 40,
+        finalizer_authority_key_provider=lambda: new_key,
+        finalizer_authority_verification_key_provider=keyring.get,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("rotated ledger replay entered full finalization")
+
+    monkeypatch.setattr(rotated.bundle_reader, "read", forbidden)
+    monkeypatch.setattr(rotated.adapter_registry, "aggregate_results", forbidden)
+    monkeypatch.setattr(rotated.artifact_store, "preview_candidate", forbidden)
+
+    replay = rotated.finalize(scenario.job_id)
+    ledger = LabJobReader(scenario.store.path).get_artifact_commit(published.request_id)
+
+    assert replay.status == "acknowledged"
+    assert replay.request_id == published.request_id
+    assert ledger is not None
+    assert ledger.envelope.authority_proof is not None
+    assert ledger.envelope.authority_proof.key_id == old_key.key_id
+    assert len(scenario.commit_spool.pending()) == 1
+
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    acknowledged = rotated.finalize(scenario.job_id)
+
+    assert acknowledged.status == "acknowledged"
+    assert acknowledged.request_id == published.request_id
+    assert scenario.commit_spool.pending() == ()
+
+
 def test_finalizer_recovers_rename_completed_interrupted_seal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1991,35 +2080,57 @@ def test_matching_sealed_replay_retries_exact_redundant_candidate_cleanup(
     assert _candidate_evidence_counts(scenario.artifact_store) == after_recovery
 
 
-def test_owned_candidate_cleanup_failure_preserves_primary_and_cleanup_errors(
+def test_repeated_seal_failure_reuses_one_active_candidate_and_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    original_seal = scenario.artifact_store.seal_candidate
 
     def fail_seal(*_args: object, **_kwargs: object) -> object:
         raise LabArtifactError("seal failed")
-
-    def fail_cleanup(*_args: object, **_kwargs: object) -> object:
-        raise LabArtifactError("cleanup failed")
 
     monkeypatch.setattr(
         scenario.artifact_store,
         "seal_candidate",
         fail_seal,
     )
-    monkeypatch.setattr(
-        scenario.artifact_store,
-        "quarantine_recovery_record",
-        fail_cleanup,
-    )
 
-    with pytest.raises(ExceptionGroup) as raised:
-        scenario.finalizer().finalize(scenario.job_id)
+    identities: list[tuple[int, int, int]] = []
+    for _ in range(100):
+        with pytest.raises(LabFinalizationIntegrityError, match="could not be sealed"):
+            scenario.finalizer().finalize(scenario.job_id)
+        candidates = tuple(scenario.artifact_store.candidates_root.iterdir())
+        assert len(candidates) == 1
+        observed = candidates[0].stat()
+        retained_bytes = sum(
+            item.stat().st_size for item in candidates[0].rglob("*") if item.is_file()
+        )
+        identities.append((observed.st_dev, observed.st_ino, retained_bytes))
+        assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
 
-    messages = tuple(str(error) for error in raised.value.exceptions)
-    assert any("job artifact could not be sealed" in message for message in messages)
-    assert any("cleanup failed" in message for message in messages)
+    assert len(set(identities)) == 1
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = tuple(
+            executor.submit(scenario.finalizer().finalize, scenario.job_id) for _ in range(16)
+        )
+        for future in futures:
+            with pytest.raises(LabFinalizationIntegrityError, match="could not be sealed"):
+                future.result()
+
+    candidates = tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert len(candidates) == 1
+    after = candidates[0].stat()
+    assert (after.st_dev, after.st_ino) == identities[0][:2]
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
+
+    monkeypatch.setattr(scenario.artifact_store, "seal_candidate", original_seal)
+    recovered = scenario.finalizer().finalize(scenario.job_id)
+
+    assert recovered.status == "published"
+    assert not tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
 
 
 def test_scheduler_commit_before_ack_replays_without_duplicate_result(tmp_path: Path) -> None:

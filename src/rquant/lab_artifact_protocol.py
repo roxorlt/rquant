@@ -198,6 +198,28 @@ def verify_finalizer_authority(
     return proof.claims
 
 
+class LabAuthenticatedArtifactCommitIdentity(LabArtifactCommitProtocolModel):
+    """Commit meaning after both the envelope and its authority claims are authenticated."""
+
+    schema_version: Literal[1] = 1
+    request_id: UUID
+    commit: LabArtifactCommit
+    claims: LabFinalizerAuthorityClaims
+
+
+def authenticate_artifact_commit_identity(
+    envelope: LabArtifactCommitEnvelope,
+    *,
+    key_provider: LabFinalizerAuthorityVerificationKeyProvider,
+) -> LabAuthenticatedArtifactCommitIdentity:
+    claims = verify_finalizer_authority(envelope, key_provider=key_provider)
+    return LabAuthenticatedArtifactCommitIdentity(
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        claims=claims,
+    )
+
+
 class LabArtifactCommitEnvelope(LabArtifactCommitProtocolModel):
     schema_version: Literal[1, 2] = 1
     request_id: UUID

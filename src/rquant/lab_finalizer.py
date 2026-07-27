@@ -27,14 +27,15 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitReceipt,
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
+    LabAuthenticatedArtifactCommitIdentity,
     LabFinalizerAuthorityAuthenticationError,
     LabFinalizerAuthorityClaims,
     LabFinalizerAuthorityKey,
     LabFinalizerAuthorityShardEvidence,
     LabFinalizerAuthoritySigningKeyProvider,
     LabFinalizerAuthorityVerificationKeyProvider,
+    authenticate_artifact_commit_identity,
     sign_finalizer_authority,
-    verify_finalizer_authority,
 )
 from rquant.lab_artifacts import (
     LabArtifactError,
@@ -1609,7 +1610,7 @@ class LabFinalizer:
                 )
             except LabArtifactError as exc:
                 raise LabFinalizationIntegrityError(
-                    "matching job candidate could not be safely recovered"
+                    "job artifact could not be sealed from retained candidate"
                 ) from exc
             for record in redundant:
                 try:
@@ -1639,16 +1640,9 @@ class LabFinalizer:
         try:
             sealed = self.artifact_store.seal_candidate(candidate)
         except LabArtifactError as exc:
-            primary_error = LabFinalizationIntegrityError("job artifact could not be sealed")
-            primary_error.__cause__ = exc
-            try:
-                self._isolate_owned_candidate(candidate)
-            except Exception as cleanup_error:
-                raise ExceptionGroup(
-                    "finalization failed and owned candidate isolation failed",
-                    [primary_error, cleanup_error],
-                ) from None
-            raise primary_error from exc
+            # The verified candidate is durable retry state; moving it would create
+            # one full quarantine copy per persistent seal failure.
+            raise LabFinalizationIntegrityError("job artifact could not be sealed") from exc
         if sealed.manifest != plan.manifest or sealed.manifest_hash != plan.manifest_hash:
             raise LabFinalizationIntegrityError(
                 "sealed job artifact conflicts with deterministic finalization output"
@@ -1663,27 +1657,6 @@ class LabFinalizer:
         if sealed is not None:
             return sealed
         return self._prepare_and_seal(plan)
-
-    def _isolate_owned_candidate(self, candidate: LabJobArtifactCandidate) -> None:
-        if not os.path.lexists(candidate.path):
-            return
-        matching = tuple(
-            record
-            for record in self.artifact_store.list_candidate_recovery()
-            if (
-                record.path == candidate.path
-                and record.device == candidate.device
-                and record.inode == candidate.inode
-            )
-        )
-        if len(matching) != 1:
-            raise LabFinalizationIntegrityError(
-                "owned finalization candidate cannot be uniquely bound for isolation"
-            )
-        self.artifact_store.quarantine_recovery_record(
-            matching[0],
-            reason="owned candidate isolated after finalization conflict",
-        )
 
     def _envelope(
         self,
@@ -1763,24 +1736,37 @@ class LabFinalizer:
         if not isinstance(durable, LabArtifactCommitSpoolEntry):
             return None
         try:
-            claims = verify_finalizer_authority(
+            durable_identity = authenticate_artifact_commit_identity(
                 durable.envelope,
+                key_provider=self.finalizer_authority_verification_key_provider,
+            )
+            expected_identity = authenticate_artifact_commit_identity(
+                envelope,
                 key_provider=self.finalizer_authority_verification_key_provider,
             )
         except LabFinalizerAuthorityAuthenticationError as exc:
             raise LabFinalizationIntegrityError(
                 "existing deterministic pending commit is not authenticated"
             ) from exc
-        expected_proof = envelope.authority_proof
-        if (
-            expected_proof is None
-            or durable.envelope.commit != envelope.commit
-            or claims != expected_proof.claims
-        ):
+        if durable_identity != expected_identity:
             raise LabFinalizationIntegrityError(
                 "existing deterministic pending commit conflicts with finalization identity"
             )
         return durable
+
+    def _authenticated_commit_identity(
+        self,
+        envelope: LabArtifactCommitEnvelope,
+        *,
+        label: str,
+    ) -> LabAuthenticatedArtifactCommitIdentity:
+        try:
+            return authenticate_artifact_commit_identity(
+                envelope,
+                key_provider=self.finalizer_authority_verification_key_provider,
+            )
+        except LabFinalizerAuthorityAuthenticationError as exc:
+            raise LabFinalizationIntegrityError(f"{label} is not authenticated") from exc
 
     @staticmethod
     def _sealed_matches_snapshot(
@@ -1832,7 +1818,21 @@ class LabFinalizer:
         acknowledged: LabAcknowledgedArtifactCommit,
     ) -> LabFinalizerResult:
         ledger = self.reader.get_artifact_commit(envelope.request_id)
-        if ledger is None or ledger.envelope != envelope or ledger.receipt != acknowledged.receipt:
+        if ledger is None:
+            raise LabFinalizationIntegrityError(
+                "artifact acknowledgement has no authoritative SQLite ledger commit"
+            )
+        if (
+            self._authenticated_commit_identity(
+                ledger.envelope,
+                label="authoritative SQLite artifact commit",
+            )
+            != self._authenticated_commit_identity(
+                envelope,
+                label="replayed artifact commit",
+            )
+            or ledger.receipt != acknowledged.receipt
+        ):
             raise LabFinalizationIntegrityError(
                 "artifact acknowledgement conflicts with authoritative SQLite ledger"
             )
@@ -1866,7 +1866,13 @@ class LabFinalizer:
                     "artifact acknowledgement has no authoritative SQLite ledger commit"
                 )
             return None
-        if ledger.envelope != envelope:
+        if self._authenticated_commit_identity(
+            ledger.envelope,
+            label="authoritative SQLite artifact commit",
+        ) != self._authenticated_commit_identity(
+            envelope,
+            label="replayed artifact commit",
+        ):
             raise LabFinalizationIntegrityError(
                 "sealed replay conflicts with authoritative SQLite ledger"
             )
@@ -1874,7 +1880,16 @@ class LabFinalizer:
             result = self._validate_acknowledgement(sealed, envelope, durable)
             self._cleanup_redundant_candidates(sealed)
             return result
-        if isinstance(durable, LabArtifactCommitSpoolEntry) and durable.envelope != envelope:
+        if isinstance(
+            durable,
+            LabArtifactCommitSpoolEntry,
+        ) and self._authenticated_commit_identity(
+            durable.envelope,
+            label="pending artifact commit",
+        ) != self._authenticated_commit_identity(
+            ledger.envelope,
+            label="authoritative SQLite artifact commit",
+        ):
             raise LabFinalizationIntegrityError(
                 "pending artifact commit conflicts with authoritative SQLite ledger"
             )
@@ -1907,7 +1922,13 @@ class LabFinalizer:
         durable = self.commit_spool.inspect(envelope.request_id)
         if not isinstance(durable, LabArtifactCommitSpoolEntry):
             return
-        if durable.envelope != envelope:
+        if self._authenticated_commit_identity(
+            durable.envelope,
+            label="uncommitted pending artifact commit",
+        ) != self._authenticated_commit_identity(
+            envelope,
+            label="replayed artifact commit",
+        ):
             raise LabFinalizationIntegrityError(
                 "uncommitted artifact commit conflicts with sealed replay identity"
             )

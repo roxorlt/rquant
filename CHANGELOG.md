@@ -50,6 +50,14 @@
 
 ### Fixed
 
+- **Strategy Lab finalizer 资源与恢复边界加固**：`ArrowDtype` 的 string/binary（含 large、
+  chunked、null 与 offset slice）改为直接按 Arrow validity/offset/data buffer 有界流式编码，
+  不再为宽值物化 Python scalar，并保持 shard、聚合结果和 artifact 的既有 JSON/hash 语义。
+  持久 seal 故障复用同一 verified active candidate，避免每次重试复制完整 quarantine；恢复后
+  仍按原 manifest authority 完成 seal。artifact commit 重放改为比较已认证的 commit+claims
+  语义身份，允许 transition key 下的 commit-before-ACK 幂等恢复，同时继续拒绝未知/坏旧
+  proof 以及不同 commit/claims。
+
 - **Strategy Lab 历史 v1 worker report 字节迁移**：success report 现在依据原始
   `model_fields_set` 区分 provenance 字段缺失与显式 `null`；真正的旧 v1 JSON 可在 typed
   allowlist 下保持原字节进入 spool、SQLite 与 finalizer，而 partial/null/extra provenance

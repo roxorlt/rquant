@@ -688,6 +688,34 @@ def test_canonical_shard_frame_digest_bounds_large_bytes_scratch() -> None:
     assert peak <= 2 * 1024 * 1024
 
 
+@pytest.mark.parametrize(
+    ("arrow_type", "value"),
+    [
+        (pa.string(), "x" * (64 * 1024 * 1024)),
+        (pa.binary(), b"x" * (64 * 1024 * 1024)),
+    ],
+    ids=["string", "binary"],
+)
+def test_canonical_shard_frame_digest_streams_large_arrow_dtype_buffers(
+    arrow_type: pa.DataType,
+    value: str | bytes,
+) -> None:
+    from rquant.canonical_json_stream import CANONICAL_JSON_STREAM_SCRATCH_BYTES
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    array = pd.arrays.ArrowExtensionArray(pa.array([value], type=arrow_type))
+    frame = pd.DataFrame({"value": pd.Series(array)})
+
+    tracemalloc.start()
+    digest = canonical_shard_frame_digest(frame)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(digest) == 64
+    assert CANONICAL_JSON_STREAM_SCRATCH_BYTES == 128 * 1024
+    assert peak <= 2 * 1024 * 1024
+
+
 def test_legacy_pandas_bytes_stream_bounds_truncated_64_mib_scratch() -> None:
     from rquant.canonical_json_stream import CanonicalJsonStreamWriter
 

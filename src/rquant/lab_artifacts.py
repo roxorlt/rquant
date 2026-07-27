@@ -2027,11 +2027,7 @@ def _table_content_hash(frame: pd.DataFrame) -> str:
         for value_index, accessor in enumerate(accessors):
             if value_index:
                 digest.update(b",")
-            if not accessor.write_valid_string(
-                writer,
-                row_index,
-                escape_forward_slash=False,
-            ):
+            if not accessor.write_canonical_table_value(writer, row_index):
                 value = accessor.value(row_index)
                 if isinstance(value, bytes):
                     writer.write_ascii(b'{"$bytes":')

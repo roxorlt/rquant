@@ -26,7 +26,7 @@ from rquant.lab_artifact_protocol import (
     LabFinalizerAuthorityClaims,
     LabFinalizerAuthorityShardEvidence,
     LabFinalizerAuthorityVerificationKeyProvider,
-    verify_finalizer_authority,
+    authenticate_artifact_commit_identity,
 )
 from rquant.lab_job_protocol import (
     CancelJobCommand,
@@ -4118,6 +4118,11 @@ class LabJobStore:
     ) -> LabArtifactCommitReceipt:
         from rquant.lab_artifacts import LabArtifactIndexEvidence
 
+        authenticated = authenticate_artifact_commit_identity(
+            envelope,
+            key_provider=authority_key_provider,
+        )
+
         existing_commit = connection.execute(
             "SELECT * FROM lab_artifact_commit WHERE request_id = ?",
             (str(envelope.request_id),),
@@ -4127,7 +4132,11 @@ class LabJobStore:
                 existing_commit,
                 expected_request_id=envelope.request_id,
             )
-            if record.envelope != envelope:
+            existing_authenticated = authenticate_artifact_commit_identity(
+                record.envelope,
+                key_provider=authority_key_provider,
+            )
+            if existing_authenticated != authenticated:
                 raise RequestContentConflictError(
                     f"request_id {envelope.request_id} already has different artifact content"
                 )
@@ -4149,10 +4158,7 @@ class LabJobStore:
                     )
             return record.receipt
 
-        authority_claims = verify_finalizer_authority(
-            envelope,
-            key_provider=authority_key_provider,
-        )
+        authority_claims = authenticated.claims
 
         commit = envelope.commit
         manifest = binding.sealed.manifest

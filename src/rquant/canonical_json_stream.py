@@ -10,6 +10,7 @@ import struct
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from enum import Enum
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -307,7 +308,7 @@ class CanonicalJsonEscapedStringSink:
 
 
 class PandasJsonColumnAccessor:
-    """Read frame cells while keeping Arrow string values descriptor-bound."""
+    """Read frame cells while keeping Arrow variable-width values buffer-bound."""
 
     def __init__(self, series: pd.Series) -> None:
         self._array = series.array
@@ -316,16 +317,41 @@ class PandasJsonColumnAccessor:
         self._arrow_chunk_index = 0
         self._arrow_chunk_start = 0
         self._arrow_chunk_end = 0
+        self._arrow_kind: Literal["string", "binary"] | None = None
         dtype = series.dtype
         if isinstance(dtype, pd.StringDtype) and dtype.storage == "pyarrow":
             chunked = self._array.__arrow_array__()
-            if not isinstance(chunked, pa.ChunkedArray):
-                chunked = pa.chunked_array((chunked,))
-            for chunk_index in range(chunked.num_chunks):
-                chunk = chunked.chunk(chunk_index)
-                if not (pa.types.is_string(chunk.type) or pa.types.is_large_string(chunk.type)):
-                    raise TypeError("Arrow-backed pandas string column has invalid storage")
-            self._arrow_chunked = chunked
+            arrow_kind: Literal["string", "binary"] = "string"
+        elif isinstance(dtype, pd.ArrowDtype) and (
+            pa.types.is_string(dtype.pyarrow_dtype)
+            or pa.types.is_large_string(dtype.pyarrow_dtype)
+            or pa.types.is_binary(dtype.pyarrow_dtype)
+            or pa.types.is_large_binary(dtype.pyarrow_dtype)
+        ):
+            chunked = self._array.__arrow_array__()
+            arrow_kind = (
+                "string"
+                if (
+                    pa.types.is_string(dtype.pyarrow_dtype)
+                    or pa.types.is_large_string(dtype.pyarrow_dtype)
+                )
+                else "binary"
+            )
+        else:
+            return
+        if not isinstance(chunked, pa.ChunkedArray):
+            chunked = pa.chunked_array((chunked,))
+        for chunk_index in range(chunked.num_chunks):
+            chunk = chunked.chunk(chunk_index)
+            valid_type = (
+                pa.types.is_string(chunk.type) or pa.types.is_large_string(chunk.type)
+                if arrow_kind == "string"
+                else pa.types.is_binary(chunk.type) or pa.types.is_large_binary(chunk.type)
+            )
+            if not valid_type:
+                raise TypeError("Arrow-backed pandas column has invalid variable-width storage")
+        self._arrow_chunked = chunked
+        self._arrow_kind = arrow_kind
 
     def _select_arrow_chunk(self, chunk_index: int, chunk_start: int) -> None:
         if self._arrow_chunked is None or chunk_index >= self._arrow_chunked.num_chunks:
@@ -340,7 +366,7 @@ class PandasJsonColumnAccessor:
         self._arrow_chunk_start = chunk_start
         self._arrow_chunk_end = chunk_start + len(chunk)
 
-    def _arrow_utf8_buffer(self, row_index: int) -> tuple[bool, memoryview | None]:
+    def _arrow_variable_buffer(self, row_index: int) -> tuple[bool, memoryview | None]:
         if self._arrow_chunked is None:
             return False, None
         if row_index < 0 or row_index >= len(self._arrow_chunked):
@@ -354,29 +380,50 @@ class PandasJsonColumnAccessor:
             )
         chunk = self._arrow_chunk
         local_index = row_index - self._arrow_chunk_start
-        scalar = chunk[local_index]
-        if not scalar.is_valid:
-            return True, None
-        _validity, offsets, data = chunk.buffers()
-        if offsets is None:
-            raise TypeError("Arrow string column is missing its offsets buffer")
-        width = 8 if pa.types.is_large_string(chunk.type) else 4
+        validity, offsets, data = chunk.buffers()
         offset_index = chunk.offset + local_index
-        start = struct.unpack_from("<q" if width == 8 else "<i", offsets, offset_index * width)[0]
-        end = struct.unpack_from(
-            "<q" if width == 8 else "<i",
-            offsets,
-            (offset_index + 1) * width,
-        )[0]
+        if validity is not None:
+            validity_view = memoryview(validity).cast("B")
+            if not validity_view[offset_index // 8] & (1 << (offset_index % 8)):
+                return True, None
+        if offsets is None:
+            raise TypeError("Arrow variable-width column is missing its offsets buffer")
+        is_large = pa.types.is_large_string(chunk.type) or pa.types.is_large_binary(chunk.type)
+        width = 8 if is_large else 4
+        offset_format = "<q" if width == 8 else "<i"
+        start = struct.unpack_from(offset_format, offsets, offset_index * width)[0]
+        end = struct.unpack_from(offset_format, offsets, (offset_index + 1) * width)[0]
         if start < 0 or end < start or (data is None and end != 0):
-            raise TypeError("Arrow string column has invalid data offsets")
-        payload = memoryview(data) if data is not None else memoryview(b"")
+            raise TypeError("Arrow variable-width column has invalid data offsets")
+        payload = memoryview(data).cast("B") if data is not None else memoryview(b"")
         if end > len(payload):
-            raise TypeError("Arrow string column offset exceeds its data buffer")
+            raise TypeError("Arrow variable-width column offset exceeds its data buffer")
         return True, payload[start:end]
 
     def value(self, row_index: int) -> object:
         return self._array[row_index]
+
+    def _write_arrow_pandas_value(
+        self,
+        writer: CanonicalJsonStreamWriter,
+        row_index: int,
+        *,
+        escape_forward_slash: bool,
+        legacy_binary: bool,
+    ) -> bool:
+        handled, value = self._arrow_variable_buffer(row_index)
+        if not handled:
+            return False
+        if value is None:
+            writer.write_ascii(b"null")
+        elif self._arrow_kind == "binary" and legacy_binary:
+            writer.write_legacy_pandas_bytes(value)
+        else:
+            writer.write_utf8_string_buffer(
+                value,
+                escape_forward_slash=escape_forward_slash,
+            )
+        return True
 
     def write_valid_string(
         self,
@@ -385,13 +432,45 @@ class PandasJsonColumnAccessor:
         *,
         escape_forward_slash: bool,
     ) -> bool:
-        handled, value = self._arrow_utf8_buffer(row_index)
+        if self._arrow_kind != "string":
+            return False
+        handled, value = self._arrow_variable_buffer(row_index)
         if not handled or value is None:
             return False
         writer.write_utf8_string_buffer(
             value,
             escape_forward_slash=escape_forward_slash,
         )
+        return True
+
+    def write_legacy_table_value(
+        self,
+        writer: CanonicalJsonStreamWriter,
+        row_index: int,
+    ) -> bool:
+        return self._write_arrow_pandas_value(
+            writer,
+            row_index,
+            escape_forward_slash=False,
+            legacy_binary=True,
+        )
+
+    def write_canonical_table_value(
+        self,
+        writer: CanonicalJsonStreamWriter,
+        row_index: int,
+    ) -> bool:
+        handled, value = self._arrow_variable_buffer(row_index)
+        if not handled:
+            return False
+        if value is None:
+            writer.write_ascii(b"null")
+        elif self._arrow_kind == "binary":
+            writer.write_ascii(b'{"$bytes":')
+            writer.write_base64_bytes(value)
+            writer.write_ascii(b"}")
+        else:
+            writer.write_utf8_string_buffer(value)
         return True
 
     def write_pandas_value(
@@ -402,15 +481,12 @@ class PandasJsonColumnAccessor:
         escape_forward_slash: bool,
         sort_mapping_keys: bool,
     ) -> None:
-        handled, value = self._arrow_utf8_buffer(row_index)
-        if handled:
-            if value is None:
-                writer.write_ascii(b"null")
-            else:
-                writer.write_utf8_string_buffer(
-                    value,
-                    escape_forward_slash=escape_forward_slash,
-                )
+        if self._write_arrow_pandas_value(
+            writer,
+            row_index,
+            escape_forward_slash=escape_forward_slash,
+            legacy_binary=False,
+        ):
             return
         write_pandas_json_value(
             writer,
@@ -608,11 +684,7 @@ class LegacyPandasTableColumnAccessor:
         writer: CanonicalJsonStreamWriter,
         row_index: int,
     ) -> None:
-        if self._values.write_valid_string(
-            writer,
-            row_index,
-            escape_forward_slash=False,
-        ):
+        if self._values.write_legacy_table_value(writer, row_index):
             return
         value = self._values.value(row_index)
         if isinstance(value, bytes):

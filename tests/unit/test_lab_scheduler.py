@@ -24,6 +24,7 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitReceipt,
     LabArtifactCommitSpool,
     LabArtifactCommitSpoolEntry,
+    LabFinalizerAuthorityAuthenticationError,
     LabFinalizerAuthorityClaims,
     LabFinalizerAuthorityKey,
     LabFinalizerAuthorityShardEvidence,
@@ -44,6 +45,7 @@ from rquant.lab_job_protocol import (
     LabSpoolEntry,
     LabSpoolFileIdentity,
     PauseJobCommand,
+    RequestContentConflictError,
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
@@ -1989,6 +1991,161 @@ def test_artifact_commit_after_sqlite_before_ack_replays_same_receipt(
         == 1
     )
     assert spool.pending() == ()
+
+
+def test_artifact_commit_key_rotation_reuses_authenticated_ledger_semantics(
+    tmp_path: Path,
+) -> None:
+    new_key = LabFinalizerAuthorityKey(key_id="scheduler-new-key", secret=b"n" * 32)
+    keyring = {AUTHORITY_KEY.key_id: AUTHORITY_KEY, new_key.key_id: new_key}
+    store, scheduler, spool, artifacts, job, sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            authority_key_provider=keyring.get,
+        )
+    )
+    scheduler.run_once()
+    recorded = LabJobReader(store.path).get_artifact_commit(envelope.request_id)
+    assert recorded is not None
+    assert envelope.authority_proof is not None
+    rotated = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=sign_finalizer_authority(
+            envelope.authority_proof.claims,
+            key_provider=lambda: new_key,
+        ),
+    )
+    assert scheduler.lease is not None
+
+    with (
+        artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
+        store.stage_artifact_commit(
+            rotated,
+            binding,
+            authority_key_provider=keyring.get,
+            lease=scheduler.lease,
+            now=clock[0],
+        ) as staged,
+    ):
+        replayed = staged.commit(lease=scheduler.lease, now=clock[0])
+
+    assert replayed == recorded.receipt
+    assert LabJobReader(store.path).get_artifact_commit(envelope.request_id) == recorded
+    assert spool.pending() == ()
+
+
+def test_artifact_commit_key_rotation_rejects_changed_claims_and_untrusted_old_proof(
+    tmp_path: Path,
+) -> None:
+    new_key = LabFinalizerAuthorityKey(key_id="scheduler-new-key", secret=b"n" * 32)
+    keyring = {AUTHORITY_KEY.key_id: AUTHORITY_KEY, new_key.key_id: new_key}
+    store, scheduler, _spool, artifacts, _job, sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(
+            tmp_path,
+            authority_key_provider=keyring.get,
+        )
+    )
+    scheduler.run_once()
+    assert envelope.authority_proof is not None
+    changed_claims = envelope.authority_proof.claims.model_copy(
+        update={"ready_event_id": envelope.authority_proof.claims.ready_event_id + 1}
+    )
+    changed = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=sign_finalizer_authority(
+            changed_claims,
+            key_provider=lambda: new_key,
+        ),
+    )
+    assert scheduler.lease is not None
+
+    with (
+        artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
+        pytest.raises(RequestContentConflictError),
+        store.stage_artifact_commit(
+            changed,
+            binding,
+            authority_key_provider=keyring.get,
+            lease=scheduler.lease,
+            now=clock[0],
+        ),
+    ):
+        pass
+
+    changed_commit = envelope.commit.model_copy(update={"manifest_hash": "0" * 64})
+    changed_commit_claims = envelope.authority_proof.claims.model_copy(
+        update={
+            "commit_content_hash": hashlib.sha256(
+                changed_commit.canonical_json_bytes()
+            ).hexdigest(),
+            "artifact_manifest_hash": "0" * 64,
+        }
+    )
+    changed_commit_envelope = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=changed_commit,
+        authority_proof=sign_finalizer_authority(
+            changed_commit_claims,
+            key_provider=lambda: new_key,
+        ),
+    )
+    with (
+        artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
+        pytest.raises(RequestContentConflictError),
+        store.stage_artifact_commit(
+            changed_commit_envelope,
+            binding,
+            authority_key_provider=keyring.get,
+            lease=scheduler.lease,
+            now=clock[0],
+        ),
+    ):
+        pass
+
+    keyring.pop(AUTHORITY_KEY.key_id)
+    rotated = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=sign_finalizer_authority(
+            envelope.authority_proof.claims,
+            key_provider=lambda: new_key,
+        ),
+    )
+    with (
+        artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
+        pytest.raises(LabFinalizerAuthorityAuthenticationError, match="unknown key_id"),
+        store.stage_artifact_commit(
+            rotated,
+            binding,
+            authority_key_provider=keyring.get,
+            lease=scheduler.lease,
+            now=clock[0],
+        ),
+    ):
+        pass
+
+    keyring[AUTHORITY_KEY.key_id] = LabFinalizerAuthorityKey(
+        key_id=AUTHORITY_KEY.key_id,
+        secret=b"x" * 32,
+    )
+    with (
+        artifacts.bind_verified_sealed(sealed.path, indexed_at=clock[0]) as binding,
+        pytest.raises(LabFinalizerAuthorityAuthenticationError, match="MAC is invalid"),
+        store.stage_artifact_commit(
+            rotated,
+            binding,
+            authority_key_provider=keyring.get,
+            lease=scheduler.lease,
+            now=clock[0],
+        ),
+    ):
+        pass
 
 
 def test_artifact_lifecycle_exit_failure_after_sqlite_commit_remains_replayable(

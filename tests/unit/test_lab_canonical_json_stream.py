@@ -138,3 +138,91 @@ def test_arrow_string_accessor_streams_highly_fragmented_chunks_with_constant_me
 
     assert digest.hexdigest() == expected
     assert peak <= 512 * 1024
+
+
+def test_arrow_dtype_variable_buffers_stream_slices_nulls_and_large_variants() -> None:
+    from rquant.canonical_json_stream import (
+        CanonicalJsonStreamWriter,
+        PandasJsonColumnAccessor,
+    )
+
+    cases = (
+        (pa.string(), ["drop", "alpha", None, "omega"], ["alpha", None, "omega"]),
+        (
+            pa.large_string(),
+            ["drop", "alpha", None, "omega"],
+            ["alpha", None, "omega"],
+        ),
+        (pa.binary(), [b"drop", b"alpha", None, b"omega"], ["alpha", None, "omega"]),
+        (
+            pa.large_binary(),
+            [b"drop", b"alpha", None, b"omega"],
+            ["alpha", None, "omega"],
+        ),
+    )
+    for arrow_type, source, expected_values in cases:
+        sliced = pa.array(source, type=arrow_type).slice(1)
+        chunked = pa.chunked_array((sliced.slice(0, 1), sliced.slice(1, 1), sliced.slice(2, 1)))
+        series = pd.Series(pd.arrays.ArrowExtensionArray(chunked), name="value")
+        encoded = bytearray()
+        writer = CanonicalJsonStreamWriter(encoded.extend)
+        accessor = PandasJsonColumnAccessor(series)
+
+        writer.write_ascii(b"[")
+        for row_index in range(len(series)):
+            if row_index:
+                writer.write_ascii(b",")
+            accessor.write_pandas_value(
+                writer,
+                row_index,
+                escape_forward_slash=False,
+                sort_mapping_keys=True,
+            )
+        writer.write_ascii(b"]")
+
+        assert bytes(encoded) == json.dumps(
+            expected_values,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+
+
+def test_arrow_dtype_fragmented_string_and_binary_use_constant_python_memory() -> None:
+    from rquant.canonical_json_stream import (
+        CanonicalJsonStreamWriter,
+        PandasJsonColumnAccessor,
+    )
+
+    for arrow_type, make_value in (
+        (pa.string(), lambda index: f"value-{index:05d}"),
+        (pa.binary(), lambda index: f"value-{index:05d}".encode()),
+    ):
+        values = [make_value(index) for index in range(20_000)]
+        chunked = pa.chunked_array([pa.array([value], type=arrow_type) for value in values])
+        series = pd.Series(pd.arrays.ArrowExtensionArray(chunked), name="value")
+        digest = hashlib.sha256()
+        writer = CanonicalJsonStreamWriter(digest.update)
+
+        tracemalloc.start()
+        accessor = PandasJsonColumnAccessor(series)
+        writer.write_ascii(b"[")
+        for row_index in range(len(series)):
+            if row_index:
+                writer.write_ascii(b",")
+            accessor.write_pandas_value(
+                writer,
+                row_index,
+                escape_forward_slash=False,
+                sort_mapping_keys=True,
+            )
+        writer.write_ascii(b"]")
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        expected = json.dumps(
+            [value.decode() if isinstance(value, bytes) else value for value in values],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        assert digest.hexdigest() == hashlib.sha256(expected).hexdigest()
+        assert peak <= 512 * 1024
