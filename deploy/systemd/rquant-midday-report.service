@@ -1,0 +1,22 @@
+[Unit]
+Description=rQuant Midday Market Report
+After=network-online.target rquant-panorama.service rquant-replica-sync.service
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/.env
+Environment=TZ=Asia/Shanghai
+Environment=RQUANT_PANORAMA_SOCKS=
+ExecStart=/home/lighthouse/rquant/.venv/bin/rquant midday-report
+Restart=no
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
