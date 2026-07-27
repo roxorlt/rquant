@@ -28,10 +28,28 @@ class LabDaemonConfigurationError(RuntimeError):
     """A daemon cannot start without weakening its trust boundary."""
 
 
-def require_private_directory(path: Path, *, label: str) -> Path:
+def _canonical_absolute_path(path: Path, *, label: str) -> Path:
     candidate = Path(path)
     if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
         raise LabDaemonConfigurationError(f"{label} path must be absolute and normalized")
+    return candidate
+
+
+def _validate_private_regular_identity(observed: os.stat_result, *, label: str) -> None:
+    if stat.S_ISLNK(observed.st_mode):
+        raise LabDaemonConfigurationError(f"{label} must not be a symlink")
+    if not stat.S_ISREG(observed.st_mode):
+        raise LabDaemonConfigurationError(f"{label} must be a regular file")
+    if observed.st_uid != os.getuid():
+        raise LabDaemonConfigurationError(f"{label} must be owned by this user")
+    if observed.st_mode & 0o777 != 0o600:
+        raise LabDaemonConfigurationError(f"{label} must have private mode 0600")
+    if observed.st_nlink != 1:
+        raise LabDaemonConfigurationError(f"{label} must not be a hardlink")
+
+
+def require_private_directory(path: Path, *, label: str) -> Path:
+    candidate = _canonical_absolute_path(path, label=label)
     try:
         observed = candidate.lstat()
     except FileNotFoundError as exc:
@@ -45,6 +63,21 @@ def require_private_directory(path: Path, *, label: str) -> Path:
     return candidate
 
 
+def ensure_private_directory(path: Path, *, label: str) -> Path:
+    """Create one validated runtime root after Settings completed pure validation."""
+    candidate = _canonical_absolute_path(path, label=label)
+    if candidate.resolve(strict=False) != candidate:
+        raise LabDaemonConfigurationError(f"{label} path must not use symlink aliases")
+    if candidate.exists() or candidate.is_symlink():
+        return require_private_directory(candidate, label=label)
+    try:
+        candidate.mkdir(parents=True, mode=0o700, exist_ok=False)
+        candidate.chmod(0o700)
+    except OSError as exc:
+        raise LabDaemonConfigurationError(f"{label} could not be created safely") from exc
+    return require_private_directory(candidate, label=label)
+
+
 def require_clean_code_sha(provider: Callable[[], str | None]) -> str:
     try:
         value = provider()
@@ -56,21 +89,19 @@ def require_clean_code_sha(provider: Callable[[], str | None]) -> str:
 
 
 def _read_private_file(path: Path, *, label: str, max_bytes: int = 16_384) -> bytes:
-    candidate = Path(path)
-    if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
-        raise LabDaemonConfigurationError(f"{label} path must be absolute and normalized")
+    candidate = _canonical_absolute_path(path, label=label)
     try:
         observed = candidate.lstat()
     except FileNotFoundError as exc:
         raise LabDaemonConfigurationError(f"{label} key file does not exist") from exc
-    if stat.S_ISLNK(observed.st_mode):
-        raise LabDaemonConfigurationError(f"{label} key file must not be a symlink")
-    if not stat.S_ISREG(observed.st_mode):
-        raise LabDaemonConfigurationError(f"{label} key file must be regular")
-    if observed.st_uid != os.getuid():
-        raise LabDaemonConfigurationError(f"{label} key file must be owned by this user")
-    if observed.st_mode & 0o077:
-        raise LabDaemonConfigurationError(f"{label} key file must have private permissions")
+    try:
+        _validate_private_regular_identity(observed, label=f"{label} key file")
+    except LabDaemonConfigurationError as exc:
+        if "mode 0600" in str(exc):
+            raise LabDaemonConfigurationError(
+                f"{label} key file must have private permissions (mode 0600)"
+            ) from exc
+        raise
     if observed.st_size > max_bytes:
         raise LabDaemonConfigurationError(f"{label} key file exceeds size limit")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -82,6 +113,7 @@ def _read_private_file(path: Path, *, label: str, max_bytes: int = 16_384) -> by
         current = os.fstat(descriptor)
         if (current.st_dev, current.st_ino) != (observed.st_dev, observed.st_ino):
             raise LabDaemonConfigurationError(f"{label} key file changed during validation")
+        _validate_private_regular_identity(current, label=f"{label} key file")
         chunks: list[bytes] = []
         remaining = max_bytes + 1
         while remaining:
@@ -99,11 +131,74 @@ def _read_private_file(path: Path, *, label: str, max_bytes: int = 16_384) -> by
             current.st_mtime_ns,
         ) or len(payload) != final.st_size:
             raise LabDaemonConfigurationError(f"{label} key file changed during read")
+        _validate_private_regular_identity(final, label=f"{label} key file")
     finally:
         os.close(descriptor)
     if len(payload) > max_bytes:
         raise LabDaemonConfigurationError(f"{label} key file exceeds size limit")
     return payload
+
+
+def prepare_private_sqlite_path(
+    path: Path,
+    *,
+    label: str,
+    create: bool,
+) -> Path:
+    """Create or verify the daemon SQLite authority without following links."""
+    candidate = _canonical_absolute_path(path, label=label)
+    parent = candidate.parent
+    try:
+        if parent.resolve(strict=True) != parent:
+            raise LabDaemonConfigurationError(f"{label} parent must be canonical")
+        parent_stat = parent.lstat()
+    except FileNotFoundError as exc:
+        raise LabDaemonConfigurationError(f"{label} parent directory does not exist") from exc
+    if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
+        raise LabDaemonConfigurationError(f"{label} parent must be a real directory")
+    if parent_stat.st_uid != os.getuid() or parent_stat.st_mode & 0o022:
+        raise LabDaemonConfigurationError(
+            f"{label} parent must be owned by this user and not group/world writable"
+        )
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_descriptor = os.open(parent, directory_flags)
+    except OSError as exc:
+        raise LabDaemonConfigurationError(f"{label} parent could not be opened safely") from exc
+    descriptor = -1
+    try:
+        try:
+            observed = os.stat(candidate.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create:
+                raise LabDaemonConfigurationError(f"{label} does not exist") from None
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(candidate.name, flags, 0o600, dir_fd=parent_descriptor)
+            except OSError as exc:
+                raise LabDaemonConfigurationError(
+                    f"{label} could not be created atomically"
+                ) from exc
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            current = os.fstat(descriptor)
+            _validate_private_regular_identity(current, label=label)
+            return candidate
+        _validate_private_regular_identity(observed, label=label)
+        flags = (os.O_RDWR if create else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(candidate.name, flags, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise LabDaemonConfigurationError(f"{label} could not be opened safely") from exc
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (observed.st_dev, observed.st_ino):
+            raise LabDaemonConfigurationError(f"{label} changed during validation")
+        _validate_private_regular_identity(current, label=label)
+        return candidate
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
 
 
 def _decode_secret(value: object, *, label: str) -> bytes:
@@ -207,10 +302,39 @@ class LabDaemonLock:
             raise LabDaemonConfigurationError("daemon lock root must be a real directory")
         if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o077:
             raise LabDaemonConfigurationError("daemon lock root must have private permissions")
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.path, flags, 0o600)
         try:
-            os.fchmod(descriptor, 0o600)
+            observed = self.path.lstat()
+        except FileNotFoundError:
+            observed = None
+        if observed is None:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(self.path, flags, 0o600)
+            except OSError as exc:
+                raise LabDaemonConfigurationError(
+                    "daemon lock file could not be created atomically"
+                ) from exc
+            created = True
+        else:
+            _validate_private_regular_identity(observed, label="daemon lock file")
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(self.path, flags)
+            except OSError as exc:
+                raise LabDaemonConfigurationError(
+                    "daemon lock file could not be opened safely"
+                ) from exc
+            created = False
+        try:
+            if created:
+                os.fchmod(descriptor, 0o600)
+            current = os.fstat(descriptor)
+            if observed is not None and (current.st_dev, current.st_ino) != (
+                observed.st_dev,
+                observed.st_ino,
+            ):
+                raise LabDaemonConfigurationError("daemon lock file changed during validation")
+            _validate_private_regular_identity(current, label="daemon lock file")
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:

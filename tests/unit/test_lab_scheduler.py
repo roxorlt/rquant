@@ -224,6 +224,37 @@ def _scheduler(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_commands_per_tick", 257),
+        ("max_reports_per_tick", 257),
+        ("max_plans_per_tick", 257),
+        ("max_claims_per_tick", 129),
+        ("max_claim_authority_per_tick", 513),
+        ("max_artifact_commits_per_tick", 257),
+    ],
+)
+def test_scheduler_rejects_unbounded_tick_batches(
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    store, spool = _components(tmp_path)
+    kwargs = {
+        "store": store,
+        "spool": spool,
+        "owner_id": "scheduler-a",
+        "lease_seconds": 60,
+        "heartbeat_seconds": 10,
+        "poll_interval_ms": 10,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match="safety limit"):
+        LabScheduler(**kwargs)
+
+
 def test_run_once_consumes_submit_but_keeps_job_queued_without_adapter(
     tmp_path: Path,
 ) -> None:

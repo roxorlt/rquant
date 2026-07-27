@@ -5,19 +5,27 @@
     settings.tushare_token_main
 """
 
+import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _ensure_private_lab_directory(path: Path) -> Path:
-    existed = path.exists() or path.is_symlink()
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not existed:
-        path.chmod(0o700)
-    return path
+def _canonical_absolute_path(path: Path, *, label: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise ValueError(f"{label} must be an absolute canonical path")
+    if candidate != Path(os.path.abspath(candidate)):
+        raise ValueError(f"{label} must be canonical (no '.' or '..')")
+    if candidate.resolve(strict=False) != candidate:
+        raise ValueError(f"{label} must be canonical (no symlink aliases)")
+    return candidate
+
+
+def _paths_alias_or_nest(left: Path, right: Path) -> bool:
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
 
 class Settings(BaseSettings):
@@ -54,15 +62,19 @@ class Settings(BaseSettings):
     lab_scheduler_lease_seconds: int = Field(default=60, ge=1)
     lab_scheduler_heartbeat_seconds: int = Field(default=10, ge=1)
     lab_scheduler_shard_lease_seconds: int = Field(default=300, ge=1)
-    lab_scheduler_max_reports_per_tick: int = Field(default=64, ge=1)
-    lab_scheduler_max_claims_per_tick: int = Field(default=16, ge=1)
-    lab_scheduler_max_artifact_commits_per_tick: int = Field(default=64, ge=1)
+    lab_scheduler_max_commands_per_tick: int = Field(default=64, ge=1, le=256)
+    lab_scheduler_max_reports_per_tick: int = Field(default=64, ge=1, le=256)
+    lab_scheduler_max_plans_per_tick: int = Field(default=64, ge=1, le=256)
+    lab_scheduler_max_claims_per_tick: int = Field(default=16, ge=1, le=128)
+    lab_scheduler_max_claim_authority_per_tick: int = Field(default=128, ge=1, le=512)
+    lab_scheduler_max_artifact_commits_per_tick: int = Field(default=64, ge=1, le=256)
     lab_scheduler_worker_ids: str = ""
     lab_worker_id: str = "rquant-mac-primary"
     lab_worker_poll_interval_ms: int = Field(default=250, ge=1)
     lab_worker_heartbeat_seconds: int = Field(default=30, ge=1)
     lab_worker_lease_extension_seconds: int = Field(default=120, ge=1, le=3_600)
     lab_worker_receipt_timeout_seconds: int = Field(default=30, ge=1)
+    lab_worker_max_shards_per_tick: int = Field(default=1, ge=1, le=1)
     lab_finalizer_poll_interval_ms: int = Field(default=1_000, ge=1)
     lab_finalizer_max_jobs_per_tick: int = Field(default=8, ge=1, le=128)
     parquet_dir: Path
@@ -153,6 +165,13 @@ class Settings(BaseSettings):
             )
         return normalized
 
+    @field_validator("data_dir", mode="before")
+    @classmethod
+    def require_canonical_data_dir(cls, v: object) -> object:
+        if isinstance(v, (str, Path)):
+            _canonical_absolute_path(Path(v), label="DATA_DIR")
+        return v
+
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="after")
     @classmethod
     def ensure_dir_exists(cls, v: Path) -> Path:
@@ -161,8 +180,8 @@ class Settings(BaseSettings):
 
     @field_validator("duckdb_path", mode="after")
     @classmethod
-    def ensure_duckdb_parent_exists(cls, v: Path) -> Path:
-        v.parent.mkdir(parents=True, exist_ok=True)
+    def validate_canonical_duckdb_path(cls, v: Path) -> Path:
+        _canonical_absolute_path(v, label="DUCKDB_PATH")
         return v
 
     @field_validator("backfill_state_path", mode="before")
@@ -202,33 +221,66 @@ class Settings(BaseSettings):
     )
     @classmethod
     def require_absolute_lab_job_path(cls, v: Path | None) -> Path | None:
-        if v is not None and not v.is_absolute():
-            raise ValueError("lab managed paths must be absolute")
+        if v is not None:
+            _canonical_absolute_path(v, label="lab managed path")
         return v
 
     @field_validator(
+        "duckdb_readonly_path",
         "research_db_path",
         "research_readonly_db_path",
         "research_lake_dir",
         "research_staging_dir",
+        "notification_state_path",
         mode="before",
     )
     @classmethod
     def normalize_empty_research_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
 
+    @field_validator(
+        "duckdb_readonly_path",
+        "research_db_path",
+        "research_readonly_db_path",
+        "research_lake_dir",
+        "research_staging_dir",
+        "notification_state_path",
+        mode="after",
+    )
+    @classmethod
+    def require_canonical_optional_path(
+        cls,
+        v: Path | None,
+        info: ValidationInfo,
+    ) -> Path | None:
+        if v is not None:
+            label = (
+                "readonly DuckDB path must differ from main DuckDB path and configured storage path"
+                if info.field_name == "duckdb_readonly_path"
+                else "configured storage path"
+            )
+            _canonical_absolute_path(v, label=label)
+        return v
+
     @field_validator("backfill_state_path", mode="after")
     @classmethod
     def ensure_backfill_state_parent_exists(cls, v: Path | None) -> Path | None:
         if v is not None:
-            v.parent.mkdir(parents=True, exist_ok=True)
+            _canonical_absolute_path(v, label="BACKFILL_STATE_PATH")
         return v
 
     @model_validator(mode="after")
     def validate_backfill_state_is_separate(self) -> "Settings":
-        state_path = self.backfill_state_path_resolved.resolve()
-        main_path = self.duckdb_path.resolve()
-        readonly_path = self.duckdb_readonly_path_resolved.resolve()
+        state_path = _canonical_absolute_path(
+            self.backfill_state_path or self.data_dir / "backfill_state.sqlite3",
+            label="backfill state path",
+        )
+        main_path = _canonical_absolute_path(self.duckdb_path, label="DuckDB path")
+        readonly_path = _canonical_absolute_path(
+            self.duckdb_readonly_path
+            or self.duckdb_path.with_name(self.duckdb_path.stem + "_ro.duckdb"),
+            label="readonly DuckDB path",
+        )
         if main_path == readonly_path:
             raise ValueError("readonly DuckDB path must differ from main DuckDB path")
         operational_paths = {
@@ -240,16 +292,22 @@ class Settings(BaseSettings):
                 "backfill state path must differ from DuckDB main and readonly paths"
             )
         research_paths = {
-            (self.research_db_path or self.data_dir / "research.duckdb").resolve(),
-            (
-                self.research_readonly_db_path
-                or self.data_dir / "research_ro.duckdb"
-            ).resolve(),
-            (self.research_lake_dir or self.data_dir / "lake").resolve(),
-            (
-                self.research_staging_dir
-                or self.data_dir / "research_staging"
-            ).resolve(),
+            _canonical_absolute_path(
+                self.research_db_path or self.data_dir / "research.duckdb",
+                label="research database path",
+            ),
+            _canonical_absolute_path(
+                self.research_readonly_db_path or self.data_dir / "research_ro.duckdb",
+                label="readonly research database path",
+            ),
+            _canonical_absolute_path(
+                self.research_lake_dir or self.data_dir / "lake",
+                label="research lake path",
+            ),
+            _canonical_absolute_path(
+                self.research_staging_dir or self.data_dir / "research_staging",
+                label="research staging path",
+            ),
         }
         if research_paths & operational_paths:
             raise ValueError(
@@ -274,57 +332,100 @@ class Settings(BaseSettings):
             )
         if self.lab_worker_heartbeat_seconds >= self.lab_worker_lease_extension_seconds:
             raise ValueError("lab worker heartbeat must precede lease extension")
-        lab_path = self.lab_jobs_path_resolved.resolve()
-        existing_database_paths = {
-            self.duckdb_path.resolve(),
-            self.duckdb_readonly_path_resolved.resolve(),
-            self.backfill_state_path_resolved.resolve(),
-            self.research_db_path_resolved.resolve(),
-            self.research_readonly_db_path_resolved.resolve(),
-            self.notification_state_path_resolved.resolve(),
-        }
+        lab_path = _canonical_absolute_path(
+            self.lab_jobs_path or self.data_dir / "lab_jobs.sqlite3",
+            label="lab jobs path",
+        )
+        existing_database_paths = (
+            _canonical_absolute_path(self.duckdb_path, label="DuckDB path"),
+            _canonical_absolute_path(
+                self.duckdb_readonly_path
+                or self.duckdb_path.with_name(self.duckdb_path.stem + "_ro.duckdb"),
+                label="readonly DuckDB path",
+            ),
+            _canonical_absolute_path(
+                self.backfill_state_path or self.data_dir / "backfill_state.sqlite3",
+                label="backfill state path",
+            ),
+            _canonical_absolute_path(
+                self.research_db_path or self.data_dir / "research.duckdb",
+                label="research database path",
+            ),
+            _canonical_absolute_path(
+                self.research_readonly_db_path or self.data_dir / "research_ro.duckdb",
+                label="readonly research database path",
+            ),
+            _canonical_absolute_path(
+                self.notification_state_path or self.data_dir / "notification_state.sqlite3",
+                label="notification state path",
+            ),
+        )
         if lab_path in existing_database_paths:
             raise ValueError(
                 "lab jobs path must differ from all existing database paths"
             )
-        managed_dirs = {
-            self.lab_job_command_dir_resolved.resolve(),
-            self.lab_job_claim_dir_resolved.resolve(),
-            self.lab_job_report_dir_resolved.resolve(),
-            self.lab_worker_artifact_dir_resolved.resolve(),
-            self.lab_final_artifact_dir_resolved.resolve(),
-            self.lab_artifact_commit_dir_resolved.resolve(),
-            self.lab_daemon_lock_dir_resolved.resolve(),
-        }
-        if len(managed_dirs) != 7:
-            raise ValueError("lab managed directories must differ from each other")
-        ordered_dirs = tuple(sorted(managed_dirs, key=str))
-        for index, left in enumerate(ordered_dirs):
-            for right in ordered_dirs[index + 1 :]:
-                if left.is_relative_to(right) or right.is_relative_to(left):
-                    raise ValueError("lab managed directories must not be nested")
-        for database_path in existing_database_paths | {lab_path}:
-            if any(
-                database_path == directory or database_path.is_relative_to(directory)
-                for directory in managed_dirs
-            ):
-                raise ValueError("lab managed directories must differ from database paths")
+        managed_dirs = (
+            _canonical_absolute_path(
+                self.lab_job_command_dir or self.data_dir / "lab_job_commands",
+                label="lab command spool",
+            ),
+            _canonical_absolute_path(
+                self.lab_job_claim_dir or self.data_dir / "lab_shard_claims",
+                label="lab claim spool",
+            ),
+            _canonical_absolute_path(
+                self.lab_job_report_dir or self.data_dir / "lab_worker_reports",
+                label="lab report spool",
+            ),
+            _canonical_absolute_path(
+                self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts",
+                label="lab worker artifact root",
+            ),
+            _canonical_absolute_path(
+                self.lab_final_artifact_dir or self.data_dir / "lab_final_artifacts",
+                label="lab final artifact root",
+            ),
+            _canonical_absolute_path(
+                self.lab_artifact_commit_dir or self.data_dir / "lab_artifact_commits",
+                label="lab artifact commit spool",
+            ),
+            _canonical_absolute_path(
+                self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks",
+                label="lab daemon lock root",
+            ),
+        )
+        existing_managed_dirs = (
+            _canonical_absolute_path(
+                self.research_lake_dir or self.data_dir / "lake",
+                label="research lake path",
+            ),
+            _canonical_absolute_path(
+                self.research_staging_dir or self.data_dir / "research_staging",
+                label="research staging path",
+            ),
+        )
         key_paths = tuple(
-            path.resolve()
+            _canonical_absolute_path(path, label="lab authority key path")
             for path in (
                 self.lab_finalizer_authority_key_path,
                 self.lab_finalizer_authority_keyring_path,
             )
             if path is not None
         )
-        if len(key_paths) != len(set(key_paths)):
-            raise ValueError("lab authority key paths must differ")
-        if any(
-            key_path.is_relative_to(directory)
-            for key_path in key_paths
-            for directory in managed_dirs
-        ):
-            raise ValueError("lab authority key files must be outside writable managed directories")
+        isolated_paths = (
+            existing_database_paths
+            + existing_managed_dirs
+            + (lab_path,)
+            + managed_dirs
+            + key_paths
+        )
+        for index, left in enumerate(isolated_paths):
+            for right in isolated_paths[index + 1 :]:
+                if _paths_alias_or_nest(left, right):
+                    raise ValueError(
+                        "lab database/managed/key paths must not alias or nest "
+                        f"(nested paths): {left} <> {right}"
+                    )
         workers = self.lab_scheduler_worker_id_list
         if len(set(workers)) != len(workers):
             raise ValueError("lab scheduler worker ids must be unique")
@@ -351,43 +452,35 @@ class Settings(BaseSettings):
     @property
     def lab_jobs_path_resolved(self) -> Path:
         path = self.lab_jobs_path or self.data_dir / "lab_jobs.sqlite3"
-        path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     @property
     def lab_job_command_dir_resolved(self) -> Path:
-        path = self.lab_job_command_dir or self.data_dir / "lab_job_commands"
-        return _ensure_private_lab_directory(path)
+        return self.lab_job_command_dir or self.data_dir / "lab_job_commands"
 
     @property
     def lab_job_claim_dir_resolved(self) -> Path:
-        path = self.lab_job_claim_dir or self.data_dir / "lab_shard_claims"
-        return _ensure_private_lab_directory(path)
+        return self.lab_job_claim_dir or self.data_dir / "lab_shard_claims"
 
     @property
     def lab_job_report_dir_resolved(self) -> Path:
-        path = self.lab_job_report_dir or self.data_dir / "lab_worker_reports"
-        return _ensure_private_lab_directory(path)
+        return self.lab_job_report_dir or self.data_dir / "lab_worker_reports"
 
     @property
     def lab_worker_artifact_dir_resolved(self) -> Path:
-        path = self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts"
-        return _ensure_private_lab_directory(path)
+        return self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts"
 
     @property
     def lab_final_artifact_dir_resolved(self) -> Path:
-        path = self.lab_final_artifact_dir or self.data_dir / "lab_final_artifacts"
-        return _ensure_private_lab_directory(path)
+        return self.lab_final_artifact_dir or self.data_dir / "lab_final_artifacts"
 
     @property
     def lab_artifact_commit_dir_resolved(self) -> Path:
-        path = self.lab_artifact_commit_dir or self.data_dir / "lab_artifact_commits"
-        return _ensure_private_lab_directory(path)
+        return self.lab_artifact_commit_dir or self.data_dir / "lab_artifact_commits"
 
     @property
     def lab_daemon_lock_dir_resolved(self) -> Path:
-        path = self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks"
-        return _ensure_private_lab_directory(path)
+        return self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks"
 
     @property
     def lab_scheduler_worker_id_list(self) -> tuple[str, ...]:

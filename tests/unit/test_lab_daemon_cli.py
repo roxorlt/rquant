@@ -128,7 +128,12 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
     monkeypatch.setattr(
         lab_daemon,
-        "require_private_directory",
+        "prepare_private_sqlite_path",
+        lambda path, *, label, create: calls.append(f"sqlite:{path.name}:{label}:{create}") or path,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "ensure_private_directory",
         lambda path, *, label: path,
     )
     monkeypatch.setattr(
@@ -149,6 +154,7 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
 
     assert result == 0
     assert "reader:lab_jobs.sqlite3:5000" in calls
+    assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:False" in calls
     assert "spool:lab_artifact_commits" in calls
     assert "store:lab_final_artifacts" in calls
     assert calls[-3:] == ["run_once", "store_close", "unlock"]
@@ -233,7 +239,12 @@ def test_finalizer_forever_installs_both_stop_signals(
     monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
     monkeypatch.setattr(
         lab_daemon,
-        "require_private_directory",
+        "prepare_private_sqlite_path",
+        lambda path, *, label, create: path,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "ensure_private_directory",
         lambda path, *, label: path,
     )
     monkeypatch.setattr(

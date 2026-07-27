@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -210,6 +212,45 @@ def detect_code_commit(repo_root: Path | None = None) -> str | None:
     return commit
 
 
+def _safe_worktree_runtime_status(
+    *,
+    checkout_root: Path,
+    common_git_dir: Path,
+    status_payload: bytes,
+) -> bool:
+    records = tuple(record for record in status_payload.split(b"\0") if record)
+    if not records:
+        return True
+    if records != (b"?? .venv",):
+        return False
+    link = checkout_root / ".venv"
+    expected = common_git_dir.parent / ".venv"
+    try:
+        link_stat = link.lstat()
+        expected_stat = expected.lstat()
+        expected_resolved = expected.resolve(strict=True)
+        target_stat = expected_resolved.lstat()
+        target_resolved = link.resolve(strict=True)
+    except OSError:
+        return False
+    return bool(
+        checkout_root != common_git_dir.parent
+        and stat.S_ISLNK(link_stat.st_mode)
+        and link_stat.st_uid == os.getuid()
+        and link_stat.st_nlink == 1
+        and target_resolved == expected_resolved
+        and expected_resolved == expected
+        and stat.S_ISDIR(expected_stat.st_mode)
+        and not stat.S_ISLNK(expected_stat.st_mode)
+        and expected_stat.st_uid == os.getuid()
+        and expected_stat.st_mode & 0o022 == 0
+        and stat.S_ISDIR(target_stat.st_mode)
+        and not stat.S_ISLNK(target_stat.st_mode)
+        and target_stat.st_uid == os.getuid()
+        and target_stat.st_mode & 0o022 == 0
+    )
+
+
 def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
     """Resolve a formal-run commit from the real clean Git checkout."""
     cwd = repo_root or Path(__file__).resolve().parents[2]
@@ -222,23 +263,53 @@ def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
             timeout=3,
             check=False,
         )
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"],
+        checkout = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
         )
+        common_dir = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=cwd,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     commit = head.stdout.strip()
-    if head.returncode != 0 or not commit or status.returncode != 0:
+    if (
+        head.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or checkout.returncode != 0
+        or common_dir.returncode != 0
+        or status.returncode != 0
+    ):
         return None
     injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected and injected != commit:
         return None
-    if status.stdout.strip():
+    checkout_root = Path(checkout.stdout.strip()).resolve(strict=True)
+    raw_common_dir = Path(common_dir.stdout.strip())
+    if not raw_common_dir.is_absolute():
+        raw_common_dir = checkout_root / raw_common_dir
+    common_git_dir = raw_common_dir.resolve(strict=True)
+    if not _safe_worktree_runtime_status(
+        checkout_root=checkout_root,
+        common_git_dir=common_git_dir,
+        status_payload=status.stdout,
+    ):
         return f"{commit}-dirty"
     return commit
 

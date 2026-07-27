@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **Strategy Lab daemon 规格复审加固**：正式 checkout readiness 只额外允许 linked worktree
+  根目录中、精确指向主 checkout 私有真实 `.venv` 的单一 symlink，其他 tracked/untracked
+  内容、身份漂移与 symlink 链继续 fail closed。scheduler 以原子方式创建并验证 `0600` Lab
+  SQLite，finalizer 只验证且绝不创建；SQLite、authority key 与 daemon lock 均拒绝 symlink、
+  hardlink、非 owner、非 regular 或公开 mode。Lab DB、spool、artifact、lock、研究托管根与
+  key 路径在任何运行时创建前执行纯 canonical 双向 alias/nesting 校验；scheduler 各输入批次
+  均接入显式安全上限，worker 固定每 tick 最多处理一个 shard。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

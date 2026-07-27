@@ -72,7 +72,7 @@ class TestSettings:
         assert configured.backfill_planner_memory_limit_mb == 1_024
         assert configured.backfill_planner_threads == 3
 
-    def test_lab_job_paths_default_under_data_dir_and_create_parents(
+    def test_lab_job_paths_default_under_data_dir_without_runtime_side_effects(
         self,
         tmp_path: Path,
     ) -> None:
@@ -85,28 +85,20 @@ class TestSettings:
             lab_worker_artifact_dir="",
         )
 
-        assert configured.lab_jobs_path_resolved == (
-            tmp_path / "data" / "lab_jobs.sqlite3"
-        )
-        assert configured.lab_job_command_dir_resolved == (
-            tmp_path / "data" / "lab_job_commands"
-        )
-        assert configured.lab_job_claim_dir_resolved == (
-            tmp_path / "data" / "lab_shard_claims"
-        )
-        assert configured.lab_job_report_dir_resolved == (
-            tmp_path / "data" / "lab_worker_reports"
-        )
+        assert configured.lab_jobs_path_resolved == (tmp_path / "data" / "lab_jobs.sqlite3")
+        assert configured.lab_job_command_dir_resolved == (tmp_path / "data" / "lab_job_commands")
+        assert configured.lab_job_claim_dir_resolved == (tmp_path / "data" / "lab_shard_claims")
+        assert configured.lab_job_report_dir_resolved == (tmp_path / "data" / "lab_worker_reports")
         assert configured.lab_worker_artifact_dir_resolved == (
             tmp_path / "data" / "lab_worker_artifacts"
         )
         assert configured.lab_jobs_path_resolved.parent.is_dir()
-        assert configured.lab_job_command_dir_resolved.is_dir()
-        assert configured.lab_job_claim_dir_resolved.is_dir()
-        assert configured.lab_job_report_dir_resolved.is_dir()
-        assert configured.lab_worker_artifact_dir_resolved.is_dir()
+        assert not configured.lab_job_command_dir_resolved.exists()
+        assert not configured.lab_job_claim_dir_resolved.exists()
+        assert not configured.lab_job_report_dir_resolved.exists()
+        assert not configured.lab_worker_artifact_dir_resolved.exists()
 
-    def test_lab_daemon_paths_default_to_distinct_absolute_private_roots(
+    def test_lab_daemon_paths_default_to_distinct_absolute_pure_roots(
         self,
         tmp_path: Path,
     ) -> None:
@@ -123,8 +115,7 @@ class TestSettings:
         }
         assert len(roots) == 7
         assert all(path.is_absolute() for path in roots)
-        assert all(path.is_dir() for path in roots)
-        assert all(path.stat().st_mode & 0o777 == 0o700 for path in roots)
+        assert all(not path.exists() for path in roots)
 
     @pytest.mark.parametrize(
         "field",
@@ -156,6 +147,124 @@ class TestSettings:
                 lab_job_claim_dir=root / "claims",
             )
 
+    def test_lab_daemon_rejects_reverse_nested_managed_root_under_database(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "not-created"
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_jobs_path=root / "lab.sqlite3",
+                lab_job_command_dir=root / "lab.sqlite3" / "commands",
+            )
+        assert not root.exists()
+
+    def test_lab_daemon_rejects_reverse_nested_managed_root_under_key_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "not-created"
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_finalizer_authority_key_path=root / "authority.key",
+                lab_job_command_dir=root / "authority.key" / "commands",
+            )
+        assert not root.exists()
+
+    def test_lab_daemon_rejects_nested_database_paths(self, tmp_path: Path) -> None:
+        values = _settings_values(tmp_path)
+        values["duckdb_path"] = tmp_path / "data" / "operational.duckdb"
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **values,
+                lab_jobs_path=values["duckdb_path"] / "lab.sqlite3",
+            )
+
+    @pytest.mark.parametrize(
+        ("existing_field", "lab_inside_existing"),
+        [
+            ("research_lake_dir", True),
+            ("research_lake_dir", False),
+            ("research_staging_dir", True),
+            ("research_staging_dir", False),
+        ],
+    )
+    def test_lab_daemon_rejects_nesting_with_existing_managed_roots(
+        self,
+        tmp_path: Path,
+        existing_field: str,
+        lab_inside_existing: bool,
+    ) -> None:
+        root = tmp_path / "not-created"
+        existing = root / "existing"
+        lab = existing / "lab" if lab_inside_existing else root
+        existing = existing if lab_inside_existing else lab / "existing"
+
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **_settings_values(tmp_path),
+                **{
+                    existing_field: existing,
+                    "lab_job_command_dir": lab,
+                },
+            )
+
+        assert not root.exists()
+
+    def test_lab_database_conflict_does_not_create_database_parent(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "not-created"
+        values = _settings_values(tmp_path)
+        values["duckdb_path"] = root / "operational.duckdb"
+
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **values,
+                lab_job_command_dir=root / "operational.duckdb" / "commands",
+            )
+
+        assert not root.exists()
+
+    def test_lab_daemon_rejects_absolute_noncanonical_path(self, tmp_path: Path) -> None:
+        noncanonical = tmp_path / "state" / ".." / "commands"
+        with pytest.raises(ValidationError, match="canonical"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_job_command_dir=noncanonical,
+            )
+
+    def test_lab_daemon_rejects_relative_data_dir_before_creating_defaults(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        values = _settings_values(tmp_path)
+        values["data_dir"] = Path("relative-data")
+
+        with pytest.raises(ValidationError, match="DATA_DIR.*absolute canonical"):
+            Settings(**values)
+
+        assert not (tmp_path / "relative-data").exists()
+
+    def test_lab_conflict_validation_does_not_create_managed_paths(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "not-created"
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_job_command_dir=root / "spool",
+                lab_job_claim_dir=root / "spool" / "claims",
+            )
+
+        assert not root.exists()
+
     def test_lab_daemon_rejects_database_inside_managed_root(self, tmp_path: Path) -> None:
         root = tmp_path / "data" / "commands"
         with pytest.raises(ValidationError, match="database"):
@@ -176,13 +285,17 @@ class TestSettings:
             lab_scheduler_lease_seconds=90,
             lab_scheduler_heartbeat_seconds=30,
             lab_scheduler_shard_lease_seconds=120,
+            lab_scheduler_max_commands_per_tick=12,
             lab_scheduler_max_reports_per_tick=11,
+            lab_scheduler_max_plans_per_tick=13,
             lab_scheduler_max_claims_per_tick=3,
+            lab_scheduler_max_claim_authority_per_tick=14,
             lab_scheduler_worker_ids="worker-a, worker-b",
             lab_worker_poll_interval_ms=125,
             lab_worker_heartbeat_seconds=15,
             lab_worker_lease_extension_seconds=90,
             lab_worker_receipt_timeout_seconds=20,
+            lab_worker_max_shards_per_tick=1,
             lab_worker_id="worker-a",
             lab_finalizer_poll_interval_ms=500,
             lab_finalizer_max_jobs_per_tick=7,
@@ -194,13 +307,17 @@ class TestSettings:
         assert configured.lab_scheduler_lease_seconds == 90
         assert configured.lab_scheduler_heartbeat_seconds == 30
         assert configured.lab_scheduler_shard_lease_seconds == 120
+        assert configured.lab_scheduler_max_commands_per_tick == 12
         assert configured.lab_scheduler_max_reports_per_tick == 11
+        assert configured.lab_scheduler_max_plans_per_tick == 13
         assert configured.lab_scheduler_max_claims_per_tick == 3
+        assert configured.lab_scheduler_max_claim_authority_per_tick == 14
         assert configured.lab_scheduler_worker_id_list == ("worker-a", "worker-b")
         assert configured.lab_worker_poll_interval_ms == 125
         assert configured.lab_worker_heartbeat_seconds == 15
         assert configured.lab_worker_lease_extension_seconds == 90
         assert configured.lab_worker_receipt_timeout_seconds == 20
+        assert configured.lab_worker_max_shards_per_tick == 1
         assert configured.lab_worker_id == "worker-a"
         assert configured.lab_finalizer_poll_interval_ms == 500
         assert configured.lab_finalizer_max_jobs_per_tick == 7
@@ -214,15 +331,27 @@ class TestSettings:
             ("lab_scheduler_lease_seconds", 0),
             ("lab_scheduler_heartbeat_seconds", 0),
             ("lab_scheduler_shard_lease_seconds", 0),
+            ("lab_scheduler_max_commands_per_tick", 0),
+            ("lab_scheduler_max_commands_per_tick", 257),
             ("lab_scheduler_max_reports_per_tick", 0),
+            ("lab_scheduler_max_reports_per_tick", 257),
+            ("lab_scheduler_max_plans_per_tick", 0),
+            ("lab_scheduler_max_plans_per_tick", 257),
             ("lab_scheduler_max_claims_per_tick", 0),
+            ("lab_scheduler_max_claims_per_tick", 129),
+            ("lab_scheduler_max_claim_authority_per_tick", 0),
+            ("lab_scheduler_max_claim_authority_per_tick", 513),
             ("lab_worker_poll_interval_ms", 0),
             ("lab_worker_heartbeat_seconds", 0),
             ("lab_worker_lease_extension_seconds", 0),
             ("lab_worker_receipt_timeout_seconds", 0),
+            ("lab_worker_max_shards_per_tick", 0),
+            ("lab_worker_max_shards_per_tick", 2),
             ("lab_finalizer_poll_interval_ms", 0),
             ("lab_finalizer_max_jobs_per_tick", 0),
+            ("lab_finalizer_max_jobs_per_tick", 129),
             ("lab_scheduler_max_artifact_commits_per_tick", 0),
+            ("lab_scheduler_max_artifact_commits_per_tick", 257),
         ],
     )
     def test_lab_scheduler_rejects_non_positive_runtime_settings(
@@ -353,9 +482,7 @@ class TestSettings:
             tmp_path / "data" / "research_ro.duckdb"
         )
         assert configured.research_lake_dir_resolved == tmp_path / "data" / "lake"
-        assert configured.research_staging_dir_resolved == (
-            tmp_path / "data" / "research_staging"
-        )
+        assert configured.research_staging_dir_resolved == (tmp_path / "data" / "research_staging")
         assert configured.research_lake_dir_resolved.is_dir()
         assert configured.research_staging_dir_resolved.is_dir()
         assert configured.research_cloud_ingest_enabled is False

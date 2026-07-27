@@ -3031,8 +3031,9 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         LabAuthorityKeyring,
         LabDaemonConfigurationError,
         LabDaemonLock,
+        ensure_private_directory,
+        prepare_private_sqlite_path,
         require_clean_code_sha,
-        require_private_directory,
     )
     from rquant.lab_job_protocol import LabCommandSpool
     from rquant.lab_jobs import LabJobStore
@@ -3064,8 +3065,13 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        require_private_directory(path, label=label)
+        ensure_private_directory(path, label=label)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "scheduler"):
+        prepare_private_sqlite_path(
+            settings.lab_jobs_path_resolved,
+            label="lab jobs SQLite",
+            create=True,
+        )
         artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
         try:
             store = LabJobStore(
@@ -3089,13 +3095,18 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 lease_seconds=settings.lab_scheduler_lease_seconds,
                 heartbeat_seconds=settings.lab_scheduler_heartbeat_seconds,
                 poll_interval_ms=settings.lab_scheduler_poll_interval_ms,
+                max_commands_per_tick=settings.lab_scheduler_max_commands_per_tick,
                 report_spool=report_spool,
                 claim_spool=claim_spool,
                 claim_worker_ids=settings.lab_scheduler_worker_id_list,
                 shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
                 max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
                 adapter_registry=default_strategy_job_adapter_registry(),
+                max_plans_per_tick=settings.lab_scheduler_max_plans_per_tick,
                 max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
+                max_claim_authority_per_tick=(
+                    settings.lab_scheduler_max_claim_authority_per_tick
+                ),
                 artifact_commit_spool=LabArtifactCommitSpool(
                     settings.lab_artifact_commit_dir_resolved
                 ),
@@ -3140,11 +3151,11 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
         LabDaemonLock,
+        ensure_private_directory,
         require_clean_code_sha,
-        require_private_directory,
     )
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
-    from rquant.lab_worker import LabWorker
+    from rquant.lab_worker import LAB_WORKER_MAX_SHARDS_PER_TICK, LabWorker
     from rquant.research_manifest import detect_verified_code_commit
     from rquant.storage.duckdb import open_readonly_store
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
@@ -3155,6 +3166,8 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         raise LabDaemonConfigurationError("worker CLI id does not match configured stable id")
     if worker_id not in settings.lab_scheduler_worker_id_list:
         raise LabDaemonConfigurationError("worker id is not present in scheduler allowlist")
+    if settings.lab_worker_max_shards_per_tick != LAB_WORKER_MAX_SHARDS_PER_TICK:
+        raise LabDaemonConfigurationError("worker batch must remain exactly one shard per tick")
     code_sha = require_clean_code_sha(detect_verified_code_commit)
     for label, path in (
         ("lab claim spool", settings.lab_job_claim_dir_resolved),
@@ -3162,7 +3175,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         ("lab worker artifact root", settings.lab_worker_artifact_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        require_private_directory(path, label=label)
+        ensure_private_directory(path, label=label)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "worker"):
         worker = LabWorker(
             worker_id=worker_id,
@@ -3217,8 +3230,9 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         LabDaemonConfigurationError,
         LabDaemonLock,
         LabFinalizerDaemon,
+        ensure_private_directory,
+        prepare_private_sqlite_path,
         require_clean_code_sha,
-        require_private_directory,
     )
     from rquant.lab_finalizer import LabFinalizer
     from rquant.lab_jobs import LabJobReader
@@ -3244,8 +3258,13 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        require_private_directory(path, label=label)
+        ensure_private_directory(path, label=label)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "finalizer"):
+        prepare_private_sqlite_path(
+            settings.lab_jobs_path_resolved,
+            label="lab jobs SQLite",
+            create=False,
+        )
         artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
         try:
             reader = LabJobReader(

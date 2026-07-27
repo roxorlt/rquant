@@ -61,6 +61,7 @@ from rquant.strategy_job_adapters import (
     default_strategy_job_adapter_registry,
 )
 
+LAB_WORKER_MAX_SHARDS_PER_TICK = 1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _GARBAGE_LEDGER_NAME = re.compile(
     r"(?P<garbage_id>[0-9a-f]{32})-(?P<sequence>[0-2])-"

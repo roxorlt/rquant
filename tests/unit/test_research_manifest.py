@@ -322,6 +322,193 @@ def test_detect_verified_code_commit_rejects_injected_identity_drift(
     assert detect_verified_code_commit(repo) == f"{head}-dirty"
 
 
+def test_detect_verified_code_commit_accepts_safe_worktree_venv_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    (repo / ".venv").mkdir(mode=0o755)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "fixture-worktree", str(worktree)],
+        cwd=repo,
+        check=True,
+    )
+    (worktree / ".venv").symlink_to(repo / ".venv", target_is_directory=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert detect_verified_code_commit(worktree) == head
+
+
+@pytest.mark.parametrize(
+    ("name", "executable"),
+    [("payload.py", False), ("runtime-tool", True), ("notes.txt", False)],
+)
+def test_detect_verified_code_commit_rejects_untrusted_untracked_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    executable: bool,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    payload = repo / name
+    payload.write_text("untrusted\n", encoding="utf-8")
+    if executable:
+        payload.chmod(0o755)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert detect_verified_code_commit(repo) == f"{head}-dirty"
+
+
+def test_detect_verified_code_commit_rejects_venv_symlink_to_unapproved_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    approved = repo / ".venv"
+    approved.mkdir(mode=0o755)
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "fixture-worktree", str(worktree)],
+        cwd=repo,
+        check=True,
+    )
+    unapproved = tmp_path / "other-venv"
+    unapproved.mkdir(mode=0o755)
+    (worktree / ".venv").symlink_to(unapproved, target_is_directory=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert detect_verified_code_commit(worktree) == f"{head}-dirty"
+
+
+def test_detect_verified_code_commit_rejects_symlinked_authoritative_venv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    actual = tmp_path / "shared-venv"
+    actual.mkdir(mode=0o755)
+    (repo / ".venv").symlink_to(actual, target_is_directory=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "fixture-worktree", str(worktree)],
+        cwd=repo,
+        check=True,
+    )
+    (worktree / ".venv").symlink_to(repo / ".venv", target_is_directory=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert detect_verified_code_commit(worktree) == f"{head}-dirty"
+
+
 def test_manifest_rejects_covered_count_above_denominator() -> None:
     from rquant.research_manifest import ResearchManifest
 
@@ -338,9 +525,7 @@ def test_current_notices_cover_all_untrusted_strategy_families() -> None:
     from rquant.research_manifest import CURRENT_RESEARCH_NOTICES
 
     covered = {
-        run_type
-        for notice in CURRENT_RESEARCH_NOTICES
-        for run_type in notice.affected_run_types
+        run_type for notice in CURRENT_RESEARCH_NOTICES for run_type in notice.affected_run_types
     }
 
     assert {

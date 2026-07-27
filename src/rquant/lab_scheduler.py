@@ -134,18 +134,30 @@ class LabScheduler:
             raise ValueError("poll_interval_ms must be positive")
         if max_commands_per_tick < 1:
             raise ValueError("max_commands_per_tick must be positive")
+        if max_commands_per_tick > 256:
+            raise ValueError("max_commands_per_tick exceeds safety limit 256")
         if shard_lease_seconds < 1:
             raise ValueError("shard_lease_seconds must be positive")
         if max_reports_per_tick < 1:
             raise ValueError("max_reports_per_tick must be positive")
+        if max_reports_per_tick > 256:
+            raise ValueError("max_reports_per_tick exceeds safety limit 256")
         if max_plans_per_tick < 1:
             raise ValueError("max_plans_per_tick must be positive")
+        if max_plans_per_tick > 256:
+            raise ValueError("max_plans_per_tick exceeds safety limit 256")
         if max_claims_per_tick < 1:
             raise ValueError("max_claims_per_tick must be positive")
+        if max_claims_per_tick > 128:
+            raise ValueError("max_claims_per_tick exceeds safety limit 128")
         if max_claim_authority_per_tick < 1:
             raise ValueError("max_claim_authority_per_tick must be positive")
+        if max_claim_authority_per_tick > 512:
+            raise ValueError("max_claim_authority_per_tick exceeds safety limit 512")
         if max_artifact_commits_per_tick < 1:
             raise ValueError("max_artifact_commits_per_tick must be positive")
+        if max_artifact_commits_per_tick > 256:
+            raise ValueError("max_artifact_commits_per_tick exceeds safety limit 256")
         if (artifact_commit_spool is None) != (artifact_store is None):
             raise ValueError("artifact commit spool and artifact store must be configured together")
         if artifact_commit_spool is not None and finalizer_authority_key_provider is None:

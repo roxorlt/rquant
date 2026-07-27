@@ -14,6 +14,8 @@ from rquant.lab_daemon import (
     LabDaemonConfigurationError,
     LabDaemonLock,
     LabFinalizerDaemon,
+    ensure_private_directory,
+    prepare_private_sqlite_path,
     require_clean_code_sha,
     require_private_directory,
 )
@@ -147,6 +149,22 @@ def test_authority_keyring_rejects_wrong_active_key_and_weak_secret(tmp_path: Pa
         )
 
 
+def test_authority_keyring_rejects_hardlinked_key_without_reading_it(tmp_path: Path) -> None:
+    victim = tmp_path / "victim.key"
+    key = tmp_path / "active.key"
+    ring = tmp_path / "keyring.json"
+    _write_private(victim, "61" * 32 + "\n")
+    key.hardlink_to(victim)
+    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+
+    with pytest.raises(LabDaemonConfigurationError, match="hardlink"):
+        LabAuthorityKeyring.load(
+            active_key_id="active",
+            active_key_path=key,
+            verification_keyring_path=ring,
+        )
+
+
 @pytest.mark.parametrize(
     "value",
     [None, "", "a" * 39, "a" * 41, "A" * 40, "a" * 40 + "-dirty"],
@@ -174,6 +192,110 @@ def test_daemon_lock_is_single_instance_and_private(tmp_path: Path) -> None:
         assert os.getpid() > 0
 
 
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_daemon_lock_rejects_linked_existing_file_without_truncating_victim(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir(mode=0o700)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n", encoding="utf-8")
+    victim.chmod(0o600)
+    lock_path = lock_dir / "scheduler.lock"
+    if link_kind == "symlink":
+        lock_path.symlink_to(victim)
+    else:
+        lock_path.hardlink_to(victim)
+
+    with pytest.raises(LabDaemonConfigurationError, match=link_kind):
+        LabDaemonLock(lock_dir, "scheduler").acquire()
+
+    assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_daemon_lock_rejects_public_or_non_regular_existing_file(tmp_path: Path) -> None:
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir(mode=0o700)
+    lock_path = lock_dir / "scheduler.lock"
+    lock_path.write_text("old\n", encoding="utf-8")
+    lock_path.chmod(0o644)
+    with pytest.raises(LabDaemonConfigurationError, match="private"):
+        LabDaemonLock(lock_dir, "scheduler").acquire()
+
+    lock_path.unlink()
+    lock_path.mkdir(mode=0o700)
+    with pytest.raises(LabDaemonConfigurationError, match="regular"):
+        LabDaemonLock(lock_dir, "scheduler").acquire()
+
+
+def test_scheduler_prepares_private_sqlite_under_public_umask(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    prior_umask = os.umask(0o022)
+    try:
+        prepared = prepare_private_sqlite_path(
+            path,
+            label="lab jobs SQLite",
+            create=True,
+        )
+    finally:
+        os.umask(prior_umask)
+
+    assert prepared == path
+    assert path.is_file()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_nlink == 1
+
+
+def test_finalizer_private_sqlite_check_never_creates_missing_file(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+
+    with pytest.raises(LabDaemonConfigurationError, match="does not exist"):
+        prepare_private_sqlite_path(path, label="lab jobs SQLite", create=False)
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("public", "private mode 0600"),
+        ("symlink", "symlink"),
+        ("hardlink", "hardlink"),
+        ("directory", "regular file"),
+    ],
+)
+def test_private_sqlite_rejects_unsafe_existing_identity(
+    tmp_path: Path,
+    kind: str,
+    message: str,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    victim = tmp_path / "victim.sqlite3"
+    victim.write_bytes(b"private state")
+    victim.chmod(0o600)
+    if kind == "public":
+        path.write_bytes(b"state")
+        path.chmod(0o644)
+    elif kind == "symlink":
+        path.symlink_to(victim)
+    elif kind == "hardlink":
+        path.hardlink_to(victim)
+    else:
+        path.mkdir(mode=0o700)
+
+    with pytest.raises(LabDaemonConfigurationError, match=message):
+        prepare_private_sqlite_path(path, label="lab jobs SQLite", create=False)
+
+    assert victim.read_bytes() == b"private state"
+
+
 def test_private_directory_gate_rejects_public_or_symlinked_roots(tmp_path: Path) -> None:
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
@@ -188,6 +310,30 @@ def test_private_directory_gate_rejects_public_or_symlinked_roots(tmp_path: Path
     linked.symlink_to(private, target_is_directory=True)
     with pytest.raises(LabDaemonConfigurationError, match="real directory"):
         require_private_directory(linked, label="command spool")
+
+
+def test_private_directory_runtime_ensure_creates_only_private_leaf(tmp_path: Path) -> None:
+    path = tmp_path / "runtime" / "commands"
+    prior_umask = os.umask(0o022)
+    try:
+        ensured = ensure_private_directory(path, label="command spool")
+    finally:
+        os.umask(prior_umask)
+
+    assert ensured == path
+    assert path.stat().st_mode & 0o777 == 0o700
+
+
+def test_private_directory_runtime_ensure_does_not_repair_public_directory(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "commands"
+    path.mkdir(mode=0o755)
+
+    with pytest.raises(LabDaemonConfigurationError, match="private permissions"):
+        ensure_private_directory(path, label="command spool")
+
+    assert path.stat().st_mode & 0o777 == 0o755
 
 
 def test_finalizer_daemon_runs_a_bounded_tick_and_reports_first_error() -> None:

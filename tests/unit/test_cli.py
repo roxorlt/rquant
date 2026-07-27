@@ -3620,8 +3620,13 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
         monkeypatch.setattr(
             lab_daemon,
-            "require_private_directory",
+            "ensure_private_directory",
             lambda path, *, label: path,
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "prepare_private_sqlite_path",
+            lambda path, *, label, create: path,
         )
         monkeypatch.setattr(
             lab_daemon.LabAuthorityKeyring,
@@ -3662,7 +3667,13 @@ class TestLabSchedulerCli:
     ) -> None:
         import argparse
 
-        from rquant import lab_job_protocol, lab_jobs, lab_scheduler, lab_shard_protocol
+        from rquant import (
+            lab_daemon,
+            lab_job_protocol,
+            lab_jobs,
+            lab_scheduler,
+            lab_shard_protocol,
+        )
         from rquant.cli import cmd_lab_scheduler
 
         calls: list[str] = []
@@ -3695,6 +3706,12 @@ class TestLabSchedulerCli:
         class FakeScheduler:
             def __init__(self, **kwargs: object) -> None:
                 calls.append(f"scheduler:{kwargs['owner_id']}")
+                assert kwargs["max_commands_per_tick"] == 64
+                assert kwargs["max_reports_per_tick"] == 64
+                assert kwargs["max_plans_per_tick"] == 64
+                assert kwargs["max_claims_per_tick"] == 16
+                assert kwargs["max_claim_authority_per_tick"] == 128
+                assert kwargs["max_artifact_commits_per_tick"] == 64
 
             def run_once(self) -> SimpleNamespace:
                 calls.append("run_once")
@@ -3708,11 +3725,19 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", FakeClaimSpool)
         monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeReportSpool)
         monkeypatch.setattr(lab_scheduler, "LabScheduler", FakeScheduler)
+        monkeypatch.setattr(
+            lab_daemon,
+            "prepare_private_sqlite_path",
+            lambda path, *, label, create: (
+                calls.append(f"sqlite:{path.name}:{label}:{create}") or path
+            ),
+        )
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
         result = cmd_lab_scheduler(argparse.Namespace(once=True))
 
         assert result == 0
+        assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:True" in calls
         assert "initialize" in calls
         assert "claim_spool:lab_shard_claims" in calls
         assert "report_spool:lab_worker_reports" in calls
@@ -3783,7 +3808,7 @@ class TestLabWorkerCli:
         monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
         monkeypatch.setattr(
             lab_daemon,
-            "require_private_directory",
+            "ensure_private_directory",
             lambda path, *, label: path,
         )
         monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
