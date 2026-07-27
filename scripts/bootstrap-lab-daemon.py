@@ -143,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-runtime-root", required=True)
     parser.add_argument("--trusted-git-path", required=True)
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--deployment-lock-fd", required=True, type=int)
@@ -154,9 +155,20 @@ def main(argv: list[str] | None = None) -> int:
         _physical_directory(root, label="expected checkout root")
         if Path.cwd().resolve(strict=True) != root:
             raise BootstrapError("working directory does not match expected checkout root")
-        venv = root / ".venv"
-        _physical_directory(venv, label="expected virtualenv")
-        _physical_directory(venv / "bin", label="expected virtualenv bin")
+        venv = _canonical(args.expected_runtime_root, label="expected runtime generation")
+        expected_environment_root = Path(args.deployment_lock_path).with_name(
+            f"{Path(args.deployment_lock_path).stem}.venvs"
+        )
+        if (
+            venv.parent != expected_environment_root
+            or Path(sys.executable) != venv / "bin" / "python"
+        ):
+            raise BootstrapError(
+                "runtime generation does not match selected environment: "
+                f"executable={sys.executable} selected={venv} root={expected_environment_root}"
+            )
+        _physical_directory(venv, label="expected runtime generation")
+        _physical_directory(venv / "bin", label="expected runtime generation bin")
         src = root / "src"
         _physical_directory(src, label="project source root")
         launcher = _canonical(args.expected_launcher, label="expected daemon launcher")

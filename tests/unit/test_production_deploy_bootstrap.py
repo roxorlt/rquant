@@ -14,6 +14,7 @@ import pytest
 
 from rquant.release_generation import (
     ReleaseGenerationAuthority,
+    commit_path_for_lock,
     marker_path_for_lock,
 )
 
@@ -146,14 +147,25 @@ def _checkout(
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            ReleaseGenerationAuthority(
+            authority = ReleaseGenerationAuthority(
                 repo=checkout,
                 lock_path=lock_path,
                 lock_fd=lock_fd,
                 python_path=python,
                 git_path=TRUSTED_GIT,
                 writable=True,
-            ).publish(expected_commit=commit)
+            )
+            initialization = authority.begin_initialization(target_sha=commit)
+            authority.publish(
+                expected_commit=commit,
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
+            authority.complete_initialization(operation_id=initialization.operation_id)
+            authority.commit_generation(
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
         finally:
             os.close(lock_fd)
     return checkout, python, lock_path, commit
@@ -190,7 +202,7 @@ def _begin_intent(
     target: str,
     target_ref: str | None = None,
 ) -> str:
-    lock_fd = os.open(lock_path, os.O_RDWR)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         authority = ReleaseGenerationAuthority(
@@ -225,6 +237,7 @@ def _command(
     recovery_action: str | None = None,
     operation_id: str | None = None,
     inherited_lock_fd: int | None = None,
+    finalize_phase: str = "publish",
 ) -> list[str]:
     command = [
         str(python),
@@ -253,6 +266,8 @@ def _command(
             [
                 "--finalize-action",
                 str(recovery_action),
+                "--finalize-phase",
+                finalize_phase,
                 "--operation-id",
                 str(operation_id),
                 "--inherited-lock-fd",
@@ -420,7 +435,66 @@ def test_initialize_generation_cannot_be_replayed_after_marker_deletion(
     assert not marker_path_for_lock(lock_path).exists()
 
 
-def test_initialize_generation_migrates_one_existing_marker_only_once(
+def test_initialize_generation_recovers_completed_transaction_before_commit_record(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path, publish_marker=False)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        authority = ReleaseGenerationAuthority(
+            repo=checkout,
+            lock_path=lock_path,
+            lock_fd=lock_fd,
+            python_path=python,
+            git_path=TRUSTED_GIT,
+            writable=True,
+        )
+        initialization = authority.begin_initialization(target_sha=commit)
+        authority.publish(
+            expected_commit=commit,
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
+        authority.complete_initialization(operation_id=initialization.operation_id)
+    finally:
+        os.close(lock_fd)
+
+    recovered = subprocess.run(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=commit,
+            mode="initialize",
+        ),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert commit_path_for_lock(lock_path).is_file()
+
+    replay = subprocess.run(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=commit,
+            mode="initialize",
+        ),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert replay.returncode == 2
+    assert "already completed" in replay.stderr
+
+
+def test_initialize_generation_refuses_replaying_a_committed_initialization(
     tmp_path: Path,
 ) -> None:
     checkout, python, lock_path, commit = _checkout(tmp_path)
@@ -447,7 +521,8 @@ def test_initialize_generation_migrates_one_existing_marker_only_once(
         check=False,
     )
 
-    assert migrated.returncode == 0, migrated.stderr
+    assert migrated.returncode == 2
+    assert "already completed" in migrated.stderr
     assert replay.returncode == 2
     assert "already completed" in replay.stderr
     assert marker_path_for_lock(lock_path).is_file()
@@ -495,6 +570,7 @@ def test_recover_generation_failure_stays_unpublished_and_can_restart(
 ) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     commit = _commit_next_release(checkout)
+    _git(checkout, "reset", "--hard", previous)
     _begin_intent(
         checkout,
         python,
@@ -502,7 +578,6 @@ def test_recover_generation_failure_stays_unpublished_and_can_restart(
         previous=previous,
         target=commit,
     )
-    _git(checkout, "reset", "--hard", previous)
     marker = marker_path_for_lock(lock_path)
     marker.unlink()
     command = _command(
@@ -545,6 +620,7 @@ def test_recover_generation_resumes_fast_forward_target_after_interruption(
 ) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     target = _commit_next_release(checkout)
+    _git(checkout, "reset", "--hard", previous)
     _begin_intent(
         checkout,
         python,
@@ -552,7 +628,6 @@ def test_recover_generation_resumes_fast_forward_target_after_interruption(
         previous=previous,
         target=target,
     )
-    _git(checkout, "reset", "--hard", previous)
     marker_path_for_lock(lock_path).unlink()
 
     result = subprocess.run(
@@ -581,6 +656,7 @@ def test_recover_generation_rolls_back_to_verified_previous_release(
 ) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     target = _commit_next_release(checkout)
+    _git(checkout, "reset", "--hard", previous)
     _begin_intent(
         checkout,
         python,
@@ -614,6 +690,7 @@ def test_recover_generation_rolls_back_to_verified_previous_release(
 def test_recovery_target_remains_pinned_when_origin_main_advances(tmp_path: Path) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     target = _commit_next_release(checkout)
+    _git(checkout, "reset", "--hard", previous)
     _begin_intent(
         checkout,
         python,
@@ -621,6 +698,7 @@ def test_recovery_target_remains_pinned_when_origin_main_advances(tmp_path: Path
         previous=previous,
         target=target,
     )
+    _git(checkout, "reset", "--hard", target)
     (checkout / "uv.lock").write_text("version = 3\n", encoding="utf-8")
     _git(checkout, "add", "uv.lock")
     _git(

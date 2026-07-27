@@ -341,6 +341,28 @@ def _load_release_authority(path: Path) -> ModuleType:
     return module
 
 
+def _selected_release_runtime(
+    marker: object,
+    *,
+    deployment_lock_path: Path,
+) -> tuple[Path, Path, Path, tuple[_PathIdentity, ...]]:
+    venv = _canonical_absolute(marker.venv_path, label="selected release environment")
+    expected_root = deployment_lock_path.with_name(f"{deployment_lock_path.stem}.venvs")
+    if venv.parent != expected_root:
+        raise WrapperError("selected release environment is outside generation storage")
+    python = _canonical_absolute(marker.python_path, label="selected release Python")
+    launcher = venv / "bin" / "rquant"
+    identities = (
+        _require_owned_directory(venv, label="selected release environment"),
+        _require_owned_directory(venv / "bin", label="selected release bin"),
+        _require_owned_regular(python, label="selected release Python", executable=True),
+        _require_owned_regular(launcher, label="selected release launcher", executable=True),
+    )
+    if python != venv / "bin" / "python":
+        raise WrapperError("selected release Python does not match generation binding")
+    return venv, python, launcher, identities
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
@@ -397,7 +419,8 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_fd=generation_lock_fd,
         )
         try:
-            _load_release_authority(release_authority_path).ReleaseGenerationAuthority(
+            release_module = _load_release_authority(release_authority_path)
+            release_marker = release_module.ReleaseGenerationAuthority(
                 repo=root,
                 lock_path=deployment_lock_path,
                 lock_fd=generation_lock_fd,
@@ -406,6 +429,12 @@ def main(argv: list[str] | None = None) -> int:
             ).verify(expected_commit=expected_commit)
         except Exception as exc:
             raise WrapperError(f"release generation marker is invalid: {exc}") from exc
+        selected_venv, selected_python, selected_launcher, selected_identities = (
+            _selected_release_runtime(
+                release_marker,
+                deployment_lock_path=deployment_lock_path,
+            )
+        )
         rebound_root, rebound_venv, rebound_python, rebound_runtime_identities = (
             _require_runtime_root(args.expected_checkout_root)
         )
@@ -438,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise WrapperError("Lab runtime identity changed during preflight")
         _run_preflight(
-            python=python,
+            python=selected_python,
             preflight=preflight,
             root=root,
             expected_commit=expected_commit,
@@ -479,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise WrapperError("Lab runtime identity changed before daemon exec")
         _run_preflight(
-            python=python,
+            python=selected_python,
             preflight=preflight,
             root=root,
             expected_commit=expected_commit,
@@ -515,13 +544,36 @@ def main(argv: list[str] | None = None) -> int:
             != expected_commit
         ):
             raise WrapperError("Lab runtime identity changed at daemon exec boundary")
+        final_marker = release_module.ReleaseGenerationAuthority(
+            repo=root,
+            lock_path=deployment_lock_path,
+            lock_fd=generation_lock_fd,
+            python_path=selected_python,
+            git_path=trusted_git,
+        ).verify(expected_commit=expected_commit)
+        (
+            final_selected_venv,
+            final_selected_python,
+            final_selected_launcher,
+            final_selected_identities,
+        ) = _selected_release_runtime(
+            final_marker,
+            deployment_lock_path=deployment_lock_path,
+        )
+        if (
+            final_marker != release_marker
+            or (final_selected_venv, final_selected_python, final_selected_launcher)
+            != (selected_venv, selected_python, selected_launcher)
+            or final_selected_identities != selected_identities
+        ):
+            raise WrapperError("selected release environment changed before daemon exec")
         os.environ.pop("__PYVENV_LAUNCHER__", None)
         sys.stdout.flush()
         sys.stderr.flush()
         os.execv(
-            python,
+            selected_python,
             [
-                str(python),
+                str(selected_python),
                 "-I",
                 "-S",
                 str(bootstrap),
@@ -529,6 +581,8 @@ def main(argv: list[str] | None = None) -> int:
                 str(root),
                 "--expected-commit",
                 expected_commit,
+                "--expected-runtime-root",
+                str(selected_venv),
                 "--trusted-git-path",
                 str(trusted_git),
                 "--deployment-lock-path",
@@ -536,7 +590,7 @@ def main(argv: list[str] | None = None) -> int:
                 "--deployment-lock-fd",
                 str(generation_lock_fd),
                 "--expected-launcher",
-                str(executable),
+                str(selected_launcher),
                 "--",
                 *daemon_argv[1:],
                 "--deployment-generation",

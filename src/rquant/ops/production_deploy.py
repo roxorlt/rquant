@@ -158,6 +158,7 @@ class GenerationFinalizer(Protocol):
         expected_commit: str,
         operation_id: str,
         action: str,
+        phase: str,
     ) -> object: ...
 
 
@@ -198,6 +199,7 @@ class IsolatedGenerationFinalizer:
         expected_commit: str,
         operation_id: str,
         action: str,
+        phase: str,
     ) -> object:
         config = self._config
         assert config.lock_fd is not None
@@ -225,6 +227,8 @@ class IsolatedGenerationFinalizer:
             operation_id,
             "--finalize-action",
             action,
+            "--finalize-phase",
+            phase,
             "--",
             "--target",
             expected_commit,
@@ -569,9 +573,17 @@ def _execute_transaction(
         expected_commit=target_sha,
         operation_id=intent.operation_id,
         action=action,
+        phase="publish",
     )
     intent = _advance_intent(config, authority, intent, "marker_published")
-    return _advance_intent(config, authority, intent, "completed")
+    intent = _advance_intent(config, authority, intent, "completed")
+    finalizer.finalize(
+        expected_commit=target_sha,
+        operation_id=intent.operation_id,
+        action=action,
+        phase="commit",
+    )
+    return intent
 
 
 def _rollback_unmanaged(
@@ -597,8 +609,6 @@ def _recover_locked(
     if action not in {"resume", "rollback"}:
         raise PolicyError("recovery action must be resume or rollback")
     intent = authority.read_deployment_intent()
-    if intent.stage == "completed":
-        raise PolicyError("deployment intent is already completed")
     if config.dry_run:
         raise PolicyError("recovery does not support dry-run")
     expected_target = intent.target_sha if action == "resume" else intent.previous_sha
@@ -627,6 +637,8 @@ def _recover_locked(
     dirty = _stdout(runner, [git, "status", "--porcelain", "--untracked-files=no"])
     if dirty:
         raise PolicyError("tracked production worktree changes must be resolved before recovery")
+    intent = _advance_intent(config, authority, intent, "recovery_started")
+    authority.invalidate()
     completed = _execute_transaction(
         config,
         runner,
@@ -762,12 +774,19 @@ def _deploy_locked(
             )
         except Exception as exc:
             try:
+                recovery = _advance_intent(
+                    config,
+                    generation_authority,
+                    generation_authority.read_deployment_intent(),
+                    "recovery_started",
+                )
+                generation_authority.invalidate()
                 completed = _execute_transaction(
                     config,
                     runner,
                     generation_authority,
                     generation_finalizer,
-                    generation_authority.read_deployment_intent(),
+                    recovery,
                     action="rollback",
                 )
             except Exception as rollback_exc:

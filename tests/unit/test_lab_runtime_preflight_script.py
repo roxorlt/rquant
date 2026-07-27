@@ -71,14 +71,25 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ReleaseGenerationAuthority(
+        authority = ReleaseGenerationAuthority(
             repo=checkout,
             lock_path=lock_path,
             lock_fd=lock_fd,
             python_path=checkout / ".venv" / "bin" / "python",
             git_path=TRUSTED_GIT,
             writable=True,
-        ).publish(expected_commit=commit)
+        )
+        initialization = authority.begin_initialization(target_sha=commit)
+        authority.publish(
+            expected_commit=commit,
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
+        authority.complete_initialization(operation_id=initialization.operation_id)
+        authority.commit_generation(
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
     finally:
         os.close(lock_fd)
     return checkout, package

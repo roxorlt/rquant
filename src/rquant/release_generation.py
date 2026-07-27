@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import stat
 import subprocess
 import tomllib
@@ -22,8 +23,11 @@ from typing import Any
 
 MARKER_SCHEMA_VERSION = 1
 INTENT_SCHEMA_VERSION = 1
+COMMIT_SCHEMA_VERSION = 1
+ENVIRONMENT_SCHEMA_VERSION = 1
 MAX_MARKER_BYTES = 32 * 1024
 MAX_INTENT_BYTES = 128 * 1024
+MAX_ENVIRONMENT_MANIFEST_BYTES = 64 * 1024 * 1024
 
 
 class ReleaseGenerationError(RuntimeError):
@@ -46,6 +50,8 @@ class PathIdentity:
 @dataclass(frozen=True)
 class ReleaseGenerationMarker:
     schema_version: int
+    operation_id: str
+    transaction_kind: str
     commit: str
     uv_lock_sha256: str
     pyproject_sha256: str
@@ -59,6 +65,8 @@ class ReleaseGenerationMarker:
     python_identity: PathIdentity
     site_packages_path: str
     site_packages_identity: PathIdentity
+    environment_generation_id: str
+    environment_manifest_sha256: str
     published_at: str
 
     def content_hash(self) -> str:
@@ -70,6 +78,8 @@ class ReleaseGenerationMarker:
         try:
             return cls(
                 schema_version=int(payload["schema_version"]),
+                operation_id=str(payload["operation_id"]),
+                transaction_kind=str(payload["transaction_kind"]),
                 commit=str(payload["commit"]),
                 uv_lock_sha256=str(payload["uv_lock_sha256"]),
                 pyproject_sha256=str(payload["pyproject_sha256"]),
@@ -83,6 +93,8 @@ class ReleaseGenerationMarker:
                 python_identity=PathIdentity(**payload["python_identity"]),
                 site_packages_path=str(payload["site_packages_path"]),
                 site_packages_identity=PathIdentity(**payload["site_packages_identity"]),
+                environment_generation_id=str(payload["environment_generation_id"]),
+                environment_manifest_sha256=str(payload["environment_manifest_sha256"]),
                 published_at=str(payload["published_at"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -106,6 +118,10 @@ class DeploymentIntent:
     created_at: str
     updated_at: str
     stage_history: tuple[dict[str, str], ...]
+
+    def content_hash(self) -> str:
+        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
 
     @classmethod
     def create(
@@ -196,6 +212,93 @@ class DeploymentIntent:
         )
 
 
+@dataclass(frozen=True)
+class EnvironmentSelector:
+    schema_version: int
+    operation_id: str
+    transaction_kind: str
+    commit: str
+    generation_id: str
+    environment_path: str
+    manifest_name: str
+    manifest_sha256: str
+    published_at: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> EnvironmentSelector:
+        try:
+            selector = cls(
+                schema_version=int(payload["schema_version"]),
+                operation_id=str(payload["operation_id"]),
+                transaction_kind=str(payload["transaction_kind"]),
+                commit=str(payload["commit"]),
+                generation_id=str(payload["generation_id"]),
+                environment_path=str(payload["environment_path"]),
+                manifest_name=str(payload["manifest_name"]),
+                manifest_sha256=str(payload["manifest_sha256"]),
+                published_at=str(payload["published_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseGenerationError("environment selector is malformed") from exc
+        if (
+            selector.schema_version != ENVIRONMENT_SCHEMA_VERSION
+            or len(selector.operation_id) != 32
+            or selector.transaction_kind not in {"deployment", "initialization"}
+            or len(selector.commit) != 40
+            or len(selector.generation_id) != 64
+            or len(selector.manifest_sha256) != 64
+        ):
+            raise ReleaseGenerationError("environment selector is invalid")
+        return selector
+
+
+@dataclass(frozen=True)
+class ReleaseGenerationCommit:
+    schema_version: int
+    operation_id: str
+    transaction_kind: str
+    commit: str
+    marker_sha256: str
+    transaction_sha256: str
+    environment_generation_id: str
+    environment_manifest_sha256: str
+    committed_at: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ReleaseGenerationCommit:
+        try:
+            record = cls(
+                schema_version=int(payload["schema_version"]),
+                operation_id=str(payload["operation_id"]),
+                transaction_kind=str(payload["transaction_kind"]),
+                commit=str(payload["commit"]),
+                marker_sha256=str(payload["marker_sha256"]),
+                transaction_sha256=str(payload["transaction_sha256"]),
+                environment_generation_id=str(payload["environment_generation_id"]),
+                environment_manifest_sha256=str(payload["environment_manifest_sha256"]),
+                committed_at=str(payload["committed_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseGenerationError("release generation commit record is malformed") from exc
+        if (
+            record.schema_version != COMMIT_SCHEMA_VERSION
+            or len(record.operation_id) != 32
+            or record.transaction_kind not in {"deployment", "initialization"}
+            or len(record.commit) != 40
+            or any(
+                len(value) != 64
+                for value in (
+                    record.marker_sha256,
+                    record.transaction_sha256,
+                    record.environment_generation_id,
+                    record.environment_manifest_sha256,
+                )
+            )
+        ):
+            raise ReleaseGenerationError("release generation commit record is invalid")
+        return record
+
+
 def marker_path_for_lock(lock_path: Path) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.complete.json")
 
@@ -206,6 +309,22 @@ def intent_path_for_lock(lock_path: Path) -> Path:
 
 def initialization_path_for_lock(lock_path: Path) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.initialized.json")
+
+
+def commit_path_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.commit.json")
+
+
+def environment_selector_path_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.environment.json")
+
+
+def environment_root_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.venvs")
+
+
+def environment_manifest_path_for_lock(lock_path: Path, generation_id: str) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.venv-{generation_id}.manifest.json")
 
 
 def _canonical(path: Path, *, label: str) -> Path:
@@ -425,9 +544,10 @@ def _write_private_json(
     payload: dict[str, Any],
     require_absent: bool,
     expected_identity: PathIdentity | None = None,
+    maximum_bytes: int = MAX_INTENT_BYTES,
 ) -> None:
     encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    if len(encoded) > MAX_INTENT_BYTES:
+    if len(encoded) > maximum_bytes:
         raise ReleaseGenerationError(f"private deployment record {name} is too large")
     temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     descriptor = -1
@@ -442,7 +562,7 @@ def _write_private_json(
         _write_all(descriptor, encoded)
         os.fsync(descriptor)
         os.lseek(descriptor, 0, os.SEEK_SET)
-        observed = os.read(descriptor, MAX_INTENT_BYTES + 1)
+        observed = os.read(descriptor, maximum_bytes + 1)
         if (
             observed != encoded
             or hashlib.sha256(observed).digest() != hashlib.sha256(encoded).digest()
@@ -487,6 +607,111 @@ def _write_private_json(
             os.close(descriptor)
 
 
+def _payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _environment_generation_id(*, operation_id: str, commit: str) -> str:
+    return hashlib.sha256(f"{operation_id}:{commit}".encode()).hexdigest()
+
+
+def _environment_entry(path: Path, root: Path) -> dict[str, Any]:
+    observed = path.lstat()
+    relative = path.relative_to(root).as_posix()
+    if stat.S_ISDIR(observed.st_mode):
+        kind = "directory"
+        digest = ""
+        size = 0
+    elif stat.S_ISREG(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
+        if observed.st_nlink != 1:
+            raise ReleaseGenerationError("environment generation contains a hardlink")
+        kind = "file"
+        digest = _hash_file(path, label=f"environment file {relative}")
+        size = observed.st_size
+    else:
+        raise ReleaseGenerationError("environment generation contains an unsafe object")
+    if observed.st_uid != os.getuid() or observed.st_mode & 0o077:
+        raise ReleaseGenerationError("environment generation is not owner-private")
+    return {
+        "path": relative,
+        "kind": kind,
+        "mode": stat.S_IMODE(observed.st_mode),
+        "size": size,
+        "mtime_ns": observed.st_mtime_ns,
+        "ctime_ns": observed.st_ctime_ns,
+        "sha256": digest,
+    }
+
+
+def _freeze_environment(root: Path) -> None:
+    for current_root, directory_names, file_names in os.walk(root, topdown=False):
+        current = Path(current_root)
+        for name in file_names:
+            path = current / name
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                raise ReleaseGenerationError("environment generation contains a symlink")
+            path.chmod(0o500 if observed.st_mode & stat.S_IXUSR else 0o400)
+        for name in directory_names:
+            path = current / name
+            observed = path.lstat()
+            if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                raise ReleaseGenerationError("environment generation contains a symlink")
+            path.chmod(0o500)
+    root.chmod(0o500)
+
+
+def _environment_manifest(
+    root: Path,
+    *,
+    operation_id: str,
+    transaction_kind: str,
+    commit: str,
+    generation_id: str,
+) -> dict[str, Any]:
+    entries = [_environment_entry(root, root)]
+    entries.extend(
+        _environment_entry(path, root)
+        for path in sorted(root.rglob("*"), key=lambda value: value.as_posix())
+    )
+    return {
+        "schema_version": ENVIRONMENT_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "transaction_kind": transaction_kind,
+        "commit": commit,
+        "generation_id": generation_id,
+        "environment_path": str(root),
+        "entries": entries,
+    }
+
+
+def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    if int(manifest.get("schema_version", 0)) != ENVIRONMENT_SCHEMA_VERSION or manifest.get(
+        "environment_path"
+    ) != str(root):
+        raise ReleaseGenerationError("environment generation manifest is invalid")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ReleaseGenerationError("environment generation manifest has no entries")
+    expected_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise ReleaseGenerationError("environment generation manifest is malformed")
+        relative = str(entry["path"])
+        path = root if relative == "." else root / relative
+        if relative in expected_paths or (relative and Path(relative).is_absolute()):
+            raise ReleaseGenerationError("environment generation manifest path is invalid")
+        expected_paths.add(relative)
+        observed = _environment_entry(path, root)
+        if observed != entry:
+            raise ReleaseGenerationError("environment generation content changed")
+    actual_paths = {"."}
+    actual_paths.update(path.relative_to(root).as_posix() for path in root.rglob("*"))
+    if actual_paths != expected_paths:
+        raise ReleaseGenerationError("environment generation namespace changed")
+
+
 class ReleaseGenerationAuthority:
     def __init__(
         self,
@@ -504,6 +729,9 @@ class ReleaseGenerationAuthority:
         self.marker_path = marker_path_for_lock(self.lock_path)
         self.intent_path = intent_path_for_lock(self.lock_path)
         self.initialization_path = initialization_path_for_lock(self.lock_path)
+        self.commit_path = commit_path_for_lock(self.lock_path)
+        self.environment_selector_path = environment_selector_path_for_lock(self.lock_path)
+        self.environment_root = environment_root_for_lock(self.lock_path)
         self.lock_fd = lock_fd
         self.python_path = _canonical(python_path, label="release Python")
         self.git_path = _canonical(git_path, label="trusted Git")
@@ -526,7 +754,13 @@ class ReleaseGenerationAuthority:
         ):
             raise ReleaseGenerationError("deployment generation lock identity changed")
 
-    def _facts(self, *, expected_commit: str) -> ReleaseGenerationMarker:
+    def _facts(
+        self,
+        *,
+        expected_commit: str,
+        selector: EnvironmentSelector,
+        manifest: dict[str, Any],
+    ) -> ReleaseGenerationMarker:
         if len(expected_commit) != 40 or any(c not in "0123456789abcdef" for c in expected_commit):
             raise ReleaseGenerationError("release commit must be a lowercase full SHA")
         commit = _git_output(self.repo, self.git_path, "rev-parse", "--verify", "HEAD^{commit}")
@@ -542,16 +776,18 @@ class ReleaseGenerationAuthority:
             )
         except (OSError, KeyError, tomllib.TOMLDecodeError) as exc:
             raise ReleaseGenerationError("package version cannot be verified") from exc
-        venv = self.repo / ".venv"
+        if selector.commit != commit or str(manifest.get("commit")) != commit:
+            raise ReleaseGenerationError("environment generation commit is stale")
+        venv = _canonical(Path(selector.environment_path), label="release environment")
+        _verify_environment_manifest(venv, manifest)
         venv_identity = _identity(venv, label="release venv", directory=True)
+        selected_python = venv / "bin" / "python"
         python_identity = _identity(
-            self.python_path,
+            selected_python,
             label="release venv Python",
             directory=False,
         )
-        if not self.python_path.is_relative_to(venv):
-            raise ReleaseGenerationError("release Python is outside the venv")
-        version, abi = _python_facts(self.python_path)
+        version, abi = _python_facts(selected_python)
         major_minor = ".".join(version.split(".")[:2])
         site_packages = venv / "lib" / f"python{major_minor}" / "site-packages"
         site_identity = _identity(
@@ -561,6 +797,8 @@ class ReleaseGenerationAuthority:
         )
         return ReleaseGenerationMarker(
             schema_version=MARKER_SCHEMA_VERSION,
+            operation_id=selector.operation_id,
+            transaction_kind=selector.transaction_kind,
             commit=commit,
             uv_lock_sha256=uv_hash,
             pyproject_sha256=pyproject_hash,
@@ -570,10 +808,12 @@ class ReleaseGenerationAuthority:
             venv_path=str(venv),
             venv_identity=venv_identity,
             pyvenv_cfg_sha256=_hash_file(venv / "pyvenv.cfg", label="pyvenv.cfg"),
-            python_path=str(self.python_path),
+            python_path=str(selected_python),
             python_identity=python_identity,
             site_packages_path=str(site_packages),
             site_packages_identity=site_identity,
+            environment_generation_id=selector.generation_id,
+            environment_manifest_sha256=selector.manifest_sha256,
             published_at=datetime.now(UTC).isoformat(),
         )
 
@@ -623,11 +863,174 @@ class ReleaseGenerationAuthority:
                 os.close(descriptor)
             os.close(root_fd)
 
+    def commit_generation(
+        self,
+        *,
+        operation_id: str,
+        transaction_kind: str,
+    ) -> ReleaseGenerationCommit:
+        if not self.writable:
+            raise ReleaseGenerationError("read-only generation authority cannot commit")
+        self._assert_lock()
+        marker = self._read_marker()
+        if marker.operation_id != operation_id or marker.transaction_kind != transaction_kind:
+            raise ReleaseGenerationError("release marker transaction binding changed")
+        transaction = self._transaction_record(
+            operation_id=operation_id,
+            transaction_kind=transaction_kind,
+        )
+        if transaction.stage != "completed":
+            raise ReleaseGenerationError("release transaction is not completed")
+        selector, _selector_identity = self._read_selector()
+        manifest, _manifest_identity = self._read_environment_manifest(selector)
+        current = self._facts(
+            expected_commit=marker.commit,
+            selector=selector,
+            manifest=manifest,
+        )
+        if self._comparable(current) != self._comparable(marker):
+            raise ReleaseGenerationError("release marker changed before commit")
+        record = ReleaseGenerationCommit(
+            schema_version=COMMIT_SCHEMA_VERSION,
+            operation_id=operation_id,
+            transaction_kind=transaction_kind,
+            commit=marker.commit,
+            marker_sha256=marker.content_hash(),
+            transaction_sha256=transaction.content_hash(),
+            environment_generation_id=marker.environment_generation_id,
+            environment_manifest_sha256=marker.environment_manifest_sha256,
+            committed_at=datetime.now(UTC).isoformat(),
+        )
+        try:
+            existing = self._read_commit_record()
+        except ReleaseGenerationError as exc:
+            if "cannot be read" not in str(exc):
+                raise
+            existing_identity = None
+        else:
+            if replace(existing, committed_at=record.committed_at) == record:
+                return existing
+            root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+            try:
+                _payload, existing_identity = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=self.commit_path.name,
+                    maximum_bytes=MAX_MARKER_BYTES,
+                )
+                self._assert_root(root_fd, root_identity)
+            finally:
+                os.close(root_fd)
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            self._mutation_hook("before_generation_commit")
+            self._assert_root(root_fd, root_identity)
+            _write_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=self.commit_path.name,
+                payload=asdict(record),
+                require_absent=existing_identity is None,
+                expected_identity=existing_identity,
+                maximum_bytes=MAX_MARKER_BYTES,
+            )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+        self._mutation_hook("generation_committed")
+        return record
+
     @staticmethod
     def _comparable(marker: ReleaseGenerationMarker) -> dict[str, Any]:
         payload = asdict(marker)
         payload.pop("published_at", None)
         return payload
+
+    def _read_selector(self) -> tuple[EnvironmentSelector, PathIdentity]:
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            payload, identity = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=self.environment_selector_path.name,
+                maximum_bytes=MAX_MARKER_BYTES,
+            )
+            self._assert_root(root_fd, root_identity)
+            return EnvironmentSelector.from_payload(payload), identity
+        finally:
+            os.close(root_fd)
+
+    def _read_environment_manifest(
+        self,
+        selector: EnvironmentSelector,
+    ) -> tuple[dict[str, Any], PathIdentity]:
+        expected = environment_manifest_path_for_lock(self.lock_path, selector.generation_id)
+        if selector.manifest_name != expected.name:
+            raise ReleaseGenerationError("environment manifest name is not generation-bound")
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            payload, identity = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=selector.manifest_name,
+                maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+            )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+        if _payload_hash(payload) != selector.manifest_sha256:
+            raise ReleaseGenerationError("environment generation manifest hash changed")
+        if (
+            str(payload.get("operation_id")) != selector.operation_id
+            or str(payload.get("transaction_kind")) != selector.transaction_kind
+            or str(payload.get("generation_id")) != selector.generation_id
+        ):
+            raise ReleaseGenerationError("environment generation manifest binding changed")
+        return payload, identity
+
+    def selected_environment(self) -> EnvironmentSelector:
+        self._assert_lock()
+        selector, _identity_value = self._read_selector()
+        manifest, _manifest_identity = self._read_environment_manifest(selector)
+        _verify_environment_manifest(Path(selector.environment_path), manifest)
+        self._assert_lock()
+        return selector
+
+    def _read_commit_record(self) -> ReleaseGenerationCommit:
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            payload, _identity_value = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=self.commit_path.name,
+                maximum_bytes=MAX_MARKER_BYTES,
+            )
+            self._assert_root(root_fd, root_identity)
+            return ReleaseGenerationCommit.from_payload(payload)
+        finally:
+            os.close(root_fd)
+
+    def _transaction_record(
+        self,
+        *,
+        operation_id: str,
+        transaction_kind: str,
+    ) -> DeploymentIntent:
+        if transaction_kind == "initialization":
+            record, _identity_value = self._read_intent_record(self.initialization_path)
+        elif transaction_kind == "deployment":
+            try:
+                record, _identity_value = self._read_intent_record(self.intent_path)
+            except ReleaseGenerationError:
+                archive = self.intent_path.with_name(
+                    f"{self.intent_path.stem}.{operation_id}.completed.json"
+                )
+                record, _identity_value = self._read_intent_record(archive)
+        else:
+            raise ReleaseGenerationError("release transaction kind is invalid")
+        if record.operation_id != operation_id:
+            raise ReleaseGenerationError("release transaction operation id changed")
+        return record
 
     def verify(self, *, expected_commit: str) -> ReleaseGenerationMarker:
         self._assert_lock()
@@ -636,13 +1039,39 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("release generation marker schema is unsupported")
         if published.commit != expected_commit:
             raise ReleaseGenerationError("release generation marker commit is stale")
-        current = self._facts(expected_commit=expected_commit)
+        transaction = self._transaction_record(
+            operation_id=published.operation_id,
+            transaction_kind=published.transaction_kind,
+        )
+        if transaction.stage != "completed":
+            raise ReleaseGenerationError("release transaction is not completed")
+        try:
+            committed = self._read_commit_record()
+        except ReleaseGenerationError as exc:
+            raise ReleaseGenerationError("release generation commit record is missing") from exc
+        selector, _selector_identity = self._read_selector()
+        manifest, _manifest_identity = self._read_environment_manifest(selector)
+        current = self._facts(
+            expected_commit=expected_commit,
+            selector=selector,
+            manifest=manifest,
+        )
         if self._comparable(published) != self._comparable(current):
             if published.uv_lock_sha256 != current.uv_lock_sha256:
                 raise ReleaseGenerationError("uv.lock no longer matches release marker")
             if published.venv_identity != current.venv_identity:
                 raise ReleaseGenerationError("release venv identity no longer matches marker")
             raise ReleaseGenerationError("release generation marker is stale")
+        if (
+            committed.operation_id != published.operation_id
+            or committed.transaction_kind != published.transaction_kind
+            or committed.commit != published.commit
+            or committed.marker_sha256 != published.content_hash()
+            or committed.transaction_sha256 != transaction.content_hash()
+            or committed.environment_generation_id != published.environment_generation_id
+            or committed.environment_manifest_sha256 != published.environment_manifest_sha256
+        ):
+            raise ReleaseGenerationError("release generation commit record is stale")
         _assert_tracked_clean(self.repo, self.git_path)
         self._assert_lock()
         return published
@@ -720,9 +1149,7 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("read-only generation authority cannot create intent")
         self._assert_lock()
         if not marker_generation:
-            marker = self._read_marker()
-            if marker.commit != previous_sha:
-                raise ReleaseGenerationError("deployment intent previous marker is stale")
+            marker = self.verify(expected_commit=previous_sha)
             marker_generation = marker.content_hash()
         try:
             current, completed_identity = self._read_intent_record(self.intent_path)
@@ -813,12 +1240,231 @@ class ReleaseGenerationAuthority:
         self._create_intent_record(self.initialization_path, intent)
         return intent
 
+    def read_initialization(self) -> DeploymentIntent:
+        self._assert_lock()
+        initialization, _identity_value = self._read_intent_record(self.initialization_path)
+        return initialization
+
     def complete_initialization(self, *, operation_id: str) -> DeploymentIntent:
         return self._update_intent_record(
             self.initialization_path,
             operation_id=operation_id,
             stage="completed",
         )
+
+    def _ensure_environment_root(self) -> tuple[int, PathIdentity]:
+        if self.environment_root.exists() or self.environment_root.is_symlink():
+            identity = _identity(
+                self.environment_root,
+                label="release environment root",
+                directory=True,
+            )
+            if stat.S_IMODE(identity.mode) != 0o700:
+                raise ReleaseGenerationError("release environment root must have mode 0700")
+        else:
+            root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+            try:
+                self._assert_root(root_fd, root_identity)
+                os.mkdir(self.environment_root.name, 0o700, dir_fd=root_fd)
+                os.fsync(root_fd)
+                self._assert_root(root_fd, root_identity)
+            except OSError as exc:
+                raise ReleaseGenerationError("release environment root cannot be created") from exc
+            finally:
+                os.close(root_fd)
+        descriptor = os.open(
+            self.environment_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        identity = _identity(
+            self.environment_root,
+            label="release environment root",
+            directory=True,
+        )
+        if PathIdentity.capture(os.fstat(descriptor)) != identity:
+            os.close(descriptor)
+            raise ReleaseGenerationError("release environment root identity changed")
+        return descriptor, identity
+
+    def _publish_environment(
+        self,
+        *,
+        expected_commit: str,
+        operation_id: str,
+        transaction_kind: str,
+    ) -> tuple[EnvironmentSelector, dict[str, Any]]:
+        source_venv = self.repo / ".venv"
+        _identity(source_venv, label="source release venv", directory=True)
+        if not self.python_path.is_relative_to(source_venv):
+            raise ReleaseGenerationError("deployment Python is outside source release venv")
+        generation_id = _environment_generation_id(
+            operation_id=operation_id,
+            commit=expected_commit,
+        )
+        final_path = self.environment_root / generation_id
+        environment_fd, environment_identity = self._ensure_environment_root()
+        staging_name = f".{generation_id}.{secrets.token_hex(8)}.building"
+        staging_path = self.environment_root / staging_name
+        manifest_path = environment_manifest_path_for_lock(self.lock_path, generation_id)
+        try:
+            manifest: dict[str, Any] | None = None
+            if final_path.exists() or final_path.is_symlink():
+                _identity(final_path, label="release environment generation", directory=True)
+                try:
+                    root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+                    try:
+                        manifest, _manifest_identity = _read_private_json(
+                            root_fd=root_fd,
+                            root_path=self.lock_path.parent,
+                            name=manifest_path.name,
+                            maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                        )
+                        self._assert_root(root_fd, root_identity)
+                    finally:
+                        os.close(root_fd)
+                except ReleaseGenerationError as exc:
+                    if "cannot be read" not in str(exc):
+                        raise
+            else:
+                os.mkdir(staging_name, 0o700, dir_fd=environment_fd)
+                try:
+                    shutil.copytree(
+                        source_venv,
+                        staging_path,
+                        dirs_exist_ok=True,
+                        symlinks=False,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                    )
+                    final_python = final_path / "bin" / "python"
+                    bin_path = staging_path / "bin"
+                    for path in bin_path.iterdir():
+                        if not path.is_file() or path.is_symlink():
+                            continue
+                        payload = path.read_bytes()
+                        lines = payload.splitlines(keepends=True)
+                        if (
+                            lines
+                            and lines[0].startswith(b"#!")
+                            and str(source_venv).encode() in lines[0]
+                        ):
+                            suffix = b"\n" if lines[0].endswith(b"\n") else b""
+                            lines[0] = b"#!" + str(final_python).encode() + suffix
+                            path.write_bytes(b"".join(lines))
+                    self._mutation_hook("environment_staged")
+                    active_environment = _identity(
+                        self.environment_root,
+                        label="release environment root",
+                        directory=True,
+                    )
+                    if _object_key(active_environment) != _object_key(
+                        environment_identity
+                    ) or _object_key(PathIdentity.capture(os.fstat(environment_fd))) != _object_key(
+                        environment_identity
+                    ):
+                        raise ReleaseGenerationError("release environment root identity changed")
+                    os.rename(
+                        staging_name,
+                        generation_id,
+                        src_dir_fd=environment_fd,
+                        dst_dir_fd=environment_fd,
+                    )
+                    os.fsync(environment_fd)
+                    _freeze_environment(final_path)
+                except BaseException:
+                    if staging_path.exists() and not staging_path.is_symlink():
+                        staging_path.chmod(0o700)
+                        for current_root, directory_names, file_names in os.walk(staging_path):
+                            current = Path(current_root)
+                            current.chmod(0o700)
+                            for name in file_names:
+                                (current / name).chmod(0o600)
+                            for name in directory_names:
+                                (current / name).chmod(0o700)
+                        shutil.rmtree(staging_path)
+                    raise
+            if manifest is None:
+                _freeze_environment(final_path)
+                active_environment = _identity(
+                    self.environment_root,
+                    label="release environment root",
+                    directory=True,
+                )
+                if _object_key(active_environment) != _object_key(
+                    environment_identity
+                ) or _object_key(PathIdentity.capture(os.fstat(environment_fd))) != _object_key(
+                    environment_identity
+                ):
+                    raise ReleaseGenerationError("release environment root identity changed")
+                self._mutation_hook("environment_generation_ready")
+                manifest = _environment_manifest(
+                    final_path,
+                    operation_id=operation_id,
+                    transaction_kind=transaction_kind,
+                    commit=expected_commit,
+                    generation_id=generation_id,
+                )
+                manifest_hash = _payload_hash(manifest)
+                root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+                try:
+                    self._assert_root(root_fd, root_identity)
+                    _write_private_json(
+                        root_fd=root_fd,
+                        root_path=self.lock_path.parent,
+                        name=manifest_path.name,
+                        payload=manifest,
+                        require_absent=True,
+                        maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                    )
+                    self._assert_root(root_fd, root_identity)
+                finally:
+                    os.close(root_fd)
+                self._mutation_hook("environment_sealed")
+            else:
+                if (
+                    str(manifest.get("operation_id")) != operation_id
+                    or str(manifest.get("transaction_kind")) != transaction_kind
+                    or str(manifest.get("commit")) != expected_commit
+                    or str(manifest.get("generation_id")) != generation_id
+                ):
+                    raise ReleaseGenerationError("existing environment generation is stale")
+                _verify_environment_manifest(final_path, manifest)
+                manifest_hash = _payload_hash(manifest)
+            selector = EnvironmentSelector(
+                schema_version=ENVIRONMENT_SCHEMA_VERSION,
+                operation_id=operation_id,
+                transaction_kind=transaction_kind,
+                commit=expected_commit,
+                generation_id=generation_id,
+                environment_path=str(final_path),
+                manifest_name=manifest_path.name,
+                manifest_sha256=manifest_hash,
+                published_at=datetime.now(UTC).isoformat(),
+            )
+            try:
+                _prior, selector_identity = self._read_selector()
+            except ReleaseGenerationError as exc:
+                if "cannot be read" not in str(exc):
+                    raise
+                selector_identity = None
+            root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+            try:
+                self._assert_root(root_fd, root_identity)
+                _write_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=self.environment_selector_path.name,
+                    payload=asdict(selector),
+                    require_absent=selector_identity is None,
+                    expected_identity=selector_identity,
+                    maximum_bytes=MAX_MARKER_BYTES,
+                )
+                self._assert_root(root_fd, root_identity)
+            finally:
+                os.close(root_fd)
+            self._mutation_hook("environment_selector_published")
+            return selector, manifest
+        finally:
+            os.close(environment_fd)
 
     def invalidate(self) -> None:
         if not self.writable:
@@ -830,17 +1476,50 @@ class ReleaseGenerationAuthority:
             self._assert_root(root_fd, root_identity)
             with suppress(FileNotFoundError):
                 os.unlink(self.marker_path.name, dir_fd=root_fd)
+            with suppress(FileNotFoundError):
+                os.unlink(self.commit_path.name, dir_fd=root_fd)
             os.fsync(root_fd)
             self._assert_root(root_fd, root_identity)
         finally:
             os.close(root_fd)
 
-    def publish(self, *, expected_commit: str) -> ReleaseGenerationMarker:
+    def publish(
+        self,
+        *,
+        expected_commit: str,
+        operation_id: str,
+        transaction_kind: str,
+    ) -> ReleaseGenerationMarker:
         if not self.writable:
             raise ReleaseGenerationError("read-only generation authority cannot publish")
         self._assert_lock()
         _assert_tracked_clean(self.repo, self.git_path)
-        marker = self._facts(expected_commit=expected_commit)
+        transaction = self._transaction_record(
+            operation_id=operation_id,
+            transaction_kind=transaction_kind,
+        )
+        expected_stage = (
+            "initializing" if transaction_kind == "initialization" else "timers_restored"
+        )
+        if transaction.stage != expected_stage:
+            raise ReleaseGenerationError("release transaction is not ready for marker publication")
+        target_commit = (
+            transaction.previous_sha
+            if transaction_kind == "deployment" and expected_commit == transaction.previous_sha
+            else transaction.target_sha
+        )
+        if target_commit != expected_commit:
+            raise ReleaseGenerationError("release transaction target does not match marker")
+        selector, manifest = self._publish_environment(
+            expected_commit=expected_commit,
+            operation_id=operation_id,
+            transaction_kind=transaction_kind,
+        )
+        marker = self._facts(
+            expected_commit=expected_commit,
+            selector=selector,
+            manifest=manifest,
+        )
         payload = (
             json.dumps(asdict(marker), sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()

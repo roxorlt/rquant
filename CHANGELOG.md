@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **生产发布可恢复提交与不可变运行环境**：generation marker 新增 operation id 和 immutable
+  environment manifest 绑定；daemon 只有在 deployment/initialization intent 已完成且原子
+  commit record 同时匹配时才接受代际。target authority 将 frozen-sync 后的 `.venv` 发布为
+  owner-only、内容清单化的不可变 generation，并原子切换 selector；Lab daemon 实际从该代际的
+  Python/site-packages 启动，mutable checkout `.venv` 只承担 stdlib bootstrap。恢复先持久记录并
+  审计 `recovery_started`，再使旧 marker/commit 失效，之后才允许 timer、checkout、依赖、
+  preflight 和服务变更；补齐 marker/intent、环境构建、timer/service、审计失败及重复恢复的中断矩阵。
+
 - **生产发布恢复事务闭环**：部署器在 marker 失效或 checkout 变更前，先以 `0600` 原子落盘
   并 `fsync` 不可变 deployment intent，绑定 operation id、previous/target SHA、原始 ref、
   changed-file/service/timer 计划、旧 marker generation 与逐阶段时间线。硬中断后的 resume/rollback

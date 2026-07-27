@@ -53,6 +53,9 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         "def main():\n"
         "    Path(os.environ['LAB_WRAPPER_MARKER']).write_text("
         "json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+        "    if os.environ.get('LAB_RUNTIME_IDENTITY_MARKER'):\n"
+        "        Path(os.environ['LAB_RUNTIME_IDENTITY_MARKER']).write_text("
+        "json.dumps({'executable': sys.executable, 'prefix': sys.prefix}), encoding='utf-8')\n"
         "    time.sleep(float(os.environ.get('LAB_WRAPPER_HOLD_SECONDS', '0')))\n"
         "    print('fake daemon executed', flush=True)\n",
         encoding="utf-8",
@@ -103,14 +106,25 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ReleaseGenerationAuthority(
+        authority = ReleaseGenerationAuthority(
             repo=checkout,
             lock_path=lock_path,
             lock_fd=lock_fd,
             python_path=python,
             git_path=TRUSTED_GIT,
             writable=True,
-        ).publish(expected_commit=commit)
+        )
+        initialization = authority.begin_initialization(target_sha=commit)
+        authority.publish(
+            expected_commit=commit,
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
+        authority.complete_initialization(operation_id=initialization.operation_id)
+        authority.commit_generation(
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
     finally:
         os.close(lock_fd)
     return checkout, executable, marker
@@ -129,6 +143,7 @@ def _run_wrapper(
     for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
         environment.pop(variable, None)
     environment["LAB_WRAPPER_MARKER"] = str(marker)
+    environment["LAB_RUNTIME_IDENTITY_MARKER"] = str(marker.with_suffix(".runtime.json"))
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return subprocess.run(
         [
@@ -175,6 +190,12 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
         "lab-worker",
         "--expected-checkout-root",
     ]
+    runtime = json.loads(marker.with_suffix(".runtime.json").read_text(encoding="utf-8"))
+    assert runtime["executable"] == runtime["prefix"] + "/bin/python"
+    assert runtime["prefix"].startswith(
+        str(_deployment_lock_path(checkout).parent / "checkout.venvs")
+    )
+    assert runtime["prefix"] != str(checkout / ".venv")
 
 
 def test_lab_runtime_wrapper_rejects_missing_release_generation_marker(
@@ -190,7 +211,7 @@ def test_lab_runtime_wrapper_rejects_missing_release_generation_marker(
     assert not marker.exists()
 
 
-def test_lab_runtime_bootstrap_never_processes_site_or_pth_hooks(tmp_path: Path) -> None:
+def test_lab_runtime_bootstrap_ignores_hooks_added_to_mutable_source_venv(tmp_path: Path) -> None:
     checkout, executable, marker = _runtime_checkout(tmp_path)
     site_packages = (
         checkout
@@ -211,9 +232,8 @@ def test_lab_runtime_bootstrap_never_processes_site_or_pth_hooks(tmp_path: Path)
 
     result = _run_wrapper(checkout, executable, marker)
 
-    assert result.returncode == 1
-    assert "generation marker" in result.stderr.lower()
-    assert not marker.exists()
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
     assert not hook_marker.exists()
 
 

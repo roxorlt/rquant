@@ -167,6 +167,7 @@ def verify_lab_runtime_binding(
     verified_code_sha: str,
     git_top_level: Path,
     git_head: str,
+    expected_runtime_prefix: Path | None = None,
 ) -> str:
     """Bind one daemon process to the checkout named by its launch contract."""
     expected, expected_venv = _require_physical_checkout_virtualenv(expected_checkout_root)
@@ -186,7 +187,24 @@ def verify_lab_runtime_binding(
             Path(console_interpreter),
             label="runtime console interpreter",
         )
-        expected_launcher = expected / ".venv" / "bin" / "rquant"
+        runtime_generation = (
+            expected_venv
+            if expected_runtime_prefix is None
+            else _canonical_absolute_path(
+                expected_runtime_prefix,
+                label="expected runtime generation",
+            )
+        )
+        runtime_generation_stat = runtime_generation.lstat()
+        if (
+            not stat.S_ISDIR(runtime_generation_stat.st_mode)
+            or stat.S_ISLNK(runtime_generation_stat.st_mode)
+            or runtime_generation_stat.st_uid != os.getuid()
+            or (expected_runtime_prefix is not None and runtime_generation_stat.st_mode & 0o077)
+            or runtime_generation.resolve(strict=True) != runtime_generation
+        ):
+            raise LabDaemonConfigurationError("lab runtime generation is unsafe")
+        expected_launcher = runtime_generation / "bin" / "rquant"
         expected_package_root = (expected / "src" / "rquant").resolve(strict=True)
         runtime_git_root = Path(git_top_level).resolve(strict=True)
     except (FileNotFoundError, OSError) as exc:
@@ -196,7 +214,7 @@ def verify_lab_runtime_binding(
     if runtime_cwd != expected:
         raise LabDaemonConfigurationError("lab runtime binding working directory mismatch")
     if (
-        not runtime_executable.is_relative_to(expected_venv)
+        not runtime_executable.is_relative_to(runtime_generation)
         or runtime_executable.parent.name != "bin"
         or not runtime_executable.name.startswith("python")
     ):
@@ -205,7 +223,7 @@ def verify_lab_runtime_binding(
         raise LabDaemonConfigurationError("lab runtime binding launcher mismatch")
     if runtime_package_root != expected_package_root:
         raise LabDaemonConfigurationError("lab runtime binding package root mismatch")
-    if runtime_prefix != expected_venv:
+    if runtime_prefix != runtime_generation:
         raise LabDaemonConfigurationError("lab runtime binding virtualenv prefix mismatch")
     if runtime_console_interpreter != runtime_executable:
         raise LabDaemonConfigurationError("lab runtime binding console shebang mismatch")
@@ -344,6 +362,7 @@ def require_lab_runtime_binding(
         verified_code_sha=git_head,
         git_top_level=Path(top_level_result.stdout.strip()),
         git_head=git_head,
+        expected_runtime_prefix=(Path(sys.prefix) if deployment_generation is not None else None),
     )
     injected_sha = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected_sha and injected_sha != git_head:
@@ -357,6 +376,11 @@ def require_lab_runtime_binding(
     if verified != git_head:
         raise LabDaemonConfigurationError("lab runtime binding verified SHA mismatch")
     if deployment_generation is not None:
+        expected_environment_root = Path(deployment_lock_path).with_name(
+            f"{Path(deployment_lock_path).stem}.venvs"
+        )
+        if Path(sys.prefix).parent != expected_environment_root:
+            raise LabDaemonConfigurationError("deployment environment selector mismatch")
         if verified != deployment_generation:
             raise LabDaemonConfigurationError("deployment generation SHA mismatch")
         _verify_deployment_generation(

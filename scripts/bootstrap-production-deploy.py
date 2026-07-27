@@ -392,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--finalize-generation", action="store_true")
     parser.add_argument("--recovery-action", choices=("resume", "rollback"))
     parser.add_argument("--finalize-action", choices=("deploy", "resume", "rollback"))
+    parser.add_argument("--finalize-phase", choices=("publish", "commit"))
     parser.add_argument("--operation-id")
     parser.add_argument("--inherited-lock-fd", type=int)
     args, deploy_argv = parser.parse_known_args(argv)
@@ -423,10 +424,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         finalize_arguments_present = any(
             value is not None
-            for value in (args.finalize_action, args.operation_id, args.inherited_lock_fd)
+            for value in (
+                args.finalize_action,
+                args.finalize_phase,
+                args.operation_id,
+                args.inherited_lock_fd,
+            )
         )
         if args.finalize_generation and (
             args.finalize_action is None
+            or args.finalize_phase is None
             or args.operation_id is None
             or args.inherited_lock_fd is None
         ):
@@ -457,19 +464,58 @@ def main(argv: list[str] | None = None) -> int:
                 git_path=git_path,
                 writable=True,
             )
-            initialization = authority.begin_initialization(target_sha=commit)
-            marker_path = lock_path.with_name(f"{lock_path.stem}.complete.json")
-            if marker_path.exists():
-                authority.verify(expected_commit=commit)
-                authority.complete_initialization(operation_id=initialization.operation_id)
-                print(json.dumps({"commit": commit, "status": "generation_initialized"}))
-                return 0
+            try:
+                initialization = authority.read_initialization()
+            except generation_error_type as exc:
+                if "cannot be read" not in str(exc):
+                    raise
+                initialization = authority.begin_initialization(target_sha=commit)
+            else:
+                if initialization.target_sha != commit:
+                    raise DeployBootstrapError("initialization target is already pinned")
+                if initialization.stage == "completed":
+                    try:
+                        authority.verify(expected_commit=commit)
+                    except generation_error_type as exc:
+                        if "commit record is missing" not in str(exc):
+                            raise generation_error_type(
+                                "release generation initialization already completed"
+                            ) from exc
+                        _run_frozen_sync(root, uv_path)
+                        _verify_current_generation_checkout(root, git_path, commit)
+                        _verify_generation_runtime(root, python_path)
+                        _run_generation_preflight(root)
+                        authority.commit_generation(
+                            operation_id=initialization.operation_id,
+                            transaction_kind="initialization",
+                        )
+                        print(
+                            json.dumps(
+                                {
+                                    "commit": commit,
+                                    "status": "generation_initialization_recovered",
+                                },
+                                sort_keys=True,
+                            )
+                        )
+                        return 0
+                    raise generation_error_type(
+                        "release generation initialization already completed"
+                    )
             _run_frozen_sync(root, uv_path)
             _verify_current_generation_checkout(root, git_path, commit)
             _verify_generation_runtime(root, python_path)
             _run_generation_preflight(root)
-            authority.publish(expected_commit=commit)
+            authority.publish(
+                expected_commit=commit,
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
             authority.complete_initialization(operation_id=initialization.operation_id)
+            authority.commit_generation(
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
             print(
                 json.dumps(
                     {"commit": commit, "status": "generation_initialized"},
@@ -499,22 +545,35 @@ def main(argv: list[str] | None = None) -> int:
             intent = authority.read_deployment_intent()
             action = str(args.finalize_action)
             expected_commit = intent.previous_sha if action == "rollback" else intent.target_sha
+            expected_stage = "timers_restored" if args.finalize_phase == "publish" else "completed"
             if (
                 intent.operation_id != args.operation_id
                 or target != expected_commit
-                or intent.stage != "timers_restored"
+                or intent.stage != expected_stage
             ):
                 raise DeployBootstrapError("finalizer does not match ready deployment intent")
             _verify_current_generation_checkout(root, git_path, expected_commit)
             _run_generation_preflight(root)
-            marker = authority.publish(expected_commit=expected_commit)
+            if args.finalize_phase == "publish":
+                result = authority.publish(
+                    expected_commit=expected_commit,
+                    operation_id=intent.operation_id,
+                    transaction_kind="deployment",
+                )
+                schema_version = result.schema_version
+            else:
+                result = authority.commit_generation(
+                    operation_id=intent.operation_id,
+                    transaction_kind="deployment",
+                )
+                schema_version = result.schema_version
             print(
                 json.dumps(
                     {
                         "commit": expected_commit,
                         "operation_id": intent.operation_id,
-                        "schema_version": marker.schema_version,
-                        "status": "generation_finalized",
+                        "schema_version": schema_version,
+                        "status": f"generation_{args.finalize_phase}",
                     },
                     sort_keys=True,
                 )
