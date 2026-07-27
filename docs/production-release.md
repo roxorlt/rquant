@@ -18,11 +18,13 @@
    bash scripts/deploy-production.sh --target v0.13.2
    ```
 
-5. 部署器依次执行：部署锁、tracked 工作区检查、`git fetch`、target/main 归属与快进检查、
-   diff 风险分类、`git merge --ff-only <exact-sha>`、`uv sync --frozen`、preflight、
-   白名单服务重启、第二次 preflight、JSONL 审计。
+5. 纯标准库 bootstrap 先取得稳定 generation 独占锁并验证当前完成标记，之后才导入项目
+   deployer。部署器依次执行：tracked 工作区检查、`git fetch`、target/main 归属与快进检查、
+   diff 风险分类、使旧完成标记失效、`git merge --ff-only <exact-sha>`、`uv sync --frozen`、
+   preflight、白名单服务重启、第二次 preflight、原子发布新完成标记、JSONL 审计。
 6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回上一 commit、
-   恢复锁定依赖并重启已经切到新代码的服务。
+   恢复锁定依赖并重启已经切到新代码的服务。只有旧 checkout、旧依赖和两次 preflight
+   全部恢复后，才重新发布旧 generation 完成标记；回滚不完整时 marker 保持缺失。
 
 ## 自动拒绝
 
@@ -31,7 +33,11 @@
 - tracked 工作区存在未提交改动；`backup/` 等 untracked 文件不阻断。
 - diff 包含 `deploy/systemd/`、`deploy/nginx/`、`deploy/frp/`、`deploy/sudoers/`。
 - 工作日 09:15-15:10 的发布需要重启任何长驻服务。
-- 另一个部署进程已持有 `logs/production-deploy.lock`。
+- 另一个部署进程或 Lab daemon 已持有
+  `/home/lighthouse/.rquant-deploy/rquant.lock`（本地主 checkout 对应
+  `/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock`）。
+- generation 完成标记缺失、格式错误，或与 Git SHA、`uv.lock`、包版本、Python ABI、
+  物理 venv/解释器/site-packages 身份不一致。
 - `sudo -n`、依赖同步、preflight 或服务健康检查失败。
 
 部署器没有 `--force` / `--emergency` 绕过参数。高风险基础设施和生产数据操作必须另开
@@ -54,6 +60,10 @@ sudo -n -l /usr/bin/systemctl restart rquant-dashboard.service
 最后一条只检查白名单授权，不会重启服务。正式安装后，Codex 仅通过
 `scripts/deploy-production.sh --target <exact-ref>` 部署。
 
+P1.5d 首次安装 Lab launchd 前还需在主 checkout 建立自有物理 `.venv`，运行锁定依赖同步和
+完整 preflight，并在独占 generation 锁下初始化第一个完成标记。不得手写 marker；初始化中断
+时保持 marker 缺失，daemon 会失败关闭。后续每次发布与回滚均由部署器维护 marker。
+
 ## 预演与审计
 
 预演会 fetch 和计算计划，但不 checkout、不更新依赖、不重启服务：
@@ -64,6 +74,9 @@ bash scripts/deploy-production.sh --target v0.13.2 --dry-run
 
 退出码：`0` 成功/无需更新，`2` 策略拒绝，`75` 交易时段延期，`1` 部署或回滚失败。
 审计记录位于 `/home/lighthouse/rquant/logs/production-deploy.jsonl`。
+完成标记位于 `/home/lighthouse/.rquant-deploy/rquant.complete.json`，由部署器以 `0600`
+临时文件、文件 `fsync`、原子 rename 和目录 `fsync` 发布。它不是人工恢复开关；故障后应重新
+运行精确 target 部署或完整回滚验证，而不是复制/修改 JSON。
 
 ## 旧脚本边界
 

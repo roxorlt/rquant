@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import fcntl
 import json
 import os
 import runpy
@@ -13,11 +14,14 @@ from pathlib import Path
 
 import pytest
 
+from rquant.release_generation import ReleaseGenerationAuthority, marker_path_for_lock
+
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "scripts" / "run-lab-daemon.py"
 PREFLIGHT = ROOT / "scripts" / "preflight-lab-runtime.py"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-lab-daemon.py"
 TRUSTED_GIT = Path("/usr/bin/git")
+RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 
 
 def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -29,6 +33,7 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     shutil.copy2(WRAPPER, scripts / WRAPPER.name)
     shutil.copy2(PREFLIGHT, scripts / PREFLIGHT.name)
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
+    shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
         "/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
@@ -36,6 +41,11 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     marker = checkout / "daemon.json"
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (checkout / "pyproject.toml").write_text(
+        '[project]\nname = "rquant"\nversion = "0.99.0"\n',
+        encoding="utf-8",
+    )
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     (package / "cli.py").write_text(
         "from __future__ import annotations\n"
         "import json, os, sys, time\n"
@@ -47,7 +57,14 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         "    print('fake daemon executed', flush=True)\n",
         encoding="utf-8",
     )
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(checkout / ".venv")
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(checkout / ".venv")
+    python_library = (
+        Path(sys.base_prefix)
+        / "lib"
+        / f"libpython{sys.version_info.major}.{sys.version_info.minor}.dylib"
+    )
+    if python_library.exists():
+        shutil.copy2(python_library, checkout / ".venv" / "lib" / python_library.name)
     python = checkout / ".venv" / "bin" / "python"
     executable = checkout / ".venv" / "bin" / "rquant"
     executable.write_text(
@@ -74,6 +91,28 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         cwd=checkout,
         check=True,
     )
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    lock_path = _deployment_lock_path(checkout)
+    lock_path.parent.mkdir(mode=0o700)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ReleaseGenerationAuthority(
+            repo=checkout,
+            lock_path=lock_path,
+            lock_fd=lock_fd,
+            python_path=python,
+            git_path=TRUSTED_GIT,
+            writable=True,
+        ).publish(expected_commit=commit)
+    finally:
+        os.close(lock_fd)
     return checkout, executable, marker
 
 
@@ -138,6 +177,19 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
     ]
 
 
+def test_lab_runtime_wrapper_rejects_missing_release_generation_marker(
+    tmp_path: Path,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    marker_path_for_lock(_deployment_lock_path(checkout)).unlink()
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode == 1
+    assert "generation marker" in result.stderr.lower()
+    assert not marker.exists()
+
+
 def test_lab_runtime_bootstrap_never_processes_site_or_pth_hooks(tmp_path: Path) -> None:
     checkout, executable, marker = _runtime_checkout(tmp_path)
     site_packages = (
@@ -159,8 +211,9 @@ def test_lab_runtime_bootstrap_never_processes_site_or_pth_hooks(tmp_path: Path)
 
     result = _run_wrapper(checkout, executable, marker)
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert marker.is_file()
+    assert result.returncode == 1
+    assert "generation marker" in result.stderr.lower()
+    assert not marker.exists()
     assert not hook_marker.exists()
 
 
@@ -171,7 +224,7 @@ def test_lab_runtime_wrapper_fails_while_deployment_generation_is_locked(
 
     checkout, executable, marker = _runtime_checkout(tmp_path)
     lock_path = _deployment_lock_path(checkout)
-    lock_path.parent.mkdir(mode=0o700)
+    lock_path.parent.mkdir(mode=0o700, exist_ok=True)
     lock_path.touch(mode=0o600)
     lock_path.chmod(0o600)
     with lock_path.open("r+b") as deployment_lock:

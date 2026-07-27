@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import runpy
+import shutil
 import subprocess
 import sys
+import venv
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from rquant.release_generation import ReleaseGenerationAuthority
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "preflight-lab-runtime.py"
 TRUSTED_GIT = Path("/usr/bin/git")
+RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 
 
 def _checkout(tmp_path: Path) -> tuple[Path, Path]:
@@ -24,6 +30,20 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     (package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
+    (checkout / "pyproject.toml").write_text(
+        '[project]\nname = "rquant"\nversion = "0.99.0"\n',
+        encoding="utf-8",
+    )
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(checkout / ".venv")
+    python_library = (
+        Path(sys.base_prefix)
+        / "lib"
+        / f"libpython{sys.version_info.major}.{sys.version_info.minor}.dylib"
+    )
+    if python_library.exists():
+        shutil.copy2(python_library, checkout / ".venv" / "lib" / python_library.name)
     subprocess.run(["git", "add", "."], cwd=checkout, check=True)
     subprocess.run(
         [
@@ -39,7 +59,76 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
         cwd=checkout,
         check=True,
     )
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    lock_path = _lock_path(checkout)
+    lock_path.parent.mkdir(mode=0o700)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ReleaseGenerationAuthority(
+            repo=checkout,
+            lock_path=lock_path,
+            lock_fd=lock_fd,
+            python_path=checkout / ".venv" / "bin" / "python",
+            git_path=TRUSTED_GIT,
+            writable=True,
+        ).publish(expected_commit=commit)
+    finally:
+        os.close(lock_fd)
     return checkout, package
+
+
+def _lock_path(checkout: Path) -> Path:
+    return checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock"
+
+
+def _invoke(
+    checkout: Path,
+    *,
+    expected_commit: str,
+    git_path: Path,
+    environment: dict[str, str] | None = None,
+    arguments: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    lock_path = _lock_path(checkout)
+    lock_fd = os.open(lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(SCRIPT),
+                "--checkout-root",
+                str(checkout),
+                "--expected-commit",
+                expected_commit,
+                "--trusted-git-path",
+                str(git_path),
+                "--deployment-lock-path",
+                str(lock_path),
+                "--deployment-lock-fd",
+                str(lock_fd),
+                "--python-path",
+                str(checkout / ".venv" / "bin" / "python"),
+                *arguments,
+            ],
+            cwd=checkout,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            pass_fds=(lock_fd,),
+        )
+    finally:
+        os.close(lock_fd)
 
 
 def _run(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -50,23 +139,11 @@ def _run(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    return subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(SCRIPT),
-            "--checkout-root",
-            str(checkout),
-            "--expected-commit",
-            expected_commit,
-            "--trusted-git-path",
-            str(TRUSTED_GIT),
-            *arguments,
-        ],
-        cwd=checkout,
-        capture_output=True,
-        text=True,
-        check=False,
+    return _invoke(
+        checkout,
+        expected_commit=expected_commit,
+        git_path=TRUSTED_GIT,
+        arguments=arguments,
     )
 
 
@@ -89,7 +166,7 @@ def test_lab_runtime_preflight_uses_explicit_trusted_git_not_path(
 ) -> None:
     checkout, package = _checkout(tmp_path)
     fake_bin = checkout / ".venv" / "bin"
-    fake_bin.mkdir(parents=True)
+    fake_bin.mkdir(parents=True, exist_ok=True)
     marker = tmp_path / "fake-git-ran"
     fake_git = fake_bin / "git"
     fake_git.write_text(
@@ -108,23 +185,11 @@ def test_lab_runtime_preflight_uses_explicit_trusted_git_not_path(
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment.get('PATH', '')}"
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(SCRIPT),
-            "--checkout-root",
-            str(checkout),
-            "--expected-commit",
-            expected_commit,
-            "--trusted-git-path",
-            str(TRUSTED_GIT),
-        ],
-        cwd=checkout,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
+    result = _invoke(
+        checkout,
+        expected_commit=expected_commit,
+        git_path=TRUSTED_GIT,
+        environment=environment,
     )
 
     assert result.returncode == 1
@@ -144,22 +209,10 @@ def test_lab_runtime_preflight_rejects_symlinked_trusted_git(tmp_path: Path) -> 
         text=True,
     ).stdout.strip()
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(SCRIPT),
-            "--checkout-root",
-            str(checkout),
-            "--expected-commit",
-            expected_commit,
-            "--trusted-git-path",
-            str(linked_git),
-        ],
-        cwd=checkout,
-        capture_output=True,
-        text=True,
-        check=False,
+    result = _invoke(
+        checkout,
+        expected_commit=expected_commit,
+        git_path=linked_git,
     )
 
     assert result.returncode == 1
@@ -169,22 +222,10 @@ def test_lab_runtime_preflight_rejects_symlinked_trusted_git(tmp_path: Path) -> 
 def test_lab_runtime_preflight_rejects_expected_commit_mismatch(tmp_path: Path) -> None:
     checkout, _package = _checkout(tmp_path)
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(SCRIPT),
-            "--checkout-root",
-            str(checkout),
-            "--expected-commit",
-            "0" * 40,
-            "--trusted-git-path",
-            str(TRUSTED_GIT),
-        ],
-        cwd=checkout,
-        capture_output=True,
-        text=True,
-        check=False,
+    result = _invoke(
+        checkout,
+        expected_commit="0" * 40,
+        git_path=TRUSTED_GIT,
     )
 
     assert result.returncode == 1

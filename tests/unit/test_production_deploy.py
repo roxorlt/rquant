@@ -38,9 +38,7 @@ class FakeRunner:
         returncode, stdout = self.responses.get(key, (0, ""))
         result = subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
         if check and returncode != 0:
-            raise subprocess.CalledProcessError(
-                returncode, args, output=stdout, stderr=""
-            )
+            raise subprocess.CalledProcessError(returncode, args, output=stdout, stderr="")
         return result
 
 
@@ -68,6 +66,70 @@ class FailedRollbackHealthRunner(FailingServiceHealthRunner):
             self.calls.append(tuple(args))
             return subprocess.CompletedProcess(args, 3, stdout="failed\n", stderr="")
         return super().run(args, check=check)
+
+
+class SimulatedDeploymentCrash(BaseException):
+    pass
+
+
+class CrashAfterRunner(FakeRunner):
+    def __init__(
+        self,
+        responses: dict[tuple[str, ...], tuple[int, str]],
+        *,
+        command: tuple[str, ...],
+        occurrence: int = 1,
+    ) -> None:
+        super().__init__(responses)
+        self._command = command
+        self._occurrence = occurrence
+        self._seen = 0
+
+    def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = super().run(args, check=check)
+        if tuple(args) == self._command:
+            self._seen += 1
+            if self._seen == self._occurrence:
+                raise SimulatedDeploymentCrash
+        return result
+
+
+class SequenceRunner(FakeRunner):
+    def __init__(
+        self,
+        responses: dict[tuple[str, ...], tuple[int, str]],
+        *,
+        command: tuple[str, ...],
+        sequence: list[tuple[int, str]],
+    ) -> None:
+        super().__init__(responses)
+        self._command = command
+        self._sequence = list(sequence)
+
+    def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        if tuple(args) != self._command or not self._sequence:
+            return super().run(args, check=check)
+        self.calls.append(tuple(args))
+        returncode, stdout = self._sequence.pop(0)
+        result = subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+        if check and returncode != 0:
+            raise subprocess.CalledProcessError(returncode, args, output=stdout, stderr="")
+        return result
+
+
+class FakeGenerationAuthority:
+    def __init__(self, *, crash_on_publish: bool = False) -> None:
+        self.events: list[tuple[str, str | None]] = []
+        self.crash_on_publish = crash_on_publish
+
+    def invalidate(self) -> None:
+        self.events.append(("invalidate", None))
+
+    def publish(self, *, expected_commit: str) -> object:
+        self.events.append(("publish", expected_commit))
+        if self.crash_on_publish:
+            raise SimulatedDeploymentCrash
+        return object()
 
 
 def _sha(char: str) -> str:
@@ -269,9 +331,7 @@ def test_deploy_refuses_restart_release_during_market_hours(tmp_path: Path) -> N
     config = DeployConfig(
         **{
             **config.__dict__,
-            "now": datetime(
-                2026, 7, 13, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")
-            ),
+            "now": datetime(2026, 7, 13, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
         }
     )
 
@@ -314,9 +374,7 @@ def test_active_affected_service_restarts_with_noninteractive_sudo(tmp_path: Pat
         "restart",
         "rquant-monitor.service",
     ) in runner.calls
-    assert runner.calls.count(
-        ("systemctl", "is-active", "rquant-monitor.service")
-    ) == 2
+    assert runner.calls.count(("systemctl", "is-active", "rquant-monitor.service")) == 2
 
 
 def test_failed_service_health_rolls_service_back_to_old_code(tmp_path: Path) -> None:
@@ -383,8 +441,13 @@ def test_failed_service_after_rollback_is_reported_as_rollback_failure(
 
 def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) -> None:
     runner = FakeRunner(_base_responses())
+    authority = FakeGenerationAuthority()
 
-    result = deploy(_config(tmp_path), runner=runner)
+    result = deploy(
+        _config(tmp_path),
+        runner=runner,
+        generation_authority=authority,
+    )
 
     assert result.status == "deployed"
     assert ("git", "merge", "--ff-only", _sha("b")) in runner.calls
@@ -393,20 +456,87 @@ def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) ->
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "deployed"' in audit
     assert f'"target_sha": "{_sha("b")}"' in audit
+    assert authority.events == [
+        ("invalidate", None),
+        ("publish", _sha("b")),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "occurrence"),
+    [
+        (("git", "merge", "--ff-only", _sha("b")), 1),
+        (("uv", "sync", "--frozen"), 1),
+        (("rquant", "preflight"), 1),
+        (("rquant", "preflight"), 2),
+    ],
+)
+def test_interrupted_deployment_phase_leaves_generation_unpublished(
+    tmp_path: Path,
+    command: tuple[str, ...],
+    occurrence: int,
+) -> None:
+    runner = CrashAfterRunner(
+        _base_responses(),
+        command=command,
+        occurrence=occurrence,
+    )
+    authority = FakeGenerationAuthority()
+
+    with pytest.raises(SimulatedDeploymentCrash):
+        deploy(
+            _config(tmp_path),
+            runner=runner,
+            generation_authority=authority,
+        )
+
+    assert authority.events == [("invalidate", None)]
+
+
+def test_interrupted_marker_publication_does_not_claim_complete_generation(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(_base_responses())
+    authority = FakeGenerationAuthority(crash_on_publish=True)
+
+    with pytest.raises(SimulatedDeploymentCrash):
+        deploy(
+            _config(tmp_path),
+            runner=runner,
+            generation_authority=authority,
+        )
+
+    assert authority.events == [
+        ("invalidate", None),
+        ("publish", _sha("b")),
+    ]
 
 
 def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> None:
     responses = _base_responses()
-    responses[("rquant", "preflight")] = (1, "preflight failed")
-    runner = FakeRunner(responses)
+    runner = SequenceRunner(
+        responses,
+        command=("rquant", "preflight"),
+        sequence=[(1, "target failed"), (0, "old ready"), (0, "old ready")],
+    )
+    authority = FakeGenerationAuthority()
 
     with pytest.raises(DeployError, match="rolled back"):
-        deploy(_config(tmp_path), runner=runner)
+        deploy(
+            _config(tmp_path),
+            runner=runner,
+            generation_authority=authority,
+        )
 
     merge_index = runner.calls.index(("git", "merge", "--ff-only", _sha("b")))
     reset_index = runner.calls.index(("git", "reset", "--hard", _sha("a")))
     assert reset_index > merge_index
     assert runner.calls.count(("uv", "sync", "--frozen")) == 2
+    assert runner.calls.count(("rquant", "preflight")) == 3
+    assert authority.events == [
+        ("invalidate", None),
+        ("publish", _sha("a")),
+    ]
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "rolled_back"' in audit
 
@@ -422,25 +552,19 @@ def test_failed_merge_attempt_still_restores_previous_head(tmp_path: Path) -> No
     assert ("git", "reset", "--hard", _sha("a")) in runner.calls
 
 
-def test_shell_entrypoint_exposes_controlled_deployer_help() -> None:
+def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import() -> None:
     repo = Path(__file__).resolve().parents[2]
-    result = subprocess.run(
-        ["bash", "scripts/deploy-production.sh", "--help"],
-        cwd=repo,
-        env={"RQUANT_DEPLOY_PYTHON": sys.executable},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    source = (repo / "scripts" / "deploy-production.sh").read_text(encoding="utf-8")
 
-    assert "SemVer tag or full 40-character SHA" in result.stdout
+    assert '"${PYTHON_BIN}" -I -S' in source
+    assert "bootstrap-production-deploy.py" in source
+    assert "-m rquant.ops.production_deploy" not in source
+    assert "/../.rquant-deploy" not in source
 
 
 def test_cli_does_not_allow_overriding_production_executables() -> None:
     with pytest.raises(SystemExit):
-        build_parser().parse_args(
-            ["--target", "v0.13.2", "--uv-bin", "/tmp/untrusted"]
-        )
+        build_parser().parse_args(["--target", "v0.13.2", "--uv-bin", "/tmp/untrusted"])
 
 
 def test_subprocess_runner_preserves_failed_command_diagnostics(tmp_path: Path) -> None:

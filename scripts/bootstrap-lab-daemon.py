@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import importlib.util
 import os
 import stat
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
+
+sys.dont_write_bytecode = True
 
 
 class BootstrapError(RuntimeError):
@@ -87,7 +91,16 @@ def _assert_generation_lock(path: Path, descriptor: int) -> None:
         raise BootstrapError("deployment generation lock identity changed")
 
 
-def _run_preflight(*, root: Path, commit: str, git_path: Path, preflight: Path) -> None:
+def _run_preflight(
+    *,
+    root: Path,
+    commit: str,
+    git_path: Path,
+    preflight: Path,
+    lock_path: Path,
+    lock_fd: int,
+    python_path: Path,
+) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -100,13 +113,30 @@ def _run_preflight(*, root: Path, commit: str, git_path: Path, preflight: Path) 
             commit,
             "--trusted-git-path",
             str(git_path),
+            "--deployment-lock-path",
+            str(lock_path),
+            "--deployment-lock-fd",
+            str(lock_fd),
+            "--python-path",
+            str(python_path),
         ],
         cwd=root,
         check=False,
         timeout=15,
+        pass_fds=(lock_fd,),
     )
     if result.returncode != 0:
         raise BootstrapError("Lab runtime preflight failed before import")
+
+
+def _load_release_authority(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("_rquant_release_generation", path)
+    if spec is None or spec.loader is None:
+        raise BootstrapError("release generation authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -146,7 +176,22 @@ def main(argv: list[str] | None = None) -> int:
             commit=args.expected_commit,
             git_path=_canonical(args.trusted_git_path, label="trusted Git path"),
             preflight=preflight,
+            lock_path=lock_path,
+            lock_fd=args.deployment_lock_fd,
+            python_path=Path(sys.executable),
         )
+        try:
+            _load_release_authority(
+                root / "src" / "rquant" / "release_generation.py"
+            ).ReleaseGenerationAuthority(
+                repo=root,
+                lock_path=lock_path,
+                lock_fd=args.deployment_lock_fd,
+                python_path=Path(sys.executable),
+                git_path=_canonical(args.trusted_git_path, label="trusted Git path"),
+            ).verify(expected_commit=args.expected_commit)
+        except Exception as exc:
+            raise BootstrapError(f"release generation marker is invalid: {exc}") from exc
         _assert_generation_lock(lock_path, args.deployment_lock_fd)
 
         site_packages = (

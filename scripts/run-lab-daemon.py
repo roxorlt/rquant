@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import importlib.util
 import os
 import stat
 import subprocess
@@ -12,6 +13,9 @@ import sys
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
+
+sys.dont_write_bytecode = True
 
 _ALLOWED_DAEMONS = frozenset({"lab-scheduler", "lab-worker", "lab-finalizer"})
 _PYTHON_INJECTION_VARIABLES = (
@@ -294,6 +298,8 @@ def _run_preflight(
     expected_commit: str,
     git_path: Path,
     git_identity: _PathIdentity,
+    deployment_lock_path: Path,
+    deployment_lock_fd: int,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
     result = subprocess.run(
@@ -308,14 +314,31 @@ def _run_preflight(
             expected_commit,
             "--trusted-git-path",
             str(git_path),
+            "--deployment-lock-path",
+            str(deployment_lock_path),
+            "--deployment-lock-fd",
+            str(deployment_lock_fd),
+            "--python-path",
+            str(python),
         ],
         cwd=root,
         check=False,
         timeout=15,
+        pass_fds=(deployment_lock_fd,),
     )
     if result.returncode != 0:
         raise WrapperError("Lab runtime preflight failed")
     _assert_trusted_git(git_path, git_identity)
+
+
+def _load_release_authority(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("_rquant_release_generation", path)
+    if spec is None or spec.loader is None:
+        raise WrapperError("release generation authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -339,11 +362,16 @@ def main(argv: list[str] | None = None) -> int:
         wrapper = root / "scripts" / "run-lab-daemon.py"
         preflight = root / "scripts" / "preflight-lab-runtime.py"
         bootstrap = root / "scripts" / "bootstrap-lab-daemon.py"
+        release_authority_path = root / "src" / "rquant" / "release_generation.py"
         if Path(__file__) != wrapper:
             raise WrapperError("wrapper path does not match expected checkout")
         wrapper_identity = _require_owned_regular(wrapper, label="Lab runtime wrapper")
         preflight_identity = _require_owned_regular(preflight, label="Lab runtime preflight")
         bootstrap_identity = _require_owned_regular(bootstrap, label="Lab daemon bootstrap")
+        release_authority_identity = _require_owned_regular(
+            release_authority_path,
+            label="release generation authority",
+        )
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
             daemon_argv.pop(0)
@@ -365,7 +393,19 @@ def main(argv: list[str] | None = None) -> int:
             expected_commit=expected_commit,
             git_path=trusted_git,
             git_identity=trusted_git_identity,
+            deployment_lock_path=deployment_lock_path,
+            deployment_lock_fd=generation_lock_fd,
         )
+        try:
+            _load_release_authority(release_authority_path).ReleaseGenerationAuthority(
+                repo=root,
+                lock_path=deployment_lock_path,
+                lock_fd=generation_lock_fd,
+                python_path=python,
+                git_path=trusted_git,
+            ).verify(expected_commit=expected_commit)
+        except Exception as exc:
+            raise WrapperError(f"release generation marker is invalid: {exc}") from exc
         rebound_root, rebound_venv, rebound_python, rebound_runtime_identities = (
             _require_runtime_root(args.expected_checkout_root)
         )
@@ -384,6 +424,11 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
             or _require_owned_regular(bootstrap, label="Lab daemon bootstrap") != bootstrap_identity
+            or _require_owned_regular(
+                release_authority_path,
+                label="release generation authority",
+            )
+            != release_authority_identity
             or _git_commit(
                 root,
                 git_path=trusted_git,
@@ -399,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
             expected_commit=expected_commit,
             git_path=trusted_git,
             git_identity=trusted_git_identity,
+            deployment_lock_path=deployment_lock_path,
+            deployment_lock_fd=generation_lock_fd,
         )
         final_root, final_venv, final_python, final_runtime_identities = _require_runtime_root(
             args.expected_checkout_root
@@ -418,6 +465,11 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
             or _require_owned_regular(bootstrap, label="Lab daemon bootstrap") != bootstrap_identity
+            or _require_owned_regular(
+                release_authority_path,
+                label="release generation authority",
+            )
+            != release_authority_identity
             or _git_commit(
                 root,
                 git_path=trusted_git,
@@ -433,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
             expected_commit=expected_commit,
             git_path=trusted_git,
             git_identity=trusted_git_identity,
+            deployment_lock_path=deployment_lock_path,
+            deployment_lock_fd=generation_lock_fd,
         )
         rebound_executable, rebound_executable_identity = _validate_daemon_argv(
             root,
@@ -448,6 +502,11 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
             or _require_owned_regular(bootstrap, label="Lab daemon bootstrap") != bootstrap_identity
+            or _require_owned_regular(
+                release_authority_path,
+                label="release generation authority",
+            )
+            != release_authority_identity
             or _git_commit(
                 root,
                 git_path=trusted_git,

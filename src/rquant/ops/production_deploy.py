@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+from rquant.release_generation import ReleaseGenerationAuthority, ReleaseGenerationError
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 
@@ -87,9 +89,7 @@ SERVICE_PATTERNS: dict[str, tuple[str, ...]] = {
         "src/rquant/presets.py",
         "src/rquant/state.py",
     ),
-    "rquant-panorama-auth.service": (
-        "src/rquant/panorama_auth.py",
-    ),
+    "rquant-panorama-auth.service": ("src/rquant/panorama_auth.py",),
     "rquant-panorama.service": (
         "src/rquant/dashboard/market_panorama.py",
         "src/rquant/panorama_*",
@@ -121,6 +121,12 @@ class Runner(Protocol):
         *,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]: ...
+
+
+class GenerationAuthority(Protocol):
+    def invalidate(self) -> None: ...
+
+    def publish(self, *, expected_commit: str) -> object: ...
 
 
 class SubprocessRunner:
@@ -165,6 +171,10 @@ class DeployConfig:
     rquant_bin: str = ".venv/bin/rquant"
     audit_path: Path | None = None
     lock_path: Path | None = None
+    lock_fd: int | None = None
+    startup_generation: str | None = None
+    python_path: Path | None = None
+    git_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -202,9 +212,7 @@ def build_change_plan(changed_files: list[str] | tuple[str, ...]) -> ChangePlan:
     services: set[str] = set()
 
     for path in files:
-        if path in {"pyproject.toml", "uv.lock"} or _matches(
-            path, SHARED_RUNTIME_PATTERNS
-        ):
+        if path in {"pyproject.toml", "uv.lock"} or _matches(path, SHARED_RUNTIME_PATTERNS):
             services.update(ALL_LONG_RUNNING_SERVICES)
             continue
         if _matches(path, NO_RESTART_SOURCE_PATTERNS):
@@ -321,17 +329,26 @@ def _rollback(
     runner: Runner,
     previous_sha: str,
     restarted_services: tuple[str, ...],
+    generation_authority: GenerationAuthority | None,
 ) -> None:
     runner.run(["git", "reset", "--hard", previous_sha])
     runner.run([config.uv_bin, "sync", "--frozen"])
+    runner.run([config.rquant_bin, "preflight"])
     for service in restarted_services:
         runner.run(["sudo", "-n", "systemctl", "restart", service])
         healthy = runner.run(["systemctl", "is-active", service], check=False)
         if healthy.returncode != 0 or healthy.stdout.strip() != "active":
             raise DeployError(f"service failed health check after rollback: {service}")
+    runner.run([config.rquant_bin, "preflight"])
+    if generation_authority is not None:
+        generation_authority.publish(expected_commit=previous_sha)
 
 
-def _deploy_locked(config: DeployConfig, runner: Runner) -> DeployResult:
+def _deploy_locked(
+    config: DeployConfig,
+    runner: Runner,
+    generation_authority: GenerationAuthority | None,
+) -> DeployResult:
     target = validate_target(config.target)
     branch = _stdout(runner, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
     if branch != "main":
@@ -348,17 +365,13 @@ def _deploy_locked(config: DeployConfig, runner: Runner) -> DeployResult:
             raise PolicyError("SemVer target must be an annotated tag")
     target_sha = _stdout(runner, ["git", "rev-parse", "--verify", f"{target}^{{commit}}"])
     if target.startswith("v"):
-        pyproject = _stdout(
-            runner, ["git", "show", f"{target_sha}:pyproject.toml"]
-        )
+        pyproject = _stdout(runner, ["git", "show", f"{target_sha}:pyproject.toml"])
         try:
             package_version = str(tomllib.loads(pyproject)["project"]["version"])
         except (KeyError, tomllib.TOMLDecodeError) as exc:
             raise PolicyError("target pyproject.toml has no readable project version") from exc
         if package_version != target[1:]:
-            raise PolicyError(
-                f"tag {target} disagrees with package version {package_version}"
-            )
+            raise PolicyError(f"tag {target} disagrees with package version {package_version}")
     _check_ancestor(
         runner,
         target_sha,
@@ -403,15 +416,25 @@ def _deploy_locked(config: DeployConfig, runner: Runner) -> DeployResult:
         return result
 
     restarted: list[str] = []
+    if generation_authority is not None:
+        generation_authority.invalidate()
     try:
         runner.run(["git", "merge", "--ff-only", target_sha])
         runner.run([config.uv_bin, "sync", "--frozen"])
         runner.run([config.rquant_bin, "preflight"])
         _restart_active_services(runner, change_plan.restart_services, restarted)
         runner.run([config.rquant_bin, "preflight"])
+        if generation_authority is not None:
+            generation_authority.publish(expected_commit=target_sha)
     except Exception as exc:
         try:
-            _rollback(config, runner, previous_sha, tuple(restarted))
+            _rollback(
+                config,
+                runner,
+                previous_sha,
+                tuple(restarted),
+                generation_authority,
+            )
         except Exception as rollback_exc:
             result = DeployResult(
                 "rollback_failed",
@@ -448,7 +471,12 @@ def _deploy_locked(config: DeployConfig, runner: Runner) -> DeployResult:
     return result
 
 
-def deploy(config: DeployConfig, *, runner: Runner | None = None) -> DeployResult:
+def deploy(
+    config: DeployConfig,
+    *,
+    runner: Runner | None = None,
+    generation_authority: GenerationAuthority | None = None,
+) -> DeployResult:
     repo = config.repo.resolve()
     effective_config = DeployConfig(
         repo=repo,
@@ -459,13 +487,50 @@ def deploy(config: DeployConfig, *, runner: Runner | None = None) -> DeployResul
         rquant_bin=config.rquant_bin,
         audit_path=config.audit_path,
         lock_path=config.lock_path,
+        lock_fd=config.lock_fd,
+        startup_generation=config.startup_generation,
+        python_path=config.python_path,
+        git_path=config.git_path,
     )
     effective_runner = runner or SubprocessRunner(repo)
-    lock_path = effective_config.lock_path or (
-        repo.parent / ".rquant-deploy" / f"{repo.name}.lock"
-    )
+    lock_path = effective_config.lock_path or (repo.parent / ".rquant-deploy" / f"{repo.name}.lock")
+    if effective_config.lock_fd is not None:
+        try:
+            opened = os.fstat(effective_config.lock_fd)
+            active = lock_path.lstat()
+        except OSError as exc:
+            raise PolicyError("inherited deployment generation lock is unavailable") from exc
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+            != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise PolicyError("inherited deployment generation lock identity changed")
+        if generation_authority is None:
+            if (
+                effective_config.startup_generation is None
+                or effective_config.python_path is None
+                or effective_config.git_path is None
+            ):
+                raise PolicyError("release generation binding is incomplete")
+            try:
+                generation_authority = ReleaseGenerationAuthority(
+                    repo=repo,
+                    lock_path=lock_path,
+                    lock_fd=effective_config.lock_fd,
+                    python_path=effective_config.python_path,
+                    git_path=effective_config.git_path,
+                    writable=True,
+                )
+                generation_authority.verify(expected_commit=effective_config.startup_generation)
+            except ReleaseGenerationError as exc:
+                raise PolicyError(f"release generation is not ready: {exc}") from exc
+        return _deploy_locked(effective_config, effective_runner, generation_authority)
     with _deployment_lock(lock_path):
-        return _deploy_locked(effective_config, effective_runner)
+        return _deploy_locked(effective_config, effective_runner, generation_authority)
 
 
 def _default_uv_bin() -> str:
@@ -478,6 +543,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", required=True, help="SemVer tag or full 40-character SHA")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--deployment-lock-path", type=Path, required=True)
+    parser.add_argument("--deployment-lock-fd", type=int, required=True)
+    parser.add_argument("--startup-generation", required=True)
+    parser.add_argument("--trusted-git-path", type=Path, required=True)
+    parser.add_argument("--python-path", type=Path, required=True)
     return parser
 
 
@@ -489,6 +559,11 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         uv_bin=_default_uv_bin(),
         rquant_bin=".venv/bin/rquant",
+        lock_path=args.deployment_lock_path,
+        lock_fd=args.deployment_lock_fd,
+        startup_generation=args.startup_generation,
+        python_path=args.python_path,
+        git_path=args.trusted_git_path,
     )
     try:
         result = deploy(config)

@@ -69,6 +69,12 @@
 
 ### Fixed
 
+- **Strategy Lab crash-persistent 发布代际**：新增原子完成标记，绑定精确 commit、锁文件 hash、
+  包版本、Python ABI 和物理 venv 身份；Lab wrapper、只读 preflight 与隔离 bootstrap 在任何
+  `rquant` import 前均持共享锁复验。生产发布入口改为 `-I -S` 纯标准库 bootstrap，先取得稳定
+  独占锁再导入项目 deployer；部署开始即失效旧 marker，只有 checkout、frozen sync、两次
+  preflight 与服务验证完成后才 fsync+rename 发布，完整回滚验证后才可恢复旧 marker。
+
 - **Strategy Lab 启动代际与 spool 权威加固**：launchd wrapper 不再直接执行会加载 Python
   `site` hook 的 console script，改在共享发布代际锁下进入 `-I -S` stdlib bootstrap，仅显式加载
   已验证的项目源码与物理 virtualenv site-packages；生产 deployer 使用同一锁的独占模式，daemon

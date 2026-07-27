@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import stat
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
+
+sys.dont_write_bytecode = True
 
 EXECUTABLE_SUFFIXES = frozenset({".pyc", ".pyo", ".so", ".dylib", ".pyd"})
 GIT_TIMEOUT_SECONDS = 5
@@ -192,11 +196,41 @@ def _runtime_artifacts(checkout: Path) -> tuple[Path, ...]:
     return tuple(sorted(set(found)))
 
 
+def _assert_generation_lock(path: Path, descriptor: int) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        active = path.lstat()
+    except OSError as exc:
+        raise PreflightError("deployment generation lock is unavailable") from exc
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+        != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise PreflightError("deployment generation lock identity changed")
+
+
+def _load_release_authority(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("_rquant_release_generation", path)
+    if spec is None or spec.loader is None:
+        raise PreflightError("release generation authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkout-root", required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--trusted-git-path", required=True)
+    parser.add_argument("--deployment-lock-path", required=True)
+    parser.add_argument("--deployment-lock-fd", required=True, type=int)
+    parser.add_argument("--python-path", required=True)
     args = parser.parse_args(argv)
     try:
         git_path, git_identity = _trusted_git(args.trusted_git_path)
@@ -212,17 +246,31 @@ def main(argv: list[str] | None = None) -> int:
             git_identity=git_identity,
         )
         artifacts = _runtime_artifacts(checkout)
-        if not artifacts:
-            print("Lab runtime preflight: no executable artifacts or package symlinks")
-            return 0
-        preview = ", ".join(str(path.relative_to(checkout)) for path in artifacts[:20])
-        if len(artifacts) > 20:
-            preview = f"{preview}, ..."
-        raise PreflightError(
-            "ignored executable artifacts or package symlinks block formal runtime: "
-            f"{len(artifacts)} artifact(s); manually verify and remove only these "
-            f"repository entries, then rerun: {preview}"
-        )
+        if artifacts:
+            preview = ", ".join(str(path.relative_to(checkout)) for path in artifacts[:20])
+            if len(artifacts) > 20:
+                preview = f"{preview}, ..."
+            raise PreflightError(
+                "ignored executable artifacts or package symlinks block formal runtime: "
+                f"{len(artifacts)} artifact(s); manually verify and remove only these "
+                f"repository entries, then rerun: {preview}"
+            )
+        lock_path = Path(args.deployment_lock_path)
+        _assert_generation_lock(lock_path, args.deployment_lock_fd)
+        try:
+            _load_release_authority(
+                checkout / "src" / "rquant" / "release_generation.py"
+            ).ReleaseGenerationAuthority(
+                repo=checkout,
+                lock_path=lock_path,
+                lock_fd=args.deployment_lock_fd,
+                python_path=Path(args.python_path),
+                git_path=git_path,
+            ).verify(expected_commit=args.expected_commit)
+        except Exception as exc:
+            raise PreflightError(f"release generation marker is invalid: {exc}") from exc
+        print("Lab runtime preflight: verified complete release generation")
+        return 0
     except PreflightError as exc:
         print(f"Lab runtime preflight failed: {exc}", file=sys.stderr)
         return 1
