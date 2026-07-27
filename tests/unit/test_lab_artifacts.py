@@ -243,6 +243,13 @@ def _artifact_namespace_identity(store: LabJobArtifactStore) -> dict[str, tuple[
     return {root.name: tuple(sorted(item.name for item in root.iterdir())) for root in roots}
 
 
+def test_artifact_lifecycle_error_is_a_typed_integrity_failure() -> None:
+    assert issubclass(
+        lab_artifacts_module.LabArtifactLifecycleError,
+        LabArtifactIntegrityError,
+    )
+
+
 def test_finalization_identity_lock_is_per_result_and_times_out_typed(
     tmp_path: Path,
 ) -> None:
@@ -373,6 +380,116 @@ def test_finalization_identity_lock_recovers_after_exit_and_rejects_clobber_or_s
         ),
     ):
         pass
+
+
+def test_same_thread_close_inside_nested_finalization_activity_fails_fast_in_subprocess(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    script = textwrap.dedent(
+        """
+        import threading
+        from pathlib import Path
+        from uuid import UUID
+
+        from rquant.lab_artifacts import (
+            LabArtifactLifecycleError,
+            LabJobArtifactStore,
+        )
+
+        store = LabJobArtifactStore(Path({root!r}))
+        job_id = UUID({job_id!r})
+
+        def reject_close(expected_depth):
+            try:
+                store.close()
+            except LabArtifactLifecycleError:
+                pass
+            else:
+                raise AssertionError("same-thread close unexpectedly succeeded")
+            owner = threading.get_ident()
+            assert store._preview_activity_owners == {{owner: expected_depth}}
+            assert store._preview_activity_count == expected_depth
+            assert store._closing is False
+            assert store._closed is False
+            store.list_candidate_recovery()
+
+        with store.finalization_identity_lock(
+            job_id=job_id,
+            manifest_hash="4" * 64,
+            timeout_seconds=1,
+        ):
+            with store._preview_activity():
+                reject_close(2)
+            reject_close(1)
+
+        assert store._preview_activity_owners == {{}}
+        assert store._preview_activity_count == 0
+        store.list_candidate_recovery()
+        store.close()
+        assert store._closed is True
+        """
+    ).format(root=str(root), job_id=str(uuid4()))
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate(timeout=3)
+        pytest.fail(f"same-thread close deadlocked\nstdout={stdout}\nstderr={stderr}")
+
+    assert process.returncode == 0, (stdout, stderr)
+
+
+def test_other_thread_close_waits_for_finalization_activity_then_succeeds(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def close_store() -> None:
+        close_started.set()
+        try:
+            store.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_finished.set()
+
+    with store.finalization_identity_lock(
+        job_id=uuid4(),
+        manifest_hash="5" * 64,
+        timeout_seconds=1,
+    ):
+        close_thread = threading.Thread(target=close_store)
+        close_thread.start()
+        assert close_started.wait(timeout=1)
+        deadline = time.monotonic() + 1
+        while not store._closing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert store._closing is True
+        assert close_finished.is_set() is False
+        with pytest.raises(
+            lab_artifacts_module.LabArtifactLifecycleError,
+            match="owns preview activity",
+        ):
+            store.close()
+        assert close_finished.is_set() is False
+
+    close_thread.join(timeout=3)
+
+    assert not close_thread.is_alive()
+    assert close_finished.is_set() is True
+    assert errors == []
+    assert store._closed is True
 
 
 def _persist_forged_manifest(

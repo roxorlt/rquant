@@ -138,6 +138,10 @@ class LabArtifactIntegrityError(LabArtifactError):
     """Artifact bytes, structure, identity, or permissions failed verification."""
 
 
+class LabArtifactLifecycleError(LabArtifactIntegrityError):
+    """An artifact store lifecycle transition conflicts with active ownership."""
+
+
 class LabArtifactPayloadLimitError(LabArtifactIntegrityError):
     """A pure artifact plan exceeded its caller-supplied in-memory budget."""
 
@@ -2198,6 +2202,7 @@ class LabJobArtifactStore:
         self._closed = False
         self._closing = False
         self._preview_activity_count = 0
+        self._preview_activity_owners: dict[int, int] = {}
         self._preview_condition = threading.Condition()
         self._poisoned = False
         self._operation_depth = 0
@@ -2313,6 +2318,15 @@ class LabJobArtifactStore:
             self._close_resources()
             return
         with condition:
+            current_thread_id = threading.get_ident()
+            owned_activity_depth = getattr(self, "_preview_activity_owners", {}).get(
+                current_thread_id,
+                0,
+            )
+            if owned_activity_depth:
+                raise LabArtifactLifecycleError(
+                    "artifact store cannot close from a thread that owns preview activity"
+                )
             while self._closing and not self._closed:
                 condition.wait()
             if self._closed:
@@ -2430,15 +2444,28 @@ class LabJobArtifactStore:
 
     @contextmanager
     def _preview_activity(self) -> Iterator[None]:
+        current_thread_id = threading.get_ident()
         with self._preview_condition:
             if self._closing or self._closed:
                 raise LabArtifactIntegrityError("artifact store is closing or closed")
             self._assert_store_operational()
             self._preview_activity_count += 1
+            self._preview_activity_owners[current_thread_id] = (
+                self._preview_activity_owners.get(current_thread_id, 0) + 1
+            )
         try:
             yield
         finally:
             with self._preview_condition:
+                owned_activity_depth = self._preview_activity_owners.get(current_thread_id, 0)
+                if owned_activity_depth <= 0 or self._preview_activity_count <= 0:
+                    raise LabArtifactLifecycleError(
+                        "preview activity ownership changed before release"
+                    )
+                if owned_activity_depth == 1:
+                    del self._preview_activity_owners[current_thread_id]
+                else:
+                    self._preview_activity_owners[current_thread_id] = owned_activity_depth - 1
                 self._preview_activity_count -= 1
                 if self._preview_activity_count == 0:
                     self._preview_condition.notify_all()

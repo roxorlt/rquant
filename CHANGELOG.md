@@ -50,6 +50,11 @@
 
 ### Fixed
 
+- **Strategy Lab artifact store 生命周期防死锁**：preview/finalization activity 现在按线程记录
+  可重入深度；activity 持有线程调用 `close()` 时在任何等待前返回 typed lifecycle error，
+  context 退出后仍可正常使用并关闭 store。其他线程的 close 继续等待在途 activity 完成，
+  不改变跨线程和跨进程语义。
+
 - **Strategy Lab finalizer 资源与恢复边界加固**：`ArrowDtype` 的 string/binary（含 large、
   chunked、null 与 offset slice）改为直接按 Arrow validity/offset/data buffer 有界流式编码，
   不再为宽值物化 Python scalar，并保持 shard、聚合结果和 artifact 的既有 JSON/hash 语义。
