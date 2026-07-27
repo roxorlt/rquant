@@ -6848,6 +6848,41 @@ def test_sealed_rollback_crash_resumes_as_deferred_gc(
     assert all(entry.state == "deferred_gc" for entry in entries)
 
 
+def test_worker_runtime_drift_at_atomic_publish_preserves_prepared_candidate(
+    tmp_path: Path,
+) -> None:
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path)
+    validated = worker.adapter_registry.validate_claim(claim)
+    prepared = worker._prepare_result(
+        claim,
+        RecordingRegistry().execute_shard(validated, object()),
+    )
+    assert prepared.temporary is not None
+    calls = 0
+
+    def runtime_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    worker.verified_code_sha_provider = runtime_guard
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        worker._publish_candidate(
+            claim,
+            prepared,
+            deadline=None,
+            effective_expiry=None,
+            validate_concurrent_race=True,
+        )
+
+    assert prepared.temporary.is_dir()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
 def test_sealed_rollback_hard_crash_resumes_in_new_process(tmp_path: Path) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)

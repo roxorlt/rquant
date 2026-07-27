@@ -1029,7 +1029,22 @@ class LabFinalizerStateStore:
                 )
             except FileNotFoundError:
                 self._assert_root_current(root_descriptor, root_identity)
-                return LabFinalizerDaemonState()
+                try:
+                    appeared = os.stat(
+                        self.path.name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    self._assert_root_current(root_descriptor, root_identity)
+                    return LabFinalizerDaemonState()
+                _validate_private_regular_identity(
+                    appeared,
+                    label="lab finalizer state file",
+                )
+                raise LabDaemonConfigurationError(
+                    "lab finalizer state appeared after missing observation"
+                ) from None
             _validate_private_regular_identity(observed, label="lab finalizer state file")
             if observed.st_size > self._MAX_BYTES:
                 raise LabDaemonConfigurationError("lab finalizer state file is too large")
@@ -1171,13 +1186,29 @@ class LabFinalizerStateStore:
                     raise LabDaemonConfigurationError(
                         "lab finalizer state identity changed before commit"
                     )
-            os.replace(
-                temporary_name,
-                self.path.name,
-                src_dir_fd=root_descriptor,
-                dst_dir_fd=root_descriptor,
-            )
-            replaced = True
+            if existing is None:
+                try:
+                    os.link(
+                        temporary_name,
+                        self.path.name,
+                        src_dir_fd=root_descriptor,
+                        dst_dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise LabDaemonConfigurationError(
+                        "lab finalizer state was created concurrently"
+                    ) from exc
+                replaced = True
+                os.unlink(temporary_name, dir_fd=root_descriptor)
+            else:
+                os.replace(
+                    temporary_name,
+                    self.path.name,
+                    src_dir_fd=root_descriptor,
+                    dst_dir_fd=root_descriptor,
+                )
+                replaced = True
             self._assert_root_current(root_descriptor, root_identity)
             committed = os.stat(
                 self.path.name,
@@ -1272,6 +1303,21 @@ class LabFinalizerStateStore:
                         os.close(restore_descriptor)
                     with suppress(FileNotFoundError):
                         os.unlink(restore_name, dir_fd=root_descriptor)
+            elif replaced:
+                try:
+                    active = os.stat(
+                        self.path.name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (active.st_dev, active.st_ino) == (
+                        temporary_identity.st_dev,
+                        temporary_identity.st_ino,
+                    ):
+                        os.unlink(self.path.name, dir_fd=root_descriptor)
+                        os.fsync(root_descriptor)
+                except OSError:
+                    pass
             if isinstance(exc, OSError):
                 raise LabDaemonConfigurationError(
                     "lab finalizer state could not be committed atomically"

@@ -292,7 +292,7 @@ def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
         if (
             suffix in _IGNORED_NATIVE_CODE_SUFFIXES
             or suffix in _IGNORED_SOURCE_CODE_SUFFIXES
-            or (suffix in _IGNORED_LEGACY_BYTECODE_SUFFIXES and "__pycache__" not in artifact.parts)
+            or suffix in _IGNORED_LEGACY_BYTECODE_SUFFIXES
         ):
             return f"{commit}-dirty"
     return commit

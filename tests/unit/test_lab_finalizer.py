@@ -2166,6 +2166,72 @@ def test_matching_sealed_replay_retries_exact_redundant_candidate_cleanup(
     assert _candidate_evidence_counts(scenario.artifact_store) == after_recovery
 
 
+def test_fast_replay_runtime_drift_during_ledger_read_preserves_candidate_and_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    plans = []
+    original_prepare = scenario.artifact_store.prepare_candidate_from_plan
+
+    def capture(plan: object) -> object:
+        plans.append(plan)
+        return original_prepare(plan)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(scenario.artifact_store, "prepare_candidate_from_plan", capture)
+    published = scenario.finalizer().finalize(scenario.job_id)
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "prepare_candidate_from_plan",
+        original_prepare,
+    )
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    seal_intent = scenario.artifact_store.seal_intents_root / f"{scenario.job_id.hex}.json"
+    os.chmod(scenario.artifact_store.seal_intents_root, 0o700)
+    seal_intent.unlink()
+    redundant = scenario.artifact_store.prepare_candidate_from_plan(plans[0])
+    baseline = _candidate_evidence_counts(scenario.artifact_store)
+    drifted = False
+    ledger_reader = LabJobReader(scenario.store.path)
+
+    class DriftAfterLedgerRead:
+        def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
+            return snapshot if job_id == scenario.job_id else None
+
+        def get_artifact_commit(self, request_id: UUID) -> LabArtifactCommitRecord | None:
+            nonlocal drifted
+            record = ledger_reader.get_artifact_commit(request_id)
+            drifted = True
+            return record
+
+    def runtime_provider() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    replay = LabFinalizer(
+        reader=DriftAfterLedgerRead(),  # type: ignore[arg-type]
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=runtime_provider,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        replay.finalize(scenario.job_id)
+
+    assert redundant.path.exists()
+    assert _candidate_evidence_counts(scenario.artifact_store) == baseline == (1, 0)
+    assert isinstance(
+        scenario.commit_spool.inspect(published.request_id),
+        LabAcknowledgedArtifactCommit,
+    )
+
+
 def test_repeated_seal_failure_reuses_one_active_candidate_and_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

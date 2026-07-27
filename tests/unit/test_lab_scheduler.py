@@ -260,6 +260,76 @@ def test_scheduler_runtime_drift_between_ticks_leaves_command_unacknowledged(
     assert not (spool.ack_dir / f"{published.envelope.request_id}.json").exists()
 
 
+def test_scheduler_runtime_drift_after_invalid_command_load_does_not_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, spool = _components(tmp_path)
+    scheduler = _scheduler(store, spool)
+    scheduler.run_once()
+    published = spool.publish(_envelope())
+    drifted = False
+    original_load = spool.load
+
+    def drift_after_load(path: Path) -> object:
+        nonlocal drifted
+        entry = original_load(path)
+        drifted = True
+        return entry
+
+    def conflict_after_load(*_args: object, **_kwargs: object) -> object:
+        raise RequestContentConflictError("injected content conflict")
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    monkeypatch.setattr(spool, "load", drift_after_load)
+    monkeypatch.setattr(store, "apply_command", conflict_after_load)
+    scheduler.runtime_guard = runtime_guard
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        scheduler.run_once()
+
+    assert published.path.exists()
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
+def test_scheduler_runtime_drift_during_invalid_command_load_does_not_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, spool = _components(tmp_path)
+    scheduler = _scheduler(store, spool)
+    scheduler.run_once()
+    pending = spool.pending_dir / f"00000000000000000000-{uuid4()}.json"
+    pending.write_text("{broken", encoding="utf-8")
+    drifted = False
+    original_load = spool.load
+
+    def drift_during_load(path: Path) -> object:
+        nonlocal drifted
+        try:
+            return original_load(path)
+        finally:
+            drifted = True
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    monkeypatch.setattr(spool, "load", drift_during_load)
+    scheduler.runtime_guard = runtime_guard
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        scheduler.run_once()
+
+    assert pending.exists()
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
 def test_scheduler_sqlite_identity_drift_rolls_back_without_command_ack(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -540,6 +610,48 @@ def test_scheduler_quarantines_bad_mac_for_known_key_without_ledger_or_ack(
     assert not (spool.ack_dir / f"{forged.request_id}.json").exists()
     current = LabJobReader(store.path).get_job(job.job_id)
     assert current is not None and current.result_state is LabResultState.READY
+
+
+def test_scheduler_runtime_drift_after_artifact_load_does_not_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, scheduler, spool, _artifacts, _job, _sealed, envelope, clock = (
+        _ready_artifact_commit_scenario(tmp_path, publish=False)
+    )
+    proof = envelope.authority_proof
+    assert proof is not None
+    forged = LabArtifactCommitEnvelope(
+        schema_version=2,
+        request_id=envelope.request_id,
+        commit=envelope.commit,
+        authority_proof=proof.model_copy(update={"mac_sha256": "0" * 64}),
+    )
+    published = spool.publish(forged)
+    clock[0] = NOW + timedelta(seconds=5)
+    drifted = False
+    original_load = spool.load
+
+    def drift_after_load(path: Path) -> object:
+        nonlocal drifted
+        entry = original_load(path)
+        drifted = True
+        return entry
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    monkeypatch.setattr(spool, "load", drift_after_load)
+    scheduler.runtime_guard = runtime_guard
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        scheduler.run_once()
+
+    assert published.path.exists()
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+    assert not (spool.ack_dir / f"{forged.request_id}.json").exists()
 
 
 def test_scheduler_rejects_bad_mac_before_artifact_binding(

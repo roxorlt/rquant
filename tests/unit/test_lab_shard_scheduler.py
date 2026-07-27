@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_job_protocol import LabCommandSpool
 from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore, ShardStatus
 from rquant.lab_scheduler import LabScheduler
@@ -317,6 +318,40 @@ def test_bad_and_symlink_reports_do_not_block_valid_report(tmp_path: Path) -> No
     assert result.reports_accepted == 1
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
     assert reports.pending() == ()
+
+
+def test_scheduler_runtime_drift_after_invalid_report_load_does_not_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [NOW]
+    reports = LabReportSpool(tmp_path / "reports")
+    _store, scheduler = _scheduler(tmp_path, clock=clock, report_spool=reports)
+    pending = reports.pending_dir / f"00000000000000000000-{uuid4()}.json"
+    pending.write_text("{broken", encoding="utf-8")
+    drifted = False
+    original_load = reports.load
+
+    def drift_after_load(path: Path) -> object:
+        nonlocal drifted
+        try:
+            return original_load(path)
+        finally:
+            drifted = True
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    monkeypatch.setattr(reports, "load", drift_after_load)
+    scheduler.runtime_guard = runtime_guard
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        scheduler.run_once()
+
+    assert pending.exists()
+    assert tuple(reports.quarantine_dir.iterdir()) == ()
 
 
 def test_oversized_heartbeat_is_quarantined_before_scheduler_or_ledger(

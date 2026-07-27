@@ -38,6 +38,8 @@
     <dict>
         <key>PATH</key>
         <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONDONTWRITEBYTECODE</key>
+        <string>1</string>
     </dict>
 </dict>
 </plist>

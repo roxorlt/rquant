@@ -58,7 +58,10 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
     assert document["Umask"] == 0o077
     assert document["StandardOutPath"].startswith(f"{WORKING_DIRECTORY}/logs/")
     assert document["StandardErrorPath"].startswith(f"{WORKING_DIRECTORY}/logs/")
-    assert set(document.get("EnvironmentVariables", {})) == {"PATH"}
+    assert document.get("EnvironmentVariables", {}) == {
+        "PATH": f"{WORKING_DIRECTORY}/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     serialized = path.read_text(encoding="utf-8")
     assert "SECRET" not in serialized
     assert "KEY=" not in serialized

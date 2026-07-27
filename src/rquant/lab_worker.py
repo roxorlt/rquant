@@ -1363,6 +1363,7 @@ class LabWorker:
         self._verify_runtime_guard()
         report = self._make_report(claim, body)
         try:
+            self._verify_runtime_guard()
             self.report_spool.publish(report)
         except Exception as exc:
             _safe_structured_log(
@@ -1932,6 +1933,7 @@ class LabWorker:
             raise LabArtifactConflictError(
                 "sealed bundle changed identity before compensating rollback"
             )
+        self._verify_runtime_guard(expected_sha=bundle.manifest.worker_code_sha)
         self.artifact_reclaimer.logical_quarantine_tree(
             bundle.path,
             purpose=(
@@ -1986,6 +1988,7 @@ class LabWorker:
         if temporary is None:  # pragma: no cover - enforced by prepared model
             raise RuntimeError("new prepared bundle has no temporary path")
         created_bundle: LabSealedShardBundle | None = None
+        preserve_temporary = False
         try:
             if (
                 self._prepared_file_identities(temporary, prepared.manifest)
@@ -1995,6 +1998,7 @@ class LabWorker:
                     "prepared bundle files changed before atomic publish"
                 )
             try:
+                self._verify_runtime_guard(expected_sha=prepared.manifest.worker_code_sha)
                 os.rename(temporary, sealed)
             except OSError as exc:
                 if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
@@ -2039,12 +2043,16 @@ class LabWorker:
                 require_current_claim=effective_expiry is not None,
             )
             return created_bundle
+        except LabDaemonConfigurationError:
+            preserve_temporary = created_bundle is None
+            raise
         except BaseException:
             if created_bundle is not None:
                 self._rollback_sealed(claim, created_bundle)
             raise
         finally:
-            self._cleanup_temporary(temporary)
+            if not preserve_temporary:
+                self._cleanup_temporary(temporary)
 
     def _seal_result(
         self,

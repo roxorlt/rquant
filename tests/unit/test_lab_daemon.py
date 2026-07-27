@@ -1441,6 +1441,60 @@ def test_finalizer_state_load_rejects_same_size_active_file_replacement_after_pa
         store.load()
 
 
+def test_finalizer_state_load_rejects_concurrent_creation_after_missing_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    original_assert = store._assert_root_current
+    checks = 0
+
+    def create_after_missing(descriptor: int, expected: os.stat_result) -> None:
+        nonlocal checks
+        original_assert(descriptor, expected)
+        checks += 1
+        if checks == 2:
+            store.path.write_text(
+                LabFinalizerDaemonState(cycle=99).model_dump_json(),
+                encoding="utf-8",
+            )
+            store.path.chmod(0o600)
+
+    monkeypatch.setattr(store, "_assert_root_current", create_after_missing)
+
+    with pytest.raises(LabDaemonConfigurationError, match="appeared"):
+        store.load()
+
+    assert LabFinalizerDaemonState.model_validate_json(store.path.read_bytes()).cycle == 99
+
+
+def test_finalizer_state_save_does_not_overwrite_concurrent_absent_state_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    concurrent = LabFinalizerDaemonState(cycle=99).model_dump_json().encode("utf-8")
+    original_assert = store._assert_root_current
+    checks = 0
+
+    def create_before_publish(descriptor: int, expected: os.stat_result) -> None:
+        nonlocal checks
+        original_assert(descriptor, expected)
+        checks += 1
+        if checks == 2:
+            store.path.write_bytes(concurrent)
+            store.path.chmod(0o600)
+
+    monkeypatch.setattr(store, "_assert_root_current", create_before_publish)
+
+    with pytest.raises(LabDaemonConfigurationError, match="concurrent|atomically"):
+        store.save(LabFinalizerDaemonState(cycle=1))
+
+    assert store.path.read_bytes() == concurrent
+
+
 def test_finalizer_state_save_rejects_same_size_replacement_and_restores_previous(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

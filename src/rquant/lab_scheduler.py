@@ -233,6 +233,7 @@ class LabScheduler:
     ) -> bool:
         if self.artifact_commit_spool is None:  # pragma: no cover - caller invariant
             raise RuntimeError("artifact commit spool is not configured")
+        self._verify_runtime()
         try:
             self.artifact_commit_spool.quarantine(entry_or_path, reason=reason)
         except Exception as exc:
@@ -261,6 +262,7 @@ class LabScheduler:
     def _start_tick(self) -> bool:
         if self.lease is None:
             now = self.clock()
+            self._verify_runtime()
             lease = self.store.acquire_scheduler_lease(
                 owner_id=self.owner_id,
                 lease_seconds=self.lease_seconds,
@@ -271,6 +273,7 @@ class LabScheduler:
             return True
         now = self.clock()
         if now >= self.lease.heartbeat_at + timedelta(seconds=self.heartbeat_seconds):
+            self._verify_runtime()
             self.lease = self.store.renew_scheduler_lease(
                 self.lease,
                 lease_seconds=self.lease_seconds,
@@ -283,6 +286,7 @@ class LabScheduler:
             raise RuntimeError("scheduler lease has not been acquired")
         now = self.clock()
         if now >= self.lease.heartbeat_at + timedelta(seconds=self.heartbeat_seconds):
+            self._verify_runtime()
             self.lease = self.store.renew_scheduler_lease(
                 self.lease,
                 lease_seconds=self.lease_seconds,
@@ -312,6 +316,7 @@ class LabScheduler:
         hook_claims: list[LabShardClaim] = []
         for active_claim in active:
             try:
+                self._verify_runtime()
                 self.claim_spool.publish(active_claim)
             except Exception as exc:
                 delivery_failures += 1
@@ -385,16 +390,19 @@ class LabScheduler:
         for delivery in stale:
             try:
                 if delivery.claim_token in accepted_success_tokens:
+                    self._verify_runtime()
                     self.claim_spool.retire(
                         delivery,
                         outcome="accepted",
                         reason="scheduler accepted shard success",
                     )
                 else:
+                    self._verify_runtime()
                     self.claim_spool.revoke(
                         delivery,
                         reason="sqlite claim is no longer active",
                     )
+                    self._verify_runtime()
                     self.claim_spool.retire(
                         delivery,
                         outcome="revoked",
@@ -420,6 +428,7 @@ class LabScheduler:
         reconciled = 0
         reconcile_failures = 0
         hook_claim_by_token = {claim.claim_token: claim for claim in hook_claims}
+        self._verify_runtime()
         for outcome in self.claim_spool.reconcile_claims(tuple(hook_claims)):
             if outcome.status == "reconciled":
                 reconciled += 1
@@ -453,9 +462,11 @@ class LabScheduler:
         recovered = 0
         if acquired:
             lease, recovery_now = self._mutation_context()
+            self._verify_runtime()
             recovered = len(self.store.recover_expired_jobs(lease, now=recovery_now))
         else:
             lease, recovery_now = self._mutation_context()
+        self._verify_runtime()
         recovered += len(
             self.store.recover_stale_shards(
                 lease,
@@ -474,23 +485,27 @@ class LabScheduler:
             try:
                 entry = self.spool.load(path)
             except InvalidCommandEnvelopeError as exc:
+                self._verify_runtime()
                 self.spool.quarantine(
                     exc.file_identity or path,
                     reason=f"invalid_envelope:{exc}",
                 )
                 quarantined += 1
                 continue
+            self._verify_runtime()
             lease, mutation_now = self._mutation_context()
             authority_now = mutation_now
             deadline_lease = lease
             deadline_now = mutation_now
             try:
+                self._verify_runtime()
                 receipt = self.store.apply_command(
                     entry.envelope,
                     lease=lease,
                     now=mutation_now,
                 )
             except RequestContentConflictError as exc:
+                self._verify_runtime()
                 self.spool.quarantine(
                     entry,
                     reason=f"request_content_conflict:{exc}",
@@ -504,6 +519,7 @@ class LabScheduler:
                 rejected += 1
             self._verify_runtime()
             self.spool.ack(entry, receipt)
+        self._verify_runtime()
         deadlines_expired = len(
             self.store.expire_deadline_jobs(
                 lease=deadline_lease,
@@ -520,15 +536,18 @@ class LabScheduler:
                 try:
                     entry = self.report_spool.load(path)
                 except InvalidCommandEnvelopeError as exc:
+                    self._verify_runtime()
                     self.report_spool.quarantine(
                         exc.file_identity or path,
                         reason=f"invalid_report:{exc}",
                     )
                     reports_quarantined += 1
                     continue
+                self._verify_runtime()
                 lease, mutation_now = self._mutation_context()
                 authority_now = mutation_now
                 try:
+                    self._verify_runtime()
                     receipt = self.store.apply_worker_report(
                         entry.report,
                         lease=lease,
@@ -536,6 +555,7 @@ class LabScheduler:
                         result_digest_policy=self.result_digest_policy,
                     )
                 except RequestContentConflictError as exc:
+                    self._verify_runtime()
                     _safe_structured_log(
                         "error",
                         "report_content_conflict",
@@ -547,6 +567,7 @@ class LabScheduler:
                         report_id=str(entry.report.report_id),
                         error_type=type(exc).__name__,
                     )
+                    self._verify_runtime()
                     self.report_spool.quarantine(
                         entry,
                         reason=f"report_content_conflict:{exc}",
@@ -594,6 +615,7 @@ class LabScheduler:
                     artifact_commits_quarantined += int(artifact_isolated)
                     artifact_commit_quarantine_failures += int(not artifact_isolated)
                     continue
+                self._verify_runtime()
                 try:
                     verify_finalizer_authority(
                         entry.envelope,
@@ -622,6 +644,7 @@ class LabScheduler:
                         ) as binding:
                             lease, mutation_now = self._mutation_context()
                             authority_now = mutation_now
+                            self._verify_runtime()
                             deadlines_expired += len(
                                 self.store.expire_deadline_jobs(
                                     lease=lease,
@@ -641,6 +664,7 @@ class LabScheduler:
                         assert staged is not None
                         if self.lease is None:  # pragma: no cover - active tick invariant
                             raise RuntimeError("scheduler lease disappeared before artifact commit")
+                        self._verify_runtime()
                         receipt = staged.commit(
                             lease=self.lease,
                             now=self.clock(),
@@ -683,6 +707,7 @@ class LabScheduler:
                     artifact_commits_accepted += 1
                 else:
                     artifact_commits_rejected += 1
+                self._verify_runtime()
                 self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
@@ -694,6 +719,7 @@ class LabScheduler:
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()
                     authority_now = mutation_now
+                    self._verify_runtime()
                     _safe_structured_log(
                         "error",
                         "adapter_plan_failed",
@@ -703,6 +729,7 @@ class LabScheduler:
                         job_id=str(job.job_id),
                         error_type=type(exc).__name__,
                     )
+                    self._verify_runtime()
                     self.store.fail_unplanned_job(
                         job.job_id,
                         reason=f"adapter plan failed: {_safe_plan_failure(exc)}",
@@ -713,6 +740,7 @@ class LabScheduler:
                     continue
                 lease, mutation_now = self._mutation_context()
                 authority_now = mutation_now
+                self._verify_runtime()
                 self.store.plan_job(
                     job.job_id,
                     definitions,
@@ -732,12 +760,14 @@ class LabScheduler:
                 inspected += 1
                 lease, mutation_now = self._mutation_context()
                 authority_now = mutation_now
+                self._verify_runtime()
                 deadlines_expired += len(
                     self.store.expire_deadline_jobs(
                         lease=lease,
                         now=mutation_now,
                     )
                 )
+                self._verify_runtime()
                 claim = self.store.claim_next_shard(
                     worker_id=worker_id,
                     shard_lease_seconds=self.shard_lease_seconds,

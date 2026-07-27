@@ -1576,6 +1576,7 @@ class LabFinalizer:
         if not os.path.lexists(target):
             return None
         try:
+            self._verified_runtime_code_sha(expected_sha=plan.manifest.code_sha)
             sealed = self.artifact_store.recover_interrupted_seal(target)
         except LabArtifactError as interrupted_error:
             try:
@@ -1610,6 +1611,7 @@ class LabFinalizer:
         )
         for record in matching:
             try:
+                self._verified_runtime_code_sha(expected_sha=sealed.manifest.code_sha)
                 self.artifact_store.quarantine_recovery_record(
                     record,
                     reason="redundant deterministic candidate after sealed publication",
@@ -1641,6 +1643,7 @@ class LabFinalizer:
         if recoverable:
             primary, *redundant = recoverable
             try:
+                self._verified_runtime_code_sha(expected_sha=plan.manifest.code_sha)
                 sealed = self.artifact_store.recover_candidate(
                     primary,
                     authority=authority,
@@ -1651,6 +1654,7 @@ class LabFinalizer:
                 ) from exc
             for record in redundant:
                 try:
+                    self._verified_runtime_code_sha(expected_sha=plan.manifest.code_sha)
                     self.artifact_store.quarantine_recovery_record(
                         record,
                         reason="redundant deterministic candidate after recovery",
@@ -1668,6 +1672,7 @@ class LabFinalizer:
 
     def _prepare_and_seal(self, plan: LabJobArtifactPlan) -> LabSealedJobArtifact:
         try:
+            self._verified_runtime_code_sha(expected_sha=plan.manifest.code_sha)
             candidate = self.artifact_store.prepare_candidate_from_plan(plan)
         except LabArtifactError as exc:
             raise LabFinalizationIntegrityError(
@@ -1675,6 +1680,7 @@ class LabFinalizer:
             ) from exc
         self._after_candidate_prepared(candidate)
         try:
+            self._verified_runtime_code_sha(expected_sha=plan.manifest.code_sha)
             sealed = self.artifact_store.seal_candidate(candidate)
         except LabArtifactError as exc:
             # The verified candidate is durable retry state; moving it would create
@@ -1688,6 +1694,7 @@ class LabFinalizer:
 
     def _recover_or_prepare(self, plan: LabJobArtifactPlan) -> LabSealedJobArtifact:
         try:
+            self._verified_runtime_code_sha(expected_sha=plan.manifest.code_sha)
             with self.artifact_store.finalization_identity_lock(
                 job_id=plan.job_id,
                 manifest_hash=plan.manifest_hash,
@@ -1870,6 +1877,7 @@ class LabFinalizer:
         acknowledged: LabAcknowledgedArtifactCommit,
     ) -> LabFinalizerResult:
         ledger = self.reader.get_artifact_commit(envelope.request_id)
+        self._verified_runtime_code_sha(expected_sha=sealed.manifest.code_sha)
         if ledger is None:
             raise LabFinalizationIntegrityError(
                 "artifact acknowledgement has no authoritative SQLite ledger commit"
@@ -1911,7 +1919,9 @@ class LabFinalizer:
             finalizer_code_sha=finalizer_code_sha,
         )
         ledger = self.reader.get_artifact_commit(envelope.request_id)
+        self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
         durable = self.commit_spool.inspect(envelope.request_id)
+        self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
         if ledger is None:
             if isinstance(durable, LabAcknowledgedArtifactCommit):
                 raise LabFinalizationIntegrityError(
@@ -1930,6 +1940,7 @@ class LabFinalizer:
             )
         if isinstance(durable, LabAcknowledgedArtifactCommit):
             result = self._validate_acknowledgement(sealed, envelope, durable)
+            self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
             self._cleanup_redundant_candidates(sealed)
             return result
         if isinstance(
@@ -1946,6 +1957,7 @@ class LabFinalizer:
                 "pending artifact commit conflicts with authoritative SQLite ledger"
             )
         result = self._result_from_receipt(sealed, envelope, ledger.receipt)
+        self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
         self._cleanup_redundant_candidates(sealed)
         return result
 
@@ -1969,9 +1981,12 @@ class LabFinalizer:
             snapshot,
             finalizer_code_sha=finalizer_code_sha,
         )
-        if self.reader.get_artifact_commit(envelope.request_id) is not None:
+        ledger = self.reader.get_artifact_commit(envelope.request_id)
+        self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
+        if ledger is not None:
             return
         durable = self.commit_spool.inspect(envelope.request_id)
+        self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
         if not isinstance(durable, LabArtifactCommitSpoolEntry):
             return
         if self._authenticated_commit_identity(
@@ -1985,6 +2000,7 @@ class LabFinalizer:
                 "uncommitted artifact commit conflicts with sealed replay identity"
             )
         try:
+            self._verified_runtime_code_sha(expected_sha=finalizer_code_sha)
             self.commit_spool.quarantine(
                 durable,
                 reason="uncommitted artifact conflicts with deterministic aggregate",

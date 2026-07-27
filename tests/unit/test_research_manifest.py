@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import importlib.util
+import marshal
+import os
+import struct
 import subprocess
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -455,6 +460,98 @@ def test_detect_verified_code_commit_rejects_ignored_loadable_source_artifacts(
     ).stdout.strip()
     (package / artifact_name).write_bytes(b"ignored executable payload")
 
+    assert detect_verified_code_commit(repo) == f"{head}-dirty"
+
+
+def test_detect_verified_code_commit_rejects_executable_timestamp_bytecode_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    package = repo / "src" / "rquant"
+    package.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n*.pyo\n", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source = package / "timestamp_payload.py"
+    source.write_text("VALUE = 'safe'\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "add",
+            ".gitignore",
+            "src/rquant/__init__.py",
+            "src/rquant/timestamp_payload.py",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_stat = source.stat()
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    cache.parent.mkdir()
+    malicious = compile("VALUE = 'evil'\n", str(source), "exec")
+    cache.write_bytes(
+        importlib.util.MAGIC_NUMBER
+        + struct.pack(
+            "<III",
+            0,
+            int(source_stat.st_mtime) & 0xFFFF_FFFF,
+            source_stat.st_size,
+        )
+        + marshal.dumps(malicious)
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repo / "src")
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    imported = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "from rquant import timestamp_payload; print(timestamp_payload.VALUE)",
+        ],
+        cwd=repo,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert imported.stdout.strip() == "evil"
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
     assert detect_verified_code_commit(repo) == f"{head}-dirty"
 
 
