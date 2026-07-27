@@ -1125,6 +1125,60 @@ def test_command_spool_checks_guard_inside_initial_directory_creation(
     assert not root.exists()
 
 
+def test_command_sequence_never_publishes_into_replaced_spool_root(tmp_path: Path) -> None:
+    root = tmp_path / "commands"
+    displaced = tmp_path / "commands.displaced"
+
+    class ReplacingSequenceSpool(LabCommandSpool):
+        def _after_sequence_stage(self, stage: str, _path: Path) -> None:
+            if stage == "temporary_written":
+                root.rename(displaced)
+                root.mkdir(mode=0o700)
+
+    spool = ReplacingSequenceSpool(root)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity changed"):
+        spool.publish(_submit_envelope())
+
+    assert tuple(root.iterdir()) == ()
+    assert not (root / ".delivery-sequence").exists()
+
+
+def test_command_sequence_rejects_symlink_without_touching_external_file(
+    tmp_path: Path,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    external = tmp_path / "external-sequence"
+    external.write_text("41\n", encoding="ascii")
+    spool._sequence_path.symlink_to(external)
+
+    with pytest.raises(OSError):
+        spool.publish(_submit_envelope())
+
+    assert external.read_text(encoding="ascii") == "41\n"
+    assert spool._sequence_path.is_symlink()
+
+
+def test_replaced_spool_lock_cannot_create_parallel_mutation_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+    first = LabCommandSpool(root)
+    lock_path = first._lock_path
+    displaced_lock = lock_path.with_suffix(".displaced")
+
+    with first._exclusive_lock():
+        lock_path.rename(displaced_lock)
+        lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        second = LabCommandSpool(root)
+        second.publish(_submit_envelope())
+        with pytest.raises(InvalidCommandEnvelopeError, match="lock identity changed"):
+            first._guard_mutation()
+
+    assert len(second.pending()) == 1
+
+
 @pytest.mark.parametrize("unsafe_name", ["pending", "ack", "quarantine"])
 def test_command_spool_rejects_symlinked_managed_directory_without_external_write(
     tmp_path: Path,
@@ -1168,7 +1222,7 @@ def test_command_spool_rejects_unsafe_lock_without_touching_target(
     unsafe_kind: str,
 ) -> None:
     spool = LabCommandSpool(tmp_path / "commands")
-    lock_path = spool.root / ".spool.lock"
+    lock_path = spool._lock_path
     lock_path.unlink()
     victim = tmp_path / "lock-victim"
     victim.write_text("preserve", encoding="utf-8")

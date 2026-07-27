@@ -69,6 +69,13 @@
 
 ### Fixed
 
+- **Strategy Lab 启动代际与 spool 权威加固**：launchd wrapper 不再直接执行会加载 Python
+  `site` hook 的 console script，改在共享发布代际锁下进入 `-I -S` stdlib bootstrap，仅显式加载
+  已验证的项目源码与物理 virtualenv site-packages；生产 deployer 使用同一锁的独占模式，daemon
+  runtime guard 持续绑定启动 SHA 与锁 inode。command/claim/report/artifact commit spools 的互斥
+  锁移到不可由 spool 根替换分裂的稳定父目录，delivery sequence 与 artifact fairness cursor
+  全部改为绑定目录 fd 的 no-follow 原子读写，根或锁入口漂移时在最终 mutation 前 fail closed。
+
 - **Strategy Lab daemon 规格复审加固**：正式 checkout readiness 不再对 linked worktree
   `.venv` 做运行时特判；Git 仅可通过根级 `/.venv` ignore 保持状态干净，而 daemon 仍要求
   checkout 自有的物理 virtualenv。其他 tracked/untracked 内容与身份漂移继续 fail closed。

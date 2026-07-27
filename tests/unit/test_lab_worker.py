@@ -4814,7 +4814,7 @@ def test_real_sigterm_never_deadlocks_success_publication_boundary(
     expected: dict[str, object],
 ) -> None:
     root = tmp_path / phase
-    root.mkdir()
+    root.mkdir(mode=0o700)
 
     completed = _run_worker_child("_sigterm_publication_child", root, phase)
 

@@ -2947,19 +2947,38 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lab_deployment_generation_binding(args: argparse.Namespace) -> dict[str, object]:
+    generation = getattr(args, "deployment_generation", None)
+    lock_path = getattr(args, "deployment_lock_path", None)
+    descriptor = getattr(args, "deployment_generation_fd", None)
+    values = (generation, lock_path, descriptor)
+    if all(value is None for value in values):
+        return {}
+    if any(value is None for value in values):
+        raise RuntimeError("incomplete Lab deployment generation binding")
+    return {
+        "deployment_generation": generation,
+        "deployment_lock_path": Path(lock_path),
+        "deployment_generation_fd": descriptor,
+    }
+
+
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
     trusted_git_path = Path(args.trusted_git_path)
+    generation_binding = _lab_deployment_generation_binding(args)
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
         Path(args.expected_checkout_root),
         code_sha,
         trusted_git_path,
+        **generation_binding,
     )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
@@ -3121,14 +3140,17 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
     trusted_git_path = Path(args.trusted_git_path)
+    generation_binding = _lab_deployment_generation_binding(args)
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
         Path(args.expected_checkout_root),
         code_sha,
         trusted_git_path,
+        **generation_binding,
     )
     from rquant.config import settings
     from rquant.lab_daemon import (
@@ -3223,14 +3245,17 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
     trusted_git_path = Path(args.trusted_git_path)
+    generation_binding = _lab_deployment_generation_binding(args)
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
         Path(args.expected_checkout_root),
         code_sha,
         trusted_git_path,
+        **generation_binding,
     )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
@@ -5016,6 +5041,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="launch contract 固定的可信绝对 Git 可执行文件",
     )
+    lab_scheduler_p.add_argument("--deployment-generation", required=True)
+    lab_scheduler_p.add_argument("--deployment-lock-path", required=True)
+    lab_scheduler_p.add_argument("--deployment-generation-fd", required=True, type=int)
     lab_scheduler_p.add_argument(
         "--once",
         action="store_true",
@@ -5036,6 +5064,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="launch contract 固定的可信绝对 Git 可执行文件",
     )
+    lab_worker_p.add_argument("--deployment-generation", required=True)
+    lab_worker_p.add_argument("--deployment-lock-path", required=True)
+    lab_worker_p.add_argument("--deployment-generation-fd", required=True, type=int)
     lab_worker_p.add_argument(
         "--worker-id",
         default=None,
@@ -5061,6 +5092,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="launch contract 固定的可信绝对 Git 可执行文件",
     )
+    lab_finalizer_p.add_argument("--deployment-generation", required=True)
+    lab_finalizer_p.add_argument("--deployment-lock-path", required=True)
+    lab_finalizer_p.add_argument("--deployment-generation-fd", required=True, type=int)
     lab_finalizer_p.add_argument(
         "--once",
         action="store_true",

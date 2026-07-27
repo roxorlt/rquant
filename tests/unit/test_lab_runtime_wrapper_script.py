@@ -7,6 +7,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import time
 import venv
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "scripts" / "run-lab-daemon.py"
 PREFLIGHT = ROOT / "scripts" / "preflight-lab-runtime.py"
+BOOTSTRAP = ROOT / "scripts" / "bootstrap-lab-daemon.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 
 
@@ -26,19 +28,22 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     package.mkdir(parents=True)
     shutil.copy2(WRAPPER, scripts / WRAPPER.name)
     shutil.copy2(PREFLIGHT, scripts / PREFLIGHT.name)
+    shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
         "/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
         encoding="utf-8",
     )
     marker = checkout / "daemon.json"
-    (package / "__init__.py").write_text(
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
         "from __future__ import annotations\n"
-        "import json, os, sys\n"
+        "import json, os, sys, time\n"
         "from pathlib import Path\n"
         "def main():\n"
         "    Path(os.environ['LAB_WRAPPER_MARKER']).write_text("
         "json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+        "    time.sleep(float(os.environ.get('LAB_WRAPPER_HOLD_SECONDS', '0')))\n"
         "    print('fake daemon executed', flush=True)\n",
         encoding="utf-8",
     )
@@ -72,6 +77,10 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     return checkout, executable, marker
 
 
+def _deployment_lock_path(checkout: Path) -> Path:
+    return checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock"
+
+
 def _run_wrapper(
     checkout: Path,
     executable: Path,
@@ -92,6 +101,8 @@ def _run_wrapper(
             str(checkout),
             "--trusted-git-path",
             str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
             "--",
             str(executable),
             "lab-worker",
@@ -125,6 +136,109 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
         "lab-worker",
         "--expected-checkout-root",
     ]
+
+
+def test_lab_runtime_bootstrap_never_processes_site_or_pth_hooks(tmp_path: Path) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    site_packages = (
+        checkout
+        / ".venv"
+        / "lib"
+        / (f"python{sys.version_info.major}.{sys.version_info.minor}")
+        / "site-packages"
+    )
+    hook_marker = tmp_path / "preimport-hook-ran"
+    (site_packages / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(hook_marker)!r}).write_text('site')\n",
+        encoding="utf-8",
+    )
+    (site_packages / "untrusted-hook.pth").write_text(
+        f"import pathlib; pathlib.Path({str(hook_marker)!r}).write_text('pth')\n",
+        encoding="utf-8",
+    )
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.is_file()
+    assert not hook_marker.exists()
+
+
+def test_lab_runtime_wrapper_fails_while_deployment_generation_is_locked(
+    tmp_path: Path,
+) -> None:
+    import fcntl
+
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    lock_path = _deployment_lock_path(checkout)
+    lock_path.parent.mkdir(mode=0o700)
+    lock_path.touch(mode=0o600)
+    lock_path.chmod(0o600)
+    with lock_path.open("r+b") as deployment_lock:
+        fcntl.flock(deployment_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode != 0
+    assert "deployment generation" in result.stderr.lower()
+    assert not marker.exists()
+
+
+def test_running_daemon_holds_one_complete_generation_against_deployment(
+    tmp_path: Path,
+) -> None:
+    import fcntl
+
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    environment = os.environ.copy()
+    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
+        environment.pop(variable, None)
+    environment.update(
+        {
+            "LAB_WRAPPER_MARKER": str(marker),
+            "LAB_WRAPPER_HOLD_SECONDS": "1.0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    process = subprocess.Popen(
+        [
+            str(checkout / ".venv" / "bin" / "python"),
+            "-I",
+            "-S",
+            str(checkout / "scripts" / WRAPPER.name),
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
+            "--",
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ],
+        cwd=checkout,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists()
+    with (
+        _deployment_lock_path(checkout).open("r+b") as deployment_lock,
+        pytest.raises(BlockingIOError),
+    ):
+        fcntl.flock(deployment_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stdout + stderr
 
 
 @pytest.mark.parametrize("suffix", [".pyc", ".pyo", ".so", ".dylib", ".pyd"])
@@ -213,6 +327,8 @@ def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflig
             str(checkout),
             "--trusted-git-path",
             str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
             "--",
             str(executable),
             "lab-worker",
@@ -265,6 +381,8 @@ def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
             str(checkout),
             "--trusted-git-path",
             str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
             "--",
             str(executable),
             "lab-worker",
@@ -321,6 +439,8 @@ def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
             str(checkout),
             "--trusted-git-path",
             str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
             "--",
             str(executable),
             "lab-worker",
@@ -372,6 +492,8 @@ def test_lab_runtime_wrapper_ignores_fake_venv_git(
             str(checkout),
             "--trusted-git-path",
             str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
             "--",
             str(executable),
             "lab-worker",
@@ -415,6 +537,8 @@ def test_lab_runtime_wrapper_rejects_mismatched_daemon_root(tmp_path: Path) -> N
             str(checkout),
             "--trusted-git-path",
             str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
             "--",
             str(executable),
             "lab-worker",
@@ -437,8 +561,9 @@ def test_lab_runtime_wrapper_rejects_mismatched_daemon_root(tmp_path: Path) -> N
     assert not marker.exists()
 
 
-def test_lab_runtime_wrapper_source_is_stdlib_only() -> None:
-    source = WRAPPER.read_text(encoding="utf-8")
+@pytest.mark.parametrize("script", [WRAPPER, BOOTSTRAP])
+def test_lab_runtime_startup_scripts_are_stdlib_only(script: Path) -> None:
+    source = script.read_text(encoding="utf-8")
     imported_roots: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
@@ -446,4 +571,10 @@ def test_lab_runtime_wrapper_source_is_stdlib_only() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported_roots.add(node.module.split(".", maxsplit=1)[0])
 
-    assert imported_roots <= sys.stdlib_module_names | {"__future__"}
+    allowed = sys.stdlib_module_names | {"__future__"}
+    if script == BOOTSTRAP:
+        allowed = allowed | {"rquant"}
+        assert source.index("from rquant.cli import main") > source.index(
+            "_run_preflight(\n            root=root"
+        )
+    assert imported_roots <= allowed

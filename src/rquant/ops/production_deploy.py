@@ -11,8 +11,10 @@ import argparse
 import fcntl
 import fnmatch
 import json
+import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tomllib
@@ -254,16 +256,42 @@ def _append_audit(config: DeployConfig, result: DeployResult, *, error: str = ""
 
 @contextmanager
 def _deployment_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent_stat = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or stat.S_ISLNK(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+    ):
+        raise PolicyError("production deployment lock root is unsafe")
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        active = path.lstat()
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+            != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise PolicyError("production deployment lock is unsafe")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise PolicyError("another production deployment is already running") from exc
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _restart_active_services(
@@ -433,7 +461,9 @@ def deploy(config: DeployConfig, *, runner: Runner | None = None) -> DeployResul
         lock_path=config.lock_path,
     )
     effective_runner = runner or SubprocessRunner(repo)
-    lock_path = effective_config.lock_path or repo / "logs" / "production-deploy.lock"
+    lock_path = effective_config.lock_path or (
+        repo.parent / ".rquant-deploy" / f"{repo.name}.lock"
+    )
     with _deployment_lock(lock_path):
         return _deploy_locked(effective_config, effective_runner)
 

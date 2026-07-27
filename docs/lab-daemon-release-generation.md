@@ -1,0 +1,34 @@
+# Strategy Lab daemon 发布代际边界
+
+## 启动链路
+
+三个 Lab daemon 由 launchd 先运行 `scripts/run-lab-daemon.py`。wrapper 只使用标准库，完成
+物理 checkout、virtualenv、可信 Git、console launcher 和 clean commit 校验，并取得该 checkout
+唯一发布锁的共享锁。随后它执行同一 virtualenv Python 的 `-I -S` bootstrap，而不是直接执行
+console script。
+
+`scripts/bootstrap-lab-daemon.py` 不处理 `site`、`.pth`、`sitecustomize` 或 user site。它只把已验证
+的项目 `src` 和该物理 virtualenv 的单一 `site-packages` 代际加入 `sys.path`，再次运行只读
+preflight，再导入 `rquant.cli`。共享发布锁 fd 会保留到 daemon 退出，runtime guard 每个副作用
+边界同时复验 clean SHA、发布代际和锁 inode。
+
+## 发布互斥
+
+主 checkout `/Users/roxor/brain/30-projects/rQuant` 的锁固定为：
+
+```text
+/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
+```
+
+daemon 持共享锁；`scripts/deploy-production.sh` 的 Python deployer 持独占锁。部署已经开始时，新
+daemon 启动失败；daemon 仍在运行时，部署失败关闭。由此一次进程只能看到一个完整 Git 代际，
+不能在检查与 import 之间混入合法部署。
+
+## P1.5d 安装要求
+
+P1.5d 安装 launchd 前必须在主 checkout 重建自有、物理、非 symlink 的 `.venv`，并确保部署锁
+目录为当前用户所有且 mode `0700`、锁文件 mode `0600`。隔离 worktree 可继续复用链接 `.venv`
+运行测试，但正式 daemon 会在读取配置或创建运行时目录前拒绝这种 runtime。
+
+该锁约束所有受控部署。具有同一 UID 且绕过 deployer 直接改写 checkout 的进程不属于本地权限
+边界；runtime guard 仍会检测漂移并停止，但不把普通可写 worktree描述成不可变文件系统。

@@ -944,6 +944,35 @@ def test_runtime_guard_rechecks_checkout_identity_between_ticks(
         guard.verify()
 
 
+def test_runtime_guard_remains_bound_to_shared_deployment_generation(tmp_path: Path) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir(mode=0o700)
+    lock_root = tmp_path / ".rquant-deploy"
+    lock_root.mkdir(mode=0o700)
+    lock_path = lock_root / "checkout.lock"
+    _write_private(lock_path, "")
+    descriptor = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    sha = "1" * 40
+    guard = LabRuntimeGuard(
+        root,
+        sha,
+        verifier=lambda _root: sha,
+        deployment_generation=sha,
+        deployment_lock_path=lock_path,
+        deployment_generation_fd=descriptor,
+    )
+    try:
+        assert guard.verify() == sha
+        displaced = lock_path.with_suffix(".displaced")
+        lock_path.rename(displaced)
+        _write_private(lock_path, "")
+        with pytest.raises(LabDaemonConfigurationError, match="lock identity changed"):
+            guard.verify()
+    finally:
+        os.close(descriptor)
+
+
 @pytest.mark.parametrize(
     "mismatch",
     ["executable", "launcher", "prefix", "shebang", "cwd", "git", "sha"],

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import stat
 import subprocess
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -202,7 +204,66 @@ def _validate_daemon_argv(
     ]
     if git_values != [str(trusted_git)]:
         raise WrapperError("daemon trusted Git path does not match wrapper binding")
+    for forbidden in (
+        "--deployment-generation",
+        "--deployment-generation-fd",
+        "--deployment-lock-path",
+    ):
+        if forbidden in daemon_argv:
+            raise WrapperError("deployment generation arguments are wrapper-controlled")
     return executable, executable_identity
+
+
+def _expected_deployment_lock(root: Path) -> Path:
+    return root.parent / ".rquant-deploy" / f"{root.name}.lock"
+
+
+def _acquire_deployment_generation(root: Path, raw_path: str) -> tuple[Path, int]:
+    path = _canonical_absolute(raw_path, label="deployment generation lock")
+    if path != _expected_deployment_lock(root):
+        raise WrapperError("deployment generation lock does not match checkout binding")
+    parent = path.parent
+    try:
+        with suppress(FileExistsError):
+            os.mkdir(parent, 0o700)
+        parent_stat = parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or stat.S_ISLNK(parent_stat.st_mode)
+            or parent_stat.st_uid != os.getuid()
+            or stat.S_IMODE(parent_stat.st_mode) != 0o700
+            or parent.resolve(strict=True) != parent
+        ):
+            raise WrapperError("deployment generation lock root is unsafe")
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+            opened = os.fstat(descriptor)
+            active = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(parent_fd)
+        if (
+            _PathIdentity.capture(opened) != _PathIdentity.capture(active)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise WrapperError("deployment generation lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise WrapperError("deployment generation is currently being updated") from exc
+        os.set_inheritable(descriptor, True)
+        return path, descriptor
+    except OSError as exc:
+        raise WrapperError("deployment generation lock is unavailable") from exc
 
 
 def _git_commit(root: Path, *, git_path: Path, git_identity: _PathIdentity) -> str:
@@ -261,20 +322,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
     parser.add_argument("--trusted-git-path", required=True)
+    parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    generation_lock_fd = -1
     try:
         root, venv, python, runtime_identities = _require_runtime_root(args.expected_checkout_root)
         trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
+        deployment_lock_path, generation_lock_fd = _acquire_deployment_generation(
+            root,
+            args.deployment_lock_path,
+        )
         for variable in _PYTHON_INJECTION_VARIABLES:
             if os.environ.get(variable):
                 raise WrapperError(f"Python environment injection is not allowed: {variable}")
         wrapper = root / "scripts" / "run-lab-daemon.py"
         preflight = root / "scripts" / "preflight-lab-runtime.py"
+        bootstrap = root / "scripts" / "bootstrap-lab-daemon.py"
         if Path(__file__) != wrapper:
             raise WrapperError("wrapper path does not match expected checkout")
         wrapper_identity = _require_owned_regular(wrapper, label="Lab runtime wrapper")
         preflight_identity = _require_owned_regular(preflight, label="Lab runtime preflight")
+        bootstrap_identity = _require_owned_regular(bootstrap, label="Lab daemon bootstrap")
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
             daemon_argv.pop(0)
@@ -314,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(wrapper, label="Lab runtime wrapper") != wrapper_identity
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
+            or _require_owned_regular(bootstrap, label="Lab daemon bootstrap") != bootstrap_identity
             or _git_commit(
                 root,
                 git_path=trusted_git,
@@ -347,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(wrapper, label="Lab runtime wrapper") != wrapper_identity
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
+            or _require_owned_regular(bootstrap, label="Lab daemon bootstrap") != bootstrap_identity
             or _git_commit(
                 root,
                 git_path=trusted_git,
@@ -376,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(wrapper, label="Lab runtime wrapper") != wrapper_identity
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
+            or _require_owned_regular(bootstrap, label="Lab daemon bootstrap") != bootstrap_identity
             or _git_commit(
                 root,
                 git_path=trusted_git,
@@ -387,10 +459,41 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.pop("__PYVENV_LAUNCHER__", None)
         sys.stdout.flush()
         sys.stderr.flush()
-        os.execv(executable, daemon_argv)
+        os.execv(
+            python,
+            [
+                str(python),
+                "-I",
+                "-S",
+                str(bootstrap),
+                "--expected-checkout-root",
+                str(root),
+                "--expected-commit",
+                expected_commit,
+                "--trusted-git-path",
+                str(trusted_git),
+                "--deployment-lock-path",
+                str(deployment_lock_path),
+                "--deployment-lock-fd",
+                str(generation_lock_fd),
+                "--expected-launcher",
+                str(executable),
+                "--",
+                *daemon_argv[1:],
+                "--deployment-generation",
+                expected_commit,
+                "--deployment-lock-path",
+                str(deployment_lock_path),
+                "--deployment-generation-fd",
+                str(generation_lock_fd),
+            ],
+        )
     except (OSError, subprocess.SubprocessError, WrapperError) as exc:
         print(f"Lab daemon wrapper failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if generation_lock_fd >= 0:
+            os.close(generation_lock_fd)
     return 1
 
 

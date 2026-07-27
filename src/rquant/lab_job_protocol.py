@@ -371,35 +371,56 @@ class LabCommandSpool:
         self.pending_dir = self.root / "pending"
         self.ack_dir = self.root / "ack"
         self.quarantine_dir = self.root / "quarantine"
-        self._lock_path = self.root / ".spool.lock"
+        lock_digest = hashlib.sha256(os.fsencode(self.root)).hexdigest()[:16]
+        self._lock_path = self.root.parent / f".{self.root.name}.{lock_digest}.spool.lock"
         self._sequence_path = self.root / ".delivery-sequence"
         self._thread_lock = RLock()
         self._managed_directory_identities: dict[Path, _ManagedDirectoryIdentity] = {}
+        self._root_identity: _ManagedDirectoryIdentity | None = None
+        self._lock_parent_identity: _ManagedDirectoryIdentity | None = None
+        self._active_lock_descriptor: int | None = None
+        self._active_lock_identity: os.stat_result | None = None
+        self._active_lock_parent_descriptor: int | None = None
+        self._active_root_descriptor: int | None = None
         self.mutation_guard = mutation_guard
         self.max_isolation_records = max_isolation_records
         self.max_isolation_bytes = max_isolation_bytes
-        self._ensure_private_root()
-        for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
-            self._ensure_directory(path)
-        with self._exclusive_lock():
+        with self._exclusive_lock(require_root=False):
+            self._ensure_private_root()
+            for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
+                self._ensure_directory(path)
             self._reconcile_owned_isolations_locked()
             self._prune_owned_isolations_locked()
 
     @contextmanager
-    def _exclusive_lock(self) -> Iterator[None]:
+    def _exclusive_lock(self, *, require_root: bool = True) -> Iterator[None]:
         with self._thread_lock:
-            root_descriptor = self._open_private_root()
+            parent_descriptor = self._open_lock_parent()
             descriptor = -1
+            root_descriptor = -1
             try:
-                descriptor = self._open_private_lock(root_descriptor)
+                descriptor = self._open_private_lock(parent_descriptor)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
-                self._assert_managed_directories_bound()
+                active_lock = os.fstat(descriptor)
+                self._active_lock_parent_descriptor = parent_descriptor
+                self._active_lock_descriptor = descriptor
+                self._active_lock_identity = active_lock
+                if require_root:
+                    root_descriptor = self._open_private_root()
+                    self._active_root_descriptor = root_descriptor
+                    self._assert_managed_directories_bound()
                 yield
             finally:
+                self._active_root_descriptor = None
+                self._active_lock_identity = None
+                self._active_lock_descriptor = None
+                self._active_lock_parent_descriptor = None
+                if root_descriptor >= 0:
+                    os.close(root_descriptor)
                 if descriptor >= 0:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
                     os.close(descriptor)
-                os.close(root_descriptor)
+                os.close(parent_descriptor)
 
     def _fsync_directory(self, path: Path) -> None:
         descriptor = self._open_managed_directory(path)
@@ -409,6 +430,8 @@ class LabCommandSpool:
             os.close(descriptor)
 
     def _guard_mutation(self) -> None:
+        if self._active_lock_descriptor is not None:
+            self._assert_active_lock_authority()
         if self.mutation_guard is not None:
             self.mutation_guard()
 
@@ -454,6 +477,10 @@ class LabCommandSpool:
         except OSError as exc:
             raise InvalidCommandEnvelopeError("command spool root is unsafe") from exc
         self._validate_private_directory_stat(observed, label="command spool root")
+        identity = self._directory_identity(observed)
+        if self._root_identity is not None and identity != self._root_identity:
+            raise InvalidCommandEnvelopeError("command spool root identity changed")
+        self._root_identity = identity
         descriptor = self._open_private_root()
         os.close(descriptor)
 
@@ -470,6 +497,11 @@ class LabCommandSpool:
                 opened,
                 include_link_count=False,
             ) or not self._same_stat(opened, active, include_link_count=False):
+                raise InvalidCommandEnvelopeError("command spool root identity changed")
+            if self._root_identity is not None and (
+                self._directory_identity(opened) != self._root_identity
+                or self._directory_identity(active) != self._root_identity
+            ):
                 raise InvalidCommandEnvelopeError("command spool root identity changed")
             return descriptor
         except BaseException:
@@ -671,12 +703,38 @@ class LabCommandSpool:
         finally:
             os.close(descriptor)
 
-    def _open_private_lock(self, root_descriptor: int) -> int:
+    def _open_lock_parent(self) -> int:
+        parent = self.root.parent
+        try:
+            before = parent.lstat()
+            self._validate_private_directory_stat(before, label="spool lock parent")
+            descriptor = os.open(
+                parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            active = parent.lstat()
+        except BaseException:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise
+        identity = self._directory_identity(opened)
+        if (
+            not self._same_stat(before, opened, include_link_count=False)
+            or not self._same_stat(opened, active, include_link_count=False)
+            or (self._lock_parent_identity is not None and identity != self._lock_parent_identity)
+        ):
+            os.close(descriptor)
+            raise InvalidCommandEnvelopeError("spool lock parent identity changed")
+        self._lock_parent_identity = identity
+        return descriptor
+
+    def _open_private_lock(self, parent_descriptor: int) -> int:
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         try:
             observed = os.stat(
                 self._lock_path.name,
-                dir_fd=root_descriptor,
+                dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
         except FileNotFoundError:
@@ -686,7 +744,7 @@ class LabCommandSpool:
                     self._lock_path.name,
                     flags | os.O_CREAT | os.O_EXCL,
                     0o600,
-                    dir_fd=root_descriptor,
+                    dir_fd=parent_descriptor,
                 )
             except FileExistsError:
                 descriptor = -1
@@ -695,7 +753,7 @@ class LabCommandSpool:
             else:
                 observed = os.stat(
                     self._lock_path.name,
-                    dir_fd=root_descriptor,
+                    dir_fd=parent_descriptor,
                     follow_symlinks=False,
                 )
         if (
@@ -712,14 +770,14 @@ class LabCommandSpool:
                 descriptor = os.open(
                     self._lock_path.name,
                     flags,
-                    dir_fd=root_descriptor,
+                    dir_fd=parent_descriptor,
                 )
             except OSError as exc:
                 raise InvalidCommandEnvelopeError("spool lock is unsafe") from exc
         opened = os.fstat(descriptor)
         active = os.stat(
             self._lock_path.name,
-            dir_fd=root_descriptor,
+            dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
         if not self._same_stat(
@@ -730,6 +788,39 @@ class LabCommandSpool:
             os.close(descriptor)
             raise InvalidCommandEnvelopeError("spool lock identity changed")
         return descriptor
+
+    def _assert_active_lock_authority(self) -> None:
+        descriptor = self._active_lock_descriptor
+        parent_descriptor = self._active_lock_parent_descriptor
+        expected = self._active_lock_identity
+        if descriptor is None or parent_descriptor is None or expected is None:
+            raise InvalidCommandEnvelopeError("spool lock authority is unavailable")
+        opened = os.fstat(descriptor)
+        active = os.stat(
+            self._lock_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        current_parent = self.root.parent.lstat()
+        if (
+            not self._same_stat(expected, opened, include_link_count=True)
+            or not self._same_stat(opened, active, include_link_count=True)
+            or self._lock_parent_identity is None
+            or self._directory_identity(current_parent) != self._lock_parent_identity
+        ):
+            raise InvalidCommandEnvelopeError("spool lock identity changed")
+        if self._root_identity is not None:
+            try:
+                current_root = self.root.lstat()
+            except OSError as exc:
+                raise InvalidCommandEnvelopeError("command spool root identity changed") from exc
+            if self._directory_identity(current_root) != self._root_identity:
+                raise InvalidCommandEnvelopeError("command spool root identity changed")
+            if self._active_root_descriptor is not None and (
+                self._directory_identity(os.fstat(self._active_root_descriptor))
+                != self._root_identity
+            ):
+                raise InvalidCommandEnvelopeError("command spool root identity changed")
 
     def _publish_no_clobber(self, target: Path, payload: bytes) -> bool:
         target_name = self._direct_child_name(target, target.parent)
@@ -799,26 +890,100 @@ class LabCommandSpool:
             os.close(directory_descriptor)
 
     def _next_sequence_locked(self) -> int:
-        if self._sequence_path.exists():
-            raw = self._sequence_path.read_text(encoding="ascii").strip()
-            if not raw.isdigit():
-                raise InvalidCommandEnvelopeError("invalid durable delivery sequence")
-            current = int(raw)
-        else:
-            current = 0
-        sequence = current + 1
-        temporary = self.root / f".{self._sequence_path.name}.{uuid4().hex}.tmp"
+        root_descriptor = self._open_private_root()
+        temporary_name = f".{self._sequence_path.name}.{uuid4().hex}.tmp"
+        temporary_descriptor = -1
         try:
-            with temporary.open("xb") as stream:
-                stream.write(f"{sequence}\n".encode("ascii"))
-                stream.flush()
-                os.fsync(stream.fileno())
+            try:
+                sequence_descriptor = os.open(
+                    self._sequence_path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=root_descriptor,
+                )
+            except FileNotFoundError:
+                current = 0
+            else:
+                try:
+                    observed = os.fstat(sequence_descriptor)
+                    if (
+                        not stat.S_ISREG(observed.st_mode)
+                        or observed.st_uid != os.getuid()
+                        or observed.st_nlink != 1
+                        or stat.S_IMODE(observed.st_mode) != 0o600
+                        or observed.st_size > 64
+                    ):
+                        raise InvalidCommandEnvelopeError("invalid durable delivery sequence")
+                    raw = os.read(sequence_descriptor, 64).decode("ascii").strip()
+                    active = os.stat(
+                        self._sequence_path.name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not self._same_stat(observed, active, include_link_count=True):
+                        raise InvalidCommandEnvelopeError(
+                            "durable delivery sequence identity changed"
+                        )
+                    if not raw.isdigit():
+                        raise InvalidCommandEnvelopeError("invalid durable delivery sequence")
+                    current = int(raw)
+                finally:
+                    os.close(sequence_descriptor)
+            sequence = current + 1
+            temporary_descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=root_descriptor,
+            )
+            payload = f"{sequence}\n".encode("ascii")
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(temporary_descriptor, payload[offset:])
+            os.fsync(temporary_descriptor)
+            self._after_sequence_stage("temporary_written", self.root / temporary_name)
             self._guard_mutation()
-            os.replace(temporary, self._sequence_path)
-            self._fsync_directory(self.root)
+            temporary_identity = os.fstat(temporary_descriptor)
+            active_temporary = os.stat(
+                temporary_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if not self._same_stat(
+                temporary_identity,
+                active_temporary,
+                include_link_count=True,
+            ):
+                raise InvalidCommandEnvelopeError("delivery sequence temporary identity changed")
+            os.replace(
+                temporary_name,
+                self._sequence_path.name,
+                src_dir_fd=root_descriptor,
+                dst_dir_fd=root_descriptor,
+            )
+            published = os.stat(
+                self._sequence_path.name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if not self._same_stat(
+                temporary_identity,
+                published,
+                include_link_count=True,
+            ):
+                raise InvalidCommandEnvelopeError("delivery sequence publish identity changed")
+            os.fsync(root_descriptor)
+            self._after_sequence_stage("sequence_replaced", self._sequence_path)
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=root_descriptor)
+            os.close(root_descriptor)
         return sequence
+
+    @staticmethod
+    def _after_sequence_stage(_stage: str, _path: Path) -> None:
+        """Fault-injection boundary for the durable delivery sequence."""
 
     @staticmethod
     def _direct_child_name(path: Path, parent: Path) -> str:

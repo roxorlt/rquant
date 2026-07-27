@@ -216,14 +216,64 @@ def verify_lab_runtime_binding(
     return verified_code_sha
 
 
+def _verify_deployment_generation(
+    *,
+    expected_checkout_root: Path,
+    expected_generation: str,
+    lock_path: Path,
+    lock_fd: int,
+) -> None:
+    expected_lock = (
+        expected_checkout_root.parent / ".rquant-deploy" / f"{expected_checkout_root.name}.lock"
+    )
+    candidate = _canonical_absolute_path(lock_path, label="deployment generation lock")
+    if candidate != expected_lock:
+        raise LabDaemonConfigurationError("deployment generation lock path mismatch")
+    if _CODE_SHA.fullmatch(expected_generation) is None or lock_fd < 0:
+        raise LabDaemonConfigurationError("deployment generation binding is invalid")
+    try:
+        opened = os.fstat(lock_fd)
+        active = candidate.lstat()
+        fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as exc:
+        raise LabDaemonConfigurationError("deployment generation lock is unavailable") from exc
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+        != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise LabDaemonConfigurationError("deployment generation lock identity changed")
+
+
 def require_lab_runtime_binding(
     expected_checkout_root: Path,
     trusted_git_path: Path = Path("/usr/bin/git"),
+    *,
+    deployment_generation: str | None = None,
+    deployment_lock_path: Path | None = None,
+    deployment_generation_fd: int | None = None,
 ) -> str:
     """Read and verify all live process identities before daemon I/O starts."""
     expected, _expected_venv = _require_physical_checkout_virtualenv(
         expected_checkout_root,
     )
+    generation_values = (
+        deployment_generation,
+        deployment_lock_path,
+        deployment_generation_fd,
+    )
+    if any(value is not None for value in generation_values):
+        if any(value is None for value in generation_values):
+            raise LabDaemonConfigurationError("deployment generation binding is incomplete")
+        _verify_deployment_generation(
+            expected_checkout_root=expected,
+            expected_generation=str(deployment_generation),
+            lock_path=Path(deployment_lock_path),
+            lock_fd=int(deployment_generation_fd),
+        )
     import rquant
     from rquant.research_manifest import (
         _run_trusted_git,
@@ -306,6 +356,15 @@ def require_lab_runtime_binding(
     )
     if verified != git_head:
         raise LabDaemonConfigurationError("lab runtime binding verified SHA mismatch")
+    if deployment_generation is not None:
+        if verified != deployment_generation:
+            raise LabDaemonConfigurationError("deployment generation SHA mismatch")
+        _verify_deployment_generation(
+            expected_checkout_root=expected,
+            expected_generation=deployment_generation,
+            lock_path=Path(deployment_lock_path),
+            lock_fd=int(deployment_generation_fd),
+        )
     return verified
 
 
@@ -317,6 +376,9 @@ class LabRuntimeGuard:
     startup_sha: str
     trusted_git_path: Path = Path("/usr/bin/git")
     verifier: Callable[[Path], str] | None = None
+    deployment_generation: str | None = None
+    deployment_lock_path: Path | None = None
+    deployment_generation_fd: int | None = None
 
     def __post_init__(self) -> None:
         expected = _canonical_absolute_path(
@@ -331,15 +393,39 @@ class LabRuntimeGuard:
         object.__setattr__(self, "expected_checkout_root", expected)
         object.__setattr__(self, "startup_sha", startup_sha)
         object.__setattr__(self, "trusted_git_path", trusted_git_path)
+        generation_values = (
+            self.deployment_generation,
+            self.deployment_lock_path,
+            self.deployment_generation_fd,
+        )
+        if any(value is not None for value in generation_values) and any(
+            value is None for value in generation_values
+        ):
+            raise LabDaemonConfigurationError("deployment generation guard is incomplete")
 
     def verify(self) -> str:
         try:
+            if self.deployment_generation is not None:
+                _verify_deployment_generation(
+                    expected_checkout_root=self.expected_checkout_root,
+                    expected_generation=self.deployment_generation,
+                    lock_path=Path(self.deployment_lock_path),
+                    lock_fd=int(self.deployment_generation_fd),
+                )
             if self.verifier is not None:
                 observed = self.verifier(self.expected_checkout_root)
             else:
+                binding: dict[str, object] = {}
+                if self.deployment_generation is not None:
+                    binding = {
+                        "deployment_generation": self.deployment_generation,
+                        "deployment_lock_path": self.deployment_lock_path,
+                        "deployment_generation_fd": self.deployment_generation_fd,
+                    }
                 observed = require_lab_runtime_binding(
                     self.expected_checkout_root,
                     self.trusted_git_path,
+                    **binding,
                 )
         except LabDaemonConfigurationError:
             raise
@@ -348,6 +434,15 @@ class LabRuntimeGuard:
         current = require_clean_code_sha(lambda: observed)
         if current != self.startup_sha:
             raise LabDaemonConfigurationError("lab runtime guard detected startup SHA drift")
+        if self.deployment_generation is not None:
+            if current != self.deployment_generation:
+                raise LabDaemonConfigurationError("lab runtime guard generation drift")
+            _verify_deployment_generation(
+                expected_checkout_root=self.expected_checkout_root,
+                expected_generation=self.deployment_generation,
+                lock_path=Path(self.deployment_lock_path),
+                lock_fd=int(self.deployment_generation_fd),
+            )
         return current
 
 

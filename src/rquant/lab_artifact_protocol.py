@@ -459,7 +459,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         if not self._managed_entry_exists(self._scan_cursor_path, self.root):
             return None
         try:
-            observed = self._scan_cursor_path.lstat()
+            observed = self._managed_entry_stat(self._scan_cursor_path, self.root)
         except FileNotFoundError:
             return None
         try:
@@ -478,11 +478,13 @@ class LabArtifactCommitSpool(LabCommandSpool):
             return None
 
     def _recover_scan_cursor_temporaries_locked(self) -> None:
-        for temporary in sorted(self.root.glob("..artifact-commit-scan-cursor.json.*.tmp")):
+        for temporary in sorted(
+            self._managed_paths(self.root, "..artifact-commit-scan-cursor.json.*.tmp")
+        ):
             if self._SCAN_CURSOR_TEMP_NAME.fullmatch(temporary.name) is None:
                 continue
             try:
-                observed = temporary.lstat()
+                observed = self._managed_entry_stat(temporary, self.root)
             except FileNotFoundError:
                 continue
             with suppress(OSError, InvalidCommandEnvelopeError):
@@ -516,24 +518,69 @@ class LabArtifactCommitSpool(LabCommandSpool):
         """Fault-injection boundary for advisory scan cursor publication."""
 
     def _write_scan_cursor_locked(self, cursor: LabArtifactCommitScanCursor) -> None:
-        temporary = self.root / f".{self._scan_cursor_path.name}.{uuid4().hex}.tmp"
+        temporary_name = f".{self._scan_cursor_path.name}.{uuid4().hex}.tmp"
+        temporary = self.root / temporary_name
+        root_descriptor = self._open_private_root()
+        temporary_descriptor = -1
         try:
             try:
-                with temporary.open("xb") as stream:
-                    stream.write(cursor.model_dump_json().encode("utf-8"))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                self._fsync_directory(self.root)
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+                payload = cursor.model_dump_json().encode("utf-8")
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(temporary_descriptor, payload[offset:])
+                os.fsync(temporary_descriptor)
+                os.fsync(root_descriptor)
                 self._after_scan_cursor_stage("temporary_written", temporary)
                 self._guard_mutation()
-                os.replace(temporary, self._scan_cursor_path)
-                self._fsync_directory(self.root)
+                temporary_identity = os.fstat(temporary_descriptor)
+                active_temporary = os.stat(
+                    temporary_name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                if not self._same_stat(
+                    temporary_identity,
+                    active_temporary,
+                    include_link_count=True,
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        "artifact scan cursor temporary identity changed"
+                    )
+                os.replace(
+                    temporary_name,
+                    self._scan_cursor_path.name,
+                    src_dir_fd=root_descriptor,
+                    dst_dir_fd=root_descriptor,
+                )
+                published = os.stat(
+                    self._scan_cursor_path.name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                if not self._same_stat(
+                    temporary_identity,
+                    published,
+                    include_link_count=True,
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        "artifact scan cursor publish identity changed"
+                    )
+                os.fsync(root_descriptor)
                 self._after_scan_cursor_stage("cursor_replaced", self._scan_cursor_path)
             except OSError:
                 return
         finally:
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
             with suppress(OSError):
-                temporary.unlink(missing_ok=True)
+                os.unlink(temporary_name, dir_fd=root_descriptor)
+            os.close(root_descriptor)
 
     def fair_pending_paths(self, *, limit: int) -> tuple[Path, ...]:
         if limit < 1:

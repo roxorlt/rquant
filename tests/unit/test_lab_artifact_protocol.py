@@ -395,6 +395,27 @@ def test_commit_spool_cursor_write_crash_is_advisory_across_restart(tmp_path: Pa
     assert tuple(root.glob(".*scan-cursor*.tmp")) == ()
 
 
+def test_commit_cursor_never_publishes_into_replaced_spool_root(tmp_path: Path) -> None:
+    root = tmp_path / "commits"
+    displaced = tmp_path / "commits.displaced"
+
+    class ReplacingCursorSpool(LabArtifactCommitSpool):
+        def _after_scan_cursor_stage(self, stage: str, _path: Path) -> None:
+            if stage == "temporary_written":
+                root.rename(displaced)
+                root.mkdir(mode=0o700)
+
+    spool = ReplacingCursorSpool(root)
+    valid = spool.publish(_envelope(tmp_path))
+    assert isinstance(valid, LabArtifactCommitSpoolEntry)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity changed"):
+        spool.fair_pending_paths(limit=1)
+
+    assert tuple(root.iterdir()) == ()
+    assert not (root / ".artifact-commit-scan-cursor.json").exists()
+
+
 @pytest.mark.parametrize("crash_stage", ["temporary_written", "cursor_replaced"])
 def test_commit_spool_real_process_cursor_crash_reconciles_owned_temporary(
     tmp_path: Path,

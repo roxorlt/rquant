@@ -14,8 +14,10 @@ PYTHON = f"{WORKING_DIRECTORY}/.venv/bin/python"
 WRAPPER = f"{WORKING_DIRECTORY}/scripts/run-lab-daemon.py"
 EXECUTABLE = f"{WORKING_DIRECTORY}/.venv/bin/rquant"
 TRUSTED_GIT = "/usr/bin/git"
+DEPLOYMENT_LOCK = "/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock"
 EXPECTED_ROOT_ARGUMENTS = ["--expected-checkout-root", WORKING_DIRECTORY]
 TRUSTED_GIT_ARGUMENTS = ["--trusted-git-path", TRUSTED_GIT]
+DEPLOYMENT_LOCK_ARGUMENTS = ["--deployment-lock-path", DEPLOYMENT_LOCK]
 WRAPPER_ARGUMENTS = [
     PYTHON,
     "-I",
@@ -23,6 +25,7 @@ WRAPPER_ARGUMENTS = [
     WRAPPER,
     *EXPECTED_ROOT_ARGUMENTS,
     *TRUSTED_GIT_ARGUMENTS,
+    *DEPLOYMENT_LOCK_ARGUMENTS,
     "--",
 ]
 
@@ -148,14 +151,24 @@ def test_lab_launchd_exact_runtime_rejects_editable_import_from_other_worktree(
     reason="linked worktree runtime is unavailable",
 )
 def test_real_worktree_launcher_rejects_symlinked_venv_before_config() -> None:
-    executable = ROOT / ".venv" / "bin" / "rquant"
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(ROOT / "src")
     environment["DATA_DIR"] = "relative-data-must-not-be-read"
 
     result = subprocess.run(
         [
-            str(executable),
+            str(ROOT / ".venv" / "bin" / "python"),
+            "-I",
+            "-S",
+            str(ROOT / "scripts" / "run-lab-daemon.py"),
+            "--expected-checkout-root",
+            str(ROOT),
+            "--trusted-git-path",
+            TRUSTED_GIT,
+            "--deployment-lock-path",
+            str(ROOT.parent / ".rquant-deploy" / f"{ROOT.name}.lock"),
+            "--",
+            str(ROOT / ".venv" / "bin" / "rquant"),
             "lab-worker",
             "--expected-checkout-root",
             str(ROOT),
@@ -175,7 +188,7 @@ def test_real_worktree_launcher_rejects_symlinked_venv_before_config() -> None:
 
     output = result.stdout + result.stderr
     assert result.returncode != 0
-    assert "physical virtualenv" in output
+    assert "physical directory" in output
     assert "relative-data-must-not-be-read" not in output
 
 

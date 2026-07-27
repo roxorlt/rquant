@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -187,6 +189,22 @@ def test_dry_run_builds_exact_plan_without_mutating_repo(tmp_path: Path) -> None
     assert result.target_sha == _sha("b")
     assert ("git", "merge", "--ff-only", _sha("b")) not in runner.calls
     assert ("uv", "sync", "--frozen") not in runner.calls
+
+
+def test_deployment_refuses_to_mutate_generation_held_by_daemon(tmp_path: Path) -> None:
+    lock_root = tmp_path.parent / ".rquant-deploy"
+    lock_root.mkdir(mode=0o700, exist_ok=True)
+    lock_path = lock_root / f"{tmp_path.name}.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    runner = FakeRunner(_base_responses())
+    try:
+        with pytest.raises(PolicyError, match="deployment is already running"):
+            deploy(_config(tmp_path, dry_run=True), runner=runner)
+    finally:
+        os.close(descriptor)
+
+    assert runner.calls == []
 
 
 def test_deploy_rejects_tracked_dirty_worktree(tmp_path: Path) -> None:

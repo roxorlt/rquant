@@ -14,6 +14,8 @@
         <string>/Users/roxor/brain/30-projects/rQuant</string>
         <string>--trusted-git-path</string>
         <string>/usr/bin/git</string>
+        <string>--deployment-lock-path</string>
+        <string>/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock</string>
         <string>--</string>
         <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/rquant</string>
         <string>lab-scheduler</string>

@@ -815,12 +815,13 @@ class LabClaimSpool(_TypedSpoolBase):
         self.pending_cursor_path = self.root / ".hot-pending-cursor-v1.json"
         self.admitted_dir = self.root / "admitted"
         self.admission_tmp_dir = self.admitted_dir / ".tmp"
-        self._ensure_directory(self.current_dir)
-        self._ensure_directory(self.retired_dir)
-        self._ensure_directory(self.revoked_dir)
-        self._ensure_directory(self.archived_revoked_dir)
-        self._ensure_directory(self.admitted_dir)
-        self._ensure_directory(self.admission_tmp_dir, mode=0o700)
+        with self._exclusive_lock():
+            self._ensure_directory(self.current_dir)
+            self._ensure_directory(self.retired_dir)
+            self._ensure_directory(self.revoked_dir)
+            self._ensure_directory(self.archived_revoked_dir)
+            self._ensure_directory(self.admitted_dir)
+            self._ensure_directory(self.admission_tmp_dir, mode=0o700)
         self._claim_advance_hook = claim_advance_hook
 
     def set_claim_advance_hook(

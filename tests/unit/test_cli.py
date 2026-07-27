@@ -17,6 +17,16 @@ from rquant.cli import build_parser
 
 _LAB_EXPECTED_ROOT = "/tmp/rquant-expected"
 _LAB_TRUSTED_GIT = "/usr/bin/git"
+_LAB_GENERATION = "1" * 40
+_LAB_DEPLOYMENT_LOCK = "/tmp/.rquant-deploy/rquant-expected.lock"
+_LAB_GENERATION_ARGUMENTS = [
+    "--deployment-generation",
+    _LAB_GENERATION,
+    "--deployment-lock-path",
+    _LAB_DEPLOYMENT_LOCK,
+    "--deployment-generation-fd",
+    "9",
+]
 
 
 class _FakeLabSqliteAuthority:
@@ -3749,6 +3759,7 @@ class TestLabSchedulerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
+                *_LAB_GENERATION_ARGUMENTS,
                 "--once",
             ]
         )
@@ -3767,6 +3778,7 @@ class TestLabSchedulerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
+                *_LAB_GENERATION_ARGUMENTS,
             ]
         )
 
@@ -3987,6 +3999,7 @@ class TestLabWorkerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
+                *_LAB_GENERATION_ARGUMENTS,
                 "--worker-id",
                 "worker-a",
                 "--once",

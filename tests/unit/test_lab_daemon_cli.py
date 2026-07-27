@@ -12,6 +12,7 @@ from rquant.lab_daemon import LabDaemonConfigurationError
 
 EXPECTED_ROOT = "/tmp/rquant-expected"
 TRUSTED_GIT = "/usr/bin/git"
+GENERATION = "1" * 40
 
 
 class _FakeSqliteAuthority:
@@ -32,6 +33,12 @@ def test_parser_registers_finalizer_and_keeps_legacy_lab_run() -> None:
             EXPECTED_ROOT,
             "--trusted-git-path",
             TRUSTED_GIT,
+            "--deployment-generation",
+            GENERATION,
+            "--deployment-lock-path",
+            "/tmp/.rquant-deploy/rquant-expected.lock",
+            "--deployment-generation-fd",
+            "9",
             "--once",
         ]
     )
