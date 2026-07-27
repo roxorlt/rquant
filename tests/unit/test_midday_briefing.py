@@ -267,6 +267,52 @@ class TestU6PositionCheck:
 
 
 class TestU7Rendering:
+    def test_pulse_groups_sections_for_mobile(self) -> None:
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=72,
+            broken_count=19,
+            limit_down_count=2,
+            up_count=5022,
+            down_count=434,
+            limit_up_delta=14,
+            broken_delta=6,
+            new_limit_ups=[
+                mb.NewLimitUp(
+                    ts_code="600683.SH",
+                    name="京投发展",
+                    theme="银发经济",
+                )
+            ],
+            theme_heat=[
+                ThemeHeat(theme="AI硬件", limit_up_count=10, delta=3)
+            ],
+            new_anomalies=[
+                mb.VolAnomaly(
+                    ts_code="300039.SZ",
+                    name="上海凯宝",
+                    vol_ratio=1.26,
+                )
+            ],
+        )
+
+        _, body = render_pulse(view)
+
+        expected = (
+            "## 市场温度\n"
+            "- 涨停：72（+14） ｜ 炸板：19（+6） ｜ 跌停：2\n"
+            "- 上涨：5022 ｜ 下跌：434\n\n"
+            "## 新晋涨停\n"
+            "- 京投发展 ｜ 银发经济\n\n"
+            "## 题材热度\n"
+            "- AI硬件：10板（+3）\n\n"
+            "## 放量异动新增\n"
+            "- 上海凯宝：量比 1.26"
+        )
+        assert expected in body
+        assert "新晋涨停：京投发展(银发经济)" not in body
+
     def test_pulse_lines(self) -> None:
         view = PulseView(
             slot_hhmm="10:30", has_prev=True, limit_up_count=47, broken_count=6,
@@ -276,8 +322,8 @@ class TestU7Rendering:
         )
         title, body = render_pulse(view)
         assert "涨停47(+9)" in title
-        assert "涨跌比 2871/2130" in body
-        assert "人形机器人 5板(+2)" in body
+        assert "- 上涨：2871 ｜ 下跌：2130" in body
+        assert "- 人形机器人：5板（+2）" in body
 
     def test_digest_five_sections(self) -> None:
         view = DigestView(
