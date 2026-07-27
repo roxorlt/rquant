@@ -1553,7 +1553,36 @@ def test_finalizer_state_existing_concurrent_replacement_is_not_overwritten(
     assert store.path.read_bytes() == concurrent
 
 
-def test_finalizer_state_save_rejects_same_size_replacement_and_restores_previous(
+def test_finalizer_state_recovery_does_not_overwrite_concurrent_legal_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=1))
+    concurrent = LabFinalizerDaemonState(cycle=99).model_dump_json().encode("utf-8")
+    real_replace = os.replace
+    injected = False
+
+    def replace_then_update(*args: object, **kwargs: object) -> None:
+        nonlocal injected
+        real_replace(*args, **kwargs)
+        if not injected and args[1] == store.path.name:
+            injected = True
+            replacement = state_dir / ".concurrent-legal-state.tmp"
+            replacement.write_bytes(concurrent)
+            replacement.chmod(0o600)
+            real_replace(replacement, store.path)
+
+    monkeypatch.setattr("rquant.lab_daemon.os.replace", replace_then_update)
+
+    with pytest.raises(LabDaemonConfigurationError, match="identity changed after commit"):
+        store.save(LabFinalizerDaemonState(cycle=2))
+
+    assert store.load().cycle == 99
+
+
+def test_finalizer_state_save_preserves_same_size_concurrent_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1561,18 +1590,17 @@ def test_finalizer_state_save_rejects_same_size_replacement_and_restores_previou
     store = LabFinalizerStateStore(state_dir)
     store.save(LabFinalizerDaemonState(cycle=7))
     state_path = state_dir / "state.json"
-    original = state_path.read_bytes()
     real_replace = os.replace
     attacked = False
+    attacker_payload = b" " * len(state_path.read_bytes())
 
     def replace_then_attack(*args: object, **kwargs: object) -> None:
         nonlocal attacked
         real_replace(*args, **kwargs)
         if not attacked and args[1] == "state.json":
             attacked = True
-            payload = state_path.read_bytes()
             attacker = state_dir / "attacker.json"
-            attacker.write_bytes(b" " * len(payload))
+            attacker.write_bytes(attacker_payload)
             attacker.chmod(0o600)
             real_replace(attacker, state_path)
 
@@ -1581,8 +1609,7 @@ def test_finalizer_state_save_rejects_same_size_replacement_and_restores_previou
     with pytest.raises(LabDaemonConfigurationError, match="identity changed after commit"):
         store.save(LabFinalizerDaemonState(cycle=8))
 
-    assert state_path.read_bytes() == original
-    assert store.load().cycle == 7
+    assert state_path.read_bytes() == attacker_payload
 
 
 def test_finalizer_state_save_rejects_root_replacement_after_atomic_replace(

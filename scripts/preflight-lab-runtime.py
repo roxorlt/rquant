@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo"})
+EXECUTABLE_SUFFIXES = frozenset({".pyc", ".pyo", ".so", ".dylib", ".pyd"})
 
 
 class PreflightError(RuntimeError):
@@ -63,7 +63,7 @@ def _runtime_artifacts(checkout: Path) -> tuple[Path, ...]:
             directory_names[:] = physical_directories
             for name in file_names:
                 child = current / name
-                if child.is_symlink() or child.suffix.lower() in BYTECODE_SUFFIXES:
+                if child.is_symlink() or child.suffix.lower() in EXECUTABLE_SUFFIXES:
                     found.append(child)
     except OSError as exc:
         raise PreflightError("runtime artifact scan failed closed") from exc
@@ -78,13 +78,13 @@ def main(argv: list[str] | None = None) -> int:
         checkout = _checkout_root(args.checkout_root)
         artifacts = _runtime_artifacts(checkout)
         if not artifacts:
-            print("Lab runtime preflight: no Python bytecode or package symlinks")
+            print("Lab runtime preflight: no executable artifacts or package symlinks")
             return 0
         preview = ", ".join(str(path.relative_to(checkout)) for path in artifacts[:20])
         if len(artifacts) > 20:
             preview = f"{preview}, ..."
         raise PreflightError(
-            "ignored Python bytecode or package symlinks block formal runtime: "
+            "ignored executable artifacts or package symlinks block formal runtime: "
             f"{len(artifacts)} artifact(s); manually verify and remove only these "
             f"repository entries, then rerun: {preview}"
         )

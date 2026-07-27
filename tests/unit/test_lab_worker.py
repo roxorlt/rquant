@@ -1049,6 +1049,30 @@ def test_artifact_reclaimer_checks_runtime_inside_evidence_lock(tmp_path: Path) 
     assert ledger_dir.is_dir()
 
 
+def test_worker_temporary_quarantine_is_fenced_inside_reclaimer_lock(
+    tmp_path: Path,
+) -> None:
+    armed = False
+
+    def runtime_guard() -> str:
+        if armed:
+            raise LabDaemonConfigurationError("runtime drifted inside quarantine lock")
+        return "1" * 40
+
+    worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
+    temporary = worker.artifact_root / "candidate-temporary"
+    temporary.mkdir(mode=0o700)
+    (temporary / "payload.json").write_text("{}", encoding="utf-8")
+    armed = True
+
+    with pytest.raises(LabDaemonConfigurationError, match="inside quarantine lock"):
+        worker._cleanup_temporary(temporary)
+
+    assert temporary.is_dir()
+    assert tuple(worker.artifact_reclaimer.garbage_deferred_dir.iterdir()) == ()
+    assert tuple(worker.artifact_reclaimer.garbage_intent_dir.iterdir()) == ()
+
+
 def _crash_reclaimer_after_tombstone_rename_child(
     root_value: str,
     claim_payload: str,
@@ -1251,15 +1275,19 @@ def test_worker_runtime_drift_before_claim_boundary_does_not_consume_claim(
     claims = LabClaimSpool(tmp_path / "claims")
     claim = _claim(_nshape_compare_spec())
     claims.publish(claim)
+    armed = False
 
     def runtime_guard() -> str:
-        raise LabDaemonConfigurationError("runtime checkout drifted")
+        if armed:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
 
     worker = _worker(
         tmp_path,
         claims=claims,
         verified_code_sha_provider=runtime_guard,
     )
+    armed = True
 
     with pytest.raises(LabDaemonConfigurationError, match="drifted"):
         worker.run_once()

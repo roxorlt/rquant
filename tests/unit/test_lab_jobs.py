@@ -352,6 +352,91 @@ def test_store_internal_mutation_fence_rolls_back_before_sqlite_commit(
     assert LabJobReader(store.path).get_job(envelope.command.job_id) is None
 
 
+def test_initialize_guards_wal_and_schema_commit_as_separate_persistent_boundaries(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lab-jobs.sqlite3"
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("runtime drifted before schema commit")
+        return "1" * 40
+
+    store = LabJobStore(path, mutation_guard=mutation_guard)
+
+    with pytest.raises(RuntimeError, match="before schema commit"):
+        store.initialize()
+
+    assert calls == 1
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'lab_%'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_initialize_guards_persistent_wal_mutation_after_schema_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(lab_jobs._LabJobStoreConnection):
+        def execute(self, sql: str, parameters: object = (), /):  # type: ignore[override]
+            if sql.strip().upper() == "PRAGMA JOURNAL_MODE = WAL":
+                events.append("wal")
+            return super().execute(sql, parameters)
+
+        def commit(self) -> None:
+            events.append("commit")
+            super().commit()
+
+    def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = TrackingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(lab_jobs.sqlite3, "connect", tracking_connect)
+
+    def mutation_guard() -> str:
+        events.append("guard")
+        return "1" * 40
+
+    LabJobStore(tmp_path / "lab-jobs.sqlite3", mutation_guard=mutation_guard).initialize()
+
+    assert events == ["guard", "commit", "guard", "wal"]
+
+
+def test_initialize_rejects_runtime_drift_between_schema_commit_and_wal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lab-jobs.sqlite3"
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("runtime drifted after schema commit")
+        return "1" * 40
+
+    with pytest.raises(RuntimeError, match="after schema commit"):
+        LabJobStore(path, mutation_guard=mutation_guard).initialize()
+
+    assert calls == 2
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA application_id").fetchone()[0] == lab_jobs._APPLICATION_ID
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == lab_jobs._SCHEMA_VERSION
+        assert str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal"
+
+
 def test_staged_commit_validation_failure_rolls_back_and_closes(tmp_path: Path) -> None:
     lease = _lease(_store(tmp_path))
     connection = _StagedLifecycleConnection()

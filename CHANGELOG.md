@@ -125,6 +125,12 @@
   finalizer state 以私有 writer lock 串行保存，并在最终替换前复验既有完整 inode 身份，拒绝覆盖
   并发创建或更新的状态。
 
+- **Strategy Lab daemon 第八轮执行边界加固**：部署前 detection-only preflight 现在同时拒绝
+  `.pyc/.pyo/.so/.dylib/.pyd` 与 package symlink；正式 worker 将动态 runtime guard 传入
+  `LabArtifactReclaimer`，并在其 queue、intent、migration、recovery、quarantine 与 reclaim 的锁内
+  最终文件 mutation 前复验。finalizer state 恢复改用 no-clobber 发布，不覆盖并发状态；Lab SQLite
+  初始化分别在 schema commit 与后续 WAL 持久化前复验，失败迁移不再改变原数据库 journal mode。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

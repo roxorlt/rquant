@@ -4985,6 +4985,19 @@ class LabJobStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect(validate_identity=False)
         try:
+            _validate_database_identity(
+                connection,
+                allow_unclaimed_empty=True,
+                accepted_versions=frozenset(
+                    {
+                        _LEGACY_SCHEMA_VERSION,
+                        _V2_SCHEMA_VERSION,
+                        _V3_SCHEMA_VERSION,
+                        _PREVIOUS_SCHEMA_VERSION,
+                        _SCHEMA_VERSION,
+                    }
+                ),
+            )
             connection.execute("BEGIN IMMEDIATE")
             unclaimed = _validate_database_identity(
                 connection,
@@ -5040,7 +5053,11 @@ class LabJobStore:
             if self.mutation_guard is not None:
                 self.mutation_guard()
             connection.commit()
-            connection.execute("PRAGMA journal_mode = WAL")
+            if self.mutation_guard is not None:
+                self.mutation_guard()
+            journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if str(journal_mode).lower() != "wal":
+                raise LabDatabaseIdentityError("lab jobs SQLite could not enable WAL mode")
         except BaseException:
             connection.rollback()
             raise

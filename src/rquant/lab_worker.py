@@ -1159,6 +1159,7 @@ class LabWorker:
         self.artifact_reclaimer = LabArtifactReclaimer(
             artifact_root=self.artifact_root,
             report_spool=self.report_spool,
+            mutation_guard=self._verify_runtime_guard,
         )
         self.claim_spool.set_claim_advance_hook(self.artifact_reclaimer.reclaim)
         self._stop = LabStopSignal()
@@ -2610,8 +2611,7 @@ class LabArtifactReclaimer:
         self.garbage_deferred_dir = self.garbage_root / "deferred_gc"
         self.garbage_legacy_complete_path = self.garbage_root / "legacy-complete-v1.json"
         self.garbage_pending_dir = self.garbage_deferred_dir
-        if self.mutation_guard is not None:
-            self.mutation_guard()
+        self._guard_mutation()
         for directory in (
             self.garbage_intent_dir,
             self.garbage_active_intent_dir,
@@ -2637,14 +2637,15 @@ class LabArtifactReclaimer:
             self.garbage_staging_dir,
             self.garbage_deferred_dir,
         ):
+            self._guard_mutation()
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
                 raise LabArtifactConflictError("garbage quarantine directory is unsafe")
             if stat.S_IMODE(directory.lstat().st_mode) != 0o700:
+                self._guard_mutation()
                 directory.chmod(0o700)
         if garbage_namespace_was_missing:
-            if self.mutation_guard is not None:
-                self.mutation_guard()
+            self._guard_mutation()
             self._write_migration_complete_locked()
             directories = self._migration_directory_identities()
             cycle = self._ensure_queue_migration_cycle_locked((), directories)
@@ -2653,6 +2654,10 @@ class LabArtifactReclaimer:
                 raise LabArtifactConflictError(
                     "fresh quarantine migration namespace changed during initialization"
                 )
+
+    def _guard_mutation(self) -> None:
+        if self.mutation_guard is not None:
+            self.mutation_guard()
 
     @staticmethod
     def _attempt_name(claim: LabShardClaim) -> str:
@@ -2770,6 +2775,7 @@ class LabArtifactReclaimer:
     def _write_ledger(self, ledger: LabReclaimLedger) -> Path:
         directory = self._ledger_dir(ledger.current_claim)
         self._assert_safe_artifact_ancestors(directory)
+        self._guard_mutation()
         directory.mkdir(parents=True, exist_ok=True)
         target = self._ledger_path(ledger.current_claim, ledger.tombstone_name)
         if os.path.lexists(target):
@@ -2780,6 +2786,7 @@ class LabArtifactReclaimer:
                 stream.write(ledger.canonical_json().encode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._guard_mutation()
             os.replace(temporary, target)
             _fsync_directory(directory)
         finally:
@@ -3361,11 +3368,13 @@ class LabArtifactReclaimer:
                 stream.write(payload.encode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
+            self._guard_mutation()
             os.replace(temporary, target)
             _fsync_directory(target.parent)
             if target.parent != self.garbage_recovery_queue_root:
                 _fsync_directory(self.garbage_recovery_queue_root)
         finally:
+            self._guard_mutation()
             temporary.unlink(missing_ok=True)
 
     def _write_recovery_queue_sequence_locked(
@@ -3543,9 +3552,11 @@ class LabArtifactReclaimer:
             marker_archive_dir = (
                 self.garbage_recovery_queue_conflict_markers_dir / f"{sequence:020d}"
             )
+            self._guard_mutation()
             marker_archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             if marker_archive_dir.is_symlink() or not marker_archive_dir.is_dir():
                 raise LabArtifactConflictError("queue conflict marker archive is unsafe")
+            self._guard_mutation()
             marker_archive_dir.chmod(0o700)
             archived_marker = marker_archive_dir / marker.name
             new_entry: LabQuarantineQueueEntry | None = None
@@ -3569,6 +3580,7 @@ class LabArtifactReclaimer:
                 if marker_entry.intent != intent or marker_entry.phase != phase:
                     raise LabArtifactConflictError("queue repair marker identity conflicts")
                 if marker_entry.sequence == sequence:
+                    self._guard_mutation()
                     os.rename(marker, archived_marker)
                     _fsync_directory(self.garbage_recovery_queue_enqueued_dir)
                     _fsync_directory(marker_archive_dir)
@@ -3707,6 +3719,7 @@ class LabArtifactReclaimer:
         target = self.garbage_intent_orphan_dir / temporary.name
         if os.path.lexists(target):
             raise LabArtifactConflictError("prepared intent temporary orphan conflicts")
+        self._guard_mutation()
         os.rename(temporary, target)
         _fsync_directory(self.garbage_intent_temp_dir)
         _fsync_directory(self.garbage_intent_orphan_dir)
@@ -3725,6 +3738,7 @@ class LabArtifactReclaimer:
             or target_stat.st_nlink != 2
         ):
             raise LabArtifactConflictError("published intent temporary identity conflicts")
+        self._guard_mutation()
         os.unlink(temporary)
         _fsync_directory(self.garbage_intent_temp_dir)
         if target.lstat().st_nlink != 1:
@@ -3750,6 +3764,7 @@ class LabArtifactReclaimer:
                 os.fsync(stream.fileno())
             _fsync_directory(self.garbage_intent_temp_dir)
             try:
+                self._guard_mutation()
                 os.link(temporary, target, follow_symlinks=False)
                 linked = True
                 _fsync_directory(self.garbage_intent_dir)
@@ -3853,6 +3868,7 @@ class LabArtifactReclaimer:
             return
         if not os.path.lexists(active) or self._load_prepared_intent(active) != intent:
             raise LabArtifactConflictError("active prepared intent marker is missing or conflicts")
+        self._guard_mutation()
         os.rename(active, health)
         _fsync_directory(self.garbage_active_intent_dir)
         _fsync_directory(self.garbage_cold_health_dir)
@@ -4069,6 +4085,7 @@ class LabArtifactReclaimer:
             or target_stat.st_nlink != 2
         ):
             raise LabArtifactConflictError("published orphan metadata temporary conflicts")
+        self._guard_mutation()
         os.unlink(temporary)
         _fsync_directory(self.garbage_orphan_metadata_dir)
         if target.lstat().st_nlink != 1:
@@ -4078,6 +4095,7 @@ class LabArtifactReclaimer:
         target = self.garbage_intent_orphan_dir / f".derived-json-tmp-v1-{uuid4().hex}.tmp"
         if os.path.lexists(target):
             raise LabArtifactConflictError("orphan metadata temporary isolation conflicts")
+        self._guard_mutation()
         os.rename(temporary, target)
         _fsync_directory(self.garbage_orphan_metadata_dir)
         _fsync_directory(self.garbage_intent_orphan_dir)
@@ -4099,6 +4117,7 @@ class LabArtifactReclaimer:
             os.fsync(stream.fileno())
         _fsync_directory(self.garbage_orphan_metadata_dir)
         try:
+            self._guard_mutation()
             os.link(temporary, target, follow_symlinks=False)
             _fsync_directory(self.garbage_orphan_metadata_dir)
         except FileExistsError as exc:
@@ -4170,6 +4189,7 @@ class LabArtifactReclaimer:
                     )
                 self._isolate_orphan_metadata_temporary(temporary)
                 continue
+            self._guard_mutation()
             os.link(temporary, target, follow_symlinks=False)
             _fsync_directory(self.garbage_orphan_metadata_dir)
             self._drop_published_orphan_metadata_temporary(temporary, target)
@@ -4270,6 +4290,7 @@ class LabArtifactReclaimer:
                     raise LabArtifactConflictError("intent temporary conflicts with durable target")
                 self._isolate_intent_temporary(temporary)
                 continue
+            self._guard_mutation()
             os.link(temporary, target, follow_symlinks=False)
             _fsync_directory(self.garbage_intent_dir)
             self._drop_published_intent_temporary(temporary, target)
@@ -4285,6 +4306,7 @@ class LabArtifactReclaimer:
         _fsync_directory(self.garbage_intent_orphan_dir)
         if os.path.lexists(target):
             return
+        self._guard_mutation()
         os.rename(temporary, target)
         _fsync_directory(target.parent)
         _fsync_directory(self.garbage_intent_orphan_dir)
@@ -4375,6 +4397,7 @@ class LabArtifactReclaimer:
         if staging != expected:
             raise LabArtifactConflictError("prepared intent staging path is unsafe")
         if not os.path.lexists(staging):
+            self._guard_mutation()
             staging.mkdir(mode=0o700)
             _fsync_directory(self.garbage_staging_dir)
         observed = staging.lstat()
@@ -4503,6 +4526,7 @@ class LabArtifactReclaimer:
     def _promote_garbage_bundle(self, source: Path, target: Path) -> None:
         if os.path.lexists(target):
             raise LabArtifactConflictError("garbage state has duplicate bundle ownership")
+        self._guard_mutation()
         os.rename(source, target)
         _fsync_directory(source.parent)
         _fsync_directory(target.parent)
@@ -4592,6 +4616,7 @@ class LabArtifactReclaimer:
                 "isolated replacement is unsafe and was preserved"
             )
         try:
+            self._guard_mutation()
             os.rename(orphan, staging)
         except OSError as exc:
             raise LabArtifactConflictError(
@@ -4631,6 +4656,7 @@ class LabArtifactReclaimer:
         )
         if os.path.lexists(orphan):
             raise LabArtifactConflictError("legacy empty staging orphan already exists")
+        self._guard_mutation()
         os.rename(staging, orphan)
         _fsync_directory(self.garbage_staging_dir)
         _fsync_directory(self.garbage_intent_orphan_dir)
@@ -4768,6 +4794,7 @@ class LabArtifactReclaimer:
                 raise LabArtifactConflictError(
                     "garbage source conflicts with owner inventory and prepared intent"
                 )
+            self._guard_mutation()
             os.rename(source, payload)
             _fsync_directory(source.parent)
             _fsync_directory(staging)
@@ -4909,6 +4936,7 @@ class LabArtifactReclaimer:
         if os.path.lexists(target):  # pragma: no cover - UUID collision
             raise LabArtifactConflictError("quarantine migration completion archive conflicts")
         try:
+            self._guard_mutation()
             os.rename(self.garbage_queue_migration_complete_path, target)
             _fsync_directory(self.garbage_queue_migration_root)
             _fsync_directory(self.garbage_queue_migration_complete_archive_dir)
@@ -5206,9 +5234,11 @@ class LabArtifactReclaimer:
         cycle_root = self.garbage_queue_migration_cycles_dir / cycle.cycle_id.hex
         index_root = cycle_root / "index"
         for directory in (cycle_root, index_root):
+            self._guard_mutation()
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
                 raise LabArtifactConflictError("quarantine migration cycle directory is unsafe")
+            self._guard_mutation()
             directory.chmod(0o700)
         for entry in entries:
             path = self._migration_index_path(cycle, entry.index)
@@ -5392,6 +5422,7 @@ class LabArtifactReclaimer:
         target = self._intent_marker_path(target_directory, intent.owner.garbage_id)
         if os.path.lexists(target):
             raise LabArtifactConflictError("cold health marker retirement conflicts")
+        self._guard_mutation()
         os.rename(path, target)
         _fsync_directory(self.garbage_cold_health_dir)
         _fsync_directory(target_directory)
@@ -5481,6 +5512,7 @@ class LabArtifactReclaimer:
             return
         if not pending_exists or self._load_recovery_queue_entry(pending) != entry:
             raise LabArtifactConflictError("pending quarantine queue entry is missing")
+        self._guard_mutation()
         os.rename(pending, archived)
         _fsync_directory(self.garbage_recovery_queue_pending_dir)
         _fsync_directory(self.garbage_recovery_queue_archive_dir)
@@ -5690,6 +5722,7 @@ class LabArtifactReclaimer:
             inventory=inventory,
         )
         with self.report_spool.evidence_lock():
+            self._guard_mutation()
             return self._logical_delete(path, owner=owner)
 
     def logical_delete_temporary_tree(
@@ -6282,6 +6315,7 @@ class LabArtifactReclaimer:
                 )
                 self._write_ledger(ledger)
             try:
+                self._guard_mutation()
                 os.rename(candidate, tombstone)
             except OSError as exc:
                 if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
@@ -6297,6 +6331,7 @@ class LabArtifactReclaimer:
                     raise LabArtifactConflictError(
                         "sealed attempt was replaced during isolation and cannot be restored"
                     )
+                self._guard_mutation()
                 os.rename(tombstone, candidate)
                 _fsync_directory(attempts_root)
                 raise LabArtifactConflictError("sealed attempt was replaced during isolation")
@@ -6378,13 +6413,10 @@ class LabArtifactReclaimer:
         if attempts_root.exists():
             self._preflight(validated, attempts_root)
         with self.report_spool.evidence_lock():
-            if self.mutation_guard is not None:
-                self.mutation_guard()
+            self._guard_mutation()
             self._cleanup_ledger_temporaries(ledger_dir)
             if attempts_root.exists():
-                if self.mutation_guard is not None:
-                    self.mutation_guard()
+                self._guard_mutation()
                 self._reclaim_locked(validated, attempts_root)
-            if self.mutation_guard is not None:
-                self.mutation_guard()
+            self._guard_mutation()
             self._reconcile_orphan_ledgers(validated)

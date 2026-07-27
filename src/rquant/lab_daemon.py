@@ -1383,37 +1383,103 @@ class LabFinalizerStateStore:
                 )
         except BaseException as exc:
             if replaced and existing_descriptor >= 0:
-                restore_name = f".state.restore.{os.getpid()}.{uuid4().hex}.tmp"
-                restore_descriptor = -1
                 try:
-                    restore_descriptor = os.open(
-                        restore_name,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                        0o600,
-                        dir_fd=root_descriptor,
-                    )
-                    os.lseek(existing_descriptor, 0, os.SEEK_SET)
-                    while True:
-                        chunk = os.read(existing_descriptor, 65_536)
-                        if not chunk:
-                            break
-                        written = 0
-                        while written < len(chunk):
-                            written += os.write(restore_descriptor, chunk[written:])
-                    os.fchmod(restore_descriptor, 0o600)
-                    os.fsync(restore_descriptor)
-                    os.rename(
-                        restore_name,
+                    active = os.stat(
                         self.path.name,
-                        src_dir_fd=root_descriptor,
-                        dst_dir_fd=root_descriptor,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
                     )
-                    os.fsync(root_descriptor)
-                finally:
-                    if restore_descriptor >= 0:
-                        os.close(restore_descriptor)
-                    with suppress(FileNotFoundError):
-                        os.unlink(restore_name, dir_fd=root_descriptor)
+                except FileNotFoundError:
+                    active = None
+                if active is None or self._state_identity(active) == self._state_identity(
+                    temporary_identity
+                ):
+                    restore_name = f".state.restore.{os.getpid()}.{uuid4().hex}.tmp"
+                    failed_name = f".state.failed.{os.getpid()}.{uuid4().hex}.tmp"
+                    restore_descriptor = -1
+                    failed_retained = False
+                    try:
+                        restore_descriptor = os.open(
+                            restore_name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                            dir_fd=root_descriptor,
+                        )
+                        os.lseek(existing_descriptor, 0, os.SEEK_SET)
+                        while True:
+                            chunk = os.read(existing_descriptor, 65_536)
+                            if not chunk:
+                                break
+                            written = 0
+                            while written < len(chunk):
+                                written += os.write(restore_descriptor, chunk[written:])
+                        os.fchmod(restore_descriptor, 0o600)
+                        os.fsync(restore_descriptor)
+                        if active is None:
+                            with suppress(FileExistsError):
+                                os.link(
+                                    restore_name,
+                                    self.path.name,
+                                    src_dir_fd=root_descriptor,
+                                    dst_dir_fd=root_descriptor,
+                                    follow_symlinks=False,
+                                )
+                        else:
+                            os.rename(
+                                self.path.name,
+                                failed_name,
+                                src_dir_fd=root_descriptor,
+                                dst_dir_fd=root_descriptor,
+                            )
+                            moved = os.stat(
+                                failed_name,
+                                dir_fd=root_descriptor,
+                                follow_symlinks=False,
+                            )
+                            if self._state_identity(moved) != self._state_identity(
+                                temporary_identity
+                            ):
+                                failed_retained = True
+                                with suppress(FileExistsError):
+                                    os.link(
+                                        failed_name,
+                                        self.path.name,
+                                        src_dir_fd=root_descriptor,
+                                        dst_dir_fd=root_descriptor,
+                                        follow_symlinks=False,
+                                    )
+                            else:
+                                with suppress(FileExistsError):
+                                    os.link(
+                                        restore_name,
+                                        self.path.name,
+                                        src_dir_fd=root_descriptor,
+                                        dst_dir_fd=root_descriptor,
+                                        follow_symlinks=False,
+                                    )
+                            try:
+                                os.stat(
+                                    self.path.name,
+                                    dir_fd=root_descriptor,
+                                    follow_symlinks=False,
+                                )
+                            except FileNotFoundError:
+                                failed_retained = True
+                            else:
+                                os.unlink(
+                                    failed_name,
+                                    dir_fd=root_descriptor,
+                                )
+                                failed_retained = False
+                        os.fsync(root_descriptor)
+                    finally:
+                        if restore_descriptor >= 0:
+                            os.close(restore_descriptor)
+                        with suppress(FileNotFoundError):
+                            os.unlink(restore_name, dir_fd=root_descriptor)
+                        if not failed_retained:
+                            with suppress(FileNotFoundError):
+                                os.unlink(failed_name, dir_fd=root_descriptor)
             elif replaced:
                 try:
                     active = os.stat(
