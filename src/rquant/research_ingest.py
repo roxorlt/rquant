@@ -163,6 +163,13 @@ class ResearchWatchlistSnapshot(_ResearchModel):
         return self
 
 
+class _ResearchSurgeEvent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ts_code: str = Field(pattern=r"^\d{6}\.(?:SZ|SH|BJ)$")
+    status: Literal["confirmed", "unbuyable"]
+
+
 class ResearchDatasetIngestAudit(_ResearchModel):
     dataset: Literal["minute_bar", "auction_bar"]
     export: ResearchExportSummary
@@ -595,6 +602,25 @@ def _load_watchlist_snapshot(
     if snapshot.trade_date != trade_date:
         raise RuntimeError("research watchlist snapshot date mismatch")
     return snapshot
+
+
+def _load_surge_event_codes(state_dir: Path, trade_date: date) -> tuple[str, ...]:
+    path = Path(state_dir) / "surge_live" / f"events-{trade_date.isoformat()}.jsonl"
+    if not path.exists():
+        return ()
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"invalid surge event file: {path}")
+    codes: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                event = _ResearchSurgeEvent.model_validate_json(line)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid surge event at {path.name}:{line_number}"
+                ) from exc
+            codes.add(event.ts_code)
+    return tuple(sorted(codes))
 
 
 def _table_exists(connection: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -2070,6 +2096,7 @@ def _run_daily_research_ingest_locked(
     generated_at: datetime,
 ) -> ResearchDailyIngestResult:
     watchlist = _load_watchlist_snapshot(paths.staging_root, trade_date)
+    surge_event_codes = set(_load_surge_event_codes(paths.state_dir, trade_date))
 
     with duckdb.connect(str(source_database), read_only=True) as source:
         _require_open_trade_date(source, trade_date)
@@ -2111,7 +2138,7 @@ def _run_daily_research_ingest_locked(
         {item.ts_code for item in watchlist.items}
         if watchlist is not None
         else observed_minute_codes
-    )
+    ) | surge_event_codes
 
     if dry_run:
         fetched_minutes = pd.DataFrame(columns=_MINUTE_COLUMNS)

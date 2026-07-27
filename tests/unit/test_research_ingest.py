@@ -628,6 +628,77 @@ def test_daily_ingest_completes_partitions_and_publishes_candidate_observation(
     assert status.eligible_for_promotion is False
 
 
+def test_daily_ingest_unions_surge_events_into_minute_universe(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    event_dir = tmp_path / "surge_live"
+    event_dir.mkdir()
+    (event_dir / f"events-{trade_date.isoformat()}.jsonl").write_text(
+        "\n".join(
+            (
+                '{"ts_code":"300001.SZ","status":"confirmed"}',
+                '{"ts_code":"300001.SZ","status":"confirmed"}',
+                '{"ts_code":"300002.SZ","status":"unbuyable"}',
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    adapter = _Adapter(trade_date)
+
+    result = run_daily_research_ingest(
+        source_database=source,
+        paths=_paths(tmp_path),
+        trade_date=trade_date,
+        adapter=adapter,
+        code_commit=_COMMIT,
+        now=lambda: datetime(2026, 7, 17, 15, 30, tzinfo=_CST),
+    )
+
+    assert result.status == "candidate"
+    assert result.minute.expected_code_count == 4
+    assert result.minute.complete_code_count == 4
+    assert adapter.minute_calls == [
+        ("000001.SZ", "300001.SZ", "300002.SZ", "600000.SH")
+    ]
+
+
+def test_malformed_surge_event_fails_before_network_or_publication(
+    tmp_path: Path,
+) -> None:
+    trade_date = date(2026, 7, 17)
+    source = tmp_path / "source.duckdb"
+    _seed_source(source, trade_date)
+    _seed_bootstrap_candidate(tmp_path)
+    _write_watchlist(tmp_path, trade_date)
+    event_dir = tmp_path / "surge_live"
+    event_dir.mkdir()
+    (event_dir / f"events-{trade_date.isoformat()}.jsonl").write_text(
+        "{not-json}\n",
+        encoding="utf-8",
+    )
+    adapter = _Adapter(trade_date)
+
+    with pytest.raises(ValueError, match="invalid surge event"):
+        run_daily_research_ingest(
+            source_database=source,
+            paths=_paths(tmp_path),
+            trade_date=trade_date,
+            adapter=adapter,
+            code_commit=_COMMIT,
+            now=lambda: datetime(2026, 7, 17, 15, 30, tzinfo=_CST),
+        )
+
+    assert adapter.minute_calls == []
+    assert adapter.auction_calls == []
+    assert not (tmp_path / "research-authority-current.json").exists()
+
+
 def test_missing_watchlist_never_becomes_candidate_even_with_observed_minutes(
     tmp_path: Path,
 ) -> None:
