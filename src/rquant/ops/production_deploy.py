@@ -44,6 +44,11 @@ ALL_LONG_RUNNING_SERVICES = (
     "rquant-panorama.service",
     "rquant-surge-watch.service",
 )
+LAB_LAUNCHD_HANDOFF_LABELS = (
+    "com.roxor.rquant-lab-scheduler",
+    "com.roxor.rquant-lab-worker",
+    "com.roxor.rquant-lab-finalizer",
+)
 
 SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
     "rquant-monitor.service": (
@@ -256,6 +261,7 @@ class ChangePlan:
     changed_files: tuple[str, ...]
     blocked_files: tuple[str, ...]
     restart_services: tuple[str, ...]
+    handoff_daemons: tuple[str, ...] = LAB_LAUNCHD_HANDOFF_LABELS
 
 
 @dataclass(frozen=True)
@@ -283,6 +289,7 @@ class DeployResult:
     target: str
     changed_files: tuple[str, ...]
     restart_services: tuple[str, ...]
+    handoff_daemons: tuple[str, ...] = LAB_LAUNCHD_HANDOFF_LABELS
 
 
 def validate_target(target: str) -> str:
@@ -931,7 +938,7 @@ def deploy(
                     lock_fd=effective_config.lock_fd,
                     python_path=effective_config.python_path,
                     git_path=effective_config.git_path,
-                    writable=True,
+                    writable=not effective_config.dry_run,
                 )
                 if effective_config.recovery_action is None:
                     generation_authority.verify(expected_commit=effective_config.startup_generation)

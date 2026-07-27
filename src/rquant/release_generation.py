@@ -6,9 +6,12 @@ load it by physical file path before importing the :mod:`rquant` package.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -28,10 +31,18 @@ ENVIRONMENT_SCHEMA_VERSION = 1
 MAX_MARKER_BYTES = 32 * 1024
 MAX_INTENT_BYTES = 128 * 1024
 MAX_ENVIRONMENT_MANIFEST_BYTES = 64 * 1024 * 1024
+DEFAULT_GENERATION_GC_GRACE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_GENERATION_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
+GENERATION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+BUILDING_GENERATION_PATTERN = re.compile(r"\.([0-9a-f]{64})\.[0-9a-f]{16}\.building")
 
 
 class ReleaseGenerationError(RuntimeError):
     """The release generation cannot be trusted."""
+
+
+class ReleaseGenerationRecordMissingError(ReleaseGenerationError):
+    """A private release record is absent from its bound authority directory."""
 
 
 @dataclass(frozen=True)
@@ -45,6 +56,17 @@ class PathIdentity:
     @classmethod
     def capture(cls, value: os.stat_result) -> PathIdentity:
         return cls(value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_nlink)
+
+
+@dataclass(frozen=True)
+class GenerationGcMetrics:
+    scanned_generations: int
+    deleted_generations: int
+    reclaimed_bytes: int
+    free_bytes_before: int
+    free_bytes_after: int
+    required_free_bytes: int
+    retained_generation_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -529,6 +551,10 @@ def _read_private_json(
         return payload, identity
     except ReleaseGenerationError:
         raise
+    except FileNotFoundError as exc:
+        raise ReleaseGenerationRecordMissingError(
+            f"private deployment record {name} is missing"
+        ) from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ReleaseGenerationError(f"private deployment record {name} cannot be read") from exc
     finally:
@@ -614,6 +640,102 @@ def _payload_hash(payload: dict[str, Any]) -> str:
 
 def _environment_generation_id(*, operation_id: str, commit: str) -> str:
     return hashlib.sha256(f"{operation_id}:{commit}".encode()).hexdigest()
+
+
+def _nonnegative_float_setting(value: float | None, *, env_name: str, default: float) -> float:
+    raw: object = os.environ.get(env_name, default) if value is None else value
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseGenerationError(f"{env_name} must be a non-negative number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ReleaseGenerationError(f"{env_name} must be a non-negative number")
+    return parsed
+
+
+def _nonnegative_int_setting(value: int | None, *, env_name: str, default: int) -> int:
+    raw: object = os.environ.get(env_name, default) if value is None else value
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseGenerationError(f"{env_name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ReleaseGenerationError(f"{env_name} must be a non-negative integer")
+    return parsed
+
+
+def _private_tree_size(root: Path) -> int:
+    total = 0
+    for current_root, directory_names, file_names in os.walk(root):
+        current = Path(current_root)
+        observed_root = current.lstat()
+        if (
+            not stat.S_ISDIR(observed_root.st_mode)
+            or stat.S_ISLNK(observed_root.st_mode)
+            or observed_root.st_uid != os.getuid()
+        ):
+            raise ReleaseGenerationError("source release venv contains an unsafe directory")
+        for name in (*directory_names, *file_names):
+            path = current / name
+            observed = path.lstat()
+            if stat.S_ISLNK(observed.st_mode) or observed.st_uid != os.getuid():
+                raise ReleaseGenerationError("source release venv contains an unsafe object")
+            if stat.S_ISREG(observed.st_mode):
+                if observed.st_nlink != 1:
+                    raise ReleaseGenerationError("source release venv contains a hardlink")
+                total += observed.st_size
+            elif not stat.S_ISDIR(observed.st_mode):
+                raise ReleaseGenerationError("source release venv contains an unsafe object")
+    return total
+
+
+def _remove_private_tree_at(parent_fd: int, name: str) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    reclaimed = 0
+    try:
+        opened = os.fstat(descriptor)
+        active = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            PathIdentity.capture(opened) != PathIdentity.capture(active)
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+        ):
+            raise ReleaseGenerationError("orphan environment generation is unsafe")
+        os.fchmod(descriptor, 0o700)
+        for child_name in os.listdir(descriptor):
+            child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(child.st_mode) and not stat.S_ISLNK(child.st_mode):
+                reclaimed += _remove_private_tree_at(descriptor, child_name)
+                continue
+            if (
+                not stat.S_ISREG(child.st_mode)
+                or stat.S_ISLNK(child.st_mode)
+                or child.st_uid != os.getuid()
+                or child.st_nlink != 1
+            ):
+                raise ReleaseGenerationError("orphan environment generation contains unsafe data")
+            child_fd = os.open(
+                child_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            try:
+                if PathIdentity.capture(os.fstat(child_fd)) != PathIdentity.capture(child):
+                    raise ReleaseGenerationError("orphan environment generation changed")
+                os.fchmod(child_fd, 0o600)
+                reclaimed += child.st_size
+            finally:
+                os.close(child_fd)
+            os.unlink(child_name, dir_fd=descriptor)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent_fd)
+    return reclaimed
 
 
 def _environment_entry(path: Path, root: Path) -> dict[str, Any]:
@@ -723,6 +845,8 @@ class ReleaseGenerationAuthority:
         git_path: Path,
         writable: bool = False,
         mutation_hook: Callable[[str], None] | None = None,
+        gc_grace_seconds: float | None = None,
+        minimum_free_bytes: int | None = None,
     ) -> None:
         self.repo = _canonical(repo, label="release checkout")
         self.lock_path = _canonical(lock_path, label="deployment lock")
@@ -737,7 +861,19 @@ class ReleaseGenerationAuthority:
         self.git_path = _canonical(git_path, label="trusted Git")
         self.writable = writable
         self._mutation_hook = mutation_hook or (lambda _stage: None)
+        self.gc_grace_seconds = _nonnegative_float_setting(
+            gc_grace_seconds,
+            env_name="RQUANT_RELEASE_GENERATION_GC_GRACE_SECONDS",
+            default=DEFAULT_GENERATION_GC_GRACE_SECONDS,
+        )
+        self.minimum_free_bytes = _nonnegative_int_setting(
+            minimum_free_bytes,
+            env_name="RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES",
+            default=DEFAULT_GENERATION_MINIMUM_FREE_BYTES,
+        )
         self._assert_lock()
+        if self.writable:
+            self._assert_exclusive_lock()
 
     def _assert_lock(self) -> None:
         try:
@@ -753,6 +889,14 @@ class ReleaseGenerationAuthority:
             or stat.S_IMODE(opened.st_mode) != 0o600
         ):
             raise ReleaseGenerationError("deployment generation lock identity changed")
+
+    def _assert_exclusive_lock(self) -> None:
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReleaseGenerationError(
+                "writable generation authority requires the exclusive deployment lock"
+            ) from exc
 
     def _facts(
         self,
@@ -829,6 +973,255 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("deployment authority root identity changed")
         self._assert_lock()
 
+    def _optional_private_payload(
+        self,
+        path: Path,
+        *,
+        maximum_bytes: int,
+    ) -> dict[str, Any] | None:
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            try:
+                payload, _identity_value = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=path.name,
+                    maximum_bytes=maximum_bytes,
+                )
+            except ReleaseGenerationRecordMissingError:
+                self._assert_root(root_fd, root_identity)
+                return None
+            self._assert_root(root_fd, root_identity)
+            return payload
+        finally:
+            os.close(root_fd)
+
+    def _retained_environment_ids(self, environment_fd: int) -> set[str]:
+        retained: set[str] = set()
+        selector_payload = self._optional_private_payload(
+            self.environment_selector_path,
+            maximum_bytes=MAX_MARKER_BYTES,
+        )
+        if selector_payload is not None:
+            retained.add(EnvironmentSelector.from_payload(selector_payload).generation_id)
+        marker_payload = self._optional_private_payload(
+            self.marker_path,
+            maximum_bytes=MAX_MARKER_BYTES,
+        )
+        if marker_payload is not None:
+            retained.add(
+                ReleaseGenerationMarker.from_payload(marker_payload).environment_generation_id
+            )
+        commit_payload = self._optional_private_payload(
+            self.commit_path,
+            maximum_bytes=MAX_MARKER_BYTES,
+        )
+        if commit_payload is not None:
+            retained.add(
+                ReleaseGenerationCommit.from_payload(commit_payload).environment_generation_id
+            )
+        for path in (self.intent_path, self.initialization_path):
+            payload = self._optional_private_payload(path, maximum_bytes=MAX_INTENT_BYTES)
+            if payload is None:
+                continue
+            intent = DeploymentIntent.from_payload(payload)
+            retained.update(
+                _environment_generation_id(operation_id=intent.operation_id, commit=commit)
+                for commit in (intent.previous_sha, intent.target_sha)
+            )
+
+        manifest_pattern = re.compile(
+            rf"{re.escape(self.lock_path.stem)}\.venv-([0-9a-f]{{64}})\.manifest\.json"
+        )
+        completed: list[tuple[int, str]] = []
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            for name in os.listdir(root_fd):
+                match = manifest_pattern.fullmatch(name)
+                if match is None or match.group(1) in retained:
+                    continue
+                payload, identity = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=name,
+                    maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                )
+                generation_id = match.group(1)
+                if (
+                    int(payload.get("schema_version", 0)) != ENVIRONMENT_SCHEMA_VERSION
+                    or payload.get("generation_id") != generation_id
+                    or payload.get("environment_path") != str(self.environment_root / generation_id)
+                    or not isinstance(payload.get("entries"), list)
+                    or not payload["entries"]
+                ):
+                    raise ReleaseGenerationError("environment generation manifest is invalid")
+                active_manifest = (self.lock_path.parent / name).lstat()
+                if PathIdentity.capture(active_manifest) != identity:
+                    raise ReleaseGenerationError("environment generation manifest identity changed")
+                completed.append((active_manifest.st_mtime_ns, generation_id))
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+        if completed:
+            retained.add(max(completed)[1])
+        return retained
+
+    def _append_generation_gc_audit(self, payload: dict[str, Any]) -> None:
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        name = f"{self.lock_path.stem}.generation-gc.jsonl"
+        descriptor = -1
+        try:
+            self._assert_root(root_fd, root_identity)
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=root_fd,
+            )
+            opened = os.fstat(descriptor)
+            active = (self.lock_path.parent / name).lstat()
+            if (
+                PathIdentity.capture(opened) != PathIdentity.capture(active)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise ReleaseGenerationError("generation GC audit is unsafe")
+            _write_all(
+                descriptor,
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+            )
+            os.fsync(descriptor)
+            self._assert_root(root_fd, root_identity)
+        except ReleaseGenerationError:
+            raise
+        except OSError as exc:
+            raise ReleaseGenerationError("generation GC audit cannot be written") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(root_fd)
+
+    def _remove_orphan_environment_manifest(self, generation_id: str) -> None:
+        manifest_path = environment_manifest_path_for_lock(self.lock_path, generation_id)
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            try:
+                payload, identity = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=manifest_path.name,
+                    maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                )
+            except ReleaseGenerationRecordMissingError:
+                self._assert_root(root_fd, root_identity)
+                return
+            if payload.get("generation_id") != generation_id or payload.get(
+                "environment_path"
+            ) != str(self.environment_root / generation_id):
+                raise ReleaseGenerationError("orphan environment manifest binding changed")
+            self._mutation_hook("before_environment_gc_manifest_delete")
+            active = manifest_path.lstat()
+            if PathIdentity.capture(active) != identity:
+                raise ReleaseGenerationError("orphan environment manifest identity changed")
+            self._assert_root(root_fd, root_identity)
+            os.unlink(manifest_path.name, dir_fd=root_fd)
+            os.fsync(root_fd)
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+
+    def garbage_collect_environments(
+        self,
+        *,
+        reason: str,
+        required_bytes: int = 0,
+    ) -> GenerationGcMetrics:
+        if not self.writable:
+            raise ReleaseGenerationError(
+                "read-only generation authority cannot collect environments"
+            )
+        if required_bytes < 0:
+            raise ReleaseGenerationError("generation disk requirement cannot be negative")
+        self._assert_lock()
+        self._assert_exclusive_lock()
+        environment_fd, environment_identity = self._ensure_environment_root()
+        free_before = shutil.disk_usage(self.environment_root).free
+        scanned = 0
+        deleted = 0
+        reclaimed = 0
+        try:
+            retained = self._retained_environment_ids(environment_fd)
+            cutoff = datetime.now(UTC).timestamp() - self.gc_grace_seconds
+            for name in sorted(os.listdir(environment_fd)):
+                generation_match = GENERATION_ID_PATTERN.fullmatch(name)
+                building_match = BUILDING_GENERATION_PATTERN.fullmatch(name)
+                if generation_match is None and building_match is None:
+                    continue
+                generation_id = name if generation_match is not None else building_match.group(1)
+                scanned += 1
+                observed = os.stat(name, dir_fd=environment_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or stat.S_ISLNK(observed.st_mode)
+                    or observed.st_uid != os.getuid()
+                ):
+                    raise ReleaseGenerationError("release environment generation is unsafe")
+                if generation_id in retained or observed.st_mtime > cutoff:
+                    continue
+                self._mutation_hook("before_environment_gc_delete")
+                active_environment = _identity(
+                    self.environment_root,
+                    label="release environment root",
+                    directory=True,
+                )
+                if _object_key(active_environment) != _object_key(
+                    environment_identity
+                ) or _object_key(PathIdentity.capture(os.fstat(environment_fd))) != _object_key(
+                    environment_identity
+                ):
+                    raise ReleaseGenerationError("release environment root identity changed")
+                if generation_match is not None:
+                    self._remove_orphan_environment_manifest(generation_id)
+                reclaimed += _remove_private_tree_at(environment_fd, name)
+                os.fsync(environment_fd)
+                deleted += 1
+            free_after = shutil.disk_usage(self.environment_root).free
+            required_free = self.minimum_free_bytes + required_bytes
+            status = "ok" if free_after >= required_free else "disk_budget_blocked"
+            metrics = GenerationGcMetrics(
+                scanned_generations=scanned,
+                deleted_generations=deleted,
+                reclaimed_bytes=reclaimed,
+                free_bytes_before=free_before,
+                free_bytes_after=free_after,
+                required_free_bytes=required_free,
+                retained_generation_ids=tuple(sorted(retained)),
+            )
+            self._append_generation_gc_audit(
+                {
+                    "deleted_generations": deleted,
+                    "free_bytes_after": free_after,
+                    "free_bytes_before": free_before,
+                    "reason": reason,
+                    "reclaimed_bytes": reclaimed,
+                    "required_free_bytes": required_free,
+                    "retained_generation_ids": list(metrics.retained_generation_ids),
+                    "scanned_generations": scanned,
+                    "status": status,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+            if free_after < required_free:
+                raise ReleaseGenerationError(
+                    "release environment disk budget is insufficient: "
+                    f"free={free_after} required={required_free}"
+                )
+            return metrics
+        finally:
+            os.close(environment_fd)
+
     def _read_marker(self) -> ReleaseGenerationMarker:
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         descriptor = -1
@@ -903,9 +1296,7 @@ class ReleaseGenerationAuthority:
         )
         try:
             existing = self._read_commit_record()
-        except ReleaseGenerationError as exc:
-            if "cannot be read" not in str(exc):
-                raise
+        except ReleaseGenerationRecordMissingError:
             existing_identity = None
         else:
             if replace(existing, committed_at=record.committed_at) == record:
@@ -1021,7 +1412,7 @@ class ReleaseGenerationAuthority:
         elif transaction_kind == "deployment":
             try:
                 record, _identity_value = self._read_intent_record(self.intent_path)
-            except ReleaseGenerationError:
+            except ReleaseGenerationRecordMissingError:
                 archive = self.intent_path.with_name(
                     f"{self.intent_path.stem}.{operation_id}.completed.json"
                 )
@@ -1153,9 +1544,8 @@ class ReleaseGenerationAuthority:
             marker_generation = marker.content_hash()
         try:
             current, completed_identity = self._read_intent_record(self.intent_path)
-        except ReleaseGenerationError as exc:
-            if "cannot be read" not in str(exc):
-                raise
+        except ReleaseGenerationRecordMissingError:
+            pass
         else:
             if current.stage != "completed":
                 raise ReleaseGenerationError("an incomplete deployment intent already exists")
@@ -1218,9 +1608,8 @@ class ReleaseGenerationAuthority:
         self._assert_lock()
         try:
             current, _identity_value = self._read_intent_record(self.initialization_path)
-        except ReleaseGenerationError as exc:
-            if "cannot be read" not in str(exc):
-                raise
+        except ReleaseGenerationRecordMissingError:
+            pass
         else:
             if current.stage == "completed":
                 raise ReleaseGenerationError("release generation initialization already completed")
@@ -1297,6 +1686,11 @@ class ReleaseGenerationAuthority:
         _identity(source_venv, label="source release venv", directory=True)
         if not self.python_path.is_relative_to(source_venv):
             raise ReleaseGenerationError("deployment Python is outside source release venv")
+        source_bytes = _private_tree_size(source_venv)
+        self.garbage_collect_environments(
+            reason=f"pre-publish:{transaction_kind}",
+            required_bytes=source_bytes,
+        )
         generation_id = _environment_generation_id(
             operation_id=operation_id,
             commit=expected_commit,
@@ -1322,9 +1716,8 @@ class ReleaseGenerationAuthority:
                         self._assert_root(root_fd, root_identity)
                     finally:
                         os.close(root_fd)
-                except ReleaseGenerationError as exc:
-                    if "cannot be read" not in str(exc):
-                        raise
+                except ReleaseGenerationRecordMissingError:
+                    pass
             else:
                 os.mkdir(staging_name, 0o700, dir_fd=environment_fd)
                 try:
@@ -1442,9 +1835,8 @@ class ReleaseGenerationAuthority:
             )
             try:
                 _prior, selector_identity = self._read_selector()
-            except ReleaseGenerationError as exc:
-                if "cannot be read" not in str(exc):
-                    raise
+            except ReleaseGenerationRecordMissingError:
+                pass
                 selector_identity = None
             root_fd, root_identity = _private_lock_root(self.lock_path.parent)
             try:

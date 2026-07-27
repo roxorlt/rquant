@@ -18,7 +18,9 @@
    bash scripts/deploy-production.sh --target v0.13.2
    ```
 
-5. 纯标准库 bootstrap 先取得稳定 generation 独占锁并验证当前已提交代际，之后才导入项目
+5. 纯标准库 bootstrap 先取得稳定 handoff lock。macOS 上它在交易保护窗口外有界停止原先 loaded
+   的三个 Lab launchd daemon，确认其 shared generation lock 已释放后取得独占锁；Linux 无此
+   本地 launchd 步骤。之后验证当前已提交代际，才导入项目
    deployer。bootstrap 与 deployer 的所有 Git 子命令都固定使用已验证的绝对
    `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`。部署器依次执行：tracked 工作区检查、
    `git fetch`、target/main 归属与快进检查、diff 风险分类、快照实际 active 的受影响服务及
@@ -31,7 +33,9 @@
    `completed`，最后由 target authority 原子发布 commit record。daemon 只接受
    `marker + completed intent + commit record + selected environment manifest` 完整一致的代际；
    旧 coordinator 不能替新版本 marker schema 写标记。每个 durable stage 同时写入 intent
-   时间线和 JSONL 审计。
+   时间线和 JSONL 审计。结束时先释放独占锁，再只恢复原先 loaded 的 Lab daemon，并验证
+   launchd health 和 shared lock；恢复失败会使发布返回非零。dry-run 只输出 handoff 计划并持
+   shared lock，不 bootout daemon。
 6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回 intent 记录的
    previous commit、恢复锁定依赖并按同一服务/timer 合同切回。只有旧 checkout、旧依赖、
    精确服务集合、第二次 preflight 与 timer 原状态全部恢复后，才由 previous checkout 的隔离
@@ -45,9 +49,9 @@
 - tracked 工作区存在未提交改动；`backup/` 等 untracked 文件不阻断。
 - diff 包含 `deploy/systemd/`、`deploy/nginx/`、`deploy/frp/`、`deploy/sudoers/`。
 - 工作日 09:15-15:10 的发布需要重启任何长驻服务。
-- 另一个部署进程或 Lab daemon 已持有
-  `/home/lighthouse/.rquant-deploy/rquant.lock`（本地主 checkout 对应
-  `/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock`）。
+- 另一个部署/交接进程已持有稳定 handoff lock；工作日 09:15-15:10 的 macOS Lab daemon
+  bootout/bootstrap 交接一律拒绝。Lab daemon 的 shared generation lock 由受控交接在窗口外
+  有界释放，不再要求人工停止 KeepAlive。
 - generation marker、completed intent、commit record、环境 selector/manifest 任一缺失、格式错误，
   或与 Git SHA、`uv.lock`、包版本、Python ABI、不可变 venv/解释器/site-packages 内容不一致。
 - `sudo -n`、依赖同步、preflight 或服务健康检查失败。
@@ -123,6 +127,15 @@ stop/start timer、切换 checkout、同步依赖、运行 preflight 或重启�
 sync、partial restart、post-preflight、timer 恢复、环境封存、marker/commit 发布中断后可原样重跑
 同一动作；
 不得改用新 ref，也不得删除 intent 后运行 initialize。
+
+## 不可变环境保留与磁盘预算
+
+每次构建新环境前会在 generation 独占锁内执行 GC。默认宽限期 7 天、发布完成后至少保留
+2 GiB 可用空间，可通过 `RQUANT_RELEASE_GENERATION_GC_GRACE_SECONDS` 与
+`RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES` 调整。current、紧邻上一有效 manifest、active intent
+的 previous/target，以及 marker/commit 引用永不作为孤儿删除；其他严格受控的旧完成/失败目录
+才会解冻删除。扫描、删除数、回收字节、前后磁盘与保留集合写入 owner-only
+`<lock-stem>.generation-gc.jsonl`。磁盘预算不足时发布在复制前失败，不会留下完整 staging。
 
 ## 预演与审计
 

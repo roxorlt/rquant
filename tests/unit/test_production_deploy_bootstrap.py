@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import fcntl
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
-import venv
+from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
+from types import ModuleType
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -23,6 +27,66 @@ BOOTSTRAP = ROOT / "scripts" / "bootstrap-production-deploy.py"
 AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 PRODUCTION_DEPLOYER = ROOT / "src" / "rquant" / "ops" / "production_deploy.py"
 TRUSTED_GIT = Path("/usr/bin/git")
+_ORIGINAL_OS_WALK = os.walk
+
+
+@pytest.fixture(autouse=True)
+def _remove_immutable_test_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    monkeypatch.setenv("RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES", "0")
+    try:
+        yield
+    finally:
+        generation_roots = [
+            Path(current_root) / name
+            for current_root, directory_names, _file_names in _ORIGINAL_OS_WALK(tmp_path)
+            for name in directory_names
+            if name.endswith(".venvs")
+        ]
+        for root in generation_roots:
+            if root.is_symlink() or not root.is_dir():
+                continue
+            for current_root, _directory_names, file_names in _ORIGINAL_OS_WALK(root):
+                current = Path(current_root)
+                if hasattr(os, "chflags"):
+                    os.chflags(current, 0)
+                current.chmod(0o700)
+                for name in file_names:
+                    path = current / name
+                    if not path.is_symlink():
+                        if hasattr(os, "chflags"):
+                            os.chflags(path, 0)
+                        path.chmod(0o600)
+            shutil.rmtree(root)
+
+
+def _bootstrap_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("_test_production_deploy_bootstrap", BOOTSTRAP)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tiny_test_venv(checkout: Path) -> Path:
+    venv_root = checkout / ".venv"
+    python = venv_root / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, python)
+    python.chmod(0o700)
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (venv_root / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
+        encoding="utf-8",
+    )
+    (venv_root / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
+    python_library = Path(sys.base_prefix) / "lib" / f"libpython{version}.dylib"
+    if python_library.exists():
+        shutil.copy2(python_library, venv_root / "lib" / python_library.name)
+    return python
 
 
 def _git(checkout: Path, *arguments: str) -> str:
@@ -83,15 +147,7 @@ def _checkout(
         encoding="utf-8",
     )
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-    venv.EnvBuilder(with_pip=False, symlinks=False).create(checkout / ".venv")
-    python_library = (
-        Path(sys.base_prefix)
-        / "lib"
-        / f"libpython{sys.version_info.major}.{sys.version_info.minor}.dylib"
-    )
-    if python_library.exists():
-        shutil.copy2(python_library, checkout / ".venv" / "lib" / python_library.name)
-    python = checkout / ".venv" / "bin" / "python"
+    python = _tiny_test_venv(checkout)
     rquant = checkout / ".venv" / "bin" / "rquant"
     rquant.write_text(
         f"#!{python}\n"
@@ -278,6 +334,183 @@ def _command(
     return command
 
 
+def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
+    module = _bootstrap_module()
+    root = tmp_path / "rquant"
+    launchd = root / "deploy" / "launchd"
+    launchd.mkdir(parents=True)
+    for label in module.LAB_LAUNCHD_LABELS:
+        path = launchd / f"{label}.plist"
+        path.write_text("<?xml version='1.0'?><plist version='1.0'><dict/></plist>\n")
+        path.chmod(0o600)
+    lock_root = tmp_path / ".rquant-deploy"
+    lock_root.mkdir(mode=0o700)
+    return module, root, lock_root / "rquant.lock"
+
+
+def test_lab_handoff_dry_run_models_labels_without_stopping_daemons(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: calls.append(arguments),
+    )
+    handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+    )
+
+    handoff.prepare(dry_run=True)
+    handoff.restore()
+
+    assert calls == []
+    payload = json.loads(capsys.readouterr().err)
+    assert payload == {
+        "lab_daemon_handoff": "planned",
+        "labels": list(module.LAB_LAUNCHD_LABELS),
+        "stopped": False,
+    }
+
+
+def test_lab_handoff_restores_only_previously_loaded_daemons_and_verifies_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    initially_loaded = set(module.LAB_LAUNCHD_LABELS[:2])
+    loaded = set(initially_loaded)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        calls.append(tuple(arguments))
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            returncode = 0 if label in loaded else 113
+        elif action == "bootout":
+            loaded.remove(label)
+            returncode = 0
+        else:
+            label = Path(arguments[-1]).stem
+            loaded.add(label)
+            returncode = 0
+        if check and returncode:
+            raise subprocess.CalledProcessError(returncode, arguments)
+        stdout = "state = running\n" if action == "print" and returncode == 0 else ""
+        return subprocess.CompletedProcess(arguments, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_generation_lock_is_held", lambda _root, _lock: True)
+    handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+    )
+
+    handoff.prepare(
+        dry_run=False,
+        now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    assert loaded == set()
+    handoff.restore()
+
+    assert loaded == initially_loaded
+    assert handoff.stopped == list(module.LAB_LAUNCHD_LABELS[:2])
+    assert not any(
+        call[0] == "bootstrap" and Path(call[-1]).stem == module.LAB_LAUNCHD_LABELS[2]
+        for call in calls
+    )
+
+
+def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, timeout_seconds
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "bootout":
+            loaded.remove(label)
+            returncode = 0
+        elif action == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+            returncode = 0
+        else:
+            returncode = 0 if label in loaded else 113
+        stdout = "state = running\n" if action == "print" and returncode == 0 else ""
+        return subprocess.CompletedProcess(arguments, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_generation_lock_is_held", lambda _root, _lock: False)
+    handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=0.01,
+    )
+    handoff.prepare(
+        dry_run=False,
+        now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="did not reacquire"):
+        handoff.restore()
+
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    assert handoff.lock_fd == -1
+
+
+def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: calls.append(arguments),
+    )
+    handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="protected"):
+        handoff.prepare(
+            dry_run=False,
+            now=datetime(2026, 7, 27, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    handoff.restore()
+
+    assert calls == []
+
+
 def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     tmp_path: Path,
 ) -> None:
@@ -327,6 +560,33 @@ def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     assert "generation is active" in second.stderr
     assert not second_import.exists()
     assert not second_run.exists()
+
+
+def test_deploy_bootstrap_dry_run_uses_shared_generation_without_stopping(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, _commit = _checkout(tmp_path)
+    daemon_lock = os.open(lock_path, os.O_RDONLY)
+    fcntl.flock(daemon_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    command = _command(checkout, python, lock_path)
+    command.append("--dry-run")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=checkout,
+            env=os.environ,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    finally:
+        os.close(daemon_lock)
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(result.stderr)
+    assert plan["lab_daemon_handoff"] == "planned"
+    assert plan["stopped"] is False
 
 
 def test_initialize_generation_publishes_first_marker_without_importing_deployer(

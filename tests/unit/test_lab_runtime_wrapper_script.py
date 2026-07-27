@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-import venv
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,57 @@ PREFLIGHT = ROOT / "scripts" / "preflight-lab-runtime.py"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-lab-daemon.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
+_ORIGINAL_OS_WALK = os.walk
+
+
+@pytest.fixture(autouse=True)
+def _remove_immutable_test_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    monkeypatch.setenv("RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES", "0")
+    try:
+        yield
+    finally:
+        generation_roots = [
+            Path(current_root) / name
+            for current_root, directory_names, _file_names in _ORIGINAL_OS_WALK(tmp_path)
+            for name in directory_names
+            if name.endswith(".venvs")
+        ]
+        for root in generation_roots:
+            if root.is_symlink() or not root.is_dir():
+                continue
+            for current_root, _directory_names, file_names in _ORIGINAL_OS_WALK(root):
+                current = Path(current_root)
+                if hasattr(os, "chflags"):
+                    os.chflags(current, 0)
+                current.chmod(0o700)
+                for name in file_names:
+                    path = current / name
+                    if not path.is_symlink():
+                        if hasattr(os, "chflags"):
+                            os.chflags(path, 0)
+                        path.chmod(0o600)
+            shutil.rmtree(root)
+
+
+def _tiny_test_venv(checkout: Path) -> Path:
+    venv_root = checkout / ".venv"
+    python = venv_root / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    shutil.copy2(sys.executable, python)
+    python.chmod(0o700)
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (venv_root / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
+        encoding="utf-8",
+    )
+    (venv_root / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
+    python_library = Path(sys.base_prefix) / "lib" / f"libpython{version}.dylib"
+    if python_library.exists():
+        shutil.copy2(python_library, venv_root / "lib" / python_library.name)
+    return python
 
 
 def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -60,15 +111,7 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         "    print('fake daemon executed', flush=True)\n",
         encoding="utf-8",
     )
-    venv.EnvBuilder(with_pip=False, symlinks=False).create(checkout / ".venv")
-    python_library = (
-        Path(sys.base_prefix)
-        / "lib"
-        / f"libpython{sys.version_info.major}.{sys.version_info.minor}.dylib"
-    )
-    if python_library.exists():
-        shutil.copy2(python_library, checkout / ".venv" / "lib" / python_library.name)
-    python = checkout / ".venv" / "bin" / "python"
+    python = _tiny_test_venv(checkout)
     executable = checkout / ".venv" / "bin" / "rquant"
     executable.write_text(
         f"#!{python}\n"

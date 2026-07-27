@@ -21,9 +21,12 @@ preflight，再导入 `rquant.cli`。共享发布锁 fd 会保留到 daemon 退�
 /Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
 ```
 
-daemon 持共享锁；`scripts/deploy-production.sh` 的 Python deployer 持独占锁。部署已经开始时，新
-daemon 启动失败；daemon 仍在运行时，部署失败关闭。由此一次进程只能看到一个完整 Git 代际，
-不能在检查与 import 之间混入合法部署。
+daemon 持共享锁；`scripts/deploy-production.sh` 另持稳定的 sibling handoff lock。macOS 正式
+发布会在交易保护窗口外记录当时 loaded 的三个 Lab label，逐个 `bootout`，有界等待 shared lock
+释放后再取得 generation 独占锁。事务成功或已回滚后，部署器只 `bootstrap` 原先 loaded 的 label，
+并验证 launchd health 与 shared lock 已重新取得；任一步超时都返回失败，不会无限等待。dry-run
+仅以共享锁核对并输出 handoff 计划，不停止 daemon。`launchctl` 始终由当前用户执行，sudoers
+不授予它。由此一次进程只能看到一个完整 Git 代际，且常驻 KeepAlive 不再永久阻塞部署。
 
 同目录的 `rQuant.complete.json` 不是单独完成凭证。daemon 必须同时核对 completed intent、
 `rQuant.commit.json`、`rQuant.environment.json` 和环境 manifest；commit record 精确绑定 marker、
@@ -32,6 +35,12 @@ intent content hash、operation id、commit 与环境 generation。部署器在 
 的 hash/身份；selector 只在完整 manifest 可验后原子切换。marker 可以先于 intent completion
 出现，但 commit record 只能在 intent=`completed` 后发布，因此任何中断代际都不会被 daemon
 接受。回滚以相同协议选择 previous commit 的不可变 generation。
+
+发布环境 GC 只在同一 generation 独占锁内运行。它保留当前 selector、marker、commit、active
+intent 的 resume/rollback 目标，以及按私有 manifest 判定的紧邻上一代；只删除超过宽限期、
+严格位于 generation root、无 symlink/hardlink 且不再被引用的完成或失败目录。只读树先受控解冻
+再按 descriptor 删除。每次扫描记录到 `rQuant.generation-gc.jsonl`，并在复制前验证
+`源环境大小 + RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES` 的磁盘预算；不足时不创建 staging。
 
 ## P1.5d 安装要求
 

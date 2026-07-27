@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **发布代际保留与 Lab daemon 部署交接**：active deployment intent 只有在活动记录真实
+  `ENOENT` 时才允许读取对应 completed archive，损坏、宽松权限或身份替换均失败关闭。
+  不可变 venv 在独占 generation lock 内按 current、上一有效 manifest、active intent、marker
+  与 commit 引用做有宽限期 GC，受发布后最小剩余磁盘预算约束并写 owner-only JSONL 指标审计；
+  测试改用微型物理环境且失败也删除 generation。macOS 正式发布以稳定 handoff lock 有界
+  bootout 原先 loaded 的三个 Lab launchd daemon，取得独占锁后执行事务，结束或回滚后只恢复
+  原服务并验证 health/shared lock；dry-run 仅报告计划，不停止 daemon，交易保护窗口内拒绝交接。
+
 - **生产发布可恢复提交与不可变运行环境**：generation marker 新增 operation id 和 immutable
   environment manifest 绑定；daemon 只有在 deployment/initialization intent 已完成且原子
   commit record 同时匹配时才接受代际。target authority 将 frozen-sync 后的 `.venv` 发布为

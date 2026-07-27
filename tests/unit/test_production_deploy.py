@@ -15,6 +15,7 @@ import pytest
 import rquant.ops.production_deploy as production_deploy
 from rquant.ops.production_deploy import (
     ALL_LONG_RUNNING_SERVICES,
+    LAB_LAUNCHD_HANDOFF_LABELS,
     DeployConfig,
     DeployError,
     PolicyError,
@@ -300,6 +301,7 @@ def test_change_plan_keeps_preflight_only_release_restart_free() -> None:
 
     assert plan.blocked_files == ()
     assert plan.restart_services == ()
+    assert plan.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
 
 
 def test_change_plan_restarts_all_for_shared_runtime_or_unknown_source() -> None:
@@ -331,6 +333,7 @@ def test_dry_run_builds_exact_plan_without_mutating_repo(tmp_path: Path) -> None
 
     assert result.status == "dry_run"
     assert result.target_sha == _sha("b")
+    assert result.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
     assert ("git", "merge", "--ff-only", _sha("b")) not in runner.calls
     assert ("uv", "sync", "--frozen") not in runner.calls
 
@@ -1196,6 +1199,9 @@ def test_sudoers_allows_only_exact_managed_timer_transitions() -> None:
         assert f"/usr/bin/systemctl start {timer}" in source
     assert "systemctl stop rquant-*" not in source
     assert "systemctl start rquant-*" not in source
+    assert "launchctl" not in "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
 
 
 def test_cli_does_not_allow_overriding_production_executables() -> None:

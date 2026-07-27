@@ -80,6 +80,7 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
     assert document.get("EnvironmentVariables", {}) == {
         "PATH": f"{WORKING_DIRECTORY}/.venv/bin:/usr/local/bin:/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "RQUANT_RELEASE_HANDOFF_MANAGED": "1",
         "RQUANT_TRUSTED_GIT_PATH": TRUSTED_GIT,
     }
     serialized = path.read_text(encoding="utf-8")

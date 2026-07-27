@@ -8,14 +8,18 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import stat
 import subprocess
 import sys
+import time
 import tomllib
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
+from zoneinfo import ZoneInfo
 
 sys.dont_write_bytecode = True
 
@@ -25,6 +29,12 @@ class DeployBootstrapError(RuntimeError):
 
 
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
+LAB_LAUNCHD_LABELS = (
+    "com.roxor.rquant-lab-scheduler",
+    "com.roxor.rquant-lab-worker",
+    "com.roxor.rquant-lab-finalizer",
+)
+LAUNCHD_HANDOFF_TIMEOUT_SECONDS = 30.0
 
 
 def _canonical(raw: str, *, label: str) -> Path:
@@ -82,7 +92,13 @@ def _trusted_git(path: Path) -> None:
         raise DeployBootstrapError("trusted Git has unsafe identity")
 
 
-def _acquire_lock(root: Path, lock_path: Path) -> int:
+def _acquire_lock(
+    root: Path,
+    lock_path: Path,
+    *,
+    shared: bool = False,
+    timeout_seconds: float = 0,
+) -> int:
     expected = root.parent / ".rquant-deploy" / f"{root.name}.lock"
     if lock_path != expected:
         raise DeployBootstrapError("deployment lock does not match checkout binding")
@@ -105,13 +121,227 @@ def _acquire_lock(root: Path, lock_path: Path) -> int:
             or stat.S_IMODE(opened.st_mode) != 0o600
         ):
             raise DeployBootstrapError("deployment generation lock is unsafe")
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
         os.set_inheritable(descriptor, True)
         return descriptor
     except BlockingIOError as exc:
         raise DeployBootstrapError("another release generation is active") from exc
     except OSError as exc:
         raise DeployBootstrapError("deployment generation lock is unavailable") from exc
+
+
+def _acquire_handoff_lock(root: Path, lock_path: Path) -> tuple[int, int]:
+    handoff_path = lock_path.with_name(f"{lock_path.stem}.handoff.lock")
+    descriptor = -1
+    root_fd = -1
+    try:
+        expected = root.parent / ".rquant-deploy" / f"{root.name}.lock"
+        if lock_path != expected:
+            raise DeployBootstrapError("deployment lock does not match checkout binding")
+        lock_path.parent.mkdir(mode=0o700, exist_ok=True)
+        _physical_directory(
+            lock_path.parent,
+            label="deployment authority root",
+            private=True,
+        )
+        before = lock_path.parent.lstat()
+        root_fd = os.open(
+            lock_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_root = os.fstat(root_fd)
+        if (before.st_dev, before.st_ino, before.st_mode, before.st_uid) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+            opened_root.st_mode,
+            opened_root.st_uid,
+        ):
+            raise DeployBootstrapError("deployment handoff root identity changed")
+        descriptor = os.open(
+            handoff_path.name,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(descriptor)
+        active = os.stat(handoff_path.name, dir_fd=root_fd, follow_symlinks=False)
+        rebound_root = lock_path.parent.lstat()
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+            != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (rebound_root.st_dev, rebound_root.st_ino, rebound_root.st_mode, rebound_root.st_uid)
+            != (before.st_dev, before.st_ino, before.st_mode, before.st_uid)
+        ):
+            raise DeployBootstrapError("deployment handoff lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return root_fd, descriptor
+    except BlockingIOError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise DeployBootstrapError("another deployment handoff/generation is active") from exc
+    except DeployBootstrapError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise DeployBootstrapError("deployment handoff lock is unavailable") from exc
+
+
+def _is_protected_handoff_window(now: datetime | None = None) -> bool:
+    local = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    else:
+        local = local.astimezone(ZoneInfo("Asia/Shanghai"))
+    if local.weekday() >= 5:
+        return False
+    current = local.hour * 60 + local.minute
+    return 9 * 60 + 15 <= current <= 15 * 60 + 10
+
+
+def _launchctl(
+    arguments: list[str],
+    *,
+    check: bool,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["/bin/launchctl", *arguments],
+            check=check,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeployBootstrapError("Lab launchd handoff command failed") from exc
+
+
+def _generation_lock_is_held(root: Path, lock_path: Path) -> bool:
+    try:
+        descriptor = _acquire_lock(root, lock_path)
+    except DeployBootstrapError as exc:
+        if "another release generation is active" in str(exc):
+            return True
+        raise
+    os.close(descriptor)
+    return False
+
+
+class _LabLaunchdHandoff:
+    def __init__(self, *, root: Path, lock_path: Path, timeout_seconds: float) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 300:
+            raise DeployBootstrapError("Lab launchd handoff timeout is invalid")
+        self.root = root
+        self.lock_path = lock_path
+        self.timeout_seconds = timeout_seconds
+        self.domain = f"gui/{os.getuid()}"
+        self.plists = {
+            label: root / "deploy" / "launchd" / f"{label}.plist" for label in LAB_LAUNCHD_LABELS
+        }
+        self.enabled = sys.platform == "darwin" and all(
+            path.is_file() for path in self.plists.values()
+        )
+        self.loaded: list[str] = []
+        self.stopped: list[str] = []
+        self.lock_fd = -1
+        self.root_fd = -1
+
+    def prepare(self, *, dry_run: bool, now: datetime | None = None) -> None:
+        self.root_fd, self.lock_fd = _acquire_handoff_lock(self.root, self.lock_path)
+        if dry_run:
+            print(
+                json.dumps(
+                    {
+                        "lab_daemon_handoff": "planned",
+                        "labels": list(LAB_LAUNCHD_LABELS),
+                        "stopped": False,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return
+        if not self.enabled:
+            return
+        if _is_protected_handoff_window(now):
+            raise DeployBootstrapError(
+                "Lab daemon handoff is forbidden during the protected 09:15-15:10 window"
+            )
+        for label, plist in self.plists.items():
+            _physical_file(plist, label=f"Lab launchd plist {label}")
+            result = _launchctl(
+                ["print", f"{self.domain}/{label}"],
+                check=False,
+                timeout_seconds=self.timeout_seconds,
+            )
+            if result.returncode == 0:
+                self.loaded.append(label)
+            elif result.returncode not in {3, 113}:
+                raise DeployBootstrapError(f"Lab launchd state is unavailable for {label}")
+        for label in self.loaded:
+            _launchctl(
+                ["bootout", f"{self.domain}/{label}"],
+                check=True,
+                timeout_seconds=self.timeout_seconds,
+            )
+            self.stopped.append(label)
+
+    def restore(self) -> None:
+        errors: list[str] = []
+        if self.enabled:
+            for label in self.stopped:
+                try:
+                    _launchctl(
+                        ["bootstrap", self.domain, str(self.plists[label])],
+                        check=True,
+                        timeout_seconds=self.timeout_seconds,
+                    )
+                    health = _launchctl(
+                        ["print", f"{self.domain}/{label}"],
+                        check=False,
+                        timeout_seconds=self.timeout_seconds,
+                    )
+                    if health.returncode != 0 or "state = running" not in health.stdout:
+                        raise DeployBootstrapError(f"Lab daemon did not become healthy: {label}")
+                except DeployBootstrapError as exc:
+                    errors.append(str(exc))
+            if self.stopped and not errors:
+                deadline = time.monotonic() + self.timeout_seconds
+                while not _generation_lock_is_held(self.root, self.lock_path):
+                    if time.monotonic() >= deadline:
+                        errors.append("restarted Lab daemons did not reacquire the generation lock")
+                        break
+                    time.sleep(0.05)
+        if self.lock_fd >= 0:
+            os.close(self.lock_fd)
+            self.lock_fd = -1
+        if self.root_fd >= 0:
+            os.close(self.root_fd)
+            self.root_fd = -1
+        if errors:
+            raise DeployBootstrapError("; ".join(errors))
 
 
 def _git_run(
@@ -398,24 +628,55 @@ def main(argv: list[str] | None = None) -> int:
     args, deploy_argv = parser.parse_known_args(argv)
     lock_fd = -1
     generation_error_type: type[BaseException] | None = None
+    missing_record_type: type[BaseException] | None = None
+    handoff: _LabLaunchdHandoff | None = None
+
+    def finish(return_code: int) -> int:
+        nonlocal handoff, lock_fd
+        if lock_fd >= 0:
+            os.close(lock_fd)
+            lock_fd = -1
+        if handoff is not None:
+            try:
+                handoff.restore()
+            except DeployBootstrapError as exc:
+                print(f"Production deploy bootstrap failed: {exc}", file=sys.stderr)
+                return_code = 2
+            handoff = None
+        return return_code
+
     try:
         root = _canonical(args.expected_checkout_root, label="deployment checkout")
         _physical_directory(root, label="deployment checkout")
         if Path.cwd().resolve(strict=True) != root:
             raise DeployBootstrapError("working directory does not match deployment checkout")
         lock_path = _canonical(args.deployment_lock_path, label="deployment lock")
-        if args.finalize_generation:
-            if args.inherited_lock_fd is None:
-                raise DeployBootstrapError("finalizer requires inherited generation lock")
-            lock_fd = _assert_inherited_lock(root, lock_path, args.inherited_lock_fd)
-        else:
-            lock_fd = _acquire_lock(root, lock_path)
         git_path = _canonical(args.trusted_git_path, label="trusted Git")
         _trusted_git(git_path)
         python_path = _canonical(args.python_path, label="deployment Python")
         _physical_file(python_path, label="deployment Python", executable=True)
         uv_path = _canonical(args.uv_path, label="deployment uv")
         _physical_file(uv_path, label="deployment uv", executable=True)
+        dry_run = "--dry-run" in _normalized_deploy_argv(deploy_argv)
+        if args.finalize_generation:
+            if args.inherited_lock_fd is None:
+                raise DeployBootstrapError("finalizer requires inherited generation lock")
+            lock_fd = _assert_inherited_lock(root, lock_path, args.inherited_lock_fd)
+        else:
+            if dry_run and (args.initialize_generation or args.recover_generation):
+                raise DeployBootstrapError("generation initialization/recovery cannot be a dry-run")
+            handoff = _LabLaunchdHandoff(
+                root=root,
+                lock_path=lock_path,
+                timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+            )
+            handoff.prepare(dry_run=dry_run)
+            lock_fd = _acquire_lock(
+                root,
+                lock_path,
+                shared=dry_run,
+                timeout_seconds=(LAUNCHD_HANDOFF_TIMEOUT_SECONDS if handoff.stopped else 0),
+            )
         authority_path = root / "src" / "rquant" / "release_generation.py"
         generation_mode = args.initialize_generation or args.recover_generation
         if args.recover_generation != (args.recovery_action is not None):
@@ -456,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
             _physical_file(authority_path, label="release generation authority")
             authority_module = _load_release_authority(authority_path)
             generation_error_type = authority_module.ReleaseGenerationError
+            missing_record_type = authority_module.ReleaseGenerationRecordMissingError
             authority = authority_module.ReleaseGenerationAuthority(
                 repo=root,
                 lock_path=lock_path,
@@ -466,9 +728,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             try:
                 initialization = authority.read_initialization()
-            except generation_error_type as exc:
-                if "cannot be read" not in str(exc):
-                    raise
+            except missing_record_type:
                 initialization = authority.begin_initialization(target_sha=commit)
             else:
                 if initialization.target_sha != commit:
@@ -498,7 +758,7 @@ def main(argv: list[str] | None = None) -> int:
                                 sort_keys=True,
                             )
                         )
-                        return 0
+                        return finish(0)
                     raise generation_error_type(
                         "release generation initialization already completed"
                     )
@@ -522,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
-            return 0
+            return finish(0)
 
         commit = _git_head(root, git_path)
         _tracked_checkout_is_clean(root, git_path)
@@ -530,6 +790,7 @@ def main(argv: list[str] | None = None) -> int:
         _physical_file(authority_path, label="release generation authority")
         authority_module = _load_release_authority(authority_path)
         generation_error_type = authority_module.ReleaseGenerationError
+        missing_record_type = authority_module.ReleaseGenerationRecordMissingError
         authority = authority_module.ReleaseGenerationAuthority(
             repo=root,
             lock_path=lock_path,
@@ -578,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
-            return 0
+            return finish(0)
 
         if args.recover_generation:
             intent = authority.read_deployment_intent()
@@ -610,25 +871,27 @@ def main(argv: list[str] | None = None) -> int:
         deploy_argv = _normalized_deploy_argv(deploy_argv)
         if args.recover_generation:
             deploy_argv.extend(["--recovery-action", str(args.recovery_action)])
-        return int(
-            deploy_main(
-                [
-                    *deploy_argv,
-                    "--repo",
-                    str(root),
-                    "--deployment-lock-path",
-                    str(lock_path),
-                    "--deployment-lock-fd",
-                    str(lock_fd),
-                    "--startup-generation",
-                    commit,
-                    "--trusted-git-path",
-                    str(git_path),
-                    "--python-path",
-                    str(python_path),
-                    "--uv-path",
-                    str(uv_path),
-                ]
+        return finish(
+            int(
+                deploy_main(
+                    [
+                        *deploy_argv,
+                        "--repo",
+                        str(root),
+                        "--deployment-lock-path",
+                        str(lock_path),
+                        "--deployment-lock-fd",
+                        str(lock_fd),
+                        "--startup-generation",
+                        commit,
+                        "--trusted-git-path",
+                        str(git_path),
+                        "--python-path",
+                        str(python_path),
+                        "--uv-path",
+                        str(uv_path),
+                    ]
+                )
             )
         )
     except Exception as exc:
@@ -638,10 +901,17 @@ def main(argv: list[str] | None = None) -> int:
         if not expected:
             raise
         print(f"Production deploy bootstrap failed: {exc}", file=sys.stderr)
-        return 2
+        return finish(2)
     finally:
         if lock_fd >= 0:
             os.close(lock_fd)
+            lock_fd = -1
+        if handoff is not None:
+            try:
+                handoff.restore()
+            except DeployBootstrapError as exc:
+                print(f"Production deploy bootstrap cleanup failed: {exc}", file=sys.stderr)
+            handoff = None
 
 
 if __name__ == "__main__":

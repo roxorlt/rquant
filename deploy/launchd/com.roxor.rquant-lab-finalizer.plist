@@ -53,6 +53,8 @@
         <string>1</string>
         <key>RQUANT_TRUSTED_GIT_PATH</key>
         <string>/usr/bin/git</string>
+        <key>RQUANT_RELEASE_HANDOFF_MANAGED</key>
+        <string>1</string>
     </dict>
 </dict>
 </plist>

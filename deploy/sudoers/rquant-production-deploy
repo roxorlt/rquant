@@ -1,5 +1,6 @@
 # Install as /etc/sudoers.d/rquant-production-deploy with mode 0440.
 # Validate before install: visudo -cf deploy/sudoers/rquant-production-deploy
+# macOS Lab launchd handoff runs as its owning user; never grant launchctl through sudo.
 
 Cmnd_Alias RQUANT_SERVICE_RESTART = \
     /usr/bin/systemctl restart rquant-canvas.service, \
