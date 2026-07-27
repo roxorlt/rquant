@@ -5,6 +5,36 @@
 
 ---
 
+## 2026-07-27 · v0.26.9 · 爆量与脉搏 Push 移动端格式优化
+
+**状态**：爆量格式 PR #133（CI run `30232003418`）与脉搏格式 PR #134（CI run
+`30233029001`）均经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag `v0.26.9`
+精确指向 `c7b38f0d6177ac35fc87de1c2c58ec51e5629241`，其父提交是包含爆量格式的
+`182f0b590313368d306f07a1f2bec18750150370`。15:10-15:11 在交易保护窗口外使用
+`scripts/deploy-production.sh --target v0.26.9` 从 `v0.26.7`
+（`9bb5235a8a2fd1d4d874a2c71858e99acb58f9fe`）快进发布，部署器返回 `deployed`；
+没有 schema、systemd、生产数据或密钥变更。
+
+**变更内容**：爆量 Push 改为每个标的一组，题材、涨幅/涨停空间、累计比/累计额和分钟方向
+逐行展示；30 分钟脉搏改为“市场温度 / 新晋涨停 / 题材热度 / 放量异动”四个 Markdown
+分节，股票与题材逐项展示。判定口径、去重、数量上限、通知路由和调度时间均未改变。
+
+**验证与生产验收**：
+
+- 本地实际 launchd 运行 worktree 用提交 `089cbe1` 仅覆盖脉搏渲染器与对应测试；47 项
+  midday/notify 聚焦测试、Ruff 和差异检查通过。根 `.venv` 已确认导入该 worktree，
+  `morning-pulse` 与 `midday-report` 均保持已加载、收盘后不运行、上次退出码 0。
+- 生产 HEAD、tag 与包版本分别为上述精确 SHA、`v0.26.9`、`0.26.9`，工作树干净；纯
+  `render_pulse` 样例输出四个分节。发布器重启的 canvas、dashboard、nl-screen、
+  panorama-auth 和 panorama 五个服务均为 `active`。
+- monitor 与 surge-watch 收盘后保持 `inactive`，两个 timer 均等待下一交易日 09:25；
+  未盘后补跑监控或发送测试 Push。
+
+**回滚**：本版本只有通知文本渲染变化。若移动端展示异常，创建针对 PR #133/#134 的
+revert PR，合并后打更高 SemVer tag，并通过受控部署器向前发布；禁止生产机直接回退旧 tag。
+
+---
+
 ## 2026-07-24 · v0.26.7 · Growth 固定回放停牌证据绑定修复
 
 **状态**：PR #131 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
