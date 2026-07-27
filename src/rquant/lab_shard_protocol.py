@@ -16,7 +16,14 @@ from pathlib import Path
 from typing import Annotated, Final, Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from rquant.lab_job_protocol import (
     InvalidCommandEnvelopeError,
@@ -448,13 +455,21 @@ class LabShardSucceeded(LabShardProtocolModel):
 
     @model_validator(mode="after")
     def validate_digest_provenance(self) -> LabShardSucceeded:
+        provenance_fields = {
+            "result_manifest_schema_version",
+            "content_digest_algorithm",
+            "worker_code_sha",
+        }
+        supplied_fields = provenance_fields.intersection(self.model_fields_set)
         provenance = (
             self.result_manifest_schema_version,
             self.content_digest_algorithm,
             self.worker_code_sha,
         )
-        if provenance == (None, None, None):
+        if not supplied_fields and provenance == (None, None, None):
             return self
+        if supplied_fields != provenance_fields:
+            raise ValueError("shard success digest provenance is incomplete or unsupported")
         if (
             self.result_manifest_schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
             and self.content_digest_algorithm == CURRENT_CONTENT_DIGEST_ALGORITHM
@@ -462,6 +477,22 @@ class LabShardSucceeded(LabShardProtocolModel):
         ):
             return self
         raise ValueError("shard success digest provenance is incomplete or unsupported")
+
+    @model_serializer(mode="wrap")
+    def serialize_digest_provenance(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> object:
+        payload = handler(self)
+        provenance_fields = {
+            "result_manifest_schema_version",
+            "content_digest_algorithm",
+            "worker_code_sha",
+        }
+        if isinstance(payload, dict) and not provenance_fields.intersection(self.model_fields_set):
+            for field in provenance_fields:
+                payload.pop(field, None)
+        return payload
 
 
 class LabShardFailed(LabShardProtocolModel):
@@ -556,6 +587,9 @@ class LabWorkerReport(LabShardProtocolModel):
         object.__setattr__(self, "reported_at", reported_at)
         object.__setattr__(self, "content_hash", expected)
         return self
+
+    def canonical_json(self) -> str:
+        return self.model_dump_json()
 
 
 class LabReportReceipt(LabShardProtocolModel):
@@ -1811,7 +1845,7 @@ class LabReportSpool(_TypedSpoolBase):
 
     def publish(self, report: LabWorkerReport) -> LabReportSpoolEntry | LabAcknowledgedReport:
         validated = LabWorkerReport.model_validate(report)
-        payload = validated.model_dump_json().encode("utf-8")
+        payload = validated.canonical_json().encode("utf-8")
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{validated.report_id}.json"
             pending = self._pending_for_message_locked(validated.report_id)
@@ -1845,6 +1879,8 @@ class LabReportSpool(_TypedSpoolBase):
         try:
             _sequence, filename_id = self._message_name_parts(candidate.name)
             report = LabWorkerReport.model_validate_json(payload)
+            if payload != report.canonical_json().encode("utf-8"):
+                raise ValueError("worker report JSON is not canonical")
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid worker report {candidate.name}: {exc}",

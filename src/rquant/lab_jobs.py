@@ -1471,7 +1471,7 @@ def _worker_report_record_from_row(
             raise ValueError("receipt status mismatch")
         if receipt.reason != str(row["reason"]):
             raise ValueError("receipt reason mismatch")
-        if report.model_dump_json() != str(row["report_json"]):
+        if report.canonical_json() != str(row["report_json"]):
             raise ValueError("worker report JSON is not canonical")
         if receipt.model_dump_json() != str(row["receipt_json"]):
             raise ValueError("worker report receipt JSON is not canonical")
@@ -6916,7 +6916,7 @@ class LabJobStore:
                 str(report.job_id),
                 str(report.shard_id),
                 report.body.report_type,
-                report.model_dump_json(),
+                report.canonical_json(),
                 receipt.status,
                 receipt.reason,
                 receipt.model_dump_json(),

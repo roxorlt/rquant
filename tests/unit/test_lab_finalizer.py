@@ -135,6 +135,7 @@ class _Scenario:
         commit_spool: LabArtifactCommitSpool,
         code_sha: str = "1" * 40,
         result_digest_policy: LabResultDigestPolicy | None = None,
+        legacy_report_bytes: tuple[bytes, ...] = (),
     ) -> None:
         self.root = root
         self.store = store
@@ -144,6 +145,7 @@ class _Scenario:
         self.commit_spool = commit_spool
         self.code_sha = code_sha
         self.result_digest_policy = result_digest_policy or LabResultDigestPolicy()
+        self.legacy_report_bytes = legacy_report_bytes
 
     def finalizer(self) -> LabFinalizer:
         return LabFinalizer(
@@ -185,6 +187,106 @@ class _CallbackSnapshotReader:
         return self.reader.get_artifact_commit(request_id)
 
 
+def _literal_json_object(fields: tuple[tuple[str, bytes], ...]) -> bytes:
+    return (
+        b"{"
+        + b",".join(
+            json.dumps(name, ensure_ascii=True).encode("ascii") + b":" + value
+            for name, value in fields
+        )
+        + b"}"
+    )
+
+
+def _literal_json_token(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _literal_legacy_success_report_bytes(
+    report: LabWorkerReport,
+    *,
+    result_manifest_hash: str,
+) -> bytes:
+    body = report.body
+    assert isinstance(body, LabShardSucceeded)
+    telemetry = body.telemetry
+    telemetry_payload: dict[str, object] | None = None
+    telemetry_json = b"null"
+    if telemetry is not None:
+        telemetry_payload = {
+            "phase": telemetry.phase,
+            "work_unit_name": telemetry.work_unit_name,
+            "work_units": telemetry.work_units,
+            "static_duration_ms": telemetry.static_duration_ms,
+            "duration_ms": telemetry.duration_ms,
+            "throughput_units_per_second": telemetry.throughput_units_per_second,
+        }
+        telemetry_json = _literal_json_object(
+            tuple((name, _literal_json_token(value)) for name, value in telemetry_payload.items())
+        )
+    body_payload = {
+        "report_type": "shard_succeeded",
+        "result_manifest_hash": result_manifest_hash,
+        "telemetry": telemetry_payload,
+    }
+    body_json = _literal_json_object(
+        (
+            ("report_type", b'"shard_succeeded"'),
+            ("result_manifest_hash", _literal_json_token(result_manifest_hash)),
+            ("telemetry", telemetry_json),
+        )
+    )
+    reported_at_hash = report.reported_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    content_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "body": body_payload,
+                "claim_generation": report.claim_generation,
+                "claim_token": str(report.claim_token),
+                "job_id": str(report.job_id),
+                "payload_hash": report.payload_hash,
+                "report_id": str(report.report_id),
+                "reported_at": reported_at_hash,
+                "scheduler_fencing_token": report.scheduler_fencing_token,
+                "schema_version": report.schema_version,
+                "shard_id": str(report.shard_id),
+                "spec_hash": report.spec_hash,
+                "worker_id": report.worker_id,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    reported_at_json = report.reported_at.isoformat().replace("+00:00", "Z")
+    return _literal_json_object(
+        (
+            ("schema_version", b"1"),
+            ("report_id", _literal_json_token(str(report.report_id))),
+            ("job_id", _literal_json_token(str(report.job_id))),
+            ("shard_id", _literal_json_token(str(report.shard_id))),
+            ("spec_hash", _literal_json_token(report.spec_hash)),
+            ("payload_hash", _literal_json_token(report.payload_hash)),
+            ("worker_id", _literal_json_token(report.worker_id)),
+            ("claim_token", _literal_json_token(str(report.claim_token))),
+            ("claim_generation", _literal_json_token(report.claim_generation)),
+            (
+                "scheduler_fencing_token",
+                _literal_json_token(report.scheduler_fencing_token),
+            ),
+            ("reported_at", _literal_json_token(reported_at_json)),
+            ("body", body_json),
+            ("content_hash", _literal_json_token(content_hash)),
+        )
+    )
+
+
 def _ready_scenario(
     tmp_path: Path,
     *,
@@ -205,6 +307,7 @@ def _ready_scenario(
     store.initialize()
     job_id = uuid4()
     resolved_spec = spec or _nshape_compare_spec(hold_days=hold_days)
+    legacy_report_payloads: list[bytes] = []
     commands.publish(
         LabCommandEnvelope(
             request_id=uuid4(),
@@ -321,19 +424,15 @@ def _ready_scenario(
             legacy_payload.pop("content_digest_algorithm", None)
             legacy = LabShardResultManifest.model_validate(legacy_payload)
             _persist_attempt_manifest(attempt, legacy)
-            reports.quarantine(entry, reason="test cutover rewrites exact legacy report")
-            report_payload = report.model_dump(mode="python")
-            report_payload.update(
-                {
-                    "report_id": uuid4(),
-                    "body": LabShardSucceeded(
-                        result_manifest_hash=legacy.manifest_hash,
-                        telemetry=body.telemetry,
-                    ),
-                    "content_hash": "",
-                }
+            literal_report = _literal_legacy_success_report_bytes(
+                report,
+                result_manifest_hash=legacy.manifest_hash,
             )
-            reports.publish(LabWorkerReport.model_validate(report_payload))
+            assert b'"result_manifest_schema_version"' not in literal_report
+            assert b'"content_digest_algorithm"' not in literal_report
+            assert b'"worker_code_sha"' not in literal_report
+            entry.path.write_bytes(literal_report)
+            legacy_report_payloads.append(literal_report)
         scheduler.run_once()
     job = LabJobReader(store.path).get_job(job_id)
     assert job is not None
@@ -348,6 +447,7 @@ def _ready_scenario(
         commit_spool=commit_spool,
         code_sha=resolved_spec.code_sha,
         result_digest_policy=result_digest_policy,
+        legacy_report_bytes=tuple(legacy_report_payloads),
     )
 
 
@@ -962,6 +1062,15 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
             result_digest_policy=policy,
             rewrite_pending_as_legacy_v1=True,
         )
+
+    assert len(scenario.legacy_report_bytes) == 1
+    legacy_report_id = json.loads(scenario.legacy_report_bytes[0])["report_id"]
+    with sqlite3.connect(scenario.store.path) as connection:
+        stored_report_json = connection.execute(
+            "SELECT report_json FROM lab_worker_report WHERE report_id = ?",
+            (legacy_report_id,),
+        ).fetchone()[0]
+    assert stored_report_json.encode("utf-8") == scenario.legacy_report_bytes[0]
 
     snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
     assert snapshot is not None

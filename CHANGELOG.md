@@ -50,6 +50,12 @@
 
 ### Fixed
 
+- **Strategy Lab 历史 v1 worker report 字节迁移**：success report 现在依据原始
+  `model_fields_set` 区分 provenance 字段缺失与显式 `null`；真正的旧 v1 JSON 可在 typed
+  allowlist 下保持原字节进入 spool、SQLite 与 finalizer，而 partial/null/extra provenance
+  及非 canonical 编码继续 fail closed。current v2 的 canonical bytes 与 exactly-once identity
+  保持不变。
+
 - **Strategy Lab shard digest provenance 加固**：worker result manifest 升级为 v2，并在
   manifest 与 accepted success report 中同时绑定 digest algorithm、verified worker code SHA
   和 manifest schema。scheduler 在 SQLite 写事务内将三者与权威 job spec 核对；finalizer

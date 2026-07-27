@@ -340,6 +340,31 @@ def test_succeeded_report_binds_current_digest_provenance() -> None:
     assert body.worker_code_sha == "1" * 40
 
 
+def test_legacy_succeeded_report_preserves_absent_digest_provenance() -> None:
+    claim = _claim()
+    report = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardSucceeded(result_manifest_hash="3" * 64),
+    )
+
+    raw = report.canonical_json().encode("utf-8")
+    parsed = LabWorkerReport.model_validate_json(raw)
+    body = parsed.body
+    assert isinstance(body, LabShardSucceeded)
+    assert not {
+        "result_manifest_schema_version",
+        "content_digest_algorithm",
+        "worker_code_sha",
+    }.intersection(body.model_fields_set)
+    assert b'"result_manifest_schema_version"' not in raw
+    assert b'"content_digest_algorithm"' not in raw
+    assert b'"worker_code_sha"' not in raw
+    assert parsed.canonical_json().encode("utf-8") == raw
+    assert parsed.model_dump_json().encode("utf-8") == raw
+
+
 @pytest.mark.parametrize(
     "updates",
     [
@@ -351,6 +376,12 @@ def test_succeeded_report_binds_current_digest_provenance() -> None:
             "content_digest_algorithm": "pandas-orient-table-json-sha256-v1",
             "worker_code_sha": "1" * 40,
         },
+        {
+            "result_manifest_schema_version": None,
+            "content_digest_algorithm": None,
+            "worker_code_sha": None,
+        },
+        {"unknown_digest_field": "forbidden"},
     ],
 )
 def test_succeeded_report_rejects_partial_or_forged_digest_provenance(
@@ -1096,8 +1127,16 @@ def test_report_spool_exactly_once_ack_restart_and_conflict(tmp_path: Path) -> N
     root = tmp_path / "reports"
     spool = LabReportSpool(root)
     claim = _claim()
-    report = _report(claim, LabShardSucceeded(result_manifest_hash="3" * 64))
+    report = _report(
+        claim,
+        LabShardSucceeded.current(
+            result_manifest_hash="3" * 64,
+            worker_code_sha="1" * 40,
+        ),
+    )
     entry = spool.publish(report)
+    assert entry.path.read_bytes() == report.canonical_json().encode("utf-8")
+    assert report.canonical_json() == report.model_dump_json()
     receipt = LabReportReceipt.from_report(
         report,
         status="accepted",
@@ -1117,6 +1156,30 @@ def test_report_spool_exactly_once_ack_restart_and_conflict(tmp_path: Path) -> N
     )
     with pytest.raises((ValidationError, RequestContentConflictError)):
         restarted.publish(conflict)
+
+
+def test_report_spool_rejects_noncanonical_legacy_report_encoding(tmp_path: Path) -> None:
+    spool = LabReportSpool(tmp_path / "reports")
+    claim = _claim()
+    report = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardSucceeded(result_manifest_hash="3" * 64),
+    )
+    entry = spool.publish(report)
+    canonical = entry.path.read_bytes()
+    noncanonical = json.dumps(
+        json.loads(canonical),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert noncanonical != canonical
+    entry.path.write_bytes(noncanonical)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="canonical"):
+        spool.load(entry.path)
 
 
 def test_success_receipt_carries_attempt_and_manifest_identity() -> None:
