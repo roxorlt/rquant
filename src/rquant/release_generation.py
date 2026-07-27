@@ -35,6 +35,7 @@ DEFAULT_GENERATION_GC_GRACE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_GENERATION_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
 GENERATION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 BUILDING_GENERATION_PATTERN = re.compile(r"\.([0-9a-f]{64})\.[0-9a-f]{16}\.building")
+_VENV_RELATIVE_SYMLINKS = frozenset({"bin/python3", "lib64"})
 
 
 class ReleaseGenerationError(RuntimeError):
@@ -88,6 +89,7 @@ class ReleaseGenerationMarker:
     site_packages_path: str
     site_packages_identity: PathIdentity
     environment_generation_id: str
+    previous_generation_id: str
     environment_manifest_sha256: str
     published_at: str
 
@@ -116,6 +118,7 @@ class ReleaseGenerationMarker:
                 site_packages_path=str(payload["site_packages_path"]),
                 site_packages_identity=PathIdentity(**payload["site_packages_identity"]),
                 environment_generation_id=str(payload["environment_generation_id"]),
+                previous_generation_id=str(payload["previous_generation_id"]),
                 environment_manifest_sha256=str(payload["environment_manifest_sha256"]),
                 published_at=str(payload["published_at"]),
             )
@@ -137,6 +140,7 @@ class DeploymentIntent:
     active_timers: tuple[str, ...]
     restarted_services: tuple[str, ...]
     marker_generation: str
+    previous_generation_id: str
     created_at: str
     updated_at: str
     stage_history: tuple[dict[str, str], ...]
@@ -157,6 +161,7 @@ class DeploymentIntent:
         active_services: tuple[str, ...],
         active_timers: tuple[str, ...],
         marker_generation: str = "",
+        previous_generation_id: str = "",
         stage: str = "planned",
     ) -> DeploymentIntent:
         for label, value in (("previous", previous_sha), ("target", target_sha)):
@@ -176,6 +181,7 @@ class DeploymentIntent:
             active_timers=tuple(active_timers),
             restarted_services=(),
             marker_generation=marker_generation,
+            previous_generation_id=previous_generation_id,
             created_at=timestamp,
             updated_at=timestamp,
             stage_history=({"stage": stage, "timestamp": timestamp},),
@@ -197,6 +203,7 @@ class DeploymentIntent:
                 active_timers=tuple(str(value) for value in payload["active_timers"]),
                 restarted_services=tuple(str(value) for value in payload["restarted_services"]),
                 marker_generation=str(payload["marker_generation"]),
+                previous_generation_id=str(payload.get("previous_generation_id", "")),
                 created_at=str(payload["created_at"]),
                 updated_at=str(payload["updated_at"]),
                 stage_history=tuple(
@@ -214,6 +221,8 @@ class DeploymentIntent:
         for label, value in (("previous", intent.previous_sha), ("target", intent.target_sha)):
             if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
                 raise ReleaseGenerationError(f"deployment intent {label} SHA is invalid")
+        if intent.previous_generation_id and len(intent.previous_generation_id) != 64:
+            raise ReleaseGenerationError("deployment intent previous generation is invalid")
         return intent
 
     def advance(
@@ -241,6 +250,7 @@ class EnvironmentSelector:
     transaction_kind: str
     commit: str
     generation_id: str
+    previous_generation_id: str
     environment_path: str
     manifest_name: str
     manifest_sha256: str
@@ -255,6 +265,7 @@ class EnvironmentSelector:
                 transaction_kind=str(payload["transaction_kind"]),
                 commit=str(payload["commit"]),
                 generation_id=str(payload["generation_id"]),
+                previous_generation_id=str(payload["previous_generation_id"]),
                 environment_path=str(payload["environment_path"]),
                 manifest_name=str(payload["manifest_name"]),
                 manifest_sha256=str(payload["manifest_sha256"]),
@@ -268,6 +279,9 @@ class EnvironmentSelector:
             or selector.transaction_kind not in {"deployment", "initialization"}
             or len(selector.commit) != 40
             or len(selector.generation_id) != 64
+            or (
+                selector.previous_generation_id != "" and len(selector.previous_generation_id) != 64
+            )
             or len(selector.manifest_sha256) != 64
         ):
             raise ReleaseGenerationError("environment selector is invalid")
@@ -283,6 +297,7 @@ class ReleaseGenerationCommit:
     marker_sha256: str
     transaction_sha256: str
     environment_generation_id: str
+    previous_generation_id: str
     environment_manifest_sha256: str
     committed_at: str
 
@@ -297,6 +312,7 @@ class ReleaseGenerationCommit:
                 marker_sha256=str(payload["marker_sha256"]),
                 transaction_sha256=str(payload["transaction_sha256"]),
                 environment_generation_id=str(payload["environment_generation_id"]),
+                previous_generation_id=str(payload["previous_generation_id"]),
                 environment_manifest_sha256=str(payload["environment_manifest_sha256"]),
                 committed_at=str(payload["committed_at"]),
             )
@@ -316,6 +332,7 @@ class ReleaseGenerationCommit:
                     record.environment_manifest_sha256,
                 )
             )
+            or (record.previous_generation_id != "" and len(record.previous_generation_id) != 64)
         ):
             raise ReleaseGenerationError("release generation commit record is invalid")
         return record
@@ -463,6 +480,47 @@ def _python_facts(python_path: Path) -> tuple[str, str]:
     if not version or abi == ":":
         raise ReleaseGenerationError("release Python ABI is incomplete")
     return version, abi
+
+
+def _verified_interpreter(path: Path, *, label: str) -> tuple[Path, PathIdentity, str]:
+    try:
+        resolved = path.resolve(strict=True)
+        observed = resolved.lstat()
+    except OSError as exc:
+        raise ReleaseGenerationError(f"{label} cannot be resolved") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or observed.st_mode & 0o022
+        or not observed.st_mode & stat.S_IXUSR
+    ):
+        raise ReleaseGenerationError(f"{label} has unsafe identity")
+    return resolved, PathIdentity.capture(observed), _hash_file(resolved, label=label)
+
+
+def _venv_system_interpreter(python_path: Path) -> tuple[Path, PathIdentity, str]:
+    try:
+        result = subprocess.run(
+            [
+                str(python_path),
+                "-I",
+                "-S",
+                "-c",
+                "import sys; print(sys._base_executable)",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReleaseGenerationError("deployment system Python cannot be discovered") from exc
+    raw_path = result.stdout.strip()
+    if not raw_path:
+        raise ReleaseGenerationError("deployment system Python is empty")
+    return _verified_interpreter(Path(raw_path), label="deployment system Python")
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -664,7 +722,13 @@ def _nonnegative_int_setting(value: int | None, *, env_name: str, default: int) 
     return parsed
 
 
-def _private_tree_size(root: Path) -> int:
+def _private_tree_size(
+    root: Path,
+    *,
+    system_python: Path,
+    system_python_identity: PathIdentity,
+    system_python_sha256: str,
+) -> int:
     total = 0
     for current_root, directory_names, file_names in os.walk(root):
         current = Path(current_root)
@@ -678,8 +742,17 @@ def _private_tree_size(root: Path) -> int:
         for name in (*directory_names, *file_names):
             path = current / name
             observed = path.lstat()
-            if stat.S_ISLNK(observed.st_mode) or observed.st_uid != os.getuid():
+            if observed.st_uid != os.getuid():
                 raise ReleaseGenerationError("source release venv contains an unsafe object")
+            if stat.S_ISLNK(observed.st_mode):
+                _environment_entry(
+                    path,
+                    root,
+                    system_python=system_python,
+                    system_python_identity=system_python_identity,
+                    system_python_sha256=system_python_sha256,
+                )
+                continue
             if stat.S_ISREG(observed.st_mode):
                 if observed.st_nlink != 1:
                     raise ReleaseGenerationError("source release venv contains a hardlink")
@@ -708,6 +781,13 @@ def _remove_private_tree_at(parent_fd: int, name: str) -> int:
         os.fchmod(descriptor, 0o700)
         for child_name in os.listdir(descriptor):
             child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(child.st_mode):
+                if child.st_uid != os.getuid():
+                    raise ReleaseGenerationError(
+                        "orphan environment generation contains unsafe data"
+                    )
+                os.unlink(child_name, dir_fd=descriptor)
+                continue
             if stat.S_ISDIR(child.st_mode) and not stat.S_ISLNK(child.st_mode):
                 reclaimed += _remove_private_tree_at(descriptor, child_name)
                 continue
@@ -738,9 +818,54 @@ def _remove_private_tree_at(parent_fd: int, name: str) -> int:
     return reclaimed
 
 
-def _environment_entry(path: Path, root: Path) -> dict[str, Any]:
+def _environment_entry(
+    path: Path,
+    root: Path,
+    *,
+    system_python: Path,
+    system_python_identity: PathIdentity,
+    system_python_sha256: str,
+) -> dict[str, Any]:
     observed = path.lstat()
     relative = path.relative_to(root).as_posix()
+    if stat.S_ISLNK(observed.st_mode):
+        version, _abi = _python_facts(system_python)
+        major_minor = ".".join(version.split(".")[:2])
+        allowed = _VENV_RELATIVE_SYMLINKS | {
+            "bin/python",
+            f"bin/python{major_minor}",
+        }
+        if relative not in allowed or observed.st_uid != os.getuid():
+            raise ReleaseGenerationError("environment generation contains an unsafe symlink")
+        target_text = os.readlink(path)
+        target = Path(target_text)
+        if relative != "bin/python" and (target.is_absolute() or ".." in target.parts):
+            raise ReleaseGenerationError("environment generation symlink target is unsafe")
+        try:
+            resolved = path.resolve(strict=True)
+            resolved_observed = resolved.lstat()
+        except OSError as exc:
+            raise ReleaseGenerationError("environment generation symlink is broken") from exc
+        if relative.startswith("bin/python"):
+            if (
+                resolved != system_python
+                or PathIdentity.capture(resolved_observed) != system_python_identity
+                or _hash_file(resolved, label="system Python") != system_python_sha256
+            ):
+                raise ReleaseGenerationError("environment generation Python symlink target changed")
+        elif relative == "lib64" and not resolved.is_relative_to(root):
+            raise ReleaseGenerationError("environment generation lib64 escapes its root")
+        return {
+            "path": relative,
+            "kind": "symlink",
+            "mode": stat.S_IMODE(observed.st_mode),
+            "size": observed.st_size,
+            "mtime_ns": observed.st_mtime_ns,
+            "ctime_ns": observed.st_ctime_ns,
+            "sha256": "",
+            "link_target": target_text,
+            "resolved_target": str(resolved),
+        }
     if stat.S_ISDIR(observed.st_mode):
         kind = "directory"
         digest = ""
@@ -766,18 +891,42 @@ def _environment_entry(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
-def _freeze_environment(root: Path) -> None:
+def _freeze_environment(
+    root: Path,
+    *,
+    system_python: Path,
+    system_python_identity: PathIdentity,
+    system_python_sha256: str,
+) -> None:
     for current_root, directory_names, file_names in os.walk(root, topdown=False):
         current = Path(current_root)
         for name in file_names:
             path = current / name
             observed = path.lstat()
+            if stat.S_ISLNK(observed.st_mode):
+                _environment_entry(
+                    path,
+                    root,
+                    system_python=system_python,
+                    system_python_identity=system_python_identity,
+                    system_python_sha256=system_python_sha256,
+                )
+                continue
             if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
                 raise ReleaseGenerationError("environment generation contains a symlink")
             path.chmod(0o500 if observed.st_mode & stat.S_IXUSR else 0o400)
         for name in directory_names:
             path = current / name
             observed = path.lstat()
+            if stat.S_ISLNK(observed.st_mode):
+                _environment_entry(
+                    path,
+                    root,
+                    system_python=system_python,
+                    system_python_identity=system_python_identity,
+                    system_python_sha256=system_python_sha256,
+                )
+                continue
             if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
                 raise ReleaseGenerationError("environment generation contains a symlink")
             path.chmod(0o500)
@@ -791,10 +940,18 @@ def _environment_manifest(
     transaction_kind: str,
     commit: str,
     generation_id: str,
+    system_python: Path,
+    system_python_identity: PathIdentity,
+    system_python_sha256: str,
 ) -> dict[str, Any]:
-    entries = [_environment_entry(root, root)]
+    entry_arguments = {
+        "system_python": system_python,
+        "system_python_identity": system_python_identity,
+        "system_python_sha256": system_python_sha256,
+    }
+    entries = [_environment_entry(root, root, **entry_arguments)]
     entries.extend(
-        _environment_entry(path, root)
+        _environment_entry(path, root, **entry_arguments)
         for path in sorted(root.rglob("*"), key=lambda value: value.as_posix())
     )
     return {
@@ -804,6 +961,9 @@ def _environment_manifest(
         "commit": commit,
         "generation_id": generation_id,
         "environment_path": str(root),
+        "system_python_path": str(system_python),
+        "system_python_identity": asdict(system_python_identity),
+        "system_python_sha256": system_python_sha256,
         "entries": entries,
     }
 
@@ -816,6 +976,25 @@ def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
     entries = manifest.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ReleaseGenerationError("environment generation manifest has no entries")
+    try:
+        system_python = _canonical(
+            Path(str(manifest["system_python_path"])),
+            label="system Python",
+        )
+        expected_system_identity = PathIdentity(**manifest["system_python_identity"])
+        expected_system_sha256 = str(manifest["system_python_sha256"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReleaseGenerationError("environment generation interpreter is malformed") from exc
+    resolved_system, system_identity, system_sha256 = _verified_interpreter(
+        system_python,
+        label="system Python",
+    )
+    if (
+        resolved_system != system_python
+        or system_identity != expected_system_identity
+        or system_sha256 != expected_system_sha256
+    ):
+        raise ReleaseGenerationError("environment generation interpreter changed")
     expected_paths: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
@@ -825,7 +1004,13 @@ def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
         if relative in expected_paths or (relative and Path(relative).is_absolute()):
             raise ReleaseGenerationError("environment generation manifest path is invalid")
         expected_paths.add(relative)
-        observed = _environment_entry(path, root)
+        observed = _environment_entry(
+            path,
+            root,
+            system_python=system_python,
+            system_python_identity=system_identity,
+            system_python_sha256=system_sha256,
+        )
         if observed != entry:
             raise ReleaseGenerationError("environment generation content changed")
     actual_paths = {"."}
@@ -847,6 +1032,8 @@ class ReleaseGenerationAuthority:
         mutation_hook: Callable[[str], None] | None = None,
         gc_grace_seconds: float | None = None,
         minimum_free_bytes: int | None = None,
+        uv_path: Path | None = None,
+        environment_builder: Callable[[Path], None] | None = None,
     ) -> None:
         self.repo = _canonical(repo, label="release checkout")
         self.lock_path = _canonical(lock_path, label="deployment lock")
@@ -859,6 +1046,8 @@ class ReleaseGenerationAuthority:
         self.lock_fd = lock_fd
         self.python_path = _canonical(python_path, label="release Python")
         self.git_path = _canonical(git_path, label="trusted Git")
+        self.uv_path = None if uv_path is None else _canonical(uv_path, label="release uv")
+        self._environment_builder = environment_builder
         self.writable = writable
         self._mutation_hook = mutation_hook or (lambda _stage: None)
         self.gc_grace_seconds = _nonnegative_float_setting(
@@ -874,6 +1063,36 @@ class ReleaseGenerationAuthority:
         self._assert_lock()
         if self.writable:
             self._assert_exclusive_lock()
+
+    def _build_environment(self, destination: Path, *, system_python: Path) -> None:
+        if self._environment_builder is not None:
+            self._environment_builder(destination)
+            return
+        if self.uv_path is None:
+            raise ReleaseGenerationError("writable generation authority requires release uv")
+        try:
+            result = subprocess.run(
+                [
+                    str(self.uv_path),
+                    "sync",
+                    "--frozen",
+                    "--python",
+                    str(system_python),
+                ],
+                cwd=self.repo,
+                env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(destination)},
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReleaseGenerationError("immutable release environment build failed") from exc
+        if result.returncode != 0:
+            diagnostic = (result.stderr or result.stdout or "no command output").strip()
+            raise ReleaseGenerationError(
+                f"immutable release environment build failed: {diagnostic[:1000]}"
+            )
 
     def _assert_lock(self) -> None:
         try:
@@ -926,11 +1145,30 @@ class ReleaseGenerationAuthority:
         _verify_environment_manifest(venv, manifest)
         venv_identity = _identity(venv, label="release venv", directory=True)
         selected_python = venv / "bin" / "python"
-        python_identity = _identity(
-            selected_python,
-            label="release venv Python",
-            directory=False,
-        )
+        try:
+            system_python = Path(str(manifest["system_python_path"]))
+            expected_system_identity = PathIdentity(**manifest["system_python_identity"])
+            expected_system_sha256 = str(manifest["system_python_sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseGenerationError("release interpreter binding is malformed") from exc
+        selected_observed = selected_python.lstat()
+        if stat.S_ISLNK(selected_observed.st_mode):
+            resolved_python, python_identity, python_sha256 = _verified_interpreter(
+                selected_python,
+                label="release venv Python",
+            )
+            if (
+                resolved_python != system_python
+                or python_identity != expected_system_identity
+                or python_sha256 != expected_system_sha256
+            ):
+                raise ReleaseGenerationError("release venv Python binding changed")
+        else:
+            python_identity = _identity(
+                selected_python,
+                label="release venv Python",
+                directory=False,
+            )
         version, abi = _python_facts(selected_python)
         major_minor = ".".join(version.split(".")[:2])
         site_packages = venv / "lib" / f"python{major_minor}" / "site-packages"
@@ -957,6 +1195,7 @@ class ReleaseGenerationAuthority:
             site_packages_path=str(site_packages),
             site_packages_identity=site_identity,
             environment_generation_id=selector.generation_id,
+            previous_generation_id=selector.previous_generation_id,
             environment_manifest_sha256=selector.manifest_sha256,
             published_at=datetime.now(UTC).isoformat(),
         )
@@ -997,73 +1236,58 @@ class ReleaseGenerationAuthority:
             os.close(root_fd)
 
     def _retained_environment_ids(self, environment_fd: int) -> set[str]:
+        del environment_fd
         retained: set[str] = set()
         selector_payload = self._optional_private_payload(
             self.environment_selector_path,
             maximum_bytes=MAX_MARKER_BYTES,
         )
         if selector_payload is not None:
-            retained.add(EnvironmentSelector.from_payload(selector_payload).generation_id)
+            selector = EnvironmentSelector.from_payload(selector_payload)
+            retained.update(
+                value
+                for value in (selector.generation_id, selector.previous_generation_id)
+                if value
+            )
         marker_payload = self._optional_private_payload(
             self.marker_path,
             maximum_bytes=MAX_MARKER_BYTES,
         )
         if marker_payload is not None:
-            retained.add(
-                ReleaseGenerationMarker.from_payload(marker_payload).environment_generation_id
+            marker = ReleaseGenerationMarker.from_payload(marker_payload)
+            retained.update(
+                value
+                for value in (
+                    marker.environment_generation_id,
+                    marker.previous_generation_id,
+                )
+                if value
             )
         commit_payload = self._optional_private_payload(
             self.commit_path,
             maximum_bytes=MAX_MARKER_BYTES,
         )
         if commit_payload is not None:
-            retained.add(
-                ReleaseGenerationCommit.from_payload(commit_payload).environment_generation_id
+            commit_record = ReleaseGenerationCommit.from_payload(commit_payload)
+            retained.update(
+                value
+                for value in (
+                    commit_record.environment_generation_id,
+                    commit_record.previous_generation_id,
+                )
+                if value
             )
         for path in (self.intent_path, self.initialization_path):
             payload = self._optional_private_payload(path, maximum_bytes=MAX_INTENT_BYTES)
             if payload is None:
                 continue
             intent = DeploymentIntent.from_payload(payload)
+            if intent.previous_generation_id:
+                retained.add(intent.previous_generation_id)
             retained.update(
                 _environment_generation_id(operation_id=intent.operation_id, commit=commit)
                 for commit in (intent.previous_sha, intent.target_sha)
             )
-
-        manifest_pattern = re.compile(
-            rf"{re.escape(self.lock_path.stem)}\.venv-([0-9a-f]{{64}})\.manifest\.json"
-        )
-        completed: list[tuple[int, str]] = []
-        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
-        try:
-            for name in os.listdir(root_fd):
-                match = manifest_pattern.fullmatch(name)
-                if match is None or match.group(1) in retained:
-                    continue
-                payload, identity = _read_private_json(
-                    root_fd=root_fd,
-                    root_path=self.lock_path.parent,
-                    name=name,
-                    maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
-                )
-                generation_id = match.group(1)
-                if (
-                    int(payload.get("schema_version", 0)) != ENVIRONMENT_SCHEMA_VERSION
-                    or payload.get("generation_id") != generation_id
-                    or payload.get("environment_path") != str(self.environment_root / generation_id)
-                    or not isinstance(payload.get("entries"), list)
-                    or not payload["entries"]
-                ):
-                    raise ReleaseGenerationError("environment generation manifest is invalid")
-                active_manifest = (self.lock_path.parent / name).lstat()
-                if PathIdentity.capture(active_manifest) != identity:
-                    raise ReleaseGenerationError("environment generation manifest identity changed")
-                completed.append((active_manifest.st_mtime_ns, generation_id))
-            self._assert_root(root_fd, root_identity)
-        finally:
-            os.close(root_fd)
-        if completed:
-            retained.add(max(completed)[1])
         return retained
 
     def _append_generation_gc_audit(self, payload: dict[str, Any]) -> None:
@@ -1291,6 +1515,7 @@ class ReleaseGenerationAuthority:
             marker_sha256=marker.content_hash(),
             transaction_sha256=transaction.content_hash(),
             environment_generation_id=marker.environment_generation_id,
+            previous_generation_id=marker.previous_generation_id,
             environment_manifest_sha256=marker.environment_manifest_sha256,
             committed_at=datetime.now(UTC).isoformat(),
         )
@@ -1408,6 +1633,15 @@ class ReleaseGenerationAuthority:
         transaction_kind: str,
     ) -> DeploymentIntent:
         if transaction_kind == "initialization":
+            try:
+                active, _active_identity = self._read_intent_record(self.intent_path)
+            except ReleaseGenerationRecordMissingError:
+                pass
+            else:
+                raise ReleaseGenerationError(
+                    "active deployment intent blocks initialization generation: "
+                    f"stage={active.stage}"
+                )
             record, _identity_value = self._read_intent_record(self.initialization_path)
         elif transaction_kind == "deployment":
             try:
@@ -1460,6 +1694,7 @@ class ReleaseGenerationAuthority:
             or committed.marker_sha256 != published.content_hash()
             or committed.transaction_sha256 != transaction.content_hash()
             or committed.environment_generation_id != published.environment_generation_id
+            or committed.previous_generation_id != published.previous_generation_id
             or committed.environment_manifest_sha256 != published.environment_manifest_sha256
         ):
             raise ReleaseGenerationError("release generation commit record is stale")
@@ -1535,6 +1770,7 @@ class ReleaseGenerationAuthority:
         active_services: tuple[str, ...],
         active_timers: tuple[str, ...],
         marker_generation: str = "",
+        previous_generation_id: str = "",
     ) -> DeploymentIntent:
         if not self.writable:
             raise ReleaseGenerationError("read-only generation authority cannot create intent")
@@ -1542,6 +1778,9 @@ class ReleaseGenerationAuthority:
         if not marker_generation:
             marker = self.verify(expected_commit=previous_sha)
             marker_generation = marker.content_hash()
+            previous_generation_id = marker.environment_generation_id
+        if len(previous_generation_id) != 64:
+            raise ReleaseGenerationError("deployment previous generation is unavailable")
         try:
             current, completed_identity = self._read_intent_record(self.intent_path)
         except ReleaseGenerationRecordMissingError:
@@ -1576,6 +1815,7 @@ class ReleaseGenerationAuthority:
             active_services=active_services,
             active_timers=active_timers,
             marker_generation=marker_generation,
+            previous_generation_id=previous_generation_id,
         )
         self._create_intent_record(self.intent_path, intent)
         return intent
@@ -1624,6 +1864,7 @@ class ReleaseGenerationAuthority:
             restart_services=(),
             active_services=(),
             active_timers=(),
+            previous_generation_id="",
             stage="initializing",
         )
         self._create_intent_record(self.initialization_path, intent)
@@ -1681,12 +1922,21 @@ class ReleaseGenerationAuthority:
         expected_commit: str,
         operation_id: str,
         transaction_kind: str,
+        previous_generation_id: str,
     ) -> tuple[EnvironmentSelector, dict[str, Any]]:
         source_venv = self.repo / ".venv"
         _identity(source_venv, label="source release venv", directory=True)
         if not self.python_path.is_relative_to(source_venv):
             raise ReleaseGenerationError("deployment Python is outside source release venv")
-        source_bytes = _private_tree_size(source_venv)
+        system_python, system_python_identity, system_python_sha256 = _venv_system_interpreter(
+            self.python_path
+        )
+        source_bytes = _private_tree_size(
+            source_venv,
+            system_python=system_python,
+            system_python_identity=system_python_identity,
+            system_python_sha256=system_python_sha256,
+        )
         self.garbage_collect_environments(
             reason=f"pre-publish:{transaction_kind}",
             required_bytes=source_bytes,
@@ -1721,13 +1971,7 @@ class ReleaseGenerationAuthority:
             else:
                 os.mkdir(staging_name, 0o700, dir_fd=environment_fd)
                 try:
-                    shutil.copytree(
-                        source_venv,
-                        staging_path,
-                        dirs_exist_ok=True,
-                        symlinks=False,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
-                    )
+                    self._build_environment(staging_path, system_python=system_python)
                     final_python = final_path / "bin" / "python"
                     bin_path = staging_path / "bin"
                     for path in bin_path.iterdir():
@@ -1762,21 +2006,25 @@ class ReleaseGenerationAuthority:
                         dst_dir_fd=environment_fd,
                     )
                     os.fsync(environment_fd)
-                    _freeze_environment(final_path)
+                    _freeze_environment(
+                        final_path,
+                        system_python=system_python,
+                        system_python_identity=system_python_identity,
+                        system_python_sha256=system_python_sha256,
+                    )
                 except BaseException:
                     if staging_path.exists() and not staging_path.is_symlink():
-                        staging_path.chmod(0o700)
-                        for current_root, directory_names, file_names in os.walk(staging_path):
-                            current = Path(current_root)
-                            current.chmod(0o700)
-                            for name in file_names:
-                                (current / name).chmod(0o600)
-                            for name in directory_names:
-                                (current / name).chmod(0o700)
-                        shutil.rmtree(staging_path)
+                        _remove_private_tree_at(environment_fd, staging_name)
+                    if manifest is None and final_path.exists() and not final_path.is_symlink():
+                        _remove_private_tree_at(environment_fd, generation_id)
                     raise
             if manifest is None:
-                _freeze_environment(final_path)
+                _freeze_environment(
+                    final_path,
+                    system_python=system_python,
+                    system_python_identity=system_python_identity,
+                    system_python_sha256=system_python_sha256,
+                )
                 active_environment = _identity(
                     self.environment_root,
                     label="release environment root",
@@ -1795,6 +2043,9 @@ class ReleaseGenerationAuthority:
                     transaction_kind=transaction_kind,
                     commit=expected_commit,
                     generation_id=generation_id,
+                    system_python=system_python,
+                    system_python_identity=system_python_identity,
+                    system_python_sha256=system_python_sha256,
                 )
                 manifest_hash = _payload_hash(manifest)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)
@@ -1828,6 +2079,7 @@ class ReleaseGenerationAuthority:
                 transaction_kind=transaction_kind,
                 commit=expected_commit,
                 generation_id=generation_id,
+                previous_generation_id=previous_generation_id,
                 environment_path=str(final_path),
                 manifest_name=manifest_path.name,
                 manifest_sha256=manifest_hash,
@@ -1906,6 +2158,7 @@ class ReleaseGenerationAuthority:
             expected_commit=expected_commit,
             operation_id=operation_id,
             transaction_kind=transaction_kind,
+            previous_generation_id=transaction.previous_generation_id,
         )
         marker = self._facts(
             expected_commit=expected_commit,

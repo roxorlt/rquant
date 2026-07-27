@@ -69,6 +69,13 @@
 
 ### Fixed
 
+- **不可变 uv 代际与 macOS Lab 发布验收**：release authority 现在用真实 `uv sync --frozen`
+  在独立 generation 目录构建小型环境，并只接受绑定到已验证系统解释器或代际内部目标的 uv
+  symlink；marker、selector、commit 与 intent 精确持久化 `previous_generation_id`，GC 不再用
+  mtime 猜回滚代际。发布新增显式 `linux-production` / `macos-lab` profile，macOS 只走 launchctl
+  handoff；三项 Lab daemon 按 PID、operation、generation、SHA 与递增单调心跳独立通过稳定窗口
+  后才算恢复健康。
+
 - **发布代际保留与 Lab daemon 部署交接**：active deployment intent 只有在活动记录真实
   `ENOENT` 时才允许读取对应 completed archive，损坏、宽松权限或身份替换均失败关闭。
   不可变 venv 在独占 generation lock 内按 current、上一有效 manifest、active intent、marker

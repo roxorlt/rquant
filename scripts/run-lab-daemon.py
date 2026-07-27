@@ -79,6 +79,37 @@ def _require_owned_regular(
     return _PathIdentity.capture(observed)
 
 
+def _require_verified_python_link(
+    path: Path,
+    *,
+    expected_identity: object,
+) -> _PathIdentity:
+    try:
+        resolved = path.resolve(strict=True)
+        observed = resolved.lstat()
+    except OSError as exc:
+        raise WrapperError("selected release Python is unavailable") from exc
+    identity = _PathIdentity.capture(observed)
+    marker_identity = _PathIdentity(
+        device=int(expected_identity.device),
+        inode=int(expected_identity.inode),
+        mode=int(expected_identity.mode),
+        owner=int(expected_identity.owner),
+        links=int(expected_identity.links),
+    )
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or observed.st_mode & 0o022
+        or not observed.st_mode & stat.S_IXUSR
+        or identity != marker_identity
+    ):
+        raise WrapperError("selected release Python target is unsafe")
+    return identity
+
+
 def _require_owned_directory(path: Path, *, label: str) -> _PathIdentity:
     try:
         observed = path.lstat()
@@ -355,7 +386,10 @@ def _selected_release_runtime(
     identities = (
         _require_owned_directory(venv, label="selected release environment"),
         _require_owned_directory(venv / "bin", label="selected release bin"),
-        _require_owned_regular(python, label="selected release Python", executable=True),
+        _require_verified_python_link(
+            python,
+            expected_identity=marker.python_identity,
+        ),
         _require_owned_regular(launcher, label="selected release launcher", executable=True),
     )
     if python != venv / "bin" / "python":
@@ -599,6 +633,10 @@ def main(argv: list[str] | None = None) -> int:
                 str(deployment_lock_path),
                 "--deployment-generation-fd",
                 str(generation_lock_fd),
+                "--deployment-operation-id",
+                final_marker.operation_id,
+                "--deployment-environment-generation",
+                final_marker.environment_generation_id,
             ],
         )
     except (OSError, subprocess.SubprocessError, WrapperError) as exc:

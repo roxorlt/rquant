@@ -57,12 +57,15 @@ def _remove_immutable_test_generations(
             shutil.rmtree(root)
 
 
-def _tiny_test_venv(checkout: Path) -> Path:
+def _tiny_test_venv(checkout: Path, *, symlink_python: bool = False) -> Path:
     venv_root = checkout / ".venv"
     python = venv_root / "bin" / "python"
     python.parent.mkdir(parents=True)
-    shutil.copy2(sys.executable, python)
-    python.chmod(0o700)
+    if symlink_python:
+        python.symlink_to(Path(sys.executable).resolve(strict=True))
+    else:
+        shutil.copy2(sys.executable, python)
+        python.chmod(0o700)
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     (venv_root / "pyvenv.cfg").write_text(
         f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
@@ -75,7 +78,11 @@ def _tiny_test_venv(checkout: Path) -> Path:
     return python
 
 
-def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _runtime_checkout(
+    tmp_path: Path,
+    *,
+    symlink_python: bool = False,
+) -> tuple[Path, Path, Path]:
     checkout = tmp_path / "checkout"
     scripts = checkout / "scripts"
     package = checkout / "src" / "rquant"
@@ -111,7 +118,7 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
         "    print('fake daemon executed', flush=True)\n",
         encoding="utf-8",
     )
-    python = _tiny_test_venv(checkout)
+    python = _tiny_test_venv(checkout, symlink_python=symlink_python)
     executable = checkout / ".venv" / "bin" / "rquant"
     executable.write_text(
         f"#!{python}\n"
@@ -156,6 +163,12 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
             python_path=python,
             git_path=TRUSTED_GIT,
             writable=True,
+            environment_builder=lambda destination: shutil.copytree(
+                checkout / ".venv",
+                destination,
+                dirs_exist_ok=True,
+                symlinks=True,
+            ),
         )
         initialization = authority.begin_initialization(target_sha=commit)
         authority.publish(
@@ -229,16 +242,31 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
     assert result.stdout.index("Lab runtime preflight") < result.stdout.index(
         "fake daemon executed"
     )
-    assert json.loads(marker.read_text(encoding="utf-8"))[:2] == [
+    daemon_argv = json.loads(marker.read_text(encoding="utf-8"))
+    assert daemon_argv[:2] == [
         "lab-worker",
         "--expected-checkout-root",
     ]
+    assert daemon_argv[daemon_argv.index("--deployment-operation-id") + 1]
+    assert len(daemon_argv[daemon_argv.index("--deployment-environment-generation") + 1]) == 64
     runtime = json.loads(marker.with_suffix(".runtime.json").read_text(encoding="utf-8"))
     assert runtime["executable"] == runtime["prefix"] + "/bin/python"
     assert runtime["prefix"].startswith(
         str(_deployment_lock_path(checkout).parent / "checkout.venvs")
     )
     assert runtime["prefix"] != str(checkout / ".venv")
+
+
+def test_lab_runtime_wrapper_executes_verified_uv_style_python_symlink(
+    tmp_path: Path,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path, symlink_python=True)
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    runtime = json.loads(marker.with_suffix(".runtime.json").read_text(encoding="utf-8"))
+    assert Path(runtime["executable"]).is_symlink()
 
 
 def test_lab_runtime_wrapper_rejects_missing_release_generation_marker(

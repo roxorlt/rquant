@@ -35,6 +35,7 @@ LAB_LAUNCHD_LABELS = (
     "com.roxor.rquant-lab-finalizer",
 )
 LAUNCHD_HANDOFF_TIMEOUT_SECONDS = 30.0
+LAUNCHD_READINESS_STABILITY_SECONDS = 5.0
 
 
 def _canonical(raw: str, *, label: str) -> Path:
@@ -76,6 +77,27 @@ def _physical_file(path: Path, *, label: str, executable: bool = False) -> os.st
         or path.resolve(strict=True) != path
     ):
         raise DeployBootstrapError(f"{label} has unsafe identity")
+    return observed
+
+
+def _verified_venv_python(root: Path, path: Path) -> os.stat_result:
+    expected_bin = root / ".venv" / "bin"
+    if path.parent != expected_bin or not path.name.startswith("python"):
+        raise DeployBootstrapError("deployment Python is outside the release venv bin")
+    try:
+        resolved = path.resolve(strict=True)
+        observed = resolved.lstat()
+    except OSError as exc:
+        raise DeployBootstrapError("deployment Python is unavailable") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or observed.st_mode & 0o022
+        or not observed.st_mode & stat.S_IXUSR
+    ):
+        raise DeployBootstrapError("deployment Python has unsafe identity")
     return observed
 
 
@@ -249,8 +271,188 @@ def _generation_lock_is_held(root: Path, lock_path: Path) -> bool:
     return False
 
 
+def _private_json(path: Path, *, label: str) -> dict[str, object]:
+    observed = _physical_file(path, label=label)
+    if stat.S_IMODE(observed.st_mode) != 0o600 or observed.st_size > 1024 * 1024:
+        raise DeployBootstrapError(f"{label} must have mode 0600")
+    try:
+        payload = path.read_bytes()
+        active = path.lstat()
+        parsed = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployBootstrapError(f"{label} is invalid") from exc
+    if (active.st_dev, active.st_ino) != (observed.st_dev, observed.st_ino):
+        raise DeployBootstrapError(f"{label} identity changed")
+    if not isinstance(parsed, dict):
+        raise DeployBootstrapError(f"{label} is invalid")
+    return parsed
+
+
+def _release_readiness_expectation(lock_path: Path) -> tuple[str, str, str]:
+    marker = _private_json(
+        lock_path.with_name(f"{lock_path.stem}.complete.json"),
+        label="release generation marker",
+    )
+    committed = _private_json(
+        lock_path.with_name(f"{lock_path.stem}.commit.json"),
+        label="release generation commit",
+    )
+    operation_id = str(marker.get("operation_id", ""))
+    generation_id = str(marker.get("environment_generation_id", ""))
+    code_sha = str(marker.get("commit", ""))
+    if (
+        len(operation_id) != 32
+        or len(generation_id) != 64
+        or TARGET_PATTERN.fullmatch(code_sha) is None
+        or code_sha.startswith("v")
+        or committed.get("operation_id") != operation_id
+        or committed.get("environment_generation_id") != generation_id
+        or committed.get("commit") != code_sha
+    ):
+        raise DeployBootstrapError("release readiness generation is inconsistent")
+    transaction_kind = str(marker.get("transaction_kind", ""))
+    if transaction_kind not in {"deployment", "initialization"}:
+        raise DeployBootstrapError("release readiness transaction kind is invalid")
+    record_name = (
+        f"{lock_path.stem}.intent.json"
+        if transaction_kind == "deployment"
+        else f"{lock_path.stem}.initialized.json"
+    )
+    transaction = _private_json(
+        lock_path.with_name(record_name),
+        label="release generation transaction",
+    )
+    if transaction.get("operation_id") != operation_id or transaction.get("stage") != "completed":
+        raise DeployBootstrapError("release readiness transaction is incomplete")
+    return operation_id, generation_id, code_sha
+
+
+def _lab_readiness_payload(lock_path: Path, label: str) -> dict[str, object]:
+    root = lock_path.with_name(f"{lock_path.stem}.lab-readiness")
+    _physical_directory(root, label="Lab readiness root", private=True)
+    return _private_json(root / f"{label}.json", label=f"Lab readiness {label}")
+
+
+def _launchctl_pid(output: str, *, label: str) -> int:
+    match = re.search(r"(?m)^\s*pid\s*=\s*(\d+)\s*$", output)
+    if match is None:
+        raise DeployBootstrapError(f"Lab daemon has no launchd PID: {label}")
+    return int(match.group(1))
+
+
+def _validate_readiness_payload(
+    payload: dict[str, object],
+    *,
+    label: str,
+    pid: int,
+    expected: tuple[str, str, str],
+    lock_identity: os.stat_result,
+) -> tuple[float, str]:
+    operation_id, generation_id, code_sha = expected
+    try:
+        heartbeat = float(payload["heartbeat_monotonic"])
+        started_at = str(payload["started_at"])
+        heartbeat_at = datetime.fromisoformat(str(payload["heartbeat_at"]))
+        started = datetime.fromisoformat(started_at)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeployBootstrapError(f"Lab daemon heartbeat is invalid: {label}") from exc
+    if (
+        payload.get("label") != label
+        or payload.get("pid") != pid
+        or payload.get("operation_id") != operation_id
+        or payload.get("environment_generation_id") != generation_id
+        or payload.get("code_sha") != code_sha
+        or payload.get("generation_lock_device") != lock_identity.st_dev
+        or payload.get("generation_lock_inode") != lock_identity.st_ino
+        or not math.isfinite(heartbeat)
+        or heartbeat < 0
+        or started.tzinfo is None
+        or started.utcoffset() is None
+        or heartbeat_at.tzinfo is None
+        or heartbeat_at.utcoffset() is None
+    ):
+        raise DeployBootstrapError(f"Lab daemon readiness generation mismatch: {label}")
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        raise DeployBootstrapError(f"Lab daemon PID is not alive: {label}") from exc
+    return heartbeat, started_at
+
+
+def _wait_for_lab_readiness(
+    *,
+    root: Path,
+    domain: str,
+    labels: list[str],
+    lock_path: Path,
+    timeout_seconds: float,
+    stability_seconds: float = LAUNCHD_READINESS_STABILITY_SECONDS,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    expected = _release_readiness_expectation(lock_path)
+    lock_identity = _physical_file(lock_path, label="deployment generation lock")
+    if stat.S_IMODE(lock_identity.st_mode) != 0o600:
+        raise DeployBootstrapError("deployment generation lock must have mode 0600")
+    first: dict[str, tuple[int, float, str, float]] = {}
+    while time.monotonic() < deadline:
+        healthy = True
+        for label in labels:
+            state = _launchctl(
+                ["print", f"{domain}/{label}"],
+                check=False,
+                timeout_seconds=timeout_seconds,
+            )
+            if state.returncode != 0 or "state = running" not in state.stdout:
+                healthy = False
+                break
+            try:
+                pid = _launchctl_pid(state.stdout, label=label)
+                heartbeat, started_at = _validate_readiness_payload(
+                    _lab_readiness_payload(lock_path, label),
+                    label=label,
+                    pid=pid,
+                    expected=expected,
+                    lock_identity=lock_identity,
+                )
+            except DeployBootstrapError:
+                healthy = False
+                break
+            prior = first.get(label)
+            now = time.monotonic()
+            if prior is None or prior[0] != pid:
+                first[label] = (pid, heartbeat, started_at, now)
+                healthy = False
+                continue
+            if started_at != prior[2] or heartbeat < prior[1]:
+                raise DeployBootstrapError(f"Lab daemon heartbeat regressed: {label}")
+            if heartbeat == prior[1]:
+                healthy = False
+                continue
+            first[label] = (pid, heartbeat, started_at, prior[3])
+            if now - prior[3] < stability_seconds:
+                healthy = False
+        if (
+            healthy
+            and len(first) == len(labels)
+            and _generation_lock_is_held(
+                root,
+                lock_path,
+            )
+        ):
+            return
+        time.sleep(min(0.1, max(0.01, stability_seconds / 4)))
+    raise DeployBootstrapError("Lab daemons did not reach generation-bound stable readiness")
+
+
 class _LabLaunchdHandoff:
-    def __init__(self, *, root: Path, lock_path: Path, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        lock_path: Path,
+        timeout_seconds: float,
+        release_profile: str = "macos-lab",
+    ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 300:
             raise DeployBootstrapError("Lab launchd handoff timeout is invalid")
         self.root = root
@@ -260,7 +462,11 @@ class _LabLaunchdHandoff:
         self.plists = {
             label: root / "deploy" / "launchd" / f"{label}.plist" for label in LAB_LAUNCHD_LABELS
         }
-        self.enabled = sys.platform == "darwin" and all(
+        if release_profile not in {"linux-production", "macos-lab"}:
+            raise DeployBootstrapError("release profile is unsupported")
+        if (release_profile == "macos-lab") != (sys.platform == "darwin"):
+            raise DeployBootstrapError("release profile does not match host platform")
+        self.enabled = release_profile == "macos-lab" and all(
             path.is_file() for path in self.plists.values()
         )
         self.loaded: list[str] = []
@@ -300,6 +506,8 @@ class _LabLaunchdHandoff:
                 self.loaded.append(label)
             elif result.returncode not in {3, 113}:
                 raise DeployBootstrapError(f"Lab launchd state is unavailable for {label}")
+        if set(self.loaded) != set(LAB_LAUNCHD_LABELS):
+            raise DeployBootstrapError("all managed Lab launchd daemons must be loaded")
         for label in self.loaded:
             _launchctl(
                 ["bootout", f"{self.domain}/{label}"],
@@ -318,22 +526,19 @@ class _LabLaunchdHandoff:
                         check=True,
                         timeout_seconds=self.timeout_seconds,
                     )
-                    health = _launchctl(
-                        ["print", f"{self.domain}/{label}"],
-                        check=False,
-                        timeout_seconds=self.timeout_seconds,
-                    )
-                    if health.returncode != 0 or "state = running" not in health.stdout:
-                        raise DeployBootstrapError(f"Lab daemon did not become healthy: {label}")
                 except DeployBootstrapError as exc:
                     errors.append(str(exc))
             if self.stopped and not errors:
-                deadline = time.monotonic() + self.timeout_seconds
-                while not _generation_lock_is_held(self.root, self.lock_path):
-                    if time.monotonic() >= deadline:
-                        errors.append("restarted Lab daemons did not reacquire the generation lock")
-                        break
-                    time.sleep(0.05)
+                try:
+                    _wait_for_lab_readiness(
+                        root=self.root,
+                        domain=self.domain,
+                        labels=list(self.stopped),
+                        lock_path=self.lock_path,
+                        timeout_seconds=self.timeout_seconds,
+                    )
+                except DeployBootstrapError as exc:
+                    errors.append(str(exc))
         if self.lock_fd >= 0:
             os.close(self.lock_fd)
             self.lock_fd = -1
@@ -616,6 +821,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--python-path", required=True)
     parser.add_argument("--uv-path", required=True)
+    parser.add_argument(
+        "--release-profile",
+        choices=("linux-production", "macos-lab"),
+        required=True,
+    )
+    parser.add_argument("--host-platform", choices=("linux", "darwin"), required=True)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--initialize-generation", action="store_true")
     modes.add_argument("--recover-generation", action="store_true")
@@ -654,10 +865,20 @@ def main(argv: list[str] | None = None) -> int:
         git_path = _canonical(args.trusted_git_path, label="trusted Git")
         _trusted_git(git_path)
         python_path = _canonical(args.python_path, label="deployment Python")
-        _physical_file(python_path, label="deployment Python", executable=True)
+        _verified_venv_python(root, python_path)
         uv_path = _canonical(args.uv_path, label="deployment uv")
         _physical_file(uv_path, label="deployment uv", executable=True)
         dry_run = "--dry-run" in _normalized_deploy_argv(deploy_argv)
+        if sys.platform == "darwin":
+            actual_platform = "darwin"
+        elif sys.platform.startswith("linux"):
+            actual_platform = "linux"
+        else:
+            actual_platform = ""
+        if args.host_platform != actual_platform or (
+            (args.release_profile == "macos-lab") != (args.host_platform == "darwin")
+        ):
+            raise DeployBootstrapError("release profile does not match host platform")
         if args.finalize_generation:
             if args.inherited_lock_fd is None:
                 raise DeployBootstrapError("finalizer requires inherited generation lock")
@@ -669,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
                 root=root,
                 lock_path=lock_path,
                 timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+                release_profile=args.release_profile,
             )
             handoff.prepare(dry_run=dry_run)
             lock_fd = _acquire_lock(
@@ -725,6 +947,7 @@ def main(argv: list[str] | None = None) -> int:
                 python_path=python_path,
                 git_path=git_path,
                 writable=True,
+                uv_path=uv_path,
             )
             try:
                 initialization = authority.read_initialization()
@@ -798,6 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
             python_path=python_path,
             git_path=git_path,
             writable=args.recover_generation or args.finalize_generation,
+            uv_path=uv_path,
         )
 
         if args.finalize_generation:
@@ -890,6 +1114,10 @@ def main(argv: list[str] | None = None) -> int:
                         str(python_path),
                         "--uv-path",
                         str(uv_path),
+                        "--release-profile",
+                        args.release_profile,
+                        "--platform-name",
+                        args.host_platform,
                     ]
                 )
             )

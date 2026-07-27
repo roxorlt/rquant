@@ -161,9 +161,12 @@ def _checkout(
     uv = checkout / ".venv" / "bin" / "uv"
     uv.write_text(
         f"#!{python}\n"
-        "import os, sys\n"
-        "if sys.argv[1:] != ['sync', '--frozen']:\n"
+        "import os, shutil, sys\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:3] != ['sync', '--frozen']:\n"
         "    raise SystemExit(64)\n"
+        "if target := os.environ.get('UV_PROJECT_ENVIRONMENT'):\n"
+        "    shutil.copytree(Path(sys.prefix), Path(target), dirs_exist_ok=True, symlinks=True)\n"
         "raise SystemExit(int(os.environ.get('UV_SYNC_EXIT', '0')))\n",
         encoding="utf-8",
     )
@@ -210,6 +213,12 @@ def _checkout(
                 python_path=python,
                 git_path=TRUSTED_GIT,
                 writable=True,
+                environment_builder=lambda destination: shutil.copytree(
+                    checkout / ".venv",
+                    destination,
+                    dirs_exist_ok=True,
+                    symlinks=True,
+                ),
             )
             initialization = authority.begin_initialization(target_sha=commit)
             authority.publish(
@@ -268,6 +277,12 @@ def _begin_intent(
             python_path=python,
             git_path=TRUSTED_GIT,
             writable=True,
+            environment_builder=lambda destination: shutil.copytree(
+                checkout / ".venv",
+                destination,
+                dirs_exist_ok=True,
+                symlinks=True,
+            ),
         )
         intent = authority.begin_deployment_intent(
             previous_sha=previous,
@@ -310,6 +325,10 @@ def _command(
         str(python),
         "--uv-path",
         str(checkout / ".venv" / "bin" / "uv"),
+        "--release-profile",
+        "macos-lab",
+        "--host-platform",
+        "darwin",
     ]
     if mode == "initialize":
         command.append("--initialize-generation")
@@ -379,12 +398,12 @@ def test_lab_handoff_dry_run_models_labels_without_stopping_daemons(
     }
 
 
-def test_lab_handoff_restores_only_previously_loaded_daemons_and_verifies_lock(
+def test_lab_handoff_restores_all_managed_daemons_and_verifies_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
-    initially_loaded = set(module.LAB_LAUNCHD_LABELS[:2])
+    initially_loaded = set(module.LAB_LAUNCHD_LABELS)
     loaded = set(initially_loaded)
     calls: list[tuple[str, ...]] = []
 
@@ -414,7 +433,7 @@ def test_lab_handoff_restores_only_previously_loaded_daemons_and_verifies_lock(
 
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
-    monkeypatch.setattr(module, "_generation_lock_is_held", lambda _root, _lock: True)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: None)
     handoff = module._LabLaunchdHandoff(
         root=root,
         lock_path=lock_path,
@@ -429,11 +448,47 @@ def test_lab_handoff_restores_only_previously_loaded_daemons_and_verifies_lock(
     handoff.restore()
 
     assert loaded == initially_loaded
-    assert handoff.stopped == list(module.LAB_LAUNCHD_LABELS[:2])
-    assert not any(
-        call[0] == "bootstrap" and Path(call[-1]).stem == module.LAB_LAUNCHD_LABELS[2]
-        for call in calls
-    )
+    assert handoff.stopped == list(module.LAB_LAUNCHD_LABELS)
+    assert sum(call[0] == "bootstrap" for call in calls) == 3
+
+
+def test_lab_handoff_fails_before_bootout_when_any_managed_daemon_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS[:2])
+    calls: list[tuple[str, ...]] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, timeout_seconds
+        calls.append(tuple(arguments))
+        label = arguments[-1].rsplit("/", 1)[-1]
+        return subprocess.CompletedProcess(
+            arguments,
+            0 if label in loaded else 113,
+            stdout="state = running\n" if label in loaded else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    try:
+        with pytest.raises(module.DeployBootstrapError, match="all managed"):
+            handoff.prepare(
+                dry_run=False,
+                now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+    finally:
+        handoff.restore()
+
+    assert not any(call[0] == "bootout" for call in calls)
 
 
 def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wait(
@@ -465,7 +520,13 @@ def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wa
 
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
-    monkeypatch.setattr(module, "_generation_lock_is_held", lambda _root, _lock: False)
+    monkeypatch.setattr(
+        module,
+        "_wait_for_lab_readiness",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            module.DeployBootstrapError("did not reacquire generation-bound readiness")
+        ),
+    )
     handoff = module._LabLaunchdHandoff(
         root=root,
         lock_path=lock_path,
@@ -481,6 +542,85 @@ def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wa
 
     assert loaded == set(module.LAB_LAUNCHD_LABELS)
     assert handoff.lock_fd == -1
+
+
+def test_lab_handoff_readiness_verifies_every_label_and_stable_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    operation_id = "a" * 32
+    generation_id = "b" * 64
+    code_sha = "c" * 40
+    for suffix, payload in (
+        (
+            "complete.json",
+            {
+                "operation_id": operation_id,
+                "environment_generation_id": generation_id,
+                "commit": code_sha,
+                "transaction_kind": "deployment",
+            },
+        ),
+        (
+            "commit.json",
+            {
+                "operation_id": operation_id,
+                "environment_generation_id": generation_id,
+                "commit": code_sha,
+            },
+        ),
+        ("intent.json", {"operation_id": operation_id, "stage": "completed"}),
+    ):
+        path = lock_path.with_name(f"{lock_path.stem}.{suffix}")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.chmod(0o600)
+    lock_identity = lock_path.lstat()
+    counts = {label: 0 for label in module.LAB_LAUNCHD_LABELS}
+    pids = {label: 1000 + index for index, label in enumerate(module.LAB_LAUNCHD_LABELS)}
+
+    def readiness(_lock_path: Path, label: str) -> dict[str, object]:
+        counts[label] += 1
+        return {
+            "label": label,
+            "pid": pids[label],
+            "operation_id": operation_id,
+            "environment_generation_id": generation_id,
+            "code_sha": code_sha,
+            "started_at": "2026-07-28T00:00:00+00:00",
+            "heartbeat_at": "2026-07-28T00:00:01+00:00",
+            "heartbeat_monotonic": float(counts[label]),
+            "generation_lock_device": lock_identity.st_dev,
+            "generation_lock_inode": lock_identity.st_ino,
+        }
+
+    monkeypatch.setattr(module, "_lab_readiness_payload", readiness)
+    monkeypatch.setattr(module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=(f"state = running\npid = {pids[arguments[-1].rsplit('/', 1)[-1]]}\n"),
+            stderr="",
+        ),
+    )
+    try:
+        module._wait_for_lab_readiness(
+            root=root,
+            domain=f"gui/{os.getuid()}",
+            labels=list(module.LAB_LAUNCHD_LABELS),
+            lock_path=lock_path,
+            timeout_seconds=1,
+            stability_seconds=0,
+        )
+    finally:
+        os.close(lock_fd)
+
+    assert all(count >= 2 for count in counts.values())
 
 
 def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
@@ -622,6 +762,33 @@ def test_initialize_generation_publishes_first_marker_without_importing_deployer
     assert not ran.exists()
 
 
+def test_initialize_generation_accepts_uv_style_symlinked_python(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path, publish_marker=False)
+    python.unlink()
+    python.symlink_to(Path(sys.executable).resolve(strict=True))
+
+    result = subprocess.run(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=commit,
+            mode="initialize",
+        ),
+        cwd=checkout,
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker_path_for_lock(lock_path).is_file()
+
+
 @pytest.mark.parametrize("failure_env", [{"UV_SYNC_EXIT": "1"}, {"PREFLIGHT_EXIT": "1"}])
 def test_initialize_generation_interruption_can_restart_without_partial_marker(
     tmp_path: Path,
@@ -709,6 +876,12 @@ def test_initialize_generation_recovers_completed_transaction_before_commit_reco
             python_path=python,
             git_path=TRUSTED_GIT,
             writable=True,
+            environment_builder=lambda destination: shutil.copytree(
+                checkout / ".venv",
+                destination,
+                dirs_exist_ok=True,
+                symlinks=True,
+            ),
         )
         initialization = authority.begin_initialization(target_sha=commit)
         authority.publish(

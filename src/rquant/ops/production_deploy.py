@@ -49,6 +49,9 @@ LAB_LAUNCHD_HANDOFF_LABELS = (
     "com.roxor.rquant-lab-worker",
     "com.roxor.rquant-lab-finalizer",
 )
+LINUX_RELEASE_PROFILE = "linux-production"
+MACOS_LAB_RELEASE_PROFILE = "macos-lab"
+RELEASE_PROFILES = (LINUX_RELEASE_PROFILE, MACOS_LAB_RELEASE_PROFILE)
 
 SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
     "rquant-monitor.service": (
@@ -225,6 +228,10 @@ class IsolatedGenerationFinalizer:
             str(config.python_path),
             "--uv-path",
             config.uv_bin,
+            "--release-profile",
+            config.release_profile,
+            "--host-platform",
+            config.platform_name,
             "--finalize-generation",
             "--inherited-lock-fd",
             str(config.lock_fd),
@@ -279,6 +286,8 @@ class DeployConfig:
     python_path: Path | None = None
     git_path: Path = Path("/usr/bin/git")
     recovery_action: str | None = None
+    release_profile: str = LINUX_RELEASE_PROFILE
+    platform_name: str = "linux"
 
 
 @dataclass(frozen=True)
@@ -289,7 +298,7 @@ class DeployResult:
     target: str
     changed_files: tuple[str, ...]
     restart_services: tuple[str, ...]
-    handoff_daemons: tuple[str, ...] = LAB_LAUNCHD_HANDOFF_LABELS
+    handoff_daemons: tuple[str, ...] = ()
 
 
 def validate_target(target: str) -> str:
@@ -309,11 +318,35 @@ def _matches(path: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
 
 
-def build_change_plan(changed_files: list[str] | tuple[str, ...]) -> ChangePlan:
+def validate_release_profile(release_profile: str, platform_name: str) -> str:
+    expected_platform = {
+        LINUX_RELEASE_PROFILE: "linux",
+        MACOS_LAB_RELEASE_PROFILE: "darwin",
+    }.get(release_profile)
+    if expected_platform is None or platform_name != expected_platform:
+        raise PolicyError(
+            f"release profile {release_profile!r} is invalid for platform {platform_name!r}"
+        )
+    return release_profile
+
+
+def build_change_plan(
+    changed_files: list[str] | tuple[str, ...],
+    *,
+    release_profile: str = LINUX_RELEASE_PROFILE,
+) -> ChangePlan:
     files = tuple(sorted({path.strip() for path in changed_files if path.strip()}))
     blocked = tuple(
         path for path in files if any(path.startswith(prefix) for prefix in PRIVILEGED_PREFIXES)
     )
+    if release_profile == MACOS_LAB_RELEASE_PROFILE:
+        # Runtime guards bind to the exact checkout SHA, so every local checkout
+        # transition requires an orderly handoff even for non-Python changes.
+        handoff = LAB_LAUNCHD_HANDOFF_LABELS if files else ()
+        return ChangePlan(files, blocked, (), handoff)
+    if release_profile != LINUX_RELEASE_PROFILE:
+        raise PolicyError(f"unknown release profile: {release_profile!r}")
+
     services: set[str] = set()
 
     for path in files:
@@ -333,7 +366,7 @@ def build_change_plan(changed_files: list[str] | tuple[str, ...]) -> ChangePlan:
     ordered_services = tuple(
         service for service in ALL_LONG_RUNNING_SERVICES if service in services
     )
-    return ChangePlan(files, blocked, ordered_services)
+    return ChangePlan(files, blocked, ordered_services, ())
 
 
 def _stdout(runner: Runner, args: list[str]) -> str:
@@ -624,10 +657,10 @@ def _recover_locked(
         allowed_refs.add(intent.target_ref)
     if config.target not in allowed_refs:
         raise PolicyError("recovery target does not match the recorded deployment intent")
-    plan = build_change_plan(intent.changed_files)
+    plan = build_change_plan(intent.changed_files, release_profile=config.release_profile)
     if plan.blocked_files or plan.restart_services != intent.restart_services:
         raise PolicyError("recorded deployment intent no longer matches change classification")
-    if intent.restart_services and is_protected_market_window(config.now):
+    if (intent.restart_services or plan.handoff_daemons) and is_protected_market_window(config.now):
         raise ProtectedWindowError(
             "deployment recovery requires service restarts during the protected 09:15-15:10 window"
         )
@@ -661,6 +694,7 @@ def _recover_locked(
         config.target,
         intent.changed_files,
         completed.restarted_services,
+        plan.handoff_daemons,
     )
     _append_audit(config, result)
     return result
@@ -713,7 +747,7 @@ def _deploy_locked(
     previous_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
 
     if previous_sha == target_sha:
-        result = DeployResult("already_current", previous_sha, target_sha, target, (), ())
+        result = DeployResult("already_current", previous_sha, target_sha, target, (), (), ())
         _append_audit(config, result)
         return result
 
@@ -725,11 +759,16 @@ def _deploy_locked(
         "target is not a fast-forward from the deployed commit",
     )
     changed_output = _stdout(runner, [git, "diff", "--name-only", f"{previous_sha}..{target_sha}"])
-    change_plan = build_change_plan(changed_output.splitlines())
+    change_plan = build_change_plan(
+        changed_output.splitlines(),
+        release_profile=config.release_profile,
+    )
     if change_plan.blocked_files:
         joined = ", ".join(change_plan.blocked_files)
         raise PolicyError(f"privileged infrastructure changes require a separate rollout: {joined}")
-    if change_plan.restart_services and is_protected_market_window(config.now):
+    if (change_plan.restart_services or change_plan.handoff_daemons) and is_protected_market_window(
+        config.now
+    ):
         raise ProtectedWindowError(
             "release requires service restarts during the protected 09:15-15:10 window"
         )
@@ -742,6 +781,7 @@ def _deploy_locked(
             target,
             change_plan.changed_files,
             change_plan.restart_services,
+            change_plan.handoff_daemons,
         )
         _append_audit(config, result)
         return result
@@ -804,6 +844,7 @@ def _deploy_locked(
                     target,
                     change_plan.changed_files,
                     generation_authority.read_deployment_intent().restarted_services,
+                    change_plan.handoff_daemons,
                 )
                 _append_audit(config, result, error=f"{exc}; rollback: {rollback_exc}")
                 raise DeployError(
@@ -816,6 +857,7 @@ def _deploy_locked(
                 target,
                 change_plan.changed_files,
                 completed.restarted_services,
+                change_plan.handoff_daemons,
             )
             _append_audit(config, result, error=str(exc))
             raise DeployError(
@@ -828,6 +870,7 @@ def _deploy_locked(
             target,
             change_plan.changed_files,
             completed.restarted_services,
+            change_plan.handoff_daemons,
         )
         _append_audit(config, result)
         return result
@@ -860,6 +903,7 @@ def _deploy_locked(
                 target,
                 change_plan.changed_files,
                 tuple(restarted),
+                change_plan.handoff_daemons,
             )
             _append_audit(config, result, error=f"{exc}; rollback: {rollback_exc}")
             raise DeployError(
@@ -872,6 +916,7 @@ def _deploy_locked(
             target,
             change_plan.changed_files,
             tuple(restarted),
+            change_plan.handoff_daemons,
         )
         _append_audit(config, result, error=str(exc))
         raise DeployError(f"deployment failed and rolled back to {previous_sha}: {exc}") from exc
@@ -883,6 +928,7 @@ def _deploy_locked(
         target,
         change_plan.changed_files,
         tuple(restarted),
+        change_plan.handoff_daemons,
     )
     _append_audit(config, result)
     return result
@@ -895,6 +941,7 @@ def deploy(
     generation_authority: GenerationAuthority | None = None,
     generation_finalizer: GenerationFinalizer | None = None,
 ) -> DeployResult:
+    validate_release_profile(config.release_profile, config.platform_name)
     repo = config.repo.resolve()
     effective_config = DeployConfig(
         repo=repo,
@@ -910,6 +957,8 @@ def deploy(
         python_path=config.python_path,
         git_path=config.git_path,
         recovery_action=config.recovery_action,
+        release_profile=config.release_profile,
+        platform_name=config.platform_name,
     )
     effective_runner = runner or SubprocessRunner(repo)
     lock_path = effective_config.lock_path or (repo.parent / ".rquant-deploy" / f"{repo.name}.lock")
@@ -939,6 +988,7 @@ def deploy(
                     python_path=effective_config.python_path,
                     git_path=effective_config.git_path,
                     writable=not effective_config.dry_run,
+                    uv_path=Path(effective_config.uv_bin),
                 )
                 if effective_config.recovery_action is None:
                     generation_authority.verify(expected_commit=effective_config.startup_generation)
@@ -982,6 +1032,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python-path", type=Path, required=True)
     parser.add_argument("--uv-path", type=Path, required=True)
     parser.add_argument("--recovery-action", choices=("resume", "rollback"))
+    parser.add_argument("--release-profile", choices=RELEASE_PROFILES, required=True)
+    parser.add_argument("--platform-name", choices=("linux", "darwin"), required=True)
     return parser
 
 
@@ -999,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
         python_path=args.python_path,
         git_path=args.trusted_git_path,
         recovery_action=args.recovery_action,
+        release_profile=args.release_profile,
+        platform_name=args.platform_name,
     )
     try:
         result = deploy(config)

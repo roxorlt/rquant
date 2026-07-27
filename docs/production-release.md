@@ -132,10 +132,29 @@ sync、partial restart、post-preflight、timer 恢复、环境封存、marker/c
 
 每次构建新环境前会在 generation 独占锁内执行 GC。默认宽限期 7 天、发布完成后至少保留
 2 GiB 可用空间，可通过 `RQUANT_RELEASE_GENERATION_GC_GRACE_SECONDS` 与
-`RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES` 调整。current、紧邻上一有效 manifest、active intent
-的 previous/target，以及 marker/commit 引用永不作为孤儿删除；其他严格受控的旧完成/失败目录
+`RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES` 调整。current 与精确持久化的
+`previous_generation_id`、active intent 的 previous/target，以及 marker/commit 引用永不作为孤儿
+删除；保留关系不使用 mtime 推断，因此时钟回拨或更新的 orphan 不会改变回滚代际。其他严格受控的旧完成/失败目录
 才会解冻删除。扫描、删除数、回收字节、前后磁盘与保留集合写入 owner-only
 `<lock-stem>.generation-gc.jsonl`。磁盘预算不足时发布在复制前失败，不会留下完整 staging。
+
+不可变 venv 由 `uv sync --frozen --python <verified-system-python>` 在新的 generation 目录内直接
+构建，不复制现用的几百 MB 环境。允许的 symlink 仅限 uv 的 `bin/python*` 与 `lib64` 结构：
+Python 链必须最终绑定 marker 中已校验的 system interpreter，其他相对链接必须留在同一 generation；
+任意额外链接、越界链接或解释器身份漂移均失败关闭。
+
+## Linux 与 macOS 发布 profile
+
+发布脚本按宿主显式选择 `linux-production` 或 `macos-lab`，profile 与平台不匹配时拒绝运行。
+Linux profile 保持既有 systemd service/timer 计划；macOS profile 不运行任何 `systemctl`。
+由于 Lab runtime guard 绑定精确 checkout SHA，macOS 上任何 commit 迁移都必须交接 scheduler、
+worker、finalizer，而不按文件后缀猜测“这次改动大概无关”。交接在交易保护窗口外确认三个 label
+均已 loaded，各执行一次 bootout，部署完成后各 bootstrap 一次，不用重启循环掩盖故障。
+
+每个 Lab daemon 在持有同一 generation shared lock 后，以 `0600` 原子文件发布 label、PID、
+operation id、environment generation id、code SHA、启动时间和单调心跳。handoff 验收要求三个
+label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 PID 推进心跳；任一 label 缺失、
+代际错误、重启抖动或 shared lock 未保持都会在有界超时后触发失败/回滚。
 
 ## 预演与审计
 

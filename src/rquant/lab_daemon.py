@@ -10,12 +10,13 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from types import MappingProxyType
 from typing import Protocol, TypeVar
 from uuid import UUID, uuid4
@@ -31,6 +32,30 @@ _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 class LabDaemonConfigurationError(RuntimeError):
     """A daemon cannot start without weakening its trust boundary."""
+
+
+class LabDaemonReadiness(BaseModel):
+    """One generation-bound heartbeat published by a formal Lab daemon."""
+
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
+
+    label: str
+    pid: int = Field(gt=0)
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    environment_generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    code_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    started_at: datetime
+    heartbeat_at: datetime
+    heartbeat_monotonic: float = Field(ge=0)
+    generation_lock_device: int = Field(ge=0)
+    generation_lock_inode: int = Field(gt=0)
+
+    @field_validator("started_at", "heartbeat_at")
+    @classmethod
+    def _aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("readiness timestamps must be timezone-aware")
+        return value.astimezone(UTC)
 
 
 def _canonical_absolute_path(path: Path, *, label: str) -> Path:
@@ -823,6 +848,255 @@ class LabAuthorityKeyring:
         if secret is None:
             return None
         return LabFinalizerAuthorityKey(key_id=key_id, secret=secret)
+
+
+class LabDaemonReadinessPublisher:
+    """Atomically publish one daemon's liveness under the deployment authority root."""
+
+    _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
+
+    def __init__(
+        self,
+        *,
+        deployment_lock_path: Path,
+        deployment_lock_fd: int,
+        label: str,
+        operation_id: str,
+        environment_generation_id: str,
+        code_sha: str,
+        heartbeat_interval_seconds: float,
+        mutation_guard: Callable[[], object] | None = None,
+        monotonic_provider: Callable[[], float] = time.monotonic,
+        now_provider: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if self._LABEL.fullmatch(label) is None:
+            raise LabDaemonConfigurationError("daemon readiness label is invalid")
+        if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+            raise LabDaemonConfigurationError("daemon readiness operation id is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", environment_generation_id) is None:
+            raise LabDaemonConfigurationError("daemon readiness environment generation is invalid")
+        if _CODE_SHA.fullmatch(code_sha) is None:
+            raise LabDaemonConfigurationError("daemon readiness code SHA is invalid")
+        if not 0.1 <= heartbeat_interval_seconds <= 60:
+            raise LabDaemonConfigurationError("daemon readiness interval is invalid")
+        self.lock_path = _canonical_absolute_path(
+            deployment_lock_path,
+            label="deployment generation lock",
+        )
+        self.lock_fd = deployment_lock_fd
+        self.label = label
+        self.operation_id = operation_id
+        self.environment_generation_id = environment_generation_id
+        self.code_sha = code_sha
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.mutation_guard = mutation_guard
+        self.monotonic_provider = monotonic_provider
+        self.now_provider = now_provider
+        self.root = self.lock_path.with_name(f"{self.lock_path.stem}.lab-readiness")
+        self.path = self.root / f"{label}.json"
+        self.started_at = self.now_provider()
+        self._stop = Event()
+        self._thread: Thread | None = None
+        self._verify_lock()
+
+    def _verify_lock(self) -> os.stat_result:
+        try:
+            opened = os.fstat(self.lock_fd)
+            active = self.lock_path.lstat()
+        except OSError as exc:
+            raise LabDaemonConfigurationError("deployment generation lock is unavailable") from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (active.st_dev, active.st_ino)
+        ):
+            raise LabDaemonConfigurationError("deployment generation lock identity changed")
+        return opened
+
+    def _root_fd(self, *, create: bool) -> tuple[int, os.stat_result]:
+        parent = require_private_directory(self.root.parent, label="release authority root")
+        if create:
+            ensure_private_directory(
+                self.root,
+                label="lab daemon readiness root",
+                mutation_guard=self.mutation_guard,
+            )
+        root = require_private_directory(self.root, label="lab daemon readiness root")
+        root_stat = root.lstat()
+        try:
+            descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as exc:
+            raise LabDaemonConfigurationError("readiness root cannot be opened safely") from exc
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (root_stat.st_dev, root_stat.st_ino):
+            os.close(descriptor)
+            raise LabDaemonConfigurationError("readiness root identity changed")
+        if parent != self.root.parent:
+            os.close(descriptor)
+            raise LabDaemonConfigurationError("readiness authority root changed")
+        return descriptor, root_stat
+
+    def _assert_root_current(self, descriptor: int, expected: os.stat_result) -> None:
+        self._verify_lock()
+        try:
+            active = self.root.lstat()
+            opened = os.fstat(descriptor)
+        except OSError as exc:
+            raise LabDaemonConfigurationError("readiness root identity changed") from exc
+        if (active.st_dev, active.st_ino) != (expected.st_dev, expected.st_ino) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise LabDaemonConfigurationError("readiness root identity changed")
+
+    @staticmethod
+    def _write_all(descriptor: int, payload: bytes) -> None:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise LabDaemonConfigurationError("readiness heartbeat write was incomplete")
+            offset += written
+
+    def publish_once(self) -> LabDaemonReadiness:
+        if self.mutation_guard is not None:
+            self.mutation_guard()
+        lock = self._verify_lock()
+        heartbeat = LabDaemonReadiness(
+            label=self.label,
+            pid=os.getpid(),
+            operation_id=self.operation_id,
+            environment_generation_id=self.environment_generation_id,
+            code_sha=self.code_sha,
+            started_at=self.started_at,
+            heartbeat_at=self.now_provider(),
+            heartbeat_monotonic=self.monotonic_provider(),
+            generation_lock_device=lock.st_dev,
+            generation_lock_inode=lock.st_ino,
+        )
+        payload = (heartbeat.model_dump_json() + "\n").encode("utf-8")
+        root_fd, root_stat = self._root_fd(create=True)
+        temporary = f".{self.label}.{os.getpid()}.{uuid4().hex}.tmp"
+        descriptor = -1
+        try:
+            if self.mutation_guard is not None:
+                self.mutation_guard()
+            self._assert_root_current(root_fd, root_stat)
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=root_fd,
+            )
+            self._write_all(descriptor, payload)
+            os.fsync(descriptor)
+            _validate_private_regular_identity(os.fstat(descriptor), label="readiness heartbeat")
+            if self.mutation_guard is not None:
+                self.mutation_guard()
+            self._assert_root_current(root_fd, root_stat)
+            os.replace(temporary, self.path.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+            os.fsync(root_fd)
+            self._assert_root_current(root_fd, root_stat)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(temporary, dir_fd=root_fd)
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(root_fd)
+        return heartbeat
+
+    @classmethod
+    def read(cls, *, deployment_lock_path: Path, label: str) -> LabDaemonReadiness:
+        lock_path = _canonical_absolute_path(
+            deployment_lock_path,
+            label="deployment generation lock",
+        )
+        root = lock_path.with_name(f"{lock_path.stem}.lab-readiness")
+        require_private_directory(root, label="lab daemon readiness root")
+        root_stat = root.lstat()
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                f"{label}.json",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+            opened = os.fstat(descriptor)
+            _validate_private_regular_identity(opened, label="readiness heartbeat")
+            payload = os.read(descriptor, 16385)
+            final = os.fstat(descriptor)
+            if len(payload) > 16384 or (
+                final.st_dev,
+                final.st_ino,
+                final.st_mode,
+                final.st_uid,
+                final.st_nlink,
+                final.st_size,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+                opened.st_size,
+            ):
+                raise LabDaemonConfigurationError("readiness heartbeat identity changed")
+            active = os.stat(f"{label}.json", dir_fd=root_fd, follow_symlinks=False)
+            if (active.st_dev, active.st_ino) != (opened.st_dev, opened.st_ino):
+                raise LabDaemonConfigurationError("readiness heartbeat identity changed")
+            current_root = root.lstat()
+            if (current_root.st_dev, current_root.st_ino) != (
+                root_stat.st_dev,
+                root_stat.st_ino,
+            ):
+                raise LabDaemonConfigurationError("readiness root identity changed")
+            return LabDaemonReadiness.model_validate_json(payload)
+        except (OSError, ValueError) as exc:
+            raise LabDaemonConfigurationError("readiness heartbeat is invalid") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(root_fd)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.heartbeat_interval_seconds):
+            try:
+                self.publish_once()
+            except Exception:
+                logger.exception("lab daemon readiness heartbeat failed")
+                self._stop.set()
+
+    def start(self) -> LabDaemonReadiness:
+        if self._thread is not None:
+            raise RuntimeError("daemon readiness publisher is already started")
+        heartbeat = self.publish_once()
+        self._thread = Thread(target=self._run, name=f"readiness-{self.label}", daemon=True)
+        self._thread.start()
+        return heartbeat
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
+            self._thread = None
+
+    def __enter__(self) -> LabDaemonReadinessPublisher:
+        self.start()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 class LabDaemonLock:

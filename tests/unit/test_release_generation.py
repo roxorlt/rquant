@@ -129,7 +129,11 @@ def _authority(
     mutation_hook: object | None = None,
     gc_grace_seconds: float | None = None,
     minimum_free_bytes: int | None = None,
+    uv_path: Path | None = None,
 ) -> ReleaseGenerationAuthority:
+    def copy_fixture_environment(destination: Path) -> None:
+        shutil.copytree(repo / ".venv", destination, dirs_exist_ok=True, symlinks=True)
+
     return ReleaseGenerationAuthority(
         repo=repo,
         lock_path=lock_path,
@@ -140,6 +144,8 @@ def _authority(
         mutation_hook=mutation_hook,
         gc_grace_seconds=gc_grace_seconds,
         minimum_free_bytes=minimum_free_bytes,
+        uv_path=uv_path,
+        environment_builder=(None if uv_path is not None else copy_fixture_environment),
     )
 
 
@@ -181,6 +187,128 @@ def test_release_generation_marker_binds_checkout_lock_python_and_venv(
     assert marker.venv_identity.inode > 0
     assert marker_path_for_lock(lock_path).is_file()
     os.close(lock_fd)
+
+
+def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uv_name = shutil.which("uv")
+    assert uv_name is not None
+    uv_path = Path(uv_name).resolve(strict=True)
+    repo, lock_path, commit, _python = _generation(tmp_path)
+    shutil.rmtree(repo / ".venv")
+    cache = tmp_path / "uv-cache"
+    monkeypatch.setenv("UV_CACHE_DIR", str(cache))
+    subprocess.run(
+        [str(uv_path), "venv", "--python", sys.executable, str(repo / ".venv")],
+        cwd=repo,
+        check=True,
+        env={**os.environ, "UV_CACHE_DIR": str(cache)},
+        capture_output=True,
+        text=True,
+    )
+    (repo / "uv.lock").unlink()
+    subprocess.run(
+        [str(uv_path), "lock", "--python", sys.executable],
+        cwd=repo,
+        check=True,
+        env={**os.environ, "UV_CACHE_DIR": str(cache)},
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run([str(TRUSTED_GIT), "add", "uv.lock"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            str(TRUSTED_GIT),
+            "-c",
+            "user.name=rQuant Tests",
+            "-c",
+            "user.email=tests@rquant.invalid",
+            "commit",
+            "-qm",
+            "lock real uv environment",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    python = repo / ".venv" / "bin" / "python"
+    assert python.is_symlink()
+    assert (repo / ".venv" / "bin" / "python3").readlink() == Path("python")
+    assert sum(path.lstat().st_size for path in (repo / ".venv").rglob("*")) < 1_000_000
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python, uv_path=uv_path)
+
+    initialized = _publish_initialized(authority, commit=commit)
+    deployment = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha="e" * 40,
+        target_ref="e" * 40,
+        changed_files=(),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+    )
+    authority.invalidate()
+    authority.update_deployment_intent(
+        operation_id=deployment.operation_id,
+        stage="timers_restored",
+    )
+    deployed = authority.publish(
+        expected_commit=commit,
+        operation_id=deployment.operation_id,
+        transaction_kind="deployment",
+    )
+
+    assert initialized.environment_generation_id != deployed.environment_generation_id
+    assert deployed.previous_generation_id == initialized.environment_generation_id
+    os.close(lock_fd)
+
+
+def test_environment_builder_rejects_non_whitelisted_symlink(tmp_path: Path) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    external = tmp_path / "external-module.so"
+    external.write_bytes(b"do-not-touch")
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def unsafe_builder(destination: Path) -> None:
+        shutil.copytree(repo / ".venv", destination, dirs_exist_ok=True, symlinks=True)
+        injected = destination / "lib" / "python3.12" / "site-packages" / "evil.so"
+        injected.parent.mkdir(parents=True, exist_ok=True)
+        injected.symlink_to(external)
+
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        writable=True,
+        environment_builder=unsafe_builder,
+    )
+    initialization = authority.begin_initialization(target_sha=commit)
+    try:
+        with pytest.raises(ReleaseGenerationError, match="unsafe symlink"):
+            authority.publish(
+                expected_commit=commit,
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
+    finally:
+        os.close(lock_fd)
+
+    assert external.read_bytes() == b"do-not-touch"
+    assert list(environment_root_for_lock(lock_path).iterdir()) == []
+    assert not lock_path.with_name(f"{lock_path.stem}.environment.json").exists()
 
 
 def test_release_generation_rejects_uv_lock_but_ignores_mutable_source_venv_drift(
@@ -467,6 +595,7 @@ def test_environment_selector_is_not_switched_when_generation_copy_is_interrupte
         active_services=(),
         active_timers=(),
         marker_generation=first.content_hash(),
+        previous_generation_id=first.environment_generation_id,
     )
     for stage in (
         "timers_stopped",
@@ -846,6 +975,36 @@ def test_unsafe_active_intent_never_falls_back_to_valid_archive(
     os.close(lock_fd)
 
 
+@pytest.mark.parametrize("active_kind", ["corrupt", "loose", "valid"])
+def test_initialization_generation_is_blocked_by_any_active_deployment_intent(
+    tmp_path: Path,
+    active_kind: str,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    _publish_initialized(authority, commit=commit)
+    active = intent_path_for_lock(lock_path)
+    if active_kind == "valid":
+        authority.begin_deployment_intent(
+            previous_sha=commit,
+            target_sha="e" * 40,
+            target_ref="e" * 40,
+            changed_files=(),
+            restart_services=(),
+            active_services=(),
+            active_timers=(),
+        )
+    else:
+        active.write_text("{not-json\n" if active_kind == "corrupt" else "{}\n")
+        active.chmod(0o600 if active_kind == "corrupt" else 0o644)
+
+    with pytest.raises(ReleaseGenerationError, match="deployment|record"):
+        authority.verify(expected_commit=commit)
+    os.close(lock_fd)
+
+
 def test_generation_gc_retains_authority_references_and_removes_only_old_orphans(
     tmp_path: Path,
 ) -> None:
@@ -875,10 +1034,10 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
         for sha in (intent.previous_sha, intent.target_sha)
     }
     root = environment_root_for_lock(lock_path)
-    previous = "b" * 64
+    previous = marker.environment_generation_id
     orphan = "c" * 64
     failed = f".{('d' * 64)}.0123456789abcdef.building"
-    for name in (previous, orphan, failed, *referenced):
+    for name in (orphan, failed, *referenced):
         candidate = root / name
         candidate.mkdir(mode=0o700)
         payload = candidate / "payload"
@@ -886,7 +1045,7 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
         payload.chmod(0o400)
         candidate.chmod(0o500)
     manifests: dict[str, Path] = {}
-    for generation_id in (previous, orphan):
+    for generation_id in (orphan,):
         manifest = lock_path.with_name(f"{lock_path.stem}.venv-{generation_id}.manifest.json")
         manifest.write_text(
             json.dumps(
@@ -902,9 +1061,7 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
         manifest.chmod(0o600)
         manifests[generation_id] = manifest
     now = time.time()
-    os.utime(manifests[previous], (now - 100, now - 100), follow_symlinks=False)
-    os.utime(manifests[orphan], (now - 200, now - 200), follow_symlinks=False)
-    os.utime(root / previous, (now - 100, now - 100), follow_symlinks=False)
+    os.utime(manifests[orphan], (now + 1_000, now + 1_000), follow_symlinks=False)
     os.utime(root / orphan, (now - 200, now - 200), follow_symlinks=False)
     os.utime(root / failed, (now - 300, now - 300), follow_symlinks=False)
     for generation_id in referenced:
@@ -922,6 +1079,111 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
     audit = lock_path.with_name(f"{lock_path.stem}.generation-gc.jsonl")
     assert audit.stat().st_mode & 0o777 == 0o600
     assert '"reason":"unit-test"' in audit.read_text(encoding="utf-8")
+    os.close(lock_fd)
+
+
+def test_generation_gc_uses_exact_previous_id_not_newer_orphan_mtime(tmp_path: Path) -> None:
+    repo, lock_path, first_commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+    )
+    first = _publish_initialized(authority, commit=first_commit)
+    (repo / "README.md").write_text("next generation\n", encoding="utf-8")
+    subprocess.run([str(TRUSTED_GIT), "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            str(TRUSTED_GIT),
+            "-c",
+            "user.name=rQuant Tests",
+            "-c",
+            "user.email=tests@rquant.invalid",
+            "commit",
+            "-qm",
+            "next generation",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    second_commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [str(TRUSTED_GIT), "reset", "--hard", first_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    intent = authority.begin_deployment_intent(
+        previous_sha=first_commit,
+        target_sha=second_commit,
+        target_ref=second_commit,
+        changed_files=("README.md",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+    )
+    authority.invalidate()
+    subprocess.run(
+        [str(TRUSTED_GIT), "reset", "--hard", second_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    authority.update_deployment_intent(operation_id=intent.operation_id, stage="timers_restored")
+    second = authority.publish(
+        expected_commit=second_commit,
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
+    authority.commit_generation(
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    assert second.previous_generation_id == first.environment_generation_id
+
+    root = environment_root_for_lock(lock_path)
+    orphan = "f" * 64
+    candidate = root / orphan
+    candidate.mkdir(mode=0o700)
+    payload = candidate / "payload"
+    payload.write_text("orphan", encoding="utf-8")
+    payload.chmod(0o400)
+    candidate.chmod(0o500)
+    orphan_manifest = lock_path.with_name(f"{lock_path.stem}.venv-{orphan}.manifest.json")
+    orphan_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generation_id": orphan,
+                "environment_path": str(candidate),
+                "entries": [{"path": "."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    orphan_manifest.chmod(0o600)
+    now = time.time()
+    os.utime(orphan_manifest, (now + 10_000, now + 10_000), follow_symlinks=False)
+    os.utime(candidate, (now - 100, now - 100), follow_symlinks=False)
+
+    metrics = authority.garbage_collect_environments(reason="clock-skew-test")
+
+    assert first.environment_generation_id in metrics.retained_generation_ids
+    assert second.environment_generation_id in metrics.retained_generation_ids
+    assert not candidate.exists()
+    assert not orphan_manifest.exists()
     os.close(lock_fd)
 
 
@@ -1077,7 +1339,15 @@ def test_rollback_selects_a_verified_immutable_previous_environment(
         transaction_kind="deployment",
     )
 
+    selector_payload = json.loads(
+        environment_selector_path_for_lock(lock_path).read_text(encoding="utf-8")
+    )
+    commit_payload = json.loads(commit_path_for_lock(lock_path).read_text(encoding="utf-8"))
+
     assert marker.commit == previous
     assert marker.environment_generation_id != original.environment_generation_id
+    assert marker.previous_generation_id == original.environment_generation_id
+    assert selector_payload["previous_generation_id"] == original.environment_generation_id
+    assert commit_payload["previous_generation_id"] == original.environment_generation_id
     assert authority.verify(expected_commit=previous) == marker
     os.close(lock_fd)

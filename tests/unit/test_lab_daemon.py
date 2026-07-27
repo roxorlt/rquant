@@ -17,6 +17,7 @@ from rquant.lab_daemon import (
     LabAuthorityKeyring,
     LabDaemonConfigurationError,
     LabDaemonLock,
+    LabDaemonReadinessPublisher,
     LabFinalizerDaemon,
     LabFinalizerDaemonState,
     LabFinalizerFailureState,
@@ -34,6 +35,65 @@ from rquant.lab_jobs import LabJobReader, LabJobStore
 def _write_private(path: Path, payload: str) -> None:
     path.write_text(payload, encoding="ascii")
     path.chmod(0o600)
+
+
+def test_daemon_readiness_is_generation_bound_and_monotonic(tmp_path: Path) -> None:
+    authority_root = tmp_path / "authority"
+    authority_root.mkdir(mode=0o700)
+    lock_path = authority_root / "rquant.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    monotonic_values = iter((10.0, 11.0))
+    publisher = LabDaemonReadinessPublisher(
+        deployment_lock_path=lock_path,
+        deployment_lock_fd=lock_fd,
+        label="com.roxor.rquant-lab-worker",
+        operation_id="a" * 32,
+        environment_generation_id="b" * 64,
+        code_sha="c" * 40,
+        heartbeat_interval_seconds=1,
+        monotonic_provider=lambda: next(monotonic_values),
+    )
+    try:
+        first = publisher.publish_once()
+        second = publisher.publish_once()
+        observed = LabDaemonReadinessPublisher.read(
+            deployment_lock_path=lock_path,
+            label="com.roxor.rquant-lab-worker",
+        )
+    finally:
+        publisher.close()
+        os.close(lock_fd)
+
+    assert first.heartbeat_monotonic == 10.0
+    assert second.heartbeat_monotonic == 11.0
+    assert observed == second
+    assert observed.environment_generation_id == "b" * 64
+    assert observed.operation_id == "a" * 32
+
+
+def test_daemon_readiness_rejects_invalid_generation_before_namespace_creation(
+    tmp_path: Path,
+) -> None:
+    authority_root = tmp_path / "authority"
+    authority_root.mkdir(mode=0o700)
+    lock_path = authority_root / "rquant.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with pytest.raises(LabDaemonConfigurationError, match="operation id"):
+            LabDaemonReadinessPublisher(
+                deployment_lock_path=lock_path,
+                deployment_lock_fd=lock_fd,
+                label="com.roxor.rquant-lab-worker",
+                operation_id="short",
+                environment_generation_id="b" * 64,
+                code_sha="c" * 40,
+                heartbeat_interval_seconds=1,
+            )
+    finally:
+        os.close(lock_fd)
+
+    assert not lock_path.with_name("rquant.lab-readiness").exists()
 
 
 def test_authority_keyring_loads_active_and_rotated_keys(tmp_path: Path) -> None:

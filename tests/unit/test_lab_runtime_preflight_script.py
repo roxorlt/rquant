@@ -120,6 +120,12 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
             python_path=checkout / ".venv" / "bin" / "python",
             git_path=TRUSTED_GIT,
             writable=True,
+            environment_builder=lambda destination: shutil.copytree(
+                checkout / ".venv",
+                destination,
+                dirs_exist_ok=True,
+                symlinks=True,
+            ),
         )
         initialization = authority.begin_initialization(target_sha=commit)
         authority.publish(

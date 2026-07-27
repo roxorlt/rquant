@@ -2963,6 +2963,37 @@ def _lab_deployment_generation_binding(args: argparse.Namespace) -> dict[str, ob
     }
 
 
+def _lab_daemon_readiness_context(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    code_sha: str,
+    runtime_guard: object,
+) -> AbstractContextManager[object]:
+    generation_binding = _lab_deployment_generation_binding(args)
+    if not generation_binding:
+        return nullcontext()
+    operation_id = getattr(args, "deployment_operation_id", None)
+    environment_generation = getattr(args, "deployment_environment_generation", None)
+    if not isinstance(operation_id, str) or not isinstance(environment_generation, str):
+        raise RuntimeError("incomplete Lab deployment readiness binding")
+    from rquant.lab_daemon import LabDaemonReadinessPublisher
+
+    verify = getattr(runtime_guard, "verify", None)
+    if not callable(verify):
+        raise RuntimeError("Lab runtime guard cannot publish readiness")
+    return LabDaemonReadinessPublisher(
+        deployment_lock_path=Path(str(generation_binding["deployment_lock_path"])),
+        deployment_lock_fd=int(generation_binding["deployment_generation_fd"]),
+        label=label,
+        operation_id=operation_id,
+        environment_generation_id=environment_generation,
+        code_sha=code_sha,
+        heartbeat_interval_seconds=2,
+        mutation_guard=verify,
+    )
+
+
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
@@ -2979,6 +3010,12 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         code_sha,
         trusted_git_path,
         **generation_binding,
+    )
+    readiness = _lab_daemon_readiness_context(
+        args,
+        label="com.roxor.rquant-lab-scheduler",
+        code_sha=code_sha,
+        runtime_guard=runtime_guard,
     )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
@@ -3105,30 +3142,31 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 ),
                 runtime_guard=runtime_guard.verify,
             )
-            if args.once:
+            with readiness:
+                if args.once:
+                    try:
+                        result = scheduler.run_once()
+                        logger.info(f"lab-scheduler tick: {result.model_dump_json()}")
+                        return 0
+                    finally:
+                        scheduler.release()
+
+                def handle_signal(signum: int, frame: object) -> None:
+                    del frame
+                    logger.info(f"lab-scheduler 收到信号 {signum}，请求停止")
+                    scheduler.request_stop()
+
+                previous = {
+                    signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+                }
+                for signum in previous:
+                    signal.signal(signum, handle_signal)
                 try:
-                    result = scheduler.run_once()
-                    logger.info(f"lab-scheduler tick: {result.model_dump_json()}")
-                    return 0
+                    scheduler.run_forever()
                 finally:
-                    scheduler.release()
-
-            def handle_signal(signum: int, frame: object) -> None:
-                del frame
-                logger.info(f"lab-scheduler 收到信号 {signum}，请求停止")
-                scheduler.request_stop()
-
-            previous = {
-                signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
-            }
-            for signum in previous:
-                signal.signal(signum, handle_signal)
-            try:
-                scheduler.run_forever()
-            finally:
-                for signum, handler in previous.items():
-                    signal.signal(signum, handler)
-            return 0
+                    for signum, handler in previous.items():
+                        signal.signal(signum, handler)
+                return 0
         finally:
             if artifact_store is not None:
                 artifact_store.close()
@@ -3151,6 +3189,12 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         code_sha,
         trusted_git_path,
         **generation_binding,
+    )
+    readiness = _lab_daemon_readiness_context(
+        args,
+        label="com.roxor.rquant-lab-worker",
+        code_sha=code_sha,
+        runtime_guard=runtime_guard,
     )
     from rquant.config import settings
     from rquant.lab_daemon import (
@@ -3215,29 +3259,32 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
             receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
             verified_code_sha_provider=runtime_guard.verify,
         )
-        if args.once:
-            result = worker.run_once()
-            logger.info(f"lab-worker tick: {result.model_dump_json()}")
-            if result.status in {"idle", "succeeded"}:
-                return 0
-            if result.status in {"failed", "stopped"}:
-                return 1
-            return 2
+        with readiness:
+            if args.once:
+                result = worker.run_once()
+                logger.info(f"lab-worker tick: {result.model_dump_json()}")
+                if result.status in {"idle", "succeeded"}:
+                    return 0
+                if result.status in {"failed", "stopped"}:
+                    return 1
+                return 2
 
-        def handle_signal(signum: int, frame: object) -> None:
-            del frame
-            logger.info(f"lab-worker 收到信号 {signum}，请求停止")
-            worker.request_stop()
+            def handle_signal(signum: int, frame: object) -> None:
+                del frame
+                logger.info(f"lab-worker 收到信号 {signum}，请求停止")
+                worker.request_stop()
 
-        previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
-        for signum in previous:
-            signal.signal(signum, handle_signal)
-        try:
-            worker.run_forever(install_signal_handlers=False)
-        finally:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
-        return 0
+            previous = {
+                signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+            }
+            for signum in previous:
+                signal.signal(signum, handle_signal)
+            try:
+                worker.run_forever(install_signal_handlers=False)
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
+            return 0
 
 
 def cmd_lab_finalizer(args: argparse.Namespace) -> int:
@@ -3256,6 +3303,12 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         code_sha,
         trusted_git_path,
         **generation_binding,
+    )
+    readiness = _lab_daemon_readiness_context(
+        args,
+        label="com.roxor.rquant-lab-finalizer",
+        code_sha=code_sha,
+        runtime_guard=runtime_guard,
     )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
@@ -3353,27 +3406,28 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 failure_cooldown_max_seconds=(settings.lab_finalizer_failure_cooldown_max_seconds),
                 runtime_guard=runtime_guard.verify,
             )
-            if args.once:
-                result = daemon.run_once()
-                logger.info(f"lab-finalizer tick: {result.model_dump_json()}")
-                return 1 if result.failed else 0
+            with readiness:
+                if args.once:
+                    result = daemon.run_once()
+                    logger.info(f"lab-finalizer tick: {result.model_dump_json()}")
+                    return 1 if result.failed else 0
 
-            def handle_signal(signum: int, frame: object) -> None:
-                del frame
-                logger.info(f"lab-finalizer 收到信号 {signum}，请求停止")
-                daemon.request_stop()
+                def handle_signal(signum: int, frame: object) -> None:
+                    del frame
+                    logger.info(f"lab-finalizer 收到信号 {signum}，请求停止")
+                    daemon.request_stop()
 
-            previous = {
-                signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
-            }
-            for signum in previous:
-                signal.signal(signum, handle_signal)
-            try:
-                daemon.run_forever()
-            finally:
-                for signum, handler in previous.items():
-                    signal.signal(signum, handler)
-            return 0
+                previous = {
+                    signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+                }
+                for signum in previous:
+                    signal.signal(signum, handle_signal)
+                try:
+                    daemon.run_forever()
+                finally:
+                    for signum, handler in previous.items():
+                        signal.signal(signum, handler)
+                return 0
         finally:
             if artifact_store is not None:
                 artifact_store.close()
@@ -5044,6 +5098,8 @@ def build_parser() -> argparse.ArgumentParser:
     lab_scheduler_p.add_argument("--deployment-generation", required=True)
     lab_scheduler_p.add_argument("--deployment-lock-path", required=True)
     lab_scheduler_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_scheduler_p.add_argument("--deployment-operation-id")
+    lab_scheduler_p.add_argument("--deployment-environment-generation")
     lab_scheduler_p.add_argument(
         "--once",
         action="store_true",
@@ -5067,6 +5123,8 @@ def build_parser() -> argparse.ArgumentParser:
     lab_worker_p.add_argument("--deployment-generation", required=True)
     lab_worker_p.add_argument("--deployment-lock-path", required=True)
     lab_worker_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_worker_p.add_argument("--deployment-operation-id")
+    lab_worker_p.add_argument("--deployment-environment-generation")
     lab_worker_p.add_argument(
         "--worker-id",
         default=None,
@@ -5095,6 +5153,8 @@ def build_parser() -> argparse.ArgumentParser:
     lab_finalizer_p.add_argument("--deployment-generation", required=True)
     lab_finalizer_p.add_argument("--deployment-lock-path", required=True)
     lab_finalizer_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_finalizer_p.add_argument("--deployment-operation-id")
+    lab_finalizer_p.add_argument("--deployment-environment-generation")
     lab_finalizer_p.add_argument(
         "--once",
         action="store_true",

@@ -25,6 +25,7 @@ from rquant.ops.production_deploy import (
     build_parser,
     deploy,
     is_protected_market_window,
+    validate_release_profile,
     validate_target,
 )
 from rquant.release_generation import DeploymentIntent
@@ -301,7 +302,7 @@ def test_change_plan_keeps_preflight_only_release_restart_free() -> None:
 
     assert plan.blocked_files == ()
     assert plan.restart_services == ()
-    assert plan.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
+    assert plan.handoff_daemons == ()
 
 
 def test_change_plan_restarts_all_for_shared_runtime_or_unknown_source() -> None:
@@ -310,6 +311,38 @@ def test_change_plan_restarts_all_for_shared_runtime_or_unknown_source() -> None
 
     assert shared.restart_services == ALL_LONG_RUNNING_SERVICES
     assert unknown.restart_services == ALL_LONG_RUNNING_SERVICES
+
+
+def test_lab_daemon_change_uses_launchd_only_for_macos_release_profile() -> None:
+    macos = build_change_plan(
+        ["src/rquant/lab_daemon.py"],
+        release_profile="macos-lab",
+    )
+    linux = build_change_plan(
+        ["src/rquant/lab_daemon.py"],
+        release_profile="linux-production",
+    )
+
+    assert macos.restart_services == ()
+    assert macos.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
+    assert linux.restart_services == ALL_LONG_RUNNING_SERVICES
+    assert linux.handoff_daemons == ()
+
+
+@pytest.mark.parametrize(
+    ("release_profile", "platform_name"),
+    [
+        ("macos-lab", "linux"),
+        ("linux-production", "darwin"),
+        ("unknown", "darwin"),
+    ],
+)
+def test_release_profile_platform_mismatch_fails_closed(
+    release_profile: str,
+    platform_name: str,
+) -> None:
+    with pytest.raises(PolicyError, match="release profile"):
+        validate_release_profile(release_profile, platform_name)
 
 
 @pytest.mark.parametrize(
@@ -333,7 +366,7 @@ def test_dry_run_builds_exact_plan_without_mutating_repo(tmp_path: Path) -> None
 
     assert result.status == "dry_run"
     assert result.target_sha == _sha("b")
-    assert result.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
+    assert result.handoff_daemons == ()
     assert ("git", "merge", "--ff-only", _sha("b")) not in runner.calls
     assert ("uv", "sync", "--frozen") not in runner.calls
 
@@ -567,6 +600,7 @@ def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) ->
     )
 
     assert result.status == "deployed"
+    assert result.handoff_daemons == ()
     assert ("git", "merge", "--ff-only", _sha("b")) in runner.calls
     assert ("uv", "sync", "--frozen") in runner.calls
     assert runner.calls.count(("rquant", "preflight")) == 2
@@ -579,6 +613,37 @@ def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) ->
         (_sha("b"), authority.intent.operation_id, "deploy", "publish"),
         (_sha("b"), authority.intent.operation_id, "deploy", "commit"),
     ]
+
+
+def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
+    responses = _base_responses()
+    responses[("git", "diff", "--name-only", f"{_sha('a')}..{_sha('b')}")] = (
+        0,
+        "src/rquant/lab_daemon.py\n",
+    )
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+        }
+    )
+    runner = FakeRunner(responses)
+    authority = FakeGenerationAuthority()
+
+    result = deploy(
+        config,
+        runner=runner,
+        generation_authority=authority,
+        generation_finalizer=FakeGenerationFinalizer(),
+    )
+
+    assert result.status == "deployed"
+    assert result.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
+    assert authority.intent is not None
+    assert authority.intent.restart_services == ()
+    assert not any("systemctl" in command for command in runner.calls)
 
 
 @pytest.mark.parametrize(

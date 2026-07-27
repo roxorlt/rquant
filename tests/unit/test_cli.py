@@ -26,6 +26,10 @@ _LAB_GENERATION_ARGUMENTS = [
     _LAB_DEPLOYMENT_LOCK,
     "--deployment-generation-fd",
     "9",
+    "--deployment-operation-id",
+    "a" * 32,
+    "--deployment-environment-generation",
+    "b" * 64,
 ]
 
 
