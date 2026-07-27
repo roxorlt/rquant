@@ -351,6 +351,34 @@ def _load_release_authority(path: Path) -> ModuleType:
     return module
 
 
+def _assert_inherited_lock(root: Path, lock_path: Path, descriptor: int) -> int:
+    expected = root.parent / ".rquant-deploy" / f"{root.name}.lock"
+    if lock_path != expected or descriptor < 0:
+        raise DeployBootstrapError("inherited generation lock binding is invalid")
+    try:
+        opened = os.fstat(descriptor)
+        active = lock_path.lstat()
+    except OSError as exc:
+        raise DeployBootstrapError("inherited generation lock is unavailable") from exc
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+        != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise DeployBootstrapError("inherited generation lock identity changed")
+    return descriptor
+
+
+def _normalized_deploy_argv(values: list[str]) -> list[str]:
+    normalized = list(values)
+    if normalized and normalized[0] == "--":
+        normalized.pop(0)
+    return normalized
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
@@ -361,7 +389,11 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--initialize-generation", action="store_true")
     modes.add_argument("--recover-generation", action="store_true")
+    modes.add_argument("--finalize-generation", action="store_true")
     parser.add_argument("--recovery-action", choices=("resume", "rollback"))
+    parser.add_argument("--finalize-action", choices=("deploy", "resume", "rollback"))
+    parser.add_argument("--operation-id")
+    parser.add_argument("--inherited-lock-fd", type=int)
     args, deploy_argv = parser.parse_known_args(argv)
     lock_fd = -1
     generation_error_type: type[BaseException] | None = None
@@ -371,7 +403,12 @@ def main(argv: list[str] | None = None) -> int:
         if Path.cwd().resolve(strict=True) != root:
             raise DeployBootstrapError("working directory does not match deployment checkout")
         lock_path = _canonical(args.deployment_lock_path, label="deployment lock")
-        lock_fd = _acquire_lock(root, lock_path)
+        if args.finalize_generation:
+            if args.inherited_lock_fd is None:
+                raise DeployBootstrapError("finalizer requires inherited generation lock")
+            lock_fd = _assert_inherited_lock(root, lock_path, args.inherited_lock_fd)
+        else:
+            lock_fd = _acquire_lock(root, lock_path)
         git_path = _canonical(args.trusted_git_path, label="trusted Git")
         _trusted_git(git_path)
         python_path = _canonical(args.python_path, label="deployment Python")
@@ -384,33 +421,66 @@ def main(argv: list[str] | None = None) -> int:
             raise DeployBootstrapError(
                 "--recovery-action is required only with --recover-generation"
             )
-        target = _generation_target(deploy_argv) if generation_mode else ""
-        if generation_mode:
-            marker_path = lock_path.with_name(f"{lock_path.stem}.complete.json")
-            try:
-                marker_path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                raise DeployBootstrapError(
-                    "generation control requires an absent completion marker"
-                )
+        finalize_arguments_present = any(
+            value is not None
+            for value in (args.finalize_action, args.operation_id, args.inherited_lock_fd)
+        )
+        if args.finalize_generation and (
+            args.finalize_action is None
+            or args.operation_id is None
+            or args.inherited_lock_fd is None
+        ):
+            raise DeployBootstrapError(
+                "finalize action and operation id are required only with finalizer mode"
+            )
+        if not args.finalize_generation and finalize_arguments_present:
+            raise DeployBootstrapError("finalizer arguments require finalizer mode")
+        target = (
+            _generation_target(deploy_argv) if generation_mode or args.finalize_generation else ""
+        )
+        if args.initialize_generation:
             commit = _verify_generation_target(root, git_path, target)
-            control_mode = "initialize" if args.initialize_generation else str(args.recovery_action)
             _prepare_generation_checkout(
                 root=root,
                 git_path=git_path,
                 target_commit=commit,
-                mode=control_mode,
+                mode="initialize",
             )
+            _physical_file(authority_path, label="release generation authority")
+            authority_module = _load_release_authority(authority_path)
+            generation_error_type = authority_module.ReleaseGenerationError
+            authority = authority_module.ReleaseGenerationAuthority(
+                repo=root,
+                lock_path=lock_path,
+                lock_fd=lock_fd,
+                python_path=python_path,
+                git_path=git_path,
+                writable=True,
+            )
+            initialization = authority.begin_initialization(target_sha=commit)
+            marker_path = lock_path.with_name(f"{lock_path.stem}.complete.json")
+            if marker_path.exists():
+                authority.verify(expected_commit=commit)
+                authority.complete_initialization(operation_id=initialization.operation_id)
+                print(json.dumps({"commit": commit, "status": "generation_initialized"}))
+                return 0
             _run_frozen_sync(root, uv_path)
             _verify_current_generation_checkout(root, git_path, commit)
             _verify_generation_runtime(root, python_path)
             _run_generation_preflight(root)
-        else:
-            commit = _git_head(root, git_path)
-            _tracked_checkout_is_clean(root, git_path)
-            _verify_generation_runtime(root, python_path)
+            authority.publish(expected_commit=commit)
+            authority.complete_initialization(operation_id=initialization.operation_id)
+            print(
+                json.dumps(
+                    {"commit": commit, "status": "generation_initialized"},
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        commit = _git_head(root, git_path)
+        _tracked_checkout_is_clean(root, git_path)
+        _verify_generation_runtime(root, python_path)
         _physical_file(authority_path, label="release generation authority")
         authority_module = _load_release_authority(authority_path)
         generation_error_type = authority_module.ReleaseGenerationError
@@ -420,20 +490,54 @@ def main(argv: list[str] | None = None) -> int:
             lock_fd=lock_fd,
             python_path=python_path,
             git_path=git_path,
-            writable=generation_mode,
+            writable=args.recover_generation or args.finalize_generation,
         )
-        if generation_mode:
-            authority.publish(expected_commit=commit)
-            status = "initialized" if args.initialize_generation else str(args.recovery_action)
+
+        if args.finalize_generation:
+            if TARGET_PATTERN.fullmatch(target) is None or target.startswith("v"):
+                raise DeployBootstrapError("finalizer target must be a full commit SHA")
+            intent = authority.read_deployment_intent()
+            action = str(args.finalize_action)
+            expected_commit = intent.previous_sha if action == "rollback" else intent.target_sha
+            if (
+                intent.operation_id != args.operation_id
+                or target != expected_commit
+                or intent.stage != "timers_restored"
+            ):
+                raise DeployBootstrapError("finalizer does not match ready deployment intent")
+            _verify_current_generation_checkout(root, git_path, expected_commit)
+            _run_generation_preflight(root)
+            marker = authority.publish(expected_commit=expected_commit)
             print(
                 json.dumps(
-                    {"commit": commit, "status": f"generation_{status}"},
+                    {
+                        "commit": expected_commit,
+                        "operation_id": intent.operation_id,
+                        "schema_version": marker.schema_version,
+                        "status": "generation_finalized",
+                    },
                     sort_keys=True,
                 )
             )
             return 0
 
-        authority.verify(expected_commit=commit)
+        if args.recover_generation:
+            intent = authority.read_deployment_intent()
+            action = str(args.recovery_action)
+            expected_target = intent.previous_sha if action == "rollback" else intent.target_sha
+            allowed_refs = {expected_target}
+            if action == "resume":
+                allowed_refs.add(intent.target_ref)
+            if target not in allowed_refs:
+                raise DeployBootstrapError(
+                    "recovery target does not match recorded deployment intent"
+                )
+            if commit not in {intent.previous_sha, intent.target_sha}:
+                raise DeployBootstrapError(
+                    "recovery checkout is outside recorded deployment intent"
+                )
+        else:
+            authority.verify(expected_commit=commit)
 
         src = root / "src"
         _physical_directory(src, label="deployment source root")
@@ -444,9 +548,9 @@ def main(argv: list[str] | None = None) -> int:
         module_path = Path(str(getattr(module, "__file__", ""))).resolve(strict=True)
         if module_path != (src / "rquant" / "ops" / "production_deploy.py"):
             raise DeployBootstrapError("production deployer imported outside locked generation")
-        deploy_argv = list(deploy_argv)
-        if deploy_argv and deploy_argv[0] == "--":
-            deploy_argv.pop(0)
+        deploy_argv = _normalized_deploy_argv(deploy_argv)
+        if args.recover_generation:
+            deploy_argv.extend(["--recovery-action", str(args.recovery_action)])
         return int(
             deploy_main(
                 [

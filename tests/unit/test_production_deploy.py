@@ -25,6 +25,7 @@ from rquant.ops.production_deploy import (
     is_protected_market_window,
     validate_target,
 )
+from rquant.release_generation import DeploymentIntent
 
 
 class FakeRunner:
@@ -128,16 +129,52 @@ class SequenceRunner(FakeRunner):
 
 
 class FakeGenerationAuthority:
-    def __init__(self, *, crash_on_publish: bool = False) -> None:
+    def __init__(self) -> None:
         self.events: list[tuple[str, str | None]] = []
-        self.crash_on_publish = crash_on_publish
+        self.intent: DeploymentIntent | None = None
 
     def invalidate(self) -> None:
         self.events.append(("invalidate", None))
 
-    def publish(self, *, expected_commit: str) -> object:
-        self.events.append(("publish", expected_commit))
-        if self.crash_on_publish:
+    def begin_deployment_intent(self, **values: object) -> DeploymentIntent:
+        self.events.append(("intent", str(values["target_sha"])))
+        self.intent = DeploymentIntent.create(**values)
+        return self.intent
+
+    def read_deployment_intent(self) -> DeploymentIntent:
+        assert self.intent is not None
+        return self.intent
+
+    def update_deployment_intent(
+        self,
+        *,
+        operation_id: str,
+        stage: str,
+        restarted_services: tuple[str, ...] | None = None,
+    ) -> DeploymentIntent:
+        assert self.intent is not None and self.intent.operation_id == operation_id
+        self.intent = self.intent.advance(
+            stage=stage,
+            restarted_services=restarted_services,
+        )
+        self.events.append(("stage", stage))
+        return self.intent
+
+
+class FakeGenerationFinalizer:
+    def __init__(self, *, crash: bool = False) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.crash = crash
+
+    def finalize(
+        self,
+        *,
+        expected_commit: str,
+        operation_id: str,
+        action: str,
+    ) -> object:
+        self.calls.append((expected_commit, operation_id, action))
+        if self.crash:
             raise SimulatedDeploymentCrash
         return object()
 
@@ -492,11 +529,13 @@ def test_failed_service_after_rollback_is_reported_as_rollback_failure(
 def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) -> None:
     runner = FakeRunner(_base_responses())
     authority = FakeGenerationAuthority()
+    finalizer = FakeGenerationFinalizer()
 
     result = deploy(
         _config(tmp_path),
         runner=runner,
         generation_authority=authority,
+        generation_finalizer=finalizer,
     )
 
     assert result.status == "deployed"
@@ -506,10 +545,9 @@ def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) ->
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "deployed"' in audit
     assert f'"target_sha": "{_sha("b")}"' in audit
-    assert authority.events == [
-        ("invalidate", None),
-        ("publish", _sha("b")),
-    ]
+    assert authority.events[0:2] == [("intent", _sha("b")), ("invalidate", None)]
+    assert authority.intent is not None and authority.intent.stage == "completed"
+    assert finalizer.calls == [(_sha("b"), authority.intent.operation_id, "deploy")]
 
 
 @pytest.mark.parametrize(
@@ -532,34 +570,273 @@ def test_interrupted_deployment_phase_leaves_generation_unpublished(
         occurrence=occurrence,
     )
     authority = FakeGenerationAuthority()
+    finalizer = FakeGenerationFinalizer()
 
     with pytest.raises(SimulatedDeploymentCrash):
         deploy(
             _config(tmp_path),
             runner=runner,
             generation_authority=authority,
+            generation_finalizer=finalizer,
         )
 
-    assert authority.events == [("invalidate", None)]
+    assert authority.events[0:2] == [("intent", _sha("b")), ("invalidate", None)]
+    assert finalizer.calls == []
 
 
 def test_interrupted_marker_publication_does_not_claim_complete_generation(
     tmp_path: Path,
 ) -> None:
     runner = FakeRunner(_base_responses())
-    authority = FakeGenerationAuthority(crash_on_publish=True)
+    authority = FakeGenerationAuthority()
+    finalizer = FakeGenerationFinalizer(crash=True)
 
     with pytest.raises(SimulatedDeploymentCrash):
         deploy(
             _config(tmp_path),
             runner=runner,
             generation_authority=authority,
+            generation_finalizer=finalizer,
         )
 
     assert authority.events == [
+        ("intent", _sha("b")),
         ("invalidate", None),
-        ("publish", _sha("b")),
+        ("stage", "timers_stopped"),
+        ("stage", "deploy_checkout_ready"),
+        ("stage", "deploy_dependencies_ready"),
+        ("stage", "deploy_preflight_ready"),
+        ("stage", "services_transitioning"),
+        ("stage", "services_ready"),
+        ("stage", "post_restart_preflight_ready"),
+        ("stage", "timers_restored"),
     ]
+
+
+def test_intent_is_durable_before_marker_invalidation(tmp_path: Path) -> None:
+    class CrashOnInvalidate(FakeGenerationAuthority):
+        def invalidate(self) -> None:
+            assert self.intent is not None
+            assert self.intent.stage == "planned"
+            super().invalidate()
+            raise SimulatedDeploymentCrash
+
+    authority = CrashOnInvalidate()
+
+    with pytest.raises(SimulatedDeploymentCrash):
+        deploy(
+            _config(tmp_path),
+            runner=FakeRunner(_base_responses()),
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
+
+    assert authority.events[:2] == [
+        ("intent", _sha("b")),
+        ("invalidate", None),
+    ]
+
+
+def test_recovery_uses_recorded_plan_after_origin_advances(tmp_path: Path) -> None:
+    authority = FakeGenerationAuthority()
+    authority.begin_deployment_intent(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref="v0.13.2",
+        changed_files=("src/rquant/monitor.py",),
+        restart_services=("rquant-monitor.service",),
+        active_services=("rquant-monitor.service",),
+        active_timers=("rquant-monitor.timer",),
+        marker_generation="marker-a",
+    )
+    authority.update_deployment_intent(
+        operation_id=authority.intent.operation_id,
+        stage="services_transitioning",
+        restarted_services=("rquant-monitor.service",),
+    )
+    responses = {
+        ("git", "rev-parse", "--abbrev-ref", "HEAD"): (0, "main\n"),
+        ("git", "status", "--porcelain", "--untracked-files=no"): (0, ""),
+        ("git", "rev-parse", "HEAD"): (0, f"{_sha('b')}\n"),
+        ("systemctl", "is-active", "rquant-monitor.service"): (0, "active\n"),
+        ("systemctl", "is-active", "rquant-monitor.timer"): (0, "active\n"),
+    }
+    runner = FakeRunner(responses)
+    finalizer = FakeGenerationFinalizer()
+    baseline = _config(tmp_path)
+    config = DeployConfig(**{**baseline.__dict__, "recovery_action": "resume"})
+
+    result = deploy(
+        config,
+        runner=runner,
+        generation_authority=authority,
+        generation_finalizer=finalizer,
+    )
+
+    assert result.status == "recovered"
+    assert not any(call[:2] == ("git", "fetch") for call in runner.calls)
+    assert not any("origin/main" in call for call in runner.calls)
+    assert finalizer.calls == [
+        (_sha("b"), authority.intent.operation_id, "resume"),
+    ]
+
+
+def test_rollback_recovery_is_deferred_during_protected_window(tmp_path: Path) -> None:
+    authority = FakeGenerationAuthority()
+    intent = authority.begin_deployment_intent(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref="v0.13.2",
+        changed_files=("src/rquant/monitor.py",),
+        restart_services=("rquant-monitor.service",),
+        active_services=("rquant-monitor.service",),
+        active_timers=("rquant-monitor.timer",),
+        marker_generation="marker-a",
+    )
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "target": intent.previous_sha,
+            "recovery_action": "rollback",
+            "now": datetime(2026, 7, 13, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        }
+    )
+    runner = FakeRunner()
+
+    with pytest.raises(ProtectedWindowError):
+        deploy(
+            config,
+            runner=runner,
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
+
+    assert runner.calls == []
+
+
+def test_recovery_after_partial_service_restart_completes_services_before_marker(
+    tmp_path: Path,
+) -> None:
+    authority = FakeGenerationAuthority()
+    intent = authority.begin_deployment_intent(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref="v0.13.2",
+        changed_files=("src/rquant/monitor.py", "src/rquant/surge_watch.py"),
+        restart_services=("rquant-monitor.service", "rquant-surge-watch.service"),
+        active_services=("rquant-monitor.service", "rquant-surge-watch.service"),
+        active_timers=("rquant-monitor.timer", "rquant-surge-watch.timer"),
+        marker_generation="marker-a",
+    )
+    authority.update_deployment_intent(
+        operation_id=intent.operation_id,
+        stage="services_transitioning",
+        restarted_services=("rquant-monitor.service",),
+    )
+    responses = {
+        ("git", "rev-parse", "--abbrev-ref", "HEAD"): (0, "main\n"),
+        ("git", "status", "--porcelain", "--untracked-files=no"): (0, ""),
+        ("git", "rev-parse", "HEAD"): (0, f"{_sha('b')}\n"),
+        ("systemctl", "is-active", "rquant-monitor.service"): (0, "active\n"),
+        ("systemctl", "is-active", "rquant-surge-watch.service"): (0, "active\n"),
+        ("systemctl", "is-active", "rquant-monitor.timer"): (0, "active\n"),
+        ("systemctl", "is-active", "rquant-surge-watch.timer"): (0, "active\n"),
+    }
+    runner = FakeRunner(responses)
+    finalizer = FakeGenerationFinalizer()
+    baseline = _config(tmp_path)
+    config = DeployConfig(**{**baseline.__dict__, "recovery_action": "resume"})
+
+    deploy(
+        config,
+        runner=runner,
+        generation_authority=authority,
+        generation_finalizer=finalizer,
+    )
+
+    second_restart = (
+        "sudo",
+        "-n",
+        "systemctl",
+        "restart",
+        "rquant-surge-watch.service",
+    )
+    assert second_restart in runner.calls
+    assert runner.calls.count(("rquant", "preflight")) == 2
+    for timer in ("rquant-monitor.timer", "rquant-surge-watch.timer"):
+        assert ("sudo", "-n", "systemctl", "stop", timer) in runner.calls
+        assert ("sudo", "-n", "systemctl", "start", timer) in runner.calls
+    assert authority.intent.stage == "completed"
+    assert finalizer.calls == [(_sha("b"), intent.operation_id, "resume")]
+
+
+def test_hard_crash_after_partial_restart_is_resumable_from_persisted_intent(
+    tmp_path: Path,
+) -> None:
+    responses = _base_responses()
+    responses[("git", "diff", "--name-only", f"{_sha('a')}..{_sha('b')}")] = (
+        0,
+        "src/rquant/monitor.py\nsrc/rquant/surge_watch.py\n",
+    )
+    for unit in (
+        "rquant-monitor.service",
+        "rquant-surge-watch.service",
+        "rquant-monitor.timer",
+        "rquant-monitor-watchdog.timer",
+        "rquant-surge-watch.timer",
+    ):
+        responses[("systemctl", "is-active", unit)] = (0, "active\n")
+    authority = FakeGenerationAuthority()
+    first_finalizer = FakeGenerationFinalizer()
+    crashing = CrashAfterRunner(
+        responses,
+        command=("sudo", "-n", "systemctl", "restart", "rquant-surge-watch.service"),
+    )
+
+    with pytest.raises(SimulatedDeploymentCrash):
+        deploy(
+            _config(tmp_path),
+            runner=crashing,
+            generation_authority=authority,
+            generation_finalizer=first_finalizer,
+        )
+
+    assert authority.intent is not None
+    assert authority.intent.stage == "services_transitioning"
+    assert authority.intent.restarted_services == ("rquant-monitor.service",)
+    assert first_finalizer.calls == []
+
+    recovery_responses = {
+        ("git", "rev-parse", "--abbrev-ref", "HEAD"): (0, "main\n"),
+        ("git", "status", "--porcelain", "--untracked-files=no"): (0, ""),
+        ("git", "rev-parse", "HEAD"): (0, f"{_sha('b')}\n"),
+        **{
+            ("systemctl", "is-active", unit): (0, "active\n")
+            for unit in (
+                "rquant-monitor.service",
+                "rquant-surge-watch.service",
+                "rquant-monitor.timer",
+                "rquant-monitor-watchdog.timer",
+                "rquant-surge-watch.timer",
+            )
+        },
+    }
+    recovery_runner = FakeRunner(recovery_responses)
+    recovery_finalizer = FakeGenerationFinalizer()
+    baseline = _config(tmp_path)
+    recovery = DeployConfig(**{**baseline.__dict__, "recovery_action": "resume"})
+
+    result = deploy(
+        recovery,
+        runner=recovery_runner,
+        generation_authority=authority,
+        generation_finalizer=recovery_finalizer,
+    )
+
+    assert result.status == "recovered"
+    assert authority.intent.stage == "completed"
+    assert recovery_finalizer.calls == [(_sha("b"), authority.intent.operation_id, "resume")]
 
 
 def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> None:
@@ -570,12 +847,14 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
         sequence=[(1, "target failed"), (0, "old ready"), (0, "old ready")],
     )
     authority = FakeGenerationAuthority()
+    finalizer = FakeGenerationFinalizer()
 
     with pytest.raises(DeployError, match="rolled back"):
         deploy(
             _config(tmp_path),
             runner=runner,
             generation_authority=authority,
+            generation_finalizer=finalizer,
         )
 
     merge_index = runner.calls.index(("git", "merge", "--ff-only", _sha("b")))
@@ -583,10 +862,8 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
     assert reset_index > merge_index
     assert runner.calls.count(("uv", "sync", "--frozen")) == 2
     assert runner.calls.count(("rquant", "preflight")) == 3
-    assert authority.events == [
-        ("invalidate", None),
-        ("publish", _sha("a")),
-    ]
+    assert authority.events[0:2] == [("intent", _sha("b")), ("invalidate", None)]
+    assert finalizer.calls == [(_sha("a"), authority.intent.operation_id, "rollback")]
     assert all(call[0] != "git" for call in runner.executed_calls)
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "rolled_back"' in audit
@@ -613,6 +890,21 @@ def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import()
     assert '-- "$@"' not in source
     assert "-m rquant.ops.production_deploy" not in source
     assert "/../.rquant-deploy" not in source
+
+
+def test_sudoers_allows_only_exact_managed_timer_transitions() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    source = (repo / "deploy" / "sudoers" / "rquant-production-deploy").read_text(encoding="utf-8")
+
+    for timer in (
+        "rquant-monitor.timer",
+        "rquant-monitor-watchdog.timer",
+        "rquant-surge-watch.timer",
+    ):
+        assert f"/usr/bin/systemctl stop {timer}" in source
+        assert f"/usr/bin/systemctl start {timer}" in source
+    assert "systemctl stop rquant-*" not in source
+    assert "systemctl start rquant-*" not in source
 
 
 def test_cli_does_not_allow_overriding_production_executables() -> None:

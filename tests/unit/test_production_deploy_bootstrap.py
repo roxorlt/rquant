@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from rquant.release_generation import (
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-production-deploy.py"
 AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
+PRODUCTION_DEPLOYER = ROOT / "src" / "rquant" / "ops" / "production_deploy.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 
 
@@ -36,6 +38,7 @@ def _checkout(
     tmp_path: Path,
     *,
     publish_marker: bool = True,
+    real_deployer: bool = False,
 ) -> tuple[Path, Path, Path, str]:
     checkout = tmp_path / "rquant"
     package = checkout / "src" / "rquant"
@@ -47,25 +50,32 @@ def _checkout(
     shutil.copy2(AUTHORITY, package / AUTHORITY.name)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (ops / "__init__.py").write_text("", encoding="utf-8")
-    (ops / "production_deploy.py").write_text(
-        "from __future__ import annotations\n"
-        "import fcntl, os, time\n"
-        "from pathlib import Path\n"
-        "lock_fd = os.open(os.environ['DEPLOY_LOCK'], os.O_RDONLY)\n"
-        "try:\n"
-        "    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)\n"
-        "except BlockingIOError:\n"
-        "    Path(os.environ['IMPORT_MARKER']).write_text('locked', encoding='utf-8')\n"
-        "else:\n"
-        "    Path(os.environ['IMPORT_MARKER']).write_text('unlocked', encoding='utf-8')\n"
-        "finally:\n"
-        "    os.close(lock_fd)\n"
-        "def main(argv=None):\n"
-        "    Path(os.environ['RUN_MARKER']).write_text('ran', encoding='utf-8')\n"
-        "    time.sleep(float(os.environ.get('DEPLOY_HOLD_SECONDS', '0')))\n"
-        "    return 0\n",
-        encoding="utf-8",
-    )
+    if real_deployer:
+        shutil.copy2(PRODUCTION_DEPLOYER, ops / PRODUCTION_DEPLOYER.name)
+    else:
+        (ops / "production_deploy.py").write_text(
+            "from __future__ import annotations\n"
+            "import fcntl, os, time\n"
+            "from pathlib import Path\n"
+            "if os.environ.get('DEPLOY_LOCK'):\n"
+            "    lock_fd = os.open(os.environ['DEPLOY_LOCK'], os.O_RDONLY)\n"
+            "    try:\n"
+            "        fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)\n"
+            "    except BlockingIOError:\n"
+            "        state = 'locked'\n"
+            "    else:\n"
+            "        state = 'unlocked'\n"
+            "    finally:\n"
+            "        os.close(lock_fd)\n"
+            "    if os.environ.get('IMPORT_MARKER'):\n"
+            "        Path(os.environ['IMPORT_MARKER']).write_text(state, encoding='utf-8')\n"
+            "def main(argv=None):\n"
+            "    if os.environ.get('RUN_MARKER'):\n"
+            "        Path(os.environ['RUN_MARKER']).write_text('ran', encoding='utf-8')\n"
+            "    time.sleep(float(os.environ.get('DEPLOY_HOLD_SECONDS', '0')))\n"
+            "    return int(os.environ.get('DEPLOY_EXIT', '0'))\n",
+            encoding="utf-8",
+        )
     (checkout / ".gitignore").write_text("/.venv\n", encoding="utf-8")
     (checkout / "pyproject.toml").write_text(
         '[project]\nname = "rquant"\nversion = "0.99.0"\n',
@@ -171,6 +181,40 @@ def _commit_next_release(checkout: Path) -> str:
     return commit
 
 
+def _begin_intent(
+    checkout: Path,
+    python: Path,
+    lock_path: Path,
+    *,
+    previous: str,
+    target: str,
+    target_ref: str | None = None,
+) -> str:
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        authority = ReleaseGenerationAuthority(
+            repo=checkout,
+            lock_path=lock_path,
+            lock_fd=lock_fd,
+            python_path=python,
+            git_path=TRUSTED_GIT,
+            writable=True,
+        )
+        intent = authority.begin_deployment_intent(
+            previous_sha=previous,
+            target_sha=target,
+            target_ref=target_ref or target,
+            changed_files=("src/rquant/preflight.py",),
+            restart_services=(),
+            active_services=(),
+            active_timers=(),
+        )
+        return intent.operation_id
+    finally:
+        os.close(lock_fd)
+
+
 def _command(
     checkout: Path,
     python: Path,
@@ -179,6 +223,8 @@ def _command(
     target: str = "v0.99.0",
     mode: str = "deploy",
     recovery_action: str | None = None,
+    operation_id: str | None = None,
+    inherited_lock_fd: int | None = None,
 ) -> list[str]:
     command = [
         str(python),
@@ -201,6 +247,18 @@ def _command(
     elif mode == "recover":
         command.append("--recover-generation")
         command.extend(["--recovery-action", str(recovery_action)])
+    elif mode == "finalize":
+        command.append("--finalize-generation")
+        command.extend(
+            [
+                "--finalize-action",
+                str(recovery_action),
+                "--operation-id",
+                str(operation_id),
+                "--inherited-lock-fd",
+                str(inherited_lock_fd),
+            ]
+        )
     command.extend(["--", "--target", target])
     return command
 
@@ -328,12 +386,86 @@ def test_initialize_generation_interruption_can_restart_without_partial_marker(
     assert marker_path_for_lock(lock_path).is_file()
 
 
+def test_initialize_generation_cannot_be_replayed_after_marker_deletion(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path, publish_marker=False)
+    command = _command(
+        checkout,
+        python,
+        lock_path,
+        target=commit,
+        mode="initialize",
+    )
+    first = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    marker_path_for_lock(lock_path).unlink()
+
+    replay = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert replay.returncode == 2
+    assert "already completed" in replay.stderr
+    assert not marker_path_for_lock(lock_path).exists()
+
+
+def test_initialize_generation_migrates_one_existing_marker_only_once(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path)
+    command = _command(
+        checkout,
+        python,
+        lock_path,
+        target=commit,
+        mode="initialize",
+    )
+
+    migrated = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    replay = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert migrated.returncode == 0, migrated.stderr
+    assert replay.returncode == 2
+    assert "already completed" in replay.stderr
+    assert marker_path_for_lock(lock_path).is_file()
+
+
 @pytest.mark.parametrize("recovery_action", ["resume", "rollback"])
 def test_recover_generation_republishes_only_exact_verified_target(
     tmp_path: Path,
     recovery_action: str,
 ) -> None:
-    checkout, python, lock_path, commit = _checkout(tmp_path)
+    checkout, python, lock_path, commit = _checkout(tmp_path, real_deployer=True)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=commit,
+        target=commit,
+    )
     marker_path_for_lock(lock_path).unlink()
 
     result = subprocess.run(
@@ -361,8 +493,15 @@ def test_recover_generation_failure_stays_unpublished_and_can_restart(
     tmp_path: Path,
     failure_env: dict[str, str],
 ) -> None:
-    checkout, python, lock_path, previous = _checkout(tmp_path)
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     commit = _commit_next_release(checkout)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=commit,
+    )
     _git(checkout, "reset", "--hard", previous)
     marker = marker_path_for_lock(lock_path)
     marker.unlink()
@@ -383,7 +522,7 @@ def test_recover_generation_failure_stays_unpublished_and_can_restart(
         text=True,
         check=False,
     )
-    assert failed.returncode == 2
+    assert failed.returncode == 1
     assert "Traceback" not in failed.stderr
     assert _git(checkout, "rev-parse", "HEAD") == commit
     assert not marker.exists()
@@ -404,8 +543,15 @@ def test_recover_generation_failure_stays_unpublished_and_can_restart(
 def test_recover_generation_resumes_fast_forward_target_after_interruption(
     tmp_path: Path,
 ) -> None:
-    checkout, python, lock_path, previous = _checkout(tmp_path)
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     target = _commit_next_release(checkout)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=target,
+    )
     _git(checkout, "reset", "--hard", previous)
     marker_path_for_lock(lock_path).unlink()
 
@@ -433,8 +579,15 @@ def test_recover_generation_resumes_fast_forward_target_after_interruption(
 def test_recover_generation_rolls_back_to_verified_previous_release(
     tmp_path: Path,
 ) -> None:
-    checkout, python, lock_path, previous = _checkout(tmp_path)
-    _commit_next_release(checkout)
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
+    target = _commit_next_release(checkout)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=target,
+    )
     marker_path_for_lock(lock_path).unlink()
 
     result = subprocess.run(
@@ -456,6 +609,185 @@ def test_recover_generation_rolls_back_to_verified_previous_release(
     assert result.returncode == 0, result.stderr
     assert _git(checkout, "rev-parse", "HEAD") == previous
     assert marker_path_for_lock(lock_path).is_file()
+
+
+def test_recovery_target_remains_pinned_when_origin_main_advances(tmp_path: Path) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
+    target = _commit_next_release(checkout)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=target,
+    )
+    (checkout / "uv.lock").write_text("version = 3\n", encoding="utf-8")
+    _git(checkout, "add", "uv.lock")
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "commit",
+        "-qm",
+        "later origin generation",
+    )
+    later = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", later)
+    _git(checkout, "reset", "--hard", previous)
+    marker_path_for_lock(lock_path).unlink()
+
+    result = subprocess.run(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=target,
+            mode="recover",
+            recovery_action="resume",
+        ),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(checkout, "rev-parse", "HEAD") == target
+
+
+def test_target_checkout_authority_publishes_its_marker_schema(tmp_path: Path) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path)
+    authority_path = checkout / "src" / "rquant" / "release_generation.py"
+    authority_path.write_text(
+        authority_path.read_text(encoding="utf-8").replace(
+            "MARKER_SCHEMA_VERSION = 1",
+            "MARKER_SCHEMA_VERSION = 2",
+        ),
+        encoding="utf-8",
+    )
+    _git(checkout, "add", str(authority_path.relative_to(checkout)))
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "commit",
+        "-qm",
+        "marker schema v2",
+    )
+    target = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", target)
+    _git(checkout, "reset", "--hard", previous)
+    operation_id = _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=target,
+    )
+    update_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(update_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        update_authority = ReleaseGenerationAuthority(
+            repo=checkout,
+            lock_path=lock_path,
+            lock_fd=update_fd,
+            python_path=python,
+            git_path=TRUSTED_GIT,
+            writable=True,
+        )
+        update_authority.update_deployment_intent(
+            operation_id=operation_id,
+            stage="timers_restored",
+        )
+    finally:
+        os.close(update_fd)
+    marker_path_for_lock(lock_path).unlink()
+    _git(checkout, "merge", "--ff-only", target)
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            _command(
+                checkout,
+                python,
+                lock_path,
+                target=target,
+                mode="finalize",
+                recovery_action="resume",
+                operation_id=operation_id,
+                inherited_lock_fd=lock_fd,
+            ),
+            cwd=checkout,
+            pass_fds=(lock_fd,),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        os.close(lock_fd)
+
+    assert result.returncode == 0, result.stderr
+    marker = json.loads(marker_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    assert marker["schema_version"] == 2
+
+
+def test_rollback_uses_previous_checkout_marker_schema(tmp_path: Path) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
+    authority_path = checkout / "src" / "rquant" / "release_generation.py"
+    authority_path.write_text(
+        authority_path.read_text(encoding="utf-8").replace(
+            "MARKER_SCHEMA_VERSION = 1",
+            "MARKER_SCHEMA_VERSION = 2",
+        ),
+        encoding="utf-8",
+    )
+    _git(checkout, "add", str(authority_path.relative_to(checkout)))
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "commit",
+        "-qm",
+        "marker schema v2",
+    )
+    target = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", target)
+    _git(checkout, "reset", "--hard", previous)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=target,
+    )
+    _git(checkout, "merge", "--ff-only", target)
+    marker_path_for_lock(lock_path).unlink()
+
+    result = subprocess.run(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=previous,
+            mode="recover",
+            recovery_action="rollback",
+        ),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(checkout, "rev-parse", "HEAD") == previous
+    marker = json.loads(marker_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    assert marker["schema_version"] == 1
 
 
 def test_generation_mode_rejects_target_that_is_not_current_head(tmp_path: Path) -> None:

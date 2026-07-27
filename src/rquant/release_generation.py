@@ -15,13 +15,15 @@ import subprocess
 import tomllib
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 MARKER_SCHEMA_VERSION = 1
+INTENT_SCHEMA_VERSION = 1
 MAX_MARKER_BYTES = 32 * 1024
+MAX_INTENT_BYTES = 128 * 1024
 
 
 class ReleaseGenerationError(RuntimeError):
@@ -59,6 +61,10 @@ class ReleaseGenerationMarker:
     site_packages_identity: PathIdentity
     published_at: str
 
+    def content_hash(self) -> str:
+        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
+
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ReleaseGenerationMarker:
         try:
@@ -83,8 +89,123 @@ class ReleaseGenerationMarker:
             raise ReleaseGenerationError("release generation marker is malformed") from exc
 
 
+@dataclass(frozen=True)
+class DeploymentIntent:
+    schema_version: int
+    operation_id: str
+    previous_sha: str
+    target_sha: str
+    target_ref: str
+    stage: str
+    changed_files: tuple[str, ...]
+    restart_services: tuple[str, ...]
+    active_services: tuple[str, ...]
+    active_timers: tuple[str, ...]
+    restarted_services: tuple[str, ...]
+    marker_generation: str
+    created_at: str
+    updated_at: str
+    stage_history: tuple[dict[str, str], ...]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        previous_sha: str,
+        target_sha: str,
+        target_ref: str,
+        changed_files: tuple[str, ...],
+        restart_services: tuple[str, ...],
+        active_services: tuple[str, ...],
+        active_timers: tuple[str, ...],
+        marker_generation: str = "",
+        stage: str = "planned",
+    ) -> DeploymentIntent:
+        for label, value in (("previous", previous_sha), ("target", target_sha)):
+            if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+                raise ReleaseGenerationError(f"deployment intent {label} SHA is invalid")
+        timestamp = datetime.now(UTC).isoformat()
+        return cls(
+            schema_version=INTENT_SCHEMA_VERSION,
+            operation_id=secrets.token_hex(16),
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+            target_ref=target_ref,
+            stage=stage,
+            changed_files=tuple(changed_files),
+            restart_services=tuple(restart_services),
+            active_services=tuple(active_services),
+            active_timers=tuple(active_timers),
+            restarted_services=(),
+            marker_generation=marker_generation,
+            created_at=timestamp,
+            updated_at=timestamp,
+            stage_history=({"stage": stage, "timestamp": timestamp},),
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> DeploymentIntent:
+        try:
+            intent = cls(
+                schema_version=int(payload["schema_version"]),
+                operation_id=str(payload["operation_id"]),
+                previous_sha=str(payload["previous_sha"]),
+                target_sha=str(payload["target_sha"]),
+                target_ref=str(payload["target_ref"]),
+                stage=str(payload["stage"]),
+                changed_files=tuple(str(value) for value in payload["changed_files"]),
+                restart_services=tuple(str(value) for value in payload["restart_services"]),
+                active_services=tuple(str(value) for value in payload["active_services"]),
+                active_timers=tuple(str(value) for value in payload["active_timers"]),
+                restarted_services=tuple(str(value) for value in payload["restarted_services"]),
+                marker_generation=str(payload["marker_generation"]),
+                created_at=str(payload["created_at"]),
+                updated_at=str(payload["updated_at"]),
+                stage_history=tuple(
+                    {
+                        "stage": str(value["stage"]),
+                        "timestamp": str(value["timestamp"]),
+                    }
+                    for value in payload["stage_history"]
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseGenerationError("deployment intent is malformed") from exc
+        if intent.schema_version != INTENT_SCHEMA_VERSION or len(intent.operation_id) != 32:
+            raise ReleaseGenerationError("deployment intent schema or operation id is invalid")
+        for label, value in (("previous", intent.previous_sha), ("target", intent.target_sha)):
+            if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+                raise ReleaseGenerationError(f"deployment intent {label} SHA is invalid")
+        return intent
+
+    def advance(
+        self,
+        *,
+        stage: str,
+        restarted_services: tuple[str, ...] | None = None,
+    ) -> DeploymentIntent:
+        timestamp = datetime.now(UTC).isoformat()
+        return replace(
+            self,
+            stage=stage,
+            restarted_services=(
+                self.restarted_services if restarted_services is None else tuple(restarted_services)
+            ),
+            updated_at=timestamp,
+            stage_history=(*self.stage_history, {"stage": stage, "timestamp": timestamp}),
+        )
+
+
 def marker_path_for_lock(lock_path: Path) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.complete.json")
+
+
+def intent_path_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.intent.json")
+
+
+def initialization_path_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.initialized.json")
 
 
 def _canonical(path: Path, *, label: str) -> Path:
@@ -247,6 +368,125 @@ def _verify_temporary_payload(
         raise ReleaseGenerationError("temporary release marker content mismatch")
 
 
+def _read_private_json(
+    *,
+    root_fd: int,
+    root_path: Path,
+    name: str,
+    maximum_bytes: int,
+) -> tuple[dict[str, Any], PathIdentity]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise ReleaseGenerationError(f"private deployment record {name} is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise ReleaseGenerationError(f"private deployment record {name} is too large")
+        active = (root_path / name).lstat()
+        identity = PathIdentity.capture(opened)
+        if identity != PathIdentity.capture(active):
+            raise ReleaseGenerationError(f"private deployment record {name} identity changed")
+        payload = json.loads(b"".join(chunks))
+        if not isinstance(payload, dict):
+            raise ReleaseGenerationError(f"private deployment record {name} is malformed")
+        return payload, identity
+    except ReleaseGenerationError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseGenerationError(f"private deployment record {name} cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _write_private_json(
+    *,
+    root_fd: int,
+    root_path: Path,
+    name: str,
+    payload: dict[str, Any],
+    require_absent: bool,
+    expected_identity: PathIdentity | None = None,
+) -> None:
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if len(encoded) > MAX_INTENT_BYTES:
+        raise ReleaseGenerationError(f"private deployment record {name} is too large")
+    temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = -1
+    published = False
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_fd,
+        )
+        _write_all(descriptor, encoded)
+        os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = os.read(descriptor, MAX_INTENT_BYTES + 1)
+        if (
+            observed != encoded
+            or hashlib.sha256(observed).digest() != hashlib.sha256(encoded).digest()
+            or not isinstance(json.loads(observed), dict)
+        ):
+            raise ReleaseGenerationError(f"private deployment record {name} verification failed")
+        if require_absent:
+            try:
+                os.link(
+                    temporary_name,
+                    name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise ReleaseGenerationError(
+                    f"private deployment record {name} already exists"
+                ) from exc
+            os.unlink(temporary_name, dir_fd=root_fd)
+        else:
+            if expected_identity is None:
+                raise ReleaseGenerationError("deployment record update lacks an identity fence")
+            active = (root_path / name).lstat()
+            if PathIdentity.capture(active) != expected_identity:
+                raise ReleaseGenerationError(f"private deployment record {name} changed")
+            os.replace(temporary_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        published = True
+        os.fsync(root_fd)
+        active = (root_path / name).lstat()
+        if PathIdentity.capture(os.fstat(descriptor)) != PathIdentity.capture(active):
+            raise ReleaseGenerationError(f"private deployment record {name} publish changed")
+    except ReleaseGenerationError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseGenerationError(f"private deployment record {name} cannot be written") from exc
+    finally:
+        if not published:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=root_fd)
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 class ReleaseGenerationAuthority:
     def __init__(
         self,
@@ -262,6 +502,8 @@ class ReleaseGenerationAuthority:
         self.repo = _canonical(repo, label="release checkout")
         self.lock_path = _canonical(lock_path, label="deployment lock")
         self.marker_path = marker_path_for_lock(self.lock_path)
+        self.intent_path = intent_path_for_lock(self.lock_path)
+        self.initialization_path = initialization_path_for_lock(self.lock_path)
         self.lock_fd = lock_fd
         self.python_path = _canonical(python_path, label="release Python")
         self.git_path = _canonical(git_path, label="trusted Git")
@@ -404,6 +646,179 @@ class ReleaseGenerationAuthority:
         _assert_tracked_clean(self.repo, self.git_path)
         self._assert_lock()
         return published
+
+    def _read_intent_record(self, path: Path) -> tuple[DeploymentIntent, PathIdentity]:
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            payload, identity = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=path.name,
+                maximum_bytes=MAX_INTENT_BYTES,
+            )
+            self._assert_root(root_fd, root_identity)
+            return DeploymentIntent.from_payload(payload), identity
+        finally:
+            os.close(root_fd)
+
+    def _create_intent_record(self, path: Path, intent: DeploymentIntent) -> None:
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            self._assert_root(root_fd, root_identity)
+            _write_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=path.name,
+                payload=asdict(intent),
+                require_absent=True,
+            )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+
+    def _update_intent_record(
+        self,
+        path: Path,
+        *,
+        operation_id: str,
+        stage: str,
+        restarted_services: tuple[str, ...] | None = None,
+    ) -> DeploymentIntent:
+        current, identity = self._read_intent_record(path)
+        if current.operation_id != operation_id:
+            raise ReleaseGenerationError("deployment intent operation id changed")
+        updated = current.advance(stage=stage, restarted_services=restarted_services)
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            self._assert_root(root_fd, root_identity)
+            _write_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=path.name,
+                payload=asdict(updated),
+                require_absent=False,
+                expected_identity=identity,
+            )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+        return updated
+
+    def begin_deployment_intent(
+        self,
+        *,
+        previous_sha: str,
+        target_sha: str,
+        target_ref: str,
+        changed_files: tuple[str, ...],
+        restart_services: tuple[str, ...],
+        active_services: tuple[str, ...],
+        active_timers: tuple[str, ...],
+        marker_generation: str = "",
+    ) -> DeploymentIntent:
+        if not self.writable:
+            raise ReleaseGenerationError("read-only generation authority cannot create intent")
+        self._assert_lock()
+        if not marker_generation:
+            marker = self._read_marker()
+            if marker.commit != previous_sha:
+                raise ReleaseGenerationError("deployment intent previous marker is stale")
+            marker_generation = marker.content_hash()
+        try:
+            current, completed_identity = self._read_intent_record(self.intent_path)
+        except ReleaseGenerationError as exc:
+            if "cannot be read" not in str(exc):
+                raise
+        else:
+            if current.stage != "completed":
+                raise ReleaseGenerationError("an incomplete deployment intent already exists")
+            archive = self.intent_path.with_name(
+                f"{self.intent_path.stem}.{current.operation_id}.completed.json"
+            )
+            root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+            try:
+                self._assert_root(root_fd, root_identity)
+                if PathIdentity.capture(self.intent_path.lstat()) != completed_identity:
+                    raise ReleaseGenerationError("completed deployment intent changed")
+                os.replace(
+                    self.intent_path.name,
+                    archive.name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+                os.fsync(root_fd)
+                self._assert_root(root_fd, root_identity)
+            finally:
+                os.close(root_fd)
+        intent = DeploymentIntent.create(
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+            target_ref=target_ref,
+            changed_files=changed_files,
+            restart_services=restart_services,
+            active_services=active_services,
+            active_timers=active_timers,
+            marker_generation=marker_generation,
+        )
+        self._create_intent_record(self.intent_path, intent)
+        return intent
+
+    def read_deployment_intent(self) -> DeploymentIntent:
+        self._assert_lock()
+        intent, _identity_value = self._read_intent_record(self.intent_path)
+        return intent
+
+    def update_deployment_intent(
+        self,
+        *,
+        operation_id: str,
+        stage: str,
+        restarted_services: tuple[str, ...] | None = None,
+    ) -> DeploymentIntent:
+        if not self.writable:
+            raise ReleaseGenerationError("read-only generation authority cannot update intent")
+        self._assert_lock()
+        return self._update_intent_record(
+            self.intent_path,
+            operation_id=operation_id,
+            stage=stage,
+            restarted_services=restarted_services,
+        )
+
+    def begin_initialization(self, *, target_sha: str) -> DeploymentIntent:
+        if not self.writable:
+            raise ReleaseGenerationError("read-only generation authority cannot initialize")
+        self._assert_lock()
+        try:
+            current, _identity_value = self._read_intent_record(self.initialization_path)
+        except ReleaseGenerationError as exc:
+            if "cannot be read" not in str(exc):
+                raise
+        else:
+            if current.stage == "completed":
+                raise ReleaseGenerationError("release generation initialization already completed")
+            if current.target_sha != target_sha:
+                raise ReleaseGenerationError("initialization target is already pinned")
+            return current
+        intent = DeploymentIntent.create(
+            previous_sha=target_sha,
+            target_sha=target_sha,
+            target_ref=target_sha,
+            changed_files=(),
+            restart_services=(),
+            active_services=(),
+            active_timers=(),
+            stage="initializing",
+        )
+        self._create_intent_record(self.initialization_path, intent)
+        return intent
+
+    def complete_initialization(self, *, operation_id: str) -> DeploymentIntent:
+        return self._update_intent_record(
+            self.initialization_path,
+            operation_id=operation_id,
+            stage="completed",
+        )
 
     def invalidate(self) -> None:
         if not self.writable:

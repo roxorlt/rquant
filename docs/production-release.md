@@ -21,12 +21,16 @@
 5. 纯标准库 bootstrap 先取得稳定 generation 独占锁并验证当前完成标记，之后才导入项目
    deployer。bootstrap 与 deployer 的所有 Git 子命令都固定使用已验证的绝对
    `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`。部署器依次执行：tracked 工作区检查、
-   `git fetch`、target/main 归属与快进检查、
-   diff 风险分类、使旧完成标记失效、`git merge --ff-only <exact-sha>`、`uv sync --frozen`、
-   preflight、白名单服务重启、第二次 preflight、原子发布新完成标记、JSONL 审计。
-6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回上一 commit、
-   恢复锁定依赖并重启已经切到新代码的服务。只有旧 checkout、旧依赖和两次 preflight
-   全部恢复后，才重新发布旧 generation 完成标记；回滚不完整时 marker 保持缺失。
+   `git fetch`、target/main 归属与快进检查、diff 风险分类、快照实际 active 的受影响服务及
+   timer、原子落盘 deployment intent、使旧 marker 失效、暂停原先 active 的相关 timer、
+   `git merge --ff-only <exact-sha>`、`uv sync --frozen`、第一次 preflight、按 intent 的精确集合
+   重启服务、第二次 preflight、恢复原先 active 的 timer。最后由 target checkout 的隔离 stdlib
+   bootstrap 重新加载 target authority 并发布 marker；旧 coordinator 不能替新版本 marker
+   schema 写标记。每个 durable stage 同时写入 intent 时间线和 JSONL 审计。
+6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回 intent 记录的
+   previous commit、恢复锁定依赖并按同一服务/timer 合同切回。只有旧 checkout、旧依赖、
+   精确服务集合、第二次 preflight 与 timer 原状态全部恢复后，才由 previous checkout 的隔离
+   authority 重新发布旧 marker；回滚不完整时 marker 保持缺失、intent 保持可恢复。
 
 ## 自动拒绝
 
@@ -57,9 +61,10 @@ sudo install -o root -g root -m 0440 \
   /etc/sudoers.d/rquant-production-deploy
 sudo visudo -cf /etc/sudoers.d/rquant-production-deploy
 sudo -n -l /usr/bin/systemctl restart rquant-dashboard.service
+sudo -n -l /usr/bin/systemctl stop rquant-monitor.timer
 ```
 
-最后一条只检查白名单授权，不会重启服务。正式安装后，Codex 仅通过
+最后两条只检查白名单授权，不会重启服务或停止 timer。正式安装后，Codex 仅通过
 `scripts/deploy-production.sh --target <exact-ref>` 部署。
 
 P1.5d 首次安装 Lab launchd 前还需在主 checkout 建立自有物理 `.venv`。完成目标 checkout 后，
@@ -71,33 +76,41 @@ bash scripts/deploy-production.sh \
   --target <exact-semver-tag-or-full-sha>
 ```
 
-该模式持有同一独占锁，要求 marker 尚不存在、main/HEAD 精确等于 target、target 属于本地
+该模式持有同一独占锁，要求 main/HEAD 精确等于 target、target 属于本地
 `origin/main`、tracked checkout 干净，并逐字节验证目标 commit 的 `uv.lock` 与
 `pyproject.toml`。随后运行物理 uv 的 `sync --frozen`、复验包版本/Python ABI/物理 venv，执行
-target preflight，最后才发布 marker。不得手写 marker；任一步中断都保持 marker 缺失，daemon
-会失败关闭。
+target preflight，最后才发布 marker。第一次执行会在任何依赖或 marker mutation 前创建并 fsync
+一次性 `rquant.initialized.json` sentinel；中断只能以同一 target 续跑。sentinel 完成后，即使
+删除 marker，`--initialize-generation` 也会拒绝重放，不能把初始化当作恢复开关。不得手写
+marker/sentinel；任一步中断时 daemon 都会失败关闭。
 
 ## 中断恢复
 
-常规部署使旧 marker 失效后若发生硬中断，正常 deploy 模式会因 marker 缺失而退出 2，不会猜测
-当前 checkout 是否可用。必须根据部署审计里已知的精确 target 或 previous SHA 选择一个动作：
+常规部署在任何 mutation 前已原子写入
+`/home/lighthouse/.rquant-deploy/rquant.intent.json`。硬中断后，正常 deploy 模式不会猜测当前
+checkout；只能读取该 intent 并选择 resume 或 rollback。命令中的 target 只是对 intent 的再次
+确认，不能覆盖 intent：
 
 ```bash
-# 当前 HEAD 是 previous 或 target，继续完成精确 target；只允许 fast-forward
+# 继续 intent 已记录的 target；可使用原始精确 tag 或 target full SHA
 bash scripts/deploy-production.sh \
   --recover-generation --recovery-action resume \
-  --target <exact-target-tag-or-full-sha>
+  --target <recorded-target-tag-or-full-sha>
 
-# 当前 HEAD 是 target 或其中间状态，恢复精确 previous；只允许回到当前 HEAD 的祖先
+# 恢复 intent 已记录的 previous，必须使用 previous full SHA
 bash scripts/deploy-production.sh \
   --recover-generation --recovery-action rollback \
-  --target <exact-previous-full-sha>
+  --target <recorded-previous-full-sha>
 ```
 
-恢复模式同样要求 marker 缺失、main/clean checkout、target 属于 `origin/main`。`resume` 用可信 Git
-执行精确 fast-forward，`rollback` 用可信 Git 执行精确 hard reset；随后两者都执行 frozen sync、
-目标文件 hash/版本/ABI/物理 venv 复验和 preflight。只有全部成功才原子发布 marker。sync、
-preflight 或 marker 发布中断后可原样重跑同一条命令；不得改用其他 ref 临时“祝福”当前状态。
+恢复模式不重新 fetch、不重新解析移动后的 `origin/main`，只接受 intent 内的 previous/target、
+changed files、service plan、当时 active 的服务和 timer。resume 使用可信 Git 精确 fast-forward，
+rollback 精确 hard reset；随后两者都重新执行 frozen sync、第一次 preflight、原计划服务切换、
+第二次 preflight 和 timer 恢复，并由最终 checkout 自己的隔离 authority 写 marker。工作日
+09:15-15:10 只要原计划包含服务切换，resume 与 rollback 都返回 75 延期，不允许借恢复绕过。
+缺少 intent、operation id 不符、当前 HEAD 不在 previous/target、plan 漂移或 intent 已完成时一律
+拒绝。sync、partial restart、post-preflight、timer 恢复或 marker 发布中断后可原样重跑同一动作；
+不得改用新 ref，也不得删除 intent 后运行 initialize。
 
 ## 预演与审计
 
@@ -109,10 +122,23 @@ bash scripts/deploy-production.sh --target v0.13.2 --dry-run
 
 退出码：`0` 成功/无需更新，`2` 策略拒绝，`75` 交易时段延期，`1` 部署或回滚失败。
 审计记录位于 `/home/lighthouse/rquant/logs/production-deploy.jsonl`。
-完成标记位于 `/home/lighthouse/.rquant-deploy/rquant.complete.json`，由部署器以 `0600`
+完成标记位于 `/home/lighthouse/.rquant-deploy/rquant.complete.json`；活动事务和首次初始化 sentinel
+分别位于同目录的 `rquant.intent.json`、`rquant.initialized.json`，均为 owner-only `0600` 原子
+记录。marker 由最终 checkout authority 以 `0600`
 临时文件循环处理 short write，文件 `fsync` 后重新读取、解析并核对内容 hash，再原子 rename 和
 目录 `fsync` 发布。它不是人工恢复开关；故障后只能运行上面的精确 initialize/resume/rollback
-流程，而不是复制或修改 JSON。
+流程，而不是复制、修改或删除 JSON。每个 intent 的 immutable plan、stage history 和操作结果还会
+写入 `logs/production-deploy.jsonl`；完成 intent 在下一次发布开始前按 operation id 归档。
+
+## 中断恢复决策
+
+1. 先读取审计与 `rquant.intent.json`，确认 operation id、previous/target、stage 和服务/timer 计划；
+   不从当前 `origin/main` 猜目标。
+2. 交易保护窗口内只做只读诊断，任何包含服务重启的 resume/rollback 都等待 15:10 后。
+3. 目标版本确认可继续时执行 recorded target 的 resume；需要撤回时执行 recorded previous 的
+   rollback。两者都必须走 `scripts/deploy-production.sh`，不能手工 reset 后补 marker。
+4. 成功标准是 intent=`completed`、marker commit/schema 与最终 checkout 一致、两次 preflight 通过、
+   intent 中 active services 健康且 active timers 已恢复。任一项缺失都仍是未完成事务。
 
 ## 旧脚本边界
 

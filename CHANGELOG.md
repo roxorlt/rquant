@@ -69,6 +69,15 @@
 
 ### Fixed
 
+- **生产发布恢复事务闭环**：部署器在 marker 失效或 checkout 变更前，先以 `0600` 原子落盘
+  并 `fsync` 不可变 deployment intent，绑定 operation id、previous/target SHA、原始 ref、
+  changed-file/service/timer 计划、旧 marker generation 与逐阶段时间线。硬中断后的 resume/rollback
+  只能使用该 intent，继续遵守交易保护窗口、精确服务切换、两次 preflight、timer 原状态恢复和
+  JSONL 审计；`origin/main` 后续前移不能改变恢复目标。marker 仅由 checkout 完成依赖同步、服务
+  验证及 post-restart preflight 后启动的目标版本隔离 authority 发布，旧 coordinator 不再为新
+  schema 生成 marker。首次 generation 初始化另有一次性持久 sentinel，删除 marker 不能重新
+  执行初始化来“祝福”任意当前状态。
+
 - **Strategy Lab crash-persistent 发布代际**：新增原子完成标记，绑定精确 commit、锁文件 hash、
   包版本、Python ABI 和物理 venv 身份；Lab wrapper、只读 preflight 与隔离 bootstrap 在任何
   `rquant` import 前均持共享锁复验。生产发布入口改为 `-I -S` 纯标准库 bootstrap，先取得稳定

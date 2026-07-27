@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -11,8 +12,11 @@ from pathlib import Path
 import pytest
 
 from rquant.release_generation import (
+    DeploymentIntent,
     ReleaseGenerationAuthority,
     ReleaseGenerationError,
+    initialization_path_for_lock,
+    intent_path_for_lock,
     marker_path_for_lock,
 )
 
@@ -242,4 +246,56 @@ def test_release_generation_does_not_publish_unverified_temporary_content(
         authority.publish(expected_commit=commit)
 
     assert not marker_path_for_lock(lock_path).exists()
+    os.close(lock_fd)
+
+
+def test_deployment_intent_pins_plan_before_marker_invalidation(tmp_path: Path) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    marker = authority.publish(expected_commit=commit)
+
+    intent = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha="b" * 40,
+        target_ref="v0.99.1",
+        changed_files=("src/rquant/monitor.py",),
+        restart_services=("rquant-monitor.service",),
+        active_services=("rquant-monitor.service",),
+        active_timers=("rquant-monitor.timer",),
+    )
+    authority.invalidate()
+
+    persisted = authority.read_deployment_intent()
+    assert persisted == intent
+    assert persisted.marker_generation == marker.content_hash()
+    assert persisted.stage == "planned"
+    assert intent_path_for_lock(lock_path).is_file()
+    assert not marker_path_for_lock(lock_path).exists()
+    os.close(lock_fd)
+
+
+def test_initialization_sentinel_cannot_be_recreated_by_deleting_marker(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+
+    initialization = authority.begin_initialization(target_sha=commit)
+    authority.publish(expected_commit=commit)
+    authority.complete_initialization(operation_id=initialization.operation_id)
+    marker_path_for_lock(lock_path).unlink()
+
+    with pytest.raises(ReleaseGenerationError, match="already completed"):
+        authority.begin_initialization(target_sha=commit)
+
+    sentinel = initialization_path_for_lock(lock_path)
+    assert sentinel.is_file()
+    assert (
+        DeploymentIntent.from_payload(json.loads(sentinel.read_text(encoding="utf-8"))).stage
+        == "completed"
+    )
     os.close(lock_fd)

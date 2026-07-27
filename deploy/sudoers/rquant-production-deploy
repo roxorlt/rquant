@@ -10,4 +10,12 @@ Cmnd_Alias RQUANT_SERVICE_RESTART = \
     /usr/bin/systemctl restart rquant-panorama.service, \
     /usr/bin/systemctl restart rquant-surge-watch.service
 
-lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART
+Cmnd_Alias RQUANT_TIMER_TRANSITION = \
+    /usr/bin/systemctl stop rquant-monitor.timer, \
+    /usr/bin/systemctl start rquant-monitor.timer, \
+    /usr/bin/systemctl stop rquant-monitor-watchdog.timer, \
+    /usr/bin/systemctl start rquant-monitor-watchdog.timer, \
+    /usr/bin/systemctl stop rquant-surge-watch.timer, \
+    /usr/bin/systemctl start rquant-surge-watch.timer
+
+lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART, RQUANT_TIMER_TRANSITION

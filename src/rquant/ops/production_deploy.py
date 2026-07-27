@@ -18,7 +18,7 @@ import stat
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time
@@ -26,7 +26,11 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from rquant.release_generation import ReleaseGenerationAuthority, ReleaseGenerationError
+from rquant.release_generation import (
+    DeploymentIntent,
+    ReleaseGenerationAuthority,
+    ReleaseGenerationError,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
@@ -40,6 +44,14 @@ ALL_LONG_RUNNING_SERVICES = (
     "rquant-panorama.service",
     "rquant-surge-watch.service",
 )
+
+SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
+    "rquant-monitor.service": (
+        "rquant-monitor.timer",
+        "rquant-monitor-watchdog.timer",
+    ),
+    "rquant-surge-watch.service": ("rquant-surge-watch.timer",),
+}
 
 PRIVILEGED_PREFIXES = (
     "deploy/systemd/",
@@ -126,7 +138,27 @@ class Runner(Protocol):
 class GenerationAuthority(Protocol):
     def invalidate(self) -> None: ...
 
-    def publish(self, *, expected_commit: str) -> object: ...
+    def begin_deployment_intent(self, **values: object) -> DeploymentIntent: ...
+
+    def read_deployment_intent(self) -> DeploymentIntent: ...
+
+    def update_deployment_intent(
+        self,
+        *,
+        operation_id: str,
+        stage: str,
+        restarted_services: tuple[str, ...] | None = None,
+    ) -> DeploymentIntent: ...
+
+
+class GenerationFinalizer(Protocol):
+    def finalize(
+        self,
+        *,
+        expected_commit: str,
+        operation_id: str,
+        action: str,
+    ) -> object: ...
 
 
 class SubprocessRunner:
@@ -154,6 +186,67 @@ class SubprocessRunner:
             ) from exc
 
 
+class IsolatedGenerationFinalizer:
+    def __init__(self, config: DeployConfig) -> None:
+        if config.lock_fd is None or config.lock_path is None or config.python_path is None:
+            raise PolicyError("isolated generation finalizer binding is incomplete")
+        self._config = config
+
+    def finalize(
+        self,
+        *,
+        expected_commit: str,
+        operation_id: str,
+        action: str,
+    ) -> object:
+        config = self._config
+        assert config.lock_fd is not None
+        assert config.lock_path is not None
+        assert config.python_path is not None
+        command = [
+            str(config.python_path),
+            "-I",
+            "-S",
+            str(config.repo / "scripts" / "bootstrap-production-deploy.py"),
+            "--expected-checkout-root",
+            str(config.repo),
+            "--trusted-git-path",
+            str(config.git_path),
+            "--deployment-lock-path",
+            str(config.lock_path),
+            "--python-path",
+            str(config.python_path),
+            "--uv-path",
+            config.uv_bin,
+            "--finalize-generation",
+            "--inherited-lock-fd",
+            str(config.lock_fd),
+            "--operation-id",
+            operation_id,
+            "--finalize-action",
+            action,
+            "--",
+            "--target",
+            expected_commit,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=config.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                pass_fds=(config.lock_fd,),
+            )
+            payload = json.loads(completed.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            raise DeployError("target generation authority failed to publish marker") from exc
+        if payload.get("commit") != expected_commit or payload.get("operation_id") != operation_id:
+            raise DeployError("target generation authority returned a mismatched result")
+        return payload
+
+
 @dataclass(frozen=True)
 class ChangePlan:
     changed_files: tuple[str, ...]
@@ -175,6 +268,7 @@ class DeployConfig:
     startup_generation: str | None = None
     python_path: Path | None = None
     git_path: Path = Path("/usr/bin/git")
+    recovery_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +360,36 @@ def _append_audit(config: DeployConfig, result: DeployResult, *, error: str = ""
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _append_intent_audit(
+    config: DeployConfig,
+    intent: DeploymentIntent,
+    *,
+    event: str,
+) -> None:
+    path = _audit_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": datetime.now(SHANGHAI).isoformat(),
+        "event": "deployment_intent",
+        "operation_id": intent.operation_id,
+        "intent_stage": intent.stage,
+        "transition": event,
+        "previous_sha": intent.previous_sha,
+        "target_sha": intent.target_sha,
+        "changed_files": list(intent.changed_files),
+        "restart_services": list(intent.restart_services),
+        "active_services": list(intent.active_services),
+        "active_timers": list(intent.active_timers),
+        "restarted_services": list(intent.restarted_services),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 @contextmanager
@@ -308,53 +432,231 @@ def _deployment_lock(path: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _restart_active_services(
+def _active_units(
     runner: Runner,
-    services: tuple[str, ...],
-    restarted: list[str],
+    units: tuple[str, ...],
+    *,
+    label: str,
 ) -> tuple[str, ...]:
-    for service in services:
-        state = runner.run(["systemctl", "is-active", service], check=False)
+    active: list[str] = []
+    for unit in units:
+        state = runner.run(["systemctl", "is-active", unit], check=False)
         state_name = state.stdout.strip()
         if state_name == "inactive":
             continue
         if state.returncode != 0 or state_name != "active":
             raise DeployError(
-                f"service was not healthy before deployment restart: {service} ({state_name})"
+                f"{label} was not healthy before deployment transition: {unit} ({state_name})"
             )
+        active.append(unit)
+    return tuple(active)
+
+
+def _timers_for_services(services: tuple[str, ...]) -> tuple[str, ...]:
+    selected = {timer for service in services for timer in SERVICE_TIMERS.get(service, ())}
+    return tuple(sorted(selected))
+
+
+def _stop_timers(runner: Runner, timers: tuple[str, ...]) -> None:
+    for timer in timers:
+        runner.run(["sudo", "-n", "systemctl", "stop", timer])
+
+
+def _restore_timers(runner: Runner, timers: tuple[str, ...]) -> None:
+    for timer in timers:
+        runner.run(["sudo", "-n", "systemctl", "start", timer])
+        state = runner.run(["systemctl", "is-active", timer], check=False)
+        if state.returncode != 0 or state.stdout.strip() != "active":
+            raise DeployError(f"timer failed health check after restoration: {timer}")
+
+
+def _restart_services(
+    runner: Runner,
+    services: tuple[str, ...],
+    *,
+    after_restart: Callable[[tuple[str, ...]], None] | None = None,
+) -> tuple[str, ...]:
+    restarted: list[str] = []
+    for service in services:
         runner.run(["sudo", "-n", "systemctl", "restart", service])
         restarted.append(service)
+        if after_restart is not None:
+            after_restart(tuple(restarted))
         healthy = runner.run(["systemctl", "is-active", service], check=False)
         if healthy.returncode != 0 or healthy.stdout.strip() != "active":
             raise DeployError(f"service failed health check after restart: {service}")
     return tuple(restarted)
 
 
-def _rollback(
+def _advance_intent(
+    config: DeployConfig,
+    authority: GenerationAuthority,
+    intent: DeploymentIntent,
+    stage: str,
+    *,
+    restarted_services: tuple[str, ...] | None = None,
+) -> DeploymentIntent:
+    updated = authority.update_deployment_intent(
+        operation_id=intent.operation_id,
+        stage=stage,
+        restarted_services=restarted_services,
+    )
+    _append_intent_audit(config, updated, event=stage)
+    return updated
+
+
+def _execute_transaction(
+    config: DeployConfig,
+    runner: Runner,
+    authority: GenerationAuthority,
+    finalizer: GenerationFinalizer,
+    intent: DeploymentIntent,
+    *,
+    action: str,
+) -> DeploymentIntent:
+    target_sha = intent.previous_sha if action == "rollback" else intent.target_sha
+    git = str(config.git_path)
+    _stop_timers(runner, intent.active_timers)
+    intent = _advance_intent(config, authority, intent, "timers_stopped")
+
+    if action == "rollback":
+        runner.run([git, "reset", "--hard", target_sha])
+    elif action == "deploy":
+        runner.run([git, "merge", "--ff-only", target_sha])
+    elif action == "resume":
+        current = _stdout(runner, [git, "rev-parse", "HEAD"])
+        if current not in {intent.previous_sha, intent.target_sha}:
+            raise DeployError("recovery checkout is outside the recorded deployment intent")
+        if current != target_sha:
+            runner.run([git, "merge", "--ff-only", target_sha])
+    else:
+        raise PolicyError("unknown deployment recovery action")
+    intent = _advance_intent(config, authority, intent, f"{action}_checkout_ready")
+
+    runner.run([config.uv_bin, "sync", "--frozen"])
+    intent = _advance_intent(config, authority, intent, f"{action}_dependencies_ready")
+    runner.run([config.rquant_bin, "preflight"])
+    intent = _advance_intent(config, authority, intent, f"{action}_preflight_ready")
+    intent = _advance_intent(config, authority, intent, "services_transitioning")
+
+    def service_restarted(restarted: tuple[str, ...]) -> None:
+        nonlocal intent
+        intent = _advance_intent(
+            config,
+            authority,
+            intent,
+            "services_transitioning",
+            restarted_services=restarted,
+        )
+
+    restarted = _restart_services(
+        runner,
+        intent.active_services,
+        after_restart=service_restarted,
+    )
+    intent = _advance_intent(
+        config,
+        authority,
+        intent,
+        "services_ready",
+        restarted_services=restarted,
+    )
+    runner.run([config.rquant_bin, "preflight"])
+    intent = _advance_intent(config, authority, intent, "post_restart_preflight_ready")
+    _restore_timers(runner, intent.active_timers)
+    intent = _advance_intent(config, authority, intent, "timers_restored")
+    finalizer.finalize(
+        expected_commit=target_sha,
+        operation_id=intent.operation_id,
+        action=action,
+    )
+    intent = _advance_intent(config, authority, intent, "marker_published")
+    return _advance_intent(config, authority, intent, "completed")
+
+
+def _rollback_unmanaged(
     config: DeployConfig,
     runner: Runner,
     previous_sha: str,
     restarted_services: tuple[str, ...],
-    generation_authority: GenerationAuthority | None,
 ) -> None:
     runner.run([str(config.git_path), "reset", "--hard", previous_sha])
     runner.run([config.uv_bin, "sync", "--frozen"])
     runner.run([config.rquant_bin, "preflight"])
-    for service in restarted_services:
-        runner.run(["sudo", "-n", "systemctl", "restart", service])
-        healthy = runner.run(["systemctl", "is-active", service], check=False)
-        if healthy.returncode != 0 or healthy.stdout.strip() != "active":
-            raise DeployError(f"service failed health check after rollback: {service}")
+    _restart_services(runner, restarted_services)
     runner.run([config.rquant_bin, "preflight"])
-    if generation_authority is not None:
-        generation_authority.publish(expected_commit=previous_sha)
+
+
+def _recover_locked(
+    config: DeployConfig,
+    runner: Runner,
+    authority: GenerationAuthority,
+    finalizer: GenerationFinalizer,
+) -> DeployResult:
+    action = config.recovery_action
+    if action not in {"resume", "rollback"}:
+        raise PolicyError("recovery action must be resume or rollback")
+    intent = authority.read_deployment_intent()
+    if intent.stage == "completed":
+        raise PolicyError("deployment intent is already completed")
+    if config.dry_run:
+        raise PolicyError("recovery does not support dry-run")
+    expected_target = intent.target_sha if action == "resume" else intent.previous_sha
+    allowed_refs = {expected_target}
+    if action == "resume":
+        allowed_refs.add(intent.target_ref)
+    if config.target not in allowed_refs:
+        raise PolicyError("recovery target does not match the recorded deployment intent")
+    plan = build_change_plan(intent.changed_files)
+    if plan.blocked_files or plan.restart_services != intent.restart_services:
+        raise PolicyError("recorded deployment intent no longer matches change classification")
+    if intent.restart_services and is_protected_market_window(config.now):
+        raise ProtectedWindowError(
+            "deployment recovery requires service restarts during the protected 09:15-15:10 window"
+        )
+    if not set(intent.active_services).issubset(intent.restart_services):
+        raise PolicyError("recorded active service plan is invalid")
+    if not set(intent.restarted_services).issubset(intent.active_services):
+        raise PolicyError("recorded restarted service state is invalid")
+    if not set(intent.active_timers).issubset(_timers_for_services(intent.restart_services)):
+        raise PolicyError("recorded active timer plan is invalid")
+    git = str(config.git_path)
+    branch = _stdout(runner, [git, "rev-parse", "--abbrev-ref", "HEAD"])
+    if branch != "main":
+        raise PolicyError(f"production checkout must be on main, found {branch!r}")
+    dirty = _stdout(runner, [git, "status", "--porcelain", "--untracked-files=no"])
+    if dirty:
+        raise PolicyError("tracked production worktree changes must be resolved before recovery")
+    completed = _execute_transaction(
+        config,
+        runner,
+        authority,
+        finalizer,
+        intent,
+        action=action,
+    )
+    result = DeployResult(
+        "recovered",
+        intent.previous_sha,
+        expected_target,
+        config.target,
+        intent.changed_files,
+        completed.restarted_services,
+    )
+    _append_audit(config, result)
+    return result
 
 
 def _deploy_locked(
     config: DeployConfig,
     runner: Runner,
     generation_authority: GenerationAuthority | None,
+    generation_finalizer: GenerationFinalizer | None,
 ) -> DeployResult:
+    if config.recovery_action is not None:
+        if generation_authority is None or generation_finalizer is None:
+            raise PolicyError("deployment recovery requires persistent generation authority")
+        return _recover_locked(config, runner, generation_authority, generation_finalizer)
     target = validate_target(config.target)
     git_path = config.git_path
     if not git_path.is_absolute():
@@ -425,25 +727,104 @@ def _deploy_locked(
         _append_audit(config, result)
         return result
 
-    restarted: list[str] = []
     if generation_authority is not None:
+        if generation_finalizer is None:
+            raise PolicyError("formal deployment requires isolated target generation authority")
+        active_services = _active_units(
+            runner,
+            change_plan.restart_services,
+            label="service",
+        )
+        active_timers = _active_units(
+            runner,
+            _timers_for_services(change_plan.restart_services),
+            label="timer",
+        )
+        intent = generation_authority.begin_deployment_intent(
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+            target_ref=target,
+            changed_files=change_plan.changed_files,
+            restart_services=change_plan.restart_services,
+            active_services=active_services,
+            active_timers=active_timers,
+        )
+        _append_intent_audit(config, intent, event="planned")
         generation_authority.invalidate()
+        try:
+            completed = _execute_transaction(
+                config,
+                runner,
+                generation_authority,
+                generation_finalizer,
+                intent,
+                action="deploy",
+            )
+        except Exception as exc:
+            try:
+                completed = _execute_transaction(
+                    config,
+                    runner,
+                    generation_authority,
+                    generation_finalizer,
+                    generation_authority.read_deployment_intent(),
+                    action="rollback",
+                )
+            except Exception as rollback_exc:
+                result = DeployResult(
+                    "rollback_failed",
+                    previous_sha,
+                    target_sha,
+                    target,
+                    change_plan.changed_files,
+                    generation_authority.read_deployment_intent().restarted_services,
+                )
+                _append_audit(config, result, error=f"{exc}; rollback: {rollback_exc}")
+                raise DeployError(
+                    f"deployment failed and rollback also failed: {rollback_exc}"
+                ) from exc
+            result = DeployResult(
+                "rolled_back",
+                previous_sha,
+                target_sha,
+                target,
+                change_plan.changed_files,
+                completed.restarted_services,
+            )
+            _append_audit(config, result, error=str(exc))
+            raise DeployError(
+                f"deployment failed and rolled back to {previous_sha}: {exc}"
+            ) from exc
+        result = DeployResult(
+            "deployed",
+            previous_sha,
+            target_sha,
+            target,
+            change_plan.changed_files,
+            completed.restarted_services,
+        )
+        _append_audit(config, result)
+        return result
+
+    restarted: list[str] = []
     try:
         runner.run([git, "merge", "--ff-only", target_sha])
         runner.run([config.uv_bin, "sync", "--frozen"])
         runner.run([config.rquant_bin, "preflight"])
-        _restart_active_services(runner, change_plan.restart_services, restarted)
+        active_services = _active_units(runner, change_plan.restart_services, label="service")
+        _restart_services(
+            runner,
+            active_services,
+            after_restart=lambda values: restarted.__setitem__(slice(None), values),
+        )
         runner.run([config.rquant_bin, "preflight"])
-        if generation_authority is not None:
-            generation_authority.publish(expected_commit=target_sha)
     except Exception as exc:
         try:
-            _rollback(
+            _rollback_unmanaged(
                 config,
                 runner,
                 previous_sha,
                 tuple(restarted),
-                generation_authority,
             )
         except Exception as rollback_exc:
             result = DeployResult(
@@ -486,6 +867,7 @@ def deploy(
     *,
     runner: Runner | None = None,
     generation_authority: GenerationAuthority | None = None,
+    generation_finalizer: GenerationFinalizer | None = None,
 ) -> DeployResult:
     repo = config.repo.resolve()
     effective_config = DeployConfig(
@@ -501,6 +883,7 @@ def deploy(
         startup_generation=config.startup_generation,
         python_path=config.python_path,
         git_path=config.git_path,
+        recovery_action=config.recovery_action,
     )
     effective_runner = runner or SubprocessRunner(repo)
     lock_path = effective_config.lock_path or (repo.parent / ".rquant-deploy" / f"{repo.name}.lock")
@@ -531,12 +914,34 @@ def deploy(
                     git_path=effective_config.git_path,
                     writable=True,
                 )
-                generation_authority.verify(expected_commit=effective_config.startup_generation)
+                if effective_config.recovery_action is None:
+                    generation_authority.verify(expected_commit=effective_config.startup_generation)
+                else:
+                    intent = generation_authority.read_deployment_intent()
+                    if effective_config.startup_generation not in {
+                        intent.previous_sha,
+                        intent.target_sha,
+                    }:
+                        raise ReleaseGenerationError(
+                            "recovery checkout is outside deployment intent"
+                        )
             except ReleaseGenerationError as exc:
                 raise PolicyError(f"release generation is not ready: {exc}") from exc
-        return _deploy_locked(effective_config, effective_runner, generation_authority)
+        if generation_finalizer is None:
+            generation_finalizer = IsolatedGenerationFinalizer(effective_config)
+        return _deploy_locked(
+            effective_config,
+            effective_runner,
+            generation_authority,
+            generation_finalizer,
+        )
     with _deployment_lock(lock_path):
-        return _deploy_locked(effective_config, effective_runner, generation_authority)
+        return _deploy_locked(
+            effective_config,
+            effective_runner,
+            generation_authority,
+            generation_finalizer,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -550,6 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trusted-git-path", type=Path, required=True)
     parser.add_argument("--python-path", type=Path, required=True)
     parser.add_argument("--uv-path", type=Path, required=True)
+    parser.add_argument("--recovery-action", choices=("resume", "rollback"))
     return parser
 
 
@@ -566,6 +972,7 @@ def main(argv: list[str] | None = None) -> int:
         startup_generation=args.startup_generation,
         python_path=args.python_path,
         git_path=args.trusted_git_path,
+        recovery_action=args.recovery_action,
     )
     try:
         result = deploy(config)
