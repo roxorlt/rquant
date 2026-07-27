@@ -123,10 +123,12 @@ _ARTIFACT_COMMIT_AUTH_FUNCTION = "rquant_lab_artifact_commit_authorized"
 _ARTIFACT_INDEX_AUTH_FUNCTION = "rquant_lab_artifact_index_authorized"
 _ARTIFACT_SUCCESS_AUTH_FUNCTION = "rquant_lab_artifact_success_authorized"
 LAB_ETA_COMPLETED_LIMIT_MAX = 256
+MAX_JOB_SHARDS = 128
 LAB_JOB_LIST_LIMIT_MAX = 100
 LAB_JOB_DETAIL_SHARD_LIMIT_MAX = 256
 LAB_JOB_DETAIL_EVENT_LIMIT_MAX = 512
 LAB_JOB_DETAIL_ARTIFACT_LIMIT_MAX = 128
+LAB_JOB_FILTER_TUPLE_INPUT_MAX = 32
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 _LEGACY_PLAN_HASH = "0" * 64
@@ -845,9 +847,13 @@ class LabArtifactCommitRecord(LabRecordModel):
 
 
 class LabJobListFilters(LabRecordModel):
-    statuses: tuple[JobStatus, ...] = ()
-    job_types: tuple[ResearchJobType, ...] = ()
-    resource_classes: tuple[ResourceClass, ...] = ()
+    statuses: tuple[JobStatus, ...] = Field(default=(), max_length=LAB_JOB_FILTER_TUPLE_INPUT_MAX)
+    job_types: tuple[ResearchJobType, ...] = Field(
+        default=(), max_length=LAB_JOB_FILTER_TUPLE_INPUT_MAX
+    )
+    resource_classes: tuple[ResourceClass, ...] = Field(
+        default=(), max_length=LAB_JOB_FILTER_TUPLE_INPUT_MAX
+    )
     created_from: datetime | None = None
     created_before: datetime | None = None
     keyword: str | None = Field(default=None, min_length=1, max_length=200)
@@ -856,6 +862,11 @@ class LabJobListFilters(LabRecordModel):
     @classmethod
     def validate_filter_time(cls, value: object) -> object:
         return None if value is None else _utc(value)  # type: ignore[arg-type]
+
+    @field_validator("statuses", "job_types", "resource_classes")
+    @classmethod
+    def canonicalize_enum_filter(cls, value: tuple[StrEnum, ...]) -> tuple[StrEnum, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
 
     @model_validator(mode="after")
     def validate_filter_range(self) -> LabJobListFilters:
@@ -866,6 +877,12 @@ class LabJobListFilters(LabRecordModel):
         ):
             raise ValueError("created_from must precede created_before")
         return self
+
+
+LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX = (
+    len(JobStatus) + len(ResearchJobType) + len(ResourceClass) + 5
+)
+LAB_JOB_LIST_QUERY_PARAMETER_MAX = LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX + 4
 
 
 class CommandAvailability(LabRecordModel):
@@ -3494,6 +3511,10 @@ class LabJobReader:
     @staticmethod
     def _progress_from_row(row: sqlite3.Row) -> LabJobProgress:
         total = _strict_sqlite_int(row["shard_count"], field="shard_count", minimum=0)
+        if total > MAX_JOB_SHARDS:
+            raise InvalidStoredJobError(
+                f"job shard count exceeds authoritative shard limit {MAX_JOB_SHARDS}"
+            )
         succeeded = _strict_sqlite_int(row["succeeded_count"], field="succeeded_count", minimum=0)
         failed = _strict_sqlite_int(row["failed_count"], field="failed_count", minimum=0)
         cancelled = _strict_sqlite_int(row["cancelled_count"], field="cancelled_count", minimum=0)
@@ -3627,6 +3648,8 @@ class LabJobReader:
                 "OR LOWER(j.spec_hash) LIKE ? ESCAPE '\\')"
             )
             parameters.extend((f"%{escaped}%",) * 3)
+        if len(parameters) > LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX:
+            raise ValueError("job list filters exceed the SQL parameter budget")
         return clauses, parameters
 
     @classmethod
@@ -3691,6 +3714,8 @@ class LabJobReader:
             cursor_time, cursor_id = self._decode_cursor(cursor)
             page_clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
             page_parameters.extend((cursor_time, cursor_time, str(cursor_id)))
+        if len(page_parameters) + 1 > LAB_JOB_LIST_QUERY_PARAMETER_MAX:
+            raise ValueError("job list query exceeds the SQL parameter budget")
         page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
         with self._connect() as connection:
             total_row = connection.execute(
@@ -3962,9 +3987,13 @@ class LabJobReader:
                     "SELECT shard_id, phase, work_unit_name, work_units, static_duration_ms "
                     "FROM lab_shard WHERE job_id = ? "
                     "AND status IN ('queued', 'running', 'checkpointed') "
-                    "ORDER BY shard_index, shard_id",
-                    (str(job_id),),
+                    "ORDER BY shard_index, shard_id LIMIT ?",
+                    (str(job_id), MAX_JOB_SHARDS + 1),
                 ).fetchall()
+                if len(remaining_rows) > MAX_JOB_SHARDS:
+                    raise InvalidStoredJobError(
+                        f"job remaining shards exceed authoritative shard limit {MAX_JOB_SHARDS}"
+                    )
             else:
                 completed_rows = ()
                 remaining_rows = ()
@@ -4260,9 +4289,13 @@ class LabJobReader:
     def list_shards(self, job_id: UUID) -> tuple[LabShardRecord, ...]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
-                (str(job_id),),
+                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index LIMIT ?",
+                (str(job_id), MAX_JOB_SHARDS + 1),
             ).fetchall()
+        if len(rows) > MAX_JOB_SHARDS:
+            raise InvalidStoredJobError(
+                f"job shards exceed authoritative shard limit {MAX_JOB_SHARDS}"
+            )
         return tuple(self._shard_from_row(row) for row in rows)
 
     def get_eta_input(
@@ -4307,9 +4340,15 @@ class LabJobReader:
                 WHERE job_id = ?
                   AND status IN ('queued', 'running', 'checkpointed')
                 ORDER BY shard_index, shard_id
+                LIMIT ?
                 """,
-                (str(job_id),),
+                (str(job_id), MAX_JOB_SHARDS + 1),
             ).fetchall()
+
+        if len(remaining_rows) > MAX_JOB_SHARDS:
+            raise InvalidStoredJobError(
+                f"job remaining shards exceed authoritative shard limit {MAX_JOB_SHARDS}"
+            )
 
         completed: list[LabEtaCompletedShard] = []
         for row in completed_rows:
@@ -6747,6 +6786,8 @@ class LabJobStore:
     ) -> tuple[LabShardRecord, ...]:
         if not definitions:
             raise ValueError("a shard plan must contain at least one definition")
+        if len(definitions) > MAX_JOB_SHARDS:
+            raise ValueError(f"a shard plan may contain at most {MAX_JOB_SHARDS} shards")
         validated = tuple(LabShardDefinition.model_validate(item) for item in definitions)
         ordered = tuple(sorted(validated, key=lambda item: item.shard_index))
         if tuple(item.shard_index for item in ordered) != tuple(range(len(ordered))):
@@ -6765,9 +6806,13 @@ class LabJobStore:
             if job_row is None:
                 raise KeyError(f"lab job not found: {job_id}")
             existing_rows = connection.execute(
-                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
-                (str(job_id),),
+                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index LIMIT ?",
+                (str(job_id), MAX_JOB_SHARDS + 1),
             ).fetchall()
+            if len(existing_rows) > MAX_JOB_SHARDS:
+                raise InvalidStoredJobError(
+                    f"stored shard plan exceeds authoritative limit {MAX_JOB_SHARDS}"
+                )
             if existing_rows:
                 records = tuple(LabJobReader._shard_from_row(row) for row in existing_rows)
                 stored_identity = tuple(
@@ -6868,9 +6913,13 @@ class LabJobStore:
                     ),
                 )
             rows = connection.execute(
-                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
-                (str(job_id),),
+                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index LIMIT ?",
+                (str(job_id), MAX_JOB_SHARDS + 1),
             ).fetchall()
+            if len(rows) > MAX_JOB_SHARDS:  # pragma: no cover - guarded before insertion
+                raise InvalidStoredJobError(
+                    f"stored shard plan exceeds authoritative limit {MAX_JOB_SHARDS}"
+                )
             records = tuple(LabJobReader._shard_from_row(row) for row in rows)
         return records
 

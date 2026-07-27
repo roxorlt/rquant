@@ -58,6 +58,7 @@ from rquant.lab_job_protocol import (
     SubmitJobCommand,
 )
 from rquant.lab_jobs import (
+    MAX_JOB_SHARDS,
     ControlIntent,
     InvalidStoredJobError,
     JobStatus,
@@ -106,6 +107,12 @@ TEST_AUTHORITY_KEY = LabFinalizerAuthorityKey(
     key_id="finalizer-test-key",
     secret=b"f" * 32,
 )
+
+
+def test_finalizer_shard_limit_cannot_exceed_ledger_authority() -> None:
+    assert LabFinalizerJobLimits().max_shards == MAX_JOB_SHARDS
+    with pytest.raises(ValueError, match="max_shards"):
+        LabFinalizerJobLimits(max_shards=MAX_JOB_SHARDS + 1)
 
 
 def _authority_key_provider() -> LabFinalizerAuthorityKey:

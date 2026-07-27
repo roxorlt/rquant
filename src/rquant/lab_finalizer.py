@@ -52,6 +52,7 @@ from rquant.lab_artifacts import (
 )
 from rquant.lab_jobs import (
     COMPLETE_RESULT_CONTRACT_VERSION,
+    MAX_JOB_SHARDS,
     LabFinalizationShardEvidence,
     LabFinalizationSnapshot,
     LabJobReader,
@@ -202,7 +203,7 @@ class LabShardBundleLimits(LabFinalizerModel):
 
 
 class LabFinalizerJobLimits(LabFinalizerModel):
-    max_shards: int = Field(default=128, ge=1)
+    max_shards: int = Field(default=MAX_JOB_SHARDS, ge=1, le=MAX_JOB_SHARDS)
     max_total_shard_rows: int = Field(default=5_000_000, ge=1)
     max_total_compressed_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
     max_total_declared_uncompressed_bytes: int = Field(default=512 * 1024 * 1024, ge=1)

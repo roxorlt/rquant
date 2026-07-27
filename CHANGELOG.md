@@ -60,6 +60,13 @@
 
 ### Fixed
 
+- **Strategy Lab job center 有界查询审查修复**：任务筛选 enum tuple 现在先限制原始长度，
+  再 canonical 去重排序，并对过滤器与 cursor 的 SQLite 参数设总预算。ledger 统一采用
+  `MAX_JOB_SHARDS=128`，规划在写入前拒绝超限，reader 的 remaining-shard 查询用 `MAX+1`
+  探针检测损坏数据库并 fail closed；finalizer 不能配置成超过 ledger 权威上限。
+  paused/checkpointed ETA 仅保留进度计数，不再返回 estimator 预测、remaining duration 或
+  finish window。
+
 - **Strategy Lab artifact store 生命周期防死锁**：preview/finalization activity 现在按线程记录
   可重入深度；activity 持有线程调用 `close()` 时在任何等待前返回 typed lifecycle error，
   context 退出后仍可正常使用并关闭 store。其他线程的 close 继续等待在途 activity 完成，

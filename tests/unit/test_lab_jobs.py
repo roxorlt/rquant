@@ -2104,7 +2104,7 @@ def test_get_job_uses_shard_aggregates_without_loading_twenty_thousand_models(
     assert "count(" in shard_queries[0]
     assert "rquant_lab_shard_row_valid" in shard_queries[0]
     assert "select *" not in shard_queries[0]
-    with pytest.raises(AssertionError, match="must not construct"):
+    with pytest.raises(InvalidStoredJobError, match="shard limit"):
         reader.list_shards(job.job_id)
 
 

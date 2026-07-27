@@ -139,10 +139,11 @@ def test_eta_uses_documented_static_interval_before_three_completed_shards() -> 
 
 
 @pytest.mark.parametrize("status", ["checkpointed", "paused"])
-def test_eta_hides_finish_time_while_execution_is_paused(status: str) -> None:
+def test_eta_has_no_prediction_while_execution_is_paused(status: str) -> None:
     estimate = estimate_lab_eta(_input(status=status))
 
-    assert estimate.remaining_duration is not None
+    assert estimate.estimator == "unavailable"
+    assert estimate.remaining_duration is None
     assert estimate.finish_at is None
 
 
@@ -227,10 +228,19 @@ def test_active_eta_projects_finish_window_from_explicit_as_of(status: str) -> N
     assert estimate.finish_at.high == AS_OF + timedelta(milliseconds=1_500)
 
 
-def test_paused_eta_keeps_duration_but_has_no_finish_time() -> None:
-    estimate = estimate_lab_eta(_input(status="paused"))
+def test_paused_eta_keeps_progress_counts_but_no_prediction_interval() -> None:
+    estimate = estimate_lab_eta(
+        _input(
+            status="paused",
+            completed=(_completed(1, 100),),
+            remaining=(_remaining(1), _remaining(2)),
+        )
+    )
 
-    assert estimate.remaining_duration is not None
+    assert estimate.completed_telemetry_shards == 1
+    assert estimate.remaining_shards == 2
+    assert estimate.estimator == "unavailable"
+    assert estimate.remaining_duration is None
     assert estimate.finish_at is None
 
 
@@ -530,7 +540,7 @@ def _seed_eta_job_with_terminal_shards(
 
 
 @pytest.mark.parametrize("job_status", ["running", "checkpointed"])
-def test_running_and_paused_checkpointed_eta_ignore_terminal_shards(
+def test_running_and_checkpointed_eta_ignore_terminal_shards_without_paused_prediction(
     tmp_path: Path,
     job_status: str,
 ) -> None:
@@ -546,8 +556,13 @@ def test_running_and_paused_checkpointed_eta_ignore_terminal_shards(
     assert tuple(item.shard_id for item in projection.remaining) == (UUID(int=20_000),)
     assert estimate is not None
     assert estimate.remaining_shards == 1
-    assert estimate.remaining_duration is not None
-    assert estimate.remaining_duration.center_ms == 1_000
+    if job_status == "running":
+        assert estimate.remaining_duration is not None
+        assert estimate.remaining_duration.center_ms == 1_000
+    else:
+        assert estimate.estimator == "unavailable"
+        assert estimate.remaining_duration is None
+        assert estimate.finish_at is None
 
 
 @pytest.mark.parametrize("job_status", ["failed", "cancelled"])

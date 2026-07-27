@@ -21,6 +21,7 @@ from rquant.lab_job_protocol import (
     RetryJobCommand,
 )
 from rquant.lab_jobs import (
+    MAX_JOB_SHARDS,
     ControlIntent,
     InvalidJobTransitionError,
     InvalidStoredJobError,
@@ -130,6 +131,26 @@ def _setup(
     )
     assert len(planned) == count
     return store, lease, job.job_id
+
+
+def test_plan_job_rejects_more_than_authoritative_shard_limit_before_insert(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    definitions = tuple(_definition(index) for index in range(MAX_JOB_SHARDS + 1))
+
+    with pytest.raises(ValueError, match=f"at most {MAX_JOB_SHARDS} shards"):
+        store.plan_job(
+            job.job_id,
+            definitions,
+            lease=lease,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    assert LabJobReader(store.path).list_shards(job.job_id) == ()
 
 
 def _claim(

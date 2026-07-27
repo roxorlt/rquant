@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 
 from rquant.lab_jobs import (
+    LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX,
+    LAB_JOB_LIST_QUERY_PARAMETER_MAX,
+    MAX_JOB_SHARDS,
+    InvalidStoredJobError,
     JobStatus,
     LabJobListFilters,
     LabJobReader,
@@ -117,6 +123,30 @@ def test_list_jobs_combines_status_type_resource_date_and_keyword_filters(
         reader.list_jobs(limit=101)
 
 
+def test_job_list_filters_canonicalize_enum_tuples_and_bound_sql_parameters() -> None:
+    filters = LabJobListFilters(
+        statuses=tuple(reversed(tuple(JobStatus))) + tuple(JobStatus),
+        job_types=tuple(reversed(tuple(ResearchJobType))) + tuple(ResearchJobType),
+        resource_classes=tuple(reversed(tuple(ResourceClass))) + tuple(ResourceClass),
+        created_from=NOW,
+        created_before=NOW + timedelta(days=1),
+        keyword="strategy",
+    )
+
+    assert filters.statuses == tuple(sorted(JobStatus, key=lambda item: item.value))
+    assert filters.job_types == tuple(sorted(ResearchJobType, key=lambda item: item.value))
+    assert filters.resource_classes == tuple(sorted(ResourceClass, key=lambda item: item.value))
+    _, parameters = LabJobReader._job_filters_sql(filters)
+    assert len(parameters) == LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX
+    assert len(parameters) + 4 == LAB_JOB_LIST_QUERY_PARAMETER_MAX
+    assert LabJobReader._job_filters_sql(LabJobListFilters()) == ([], [])
+
+
+def test_job_list_filters_reject_pathological_raw_tuple_before_sql() -> None:
+    with pytest.raises(ValidationError, match="statuses"):
+        LabJobListFilters(statuses=(JobStatus.QUEUED,) * 100_000)
+
+
 def test_job_detail_is_bounded_and_reports_first_failure_without_paused_eta(
     tmp_path: Path,
 ) -> None:
@@ -164,8 +194,9 @@ def test_job_detail_marks_running_heartbeat_stale_and_truncates_independently(
 ) -> None:
     store, lease, job_id = _setup(tmp_path, count=3, with_work_plan=True)
     _claim(store, lease, duration=120)
+    reader = _CountingReader(store.path)
 
-    detail = LabJobReader(store.path).get_job_detail(
+    detail = reader.get_job_detail(
         job_id,
         as_of=NOW + timedelta(seconds=40),
         heartbeat_stale_after=timedelta(seconds=10),
@@ -178,6 +209,60 @@ def test_job_detail_marks_running_heartbeat_stale_and_truncates_independently(
     assert detail.heartbeat.stale is True
     assert detail.progress.phase == "strategy_replay"
     assert detail.shards_truncated is True
+    assert any(f"LIMIT {MAX_JOB_SHARDS + 1}" in statement for statement in reader.statements)
+
+
+def test_eta_and_detail_fail_closed_on_damaged_oversized_remaining_shard_graph(
+    tmp_path: Path,
+) -> None:
+    store, job_ids = _seed_jobs(tmp_path, 1)
+    timestamp = NOW.isoformat(timespec="microseconds")
+    with sqlite3.connect(store.path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO lab_shard (
+                shard_id, job_id, shard_index, status, version,
+                attempt_count, max_attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', 0, 0, 3, ?, ?)
+            """,
+            (
+                (
+                    str(UUID(int=10_000 + index)),
+                    str(job_ids[0]),
+                    index,
+                    timestamp,
+                    timestamp,
+                )
+                for index in range(MAX_JOB_SHARDS + 1)
+            ),
+        )
+
+    eta_reader = _CountingReader(store.path)
+    with pytest.raises(InvalidStoredJobError, match="shard limit"):
+        eta_reader.get_eta_input(job_ids[0], as_of=NOW)
+    eta_selects = [
+        statement for statement in eta_reader.statements if statement.startswith("SELECT")
+    ]
+    assert len(eta_selects) == 3
+    assert any(f"LIMIT {MAX_JOB_SHARDS + 1}" in statement for statement in eta_selects)
+    with pytest.raises(InvalidStoredJobError, match="shard limit"):
+        eta_reader.list_shards(job_ids[0])
+
+    detail_reader = _CountingReader(store.path)
+    with pytest.raises(InvalidStoredJobError, match="shard limit"):
+        detail_reader.get_job_detail(
+            job_ids[0],
+            as_of=NOW,
+            shard_limit=1,
+            event_limit=1,
+            artifact_limit=1,
+        )
+    detail_selects = [
+        statement
+        for statement in detail_reader.statements
+        if statement.startswith(("SELECT", "WITH"))
+    ]
+    assert len(detail_selects) <= 13
 
 
 def test_list_finalization_candidates_is_typed_readonly_and_bounded(tmp_path: Path) -> None:

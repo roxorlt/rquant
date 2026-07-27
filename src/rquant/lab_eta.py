@@ -234,7 +234,7 @@ def estimate_lab_eta(value: LabEtaInput) -> LabEtaEstimate:
         "completed_telemetry_shards": completed_count,
         "remaining_shards": remaining_count,
     }
-    if eta_input.status in {"failed", "cancelled"}:
+    if eta_input.status in {"failed", "cancelled", "checkpointed", "paused"}:
         return LabEtaEstimate(
             **common,
             estimator="unavailable",
@@ -292,7 +292,5 @@ def estimate_lab_eta(value: LabEtaInput) -> LabEtaEstimate:
         **common,
         estimator=estimator,
         remaining_duration=duration,
-        finish_at=None
-        if eta_input.status in {"checkpointed", "paused"}
-        else _finish_window(eta_input.as_of, duration),
+        finish_at=_finish_window(eta_input.as_of, duration),
     )
