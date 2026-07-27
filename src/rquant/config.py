@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     lab_final_artifact_dir: Path | None = None
     lab_artifact_commit_dir: Path | None = None
     lab_daemon_lock_dir: Path | None = None
+    lab_finalizer_state_dir: Path | None = None
     lab_finalizer_authority_key_id: str = ""
     lab_finalizer_authority_key_path: Path | None = None
     lab_finalizer_authority_keyring_path: Path | None = None
@@ -77,6 +78,8 @@ class Settings(BaseSettings):
     lab_worker_max_shards_per_tick: int = Field(default=1, ge=1, le=1)
     lab_finalizer_poll_interval_ms: int = Field(default=1_000, ge=1)
     lab_finalizer_max_jobs_per_tick: int = Field(default=8, ge=1, le=128)
+    lab_finalizer_failure_cooldown_seconds: int = Field(default=30, ge=1, le=3_600)
+    lab_finalizer_failure_cooldown_max_seconds: int = Field(default=3_600, ge=1, le=86_400)
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
@@ -165,17 +168,16 @@ class Settings(BaseSettings):
             )
         return normalized
 
-    @field_validator("data_dir", mode="before")
+    @field_validator("data_dir", "parquet_dir", "log_dir", mode="before")
     @classmethod
-    def require_canonical_data_dir(cls, v: object) -> object:
+    def require_canonical_base_dir(cls, v: object, info: ValidationInfo) -> object:
         if isinstance(v, (str, Path)):
-            _canonical_absolute_path(Path(v), label="DATA_DIR")
+            _canonical_absolute_path(Path(v), label=info.field_name.upper())
         return v
 
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="after")
     @classmethod
-    def ensure_dir_exists(cls, v: Path) -> Path:
-        v.mkdir(parents=True, exist_ok=True)
+    def retain_pure_base_dir(cls, v: Path) -> Path:
         return v
 
     @field_validator("duckdb_path", mode="after")
@@ -198,6 +200,7 @@ class Settings(BaseSettings):
         "lab_final_artifact_dir",
         "lab_artifact_commit_dir",
         "lab_daemon_lock_dir",
+        "lab_finalizer_state_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
         mode="before",
@@ -215,6 +218,7 @@ class Settings(BaseSettings):
         "lab_final_artifact_dir",
         "lab_artifact_commit_dir",
         "lab_daemon_lock_dir",
+        "lab_finalizer_state_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
         mode="after",
@@ -232,6 +236,7 @@ class Settings(BaseSettings):
         "research_lake_dir",
         "research_staging_dir",
         "notification_state_path",
+        "panorama_users_path",
         mode="before",
     )
     @classmethod
@@ -245,6 +250,7 @@ class Settings(BaseSettings):
         "research_lake_dir",
         "research_staging_dir",
         "notification_state_path",
+        "panorama_users_path",
         mode="after",
     )
     @classmethod
@@ -332,6 +338,11 @@ class Settings(BaseSettings):
             )
         if self.lab_worker_heartbeat_seconds >= self.lab_worker_lease_extension_seconds:
             raise ValueError("lab worker heartbeat must precede lease extension")
+        if (
+            self.lab_finalizer_failure_cooldown_max_seconds
+            < self.lab_finalizer_failure_cooldown_seconds
+        ):
+            raise ValueError("lab finalizer cooldown maximum must not be below its base")
         lab_path = _canonical_absolute_path(
             self.lab_jobs_path or self.data_dir / "lab_jobs.sqlite3",
             label="lab jobs path",
@@ -358,6 +369,10 @@ class Settings(BaseSettings):
             _canonical_absolute_path(
                 self.notification_state_path or self.data_dir / "notification_state.sqlite3",
                 label="notification state path",
+            ),
+            _canonical_absolute_path(
+                self.panorama_users_path or self.data_dir / "panorama-users.txt",
+                label="panorama users path",
             ),
         )
         if lab_path in existing_database_paths:
@@ -393,8 +408,14 @@ class Settings(BaseSettings):
                 self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks",
                 label="lab daemon lock root",
             ),
+            _canonical_absolute_path(
+                self.lab_finalizer_state_dir or self.data_dir / "lab_finalizer_state",
+                label="lab finalizer state root",
+            ),
         )
         existing_managed_dirs = (
+            _canonical_absolute_path(self.parquet_dir, label="Parquet root"),
+            _canonical_absolute_path(self.log_dir, label="log root"),
             _canonical_absolute_path(
                 self.research_lake_dir or self.data_dir / "lake",
                 label="research lake path",
@@ -433,6 +454,12 @@ class Settings(BaseSettings):
             raise ValueError("lab worker id must not be empty")
         if workers and self.lab_worker_id not in workers:
             raise ValueError("lab worker id must be present in scheduler worker ids")
+        return self
+
+    @model_validator(mode="after")
+    def materialize_base_directories(self) -> "Settings":
+        for path in (self.data_dir, self.parquet_dir, self.log_dir):
+            path.mkdir(parents=True, exist_ok=True)
         return self
 
     @property
@@ -481,6 +508,10 @@ class Settings(BaseSettings):
     @property
     def lab_daemon_lock_dir_resolved(self) -> Path:
         return self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks"
+
+    @property
+    def lab_finalizer_state_dir_resolved(self) -> Path:
+        return self.lab_finalizer_state_dir or self.data_dir / "lab_finalizer_state"
 
     @property
     def lab_scheduler_worker_id_list(self) -> tuple[str, ...]:

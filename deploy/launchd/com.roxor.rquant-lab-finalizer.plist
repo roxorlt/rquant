@@ -8,6 +8,8 @@
     <array>
         <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/rquant</string>
         <string>lab-finalizer</string>
+        <string>--expected-checkout-root</string>
+        <string>/Users/roxor/brain/30-projects/rQuant</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/roxor/brain/30-projects/rQuant</string>

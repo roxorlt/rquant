@@ -15,6 +15,16 @@ import pytest
 
 from rquant.cli import build_parser
 
+_LAB_EXPECTED_ROOT = "/tmp/rquant-expected"
+
+
+class _FakeLabSqliteAuthority:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def close(self) -> None:
+        pass
+
 
 class TestBuildParser:
     def test_serve_defaults(self) -> None:
@@ -3617,7 +3627,7 @@ class TestLabSchedulerCli:
                 pass
 
         monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
-        monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+        monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
@@ -3626,7 +3636,7 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(
             lab_daemon,
             "prepare_private_sqlite_path",
-            lambda path, *, label, create: path,
+            lambda path, *, label, create: _FakeLabSqliteAuthority(path),
         )
         monkeypatch.setattr(
             lab_daemon.LabAuthorityKeyring,
@@ -3648,7 +3658,14 @@ class TestLabSchedulerCli:
         )
 
     def test_parser_accepts_once_and_preserves_lab_run(self) -> None:
-        scheduler = build_parser().parse_args(["lab-scheduler", "--once"])
+        scheduler = build_parser().parse_args(
+            [
+                "lab-scheduler",
+                "--expected-checkout-root",
+                _LAB_EXPECTED_ROOT,
+                "--once",
+            ]
+        )
         legacy = build_parser().parse_args(["lab-run", "--spec", "/tmp/spec.json"])
 
         assert scheduler.command == "lab-scheduler"
@@ -3657,7 +3674,9 @@ class TestLabSchedulerCli:
         assert legacy.spec == "/tmp/spec.json"
 
     def test_parser_defaults_to_forever(self) -> None:
-        args = build_parser().parse_args(["lab-scheduler"])
+        args = build_parser().parse_args(
+            ["lab-scheduler", "--expected-checkout-root", _LAB_EXPECTED_ROOT]
+        )
 
         assert args.once is False
 
@@ -3679,8 +3698,15 @@ class TestLabSchedulerCli:
         calls: list[str] = []
 
         class FakeStore:
-            def __init__(self, path: Path, *, busy_timeout_ms: int) -> None:
+            def __init__(
+                self,
+                path: Path,
+                *,
+                busy_timeout_ms: int,
+                identity_authority: object,
+            ) -> None:
                 calls.append(f"store:{path.name}:{busy_timeout_ms}")
+                assert isinstance(identity_authority, _FakeLabSqliteAuthority)
 
             def initialize(self) -> None:
                 calls.append("initialize")
@@ -3729,12 +3755,15 @@ class TestLabSchedulerCli:
             lab_daemon,
             "prepare_private_sqlite_path",
             lambda path, *, label, create: (
-                calls.append(f"sqlite:{path.name}:{label}:{create}") or path
+                calls.append(f"sqlite:{path.name}:{label}:{create}")
+                or _FakeLabSqliteAuthority(path)
             ),
         )
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
-        result = cmd_lab_scheduler(argparse.Namespace(once=True))
+        result = cmd_lab_scheduler(
+            argparse.Namespace(once=True, expected_checkout_root=_LAB_EXPECTED_ROOT)
+        )
 
         assert result == 0
         assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:True" in calls
@@ -3782,7 +3811,9 @@ class TestLabSchedulerCli:
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
         monkeypatch.setattr(signal, "signal", fake_signal)
 
-        result = cmd_lab_scheduler(argparse.Namespace(once=False))
+        result = cmd_lab_scheduler(
+            argparse.Namespace(once=False, expected_checkout_root=_LAB_EXPECTED_ROOT)
+        )
 
         assert result == 0
         assert calls == ["run_forever", "request_stop"]
@@ -3805,7 +3836,7 @@ class TestLabWorkerCli:
                 pass
 
         monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
-        monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+        monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
@@ -3816,7 +3847,14 @@ class TestLabWorkerCli:
 
     def test_parser_accepts_worker_identity_and_once(self) -> None:
         args = build_parser().parse_args(
-            ["lab-worker", "--worker-id", "worker-a", "--once"]
+            [
+                "lab-worker",
+                "--expected-checkout-root",
+                _LAB_EXPECTED_ROOT,
+                "--worker-id",
+                "worker-a",
+                "--once",
+            ]
         )
 
         assert args.command == "lab-worker"
@@ -3868,7 +3906,13 @@ class TestLabWorkerCli:
         monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
-        result = cmd_lab_worker(argparse.Namespace(worker_id="worker-a", once=True))
+        result = cmd_lab_worker(
+            argparse.Namespace(
+                worker_id="worker-a",
+                once=True,
+                expected_checkout_root=_LAB_EXPECTED_ROOT,
+            )
+        )
 
         assert result == expected_exit
         assert "spool:lab_shard_claims" in calls
@@ -3918,7 +3962,13 @@ class TestLabWorkerCli:
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
         monkeypatch.setattr(signal, "signal", fake_signal)
 
-        result = cmd_lab_worker(argparse.Namespace(worker_id="worker-a", once=False))
+        result = cmd_lab_worker(
+            argparse.Namespace(
+                worker_id="worker-a",
+                once=False,
+                expected_checkout_root=_LAB_EXPECTED_ROOT,
+            )
+        )
 
         assert result == 0
         assert calls == ["run_forever", "request_stop", "request_stop"]

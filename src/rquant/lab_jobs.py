@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal, Protocol, Self
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from weakref import ReferenceType, ref
@@ -70,6 +70,15 @@ from rquant.research_run_spec import (
 
 if TYPE_CHECKING:
     from rquant.lab_artifacts import LabVerifiedSealedBinding
+
+
+class LabSqliteIdentityAuthority(Protocol):
+    path: Path
+
+    def open_verified_connection(
+        self,
+        opener: Callable[[Path], sqlite3.Connection],
+    ) -> sqlite3.Connection: ...
 
 
 class SchedulerLeaseUnavailableError(RuntimeError):
@@ -2947,19 +2956,35 @@ class LabJobReader:
     current identity or availability of paths recorded by that graph.
     """
 
-    def __init__(self, path: Path, *, busy_timeout_ms: int = 5_000) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        busy_timeout_ms: int = 5_000,
+        identity_authority: LabSqliteIdentityAuthority | None = None,
+    ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
+        self.identity_authority = identity_authority
+        if identity_authority is not None and identity_authority.path != self.path:
+            raise ValueError("SQLite identity authority path mismatch")
 
     def _connect(self) -> sqlite3.Connection:
-        uri = f"file:{quote(str(self.path.resolve()))}?mode=ro"
-        connection = sqlite3.connect(
-            uri,
-            uri=True,
-            timeout=self.busy_timeout_ms / 1_000,
-            isolation_level=None,
+        def open_readonly(path: Path) -> sqlite3.Connection:
+            uri = f"file:{quote(str(path if self.identity_authority else path.resolve()))}?mode=ro"
+            return sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=self.busy_timeout_ms / 1_000,
+                isolation_level=None,
+            )
+
+        connection = (
+            self.identity_authority.open_verified_connection(open_readonly)
+            if self.identity_authority is not None
+            else open_readonly(self.path)
         )
         connection.create_function(
             _SHARD_ROW_VALID_FUNCTION,
@@ -4677,19 +4702,38 @@ class LabJobStore:
     SCHEMA_VERSION = _SCHEMA_VERSION
     LEASE_NAME = "strategy-lab-scheduler"
 
-    def __init__(self, path: Path, *, busy_timeout_ms: int = 5_000) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        busy_timeout_ms: int = 5_000,
+        identity_authority: LabSqliteIdentityAuthority | None = None,
+    ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
+        self.identity_authority = identity_authority
+        if identity_authority is not None and identity_authority.path != self.path:
+            raise ValueError("SQLite identity authority path mismatch")
 
     def _connect(self, *, validate_identity: bool = True) -> _LabJobStoreConnection:
-        connection = sqlite3.connect(
-            self.path,
-            timeout=self.busy_timeout_ms / 1_000,
-            isolation_level=None,
-            factory=_LabJobStoreConnection,
+        def open_writable(path: Path) -> _LabJobStoreConnection:
+            return sqlite3.connect(
+                path,
+                timeout=self.busy_timeout_ms / 1_000,
+                isolation_level=None,
+                factory=_LabJobStoreConnection,
+            )
+
+        connection = (
+            self.identity_authority.open_verified_connection(open_writable)
+            if self.identity_authority is not None
+            else open_writable(self.path)
         )
+        if not isinstance(connection, _LabJobStoreConnection):
+            connection.close()
+            raise TypeError("lab SQLite authority returned an incompatible connection")
         authorization = _LabWriteAuthorization(connection)
         connection.write_authorization = authorization
         connection.set_trace_callback(connection._trace_transaction_boundary)
@@ -4768,7 +4812,8 @@ class LabJobStore:
             connection.close()
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.identity_authority is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect(validate_identity=False)
         try:
             connection.execute("BEGIN IMMEDIATE")

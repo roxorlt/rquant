@@ -112,8 +112,9 @@ class TestSettings:
             configured.lab_final_artifact_dir_resolved,
             configured.lab_artifact_commit_dir_resolved,
             configured.lab_daemon_lock_dir_resolved,
+            configured.lab_finalizer_state_dir_resolved,
         }
-        assert len(roots) == 7
+        assert len(roots) == 8
         assert all(path.is_absolute() for path in roots)
         assert all(not path.exists() for path in roots)
 
@@ -128,6 +129,7 @@ class TestSettings:
             "lab_final_artifact_dir",
             "lab_artifact_commit_dir",
             "lab_daemon_lock_dir",
+            "lab_finalizer_state_dir",
         ],
     )
     def test_lab_daemon_rejects_relative_managed_paths(
@@ -265,6 +267,66 @@ class TestSettings:
 
         assert not root.exists()
 
+    def test_invalid_lab_config_creates_no_base_or_managed_directories(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_dir = tmp_path / "fresh-data"
+        parquet_dir = tmp_path / "fresh-parquet"
+        log_dir = tmp_path / "fresh-logs"
+        managed = tmp_path / "fresh-managed"
+        values = _settings_values(tmp_path)
+        values.update(
+            data_dir=data_dir,
+            duckdb_path=data_dir / "rquant.duckdb",
+            parquet_dir=parquet_dir,
+            log_dir=log_dir,
+            lab_job_command_dir=managed,
+            lab_job_claim_dir=managed / "claims",
+        )
+
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(**values)
+
+        assert not data_dir.exists()
+        assert not parquet_dir.exists()
+        assert not log_dir.exists()
+        assert not managed.exists()
+
+    @pytest.mark.parametrize(
+        "existing_field",
+        ["parquet_dir", "log_dir", "panorama_users_path"],
+    )
+    @pytest.mark.parametrize("relation", ["equal", "lab_inside", "existing_inside"])
+    def test_lab_paths_are_bidirectionally_isolated_from_other_write_paths(
+        self,
+        tmp_path: Path,
+        existing_field: str,
+        relation: str,
+    ) -> None:
+        root = tmp_path / "not-created"
+        existing = root / "existing"
+        if relation == "equal":
+            lab = existing
+        elif relation == "lab_inside":
+            lab = existing / "lab"
+        else:
+            lab = root
+            existing = lab / "existing"
+        values = _settings_values(tmp_path)
+        configured_field = (
+            "RQUANT_PANORAMA_USERS_PATH"
+            if existing_field == "panorama_users_path"
+            else existing_field
+        )
+        values[configured_field] = existing
+        values["lab_job_command_dir"] = lab
+
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(**values)
+
+        assert not root.exists()
+
     def test_lab_daemon_rejects_database_inside_managed_root(self, tmp_path: Path) -> None:
         root = tmp_path / "data" / "commands"
         with pytest.raises(ValidationError, match="database"):
@@ -299,6 +361,8 @@ class TestSettings:
             lab_worker_id="worker-a",
             lab_finalizer_poll_interval_ms=500,
             lab_finalizer_max_jobs_per_tick=7,
+            lab_finalizer_failure_cooldown_seconds=45,
+            lab_finalizer_failure_cooldown_max_seconds=300,
             lab_scheduler_max_artifact_commits_per_tick=9,
         )
 
@@ -321,6 +385,8 @@ class TestSettings:
         assert configured.lab_worker_id == "worker-a"
         assert configured.lab_finalizer_poll_interval_ms == 500
         assert configured.lab_finalizer_max_jobs_per_tick == 7
+        assert configured.lab_finalizer_failure_cooldown_seconds == 45
+        assert configured.lab_finalizer_failure_cooldown_max_seconds == 300
         assert configured.lab_scheduler_max_artifact_commits_per_tick == 9
 
     @pytest.mark.parametrize(
@@ -350,6 +416,8 @@ class TestSettings:
             ("lab_finalizer_poll_interval_ms", 0),
             ("lab_finalizer_max_jobs_per_tick", 0),
             ("lab_finalizer_max_jobs_per_tick", 129),
+            ("lab_finalizer_failure_cooldown_seconds", 0),
+            ("lab_finalizer_failure_cooldown_max_seconds", 86_401),
             ("lab_scheduler_max_artifact_commits_per_tick", 0),
             ("lab_scheduler_max_artifact_commits_per_tick", 257),
         ],
@@ -362,6 +430,14 @@ class TestSettings:
     ) -> None:
         with pytest.raises(ValidationError):
             Settings(**_settings_values(tmp_path), **{field: value})
+
+    def test_lab_finalizer_cooldown_maximum_must_cover_base(self, tmp_path: Path) -> None:
+        with pytest.raises(ValidationError, match="cooldown maximum"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_finalizer_failure_cooldown_seconds=60,
+                lab_finalizer_failure_cooldown_max_seconds=30,
+            )
 
     def test_lab_scheduler_lease_must_cover_three_heartbeats(
         self,

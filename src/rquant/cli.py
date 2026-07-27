@@ -3033,18 +3033,17 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         LabDaemonLock,
         ensure_private_directory,
         prepare_private_sqlite_path,
-        require_clean_code_sha,
+        require_lab_runtime_binding,
     )
     from rquant.lab_job_protocol import LabCommandSpool
     from rquant.lab_jobs import LabJobStore
     from rquant.lab_scheduler import LabScheduler
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LabArtifactReclaimer
-    from rquant.research_manifest import detect_verified_code_commit
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    code_sha = require_clean_code_sha(detect_verified_code_commit)
+    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -3067,16 +3066,18 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     ):
         ensure_private_directory(path, label=label)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "scheduler"):
-        prepare_private_sqlite_path(
+        sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
             label="lab jobs SQLite",
             create=True,
         )
-        artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
+        artifact_store = None
         try:
+            artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
             store = LabJobStore(
                 settings.lab_jobs_path_resolved,
                 busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+                identity_authority=sqlite_authority,
             )
             store.initialize()
             report_spool = LabReportSpool(settings.lab_job_report_dir_resolved)
@@ -3142,7 +3143,9 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                     signal.signal(signum, handler)
             return 0
         finally:
-            artifact_store.close()
+            if artifact_store is not None:
+                artifact_store.close()
+            sqlite_authority.close()
 
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
@@ -3152,15 +3155,15 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         LabDaemonConfigurationError,
         LabDaemonLock,
         ensure_private_directory,
-        require_clean_code_sha,
+        require_lab_runtime_binding,
     )
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LAB_WORKER_MAX_SHARDS_PER_TICK, LabWorker
-    from rquant.research_manifest import detect_verified_code_commit
     from rquant.storage.duckdb import open_readonly_store
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
+    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     worker_id = (args.worker_id or settings.lab_worker_id).strip()
     if worker_id != settings.lab_worker_id:
         raise LabDaemonConfigurationError("worker CLI id does not match configured stable id")
@@ -3168,7 +3171,6 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         raise LabDaemonConfigurationError("worker id is not present in scheduler allowlist")
     if settings.lab_worker_max_shards_per_tick != LAB_WORKER_MAX_SHARDS_PER_TICK:
         raise LabDaemonConfigurationError("worker batch must remain exactly one shard per tick")
-    code_sha = require_clean_code_sha(detect_verified_code_commit)
     for label, path in (
         ("lab claim spool", settings.lab_job_claim_dir_resolved),
         ("lab report spool", settings.lab_job_report_dir_resolved),
@@ -3230,17 +3232,17 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         LabDaemonConfigurationError,
         LabDaemonLock,
         LabFinalizerDaemon,
+        LabFinalizerStateStore,
         ensure_private_directory,
         prepare_private_sqlite_path,
-        require_clean_code_sha,
+        require_lab_runtime_binding,
     )
     from rquant.lab_finalizer import LabFinalizer
     from rquant.lab_jobs import LabJobReader
-    from rquant.research_manifest import detect_verified_code_commit
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    code_sha = require_clean_code_sha(detect_verified_code_commit)
+    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -3257,19 +3259,22 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         ("lab final artifact root", settings.lab_final_artifact_dir_resolved),
         ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
+        ("lab finalizer state root", settings.lab_finalizer_state_dir_resolved),
     ):
         ensure_private_directory(path, label=label)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "finalizer"):
-        prepare_private_sqlite_path(
+        sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
             label="lab jobs SQLite",
             create=False,
         )
-        artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
+        artifact_store = None
         try:
+            artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
             reader = LabJobReader(
                 settings.lab_jobs_path_resolved,
                 busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+                identity_authority=sqlite_authority,
             )
             finalizer = LabFinalizer(
                 reader=reader,
@@ -3286,8 +3291,17 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
             daemon = LabFinalizerDaemon(
                 reader=reader,
                 finalizer=finalizer,
+                state_store=LabFinalizerStateStore(
+                    settings.lab_finalizer_state_dir_resolved
+                ),
                 max_jobs_per_tick=settings.lab_finalizer_max_jobs_per_tick,
                 poll_interval_ms=settings.lab_finalizer_poll_interval_ms,
+                failure_cooldown_seconds=(
+                    settings.lab_finalizer_failure_cooldown_seconds
+                ),
+                failure_cooldown_max_seconds=(
+                    settings.lab_finalizer_failure_cooldown_max_seconds
+                ),
             )
             if args.once:
                 result = daemon.run_once()
@@ -3312,7 +3326,9 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                     signal.signal(signum, handler)
             return 0
         finally:
-            artifact_store.close()
+            if artifact_store is not None:
+                artifact_store.close()
+            sqlite_authority.close()
 
 
 def cmd_panorama_auth_serve(args: argparse.Namespace) -> int:
@@ -4748,6 +4764,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行 Strategy Lab 持久任务控制面",
     )
     lab_scheduler_p.add_argument(
+        "--expected-checkout-root",
+        required=True,
+        help="launch contract 固定的绝对 checkout 根路径",
+    )
+    lab_scheduler_p.add_argument(
         "--once",
         action="store_true",
         help="只消费一批命令并退出",
@@ -4756,6 +4777,11 @@ def build_parser() -> argparse.ArgumentParser:
     lab_worker_p = sub.add_parser(
         "lab-worker",
         help="运行 Strategy Lab 后台分片 worker",
+    )
+    lab_worker_p.add_argument(
+        "--expected-checkout-root",
+        required=True,
+        help="launch contract 固定的绝对 checkout 根路径",
     )
     lab_worker_p.add_argument(
         "--worker-id",
@@ -4771,6 +4797,11 @@ def build_parser() -> argparse.ArgumentParser:
     lab_finalizer_p = sub.add_parser(
         "lab-finalizer",
         help="只读聚合已完成分片并发布完整结果 commit",
+    )
+    lab_finalizer_p.add_argument(
+        "--expected-checkout-root",
+        required=True,
+        help="launch contract 固定的绝对 checkout 根路径",
     )
     lab_finalizer_p.add_argument(
         "--once",

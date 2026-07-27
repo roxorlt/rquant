@@ -77,6 +77,15 @@
   key 路径在任何运行时创建前执行纯 canonical 双向 alias/nesting 校验；scheduler 各输入批次
   均接入显式安全上限，worker 固定每 tick 最多处理一个 shard。
 
+- **Strategy Lab daemon 第二轮身份与公平性加固**：launch contract 现在同时绑定预期 checkout、
+  cwd、Git top-level/HEAD/status、`sys.executable`/virtualenv、console shebang 与实际导入 package
+  root，editable 安装串到其他 worktree 时拒绝启动。Lab SQLite 由保留 parent/database fd、文件
+  身份和共享维护锁的 authority 在连接前后 fencing；仍使用真实路径以保留 SQLite WAL 语义，
+  因此明确不承诺抵御恶意同 UID 进程在连接窗口内实施完整 ABA。finalizer 以独立私有原子 JSON
+  持久化 keyset cursor、cycle 和绑定 job version/spec/update 时间的指数失败冷却，损坏状态直接
+  阻断且不写 Lab SQLite。daemon lock 保留根目录 fd 并以 openat 创建文件；基础目录只在全部
+  canonical/alias/nesting 校验成功后创建，Parquet、日志和 finalizer state 根也纳入双向隔离。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

@@ -35,7 +35,7 @@ from rquant.lab_artifacts import (
     LabArtifactFinalizationLockTimeoutError,
     LabJobArtifactStore,
 )
-from rquant.lab_daemon import LabFinalizerDaemon
+from rquant.lab_daemon import LabFinalizerDaemon, LabFinalizerStateStore
 from rquant.lab_finalizer import (
     LabArtifactRoundtripPeakUsage,
     LabFinalizationCodeMismatchError,
@@ -973,11 +973,16 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
 def test_finalizer_daemon_commit_is_consumed_and_seals_job(tmp_path: Path) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
     reader = LabJobReader(scenario.store.path)
+    state_dir = tmp_path / "finalizer-state"
+    state_dir.mkdir(mode=0o700)
     daemon = LabFinalizerDaemon(
         reader=reader,
         finalizer=scenario.finalizer(),
+        state_store=LabFinalizerStateStore(state_dir),
         max_jobs_per_tick=4,
         poll_interval_ms=10,
+        failure_cooldown_seconds=30,
+        failure_cooldown_max_seconds=300,
     )
 
     finalized = daemon.run_once()

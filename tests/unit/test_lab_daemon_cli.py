@@ -10,9 +10,23 @@ import pytest
 from rquant.cli import build_parser, cmd_lab_finalizer, cmd_lab_scheduler, cmd_lab_worker
 from rquant.lab_daemon import LabDaemonConfigurationError
 
+EXPECTED_ROOT = "/tmp/rquant-expected"
+
+
+class _FakeSqliteAuthority:
+    def __init__(self, path: Path, calls: list[str] | None = None) -> None:
+        self.path = path
+        self.calls = calls
+
+    def close(self) -> None:
+        if self.calls is not None:
+            self.calls.append("sqlite_close")
+
 
 def test_parser_registers_finalizer_and_keeps_legacy_lab_run() -> None:
-    finalizer = build_parser().parse_args(["lab-finalizer", "--once"])
+    finalizer = build_parser().parse_args(
+        ["lab-finalizer", "--expected-checkout-root", EXPECTED_ROOT, "--once"]
+    )
     legacy = build_parser().parse_args(["lab-run", "--spec", "/tmp/spec.json"])
 
     assert finalizer.command == "lab-finalizer"
@@ -26,7 +40,7 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     from rquant import lab_daemon, lab_jobs
     from rquant.config import settings
 
-    monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+    monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
     monkeypatch.setattr(settings, "lab_finalizer_authority_key_id", "")
     monkeypatch.setattr(settings, "lab_finalizer_authority_key_path", None)
     monkeypatch.setattr(settings, "lab_finalizer_authority_keyring_path", None)
@@ -37,17 +51,18 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     )
 
     with pytest.raises(LabDaemonConfigurationError, match="incomplete"):
-        cmd_lab_scheduler(argparse.Namespace(once=True))
+        cmd_lab_scheduler(argparse.Namespace(once=True, expected_checkout_root=EXPECTED_ROOT))
 
 
 def test_worker_rejects_unlisted_identity_before_constructing_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rquant import lab_worker
+    from rquant import lab_daemon, lab_worker
     from rquant.config import settings
 
     monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
     monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-b")
+    monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
     monkeypatch.setattr(
         lab_worker,
         "LabWorker",
@@ -55,7 +70,13 @@ def test_worker_rejects_unlisted_identity_before_constructing_worker(
     )
 
     with pytest.raises(LabDaemonConfigurationError, match="allowlist"):
-        cmd_lab_worker(argparse.Namespace(worker_id="worker-a", once=True))
+        cmd_lab_worker(
+            argparse.Namespace(
+                worker_id="worker-a",
+                once=True,
+                expected_checkout_root=EXPECTED_ROOT,
+            )
+        )
 
 
 def test_finalizer_once_uses_readonly_reader_and_commit_spool(
@@ -73,8 +94,15 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     calls: list[str] = []
 
     class FakeReader:
-        def __init__(self, path: Path, *, busy_timeout_ms: int) -> None:
+        def __init__(
+            self,
+            path: Path,
+            *,
+            busy_timeout_ms: int,
+            identity_authority: object,
+        ) -> None:
             calls.append(f"reader:{path.name}:{busy_timeout_ms}")
+            assert isinstance(identity_authority, _FakeSqliteAuthority)
 
     class FakeSpool:
         def __init__(self, path: Path) -> None:
@@ -125,11 +153,14 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     monkeypatch.setattr(lab_finalizer, "LabFinalizer", FakeFinalizer)
     monkeypatch.setattr(lab_daemon, "LabFinalizerDaemon", FakeDaemon)
     monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
-    monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+    monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
     monkeypatch.setattr(
         lab_daemon,
         "prepare_private_sqlite_path",
-        lambda path, *, label, create: calls.append(f"sqlite:{path.name}:{label}:{create}") or path,
+        lambda path, *, label, create: (
+            calls.append(f"sqlite:{path.name}:{label}:{create}")
+            or _FakeSqliteAuthority(path, calls)
+        ),
     )
     monkeypatch.setattr(
         lab_daemon,
@@ -150,14 +181,14 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     )
     monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
-    result = cmd_lab_finalizer(argparse.Namespace(once=True))
+    result = cmd_lab_finalizer(argparse.Namespace(once=True, expected_checkout_root=EXPECTED_ROOT))
 
     assert result == 0
     assert "reader:lab_jobs.sqlite3:5000" in calls
     assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:False" in calls
     assert "spool:lab_artifact_commits" in calls
     assert "store:lab_final_artifacts" in calls
-    assert calls[-3:] == ["run_once", "store_close", "unlock"]
+    assert calls[-4:] == ["run_once", "store_close", "sqlite_close", "unlock"]
 
 
 def test_finalizer_forever_installs_both_stop_signals(
@@ -176,8 +207,15 @@ def test_finalizer_forever_installs_both_stop_signals(
     calls: list[str] = []
 
     class FakeReader:
-        def __init__(self, _path: Path, *, busy_timeout_ms: int) -> None:
+        def __init__(
+            self,
+            _path: Path,
+            *,
+            busy_timeout_ms: int,
+            identity_authority: object,
+        ) -> None:
             assert busy_timeout_ms > 0
+            assert isinstance(identity_authority, _FakeSqliteAuthority)
 
     class FakeSpool:
         def __init__(self, _path: Path) -> None:
@@ -236,11 +274,11 @@ def test_finalizer_forever_installs_both_stop_signals(
     monkeypatch.setattr(lab_finalizer, "LabFinalizer", FakeFinalizer)
     monkeypatch.setattr(lab_daemon, "LabFinalizerDaemon", FakeDaemon)
     monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
-    monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+    monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
     monkeypatch.setattr(
         lab_daemon,
         "prepare_private_sqlite_path",
-        lambda path, *, label, create: path,
+        lambda path, *, label, create: _FakeSqliteAuthority(path, calls),
     )
     monkeypatch.setattr(
         lab_daemon,
@@ -262,7 +300,13 @@ def test_finalizer_forever_installs_both_stop_signals(
     monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
     monkeypatch.setattr(signal, "signal", fake_signal)
 
-    result = cmd_lab_finalizer(argparse.Namespace(once=False))
+    result = cmd_lab_finalizer(argparse.Namespace(once=False, expected_checkout_root=EXPECTED_ROOT))
 
     assert result == 0
-    assert calls == ["run_forever", "request_stop", "request_stop", "close"]
+    assert calls == [
+        "run_forever",
+        "request_stop",
+        "request_stop",
+        "close",
+        "sqlite_close",
+    ]
