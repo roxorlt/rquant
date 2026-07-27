@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **爆量事件分钟线完全迁云**：云端 `research-ingest` 的当日分钟采集集合改为“盘前
+  Pool 1/2 watchlist ∪ 当日 surge-watch 事件”，`confirmed` 与 `unbuyable` 都纳入，
+  重复事件按代码去重；事件 JSON、代码或状态非法时在任何网络请求和研究湖发布前
+  fail closed。这样爆量记录对应的 241 根日内分钟线不再依赖 Mac monitor 留存。
+  项目版本从 `0.27.0` 更新到 `0.27.1`。
+
 ### Added
 
 - **脉搏与午间报告迁云**：新增 `rquant-morning-pulse`、`rquant-midday-report`
