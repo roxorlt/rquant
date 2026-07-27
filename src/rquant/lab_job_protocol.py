@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import heapq
 import json
@@ -35,6 +36,14 @@ _LabSpoolFileType = Literal[
     "other",
 ]
 _RENAME_NOREPLACE_MAX_ATTEMPTS = 8
+
+
+@dataclass(frozen=True)
+class _ManagedDirectoryIdentity:
+    device: int
+    inode: int
+    mode: int
+    owner: int
 
 
 def _rename_noreplace(
@@ -365,6 +374,7 @@ class LabCommandSpool:
         self._lock_path = self.root / ".spool.lock"
         self._sequence_path = self.root / ".delivery-sequence"
         self._thread_lock = RLock()
+        self._managed_directory_identities: dict[Path, _ManagedDirectoryIdentity] = {}
         self.mutation_guard = mutation_guard
         self.max_isolation_records = max_isolation_records
         self.max_isolation_bytes = max_isolation_bytes
@@ -383,6 +393,7 @@ class LabCommandSpool:
             try:
                 descriptor = self._open_private_lock(root_descriptor)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
+                self._assert_managed_directories_bound()
                 yield
             finally:
                 if descriptor >= 0:
@@ -390,9 +401,8 @@ class LabCommandSpool:
                     os.close(descriptor)
                 os.close(root_descriptor)
 
-    @staticmethod
-    def _fsync_directory(path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY)
+    def _fsync_directory(self, path: Path) -> None:
+        descriptor = self._open_managed_directory(path)
         try:
             os.fsync(descriptor)
         finally:
@@ -515,6 +525,151 @@ class LabCommandSpool:
         finally:
             for descriptor in reversed(opened_descriptors):
                 os.close(descriptor)
+        self._bind_managed_directory(path)
+
+    @staticmethod
+    def _directory_identity(observed: os.stat_result) -> _ManagedDirectoryIdentity:
+        return _ManagedDirectoryIdentity(
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=observed.st_mode,
+            owner=observed.st_uid,
+        )
+
+    def _open_managed_directory(self, path: Path) -> int:
+        normalized = Path(os.path.abspath(path))
+        if normalized == self.root:
+            return self._open_private_root()
+        try:
+            relative = normalized.relative_to(self.root)
+        except ValueError as exc:
+            raise InvalidCommandEnvelopeError("managed spool directory escaped root") from exc
+        parent_descriptor = self._open_private_root()
+        opened_descriptors = [parent_descriptor]
+        try:
+            current = self.root
+            for part in relative.parts:
+                current = current / part
+                descriptor = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
+                opened_descriptors.append(descriptor)
+                parent_descriptor = descriptor
+                bound = self._managed_directory_identities.get(current)
+                opened = os.fstat(descriptor)
+                active = os.stat(part, dir_fd=opened_descriptors[-2], follow_symlinks=False)
+                if bound is not None and (
+                    self._directory_identity(opened) != bound
+                    or self._directory_identity(active) != bound
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        f"managed spool directory identity changed: {current.name}"
+                    )
+                if bound is None:
+                    self._validate_private_directory_stat(
+                        opened,
+                        label="dynamic private spool path",
+                    )
+                    if not self._same_stat(
+                        opened,
+                        active,
+                        include_link_count=False,
+                    ):
+                        raise InvalidCommandEnvelopeError(
+                            f"dynamic spool directory identity changed: {current.name}"
+                        )
+            result = os.dup(parent_descriptor)
+        except (OSError, InvalidCommandEnvelopeError) as exc:
+            if isinstance(exc, InvalidCommandEnvelopeError):
+                raise
+            raise InvalidCommandEnvelopeError(
+                f"managed spool directory identity changed: {normalized.name}"
+            ) from exc
+        finally:
+            for descriptor in reversed(opened_descriptors):
+                os.close(descriptor)
+        return result
+
+    def _bind_managed_directory(self, path: Path) -> None:
+        normalized = Path(os.path.abspath(path))
+        if normalized in self._managed_directory_identities:
+            descriptor = self._open_managed_directory(normalized)
+            os.close(descriptor)
+            return
+        try:
+            observed = normalized.lstat()
+        except OSError as exc:
+            raise InvalidCommandEnvelopeError("managed spool directory is unavailable") from exc
+        self._validate_private_directory_stat(observed, label="managed spool path")
+        self._managed_directory_identities[normalized] = self._directory_identity(observed)
+        try:
+            descriptor = self._open_managed_directory(normalized)
+        except BaseException:
+            self._managed_directory_identities.pop(normalized, None)
+            raise
+        os.close(descriptor)
+
+    def _assert_managed_directories_bound(self) -> None:
+        for path in tuple(self._managed_directory_identities):
+            descriptor = self._open_managed_directory(path)
+            os.close(descriptor)
+
+    def _managed_paths(self, directory: Path, pattern: str) -> tuple[Path, ...]:
+        descriptor = self._open_managed_directory(directory)
+        try:
+            names = tuple(os.listdir(descriptor))
+        finally:
+            os.close(descriptor)
+        return tuple(directory / name for name in names if fnmatch.fnmatchcase(name, pattern))
+
+    def _managed_entry_exists(self, path: Path, directory: Path) -> bool:
+        name = self._direct_child_name(path, directory)
+        descriptor = self._open_managed_directory(directory)
+        try:
+            try:
+                os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            return True
+        finally:
+            os.close(descriptor)
+
+    def _managed_entry_stat(self, path: Path, directory: Path) -> os.stat_result:
+        name = self._direct_child_name(path, directory)
+        descriptor = self._open_managed_directory(directory)
+        try:
+            return os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        finally:
+            os.close(descriptor)
+
+    def _managed_link_target(self, path: Path, directory: Path) -> str:
+        name = self._direct_child_name(path, directory)
+        descriptor = self._open_managed_directory(directory)
+        try:
+            return os.readlink(name, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _unlink_managed_entry(
+        self,
+        path: Path,
+        directory: Path,
+        *,
+        expected: os.stat_result | None = None,
+    ) -> None:
+        name = self._direct_child_name(path, directory)
+        descriptor = self._open_managed_directory(directory)
+        try:
+            current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if expected is not None and not self._stat_matches_bound_entry(current, expected):
+                raise InvalidCommandEnvelopeError("managed spool entry identity changed")
+            self._guard_mutation()
+            os.unlink(name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _open_private_lock(self, root_descriptor: int) -> int:
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
@@ -577,21 +732,71 @@ class LabCommandSpool:
         return descriptor
 
     def _publish_no_clobber(self, target: Path, payload: bytes) -> bool:
-        temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+        target_name = self._direct_child_name(target, target.parent)
+        temporary_name = f".{target.name}.{uuid4().hex}.tmp"
+        directory_descriptor = self._open_managed_directory(target.parent)
+        temporary_descriptor = -1
         try:
-            with temporary.open("xb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
+            temporary_descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(temporary_descriptor, payload[offset:])
+            os.fsync(temporary_descriptor)
             try:
                 self._guard_mutation()
-                os.link(temporary, target)
+                os.link(
+                    temporary_name,
+                    target_name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
             except FileExistsError:
                 return False
-            self._fsync_directory(target.parent)
+            os.fsync(directory_descriptor)
             return True
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            os.close(directory_descriptor)
+
+    def _replace_managed_payload(self, target: Path, payload: bytes) -> None:
+        target_name = self._direct_child_name(target, target.parent)
+        temporary_name = f".{target_name}.{uuid4().hex}.tmp"
+        directory_descriptor = self._open_managed_directory(target.parent)
+        temporary_descriptor = -1
+        try:
+            temporary_descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(temporary_descriptor, payload[offset:])
+            os.fsync(temporary_descriptor)
+            self._guard_mutation()
+            os.replace(
+                temporary_name,
+                target_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            os.fsync(directory_descriptor)
+        finally:
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            os.close(directory_descriptor)
 
     def _next_sequence_locked(self) -> int:
         if self._sequence_path.exists():
@@ -713,14 +918,8 @@ class LabCommandSpool:
         destination_name: str = "entry",
     ) -> Path:
         source_name = self._direct_child_name(source, source.parent)
-        source_fd = os.open(
-            source.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        container_fd = os.open(
-            container,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        source_fd = self._open_managed_directory(source.parent)
+        container_fd = self._open_managed_directory(container)
         try:
             current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
             if not self._stat_matches_bound_entry(current, observed):
@@ -793,12 +992,13 @@ class LabCommandSpool:
         observed: os.stat_result,
     ) -> None:
         try:
-            current = source.lstat()
+            current = self._managed_entry_stat(source, source.parent)
         except FileNotFoundError:
             return
-        if not self._stat_matches_bound_entry(current, observed) or os.path.lexists(
-            container / "entry"
-        ):
+        if not self._stat_matches_bound_entry(
+            current,
+            observed,
+        ) or self._managed_entry_exists(container / "entry", container):
             return
         for record in self._owned_isolation_records_locked():
             if record.container == container:
@@ -818,18 +1018,20 @@ class LabCommandSpool:
         source_area = self._owned_source_area(source.parent)
         file_type = self._spool_file_type(observed.st_mode)
         if file_type == "symlink" and expected_link_target is None:
-            source_fd = os.open(
-                source.parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
+            source_fd = self._open_managed_directory(source.parent)
             try:
                 expected_link_target = os.readlink(source_name, dir_fd=source_fd)
             finally:
                 os.close(source_fd)
         isolation_id = uuid4()
         container = self.quarantine_dir / f"owned-entry-{isolation_id}.dead"
-        self._guard_mutation()
-        os.mkdir(container, mode=0o700)
+        quarantine_fd = self._open_managed_directory(self.quarantine_dir)
+        try:
+            self._guard_mutation()
+            os.mkdir(container.name, mode=0o700, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+        finally:
+            os.close(quarantine_fd)
         evidence = _LabOwnedEntryIsolationEvidence(
             isolation_id=isolation_id,
             source_area=source_area,
@@ -945,7 +1147,9 @@ class LabCommandSpool:
                     f"invalid identity evidence changed while reading: {path.name}"
                 )
             content_hash = hashlib.sha256(payload).hexdigest()
-        link_target = os.readlink(path) if stat.S_ISLNK(observed.st_mode) else None
+        link_target = (
+            self._managed_link_target(path, path.parent) if stat.S_ISLNK(observed.st_mode) else None
+        )
         return _LabOwnedInvalidEvidenceIdentity(
             name=self._invalid_evidence_name(observed, content_hash=content_hash),
             device=observed.st_dev,
@@ -966,7 +1170,11 @@ class LabCommandSpool:
         *,
         invalid_evidence: _LabOwnedInvalidEvidenceIdentity | None,
     ) -> _LabOwnedEntryIsolationEvidence:
-        link_target = os.readlink(container / "entry") if stat.S_ISLNK(entry_stat.st_mode) else None
+        link_target = (
+            self._managed_link_target(container / "entry", container)
+            if stat.S_ISLNK(entry_stat.st_mode)
+            else None
+        )
         evidence = _LabOwnedEntryIsolationEvidence(
             isolation_id=isolation_id,
             source_area="recovered",
@@ -997,7 +1205,7 @@ class LabCommandSpool:
         if match is None:
             return
         try:
-            container_stat = container.lstat()
+            container_stat = self._managed_entry_stat(container, self.quarantine_dir)
         except FileNotFoundError:
             return
         if not stat.S_ISDIR(container_stat.st_mode):
@@ -1009,7 +1217,7 @@ class LabCommandSpool:
             return
         entry = container / "entry"
         try:
-            entry_stat = entry.lstat()
+            entry_stat = self._managed_entry_stat(entry, container)
         except FileNotFoundError:
             entry_stat = None
         try:
@@ -1019,8 +1227,8 @@ class LabCommandSpool:
                 return
             evidence_path = container / "evidence.json"
             invalid_evidence: _LabOwnedInvalidEvidenceIdentity | None = None
-            if os.path.lexists(evidence_path):
-                invalid_stat = evidence_path.lstat()
+            if self._managed_entry_exists(evidence_path, container):
+                invalid_stat = self._managed_entry_stat(evidence_path, container)
                 invalid_evidence = self._invalid_evidence_identity_locked(
                     evidence_path,
                     invalid_stat,
@@ -1041,14 +1249,17 @@ class LabCommandSpool:
         if entry_stat is not None:
             if not self._stat_matches_isolation(entry_stat, evidence):
                 return
-            if evidence.link_target is not None and os.readlink(entry) != evidence.link_target:
+            if (
+                evidence.link_target is not None
+                and self._managed_link_target(entry, container) != evidence.link_target
+            ):
                 return
             return
         source = self._owned_source_path(evidence)
         if source is None:
             return
         try:
-            source_stat = source.lstat()
+            source_stat = self._managed_entry_stat(source, source.parent)
         except FileNotFoundError:
             return
         if not self._stat_matches_isolation(source_stat, evidence):
@@ -1061,7 +1272,7 @@ class LabCommandSpool:
         )
 
     def _reconcile_owned_isolations_locked(self) -> None:
-        for container in sorted(self.quarantine_dir.glob("owned-entry-*.dead")):
+        for container in sorted(self._managed_paths(self.quarantine_dir, "owned-entry-*.dead")):
             if self._OWNED_ISOLATION_NAME.fullmatch(container.name) is None:
                 continue
             with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
@@ -1069,11 +1280,11 @@ class LabCommandSpool:
 
     def _owned_isolation_records_locked(self) -> list[_LabOwnedIsolationRecord]:
         records: list[_LabOwnedIsolationRecord] = []
-        for container in self.quarantine_dir.glob("owned-entry-*.dead"):
+        for container in self._managed_paths(self.quarantine_dir, "owned-entry-*.dead"):
             if self._OWNED_ISOLATION_NAME.fullmatch(container.name) is None:
                 continue
             try:
-                container_stat = container.lstat()
+                container_stat = self._managed_entry_stat(container, self.quarantine_dir)
             except FileNotFoundError:
                 continue
             if not stat.S_ISDIR(container_stat.st_mode):
@@ -1088,17 +1299,28 @@ class LabCommandSpool:
                 continue
             modified_at_ns = container_stat.st_mtime_ns
             byte_count = 0
+            container_fd = -1
             try:
-                names = os.listdir(container)
-            except OSError:
-                names = []
-            for name in names:
-                try:
-                    child_stat = (container / name).lstat()
-                except FileNotFoundError:
+                container_fd = self._open_managed_directory(container)
+                opened = os.fstat(container_fd)
+                if not self._stat_matches_bound_entry(opened, container_stat):
                     continue
-                modified_at_ns = max(modified_at_ns, child_stat.st_mtime_ns)
-                byte_count += max(0, child_stat.st_size)
+                for name in os.listdir(container_fd):
+                    try:
+                        child_stat = os.stat(
+                            name,
+                            dir_fd=container_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    modified_at_ns = max(modified_at_ns, child_stat.st_mtime_ns)
+                    byte_count += max(0, child_stat.st_size)
+            except (OSError, InvalidCommandEnvelopeError):
+                pass
+            finally:
+                if container_fd >= 0:
+                    os.close(container_fd)
             records.append(
                 _LabOwnedIsolationRecord(
                     container=container,
@@ -1139,7 +1361,10 @@ class LabCommandSpool:
         record: _LabOwnedIsolationRecord,
     ) -> bool:
         try:
-            current_container = record.container.lstat()
+            current_container = self._managed_entry_stat(
+                record.container,
+                self.quarantine_dir,
+            )
         except FileNotFoundError:
             return True
         if (
@@ -1149,10 +1374,7 @@ class LabCommandSpool:
         ):
             return False
         if not stat.S_ISDIR(current_container.st_mode):
-            quarantine_fd = os.open(
-                self.quarantine_dir,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
+            quarantine_fd = self._open_managed_directory(self.quarantine_dir)
             try:
                 return self._remove_bound_directory_entry(
                     quarantine_fd,
@@ -1161,11 +1383,10 @@ class LabCommandSpool:
                 )
             finally:
                 os.close(quarantine_fd)
-        container_fd = os.open(
-            record.container,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        container_fd = self._open_managed_directory(record.container)
         try:
+            if not self._stat_matches_bound_entry(os.fstat(container_fd), current_container):
+                return False
             names = os.listdir(container_fd)
             try:
                 evidence, evidence_stat = self._load_owned_isolation_evidence_with_stat(
@@ -1253,10 +1474,7 @@ class LabCommandSpool:
                     return False
         finally:
             os.close(container_fd)
-        quarantine_fd = os.open(
-            self.quarantine_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        quarantine_fd = self._open_managed_directory(self.quarantine_dir)
         try:
             current_container = os.stat(
                 record.container.name,
@@ -1299,18 +1517,17 @@ class LabCommandSpool:
     def _prune_quarantine_locked(self) -> None:
         self._prune_owned_isolations_locked()
 
-    @staticmethod
     def _read_regular_child(
+        self,
         path: Path,
         parent: Path,
         *,
         allowed_link_counts: frozenset[int] = frozenset({1}),
     ) -> tuple[Path, bytes, os.stat_result]:
-        name = LabCommandSpool._direct_child_name(path, parent)
+        name = self._direct_child_name(path, parent)
         normalized = Path(os.path.abspath(parent)) / name
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        directory_fd = os.open(parent, directory_flags)
+        directory_fd = self._open_managed_directory(parent)
         try:
             try:
                 path_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1335,7 +1552,7 @@ class LabCommandSpool:
                     path=normalized,
                     device=path_stat.st_dev,
                     inode=path_stat.st_ino,
-                    file_type=LabCommandSpool._spool_file_type(path_stat.st_mode),
+                    file_type=self._spool_file_type(path_stat.st_mode),
                     link_count=path_stat.st_nlink,
                 )
                 raise InvalidCommandEnvelopeError(
@@ -1399,7 +1616,7 @@ class LabCommandSpool:
 
     def _pending_for_request_locked(self, request_id: UUID) -> Path | None:
         matches: list[Path] = []
-        for candidate in self.pending_dir.glob("*.json"):
+        for candidate in self._managed_paths(self.pending_dir, "*.json"):
             try:
                 _sequence, candidate_request_id = self._pending_name_parts(candidate.name)
             except InvalidCommandEnvelopeError:
@@ -1421,7 +1638,7 @@ class LabCommandSpool:
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{request_id}.json"
             pending_path = self._pending_for_request_locked(request_id)
-            if os.path.lexists(ack_path):
+            if self._managed_entry_exists(ack_path, self.ack_dir):
                 receipt = self.load_receipt(ack_path)
                 if pending_path is not None:
                     pending = self.load(pending_path)
@@ -1441,7 +1658,7 @@ class LabCommandSpool:
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{validated.request_id}.json"
             pending_path = self._pending_for_request_locked(validated.request_id)
-            if os.path.lexists(ack_path):
+            if self._managed_entry_exists(ack_path, self.ack_dir):
                 receipt = self.load_receipt(ack_path)
                 if pending_path is not None:
                     pending = self.load(pending_path)
@@ -1566,7 +1783,12 @@ class LabCommandSpool:
 
     def pending_paths(self, *, limit: int | None = None) -> tuple[Path, ...]:
         with self._exclusive_lock():
-            paths = tuple(sorted(self.pending_dir.glob("*.json"), key=self._delivery_key))
+            paths = tuple(
+                sorted(
+                    self._managed_paths(self.pending_dir, "*.json"),
+                    key=self._delivery_key,
+                )
+            )
             ordered = self._apply_command_precedence(paths)
             return ordered if limit is None else ordered[:limit]
 
@@ -1624,8 +1846,7 @@ class LabCommandSpool:
         expected_link_count: int = 1,
     ) -> None:
         name = self._direct_child_name(path, self.pending_dir)
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_fd = os.open(self.pending_dir, directory_flags)
+        directory_fd = self._open_managed_directory(self.pending_dir)
         try:
             try:
                 current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1662,7 +1883,7 @@ class LabCommandSpool:
             source = Path(os.path.abspath(source))
             self._direct_child_name(source, self.pending_dir)
             try:
-                observed = source.lstat()
+                observed = self._managed_entry_stat(source, self.pending_dir)
             except FileNotFoundError:
                 return self._record_disappeared_locked(source, reason=reason)
             expected_link_target: str | None = None

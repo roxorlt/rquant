@@ -13,13 +13,16 @@ WORKING_DIRECTORY = "/Users/roxor/brain/30-projects/rQuant"
 PYTHON = f"{WORKING_DIRECTORY}/.venv/bin/python"
 WRAPPER = f"{WORKING_DIRECTORY}/scripts/run-lab-daemon.py"
 EXECUTABLE = f"{WORKING_DIRECTORY}/.venv/bin/rquant"
+TRUSTED_GIT = "/usr/bin/git"
 EXPECTED_ROOT_ARGUMENTS = ["--expected-checkout-root", WORKING_DIRECTORY]
+TRUSTED_GIT_ARGUMENTS = ["--trusted-git-path", TRUSTED_GIT]
 WRAPPER_ARGUMENTS = [
     PYTHON,
     "-I",
     "-S",
     WRAPPER,
     *EXPECTED_ROOT_ARGUMENTS,
+    *TRUSTED_GIT_ARGUMENTS,
     "--",
 ]
 
@@ -54,12 +57,14 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
         document = plistlib.load(stream)
 
     assert document["Label"] == label
-    assert document["ProgramArguments"][: len(WRAPPER_ARGUMENTS) + 4] == [
+    expected_prefix = [
         *WRAPPER_ARGUMENTS,
         EXECUTABLE,
         command,
         *EXPECTED_ROOT_ARGUMENTS,
+        *TRUSTED_GIT_ARGUMENTS,
     ]
+    assert document["ProgramArguments"][: len(expected_prefix)] == expected_prefix
     assert document["WorkingDirectory"] == WORKING_DIRECTORY
     assert document["RunAtLoad"] is True
     assert document["KeepAlive"] == {"SuccessfulExit": False}
@@ -72,6 +77,7 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
     assert document.get("EnvironmentVariables", {}) == {
         "PATH": f"{WORKING_DIRECTORY}/.venv/bin:/usr/local/bin:/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "RQUANT_TRUSTED_GIT_PATH": TRUSTED_GIT,
     }
     serialized = path.read_text(encoding="utf-8")
     assert "SECRET" not in serialized
@@ -88,6 +94,7 @@ def test_lab_worker_launchd_uses_configured_stable_identity() -> None:
         EXECUTABLE,
         "lab-worker",
         *EXPECTED_ROOT_ARGUMENTS,
+        *TRUSTED_GIT_ARGUMENTS,
         "--worker-id",
         "rquant-mac-primary",
     ]
@@ -152,6 +159,8 @@ def test_real_worktree_launcher_rejects_symlinked_venv_before_config() -> None:
             "lab-worker",
             "--expected-checkout-root",
             str(ROOT),
+            "--trusted-git-path",
+            TRUSTED_GIT,
             "--worker-id",
             "rquant-mac-primary",
             "--once",

@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "scripts" / "run-lab-daemon.py"
 PREFLIGHT = ROOT / "scripts" / "preflight-lab-runtime.py"
+TRUSTED_GIT = Path("/usr/bin/git")
 
 
 def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -89,11 +90,15 @@ def _run_wrapper(
             str(checkout / "scripts" / WRAPPER.name),
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--",
             str(executable),
             "lab-worker",
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--worker-id",
             "rquant-mac-primary",
             "--once",
@@ -206,11 +211,15 @@ def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflig
         [
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--",
             str(executable),
             "lab-worker",
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--worker-id",
             "rquant-mac-primary",
             "--once",
@@ -254,11 +263,15 @@ def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
         [
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--",
             str(executable),
             "lab-worker",
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--worker-id",
             "rquant-mac-primary",
             "--once",
@@ -267,6 +280,119 @@ def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
 
     assert result == 1
     assert exec_calls == []
+    assert not marker.exists()
+
+
+def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    namespace = runpy.run_path(str(WRAPPER), run_name="lab_wrapper_test")
+    namespace["main"].__globals__["__file__"] = str(checkout / "scripts" / WRAPPER.name)
+    tracked = checkout / "src" / "rquant" / "__init__.py"
+    exec_calls: list[tuple[object, ...]] = []
+    original_run = subprocess.run
+    preflight_calls = 0
+
+    def dirty_after_second_preflight(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal preflight_calls
+        result = original_run(*args, **kwargs)
+        command = args[0]
+        if any(Path(str(value)).name == PREFLIGHT.name for value in command):
+            preflight_calls += 1
+            if preflight_calls == 2:
+                tracked.write_text("UNTRUSTED_AFTER_SECOND = True\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", dirty_after_second_preflight)
+    monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
+    monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
+    monkeypatch.chdir(checkout)
+    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
+        monkeypatch.delenv(variable, raising=False)
+
+    result = namespace["main"](
+        [
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--",
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ]
+    )
+
+    assert preflight_calls >= 2
+    assert result == 1
+    assert exec_calls == []
+    assert not marker.exists()
+
+
+def test_lab_runtime_wrapper_ignores_fake_venv_git(
+    tmp_path: Path,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    fake_marker = tmp_path / "fake-git-ran"
+    fake_git = checkout / ".venv" / "bin" / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\ntouch {fake_marker!s}\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    (checkout / "src" / "rquant" / "__init__.py").write_text(
+        "UNTRUSTED = True\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
+        environment.pop(variable, None)
+    environment["PATH"] = f"{fake_git.parent}:{environment.get('PATH', '')}"
+    environment["LAB_WRAPPER_MARKER"] = str(marker)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    result = subprocess.run(
+        [
+            str(checkout / ".venv" / "bin" / "python"),
+            "-I",
+            "-S",
+            str(checkout / "scripts" / WRAPPER.name),
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--",
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ],
+        cwd=checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode != 0
+    assert not fake_marker.exists()
     assert not marker.exists()
 
 
@@ -287,11 +413,15 @@ def test_lab_runtime_wrapper_rejects_mismatched_daemon_root(tmp_path: Path) -> N
             str(checkout / "scripts" / WRAPPER.name),
             "--expected-checkout-root",
             str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--",
             str(executable),
             "lab-worker",
             "--expected-checkout-root",
             str(other),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             "--once",
         ],
         cwd=checkout,

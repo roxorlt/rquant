@@ -101,6 +101,22 @@ def _envelope(tmp_path: Path, *, request_id: UUID | None = None) -> LabArtifactC
     )
 
 
+def test_artifact_commit_spool_rejects_post_init_pending_replacement(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "artifact-commits")
+    external = tmp_path / "external-pending"
+    external.mkdir(mode=0o700)
+    displaced = spool.pending_dir.with_name(f"{spool.pending_dir.name}-displaced")
+    spool.pending_dir.rename(displaced)
+    spool.pending_dir.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.publish(_envelope(tmp_path))
+
+    assert tuple(external.iterdir()) == ()
+
+
 def test_finalizer_authority_key_is_validated_and_secret_is_not_serialized() -> None:
     key = LabFinalizerAuthorityKey(key_id="rotation-a", secret=b"s" * 32)
 

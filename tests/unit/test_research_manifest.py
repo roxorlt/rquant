@@ -327,6 +327,59 @@ def test_detect_verified_code_commit_rejects_injected_identity_drift(
     assert detect_verified_code_commit(repo) == f"{head}-dirty"
 
 
+def test_detect_verified_code_commit_uses_explicit_trusted_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    repo = tmp_path / "repo"
+    fake_bin = repo / ".venv" / "bin"
+    fake_bin.mkdir(parents=True)
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=repo, check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["/usr/bin/git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    marker = tmp_path / "fake-git-ran"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(f"#!/bin/sh\ntouch {marker!s}\nexit 0\n", encoding="utf-8")
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+    tracked.write_text("dirty\n", encoding="utf-8")
+
+    observed = detect_verified_code_commit(
+        repo,
+        trusted_git_path=Path("/usr/bin/git"),
+    )
+
+    assert observed is not None and observed.endswith("-dirty")
+    assert not marker.exists()
+
+
+def test_trusted_git_binding_rejects_symlink(tmp_path: Path) -> None:
+    from rquant.research_manifest import bind_trusted_git_executable
+
+    linked_git = tmp_path / "linked-git"
+    linked_git.symlink_to("/usr/bin/git")
+
+    with pytest.raises(ValueError, match="physical"):
+        bind_trusted_git_executable(linked_git)
+
+
 def test_detect_verified_code_commit_rejects_unignored_worktree_venv_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

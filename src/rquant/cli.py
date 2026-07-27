@@ -2951,8 +2951,16 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
-    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
-    runtime_guard = LabRuntimeGuard(Path(args.expected_checkout_root), code_sha)
+    trusted_git_path = Path(args.trusted_git_path)
+    code_sha = require_lab_runtime_binding(
+        Path(args.expected_checkout_root),
+        trusted_git_path,
+    )
+    runtime_guard = LabRuntimeGuard(
+        Path(args.expected_checkout_root),
+        code_sha,
+        trusted_git_path,
+    )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -2972,6 +2980,8 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
+    if settings.lab_trusted_git_path != trusted_git_path:
+        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -3110,8 +3120,16 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     """Run a fenced Strategy Lab shard worker."""
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
-    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
-    runtime_guard = LabRuntimeGuard(Path(args.expected_checkout_root), code_sha)
+    trusted_git_path = Path(args.trusted_git_path)
+    code_sha = require_lab_runtime_binding(
+        Path(args.expected_checkout_root),
+        trusted_git_path,
+    )
+    runtime_guard = LabRuntimeGuard(
+        Path(args.expected_checkout_root),
+        code_sha,
+        trusted_git_path,
+    )
     from rquant.config import settings
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
@@ -3125,6 +3143,8 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
+    if settings.lab_trusted_git_path != trusted_git_path:
+        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     worker_id = (args.worker_id or settings.lab_worker_id).strip()
     if worker_id != settings.lab_worker_id:
         raise LabDaemonConfigurationError("worker CLI id does not match configured stable id")
@@ -3202,8 +3222,16 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     """Finalize ready Strategy Lab jobs without writable SQLite access."""
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
-    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
-    runtime_guard = LabRuntimeGuard(Path(args.expected_checkout_root), code_sha)
+    trusted_git_path = Path(args.trusted_git_path)
+    code_sha = require_lab_runtime_binding(
+        Path(args.expected_checkout_root),
+        trusted_git_path,
+    )
+    runtime_guard = LabRuntimeGuard(
+        Path(args.expected_checkout_root),
+        code_sha,
+        trusted_git_path,
+    )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3222,6 +3250,8 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
+    if settings.lab_trusted_git_path != trusted_git_path:
+        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -4982,6 +5012,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="launch contract 固定的绝对 checkout 根路径",
     )
     lab_scheduler_p.add_argument(
+        "--trusted-git-path",
+        required=True,
+        help="launch contract 固定的可信绝对 Git 可执行文件",
+    )
+    lab_scheduler_p.add_argument(
         "--once",
         action="store_true",
         help="只消费一批命令并退出",
@@ -4995,6 +5030,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-checkout-root",
         required=True,
         help="launch contract 固定的绝对 checkout 根路径",
+    )
+    lab_worker_p.add_argument(
+        "--trusted-git-path",
+        required=True,
+        help="launch contract 固定的可信绝对 Git 可执行文件",
     )
     lab_worker_p.add_argument(
         "--worker-id",
@@ -5015,6 +5055,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-checkout-root",
         required=True,
         help="launch contract 固定的绝对 checkout 根路径",
+    )
+    lab_finalizer_p.add_argument(
+        "--trusted-git-path",
+        required=True,
+        help="launch contract 固定的可信绝对 Git 可执行文件",
     )
     lab_finalizer_p.add_argument(
         "--once",

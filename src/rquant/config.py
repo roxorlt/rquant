@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     lab_artifact_commit_dir: Path | None = None
     lab_daemon_lock_dir: Path | None = None
     lab_finalizer_state_dir: Path | None = None
+    lab_trusted_git_path: Path = Path("/usr/bin/git")
     lab_finalizer_authority_key_id: str = ""
     lab_finalizer_authority_key_path: Path | None = None
     lab_finalizer_authority_keyring_path: Path | None = None
@@ -206,6 +207,7 @@ class Settings(BaseSettings):
         "lab_finalizer_state_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
+        "lab_trusted_git_path",
         mode="before",
     )
     @classmethod
@@ -224,6 +226,7 @@ class Settings(BaseSettings):
         "lab_finalizer_state_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
+        "lab_trusted_git_path",
         mode="after",
     )
     @classmethod

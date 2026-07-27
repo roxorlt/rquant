@@ -408,6 +408,90 @@ def test_spool_publish_load_ack_is_durable_and_typed(tmp_path: Path) -> None:
     assert spool.load_receipt(acknowledged.path) == receipt
 
 
+def _replace_managed_spool_directory(path: Path, external: Path) -> Path:
+    displaced = path.with_name(f"{path.name}-displaced")
+    path.rename(displaced)
+    path.symlink_to(external, target_is_directory=True)
+    return displaced
+
+
+def test_spool_publish_rejects_post_init_pending_symlink_without_external_write(
+    tmp_path: Path,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    external = tmp_path / "external-pending"
+    external.mkdir(mode=0o700)
+    _replace_managed_spool_directory(spool.pending_dir, external)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.publish(_submit_envelope())
+
+    assert tuple(external.iterdir()) == ()
+
+
+def test_spool_list_and_load_reject_post_init_pending_replacement(
+    tmp_path: Path,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    published = spool.publish(_submit_envelope())
+    payload = published.path.read_bytes()
+    external = tmp_path / "external-pending"
+    external.mkdir(mode=0o700)
+    displaced = _replace_managed_spool_directory(spool.pending_dir, external)
+    external_entry = external / published.path.name
+    external_entry.write_bytes(payload)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.pending()
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.load(spool.pending_dir / published.path.name)
+
+    assert external_entry.read_bytes() == payload
+    assert (displaced / published.path.name).read_bytes() == payload
+
+
+def test_spool_ack_rejects_post_init_ack_symlink_without_external_write(
+    tmp_path: Path,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    envelope = _submit_envelope()
+    published = spool.publish(envelope)
+    external = tmp_path / "external-ack"
+    external.mkdir(mode=0o700)
+    _replace_managed_spool_directory(spool.ack_dir, external)
+    receipt = LabCommandReceipt(
+        request_id=envelope.request_id,
+        content_hash=envelope.content_hash,
+        job_id=envelope.command.job_id,
+        status="applied",
+        reason="submitted",
+        job_version=0,
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.ack(published, receipt)
+
+    assert tuple(external.iterdir()) == ()
+    assert published.path.exists()
+
+
+def test_spool_quarantine_rejects_post_init_replacement_without_external_write(
+    tmp_path: Path,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    bad = spool.pending_dir / f"{uuid4()}.json"
+    bad.write_text("{broken", encoding="utf-8")
+    external = tmp_path / "external-quarantine"
+    external.mkdir(mode=0o700)
+    _replace_managed_spool_directory(spool.quarantine_dir, external)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.quarantine(bad, reason="invalid_json")
+
+    assert tuple(external.iterdir()) == ()
+    assert bad.exists()
+
+
 def test_same_request_and_content_publish_is_idempotent(tmp_path: Path) -> None:
     spool = LabCommandSpool(tmp_path / "commands")
     envelope = _submit_envelope()

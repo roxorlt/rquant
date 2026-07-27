@@ -456,7 +456,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         return self.quarantine_dir / f".{target.name}.publishing.tmp"
 
     def _load_scan_cursor_locked(self) -> LabArtifactCommitScanCursor | None:
-        if not os.path.lexists(self._scan_cursor_path):
+        if not self._managed_entry_exists(self._scan_cursor_path, self.root):
             return None
         try:
             observed = self._scan_cursor_path.lstat()
@@ -539,7 +539,12 @@ class LabArtifactCommitSpool(LabCommandSpool):
         if limit < 1:
             raise ValueError("artifact fair scan limit must be positive")
         with self._exclusive_lock():
-            paths = tuple(sorted(self.pending_dir.glob("*.json"), key=self._delivery_key))
+            paths = tuple(
+                sorted(
+                    self._managed_paths(self.pending_dir, "*.json"),
+                    key=self._delivery_key,
+                )
+            )
             if not paths:
                 return ()
             cursor = self._load_scan_cursor_locked()
@@ -617,7 +622,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         target_name: str,
     ) -> None:
         try:
-            observed = temporary.lstat()
+            observed = self._managed_entry_stat(temporary, self.quarantine_dir)
         except FileNotFoundError:
             return
         target = self.quarantine_dir / target_name
@@ -642,7 +647,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             )
             if relation is not None:
                 try:
-                    target_stat = target.lstat()
+                    target_stat = self._managed_entry_stat(target, self.quarantine_dir)
                 except FileNotFoundError:
                     return
                 self._isolate_conflict_entry_locked(
@@ -659,11 +664,11 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 reason="artifact conflict temporary basename does not match typed evidence",
             )
             return
-        if os.path.lexists(target) and relation is None:
+        if self._managed_entry_exists(target, target.parent) and relation is None:
             try:
                 existing, existing_payload, _target_stat = self._load_conflict_target_locked(target)
             except (InvalidCommandEnvelopeError, ValueError):
-                target_stat = target.lstat()
+                target_stat = self._managed_entry_stat(target, self.quarantine_dir)
                 self._isolate_conflict_entry_locked(
                     target,
                     target_stat,
@@ -677,17 +682,14 @@ class LabArtifactCommitSpool(LabCommandSpool):
                         reason="duplicate artifact conflict publication temporary",
                     )
                     return
-                target_stat = target.lstat()
+                target_stat = self._managed_entry_stat(target, self.quarantine_dir)
                 self._isolate_conflict_entry_locked(
                     target,
                     target_stat,
                     reason="conflicting deterministic artifact conflict evidence target",
                 )
-        if not os.path.lexists(target):
-            directory_fd = os.open(
-                self.quarantine_dir,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
+        if not self._managed_entry_exists(target, target.parent):
+            directory_fd = self._open_managed_directory(self.quarantine_dir)
             try:
                 try:
                     self._guard_mutation()
@@ -705,7 +707,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 os.close(directory_fd)
         relation = self._matching_regular_entries(temporary, target)
         if relation is None:
-            current = temporary.lstat()
+            current = self._managed_entry_stat(temporary, self.quarantine_dir)
             self._isolate_conflict_entry_locked(
                 temporary,
                 current,
@@ -715,7 +717,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         self._before_conflict_temp_unlink(temporary, target)
         relation = self._matching_regular_entries(temporary, target)
         if relation is None:
-            current = temporary.lstat()
+            current = self._managed_entry_stat(temporary, self.quarantine_dir)
             self._isolate_conflict_entry_locked(
                 temporary,
                 current,
@@ -730,14 +732,14 @@ class LabArtifactCommitSpool(LabCommandSpool):
         )
 
     def _isolate_invalid_conflict_targets_locked(self) -> None:
-        for target in sorted(self.quarantine_dir.glob("*.conflict.evidence.json")):
+        for target in sorted(self._managed_paths(self.quarantine_dir, "*.conflict.evidence.json")):
             if self._CONFLICT_NAME.fullmatch(target.name) is None:
                 continue
             try:
                 self._load_conflict_target_locked(target)
             except (InvalidCommandEnvelopeError, ValueError, OSError):
                 try:
-                    observed = target.lstat()
+                    observed = self._managed_entry_stat(target, self.quarantine_dir)
                 except FileNotFoundError:
                     continue
                 with suppress(InvalidCommandEnvelopeError, OSError):
@@ -758,11 +760,11 @@ class LabArtifactCommitSpool(LabCommandSpool):
         self._recover_conflict_evidence_locked()
         target = self._conflict_evidence_path(evidence)
         payload = evidence.model_dump_json().encode("utf-8")
-        if os.path.lexists(target):
+        if self._managed_entry_exists(target, target.parent):
             try:
                 existing, existing_payload, _file_stat = self._load_conflict_target_locked(target)
             except (InvalidCommandEnvelopeError, ValueError):
-                observed = target.lstat()
+                observed = self._managed_entry_stat(target, self.quarantine_dir)
                 self._isolate_conflict_entry_locked(
                     target,
                     observed,
@@ -771,7 +773,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             else:
                 if existing == evidence and existing_payload == payload:
                     return
-                observed = target.lstat()
+                observed = self._managed_entry_stat(target, self.quarantine_dir)
                 self._isolate_conflict_entry_locked(
                     target,
                     observed,
@@ -779,31 +781,42 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 )
 
         temporary = self._conflict_temporary_path(evidence)
-        if os.path.lexists(temporary):
+        if self._managed_entry_exists(temporary, temporary.parent):
             self._recover_conflict_evidence_locked()
-            if os.path.lexists(target):
+            if self._managed_entry_exists(target, target.parent):
                 existing, existing_payload, _file_stat = self._load_conflict_target_locked(target)
                 if existing == evidence and existing_payload == payload:
                     return
-            if os.path.lexists(temporary):
-                observed = temporary.lstat()
+            if self._managed_entry_exists(temporary, temporary.parent):
+                observed = self._managed_entry_stat(temporary, self.quarantine_dir)
                 self._isolate_conflict_entry_locked(
                     temporary,
                     observed,
                     reason="unrecoverable artifact conflict publication temporary",
                 )
 
-        with temporary.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        self._fsync_directory(self.quarantine_dir)
+        directory_fd = self._open_managed_directory(self.quarantine_dir)
+        temporary_fd = -1
+        try:
+            temporary_fd = os.open(
+                temporary.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(temporary_fd, payload[offset:])
+            os.fsync(temporary_fd)
+            os.fsync(directory_fd)
+        except BaseException:
+            os.close(directory_fd)
+            raise
+        finally:
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
         self._after_conflict_evidence_stage("temporary_written", temporary)
 
-        directory_fd = os.open(
-            self.quarantine_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
         try:
             try:
                 self._guard_mutation()
@@ -827,7 +840,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             os.close(directory_fd)
         self._after_conflict_evidence_stage("target_linked", target)
 
-        temporary_stat = temporary.lstat()
+        temporary_stat = self._managed_entry_stat(temporary, self.quarantine_dir)
         self._unlink_regular_identity(
             temporary,
             temporary_stat,
@@ -857,10 +870,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         *,
         allowed_link_counts: frozenset[int] = frozenset({1}),
     ) -> None:
-        directory_fd = os.open(
-            path.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        directory_fd = self._open_managed_directory(path.parent)
         try:
             try:
                 current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
@@ -881,14 +891,14 @@ class LabArtifactCommitSpool(LabCommandSpool):
         finally:
             os.close(directory_fd)
 
-    @staticmethod
     def _matching_regular_entries(
+        self,
         first: Path,
         second: Path,
     ) -> tuple[os.stat_result, os.stat_result] | None:
         try:
-            first_stat = first.lstat()
-            second_stat = second.lstat()
+            first_stat = self._managed_entry_stat(first, first.parent)
+            second_stat = self._managed_entry_stat(second, second.parent)
         except FileNotFoundError:
             return None
         if (
@@ -903,7 +913,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         return first_stat, second_stat
 
     def _recover_conflict_evidence_locked(self) -> None:
-        for temporary in sorted(self.quarantine_dir.glob(".*.publishing.tmp")):
+        for temporary in sorted(self._managed_paths(self.quarantine_dir, ".*.publishing.tmp")):
             match = self._CONFLICT_TEMP_NAME.fullmatch(temporary.name)
             if match is None:
                 continue
@@ -916,7 +926,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
 
     def _new_conflict_records_locked(self) -> list[_ConflictEvidenceRecord]:
         records: list[_ConflictEvidenceRecord] = []
-        for path in self.quarantine_dir.glob("*.conflict.evidence.json"):
+        for path in self._managed_paths(self.quarantine_dir, "*.conflict.evidence.json"):
             try:
                 evidence, _payload, file_stat = self._load_conflict_evidence_file(path)
             except (InvalidCommandEnvelopeError, ValueError):
@@ -931,7 +941,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     files=((path, file_stat),),
                 )
             )
-        for path in self.quarantine_dir.glob(".*.publishing.tmp"):
+        for path in self._managed_paths(self.quarantine_dir, ".*.publishing.tmp"):
             if self._CONFLICT_TEMP_NAME.fullmatch(path.name) is None:
                 continue
             try:
@@ -956,7 +966,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
     def _legacy_conflict_records_locked(self) -> list[_ConflictEvidenceRecord]:
         records: list[_ConflictEvidenceRecord] = []
         seen_metadata: set[Path] = set()
-        for payload_path in self.quarantine_dir.glob("*.conflict.bad"):
+        for payload_path in self._managed_paths(self.quarantine_dir, "*.conflict.bad"):
             match = self._LEGACY_CONFLICT_NAME.fullmatch(payload_path.name)
             if match is None:
                 continue
@@ -975,7 +985,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 continue
             files: list[tuple[Path, os.stat_result]] = [(payload_path, payload_stat)]
             metadata_path = Path(f"{payload_path}.json")
-            if os.path.lexists(metadata_path):
+            if self._managed_entry_exists(metadata_path, metadata_path.parent):
                 try:
                     _metadata, metadata, metadata_stat = self._read_regular_child(
                         metadata_path,
@@ -999,7 +1009,10 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     files=tuple(files),
                 )
             )
-        for metadata_path in self.quarantine_dir.glob("*.conflict.bad.json"):
+        for metadata_path in self._managed_paths(
+            self.quarantine_dir,
+            "*.conflict.bad.json",
+        ):
             if metadata_path in seen_metadata:
                 continue
             payload_path = Path(str(metadata_path)[: -len(".json")])
@@ -1106,7 +1119,9 @@ class LabArtifactCommitSpool(LabCommandSpool):
             self._recover_conflict_evidence_locked()
             self._prune_conflicts_locked()
             evidence: list[LabArtifactConflictEvidence] = []
-            for path in sorted(self.quarantine_dir.glob("*.conflict.evidence.json")):
+            for path in sorted(
+                self._managed_paths(self.quarantine_dir, "*.conflict.evidence.json")
+            ):
                 try:
                     item, _payload, _file_stat = self._load_conflict_evidence_file(path)
                 except (InvalidCommandEnvelopeError, ValueError):
@@ -1124,7 +1139,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{validated.request_id}.json"
             pending_path = self._pending_for_request_locked(validated.request_id)
-            if os.path.lexists(ack_path):
+            if self._managed_entry_exists(ack_path, self.ack_dir):
                 receipt = self.load_receipt(ack_path)
                 if pending_path is not None:
                     pending = self.load(pending_path)
@@ -1191,7 +1206,12 @@ class LabArtifactCommitSpool(LabCommandSpool):
 
     def pending_paths(self, *, limit: int | None = None) -> tuple[Path, ...]:
         with self._exclusive_lock():
-            paths = tuple(sorted(self.pending_dir.glob("*.json"), key=self._delivery_key))
+            paths = tuple(
+                sorted(
+                    self._managed_paths(self.pending_dir, "*.json"),
+                    key=self._delivery_key,
+                )
+            )
             return paths if limit is None else paths[:limit]
 
     def pending(
@@ -1210,7 +1230,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{request_id}.json"
             pending_path = self._pending_for_request_locked(request_id)
-            if os.path.lexists(ack_path):
+            if self._managed_entry_exists(ack_path, self.ack_dir):
                 receipt = self.load_receipt(ack_path)
                 if pending_path is not None:
                     pending = self.load(pending_path)

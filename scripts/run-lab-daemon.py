@@ -89,6 +89,45 @@ def _require_owned_directory(path: Path, *, label: str) -> _PathIdentity:
     return _PathIdentity.capture(observed)
 
 
+def _require_trusted_git(raw_path: str | Path) -> tuple[Path, _PathIdentity]:
+    path = _canonical_absolute(raw_path, label="trusted Git executable")
+    try:
+        if path.resolve(strict=True) != path:
+            raise WrapperError("trusted Git executable must be physical")
+        for parent in path.parents:
+            observed_parent = parent.lstat()
+            if (
+                not stat.S_ISDIR(observed_parent.st_mode)
+                or stat.S_ISLNK(observed_parent.st_mode)
+                or observed_parent.st_uid != 0
+                or observed_parent.st_mode & 0o022
+            ):
+                raise WrapperError("trusted Git parent path is unsafe")
+        observed = path.lstat()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise WrapperError("trusted Git executable is unavailable") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != 0
+        or observed.st_mode & 0o022
+        or not observed.st_mode & stat.S_IXUSR
+        or _PathIdentity.capture(observed) != _PathIdentity.capture(opened)
+    ):
+        raise WrapperError("trusted Git executable is unsafe")
+    return path, _PathIdentity.capture(observed)
+
+
+def _assert_trusted_git(path: Path, expected: _PathIdentity) -> None:
+    rebound_path, rebound = _require_trusted_git(path)
+    if rebound_path != path or rebound != expected:
+        raise WrapperError("trusted Git executable identity changed")
+
+
 def _require_runtime_root(
     raw_root: str,
 ) -> tuple[Path, Path, Path, tuple[_PathIdentity, ...]]:
@@ -133,6 +172,7 @@ def _require_runtime_root(
 def _validate_daemon_argv(
     root: Path,
     venv: Path,
+    trusted_git: Path,
     daemon_argv: list[str],
 ) -> tuple[Path, _PathIdentity]:
     if len(daemon_argv) < 4:
@@ -155,13 +195,21 @@ def _validate_daemon_argv(
     ]
     if root_values != [str(root)]:
         raise WrapperError("daemon expected checkout root does not match wrapper binding")
+    git_values = [
+        daemon_argv[index + 1]
+        for index, value in enumerate(daemon_argv[:-1])
+        if value == "--trusted-git-path"
+    ]
+    if git_values != [str(trusted_git)]:
+        raise WrapperError("daemon trusted Git path does not match wrapper binding")
     return executable, executable_identity
 
 
-def _git_commit(root: Path) -> str:
+def _git_commit(root: Path, *, git_path: Path, git_identity: _PathIdentity) -> str:
+    _assert_trusted_git(git_path, git_identity)
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            [str(git_path), "rev-parse", "--verify", "HEAD^{commit}"],
             cwd=root,
             check=True,
             capture_output=True,
@@ -170,6 +218,7 @@ def _git_commit(root: Path) -> str:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise WrapperError("checkout commit cannot be verified") from exc
+    _assert_trusted_git(git_path, git_identity)
     commit = result.stdout.strip()
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise WrapperError("checkout commit is not a full lowercase SHA")
@@ -182,7 +231,10 @@ def _run_preflight(
     preflight: Path,
     root: Path,
     expected_commit: str,
+    git_path: Path,
+    git_identity: _PathIdentity,
 ) -> None:
+    _assert_trusted_git(git_path, git_identity)
     result = subprocess.run(
         [
             str(python),
@@ -193,6 +245,8 @@ def _run_preflight(
             str(root),
             "--expected-commit",
             expected_commit,
+            "--trusted-git-path",
+            str(git_path),
         ],
         cwd=root,
         check=False,
@@ -200,15 +254,18 @@ def _run_preflight(
     )
     if result.returncode != 0:
         raise WrapperError("Lab runtime preflight failed")
+    _assert_trusted_git(git_path, git_identity)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
+    parser.add_argument("--trusted-git-path", required=True)
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
         root, venv, python, runtime_identities = _require_runtime_root(args.expected_checkout_root)
+        trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
         for variable in _PYTHON_INJECTION_VARIABLES:
             if os.environ.get(variable):
                 raise WrapperError(f"Python environment injection is not allowed: {variable}")
@@ -221,13 +278,24 @@ def main(argv: list[str] | None = None) -> int:
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
             daemon_argv.pop(0)
-        executable, executable_identity = _validate_daemon_argv(root, venv, daemon_argv)
-        expected_commit = _git_commit(root)
+        executable, executable_identity = _validate_daemon_argv(
+            root,
+            venv,
+            trusted_git,
+            daemon_argv,
+        )
+        expected_commit = _git_commit(
+            root,
+            git_path=trusted_git,
+            git_identity=trusted_git_identity,
+        )
         _run_preflight(
             python=python,
             preflight=preflight,
             root=root,
             expected_commit=expected_commit,
+            git_path=trusted_git,
+            git_identity=trusted_git_identity,
         )
         rebound_root, rebound_venv, rebound_python, rebound_runtime_identities = (
             _require_runtime_root(args.expected_checkout_root)
@@ -235,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         rebound_executable, rebound_executable_identity = _validate_daemon_argv(
             rebound_root,
             rebound_venv,
+            trusted_git,
             daemon_argv,
         )
         if (
@@ -245,7 +314,12 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(wrapper, label="Lab runtime wrapper") != wrapper_identity
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
-            or _git_commit(root) != expected_commit
+            or _git_commit(
+                root,
+                git_path=trusted_git,
+                git_identity=trusted_git_identity,
+            )
+            != expected_commit
         ):
             raise WrapperError("Lab runtime identity changed during preflight")
         _run_preflight(
@@ -253,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
             preflight=preflight,
             root=root,
             expected_commit=expected_commit,
+            git_path=trusted_git,
+            git_identity=trusted_git_identity,
         )
         final_root, final_venv, final_python, final_runtime_identities = _require_runtime_root(
             args.expected_checkout_root
@@ -260,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         final_executable, final_executable_identity = _validate_daemon_argv(
             final_root,
             final_venv,
+            trusted_git,
             daemon_argv,
         )
         if (
@@ -270,9 +347,43 @@ def main(argv: list[str] | None = None) -> int:
             or _require_owned_regular(wrapper, label="Lab runtime wrapper") != wrapper_identity
             or _require_owned_regular(preflight, label="Lab runtime preflight")
             != preflight_identity
-            or _git_commit(root) != expected_commit
+            or _git_commit(
+                root,
+                git_path=trusted_git,
+                git_identity=trusted_git_identity,
+            )
+            != expected_commit
         ):
             raise WrapperError("Lab runtime identity changed before daemon exec")
+        _run_preflight(
+            python=python,
+            preflight=preflight,
+            root=root,
+            expected_commit=expected_commit,
+            git_path=trusted_git,
+            git_identity=trusted_git_identity,
+        )
+        rebound_executable, rebound_executable_identity = _validate_daemon_argv(
+            root,
+            venv,
+            trusted_git,
+            daemon_argv,
+        )
+        if (
+            rebound_executable != executable
+            or rebound_executable_identity != executable_identity
+            or _require_runtime_root(args.expected_checkout_root)[3] != runtime_identities
+            or _require_owned_regular(wrapper, label="Lab runtime wrapper") != wrapper_identity
+            or _require_owned_regular(preflight, label="Lab runtime preflight")
+            != preflight_identity
+            or _git_commit(
+                root,
+                git_path=trusted_git,
+                git_identity=trusted_git_identity,
+            )
+            != expected_commit
+        ):
+            raise WrapperError("Lab runtime identity changed at daemon exec boundary")
         os.environ.pop("__PYVENV_LAUNCHER__", None)
         sys.stdout.flush()
         sys.stderr.flush()

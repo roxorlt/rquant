@@ -16,6 +16,7 @@ import pytest
 from rquant.cli import build_parser
 
 _LAB_EXPECTED_ROOT = "/tmp/rquant-expected"
+_LAB_TRUSTED_GIT = "/usr/bin/git"
 
 
 class _FakeLabSqliteAuthority:
@@ -3705,7 +3706,11 @@ class TestLabSchedulerCli:
                 assert callable(mutation_guard)
 
         monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
-        monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
+        monkeypatch.setattr(
+            lab_daemon,
+            "require_lab_runtime_binding",
+            lambda _root, _git: "1" * 40,
+        )
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
@@ -3734,6 +3739,7 @@ class TestLabSchedulerCli:
             "lab_finalizer_authority_keyring_path",
             Path("/tmp/keyring"),
         )
+        monkeypatch.setattr(settings, "lab_trusted_git_path", Path(_LAB_TRUSTED_GIT))
 
     def test_parser_accepts_once_and_preserves_lab_run(self) -> None:
         scheduler = build_parser().parse_args(
@@ -3741,6 +3747,8 @@ class TestLabSchedulerCli:
                 "lab-scheduler",
                 "--expected-checkout-root",
                 _LAB_EXPECTED_ROOT,
+                "--trusted-git-path",
+                _LAB_TRUSTED_GIT,
                 "--once",
             ]
         )
@@ -3753,7 +3761,13 @@ class TestLabSchedulerCli:
 
     def test_parser_defaults_to_forever(self) -> None:
         args = build_parser().parse_args(
-            ["lab-scheduler", "--expected-checkout-root", _LAB_EXPECTED_ROOT]
+            [
+                "lab-scheduler",
+                "--expected-checkout-root",
+                _LAB_EXPECTED_ROOT,
+                "--trusted-git-path",
+                _LAB_TRUSTED_GIT,
+            ]
         )
 
         assert args.once is False
@@ -3847,7 +3861,11 @@ class TestLabSchedulerCli:
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
         result = cmd_lab_scheduler(
-            argparse.Namespace(once=True, expected_checkout_root=_LAB_EXPECTED_ROOT)
+            argparse.Namespace(
+                once=True,
+                expected_checkout_root=_LAB_EXPECTED_ROOT,
+                trusted_git_path=_LAB_TRUSTED_GIT,
+            )
         )
 
         assert result == 0
@@ -3919,7 +3937,11 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(signal, "signal", fake_signal)
 
         result = cmd_lab_scheduler(
-            argparse.Namespace(once=False, expected_checkout_root=_LAB_EXPECTED_ROOT)
+            argparse.Namespace(
+                once=False,
+                expected_checkout_root=_LAB_EXPECTED_ROOT,
+                trusted_git_path=_LAB_TRUSTED_GIT,
+            )
         )
 
         assert result == 0
@@ -3943,7 +3965,11 @@ class TestLabWorkerCli:
                 pass
 
         monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
-        monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", lambda _root: "1" * 40)
+        monkeypatch.setattr(
+            lab_daemon,
+            "require_lab_runtime_binding",
+            lambda _root, _git: "1" * 40,
+        )
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
@@ -3951,6 +3977,7 @@ class TestLabWorkerCli:
         )
         monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
         monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-a")
+        monkeypatch.setattr(settings, "lab_trusted_git_path", Path(_LAB_TRUSTED_GIT))
 
     def test_parser_accepts_worker_identity_and_once(self) -> None:
         args = build_parser().parse_args(
@@ -3958,6 +3985,8 @@ class TestLabWorkerCli:
                 "lab-worker",
                 "--expected-checkout-root",
                 _LAB_EXPECTED_ROOT,
+                "--trusted-git-path",
+                _LAB_TRUSTED_GIT,
                 "--worker-id",
                 "worker-a",
                 "--once",
@@ -4019,6 +4048,7 @@ class TestLabWorkerCli:
                 worker_id="worker-a",
                 once=True,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
+                trusted_git_path=_LAB_TRUSTED_GIT,
             )
         )
 
@@ -4075,6 +4105,7 @@ class TestLabWorkerCli:
                 worker_id="worker-a",
                 once=False,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
+                trusted_git_path=_LAB_TRUSTED_GIT,
             )
         )
 

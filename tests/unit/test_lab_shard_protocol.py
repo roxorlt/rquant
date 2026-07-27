@@ -88,6 +88,30 @@ def _report(
     )
 
 
+@pytest.mark.parametrize("kind", ["claim", "report"])
+def test_derived_spools_reject_post_init_pending_replacement(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    claim = _claim()
+    if kind == "claim":
+        spool: LabClaimSpool | LabReportSpool = LabClaimSpool(tmp_path / "claims")
+        payload: LabShardClaim | LabWorkerReport = claim
+    else:
+        spool = LabReportSpool(tmp_path / "reports")
+        payload = _report(claim, LabShardHeartbeat(lease_extension_seconds=60))
+    external = tmp_path / f"external-{kind}"
+    external.mkdir(mode=0o700)
+    displaced = spool.pending_dir.with_name(f"{spool.pending_dir.name}-displaced")
+    spool.pending_dir.rename(displaced)
+    spool.pending_dir.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="identity"):
+        spool.publish(payload)  # type: ignore[arg-type]
+
+    assert tuple(external.iterdir()) == ()
+
+
 def test_definition_has_deterministic_identity_and_canonical_payload() -> None:
     first = _definition(payload_json=' { "hold_days" : 3, "label" : "x" } ')
     second = _definition(payload_json='{"label":"x","hold_days":3}')
@@ -1016,21 +1040,22 @@ def test_execution_admission_recovers_crash_after_marker_link(
     spool = LabClaimSpool(root)
     claim = _claim()
     spool.consume(spool.publish(claim))
-    original_unlink = Path.unlink
 
-    def crash_before_temporary_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        if path.parent == spool.admission_tmp_dir:
-            raise AdmissionCrash("crash after admission marker link")
-        original_unlink(path, *args, **kwargs)
+    def crash_before_temporary_unlink(_path: Path) -> None:
+        raise AdmissionCrash("crash after admission marker link")
 
-    monkeypatch.setattr(Path, "unlink", crash_before_temporary_unlink)
+    monkeypatch.setattr(
+        spool,
+        "_before_admission_temporary_unlink",
+        crash_before_temporary_unlink,
+    )
     with pytest.raises(AdmissionCrash):
         spool.admit_execution(claim)
     marker = spool.admitted_dir / f"{claim.claim_token}.json"
     temporary = tuple(spool.admission_tmp_dir.iterdir())[0]
     assert marker.stat().st_ino == temporary.stat().st_ino
     assert marker.stat().st_nlink == 2
-    monkeypatch.setattr(Path, "unlink", original_unlink)
+    monkeypatch.undo()
 
     recovered = LabClaimSpool(root).admit_execution(claim)
 

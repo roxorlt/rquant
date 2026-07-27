@@ -149,6 +149,14 @@
   staging、Parquet 与 manifest 完成标记均在最终持久 mutation 前复验 runtime；旧 runtime
   只能留下不可完成的临时项，不能发布可恢复的完整 prepared bundle。
 
+- **Strategy Lab daemon 第十一轮 Git 与 spool 身份加固**：preflight、stdlib wrapper 与
+  长驻 runtime guard 统一绑定显式的物理、root-owned 系统 Git executable，不再受 launchd
+  `PATH` 或 checkout `.venv/bin/git` 影响；wrapper 在 `exec` 紧前重跑完整 tracked-clean、
+  ignored executable artifact、package symlink、精确 SHA 与 executable inode 验证。command、
+  claim、report 和 artifact-commit spool 的 pending/ack/quarantine 及派生目录在初始化后持续
+  绑定 device/inode，枚举、读取、发布、ACK、隔离和清理均从受信目录 fd 执行，运行期目录被
+  rename/symlink 替换时 fail closed 且不触碰外部目标。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

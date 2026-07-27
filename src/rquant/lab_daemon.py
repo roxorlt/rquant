@@ -216,31 +216,34 @@ def verify_lab_runtime_binding(
     return verified_code_sha
 
 
-def require_lab_runtime_binding(expected_checkout_root: Path) -> str:
+def require_lab_runtime_binding(
+    expected_checkout_root: Path,
+    trusted_git_path: Path = Path("/usr/bin/git"),
+) -> str:
     """Read and verify all live process identities before daemon I/O starts."""
     expected, _expected_venv = _require_physical_checkout_virtualenv(
         expected_checkout_root,
     )
     import rquant
+    from rquant.research_manifest import (
+        _run_trusted_git,
+        bind_trusted_git_executable,
+        detect_verified_code_commit,
+    )
 
     try:
-        top_level_result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+        trusted_git = bind_trusted_git_executable(trusted_git_path)
+        top_level_result = _run_trusted_git(
+            trusted_git,
+            ["rev-parse", "--show-toplevel"],
             cwd=expected,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
         )
-        head_result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+        head_result = _run_trusted_git(
+            trusted_git,
+            ["rev-parse", "HEAD"],
             cwd=expected,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise LabDaemonConfigurationError("lab runtime binding Git probe failed") from exc
     git_head = head_result.stdout.strip()
     if top_level_result.returncode != 0 or head_result.returncode != 0:
@@ -292,12 +295,15 @@ def require_lab_runtime_binding(expected_checkout_root: Path) -> str:
         git_top_level=Path(top_level_result.stdout.strip()),
         git_head=git_head,
     )
-    from rquant.research_manifest import detect_verified_code_commit
-
     injected_sha = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected_sha and injected_sha != git_head:
         raise LabDaemonConfigurationError("lab runtime binding injected SHA mismatch")
-    verified = require_clean_code_sha(lambda: detect_verified_code_commit(expected))
+    verified = require_clean_code_sha(
+        lambda: detect_verified_code_commit(
+            expected,
+            trusted_git_path=trusted_git.path,
+        )
+    )
     if verified != git_head:
         raise LabDaemonConfigurationError("lab runtime binding verified SHA mismatch")
     return verified
@@ -309,6 +315,7 @@ class LabRuntimeGuard:
 
     expected_checkout_root: Path
     startup_sha: str
+    trusted_git_path: Path = Path("/usr/bin/git")
     verifier: Callable[[Path], str] | None = None
 
     def __post_init__(self) -> None:
@@ -317,13 +324,23 @@ class LabRuntimeGuard:
             label="expected checkout root",
         )
         startup_sha = require_clean_code_sha(lambda: self.startup_sha)
+        trusted_git_path = _canonical_absolute_path(
+            self.trusted_git_path,
+            label="trusted Git path",
+        )
         object.__setattr__(self, "expected_checkout_root", expected)
         object.__setattr__(self, "startup_sha", startup_sha)
+        object.__setattr__(self, "trusted_git_path", trusted_git_path)
 
     def verify(self) -> str:
         try:
-            verifier = self.verifier or require_lab_runtime_binding
-            observed = verifier(self.expected_checkout_root)
+            if self.verifier is not None:
+                observed = self.verifier(self.expected_checkout_root)
+            else:
+                observed = require_lab_runtime_binding(
+                    self.expected_checkout_root,
+                    self.trusted_git_path,
+                )
         except LabDaemonConfigurationError:
             raise
         except Exception as exc:

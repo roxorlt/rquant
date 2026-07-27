@@ -11,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "preflight-lab-runtime.py"
+TRUSTED_GIT = Path("/usr/bin/git")
 
 
 def _checkout(tmp_path: Path) -> tuple[Path, Path]:
@@ -58,6 +59,8 @@ def _run(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
             str(checkout),
             "--expected-commit",
             expected_commit,
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
             *arguments,
         ],
         cwd=checkout,
@@ -81,6 +84,88 @@ def test_lab_runtime_preflight_rejects_dirty_tracked_package_source(
     assert tracked.read_text(encoding="utf-8") == "UNTRUSTED = True\n"
 
 
+def test_lab_runtime_preflight_uses_explicit_trusted_git_not_path(
+    tmp_path: Path,
+) -> None:
+    checkout, package = _checkout(tmp_path)
+    fake_bin = checkout / ".venv" / "bin"
+    fake_bin.mkdir(parents=True)
+    marker = tmp_path / "fake-git-ran"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\ntouch {marker!s}\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    (package / "__init__.py").write_text("UNTRUSTED = True\n", encoding="utf-8")
+    expected_commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment.get('PATH', '')}"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SCRIPT),
+            "--checkout-root",
+            str(checkout),
+            "--expected-commit",
+            expected_commit,
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+        ],
+        cwd=checkout,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "tracked" in result.stderr.lower()
+    assert not marker.exists()
+
+
+def test_lab_runtime_preflight_rejects_symlinked_trusted_git(tmp_path: Path) -> None:
+    checkout, _package = _checkout(tmp_path)
+    linked_git = tmp_path / "linked-git"
+    linked_git.symlink_to(TRUSTED_GIT)
+    expected_commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SCRIPT),
+            "--checkout-root",
+            str(checkout),
+            "--expected-commit",
+            expected_commit,
+            "--trusted-git-path",
+            str(linked_git),
+        ],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "physical" in result.stderr
+
+
 def test_lab_runtime_preflight_rejects_expected_commit_mismatch(tmp_path: Path) -> None:
     checkout, _package = _checkout(tmp_path)
 
@@ -93,6 +178,8 @@ def test_lab_runtime_preflight_rejects_expected_commit_mismatch(tmp_path: Path) 
             str(checkout),
             "--expected-commit",
             "0" * 40,
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
         ],
         cwd=checkout,
         capture_output=True,
