@@ -6,6 +6,7 @@
 """
 
 import os
+import unicodedata
 from pathlib import Path
 from typing import Literal
 
@@ -25,7 +26,13 @@ def _canonical_absolute_path(path: Path, *, label: str) -> Path:
 
 
 def _paths_alias_or_nest(left: Path, right: Path) -> bool:
-    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+    left_key = tuple(unicodedata.normalize("NFC", part).casefold() for part in left.parts)
+    right_key = tuple(unicodedata.normalize("NFC", part).casefold() for part in right.parts)
+    return (
+        left_key == right_key
+        or left_key[: len(right_key)] == right_key
+        or right_key[: len(left_key)] == left_key
+    )
 
 
 class Settings(BaseSettings):

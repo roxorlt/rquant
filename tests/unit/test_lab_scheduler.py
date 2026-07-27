@@ -36,6 +36,10 @@ from rquant.lab_artifacts import (
     LabJobArtifactStore,
     LabSealedJobArtifact,
 )
+from rquant.lab_daemon import (
+    LabDaemonConfigurationError,
+    prepare_private_sqlite_path,
+)
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabAcknowledgedCommand,
@@ -222,6 +226,85 @@ def _scheduler(
         max_commands_per_tick=batch_size,
         clock=lambda: now,
     )
+
+
+def test_scheduler_runtime_drift_between_ticks_leaves_command_unacknowledged(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+    drifted = False
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        runtime_guard=runtime_guard,
+        clock=lambda: NOW,
+    )
+    assert scheduler.run_once().processed == 0
+    published = spool.publish(_envelope())
+    drifted = True
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        scheduler.run_once()
+
+    assert published.path.exists()
+    assert not (spool.ack_dir / f"{published.envelope.request_id}.json").exists()
+
+
+def test_scheduler_sqlite_identity_drift_rolls_back_without_command_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(path, label="lab jobs SQLite", create=True)
+    store = LabJobStore(path, identity_authority=authority)
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    scheduler = _scheduler(store, spool)
+    scheduler.run_once()
+    published = spool.publish(_envelope())
+    original = root / "original.sqlite3"
+    replacement = root / "replacement.sqlite3"
+    with sqlite3.connect(path) as source, sqlite3.connect(replacement) as target:
+        source.backup(target)
+    replacement.chmod(0o600)
+    real_commit = lab_jobs._LabJobStoreConnection.commit
+    swapped = False
+
+    def swap_before_commit(connection: lab_jobs._LabJobStoreConnection) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            path.rename(original)
+            replacement.rename(path)
+        real_commit(connection)
+
+    monkeypatch.setattr(lab_jobs._LabJobStoreConnection, "commit", swap_before_commit)
+    try:
+        with pytest.raises(LabDaemonConfigurationError, match="identity changed"):
+            scheduler.run_once()
+    finally:
+        monkeypatch.setattr(lab_jobs._LabJobStoreConnection, "commit", real_commit)
+        if path.exists():
+            path.rename(replacement)
+        if original.exists():
+            original.rename(path)
+        authority.close()
+
+    assert published.path.exists()
+    assert not (spool.ack_dir / f"{published.envelope.request_id}.json").exists()
+    assert LabJobReader(path).get_job(published.envelope.command.job_id) is None
 
 
 @pytest.mark.parametrize(

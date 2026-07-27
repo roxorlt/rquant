@@ -27,6 +27,7 @@ import pyarrow as pa
 import pytest
 from pydantic import ValidationError
 
+from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_result_digest import (
     CURRENT_CONTENT_DIGEST_ALGORITHM,
@@ -1208,6 +1209,28 @@ def test_worker_consumes_only_its_owned_unexpired_claim(tmp_path: Path) -> None:
     assert report.body.result_manifest_schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
     assert report.body.content_digest_algorithm == CURRENT_CONTENT_DIGEST_ALGORITHM
     assert report.body.worker_code_sha == "1" * 40
+
+
+def test_worker_runtime_drift_before_claim_boundary_does_not_consume_claim(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec())
+    claims.publish(claim)
+
+    def runtime_guard() -> str:
+        raise LabDaemonConfigurationError("runtime checkout drifted")
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        verified_code_sha_provider=runtime_guard,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        worker.run_once()
+
+    assert [entry.claim for entry in claims.pending()] == [claim]
 
 
 def test_worker_does_not_rehash_large_quarantine_for_each_claim(

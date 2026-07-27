@@ -3024,9 +3024,10 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
 
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
-    from rquant.lab_daemon import require_lab_runtime_binding
+    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
     code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
+    runtime_guard = LabRuntimeGuard(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3036,6 +3037,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         LabDaemonLock,
         ensure_private_directory,
         prepare_private_sqlite_path,
+        require_unique_runtime_paths,
     )
     from rquant.lab_job_protocol import LabCommandSpool
     from rquant.lab_jobs import LabJobStore
@@ -3066,6 +3068,20 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
         ensure_private_directory(path, label=label)
+    runtime_paths = {
+        "lab command spool": settings.lab_job_command_dir_resolved,
+        "lab claim spool": settings.lab_job_claim_dir_resolved,
+        "lab report spool": settings.lab_job_report_dir_resolved,
+        "lab worker artifact root": settings.lab_worker_artifact_dir_resolved,
+        "lab final artifact root": settings.lab_final_artifact_dir_resolved,
+        "lab artifact commit spool": settings.lab_artifact_commit_dir_resolved,
+        "lab daemon lock root": settings.lab_daemon_lock_dir_resolved,
+        "lab authority signing key": settings.lab_finalizer_authority_key_path,
+        "lab authority keyring": settings.lab_finalizer_authority_keyring_path,
+    }
+    if os.path.lexists(settings.lab_jobs_path_resolved):
+        runtime_paths["lab jobs SQLite"] = settings.lab_jobs_path_resolved
+    require_unique_runtime_paths(runtime_paths)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "scheduler"):
         sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
@@ -3117,6 +3133,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 max_artifact_commits_per_tick=(
                     settings.lab_scheduler_max_artifact_commits_per_tick
                 ),
+                runtime_guard=runtime_guard.verify,
             )
             if args.once:
                 try:
@@ -3151,14 +3168,16 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
     """Run a fenced Strategy Lab shard worker."""
-    from rquant.lab_daemon import require_lab_runtime_binding
+    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
     code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
+    runtime_guard = LabRuntimeGuard(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
         LabDaemonLock,
         ensure_private_directory,
+        require_unique_runtime_paths,
     )
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LAB_WORKER_MAX_SHARDS_PER_TICK, LabWorker
@@ -3180,6 +3199,14 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
         ensure_private_directory(path, label=label)
+    require_unique_runtime_paths(
+        {
+            "lab claim spool": settings.lab_job_claim_dir_resolved,
+            "lab report spool": settings.lab_job_report_dir_resolved,
+            "lab worker artifact root": settings.lab_worker_artifact_dir_resolved,
+            "lab daemon lock root": settings.lab_daemon_lock_dir_resolved,
+        }
+    )
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "worker"):
         worker = LabWorker(
             worker_id=worker_id,
@@ -3194,7 +3221,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
             lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
             poll_interval_ms=settings.lab_worker_poll_interval_ms,
             receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
-            verified_code_sha_provider=lambda: code_sha,
+            verified_code_sha_provider=runtime_guard.verify,
         )
         if args.once:
             result = worker.run_once()
@@ -3226,9 +3253,10 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
 
 def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     """Finalize ready Strategy Lab jobs without writable SQLite access."""
-    from rquant.lab_daemon import require_lab_runtime_binding
+    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
 
     code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
+    runtime_guard = LabRuntimeGuard(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3240,6 +3268,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         LabFinalizerStateStore,
         ensure_private_directory,
         prepare_private_sqlite_path,
+        require_unique_runtime_paths,
     )
     from rquant.lab_finalizer import LabFinalizer
     from rquant.lab_jobs import LabJobReader
@@ -3265,6 +3294,18 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         ("lab finalizer state root", settings.lab_finalizer_state_dir_resolved),
     ):
         ensure_private_directory(path, label=label)
+    runtime_paths = {
+        "lab worker artifact root": settings.lab_worker_artifact_dir_resolved,
+        "lab final artifact root": settings.lab_final_artifact_dir_resolved,
+        "lab artifact commit spool": settings.lab_artifact_commit_dir_resolved,
+        "lab daemon lock root": settings.lab_daemon_lock_dir_resolved,
+        "lab finalizer state root": settings.lab_finalizer_state_dir_resolved,
+        "lab authority signing key": settings.lab_finalizer_authority_key_path,
+        "lab authority keyring": settings.lab_finalizer_authority_keyring_path,
+    }
+    if os.path.lexists(settings.lab_jobs_path_resolved):
+        runtime_paths["lab jobs SQLite"] = settings.lab_jobs_path_resolved
+    require_unique_runtime_paths(runtime_paths)
     with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "finalizer"):
         sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
@@ -3286,7 +3327,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 commit_spool=LabArtifactCommitSpool(
                     settings.lab_artifact_commit_dir_resolved
                 ),
-                verified_code_sha_provider=lambda: code_sha,
+                verified_code_sha_provider=runtime_guard.verify,
                 finalizer_authority_key_provider=keyring.signing_key,
                 finalizer_authority_verification_key_provider=keyring.verification_key,
                 adapter_registry=default_strategy_job_adapter_registry(),
@@ -3305,6 +3346,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 failure_cooldown_max_seconds=(
                     settings.lab_finalizer_failure_cooldown_max_seconds
                 ),
+                runtime_guard=runtime_guard.verify,
             )
             if args.once:
                 result = daemon.run_once()

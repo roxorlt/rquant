@@ -103,6 +103,13 @@
   finalizer state 的空状态与完整解析返回均复验 root identity，active key 与 keyring 也在读取
   结束前复验活动路径，rename/replacement 不再静默通过。
 
+- **Strategy Lab daemon 第五轮长驻身份加固**：scheduler、worker、finalizer 现在以启动时
+  clean SHA 构造动态 runtime guard，并在每个 tick、claim、SQLite/spool 副作用边界重验
+  checkout、解释器、导入包、Git 状态及 ignored loadable artifacts；漂移立即阻断且不 ACK。
+  Lab SQLite authority 覆盖读写事务和连接关闭，finalizer state 保存后绑定临时 fd 与活动路径
+  的完整身份。Lab 私有目录严格要求 owner `0700`，配置路径按 macOS Unicode/大小写语义隔离，
+  运行时再以 device/inode 去重，均在 SQLite 初始化前完成。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

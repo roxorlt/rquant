@@ -3759,6 +3759,7 @@ class TestLabSchedulerCli:
                 or _FakeLabSqliteAuthority(path)
             ),
         )
+        monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
         result = cmd_lab_scheduler(
@@ -3779,7 +3780,7 @@ class TestLabSchedulerCli:
         import argparse
         import signal
 
-        from rquant import lab_scheduler
+        from rquant import lab_daemon, lab_scheduler
         from rquant.cli import cmd_lab_scheduler
 
         handlers: dict[int, object] = {}
@@ -3808,6 +3809,7 @@ class TestLabSchedulerCli:
             "rquant.lab_jobs.LabJobStore.initialize",
             lambda _self: None,
         )
+        monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
         monkeypatch.setattr(signal, "signal", fake_signal)
 

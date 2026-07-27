@@ -28,6 +28,7 @@ from rquant.canonical_json_stream import (
     write_legacy_pandas_table_json,
 )
 from rquant.data_metadata import DatasetSnapshotBinding
+from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_logging import _safe_structured_log
 from rquant.lab_result_digest import (
@@ -1168,6 +1169,24 @@ class LabWorker:
     def request_stop(self) -> None:
         self._stop.request()
 
+    def _verify_runtime_guard(self, *, expected_sha: str | None = None) -> str:
+        if self.verified_code_sha_provider is None:
+            raise PermissionError("worker execution requires verified runtime code SHA")
+        try:
+            runtime_code_sha = self.verified_code_sha_provider()
+        except LabDaemonConfigurationError:
+            raise
+        except Exception as exc:
+            raise PermissionError("verified runtime code SHA provider failed") from exc
+        if (
+            not isinstance(runtime_code_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None
+        ):
+            raise PermissionError("worker runtime code SHA is invalid")
+        if expected_sha is not None and runtime_code_sha != expected_sha:
+            raise PermissionError("runtime clean code SHA does not match ResearchRunSpec")
+        return runtime_code_sha
+
     def sealed_bundle_path(self, claim: LabShardClaim) -> Path:
         shard_root = (
             self.artifact_root / "jobs" / str(claim.job_id) / "shards" / str(claim.shard_id)
@@ -1341,6 +1360,7 @@ class LabWorker:
         claim: LabShardClaim,
         body: LabShardHeartbeat | LabShardSucceeded | LabShardFailed | LabWorkerStopped,
     ) -> LabWorkerReport:
+        self._verify_runtime_guard()
         report = self._make_report(claim, body)
         try:
             self.report_spool.publish(report)
@@ -1438,6 +1458,8 @@ class LabWorker:
     ) -> bool:
         try:
             self._publish_report(claim, body)
+        except LabDaemonConfigurationError:
+            raise
         except Exception as exc:
             normalized_message = " ".join(str(exc).split()) or type(exc).__name__
             _safe_structured_log(
@@ -1473,6 +1495,7 @@ class LabWorker:
                     claim.worker_id == self.worker_id
                     and claim.claim_generation <= marker.claim.claim_generation
                 ):
+                    self._verify_runtime_guard()
                     with suppress(InvalidCommandEnvelopeError):
                         self.claim_spool.quarantine(
                             entry,
@@ -1484,6 +1507,7 @@ class LabWorker:
             if claim.worker_id != self.worker_id:
                 continue
             try:
+                self._verify_runtime_guard()
                 return self.claim_spool.consume(entry)
             except (
                 InvalidCommandEnvelopeError,
@@ -1496,19 +1520,7 @@ class LabWorker:
         return None
 
     def _verified_runtime_code_sha(self, spec: ResearchRunSpec) -> str:
-        if self.verified_code_sha_provider is None:
-            raise PermissionError("worker execution requires verified runtime code SHA")
-        try:
-            runtime_code_sha = self.verified_code_sha_provider()
-        except Exception as exc:
-            raise PermissionError("verified runtime code SHA provider failed") from exc
-        if (
-            not isinstance(runtime_code_sha, str)
-            or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None
-            or runtime_code_sha != spec.code_sha
-        ):
-            raise PermissionError("runtime clean code SHA does not match ResearchRunSpec")
-        return runtime_code_sha
+        return self._verify_runtime_guard(expected_sha=spec.code_sha)
 
     @contextmanager
     def _open_store(
@@ -1837,6 +1849,7 @@ class LabWorker:
         *,
         worker_code_sha: str | None = None,
     ) -> LabPreparedShardBundle:
+        self._verify_runtime_guard(expected_sha=worker_code_sha)
         self._validate_result_identity(claim, result)
         resolved_code_sha = worker_code_sha or self._verified_runtime_code_sha(
             self.adapter_registry.validate_claim(claim).spec
@@ -1895,6 +1908,7 @@ class LabWorker:
         effective_expiry: datetime | None,
         require_current_claim: bool,
     ) -> None:
+        self._verify_runtime_guard()
         if self._stop.is_set():
             raise InterruptedError("worker stop requested before success point-of-no-return")
         now = _utc(self.clock())
@@ -2079,6 +2093,7 @@ class LabWorker:
         pending = self._pending_success
         if pending is None:  # pragma: no cover - guarded by caller
             raise RuntimeError("worker has no pending success report")
+        self._verify_runtime_guard(expected_sha=pending.bundle.manifest.worker_code_sha)
         try:
             self.report_spool.publish(pending.report)
         except Exception as exc:
@@ -2190,6 +2205,7 @@ class LabWorker:
         if now < self._next_quarantine_reconcile_at:
             return ()
         self._next_quarantine_reconcile_at = now + self.quarantine_reconcile_interval_seconds
+        self._verify_runtime_guard()
         try:
             self.artifact_reclaimer.recover_active(max_entries=16)
         except Exception as exc:
@@ -2212,6 +2228,7 @@ class LabWorker:
         return ()
 
     def run_once(self) -> LabWorkerTickResult:
+        self._verify_runtime_guard()
         warnings = (
             ()
             if self._pending_success is not None or self._stop.is_set()
@@ -2237,8 +2254,11 @@ class LabWorker:
             )
 
         try:
+            self._verify_runtime_guard()
             self._reclaim_obsolete_temporaries(claim)
             self.artifact_reclaimer.reclaim(claim)
+        except LabDaemonConfigurationError:
+            raise
         except Exception as exc:
             return self._failure_result(claim, phase="claim", error=exc)
 
@@ -2249,6 +2269,8 @@ class LabWorker:
 
         try:
             runtime_code_sha = self._verified_runtime_code_sha(validated.spec)
+        except LabDaemonConfigurationError:
+            raise
         except Exception as exc:
             return self._failure_result(claim, phase="session", error=exc)
 
@@ -2258,6 +2280,7 @@ class LabWorker:
             return self._failure_result(claim, phase="deadline", error=exc)
 
         try:
+            self._verify_runtime_guard(expected_sha=runtime_code_sha)
             self.claim_spool.admit_execution(claim)
         except (
             LabClaimNotConsumedError,
@@ -2295,6 +2318,8 @@ class LabWorker:
             except PermissionError as exc:
                 operation_phase = "session"
                 operation_error = exc
+            except LabDaemonConfigurationError:
+                raise
             except Exception as exc:
                 operation_phase = "execute"
                 operation_error = exc
@@ -2309,6 +2334,7 @@ class LabWorker:
                         operation_error = exc
             if operation_error is None and stop_reason is None:
                 try:
+                    self._verify_runtime_guard(expected_sha=runtime_code_sha)
                     prepared = self._prepare_result(
                         claim,
                         result,
@@ -2318,6 +2344,8 @@ class LabWorker:
                 except TimeoutError as exc:
                     operation_phase = "deadline"
                     operation_error = exc
+                except LabDaemonConfigurationError:
+                    raise
                 except Exception as exc:
                     operation_phase = "seal"
                     operation_error = exc
@@ -2339,6 +2367,8 @@ class LabWorker:
             )
         if heartbeat_errors:
             self._discard_prepared(prepared)
+            if isinstance(heartbeat_errors[0], LabDaemonConfigurationError):
+                raise heartbeat_errors[0]
             return self._failure_result(
                 claim,
                 phase="fence",
@@ -2384,6 +2414,9 @@ class LabWorker:
                 claim,
                 reason="worker stop requested while confirming final shard fence",
             )
+        except LabDaemonConfigurationError:
+            self._discard_prepared(prepared)
+            raise
         except Exception as exc:
             self._discard_prepared(prepared)
             return self._failure_result(claim, phase="fence", error=exc)
@@ -2403,6 +2436,8 @@ class LabWorker:
             )
         except TimeoutError as exc:
             return self._failure_result(claim, phase="deadline", error=exc)
+        except LabDaemonConfigurationError:
+            raise
         except Exception as exc:
             return self._failure_result(claim, phase="seal", error=exc)
 
@@ -2438,6 +2473,7 @@ class LabWorker:
                     bundle=bundle,
                     receipt_state="reported",
                 )
+                self._verify_runtime_guard(expected_sha=runtime_code_sha)
                 self.report_spool.publish(report)
         except InterruptedError:
             self._rollback_sealed(claim, bundle)
@@ -2448,6 +2484,9 @@ class LabWorker:
         except TimeoutError as exc:
             self._rollback_sealed(claim, bundle)
             return self._failure_result(claim, phase="deadline", error=exc)
+        except LabDaemonConfigurationError:
+            self._rollback_sealed(claim, bundle)
+            raise
         except Exception as exc:
             if self._pending_success is None:
                 self._rollback_sealed(claim, bundle)

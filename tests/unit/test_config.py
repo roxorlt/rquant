@@ -1,5 +1,6 @@
 """Config 层单测：确保 .env 能正确加载、字段校验生效。"""
 
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,29 @@ class TestSettings:
                 lab_job_command_dir=root,
                 lab_job_claim_dir=root / "claims",
             )
+
+    @pytest.mark.parametrize("alias_kind", ["case", "unicode"])
+    def test_lab_daemon_rejects_macos_normalized_path_aliases(
+        self,
+        tmp_path: Path,
+        alias_kind: str,
+    ) -> None:
+        root = tmp_path / "not-created"
+        if alias_kind == "case":
+            command = root / "LabCommands"
+            claim = root / "labcommands"
+        else:
+            command = root / unicodedata.normalize("NFC", "cafe\u0301")
+            claim = root / unicodedata.normalize("NFD", "cafe\u0301")
+
+        with pytest.raises(ValidationError, match="alias or nest"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_job_command_dir=command,
+                lab_job_claim_dir=claim,
+            )
+
+        assert not root.exists()
 
     def test_lab_daemon_rejects_reverse_nested_managed_root_under_database(
         self,

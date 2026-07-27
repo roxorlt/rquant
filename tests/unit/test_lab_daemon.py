@@ -21,10 +21,12 @@ from rquant.lab_daemon import (
     LabFinalizerDaemonState,
     LabFinalizerFailureState,
     LabFinalizerStateStore,
+    LabRuntimeGuard,
     ensure_private_directory,
     prepare_private_sqlite_path,
     require_clean_code_sha,
     require_private_directory,
+    require_unique_runtime_paths,
 )
 from rquant.lab_jobs import LabJobReader, LabJobStore
 
@@ -535,6 +537,73 @@ def test_sqlite_authority_connection_remains_bound_to_original_inode_after_swap(
         ).fetchone() == (0,)
 
 
+def test_sqlite_authority_fences_entire_wal_write_transaction_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(path, label="lab jobs SQLite", create=True)
+    store = LabJobStore(path, identity_authority=authority)
+    store.initialize()
+    original = root / "original.sqlite3"
+    replacement = root / "replacement.sqlite3"
+    with sqlite3.connect(path) as source, sqlite3.connect(replacement) as target:
+        source.backup(target)
+    replacement.chmod(0o600)
+
+    try:
+        with (
+            pytest.raises(LabDaemonConfigurationError, match="identity changed"),
+            store._transaction() as connection,
+        ):
+            connection.execute("CREATE TABLE transaction_marker(value TEXT)")
+            path.rename(original)
+            replacement.rename(path)
+    finally:
+        if path.exists():
+            path.rename(replacement)
+        if original.exists():
+            original.rename(path)
+        authority.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'transaction_marker'"
+        ).fetchone() == (0,)
+
+
+def test_sqlite_authority_fences_read_snapshot_before_return_after_path_swap(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(path, label="lab jobs SQLite", create=True)
+    LabJobStore(path, identity_authority=authority).initialize()
+    reader = LabJobReader(path, identity_authority=authority)
+    original = root / "original.sqlite3"
+    replacement = root / "replacement.sqlite3"
+    with sqlite3.connect(path) as source, sqlite3.connect(replacement) as target:
+        source.backup(target)
+    replacement.chmod(0o600)
+
+    try:
+        with (
+            pytest.raises(LabDaemonConfigurationError, match="identity changed"),
+            reader._read_snapshot(label="replacement test") as connection,
+        ):
+            connection.execute("SELECT COUNT(*) FROM lab_job").fetchone()
+            path.rename(original)
+            replacement.rename(path)
+    finally:
+        if path.exists():
+            path.rename(replacement)
+        if original.exists():
+            original.rename(path)
+        authority.close()
+
+
 def test_sqlite_authority_holds_shared_parent_maintenance_lock(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
@@ -624,7 +693,7 @@ def test_private_directory_gate_rejects_public_or_symlinked_roots(tmp_path: Path
     require_private_directory(private, label="command spool")
 
     private.chmod(0o755)
-    with pytest.raises(LabDaemonConfigurationError, match="private permissions"):
+    with pytest.raises(LabDaemonConfigurationError, match="mode 0700"):
         require_private_directory(private, label="command spool")
 
     private.chmod(0o700)
@@ -632,6 +701,19 @@ def test_private_directory_gate_rejects_public_or_symlinked_roots(tmp_path: Path
     linked.symlink_to(private, target_is_directory=True)
     with pytest.raises(LabDaemonConfigurationError, match="real directory"):
         require_private_directory(linked, label="command spool")
+
+
+@pytest.mark.parametrize("mode", [0o500, 0o600, 0o755])
+def test_private_directory_gate_requires_exact_mode_0700(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    root = tmp_path / "managed"
+    root.mkdir(mode=mode)
+    root.chmod(mode)
+
+    with pytest.raises(LabDaemonConfigurationError, match="mode 0700"):
+        require_private_directory(root, label="lab managed root")
 
 
 def test_private_directory_runtime_ensure_creates_only_private_leaf(tmp_path: Path) -> None:
@@ -652,10 +734,33 @@ def test_private_directory_runtime_ensure_does_not_repair_public_directory(
     path = tmp_path / "commands"
     path.mkdir(mode=0o755)
 
-    with pytest.raises(LabDaemonConfigurationError, match="private permissions"):
+    with pytest.raises(LabDaemonConfigurationError, match="mode 0700"):
         ensure_private_directory(path, label="command spool")
 
     assert path.stat().st_mode & 0o777 == 0o755
+
+
+def test_runtime_path_identity_gate_rejects_duplicate_inode(tmp_path: Path) -> None:
+    first = tmp_path / "first.key"
+    second = tmp_path / "second.key"
+    _write_private(first, "payload")
+    second.hardlink_to(first)
+
+    with pytest.raises(LabDaemonConfigurationError, match="same filesystem identity"):
+        require_unique_runtime_paths({"first": first, "second": second})
+
+
+def test_runtime_path_identity_gate_rejects_case_alias_on_casefolding_filesystem(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "LabCommands"
+    first.mkdir(mode=0o700)
+    second = tmp_path / "labcommands"
+    if not second.exists() or second.stat().st_ino != first.stat().st_ino:
+        pytest.skip("test filesystem is case-sensitive")
+
+    with pytest.raises(LabDaemonConfigurationError, match="same filesystem identity"):
+        require_unique_runtime_paths({"commands": first, "claims": second})
 
 
 def test_runtime_binding_rejects_package_from_another_checkout(tmp_path: Path) -> None:
@@ -733,6 +838,55 @@ def test_runtime_binding_rejects_symlinked_venv_before_git_probe(
     monkeypatch.setattr("rquant.lab_daemon.subprocess.run", reject_probe)
     with pytest.raises(LabDaemonConfigurationError, match="physical virtualenv"):
         require_lab_runtime_binding(expected)
+
+
+@pytest.mark.parametrize("drift", ["head", "tracked", "ignored_native"])
+def test_runtime_guard_rechecks_checkout_identity_between_ticks(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    import subprocess
+
+    from rquant.research_manifest import detect_verified_code_commit
+
+    repo = tmp_path / "checkout"
+    package = repo / "src" / "rquant"
+    package.mkdir(parents=True)
+    (repo / ".gitignore").write_text("src/rquant/*.so\n", encoding="utf-8")
+    tracked = package / "runtime.py"
+    tracked.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+    startup_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    def verify(checkout: Path) -> str:
+        observed = detect_verified_code_commit(checkout)
+        if observed is None or observed.endswith("-dirty"):
+            raise LabDaemonConfigurationError("runtime checkout is dirty")
+        return observed
+
+    guard = LabRuntimeGuard(repo, startup_sha, verifier=verify)
+    assert guard.verify() == startup_sha
+    if drift == "head":
+        (repo / "next.txt").write_text("next\n", encoding="utf-8")
+        subprocess.run(["git", "add", "next.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "next"], cwd=repo, check=True, capture_output=True)
+    elif drift == "tracked":
+        tracked.write_text("VALUE = 2\n", encoding="utf-8")
+    else:
+        (package / "runtime.so").write_bytes(b"native")
+
+    with pytest.raises(LabDaemonConfigurationError, match="runtime"):
+        guard.verify()
 
 
 @pytest.mark.parametrize(
@@ -839,6 +993,55 @@ def test_finalizer_daemon_runs_a_bounded_tick_and_reports_first_error(
     assert result.failed == 1
     assert result.first_error_type == "ValueError"
     assert result.first_error_message == "broken candidate"
+
+
+def test_finalizer_runtime_drift_between_candidates_stops_without_state_ack(
+    tmp_path: Path,
+) -> None:
+    job_ids = (
+        UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+    )
+    guard_calls = 0
+    finalized: list[UUID] = []
+
+    class Reader:
+        def list_finalization_candidates(self, *, limit: int, cursor: str | None = None):
+            return SimpleNamespace(
+                items=tuple(_finalization_candidate(job_id) for job_id in job_ids),
+                has_more=False,
+                next_cursor=None,
+            )
+
+    class Finalizer:
+        def finalize(self, job_id: UUID):
+            finalized.append(job_id)
+            return SimpleNamespace(status="published")
+
+    def runtime_guard() -> str:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls >= 3:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    state_store = LabFinalizerStateStore(_private_state_dir(tmp_path))
+    daemon = LabFinalizerDaemon(
+        reader=Reader(),
+        finalizer=Finalizer(),
+        state_store=state_store,
+        max_jobs_per_tick=2,
+        poll_interval_ms=10,
+        failure_cooldown_seconds=10,
+        failure_cooldown_max_seconds=60,
+        runtime_guard=runtime_guard,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        daemon.run_once()
+
+    assert finalized == [job_ids[0]]
+    assert state_store.load().cursor is None
 
 
 def test_finalizer_daemon_stop_prevents_busy_loop(tmp_path: Path) -> None:
@@ -1208,6 +1411,66 @@ def test_finalizer_state_read_rechecks_root_identity_before_return(
     monkeypatch.setattr("rquant.lab_daemon.os.read", replacing_read)
     with pytest.raises(LabDaemonConfigurationError, match="directory identity changed"):
         store.load()
+
+
+def test_finalizer_state_load_rejects_same_size_active_file_replacement_after_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=3))
+    state_path = state_dir / "state.json"
+    displaced = state_dir / "original.json"
+    original_assert_root = store._assert_root_current
+    checks = 0
+
+    def replace_after_parse(descriptor: int, expected: os.stat_result) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            payload = state_path.read_bytes()
+            state_path.rename(displaced)
+            state_path.write_bytes(payload)
+            state_path.chmod(0o600)
+        original_assert_root(descriptor, expected)
+
+    monkeypatch.setattr(store, "_assert_root_current", replace_after_parse)
+
+    with pytest.raises(LabDaemonConfigurationError, match="state.*changed"):
+        store.load()
+
+
+def test_finalizer_state_save_rejects_same_size_replacement_and_restores_previous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=7))
+    state_path = state_dir / "state.json"
+    original = state_path.read_bytes()
+    real_replace = os.replace
+    attacked = False
+
+    def replace_then_attack(*args: object, **kwargs: object) -> None:
+        nonlocal attacked
+        real_replace(*args, **kwargs)
+        if not attacked and args[1] == "state.json":
+            attacked = True
+            payload = state_path.read_bytes()
+            attacker = state_dir / "attacker.json"
+            attacker.write_bytes(b" " * len(payload))
+            attacker.chmod(0o600)
+            real_replace(attacker, state_path)
+
+    monkeypatch.setattr("rquant.lab_daemon.os.replace", replace_then_attack)
+
+    with pytest.raises(LabDaemonConfigurationError, match="identity changed after commit"):
+        store.save(LabFinalizerDaemonState(cycle=8))
+
+    assert state_path.read_bytes() == original
+    assert store.load().cycle == 7
 
 
 def test_finalizer_state_save_rejects_root_replacement_after_atomic_replace(

@@ -68,12 +68,7 @@ def require_private_directory(path: Path, *, label: str) -> Path:
         observed = candidate.lstat()
     except FileNotFoundError as exc:
         raise LabDaemonConfigurationError(f"{label} directory does not exist") from exc
-    if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
-        raise LabDaemonConfigurationError(f"{label} must be a real directory")
-    if observed.st_uid != os.getuid():
-        raise LabDaemonConfigurationError(f"{label} must be owned by this user")
-    if observed.st_mode & 0o077:
-        raise LabDaemonConfigurationError(f"{label} must have private permissions")
+    _validate_private_directory_identity(observed, label=label)
     return candidate
 
 
@@ -90,6 +85,30 @@ def ensure_private_directory(path: Path, *, label: str) -> Path:
     except OSError as exc:
         raise LabDaemonConfigurationError(f"{label} could not be created safely") from exc
     return require_private_directory(candidate, label=label)
+
+
+def require_unique_runtime_paths(paths: Mapping[str, Path]) -> None:
+    """Reject distinct configured paths that resolve to one live filesystem object."""
+    identities: dict[tuple[int, int], tuple[str, Path]] = {}
+    for label, raw_path in paths.items():
+        candidate = _canonical_absolute_path(raw_path, label=label)
+        try:
+            observed = candidate.lstat()
+        except OSError as exc:
+            raise LabDaemonConfigurationError(f"{label} path is unavailable") from exc
+        if stat.S_ISLNK(observed.st_mode):
+            raise LabDaemonConfigurationError(f"{label} path must not be a symlink")
+        if observed.st_uid != os.getuid():
+            raise LabDaemonConfigurationError(f"{label} path must be owned by this user")
+        identity = observed.st_dev, observed.st_ino
+        prior = identities.get(identity)
+        if prior is not None:
+            prior_label, prior_path = prior
+            raise LabDaemonConfigurationError(
+                "lab runtime paths share the same filesystem identity: "
+                f"{prior_label}={prior_path} <> {label}={candidate}"
+            )
+        identities[identity] = (label, candidate)
 
 
 def require_clean_code_sha(provider: Callable[[], str | None]) -> str:
@@ -276,6 +295,37 @@ def require_lab_runtime_binding(expected_checkout_root: Path) -> str:
     if verified != git_head:
         raise LabDaemonConfigurationError("lab runtime binding verified SHA mismatch")
     return verified
+
+
+@dataclass(frozen=True)
+class LabRuntimeGuard:
+    """Re-run the complete checkout binding and pin it to the startup commit."""
+
+    expected_checkout_root: Path
+    startup_sha: str
+    verifier: Callable[[Path], str] | None = None
+
+    def __post_init__(self) -> None:
+        expected = _canonical_absolute_path(
+            self.expected_checkout_root,
+            label="expected checkout root",
+        )
+        startup_sha = require_clean_code_sha(lambda: self.startup_sha)
+        object.__setattr__(self, "expected_checkout_root", expected)
+        object.__setattr__(self, "startup_sha", startup_sha)
+
+    def verify(self) -> str:
+        try:
+            verifier = self.verifier or require_lab_runtime_binding
+            observed = verifier(self.expected_checkout_root)
+        except LabDaemonConfigurationError:
+            raise
+        except Exception as exc:
+            raise LabDaemonConfigurationError("lab runtime guard verification failed") from exc
+        current = require_clean_code_sha(lambda: observed)
+        if current != self.startup_sha:
+            raise LabDaemonConfigurationError("lab runtime guard detected startup SHA drift")
+        return current
 
 
 def _read_private_file(path: Path, *, label: str, max_bytes: int = 16_384) -> bytes:
@@ -1014,6 +1064,40 @@ class LabFinalizerStateStore:
             if len(state.failures) > self._MAX_FAILURES:
                 raise LabDaemonConfigurationError("lab finalizer state has too many failures")
             self._assert_root_current(root_descriptor, root_identity)
+            active = os.stat(
+                self.path.name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            active_path = self.path.lstat()
+            for identity in (active, active_path):
+                _validate_private_regular_identity(
+                    identity,
+                    label="lab finalizer state file",
+                )
+            expected_identity = (
+                final.st_dev,
+                final.st_ino,
+                final.st_mode,
+                final.st_uid,
+                final.st_nlink,
+                final.st_size,
+                final.st_mtime_ns,
+            )
+            if any(
+                (
+                    identity.st_dev,
+                    identity.st_ino,
+                    identity.st_mode,
+                    identity.st_uid,
+                    identity.st_nlink,
+                    identity.st_size,
+                    identity.st_mtime_ns,
+                )
+                != expected_identity
+                for identity in (active, active_path)
+            ):
+                raise LabDaemonConfigurationError("lab finalizer state changed during read")
             return state
         finally:
             if descriptor >= 0:
@@ -1030,6 +1114,8 @@ class LabFinalizerStateStore:
         root_descriptor, root_identity = self._open_root()
         temporary_name = f".state.{os.getpid()}.{uuid4().hex}.tmp"
         descriptor = -1
+        existing_descriptor = -1
+        replaced = False
         try:
             try:
                 existing = os.stat(
@@ -1041,6 +1127,19 @@ class LabFinalizerStateStore:
                 existing = None
             if existing is not None:
                 _validate_private_regular_identity(existing, label="lab finalizer state file")
+                existing_descriptor = os.open(
+                    self.path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=root_descriptor,
+                )
+                opened_existing = os.fstat(existing_descriptor)
+                if (opened_existing.st_dev, opened_existing.st_ino) != (
+                    existing.st_dev,
+                    existing.st_ino,
+                ):
+                    raise LabDaemonConfigurationError(
+                        "lab finalizer state identity changed before commit"
+                    )
             descriptor = os.open(
                 temporary_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -1052,8 +1151,11 @@ class LabFinalizerStateStore:
             while offset < len(payload):
                 offset += os.write(descriptor, payload[offset:])
             os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = -1
+            temporary_identity = os.fstat(descriptor)
+            _validate_private_regular_identity(
+                temporary_identity,
+                label="lab finalizer state temporary file",
+            )
             self._assert_root_current(root_descriptor, root_identity)
             if existing is not None:
                 active = os.stat(
@@ -1075,6 +1177,7 @@ class LabFinalizerStateStore:
                 src_dir_fd=root_descriptor,
                 dst_dir_fd=root_descriptor,
             )
+            replaced = True
             self._assert_root_current(root_descriptor, root_identity)
             committed = os.stat(
                 self.path.name,
@@ -1090,21 +1193,95 @@ class LabFinalizerStateStore:
                 active_path,
                 label="lab finalizer state file",
             )
-            if (committed.st_dev, committed.st_ino) != (
-                active_path.st_dev,
-                active_path.st_ino,
+            if any(
+                (identity.st_dev, identity.st_ino)
+                != (temporary_identity.st_dev, temporary_identity.st_ino)
+                for identity in (committed, active_path)
             ) or committed.st_size != len(payload):
                 raise LabDaemonConfigurationError(
                     "lab finalizer state identity changed after commit"
                 )
             os.fsync(root_descriptor)
-        except OSError as exc:
-            raise LabDaemonConfigurationError(
-                "lab finalizer state could not be committed atomically"
-            ) from exc
+            self._assert_root_current(root_descriptor, root_identity)
+            final_active = os.stat(
+                self.path.name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            final_active_path = self.path.lstat()
+            for identity in (final_active, final_active_path):
+                _validate_private_regular_identity(
+                    identity,
+                    label="lab finalizer state file",
+                )
+            expected_identity = (
+                temporary_identity.st_dev,
+                temporary_identity.st_ino,
+                temporary_identity.st_mode,
+                temporary_identity.st_uid,
+                temporary_identity.st_nlink,
+                temporary_identity.st_size,
+                temporary_identity.st_mtime_ns,
+            )
+            if any(
+                (
+                    identity.st_dev,
+                    identity.st_ino,
+                    identity.st_mode,
+                    identity.st_uid,
+                    identity.st_nlink,
+                    identity.st_size,
+                    identity.st_mtime_ns,
+                )
+                != expected_identity
+                for identity in (final_active, final_active_path)
+            ):
+                raise LabDaemonConfigurationError(
+                    "lab finalizer state identity changed after commit"
+                )
+        except BaseException as exc:
+            if replaced and existing_descriptor >= 0:
+                restore_name = f".state.restore.{os.getpid()}.{uuid4().hex}.tmp"
+                restore_descriptor = -1
+                try:
+                    restore_descriptor = os.open(
+                        restore_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=root_descriptor,
+                    )
+                    os.lseek(existing_descriptor, 0, os.SEEK_SET)
+                    while True:
+                        chunk = os.read(existing_descriptor, 65_536)
+                        if not chunk:
+                            break
+                        written = 0
+                        while written < len(chunk):
+                            written += os.write(restore_descriptor, chunk[written:])
+                    os.fchmod(restore_descriptor, 0o600)
+                    os.fsync(restore_descriptor)
+                    os.rename(
+                        restore_name,
+                        self.path.name,
+                        src_dir_fd=root_descriptor,
+                        dst_dir_fd=root_descriptor,
+                    )
+                    os.fsync(root_descriptor)
+                finally:
+                    if restore_descriptor >= 0:
+                        os.close(restore_descriptor)
+                    with suppress(FileNotFoundError):
+                        os.unlink(restore_name, dir_fd=root_descriptor)
+            if isinstance(exc, OSError):
+                raise LabDaemonConfigurationError(
+                    "lab finalizer state could not be committed atomically"
+                ) from exc
+            raise
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+            if existing_descriptor >= 0:
+                os.close(existing_descriptor)
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=root_descriptor)
             os.close(root_descriptor)
@@ -1154,6 +1331,7 @@ class LabFinalizerDaemon:
         poll_interval_ms: int,
         failure_cooldown_seconds: int,
         failure_cooldown_max_seconds: int,
+        runtime_guard: Callable[[], str] | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         if not 1 <= max_jobs_per_tick <= 128:
@@ -1171,11 +1349,16 @@ class LabFinalizerDaemon:
         self.poll_interval_ms = poll_interval_ms
         self.failure_cooldown_seconds = failure_cooldown_seconds
         self.failure_cooldown_max_seconds = failure_cooldown_max_seconds
+        self.runtime_guard = runtime_guard
         self.now_provider = now_provider or (lambda: datetime.now(UTC))
         self._stop = Event()
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _verify_runtime(self) -> None:
+        if self.runtime_guard is not None:
+            self.runtime_guard()
 
     @staticmethod
     def _make_failure_room(
@@ -1198,6 +1381,7 @@ class LabFinalizerDaemon:
         state.failures.pop(victim)
 
     def run_once(self) -> LabFinalizerTickResult:
+        self._verify_runtime()
         state = self.state_store.load()
         page = self.reader.list_finalization_candidates(
             limit=self.max_jobs_per_tick,
@@ -1216,6 +1400,7 @@ class LabFinalizerDaemon:
         for candidate in page.items:
             if self._stop.is_set():
                 break
+            self._verify_runtime()
             now = self.now_provider()
             if now.tzinfo is None or now.utcoffset() is None:
                 raise LabDaemonConfigurationError("finalizer clock must be timezone-aware")
@@ -1233,10 +1418,13 @@ class LabFinalizerDaemon:
                 continue
             try:
                 result = self.finalizer.finalize(candidate.job_id)
+                self._verify_runtime()
                 if result.status not in counts:
                     raise RuntimeError(f"unknown finalizer status: {result.status}")
                 counts[result.status] += 1
                 state.failures.pop(failure_key, None)
+            except LabDaemonConfigurationError:
+                raise
             except Exception as exc:
                 failed += 1
                 attempts = 1 if prior_failure is None else prior_failure.attempts + 1
@@ -1252,6 +1440,7 @@ class LabFinalizerDaemon:
                     cooldown_until=now + timedelta(seconds=cooldown_seconds),
                     last_seen_cycle=state.cycle,
                 )
+                self._verify_runtime()
                 self.state_store.save(state)
                 if first_error_type is None:
                     first_error_type = type(exc).__name__
@@ -1276,6 +1465,7 @@ class LabFinalizerDaemon:
                     if failure.last_seen_cycle >= state.cycle
                 }
                 state.cycle += 1
+        self._verify_runtime()
         self.state_store.save(state)
         return LabFinalizerTickResult(
             candidates=len(page.items),

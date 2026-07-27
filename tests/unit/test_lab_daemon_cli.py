@@ -167,6 +167,7 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
         "ensure_private_directory",
         lambda path, *, label: path,
     )
+    monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
     monkeypatch.setattr(
         lab_daemon.LabAuthorityKeyring,
         "load",
@@ -285,6 +286,7 @@ def test_finalizer_forever_installs_both_stop_signals(
         "ensure_private_directory",
         lambda path, *, label: path,
     )
+    monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
     monkeypatch.setattr(
         lab_daemon.LabAuthorityKeyring,
         "load",

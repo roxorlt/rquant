@@ -35,7 +35,11 @@ from rquant.lab_artifacts import (
     LabArtifactFinalizationLockTimeoutError,
     LabJobArtifactStore,
 )
-from rquant.lab_daemon import LabFinalizerDaemon, LabFinalizerStateStore
+from rquant.lab_daemon import (
+    LabDaemonConfigurationError,
+    LabFinalizerDaemon,
+    LabFinalizerStateStore,
+)
 from rquant.lab_finalizer import (
     LabArtifactRoundtripPeakUsage,
     LabFinalizationCodeMismatchError,
@@ -1533,13 +1537,13 @@ def test_finalizer_calls_verified_code_provider_for_every_finalize(
     tmp_path: Path,
 ) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
-    values = iter(("1" * 40, "2" * 40))
+    active_sha = ["1" * 40]
     calls = 0
 
     def provider() -> str:
         nonlocal calls
         calls += 1
-        return next(values)
+        return active_sha[0]
 
     finalizer = LabFinalizer(
         reader=LabJobReader(scenario.store.path),
@@ -1551,9 +1555,45 @@ def test_finalizer_calls_verified_code_provider_for_every_finalize(
     )
 
     assert finalizer.finalize(scenario.job_id).status == "published"
+    first_finalize_calls = calls
+    assert first_finalize_calls >= 3
+    active_sha[0] = "2" * 40
     with pytest.raises(LabFinalizationCodeMismatchError):
         finalizer.finalize(scenario.job_id)
-    assert calls == 2
+    assert calls == first_finalize_calls + 1
+
+
+def test_finalizer_runtime_drift_after_seal_does_not_publish_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    drifted = False
+
+    def provider() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime checkout drifted")
+        return "1" * 40
+
+    finalizer = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=tmp_path / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        verified_code_sha_provider=provider,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+
+    def drift_after_seal(_sealed: object) -> None:
+        nonlocal drifted
+        drifted = True
+
+    monkeypatch.setattr(finalizer, "_after_artifact_sealed", drift_after_seal)
+
+    with pytest.raises(LabDaemonConfigurationError, match="drifted"):
+        finalizer.finalize(scenario.job_id)
+
+    assert scenario.commit_spool.pending() == ()
 
 
 def test_finalizer_provider_failure_is_typed_and_has_no_side_effect(

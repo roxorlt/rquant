@@ -50,6 +50,7 @@ from rquant.lab_artifacts import (
     LabJobArtifactStore,
     LabSealedJobArtifact,
 )
+from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_jobs import (
     COMPLETE_RESULT_CONTRACT_VERSION,
     MAX_JOB_SHARDS,
@@ -1405,6 +1406,27 @@ class LabFinalizer:
             )
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
 
+    def _verified_runtime_code_sha(self, *, expected_sha: str | None = None) -> str:
+        try:
+            runtime_code_sha = self.verified_code_sha_provider()
+        except LabDaemonConfigurationError:
+            raise
+        except Exception as exc:
+            raise LabFinalizationCodeProviderError("verified code SHA provider failed") from exc
+        if (
+            not isinstance(runtime_code_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None
+        ):
+            raise LabFinalizationCodeProviderError(
+                "verified code SHA provider returned an invalid commit"
+            )
+        if expected_sha is not None and runtime_code_sha != expected_sha:
+            raise LabFinalizationCodeMismatchError(
+                expected=expected_sha,
+                actual=runtime_code_sha,
+            )
+        return runtime_code_sha
+
     @staticmethod
     def _after_candidate_prepared(_candidate: LabJobArtifactCandidate) -> None:
         """Fault-injection boundary after durable candidate publication."""
@@ -1987,22 +2009,7 @@ class LabFinalizer:
         snapshot = self.reader.get_finalization_snapshot(job_id)
         if snapshot is None:
             return LabFinalizerResult(status="not_ready", job_id=job_id)
-        try:
-            runtime_code_sha = self.verified_code_sha_provider()
-        except Exception as exc:
-            raise LabFinalizationCodeProviderError("verified code SHA provider failed") from exc
-        if (
-            not isinstance(runtime_code_sha, str)
-            or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None
-        ):
-            raise LabFinalizationCodeProviderError(
-                "verified code SHA provider returned an invalid commit"
-            )
-        if snapshot.job.spec.code_sha != runtime_code_sha:
-            raise LabFinalizationCodeMismatchError(
-                expected=snapshot.job.spec.code_sha,
-                actual=runtime_code_sha,
-            )
+        runtime_code_sha = self._verified_runtime_code_sha(expected_sha=snapshot.job.spec.code_sha)
         snapshot_control_bytes = _resident_object_bytes(snapshot)
         self._require_within_limit(
             actual=snapshot_control_bytes,
@@ -2342,6 +2349,7 @@ class LabFinalizer:
             label="materialized artifact roundtrip peak resident bytes",
         )
         try:
+            self._verified_runtime_code_sha(expected_sha=runtime_code_sha)
             sealed = self._recover_or_prepare(plan)
         except LabFinalizationIntegrityError as primary_error:
             try:
@@ -2363,7 +2371,9 @@ class LabFinalizer:
         )
         published = self._verified_pending_for_envelope(envelope)
         if published is None:
+            self._verified_runtime_code_sha(expected_sha=runtime_code_sha)
             published = self.commit_spool.publish(envelope)
+        self._verified_runtime_code_sha(expected_sha=runtime_code_sha)
         self._after_commit_published(published)
         if isinstance(published, LabAcknowledgedArtifactCommit):
             return self._validate_acknowledgement(sealed, envelope, published)

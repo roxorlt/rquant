@@ -122,6 +122,7 @@ class LabScheduler:
         ) = None,
         max_artifact_commits_per_tick: int = 64,
         result_digest_policy: LabResultDigestPolicy | None = None,
+        runtime_guard: Callable[[], str] | None = None,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
         if not owner_id.strip():
@@ -190,11 +191,16 @@ class LabScheduler:
         self.result_digest_policy = LabResultDigestPolicy.model_validate(
             result_digest_policy or LabResultDigestPolicy()
         )
+        self.runtime_guard = runtime_guard
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
         self._claim_cursor = 0
         self._claim_cursor_fence: int | None = None
         self._stop = Event()
+
+    def _verify_runtime(self) -> None:
+        if self.runtime_guard is not None:
+            self.runtime_guard()
 
     @staticmethod
     def _after_artifact_commit_staged(
@@ -442,6 +448,7 @@ class LabScheduler:
         )
 
     def run_once(self) -> SchedulerTickResult:
+        self._verify_runtime()
         acquired = self._start_tick()
         recovered = 0
         if acquired:
@@ -463,6 +470,7 @@ class LabScheduler:
         deadline_lease = lease
         deadline_now = recovery_now
         for path in self.spool.pending_paths(limit=self.max_commands_per_tick):
+            self._verify_runtime()
             try:
                 entry = self.spool.load(path)
             except InvalidCommandEnvelopeError as exc:
@@ -494,6 +502,7 @@ class LabScheduler:
                 applied += 1
             else:
                 rejected += 1
+            self._verify_runtime()
             self.spool.ack(entry, receipt)
         deadlines_expired = len(
             self.store.expire_deadline_jobs(
@@ -507,6 +516,7 @@ class LabScheduler:
         reports_quarantined = 0
         if self.report_spool is not None:
             for path in self.report_spool.pending_paths(limit=self.max_reports_per_tick):
+                self._verify_runtime()
                 try:
                     entry = self.report_spool.load(path)
                 except InvalidCommandEnvelopeError as exc:
@@ -560,6 +570,7 @@ class LabScheduler:
                         report_id=str(entry.report.report_id),
                         report_type=entry.report.body.report_type,
                     )
+                self._verify_runtime()
                 self.report_spool.ack(entry, receipt)
         artifact_commits_processed = 0
         artifact_commits_accepted = 0
@@ -570,6 +581,7 @@ class LabScheduler:
             for path in self.artifact_commit_spool.fair_pending_paths(
                 limit=self.max_artifact_commits_per_tick + 64
             ):
+                self._verify_runtime()
                 if artifact_commits_processed >= self.max_artifact_commits_per_tick:
                     break
                 try:
@@ -665,6 +677,7 @@ class LabScheduler:
                     continue
                 assert receipt is not None
                 self._after_artifact_commit_sqlite_commit(entry)
+                self._verify_runtime()
                 artifact_commits_processed += 1
                 if receipt.status == "accepted":
                     artifact_commits_accepted += 1
@@ -675,6 +688,7 @@ class LabScheduler:
         plans_failed = 0
         if self.adapter_registry is not None:
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
+                self._verify_runtime()
                 try:
                     definitions = self.adapter_registry.plan(job.spec)
                 except Exception as exc:
@@ -713,6 +727,7 @@ class LabScheduler:
             start = self._claim_cursor
             inspected = 0
             while inspected < worker_count and claims_created < self.max_claims_per_tick:
+                self._verify_runtime()
                 worker_id = self.claim_worker_ids[(start + inspected) % worker_count]
                 inspected += 1
                 lease, mutation_now = self._mutation_context()
@@ -734,6 +749,7 @@ class LabScheduler:
                 new_claim_tokens.add(claim.claim_token)
                 claims_created += 1
             self._claim_cursor = (start + inspected) % worker_count
+        self._verify_runtime()
         authority = self._reconcile_claim_authority(
             lease,
             now=authority_now,

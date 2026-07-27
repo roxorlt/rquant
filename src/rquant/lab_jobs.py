@@ -75,6 +75,8 @@ if TYPE_CHECKING:
 class LabSqliteIdentityAuthority(Protocol):
     path: Path
 
+    def assert_current(self) -> None: ...
+
     def open_verified_connection(
         self,
         opener: Callable[[Path], sqlite3.Connection],
@@ -435,11 +437,17 @@ class _LabJobStoreCursor(sqlite3.Cursor):
         parameters: _SqlParameters = (),
         /,
     ) -> sqlite3.Cursor:
+        connection = self.connection
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._assert_identity_current()
         try:
-            return super().execute(sql, parameters)
+            result = super().execute(sql, parameters)
         except sqlite3.Error:
             self._expire_authorization()
             raise
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._assert_identity_current()
+        return result
 
     def executemany(
         self,
@@ -447,22 +455,46 @@ class _LabJobStoreCursor(sqlite3.Cursor):
         seq_of_parameters: Iterable[_SqlParameters],
         /,
     ) -> sqlite3.Cursor:
+        connection = self.connection
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._assert_identity_current()
         try:
-            return super().executemany(sql, seq_of_parameters)
+            result = super().executemany(sql, seq_of_parameters)
         except sqlite3.Error:
             self._expire_authorization()
             raise
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._assert_identity_current()
+        return result
 
     def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        connection = self.connection
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._assert_identity_current()
         try:
-            return super().executescript(sql_script)
+            result = super().executescript(sql_script)
         except sqlite3.Error:
             self._expire_authorization()
             raise
+        if isinstance(connection, _LabJobStoreConnection):
+            connection._assert_identity_current()
+        return result
 
 
 class _LabJobStoreConnection(sqlite3.Connection):
     write_authorization: _LabWriteAuthorization
+    identity_authority: LabSqliteIdentityAuthority | None = None
+    _identity_failed: bool = False
+
+    def _assert_identity_current(self) -> None:
+        authority = self.identity_authority
+        if authority is None:
+            return
+        try:
+            authority.assert_current()
+        except BaseException:
+            self._identity_failed = True
+            raise
 
     def cursor(
         self,
@@ -509,17 +541,125 @@ class _LabJobStoreConnection(sqlite3.Connection):
             self._expire_write_authorization()
 
     def commit(self) -> None:
+        self._assert_identity_current()
         self._expire_write_authorization()
         super().commit()
+        self._assert_identity_current()
 
     def rollback(self) -> None:
         self._expire_write_authorization()
         super().rollback()
 
     def close(self) -> None:
+        identity_error: BaseException | None = None
+        if not self._identity_failed:
+            try:
+                self._assert_identity_current()
+            except BaseException as exc:
+                identity_error = exc
         self._expire_write_authorization()
         self.set_trace_callback(None)
         super().close()
+        if identity_error is not None:
+            raise identity_error
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        if self.identity_authority is None:
+            return super().__exit__(exc_type, exc, traceback)
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+        return False
+
+
+class _LabJobReaderCursor(sqlite3.Cursor):
+    def execute(
+        self,
+        sql: str,
+        parameters: _SqlParameters = (),
+        /,
+    ) -> sqlite3.Cursor:
+        connection = self.connection
+        if isinstance(connection, _LabJobReaderConnection):
+            connection._assert_identity_current()
+        result = super().execute(sql, parameters)
+        if isinstance(connection, _LabJobReaderConnection):
+            connection._assert_identity_current()
+        return result
+
+
+class _LabJobReaderConnection(sqlite3.Connection):
+    identity_authority: LabSqliteIdentityAuthority | None = None
+    _identity_failed: bool = False
+
+    def _assert_identity_current(self) -> None:
+        authority = self.identity_authority
+        if authority is None:
+            return
+        try:
+            authority.assert_current()
+        except BaseException:
+            self._identity_failed = True
+            raise
+
+    def cursor(
+        self,
+        factory: type[sqlite3.Cursor] | None = None,
+    ) -> sqlite3.Cursor:
+        if factory is not None and factory is not _LabJobReaderCursor:
+            raise TypeError("lab job reader cursor factory must preserve identity fencing")
+        return super().cursor(_LabJobReaderCursor)
+
+    def execute(
+        self,
+        sql: str,
+        parameters: _SqlParameters = (),
+        /,
+    ) -> sqlite3.Cursor:
+        return self.cursor().execute(sql, parameters)
+
+    def commit(self) -> None:
+        self._assert_identity_current()
+        super().commit()
+        self._assert_identity_current()
+
+    def rollback(self) -> None:
+        super().rollback()
+
+    def close(self) -> None:
+        identity_error: BaseException | None = None
+        if not self._identity_failed:
+            try:
+                self._assert_identity_current()
+            except BaseException as exc:
+                identity_error = exc
+        super().close()
+        if identity_error is not None:
+            raise identity_error
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+        return False
 
 
 def _write_authorization(connection: sqlite3.Connection) -> _LabWriteAuthorization:
@@ -2974,6 +3114,14 @@ class LabJobReader:
     def _connect(self) -> sqlite3.Connection:
         def open_readonly(path: Path) -> sqlite3.Connection:
             uri = f"file:{quote(str(path if self.identity_authority else path.resolve()))}?mode=ro"
+            if self.identity_authority is not None:
+                return sqlite3.connect(
+                    uri,
+                    uri=True,
+                    timeout=self.busy_timeout_ms / 1_000,
+                    isolation_level=None,
+                    factory=_LabJobReaderConnection,
+                )
             return sqlite3.connect(
                 uri,
                 uri=True,
@@ -2986,6 +3134,11 @@ class LabJobReader:
             if self.identity_authority is not None
             else open_readonly(self.path)
         )
+        if self.identity_authority is not None:
+            if not isinstance(connection, _LabJobReaderConnection):
+                connection.close()
+                raise TypeError("lab SQLite authority returned an incompatible reader connection")
+            connection.identity_authority = self.identity_authority
         connection.create_function(
             _SHARD_ROW_VALID_FUNCTION,
             32,
@@ -4741,6 +4894,7 @@ class LabJobStore:
             connection.close()
             raise TypeError("lab SQLite authority returned an incompatible connection")
         authorization = _LabWriteAuthorization(connection)
+        connection.identity_authority = self.identity_authority
         connection.write_authorization = authorization
         connection.set_trace_callback(connection._trace_transaction_boundary)
         connection.create_function(
