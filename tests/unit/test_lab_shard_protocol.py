@@ -14,6 +14,10 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError, RequestContentConflictError
+from rquant.lab_result_digest import (
+    CURRENT_CONTENT_DIGEST_ALGORITHM,
+    CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
+)
 from rquant.lab_shard_protocol import (
     LabAdmittedExecution,
     LabClaimDeliveryReceipt,
@@ -323,6 +327,40 @@ def test_report_union_roundtrip_and_content_hash_tamper_detection(
     tampered["content_hash"] = "f" * 64
     with pytest.raises(ValidationError, match="content_hash"):
         LabWorkerReport.model_validate(tampered)
+
+
+def test_succeeded_report_binds_current_digest_provenance() -> None:
+    body = LabShardSucceeded.current(
+        result_manifest_hash="3" * 64,
+        worker_code_sha="1" * 40,
+    )
+
+    assert body.result_manifest_schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
+    assert body.content_digest_algorithm == CURRENT_CONTENT_DIGEST_ALGORITHM
+    assert body.worker_code_sha == "1" * 40
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"result_manifest_schema_version": 2},
+        {"content_digest_algorithm": CURRENT_CONTENT_DIGEST_ALGORITHM},
+        {"worker_code_sha": "1" * 40},
+        {
+            "result_manifest_schema_version": 1,
+            "content_digest_algorithm": "pandas-orient-table-json-sha256-v1",
+            "worker_code_sha": "1" * 40,
+        },
+    ],
+)
+def test_succeeded_report_rejects_partial_or_forged_digest_provenance(
+    updates: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        LabShardSucceeded(
+            result_manifest_hash="3" * 64,
+            **updates,
+        )
 
 
 def test_failed_report_canonicalizes_failure_and_rejects_float() -> None:

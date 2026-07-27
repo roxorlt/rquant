@@ -25,8 +25,13 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
+from pydantic import ValidationError
 
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
+from rquant.lab_result_digest import (
+    CURRENT_CONTENT_DIGEST_ALGORITHM,
+    CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
+)
 from rquant.lab_shard_protocol import (
     LabClaimRevokedError,
     LabClaimSpool,
@@ -410,8 +415,6 @@ def test_canonical_shard_frame_digest_matches_legacy_timedelta_column_context(
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (b"\xc3", "\u00c0"),
-        (b"\xe2\x82", "\u2080"),
         (b"x" * 4095 + b"\xe2\x82\xac", "x" * 4095 + "\u20ac"),
         (b"x" * 4095 + b"\xe2\x82\x00", "x" * 4095 + "\u2080"),
         (b"a\x00b", "a\x00b"),
@@ -420,8 +423,6 @@ def test_canonical_shard_frame_digest_matches_legacy_timedelta_column_context(
         (b"\xf4\x90\x80\x80", "\udc00\udc00"),
     ],
     ids=[
-        "truncated-two-byte",
-        "truncated-three-byte",
         "valid-across-chunk",
         "truncated-across-chunk",
         "embedded-nul",
@@ -447,10 +448,26 @@ def test_canonical_shard_frame_digest_matches_legacy_bytes_tokens(
     )
 
     assert json.loads(raw)["data"][0]["v"] == expected
-    legacy_digest = _legacy_canonical_shard_frame_digest(frame)
-    if value == b"\xc3":
-        assert legacy_digest == "c8708819a08439e8499de616b18df66df1c67d13eee1ee8b8728e8b89fc3c742"
-    assert canonical_shard_frame_digest(frame) == legacy_digest
+    assert canonical_shard_frame_digest(frame) == _legacy_canonical_shard_frame_digest(frame)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_digest"),
+    [
+        (b"\xc3", "c8708819a08439e8499de616b18df66df1c67d13eee1ee8b8728e8b89fc3c742"),
+        (b"\xe2\x82", "37ceed389f24211ba9d9077a0e1fb7b02b69b8f5dc8400ea35ad8a0fc04e38da"),
+    ],
+    ids=["truncated-two-byte", "truncated-three-byte"],
+)
+def test_canonical_shard_frame_digest_stabilizes_terminal_truncated_bytes(
+    value: bytes,
+    expected_digest: str,
+) -> None:
+    from rquant.lab_worker import canonical_shard_frame_digest
+
+    frame = pd.DataFrame({"v": pd.Series([value], dtype=object)})
+
+    assert canonical_shard_frame_digest(frame) == expected_digest
 
 
 @pytest.mark.parametrize("input_chunk_bytes", (1, 2, 3, 4, 4095, 4096, 4097, 64 * 1024))
@@ -1160,6 +1177,9 @@ def test_worker_consumes_only_its_owned_unexpired_claim(tmp_path: Path) -> None:
     assert report.scheduler_fencing_token == owned.scheduler_fencing_token
     assert report.claim_token == owned.claim_token
     assert report.worker_id == owned.worker_id
+    assert report.body.result_manifest_schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
+    assert report.body.content_digest_algorithm == CURRENT_CONTENT_DIGEST_ALGORITHM
+    assert report.body.worker_code_sha == "1" * 40
 
 
 def test_worker_does_not_rehash_large_quarantine_for_each_claim(
@@ -3653,6 +3673,9 @@ def test_bundle_is_canonical_and_obsolete_attempt_is_reclaimed_across_retry(
     manifest_path = sealed / "manifest.json"
     manifest = LabShardResultManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     assert first.manifest_hash == manifest.manifest_hash
+    assert manifest.schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
+    assert manifest.content_digest_algorithm == CURRENT_CONTENT_DIGEST_ALGORITHM
+    assert manifest.worker_code_sha == "1" * 40
     assert manifest_path.read_text(encoding="utf-8") == manifest.canonical_json()
     assert (sealed / manifest.artifacts[0].file_name).is_file()
     retry = _retry_claim(claim)
@@ -3671,6 +3694,95 @@ def test_bundle_is_canonical_and_obsolete_attempt_is_reclaimed_across_retry(
     assert not tuple(
         path for path in (tmp_path / "artifacts" / ".tmp").rglob("*") if path.is_file()
     )
+
+
+def test_result_manifest_preserves_legacy_v1_canonical_bytes() -> None:
+    from rquant.lab_worker import LabShardResultManifest
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    payload = {
+        "schema_version": 1,
+        "job_id": str(claim.job_id),
+        "shard_id": str(claim.shard_id),
+        "claim_token": str(claim.claim_token),
+        "claim_generation": claim.claim_generation,
+        "scheduler_fencing_token": claim.scheduler_fencing_token,
+        "spec_hash": claim.spec_hash,
+        "payload_hash": claim.payload_hash,
+        "plan_hash": claim.plan_hash,
+        "adapter_id": claim.definition.adapter_id,
+        "adapter_version": claim.definition.adapter_version,
+        "artifacts": [
+            {
+                "name": "trades",
+                "file_name": "000-trades.parquet",
+                "format": "parquet",
+                "row_count": 1,
+                "columns": ["hold_days", "ret_pct"],
+                "file_size": 1,
+                "file_sha256": "2" * 64,
+                "content_sha256": "3" * 64,
+            }
+        ],
+        "metrics": [],
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+    manifest = LabShardResultManifest.model_validate_json(raw)
+
+    assert manifest.canonical_json() == raw
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"schema_version": 2},
+        {
+            "schema_version": 1,
+            "worker_code_sha": "1" * 40,
+            "content_digest_algorithm": CURRENT_CONTENT_DIGEST_ALGORITHM,
+        },
+    ],
+)
+def test_result_manifest_rejects_missing_or_forged_digest_provenance(
+    updates: dict[str, object],
+) -> None:
+    from rquant.lab_worker import LabShardResultManifest
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    payload = {
+        "schema_version": 1,
+        "job_id": str(claim.job_id),
+        "shard_id": str(claim.shard_id),
+        "claim_token": str(claim.claim_token),
+        "claim_generation": claim.claim_generation,
+        "scheduler_fencing_token": claim.scheduler_fencing_token,
+        "spec_hash": claim.spec_hash,
+        "payload_hash": claim.payload_hash,
+        "plan_hash": claim.plan_hash,
+        "adapter_id": claim.definition.adapter_id,
+        "adapter_version": claim.definition.adapter_version,
+        "artifacts": [
+            {
+                "name": "trades",
+                "file_name": "000-trades.parquet",
+                "row_count": 1,
+                "columns": ["value"],
+                "file_size": 1,
+                "file_sha256": "2" * 64,
+                "content_sha256": "3" * 64,
+            }
+        ],
+        **updates,
+    }
+    with pytest.raises(ValidationError, match="digest provenance"):
+        LabShardResultManifest.model_validate(payload)
 
 
 def test_same_attempt_conflicting_result_fails_closed(tmp_path: Path) -> None:
@@ -4872,7 +4984,10 @@ def test_stale_pending_success_does_not_block_obsolete_sealed_reclamation(
         generation_one,
         report_id=uuid4(),
         reported_at=NOW,
-        body=LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+        body=LabShardSucceeded.current(
+            result_manifest_hash=manifest.manifest_hash,
+            worker_code_sha="1" * 40,
+        ),
     )
     reports.publish(success)
 
@@ -7148,8 +7263,9 @@ def test_scheduler_retires_accepted_success_from_hot_claim_authority(tmp_path: P
         claim,
         report_id=uuid4(),
         reported_at=NOW,
-        body=LabShardSucceeded(
+        body=LabShardSucceeded.current(
             result_manifest_hash="a" * 64,
+            worker_code_sha="1" * 40,
             telemetry=LabShardTelemetry.from_work_plan(
                 claim.definition.work_plan,
                 monotonic_started=10,

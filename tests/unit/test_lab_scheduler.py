@@ -283,7 +283,10 @@ def test_scheduler_commits_verified_complete_result_before_ack(tmp_path: Path) -
         claim,
         report_id=uuid4(),
         reported_at=NOW + timedelta(seconds=3),
-        body=LabShardSucceeded(result_manifest_hash="9" * 64),
+        body=LabShardSucceeded.current(
+            result_manifest_hash="9" * 64,
+            worker_code_sha="1" * 40,
+        ),
     )
     assert (
         store.apply_worker_report(
@@ -674,7 +677,10 @@ def _ready_artifact_commit_scenario(
         claim,
         report_id=uuid4(),
         reported_at=NOW + timedelta(seconds=3),
-        body=LabShardSucceeded(result_manifest_hash="9" * 64),
+        body=LabShardSucceeded.current(
+            result_manifest_hash="9" * 64,
+            worker_code_sha="1" * 40,
+        ),
     )
     assert (
         store.apply_worker_report(

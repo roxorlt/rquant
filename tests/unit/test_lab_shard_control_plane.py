@@ -31,6 +31,10 @@ from rquant.lab_jobs import (
     ShardPlanConflictError,
     ShardStatus,
 )
+from rquant.lab_result_digest import (
+    LabLegacyContentDigestProvenance,
+    LabResultDigestPolicy,
+)
 from rquant.lab_shard_protocol import (
     LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
     LAB_SHARD_DURATION_MS_MIN,
@@ -153,6 +157,12 @@ def _report(
     offset: int = 3,
     report_id: UUID | None = None,
 ) -> LabWorkerReport:
+    if isinstance(body, LabShardSucceeded) and body.result_manifest_schema_version is None:
+        body = LabShardSucceeded.current(
+            result_manifest_hash=body.result_manifest_hash,
+            worker_code_sha="1" * 40,
+            telemetry=body.telemetry,
+        )
     return LabWorkerReport.from_claim(
         claim,
         report_id=report_id or uuid4(),
@@ -164,8 +174,9 @@ def _report(
 def _success(claim: LabShardClaim, *, duration_ms: float) -> LabShardSucceeded:
     plan = claim.definition.work_plan
     assert plan is not None
-    return LabShardSucceeded(
+    return LabShardSucceeded.current(
         result_manifest_hash=f"{claim.shard_index + 1:x}" * 64,
+        worker_code_sha="1" * 40,
         telemetry=LabShardTelemetry(
             phase=plan.phase,
             work_unit_name=plan.work_unit_name,
@@ -175,6 +186,111 @@ def _success(claim: LabShardClaim, *, duration_ms: float) -> LabShardSucceeded:
             throughput_units_per_second=plan.work_units / (duration_ms / 1_000),
         ),
     )
+
+
+def test_scheduler_rejects_current_job_success_without_digest_provenance(
+    tmp_path: Path,
+) -> None:
+    store, lease, _ = _setup(tmp_path)
+    claim = _claim(store, lease)
+    unprovenanced = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardSucceeded(result_manifest_hash="6" * 64),
+    )
+
+    rejected = store.apply_worker_report(
+        unprovenanced,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    wrong_code = store.apply_worker_report(
+        _report(
+            claim,
+            LabShardSucceeded.current(
+                result_manifest_hash="6" * 64,
+                worker_code_sha="2" * 40,
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    accepted = store.apply_worker_report(
+        _report(
+            claim,
+            LabShardSucceeded.current(
+                result_manifest_hash="6" * 64,
+                worker_code_sha="1" * 40,
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert rejected.status == "rejected"
+    assert rejected.reason == "unsupported_result_digest_provenance"
+    assert wrong_code.status == "rejected"
+    assert wrong_code.reason == "unsupported_result_digest_provenance"
+    assert accepted.status == "accepted"
+
+
+def test_scheduler_accepts_unversioned_legacy_success_only_for_exact_allowlist(
+    tmp_path: Path,
+) -> None:
+    legacy_code_sha = "53dc0afe74d5af44f1d4a4bcda149d6a5b52c854"
+    base = _submit().command.spec
+    legacy_spec = type(base).model_validate(
+        {**base.model_dump(mode="python"), "code_sha": legacy_code_sha}
+    )
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    custom = _submit(job_id=uuid4(), spec=legacy_spec)
+    assert store.apply_command(custom, lease=lease, now=NOW).status == "applied"
+    store.plan_job(
+        custom.command.job_id,
+        (_definition(0),),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    claim = _claim(store, lease)
+    report = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW + timedelta(seconds=3),
+        body=LabShardSucceeded(result_manifest_hash="6" * 64),
+    )
+    wrong_policy = LabResultDigestPolicy(
+        legacy_allowlist=(LabLegacyContentDigestProvenance(code_sha="0" * 40),)
+    )
+    exact_policy = LabResultDigestPolicy(
+        legacy_allowlist=(LabLegacyContentDigestProvenance(code_sha=legacy_code_sha),)
+    )
+
+    wrong = store.apply_worker_report(
+        report,
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+        result_digest_policy=wrong_policy,
+    )
+    accepted = store.apply_worker_report(
+        LabWorkerReport.from_claim(
+            claim,
+            report_id=uuid4(),
+            reported_at=NOW + timedelta(seconds=3),
+            body=LabShardSucceeded(result_manifest_hash="6" * 64),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+        result_digest_policy=exact_policy,
+    )
+
+    assert job.job_id != custom.command.job_id
+    assert wrong.status == "rejected"
+    assert wrong.reason == "unsupported_result_digest_provenance"
+    assert accepted.status == "accepted"
 
 
 def _pause(store: LabJobStore, lease: LabLeaseRecord, job_id: UUID, *, offset: int) -> None:

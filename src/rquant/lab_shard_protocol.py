@@ -25,6 +25,10 @@ from rquant.lab_job_protocol import (
     LabSpoolFileIdentity,
     RequestContentConflictError,
 )
+from rquant.lab_result_digest import (
+    CURRENT_CONTENT_DIGEST_ALGORITHM,
+    CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
+)
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _SPOOL_NAME = re.compile(
@@ -421,7 +425,43 @@ class LabShardHeartbeat(LabShardProtocolModel):
 class LabShardSucceeded(LabShardProtocolModel):
     report_type: Literal["shard_succeeded"] = "shard_succeeded"
     result_manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    result_manifest_schema_version: Literal[2] | None = None
+    content_digest_algorithm: Literal["rquant-pandas-table-json-sha256-v2"] | None = None
+    worker_code_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     telemetry: LabShardTelemetry | None = None
+
+    @classmethod
+    def current(
+        cls,
+        *,
+        result_manifest_hash: str,
+        worker_code_sha: str,
+        telemetry: LabShardTelemetry | None = None,
+    ) -> LabShardSucceeded:
+        return cls(
+            result_manifest_hash=result_manifest_hash,
+            result_manifest_schema_version=CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
+            content_digest_algorithm=CURRENT_CONTENT_DIGEST_ALGORITHM,
+            worker_code_sha=worker_code_sha,
+            telemetry=telemetry,
+        )
+
+    @model_validator(mode="after")
+    def validate_digest_provenance(self) -> LabShardSucceeded:
+        provenance = (
+            self.result_manifest_schema_version,
+            self.content_digest_algorithm,
+            self.worker_code_sha,
+        )
+        if provenance == (None, None, None):
+            return self
+        if (
+            self.result_manifest_schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
+            and self.content_digest_algorithm == CURRENT_CONTENT_DIGEST_ALGORITHM
+            and self.worker_code_sha is not None
+        ):
+            return self
+        raise ValueError("shard success digest provenance is incomplete or unsupported")
 
 
 class LabShardFailed(LabShardProtocolModel):

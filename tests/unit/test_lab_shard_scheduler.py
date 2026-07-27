@@ -801,7 +801,10 @@ def test_scheduler_does_not_revoke_consumed_claim_after_accepted_success(
     reports.publish(
         _report(
             claim,
-            LabShardSucceeded(result_manifest_hash="a" * 64),
+            LabShardSucceeded.current(
+                result_manifest_hash="a" * 64,
+                worker_code_sha="1" * 40,
+            ),
         )
     )
     clock[0] = NOW + timedelta(seconds=3)

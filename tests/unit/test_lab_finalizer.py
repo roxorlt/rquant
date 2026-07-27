@@ -58,6 +58,10 @@ from rquant.lab_jobs import (
     LabResultState,
     LabWorkerReportRecord,
 )
+from rquant.lab_result_digest import (
+    LabLegacyContentDigestProvenance,
+    LabResultDigestPolicy,
+)
 from rquant.lab_scheduler import LabScheduler
 from rquant.lab_shard_protocol import (
     LabClaimSpool,
@@ -74,6 +78,7 @@ from rquant.strategy_job_adapters import (
     LabShardMetric,
     LabShardTable,
     ValidatedStrategyShard,
+    build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
 
@@ -128,6 +133,8 @@ class _Scenario:
         job_id: UUID,
         artifact_store: LabJobArtifactStore,
         commit_spool: LabArtifactCommitSpool,
+        code_sha: str = "1" * 40,
+        result_digest_policy: LabResultDigestPolicy | None = None,
     ) -> None:
         self.root = root
         self.store = store
@@ -135,6 +142,8 @@ class _Scenario:
         self.job_id = job_id
         self.artifact_store = artifact_store
         self.commit_spool = commit_spool
+        self.code_sha = code_sha
+        self.result_digest_policy = result_digest_policy or LabResultDigestPolicy()
 
     def finalizer(self) -> LabFinalizer:
         return LabFinalizer(
@@ -143,8 +152,9 @@ class _Scenario:
             artifact_store=self.artifact_store,
             commit_spool=self.commit_spool,
             adapter_registry=default_strategy_job_adapter_registry(),
-            verified_code_sha_provider=lambda: "1" * 40,
+            verified_code_sha_provider=lambda: self.code_sha,
             finalizer_authority_key_provider=_authority_key_provider,
+            result_digest_policy=self.result_digest_policy,
         )
 
 
@@ -181,6 +191,10 @@ def _ready_scenario(
     hold_days: tuple[int, ...] = (1, 2),
     commit_spool_type: type[LabArtifactCommitSpool] = LabArtifactCommitSpool,
     worker_registry: RecordingRegistry | None = None,
+    spec: ResearchRunSpec | None = None,
+    result_digest_policy: LabResultDigestPolicy | None = None,
+    rewrite_pending_as_legacy_v1: bool = False,
+    forged_current_content_hash: str | None = None,
 ) -> _Scenario:
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -190,12 +204,13 @@ def _ready_scenario(
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
     job_id = uuid4()
+    resolved_spec = spec or _nshape_compare_spec(hold_days=hold_days)
     commands.publish(
         LabCommandEnvelope(
             request_id=uuid4(),
             command=SubmitJobCommand(
                 job_id=job_id,
-                spec=_nshape_compare_spec(hold_days=hold_days),
+                spec=resolved_spec,
                 max_attempts=2,
             ),
         )
@@ -215,6 +230,7 @@ def _ready_scenario(
         artifact_commit_spool=commit_spool,
         artifact_store=artifact_store,
         finalizer_authority_key_provider=_authority_verification_key_provider,
+        result_digest_policy=result_digest_policy,
         clock=lambda: NOW,
     )
     scheduler.run_once()
@@ -223,9 +239,101 @@ def _ready_scenario(
         registry=worker_registry or RecordingRegistry(),
         claims=claims,
         reports=reports,
+        verified_code_sha_provider=lambda: resolved_spec.code_sha,
     )
     for _ in hold_days:
         assert worker.run_once().status == "succeeded"
+        if forged_current_content_hash is not None:
+            pending = tuple(
+                item
+                for item in reports.pending()
+                if isinstance(item.report.body, LabShardSucceeded)
+            )
+            assert len(pending) == 1
+            entry = pending[0]
+            report = entry.report
+            body = report.body
+            assert isinstance(body, LabShardSucceeded)
+            attempt = (
+                tmp_path
+                / "artifacts"
+                / "jobs"
+                / str(report.job_id)
+                / "shards"
+                / str(report.shard_id)
+                / "attempts"
+                / (
+                    f"{report.scheduler_fencing_token:020d}-"
+                    f"{report.claim_generation:020d}-{report.claim_token}"
+                )
+            )
+            current = LabShardResultManifest.model_validate_json(
+                (attempt / "manifest.json").read_bytes()
+            )
+            artifacts = tuple(
+                artifact.model_copy(update={"content_sha256": forged_current_content_hash})
+                for artifact in current.artifacts
+            )
+            forged = LabShardResultManifest.model_validate(
+                current.model_copy(update={"artifacts": artifacts})
+            )
+            _persist_attempt_manifest(attempt, forged)
+            reports.quarantine(entry, reason="test rewrites current content digest")
+            report_payload = report.model_dump(mode="python")
+            report_payload.update(
+                {
+                    "report_id": uuid4(),
+                    "body": body.model_copy(update={"result_manifest_hash": forged.manifest_hash}),
+                    "content_hash": "",
+                }
+            )
+            reports.publish(LabWorkerReport.model_validate(report_payload))
+        if rewrite_pending_as_legacy_v1:
+            pending = tuple(
+                item
+                for item in reports.pending()
+                if isinstance(item.report.body, LabShardSucceeded)
+            )
+            assert len(pending) == 1
+            entry = pending[0]
+            report = entry.report
+            body = report.body
+            assert isinstance(body, LabShardSucceeded)
+            attempt = (
+                tmp_path
+                / "artifacts"
+                / "jobs"
+                / str(report.job_id)
+                / "shards"
+                / str(report.shard_id)
+                / "attempts"
+                / (
+                    f"{report.scheduler_fencing_token:020d}-"
+                    f"{report.claim_generation:020d}-{report.claim_token}"
+                )
+            )
+            current = LabShardResultManifest.model_validate_json(
+                (attempt / "manifest.json").read_bytes()
+            )
+            legacy_payload = current.model_dump(mode="python", exclude_none=True)
+            legacy_payload["schema_version"] = 1
+            legacy_payload.pop("worker_code_sha", None)
+            legacy_payload.pop("content_digest_algorithm", None)
+            legacy = LabShardResultManifest.model_validate(legacy_payload)
+            _persist_attempt_manifest(attempt, legacy)
+            reports.quarantine(entry, reason="test cutover rewrites exact legacy report")
+            report_payload = report.model_dump(mode="python")
+            report_payload.update(
+                {
+                    "report_id": uuid4(),
+                    "body": LabShardSucceeded(
+                        result_manifest_hash=legacy.manifest_hash,
+                        telemetry=body.telemetry,
+                    ),
+                    "content_hash": "",
+                }
+            )
+            reports.publish(LabWorkerReport.model_validate(report_payload))
         scheduler.run_once()
     job = LabJobReader(store.path).get_job(job_id)
     assert job is not None
@@ -238,6 +346,8 @@ def _ready_scenario(
         job_id=job_id,
         artifact_store=artifact_store,
         commit_spool=commit_spool,
+        code_sha=resolved_spec.code_sha,
+        result_digest_policy=result_digest_policy,
     )
 
 
@@ -432,10 +542,14 @@ def _evidence_for_manifest(
     manifest: LabShardResultManifest,
 ) -> LabFinalizationShardEvidence:
     original = evidence.accepted_success
+    original_body = original.report.body
+    assert isinstance(original_body, LabShardSucceeded)
     report_payload = original.report.model_dump(mode="python")
     report_payload.update(
         {
-            "body": LabShardSucceeded(result_manifest_hash=manifest.manifest_hash),
+            "body": original_body.model_copy(
+                update={"result_manifest_hash": manifest.manifest_hash}
+            ),
             "content_hash": "",
         }
     )
@@ -456,6 +570,89 @@ def _evidence_for_manifest(
     )
     shard = evidence.shard.model_copy(update={"result_manifest_hash": manifest.manifest_hash})
     return LabFinalizationShardEvidence(shard=shard, accepted_success=accepted)
+
+
+def test_current_terminal_bytes_manifest_with_forged_content_hash_fails_closed(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(
+        tmp_path,
+        hold_days=(1,),
+        worker_registry=_LegacyBoundaryBytesRegistry(),
+    )
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    attempt = _attempt_path(tmp_path, evidence)
+    manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    artifact = manifest.artifacts[0].model_copy(update={"content_sha256": "0" * 64})
+    changed = LabShardResultManifest.model_validate(
+        manifest.model_copy(update={"artifacts": (artifact,)})
+    )
+    _persist_attempt_manifest(attempt, changed)
+    accepted = _evidence_for_manifest(evidence, changed)
+
+    with pytest.raises(LabFinalizationIntegrityError, match="Parquet content conflicts"):
+        LabSealedShardBundleReader(tmp_path / "artifacts").read(accepted)
+
+
+def test_finalizer_rejects_scheduler_accepted_current_forged_content_hash(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(
+        tmp_path,
+        hold_days=(1,),
+        worker_registry=_LegacyBoundaryBytesRegistry(),
+        forged_current_content_hash="0" * 64,
+    )
+
+    with pytest.raises(LabFinalizationIntegrityError, match="Parquet content conflicts"):
+        scenario.finalizer().finalize(scenario.job_id)
+
+    assert scenario.commit_spool.pending() == ()
+    assert not (scenario.artifact_store.sealed_root / scenario.job_id.hex).exists()
+
+
+def test_bundle_reader_rejects_accepted_worker_code_evidence_before_filesystem_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
+    assert snapshot is not None
+    evidence = snapshot.shards[0]
+    original = evidence.accepted_success
+    body = original.report.body
+    assert isinstance(body, LabShardSucceeded)
+    report_payload = original.report.model_dump(mode="python")
+    report_payload.update(
+        {
+            "body": body.model_copy(update={"worker_code_sha": "2" * 40}),
+            "content_hash": "",
+        }
+    )
+    report = LabWorkerReport.model_validate(report_payload)
+    receipt = LabReportReceipt.from_report(
+        report,
+        status="accepted",
+        reason="shard_succeeded",
+        accepted_at=original.receipt.accepted_at,
+    )
+    tampered = LabFinalizationShardEvidence(
+        shard=evidence.shard,
+        accepted_success=original.model_copy(update={"report": report, "receipt": receipt}),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("digest provenance mismatch reached artifact filesystem")
+
+    monkeypatch.setattr(LabSealedShardBundleReader, "_open_directory", forbidden)
+
+    with pytest.raises(LabFinalizationIntegrityError, match="provenance is not authorized"):
+        LabSealedShardBundleReader(tmp_path / "artifacts").read(
+            tampered,
+            expected_job_code_sha="1" * 40,
+        )
 
 
 def _rewrite_parquet_dtype(
@@ -735,6 +932,22 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
         return _legacy_canonical_shard_frame_digest(frame)
 
     registry = _LegacyBoundaryBytesRegistry()
+    legacy_code_sha = "53dc0afe74d5af44f1d4a4bcda149d6a5b52c854"
+    base_spec = _nshape_compare_spec(hold_days=(1,))
+    legacy_spec = ResearchRunSpec.model_validate(
+        {
+            **base_spec.model_dump(mode="python"),
+            "code_sha": legacy_code_sha,
+            "feature_contract": build_adapter_execution_contract(
+                "nshape-compare",
+                "1",
+                legacy_code_sha,
+            ),
+        }
+    )
+    policy = LabResultDigestPolicy(
+        legacy_allowlist=(LabLegacyContentDigestProvenance(code_sha=legacy_code_sha),)
+    )
     with monkeypatch.context() as legacy_worker:
         legacy_worker.setattr(
             lab_worker_module,
@@ -745,6 +958,9 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
             tmp_path,
             hold_days=(1,),
             worker_registry=registry,
+            spec=legacy_spec,
+            result_digest_policy=policy,
+            rewrite_pending_as_legacy_v1=True,
         )
 
     snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
@@ -752,7 +968,22 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
     evidence = snapshot.shards[0]
     attempt = _attempt_path(tmp_path, evidence)
     manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
+    assert manifest.schema_version == 1
+    assert manifest.worker_code_sha is None
+    assert manifest.content_digest_algorithm is None
     assert manifest.artifacts[0].content_sha256 == observed_legacy_digest
+
+    untrusted_legacy = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=scenario.root / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=registry,
+        verified_code_sha_provider=lambda: legacy_code_sha,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+    with pytest.raises(LabFinalizationIntegrityError, match="provenance is not authorized"):
+        untrusted_legacy.finalize(scenario.job_id)
 
     finalizer = LabFinalizer(
         reader=LabJobReader(scenario.store.path),
@@ -760,8 +991,9 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=registry,
-        verified_code_sha_provider=lambda: "1" * 40,
+        verified_code_sha_provider=lambda: legacy_code_sha,
         finalizer_authority_key_provider=_authority_key_provider,
+        result_digest_policy=policy,
     )
     result = finalizer.finalize(scenario.job_id)
 

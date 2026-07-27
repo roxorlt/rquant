@@ -19,10 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from rquant.canonical_json_stream import (
-    CANONICAL_JSON_STREAM_SCRATCH_BYTES,
-    legacy_pandas_bytes_requires_virtual_terminator,
-)
+from rquant.canonical_json_stream import CANONICAL_JSON_STREAM_SCRATCH_BYTES
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -55,6 +52,12 @@ from rquant.lab_jobs import (
     LabFinalizationShardEvidence,
     LabFinalizationSnapshot,
     LabJobReader,
+)
+from rquant.lab_result_digest import (
+    LabResultDigestPolicy,
+    LabResultDigestProvenanceError,
+    require_matching_manifest_digest_provenance,
+    resolve_success_digest_provenance,
 )
 from rquant.lab_shard_protocol import LabShardSucceeded
 from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_digest
@@ -366,14 +369,6 @@ def _resident_object_bytes(value: object, *, _seen: set[int] | None = None) -> i
     return size
 
 
-def _has_legacy_terminal_bytes(frame: pd.DataFrame) -> bool:
-    for column in frame.columns:
-        for value in frame[column].array:
-            if isinstance(value, bytes) and legacy_pandas_bytes_requires_virtual_terminator(value):
-                return True
-    return False
-
-
 def _scan_json_string_end(payload: bytes, start: int, *, label: str) -> int:
     if start >= len(payload) or payload[start] != ord('"'):
         raise LabFinalizationIntegrityError(f"accepted shard {label} is not a JSON string")
@@ -613,6 +608,7 @@ class LabSealedShardBundleReader:
         *,
         limits: LabShardBundleLimits | None = None,
         max_peak_resident_bytes: int | None = None,
+        result_digest_policy: LabResultDigestPolicy | None = None,
     ) -> None:
         self.artifact_root = Path(artifact_root).resolve()
         self.limits = limits or LabShardBundleLimits()
@@ -621,6 +617,9 @@ class LabSealedShardBundleReader:
         self.max_peak_resident_bytes = min(
             self.limits.max_manifest_peak_bytes,
             max_peak_resident_bytes or self.limits.max_manifest_peak_bytes,
+        )
+        self.result_digest_policy = LabResultDigestPolicy.model_validate(
+            result_digest_policy or LabResultDigestPolicy()
         )
 
     def _preflight_manifest_size(self, size: int, *, resident_bytes: int) -> None:
@@ -954,11 +953,29 @@ class LabSealedShardBundleReader:
         materialize: bool,
         expected_inspection: LabShardBundleInspection | None,
         resident_bytes: int,
+        expected_job_code_sha: str | None,
     ) -> LabShardExecutionResult | LabShardBundleInspection:
         report = evidence.accepted_success.report
         body = report.body
         if not isinstance(body, LabShardSucceeded):
             raise LabFinalizationIntegrityError("accepted attempt is not shard_succeeded")
+        job_code_sha = expected_job_code_sha or body.worker_code_sha
+        if job_code_sha is None:
+            raise LabFinalizationIntegrityError(
+                "legacy accepted attempt requires explicit job code provenance"
+            )
+        try:
+            digest_provenance = resolve_success_digest_provenance(
+                expected_job_code_sha=job_code_sha,
+                result_manifest_schema_version=body.result_manifest_schema_version,
+                content_digest_algorithm=body.content_digest_algorithm,
+                worker_code_sha=body.worker_code_sha,
+                policy=self.result_digest_policy,
+            )
+        except LabResultDigestProvenanceError as exc:
+            raise LabFinalizationIntegrityError(
+                "accepted shard digest provenance is not authorized"
+            ) from exc
         segments = (
             "jobs",
             str(report.job_id),
@@ -1036,6 +1053,17 @@ class LabSealedShardBundleReader:
                 raise LabFinalizationIntegrityError("accepted shard manifest is invalid") from exc
             if manifest_bytes != manifest.canonical_json().encode("utf-8"):
                 raise LabFinalizationIntegrityError("accepted shard manifest is not canonical JSON")
+            try:
+                require_matching_manifest_digest_provenance(
+                    digest_provenance,
+                    manifest_schema_version=manifest.schema_version,
+                    content_digest_algorithm=manifest.content_digest_algorithm,
+                    worker_code_sha=manifest.worker_code_sha,
+                )
+            except LabResultDigestProvenanceError as exc:
+                raise LabFinalizationIntegrityError(
+                    "accepted shard manifest digest provenance conflicts"
+                ) from exc
             self._validate_manifest_resources(
                 manifest,
                 manifest_size=len(manifest_bytes),
@@ -1149,11 +1177,7 @@ class LabSealedShardBundleReader:
                             "accepted shard Parquet shape conflicts"
                         )
                     content_hash = canonical_shard_frame_digest(frame)
-                    # Old ujson could consume bytes beyond its C-string NUL after this EOF shape;
-                    # the accepted manifest and exact file hash checked above remain authoritative.
-                    if content_hash != artifact.content_sha256 and not _has_legacy_terminal_bytes(
-                        frame
-                    ):
+                    if content_hash != artifact.content_sha256 and not digest_provenance.legacy:
                         raise LabFinalizationIntegrityError(
                             "accepted shard Parquet content conflicts"
                         )
@@ -1239,6 +1263,7 @@ class LabSealedShardBundleReader:
         observe_usage: Callable[[LabShardBundleUsage], None] | None = None,
         expected_inspection: LabShardBundleInspection | None = None,
         resident_bytes: int = 0,
+        expected_job_code_sha: str | None = None,
     ) -> LabShardExecutionResult:
         descriptors: list[int] = []
         result: LabShardExecutionResult | None = None
@@ -1251,6 +1276,7 @@ class LabSealedShardBundleReader:
                 materialize=True,
                 expected_inspection=expected_inspection,
                 resident_bytes=resident_bytes,
+                expected_job_code_sha=expected_job_code_sha,
             )
         except BaseException as exc:
             errors.append(exc)
@@ -1277,6 +1303,7 @@ class LabSealedShardBundleReader:
         evidence: LabFinalizationShardEvidence,
         *,
         resident_bytes: int = 0,
+        expected_job_code_sha: str | None = None,
     ) -> LabShardBundleInspection:
         descriptors: list[int] = []
         result: LabShardExecutionResult | LabShardBundleInspection | None = None
@@ -1289,6 +1316,7 @@ class LabSealedShardBundleReader:
                 materialize=False,
                 expected_inspection=None,
                 resident_bytes=resident_bytes,
+                expected_job_code_sha=expected_job_code_sha,
             )
         except BaseException as exc:
             errors.append(exc)
@@ -1327,13 +1355,18 @@ class LabFinalizer:
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
+        result_digest_policy: LabResultDigestPolicy | None = None,
     ) -> None:
         self.reader = reader
         self.job_limits = job_limits or LabFinalizerJobLimits()
+        self.result_digest_policy = LabResultDigestPolicy.model_validate(
+            result_digest_policy or LabResultDigestPolicy()
+        )
         self.bundle_reader = LabSealedShardBundleReader(
             shard_artifact_root,
             limits=bundle_limits,
             max_peak_resident_bytes=self.job_limits.max_peak_resident_bytes,
+            result_digest_policy=self.result_digest_policy,
         )
         self.artifact_store = artifact_store
         self.commit_spool = commit_spool
@@ -1958,6 +1991,7 @@ class LabFinalizer:
             self.bundle_reader.inspect(
                 evidence,
                 resident_bytes=control_usage.resident_bytes,
+                expected_job_code_sha=snapshot.job.spec.code_sha,
             )
             for evidence in snapshot.shards
         )
@@ -2049,6 +2083,7 @@ class LabFinalizer:
                             + total_dataframe_bytes
                             + total_retained_metric_bytes
                         ),
+                        expected_job_code_sha=snapshot.job.spec.code_sha,
                     )
                 )
                 if len(usages) != 1:

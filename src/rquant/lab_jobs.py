@@ -38,6 +38,11 @@ from rquant.lab_job_protocol import (
     RetryJobCommand,
     SubmitJobCommand,
 )
+from rquant.lab_result_digest import (
+    LabResultDigestPolicy,
+    LabResultDigestProvenanceError,
+    resolve_success_digest_provenance,
+)
 from rquant.lab_shard_protocol import (
     LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
     LAB_SHARD_DURATION_MS_MIN,
@@ -6930,6 +6935,7 @@ class LabJobStore:
         job_row: sqlite3.Row,
         shard_row: sqlite3.Row,
         now: datetime,
+        result_digest_policy: LabResultDigestPolicy,
     ) -> str | None:
         if str(shard_row["job_id"]) != str(report.job_id):
             return "job_shard_mismatch"
@@ -6981,6 +6987,17 @@ class LabJobStore:
         ):
             return "cancel_requested"
         if isinstance(report.body, LabShardSucceeded):
+            job = LabJobReader._job_from_row(job_row)
+            try:
+                resolve_success_digest_provenance(
+                    expected_job_code_sha=job.spec.code_sha,
+                    result_manifest_schema_version=(report.body.result_manifest_schema_version),
+                    content_digest_algorithm=report.body.content_digest_algorithm,
+                    worker_code_sha=report.body.worker_code_sha,
+                    policy=result_digest_policy,
+                )
+            except LabResultDigestProvenanceError:
+                return "unsupported_result_digest_provenance"
             expected_plan = LabJobStore._definition_from_shard_row(shard_row).work_plan
             reported_telemetry = report.body.telemetry
             if expected_plan is None:
@@ -7371,8 +7388,12 @@ class LabJobStore:
         *,
         lease: LabLeaseRecord,
         now: datetime,
+        result_digest_policy: LabResultDigestPolicy | None = None,
     ) -> LabReportReceipt:
         validated = LabWorkerReport.model_validate(report)
+        digest_policy = LabResultDigestPolicy.model_validate(
+            result_digest_policy or LabResultDigestPolicy()
+        )
         current = _utc(now)
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
@@ -7410,6 +7431,7 @@ class LabJobStore:
                 job_row=job_row,
                 shard_row=shard_row,
                 now=current,
+                result_digest_policy=digest_policy,
             )
             if rejection is not None:
                 receipt = self._report_receipt(

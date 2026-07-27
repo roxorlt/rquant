@@ -30,6 +30,10 @@ from rquant.canonical_json_stream import (
 from rquant.data_metadata import DatasetSnapshotBinding
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_logging import _safe_structured_log
+from rquant.lab_result_digest import (
+    CURRENT_CONTENT_DIGEST_ALGORITHM,
+    CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
+)
 from rquant.lab_shard_protocol import (
     LabClaimAlreadyConsumedError,
     LabClaimNotConsumedError,
@@ -155,7 +159,9 @@ class LabShardArtifactManifest(LabWorkerModel):
 
 
 class LabShardResultManifest(LabWorkerModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = CURRENT_RESULT_MANIFEST_SCHEMA_VERSION
+    worker_code_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    content_digest_algorithm: Literal["rquant-pandas-table-json-sha256-v2"] | None = None
     job_id: UUID
     shard_id: UUID
     claim_token: UUID
@@ -171,6 +177,15 @@ class LabShardResultManifest(LabWorkerModel):
 
     @model_validator(mode="after")
     def validate_artifacts(self) -> LabShardResultManifest:
+        provenance = (self.worker_code_sha, self.content_digest_algorithm)
+        if self.schema_version == CURRENT_RESULT_MANIFEST_SCHEMA_VERSION:
+            if (
+                self.worker_code_sha is None
+                or self.content_digest_algorithm != CURRENT_CONTENT_DIGEST_ALGORITHM
+            ):
+                raise ValueError("current result manifest requires complete digest provenance")
+        elif provenance != (None, None):
+            raise ValueError("legacy result manifest cannot carry current digest provenance")
         names = tuple(artifact.name for artifact in self.artifacts)
         files = tuple(artifact.file_name for artifact in self.artifacts)
         if not names:
@@ -181,7 +196,7 @@ class LabShardResultManifest(LabWorkerModel):
 
     def canonical_json(self) -> str:
         return json.dumps(
-            self.model_dump(mode="json"),
+            self.model_dump(mode="json", exclude_none=True),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -1479,8 +1494,28 @@ class LabWorker:
                 continue
         return None
 
+    def _verified_runtime_code_sha(self, spec: ResearchRunSpec) -> str:
+        if self.verified_code_sha_provider is None:
+            raise PermissionError("worker execution requires verified runtime code SHA")
+        try:
+            runtime_code_sha = self.verified_code_sha_provider()
+        except Exception as exc:
+            raise PermissionError("verified runtime code SHA provider failed") from exc
+        if (
+            not isinstance(runtime_code_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", runtime_code_sha) is None
+            or runtime_code_sha != spec.code_sha
+        ):
+            raise PermissionError("runtime clean code SHA does not match ResearchRunSpec")
+        return runtime_code_sha
+
     @contextmanager
-    def _open_store(self, spec: ResearchRunSpec) -> Iterator[object]:
+    def _open_store(
+        self,
+        spec: ResearchRunSpec,
+        *,
+        runtime_code_sha: str,
+    ) -> Iterator[object]:
         if spec.research_status == "exploratory":
             if self.exploratory_store_factory is None:
                 raise PermissionError(
@@ -1497,16 +1532,6 @@ class LabWorker:
             raise PermissionError(
                 "formal worker execution requires metadata store and research lake"
             )
-        if self.verified_code_sha_provider is None:
-            raise PermissionError("formal worker execution requires verified runtime code SHA")
-        runtime_code_sha = self.verified_code_sha_provider()
-        if (
-            runtime_code_sha is None
-            or len(runtime_code_sha) != 40
-            or any(character not in "0123456789abcdef" for character in runtime_code_sha)
-            or runtime_code_sha != spec.code_sha
-        ):
-            raise PermissionError("formal runtime clean code SHA does not match ResearchRunSpec")
         adapter = self.adapter_registry.for_spec(spec)
         request = ResearchGateRequest(
             mode="formal",
@@ -1587,6 +1612,8 @@ class LabWorker:
         temporary: Path,
         claim: LabShardClaim,
         result: LabShardExecutionResult,
+        *,
+        worker_code_sha: str,
     ) -> LabShardResultManifest:
         temporary.mkdir(parents=True, exist_ok=False)
         artifacts: list[LabShardArtifactManifest] = []
@@ -1612,6 +1639,8 @@ class LabWorker:
                 )
             )
         manifest = LabShardResultManifest(
+            worker_code_sha=worker_code_sha,
+            content_digest_algorithm=CURRENT_CONTENT_DIGEST_ALGORITHM,
             job_id=claim.job_id,
             shard_id=claim.shard_id,
             claim_token=claim.claim_token,
@@ -1804,8 +1833,13 @@ class LabWorker:
         self,
         claim: LabShardClaim,
         result: LabShardExecutionResult,
+        *,
+        worker_code_sha: str | None = None,
     ) -> LabPreparedShardBundle:
         self._validate_result_identity(claim, result)
+        resolved_code_sha = worker_code_sha or self._verified_runtime_code_sha(
+            self.adapter_registry.validate_claim(claim).spec
+        )
         sealed = self.sealed_bundle_path(claim)
         temporary_root = self._temporary_bundle_path(claim)
         self._assert_safe_artifact_ancestors(temporary_root)
@@ -1814,7 +1848,12 @@ class LabWorker:
         _fsync_directory(sealed.parent)
         temporary = temporary_root / uuid4().hex
         try:
-            self._write_bundle(temporary, claim, result)
+            self._write_bundle(
+                temporary,
+                claim,
+                result,
+                worker_code_sha=resolved_code_sha,
+            )
             candidate = self._validate_bundle(temporary, claim)
             candidate_files = self._prepared_file_identities(temporary, candidate)
             if sealed.exists() or sealed.is_symlink():
@@ -2208,6 +2247,11 @@ class LabWorker:
             return self._failure_result(claim, phase="claim", error=exc)
 
         try:
+            runtime_code_sha = self._verified_runtime_code_sha(validated.spec)
+        except Exception as exc:
+            return self._failure_result(claim, phase="session", error=exc)
+
+        try:
             self._check_deadline(validated.spec)
         except Exception as exc:
             return self._failure_result(claim, phase="deadline", error=exc)
@@ -2242,7 +2286,10 @@ class LabWorker:
         stop_reason: str | None = None
         try:
             try:
-                with self._open_store(validated.spec) as store:
+                with self._open_store(
+                    validated.spec,
+                    runtime_code_sha=runtime_code_sha,
+                ) as store:
                     result = self.adapter_registry.execute_shard(validated, store)
             except PermissionError as exc:
                 operation_phase = "session"
@@ -2261,7 +2308,11 @@ class LabWorker:
                         operation_error = exc
             if operation_error is None and stop_reason is None:
                 try:
-                    prepared = self._prepare_result(claim, result)
+                    prepared = self._prepare_result(
+                        claim,
+                        result,
+                        worker_code_sha=runtime_code_sha,
+                    )
                     self._check_deadline(validated.spec)
                 except TimeoutError as exc:
                     operation_phase = "deadline"
@@ -2374,8 +2425,9 @@ class LabWorker:
                 )
                 report = self._make_report(
                     claim,
-                    LabShardSucceeded(
+                    LabShardSucceeded.current(
                         result_manifest_hash=bundle.manifest.manifest_hash,
+                        worker_code_sha=runtime_code_sha,
                         telemetry=telemetry,
                     ),
                 )

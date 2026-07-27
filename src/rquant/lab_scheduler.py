@@ -31,6 +31,7 @@ from rquant.lab_jobs import (
     SchedulerLeaseFencedError,
 )
 from rquant.lab_logging import _safe_structured_log
+from rquant.lab_result_digest import LabResultDigestPolicy
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim
 from rquant.strategy_job_adapters import StrategyJobAdapterRegistry
 
@@ -120,6 +121,7 @@ class LabScheduler:
             LabFinalizerAuthorityVerificationKeyProvider | None
         ) = None,
         max_artifact_commits_per_tick: int = 64,
+        result_digest_policy: LabResultDigestPolicy | None = None,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
         if not owner_id.strip():
@@ -173,6 +175,9 @@ class LabScheduler:
         self.artifact_store = artifact_store
         self.finalizer_authority_key_provider = finalizer_authority_key_provider
         self.max_artifact_commits_per_tick = max_artifact_commits_per_tick
+        self.result_digest_policy = LabResultDigestPolicy.model_validate(
+            result_digest_policy or LabResultDigestPolicy()
+        )
         self.clock = clock
         self.lease: LabLeaseRecord | None = None
         self._claim_cursor = 0
@@ -506,6 +511,7 @@ class LabScheduler:
                         entry.report,
                         lease=lease,
                         now=mutation_now,
+                        result_digest_policy=self.result_digest_policy,
                     )
                 except RequestContentConflictError as exc:
                     _safe_structured_log(
