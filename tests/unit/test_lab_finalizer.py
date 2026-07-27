@@ -4,9 +4,14 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
+import textwrap
+import threading
 import tracemalloc
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -25,11 +30,16 @@ from rquant.lab_artifact_protocol import (
     LabArtifactCommitSpoolEntry,
     LabFinalizerAuthorityKey,
 )
-from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore
+from rquant.lab_artifacts import (
+    LabArtifactError,
+    LabArtifactFinalizationLockTimeoutError,
+    LabJobArtifactStore,
+)
 from rquant.lab_finalizer import (
     LabArtifactRoundtripPeakUsage,
     LabFinalizationCodeMismatchError,
     LabFinalizationCodeProviderError,
+    LabFinalizationCoordinationTimeoutError,
     LabFinalizationIntegrityError,
     LabFinalizationResourceLimitError,
     LabFinalizer,
@@ -2129,6 +2139,203 @@ def test_repeated_seal_failure_reuses_one_active_candidate_and_recovers(
     recovered = scenario.finalizer().finalize(scenario.job_id)
 
     assert recovered.status == "published"
+    assert not tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
+
+
+def test_finalizer_reports_typed_coordination_timeout_without_artifact_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+
+    @contextmanager
+    def timeout_lock(**_kwargs: object) -> Iterator[None]:
+        raise LabArtifactFinalizationLockTimeoutError("forced timeout")
+        yield
+
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "finalization_identity_lock",
+        timeout_lock,
+    )
+
+    with pytest.raises(
+        LabFinalizationCoordinationTimeoutError,
+        match="decision lock timed out",
+    ):
+        scenario.finalizer().finalize(scenario.job_id)
+
+    assert not tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert not tuple(scenario.artifact_store.sealed_root.iterdir())
+    assert scenario.commit_spool.pending() == ()
+
+
+@pytest.mark.parametrize("callers", (8, 32))
+def test_empty_candidate_concurrent_first_finalize_creates_one_retry_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    callers: int,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    original_seal = scenario.artifact_store.seal_candidate
+    original_list = scenario.artifact_store.list_candidate_recovery
+    snapshot_condition = threading.Condition()
+    snapshot_callers = 0
+    snapshot_released = False
+
+    def synchronized_empty_snapshot() -> object:
+        nonlocal snapshot_callers, snapshot_released
+        snapshot = original_list()
+        with snapshot_condition:
+            if snapshot_released:
+                return snapshot
+            snapshot_callers += 1
+            if snapshot_callers == callers:
+                snapshot_released = True
+                snapshot_condition.notify_all()
+                return snapshot
+            snapshot_condition.wait_for(lambda: snapshot_released, timeout=1)
+            snapshot_released = True
+            snapshot_condition.notify_all()
+        return snapshot
+
+    def fail_seal(*_args: object, **_kwargs: object) -> object:
+        raise LabArtifactError("forced pre-intent seal failure")
+
+    monkeypatch.setattr(
+        scenario.artifact_store,
+        "list_candidate_recovery",
+        synchronized_empty_snapshot,
+    )
+    monkeypatch.setattr(scenario.artifact_store, "seal_candidate", fail_seal)
+
+    with ThreadPoolExecutor(max_workers=callers) as executor:
+        futures = tuple(
+            executor.submit(scenario.finalizer().finalize, scenario.job_id) for _ in range(callers)
+        )
+        for future in futures:
+            with pytest.raises(LabFinalizationIntegrityError, match="could not be sealed"):
+                future.result(timeout=30)
+
+    candidates = tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert len(candidates) == 1
+    retained_bytes = sum(item.stat().st_size for item in candidates[0].rglob("*") if item.is_file())
+    assert retained_bytes <= LabFinalizerJobLimits().max_final_artifact_payload_bytes
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
+
+    successful_seals = 0
+
+    def count_successful_seal(*args: object, **kwargs: object) -> object:
+        nonlocal successful_seals
+        successful_seals += 1
+        return original_seal(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(scenario.artifact_store, "list_candidate_recovery", original_list)
+    monkeypatch.setattr(scenario.artifact_store, "seal_candidate", count_successful_seal)
+    published = scenario.finalizer().finalize(scenario.job_id)
+
+    assert published.status == "published"
+    assert successful_seals == 1
+    assert len(scenario.commit_spool.pending()) == 1
+    assert not tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
+
+    monkeypatch.setattr(scenario.artifact_store, "seal_candidate", original_seal)
+    recovered = scenario.finalizer().finalize(scenario.job_id)
+
+    assert recovered.status == "published"
+    assert not tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
+
+
+def test_empty_candidate_multi_process_first_finalize_creates_one_retry_candidate(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    callers = 4
+    barrier_root = tmp_path / "process-barrier"
+    barrier_root.mkdir()
+    script = textwrap.dedent(
+        """
+        import os
+        import time
+        from pathlib import Path
+        from uuid import UUID
+
+        from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
+        from rquant.lab_artifacts import LabArtifactError, LabJobArtifactStore
+        from rquant.lab_finalizer import LabFinalizationIntegrityError, LabFinalizer
+        from rquant.lab_jobs import LabJobReader
+        from rquant.lab_artifact_protocol import LabArtifactCommitSpool
+
+        artifact_store = LabJobArtifactStore(Path({artifact_store_root!r}))
+        original_list = artifact_store.list_candidate_recovery
+        barrier_root = Path({barrier_root!r})
+        callers = {callers}
+
+        def synchronized_snapshot():
+            snapshot = original_list()
+            (barrier_root / str(os.getpid())).write_text("ready", encoding="utf-8")
+            deadline = time.monotonic() + 1
+            while len(tuple(barrier_root.iterdir())) < callers and time.monotonic() < deadline:
+                time.sleep(0.005)
+            return snapshot
+
+        def fail_seal(*_args, **_kwargs):
+            raise LabArtifactError("forced pre-intent seal failure")
+
+        artifact_store.list_candidate_recovery = synchronized_snapshot
+        artifact_store.seal_candidate = fail_seal
+        finalizer = LabFinalizer(
+            reader=LabJobReader(Path({ledger_path!r})),
+            shard_artifact_root=Path({shard_root!r}),
+            artifact_store=artifact_store,
+            commit_spool=LabArtifactCommitSpool(Path({commit_spool_root!r})),
+            verified_code_sha_provider=lambda: "1" * 40,
+            finalizer_authority_key_provider=lambda: LabFinalizerAuthorityKey(
+                key_id="finalizer-test-key",
+                secret=b"f" * 32,
+            ),
+        )
+        try:
+            finalizer.finalize(UUID({job_id!r}))
+        except LabFinalizationIntegrityError:
+            raise SystemExit(0)
+        raise SystemExit(2)
+        """
+    ).format(
+        artifact_store_root=str(scenario.artifact_store.root),
+        barrier_root=str(barrier_root),
+        callers=callers,
+        ledger_path=str(scenario.store.path),
+        shard_root=str(tmp_path / "artifacts"),
+        commit_spool_root=str(scenario.commit_spool.root),
+        job_id=str(scenario.job_id),
+    )
+    processes = tuple(
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(callers)
+    )
+    outputs = tuple(process.communicate(timeout=30) for process in processes)
+    assert [process.returncode for process in processes] == [0] * callers, outputs
+
+    candidates = tuple(scenario.artifact_store.candidates_root.iterdir())
+    assert len(candidates) == 1
+    retained_bytes = sum(item.stat().st_size for item in candidates[0].rglob("*") if item.is_file())
+    assert retained_bytes <= LabFinalizerJobLimits().max_final_artifact_payload_bytes
+    assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
+
+    published = scenario.finalizer().finalize(scenario.job_id)
+
+    assert published.status == "published"
+    assert len(scenario.commit_spool.pending()) == 1
     assert not tuple(scenario.artifact_store.candidates_root.iterdir())
     assert not tuple(scenario.artifact_store.quarantine_root.iterdir())
 

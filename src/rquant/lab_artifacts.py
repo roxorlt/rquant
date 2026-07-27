@@ -16,6 +16,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ _ZIP_STREAM_CHUNK_SIZE = 1024 * 1024
 _LEGACY_GENESIS_HASH = "0" * 64
 _LEGACY_PROCESS_LOCKS_GUARD = threading.Lock()
 _ARTIFACT_PROCESS_LOCKS_GUARD = threading.Lock()
+_FINALIZATION_PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass
@@ -70,6 +72,18 @@ class _ArtifactProcessLockEntry:
 
 
 _ARTIFACT_PROCESS_LOCKS: dict[tuple[int, int], _ArtifactProcessLockEntry] = {}
+
+
+@dataclass
+class _FinalizationProcessLockEntry:
+    lock: threading.Lock
+    references: int
+
+
+_FINALIZATION_PROCESS_LOCKS: dict[
+    tuple[int, int, str, str],
+    _FinalizationProcessLockEntry,
+] = {}
 _ArtifactOperationParams = ParamSpec("_ArtifactOperationParams")
 _ArtifactOperationResult = TypeVar("_ArtifactOperationResult")
 
@@ -138,6 +152,14 @@ class LabArtifactAuthorizationError(LabArtifactError):
 
 class LabArtifactPlatformError(LabArtifactError):
     """The host cannot provide a required fail-closed filesystem primitive."""
+
+
+class LabArtifactFinalizationLockError(LabArtifactError):
+    """A per-result finalization lock could not be acquired or verified."""
+
+
+class LabArtifactFinalizationLockTimeoutError(LabArtifactFinalizationLockError):
+    """A per-result finalization lock remained unavailable until its deadline."""
 
 
 class _BoundedBytesIO(io.BytesIO):
@@ -2172,6 +2194,7 @@ class LabJobArtifactStore:
         self.namespace_guard_active_root = self.root / "namespace-guard-active"
         self.namespace_guard_history_root = self.root / "namespace-guard-history"
         self.namespace_guard_quarantine_root = self.root / "namespace-guard-quarantine"
+        self.finalization_locks_root = self.root / "finalization-locks"
         self._closed = False
         self._closing = False
         self._preview_activity_count = 0
@@ -2203,6 +2226,7 @@ class LabJobArtifactStore:
                 self.namespace_guard_active_root,
                 self.namespace_guard_history_root,
                 self.namespace_guard_quarantine_root,
+                self.finalization_locks_root,
             ):
                 _ensure_private_directory(
                     path,
@@ -2245,6 +2269,7 @@ class LabJobArtifactStore:
                 self.namespace_guard_active_root,
                 self.namespace_guard_history_root,
                 self.namespace_guard_quarantine_root,
+                self.finalization_locks_root,
             ):
                 self._managed_descriptors[child] = os.open(
                     child.name,
@@ -2417,6 +2442,263 @@ class LabJobArtifactStore:
                 self._preview_activity_count -= 1
                 if self._preview_activity_count == 0:
                     self._preview_condition.notify_all()
+
+    def _assert_finalization_lock_identity(
+        self,
+        *,
+        descriptor: int,
+        name: str,
+        expected: _FileObservation | None = None,
+    ) -> _FileObservation:
+        self._assert_managed_roots()
+        parent_descriptor = self._managed_descriptors[self.finalization_locks_root]
+        try:
+            opened_stat = os.fstat(descriptor)
+            path_stat = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise LabArtifactFinalizationLockError(
+                "finalization lock identity is unavailable"
+            ) from exc
+        opened = _FileObservation.from_stat(opened_stat)
+        at_path = _FileObservation.from_stat(path_stat)
+        if (
+            not self._same_finalization_lock_identity(opened, at_path)
+            or (
+                expected is not None and not self._same_finalization_lock_identity(opened, expected)
+            )
+            or opened.mode != stat.S_IFREG
+            or opened.nlink != 1
+            or opened.size != 0
+            or stat.S_IMODE(opened_stat.st_mode) != 0o600
+            or stat.S_IMODE(path_stat.st_mode) != 0o600
+        ):
+            raise LabArtifactFinalizationLockError(
+                "finalization lock is not a secure regular file or changed identity"
+            )
+        return opened
+
+    @staticmethod
+    def _same_finalization_lock_identity(
+        left: _FileObservation,
+        right: _FileObservation,
+    ) -> bool:
+        # Lock acquisition can overlap first creation; ctime/mtime are not
+        # authority, while inode, link count, type and zero length are.
+        return (
+            left.device,
+            left.inode,
+            left.mode,
+            left.nlink,
+            left.size,
+        ) == (
+            right.device,
+            right.inode,
+            right.mode,
+            right.nlink,
+            right.size,
+        )
+
+    def _open_finalization_lock_descriptor(self, name: str) -> int:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise LabArtifactFinalizationLockError(
+                "finalization lock requires secure no-follow file opens"
+            )
+        parent_descriptor = self._managed_descriptors[self.finalization_locks_root]
+        flags = os.O_RDWR | nofollow
+        created = False
+        try:
+            try:
+                descriptor = os.open(
+                    name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise LabArtifactFinalizationLockError(
+                "finalization lock is not a secure regular file"
+            ) from exc
+        try:
+            self._assert_finalization_lock_identity(
+                descriptor=descriptor,
+                name=name,
+            )
+            if created:
+                os.fsync(descriptor)
+                os.fsync(parent_descriptor)
+            return descriptor
+        except BaseException as error:
+            try:
+                _close_descriptor_fail_closed(
+                    descriptor,
+                    label="invalid finalization lock descriptor",
+                )
+            except BaseException as cleanup_error:
+                _raise_collected_errors(
+                    "finalization lock validation and close both failed",
+                    [error, cleanup_error],
+                )
+            raise
+
+    @staticmethod
+    def _acquire_finalization_flock(
+        descriptor: int,
+        *,
+        deadline: float,
+        poll_interval_seconds: float,
+    ) -> None:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except InterruptedError:
+                pass
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR}:
+                    raise LabArtifactFinalizationLockError(
+                        "finalization lock acquisition failed"
+                    ) from exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LabArtifactFinalizationLockTimeoutError(
+                    "finalization lock acquisition timed out"
+                )
+            time.sleep(min(poll_interval_seconds, remaining))
+
+    @contextmanager
+    def finalization_identity_lock(
+        self,
+        *,
+        job_id: UUID,
+        manifest_hash: str,
+        timeout_seconds: float,
+        poll_interval_seconds: float = 0.01,
+    ) -> Iterator[None]:
+        """Serialize one result's recover/prepare/seal decision across processes."""
+
+        if not isinstance(job_id, UUID):
+            raise TypeError("job_id must be a UUID")
+        if re.fullmatch(_HASH_PATTERN, manifest_hash) is None:
+            raise ValueError("manifest_hash must be a lowercase SHA256")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive finite number")
+        if (
+            isinstance(poll_interval_seconds, bool)
+            or not isinstance(poll_interval_seconds, (int, float))
+            or not math.isfinite(poll_interval_seconds)
+            or poll_interval_seconds <= 0
+        ):
+            raise ValueError("poll_interval_seconds must be a positive finite number")
+        deadline = time.monotonic() + timeout_seconds
+        lock_name = f"{job_id.hex}-{manifest_hash}.lock"
+        process_key = (
+            self._root_identity.device,
+            self._root_identity.inode,
+            job_id.hex,
+            manifest_hash,
+        )
+        with self._preview_activity():
+            with _FINALIZATION_PROCESS_LOCKS_GUARD:
+                entry = _FINALIZATION_PROCESS_LOCKS.get(process_key)
+                if entry is None:
+                    entry = _FinalizationProcessLockEntry(
+                        lock=threading.Lock(),
+                        references=0,
+                    )
+                    _FINALIZATION_PROCESS_LOCKS[process_key] = entry
+                entry.references += 1
+            process_lock_acquired = False
+            descriptor = -1
+            flock_acquired = False
+            operation_error: BaseException | None = None
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not entry.lock.acquire(timeout=remaining):
+                    raise LabArtifactFinalizationLockTimeoutError(
+                        "finalization lock acquisition timed out"
+                    )
+                process_lock_acquired = True
+                descriptor = self._open_finalization_lock_descriptor(lock_name)
+                expected = self._assert_finalization_lock_identity(
+                    descriptor=descriptor,
+                    name=lock_name,
+                )
+                self._acquire_finalization_flock(
+                    descriptor,
+                    deadline=deadline,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
+                flock_acquired = True
+                self._assert_finalization_lock_identity(
+                    descriptor=descriptor,
+                    name=lock_name,
+                    expected=expected,
+                )
+                yield
+            except BaseException as exc:
+                operation_error = exc
+            cleanup_errors: list[BaseException] = []
+            if flock_acquired:
+                try:
+                    self._assert_finalization_lock_identity(
+                        descriptor=descriptor,
+                        name=lock_name,
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if descriptor >= 0:
+                try:
+                    _close_descriptor_fail_closed(
+                        descriptor,
+                        label="finalization lock descriptor",
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if process_lock_acquired:
+                try:
+                    entry.lock.release()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            with _FINALIZATION_PROCESS_LOCKS_GUARD:
+                registered = _FINALIZATION_PROCESS_LOCKS.get(process_key)
+                if registered is entry:
+                    entry.references -= 1
+                    if entry.references == 0:
+                        del _FINALIZATION_PROCESS_LOCKS[process_key]
+                else:
+                    cleanup_errors.append(
+                        LabArtifactFinalizationLockError(
+                            "finalization process lock registry changed"
+                        )
+                    )
+            errors = (
+                [operation_error, *cleanup_errors]
+                if operation_error is not None
+                else cleanup_errors
+            )
+            _raise_collected_errors(
+                "finalization operation and lock cleanup failed",
+                errors,
+            )
 
     def _mark_store_poisoned(self) -> None:
         self._poisoned = True

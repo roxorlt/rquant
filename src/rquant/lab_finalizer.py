@@ -39,6 +39,8 @@ from rquant.lab_artifact_protocol import (
 )
 from rquant.lab_artifacts import (
     LabArtifactError,
+    LabArtifactFinalizationLockError,
+    LabArtifactFinalizationLockTimeoutError,
     LabArtifactPayloadBudget,
     LabArtifactPayloadLimitError,
     LabArtifactRecoveryAuthority,
@@ -97,6 +99,14 @@ class LabFinalizationCodeMismatchError(LabFinalizationError):
 
 class LabFinalizationCodeProviderError(LabFinalizationError):
     """The trusted runtime code provider failed or returned an invalid SHA."""
+
+
+class LabFinalizationCoordinationError(LabFinalizationError):
+    """The per-result finalization decision could not be safely coordinated."""
+
+
+class LabFinalizationCoordinationTimeoutError(LabFinalizationCoordinationError):
+    """The per-result finalization decision lock exceeded its deadline."""
 
 
 class LabFinalizerModel(BaseModel):
@@ -212,11 +222,15 @@ class LabFinalizerJobLimits(LabFinalizerModel):
     )
     max_final_artifact_table_count: int = Field(default=128, ge=1)
     max_peak_resident_bytes: int = Field(default=640 * 1024 * 1024, ge=1)
+    finalization_lock_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
+    finalization_lock_poll_interval_seconds: float = Field(default=0.01, gt=0, le=1)
 
     @model_validator(mode="after")
     def validate_job_limits(self) -> LabFinalizerJobLimits:
         if self.max_final_artifact_single_payload_bytes > self.max_final_artifact_payload_bytes:
             raise ValueError("single final payload limit cannot exceed total payload limit")
+        if self.finalization_lock_poll_interval_seconds > self.finalization_lock_timeout_seconds:
+            raise ValueError("finalization lock poll interval cannot exceed its timeout")
         return self
 
 
@@ -1650,13 +1664,28 @@ class LabFinalizer:
         return sealed
 
     def _recover_or_prepare(self, plan: LabJobArtifactPlan) -> LabSealedJobArtifact:
-        sealed = self._verify_or_recover_sealed(plan)
-        if sealed is not None:
-            return sealed
-        sealed = self._recover_candidate_from_plan(plan)
-        if sealed is not None:
-            return sealed
-        return self._prepare_and_seal(plan)
+        try:
+            with self.artifact_store.finalization_identity_lock(
+                job_id=plan.job_id,
+                manifest_hash=plan.manifest_hash,
+                timeout_seconds=self.job_limits.finalization_lock_timeout_seconds,
+                poll_interval_seconds=(self.job_limits.finalization_lock_poll_interval_seconds),
+            ):
+                sealed = self._verify_or_recover_sealed(plan)
+                if sealed is not None:
+                    return sealed
+                sealed = self._recover_candidate_from_plan(plan)
+                if sealed is not None:
+                    return sealed
+                return self._prepare_and_seal(plan)
+        except LabArtifactFinalizationLockTimeoutError as exc:
+            raise LabFinalizationCoordinationTimeoutError(
+                "finalization decision lock timed out"
+            ) from exc
+        except LabArtifactFinalizationLockError as exc:
+            raise LabFinalizationCoordinationError(
+                "finalization decision lock failed integrity validation"
+            ) from exc
 
     def _envelope(
         self,

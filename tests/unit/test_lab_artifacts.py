@@ -34,6 +34,8 @@ from rquant.lab_artifacts import (
     LabArtifactAuthorizationError,
     LabArtifactConflictError,
     LabArtifactError,
+    LabArtifactFinalizationLockError,
+    LabArtifactFinalizationLockTimeoutError,
     LabArtifactIndexEvidence,
     LabArtifactIntegrityError,
     LabArtifactPathError,
@@ -239,6 +241,138 @@ def _artifact_namespace_identity(store: LabJobArtifactStore) -> dict[str, tuple[
         store.seal_intents_quarantine_root,
     )
     return {root.name: tuple(sorted(item.name for item in root.iterdir())) for root in roots}
+
+
+def test_finalization_identity_lock_is_per_result_and_times_out_typed(
+    tmp_path: Path,
+) -> None:
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    first_job = uuid4()
+    second_job = uuid4()
+    unrelated_entered = threading.Event()
+    same_identity_error: list[BaseException] = []
+
+    def enter_unrelated() -> None:
+        with store.finalization_identity_lock(
+            job_id=second_job,
+            manifest_hash="2" * 64,
+            timeout_seconds=1,
+        ):
+            unrelated_entered.set()
+
+    def contend_same_identity() -> None:
+        try:
+            with store.finalization_identity_lock(
+                job_id=first_job,
+                manifest_hash="1" * 64,
+                timeout_seconds=0.05,
+            ):
+                raise AssertionError("contended identity lock was entered")
+        except BaseException as exc:
+            same_identity_error.append(exc)
+
+    with store.finalization_identity_lock(
+        job_id=first_job,
+        manifest_hash="1" * 64,
+        timeout_seconds=1,
+    ):
+        unrelated = threading.Thread(target=enter_unrelated)
+        contended = threading.Thread(target=contend_same_identity)
+        unrelated.start()
+        contended.start()
+        assert unrelated_entered.wait(timeout=0.5), "unrelated job was globally serialized"
+        unrelated.join(timeout=2)
+        contended.join(timeout=2)
+
+    assert not unrelated.is_alive()
+    assert not contended.is_alive()
+    assert len(same_identity_error) == 1
+    assert isinstance(same_identity_error[0], LabArtifactFinalizationLockTimeoutError)
+
+
+def test_finalization_identity_lock_recovers_after_exit_and_rejects_clobber_or_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    marker = tmp_path / "locked"
+    job_id = uuid4()
+    manifest_hash = "3" * 64
+    script = textwrap.dedent(
+        """
+        import os
+        from pathlib import Path
+        from uuid import UUID
+
+        from rquant.lab_artifacts import LabJobArtifactStore
+
+        store = LabJobArtifactStore(Path({root!r}))
+        with store.finalization_identity_lock(
+            job_id=UUID({job_id!r}),
+            manifest_hash={manifest_hash!r},
+            timeout_seconds=5,
+        ):
+            Path({marker!r}).write_text("locked", encoding="utf-8")
+            os._exit(0)
+        """
+    ).format(
+        root=str(root),
+        job_id=str(job_id),
+        manifest_hash=manifest_hash,
+        marker=str(marker),
+    )
+    process = subprocess.Popen(
+        [str(Path(sys.executable)), "-c", script],
+        cwd=Path.cwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, (stdout, stderr)
+
+    store = LabJobArtifactStore(root)
+    with store.finalization_identity_lock(
+        job_id=job_id,
+        manifest_hash=manifest_hash,
+        timeout_seconds=1,
+    ):
+        pass
+
+    lock_files = tuple(store.finalization_locks_root.iterdir())
+    assert len(lock_files) == 1
+    lock_file = lock_files[0]
+    lock_file.unlink()
+    lock_file.write_bytes(b"retained conflict evidence")
+    lock_file.chmod(0o600)
+
+    with (
+        pytest.raises(LabArtifactFinalizationLockError, match="secure|regular|identity"),
+        store.finalization_identity_lock(
+            job_id=job_id,
+            manifest_hash=manifest_hash,
+            timeout_seconds=1,
+        ),
+    ):
+        pass
+    assert lock_file.read_bytes() == b"retained conflict evidence"
+
+    external = tmp_path / "external-lock"
+    external.write_text("external", encoding="utf-8")
+    lock_file.unlink()
+    lock_file.symlink_to(external)
+
+    with (
+        pytest.raises(LabArtifactFinalizationLockError, match="secure|regular|identity"),
+        store.finalization_identity_lock(
+            job_id=job_id,
+            manifest_hash=manifest_hash,
+            timeout_seconds=1,
+        ),
+    ):
+        pass
 
 
 def _persist_forged_manifest(

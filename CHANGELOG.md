@@ -54,7 +54,9 @@
   chunked、null 与 offset slice）改为直接按 Arrow validity/offset/data buffer 有界流式编码，
   不再为宽值物化 Python scalar，并保持 shard、聚合结果和 artifact 的既有 JSON/hash 语义。
   持久 seal 故障复用同一 verified active candidate，避免每次重试复制完整 quarantine；恢复后
-  仍按原 manifest authority 完成 seal。artifact commit 重放改为比较已认证的 commit+claims
+  仍按原 manifest authority 完成 seal。首次 finalization 的 recover/prepare/seal 决策按
+  job + result identity 使用安全的跨进程锁串行，避免并发空状态创建重复 candidate，同时不
+  阻塞其他 job，进程崩溃后可由内核释放并恢复。artifact commit 重放改为比较已认证的 commit+claims
   语义身份，允许 transition key 下的 commit-before-ACK 幂等恢复，同时继续拒绝未知/坏旧
   proof 以及不同 commit/claims。
 
