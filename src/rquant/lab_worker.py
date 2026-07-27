@@ -1622,6 +1622,59 @@ class LabWorker:
         if actual != expected:
             raise ValueError("adapter result identity does not match claim")
 
+    @staticmethod
+    def _after_result_staging_created(_temporary: Path) -> None:
+        """Fault-injection boundary after an incomplete staging directory exists."""
+
+    @staticmethod
+    def _before_result_staging_creation(_temporary: Path) -> None:
+        """Fault-injection boundary after private parents exist but before staging creation."""
+
+    @staticmethod
+    def _after_result_parquet_temp_fsync(_temporary: Path, _parquet_temp: Path) -> None:
+        """Fault-injection boundary before a parquet payload receives its final name."""
+
+    @staticmethod
+    def _after_result_manifest_temp_fsync(_temporary: Path, _manifest_temp: Path) -> None:
+        """Fault-injection boundary before manifest.json marks a complete prepared bundle."""
+
+    def _ensure_result_directory(self, path: Path, *, worker_code_sha: str) -> None:
+        try:
+            relative = path.relative_to(self.artifact_root)
+        except ValueError as exc:
+            raise LabArtifactConflictError("result directory escapes artifact root") from exc
+        current = self.artifact_root
+        for part in relative.parts:
+            current = current / part
+            if os.path.lexists(current):
+                observed = current.lstat()
+                if (
+                    current.is_symlink()
+                    or not stat.S_ISDIR(observed.st_mode)
+                    or observed.st_uid != os.getuid()
+                    or stat.S_IMODE(observed.st_mode) != 0o700
+                ):
+                    raise LabArtifactConflictError(
+                        "result directory ancestor is not an owned physical 0700 directory"
+                    )
+                continue
+            self._verify_runtime_guard(expected_sha=worker_code_sha)
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                observed = current.lstat()
+                if (
+                    current.is_symlink()
+                    or not stat.S_ISDIR(observed.st_mode)
+                    or observed.st_uid != os.getuid()
+                    or stat.S_IMODE(observed.st_mode) != 0o700
+                ):
+                    raise LabArtifactConflictError(
+                        "result directory ancestor raced with an unsafe entry"
+                    ) from None
+            else:
+                _fsync_directory(current.parent)
+
     def _write_bundle(
         self,
         temporary: Path,
@@ -1630,13 +1683,24 @@ class LabWorker:
         *,
         worker_code_sha: str,
     ) -> LabShardResultManifest:
-        temporary.mkdir(parents=True, exist_ok=False)
+        self._ensure_result_directory(temporary.parent, worker_code_sha=worker_code_sha)
+        self._before_result_staging_creation(temporary)
+        self._verify_runtime_guard(expected_sha=worker_code_sha)
+        temporary.mkdir(mode=0o700, exist_ok=False)
+        _fsync_directory(temporary.parent)
+        self._after_result_staging_created(temporary)
         artifacts: list[LabShardArtifactManifest] = []
         for index, table in enumerate(result.tables):
             file_name = f"{index:03d}-{table.name}.parquet"
             path = temporary / file_name
-            table.frame.to_parquet(path, index=False)
-            _fsync_file(path)
+            parquet_temp = temporary / f".{file_name}.{uuid4().hex}.tmp"
+            self._verify_runtime_guard(expected_sha=worker_code_sha)
+            table.frame.to_parquet(parquet_temp, index=False)
+            _fsync_file(parquet_temp)
+            self._after_result_parquet_temp_fsync(temporary, parquet_temp)
+            self._verify_runtime_guard(expected_sha=worker_code_sha)
+            os.rename(parquet_temp, path)
+            _fsync_directory(temporary)
             persisted = pd.read_parquet(path)
             if len(persisted) != len(table.frame) or tuple(persisted.columns) != tuple(
                 table.frame.columns
@@ -1670,10 +1734,15 @@ class LabWorker:
             metrics=result.metrics,
         )
         manifest_path = temporary / "manifest.json"
-        with manifest_path.open("x", encoding="utf-8", newline="") as stream:
+        manifest_temp = temporary / f".manifest.{uuid4().hex}.tmp"
+        self._verify_runtime_guard(expected_sha=worker_code_sha)
+        with manifest_temp.open("x", encoding="utf-8", newline="") as stream:
             stream.write(manifest.canonical_json())
             stream.flush()
             os.fsync(stream.fileno())
+        self._after_result_manifest_temp_fsync(temporary, manifest_temp)
+        self._verify_runtime_guard(expected_sha=worker_code_sha)
+        os.rename(manifest_temp, manifest_path)
         _fsync_directory(temporary)
         return manifest
 
@@ -1860,8 +1929,7 @@ class LabWorker:
         temporary_root = self._temporary_bundle_path(claim)
         self._assert_safe_artifact_ancestors(temporary_root)
         self._assert_safe_artifact_ancestors(sealed.parent)
-        sealed.parent.mkdir(parents=True, exist_ok=True)
-        _fsync_directory(sealed.parent)
+        self._ensure_result_directory(sealed.parent, worker_code_sha=resolved_code_sha)
         temporary = temporary_root / uuid4().hex
         try:
             self._write_bundle(

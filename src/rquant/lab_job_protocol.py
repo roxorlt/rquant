@@ -368,6 +368,7 @@ class LabCommandSpool:
         self.mutation_guard = mutation_guard
         self.max_isolation_records = max_isolation_records
         self.max_isolation_bytes = max_isolation_bytes
+        self._ensure_private_root()
         for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
             self._ensure_directory(path)
         with self._exclusive_lock():
@@ -377,15 +378,17 @@ class LabCommandSpool:
     @contextmanager
     def _exclusive_lock(self) -> Iterator[None]:
         with self._thread_lock:
-            if not self._lock_path.exists():
-                self._guard_mutation()
-            descriptor = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            root_descriptor = self._open_private_root()
+            descriptor = -1
             try:
+                descriptor = self._open_private_lock(root_descriptor)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 yield
             finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+                if descriptor >= 0:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                os.close(root_descriptor)
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -399,11 +402,179 @@ class LabCommandSpool:
         if self.mutation_guard is not None:
             self.mutation_guard()
 
-    def _ensure_directory(self, path: Path, *, mode: int = 0o777) -> None:
-        if path.exists():
+    @staticmethod
+    def _same_stat(
+        left: os.stat_result,
+        right: os.stat_result,
+        *,
+        include_link_count: bool,
+    ) -> bool:
+        identity_matches = (
+            left.st_dev,
+            left.st_ino,
+            left.st_mode,
+            left.st_uid,
+        ) == (
+            right.st_dev,
+            right.st_ino,
+            right.st_mode,
+            right.st_uid,
+        )
+        return identity_matches and (not include_link_count or left.st_nlink == right.st_nlink)
+
+    @staticmethod
+    def _validate_private_directory_stat(observed: os.stat_result, *, label: str) -> None:
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) != 0o700
+        ):
+            raise InvalidCommandEnvelopeError(
+                f"{label} must be an owned physical 0700 private directory"
+            )
+
+    def _ensure_private_root(self) -> None:
+        try:
+            observed = self.root.lstat()
+        except FileNotFoundError:
+            self._guard_mutation()
+            with suppress(FileExistsError):
+                os.mkdir(self.root, 0o700)
+            observed = self.root.lstat()
+        except OSError as exc:
+            raise InvalidCommandEnvelopeError("command spool root is unsafe") from exc
+        self._validate_private_directory_stat(observed, label="command spool root")
+        descriptor = self._open_private_root()
+        os.close(descriptor)
+
+    def _open_private_root(self) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            before = self.root.lstat()
+            self._validate_private_directory_stat(before, label="command spool root")
+            descriptor = os.open(self.root, flags)
+            opened = os.fstat(descriptor)
+            active = self.root.lstat()
+            if not self._same_stat(
+                before,
+                opened,
+                include_link_count=False,
+            ) or not self._same_stat(opened, active, include_link_count=False):
+                raise InvalidCommandEnvelopeError("command spool root identity changed")
+            return descriptor
+        except BaseException:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise
+
+    def _ensure_directory(self, path: Path, *, mode: int = 0o700) -> None:
+        if mode != 0o700:
+            raise InvalidCommandEnvelopeError("managed spool directories must use mode 0700")
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as exc:
+            raise InvalidCommandEnvelopeError("unsafe managed spool directory path") from exc
+        if not relative.parts:
+            self._ensure_private_root()
             return
-        self._guard_mutation()
-        path.mkdir(parents=True, mode=mode, exist_ok=True)
+        parent_descriptor = self._open_private_root()
+        opened_descriptors = [parent_descriptor]
+        try:
+            for part in relative.parts:
+                if part in {"", ".", ".."}:
+                    raise InvalidCommandEnvelopeError("unsafe managed spool directory component")
+                try:
+                    observed = os.stat(part, dir_fd=parent_descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    self._guard_mutation()
+                    with suppress(FileExistsError):
+                        os.mkdir(part, 0o700, dir_fd=parent_descriptor)
+                    observed = os.stat(part, dir_fd=parent_descriptor, follow_symlinks=False)
+                self._validate_private_directory_stat(
+                    observed,
+                    label="managed spool path",
+                )
+                child_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
+                opened = os.fstat(child_descriptor)
+                active = os.stat(part, dir_fd=parent_descriptor, follow_symlinks=False)
+                if not self._same_stat(
+                    observed,
+                    opened,
+                    include_link_count=False,
+                ) or not self._same_stat(opened, active, include_link_count=False):
+                    os.close(child_descriptor)
+                    raise InvalidCommandEnvelopeError("managed spool path identity changed")
+                opened_descriptors.append(child_descriptor)
+                parent_descriptor = child_descriptor
+        except OSError as exc:
+            raise InvalidCommandEnvelopeError("managed spool private directory is unsafe") from exc
+        finally:
+            for descriptor in reversed(opened_descriptors):
+                os.close(descriptor)
+
+    def _open_private_lock(self, root_descriptor: int) -> int:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            observed = os.stat(
+                self._lock_path.name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            self._guard_mutation()
+            try:
+                descriptor = os.open(
+                    self._lock_path.name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except FileExistsError:
+                descriptor = -1
+            if descriptor >= 0:
+                observed = os.fstat(descriptor)
+            else:
+                observed = os.stat(
+                    self._lock_path.name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            if "descriptor" in locals() and descriptor >= 0:
+                os.close(descriptor)
+            raise InvalidCommandEnvelopeError("spool lock must be an owned 0600 regular file")
+        if "descriptor" not in locals() or descriptor < 0:
+            try:
+                descriptor = os.open(
+                    self._lock_path.name,
+                    flags,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as exc:
+                raise InvalidCommandEnvelopeError("spool lock is unsafe") from exc
+        opened = os.fstat(descriptor)
+        active = os.stat(
+            self._lock_path.name,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        if not self._same_stat(
+            observed,
+            opened,
+            include_link_count=True,
+        ) or not self._same_stat(opened, active, include_link_count=True):
+            os.close(descriptor)
+            raise InvalidCommandEnvelopeError("spool lock identity changed")
+        return descriptor
 
     def _publish_no_clobber(self, target: Path, payload: bytes) -> bool:
         temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"

@@ -4685,6 +4685,7 @@ class LabJobArtifactStore:
             if opened != before or stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
                 raise LabArtifactIntegrityError("seal intent recovery entry identity changed")
             target_name = f"{name.lstrip('.')}.{uuid4().hex}.quarantined"
+            self._guard_mutation()
             _rename_noreplace(source_parent, name, target_parent, target_name)
             target = _FileObservation.from_stat(
                 os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
@@ -4863,6 +4864,7 @@ class LabJobArtifactStore:
                     fault_boundary_reached = True
                     self._after_seal_intent_temp_fsync(descriptor, temporary_name)
                     try:
+                        self._guard_mutation()
                         _rename_noreplace(
                             parent_descriptor,
                             temporary_name,
@@ -5053,6 +5055,7 @@ class LabJobArtifactStore:
             try:
                 current_permissions = stat.S_IMODE(os.fstat(item.descriptor).st_mode)
                 if current_permissions == 0o600:
+                    self._guard_mutation()
                     os.fchmod(item.descriptor, 0o400)
                     after_chmod = _FileObservation.from_stat(os.fstat(item.descriptor))
                     self._validate_metadata_transition(
@@ -5101,6 +5104,7 @@ class LabJobArtifactStore:
     def _finalize_bound_directories(self, bound: _BoundArtifactBundle) -> None:
         self._assert_bound_paths(bound)
         before_tables = _FileObservation.from_stat(os.fstat(bound.tables_descriptor))
+        self._guard_mutation()
         os.fchmod(bound.tables_descriptor, 0o500)
         after_tables = _FileObservation.from_stat(os.fstat(bound.tables_descriptor))
         self._validate_metadata_transition(
@@ -5118,6 +5122,7 @@ class LabJobArtifactStore:
         self._assert_bound_paths(bound)
 
         before_bundle = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
+        self._guard_mutation()
         os.fchmod(bound.bundle_descriptor, 0o500)
         after_bundle = _FileObservation.from_stat(os.fstat(bound.bundle_descriptor))
         self._validate_metadata_transition(

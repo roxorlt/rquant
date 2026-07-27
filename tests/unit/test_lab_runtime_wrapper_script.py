@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,20 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     executable.chmod(0o700)
     subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rQuant Tests",
+            "-c",
+            "user.email=tests@rquant.invalid",
+            "commit",
+            "-qm",
+            "test fixture",
+        ],
+        cwd=checkout,
+        check=True,
+    )
     return checkout, executable, marker
 
 
@@ -136,6 +151,123 @@ def test_lab_runtime_wrapper_rejects_package_symlink_before_import(tmp_path: Pat
     assert result.returncode != 0
     assert not marker.exists()
     assert (external / "__init__.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_lab_runtime_wrapper_rejects_symlinked_virtualenv_bin_before_import(
+    tmp_path: Path,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    physical_bin = checkout / ".venv" / "physical-bin"
+    (checkout / ".venv" / "bin").rename(physical_bin)
+    (checkout / ".venv" / "bin").symlink_to(physical_bin, target_is_directory=True)
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode != 0
+    assert "physical" in result.stderr.lower()
+    assert not marker.exists()
+
+
+def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    namespace = runpy.run_path(str(WRAPPER), run_name="lab_wrapper_test")
+    namespace["main"].__globals__["__file__"] = str(checkout / "scripts" / WRAPPER.name)
+    original_bytes = executable.read_bytes()
+    displaced = checkout / ".venv" / "bin" / "rquant.displaced"
+    exec_calls: list[tuple[object, ...]] = []
+    original_run = subprocess.run
+    replaced = False
+
+    def replace_during_preflight(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal replaced
+        result = original_run(*args, **kwargs)
+        command = args[0]
+        if not replaced and any(Path(str(value)).name == PREFLIGHT.name for value in command):
+            executable.rename(displaced)
+            executable.write_bytes(original_bytes)
+            executable.chmod(0o700)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(subprocess, "run", replace_during_preflight)
+    monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
+    monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
+    monkeypatch.chdir(checkout)
+    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
+        monkeypatch.delenv(variable, raising=False)
+
+    result = namespace["main"](
+        [
+            "--expected-checkout-root",
+            str(checkout),
+            "--",
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(checkout),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ]
+    )
+
+    assert result == 1
+    assert exec_calls == []
+    assert not marker.exists()
+
+
+def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    namespace = runpy.run_path(str(WRAPPER), run_name="lab_wrapper_test")
+    namespace["main"].__globals__["__file__"] = str(checkout / "scripts" / WRAPPER.name)
+    tracked = checkout / "src" / "rquant" / "__init__.py"
+    exec_calls: list[tuple[object, ...]] = []
+    original_run = subprocess.run
+    dirtied = False
+
+    def dirty_after_preflight(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal dirtied
+        result = original_run(*args, **kwargs)
+        command = args[0]
+        if not dirtied and any(Path(str(value)).name == PREFLIGHT.name for value in command):
+            tracked.write_text("UNTRUSTED = True\n", encoding="utf-8")
+            dirtied = True
+        return result
+
+    monkeypatch.setattr(subprocess, "run", dirty_after_preflight)
+    monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
+    monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
+    monkeypatch.chdir(checkout)
+    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
+        monkeypatch.delenv(variable, raising=False)
+
+    result = namespace["main"](
+        [
+            "--expected-checkout-root",
+            str(checkout),
+            "--",
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(checkout),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ]
+    )
+
+    assert result == 1
+    assert exec_calls == []
+    assert not marker.exists()
 
 
 def test_lab_runtime_wrapper_rejects_mismatched_daemon_root(tmp_path: Path) -> None:

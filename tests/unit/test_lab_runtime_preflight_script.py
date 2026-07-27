@@ -24,10 +24,31 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     )
     (package / "__init__.py").write_text("", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rQuant Tests",
+            "-c",
+            "user.email=tests@rquant.invalid",
+            "commit",
+            "-qm",
+            "test fixture",
+        ],
+        cwd=checkout,
+        check=True,
+    )
     return checkout, package
 
 
 def _run(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     return subprocess.run(
         [
             sys.executable,
@@ -35,6 +56,8 @@ def _run(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
             str(SCRIPT),
             "--checkout-root",
             str(checkout),
+            "--expected-commit",
+            expected_commit,
             *arguments,
         ],
         cwd=checkout,
@@ -42,6 +65,43 @@ def _run(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def test_lab_runtime_preflight_rejects_dirty_tracked_package_source(
+    tmp_path: Path,
+) -> None:
+    checkout, package = _checkout(tmp_path)
+    tracked = package / "__init__.py"
+    tracked.write_text("UNTRUSTED = True\n", encoding="utf-8")
+
+    result = _run(checkout)
+
+    assert result.returncode == 1
+    assert "tracked" in result.stderr.lower()
+    assert tracked.read_text(encoding="utf-8") == "UNTRUSTED = True\n"
+
+
+def test_lab_runtime_preflight_rejects_expected_commit_mismatch(tmp_path: Path) -> None:
+    checkout, _package = _checkout(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SCRIPT),
+            "--checkout-root",
+            str(checkout),
+            "--expected-commit",
+            "0" * 40,
+        ],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "commit" in result.stderr.lower()
 
 
 @pytest.mark.parametrize("suffix", [".pyc", ".pyo", ".so", ".dylib", ".pyd"])

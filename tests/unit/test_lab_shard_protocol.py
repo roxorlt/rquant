@@ -441,6 +441,26 @@ def test_claim_spool_checks_guard_inside_claim_namespace_creation(
     assert not (root / "current").exists()
 
 
+def test_claim_spool_rejects_symlinked_nested_archive_without_external_write(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    setup = LabClaimSpool(root)
+    external = tmp_path / "external-archive"
+    external.mkdir()
+    marker = external / "preserve.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    setup.retired_dir.rmdir()
+    setup.archived_revoked_dir.rmdir()
+    (root / "archive").rmdir()
+    (root / "archive").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="private directory|unsafe"):
+        LabClaimSpool(root)
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
 def test_claim_spool_persists_exact_high_water_across_consume_and_restart(
     tmp_path: Path,
 ) -> None:

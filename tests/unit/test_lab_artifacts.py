@@ -1807,6 +1807,68 @@ def test_crash_before_seal_intent_publish_leaves_recoverable_temp(
     assert recovered.manifest_hash == candidate.manifest_hash
 
 
+def test_runtime_drift_before_seal_intent_rename_never_publishes_final_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = False
+
+    def mutation_guard() -> None:
+        if drifted:
+            raise RuntimeError("runtime drifted before seal intent rename")
+
+    store = LabJobArtifactStore(tmp_path / "artifacts", mutation_guard=mutation_guard)
+    candidate = _prepare(store)
+
+    def drift_after_temp_fsync(_descriptor: int, _name: str) -> None:
+        nonlocal drifted
+        drifted = True
+
+    monkeypatch.setattr(store, "_after_seal_intent_temp_fsync", drift_after_temp_fsync)
+
+    with pytest.raises(RuntimeError, match="seal intent rename"):
+        store.seal_candidate(candidate)
+
+    assert not (store.seal_intents_root / f"{candidate.job_id.hex}.json").exists()
+    assert candidate.path.exists()
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600
+        for path in candidate.path.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_runtime_drift_before_first_freeze_leaves_candidate_unmodified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = False
+
+    def mutation_guard() -> None:
+        if drifted:
+            raise RuntimeError("runtime drifted before artifact freeze")
+
+    store = LabJobArtifactStore(tmp_path / "artifacts", mutation_guard=mutation_guard)
+    candidate = _prepare(store)
+
+    def drift_after_intent_publish(_bound: object) -> None:
+        nonlocal drifted
+        drifted = True
+
+    monkeypatch.setattr(store, "_after_seal_intent_publish", drift_after_intent_publish)
+
+    with pytest.raises(RuntimeError, match="artifact freeze"):
+        store.seal_candidate(candidate)
+
+    assert candidate.path.exists()
+    assert stat.S_IMODE(candidate.path.stat().st_mode) == 0o700
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600
+        for path in candidate.path.rglob("*")
+        if path.is_file()
+    )
+
+
 def test_crash_after_seal_intent_publish_reuses_complete_final_intent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

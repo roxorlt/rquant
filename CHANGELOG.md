@@ -140,6 +140,15 @@
   post-publish
   补偿则在 writer lock 内逐次 guard 并保持 CAS/no-clobber，不由旧 runtime 覆盖较新状态。
 
+- **Strategy Lab daemon 第十轮启动与制品边界加固**：stdlib preflight 在任何 `rquant`
+  import 前绑定 Git top-level、精确 full SHA，并以超时受限的 status/diff-index 拒绝 tracked
+  dirty；wrapper 同时绑定物理 checkout、`.venv/bin`、launcher 与 daemon executable inode，
+  preflight 后再次执行完整检查，路径或源码漂移时不 `exec`。command/claim/report spool 的根、
+  托管子目录与锁改为 dir-fd、`O_NOFOLLOW`、owner `0700/0600` 和 inode/nlink 身份验证，拒绝
+  symlink、宽松权限及外部目标。artifact seal intent rename、文件/目录 freeze，以及 worker
+  staging、Parquet 与 manifest 完成标记均在最终持久 mutation 前复验 runtime；旧 runtime
+  只能留下不可完成的临时项，不能发布可恢复的完整 prepared bundle。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

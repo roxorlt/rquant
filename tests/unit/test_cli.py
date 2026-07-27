@@ -3864,7 +3864,13 @@ class TestLabSchedulerCli:
         import argparse
         import signal
 
-        from rquant import lab_daemon, lab_scheduler
+        from rquant import (
+            lab_daemon,
+            lab_job_protocol,
+            lab_scheduler,
+            lab_shard_protocol,
+            lab_worker,
+        )
         from rquant.cli import cmd_lab_scheduler
 
         handlers: dict[int, object] = {}
@@ -3883,12 +3889,27 @@ class TestLabSchedulerCli:
                 assert callable(handler)
                 handler(signal.SIGTERM, None)
 
+        class FakeSpool:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        class FakeReclaimer:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def reclaim(self, *_args: object) -> None:
+                pass
+
         def fake_signal(signum: int, handler: object) -> object:
             previous = handlers.get(signum, signal.SIG_DFL)
             handlers[signum] = handler
             return previous
 
         monkeypatch.setattr(lab_scheduler, "LabScheduler", FakeScheduler)
+        monkeypatch.setattr(lab_job_protocol, "LabCommandSpool", FakeSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", FakeSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeSpool)
+        monkeypatch.setattr(lab_worker, "LabArtifactReclaimer", FakeReclaimer)
         monkeypatch.setattr(
             "rquant.lab_jobs.LabJobStore.initialize",
             lambda _self: None,

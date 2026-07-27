@@ -6945,6 +6945,106 @@ def test_worker_runtime_drift_at_atomic_publish_preserves_prepared_candidate(
     assert not worker.sealed_bundle_path(claim).exists()
 
 
+def test_worker_runtime_drift_before_staging_creation_leaves_no_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = False
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime drifted before staging creation")
+        return "1" * 40
+
+    worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    validated = worker.adapter_registry.validate_claim(claim)
+    result = RecordingRegistry().execute_shard(validated, object())
+
+    def drift_after_parent_ready(_temporary: Path) -> None:
+        nonlocal drifted
+        drifted = True
+
+    monkeypatch.setattr(
+        worker,
+        "_before_result_staging_creation",
+        drift_after_parent_ready,
+        raising=False,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="staging creation"):
+        worker._prepare_result(claim, result)
+
+    assert tuple((worker.artifact_root / ".tmp").rglob("manifest.json")) == ()
+
+
+def test_worker_runtime_drift_before_parquet_publication_leaves_incomplete_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = False
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime drifted before parquet publication")
+        return "1" * 40
+
+    worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    validated = worker.adapter_registry.validate_claim(claim)
+    result = RecordingRegistry().execute_shard(validated, object())
+
+    def drift_after_parquet_fsync(_temporary: Path, _parquet_temp: Path) -> None:
+        nonlocal drifted
+        drifted = True
+
+    monkeypatch.setattr(
+        worker,
+        "_after_result_parquet_temp_fsync",
+        drift_after_parquet_fsync,
+        raising=False,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="parquet publication"):
+        worker._prepare_result(claim, result)
+
+    assert tuple((worker.artifact_root / ".tmp").rglob("manifest.json")) == ()
+    assert tuple((worker.artifact_root / ".tmp").rglob("*.parquet")) == ()
+
+
+def test_worker_runtime_drift_before_manifest_completion_leaves_no_complete_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted = False
+
+    def runtime_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("runtime drifted before manifest completion")
+        return "1" * 40
+
+    worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    validated = worker.adapter_registry.validate_claim(claim)
+    result = RecordingRegistry().execute_shard(validated, object())
+
+    def drift_after_manifest_fsync(_temporary: Path, _manifest_temp: Path) -> None:
+        nonlocal drifted
+        drifted = True
+
+    monkeypatch.setattr(
+        worker,
+        "_after_result_manifest_temp_fsync",
+        drift_after_manifest_fsync,
+        raising=False,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="manifest completion"):
+        worker._prepare_result(claim, result)
+
+    assert tuple((worker.artifact_root / ".tmp").rglob("manifest.json")) == ()
+
+
 def test_sealed_rollback_hard_crash_resumes_in_new_process(tmp_path: Path) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)

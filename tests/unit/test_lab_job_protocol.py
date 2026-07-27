@@ -1041,6 +1041,73 @@ def test_command_spool_checks_guard_inside_initial_directory_creation(
     assert not root.exists()
 
 
+@pytest.mark.parametrize("unsafe_name", ["pending", "ack", "quarantine"])
+def test_command_spool_rejects_symlinked_managed_directory_without_external_write(
+    tmp_path: Path,
+    unsafe_name: str,
+) -> None:
+    root = tmp_path / "commands"
+    root.mkdir(mode=0o700)
+    external = tmp_path / f"external-{unsafe_name}"
+    external.mkdir()
+    marker = external / "preserve.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    (root / unsafe_name).symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="private directory|unsafe"):
+        LabCommandSpool(root)
+
+    assert (root / unsafe_name).is_symlink()
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o711, 0o600])
+def test_command_spool_rejects_non_private_managed_directory(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    root = tmp_path / "commands"
+    root.mkdir(mode=0o700)
+    pending = root / "pending"
+    pending.mkdir(mode=0o700)
+    pending.chmod(mode)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="0700"):
+        LabCommandSpool(root)
+
+    assert stat.S_IMODE(pending.stat().st_mode) == mode
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "loose"])
+def test_command_spool_rejects_unsafe_lock_without_touching_target(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    lock_path = spool.root / ".spool.lock"
+    lock_path.unlink()
+    victim = tmp_path / "lock-victim"
+    victim.write_text("preserve", encoding="utf-8")
+    if unsafe_kind == "symlink":
+        lock_path.symlink_to(victim)
+    elif unsafe_kind == "hardlink":
+        os.link(victim, lock_path)
+    else:
+        lock_path.write_text("", encoding="utf-8")
+        lock_path.chmod(0o644)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="spool lock"):
+        LabCommandSpool(spool.root)
+
+    assert victim.read_text(encoding="utf-8") == "preserve"
+    if unsafe_kind == "symlink":
+        assert lock_path.is_symlink()
+    elif unsafe_kind == "hardlink":
+        assert lock_path.stat().st_nlink == 2
+    else:
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o644
+
+
 def test_load_and_quarantine_reject_external_symlink_and_mismatched_basename(
     tmp_path: Path,
 ) -> None:
