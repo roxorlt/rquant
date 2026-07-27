@@ -1229,6 +1229,7 @@ def _secure_open_directory(
     *,
     create: bool,
     create_mode: int = 0o700,
+    mutation_guard: Callable[[], object] | None = None,
 ) -> int:
     """Open an absolute directory without following any ancestor symlink."""
 
@@ -1251,6 +1252,8 @@ def _secure_open_directory(
                     raise
                 created_or_observed_missing = True
                 with suppress(FileExistsError):
+                    if mutation_guard is not None:
+                        mutation_guard()
                     os.mkdir(component, mode=create_mode, dir_fd=descriptor)
                 os.fsync(descriptor)
                 child_descriptor = os.open(component, flags, dir_fd=descriptor)
@@ -1448,12 +1451,15 @@ def _open_or_create_private_regular_at(
     *,
     access_flags: int,
     require_private_existing: bool = False,
+    mutation_guard: Callable[[], object] | None = None,
 ) -> tuple[int, bool]:
     if PurePosixPath(name).name != name or name in {"", ".", ".."}:
         raise LabArtifactPathError("managed file name is unsafe")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     created = False
     try:
+        if mutation_guard is not None:
+            mutation_guard()
         descriptor = os.open(
             name,
             access_flags | os.O_CREAT | os.O_EXCL | nofollow,
@@ -1471,7 +1477,9 @@ def _open_or_create_private_regular_at(
         if observed != at_path or observed.mode != stat.S_IFREG or observed.nlink != 1:
             raise LabArtifactIntegrityError("managed file is not a private regular file")
         permissions = stat.S_IMODE(os.fstat(descriptor).st_mode)
-        if created or not require_private_existing:
+        if not created and not require_private_existing:
+            if mutation_guard is not None:
+                mutation_guard()
             os.fchmod(descriptor, 0o600)
             permissions = stat.S_IMODE(os.fstat(descriptor).st_mode)
         if permissions != 0o600:
@@ -1501,6 +1509,7 @@ def _ensure_private_directory(
     *,
     manage_existing: bool = True,
     require_private_existing: bool = False,
+    mutation_guard: Callable[[], object] | None = None,
 ) -> None:
     existed = True
     descriptor = -1
@@ -1512,13 +1521,19 @@ def _ensure_private_directory(
             if not isinstance(exc.__cause__, FileNotFoundError):
                 raise
             existed = False
-            descriptor = _secure_open_directory(path, create=True)
+            descriptor = _secure_open_directory(
+                path,
+                create=True,
+                mutation_guard=mutation_guard,
+            )
         if existed and require_private_existing:
             if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
                 raise LabArtifactIntegrityError(
                     f"managed directory permissions must be exactly 0700: {path}"
                 )
-        elif not existed or manage_existing:
+        elif existed and manage_existing:
+            if mutation_guard is not None:
+                mutation_guard()
             os.fchmod(descriptor, 0o700)
             os.fsync(descriptor)
     except BaseException as exc:
@@ -2227,6 +2242,7 @@ class LabJobArtifactStore:
                 self.root,
                 manage_existing=False,
                 require_private_existing=True,
+                mutation_guard=self.mutation_guard,
             )
             for path in (
                 self.candidates_root,
@@ -2243,6 +2259,7 @@ class LabJobArtifactStore:
                     path,
                     manage_existing=False,
                     require_private_existing=(path != self.candidates_root),
+                    mutation_guard=self.mutation_guard,
                 )
             directory_flags = (
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -2296,6 +2313,7 @@ class LabJobArtifactStore:
                 "namespace-guard.lock",
                 access_flags=os.O_RDWR,
                 require_private_existing=True,
+                mutation_guard=self.mutation_guard,
             )
             self._guard_lock_identity = _FileObservation.from_stat(
                 os.fstat(self._guard_lock_descriptor)
@@ -3042,6 +3060,7 @@ class LabJobArtifactStore:
         temporary_name = f".{intent.candidate_name}.{intent.operation_id.hex}.tmp"
         final_name = self._guard_intent_name(intent)
         payload = intent.canonical_json_bytes()
+        self._guard_mutation()
         _write_private_bytes_at(active_descriptor, temporary_name, payload)
         temporary_descriptor = os.open(
             temporary_name,
@@ -3058,6 +3077,7 @@ class LabJobArtifactStore:
             if rebuilt != intent or _read_descriptor(temporary_descriptor) != payload:
                 raise LabArtifactIntegrityError("namespace guard temp is not canonical")
             try:
+                self._guard_mutation()
                 _rename_noreplace(
                     active_descriptor,
                     temporary_name,
@@ -3160,6 +3180,7 @@ class LabJobArtifactStore:
         candidate_descriptor: int,
         tables_descriptor: int,
     ) -> None:
+        self._guard_mutation()
         self._assert_namespace_guard_identities(
             intent,
             candidates_descriptor=candidates_descriptor,
@@ -3193,6 +3214,7 @@ class LabJobArtifactStore:
         candidate_descriptor: int,
         tables_descriptor: int,
     ) -> None:
+        self._guard_mutation()
         self._assert_namespace_guard_identities(
             intent,
             candidates_descriptor=candidates_descriptor,
@@ -3240,11 +3262,14 @@ class LabJobArtifactStore:
     def _archive_namespace_guard_intent(
         self,
         intent: LabCandidateNamespaceGuardIntent,
+        *,
+        outcome: Literal["published", "aborted"] = "published",
     ) -> None:
         active_descriptor = self._managed_descriptors[self.namespace_guard_active_root]
         history_descriptor = self._managed_descriptors[self.namespace_guard_history_root]
         source_name = self._guard_intent_name(intent)
-        target_name = f"{intent.candidate_name}.{intent.operation_id.hex}.json"
+        suffix = ".json" if outcome == "published" else ".aborted.json"
+        target_name = f"{intent.candidate_name}.{intent.operation_id.hex}{suffix}"
         source_descriptor = os.open(
             source_name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -3255,6 +3280,7 @@ class LabJobArtifactStore:
             payload = _read_descriptor(source_descriptor)
             if payload != intent.canonical_json_bytes():
                 raise LabArtifactIntegrityError("namespace guard intent changed before archive")
+            self._guard_mutation()
             _rename_noreplace(
                 active_descriptor,
                 source_name,
@@ -3284,6 +3310,7 @@ class LabJobArtifactStore:
         ):
             raise LabArtifactIntegrityError("namespace guard temp is unsafe")
         target_name = f"{name}.{uuid4().hex}.quarantined"
+        self._guard_mutation()
         _rename_noreplace(
             active_descriptor,
             name,
@@ -3336,7 +3363,7 @@ class LabJobArtifactStore:
                     candidate_descriptor=candidate_descriptor,
                     tables_descriptor=tables_descriptor,
                 )
-                self._archive_namespace_guard_intent(intent)
+                self._archive_namespace_guard_intent(intent, outcome="aborted")
             except Exception:
                 self._mark_store_poisoned()
                 raise
@@ -3354,6 +3381,19 @@ class LabJobArtifactStore:
         _intent: LabCandidateNamespaceGuardIntent,
     ) -> None:
         """Fault-injection boundary after durable namespace protection is active."""
+
+    @staticmethod
+    def _before_complete_candidate_return(_candidate: LabJobArtifactCandidate) -> None:
+        """Fault-injection boundary immediately before candidate publication."""
+
+    def _assert_candidate_publication_not_aborted(self, candidate_name: str) -> None:
+        history_descriptor = self._managed_descriptors[self.namespace_guard_history_root]
+        prefix = f"{candidate_name}."
+        if any(
+            name.startswith(prefix) and name.endswith(".aborted.json")
+            for name in os.listdir(history_descriptor)
+        ):
+            raise LabArtifactIntegrityError("candidate publication was aborted")
 
     @staticmethod
     def _same_directory_identity(
@@ -3866,6 +3906,7 @@ class LabJobArtifactStore:
             payload_descriptors: dict[str, int] = {}
             guard_intent: LabCandidateNamespaceGuardIntent | None = None
             guard_archived = False
+            guard_restored = False
             try:
                 self._guard_mutation()
                 os.mkdir(candidate_name, mode=0o700, dir_fd=candidates_descriptor)
@@ -3877,7 +3918,6 @@ class LabJobArtifactStore:
                 candidate_identity = _FileObservation.from_stat(os.fstat(candidate_descriptor))
                 if candidate_identity.mode != stat.S_IFDIR:
                     raise LabArtifactIntegrityError("candidate output is not a directory")
-                os.fchmod(candidate_descriptor, 0o700)
                 if stat.S_IMODE(os.fstat(candidate_descriptor).st_mode) != 0o700:
                     raise LabArtifactIntegrityError("candidate permissions did not become 0700")
                 self._after_candidate_directory_bound(
@@ -3890,6 +3930,7 @@ class LabJobArtifactStore:
                     candidate_descriptor=candidate_descriptor,
                     candidate_identity=candidate_identity,
                 )
+                self._guard_mutation()
                 os.mkdir("tables", mode=0o700, dir_fd=candidate_descriptor)
                 tables_descriptor = os.open(
                     "tables",
@@ -3899,7 +3940,6 @@ class LabJobArtifactStore:
                 tables_identity = _FileObservation.from_stat(os.fstat(tables_descriptor))
                 if tables_identity.mode != stat.S_IFDIR:
                     raise LabArtifactIntegrityError("candidate tables output is not a directory")
-                os.fchmod(tables_descriptor, 0o700)
                 if stat.S_IMODE(os.fstat(tables_descriptor).st_mode) != 0o700:
                     raise LabArtifactIntegrityError(
                         "candidate tables permissions did not become 0700"
@@ -3911,6 +3951,7 @@ class LabJobArtifactStore:
                         if pure.parent.as_posix() == "tables"
                         else candidate_descriptor
                     )
+                    self._guard_mutation()
                     payload_descriptors[relative_path] = _open_empty_private_file_at(
                         parent_descriptor,
                         pure.name,
@@ -3952,12 +3993,14 @@ class LabJobArtifactStore:
                             if pure.parent.as_posix() == "tables"
                             else candidate_descriptor
                         )
+                        self._guard_mutation()
                         _write_bound_payload(
                             payload_descriptors[relative_path],
                             parent_descriptor,
                             pure.name,
                             bundle_payloads[relative_path],
                         )
+                    self._guard_mutation()
                     os.fsync(tables_descriptor)
                     os.fsync(candidate_descriptor)
                     os.fsync(candidates_descriptor)
@@ -3967,18 +4010,49 @@ class LabJobArtifactStore:
                         candidate_descriptor=candidate_descriptor,
                         tables_descriptor=tables_descriptor,
                     )
-                    self._archive_namespace_guard_intent(guard_intent)
+                    guard_restored = True
+                    self._assert_candidate_creation_binding(
+                        candidates_descriptor=candidates_descriptor,
+                        candidate_name=candidate_name,
+                        candidate_descriptor=candidate_descriptor,
+                        candidate_identity=candidate_identity,
+                        tables_descriptor=tables_descriptor,
+                        tables_identity=tables_identity,
+                    )
+                    for descriptor in payload_descriptors.values():
+                        os.close(descriptor)
+                    payload_descriptors.clear()
+                    os.close(tables_descriptor)
+                    tables_descriptor = -1
+                    os.close(candidate_descriptor)
+                    candidate_descriptor = -1
+                    os.close(candidates_descriptor)
+                    candidates_descriptor = -1
+                    candidate = self._finalize_public_candidate(
+                        self._candidate_from_path(candidate_path)
+                    )
+                    self._before_complete_candidate_return(candidate)
+                    self._guard_mutation()
+                    self._archive_namespace_guard_intent(
+                        guard_intent,
+                        outcome="published",
+                    )
                     guard_archived = True
+                    return candidate
                 except BaseException as operation_error:
                     if not guard_archived:
                         try:
-                            self._restore_candidate_namespace_guard(
+                            if not guard_restored:
+                                self._restore_candidate_namespace_guard(
+                                    guard_intent,
+                                    candidates_descriptor=candidates_descriptor,
+                                    candidate_descriptor=candidate_descriptor,
+                                    tables_descriptor=tables_descriptor,
+                                )
+                            self._archive_namespace_guard_intent(
                                 guard_intent,
-                                candidates_descriptor=candidates_descriptor,
-                                candidate_descriptor=candidate_descriptor,
-                                tables_descriptor=tables_descriptor,
+                                outcome="aborted",
                             )
-                            self._archive_namespace_guard_intent(guard_intent)
                             guard_archived = True
                         except BaseException as cleanup_error:
                             self._mark_store_poisoned()
@@ -3987,25 +4061,6 @@ class LabJobArtifactStore:
                                 [operation_error, cleanup_error],
                             ) from None
                     raise
-                self._assert_candidate_creation_binding(
-                    candidates_descriptor=candidates_descriptor,
-                    candidate_name=candidate_name,
-                    candidate_descriptor=candidate_descriptor,
-                    candidate_identity=candidate_identity,
-                    tables_descriptor=tables_descriptor,
-                    tables_identity=tables_identity,
-                )
-                for descriptor in payload_descriptors.values():
-                    os.close(descriptor)
-                payload_descriptors.clear()
-                os.close(tables_descriptor)
-                tables_descriptor = -1
-                os.close(candidate_descriptor)
-                candidate_descriptor = -1
-                os.close(candidates_descriptor)
-                candidates_descriptor = -1
-                candidate = self._candidate_from_path(candidate_path)
-                return self._finalize_public_candidate(candidate)
             finally:
                 for descriptor in payload_descriptors.values():
                     with suppress(OSError):
@@ -5087,6 +5142,7 @@ class LabJobArtifactStore:
         allow_interrupted_seal: bool = False,
     ) -> LabJobArtifactCandidate:
         managed = self._assert_managed_child(path, self.candidates_root, label="candidate")
+        self._assert_candidate_publication_not_aborted(managed.name)
         _, preliminary_manifest, _ = self._probe_bundle(
             managed,
             parent_root=self.candidates_root,

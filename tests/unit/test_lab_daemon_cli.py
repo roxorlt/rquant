@@ -140,8 +140,9 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
             return SimpleNamespace(failed=0, model_dump_json=lambda: "{}")
 
     class FakeLock:
-        def __init__(self, _path: Path, name: str) -> None:
+        def __init__(self, _path: Path, name: str, *, mutation_guard: object) -> None:
             calls.append(f"lock:{name}")
+            assert callable(mutation_guard)
 
         def __enter__(self) -> FakeLock:
             return self
@@ -159,7 +160,7 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     monkeypatch.setattr(
         lab_daemon,
         "prepare_private_sqlite_path",
-        lambda path, *, label, create: (
+        lambda path, *, label, create, mutation_guard: (
             calls.append(f"sqlite:{path.name}:{label}:{create}")
             or _FakeSqliteAuthority(path, calls)
         ),
@@ -167,7 +168,7 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     monkeypatch.setattr(
         lab_daemon,
         "ensure_private_directory",
-        lambda path, *, label: path,
+        lambda path, *, label, mutation_guard: path,
     )
     monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
     monkeypatch.setattr(
@@ -257,8 +258,8 @@ def test_finalizer_forever_installs_both_stop_signals(
                 handler(signum, None)
 
     class FakeLock:
-        def __init__(self, *_args: object) -> None:
-            pass
+        def __init__(self, *_args: object, mutation_guard: object) -> None:
+            assert callable(mutation_guard)
 
         def __enter__(self) -> FakeLock:
             return self
@@ -281,12 +282,12 @@ def test_finalizer_forever_installs_both_stop_signals(
     monkeypatch.setattr(
         lab_daemon,
         "prepare_private_sqlite_path",
-        lambda path, *, label, create: _FakeSqliteAuthority(path, calls),
+        lambda path, *, label, create, mutation_guard: _FakeSqliteAuthority(path, calls),
     )
     monkeypatch.setattr(
         lab_daemon,
         "ensure_private_directory",
-        lambda path, *, label: path,
+        lambda path, *, label, mutation_guard: path,
     )
     monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
     monkeypatch.setattr(

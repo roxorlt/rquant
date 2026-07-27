@@ -369,7 +369,7 @@ class LabCommandSpool:
         self.max_isolation_records = max_isolation_records
         self.max_isolation_bytes = max_isolation_bytes
         for path in (self.pending_dir, self.ack_dir, self.quarantine_dir):
-            path.mkdir(parents=True, exist_ok=True)
+            self._ensure_directory(path)
         with self._exclusive_lock():
             self._reconcile_owned_isolations_locked()
             self._prune_owned_isolations_locked()
@@ -377,6 +377,8 @@ class LabCommandSpool:
     @contextmanager
     def _exclusive_lock(self) -> Iterator[None]:
         with self._thread_lock:
+            if not self._lock_path.exists():
+                self._guard_mutation()
             descriptor = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -396,6 +398,12 @@ class LabCommandSpool:
     def _guard_mutation(self) -> None:
         if self.mutation_guard is not None:
             self.mutation_guard()
+
+    def _ensure_directory(self, path: Path, *, mode: int = 0o777) -> None:
+        if path.exists():
+            return
+        self._guard_mutation()
+        path.mkdir(parents=True, mode=mode, exist_ok=True)
 
     def _publish_no_clobber(self, target: Path, payload: bytes) -> bool:
         temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"

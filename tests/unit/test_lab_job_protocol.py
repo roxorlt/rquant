@@ -1027,6 +1027,20 @@ def test_command_spool_internal_mutation_fence_prevents_quarantine_and_ack(
     assert tuple(spool.ack_dir.iterdir()) == ()
 
 
+def test_command_spool_checks_guard_inside_initial_directory_creation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "commands"
+
+    def mutation_guard() -> str:
+        raise RuntimeError("runtime drifted before command spool initialization")
+
+    with pytest.raises(RuntimeError, match="command spool initialization"):
+        LabCommandSpool(root, mutation_guard=mutation_guard)
+
+    assert not root.exists()
+
+
 def test_load_and_quarantine_reject_external_symlink_and_mismatched_basename(
     tmp_path: Path,
 ) -> None:

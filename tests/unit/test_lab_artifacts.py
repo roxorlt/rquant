@@ -165,6 +165,18 @@ def test_artifact_store_internal_mutation_fence_prevents_seal_publish(
     assert not (store.sealed_root / candidate.job_id.hex).exists()
 
 
+def test_artifact_store_checks_guard_inside_initial_root_creation(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+
+    def mutation_guard() -> str:
+        raise RuntimeError("runtime drifted before artifact namespace creation")
+
+    with pytest.raises(RuntimeError, match="artifact namespace creation"):
+        LabJobArtifactStore(root, mutation_guard=mutation_guard)
+
+    assert not root.exists()
+
+
 def _prepare_arguments() -> dict[str, object]:
     return {
         "job_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
@@ -5770,6 +5782,81 @@ def test_namespace_guard_intent_is_canonical_and_archived_after_prepare(tmp_path
     if sys.platform == "darwin":
         assert candidate.path.stat().st_flags & stat.UF_IMMUTABLE == 0
         assert (candidate.path / "tables").stat().st_flags & stat.UF_IMMUTABLE == 0
+
+
+@pytest.mark.parametrize(
+    "drift_stage",
+    ["namespace_intent", "payload_completion", "intent_archive", "final_return"],
+)
+def test_candidate_runtime_drift_never_publishes_recoverable_complete_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift_stage: str,
+) -> None:
+    drifted = False
+
+    def mutation_guard() -> str:
+        if drifted:
+            raise RuntimeError(f"runtime drifted at {drift_stage}")
+        return "1" * 40
+
+    root = tmp_path / "artifacts"
+    store = LabJobArtifactStore(root, mutation_guard=mutation_guard)
+    if drift_stage == "namespace_intent":
+        original = store._publish_namespace_guard_intent
+
+        def drift_before_intent(intent: object) -> None:
+            nonlocal drifted
+            drifted = True
+            original(intent)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "_publish_namespace_guard_intent", drift_before_intent)
+    elif drift_stage == "payload_completion":
+
+        def drift_before_payload(_intent: object) -> None:
+            nonlocal drifted
+            drifted = True
+
+        monkeypatch.setattr(store, "_after_candidate_namespace_guarded", drift_before_payload)
+    elif drift_stage == "intent_archive":
+        original = store._archive_namespace_guard_intent
+
+        def drift_before_archive(intent: object, **kwargs: object) -> None:
+            nonlocal drifted
+            drifted = True
+            original(intent, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "_archive_namespace_guard_intent", drift_before_archive)
+    else:
+
+        def drift_before_return(_candidate: object) -> None:
+            nonlocal drifted
+            drifted = True
+
+        monkeypatch.setattr(
+            store,
+            "_before_complete_candidate_return",
+            drift_before_return,
+            raising=False,
+        )
+
+    with pytest.raises(BaseException) as raised:
+        _prepare(store)
+    assert "runtime drifted" in repr(raised.value)
+
+    candidate_paths = tuple(store.candidates_root.iterdir())
+    assert len(candidate_paths) == 1
+    drifted = False
+    monkeypatch.undo()
+    store.close()
+    restarted = LabJobArtifactStore(root, mutation_guard=mutation_guard)
+    recovery = next(
+        record
+        for record in restarted.list_candidate_recovery()
+        if record.path == candidate_paths[0]
+    )
+    assert recovery.status == "invalid"
+    restarted.close()
 
 
 def test_namespace_guard_intent_is_durable_before_namespace_mutation(

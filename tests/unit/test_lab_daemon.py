@@ -728,6 +728,61 @@ def test_private_directory_runtime_ensure_creates_only_private_leaf(tmp_path: Pa
     assert path.stat().st_mode & 0o777 == 0o700
 
 
+def test_private_directory_runtime_ensure_checks_guard_inside_create_boundary(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime" / "commands"
+
+    def mutation_guard() -> str:
+        raise LabDaemonConfigurationError("runtime drifted before directory creation")
+
+    with pytest.raises(LabDaemonConfigurationError, match="before directory creation"):
+        ensure_private_directory(
+            path,
+            label="command spool",
+            mutation_guard=mutation_guard,
+        )
+
+    assert not (tmp_path / "runtime").exists()
+
+
+def test_prepare_private_sqlite_checks_guard_inside_create_boundary(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    path = parent / "lab-jobs.sqlite3"
+
+    def mutation_guard() -> str:
+        raise LabDaemonConfigurationError("runtime drifted before SQLite creation")
+
+    with pytest.raises(LabDaemonConfigurationError, match="before SQLite creation"):
+        prepare_private_sqlite_path(
+            path,
+            label="lab jobs SQLite",
+            create=True,
+            mutation_guard=mutation_guard,
+        )
+
+    assert not path.exists()
+
+
+def test_daemon_lock_checks_guard_inside_namespace_create_boundary(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    root = parent / "locks"
+
+    def mutation_guard() -> str:
+        raise LabDaemonConfigurationError("runtime drifted before lock namespace creation")
+
+    with pytest.raises(LabDaemonConfigurationError, match="lock namespace creation"):
+        LabDaemonLock(root, "scheduler", mutation_guard=mutation_guard).acquire()
+
+    assert not root.exists()
+
+
 def test_private_directory_runtime_ensure_does_not_repair_public_directory(
     tmp_path: Path,
 ) -> None:
@@ -1580,6 +1635,48 @@ def test_finalizer_state_recovery_does_not_overwrite_concurrent_legal_update(
         store.save(LabFinalizerDaemonState(cycle=2))
 
     assert store.load().cycle == 99
+
+
+def test_finalizer_state_post_publish_drift_blocks_compensation_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=1))
+    real_replace = os.replace
+    real_assert_root = store._assert_root_current
+    drifted = False
+
+    def replace_then_drift(*args: object, **kwargs: object) -> None:
+        nonlocal drifted
+        real_replace(*args, **kwargs)
+        if args[1] == store.path.name:
+            drifted = True
+
+    def fail_post_publish(descriptor: int, identity: os.stat_result) -> None:
+        if drifted:
+            raise LabDaemonConfigurationError("post-publish validation failed")
+        real_assert_root(descriptor, identity)
+
+    def mutation_guard() -> str:
+        if drifted:
+            raise LabDaemonConfigurationError("stale runtime compensation blocked")
+        return "1" * 40
+
+    monkeypatch.setattr("rquant.lab_daemon.os.replace", replace_then_drift)
+    monkeypatch.setattr(store, "_assert_root_current", fail_post_publish)
+
+    with pytest.raises(BaseException, match="stale runtime compensation blocked"):
+        store.save(
+            LabFinalizerDaemonState(cycle=2),
+            mutation_guard=mutation_guard,
+        )
+
+    persisted = LabFinalizerDaemonState.model_validate_json(store.path.read_bytes())
+    assert persisted.cycle == 2
+    assert not tuple(state_dir.glob(".state.restore.*"))
+    assert not tuple(state_dir.glob(".state.failed.*"))
 
 
 def test_finalizer_state_save_preserves_same_size_concurrent_replacement(

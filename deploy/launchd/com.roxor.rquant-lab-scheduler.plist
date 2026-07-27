@@ -6,6 +6,13 @@
     <string>com.roxor.rquant-lab-scheduler</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/python</string>
+        <string>-I</string>
+        <string>-S</string>
+        <string>/Users/roxor/brain/30-projects/rQuant/scripts/run-lab-daemon.py</string>
+        <string>--expected-checkout-root</string>
+        <string>/Users/roxor/brain/30-projects/rQuant</string>
+        <string>--</string>
         <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/rquant</string>
         <string>lab-scheduler</string>
         <string>--expected-checkout-root</string>

@@ -9,9 +9,19 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHD_DIR = ROOT / "deploy" / "launchd"
-EXECUTABLE = "/Users/roxor/brain/30-projects/rQuant/.venv/bin/rquant"
 WORKING_DIRECTORY = "/Users/roxor/brain/30-projects/rQuant"
+PYTHON = f"{WORKING_DIRECTORY}/.venv/bin/python"
+WRAPPER = f"{WORKING_DIRECTORY}/scripts/run-lab-daemon.py"
+EXECUTABLE = f"{WORKING_DIRECTORY}/.venv/bin/rquant"
 EXPECTED_ROOT_ARGUMENTS = ["--expected-checkout-root", WORKING_DIRECTORY]
+WRAPPER_ARGUMENTS = [
+    PYTHON,
+    "-I",
+    "-S",
+    WRAPPER,
+    *EXPECTED_ROOT_ARGUMENTS,
+    "--",
+]
 
 
 @pytest.mark.parametrize(
@@ -44,7 +54,8 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
         document = plistlib.load(stream)
 
     assert document["Label"] == label
-    assert document["ProgramArguments"][:4] == [
+    assert document["ProgramArguments"][: len(WRAPPER_ARGUMENTS) + 4] == [
+        *WRAPPER_ARGUMENTS,
         EXECUTABLE,
         command,
         *EXPECTED_ROOT_ARGUMENTS,
@@ -73,6 +84,7 @@ def test_lab_worker_launchd_uses_configured_stable_identity() -> None:
         document = plistlib.load(stream)
 
     assert document["ProgramArguments"] == [
+        *WRAPPER_ARGUMENTS,
         EXECUTABLE,
         "lab-worker",
         *EXPECTED_ROOT_ARGUMENTS,
@@ -82,7 +94,9 @@ def test_lab_worker_launchd_uses_configured_stable_identity() -> None:
 
 
 @pytest.mark.skipif(
-    not Path(EXECUTABLE).is_file() or not Path(WORKING_DIRECTORY).is_dir(),
+    not Path(EXECUTABLE).is_file()
+    or not Path(WRAPPER).is_file()
+    or not Path(WORKING_DIRECTORY).is_dir(),
     reason="owner Mac launchd runtime is unavailable",
 )
 def test_lab_launchd_exact_runtime_rejects_editable_import_from_other_worktree(
@@ -119,7 +133,7 @@ def test_lab_launchd_exact_runtime_rejects_editable_import_from_other_worktree(
     )
 
     assert result.returncode != 0
-    assert "package root" in result.stdout + result.stderr
+    assert "environment injection" in result.stdout + result.stderr
 
 
 @pytest.mark.skipif(

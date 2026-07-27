@@ -72,7 +72,12 @@ def require_private_directory(path: Path, *, label: str) -> Path:
     return candidate
 
 
-def ensure_private_directory(path: Path, *, label: str) -> Path:
+def ensure_private_directory(
+    path: Path,
+    *,
+    label: str,
+    mutation_guard: Callable[[], object] | None = None,
+) -> Path:
     """Create one validated runtime root after Settings completed pure validation."""
     candidate = _canonical_absolute_path(path, label=label)
     if candidate.resolve(strict=False) != candidate:
@@ -80,8 +85,9 @@ def ensure_private_directory(path: Path, *, label: str) -> Path:
     if candidate.exists() or candidate.is_symlink():
         return require_private_directory(candidate, label=label)
     try:
+        if mutation_guard is not None:
+            mutation_guard()
         candidate.mkdir(parents=True, mode=0o700, exist_ok=False)
-        candidate.chmod(0o700)
     except OSError as exc:
         raise LabDaemonConfigurationError(f"{label} could not be created safely") from exc
     return require_private_directory(candidate, label=label)
@@ -514,6 +520,7 @@ def prepare_private_sqlite_path(
     *,
     label: str,
     create: bool,
+    mutation_guard: Callable[[], object] | None = None,
 ) -> LabSqliteAuthority:
     """Create or verify the daemon SQLite authority without following links."""
     candidate = _canonical_absolute_path(path, label=label)
@@ -558,12 +565,13 @@ def prepare_private_sqlite_path(
                 raise LabDaemonConfigurationError(f"{label} does not exist") from None
             flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             try:
+                if mutation_guard is not None:
+                    mutation_guard()
                 descriptor = os.open(candidate.name, flags, 0o600, dir_fd=parent_descriptor)
             except OSError as exc:
                 raise LabDaemonConfigurationError(
                     f"{label} could not be created atomically"
                 ) from exc
-            os.fchmod(descriptor, 0o600)
             os.fsync(descriptor)
             observed = os.fstat(descriptor)
         else:
@@ -690,11 +698,18 @@ class LabDaemonLock:
     local filesystem boundary.
     """
 
-    def __init__(self, root: Path, name: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        name: str,
+        *,
+        mutation_guard: Callable[[], object] | None = None,
+    ) -> None:
         if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name) is None:
             raise ValueError("daemon lock name is invalid")
         self.root = Path(root)
         self.name = name
+        self.mutation_guard = mutation_guard
         self.path = self.root / f"{name}.lock"
         self.authority_path: Path | None = None
         self._descriptor = -1
@@ -707,6 +722,7 @@ class LabDaemonLock:
         name: str,
         *,
         label: str,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> int:
         try:
             observed = os.stat(
@@ -719,12 +735,13 @@ class LabDaemonLock:
         if observed is None:
             flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             try:
+                if mutation_guard is not None:
+                    mutation_guard()
                 descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
             except OSError as exc:
                 raise LabDaemonConfigurationError(
                     f"{label} could not be created atomically"
                 ) from exc
-            created = True
         else:
             _validate_private_regular_identity(observed, label=label)
             flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
@@ -732,10 +749,7 @@ class LabDaemonLock:
                 descriptor = os.open(name, flags, dir_fd=directory_descriptor)
             except OSError as exc:
                 raise LabDaemonConfigurationError(f"{label} could not be opened safely") from exc
-            created = False
         try:
-            if created:
-                os.fchmod(descriptor, 0o600)
             current = os.fstat(descriptor)
             if observed is not None and (current.st_dev, current.st_ino) != (
                 observed.st_dev,
@@ -823,6 +837,8 @@ class LabDaemonLock:
                 )
             except FileNotFoundError:
                 try:
+                    if self.mutation_guard is not None:
+                        self.mutation_guard()
                     os.mkdir(self.root.name, mode=0o700, dir_fd=parent_descriptor)
                 except OSError as exc:
                     raise LabDaemonConfigurationError(
@@ -849,6 +865,7 @@ class LabDaemonLock:
                 parent_descriptor,
                 authority_name,
                 label="daemon authority lock file",
+                mutation_guard=self.mutation_guard,
             )
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -863,7 +880,10 @@ class LabDaemonLock:
                 root_descriptor,
                 self.path.name,
                 label="daemon lock file",
+                mutation_guard=self.mutation_guard,
             )
+            if self.mutation_guard is not None:
+                self.mutation_guard()
             os.ftruncate(metadata_descriptor, 0)
             os.write(metadata_descriptor, f"{os.getpid()}\n".encode("ascii"))
             os.fsync(metadata_descriptor)
@@ -1041,17 +1061,19 @@ class LabFinalizerStateStore:
         self,
         root_descriptor: int,
         root_identity: os.stat_result,
+        *,
+        mutation_guard: Callable[[], object] | None = None,
     ) -> int:
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        created = False
         try:
+            if mutation_guard is not None:
+                mutation_guard()
             descriptor = os.open(
                 self._WRITER_LOCK_NAME,
                 flags | os.O_CREAT | os.O_EXCL,
                 0o600,
                 dir_fd=root_descriptor,
             )
-            created = True
         except FileExistsError:
             descriptor = os.open(
                 self._WRITER_LOCK_NAME,
@@ -1059,8 +1081,6 @@ class LabFinalizerStateStore:
                 dir_fd=root_descriptor,
             )
         try:
-            if created:
-                os.fchmod(descriptor, 0o600)
             opened = os.fstat(descriptor)
             _validate_private_regular_identity(
                 opened,
@@ -1219,10 +1239,24 @@ class LabFinalizerStateStore:
         existing_descriptor = -1
         writer_lock_descriptor = -1
         replaced = False
+
+        def guard_mutation() -> None:
+            if mutation_guard is not None:
+                mutation_guard()
+
+        def guarded_unlink_if_exists(name: str) -> None:
+            try:
+                os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            guard_mutation()
+            os.unlink(name, dir_fd=root_descriptor)
+
         try:
             writer_lock_descriptor = self._open_writer_lock(
                 root_descriptor,
                 root_identity,
+                mutation_guard=mutation_guard,
             )
             try:
                 existing = os.stat(
@@ -1247,13 +1281,13 @@ class LabFinalizerStateStore:
                     raise LabDaemonConfigurationError(
                         "lab finalizer state identity changed before commit"
                     )
+            guard_mutation()
             descriptor = os.open(
                 temporary_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=root_descriptor,
             )
-            os.fchmod(descriptor, 0o600)
             offset = 0
             while offset < len(payload):
                 offset += os.write(descriptor, payload[offset:])
@@ -1280,8 +1314,7 @@ class LabFinalizerStateStore:
                     )
             if existing is None:
                 try:
-                    if mutation_guard is not None:
-                        mutation_guard()
+                    guard_mutation()
                     os.link(
                         temporary_name,
                         self.path.name,
@@ -1294,7 +1327,7 @@ class LabFinalizerStateStore:
                         "lab finalizer state was created concurrently"
                     ) from exc
                 replaced = True
-                os.unlink(temporary_name, dir_fd=root_descriptor)
+                guarded_unlink_if_exists(temporary_name)
             else:
                 self._before_state_exchange(root_descriptor)
                 self._assert_root_current(root_descriptor, root_identity)
@@ -1311,8 +1344,7 @@ class LabFinalizerStateStore:
                     raise LabDaemonConfigurationError(
                         "lab finalizer state changed concurrently before commit"
                     )
-                if mutation_guard is not None:
-                    mutation_guard()
+                guard_mutation()
                 os.replace(
                     temporary_name,
                     self.path.name,
@@ -1399,6 +1431,7 @@ class LabFinalizerStateStore:
                     restore_descriptor = -1
                     failed_retained = False
                     try:
+                        guard_mutation()
                         restore_descriptor = os.open(
                             restore_name,
                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -1413,10 +1446,10 @@ class LabFinalizerStateStore:
                             written = 0
                             while written < len(chunk):
                                 written += os.write(restore_descriptor, chunk[written:])
-                        os.fchmod(restore_descriptor, 0o600)
                         os.fsync(restore_descriptor)
                         if active is None:
                             with suppress(FileExistsError):
+                                guard_mutation()
                                 os.link(
                                     restore_name,
                                     self.path.name,
@@ -1425,6 +1458,7 @@ class LabFinalizerStateStore:
                                     follow_symlinks=False,
                                 )
                         else:
+                            guard_mutation()
                             os.rename(
                                 self.path.name,
                                 failed_name,
@@ -1441,6 +1475,7 @@ class LabFinalizerStateStore:
                             ):
                                 failed_retained = True
                                 with suppress(FileExistsError):
+                                    guard_mutation()
                                     os.link(
                                         failed_name,
                                         self.path.name,
@@ -1450,6 +1485,7 @@ class LabFinalizerStateStore:
                                     )
                             else:
                                 with suppress(FileExistsError):
+                                    guard_mutation()
                                     os.link(
                                         restore_name,
                                         self.path.name,
@@ -1466,6 +1502,7 @@ class LabFinalizerStateStore:
                             except FileNotFoundError:
                                 failed_retained = True
                             else:
+                                guard_mutation()
                                 os.unlink(
                                     failed_name,
                                     dir_fd=root_descriptor,
@@ -1475,11 +1512,9 @@ class LabFinalizerStateStore:
                     finally:
                         if restore_descriptor >= 0:
                             os.close(restore_descriptor)
-                        with suppress(FileNotFoundError):
-                            os.unlink(restore_name, dir_fd=root_descriptor)
+                        guarded_unlink_if_exists(restore_name)
                         if not failed_retained:
-                            with suppress(FileNotFoundError):
-                                os.unlink(failed_name, dir_fd=root_descriptor)
+                            guarded_unlink_if_exists(failed_name)
             elif replaced:
                 try:
                     active = os.stat(
@@ -1491,6 +1526,7 @@ class LabFinalizerStateStore:
                         temporary_identity.st_dev,
                         temporary_identity.st_ino,
                     ):
+                        guard_mutation()
                         os.unlink(self.path.name, dir_fd=root_descriptor)
                         os.fsync(root_descriptor)
                 except OSError:
@@ -1508,8 +1544,7 @@ class LabFinalizerStateStore:
             if writer_lock_descriptor >= 0:
                 fcntl.flock(writer_lock_descriptor, fcntl.LOCK_UN)
                 os.close(writer_lock_descriptor)
-            with suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=root_descriptor)
+            guarded_unlink_if_exists(temporary_name)
             os.close(root_descriptor)
 
 

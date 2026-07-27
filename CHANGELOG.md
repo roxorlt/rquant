@@ -131,6 +131,15 @@
   最终文件 mutation 前复验。finalizer state 恢复改用 no-clobber 发布，不覆盖并发状态；Lab SQLite
   初始化分别在 schema commit 与后续 WAL 持久化前复验，失败迁移不再改变原数据库 journal mode。
 
+- **Strategy Lab daemon 第九轮启动与发布边界加固**：三份 launchd contract 改由纯 stdlib
+  wrapper 在任何 `rquant` import 前运行 detection-only preflight，失败时不进入 daemon；wrapper
+  绑定物理 checkout/virtualenv、精确 executable、工作目录与 daemon checkout 参数后才 `execv`。
+  runtime guard 进一步下沉到私有目录、SQLite、daemon lock、command/claim spool 与 artifact
+  namespace 的最终 `mkdir`/`O_CREAT` 边界。candidate 在 intent、payload、archive 和公开返回前
+  持续复验 runtime，崩溃恢复会把已持久化 intent 的未完成发布标为 aborted；finalizer state 的
+  post-publish
+  补偿则在 writer lock 内逐次 guard 并保持 CAS/no-clobber，不由旧 runtime 覆盖较新状态。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。

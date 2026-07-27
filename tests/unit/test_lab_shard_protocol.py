@@ -422,6 +422,25 @@ def test_claim_spool_is_no_clobber_and_reader_detects_tamper(tmp_path: Path) -> 
         spool.consume(entries[0])
 
 
+def test_claim_spool_checks_guard_inside_claim_namespace_creation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claims"
+    calls = 0
+
+    def mutation_guard() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 5:
+            raise RuntimeError("runtime drifted before claim namespace creation")
+        return "1" * 40
+
+    with pytest.raises(RuntimeError, match="claim namespace creation"):
+        LabClaimSpool(root, mutation_guard=mutation_guard)
+
+    assert not (root / "current").exists()
+
+
 def test_claim_spool_persists_exact_high_water_across_consume_and_restart(
     tmp_path: Path,
 ) -> None:

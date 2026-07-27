@@ -3674,8 +3674,8 @@ class TestLabSchedulerCli:
                 return None
 
         class FakeLock:
-            def __init__(self, *_args: object) -> None:
-                pass
+            def __init__(self, *_args: object, mutation_guard: object) -> None:
+                assert callable(mutation_guard)
 
             def __enter__(self) -> FakeLock:
                 return self
@@ -3709,12 +3709,12 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
-            lambda path, *, label: path,
+            lambda path, *, label, mutation_guard: path,
         )
         monkeypatch.setattr(
             lab_daemon,
             "prepare_private_sqlite_path",
-            lambda path, *, label, create: _FakeLabSqliteAuthority(path),
+            lambda path, *, label, create, mutation_guard: _FakeLabSqliteAuthority(path),
         )
         monkeypatch.setattr(
             lab_daemon.LabAuthorityKeyring,
@@ -3838,7 +3838,7 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(
             lab_daemon,
             "prepare_private_sqlite_path",
-            lambda path, *, label, create: (
+            lambda path, *, label, create, mutation_guard: (
                 calls.append(f"sqlite:{path.name}:{label}:{create}")
                 or _FakeLabSqliteAuthority(path)
             ),
@@ -3912,8 +3912,8 @@ class TestLabWorkerCli:
         from rquant.config import settings
 
         class FakeLock:
-            def __init__(self, *_args: object) -> None:
-                pass
+            def __init__(self, *_args: object, mutation_guard: object) -> None:
+                assert callable(mutation_guard)
 
             def __enter__(self) -> FakeLock:
                 return self
@@ -3926,7 +3926,7 @@ class TestLabWorkerCli:
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
-            lambda path, *, label: path,
+            lambda path, *, label, mutation_guard: path,
         )
         monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
         monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-a")

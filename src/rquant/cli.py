@@ -2992,7 +2992,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        ensure_private_directory(path, label=label)
+        ensure_private_directory(path, label=label, mutation_guard=runtime_guard.verify)
     runtime_paths = {
         "lab command spool": settings.lab_job_command_dir_resolved,
         "lab claim spool": settings.lab_job_claim_dir_resolved,
@@ -3007,11 +3007,16 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     if os.path.lexists(settings.lab_jobs_path_resolved):
         runtime_paths["lab jobs SQLite"] = settings.lab_jobs_path_resolved
     require_unique_runtime_paths(runtime_paths)
-    with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "scheduler"):
+    with LabDaemonLock(
+        settings.lab_daemon_lock_dir_resolved,
+        "scheduler",
+        mutation_guard=runtime_guard.verify,
+    ):
         sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
             label="lab jobs SQLite",
             create=True,
+            mutation_guard=runtime_guard.verify,
         )
         artifact_store = None
         try:
@@ -3133,7 +3138,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         ("lab worker artifact root", settings.lab_worker_artifact_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        ensure_private_directory(path, label=label)
+        ensure_private_directory(path, label=label, mutation_guard=runtime_guard.verify)
     require_unique_runtime_paths(
         {
             "lab claim spool": settings.lab_job_claim_dir_resolved,
@@ -3142,7 +3147,11 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
             "lab daemon lock root": settings.lab_daemon_lock_dir_resolved,
         }
     )
-    with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "worker"):
+    with LabDaemonLock(
+        settings.lab_daemon_lock_dir_resolved,
+        "worker",
+        mutation_guard=runtime_guard.verify,
+    ):
         worker = LabWorker(
             worker_id=worker_id,
             claim_spool=LabClaimSpool(
@@ -3231,7 +3240,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
         ("lab finalizer state root", settings.lab_finalizer_state_dir_resolved),
     ):
-        ensure_private_directory(path, label=label)
+        ensure_private_directory(path, label=label, mutation_guard=runtime_guard.verify)
     runtime_paths = {
         "lab worker artifact root": settings.lab_worker_artifact_dir_resolved,
         "lab final artifact root": settings.lab_final_artifact_dir_resolved,
@@ -3244,11 +3253,16 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     if os.path.lexists(settings.lab_jobs_path_resolved):
         runtime_paths["lab jobs SQLite"] = settings.lab_jobs_path_resolved
     require_unique_runtime_paths(runtime_paths)
-    with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "finalizer"):
+    with LabDaemonLock(
+        settings.lab_daemon_lock_dir_resolved,
+        "finalizer",
+        mutation_guard=runtime_guard.verify,
+    ):
         sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
             label="lab jobs SQLite",
             create=False,
+            mutation_guard=runtime_guard.verify,
         )
         artifact_store = None
         try:
