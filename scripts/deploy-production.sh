@@ -3,9 +3,14 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${RQUANT_DEPLOY_PYTHON:-${PROJECT_DIR}/.venv/bin/python}"
+UV_BIN="${RQUANT_DEPLOY_UV:-${HOME}/.local/bin/uv}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     printf 'Deployment Python is not executable: %s\n' "${PYTHON_BIN}" >&2
+    exit 2
+fi
+if [[ ! -x "${UV_BIN}" ]]; then
+    printf 'Deployment uv is not executable: %s\n' "${UV_BIN}" >&2
     exit 2
 fi
 
@@ -18,4 +23,5 @@ exec "${PYTHON_BIN}" -I -S "${PROJECT_DIR}/scripts/bootstrap-production-deploy.p
     --trusted-git-path "${TRUSTED_GIT}" \
     --deployment-lock-path "${DEPLOY_LOCK}" \
     --python-path "${PYTHON_BIN}" \
-    -- "$@"
+    --uv-path "${UV_BIN}" \
+    "$@"

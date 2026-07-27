@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -192,4 +193,53 @@ def test_release_generation_rejects_tracked_source_drift(tmp_path: Path) -> None
 
     with pytest.raises(ReleaseGenerationError, match="tracked checkout"):
         authority.verify(expected_commit=commit)
+    os.close(lock_fd)
+
+
+def test_release_generation_marker_handles_short_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    real_write: Callable[[int, bytes], int] = os.write
+    writes: list[int] = []
+
+    def short_write(descriptor: int, payload: bytes) -> int:
+        chunk = payload[: max(1, len(payload) // 3)]
+        writes.append(len(chunk))
+        return real_write(descriptor, chunk)
+
+    monkeypatch.setattr("rquant.release_generation.os.write", short_write)
+
+    published = authority.publish(expected_commit=commit)
+
+    assert len(writes) > 1
+    assert authority.verify(expected_commit=commit) == published
+    os.close(lock_fd)
+
+
+def test_release_generation_does_not_publish_unverified_temporary_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+
+    def reject_temporary_content(*_args: object, **_kwargs: object) -> None:
+        raise ReleaseGenerationError("temporary release marker content mismatch")
+
+    monkeypatch.setattr(
+        "rquant.release_generation._verify_temporary_payload",
+        reject_temporary_content,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="temporary release marker"):
+        authority.publish(expected_commit=commit)
+
+    assert not marker_path_for_lock(lock_path).exists()
     os.close(lock_fd)

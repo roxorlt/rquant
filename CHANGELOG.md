@@ -73,7 +73,10 @@
   包版本、Python ABI 和物理 venv 身份；Lab wrapper、只读 preflight 与隔离 bootstrap 在任何
   `rquant` import 前均持共享锁复验。生产发布入口改为 `-I -S` 纯标准库 bootstrap，先取得稳定
   独占锁再导入项目 deployer；部署开始即失效旧 marker，只有 checkout、frozen sync、两次
-  preflight 与服务验证完成后才 fsync+rename 发布，完整回滚验证后才可恢复旧 marker。
+  preflight 与服务验证完成后才 fsync+rename 发布，完整回滚验证后才可恢复旧 marker。新增同锁下
+  显式 `initialize-generation` 与 `recover-generation` 控制面：first migration、fast-forward
+  resume 和 ancestor rollback 均绑定精确 origin/main ref、可信绝对 Git、锁文件 hash、物理
+  runtime 与 target preflight；marker 写入循环处理 short write，并在 rename 前回读解析及核对 hash。
 
 - **Strategy Lab 启动代际与 spool 权威加固**：launchd wrapper 不再直接执行会加载 Python
   `site` hook 的 console script，改在共享发布代际锁下进入 `-I -S` stdlib bootstrap，仅显式加载

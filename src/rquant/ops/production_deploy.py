@@ -174,7 +174,7 @@ class DeployConfig:
     lock_fd: int | None = None
     startup_generation: str | None = None
     python_path: Path | None = None
-    git_path: Path | None = None
+    git_path: Path = Path("/usr/bin/git")
 
 
 @dataclass(frozen=True)
@@ -235,9 +235,15 @@ def _stdout(runner: Runner, args: list[str]) -> str:
     return runner.run(args).stdout.strip()
 
 
-def _check_ancestor(runner: Runner, ancestor: str, descendant: str, message: str) -> None:
+def _check_ancestor(
+    runner: Runner,
+    git_path: Path,
+    ancestor: str,
+    descendant: str,
+    message: str,
+) -> None:
     result = runner.run(
-        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        [str(git_path), "merge-base", "--is-ancestor", ancestor, descendant],
         check=False,
     )
     if result.returncode != 0:
@@ -331,7 +337,7 @@ def _rollback(
     restarted_services: tuple[str, ...],
     generation_authority: GenerationAuthority | None,
 ) -> None:
-    runner.run(["git", "reset", "--hard", previous_sha])
+    runner.run([str(config.git_path), "reset", "--hard", previous_sha])
     runner.run([config.uv_bin, "sync", "--frozen"])
     runner.run([config.rquant_bin, "preflight"])
     for service in restarted_services:
@@ -350,22 +356,26 @@ def _deploy_locked(
     generation_authority: GenerationAuthority | None,
 ) -> DeployResult:
     target = validate_target(config.target)
-    branch = _stdout(runner, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    git_path = config.git_path
+    if not git_path.is_absolute():
+        raise PolicyError("trusted Git path must be absolute")
+    git = str(git_path)
+    branch = _stdout(runner, [git, "rev-parse", "--abbrev-ref", "HEAD"])
     if branch != "main":
         raise PolicyError(f"production checkout must be on main, found {branch!r}")
 
-    dirty = _stdout(runner, ["git", "status", "--porcelain", "--untracked-files=no"])
+    dirty = _stdout(runner, [git, "status", "--porcelain", "--untracked-files=no"])
     if dirty:
         raise PolicyError("tracked production worktree changes must be resolved before deploy")
 
-    runner.run(["git", "fetch", "--tags", "origin", "main"])
+    runner.run([git, "fetch", "--tags", "origin", "main"])
     if target.startswith("v"):
-        tag_type = _stdout(runner, ["git", "cat-file", "-t", target])
+        tag_type = _stdout(runner, [git, "cat-file", "-t", target])
         if tag_type != "tag":
             raise PolicyError("SemVer target must be an annotated tag")
-    target_sha = _stdout(runner, ["git", "rev-parse", "--verify", f"{target}^{{commit}}"])
+    target_sha = _stdout(runner, [git, "rev-parse", "--verify", f"{target}^{{commit}}"])
     if target.startswith("v"):
-        pyproject = _stdout(runner, ["git", "show", f"{target_sha}:pyproject.toml"])
+        pyproject = _stdout(runner, [git, "show", f"{target_sha}:pyproject.toml"])
         try:
             package_version = str(tomllib.loads(pyproject)["project"]["version"])
         except (KeyError, tomllib.TOMLDecodeError) as exc:
@@ -374,11 +384,12 @@ def _deploy_locked(
             raise PolicyError(f"tag {target} disagrees with package version {package_version}")
     _check_ancestor(
         runner,
+        git_path,
         target_sha,
         "origin/main",
         "target is not contained in origin/main",
     )
-    previous_sha = _stdout(runner, ["git", "rev-parse", "HEAD"])
+    previous_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
 
     if previous_sha == target_sha:
         result = DeployResult("already_current", previous_sha, target_sha, target, (), ())
@@ -387,13 +398,12 @@ def _deploy_locked(
 
     _check_ancestor(
         runner,
+        git_path,
         previous_sha,
         target_sha,
         "target is not a fast-forward from the deployed commit",
     )
-    changed_output = _stdout(
-        runner, ["git", "diff", "--name-only", f"{previous_sha}..{target_sha}"]
-    )
+    changed_output = _stdout(runner, [git, "diff", "--name-only", f"{previous_sha}..{target_sha}"])
     change_plan = build_change_plan(changed_output.splitlines())
     if change_plan.blocked_files:
         joined = ", ".join(change_plan.blocked_files)
@@ -419,7 +429,7 @@ def _deploy_locked(
     if generation_authority is not None:
         generation_authority.invalidate()
     try:
-        runner.run(["git", "merge", "--ff-only", target_sha])
+        runner.run([git, "merge", "--ff-only", target_sha])
         runner.run([config.uv_bin, "sync", "--frozen"])
         runner.run([config.rquant_bin, "preflight"])
         _restart_active_services(runner, change_plan.restart_services, restarted)
@@ -510,11 +520,7 @@ def deploy(
         ):
             raise PolicyError("inherited deployment generation lock identity changed")
         if generation_authority is None:
-            if (
-                effective_config.startup_generation is None
-                or effective_config.python_path is None
-                or effective_config.git_path is None
-            ):
+            if effective_config.startup_generation is None or effective_config.python_path is None:
                 raise PolicyError("release generation binding is incomplete")
             try:
                 generation_authority = ReleaseGenerationAuthority(
@@ -533,11 +539,6 @@ def deploy(
         return _deploy_locked(effective_config, effective_runner, generation_authority)
 
 
-def _default_uv_bin() -> str:
-    user_uv = Path.home() / ".local" / "bin" / "uv"
-    return str(user_uv) if user_uv.exists() else "uv"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deploy an exact rQuant tag or commit")
     parser.add_argument("--target", required=True, help="SemVer tag or full 40-character SHA")
@@ -548,6 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-generation", required=True)
     parser.add_argument("--trusted-git-path", type=Path, required=True)
     parser.add_argument("--python-path", type=Path, required=True)
+    parser.add_argument("--uv-path", type=Path, required=True)
     return parser
 
 
@@ -557,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
         repo=args.repo,
         target=args.target,
         dry_run=args.dry_run,
-        uv_bin=_default_uv_bin(),
+        uv_bin=str(args.uv_path),
         rquant_bin=".venv/bin/rquant",
         lock_path=args.deployment_lock_path,
         lock_fd=args.deployment_lock_fd,

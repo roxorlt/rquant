@@ -31,11 +31,21 @@ class FakeRunner:
     def __init__(self, responses: dict[tuple[str, ...], tuple[int, str]] | None = None) -> None:
         self.responses = responses or {}
         self.calls: list[tuple[str, ...]] = []
+        self.executed_calls: list[tuple[str, ...]] = []
+
+    @staticmethod
+    def _normalize(args: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        command = tuple(args)
+        if command and command[0] == "/usr/bin/git":
+            return ("git", *command[1:])
+        return command
 
     def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-        key = tuple(args)
+        executed = tuple(args)
+        key = self._normalize(args)
+        self.executed_calls.append(executed)
         self.calls.append(key)
-        returncode, stdout = self.responses.get(key, (0, ""))
+        returncode, stdout = self.responses.get(executed, self.responses.get(key, (0, "")))
         result = subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
         if check and returncode != 0:
             raise subprocess.CalledProcessError(returncode, args, output=stdout, stderr="")
@@ -87,7 +97,7 @@ class CrashAfterRunner(FakeRunner):
 
     def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = super().run(args, check=check)
-        if tuple(args) == self._command:
+        if self._normalize(args) == self._command:
             self._seen += 1
             if self._seen == self._occurrence:
                 raise SimulatedDeploymentCrash
@@ -107,7 +117,7 @@ class SequenceRunner(FakeRunner):
         self._sequence = list(sequence)
 
     def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-        if tuple(args) != self._command or not self._sequence:
+        if self._normalize(args) != self._command or not self._sequence:
             return super().run(args, check=check)
         self.calls.append(tuple(args))
         returncode, stdout = self._sequence.pop(0)
@@ -159,6 +169,16 @@ def _base_responses(target: str = "v0.13.2") -> dict[tuple[str, ...], tuple[int,
             f'[project]\nname = "rquant"\nversion = "{target[1:]}"\n',
         )
     return responses
+
+
+def _bind_git_responses(
+    responses: dict[tuple[str, ...], tuple[int, str]],
+    git_path: Path,
+) -> dict[tuple[str, ...], tuple[int, str]]:
+    return {
+        ((str(git_path), *command[1:]) if command[0] == "git" else command): response
+        for command, response in responses.items()
+    }
 
 
 def _config(tmp_path: Path, *, target: str = "v0.13.2", dry_run: bool = False) -> DeployConfig:
@@ -251,6 +271,36 @@ def test_dry_run_builds_exact_plan_without_mutating_repo(tmp_path: Path) -> None
     assert result.target_sha == _sha("b")
     assert ("git", "merge", "--ff-only", _sha("b")) not in runner.calls
     assert ("uv", "sync", "--frozen") not in runner.calls
+
+
+def test_all_deploy_git_commands_use_verified_absolute_git_path(tmp_path: Path) -> None:
+    trusted_git = Path("/usr/bin/git")
+    runner = FakeRunner(_bind_git_responses(_base_responses(), trusted_git))
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(**{**baseline.__dict__, "git_path": trusted_git})
+
+    result = deploy(config, runner=runner)
+
+    assert result.status == "dry_run"
+    git_calls = [
+        call
+        for call in runner.executed_calls
+        if call[1:2]
+        in {
+            ("rev-parse",),
+            ("status",),
+            ("fetch",),
+            ("cat-file",),
+            ("show",),
+            ("merge-base",),
+            ("diff",),
+            ("merge",),
+            ("reset",),
+        }
+    ]
+    assert git_calls
+    assert all(call[0] == str(trusted_git) for call in git_calls)
+    assert all(call[0] != "git" for call in runner.executed_calls)
 
 
 def test_deployment_refuses_to_mutate_generation_held_by_daemon(tmp_path: Path) -> None:
@@ -537,6 +587,7 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
         ("invalidate", None),
         ("publish", _sha("a")),
     ]
+    assert all(call[0] != "git" for call in runner.executed_calls)
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "rolled_back"' in audit
 
@@ -558,6 +609,8 @@ def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import()
 
     assert '"${PYTHON_BIN}" -I -S' in source
     assert "bootstrap-production-deploy.py" in source
+    assert '--uv-path "${UV_BIN}"' in source
+    assert '-- "$@"' not in source
     assert "-m rquant.ops.production_deploy" not in source
     assert "/../.rquant-deploy" not in source
 
@@ -580,14 +633,18 @@ def test_subprocess_runner_preserves_failed_command_diagnostics(tmp_path: Path) 
         )
 
 
-def test_real_git_repository_deploys_annotated_fast_forward_tag(tmp_path: Path) -> None:
+def test_real_git_repository_deploys_annotated_fast_forward_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repo = tmp_path / "prod"
     origin = tmp_path / "origin.git"
+    trusted_git = Path("/usr/bin/git")
     repo.mkdir()
 
     def git(*args: str) -> str:
         result = subprocess.run(
-            ["git", *args],
+            [str(trusted_git), *args],
             cwd=repo,
             capture_output=True,
             text=True,
@@ -616,13 +673,23 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(tmp_path: Path) 
     git("tag", "-a", "v0.13.2", "-m", "release")
 
     subprocess.run(
-        ["git", "clone", "--bare", str(repo), str(origin)],
+        [str(trusted_git), "clone", "--bare", str(repo), str(origin)],
         capture_output=True,
         text=True,
         check=True,
     )
     git("reset", "--hard", base_sha)
     git("remote", "add", "origin", str(origin))
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git_called = tmp_path / "fake-git-called"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf called > {fake_git_called}\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
 
     config = DeployConfig(
         repo=repo,
@@ -632,6 +699,7 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(tmp_path: Path) 
         rquant_bin="/usr/bin/true",
         audit_path=tmp_path / "audit.jsonl",
         lock_path=tmp_path / "deploy.lock",
+        git_path=trusted_git,
     )
 
     result = deploy(config)
@@ -639,4 +707,5 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(tmp_path: Path) 
     assert result.status == "deployed"
     assert result.target_sha == target_sha
     assert git("rev-parse", "HEAD") == target_sha
+    assert not fake_git_called.exists()
     assert '"status": "deployed"' in config.audit_path.read_text(encoding="utf-8")

@@ -203,6 +203,50 @@ def _python_facts(python_path: Path) -> tuple[str, str]:
     return version, abi
 
 
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(descriptor, payload[offset:])
+        except OSError as exc:
+            raise ReleaseGenerationError("release generation marker cannot be written") from exc
+        if written <= 0:
+            raise ReleaseGenerationError("release generation marker write made no progress")
+        offset += written
+
+
+def _verify_temporary_payload(
+    descriptor: int,
+    *,
+    expected_payload: bytes,
+    expected_marker: ReleaseGenerationMarker,
+) -> None:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_MARKER_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_MARKER_BYTES:
+                raise ReleaseGenerationError("temporary release marker is too large")
+        observed_payload = b"".join(chunks)
+        observed_marker = ReleaseGenerationMarker.from_payload(json.loads(observed_payload))
+    except ReleaseGenerationError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseGenerationError("temporary release marker cannot be verified") from exc
+    if (
+        len(observed_payload) != len(expected_payload)
+        or hashlib.sha256(observed_payload).digest() != hashlib.sha256(expected_payload).digest()
+        or observed_marker != expected_marker
+    ):
+        raise ReleaseGenerationError("temporary release marker content mismatch")
+
+
 class ReleaseGenerationAuthority:
     def __init__(
         self,
@@ -388,18 +432,25 @@ class ReleaseGenerationAuthority:
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         temporary_name = f".{self.marker_path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         descriptor = -1
-        published = False
+        renamed = False
+        completed = False
         try:
             self._assert_root(root_fd, root_identity)
             descriptor = os.open(
                 temporary_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=root_fd,
             )
-            os.write(descriptor, payload)
+            _write_all(descriptor, payload)
             os.fsync(descriptor)
             self._mutation_hook("marker_temp_fsynced")
+            self._assert_root(root_fd, root_identity)
+            _verify_temporary_payload(
+                descriptor,
+                expected_payload=payload,
+                expected_marker=marker,
+            )
             self._assert_root(root_fd, root_identity)
             os.replace(
                 temporary_name,
@@ -407,20 +458,31 @@ class ReleaseGenerationAuthority:
                 src_dir_fd=root_fd,
                 dst_dir_fd=root_fd,
             )
-            published = True
+            renamed = True
             os.fsync(root_fd)
             self._assert_root(root_fd, root_identity)
             active = self.marker_path.lstat()
             if PathIdentity.capture(os.fstat(descriptor)) != PathIdentity.capture(active):
                 raise ReleaseGenerationError("published generation marker identity changed")
+            completed = True
             self._mutation_hook("marker_published")
             return marker
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if not published:
+            if not completed and renamed:
+                try:
+                    active = self.marker_path.lstat()
+                    if descriptor >= 0 and PathIdentity.capture(
+                        os.fstat(descriptor)
+                    ) == PathIdentity.capture(active):
+                        os.unlink(self.marker_path.name, dir_fd=root_fd)
+                        os.fsync(root_fd)
+                except FileNotFoundError:
+                    pass
+            elif not renamed:
                 with suppress(FileNotFoundError):
                     os.unlink(temporary_name, dir_fd=root_fd)
+            if descriptor >= 0:
+                os.close(descriptor)
             os.close(root_fd)
 
 
