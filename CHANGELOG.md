@@ -60,6 +60,12 @@
 
 ### Fixed
 
+- **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
+  权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
+  WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。
+  job detail、job list 与 finalization candidate list 复用相同 read-snapshot 生命周期，所有
+  `BaseException` 路径均 rollback 并关闭连接，同时保留原有有界查询与无 N+1 行为。
+
 - **Strategy Lab job center quality review 加固**：任务列表 cursor 改为绑定 filter identity 与
   schema version 的 immutable `created_at + job_id` keyset，分页明确为 live query 而非
   snapshot，job 状态更新不再导致初始序列漏项。Parquet preview 在 materialize 前校验全部

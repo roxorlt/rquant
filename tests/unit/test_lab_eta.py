@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -414,6 +417,186 @@ def _insert_completed_eta_shards(store: LabJobStore, job_id: UUID, count: int) -
             """,
             rows,
         )
+
+
+def _insert_queued_eta_shard(store: LabJobStore, job_id: UUID, index: int) -> None:
+    timestamp = AS_OF.isoformat(timespec="microseconds")
+    with sqlite3.connect(store.path, timeout=5) as connection:
+        connection.execute(
+            """
+            INSERT INTO lab_shard (
+                shard_id, job_id, shard_index, status, version,
+                attempt_count, max_attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', 0, 0, 3, ?, ?)
+            """,
+            (
+                str(UUID(int=100_000 + index)),
+                str(job_id),
+                index,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+class _ProbeBarrierCursor:
+    def __init__(
+        self, cursor: sqlite3.Cursor, *, release_writer: Event, writer_done: Event
+    ) -> None:
+        self._cursor = cursor
+        self._release_writer = release_writer
+        self._writer_done = writer_done
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        rows = self._cursor.fetchall()
+        self._release_writer.set()
+        assert self._writer_done.wait(timeout=5), "concurrent writer did not commit"
+        return rows
+
+
+class _ProbeBarrierConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        release_writer: Event,
+        writer_done: Event,
+    ) -> None:
+        self._connection = connection
+        self._release_writer = release_writer
+        self._writer_done = writer_done
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._connection.in_transaction
+
+    def __enter__(self) -> _ProbeBarrierConnection:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        return False
+
+    def execute(self, statement: str, parameters: Any = ()) -> sqlite3.Cursor | _ProbeBarrierCursor:
+        cursor = self._connection.execute(statement, parameters)
+        if "SELECT 1 FROM lab_shard" in " ".join(statement.split()):
+            return _ProbeBarrierCursor(
+                cursor,
+                release_writer=self._release_writer,
+                writer_done=self._writer_done,
+            )
+        return cursor
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class _FailingEtaConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.calls: list[str] = []
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._connection.in_transaction
+
+    def __enter__(self) -> _FailingEtaConnection:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        return False
+
+    def execute(self, statement: str, parameters: Any = ()) -> sqlite3.Cursor:
+        normalized = " ".join(statement.split())
+        if normalized == "BEGIN":
+            self.calls.append("begin")
+        if "completion_sequence FROM lab_shard" in normalized:
+            self.calls.append("fault")
+            raise KeyboardInterrupt("eta sample interrupted")
+        return self._connection.execute(statement, parameters)
+
+    def rollback(self) -> None:
+        self.calls.append("rollback")
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self.calls.append("close")
+        self._connection.close()
+
+
+def test_eta_reader_uses_one_wal_snapshot_across_concurrent_shard_insert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job = _submit_job(store, _lease(store))
+    _insert_completed_eta_shards(store, job.job_id, MAX_JOB_SHARDS - 1)
+    _insert_queued_eta_shard(store, job.job_id, MAX_JOB_SHARDS - 1)
+    reader = LabJobReader(store.path)
+    original_connect = reader._connect
+    release_writer = Event()
+    writer_done = Event()
+
+    def connect_with_probe_barrier() -> _ProbeBarrierConnection:
+        return _ProbeBarrierConnection(
+            original_connect(),
+            release_writer=release_writer,
+            writer_done=writer_done,
+        )
+
+    def insert_after_probe() -> None:
+        assert release_writer.wait(timeout=5), "reader did not finish the shard probe"
+        try:
+            _insert_queued_eta_shard(store, job.job_id, MAX_JOB_SHARDS)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(reader, "_connect", connect_with_probe_barrier)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        writer = executor.submit(insert_after_probe)
+        projection = reader.get_eta_input(job.job_id, as_of=AS_OF)
+        writer.result(timeout=5)
+
+    assert projection is not None
+    assert len(projection.completed) + len(projection.remaining) == MAX_JOB_SHARDS
+    with sqlite3.connect(store.path) as connection:
+        persisted_count = connection.execute(
+            "SELECT COUNT(*) FROM lab_shard WHERE job_id = ?", (str(job.job_id),)
+        ).fetchone()
+    assert persisted_count is not None and persisted_count[0] == MAX_JOB_SHARDS + 1
+
+
+def test_eta_reader_rolls_back_and_closes_on_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    job = _submit_job(store, _lease(store))
+    raw_connection = LabJobReader(store.path)._connect()
+    connection = _FailingEtaConnection(raw_connection)
+    reader = LabJobReader(store.path)
+    monkeypatch.setattr(reader, "_connect", lambda: connection)
+
+    with pytest.raises(KeyboardInterrupt, match="eta sample interrupted"):
+        reader.get_eta_input(job.job_id, as_of=AS_OF)
+
+    assert connection.calls == ["begin", "fault", "rollback", "close"]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        raw_connection.execute("SELECT 1")
 
 
 def test_eta_reader_rejects_10k_completed_graph_before_sampling(tmp_path: Path) -> None:

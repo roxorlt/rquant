@@ -2982,6 +2982,34 @@ class LabJobReader:
             raise
         return connection
 
+    @contextmanager
+    def _read_snapshot(self, *, label: str) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        lifecycle_errors: list[BaseException] = []
+        try:
+            connection.execute("BEGIN")
+            yield connection
+            connection.execute("COMMIT")
+        except BaseException as exc:
+            lifecycle_errors.append(exc)
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except BaseException as rollback_error:
+                    lifecycle_errors.append(rollback_error)
+        finally:
+            try:
+                connection.close()
+            except BaseException as close_error:
+                lifecycle_errors.append(close_error)
+        if len(lifecycle_errors) == 1:
+            raise lifecycle_errors[0]
+        if lifecycle_errors:
+            raise BaseExceptionGroup(
+                f"{label} query and cleanup failed",
+                lifecycle_errors,
+            )
+
     @staticmethod
     def _after_finalization_job_read(_job_id: UUID) -> None:
         """Fault-injection boundary after the snapshot's first authoritative read."""
@@ -3810,8 +3838,7 @@ class LabJobReader:
         if len(page_parameters) + 1 > LAB_JOB_LIST_QUERY_PARAMETER_MAX:
             raise ValueError("job list query exceeds the SQL parameter budget")
         page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
-        with self._connect() as connection:
-            connection.execute("BEGIN")
+        with self._read_snapshot(label="job list") as connection:
             total_row = connection.execute(
                 f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
                 parameters,
@@ -3823,7 +3850,6 @@ class LabJobReader:
                 "ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?",
                 (*page_parameters, limit + 1),
             ).fetchall()
-            connection.execute("COMMIT")
         assert total_row is not None
         total_count = _strict_sqlite_int(total_row["total_count"], field="total_count", minimum=0)
         has_more = len(rows) > limit
@@ -3866,7 +3892,7 @@ class LabJobReader:
             cursor_time, cursor_id = self._decode_cursor(cursor)
             clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
             parameters.extend((cursor_time, cursor_time, str(cursor_id)))
-        with self._connect() as connection:
+        with self._read_snapshot(label="finalization candidate list") as connection:
             total_row = connection.execute(
                 f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
                 (COMPLETE_RESULT_CONTRACT_VERSION,),
@@ -4029,13 +4055,11 @@ class LabJobReader:
         if not math.isfinite(stale_seconds) or stale_seconds <= 0:
             raise ValueError("heartbeat_stale_after must be a positive finite duration")
 
-        with self._connect() as connection:
-            connection.execute("BEGIN")
+        with self._read_snapshot(label="job detail") as connection:
             job_row = connection.execute(
                 "SELECT * FROM lab_job WHERE job_id = ?", (str(job_id),)
             ).fetchone()
             if job_row is None:
-                connection.execute("COMMIT")
                 return None
             job = self._job_from_row(job_row)
             result_evidence = self._validate_complete_result_graph(connection, job)
@@ -4047,6 +4071,10 @@ class LabJobReader:
             ).fetchone()
             assert stats_row is not None
             progress = self._progress_from_row(stats_row)
+            if progress.total_shards > MAX_JOB_SHARDS:
+                raise InvalidStoredJobError(
+                    f"job shard count exceeds authoritative shard limit {MAX_JOB_SHARDS}"
+                )
             has_exhausted = _strict_sqlite_bool(stats_row["has_exhausted"], field="has_exhausted")
 
             shard_rows = connection.execute(
@@ -4097,10 +4125,14 @@ class LabJobReader:
                     raise InvalidStoredJobError(
                         f"job remaining shards exceed authoritative shard limit {MAX_JOB_SHARDS}"
                     )
+                eta_shard_count = len(completed_rows) + len(remaining_rows)
+                if eta_shard_count > MAX_JOB_SHARDS or eta_shard_count > progress.total_shards:
+                    raise InvalidStoredJobError(
+                        "job ETA shard sample exceeds the authoritative shard count"
+                    )
             else:
                 completed_rows = ()
                 remaining_rows = ()
-            connection.execute("COMMIT")
 
         shards_truncated = len(shard_rows) > shard_limit
         shards = tuple(self._shard_from_row(row) for row in shard_rows[:shard_limit])
@@ -4411,14 +4443,12 @@ class LabJobReader:
         as_of: datetime,
         completed_limit: int = LAB_ETA_COMPLETED_LIMIT_MAX,
     ) -> LabEtaInput | None:
-        from rquant.lab_eta import LabEtaCompletedShard, LabEtaInput, LabEtaRemainingShard
-
         if not 3 <= completed_limit <= LAB_ETA_COMPLETED_LIMIT_MAX:
             raise ValueError(
                 f"completed telemetry limit must be between 3 and {LAB_ETA_COMPLETED_LIMIT_MAX}"
             )
         current = _utc(as_of)
-        with self._connect() as connection:
+        with self._read_snapshot(label="ETA input") as connection:
             job_row = connection.execute(
                 "SELECT status, control_intent FROM lab_job WHERE job_id = ?",
                 (str(job_id),),
@@ -4433,6 +4463,7 @@ class LabJobReader:
                 raise InvalidStoredJobError(
                     f"job shard count exceeds authoritative shard limit {MAX_JOB_SHARDS}"
                 )
+            authoritative_shard_count = len(shard_count_probe)
             completed_rows = connection.execute(
                 """
                 SELECT shard_id, phase, work_unit_name, work_units,
@@ -4458,109 +4489,26 @@ class LabJobReader:
                 """,
                 (str(job_id), MAX_JOB_SHARDS + 1),
             ).fetchall()
-
-        if len(remaining_rows) > MAX_JOB_SHARDS:
-            raise InvalidStoredJobError(
-                f"job remaining shards exceed authoritative shard limit {MAX_JOB_SHARDS}"
-            )
-
-        completed: list[LabEtaCompletedShard] = []
-        for row in completed_rows:
-            telemetry = LabShardTelemetry(
-                phase=str(row["phase"]),
-                work_unit_name=str(row["work_unit_name"]),
-                work_units=_strict_sqlite_int(
-                    row["work_units"],
-                    field="lab_shard.work_units",
-                    minimum=1,
-                    maximum=SQLITE_SIGNED_INTEGER_MAX,
-                ),
-                static_duration_ms=_strict_sqlite_int(
-                    row["static_duration_ms"],
-                    field="lab_shard.static_duration_ms",
-                    minimum=1,
-                    maximum=SQLITE_SIGNED_INTEGER_MAX,
-                ),
-                duration_ms=_strict_nullable_sqlite_real(
-                    row["duration_ms"],
-                    field="lab_shard.duration_ms",
-                    positive=True,
-                    minimum_inclusive=LAB_SHARD_DURATION_MS_MIN,
-                    maximum_exclusive=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
-                ),
-                throughput_units_per_second=_strict_nullable_sqlite_real(
-                    row["throughput_units_per_second"],
-                    field="lab_shard.throughput_units_per_second",
-                    positive=True,
-                    maximum_exclusive=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
-                ),
-            )
-            completed.append(
-                LabEtaCompletedShard(
-                    shard_id=_canonical_uuid_text(
-                        row["shard_id"],
-                        field="lab_shard.shard_id",
-                    ),
-                    completion_sequence=_strict_sqlite_int(
-                        row["completion_sequence"],
-                        field="lab_shard.completion_sequence",
-                        minimum=1,
-                    ),
-                    telemetry=telemetry,
-                )
-            )
-        completed.sort(key=lambda item: item.completion_sequence)
-
-        remaining: list[LabEtaRemainingShard] = []
-        for row in remaining_rows:
-            plan_values = (
-                row["phase"],
-                row["work_unit_name"],
-                row["work_units"],
-                row["static_duration_ms"],
-            )
-            if all(value is None for value in plan_values):
-                plan = None
-            elif all(value is not None for value in plan_values):
-                plan = LabShardWorkPlan(
-                    phase=str(row["phase"]),
-                    work_unit_name=str(row["work_unit_name"]),
-                    work_units=_strict_sqlite_int(
-                        row["work_units"],
-                        field="lab_shard.work_units",
-                        minimum=1,
-                        maximum=SQLITE_SIGNED_INTEGER_MAX,
-                    ),
-                    static_duration_ms=_strict_sqlite_int(
-                        row["static_duration_ms"],
-                        field="lab_shard.static_duration_ms",
-                        minimum=1,
-                        maximum=SQLITE_SIGNED_INTEGER_MAX,
-                    ),
-                )
-            else:
+            if len(remaining_rows) > MAX_JOB_SHARDS:
                 raise InvalidStoredJobError(
-                    "lab_shard work plan must be entirely present or absent"
+                    f"job remaining shards exceed authoritative shard limit {MAX_JOB_SHARDS}"
                 )
-            remaining.append(
-                LabEtaRemainingShard(
-                    shard_id=_canonical_uuid_text(
-                        row["shard_id"],
-                        field="lab_shard.shard_id",
-                    ),
-                    work_plan=plan,
+            eta_shard_count = len(completed_rows) + len(remaining_rows)
+            if eta_shard_count > MAX_JOB_SHARDS or eta_shard_count > authoritative_shard_count:
+                raise InvalidStoredJobError(
+                    "ETA shard sample exceeds the authoritative shard count"
                 )
+            eta_input = self._eta_input_from_rows(
+                job_id=job_id,
+                status=_effective_lab_eta_status(
+                    status=JobStatus(str(job_row["status"])),
+                    control_intent=ControlIntent(str(job_row["control_intent"])),
+                ),
+                as_of=current,
+                completed_rows=completed_rows,
+                remaining_rows=remaining_rows,
             )
-        return LabEtaInput(
-            job_id=job_id,
-            status=_effective_lab_eta_status(
-                status=JobStatus(str(job_row["status"])),
-                control_intent=ControlIntent(str(job_row["control_intent"])),
-            ),
-            as_of=current,
-            completed=tuple(completed),
-            remaining=tuple(remaining),
-        )
+        return eta_input
 
     def estimate_eta(
         self,

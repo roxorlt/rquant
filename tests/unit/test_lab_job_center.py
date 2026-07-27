@@ -356,12 +356,14 @@ def test_eta_and_detail_fail_closed_on_damaged_oversized_remaining_shard_graph(
 
 def test_list_finalization_candidates_is_typed_readonly_and_bounded(tmp_path: Path) -> None:
     scenario = _ready_scenario(tmp_path, hold_days=(1,))
-    reader = LabJobReader(scenario.store.path)
+    reader = _CountingReader(scenario.store.path)
 
     page = reader.list_finalization_candidates(limit=1)
 
     assert tuple(item.job_id for item in page.items) == (scenario.job_id,)
     assert page.has_more is False
+    assert reader.statements.count("BEGIN") == 1
+    assert reader.statements.count("COMMIT") == 1
     reader.execute_for_test("SELECT 1")
     with pytest.raises(Exception, match="readonly|read-only|query_only"):
         reader.execute_for_test("DELETE FROM lab_job")
