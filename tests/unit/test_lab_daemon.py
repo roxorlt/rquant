@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 
 from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
 from rquant.lab_daemon import (
@@ -17,6 +18,8 @@ from rquant.lab_daemon import (
     LabDaemonConfigurationError,
     LabDaemonLock,
     LabFinalizerDaemon,
+    LabFinalizerDaemonState,
+    LabFinalizerFailureState,
     LabFinalizerStateStore,
     ensure_private_directory,
     prepare_private_sqlite_path,
@@ -344,6 +347,37 @@ def test_scheduler_sqlite_authority_rejects_replacement_before_first_sql(
         ).fetchone() == (0,)
 
 
+def test_scheduler_sqlite_rw_uri_never_creates_missing_symlink_target_after_precheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(path, label="lab jobs SQLite", create=True)
+    original = root / "original.sqlite3"
+    missing_target = root / "missing.sqlite3"
+    original_assert_current = authority.assert_current
+    checked = False
+
+    def swap_after_precheck() -> None:
+        nonlocal checked
+        original_assert_current()
+        if not checked:
+            checked = True
+            path.rename(original)
+            path.symlink_to(missing_target)
+
+    monkeypatch.setattr(authority, "assert_current", swap_after_precheck)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            LabJobStore(path, identity_authority=authority).initialize()
+    finally:
+        authority.close()
+
+    assert not missing_target.exists()
+
+
 def test_finalizer_sqlite_authority_rejects_rename_swap_before_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -465,6 +499,36 @@ def test_private_sqlite_rejects_unsafe_existing_identity(
     assert victim.read_bytes() == b"private state"
 
 
+@pytest.mark.parametrize("mode", [0o755, 0o711])
+def test_private_sqlite_requires_private_0700_parent(tmp_path: Path, mode: int) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    root.chmod(mode)
+    path = root / "lab_jobs.sqlite3"
+    path.write_bytes(b"")
+    path.chmod(0o600)
+
+    with (
+        pytest.raises(LabDaemonConfigurationError, match="private mode 0700"),
+        prepare_private_sqlite_path(path, label="lab jobs SQLite", create=False),
+    ):
+        pass
+
+
+def test_sqlite_authority_rejects_parent_permission_drift(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    path = root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(path, label="lab jobs SQLite", create=True)
+    root.chmod(0o711)
+    try:
+        with pytest.raises(LabDaemonConfigurationError, match="parent identity changed"):
+            authority.assert_current()
+    finally:
+        root.chmod(0o700)
+        authority.close()
+
+
 def test_private_directory_gate_rejects_public_or_symlinked_roots(tmp_path: Path) -> None:
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
@@ -530,6 +594,56 @@ def test_runtime_binding_rejects_package_from_another_checkout(tmp_path: Path) -
             git_top_level=expected,
             git_head="1" * 40,
         )
+
+
+def test_runtime_binding_rejects_symlinked_checkout_virtualenv(tmp_path: Path) -> None:
+    from rquant.lab_daemon import verify_lab_runtime_binding
+
+    expected = tmp_path / "expected"
+    shared_venv = tmp_path / "shared-venv"
+    (expected / "src" / "rquant").mkdir(parents=True)
+    (shared_venv / "bin").mkdir(parents=True)
+    package_file = expected / "src" / "rquant" / "__init__.py"
+    executable = expected / ".venv" / "bin" / "python"
+    launcher = expected / ".venv" / "bin" / "rquant"
+    package_file.touch()
+    (shared_venv / "bin" / "python").touch()
+    (shared_venv / "bin" / "rquant").touch()
+    (expected / ".venv").symlink_to(shared_venv, target_is_directory=True)
+
+    with pytest.raises(LabDaemonConfigurationError, match="physical virtualenv"):
+        verify_lab_runtime_binding(
+            expected_checkout_root=expected,
+            executable=executable,
+            launcher=launcher,
+            virtualenv_prefix=expected / ".venv",
+            console_interpreter=executable,
+            package_file=package_file,
+            working_directory=expected,
+            verified_code_sha="1" * 40,
+            git_top_level=expected,
+            git_head="1" * 40,
+        )
+
+
+def test_runtime_binding_rejects_symlinked_venv_before_git_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_daemon import require_lab_runtime_binding
+
+    expected = tmp_path / "expected"
+    shared_venv = tmp_path / "shared-venv"
+    expected.mkdir()
+    shared_venv.mkdir()
+    (expected / ".venv").symlink_to(shared_venv, target_is_directory=True)
+
+    def reject_probe(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Git probe must not run before the physical venv gate")
+
+    monkeypatch.setattr("rquant.lab_daemon.subprocess.run", reject_probe)
+    with pytest.raises(LabDaemonConfigurationError, match="physical virtualenv"):
+        require_lab_runtime_binding(expected)
 
 
 @pytest.mark.parametrize(
@@ -783,6 +897,79 @@ def test_finalizer_restart_preserves_fingerprint_cooldown(tmp_path: Path) -> Non
     assert calls == 1
 
 
+def test_finalizer_failure_capacity_evicts_stale_entries_and_reaches_next_page(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 27, 2, 0, tzinfo=UTC)
+    failures = {
+        str(UUID(int=index + 1)): LabFinalizerFailureState(
+            fingerprint=f"{index:064x}",
+            attempts=1,
+            cooldown_until=now,
+        )
+        for index in range(4_096)
+    }
+    state_store = LabFinalizerStateStore(_private_state_dir(tmp_path))
+    state_store.save(LabFinalizerDaemonState(cycle=1, failures=failures))
+    failing_id = UUID(int=5_000)
+    healthy_id = UUID(int=5_001)
+
+    class Reader:
+        def list_finalization_candidates(self, *, limit: int, cursor: str | None = None):
+            assert limit == 1
+            if cursor is None:
+                return SimpleNamespace(
+                    items=(_finalization_candidate(failing_id),),
+                    has_more=True,
+                    next_cursor="healthy-page",
+                )
+            assert cursor == "healthy-page"
+            return SimpleNamespace(
+                items=(_finalization_candidate(healthy_id),),
+                has_more=False,
+                next_cursor=None,
+            )
+
+    class Finalizer:
+        def finalize(self, job_id: UUID) -> SimpleNamespace:
+            if job_id == failing_id:
+                raise RuntimeError("new failure")
+            assert job_id == healthy_id
+            return SimpleNamespace(status="published")
+
+    first = LabFinalizerDaemon(
+        reader=Reader(),
+        finalizer=Finalizer(),
+        state_store=state_store,
+        max_jobs_per_tick=1,
+        poll_interval_ms=1,
+        failure_cooldown_seconds=30,
+        failure_cooldown_max_seconds=300,
+        now_provider=lambda: now,
+    )
+    assert first.run_once().failed == 1
+    after_first = state_store.load()
+    assert after_first.cursor == "healthy-page"
+    assert len(after_first.failures) == 4_096
+    assert str(failing_id) in after_first.failures
+
+    restarted = LabFinalizerDaemon(
+        reader=Reader(),
+        finalizer=Finalizer(),
+        state_store=state_store,
+        max_jobs_per_tick=1,
+        poll_interval_ms=1,
+        failure_cooldown_seconds=30,
+        failure_cooldown_max_seconds=300,
+        now_provider=lambda: now + timedelta(seconds=1),
+    )
+    assert restarted.run_once().published == 1
+    completed_cycle = state_store.load()
+    assert completed_cycle.cursor is None
+    assert completed_cycle.cycle == 2
+    assert set(completed_cycle.failures) == {str(failing_id)}
+
+
 def test_finalizer_corrupt_state_blocks_before_reader_access(tmp_path: Path) -> None:
     state_dir = _private_state_dir(tmp_path)
     state_path = state_dir / "state.json"
@@ -834,3 +1021,128 @@ def test_finalizer_state_rejects_unsafe_file_identity(
 
     with pytest.raises(LabDaemonConfigurationError, match=message):
         LabFinalizerStateStore(state_dir).load()
+
+
+def test_finalizer_state_rejects_hardlink_created_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=3))
+    state_path = state_dir / "state.json"
+    linked = state_dir / "linked-state.json"
+    real_read = os.read
+    linked_once = False
+
+    def linking_read(descriptor: int, size: int) -> bytes:
+        nonlocal linked_once
+        payload = real_read(descriptor, size)
+        if not linked_once:
+            linked_once = True
+            linked.hardlink_to(state_path)
+        return payload
+
+    monkeypatch.setattr("rquant.lab_daemon.os.read", linking_read)
+    with pytest.raises(LabDaemonConfigurationError, match="hardlink"):
+        store.load()
+
+
+def test_finalizer_state_save_rejects_root_replacement_after_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=1))
+    displaced = tmp_path / "displaced-state"
+    real_replace = os.replace
+
+    def replacing_root(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        state_dir.rename(displaced)
+        state_dir.mkdir(mode=0o700)
+
+    monkeypatch.setattr("rquant.lab_daemon.os.replace", replacing_root)
+    with pytest.raises(LabDaemonConfigurationError, match="directory identity changed"):
+        store.save(LabFinalizerDaemonState(cycle=2))
+
+    assert (displaced / "state.json").is_file()
+    assert not (state_dir / "state.json").exists()
+
+
+def test_finalizer_state_save_rejects_root_replacement_before_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=1))
+    original = (state_dir / "state.json").read_bytes()
+    displaced = tmp_path / "displaced-before-commit"
+    real_fsync = os.fsync
+    swapped = False
+
+    def replacing_root(descriptor: int) -> None:
+        nonlocal swapped
+        real_fsync(descriptor)
+        if not swapped:
+            swapped = True
+            state_dir.rename(displaced)
+            state_dir.mkdir(mode=0o700)
+
+    monkeypatch.setattr("rquant.lab_daemon.os.fsync", replacing_root)
+    with pytest.raises(LabDaemonConfigurationError, match="directory identity changed"):
+        store.save(LabFinalizerDaemonState(cycle=2))
+
+    assert (displaced / "state.json").read_bytes() == original
+    assert not (state_dir / "state.json").exists()
+
+
+def test_finalizer_state_save_failure_preserves_previous_valid_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=4))
+    state_path = state_dir / "state.json"
+    original = state_path.read_bytes()
+
+    def reject_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr("rquant.lab_daemon.os.replace", reject_replace)
+    with pytest.raises(LabDaemonConfigurationError, match="committed atomically"):
+        store.save(LabFinalizerDaemonState(cycle=5))
+
+    assert state_path.read_bytes() == original
+    assert store.load().cycle == 4
+
+
+def test_finalizer_failure_cooldown_requires_aware_datetime_and_normalizes_utc() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        LabFinalizerFailureState(
+            fingerprint="a" * 64,
+            attempts=1,
+            cooldown_until=datetime(2026, 7, 27, 1, 0),
+        )
+
+    observed = LabFinalizerFailureState(
+        fingerprint="a" * 64,
+        attempts=1,
+        cooldown_until=datetime.fromisoformat("2026-07-27T09:00:00+08:00"),
+    )
+    assert observed.cooldown_until == datetime(2026, 7, 27, 1, 0, tzinfo=UTC)
+    assert observed.cooldown_until.tzinfo is UTC

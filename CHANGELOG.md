@@ -69,9 +69,10 @@
 
 ### Fixed
 
-- **Strategy Lab daemon 规格复审加固**：正式 checkout readiness 只额外允许 linked worktree
-  根目录中、精确指向主 checkout 私有真实 `.venv` 的单一 symlink，其他 tracked/untracked
-  内容、身份漂移与 symlink 链继续 fail closed。scheduler 以原子方式创建并验证 `0600` Lab
+- **Strategy Lab daemon 规格复审加固**：正式 checkout readiness 不再对 linked worktree
+  `.venv` 做运行时特判；Git 仅可通过根级 `/.venv` ignore 保持状态干净，而 daemon 仍要求
+  checkout 自有的物理 virtualenv。其他 tracked/untracked 内容与身份漂移继续 fail closed。
+  scheduler 以原子方式创建并验证 `0600` Lab
   SQLite，finalizer 只验证且绝不创建；SQLite、authority key 与 daemon lock 均拒绝 symlink、
   hardlink、非 owner、非 regular 或公开 mode。Lab DB、spool、artifact、lock、研究托管根与
   key 路径在任何运行时创建前执行纯 canonical 双向 alias/nesting 校验；scheduler 各输入批次
@@ -85,6 +86,14 @@
   持久化 keyset cursor、cycle 和绑定 job version/spec/update 时间的指数失败冷却，损坏状态直接
   阻断且不写 Lab SQLite。daemon lock 保留根目录 fd 并以 openat 创建文件；基础目录只在全部
   canonical/alias/nesting 校验成功后创建，Parquet、日志和 finalizer state 根也纳入双向隔离。
+
+- **Strategy Lab daemon 第三轮 fail-closed 加固**：daemon 在配置与日志初始化前拒绝共享或
+  symlink `.venv`，并绑定 checkout 自有 venv、解释器、launcher 与 import root；scheduler
+  authority-backed SQLite 仅用 URI `mode=rw` 打开已创建 inode，悬空 replacement 不会被连接
+  阶段创建。Lab SQLite parent 初始和持续身份均要求 owner `0700`，默认新建 `DATA_DIR` 在公开
+  umask 下仍为 `0700`。finalizer failure state 在 4096 上限内确定性淘汰，并按完整 cycle 清理
+  陈旧项；状态读取最终复验 type/owner/mode/nlink，原子保存前后 fencing root 与活动路径，
+  timezone 必须 aware 并规范为 UTC，异常路径保留既有有效状态。
 
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，

@@ -118,6 +118,15 @@ class TestSettings:
         assert all(path.is_absolute() for path in roots)
         assert all(not path.exists() for path in roots)
 
+    def test_default_lab_sqlite_parent_is_private_under_public_umask(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        configured = Settings(**_settings_values(tmp_path))
+
+        assert configured.lab_jobs_path_resolved.parent == configured.data_dir
+        assert configured.data_dir.stat().st_mode & 0o777 == 0o700
+
     @pytest.mark.parametrize(
         "field",
         [

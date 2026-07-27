@@ -4719,8 +4719,14 @@ class LabJobStore:
 
     def _connect(self, *, validate_identity: bool = True) -> _LabJobStoreConnection:
         def open_writable(path: Path) -> _LabJobStoreConnection:
+            target: Path | str = path
+            use_uri = False
+            if self.identity_authority is not None:
+                target = f"file:{quote(str(path))}?mode=rw"
+                use_uri = True
             return sqlite3.connect(
-                path,
+                target,
+                uri=use_uri,
                 timeout=self.busy_timeout_ms / 1_000,
                 isolation_level=None,
                 factory=_LabJobStoreConnection,

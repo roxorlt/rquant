@@ -458,7 +458,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def materialize_base_directories(self) -> "Settings":
-        for path in (self.data_dir, self.parquet_dir, self.log_dir):
+        data_dir_existed = self.data_dir.exists()
+        self.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not data_dir_existed:
+            self.data_dir.chmod(0o700)
+        for path in (self.parquet_dir, self.log_dir):
             path.mkdir(parents=True, exist_ok=True)
         return self
 

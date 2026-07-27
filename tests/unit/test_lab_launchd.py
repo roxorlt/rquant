@@ -119,6 +119,40 @@ def test_lab_launchd_exact_runtime_rejects_editable_import_from_other_worktree(
     assert "package root" in result.stdout + result.stderr
 
 
+@pytest.mark.skipif(
+    not (ROOT / ".venv" / "bin" / "rquant").is_file(),
+    reason="linked worktree runtime is unavailable",
+)
+def test_real_worktree_launcher_rejects_symlinked_venv_before_config() -> None:
+    executable = ROOT / ".venv" / "bin" / "rquant"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    environment["DATA_DIR"] = "relative-data-must-not-be-read"
+
+    result = subprocess.run(
+        [
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(ROOT),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "physical virtualenv" in output
+    assert "relative-data-must-not-be-read" not in output
+
+
 def test_lab_launchd_plists_pass_plutil_lint() -> None:
     paths = sorted(LAUNCHD_DIR.glob("com.roxor.rquant-lab-*.plist"))
     assert len(paths) == 3

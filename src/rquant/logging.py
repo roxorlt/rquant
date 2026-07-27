@@ -12,15 +12,18 @@ import sys
 
 from loguru import logger
 
-from rquant.config import settings
-
 _initialized = False
+_FILE_LOG_FORMAT = (
+    "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"  # noqa: E501
+)
 
 
 def setup_logging() -> None:
     global _initialized
     if _initialized:
         return
+
+    from rquant.config import settings
 
     logger.remove()
 
@@ -42,7 +45,7 @@ def setup_logging() -> None:
         retention="30 days",
         compression="zip",
         enqueue=True,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        format=_FILE_LOG_FORMAT,
     )
 
     _initialized = True

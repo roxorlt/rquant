@@ -9,14 +9,13 @@ from collections.abc import Sequence
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import duckdb
 import pandas as pd
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 
-from rquant.config import settings
 from rquant.data_metadata import (
     DataAuditRun,
     DataAuditRunFinalization,
@@ -51,6 +50,24 @@ from rquant.trade_calendar import (
     deduplicate_trade_calendar_rows,
     trade_calendar_business_facts,
 )
+
+
+class _LazySettings:
+    def __getattr__(self, name: str) -> Any:
+        from rquant.config import settings as resolved
+
+        return getattr(resolved, name)
+
+    @property
+    def duckdb_readonly_path_resolved(self) -> Path:
+        explicit = self.duckdb_readonly_path
+        if explicit is not None:
+            return explicit
+        primary = self.duckdb_path
+        return primary.with_name(primary.stem + "_ro.duckdb")
+
+
+settings = _LazySettings()
 
 _INVALID_STOCK_STATUS_PREDICATE = """
 (

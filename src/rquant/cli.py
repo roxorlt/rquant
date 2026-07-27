@@ -3024,6 +3024,9 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
 
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
+    from rquant.lab_daemon import require_lab_runtime_binding
+
+    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3033,7 +3036,6 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         LabDaemonLock,
         ensure_private_directory,
         prepare_private_sqlite_path,
-        require_lab_runtime_binding,
     )
     from rquant.lab_job_protocol import LabCommandSpool
     from rquant.lab_jobs import LabJobStore
@@ -3043,7 +3045,6 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -3150,12 +3151,14 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
     """Run a fenced Strategy Lab shard worker."""
+    from rquant.lab_daemon import require_lab_runtime_binding
+
+    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     from rquant.config import settings
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
         LabDaemonLock,
         ensure_private_directory,
-        require_lab_runtime_binding,
     )
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LAB_WORKER_MAX_SHARDS_PER_TICK, LabWorker
@@ -3163,7 +3166,6 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     worker_id = (args.worker_id or settings.lab_worker_id).strip()
     if worker_id != settings.lab_worker_id:
         raise LabDaemonConfigurationError("worker CLI id does not match configured stable id")
@@ -3224,6 +3226,9 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
 
 def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     """Finalize ready Strategy Lab jobs without writable SQLite access."""
+    from rquant.lab_daemon import require_lab_runtime_binding
+
+    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3235,14 +3240,12 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         LabFinalizerStateStore,
         ensure_private_directory,
         prepare_private_sqlite_path,
-        require_lab_runtime_binding,
     )
     from rquant.lab_finalizer import LabFinalizer
     from rquant.lab_jobs import LabJobReader
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    code_sha = require_lab_runtime_binding(Path(args.expected_checkout_root))
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None

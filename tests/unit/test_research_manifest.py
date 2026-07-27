@@ -322,7 +322,7 @@ def test_detect_verified_code_commit_rejects_injected_identity_drift(
     assert detect_verified_code_commit(repo) == f"{head}-dirty"
 
 
-def test_detect_verified_code_commit_accepts_safe_worktree_venv_symlink(
+def test_detect_verified_code_commit_rejects_unignored_worktree_venv_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -335,6 +335,52 @@ def test_detect_verified_code_commit_accepts_safe_worktree_venv_symlink(
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    (repo / ".venv").mkdir(mode=0o755)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "fixture-worktree", str(worktree)],
+        cwd=repo,
+        check=True,
+    )
+    (worktree / ".venv").symlink_to(repo / ".venv", target_is_directory=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert detect_verified_code_commit(worktree) == f"{head}-dirty"
+
+
+def test_detect_verified_code_commit_uses_precise_gitignore_for_worktree_venv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text("/.venv\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore", "tracked.txt"], cwd=repo, check=True)
     subprocess.run(
         [
             "git",
