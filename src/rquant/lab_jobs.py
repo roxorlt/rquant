@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sqlite3
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
@@ -18,7 +19,7 @@ from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from weakref import ReferenceType, ref
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rquant.lab_artifact_protocol import (
     LabArtifactCommitEnvelope,
@@ -28,6 +29,8 @@ from rquant.lab_artifact_protocol import (
     LabFinalizerAuthorityVerificationKeyProvider,
     authenticate_artifact_commit_identity,
 )
+from rquant.lab_artifacts import LabArtifactIndexEvidence
+from rquant.lab_eta import LabEtaEstimate, LabEtaInput
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
@@ -66,8 +69,7 @@ from rquant.research_run_spec import (
 )
 
 if TYPE_CHECKING:
-    from rquant.lab_artifacts import LabArtifactIndexEvidence, LabVerifiedSealedBinding
-    from rquant.lab_eta import LabEtaEstimate, LabEtaInput
+    from rquant.lab_artifacts import LabVerifiedSealedBinding
 
 
 class SchedulerLeaseUnavailableError(RuntimeError):
@@ -121,6 +123,10 @@ _ARTIFACT_COMMIT_AUTH_FUNCTION = "rquant_lab_artifact_commit_authorized"
 _ARTIFACT_INDEX_AUTH_FUNCTION = "rquant_lab_artifact_index_authorized"
 _ARTIFACT_SUCCESS_AUTH_FUNCTION = "rquant_lab_artifact_success_authorized"
 LAB_ETA_COMPLETED_LIMIT_MAX = 256
+LAB_JOB_LIST_LIMIT_MAX = 100
+LAB_JOB_DETAIL_SHARD_LIMIT_MAX = 256
+LAB_JOB_DETAIL_EVENT_LIMIT_MAX = 512
+LAB_JOB_DETAIL_ARTIFACT_LIMIT_MAX = 128
 _EMPTY_PAYLOAD_JSON = "{}"
 _EMPTY_PAYLOAD_HASH = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 _LEGACY_PLAN_HASH = "0" * 64
@@ -836,6 +842,170 @@ class LabArtifactCommitRecord(LabRecordModel):
     receipt: LabArtifactCommitReceipt
     received_at: datetime
     applied_at: datetime
+
+
+class LabJobListFilters(LabRecordModel):
+    statuses: tuple[JobStatus, ...] = ()
+    job_types: tuple[ResearchJobType, ...] = ()
+    resource_classes: tuple[ResourceClass, ...] = ()
+    created_from: datetime | None = None
+    created_before: datetime | None = None
+    keyword: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("created_from", "created_before", mode="before")
+    @classmethod
+    def validate_filter_time(cls, value: object) -> object:
+        return None if value is None else _utc(value)  # type: ignore[arg-type]
+
+    @model_validator(mode="after")
+    def validate_filter_range(self) -> LabJobListFilters:
+        if (
+            self.created_from is not None
+            and self.created_before is not None
+            and self.created_from >= self.created_before
+        ):
+            raise ValueError("created_from must precede created_before")
+        return self
+
+
+class CommandAvailability(LabRecordModel):
+    pause: bool
+    resume: bool
+    cancel: bool
+    retry: bool
+
+
+class LabJobProgress(LabRecordModel):
+    total_shards: int = Field(ge=0)
+    terminal_shards: int = Field(ge=0)
+    succeeded_shards: int = Field(ge=0)
+    failed_shards: int = Field(ge=0)
+    cancelled_shards: int = Field(ge=0)
+    fraction: float = Field(ge=0, le=1, allow_inf_nan=False)
+    phase: str | None = None
+
+
+class LabHeartbeatStatus(LabRecordModel):
+    active_shards: int = Field(ge=0)
+    latest_heartbeat_at: datetime | None
+    stale_after_seconds: float = Field(gt=0, allow_inf_nan=False)
+    stale: bool
+
+
+class LabFirstFailure(LabRecordModel):
+    shard_id: UUID
+    shard_index: int = Field(ge=0)
+    failure: LabShardFailed
+    finished_at: datetime
+
+
+class LabJobSummary(LabRecordModel):
+    job_id: UUID
+    strategy_name: str
+    spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    job_type: ResearchJobType
+    resource_class: ResourceClass
+    status: JobStatus
+    control_intent: ControlIntent
+    result_state: LabResultState
+    version: int = Field(ge=0)
+    deadline: datetime
+    created_at: datetime
+    updated_at: datetime
+    progress: LabJobProgress
+    command_availability: CommandAvailability
+
+
+class LabJobPage(LabRecordModel):
+    items: tuple[LabJobSummary, ...]
+    total_count: int = Field(ge=0)
+    has_more: bool
+    next_cursor: str | None
+
+
+class LabFinalizationCandidate(LabRecordModel):
+    job_id: UUID
+    job_version: int = Field(ge=0)
+    spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    updated_at: datetime
+
+
+class LabFinalizationCandidatePage(LabRecordModel):
+    items: tuple[LabFinalizationCandidate, ...]
+    total_count: int = Field(ge=0)
+    has_more: bool
+    next_cursor: str | None
+
+
+class LabJobDetail(LabRecordModel):
+    job: LabJobRecord
+    progress: LabJobProgress
+    heartbeat: LabHeartbeatStatus
+    command_availability: CommandAvailability
+    eta: LabEtaEstimate | None
+    first_failure: LabFirstFailure | None
+    shards: tuple[LabShardRecord, ...]
+    shard_count: int = Field(ge=0)
+    shards_truncated: bool
+    events: tuple[LabEventRecord, ...]
+    event_count: int = Field(ge=0)
+    events_truncated: bool
+    artifacts: tuple[LabArtifactRecord, ...]
+    artifact_count: int = Field(ge=0)
+    artifacts_truncated: bool
+    result_evidence: LabArtifactIndexEvidence | None
+
+
+class LabArtifactPreviewAuthority(LabRecordModel):
+    job: LabJobRecord
+    evidence: LabArtifactIndexEvidence
+
+    @model_validator(mode="after")
+    def validate_preview_authority(self) -> LabArtifactPreviewAuthority:
+        if (
+            self.job.status is not JobStatus.SUCCEEDED
+            or self.job.result_state is not LabResultState.SEALED
+            or self.evidence.job_id != self.job.job_id
+        ):
+            raise ValueError("artifact preview authority requires one succeeded sealed job")
+        return self
+
+
+class LabJobCommandContext(LabRecordModel):
+    job: LabJobRecord
+    availability: CommandAvailability
+
+
+def command_availability_for_job(
+    job: LabJobRecord,
+    *,
+    has_exhausted_non_succeeded_shard: bool = False,
+) -> CommandAvailability:
+    pause = (
+        job.status is JobStatus.RUNNING
+        and job.result_state is not LabResultState.READY
+        and job.control_intent is ControlIntent.NONE
+    )
+    resume = job.status is JobStatus.CHECKPOINTED or (
+        job.status is JobStatus.RUNNING and job.control_intent is ControlIntent.PAUSE_REQUESTED
+    )
+    cancel = job.status in {
+        JobStatus.QUEUED,
+        JobStatus.RUNNING,
+        JobStatus.CHECKPOINTED,
+    }
+    retry = (
+        job.status is JobStatus.FAILED
+        and job.recoverable
+        and job.attempt_count < job.max_attempts
+        and not has_exhausted_non_succeeded_shard
+    )
+    return CommandAvailability(
+        pause=pause,
+        resume=resume,
+        cancel=cancel,
+        retry=retry,
+    )
 
 
 class _LabStagedArtifactCommit:
@@ -2766,6 +2936,8 @@ class LabJobReader:
             stored_job_type = ResearchJobType(str(row["job_type"]))
             stored_resource = ResourceClass(str(row["resource_class"]))
             stored_deadline = _load_time(str(row["deadline"]))
+            if spec.model_dump_json(round_trip=True) != str(row["spec_json"]):
+                raise ValueError("spec JSON is not canonical")
             if spec.spec_hash != stored_hash:
                 raise ValueError("spec hash mismatch")
             if spec.job_type is not stored_job_type:
@@ -3289,6 +3461,602 @@ class LabJobReader:
             raise InvalidStoredJobError("accepted commit identity conflicts with succeeded shards")
         return evidence
 
+    @staticmethod
+    def _encode_cursor(updated_at: datetime, job_id: UUID) -> str:
+        payload = json.dumps(
+            [_dump_time(updated_at), str(job_id)],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> tuple[str, UUID]:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = urlsafe_b64decode(f"{cursor}{padding}".encode("ascii"))
+            value = json.loads(payload)
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or not all(isinstance(item, str) for item in value)
+            ):
+                raise ValueError
+            updated_at = _dump_time(_load_time(value[0]))
+            job_id = _canonical_uuid_text(value[1], field="cursor.job_id")
+            canonical = LabJobReader._encode_cursor(_load_time(updated_at), job_id)
+            if canonical != cursor:
+                raise ValueError
+            return updated_at, job_id
+        except Exception as exc:
+            raise ValueError("invalid opaque job cursor") from exc
+
+    @staticmethod
+    def _progress_from_row(row: sqlite3.Row) -> LabJobProgress:
+        total = _strict_sqlite_int(row["shard_count"], field="shard_count", minimum=0)
+        succeeded = _strict_sqlite_int(row["succeeded_count"], field="succeeded_count", minimum=0)
+        failed = _strict_sqlite_int(row["failed_count"], field="failed_count", minimum=0)
+        cancelled = _strict_sqlite_int(row["cancelled_count"], field="cancelled_count", minimum=0)
+        terminal = succeeded + failed + cancelled
+        if terminal > total:
+            raise InvalidStoredJobError("terminal shard count exceeds total shard count")
+        return LabJobProgress(
+            total_shards=total,
+            terminal_shards=terminal,
+            succeeded_shards=succeeded,
+            failed_shards=failed,
+            cancelled_shards=cancelled,
+            fraction=(terminal / total if total else 0),
+            phase=(str(row["active_phase"]) if row["active_phase"] is not None else None),
+        )
+
+    @staticmethod
+    def _artifact_from_row(row: sqlite3.Row) -> LabArtifactRecord:
+        try:
+            return LabArtifactRecord(
+                artifact_id=_canonical_uuid_text(
+                    row["artifact_id"], field="lab_artifact.artifact_id"
+                ),
+                job_id=_canonical_uuid_text(row["job_id"], field="lab_artifact.job_id"),
+                shard_id=(
+                    _canonical_uuid_text(row["shard_id"], field="lab_artifact.shard_id")
+                    if row["shard_id"] is not None
+                    else None
+                ),
+                artifact_type=str(row["artifact_type"]),
+                uri=str(row["uri"]),
+                content_hash=str(row["content_hash"]),
+                created_at=_load_time(str(row["created_at"])),
+            )
+        except Exception as exc:
+            raise InvalidStoredJobError(
+                f"invalid stored lab artifact {row['artifact_id']}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _summary_stats_sql() -> str:
+        return """
+            WITH shard_stats AS (
+                SELECT job_id,
+                       COUNT(*) AS shard_count,
+                       SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END)
+                           AS succeeded_count,
+                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+                           AS failed_count,
+                       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END)
+                           AS cancelled_count,
+                       MAX(CASE WHEN status <> 'succeeded' AND attempt_count >= max_attempts
+                                THEN 1 ELSE 0 END) AS has_exhausted,
+                       COALESCE(MIN(rquant_lab_shard_row_valid(
+                           shard_id, job_id, shard_index, status, version,
+                           attempt_count, max_attempts, plan_hash, adapter_id,
+                           adapter_version, payload_json, payload_hash, worker_id,
+                           scheduler_fencing_token, claim_token, claim_generation,
+                           claimed_at, heartbeat_at, lease_expires_at,
+                           result_manifest_hash, failure_json, finished_at,
+                           checkpoint_json, created_at, updated_at, phase,
+                           work_unit_name, work_units, static_duration_ms,
+                           duration_ms, throughput_units_per_second,
+                           completion_sequence
+                       )), 1) AS rows_valid,
+                       MAX(CASE WHEN status = 'running' THEN heartbeat_at END)
+                           AS latest_heartbeat_at,
+                       SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END)
+                           AS active_count
+                FROM lab_shard GROUP BY job_id
+            )
+        """
+
+    @staticmethod
+    def _summary_columns_sql() -> str:
+        return """
+            j.*,
+            COALESCE(ss.shard_count, 0) AS shard_count,
+            COALESCE(ss.succeeded_count, 0) AS succeeded_count,
+            COALESCE(ss.failed_count, 0) AS failed_count,
+            COALESCE(ss.cancelled_count, 0) AS cancelled_count,
+            COALESCE(ss.has_exhausted, 0) AS has_exhausted,
+            COALESCE(ss.rows_valid, 1) AS rows_valid,
+            COALESCE(ss.active_count, 0) AS active_count,
+            ss.latest_heartbeat_at AS latest_heartbeat_at,
+            (SELECT s.phase FROM lab_shard AS s
+             WHERE s.job_id = j.job_id
+               AND s.status IN ('running', 'queued', 'checkpointed')
+             ORDER BY CASE s.status WHEN 'running' THEN 0
+                                    WHEN 'checkpointed' THEN 1 ELSE 2 END,
+                      s.shard_index, s.shard_id
+             LIMIT 1) AS active_phase,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM lab_job_result_artifact AS result
+                WHERE result.job_id = j.job_id
+            ) THEN 1 ELSE 0 END AS has_result_index,
+            (SELECT result.evidence_json FROM lab_job_result_artifact AS result
+             WHERE result.job_id = j.job_id) AS result_evidence_json
+        """
+
+    @staticmethod
+    def _job_filters_sql(
+        filters: LabJobListFilters,
+    ) -> tuple[list[str], list[object]]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for column, values in (
+            ("j.status", filters.statuses),
+            ("j.job_type", filters.job_types),
+            ("j.resource_class", filters.resource_classes),
+        ):
+            if values:
+                clauses.append(f"{column} IN ({','.join('?' for _ in values)})")
+                parameters.extend(item.value for item in values)
+        if filters.created_from is not None:
+            clauses.append("j.created_at >= ?")
+            parameters.append(_dump_time(filters.created_from))
+        if filters.created_before is not None:
+            clauses.append("j.created_at < ?")
+            parameters.append(_dump_time(filters.created_before))
+        if filters.keyword is not None:
+            escaped = (
+                filters.keyword.casefold()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            clauses.append(
+                "(LOWER(json_extract(j.spec_json, '$.parameters.strategy_name')) "
+                "LIKE ? ESCAPE '\\' OR LOWER(j.job_id) LIKE ? ESCAPE '\\' "
+                "OR LOWER(j.spec_hash) LIKE ? ESCAPE '\\')"
+            )
+            parameters.extend((f"%{escaped}%",) * 3)
+        return clauses, parameters
+
+    @classmethod
+    def _summary_from_row(cls, row: sqlite3.Row) -> LabJobSummary:
+        job = cls._job_from_row(row)
+        progress = cls._progress_from_row(row)
+        rows_valid = _strict_sqlite_bool(row["rows_valid"], field="rows_valid")
+        if not rows_valid:
+            raise InvalidStoredJobError("job summary contains an invalid stored lab shard")
+        has_result_index = _strict_sqlite_bool(row["has_result_index"], field="has_result_index")
+        if (job.result_state is LabResultState.SEALED) != has_result_index:
+            raise InvalidStoredJobError("job summary result index conflicts with result state")
+        if has_result_index:
+            try:
+                evidence = LabArtifactIndexEvidence.model_validate_json(
+                    str(row["result_evidence_json"])
+                )
+            except Exception as exc:
+                raise InvalidStoredJobError("job summary result evidence is not canonical") from exc
+            if evidence.job_id != job.job_id or _canonical_model_json(evidence) != str(
+                row["result_evidence_json"]
+            ):
+                raise InvalidStoredJobError(
+                    "job summary result evidence conflicts with job identity"
+                )
+        has_exhausted = _strict_sqlite_bool(row["has_exhausted"], field="has_exhausted")
+        return LabJobSummary(
+            job_id=job.job_id,
+            strategy_name=job.spec.parameters.strategy_name,
+            spec_hash=job.spec_hash,
+            job_type=job.job_type,
+            resource_class=job.resource_class,
+            status=job.status,
+            control_intent=job.control_intent,
+            result_state=job.result_state,
+            version=job.version,
+            deadline=job.deadline,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            progress=progress,
+            command_availability=command_availability_for_job(
+                job,
+                has_exhausted_non_succeeded_shard=has_exhausted,
+            ),
+        )
+
+    def list_jobs(
+        self,
+        *,
+        filters: LabJobListFilters | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> LabJobPage:
+        if not 1 <= limit <= LAB_JOB_LIST_LIMIT_MAX:
+            raise ValueError(f"limit must be between 1 and {LAB_JOB_LIST_LIMIT_MAX}")
+        selected_filters = LabJobListFilters.model_validate(filters or LabJobListFilters())
+        clauses, parameters = self._job_filters_sql(selected_filters)
+        total_where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        page_clauses = list(clauses)
+        page_parameters = list(parameters)
+        if cursor is not None:
+            cursor_time, cursor_id = self._decode_cursor(cursor)
+            page_clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
+            page_parameters.extend((cursor_time, cursor_time, str(cursor_id)))
+        page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
+        with self._connect() as connection:
+            total_row = connection.execute(
+                f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
+                parameters,
+            ).fetchone()
+            rows = connection.execute(
+                f"{self._summary_stats_sql()} "
+                f"SELECT {self._summary_columns_sql()} FROM lab_job AS j "
+                f"LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id{page_where} "
+                "ORDER BY j.updated_at DESC, j.job_id DESC LIMIT ?",
+                (*page_parameters, limit + 1),
+            ).fetchall()
+        assert total_row is not None
+        total_count = _strict_sqlite_int(total_row["total_count"], field="total_count", minimum=0)
+        has_more = len(rows) > limit
+        visible = rows[:limit]
+        items = tuple(self._summary_from_row(row) for row in visible)
+        next_cursor = (
+            self._encode_cursor(items[-1].updated_at, items[-1].job_id)
+            if has_more and items
+            else None
+        )
+        return LabJobPage(
+            items=items,
+            total_count=total_count,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+
+    def list_finalization_candidates(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> LabFinalizationCandidatePage:
+        if not 1 <= limit <= LAB_JOB_LIST_LIMIT_MAX:
+            raise ValueError(f"limit must be between 1 and {LAB_JOB_LIST_LIMIT_MAX}")
+        clauses = [
+            "j.status = 'running'",
+            "j.control_intent = 'none'",
+            "j.result_state = 'ready'",
+            "j.requires_complete_result = 1",
+            "j.result_contract_version = ?",
+        ]
+        parameters: list[object] = [COMPLETE_RESULT_CONTRACT_VERSION]
+        total_where = f" WHERE {' AND '.join(clauses)}"
+        if cursor is not None:
+            cursor_time, cursor_id = self._decode_cursor(cursor)
+            clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
+            parameters.extend((cursor_time, cursor_time, str(cursor_id)))
+        with self._connect() as connection:
+            total_row = connection.execute(
+                f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
+                (COMPLETE_RESULT_CONTRACT_VERSION,),
+            ).fetchone()
+            rows = connection.execute(
+                f"SELECT j.* FROM lab_job AS j WHERE {' AND '.join(clauses)} "
+                "ORDER BY j.updated_at DESC, j.job_id DESC LIMIT ?",
+                (*parameters, limit + 1),
+            ).fetchall()
+        assert total_row is not None
+        has_more = len(rows) > limit
+        jobs = tuple(self._job_from_row(row) for row in rows[:limit])
+        items = tuple(
+            LabFinalizationCandidate(
+                job_id=job.job_id,
+                job_version=job.version,
+                spec_hash=job.spec_hash,
+                updated_at=job.updated_at,
+            )
+            for job in jobs
+        )
+        return LabFinalizationCandidatePage(
+            items=items,
+            total_count=_strict_sqlite_int(
+                total_row["total_count"], field="total_count", minimum=0
+            ),
+            has_more=has_more,
+            next_cursor=(
+                self._encode_cursor(items[-1].updated_at, items[-1].job_id)
+                if has_more and items
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _eta_input_from_rows(
+        *,
+        job_id: UUID,
+        status: str,
+        as_of: datetime,
+        completed_rows: Iterable[sqlite3.Row],
+        remaining_rows: Iterable[sqlite3.Row],
+    ) -> LabEtaInput:
+        from rquant.lab_eta import LabEtaCompletedShard, LabEtaRemainingShard
+
+        completed: list[LabEtaCompletedShard] = []
+        for row in completed_rows:
+            telemetry = LabShardTelemetry(
+                phase=str(row["phase"]),
+                work_unit_name=str(row["work_unit_name"]),
+                work_units=_strict_sqlite_int(
+                    row["work_units"],
+                    field="lab_shard.work_units",
+                    minimum=1,
+                    maximum=SQLITE_SIGNED_INTEGER_MAX,
+                ),
+                static_duration_ms=_strict_sqlite_int(
+                    row["static_duration_ms"],
+                    field="lab_shard.static_duration_ms",
+                    minimum=1,
+                    maximum=SQLITE_SIGNED_INTEGER_MAX,
+                ),
+                duration_ms=_strict_nullable_sqlite_real(
+                    row["duration_ms"],
+                    field="lab_shard.duration_ms",
+                    positive=True,
+                    minimum_inclusive=LAB_SHARD_DURATION_MS_MIN,
+                    maximum_exclusive=LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
+                ),
+                throughput_units_per_second=_strict_nullable_sqlite_real(
+                    row["throughput_units_per_second"],
+                    field="lab_shard.throughput_units_per_second",
+                    positive=True,
+                    maximum_exclusive=LAB_SHARD_THROUGHPUT_MAX_EXCLUSIVE,
+                ),
+            )
+            completed.append(
+                LabEtaCompletedShard(
+                    shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+                    completion_sequence=_strict_sqlite_int(
+                        row["completion_sequence"],
+                        field="lab_shard.completion_sequence",
+                        minimum=1,
+                    ),
+                    telemetry=telemetry,
+                )
+            )
+        completed.sort(key=lambda item: item.completion_sequence)
+
+        remaining: list[LabEtaRemainingShard] = []
+        for row in remaining_rows:
+            plan_values = (
+                row["phase"],
+                row["work_unit_name"],
+                row["work_units"],
+                row["static_duration_ms"],
+            )
+            if all(value is None for value in plan_values):
+                plan = None
+            elif all(value is not None for value in plan_values):
+                plan = LabShardWorkPlan(
+                    phase=str(row["phase"]),
+                    work_unit_name=str(row["work_unit_name"]),
+                    work_units=_strict_sqlite_int(
+                        row["work_units"],
+                        field="lab_shard.work_units",
+                        minimum=1,
+                        maximum=SQLITE_SIGNED_INTEGER_MAX,
+                    ),
+                    static_duration_ms=_strict_sqlite_int(
+                        row["static_duration_ms"],
+                        field="lab_shard.static_duration_ms",
+                        minimum=1,
+                        maximum=SQLITE_SIGNED_INTEGER_MAX,
+                    ),
+                )
+            else:
+                raise InvalidStoredJobError(
+                    "lab_shard work plan must be entirely present or absent"
+                )
+            remaining.append(
+                LabEtaRemainingShard(
+                    shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+                    work_plan=plan,
+                )
+            )
+        return LabEtaInput(
+            job_id=job_id,
+            status=status,
+            as_of=as_of,
+            completed=tuple(completed),
+            remaining=tuple(remaining),
+        )
+
+    def get_job_detail(
+        self,
+        job_id: UUID,
+        *,
+        as_of: datetime,
+        shard_limit: int = 100,
+        event_limit: int = 100,
+        artifact_limit: int = 50,
+        heartbeat_stale_after: timedelta = timedelta(minutes=2),
+        completed_telemetry_limit: int = LAB_ETA_COMPLETED_LIMIT_MAX,
+    ) -> LabJobDetail | None:
+        if not 1 <= shard_limit <= LAB_JOB_DETAIL_SHARD_LIMIT_MAX:
+            raise ValueError(f"shard_limit must be between 1 and {LAB_JOB_DETAIL_SHARD_LIMIT_MAX}")
+        if not 1 <= event_limit <= LAB_JOB_DETAIL_EVENT_LIMIT_MAX:
+            raise ValueError(f"event_limit must be between 1 and {LAB_JOB_DETAIL_EVENT_LIMIT_MAX}")
+        if not 1 <= artifact_limit <= LAB_JOB_DETAIL_ARTIFACT_LIMIT_MAX:
+            raise ValueError(
+                f"artifact_limit must be between 1 and {LAB_JOB_DETAIL_ARTIFACT_LIMIT_MAX}"
+            )
+        if not 3 <= completed_telemetry_limit <= LAB_ETA_COMPLETED_LIMIT_MAX:
+            raise ValueError(
+                f"completed telemetry limit must be between 3 and {LAB_ETA_COMPLETED_LIMIT_MAX}"
+            )
+        current = _utc(as_of)
+        stale_seconds = heartbeat_stale_after.total_seconds()
+        if not math.isfinite(stale_seconds) or stale_seconds <= 0:
+            raise ValueError("heartbeat_stale_after must be a positive finite duration")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            job_row = connection.execute(
+                "SELECT * FROM lab_job WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+            if job_row is None:
+                connection.execute("COMMIT")
+                return None
+            job = self._job_from_row(job_row)
+            result_evidence = self._validate_complete_result_graph(connection, job)
+            stats_row = connection.execute(
+                f"{self._summary_stats_sql()} "
+                f"SELECT {self._summary_columns_sql()} FROM lab_job AS j "
+                "LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id WHERE j.job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            assert stats_row is not None
+            progress = self._progress_from_row(stats_row)
+            has_exhausted = _strict_sqlite_bool(stats_row["has_exhausted"], field="has_exhausted")
+
+            shard_rows = connection.execute(
+                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index, shard_id LIMIT ?",
+                (str(job_id), shard_limit + 1),
+            ).fetchall()
+            event_rows = connection.execute(
+                "SELECT *, COUNT(*) OVER() AS bounded_total FROM lab_event "
+                "WHERE job_id = ? ORDER BY event_id DESC LIMIT ?",
+                (str(job_id), event_limit + 1),
+            ).fetchall()
+            failure_row = connection.execute(
+                "SELECT report.*, shard.shard_index FROM lab_worker_report AS report "
+                "JOIN lab_shard AS shard ON shard.shard_id = report.shard_id "
+                "WHERE report.job_id = ? AND report.status = 'accepted' "
+                "AND report.report_type = 'shard_failed' "
+                "ORDER BY report.applied_at, report.report_id LIMIT 1",
+                (str(job_id),),
+            ).fetchone()
+            artifact_rows = connection.execute(
+                "SELECT *, COUNT(*) OVER() AS bounded_total FROM lab_artifact "
+                "WHERE job_id = ? ORDER BY created_at, artifact_id LIMIT ?",
+                (str(job_id), artifact_limit + 1),
+            ).fetchall()
+
+            if job.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
+                completed_rows = connection.execute(
+                    "SELECT shard_id, phase, work_unit_name, work_units, "
+                    "static_duration_ms, duration_ms, throughput_units_per_second, "
+                    "completion_sequence FROM lab_shard "
+                    "WHERE job_id = ? AND status = 'succeeded' "
+                    "AND completion_sequence IS NOT NULL "
+                    "ORDER BY completion_sequence DESC LIMIT ?",
+                    (str(job_id), completed_telemetry_limit),
+                ).fetchall()
+                remaining_rows = connection.execute(
+                    "SELECT shard_id, phase, work_unit_name, work_units, static_duration_ms "
+                    "FROM lab_shard WHERE job_id = ? "
+                    "AND status IN ('queued', 'running', 'checkpointed') "
+                    "ORDER BY shard_index, shard_id",
+                    (str(job_id),),
+                ).fetchall()
+            else:
+                completed_rows = ()
+                remaining_rows = ()
+            connection.execute("COMMIT")
+
+        shards_truncated = len(shard_rows) > shard_limit
+        shards = tuple(self._shard_from_row(row) for row in shard_rows[:shard_limit])
+        events_truncated = len(event_rows) > event_limit
+        events = tuple(self._event_from_row(row) for row in event_rows[:event_limit])
+        event_count = (
+            _strict_sqlite_int(event_rows[0]["bounded_total"], field="event_count", minimum=0)
+            if event_rows
+            else 0
+        )
+        artifacts_truncated = len(artifact_rows) > artifact_limit
+        artifacts = tuple(self._artifact_from_row(row) for row in artifact_rows[:artifact_limit])
+        artifact_count = (
+            _strict_sqlite_int(artifact_rows[0]["bounded_total"], field="artifact_count", minimum=0)
+            if artifact_rows
+            else 0
+        )
+        first_failure = None
+        if failure_row is not None:
+            report_id = _canonical_uuid_text(
+                failure_row["report_id"], field="lab_worker_report.report_id"
+            )
+            failed_report = _worker_report_record_from_row(
+                failure_row,
+                expected_report_id=report_id,
+            )
+            if not isinstance(failed_report.report.body, LabShardFailed):
+                raise InvalidStoredJobError("accepted first failure has the wrong report body")
+            first_failure = LabFirstFailure(
+                shard_id=_canonical_uuid_text(failure_row["shard_id"], field="lab_shard.shard_id"),
+                shard_index=_strict_sqlite_int(
+                    failure_row["shard_index"],
+                    field="lab_shard.shard_index",
+                    minimum=0,
+                ),
+                failure=failed_report.report.body,
+                finished_at=failed_report.applied_at,
+            )
+        latest_heartbeat = (
+            _load_time(str(stats_row["latest_heartbeat_at"]))
+            if stats_row["latest_heartbeat_at"] is not None
+            else None
+        )
+        active_count = _strict_sqlite_int(
+            stats_row["active_count"], field="active_count", minimum=0
+        )
+        heartbeat = LabHeartbeatStatus(
+            active_shards=active_count,
+            latest_heartbeat_at=latest_heartbeat,
+            stale_after_seconds=stale_seconds,
+            stale=(
+                active_count > 0
+                and (latest_heartbeat is None or current - latest_heartbeat > heartbeat_stale_after)
+            ),
+        )
+        from rquant.lab_eta import estimate_lab_eta
+
+        eta = estimate_lab_eta(
+            self._eta_input_from_rows(
+                job_id=job_id,
+                status=job.status.value,
+                as_of=current,
+                completed_rows=completed_rows,
+                remaining_rows=remaining_rows,
+            )
+        )
+        return LabJobDetail(
+            job=job,
+            progress=progress,
+            heartbeat=heartbeat,
+            command_availability=command_availability_for_job(
+                job,
+                has_exhausted_non_succeeded_shard=has_exhausted,
+            ),
+            eta=eta,
+            first_failure=first_failure,
+            shards=shards,
+            shard_count=progress.total_shards,
+            shards_truncated=shards_truncated,
+            events=events,
+            event_count=event_count,
+            events_truncated=events_truncated,
+            artifacts=artifacts,
+            artifact_count=artifact_count,
+            artifacts_truncated=artifacts_truncated,
+            result_evidence=result_evidence,
+        )
+
     def get_job(self, job_id: UUID) -> LabJobRecord | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -3300,6 +4068,50 @@ class LabJobReader:
             job = self._job_from_row(row)
             self._validate_complete_result_graph(connection, job)
             return job
+
+    def get_command_context(self, job_id: UUID) -> LabJobCommandContext | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                f"{self._summary_stats_sql()} "
+                f"SELECT {self._summary_columns_sql()} FROM lab_job AS j "
+                "LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id WHERE j.job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            job = self._job_from_row(row)
+            self._validate_complete_result_graph(connection, job)
+            summary = self._summary_from_row(row)
+            return LabJobCommandContext(
+                job=job,
+                availability=summary.command_availability,
+            )
+
+    def get_artifact_preview_authority(
+        self,
+        job_id: UUID,
+    ) -> LabArtifactPreviewAuthority | None:
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT * FROM lab_job WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return None
+            job = self._job_from_row(row)
+            evidence = self._validate_complete_result_graph(connection, job)
+            if (
+                job.status is not JobStatus.SUCCEEDED
+                or job.result_state is not LabResultState.SEALED
+                or evidence is None
+            ):
+                connection.execute("COMMIT")
+                return None
+            authority = LabArtifactPreviewAuthority(job=job, evidence=evidence)
+            connection.execute("COMMIT")
+            return authority
 
     def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
         """Return one validated ready-result graph from a single read transaction."""

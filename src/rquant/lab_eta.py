@@ -293,6 +293,6 @@ def estimate_lab_eta(value: LabEtaInput) -> LabEtaEstimate:
         estimator=estimator,
         remaining_duration=duration,
         finish_at=None
-        if eta_input.status == "paused"
+        if eta_input.status in {"checkpointed", "paused"}
         else _finish_window(eta_input.as_of, duration),
     )

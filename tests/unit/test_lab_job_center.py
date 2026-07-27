@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+
+from rquant.lab_jobs import (
+    JobStatus,
+    LabJobListFilters,
+    LabJobReader,
+    LabJobStore,
+    ResourceClass,
+)
+from rquant.lab_shard_protocol import LabShardFailed
+from rquant.research_run_spec import ResearchJobType
+
+from .test_lab_finalizer import _ready_scenario
+from .test_lab_jobs import NOW, _lease, _spec, _submit
+from .test_lab_shard_control_plane import _claim, _report, _setup
+
+
+class _CountingReader(LabJobReader):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.statements: list[str] = []
+
+    def _connect(self):  # type: ignore[no-untyped-def]
+        connection = super()._connect()
+        connection.set_trace_callback(
+            lambda statement: self.statements.append(" ".join(statement.split()))
+        )
+        return connection
+
+
+def _seed_jobs(tmp_path: Path, count: int) -> tuple[LabJobStore, tuple[UUID, ...]]:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store, seconds=10_000)
+    job_ids: list[UUID] = []
+    for index in range(count):
+        job_id = UUID(int=index + 1)
+        spec = _spec(
+            job_type=(
+                ResearchJobType.PARAMETER_SEARCH if index % 2 else ResearchJobType.STRATEGY_REPLAY
+            ),
+            resource_class=(ResourceClass.HEAVY if index % 3 == 0 else ResourceClass.STANDARD),
+        )
+        spec = spec.model_copy(
+            update={
+                "parameters": spec.parameters.model_copy(
+                    update={"strategy_name": f"strategy-{index:03d}"}
+                )
+            }
+        )
+        envelope = _submit(job_id=job_id, spec=spec)
+        receipt = store.apply_command(
+            envelope,
+            lease=lease,
+            now=NOW + timedelta(seconds=index),
+        )
+        assert receipt.status == "applied"
+        job_ids.append(job_id)
+    return store, tuple(job_ids)
+
+
+def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(
+    tmp_path: Path,
+) -> None:
+    store, expected_ids = _seed_jobs(tmp_path, 125)
+    reader = _CountingReader(store.path)
+
+    cursor: str | None = None
+    observed: list[UUID] = []
+    while True:
+        page = reader.list_jobs(limit=17, cursor=cursor)
+        observed.extend(item.job_id for item in page.items)
+        assert page.total_count == 125
+        if not page.has_more:
+            assert page.next_cursor is None
+            break
+        assert page.next_cursor is not None
+        cursor = page.next_cursor
+
+    assert observed == list(reversed(expected_ids))
+    assert len(observed) == len(set(observed)) == 125
+    selects = [
+        statement for statement in reader.statements if statement.startswith(("SELECT", "WITH"))
+    ]
+    assert len(selects) == 2 * 8
+
+
+def test_list_jobs_combines_status_type_resource_date_and_keyword_filters(
+    tmp_path: Path,
+) -> None:
+    store, _ = _seed_jobs(tmp_path, 12)
+    reader = LabJobReader(store.path)
+
+    page = reader.list_jobs(
+        filters=LabJobListFilters(
+            statuses=(JobStatus.QUEUED,),
+            job_types=(ResearchJobType.PARAMETER_SEARCH,),
+            resource_classes=(ResourceClass.STANDARD,),
+            created_from=NOW + timedelta(seconds=1),
+            created_before=NOW + timedelta(seconds=11),
+            keyword="strategy-007",
+        ),
+        limit=10,
+    )
+
+    assert page.total_count == 1
+    assert tuple(item.strategy_name for item in page.items) == ("strategy-007",)
+    with pytest.raises(ValueError, match="cursor"):
+        reader.list_jobs(limit=10, cursor="not-an-opaque-cursor")
+    with pytest.raises(ValueError, match="limit"):
+        reader.list_jobs(limit=101)
+
+
+def test_job_detail_is_bounded_and_reports_first_failure_without_paused_eta(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=5, max_attempts=3, with_work_plan=True)
+    claim = _claim(store, lease)
+    failed = store.apply_worker_report(
+        _report(
+            claim,
+            LabShardFailed(failure_json='{"kind":"first"}'),
+            offset=4,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert failed.status == "accepted"
+    reader = _CountingReader(store.path)
+
+    detail = reader.get_job_detail(
+        job_id,
+        as_of=NOW + timedelta(seconds=20),
+        shard_limit=2,
+        event_limit=2,
+        artifact_limit=1,
+    )
+
+    assert detail is not None
+    assert detail.job.status is JobStatus.FAILED
+    assert len(detail.shards) == 2
+    assert detail.shard_count == 5
+    assert detail.shards_truncated is True
+    assert len(detail.events) == 2
+    assert detail.events_truncated is True
+    assert detail.first_failure is not None
+    assert detail.first_failure.failure.failure_json == '{"kind":"first"}'
+    assert detail.eta is not None and detail.eta.finish_at is None
+    assert detail.command_availability.retry is True
+    selects = [
+        statement for statement in reader.statements if statement.startswith(("SELECT", "WITH"))
+    ]
+    assert len(selects) <= 13
+
+
+def test_job_detail_marks_running_heartbeat_stale_and_truncates_independently(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3, with_work_plan=True)
+    _claim(store, lease, duration=120)
+
+    detail = LabJobReader(store.path).get_job_detail(
+        job_id,
+        as_of=NOW + timedelta(seconds=40),
+        heartbeat_stale_after=timedelta(seconds=10),
+        shard_limit=1,
+        event_limit=10,
+    )
+
+    assert detail is not None
+    assert detail.heartbeat.active_shards == 1
+    assert detail.heartbeat.stale is True
+    assert detail.progress.phase == "strategy_replay"
+    assert detail.shards_truncated is True
+
+
+def test_list_finalization_candidates_is_typed_readonly_and_bounded(tmp_path: Path) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    reader = LabJobReader(scenario.store.path)
+
+    page = reader.list_finalization_candidates(limit=1)
+
+    assert tuple(item.job_id for item in page.items) == (scenario.job_id,)
+    assert page.has_more is False
+    reader.execute_for_test("SELECT 1")
+    with pytest.raises(Exception, match="readonly|read-only|query_only"):
+        reader.execute_for_test("DELETE FROM lab_job")

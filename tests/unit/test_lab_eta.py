@@ -138,6 +138,14 @@ def test_eta_uses_documented_static_interval_before_three_completed_shards() -> 
     assert estimate.remaining_duration.high_ms == 6_000
 
 
+@pytest.mark.parametrize("status", ["checkpointed", "paused"])
+def test_eta_hides_finish_time_while_execution_is_paused(status: str) -> None:
+    estimate = estimate_lab_eta(_input(status=status))
+
+    assert estimate.remaining_duration is not None
+    assert estimate.finish_at is None
+
+
 def test_eta_switches_at_exactly_three_and_uses_deterministic_ewma_variance() -> None:
     estimate = estimate_lab_eta(
         _input(
@@ -209,7 +217,7 @@ def test_eta_is_independent_of_input_order() -> None:
     assert reverse == forward
 
 
-@pytest.mark.parametrize("status", ["queued", "running", "checkpointed"])
+@pytest.mark.parametrize("status", ["queued", "running"])
 def test_active_eta_projects_finish_window_from_explicit_as_of(status: str) -> None:
     estimate = estimate_lab_eta(_input(status=status))
 

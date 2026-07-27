@@ -1223,6 +1223,26 @@ class LabCommandSpool:
             )
         return matches[0] if matches else None
 
+    def find(
+        self,
+        request_id: UUID,
+    ) -> LabSpoolEntry | LabAcknowledgedCommand | None:
+        """Return one durable request identity without creating or moving entries."""
+
+        with self._exclusive_lock():
+            ack_path = self.ack_dir / f"{request_id}.json"
+            pending_path = self._pending_for_request_locked(request_id)
+            if os.path.lexists(ack_path):
+                receipt = self.load_receipt(ack_path)
+                if pending_path is not None:
+                    pending = self.load(pending_path)
+                    if pending.envelope.content_hash != receipt.content_hash:
+                        raise RequestContentConflictError(
+                            f"request_id {request_id} has conflicting ack and pending"
+                        )
+                return LabAcknowledgedCommand(path=ack_path, receipt=receipt)
+            return self.load(pending_path) if pending_path is not None else None
+
     def publish(
         self,
         envelope: LabCommandEnvelope,

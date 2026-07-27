@@ -6,6 +6,16 @@
 
 ### Added
 
+- **Strategy Lab durable job center typed backend foundation**：`LabJobReader` 新增只读、稳定
+  keyset 分页的任务筛选和有界详情聚合，统一返回进度、phase、心跳陈旧、首个 accepted failure、
+  command availability、ETA、截断事件/分片及 sealed result evidence，并提供有界 finalization
+  candidate 查询。新增四类现有策略参数模型到 canonical `ResearchRunSpec`/typed create command
+  的 factory，formal run 严格绑定 clean 40 位 code SHA、审计、不可变快照和 feature/cost contract。
+  新增只读 command submission façade，以稳定 interaction key 跨 rerun/进程重启复用 request id，
+  只向现有 typed spool 原子发布 pause/resume（含撤回 pause）/cancel/retry/create；SQLite 仍只由
+  scheduler 写入。新增 descriptor-bound `ArtifactPreviewReader`，仅对 succeeded+sealed+indexed
+  result 提供有大小、行列上限的 report/metrics/Parquet 预览，并校验路径、inode、文件身份和 hash。
+
 - **Strategy Lab 独立完整结果 finalizer 核心**：新增单次 readonly SQLite transaction 的
   强类型 `LabFinalizationSnapshot`，原子校验 RUNNING/ready/complete contract、全部成功
   shard 及每片唯一 accepted success report/receipt。finalizer 按 scheduler 已接受的 exact
