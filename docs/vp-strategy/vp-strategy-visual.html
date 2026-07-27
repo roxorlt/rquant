@@ -1,0 +1,1059 @@
+<title>三重锁相 VP 策略 · 全貌与细节</title>
+
+<style>
+/* ============ tokens ============ */
+:root{
+  --ground:#F7F8F9;
+  --surface:#FFFFFF;
+  --surface-2:#EFF1F3;
+  --line:#DDE1E5;
+  --line-soft:#E9ECEF;
+  --tx:#141A20;
+  --tx-2:#4A555F;
+  --tx-3:#7B868F;
+  --up:#CE3A31;        /* A股 红 = 涨 */
+  --down:#0B8F63;      /* A股 绿 = 跌 */
+  --poc:#B37A22;       /* 琥珀铜 = 成交密集 / 结构强调 */
+  --poc-soft:#F3E6CF;
+  --up-soft:#FAE3E1;
+  --down-soft:#D9F0E6;
+  --shadow:0 1px 2px rgba(20,26,32,.05), 0 8px 24px -12px rgba(20,26,32,.18);
+  --radius:3px;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --ground:#0E1216; --surface:#151B21; --surface-2:#1C242B;
+    --line:#2A343D; --line-soft:#222B33;
+    --tx:#E4E9ED; --tx-2:#A3AFB9; --tx-3:#707D88;
+    --up:#F0605A; --down:#2FBE8B; --poc:#D9A24A;
+    --poc-soft:#3A2E19; --up-soft:#3A1E1D; --down-soft:#12332A;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="light"]{
+  --ground:#F7F8F9; --surface:#FFFFFF; --surface-2:#EFF1F3;
+  --line:#DDE1E5; --line-soft:#E9ECEF;
+  --tx:#141A20; --tx-2:#4A555F; --tx-3:#7B868F;
+  --up:#CE3A31; --down:#0B8F63; --poc:#B37A22;
+  --poc-soft:#F3E6CF; --up-soft:#FAE3E1; --down-soft:#D9F0E6;
+  --shadow:0 1px 2px rgba(20,26,32,.05), 0 8px 24px -12px rgba(20,26,32,.18);
+}
+:root[data-theme="dark"]{
+  --ground:#0E1216; --surface:#151B21; --surface-2:#1C242B;
+  --line:#2A343D; --line-soft:#222B33;
+  --tx:#E4E9ED; --tx-2:#A3AFB9; --tx-3:#707D88;
+  --up:#F0605A; --down:#2FBE8B; --poc:#D9A24A;
+  --poc-soft:#3A2E19; --up-soft:#3A1E1D; --down-soft:#12332A;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--tx);
+  font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;
+  font-size:16px; line-height:1.75;
+  -webkit-font-smoothing:antialiased;
+}
+.serif{font-family:"Songti SC","Noto Serif SC","Source Han Serif SC",SimSun,serif}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+
+/* ============ shell ============ */
+.shell{display:grid;grid-template-columns:minmax(180px,220px) minmax(0,1fr);gap:0;max-width:1240px;margin:0 auto}
+@media(max-width:900px){.shell{grid-template-columns:1fr}}
+
+/* left price-ladder rail */
+.rail{
+  position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:34px 0 34px 22px;border-right:1px solid var(--line-soft);
+}
+@media(max-width:900px){.rail{display:none}}
+.rail-title{font-size:11px;letter-spacing:.16em;color:var(--tx-3);margin-bottom:18px;text-transform:uppercase}
+.rung{
+  display:block;width:100%;text-align:left;background:none;border:0;padding:7px 14px 7px 0;
+  color:var(--tx-2);font-size:13.5px;cursor:pointer;position:relative;line-height:1.45;
+  border-left:2px solid transparent;padding-left:14px;margin-left:-2px;
+  font-family:inherit;
+}
+.rung:hover{color:var(--tx)}
+.rung.on{color:var(--tx);border-left-color:var(--poc);font-weight:600}
+.rung .cnt{
+  display:block;height:2px;background:var(--poc);opacity:.45;margin-top:5px;border-radius:1px;
+  transition:opacity .2s;
+}
+.rung.on .cnt{opacity:1}
+.rung:focus-visible,.tab:focus-visible,button:focus-visible,summary:focus-visible{
+  outline:2px solid var(--poc);outline-offset:2px;
+}
+
+main{padding:34px 32px 120px;min-width:0}
+@media(max-width:900px){main{padding:26px 18px 90px}}
+
+/* ============ type ============ */
+.eyebrow{font-size:11px;letter-spacing:.18em;color:var(--poc);text-transform:uppercase;margin:0 0 10px}
+h1{font-size:clamp(30px,5vw,46px);line-height:1.24;margin:0 0 16px;font-weight:600;text-wrap:balance;letter-spacing:-.01em}
+h2{font-size:clamp(21px,3vw,27px);line-height:1.35;margin:0 0 6px;font-weight:600;text-wrap:balance}
+h3{font-size:16.5px;margin:26px 0 8px;font-weight:600}
+h4{font-size:14px;margin:18px 0 6px;font-weight:600;color:var(--tx-2)}
+p{margin:0 0 14px;max-width:68ch}
+.lede{font-size:18px;color:var(--tx-2);max-width:62ch;line-height:1.7}
+section{padding:44px 0;border-top:1px solid var(--line-soft)}
+section:first-of-type{border-top:0;padding-top:12px}
+.sec-head{display:flex;align-items:baseline;gap:12px;margin-bottom:18px;flex-wrap:wrap}
+.sec-num{font-size:12px;color:var(--tx-3);letter-spacing:.1em;flex:none}
+small,.small{font-size:13px;color:var(--tx-3);line-height:1.65}
+code{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:.88em;background:var(--surface-2);padding:1px 5px;border-radius:2px}
+a{color:var(--poc)}
+ul{margin:0 0 14px;padding-left:1.15em;max-width:68ch}
+li{margin-bottom:6px}
+
+/* ============ components ============ */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+
+.note{border-left:2px solid var(--poc);background:var(--poc-soft);padding:12px 16px;margin:16px 0;border-radius:0 var(--radius) var(--radius) 0;max-width:68ch}
+.note.crit{border-left-color:var(--up);background:var(--up-soft)}
+.note p:last-child{margin-bottom:0}
+.note strong{color:var(--tx)}
+
+.tbl-wrap{overflow-x:auto;margin:14px 0;border:1px solid var(--line);border-radius:var(--radius)}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--surface)}
+th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+th{background:var(--surface-2);font-weight:600;font-size:12.5px;letter-spacing:.02em;white-space:nowrap;color:var(--tx-2)}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-family:ui-monospace,"SF Mono",Menlo,monospace;font-variant-numeric:tabular-nums}
+
+.pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.p-crit{background:var(--up-soft);color:var(--up)}
+.p-imp{background:var(--poc-soft);color:var(--poc)}
+.p-min{background:var(--surface-2);color:var(--tx-3)}
+.p-new{background:var(--down-soft);color:var(--down)}
+
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--line);margin-bottom:0;flex-wrap:wrap}
+.tab{
+  background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;
+  padding:9px 15px;font-size:14px;color:var(--tx-3);cursor:pointer;font-family:inherit;font-weight:500;
+}
+.tab:hover{color:var(--tx-2)}
+.tab.on{color:var(--tx);border-bottom-color:var(--poc);font-weight:600}
+
+details{border:1px solid var(--line);border-radius:var(--radius);margin-bottom:8px;background:var(--surface);overflow:hidden}
+summary{padding:11px 15px;cursor:pointer;font-weight:600;font-size:14.5px;list-style:none;display:flex;gap:10px;align-items:center}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"+";margin-left:auto;color:var(--tx-3);font-weight:400;font-size:17px;flex:none}
+details[open] summary::after{content:"−"}
+details .body{padding:0 15px 15px;font-size:14.5px;color:var(--tx-2)}
+details .body p{max-width:none}
+
+.kbd{font-size:11.5px;color:var(--tx-3);letter-spacing:.06em}
+.hr{height:1px;background:var(--line-soft);margin:22px 0;border:0}
+
+/* VP canvas module */
+.vpmod{display:grid;grid-template-columns:minmax(0,1fr) minmax(210px,270px);gap:22px;align-items:start}
+@media(max-width:760px){.vpmod{grid-template-columns:1fr}}
+canvas{display:block;width:100%;height:auto;border-radius:var(--radius)}
+.legend{display:flex;flex-direction:column;gap:9px;font-size:13.5px}
+.legend button{
+  display:flex;gap:9px;align-items:flex-start;background:none;border:0;padding:7px 9px;text-align:left;
+  cursor:pointer;color:var(--tx-2);border-radius:var(--radius);font-family:inherit;font-size:13.5px;width:100%;line-height:1.5;
+}
+.legend button:hover{background:var(--surface-2)}
+.legend button.on{background:var(--surface-2);color:var(--tx)}
+.swatch{width:11px;height:11px;border-radius:2px;flex:none;margin-top:5px}
+
+/* pools */
+.pools{display:flex;flex-direction:column;gap:5px}
+.pool{
+  display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:center;
+  border:1px solid var(--line);background:var(--surface);border-radius:var(--radius);
+  padding:12px 15px;cursor:pointer;text-align:left;font-family:inherit;color:inherit;font-size:15px;
+  transition:border-color .15s, transform .15s;
+}
+.pool:hover{border-color:var(--poc)}
+.pool.on{border-color:var(--poc);box-shadow:inset 3px 0 0 var(--poc)}
+.pool .lvl{font-size:12px;letter-spacing:.1em;color:var(--poc);font-weight:700}
+.pool .nm{font-weight:600;display:block}
+.pool .sz{font-size:12.5px;color:var(--tx-3);margin-top:2px;display:block;line-height:1.5}
+.pool .bar{height:26px;width:110px;display:flex;align-items:flex-end;gap:2px}
+.pool .bar i{background:var(--poc);opacity:.32;flex:1;border-radius:1px 1px 0 0;display:block}
+.pool.on .bar i{opacity:.75}
+
+/* timeline */
+.tl{position:relative;padding-top:6px}
+.tl-track{display:flex;gap:0;overflow-x:auto;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.tl-btn{
+  flex:1;min-width:84px;background:none;border:0;padding:9px 4px 13px;cursor:pointer;
+  font-family:inherit;color:var(--tx-3);position:relative;text-align:center;
+}
+.tl-btn .t{font-size:13px;font-family:ui-monospace,"SF Mono",Menlo,monospace;font-variant-numeric:tabular-nums;display:block;font-weight:600}
+.tl-btn .l{font-size:11px;display:block;margin-top:2px;line-height:1.35}
+.tl-btn::after{content:"";position:absolute;bottom:-1px;left:0;right:0;height:2px;background:transparent}
+.tl-btn.on{color:var(--tx)}
+.tl-btn.on::after{background:var(--poc)}
+.tl-btn:hover{color:var(--tx-2)}
+.tl-body{padding:18px 0 0;min-height:150px}
+
+/* seal simulator */
+.sim{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,320px);gap:26px;align-items:start}
+@media(max-width:760px){.sim{grid-template-columns:1fr}}
+input[type=range]{width:100%;accent-color:var(--poc);margin:8px 0}
+.state{border:1px solid var(--line);border-radius:var(--radius);padding:16px;background:var(--surface)}
+.state .nm{font-size:19px;font-weight:700;margin-bottom:5px}
+.state .act{font-size:14px;color:var(--tx-2);line-height:1.6}
+.ladder{display:flex;flex-direction:column;gap:3px;margin-top:14px}
+.rung2{display:grid;grid-template-columns:88px minmax(0,1fr);gap:10px;align-items:center;font-size:12px}
+.rung2 .px{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;color:var(--tx-3);text-align:right;white-space:nowrap}
+.rung2 .qb{height:15px;background:var(--up);opacity:.22;border-radius:1px;transition:width .25s}
+.rung2.lim .qb{opacity:.85}
+.rung2.lim .px{color:var(--up);font-weight:700}
+
+.stateflow{display:flex;flex-direction:column;gap:3px;margin-top:12px}
+.sf{padding:9px 13px;border:1px solid var(--line);border-radius:var(--radius);font-size:13.5px;opacity:.4;transition:opacity .2s, border-color .2s;background:var(--surface)}
+.sf.on{opacity:1;border-color:var(--poc);background:var(--poc-soft)}
+.sf b{display:block;font-size:12px;letter-spacing:.08em;margin-bottom:2px}
+
+/* gap filter */
+.filters{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+.fbtn{
+  border:1px solid var(--line);background:var(--surface);padding:5px 13px;border-radius:99px;
+  font-size:13px;cursor:pointer;color:var(--tx-2);font-family:inherit;
+}
+.fbtn.on{border-color:var(--poc);color:var(--tx);font-weight:600;background:var(--poc-soft)}
+
+/* phases */
+.ph{display:grid;grid-template-columns:74px minmax(0,1fr);gap:16px;padding:15px 0;border-bottom:1px solid var(--line-soft)}
+.ph:last-child{border-bottom:0}
+.ph .code{font-size:15px;font-weight:700;color:var(--poc);font-family:ui-monospace,Menlo,monospace}
+.ph .dur{font-size:11.5px;color:var(--tx-3);margin-top:2px}
+.gate{margin-top:7px;font-size:13.5px;padding:8px 12px;background:var(--surface-2);border-radius:var(--radius);border-left:2px solid var(--up)}
+
+.verdict{display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;padding:13px 0;border-bottom:1px solid var(--line-soft)}
+.verdict:last-child{border-bottom:0}
+.vmark{font-size:13px;font-weight:700;padding:3px 10px;border-radius:2px;white-space:nowrap}
+.v-ok{background:var(--down-soft);color:var(--down)}
+.v-no{background:var(--up-soft);color:var(--up)}
+.v-mid{background:var(--poc-soft);color:var(--poc)}
+
+footer{padding:34px 0 0;border-top:1px solid var(--line);color:var(--tx-3);font-size:13px}
+
+@media (prefers-reduced-motion: reduce){
+  *{transition:none !important;animation:none !important;scroll-behavior:auto !important}
+}
+html{scroll-behavior:smooth}
+</style>
+
+<div class="shell">
+
+<nav class="rail" aria-label="章节导航">
+  <div class="rail-title">规格章节</div>
+  <div id="railList"></div>
+</nav>
+
+<main>
+
+<!-- ============ HERO ============ -->
+<section id="s-hero">
+  <p class="eyebrow">策略规格 · v0.1 草案 · 2026-07-27</p>
+  <h1 class="serif">三重锁相 VP 策略<br>全貌与每一处细节</h1>
+  <p class="lede">用真实成交量在价格上的堆积位置，找到主力换手最密集的地方，在价格回踩这些位置且抛压衰竭时买入。这一页把策略拆到可以直接写成代码的颗粒度——包括原始讨论里<strong>漏掉的 20 个缺口</strong>。</p>
+
+  <div class="grid g3" style="margin-top:26px">
+    <div class="card">
+      <div class="mono" style="font-size:26px;color:var(--poc);font-weight:700">20</div>
+      <div style="font-size:13.5px;color:var(--tx-2);margin-top:3px">个规格缺口<br><span class="small">7 个致命 · 11 个重要 · 2 个次要</span></div>
+    </div>
+    <div class="card">
+      <div class="mono" style="font-size:26px;color:var(--poc);font-weight:700">4</div>
+      <div style="font-size:13.5px;color:var(--tx-2);margin-top:3px">级数据订阅池<br><span class="small">不分级则年增 200–320 GB</span></div>
+    </div>
+    <div class="card">
+      <div class="mono" style="font-size:26px;color:var(--poc);font-weight:700">3</div>
+      <div style="font-size:13.5px;color:var(--tx-2);margin-top:3px">个必须你拍板的决策<br><span class="small">见文末</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 1 先看懂 VP ============ -->
+<section id="s-vp">
+  <div class="sec-head"><span class="sec-num mono">01</span><h2 class="serif">先看懂这张图</h2></div>
+  <p>成交量分布（Volume Profile，简称 VP）把成交量按<strong>价格</strong>堆起来，而不是按时间。横着的每一根柱子代表「在这个价位上一共成交了多少钱」。柱子越长，说明越多人在这个价位换过手。</p>
+  <p class="small" style="max-width:68ch">这跟通达信里的「筹码峰」<strong>不是一回事</strong>：筹码峰是按换手率衰减模型<em>推算</em>出来的持仓成本，VP 是<em>真实发生过</em>的成交统计。</p>
+
+  <div class="card" style="margin-top:18px">
+    <div class="tabs" role="tablist" style="margin-bottom:16px">
+      <button class="tab on" data-vp="session" role="tab">单日 VP<span class="kbd"> · 战术</span></button>
+      <button class="tab" data-vp="composite" role="tab">复合 VP 60日<span class="kbd"> · 大局</span></button>
+      <button class="tab" data-vp="anchored" role="tab">锚点 VP<span class="kbd"> · 主力成本</span></button>
+    </div>
+    <div class="vpmod">
+      <div>
+        <canvas id="vpCanvas" width="720" height="420" aria-label="成交量分布示意图"></canvas>
+        <p class="small" id="vpCaption" style="margin-top:10px"></p>
+      </div>
+      <div class="legend" id="vpLegend"></div>
+    </div>
+  </div>
+
+  <div class="note">
+    <p><strong>原讨论最致命的缺口就在这里。</strong>整套策略反复用 POC、VAH、VAL、LVN 做买卖点，但从头到尾<strong>没有一处定义它们怎么算</strong>——价格分几档？一分钟的成交量怎么摊到各个价位？价值区从哪边开始扩？没定义就意味着两个人写出来的代码结果不同，回测和实盘必然分叉。</p>
+  </div>
+
+  <div class="note" style="border-left-color:var(--down);background:var(--down-soft)">
+    <p><strong>好消息：这部分不用从零写。</strong>rQuant 里已经有一个 551 行的 <code>volume_profile.py</code>，POC、价值区、支撑阻力候选、风控计划都有，而且已经接进了筛选和模拟盘风控。要做的是<strong>增量改造</strong>，不是重建：</p>
+    <ul style="margin:10px 0 0;font-size:14px">
+      <li>价格分档现在固定 0.01 元 —— 3 元股和 300 元股不可比，要改成按价格比例自适应</li>
+      <li>价值区算法不标准 —— 见缺口 <b>G20</b>，双峰形态下会系统性拉宽</li>
+      <li>盘中实时的单日 VP、锚点 VP、LVN —— 这三样是真的没有，要新增</li>
+      <li>复权处理已经有了，而且区分了「可比股数」和「原始成交额」双口径，比我原本设想的还细</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============ 2 一天 ============ -->
+<section id="s-day">
+  <div class="sec-head"><span class="sec-num mono">02</span><h2 class="serif">策略的一天</h2></div>
+  <p>点任意时刻，看系统那一刻在做什么、能做什么、<strong>不能</strong>做什么。</p>
+  <div class="card" style="margin-top:16px">
+    <div class="tl">
+      <div class="tl-track" id="tlTrack" role="tablist"></div>
+      <div class="tl-body" id="tlBody" role="tabpanel"></div>
+    </div>
+  </div>
+  <div class="note">
+    <p><strong>原讨论的时间轴从 09:30 开始，前后各少一截。</strong>开头少了集合竞价（09:15–09:25）——开盘价其实 09:25 就定了，09:30 才能交易，中间那 5 分钟是纯决策窗；结尾少了收盘集合竞价（14:57–15:00）——那三分钟<strong>只能挂单不能撤单，也没有连续竞价</strong>，任何写着「14:58 清仓」的规则实际执行方式跟预期完全不同。</p>
+  </div>
+</section>
+
+<!-- ============ 3 订阅池 ============ -->
+<section id="s-pool">
+  <div class="sec-head"><span class="sec-num mono">03</span><h2 class="serif">四级订阅池</h2><span class="pill p-new">本轮补全</span></div>
+  <p>这是你问的第一个缺口。原策略默认「随时能看到任意股票的实时数据」，但不同数据的获取成本差三个数量级。<strong>不分级不是不优雅，是根本跑不起来</strong>——下面点开 L2 看那个数字。</p>
+
+  <div class="pools" id="pools" style="margin-top:18px"></div>
+  <div class="card" id="poolDetail" style="margin-top:14px"></div>
+
+  <div class="note crit">
+    <p><strong>订阅分级是可行性前提，不是优化项。</strong>全市场 5400 只每 3 秒存一次五档盘口 ≈ <span class="mono">250 GB/年</span>，单机直接出局；只对触发池 30 只存 ≈ <span class="mono">1.5 GB/年</span>，轻松。同一套策略，差别只在于有没有订阅生命周期。</p>
+  </div>
+
+  <h3>订阅管理的六条工程硬要求</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th style="width:110px">要求</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><b>幂等</b></td><td><code>subscribe(code, level)</code> 重复调用无副作用</td></tr>
+        <tr><td><b>持久化</b></td><td>订阅表落库，不只在内存。重启后按库重建——rQuant 的 surge-watch 就因为累计量只在内存，重启后归零丢了一整个早盘</td></tr>
+        <tr><td><b>TTL 兜底</b></td><td>每条订阅带过期时间，最长到当日 15:00，防止「只增不减」的订阅泄漏</td></tr>
+        <tr><td><b>退订 ≠ 删数据</b></td><td>退订只停止新数据流入，已落库的历史一律保留</td></tr>
+        <tr><td><b>配额预算</b></td><td>启动时算出当日最大请求数与数据源配额比对，超出则<strong>拒绝启动并报警</strong>，不能盘中才发现打爆</td></tr>
+        <tr><td><b>降级留痕</b></td><td>主数据源失败切备用时必须记日志并在信号上打标——用降级数据产生的信号可信度不同，不能静默降级</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>升降级的防抖设计</h3>
+  <p>价格在阈值附近来回抖动会导致同一只票每分钟升降级几十次，打爆配额。所以升级和降级用<strong>不同的阈值</strong>（滞回），并且降级后有冷却期。</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>动作</th><th>条件</th><th class="num">阈值</th></tr></thead>
+      <tbody>
+        <tr><td>L1 → L2 升级</td><td>价格进入昨日 POC 缓冲带</td><td class="num">±1.5%</td></tr>
+        <tr><td>L2 → L1 降级</td><td>脱离缓冲带（<b>宽于升级线</b>）</td><td class="num">±2.5%</td></tr>
+        <tr><td>降级确认时长</td><td>连续脱离多久才降</td><td class="num">30 min</td></tr>
+        <tr><td>降级后冷却</td><td>多久内不得再升级</td><td class="num">15 min</td></tr>
+        <tr><td>L2 池上限</td><td>超限按接近度挤掉最远的，<b>并记录被挤掉的数量</b></td><td class="num">30 只</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 4 买入 ============ -->
+<section id="s-entry">
+  <div class="sec-head"><span class="sec-num mono">04</span><h2 class="serif">买入判定</h2></div>
+  <p>六个条件同时满足才买。时间窗锁定在下午——因为 A 股是 T+1，当天买了当天不能卖，越晚买承担的当日波动风险越小。</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th style="width:46px">#</th><th>条件</th><th>精确表达</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">E1</td><td>时间窗</td><td class="mono">13:30 ≤ now ≤ 14:30</td></tr>
+        <tr><td class="mono">E2</td><td>回踩昨日筹码峰</td><td class="mono">|P − POC_yest| / POC_yest ≤ 0.8%</td></tr>
+        <tr><td class="mono">E3</td><td>抛压衰竭（缩量）</td><td class="mono">V_5m_prev &lt; 0.6 × V_5m_avg20</td></tr>
+        <tr><td class="mono">E4</td><td>未临近涨停</td><td class="mono">P &lt; limit_up × 0.98</td></tr>
+        <tr><td class="mono">E5</td><td>大盘未熔断</td><td>见风控</td></tr>
+        <tr><td class="mono">E6</td><td>仓位有空间</td><td>持仓 &lt; 4 只 且 总仓位 &lt; 80%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note crit">
+    <p><strong>E3 藏着一个必然出错的未来函数。</strong>原文写的是「当前 5 分钟成交量 &lt; 0.6 × 平均」。可是在 13:31 判定时，「当前这根 5 分钟」才走了 1 分钟，成交量天然只有五分之一——<strong>它会把每一根 5 分钟 K 线的开头都判成缩量</strong>。</p>
+    <p style="margin-top:8px">修法只有两种，必须二选一写死：用<strong>最近一根已经收完的</strong> 5 分钟；或者用当前根按时间比例归一（<code class="mono">V / (已过秒数 / 300)</code>），并且字段名里必须体现出来。</p>
+  </div>
+
+  <h3>还有一个原文完全没写的分支</h3>
+  <p>如果同一时刻冒出 5 个信号，但只剩 2 个仓位，买哪两个？原策略没有答案。没有打分函数，代码就会退化成「按股票代码顺序」——那意味着回测结果不可复现，而且系统性偏向 000 开头的票。</p>
+  <div class="card">
+    <div class="mono small" style="line-height:2;color:var(--tx-2)">
+      score = w₁ × 贴近 POC 的程度<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ w₂ × 缩量的程度<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ w₃ × 突破复合 VP 上界的幅度分位<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;+ w₄ × 贴近主力锚点成本的程度
+    </div>
+    <p class="small" style="margin:12px 0 0">先用等权跑通，权重留到 P2 阶段用数据标定。<strong>不要一上来就调权重</strong>——那是在还没证明策略有效之前就开始过拟合。</p>
+  </div>
+</section>
+
+<!-- ============ 5 持仓矩阵 ============ -->
+<section id="s-hold">
+  <div class="sec-head"><span class="sec-num mono">05</span><h2 class="serif">持仓管理决策矩阵</h2></div>
+  <p>T+1 制度下，买入的仓位从次日 09:30 起可卖。把一天切成三段，每段的分支必须<strong>互斥且穷尽</strong>——任何两条规则同时适用，或者任何一种价格走势没被覆盖，程序就会做出意料之外的操作。</p>
+
+  <div class="tabs" role="tablist" style="margin:20px 0 16px">
+    <button class="tab on" data-slot="A" role="tab">时段 A<span class="kbd"> 09:30–10:30</span></button>
+    <button class="tab" data-slot="B" role="tab">时段 B<span class="kbd"> 10:30–14:30</span></button>
+    <button class="tab" data-slot="C" role="tab">时段 C<span class="kbd"> 14:30–15:00</span></button>
+  </div>
+  <div id="slotBody"></div>
+
+  <div class="note">
+    <p><strong>原策略在这里有两处分支漏洞，本轮已修补。</strong></p>
+    <p style="margin-top:8px">其一，A4「未涨停且突破不了昨日价值区上界就卖 50%」和 A5「跌破昨日 POC 就清仓」在价格处于两线之间时<strong>同时部分适用</strong>，而且原文没说 A4 是 09:31 就判还是 10:30 才判——修法是把 A4 定为「10:30 这一个时点判一次」，A5 为「全时段持续监控且优先级更高」。</p>
+    <p style="margin-top:8px">其二，尾盘只写了 3 个状态，漏掉了「收在 POC 与 VAH 之间」和「收在 POC 之下但白天没触发过止损」两种真实会发生的情况。</p>
+  </div>
+</section>
+
+<!-- ============ 6 封单 ============ -->
+<section id="s-seal">
+  <div class="sec-head"><span class="sec-num mono">06</span><h2 class="serif">封单量监控与条件单</h2><span class="pill p-new">本轮补全</span></div>
+  <p>这是你问的第二个缺口，而且指得很准。原策略在这里只有一句「触及涨停但炸板放量 → 卖 50%」——「炸板」没定义，「放量」没定义，整个<strong>封板质量监控体系</strong>是空的。而在 A 股短线里，封板质量比涨停本身重要得多。</p>
+
+  <h3>先把三个词定死</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th style="width:82px">状态</th><th>可执行定义</th></tr></thead>
+      <tbody>
+        <tr><td><b>封板</b></td><td class="mono" style="font-size:13px">bid1_price == limit_up 且 seal_vol &gt; 0</td></tr>
+        <tr><td><b>炸板</b></td><td class="mono" style="font-size:13px">曾封板，之后 last_price &lt; limit_up 且<b>持续 ≥ 10 秒</b></td></tr>
+        <tr><td><b>回封</b></td><td class="mono" style="font-size:13px">炸板后重新封板，且封单额 ≥ 炸板前的 50%</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">那 10 秒是防止一笔大单瞬间砸穿后立刻回封被误判成炸板。另外「当日炸板次数」必须落库计数——<strong>炸板 2 次及以上的票当日直接拉黑</strong>，这个概念原策略里完全没有。</p>
+
+  <h3>封单衰减条件单 · 拖动试试</h3>
+  <p>持仓票封板期间，每 3 秒评估一次封单还剩多少。拖动滑块看状态机怎么走。</p>
+
+  <div class="card" style="margin-top:14px">
+    <div class="sim">
+      <div>
+        <label for="sealSlider" style="font-size:13.5px;color:var(--tx-2)">封单量相对当日峰值的剩余比例</label>
+        <input type="range" id="sealSlider" min="0" max="100" value="100" step="1" aria-describedby="sealReadout">
+        <div id="sealReadout" class="mono" style="display:flex;justify-content:space-between;font-size:13px;color:var(--tx-3)">
+          <span>0%（崩了）</span><span id="sealPct" style="color:var(--poc);font-weight:700;font-size:15px">100%</span><span>100%（峰值）</span>
+        </div>
+
+        <div style="margin-top:20px">
+          <div class="small" style="margin-bottom:6px">涨停价档位挂单量示意</div>
+          <div class="ladder" id="ladder"></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="state">
+          <div class="nm" id="stName">—</div>
+          <div class="act" id="stAct">—</div>
+        </div>
+        <div class="stateflow" id="stFlow"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="note">
+    <p><strong>为什么预警时是「挂涨停价排队」而不是直接砸盘。</strong>封板的时候涨停价上还压着巨量买单，这时挂涨停价卖出<strong>能立刻成交且一分钱不让</strong>。等封单真崩了再挂，前面已经排了几千手，根本轮不到你。这是 A 股涨停板机制里的一个具体优势，原策略完全没利用。</p>
+  </div>
+
+  <div class="note">
+    <p><strong>数据这一关比原先判断的好走得多。</strong>我初稿以为封单监控必须要五档盘口，云端拿不到就得整节砍掉。核实之后发现判断错了：</p>
+    <p style="margin-top:8px">封单量的定义是「<b>买一价</b>等于涨停价时的<b>买一挂单量</b>」——买一价量属于 <b>Level-1</b> 范畴，不是 Level-2。而 tushare 有一个叫 <code>rt_k</code> 的接口（<b>¥200/月</b>），单次调用 6000 条就能覆盖全市场，返回买一/卖一的价和量，外加开盘以来的成交笔数，而且是 token 认证——<b>完全不吃 IP 反爬</b>。这条路在初稿里被整个漏掉了。</p>
+    <p style="margin-top:8px">更省事的是，<strong>封单的日频历史已经在 rQuant 的库里了</strong>：<code>limit_list_daily</code> 有封单金额和开板次数，<code>limit_up_pool_daily</code> 有封板资金和炸板次数，<code>kpl_list_daily</code> 有封单量和最大封单。这意味着「封单强度到底能不能预测次日收益」这个问题，<b>用现成的日频数据就能先验证一遍，不用先花钱接实时</b>。</p>
+  </div>
+  <div class="note crit">
+    <p><strong>仍然成立的红线：绝不用分钟线去「猜」实时封单量。</strong>日频历史用来验证因子有没有用，实时数据用来盘中执行，两者不能互相替代。硬凑一个「近似封单量」出来，会得到一个看起来能跑、实际全是噪声的指标。</p>
+  </div>
+</section>
+
+<!-- ============ 7 缺口 ============ -->
+<section id="s-gaps">
+  <div class="sec-head"><span class="sec-num mono">07</span><h2 class="serif">全部 20 个缺口</h2></div>
+  <p>你问「类似的缺漏不确定是否还有」。有，一共 20 项——其中 <b>1 项不是原讨论的问题，而是核实代码时在 rQuant 现有实现里发现的</b>。<strong>致命</strong>指不补就写不出可复现的代码；<strong>重要</strong>指不补会导致回测与实盘分叉；<strong>次要</strong>指影响收益但不影响正确性。</p>
+  <div class="filters" id="gapFilters"></div>
+  <div id="gapList"></div>
+</section>
+
+<!-- ============ 8 可行性 ============ -->
+<section id="s-feas">
+  <div class="sec-head"><span class="sec-num mono">08</span><h2 class="serif">工程可行性</h2></div>
+
+  <h3>存储：分级之后才可行</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>数据</th><th>范围</th><th class="num">年增量</th><th>判断</th></tr></thead>
+      <tbody>
+        <tr><td>日线 OHLCV</td><td>全市场 5400</td><td class="num">~130 MB</td><td><span class="pill p-new">轻松</span></td></tr>
+        <tr><td>1 分钟 K 线</td><td>全市场 5400</td><td class="num">5.0–6.4 GB</td><td><span class="pill p-new">可行</span></td></tr>
+        <tr><td>五档盘口 3s</td><td><b>全市场</b></td><td class="num">200–320 GB</td><td><span class="pill p-crit">不可行</span></td></tr>
+        <tr><td>五档盘口 3s</td><td>候选池 200 只</td><td class="num">7.5–11.7 GB</td><td><span class="pill p-new">可行</span></td></tr>
+        <tr><td>五档盘口 3s</td><td>触发池 50 只</td><td class="num">1.9–2.9 GB</td><td><span class="pill p-new">轻松</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">以上不是拍脑袋——用真实结构的样本实测过 Parquet+zstd 落盘：五档快照 <b class="mono">32.1 B/行</b>，1 分钟 K 线 <b class="mono">15.8 B/行</b>。只落「有变化的快照」还能再砍约三分之二。</p>
+  <div class="grid g3" style="margin-top:14px">
+    <div class="card"><div class="small">云端只读副本</div><div class="mono" style="font-size:20px;font-weight:700;color:var(--poc)">7.55 GB</div><div class="small">52 张表</div></div>
+    <div class="card"><div class="small">分钟线行数</div><div class="mono" style="font-size:20px;font-weight:700;color:var(--poc)">4750 万</div><div class="small">覆盖 2025-03-28 至今</div></div>
+    <div class="card"><div class="small">云盘可用空间</div><div class="mono" style="font-size:20px;font-weight:700;color:var(--poc)">~63 GiB</div><div class="small">撑三年以上</div></div>
+  </div>
+  <div class="note"><p><strong>存储不是瓶颈，请求配额和 IP 信誉才是。</strong>但有一件事必须补：<strong>云服务器的 CPU 和内存规格在任何文档里都没有记录</strong>——DEPLOY.md、docs/deploy、README 全无。P0 得 ssh 上去跑一次 <code>nproc &amp;&amp; free -h &amp;&amp; df -h</code> 补进部署文档。</p></div>
+
+  <h3>算力：瓶颈不在 CPU</h3>
+  <p>VP 计算本质是按价格分桶的 group-by 聚合，DuckDB 的向量化引擎处理这个量级是秒级的。真正的瓶颈是<strong>数据获取的网络 IO 和 API 限频</strong>。</p>
+  <p>唯一需要小心的设计点：60 日复合 VP 必须<strong>增量滚动</strong>（每天加一天、减一天），不能每天全量重算——全量是 5400 只 × 60 天 × 240 根 ≈ 7.8 亿行。</p>
+
+  <h3>接口封禁：已经用生产事故验证过了</h3>
+  <div id="feasSources"></div>
+
+  <h3 id="hybridHead">推荐方案：纯云端，走 <code>rt_k</code></h3>
+  <div class="card">
+    <div class="mono" style="font-size:13px;line-height:1.9;color:var(--tx-2);overflow-x:auto">
+云端服务器（唯一运行环境）<br>
+&nbsp;&nbsp;├─ tushare stk_mins / rt_min ──► 分钟线（现状，已稳定）<br>
+&nbsp;&nbsp;├─ tushare rt_k ¥200/月 ──────► 全市场买一/卖一价量 + 成交笔数<br>
+&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─ 封单量 = 买一价等于涨停价时的买一挂单量<br>
+&nbsp;&nbsp;├─ VP 计算 + 状态机 + 回测<br>
+&nbsp;&nbsp;└─ 告警推送（复用现有通道）
+    </div>
+    <p style="margin:14px 0 0"><strong>不需要家宽混合架构，不需要五档，不需要代理，月成本 ¥200。</strong></p>
+    <p class="small" style="margin:10px 0 0">我初稿建议的「家里 Mac 采集五档、加密上行云端」这套混合架构<strong>作废</strong>，三个理由：封单量只要买一档而 <code>rt_k</code> 就有；rQuant 的本地主库已在 2026-07-27 全量迁云并删除，本地 <code>data/</code> 只剩 76 MB，本地已经不再是数据的一极；引入家宽链路就得处理断网降级、时钟同步、上行加密三件事，为了「五档比一档多四档」这点增量不划算。</p>
+    <p class="small" style="margin:8px 0 0">保留一个前提：如果 P4 实测发现买一档不足以刻画封板质量（比如需要看委托队列区分「一笔大单」还是「很多小单」），再重新评估五档，届时家宽方案可以捡回来。</p>
+  </div>
+
+  <div class="note crit">
+    <p><strong>顺带发现一个跟本策略无关、但属于生产风险的事：本地热备当前是失效的。</strong><code>logs/sync-from-cloud.log</code> 尾部显示近 25 次同步<strong>全部超时失败</strong>（每次拉到 5.7 亿～15.5 亿字节就断）。也就是说 07-27 全量迁云之后，云端那 7.55 GB 数据目前没有可用的本地备份。建议单独处理。</p>
+  </div>
+</section>
+
+<!-- ============ 9 计划 ============ -->
+<section id="s-plan">
+  <div class="sec-head"><span class="sec-num mono">09</span><h2 class="serif">分阶段计划与闸门</h2></div>
+  <p>每个阶段都有一道<strong>不过就停</strong>的闸门。最重要的是 P0 和 P2——它们花的时间最少，否定得最彻底。</p>
+  <div class="card" style="margin-top:16px" id="phases"></div>
+
+  <div class="note crit">
+    <p><strong>P0 为什么用日线代理而不是分钟线。</strong>云端 <code>minute_bar</code> 覆盖 <span class="mono">2025-03-28</span> 至今，约 16 个月。按「开发集 / 验证集 / 盲测集」三段切分，每段不足 6 个月，统计功效严重不足。而日线已经回补到 2020-08-24，足以先回答那个最该先问的问题：<strong>这套条件一年到底触发几次？</strong>如果一年不到 100 次，样本量根本证明不了任何事，项目直接终止，省下后面十几周。</p>
+    <p style="margin-top:8px">这个做法 rQuant 已经验证可行——爆量因子那次就是用日线代理跑了 25 个交易日、2097 条信号，把「前几日无爆量」这个听起来很有道理的因子直接证伪了。</p>
+  </div>
+</section>
+
+<!-- ============ 10 决策 ============ -->
+<section id="s-decide">
+  <div class="sec-head"><span class="sec-num mono">10</span><h2 class="serif">需要你拍板的三件事</h2></div>
+  <div class="card">
+    <div class="verdict">
+      <span class="vmark v-mid mono">D1</span>
+      <div>
+        <b>交付形态：信号提醒，还是全自动实盘？</b>
+        <p class="small" style="margin:5px 0 0">决定整个系统的严格程度。信号提醒意味着执行价与信号价必然有偏差，回测必须建模「信号后 N 分钟的成交价」；全自动实盘需要券商接口，mac 环境下选择极少，且合规与资金风险陡增。<strong>建议信号提醒。</strong></p>
+      </div>
+    </div>
+    <div class="verdict">
+      <span class="vmark v-mid mono">D2</span>
+      <div>
+        <b>封单监控的数据从哪来？</b>
+        <p class="small" style="margin:5px 0 0"><strong>建议接 tushare <code>rt_k</code>，¥200/月。</strong>这个选项在我初稿里被完全漏掉了——当时以为必须要五档，而云端拿不到五档，于是只能在「砍掉封单监控」和「先解决数据源」之间二选一。实际上封单量只需要买一档，<code>rt_k</code> 一次调用就能拿全市场，还不吃 IP 反爬。<br><br>而且不急着付钱：封单的日频历史已经在库里，<strong>P2 就能先用它验证这个因子到底有没有用</strong>，验证通过再买。</p>
+      </div>
+    </div>
+    <div class="verdict">
+      <span class="vmark v-mid mono">D3</span>
+      <div>
+        <b>项目归属：塞进 rQuant，还是新开一个？</b>
+        <p class="small" style="margin:5px 0 0"><strong>建议留在 rQuant 仓库内，但用独立的写库和独立的 systemd unit 做运行时隔离。</strong></p>
+        <p class="small" style="margin:8px 0 0">这里我改了主意。初稿判断是「新开项目」，理由是这套策略占了 rQuant 三条禁区。核实代码之后发现不成立：<strong>rQuant 早就在算 VP 了</strong>（<code>volume_profile.py</code> 551 行，POC、价值区、支撑阻力、风控计划齐全，已接入筛选）；<strong>封单的日频数据也早就在库里</strong>；而且<strong>本地主库已在 07-27 全量迁云删除</strong>，初稿设想的「新项目 ATTACH 本地只读副本」这个方案，前提已经没了。</p>
+        <p class="small" style="margin:8px 0 0">新开项目意味着要么复制 VP 代码（两份实现必然分叉），要么远程调用（徒增复杂度）。<strong>但运行时必须隔离</strong>——独立写库 <code>rvp.duckdb</code>、只读 ATTACH 主库副本、独立 systemd unit 错开时间窗、独立通知场景、独立 CLI 命名空间。这五条缺一条就会重演 DuckDB 写锁事故。</p>
+        <p class="small" style="margin:8px 0 0">代价是 <code>CLAUDE.md</code> 的边界守则要修订一条：买一档挂单量（Level-1 范畴）用于封板质量判断属于例外，逐笔和十档仍然不做。<strong>这是一次有理由、写明白的边界修订，不是无声扩张。</strong></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p style="max-width:68ch">配套的完整规格文档（数据字典、全分支矩阵、回测底座契约、实验协议、参数总表）见 <code>docs/vp-strategy/VP-STRATEGY-SPEC.md</code>。<br>
+  本页所有标注 ⚠️ 的参数均为待标定占位符，P0 阶段前不得写死进代码。</p>
+</footer>
+
+</main>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---------- 章节导航（左侧密度条编码该节的确定性规则条数） ---------- */
+var SECTIONS=[
+  {id:"s-hero",  t:"总览",            n:0},
+  {id:"s-vp",    t:"01 先看懂这张图",  n:9},
+  {id:"s-day",   t:"02 策略的一天",    n:11},
+  {id:"s-pool",  t:"03 四级订阅池",    n:16},
+  {id:"s-entry", t:"04 买入判定",      n:10},
+  {id:"s-hold",  t:"05 持仓决策矩阵",  n:15},
+  {id:"s-seal",  t:"06 封单量监控",    n:14},
+  {id:"s-gaps",  t:"07 全部 20 个缺口",n:20},
+  {id:"s-feas",  t:"08 工程可行性",    n:8},
+  {id:"s-plan",  t:"09 阶段与闸门",    n:7},
+  {id:"s-decide",t:"10 待你拍板",      n:3}
+];
+var maxN=0; SECTIONS.forEach(function(s){ if(s.n>maxN) maxN=s.n; });
+var railList=document.getElementById("railList");
+SECTIONS.forEach(function(s){
+  var b=document.createElement("button");
+  b.className="rung"; b.dataset.target=s.id;
+  b.innerHTML='<span>'+s.t+'</span>'+(s.n?'<span class="cnt" style="width:'+Math.round(s.n/maxN*100)+'%"></span>':'');
+  if(s.n) b.title=s.n+" 条确定性规则";
+  b.addEventListener("click",function(){
+    var el=document.getElementById(s.id);
+    if(el) el.scrollIntoView({block:"start"});
+  });
+  railList.appendChild(b);
+});
+var rungs=[].slice.call(railList.querySelectorAll(".rung"));
+if("IntersectionObserver" in window){
+  var io=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){
+        rungs.forEach(function(r){ r.classList.toggle("on", r.dataset.target===e.target.id); });
+      }
+    });
+  },{rootMargin:"-15% 0px -70% 0px"});
+  SECTIONS.forEach(function(s){ var el=document.getElementById(s.id); if(el) io.observe(el); });
+}
+
+/* ---------- VP 直方图 ---------- */
+function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+/* 确定性伪随机，保证每次渲染形状一致 */
+function mk(seed){ var s=seed; return function(){ s=(s*1103515245+12345)&0x7fffffff; return s/0x7fffffff; }; }
+
+var VP_MODES={
+  session:{
+    label:"单日 VP · Session Profile",
+    cap:"当天 09:30–15:00 的成交量按价格堆叠。用于日内战术——找当天的支撑与阻力，判断市场是平衡还是失衡。",
+    seed:7, peaks:[{c:.52,w:.11,h:1},{c:.74,w:.07,h:.42}], lo:11.20, hi:12.60
+  },
+  composite:{
+    label:"复合 VP · 60 个交易日",
+    cap:"最近 60 个交易日合成一张。用于波段判断——这里的 POC 是整个箱体的中枢轴，突破它意味着价格进入新的价值发现区。必须增量滚动更新，不能每天全量重算。",
+    seed:23, peaks:[{c:.34,w:.13,h:1},{c:.62,w:.10,h:.72},{c:.85,w:.06,h:.30}], lo:9.80, hi:13.40
+  },
+  anchored:{
+    label:"锚点 VP · 起爆日至今",
+    cap:"从「涨幅 >7% 且成交量 ≥ 2 倍均量」的那根大阳线起算。目的是看清主力在哪个价格区间完成的换手。锚点一旦选定就不再变更——否则 POC 每天漂移，止损线跟着乱跳。",
+    seed:41, peaks:[{c:.28,w:.09,h:1},{c:.55,w:.12,h:.86}], lo:10.60, hi:13.00
+  }
+};
+
+var vpMode="session";
+var cv=document.getElementById("vpCanvas");
+var ctx=cv.getContext("2d");
+var vpHi=null;
+var VP_KEYS=[
+  {k:"poc", nm:"POC · 成交最密集的价位",   d:"整段时间里成交量最大的那个价格。价格回踩 POC 往往是最佳卡位点。"},
+  {k:"va",  nm:"价值区 VA（VAH / VAL）",   d:"从 POC 向两侧扩展，直到覆盖 70% 成交量。上界叫 VAH，下界叫 VAL。价格在价值区内 = 平衡，冲出去 = 失衡。"},
+  {k:"lvn", nm:"LVN · 低成交凹陷区",       d:"两座「山」之间的谷。成交极少说明价格在这里停留时间短，反弹到这里容易被挡住——策略拿它当第一止盈点。"},
+  {k:"hvn", nm:"HVN · 高成交节点",         d:"局部的成交高峰，是识别 LVN 的参照物：一个谷必须两侧各有一座山，才算真正的 LVN。"}
+];
+
+function buildProfile(mode){
+  var m=VP_MODES[mode], rnd=mk(m.seed), N=48, arr=[];
+  for(var i=0;i<N;i++){
+    var x=i/(N-1), v=0;
+    m.peaks.forEach(function(p){ v+=p.h*Math.exp(-Math.pow((x-p.c)/p.w,2)); });
+    v+= (rnd()*0.13);
+    arr.push(Math.max(v,0.012));
+  }
+  return arr;
+}
+
+function computeVA(arr){
+  var total=arr.reduce(function(a,b){return a+b;},0);
+  var pi=arr.indexOf(Math.max.apply(null,arr));
+  var lo=pi, hi=pi, acc=arr[pi];
+  while(acc<total*0.7 && (lo>0||hi<arr.length-1)){
+    var up = hi<arr.length-1 ? arr[hi+1] : -1;
+    var dn = lo>0 ? arr[lo-1] : -1;
+    if(up>=dn){ hi++; acc+=arr[hi]; } else { lo--; acc+=arr[lo]; }
+  }
+  return {poc:pi, val:lo, vah:hi};
+}
+
+function findLVN(arr,va){
+  /* 在 POC 上方找一个真正的谷：两侧各有一个相对高点 */
+  var best=null;
+  for(var i=va.vah+2;i<arr.length-2;i++){
+    if(arr[i]<arr[i-1] && arr[i]<=arr[i+1] && arr[i]<arr[va.poc]*0.3){
+      var rightMax=0;
+      for(var j=i+1;j<arr.length;j++) if(arr[j]>rightMax) rightMax=arr[j];
+      if(rightMax>arr[i]*2.2){ best=i; break; }
+    }
+  }
+  if(best===null){
+    for(var k=va.vah+1;k<arr.length-1;k++){ if(arr[k]<arr[va.poc]*0.28){ best=k; break; } }
+  }
+  return best;
+}
+
+function drawVP(){
+  var m=VP_MODES[vpMode];
+  var arr=buildProfile(vpMode), va=computeVA(arr), lvn=findLVN(arr,va);
+  var W=cv.width, H=cv.height, padL=64, padR=22, padT=16, padB=30;
+  var plotW=W-padL-padR, plotH=H-padT-padB;
+  var maxV=Math.max.apply(null,arr);
+  var barH=plotH/arr.length;
+
+  var cSurf=css("--surface"), cLine=css("--line-soft"), cTx3=css("--tx-3"),
+      cPoc=css("--poc"), cUp=css("--up"), cDown=css("--down"), cTx2=css("--tx-2");
+
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle=cSurf; ctx.fillRect(0,0,W,H);
+
+  /* 价值区底纹 */
+  var vaTop=padT+(arr.length-1-va.vah)*barH;
+  var vaBot=padT+(arr.length-1-va.val+1)*barH;
+  ctx.fillStyle=cPoc; ctx.globalAlpha=0.07;
+  ctx.fillRect(padL-8,vaTop,plotW+8,vaBot-vaTop);
+  ctx.globalAlpha=1;
+
+  /* 柱子 */
+  for(var i=0;i<arr.length;i++){
+    var y=padT+(arr.length-1-i)*barH;
+    var w=arr[i]/maxV*plotW;
+    var inVA = i>=va.val && i<=va.vah;
+    var isPOC = i===va.poc;
+    var isLVN = lvn!==null && i===lvn;
+    ctx.globalAlpha = (vpHi===null)?1:( (vpHi==="poc"&&isPOC)||(vpHi==="va"&&inVA)||(vpHi==="lvn"&&isLVN)||(vpHi==="hvn"&&arr[i]>maxV*0.6) ?1:0.2 );
+    ctx.fillStyle = isPOC?cPoc : isLVN?cDown : inVA?cPoc : cTx3;
+    if(!isPOC && !isLVN) ctx.globalAlpha *= inVA?0.55:0.38;
+    ctx.fillRect(padL,y+barH*0.14,w,barH*0.72);
+  }
+  ctx.globalAlpha=1;
+
+  /* 价格轴 */
+  ctx.font='11px ui-monospace, Menlo, monospace';
+  ctx.fillStyle=cTx3; ctx.textAlign="right";
+  for(var t=0;t<=4;t++){
+    var idx=Math.round(t/4*(arr.length-1));
+    var py=padT+(arr.length-1-idx)*barH+barH/2;
+    var price=(m.lo+(m.hi-m.lo)*(idx/(arr.length-1))).toFixed(2);
+    ctx.fillText(price,padL-10,py+3.5);
+    ctx.strokeStyle=cLine; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL-5,Math.round(py)+.5); ctx.lineTo(padL,Math.round(py)+.5); ctx.stroke();
+  }
+
+  function tag(idx,text,color,dashed){
+    var py=padT+(arr.length-1-idx)*barH+barH/2;
+    ctx.strokeStyle=color; ctx.lineWidth=1.5;
+    if(dashed) ctx.setLineDash([4,3]); else ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(padL,Math.round(py)+.5); ctx.lineTo(W-padR,Math.round(py)+.5); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.textAlign="right"; ctx.font='600 11px ui-monospace, Menlo, monospace';
+    ctx.fillStyle=color;
+    var tw=ctx.measureText(text).width;
+    ctx.fillStyle=cSurf; ctx.fillRect(W-padR-tw-7,py-8,tw+7,15);
+    ctx.fillStyle=color; ctx.fillText(text,W-padR-3,py+3.5);
+  }
+  var dim = function(k){ return vpHi===null||vpHi===k; };
+  if(dim("va")){ tag(va.vah,"VAH",cPoc,true); tag(va.val,"VAL",cPoc,true); }
+  if(dim("poc")) tag(va.poc,"POC",cPoc,false);
+  if(lvn!==null && dim("lvn")) tag(lvn,"LVN",cDown,true);
+
+  ctx.textAlign="left"; ctx.font='11px ui-monospace, Menlo, monospace'; ctx.fillStyle=cTx3;
+  ctx.fillText("成交量 →",padL,H-9);
+  ctx.textAlign="right"; ctx.fillText("价格 ↑",padL-10,padT-3);
+
+  document.getElementById("vpCaption").textContent=m.cap;
+}
+
+var vpLegend=document.getElementById("vpLegend");
+VP_KEYS.forEach(function(k){
+  var b=document.createElement("button");
+  var col = k.k==="lvn" ? "var(--down)" : k.k==="hvn" ? "var(--tx-3)" : "var(--poc)";
+  b.innerHTML='<span class="swatch" style="background:'+col+'"></span><span><b>'+k.nm+'</b><br><span style="font-size:12.5px;color:var(--tx-3)">'+k.d+'</span></span>';
+  b.addEventListener("mouseenter",function(){ vpHi=k.k; b.classList.add("on"); drawVP(); });
+  b.addEventListener("mouseleave",function(){ vpHi=null; b.classList.remove("on"); drawVP(); });
+  b.addEventListener("focus",function(){ vpHi=k.k; b.classList.add("on"); drawVP(); });
+  b.addEventListener("blur",function(){ vpHi=null; b.classList.remove("on"); drawVP(); });
+  vpLegend.appendChild(b);
+});
+[].slice.call(document.querySelectorAll("[data-vp]")).forEach(function(t){
+  t.addEventListener("click",function(){
+    document.querySelectorAll("[data-vp]").forEach(function(x){x.classList.remove("on")});
+    t.classList.add("on"); vpMode=t.dataset.vp; drawVP();
+  });
+});
+
+/* ---------- 时间轴 ---------- */
+var TL=[
+  {t:"09:15",l:"竞价开始",b:"<b>可挂单、也可撤单。</b>此段的竞价量价含大量虚假撤单诱骗，<b>只观察不决策</b>，不得作为任何信号的输入。<br><br>原策略的时间轴从 09:30 开始，整个集合竞价段是空白的。"},
+  {t:"09:20",l:"不可撤单",b:"进入不可撤单阶段，竞价数据开始可信。此时计算竞价量比、竞价涨幅。"},
+  {t:"09:25",l:"开盘价确定",b:"集合竞价撮合完成，<b>开盘价此刻已经定了</b>。立即计算：开盘价 vs 昨日 POC、开盘价 vs 昨收。"},
+  {t:"09:25<br>–09:30",l:"静默决策窗",b:"不可交易的 5 分钟，纯决策窗：<br>· 预判 A5——若低开且开盘价跌破昨日 POC，<b>09:30 开盘即清仓</b>，不等盘中<br>· 标记高开 &gt;5% 的票，当日禁止加仓、新信号不进触发池"},
+  {t:"09:30",l:"连续竞价",b:"执行静默窗定下的动作。持仓进入<b>时段 A</b> 决策矩阵（A1–A5，五分支互斥且穷尽）。"},
+  {t:"10:30",l:"A4 判定点",b:"时段 A 结束。<b>A4「冲高受阻于昨日 VAH 就卖 50%」在这一个时点判定一次</b>——原策略没说这条什么时候判，是本轮补的。<br><br>此后进入时段 B，重点是硬止损与跟踪止损。"},
+  {t:"13:30",l:"买入窗开",b:"唯一的买入时间窗开启。选在下午是因为 T+1——当天买当天不能卖，越晚买承担的当日波动越小。<br><br>六个条件 E1–E6 同时满足才触发。"},
+  {t:"14:30",l:"买入窗关",b:"不再产生新的买入信号。持仓进入<b>时段 C</b> 尾盘终局判定（五分支）。"},
+  {t:"14:45",l:"加仓判定",b:"当日已建仓 10% 的票做一次性判定：站上今日实时 POC 则加到 20%，否则维持 10%。<br><br>高位放量长上影（C2）也在此刻清仓。"},
+  {t:"14:50",l:"尾盘清仓",b:"所有「尾盘定型类」清仓动作统一定在这里，<b>留足 7 分钟缓冲</b>。"},
+  {t:"14:57<br>–15:00",l:"收盘竞价",b:"<b>沪深两市的收盘集合竞价：只能挂单，不能撤单，没有连续竞价。</b><br><br>这意味着此时段内<b>无法按市价即时成交</b>——挂出去就是挂出去了，成交价等于收盘价，不可反悔。<br><br>所以所有需要即时成交的动作（硬止损、封单崩盘转市价）必须在 <b>14:56:30 之前</b>发出，否则顺延次日。回测引擎也必须把这三分钟建模为「只能以收盘价成交」。<br><br><b>这一条是原策略完全缺失的（缺口 G16）。</b>"}
+];
+var tlTrack=document.getElementById("tlTrack"), tlBody=document.getElementById("tlBody");
+TL.forEach(function(x,i){
+  var b=document.createElement("button");
+  b.className="tl-btn"+(i===0?" on":""); b.setAttribute("role","tab");
+  b.innerHTML='<span class="t">'+x.t+'</span><span class="l">'+x.l+'</span>';
+  b.addEventListener("click",function(){
+    tlTrack.querySelectorAll(".tl-btn").forEach(function(y){y.classList.remove("on")});
+    b.classList.add("on");
+    tlBody.innerHTML='<p style="max-width:64ch">'+x.b+'</p>';
+  });
+  tlTrack.appendChild(b);
+});
+tlBody.innerHTML='<p style="max-width:64ch">'+TL[0].b+'</p>';
+
+/* ---------- 订阅池 ---------- */
+var POOLS=[
+  {lvl:"L0",nm:"全市场",sz:"~5400 只",bars:[3,3,3,3,3],
+   data:"日线 OHLCV",freq:"1 次 / 日",vol:"~0.5 MB / 日",
+   inn:"全部 A 股",out:"ST / 退市 / 上市不足 90 天 / 停牌 / 昨日一字板"},
+  {lvl:"L1",nm:"候选池 Watch",sz:"50–300 只",bars:[10,14,9,12,8],
+   data:"1 分钟 K 线",freq:"240 次 / 日",vol:"0.5–3 MB / 日",
+   inn:"盘前 09:15 一次性算出：站上 60 日复合 VP 上界 + 距锚点成本 ≤15% + 近 15 日有起爆大阳线",
+   out:"跌破复合 VP 中枢 / 停牌 / 涨停封板（买不进）→ 当日不再回来"},
+  {lvl:"L2",nm:"触发池 Focus",sz:"5–30 只",bars:[18,24,21,26,20],
+   data:"五档盘口快照",freq:"每 3 秒（4800 次 / 日）",vol:"5–30 MB / 日",
+   inn:"盘中每分钟判一次：价格进入昨日 POC ±1.5% 缓冲带",
+   out:"连续 30 分钟脱离 ±2.5% 带（滞回）→ 降回 L1，且 15 分钟内不得再升级"},
+  {lvl:"L3",nm:"持仓池 Position",sz:"0–4 只",bars:[26,22,28,25,27],
+   data:"五档盘口 + 委托队列",freq:"每 3 秒",vol:"≤8 MB / 日",
+   inn:"买入信号发出后立即升级",
+   out:"清仓后 T+1 日收盘退订（多留一天用于复盘卖出质量）"}
+];
+var poolsEl=document.getElementById("pools"), poolDetail=document.getElementById("poolDetail"), curPool=2;
+POOLS.forEach(function(p,i){
+  var b=document.createElement("button");
+  b.className="pool"+(i===curPool?" on":"");
+  b.innerHTML='<span class="lvl">'+p.lvl+'</span>'+
+    '<span><span class="nm">'+p.nm+'</span><span class="sz">'+p.sz+' · '+p.data+' · '+p.freq+'</span></span>'+
+    '<span class="bar">'+p.bars.map(function(h){return '<i style="height:'+h+'px"></i>'}).join("")+'</span>';
+  b.addEventListener("click",function(){
+    curPool=i;
+    poolsEl.querySelectorAll(".pool").forEach(function(x){x.classList.remove("on")});
+    b.classList.add("on"); renderPool();
+  });
+  poolsEl.appendChild(b);
+});
+function renderPool(){
+  var p=POOLS[curPool];
+  poolDetail.innerHTML=
+    '<div style="font-size:12px;letter-spacing:.1em;color:var(--poc);font-weight:700;margin-bottom:6px">'+p.lvl+' · '+p.nm+'</div>'+
+    '<div class="grid g2">'+
+      '<div><h4 style="margin-top:0">怎么进来</h4><p class="small" style="margin:0">'+p.inn+'</p></div>'+
+      '<div><h4 style="margin-top:0">怎么出去</h4><p class="small" style="margin:0">'+p.out+'</p></div>'+
+    '</div>'+
+    '<hr class="hr" style="margin:16px 0">'+
+    '<div class="grid g3">'+
+      '<div><div class="small">订阅数据</div><div style="font-weight:600;font-size:14.5px">'+p.data+'</div></div>'+
+      '<div><div class="small">频率</div><div style="font-weight:600;font-size:14.5px" class="mono">'+p.freq+'</div></div>'+
+      '<div><div class="small">全池日数据量</div><div style="font-weight:600;font-size:14.5px" class="mono">'+p.vol+'</div></div>'+
+    '</div>';
+}
+renderPool();
+
+/* ---------- 持仓矩阵 ---------- */
+var SLOTS={
+A:{note:"开盘冲高期。五个分支互斥且穷尽——A5 全时段持续监控且优先级最高，A4 只在 10:30 判一次。",
+ rows:[
+  ["A1","封涨停 且 未炸板","持有不动，转入封单监控","最强形态，享受涨停溢价","ok"],
+  ["A2","曾触及涨停但已炸板","卖出 50%","有冲高意愿但高位形成巨量抛压","mid"],
+  ["A3","未涨停，价格 &gt; 昨日 VAH","持有，止损位抬升至昨日 POC","已进入向上失衡扩展阶段","ok"],
+  ["A4","未涨停，价格在 [昨日 POC, 昨日 VAH] 之间","<b>10:30 时点</b>卖出 50%","昨日价值区上界构成有效阻力","mid"],
+  ["A5","价格 &lt; 昨日 POC","清仓 100%","昨日买入资金全部被套，快速离场","no"]
+ ]},
+B:{note:"盘中震荡期。重点是硬止损与异常事件。注意 B1 与 B3 的冲突处理：已经止损卖了就是卖了，回封也不追。",
+ rows:[
+  ["B1","价格 &lt; 锚点 POC × 0.985","清仓 100%（硬止损）","跌破主力成本区，逻辑破产","no"],
+  ["B2","已减仓 50% 且 跌破今日实时 POC 超 15 分钟","清掉剩余 50%","今日筹码中枢失守","no"],
+  ["B3","盘中重新封住涨停","撤销所有卖单，锁仓持有","二次攻板成功","ok"],
+  ["B4","触及上方 LVN 下沿","卖出 50%（已卖过则清仓）","筹码真空区构成强阻力","mid"],
+  ["B5","以上都不满足","无动作","筹码正常交换区间","ok"]
+ ]},
+C:{note:"尾盘终局。原策略只有 3 个分支，漏了两种真实会发生的情况——这里补成 5 分支穷尽。",
+ rows:[
+  ["C1","最终封死涨停","锁仓持有至次日","最强形态","ok"],
+  ["C2","高位放量长上影：上影占比 &gt;0.6 且 换手 &gt;20% 且 POC 在当日价格区间上 1/3","14:45 清仓 100%","主力高位派发换手","no"],
+  ["C3","平稳收于昨日 VAH 之上","持有，止损线更新至今日 VAL","趋势健康","ok"],
+  ["C4","收于 [昨日 POC, 昨日 VAH] 之间","持有，止损线维持不变","<b>原策略缺失的分支</b>","mid"],
+  ["C5","收于昨日 POC 之下","14:50 清仓 100%","<b>原策略缺失的分支</b>","no"]
+ ]}
+};
+function renderSlot(k){
+  var s=SLOTS[k];
+  var h='<p class="small" style="max-width:68ch;margin-bottom:12px">'+s.note+'</p><div class="tbl-wrap"><table><thead><tr><th style="width:44px">#</th><th>条件</th><th>动作</th><th>逻辑</th></tr></thead><tbody>';
+  s.rows.forEach(function(r){
+    var col = r[4]==="no" ? "var(--up)" : r[4]==="ok" ? "var(--down)" : "var(--poc)";
+    h+='<tr><td class="mono" style="color:'+col+';font-weight:700">'+r[0]+'</td><td>'+r[1]+'</td><td><b>'+r[2]+'</b></td><td class="small">'+r[3]+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  document.getElementById("slotBody").innerHTML=h;
+}
+renderSlot("A");
+[].slice.call(document.querySelectorAll("[data-slot]")).forEach(function(t){
+  t.addEventListener("click",function(){
+    document.querySelectorAll("[data-slot]").forEach(function(x){x.classList.remove("on")});
+    t.classList.add("on"); renderSlot(t.dataset.slot);
+  });
+});
+
+/* ---------- 封单模拟器 ---------- */
+var SEAL_STATES=[
+  {k:"SEALED",nm:"封板持有",act:"零动作。封单充足，享受涨停溢价，继续持有到次日。",lo:75,hi:100},
+  {k:"WARN",  nm:"预警 · 挂涨停价排队",act:"在涨停价挂出卖单排队，<b>不砸盘</b>。此时涨停价上还压着巨量买单，挂涨停价能立刻成交且一分钱不让——等封单真崩了再挂就排不上队了。",lo:30,hi:75},
+  {k:"FLUSH", nm:"撤单转市价",act:"撤掉涨停价挂单，改以买一价 / 对手价卖出剩余仓位的 50%。封单已经衰减超过 70%，再等就要跟着炸板一起往下走。",lo:10,hi:30},
+  {k:"DUMP",  nm:"清仓",act:"封板彻底崩溃，市价清掉全部剩余仓位。同时该票当日拉黑，不再产生任何买入信号。",lo:0,hi:10}
+];
+var stFlow=document.getElementById("stFlow");
+SEAL_STATES.forEach(function(s){
+  var d=document.createElement("div");
+  d.className="sf"; d.dataset.k=s.k;
+  d.innerHTML='<b class="mono" style="color:var(--poc)">'+s.k+'</b>'+s.nm;
+  stFlow.appendChild(d);
+});
+var ladderEl=document.getElementById("ladder");
+var LADDER=[{p:"11.55",lim:true,base:100},{p:"11.54",base:22},{p:"11.53",base:16},{p:"11.52",base:12},{p:"11.51",base:9}];
+LADDER.forEach(function(r){
+  var d=document.createElement("div");
+  d.className="rung2"+(r.lim?" lim":"");
+  d.innerHTML='<span class="px">'+r.p+(r.lim?'\u00a0涨停':'')+'</span><span class="qb" style="width:'+r.base+'%"></span>';
+  ladderEl.appendChild(d);
+});
+var slider=document.getElementById("sealSlider");
+function updSeal(){
+  var v=+slider.value;
+  document.getElementById("sealPct").textContent=v+"%";
+  var st=SEAL_STATES.find(function(s){ return v>=s.lo && v<=s.hi; }) || SEAL_STATES[SEAL_STATES.length-1];
+  document.getElementById("stName").textContent=st.nm;
+  document.getElementById("stAct").innerHTML=st.act;
+  stFlow.querySelectorAll(".sf").forEach(function(d){ d.classList.toggle("on", d.dataset.k===st.k); });
+  var bars=ladderEl.querySelectorAll(".qb");
+  bars[0].style.width=Math.max(v,2)+"%";
+  var col = st.k==="SEALED" ? "var(--up)" : st.k==="WARN" ? "var(--poc)" : "var(--down)";
+  bars[0].style.background=col;
+}
+slider.addEventListener("input",updSeal);
+updSeal();
+
+/* ---------- 缺口清单 ---------- */
+var GAPS=[
+ {n:"G1", s:"crit",t:"VP 的分桶宽度、成交量分配算法、价值区扩展算法全部未定义",d:"POC / VAH / VAL 被反复用作买卖点，却从没说过怎么算。价格分几档？一分钟的成交量怎么摊到各个价位？两个人写出来的结果不同 = 不可复现。"},
+ {n:"G2", s:"crit",t:"复权口径未定义；用前复权则跨日 VP 含未来函数",d:"前复权序列会随每次除权改写历史价格——今天算的 60 日 POC 是 12.50，除权后重算同一段历史变成 12.05。这等于用了未来才知道的除权因子。死规定：一律用不复权 + 除权日重置锚点。"},
+ {n:"G3", s:"crit",t:"LVN（第一止盈点）从未定义",d:"策略拿 LVN 当第一止盈点，但「什么算 LVN」通篇没写。需要：局部极小值 + 低于相邻高点的一定比例 + 最小宽度 + 两侧各有一座山。"},
+ {n:"G4", s:"crit",t:"「缩量」用了未走完的 5 分钟，必然误判",d:"在 13:31 判定时当前这根 5 分钟才走了 1 分钟，成交量天然只有五分之一——它会把每根 K 线的开头都判成缩量。必须改用已收盘的上一根，或按时间比例归一。"},
+ {n:"G5", s:"crit",t:"数据订阅生命周期缺失 → 存储与配额不可行",d:"不分级则五档盘口年增 250 GB，单机直接出局。订阅分级不是优化项，是可行性前提。"},
+ {n:"G20",s:"crit",t:"rQuant 现有的价值区算法不标准，双峰形态下会系统性拉宽",d:"这一条不是原讨论的问题，是核实代码时在 <code>volume_profile.py</code> 里发现的。现有实现把所有价格档按成交量从大到小排序，累加到 70% 就停，然后取被选中档位的最低价和最高价当作价值区上下界——<b>但被选中的档位不要求连续</b>。<br><br>价格呈双峰分布时（箱体上沿和下沿各一个峰，这在震荡行情里极其常见），排序法会同时选中两个峰，然后把中间那段成交极少的区域也一并圈进「价值区」。标准算法是从 POC 出发逐档向两侧扩展，保证价值区是连续区间。<br><br><b>这个缺陷影响的不只是新策略，还影响 rQuant 当前已经在用的风控计划。</b>修复时必须重跑依赖它的历史实验。"},
+ {n:"G6", s:"crit",t:"封单量监控 / 炸板定义 / 条件单状态机全缺",d:"原文只有一句「炸板放量就卖 50%」，炸板和放量都没定义，整个封板质量监控体系是空的。"},
+ {n:"G7", s:"imp", t:"集合竞价段（09:15–09:30）完全缺失",d:"开盘价 09:25 就定了，09:30 才能交易，中间 5 分钟是纯决策窗。而且 09:20 之前的竞价数据含大量虚假撤单，不能当信号用。"},
+ {n:"G8", s:"imp", t:"涨跌停价的计算规则与分档未定义",d:"主板 10%、创业科创 20%、ST 5%、北交所 30%、新股前 5 日无限制。四舍五入到分（不是截断）。差一分钱就会让「临近涨停」判错。而且 ST 必须查名称，不能只看代码。"},
+ {n:"G9", s:"imp", t:"多信号竞争时的排序打分函数缺失",d:"5 个信号只剩 2 个仓位时买哪两个？没有打分函数，代码会退化成按代码顺序——回测不可复现，且系统性偏向某类代码。"},
+ {n:"G10",s:"imp", t:"状态机未定义持久化，进程重启后状态丢失",d:"每只票的状态、已减仓比例、已抬升的止损位、当日炸板次数必须实时落库。rQuant 已经因为累计量只在内存，重启后归零丢过一整个早盘。"},
+ {n:"G11",s:"imp", t:"时段 A 的 A4 / A5 分支重叠且未定义判定时刻",d:"价格在昨日 POC 与 VAH 之间时两条规则同时部分适用，而且原文没说 A4 什么时候判。"},
+ {n:"G12",s:"imp", t:"尾盘时段只有 3 个分支，未穷尽",d:"漏了「收在 POC 与 VAH 之间」和「收在 POC 之下但白天没触发过止损」两种真实会发生的情况。"},
+ {n:"G13",s:"imp", t:"成交假设、手续费、滑点、涨跌停成交模拟全缺",d:"「回调到 POC 就买」——用什么价成交？触发价还是下一分钟开盘？涨停买不进、跌停卖不出要不要模拟排队？滑点用百分比会系统性低估低价股的摩擦（A 股最小变动 0.01 元，3 元股一跳就是 0.33%）。"},
+ {n:"G14",s:"imp", t:"大盘熔断的「放量」「哪个指数」「何时解除」未定义",d:"原文只说「大盘跌超 2% 且放量下杀就冻结买入」。放量多少？跟什么比？用上证还是创业板指？当日解不解除？"},
+ {n:"G16",s:"imp", t:"收盘集合竞价（14:57–15:00）未考虑",d:"那三分钟只能挂单不能撤单，也没有连续竞价——任何写着「14:58 清仓」的规则实际执行方式跟预期完全不同。"},
+ {n:"G17",s:"imp", t:"持仓期间除权除息会让止损线被误触发",d:"10 送 10 价格腰斩，任何止损线都被「跌破」。止损价、POC、锚点成本、LVN 位置全部需要按除权因子等比调整，且除权当日暂停止盈规则。"},
+ {n:"G18",s:"imp", t:"股票池未要求 point-in-time = 幸存者偏差",d:"用今天的股票列表回测历史，等于把后来退市的票全部剔除了——而那些恰恰是亏损来源。ST 状态也必须用当时的，因为它决定涨跌幅是 5% 还是 10%。"},
+ {n:"G15",s:"min", t:"容量限制未评估",d:"单票买入金额超过该股当日成交额的 0.5%，冲击成本就失真了。反推账户规模上限 ≈ 个股日成交额 × 2.5%。超过这个规模回测结果不可信。"},
+ {n:"G19",s:"min", t:"同一只票当日可重复触发信号，未定义去重",d:"价格在缓冲带里来回走会反复触发同一逻辑。规则：每票每日最多 1 次买入信号。"}
+];
+var SEV={crit:{n:"致命",c:"p-crit"},imp:{n:"重要",c:"p-imp"},min:{n:"次要",c:"p-min"}};
+var curFilter="all";
+var FILTERS=[{k:"all",n:"全部 20"},{k:"crit",n:"致命 7"},{k:"imp",n:"重要 11"},{k:"min",n:"次要 2"}];
+var gf=document.getElementById("gapFilters");
+FILTERS.forEach(function(f){
+  var b=document.createElement("button");
+  b.className="fbtn"+(f.k==="all"?" on":""); b.textContent=f.n;
+  b.addEventListener("click",function(){
+    curFilter=f.k;
+    gf.querySelectorAll(".fbtn").forEach(function(x){x.classList.remove("on")});
+    b.classList.add("on"); renderGaps();
+  });
+  gf.appendChild(b);
+});
+function renderGaps(){
+  var list=document.getElementById("gapList"); list.innerHTML="";
+  GAPS.filter(function(g){ return curFilter==="all"||g.s===curFilter; }).forEach(function(g){
+    var d=document.createElement("details");
+    d.innerHTML='<summary><span class="mono" style="color:var(--tx-3);font-size:12.5px;flex:none">'+g.n+
+      '</span><span class="pill '+SEV[g.s].c+'">'+SEV[g.s].n+'</span><span style="font-weight:600">'+g.t+
+      '</span></summary><div class="body"><p>'+g.d+'</p></div>';
+    list.appendChild(d);
+  });
+}
+renderGaps();
+
+/* ---------- 阶段 ---------- */
+var PHASES=[
+ {c:"P0",d:"1–2 周",t:"可行性",b:"数据字典实测校验（单位、落地延迟、盘前可得性）+ <code>rt_k</code> 三项实测 + 云端 CPU/内存补测 + <b>用日线代理做信号频次估算</b>。这个阶段一行策略代码都不写。",g:"日线代理信号 &lt; 100 次 / 年 → <b>直接终止项目</b>"},
+ {c:"P1",d:"2 周",t:"VP 引擎改造",b:"<b>不是从零写——rQuant 已有 551 行的 <code>volume_profile.py</code>。</b>要做的是：修价值区算法（G20）、bin 宽度改自适应、新增盘中 Session VP 与锚点 VP、新增 LVN。",g:"VP 图形抽样人工核对通过；修完价值区后重跑现有依赖实验，差异可解释"},
+ {c:"P2",d:"2–3 周",t:"离线回测",b:"策略主体回测，<b>并且把封单因子用日频历史一起验证</b>（封单金额、开板次数、封板资金、炸板次数都已在库）。",g:"8 条失败标准全部通过；封单因子若在日频上就没有预测力，P4 直接砍掉"},
+ {c:"P3",d:"1–2 周",t:"实时盘口接入",b:"新增 <code>rt_k</code> adapter + 订阅分级 + 存储实测。这一步才开始花钱。",g:"刷新频率满足需求；封单量与东财盘口人工对照一致"},
+ {c:"P4",d:"2 周",t:"封单条件单",b:"封单监控状态机 + 阈值标定，<b>用 P2 已经验证过的因子</b>，不是从零猜。",g:"阈值有分布统计支撑，不是拍脑袋"},
+ {c:"P5",d:"2–4 周",t:"影子模式",b:"实盘信号 vs 事后用历史数据重算的信号，逐条对比。这是回测与实盘一致性的唯一验证手段。",g:"差异率 &lt; 5% 且每条差异原因都能解释"},
+ {c:"P6",d:"—",t:"上线",b:"接入推送通道，形态 A（只推信号，不下单）。",g:"—"}
+];
+var ph=document.getElementById("phases");
+PHASES.forEach(function(p){
+  var d=document.createElement("div"); d.className="ph";
+  d.innerHTML='<div><div class="code">'+p.c+'</div><div class="dur">'+p.d+'</div></div>'+
+    '<div><b style="font-size:15px">'+p.t+'</b><p class="small" style="margin:4px 0 0">'+p.b+'</p>'+
+    (p.g!=="—"?'<div class="gate"><b>闸门：</b>'+p.g+'</div>':'')+'</div>';
+  ph.appendChild(d);
+});
+
+/* ---------- 数据源结论（调研结果填充位） ---------- */
+var FEAS_SOURCES=[
+ {v:"ok", nm:"tushare <code>rt_k</code> · ¥200/月",d:"<b>本次调研里性价比最被低估的接口。</b>单次 6000 条覆盖全市场，返回<b>买一/卖一的价和量</b>加开盘以来成交笔数，token 认证<b>零 IP 风险</b>。封单量算得出来，一档就够。<br><br>⚠️ 付钱之前必须实测三件事：实际刷新频率（官方文档没写）、盘口字段需在 fields 里显式请求才返回、封板时买一价是否确实等于涨停价。"},
+ {v:"ok", nm:"tushare 分钟线（现状）",d:"token 认证，不封 IP 只限频，云端已稳定跑了几个月。云端 <code>minute_bar</code> 已有 <b class='mono'>4750 万行</b>。"},
+ {v:"no", nm:"新浪 / 东财免费五档",d:"<b>rQuant 已经被封过四次，这是记录不是推测。</b>2026-04-29 东财按<b>腾讯云 IP 段</b>屏蔽，同一时刻家庭 IP 正常；07-06 办公网 IP 因高频并发被东财+新浪双风控；07-07 云端 IP 被两家同时拉黑，surge 零快照饿死一整天。<br><br>由此得到的教训是：多源兜底不管用（两家同一天一起封），降频缩池也不够（4 月就限到 50 只/3 秒，7 月照样被封）。<b>唯一验证有效的根治方案是换 token 认证 API。</b>"},
+ {v:"no", nm:"mootdx / 通达信协议",d:"Linux 上原生可用、免费、有五档和历史逐笔，听起来很美。但代码两年没有实质更新，而且 <b>2026-07-20（一周前）的 issue 报告全部 8 个公开节点返回空数据</b>，至今无人修复。<br><br>建议把 <code>CLAUDE.md</code> 技术栈表里给 mootdx 的评级下调。"},
+ {v:"no", nm:"A 股逐笔 / 十档",d:"<b>零售 + Linux 没有任何一条既合规又稳定又便宜的路。</b>tushare 没卖（SDK 里那个十档 WebSocket 需要华锐或华泰的机构网关）；QMT 是 Windows-only 且多家券商 2026-07-06 起停了新开户；Ptrade 和掘金锁在券商内网；交易所只对机构；社区转发服务本质是未授权二次分发。<br><br><b>所以本规格从设计上就不依赖逐笔数据。</b>"},
+ {v:"mid",nm:"分钟数据的历史深度",d:"云端 <code>minute_bar</code> 覆盖 <b class='mono'>2025-03-28</b> 至今，约 16 个月。按三段切分每段不足 6 个月，<b>统计功效严重不足</b>——这正是 P0 必须改用日线代理的原因（日线已回补到 2020-08-24）。"}
+];
+var fs=document.getElementById("feasSources");
+FEAS_SOURCES.forEach(function(f){
+  var d=document.createElement("div"); d.className="verdict";
+  var cls = f.v==="ok"?"v-ok":f.v==="no"?"v-no":"v-mid";
+  var mark= f.v==="ok"?"可行":f.v==="no"?"不可行":"受限";
+  d.innerHTML='<span class="vmark '+cls+'">'+mark+'</span><div><b>'+f.nm+'</b><p class="small" style="margin:4px 0 0">'+f.d+'</p></div>';
+  fs.appendChild(d);
+});
+
+/* ---------- 主题切换时重绘 canvas ---------- */
+drawVP();
+if(window.matchMedia){
+  var mq=window.matchMedia("(prefers-color-scheme: dark)");
+  if(mq.addEventListener) mq.addEventListener("change",drawVP);
+}
+new MutationObserver(drawVP).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});
+window.addEventListener("resize",function(){ clearTimeout(window.__rt); window.__rt=setTimeout(drawVP,140); });
+
+})();
+</script>
