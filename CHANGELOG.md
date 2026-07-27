@@ -6,6 +6,12 @@
 
 ### Added
 
+- **脉搏与午间报告迁云**：新增 `rquant-morning-pulse`、`rquant-midday-report`
+  systemd service/timer。云端复用同机 Panorama 快照与只读副本，在工作日
+  10:00/10:30/11:00/11:30 发送30分钟脉搏、12:00 发送午间战报；timer 不做跨日
+  catch-up，失败统一进入 `rquant-alert@`，避免 Mac 睡眠、旧隧道和本地 DuckDB 成为
+  推送前置条件。项目版本从 `0.26.9` 更新到 `0.27.0`。
+
 - **策略分钟回补 manifest 可审计终止**：新增 `abandoned` 终态和
   `rquant backfill-abandon`。命令默认只生成绑定 manifest 内容、任务计数、终止原因与干净
   Git commit 的 SHA256 计划；只有显式传入同一 `plan_id` 和 `--apply` 才以短事务 CAS

@@ -1,0 +1,13 @@
+[Unit]
+Description=Trigger rQuant intraday market pulse on each morning slot
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 10:00:00
+OnCalendar=Mon..Fri *-*-* 10:30:00
+OnCalendar=Mon..Fri *-*-* 11:00:00
+OnCalendar=Mon..Fri *-*-* 11:30:00
+AccuracySec=1s
+Unit=rquant-morning-pulse.service
+
+[Install]
+WantedBy=timers.target
