@@ -1203,35 +1203,42 @@ def build_surge_messages(
     n = config.cum_lookback_days
     n_unbuyable = sum(1 for c in confirmed if c.status == "unbuyable")
     for c in shown:
-        theme = f"·{c.theme}" if c.theme else ""
-        room = f" 距涨停{c.room_to_limit_pct:.1f}%" if c.room_to_limit_pct is not None else ""
         # 临近涨停/封板标记：买不进的确认票也推,加 icon 让用户自行判断（2026-07-08 起）。
         flag = ""
         if c.status == "unbuyable":
             sealed = c.room_to_limit_pct is not None and c.room_to_limit_pct <= 0
             flag = "🔒已封板 " if sealed else "🔔临近涨停 "
-        # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
-        delta_txt = (
-            f"（本分钟{_fmt_amount(c.minute_delta)}/{n}日中位{_fmt_amount(c.minute_delta_median)}）"
-            if config.k_delta_confirm > 0
-            else ""
+        lines.append(f"## {flag}{c.ts_code} {c.name}")
+        if c.theme:
+            lines.append(f"**题材**：{c.theme}")
+
+        price_parts = [f"涨幅：+{c.pct_chg:.1f}%"]
+        if c.room_to_limit_pct is not None:
+            price_parts.append(f"距涨停：{c.room_to_limit_pct:.1f}%")
+        lines.append(f"- {' ｜ '.join(price_parts)}")
+        lines.append(
+            f"- 累计比：{n}日 {c.rel_cum:.1f}×"
+            f" ｜ 累计额：{_fmt_amount(c.cum_amount)}"
         )
-        direction_txt = ""
+
+        # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
+        if config.k_delta_confirm > 0:
+            lines.append(
+                f"- 增量：本分钟 {_fmt_amount(c.minute_delta)}"
+                f" ｜ {n}日中位 {_fmt_amount(c.minute_delta_median)}"
+            )
         if c.return_1m_pct is not None:
             flow = (
-                f" 外/内≈{c.outer_inner_ratio_approx:.2f}×"
+                f"外/内≈{c.outer_inner_ratio_approx:.2f}×"
                 if c.outer_inner_ratio_approx is not None
-                else " 外盘占优"
+                else "外盘占优"
             )
-            direction_txt = f" 1分钟{c.return_1m_pct:+.2f}%{flow}"
-        lines.append(
-            f"- {flag}{c.ts_code} {c.name}{theme} +{c.pct_chg:.1f}% "
-            f"累计比{n}日{c.rel_cum:.1f}× 累计{_fmt_amount(c.cum_amount)}"
-            f"{delta_txt}{direction_txt}{room}"
-        )
+            lines.append(
+                f"- 方向：1分钟 {c.return_1m_pct:+.2f}% ｜ {flow}"
+            )
+        lines.append("")
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
-    lines.append("")
     if n_unbuyable > 0:
         lines.append(f"> 🔔临近涨停/🔒已封板 {n_unbuyable} 只：现价贴近涨停，买入难度大，自行判断")
     delta_seg = (

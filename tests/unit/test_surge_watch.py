@@ -450,7 +450,7 @@ class TestU5DedupSilentFold:
         assert len(msgs) == 1
         title, body = msgs[0]
         assert "9 只" in title
-        assert body.count("\n- ") == cfg.max_per_push + 1  # 8 只 + 折叠行
+        assert body.count("\n## ") == cfg.max_per_push
         assert "另有 1 只" in body
 
 
@@ -671,6 +671,35 @@ class TestU9CloudFeed:
 
 
 class TestU10Push:
+    def test_message_groups_each_stock_for_mobile(self) -> None:
+        c = SurgeConfirmed(
+            ts_code="300001.SZ",
+            name="机器人A",
+            theme="人形机器人",
+            pct_chg=8.3,
+            rel_cum=2.7,
+            cum_amount=1.2e8,
+            room_to_limit_pct=4.5,
+            return_1m_pct=0.46,
+            outer_inner_ratio_approx=2.34,
+        )
+
+        _, body = build_surge_messages(
+            [c],
+            datetime(2026, 7, 6, 10, 5, tzinfo=CST),
+            SurgeConfig(),
+        )[0]
+
+        expected_block = (
+            "## 300001.SZ 机器人A\n"
+            "**题材**：人形机器人\n"
+            "- 涨幅：+8.3% ｜ 距涨停：4.5%\n"
+            "- 累计比：4日 2.7× ｜ 累计额：1.20亿\n"
+            "- 方向：1分钟 +0.46% ｜ 外/内≈2.34×"
+        )
+        assert expected_block in body
+        assert "机器人A·人形机器人 +8.3% 累计比" not in body
+
     def test_message_structure_fields(self) -> None:
         c = SurgeConfirmed(ts_code="300001.SZ", name="机器人A", theme="人形机器人",
                            pct_chg=8.3, rel_cum=2.7, cum_amount=1.2e8,
@@ -679,8 +708,8 @@ class TestU10Push:
         title, body = build_surge_messages([c], now, SurgeConfig())[0]
         assert "10:05" in title
         assert "人形机器人" in body                   # 题材
-        assert "累计比4日2.7×" in body                # 纯累计比值（N=4）
-        assert "距涨停4.5%" in body                   # 距涨停空间
+        assert "累计比：4日 2.7×" in body             # 纯累计比值（N=4）
+        assert "距涨停：4.5%" in body                  # 距涨停空间
         assert "口径 v4(累计+方向)" in body            # 尾注口径版本
         assert "累计比值∈[2.5,8]" in body            # 上下门口径
         assert "9:31起判" in body                     # skip=0 → 9:31 起判（首个可确认格）
