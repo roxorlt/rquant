@@ -106,6 +106,65 @@ class TestSettings:
         assert configured.lab_job_report_dir_resolved.is_dir()
         assert configured.lab_worker_artifact_dir_resolved.is_dir()
 
+    def test_lab_daemon_paths_default_to_distinct_absolute_private_roots(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        configured = Settings(**_settings_values(tmp_path))
+
+        roots = {
+            configured.lab_job_command_dir_resolved,
+            configured.lab_job_claim_dir_resolved,
+            configured.lab_job_report_dir_resolved,
+            configured.lab_worker_artifact_dir_resolved,
+            configured.lab_final_artifact_dir_resolved,
+            configured.lab_artifact_commit_dir_resolved,
+            configured.lab_daemon_lock_dir_resolved,
+        }
+        assert len(roots) == 7
+        assert all(path.is_absolute() for path in roots)
+        assert all(path.is_dir() for path in roots)
+        assert all(path.stat().st_mode & 0o777 == 0o700 for path in roots)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "lab_jobs_path",
+            "lab_job_command_dir",
+            "lab_job_claim_dir",
+            "lab_job_report_dir",
+            "lab_worker_artifact_dir",
+            "lab_final_artifact_dir",
+            "lab_artifact_commit_dir",
+            "lab_daemon_lock_dir",
+        ],
+    )
+    def test_lab_daemon_rejects_relative_managed_paths(
+        self,
+        tmp_path: Path,
+        field: str,
+    ) -> None:
+        with pytest.raises(ValidationError, match="absolute"):
+            Settings(**_settings_values(tmp_path), **{field: Path("relative") / field})
+
+    def test_lab_daemon_rejects_nested_managed_roots(self, tmp_path: Path) -> None:
+        root = tmp_path / "data" / "lab-root"
+        with pytest.raises(ValidationError, match="nested"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_job_command_dir=root,
+                lab_job_claim_dir=root / "claims",
+            )
+
+    def test_lab_daemon_rejects_database_inside_managed_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "data" / "commands"
+        with pytest.raises(ValidationError, match="database"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_job_command_dir=root,
+                lab_jobs_path=root / "lab.sqlite3",
+            )
+
     def test_lab_scheduler_runtime_settings_are_configurable(
         self,
         tmp_path: Path,
@@ -124,6 +183,10 @@ class TestSettings:
             lab_worker_heartbeat_seconds=15,
             lab_worker_lease_extension_seconds=90,
             lab_worker_receipt_timeout_seconds=20,
+            lab_worker_id="worker-a",
+            lab_finalizer_poll_interval_ms=500,
+            lab_finalizer_max_jobs_per_tick=7,
+            lab_scheduler_max_artifact_commits_per_tick=9,
         )
 
         assert configured.lab_jobs_busy_timeout_ms == 1_234
@@ -138,6 +201,10 @@ class TestSettings:
         assert configured.lab_worker_heartbeat_seconds == 15
         assert configured.lab_worker_lease_extension_seconds == 90
         assert configured.lab_worker_receipt_timeout_seconds == 20
+        assert configured.lab_worker_id == "worker-a"
+        assert configured.lab_finalizer_poll_interval_ms == 500
+        assert configured.lab_finalizer_max_jobs_per_tick == 7
+        assert configured.lab_scheduler_max_artifact_commits_per_tick == 9
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -153,6 +220,9 @@ class TestSettings:
             ("lab_worker_heartbeat_seconds", 0),
             ("lab_worker_lease_extension_seconds", 0),
             ("lab_worker_receipt_timeout_seconds", 0),
+            ("lab_finalizer_poll_interval_ms", 0),
+            ("lab_finalizer_max_jobs_per_tick", 0),
+            ("lab_scheduler_max_artifact_commits_per_tick", 0),
         ],
     )
     def test_lab_scheduler_rejects_non_positive_runtime_settings(

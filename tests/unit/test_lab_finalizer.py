@@ -35,6 +35,7 @@ from rquant.lab_artifacts import (
     LabArtifactFinalizationLockTimeoutError,
     LabJobArtifactStore,
 )
+from rquant.lab_daemon import LabFinalizerDaemon
 from rquant.lab_finalizer import (
     LabArtifactRoundtripPeakUsage,
     LabFinalizationCodeMismatchError,
@@ -967,6 +968,29 @@ def test_finalizer_builds_deterministic_complete_artifact_and_commit(tmp_path: P
     assert replay_counts == [(0, 0)] * 5
     assert (sealed.path / "metrics.json").read_bytes() == metrics_before
     assert (sealed.path / "report.md").read_bytes() == report_before
+
+
+def test_finalizer_daemon_commit_is_consumed_and_seals_job(tmp_path: Path) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    reader = LabJobReader(scenario.store.path)
+    daemon = LabFinalizerDaemon(
+        reader=reader,
+        finalizer=scenario.finalizer(),
+        max_jobs_per_tick=4,
+        poll_interval_ms=10,
+    )
+
+    finalized = daemon.run_once()
+    scheduled = scenario.scheduler.run_once()
+    job = reader.get_job(scenario.job_id)
+
+    assert finalized.candidates == 1
+    assert finalized.published == 1
+    assert finalized.failed == 0
+    assert scheduled.artifact_commits_accepted == 1
+    assert job is not None
+    assert job.status is JobStatus.SUCCEEDED
+    assert job.result_state is LabResultState.SEALED
 
 
 def test_finalizer_recovers_accepted_legacy_uint64_bundle(

@@ -12,6 +12,14 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _ensure_private_lab_directory(path: Path) -> Path:
+    existed = path.exists() or path.is_symlink()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not existed:
+        path.chmod(0o700)
+    return path
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -35,6 +43,12 @@ class Settings(BaseSettings):
     lab_job_claim_dir: Path | None = None
     lab_job_report_dir: Path | None = None
     lab_worker_artifact_dir: Path | None = None
+    lab_final_artifact_dir: Path | None = None
+    lab_artifact_commit_dir: Path | None = None
+    lab_daemon_lock_dir: Path | None = None
+    lab_finalizer_authority_key_id: str = ""
+    lab_finalizer_authority_key_path: Path | None = None
+    lab_finalizer_authority_keyring_path: Path | None = None
     lab_jobs_busy_timeout_ms: int = Field(default=5_000, ge=1)
     lab_scheduler_poll_interval_ms: int = Field(default=250, ge=1)
     lab_scheduler_lease_seconds: int = Field(default=60, ge=1)
@@ -42,11 +56,15 @@ class Settings(BaseSettings):
     lab_scheduler_shard_lease_seconds: int = Field(default=300, ge=1)
     lab_scheduler_max_reports_per_tick: int = Field(default=64, ge=1)
     lab_scheduler_max_claims_per_tick: int = Field(default=16, ge=1)
+    lab_scheduler_max_artifact_commits_per_tick: int = Field(default=64, ge=1)
     lab_scheduler_worker_ids: str = ""
+    lab_worker_id: str = "rquant-mac-primary"
     lab_worker_poll_interval_ms: int = Field(default=250, ge=1)
     lab_worker_heartbeat_seconds: int = Field(default=30, ge=1)
     lab_worker_lease_extension_seconds: int = Field(default=120, ge=1, le=3_600)
     lab_worker_receipt_timeout_seconds: int = Field(default=30, ge=1)
+    lab_finalizer_poll_interval_ms: int = Field(default=1_000, ge=1)
+    lab_finalizer_max_jobs_per_tick: int = Field(default=8, ge=1, le=128)
     parquet_dir: Path
     research_db_path: Path | None = None
     research_readonly_db_path: Path | None = None
@@ -158,11 +176,35 @@ class Settings(BaseSettings):
         "lab_job_claim_dir",
         "lab_job_report_dir",
         "lab_worker_artifact_dir",
+        "lab_final_artifact_dir",
+        "lab_artifact_commit_dir",
+        "lab_daemon_lock_dir",
+        "lab_finalizer_authority_key_path",
+        "lab_finalizer_authority_keyring_path",
         mode="before",
     )
     @classmethod
     def normalize_empty_lab_job_path(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator(
+        "lab_jobs_path",
+        "lab_job_command_dir",
+        "lab_job_claim_dir",
+        "lab_job_report_dir",
+        "lab_worker_artifact_dir",
+        "lab_final_artifact_dir",
+        "lab_artifact_commit_dir",
+        "lab_daemon_lock_dir",
+        "lab_finalizer_authority_key_path",
+        "lab_finalizer_authority_keyring_path",
+        mode="after",
+    )
+    @classmethod
+    def require_absolute_lab_job_path(cls, v: Path | None) -> Path | None:
+        if v is not None and not v.is_absolute():
+            raise ValueError("lab managed paths must be absolute")
+        return v
 
     @field_validator(
         "research_db_path",
@@ -245,27 +287,51 @@ class Settings(BaseSettings):
             raise ValueError(
                 "lab jobs path must differ from all existing database paths"
             )
-        spool_dirs = {
+        managed_dirs = {
             self.lab_job_command_dir_resolved.resolve(),
             self.lab_job_claim_dir_resolved.resolve(),
             self.lab_job_report_dir_resolved.resolve(),
+            self.lab_worker_artifact_dir_resolved.resolve(),
+            self.lab_final_artifact_dir_resolved.resolve(),
+            self.lab_artifact_commit_dir_resolved.resolve(),
+            self.lab_daemon_lock_dir_resolved.resolve(),
         }
-        if len(spool_dirs) != 3:
-            raise ValueError("lab job spool directories must differ from each other")
-        if lab_path in spool_dirs or spool_dirs & existing_database_paths:
-            raise ValueError("lab job spool directories must differ from database paths")
-        artifact_dir = self.lab_worker_artifact_dir_resolved.resolve()
-        if (
-            artifact_dir == lab_path
-            or artifact_dir in spool_dirs
-            or artifact_dir in existing_database_paths
-        ):
-            raise ValueError(
-                "lab worker artifact directory must differ from spools and database paths"
+        if len(managed_dirs) != 7:
+            raise ValueError("lab managed directories must differ from each other")
+        ordered_dirs = tuple(sorted(managed_dirs, key=str))
+        for index, left in enumerate(ordered_dirs):
+            for right in ordered_dirs[index + 1 :]:
+                if left.is_relative_to(right) or right.is_relative_to(left):
+                    raise ValueError("lab managed directories must not be nested")
+        for database_path in existing_database_paths | {lab_path}:
+            if any(
+                database_path == directory or database_path.is_relative_to(directory)
+                for directory in managed_dirs
+            ):
+                raise ValueError("lab managed directories must differ from database paths")
+        key_paths = tuple(
+            path.resolve()
+            for path in (
+                self.lab_finalizer_authority_key_path,
+                self.lab_finalizer_authority_keyring_path,
             )
+            if path is not None
+        )
+        if len(key_paths) != len(set(key_paths)):
+            raise ValueError("lab authority key paths must differ")
+        if any(
+            key_path.is_relative_to(directory)
+            for key_path in key_paths
+            for directory in managed_dirs
+        ):
+            raise ValueError("lab authority key files must be outside writable managed directories")
         workers = self.lab_scheduler_worker_id_list
         if len(set(workers)) != len(workers):
             raise ValueError("lab scheduler worker ids must be unique")
+        if not self.lab_worker_id.strip():
+            raise ValueError("lab worker id must not be empty")
+        if workers and self.lab_worker_id not in workers:
+            raise ValueError("lab worker id must be present in scheduler worker ids")
         return self
 
     @property
@@ -291,26 +357,37 @@ class Settings(BaseSettings):
     @property
     def lab_job_command_dir_resolved(self) -> Path:
         path = self.lab_job_command_dir or self.data_dir / "lab_job_commands"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return _ensure_private_lab_directory(path)
 
     @property
     def lab_job_claim_dir_resolved(self) -> Path:
         path = self.lab_job_claim_dir or self.data_dir / "lab_shard_claims"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return _ensure_private_lab_directory(path)
 
     @property
     def lab_job_report_dir_resolved(self) -> Path:
         path = self.lab_job_report_dir or self.data_dir / "lab_worker_reports"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return _ensure_private_lab_directory(path)
 
     @property
     def lab_worker_artifact_dir_resolved(self) -> Path:
         path = self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return _ensure_private_lab_directory(path)
+
+    @property
+    def lab_final_artifact_dir_resolved(self) -> Path:
+        path = self.lab_final_artifact_dir or self.data_dir / "lab_final_artifacts"
+        return _ensure_private_lab_directory(path)
+
+    @property
+    def lab_artifact_commit_dir_resolved(self) -> Path:
+        path = self.lab_artifact_commit_dir or self.data_dir / "lab_artifact_commits"
+        return _ensure_private_lab_directory(path)
+
+    @property
+    def lab_daemon_lock_dir_resolved(self) -> Path:
+        path = self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks"
+        return _ensure_private_lab_directory(path)
 
     @property
     def lab_scheduler_worker_id_list(self) -> tuple[str, ...]:

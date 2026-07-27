@@ -3586,6 +3586,62 @@ class TestIngestRetryBusinessError:
 
 
 class TestLabSchedulerCli:
+    @pytest.fixture(autouse=True)
+    def configured_daemon_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from rquant import lab_artifact_protocol, lab_artifacts, lab_daemon
+        from rquant.config import settings
+
+        class FakeKeyring:
+            def verification_key(self, _key_id: str) -> None:
+                return None
+
+        class FakeLock:
+            def __init__(self, *_args: object) -> None:
+                pass
+
+            def __enter__(self) -> FakeLock:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+        class FakeArtifactStore:
+            def __init__(self, _path: Path) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class FakeArtifactCommitSpool:
+            def __init__(self, _path: Path) -> None:
+                pass
+
+        monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
+        monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+        monkeypatch.setattr(
+            lab_daemon,
+            "require_private_directory",
+            lambda path, *, label: path,
+        )
+        monkeypatch.setattr(
+            lab_daemon.LabAuthorityKeyring,
+            "load",
+            classmethod(lambda cls, **kwargs: FakeKeyring()),
+        )
+        monkeypatch.setattr(lab_artifacts, "LabJobArtifactStore", FakeArtifactStore)
+        monkeypatch.setattr(
+            lab_artifact_protocol,
+            "LabArtifactCommitSpool",
+            FakeArtifactCommitSpool,
+        )
+        monkeypatch.setattr(settings, "lab_finalizer_authority_key_id", "active")
+        monkeypatch.setattr(settings, "lab_finalizer_authority_key_path", Path("/tmp/key"))
+        monkeypatch.setattr(
+            settings,
+            "lab_finalizer_authority_keyring_path",
+            Path("/tmp/keyring"),
+        )
+
     def test_parser_accepts_once_and_preserves_lab_run(self) -> None:
         scheduler = build_parser().parse_args(["lab-scheduler", "--once"])
         legacy = build_parser().parse_args(["lab-run", "--spec", "/tmp/spec.json"])
@@ -3684,6 +3740,9 @@ class TestLabSchedulerCli:
 
             def run_forever(self) -> None:
                 calls.append("run_forever")
+                handler = handlers[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
 
         def fake_signal(signum: int, handler: object) -> object:
             previous = handlers.get(signum, signal.SIG_DFL)
@@ -3699,15 +3758,37 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(signal, "signal", fake_signal)
 
         result = cmd_lab_scheduler(argparse.Namespace(once=False))
-        term_handler = handlers[signal.SIGTERM]
-        assert callable(term_handler)
-        term_handler(signal.SIGTERM, None)
 
         assert result == 0
         assert calls == ["run_forever", "request_stop"]
 
 
 class TestLabWorkerCli:
+    @pytest.fixture(autouse=True)
+    def configured_daemon_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from rquant import lab_daemon
+        from rquant.config import settings
+
+        class FakeLock:
+            def __init__(self, *_args: object) -> None:
+                pass
+
+            def __enter__(self) -> FakeLock:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+        monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
+        monkeypatch.setattr(lab_daemon, "require_clean_code_sha", lambda _provider: "1" * 40)
+        monkeypatch.setattr(
+            lab_daemon,
+            "require_private_directory",
+            lambda path, *, label: path,
+        )
+        monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
+        monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-a")
+
     def test_parser_accepts_worker_identity_and_once(self) -> None:
         args = build_parser().parse_args(
             ["lab-worker", "--worker-id", "worker-a", "--once"]
@@ -3768,3 +3849,51 @@ class TestLabWorkerCli:
         assert "spool:lab_shard_claims" in calls
         assert "spool:lab_worker_reports" in calls
         assert calls[-2:] == ["worker:worker-a", "run_once"]
+
+    def test_cmd_lab_worker_forever_installs_both_stop_signals(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+        import signal
+
+        from rquant import lab_shard_protocol, lab_worker
+        from rquant.cli import cmd_lab_worker
+
+        handlers: dict[int, object] = {}
+        calls: list[str] = []
+
+        class FakeSpool:
+            def __init__(self, _path: Path) -> None:
+                pass
+
+        class FakeWorker:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def request_stop(self) -> None:
+                calls.append("request_stop")
+
+            def run_forever(self, *, install_signal_handlers: bool) -> None:
+                assert install_signal_handlers is False
+                calls.append("run_forever")
+                for signum in (signal.SIGINT, signal.SIGTERM):
+                    handler = handlers[signum]
+                    assert callable(handler)
+                    handler(signum, None)
+
+        def fake_signal(signum: int, handler: object) -> object:
+            previous = handlers.get(signum, signal.SIG_DFL)
+            handlers[signum] = handler
+            return previous
+
+        monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", FakeSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeSpool)
+        monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        monkeypatch.setattr(signal, "signal", fake_signal)
+
+        result = cmd_lab_worker(argparse.Namespace(worker_id="worker-a", once=False))
+
+        assert result == 0
+        assert calls == ["run_forever", "request_stop", "request_stop"]

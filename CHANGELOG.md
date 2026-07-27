@@ -6,6 +6,15 @@
 
 ### Added
 
+- **Strategy Lab 本地守护进程运行面**：`lab-scheduler` 现完整接入 command/claim/report 与
+  签名 artifact commit spool、最终 artifact store 和可轮换验证 keyring，继续作为唯一
+  `lab_jobs.sqlite3` writer；`lab-worker` 以稳定 allowlist id、只读研究 store 和启动时验证的
+  clean 40 位 Git SHA 执行分片；新增只读 SQLite 的 `lab-finalizer`，有界聚合 ready job 并仅向
+  commit spool 发布结果。三个 daemon 均使用私有单实例进程锁、SIGINT/SIGTERM 协作停止、
+  有界 poll/batch 与失败关闭的路径/密钥权限检查。新增三份仅供后续人工安装的 macOS launchd
+  plist（本阶段未 load/bootstrap），固定主 checkout、`Umask=077`、失败重启节流和独立日志；
+  环境模板补齐全部路径、轮换 keyring、worker allowlist 及轮询参数。
+
 - **Strategy Lab durable job center typed backend foundation**：`LabJobReader` 新增只读、稳定
   keyset 分页的任务筛选和有界详情聚合，统一返回进度、phase、心跳陈旧、首个 accepted failure、
   command availability、ETA、截断事件/分片及 sealed result evidence，并提供有界 finalization

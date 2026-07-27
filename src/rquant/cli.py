@@ -3025,95 +3025,275 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
     from rquant.config import settings
+    from rquant.lab_artifact_protocol import LabArtifactCommitSpool
+    from rquant.lab_artifacts import LabJobArtifactStore
+    from rquant.lab_daemon import (
+        LabAuthorityKeyring,
+        LabDaemonConfigurationError,
+        LabDaemonLock,
+        require_clean_code_sha,
+        require_private_directory,
+    )
     from rquant.lab_job_protocol import LabCommandSpool
     from rquant.lab_jobs import LabJobStore
     from rquant.lab_scheduler import LabScheduler
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LabArtifactReclaimer
+    from rquant.research_manifest import detect_verified_code_commit
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    store = LabJobStore(
-        settings.lab_jobs_path_resolved,
-        busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+    code_sha = require_clean_code_sha(detect_verified_code_commit)
+    if (
+        not settings.lab_finalizer_authority_key_id
+        or settings.lab_finalizer_authority_key_path is None
+        or settings.lab_finalizer_authority_keyring_path is None
+    ):
+        raise LabDaemonConfigurationError("lab authority key configuration is incomplete")
+    keyring = LabAuthorityKeyring.load(
+        active_key_id=settings.lab_finalizer_authority_key_id,
+        active_key_path=settings.lab_finalizer_authority_key_path,
+        verification_keyring_path=settings.lab_finalizer_authority_keyring_path,
     )
-    store.initialize()
-    report_spool = LabReportSpool(settings.lab_job_report_dir_resolved)
-    artifact_reclaimer = LabArtifactReclaimer(
-        artifact_root=settings.lab_worker_artifact_dir_resolved,
-        report_spool=report_spool,
-    )
-    claim_spool = LabClaimSpool(
-        settings.lab_job_claim_dir_resolved,
-        claim_advance_hook=artifact_reclaimer.reclaim,
-    )
-    scheduler = LabScheduler(
-        store=store,
-        spool=LabCommandSpool(settings.lab_job_command_dir_resolved),
-        owner_id=f"{socket.gethostname()}:{os.getpid()}",
-        lease_seconds=settings.lab_scheduler_lease_seconds,
-        heartbeat_seconds=settings.lab_scheduler_heartbeat_seconds,
-        poll_interval_ms=settings.lab_scheduler_poll_interval_ms,
-        report_spool=report_spool,
-        claim_spool=claim_spool,
-        claim_worker_ids=settings.lab_scheduler_worker_id_list,
-        shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
-        max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
-        adapter_registry=default_strategy_job_adapter_registry(),
-        max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
-    )
-    if args.once:
+    for label, path in (
+        ("lab command spool", settings.lab_job_command_dir_resolved),
+        ("lab claim spool", settings.lab_job_claim_dir_resolved),
+        ("lab report spool", settings.lab_job_report_dir_resolved),
+        ("lab worker artifact root", settings.lab_worker_artifact_dir_resolved),
+        ("lab final artifact root", settings.lab_final_artifact_dir_resolved),
+        ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
+        ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
+    ):
+        require_private_directory(path, label=label)
+    with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "scheduler"):
+        artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
         try:
-            result = scheduler.run_once()
-            logger.info(f"lab-scheduler tick: {result.model_dump_json()}")
+            store = LabJobStore(
+                settings.lab_jobs_path_resolved,
+                busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+            )
+            store.initialize()
+            report_spool = LabReportSpool(settings.lab_job_report_dir_resolved)
+            artifact_reclaimer = LabArtifactReclaimer(
+                artifact_root=settings.lab_worker_artifact_dir_resolved,
+                report_spool=report_spool,
+            )
+            claim_spool = LabClaimSpool(
+                settings.lab_job_claim_dir_resolved,
+                claim_advance_hook=artifact_reclaimer.reclaim,
+            )
+            scheduler = LabScheduler(
+                store=store,
+                spool=LabCommandSpool(settings.lab_job_command_dir_resolved),
+                owner_id=f"{socket.gethostname()}:{os.getpid()}:{code_sha[:12]}",
+                lease_seconds=settings.lab_scheduler_lease_seconds,
+                heartbeat_seconds=settings.lab_scheduler_heartbeat_seconds,
+                poll_interval_ms=settings.lab_scheduler_poll_interval_ms,
+                report_spool=report_spool,
+                claim_spool=claim_spool,
+                claim_worker_ids=settings.lab_scheduler_worker_id_list,
+                shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
+                max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
+                adapter_registry=default_strategy_job_adapter_registry(),
+                max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
+                artifact_commit_spool=LabArtifactCommitSpool(
+                    settings.lab_artifact_commit_dir_resolved
+                ),
+                artifact_store=artifact_store,
+                finalizer_authority_key_provider=keyring.verification_key,
+                max_artifact_commits_per_tick=(
+                    settings.lab_scheduler_max_artifact_commits_per_tick
+                ),
+            )
+            if args.once:
+                try:
+                    result = scheduler.run_once()
+                    logger.info(f"lab-scheduler tick: {result.model_dump_json()}")
+                    return 0
+                finally:
+                    scheduler.release()
+
+            def handle_signal(signum: int, frame: object) -> None:
+                del frame
+                logger.info(f"lab-scheduler 收到信号 {signum}，请求停止")
+                scheduler.request_stop()
+
+            previous = {
+                signum: signal.getsignal(signum)
+                for signum in (signal.SIGINT, signal.SIGTERM)
+            }
+            for signum in previous:
+                signal.signal(signum, handle_signal)
+            try:
+                scheduler.run_forever()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
             return 0
         finally:
-            scheduler.release()
-
-    def handle_signal(signum: int, frame: object) -> None:
-        del frame
-        logger.info(f"lab-scheduler 收到信号 {signum}，请求停止")
-        scheduler.request_stop()
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-    scheduler.run_forever()
-    return 0
+            artifact_store.close()
 
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
     """Run a fenced Strategy Lab shard worker."""
     from rquant.config import settings
+    from rquant.lab_daemon import (
+        LabDaemonConfigurationError,
+        LabDaemonLock,
+        require_clean_code_sha,
+        require_private_directory,
+    )
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LabWorker
     from rquant.research_manifest import detect_verified_code_commit
     from rquant.storage.duckdb import open_readonly_store
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    worker = LabWorker(
-        worker_id=args.worker_id,
-        claim_spool=LabClaimSpool(settings.lab_job_claim_dir_resolved),
-        report_spool=LabReportSpool(settings.lab_job_report_dir_resolved),
-        artifact_root=settings.lab_worker_artifact_dir_resolved,
-        exploratory_store_factory=open_readonly_store,
-        metadata_store_factory=open_readonly_store,
-        research_lake_root=settings.research_lake_dir_resolved,
-        heartbeat_interval_seconds=settings.lab_worker_heartbeat_seconds,
-        lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
-        poll_interval_ms=settings.lab_worker_poll_interval_ms,
-        receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
-        verified_code_sha_provider=detect_verified_code_commit,
+    worker_id = (args.worker_id or settings.lab_worker_id).strip()
+    if worker_id != settings.lab_worker_id:
+        raise LabDaemonConfigurationError("worker CLI id does not match configured stable id")
+    if worker_id not in settings.lab_scheduler_worker_id_list:
+        raise LabDaemonConfigurationError("worker id is not present in scheduler allowlist")
+    code_sha = require_clean_code_sha(detect_verified_code_commit)
+    for label, path in (
+        ("lab claim spool", settings.lab_job_claim_dir_resolved),
+        ("lab report spool", settings.lab_job_report_dir_resolved),
+        ("lab worker artifact root", settings.lab_worker_artifact_dir_resolved),
+        ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
+    ):
+        require_private_directory(path, label=label)
+    with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "worker"):
+        worker = LabWorker(
+            worker_id=worker_id,
+            claim_spool=LabClaimSpool(settings.lab_job_claim_dir_resolved),
+            report_spool=LabReportSpool(settings.lab_job_report_dir_resolved),
+            artifact_root=settings.lab_worker_artifact_dir_resolved,
+            adapter_registry=default_strategy_job_adapter_registry(),
+            exploratory_store_factory=open_readonly_store,
+            metadata_store_factory=open_readonly_store,
+            research_lake_root=settings.research_lake_dir_resolved,
+            heartbeat_interval_seconds=settings.lab_worker_heartbeat_seconds,
+            lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
+            poll_interval_ms=settings.lab_worker_poll_interval_ms,
+            receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
+            verified_code_sha_provider=lambda: code_sha,
+        )
+        if args.once:
+            result = worker.run_once()
+            logger.info(f"lab-worker tick: {result.model_dump_json()}")
+            if result.status in {"idle", "succeeded"}:
+                return 0
+            if result.status in {"failed", "stopped"}:
+                return 1
+            return 2
+
+        def handle_signal(signum: int, frame: object) -> None:
+            del frame
+            logger.info(f"lab-worker 收到信号 {signum}，请求停止")
+            worker.request_stop()
+
+        previous = {
+            signum: signal.getsignal(signum)
+            for signum in (signal.SIGINT, signal.SIGTERM)
+        }
+        for signum in previous:
+            signal.signal(signum, handle_signal)
+        try:
+            worker.run_forever(install_signal_handlers=False)
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+        return 0
+
+
+def cmd_lab_finalizer(args: argparse.Namespace) -> int:
+    """Finalize ready Strategy Lab jobs without writable SQLite access."""
+    from rquant.config import settings
+    from rquant.lab_artifact_protocol import LabArtifactCommitSpool
+    from rquant.lab_artifacts import LabJobArtifactStore
+    from rquant.lab_daemon import (
+        LabAuthorityKeyring,
+        LabDaemonConfigurationError,
+        LabDaemonLock,
+        LabFinalizerDaemon,
+        require_clean_code_sha,
+        require_private_directory,
     )
-    if args.once:
-        result = worker.run_once()
-        logger.info(f"lab-worker tick: {result.model_dump_json()}")
-        if result.status in {"idle", "succeeded"}:
+    from rquant.lab_finalizer import LabFinalizer
+    from rquant.lab_jobs import LabJobReader
+    from rquant.research_manifest import detect_verified_code_commit
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    setup_logging()
+    code_sha = require_clean_code_sha(detect_verified_code_commit)
+    if (
+        not settings.lab_finalizer_authority_key_id
+        or settings.lab_finalizer_authority_key_path is None
+        or settings.lab_finalizer_authority_keyring_path is None
+    ):
+        raise LabDaemonConfigurationError("lab authority key configuration is incomplete")
+    keyring = LabAuthorityKeyring.load(
+        active_key_id=settings.lab_finalizer_authority_key_id,
+        active_key_path=settings.lab_finalizer_authority_key_path,
+        verification_keyring_path=settings.lab_finalizer_authority_keyring_path,
+    )
+    for label, path in (
+        ("lab worker artifact root", settings.lab_worker_artifact_dir_resolved),
+        ("lab final artifact root", settings.lab_final_artifact_dir_resolved),
+        ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
+        ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
+    ):
+        require_private_directory(path, label=label)
+    with LabDaemonLock(settings.lab_daemon_lock_dir_resolved, "finalizer"):
+        artifact_store = LabJobArtifactStore(settings.lab_final_artifact_dir_resolved)
+        try:
+            reader = LabJobReader(
+                settings.lab_jobs_path_resolved,
+                busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+            )
+            finalizer = LabFinalizer(
+                reader=reader,
+                shard_artifact_root=settings.lab_worker_artifact_dir_resolved,
+                artifact_store=artifact_store,
+                commit_spool=LabArtifactCommitSpool(
+                    settings.lab_artifact_commit_dir_resolved
+                ),
+                verified_code_sha_provider=lambda: code_sha,
+                finalizer_authority_key_provider=keyring.signing_key,
+                finalizer_authority_verification_key_provider=keyring.verification_key,
+                adapter_registry=default_strategy_job_adapter_registry(),
+            )
+            daemon = LabFinalizerDaemon(
+                reader=reader,
+                finalizer=finalizer,
+                max_jobs_per_tick=settings.lab_finalizer_max_jobs_per_tick,
+                poll_interval_ms=settings.lab_finalizer_poll_interval_ms,
+            )
+            if args.once:
+                result = daemon.run_once()
+                logger.info(f"lab-finalizer tick: {result.model_dump_json()}")
+                return 1 if result.failed else 0
+
+            def handle_signal(signum: int, frame: object) -> None:
+                del frame
+                logger.info(f"lab-finalizer 收到信号 {signum}，请求停止")
+                daemon.request_stop()
+
+            previous = {
+                signum: signal.getsignal(signum)
+                for signum in (signal.SIGINT, signal.SIGTERM)
+            }
+            for signum in previous:
+                signal.signal(signum, handle_signal)
+            try:
+                daemon.run_forever()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
             return 0
-        if result.status in {"failed", "stopped"}:
-            return 1
-        return 2
-    worker.run_forever()
-    return 0
+        finally:
+            artifact_store.close()
 
 
 def cmd_panorama_auth_serve(args: argparse.Namespace) -> int:
@@ -4560,13 +4740,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lab_worker_p.add_argument(
         "--worker-id",
-        required=True,
-        help="只消费分配给该 worker id 的 claim",
+        default=None,
+        help="稳定 worker id；默认读取 LAB_WORKER_ID，显式值必须与配置一致",
     )
     lab_worker_p.add_argument(
         "--once",
         action="store_true",
         help="只消费一个分片并退出",
+    )
+
+    lab_finalizer_p = sub.add_parser(
+        "lab-finalizer",
+        help="只读聚合已完成分片并发布完整结果 commit",
+    )
+    lab_finalizer_p.add_argument(
+        "--once",
+        action="store_true",
+        help="只处理一批待 finalization 任务并退出",
     )
 
     pa_serve_p = sub.add_parser(
@@ -4665,6 +4855,7 @@ def main() -> int:
         "lab-run": cmd_lab_run,
         "lab-scheduler": cmd_lab_scheduler,
         "lab-worker": cmd_lab_worker,
+        "lab-finalizer": cmd_lab_finalizer,
         "panorama-auth-serve": cmd_panorama_auth_serve,
         "panorama-user-add": cmd_panorama_user_add,
         "panorama-user-remove": cmd_panorama_user_remove,
@@ -4683,7 +4874,7 @@ def main() -> int:
     if args.command in (
         "serve", "notify-test", "alert", "alert-resolve",
         "daily-report", "pre-market-check", "preflight", "data-audit", "lab-run",
-        "lab-scheduler", "lab-worker",
+        "lab-scheduler", "lab-worker", "lab-finalizer",
         "panorama-auth-serve", "panorama-user-add",
         "panorama-user-remove", "panorama-user-list", "panorama-gate-token",
     ):
