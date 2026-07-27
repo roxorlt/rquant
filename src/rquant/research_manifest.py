@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field, model_validator
+
+_IGNORED_NATIVE_CODE_SUFFIXES = frozenset({".so", ".dylib", ".pyd"})
+_IGNORED_SOURCE_CODE_SUFFIXES = frozenset({".py", ".pyw"})
+_IGNORED_LEGACY_BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo"})
 
 ResearchStatus = Literal[
     "exploratory",
@@ -238,6 +243,22 @@ def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
             timeout=3,
             check=False,
         )
+        ignored_source_artifacts = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ":(top)src/rquant",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     commit = head.stdout.strip()
@@ -246,13 +267,34 @@ def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
         or re.fullmatch(r"[0-9a-f]{40}", commit) is None
         or checkout.returncode != 0
         or status.returncode != 0
+        or ignored_source_artifacts.returncode != 0
     ):
         return None
     injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected and injected != commit:
         return None
+    checkout_root = Path(checkout.stdout.strip())
+    if not checkout_root.is_absolute():
+        return None
     if status.stdout:
         return f"{commit}-dirty"
+    for raw_path in ignored_source_artifacts.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        artifact = Path(os.fsdecode(raw_path))
+        try:
+            artifact_identity = (checkout_root / artifact).lstat()
+        except OSError:
+            return f"{commit}-dirty"
+        if stat.S_ISLNK(artifact_identity.st_mode):
+            return f"{commit}-dirty"
+        suffix = artifact.suffix.lower()
+        if (
+            suffix in _IGNORED_NATIVE_CODE_SUFFIXES
+            or suffix in _IGNORED_SOURCE_CODE_SUFFIXES
+            or (suffix in _IGNORED_LEGACY_BYTECODE_SUFFIXES and "__pycache__" not in artifact.parts)
+        ):
+            return f"{commit}-dirty"
     return commit
 
 

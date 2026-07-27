@@ -173,6 +173,44 @@ def test_authority_keyring_rejects_hardlinked_key_without_reading_it(tmp_path: P
         )
 
 
+@pytest.mark.parametrize("replacement_target", ["active", "keyring"])
+def test_authority_keyring_rejects_active_path_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_target: str,
+) -> None:
+    active = tmp_path / "active.key"
+    ring = tmp_path / "keyring.json"
+    _write_private(active, "61" * 32 + "\n")
+    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+    target = active if replacement_target == "active" else ring
+    target_identity = target.stat()
+    displaced = tmp_path / f"original-{target.name}"
+    real_read = os.read
+    swapped = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal swapped
+        payload = real_read(descriptor, size)
+        current = os.fstat(descriptor)
+        if not swapped and (current.st_dev, current.st_ino) == (
+            target_identity.st_dev,
+            target_identity.st_ino,
+        ):
+            swapped = True
+            target.rename(displaced)
+            _write_private(target, displaced.read_text(encoding="ascii"))
+        return payload
+
+    monkeypatch.setattr("rquant.lab_daemon.os.read", replacing_read)
+    with pytest.raises(LabDaemonConfigurationError, match="changed during read"):
+        LabAuthorityKeyring.load(
+            active_key_id="active",
+            active_key_path=active,
+            verification_keyring_path=ring,
+        )
+
+
 @pytest.mark.parametrize(
     "value",
     [None, "", "a" * 39, "a" * 41, "A" * 40, "a" * 40 + "-dirty"],
@@ -253,7 +291,7 @@ def test_daemon_lock_rejects_root_replacement_before_touching_lock_file(
     def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
         nonlocal swapped
         descriptor = real_open(path, flags, *args, **kwargs)
-        if not swapped and Path(path) == lock_dir and kwargs.get("dir_fd") is None:
+        if not swapped and Path(path) == Path(lock_dir.name) and kwargs.get("dir_fd") is not None:
             swapped = True
             lock_dir.rename(original)
             lock_dir.mkdir(mode=0o700)
@@ -265,6 +303,29 @@ def test_daemon_lock_rejects_root_replacement_before_touching_lock_file(
         LabDaemonLock(lock_dir, "scheduler").acquire()
 
     assert replacement_victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_daemon_lock_remains_exclusive_after_root_is_renamed_and_recreated(
+    tmp_path: Path,
+) -> None:
+    lock_dir = tmp_path / "locks"
+    displaced = tmp_path / "displaced-locks"
+    first = LabDaemonLock(lock_dir, "scheduler")
+    first.acquire()
+    try:
+        lock_dir.rename(displaced)
+        lock_dir.mkdir(mode=0o700)
+
+        second = LabDaemonLock(lock_dir, "scheduler")
+        with pytest.raises(LabDaemonConfigurationError, match="already running"):
+            second.acquire()
+        assert first.authority_path == second.authority_path
+        assert first.authority_path is not None
+        assert first.authority_path.parent == tmp_path
+        assert first.authority_path.stat().st_mode & 0o777 == 0o600
+        second.release()
+    finally:
+        first.release()
 
 
 def test_scheduler_prepares_private_sqlite_under_public_umask(tmp_path: Path) -> None:
@@ -376,6 +437,34 @@ def test_scheduler_sqlite_rw_uri_never_creates_missing_symlink_target_after_prec
         authority.close()
 
     assert not missing_target.exists()
+
+
+def test_private_sqlite_rejects_parent_replacement_immediately_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced-state"
+    path = root / "lab_jobs.sqlite3"
+    real_open = os.open
+    swapped = False
+
+    def replacing_open(path_arg: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        descriptor = real_open(path_arg, flags, *args, **kwargs)
+        if not swapped and Path(path_arg) == root and kwargs.get("dir_fd") is None:
+            swapped = True
+            root.rename(displaced)
+            root.mkdir(mode=0o700)
+        return descriptor
+
+    monkeypatch.setattr("rquant.lab_daemon.os.open", replacing_open)
+    with pytest.raises(LabDaemonConfigurationError, match="parent identity changed"):
+        prepare_private_sqlite_path(path, label="lab jobs SQLite", create=True)
+
+    assert not (root / path.name).exists()
+    assert not (displaced / path.name).exists()
 
 
 def test_finalizer_sqlite_authority_rejects_rename_swap_before_read(
@@ -1045,6 +1134,79 @@ def test_finalizer_state_rejects_hardlink_created_during_read(
 
     monkeypatch.setattr("rquant.lab_daemon.os.read", linking_read)
     with pytest.raises(LabDaemonConfigurationError, match="hardlink"):
+        store.load()
+
+
+def test_finalizer_state_open_rejects_root_replaced_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    displaced = tmp_path / "displaced-before-open"
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=2))
+    real_open = os.open
+    swapped = False
+
+    def replacing_open(path_arg: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if not swapped and Path(path_arg) == state_dir and kwargs.get("dir_fd") is None:
+            swapped = True
+            state_dir.rename(displaced)
+            state_dir.mkdir(mode=0o700)
+        return real_open(path_arg, flags, *args, **kwargs)
+
+    monkeypatch.setattr("rquant.lab_daemon.os.open", replacing_open)
+    with pytest.raises(LabDaemonConfigurationError, match="directory identity changed"):
+        store.load()
+
+
+def test_finalizer_state_missing_result_rechecks_root_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    displaced = tmp_path / "displaced-missing-state"
+    store = LabFinalizerStateStore(state_dir)
+    real_stat = os.stat
+    swapped = False
+
+    def replacing_stat(path_arg: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal swapped
+        if not swapped and path_arg == "state.json" and kwargs.get("dir_fd") is not None:
+            swapped = True
+            state_dir.rename(displaced)
+            state_dir.mkdir(mode=0o700)
+            raise FileNotFoundError(path_arg)
+        return real_stat(path_arg, *args, **kwargs)
+
+    monkeypatch.setattr("rquant.lab_daemon.os.stat", replacing_stat)
+    with pytest.raises(LabDaemonConfigurationError, match="directory identity changed"):
+        store.load()
+
+
+def test_finalizer_state_read_rechecks_root_identity_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    displaced = tmp_path / "displaced-during-read"
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=3))
+    real_read = os.read
+    swapped = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal swapped
+        payload = real_read(descriptor, size)
+        if not swapped:
+            swapped = True
+            state_dir.rename(displaced)
+            state_dir.mkdir(mode=0o700)
+        return payload
+
+    monkeypatch.setattr("rquant.lab_daemon.os.read", replacing_read)
+    with pytest.raises(LabDaemonConfigurationError, match="directory identity changed"):
         store.load()
 
 

@@ -414,6 +414,94 @@ def test_detect_verified_code_commit_uses_precise_gitignore_for_worktree_venv(
 
 
 @pytest.mark.parametrize(
+    "artifact_name",
+    ["trusted.so", "native.dylib", "native.pyd", "legacy.pyc", "legacy.pyo"],
+)
+def test_detect_verified_code_commit_rejects_ignored_loadable_source_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    package = repo / "src" / "rquant"
+    package.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text("*.so\n*.dylib\n*.pyd\n*.pyc\n*.pyo\n", encoding="utf-8")
+    (package / "trusted.py").write_text("VALUE = 'tracked'\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore", "src/rquant/trusted.py"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (package / artifact_name).write_bytes(b"ignored executable payload")
+
+    assert detect_verified_code_commit(repo) == f"{head}-dirty"
+
+
+def test_detect_verified_code_commit_rejects_ignored_package_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.research_manifest import detect_verified_code_commit
+
+    monkeypatch.delenv("RQUANT_CODE_COMMIT", raising=False)
+    repo = tmp_path / "repo"
+    package = repo / "src" / "rquant"
+    package.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text("/src/rquant/plugged\n", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore", "src/rquant/__init__.py"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    payload = tmp_path / "payload-package"
+    payload.mkdir()
+    (payload / "__init__.py").write_text("VALUE = 'ignored'\n", encoding="utf-8")
+    (package / "plugged").symlink_to(payload, target_is_directory=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert detect_verified_code_commit(repo) == f"{head}-dirty"
+
+
+@pytest.mark.parametrize(
     ("name", "executable"),
     [("payload.py", False), ("runtime-tool", True), ("notes.txt", False)],
 )

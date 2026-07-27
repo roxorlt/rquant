@@ -53,6 +53,15 @@ def _validate_private_regular_identity(observed: os.stat_result, *, label: str) 
         raise LabDaemonConfigurationError(f"{label} must not be a hardlink")
 
 
+def _validate_private_directory_identity(observed: os.stat_result, *, label: str) -> None:
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+        raise LabDaemonConfigurationError(f"{label} must be a real directory")
+    if observed.st_uid != os.getuid():
+        raise LabDaemonConfigurationError(f"{label} must be owned by this user")
+    if stat.S_IMODE(observed.st_mode) != 0o700:
+        raise LabDaemonConfigurationError(f"{label} must have private mode 0700")
+
+
 def require_private_directory(path: Path, *, label: str) -> Path:
     candidate = _canonical_absolute_path(path, label=label)
     try:
@@ -313,6 +322,23 @@ def _read_private_file(path: Path, *, label: str, max_bytes: int = 16_384) -> by
         ) or len(payload) != final.st_size:
             raise LabDaemonConfigurationError(f"{label} key file changed during read")
         _validate_private_regular_identity(final, label=f"{label} key file")
+        try:
+            active = candidate.lstat()
+            _validate_private_regular_identity(active, label=f"{label} key file")
+        except (OSError, LabDaemonConfigurationError) as exc:
+            raise LabDaemonConfigurationError(f"{label} key file changed during read") from exc
+        if (
+            active.st_dev,
+            active.st_ino,
+            active.st_size,
+            active.st_mtime_ns,
+        ) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_mtime_ns,
+        ):
+            raise LabDaemonConfigurationError(f"{label} key file changed during read")
     finally:
         os.close(descriptor)
     if len(payload) > max_bytes:
@@ -369,14 +395,22 @@ class LabSqliteAuthority:
             raise LabDaemonConfigurationError(
                 f"{self.label} identity changed after validation"
             ) from exc
-        if (
-            self._identity(parent_fd_stat) != self._identity(self._parent_identity)
-            or self._identity(parent_path_stat) != self._identity(self._parent_identity)
-            or not stat.S_ISDIR(parent_fd_stat.st_mode)
-            or stat.S_ISLNK(parent_path_stat.st_mode)
-            or parent_fd_stat.st_uid != os.getuid()
-            or parent_fd_stat.st_mode & 0o077
-        ):
+        try:
+            _validate_private_directory_identity(
+                parent_fd_stat,
+                label=f"{self.label} parent",
+            )
+            _validate_private_directory_identity(
+                parent_path_stat,
+                label=f"{self.label} parent",
+            )
+        except LabDaemonConfigurationError as exc:
+            raise LabDaemonConfigurationError(
+                f"{self.label} parent identity changed after validation"
+            ) from exc
+        if self._identity(parent_fd_stat) != self._identity(
+            self._parent_identity
+        ) or self._identity(parent_path_stat) != self._identity(self._parent_identity):
             raise LabDaemonConfigurationError(
                 f"{self.label} parent identity changed after validation"
             )
@@ -451,6 +485,20 @@ def prepare_private_sqlite_path(
         parent_descriptor = os.open(parent, directory_flags)
     except OSError as exc:
         raise LabDaemonConfigurationError(f"{label} parent could not be opened safely") from exc
+    try:
+        opened_parent = os.fstat(parent_descriptor)
+        active_parent = parent.lstat()
+        _validate_private_directory_identity(opened_parent, label=f"{label} parent")
+        _validate_private_directory_identity(active_parent, label=f"{label} parent")
+        expected_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        if (opened_parent.st_dev, opened_parent.st_ino) != expected_identity or (
+            active_parent.st_dev,
+            active_parent.st_ino,
+        ) != expected_identity:
+            raise LabDaemonConfigurationError(f"{label} parent identity changed")
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
     descriptor = -1
     try:
         try:
@@ -490,7 +538,7 @@ def prepare_private_sqlite_path(
             label=label,
             parent_descriptor=parent_descriptor,
             database_descriptor=descriptor,
-            parent_identity=os.fstat(parent_descriptor),
+            parent_identity=opened_parent,
             database_identity=current,
         )
         authority.assert_current()
@@ -584,7 +632,13 @@ class LabAuthorityKeyring:
 
 
 class LabDaemonLock:
-    """Advisory per-daemon process lock retained for the process lifetime."""
+    """Advisory daemon lock anchored beside, rather than inside, its runtime root.
+
+    The stable lock name binds the configured canonical root path and daemon name.
+    Replacing the lock root therefore cannot create a second lock namespace. A
+    malicious same-UID replacement of a higher-level parent remains outside this
+    local filesystem boundary.
+    """
 
     def __init__(self, root: Path, name: str) -> None:
         if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name) is None:
@@ -592,8 +646,78 @@ class LabDaemonLock:
         self.root = Path(root)
         self.name = name
         self.path = self.root / f"{name}.lock"
+        self.authority_path: Path | None = None
         self._descriptor = -1
         self._root_descriptor = -1
+        self._parent_descriptor = -1
+
+    @staticmethod
+    def _open_private_file(
+        directory_descriptor: int,
+        name: str,
+        *,
+        label: str,
+    ) -> int:
+        try:
+            observed = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            observed = None
+        if observed is None:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+            except OSError as exc:
+                raise LabDaemonConfigurationError(
+                    f"{label} could not be created atomically"
+                ) from exc
+            created = True
+        else:
+            _validate_private_regular_identity(observed, label=label)
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+            except OSError as exc:
+                raise LabDaemonConfigurationError(f"{label} could not be opened safely") from exc
+            created = False
+        try:
+            if created:
+                os.fchmod(descriptor, 0o600)
+            current = os.fstat(descriptor)
+            if observed is not None and (current.st_dev, current.st_ino) != (
+                observed.st_dev,
+                observed.st_ino,
+            ):
+                raise LabDaemonConfigurationError(f"{label} changed during validation")
+            _validate_private_regular_identity(current, label=label)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _assert_parent_current(
+        self,
+        descriptor: int,
+        expected: os.stat_result,
+    ) -> None:
+        try:
+            current = os.fstat(descriptor)
+            path_current = self.root.parent.lstat()
+        except OSError as exc:
+            raise LabDaemonConfigurationError("daemon lock parent identity changed") from exc
+        try:
+            _validate_private_directory_identity(current, label="daemon lock parent")
+            _validate_private_directory_identity(path_current, label="daemon lock parent")
+        except LabDaemonConfigurationError as exc:
+            raise LabDaemonConfigurationError("daemon lock parent identity changed") from exc
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino) or (
+            path_current.st_dev,
+            path_current.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise LabDaemonConfigurationError("daemon lock parent identity changed")
 
     def _assert_root_current(
         self,
@@ -605,107 +729,117 @@ class LabDaemonLock:
             path_current = self.root.lstat()
         except OSError as exc:
             raise LabDaemonConfigurationError("daemon lock root identity changed") from exc
-        if (
-            (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
-            or (path_current.st_dev, path_current.st_ino) != (expected.st_dev, expected.st_ino)
-            or not stat.S_ISDIR(current.st_mode)
-            or stat.S_ISLNK(path_current.st_mode)
-            or current.st_uid != os.getuid()
-            or current.st_mode & 0o077
-        ):
+        try:
+            _validate_private_directory_identity(current, label="daemon lock root")
+            _validate_private_directory_identity(path_current, label="daemon lock root")
+        except LabDaemonConfigurationError as exc:
+            raise LabDaemonConfigurationError("daemon lock root identity changed") from exc
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino) or (
+            path_current.st_dev,
+            path_current.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
             raise LabDaemonConfigurationError("daemon lock root identity changed")
 
     def acquire(self) -> None:
-        if self._descriptor >= 0 or self._root_descriptor >= 0:
+        if self._descriptor >= 0 or self._root_descriptor >= 0 or self._parent_descriptor >= 0:
             raise RuntimeError("daemon lock is already acquired")
-        existed = self.root.exists()
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not existed:
-            self.root.chmod(0o700)
-        root_stat = self.root.lstat()
-        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
-            raise LabDaemonConfigurationError("daemon lock root must be a real directory")
-        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o077:
-            raise LabDaemonConfigurationError("daemon lock root must have private permissions")
+        self.root = _canonical_absolute_path(self.root, label="daemon lock root")
+        self.path = self.root / f"{self.name}.lock"
+        parent = self.root.parent
+        try:
+            parent_stat = parent.lstat()
+            if parent.resolve(strict=True) != parent:
+                raise LabDaemonConfigurationError("daemon lock parent must be canonical")
+            _validate_private_directory_identity(parent_stat, label="daemon lock parent")
+        except FileNotFoundError as exc:
+            raise LabDaemonConfigurationError("daemon lock parent does not exist") from exc
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            root_descriptor = os.open(self.root, directory_flags)
+            parent_descriptor = os.open(parent, directory_flags)
         except OSError as exc:
             raise LabDaemonConfigurationError(
-                "daemon lock root could not be opened safely"
+                "daemon lock parent could not be opened safely"
             ) from exc
+        root_descriptor = -1
         descriptor = -1
+        metadata_descriptor = -1
         try:
-            self._assert_root_current(root_descriptor, root_stat)
+            self._assert_parent_current(parent_descriptor, parent_stat)
             try:
-                observed = os.stat(
-                    self.path.name,
-                    dir_fd=root_descriptor,
+                root_stat = os.stat(
+                    self.root.name,
+                    dir_fd=parent_descriptor,
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                observed = None
-            if observed is None:
-                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
                 try:
-                    descriptor = os.open(
-                        self.path.name,
-                        flags,
-                        0o600,
-                        dir_fd=root_descriptor,
-                    )
+                    os.mkdir(self.root.name, mode=0o700, dir_fd=parent_descriptor)
                 except OSError as exc:
                     raise LabDaemonConfigurationError(
-                        "daemon lock file could not be created atomically"
+                        "daemon lock root could not be created safely"
                     ) from exc
-                created = True
-            else:
-                _validate_private_regular_identity(observed, label="daemon lock file")
-                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-                try:
-                    descriptor = os.open(
-                        self.path.name,
-                        flags,
-                        dir_fd=root_descriptor,
-                    )
-                except OSError as exc:
-                    raise LabDaemonConfigurationError(
-                        "daemon lock file could not be opened safely"
-                    ) from exc
-                created = False
-            if created:
-                os.fchmod(descriptor, 0o600)
-            current = os.fstat(descriptor)
-            if observed is not None and (current.st_dev, current.st_ino) != (
-                observed.st_dev,
-                observed.st_ino,
-            ):
-                raise LabDaemonConfigurationError("daemon lock file changed during validation")
-            _validate_private_regular_identity(current, label="daemon lock file")
+                root_stat = os.stat(
+                    self.root.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            _validate_private_directory_identity(root_stat, label="daemon lock root")
+            root_descriptor = os.open(
+                self.root.name,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            self._assert_parent_current(parent_descriptor, parent_stat)
             self._assert_root_current(root_descriptor, root_stat)
+
+            root_identity = hashlib.sha256(os.fsencode(str(self.root))).hexdigest()[:24]
+            authority_name = f".rquant-lab-lock-{root_identity}-{self.name}.lock"
+            self.authority_path = parent / authority_name
+            descriptor = self._open_private_file(
+                parent_descriptor,
+                authority_name,
+                label="daemon authority lock file",
+            )
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise LabDaemonConfigurationError(
                     f"lab {self.name} daemon is already running"
                 ) from exc
+            self._assert_parent_current(parent_descriptor, parent_stat)
             self._assert_root_current(root_descriptor, root_stat)
-            os.ftruncate(descriptor, 0)
-            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-            os.fsync(descriptor)
+
+            metadata_descriptor = self._open_private_file(
+                root_descriptor,
+                self.path.name,
+                label="daemon lock file",
+            )
+            os.ftruncate(metadata_descriptor, 0)
+            os.write(metadata_descriptor, f"{os.getpid()}\n".encode("ascii"))
+            os.fsync(metadata_descriptor)
+            os.close(metadata_descriptor)
+            metadata_descriptor = -1
+            self._assert_parent_current(parent_descriptor, parent_stat)
+            self._assert_root_current(root_descriptor, root_stat)
         except BaseException:
+            if metadata_descriptor >= 0:
+                os.close(metadata_descriptor)
             if descriptor >= 0:
                 os.close(descriptor)
-            os.close(root_descriptor)
+            if root_descriptor >= 0:
+                os.close(root_descriptor)
+            os.close(parent_descriptor)
             raise
         self._descriptor = descriptor
         self._root_descriptor = root_descriptor
+        self._parent_descriptor = parent_descriptor
 
     def release(self) -> None:
-        if self._descriptor < 0 and self._root_descriptor < 0:
+        if self._descriptor < 0 and self._root_descriptor < 0 and self._parent_descriptor < 0:
             return
         descriptor, self._descriptor = self._descriptor, -1
         root_descriptor, self._root_descriptor = self._root_descriptor, -1
+        parent_descriptor, self._parent_descriptor = self._parent_descriptor, -1
         try:
             if descriptor >= 0:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -714,6 +848,8 @@ class LabDaemonLock:
                 os.close(descriptor)
             if root_descriptor >= 0:
                 os.close(root_descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
 
     def __enter__(self) -> LabDaemonLock:
         self.acquire()
@@ -788,8 +924,10 @@ class LabFinalizerStateStore:
         self.root = _canonical_absolute_path(root, label="lab finalizer state")
         self.path = self.root / "state.json"
 
-    def _open_root(self) -> int:
+    def _open_root(self) -> tuple[int, os.stat_result]:
         require_private_directory(self.root, label="lab finalizer state")
+        initial = self.root.lstat()
+        _validate_private_directory_identity(initial, label="lab finalizer state")
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(self.root, flags)
@@ -797,13 +935,12 @@ class LabFinalizerStateStore:
             raise LabDaemonConfigurationError(
                 "lab finalizer state directory could not be opened safely"
             ) from exc
-        observed = os.fstat(descriptor)
         try:
-            self._assert_root_current(descriptor, observed)
+            self._assert_root_current(descriptor, initial)
         except BaseException:
             os.close(descriptor)
             raise
-        return descriptor
+        return descriptor, initial
 
     def _assert_root_current(
         self,
@@ -817,18 +954,21 @@ class LabFinalizerStateStore:
             raise LabDaemonConfigurationError(
                 "lab finalizer state directory identity changed"
             ) from exc
-        if (
-            (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino)
-            or (path_observed.st_dev, path_observed.st_ino) != (expected.st_dev, expected.st_ino)
-            or not stat.S_ISDIR(observed.st_mode)
-            or stat.S_ISLNK(path_observed.st_mode)
-            or observed.st_uid != os.getuid()
-            or observed.st_mode & 0o077
-        ):
+        try:
+            _validate_private_directory_identity(observed, label="lab finalizer state")
+            _validate_private_directory_identity(path_observed, label="lab finalizer state")
+        except LabDaemonConfigurationError as exc:
+            raise LabDaemonConfigurationError(
+                "lab finalizer state directory identity changed"
+            ) from exc
+        if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino) or (
+            path_observed.st_dev,
+            path_observed.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
             raise LabDaemonConfigurationError("lab finalizer state directory identity changed")
 
     def load(self) -> LabFinalizerDaemonState:
-        root_descriptor = self._open_root()
+        root_descriptor, root_identity = self._open_root()
         descriptor = -1
         try:
             try:
@@ -838,6 +978,7 @@ class LabFinalizerStateStore:
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
+                self._assert_root_current(root_descriptor, root_identity)
                 return LabFinalizerDaemonState()
             _validate_private_regular_identity(observed, label="lab finalizer state file")
             if observed.st_size > self._MAX_BYTES:
@@ -872,6 +1013,7 @@ class LabFinalizerStateStore:
                 raise LabDaemonConfigurationError("lab finalizer state is corrupt") from exc
             if len(state.failures) > self._MAX_FAILURES:
                 raise LabDaemonConfigurationError("lab finalizer state has too many failures")
+            self._assert_root_current(root_descriptor, root_identity)
             return state
         finally:
             if descriptor >= 0:
@@ -885,8 +1027,7 @@ class LabFinalizerStateStore:
         payload = state.model_dump_json().encode("utf-8")
         if len(payload) > self._MAX_BYTES:
             raise LabDaemonConfigurationError("lab finalizer state file is too large")
-        root_descriptor = self._open_root()
-        root_identity = os.fstat(root_descriptor)
+        root_descriptor, root_identity = self._open_root()
         temporary_name = f".state.{os.getpid()}.{uuid4().hex}.tmp"
         descriptor = -1
         try:

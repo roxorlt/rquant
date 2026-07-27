@@ -95,6 +95,14 @@
   陈旧项；状态读取最终复验 type/owner/mode/nlink，原子保存前后 fencing root 与活动路径，
   timezone 必须 aware 并规范为 UTC，异常路径保留既有有效状态。
 
+- **Strategy Lab daemon 第四轮文件系统 race 加固**：clean SHA 额外审计 `src/rquant` 下被
+  ignore 的 Python、原生动态库和 legacy sourceless bytecode；SQLite 在任何 DB stat/create
+  前绑定 open 前 parent、fd 与活动路径。daemon 真正的互斥锁改为稳定私有 parent 下、绑定
+  canonical lock-root identity 与 daemon 名的 sibling 文件，root 内文件仅保存 PID metadata，
+  并持续持有 parent/lock/root fd；更高层 parent 被恶意同 UID 进程完整替换仍是明确边界。
+  finalizer state 的空状态与完整解析返回均复验 root identity，active key 与 keyring 也在读取
+  结束前复验活动路径，rename/replacement 不再静默通过。
+
 - **Strategy Lab ETA 只读快照一致性**：`get_eta_input` 的 job、`MAX_JOB_SHARDS+1`
   权威探针、completed sample 与 remaining shards 现在共享同一显式 readonly transaction，
   WAL 并发插入不能再拼出跨快照 129-shard ETA；返回前同时校验 sample 不超过同快照权威总数。
