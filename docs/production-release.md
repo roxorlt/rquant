@@ -127,6 +127,11 @@ LOCK=/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
   -- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare
 ```
 
+准备命令最后以原子 `0600` 的 `lab-runtime/.prepared.json` 固化 checkout SHA、runtime 根身份、
+全部托管目录/文件和每个 legacy 迁移来源。它不会把一个空的 `0700` 目录当作已准备环境；旧
+`lab_jobs.sqlite3` 在迁移后重新出现、sentinel 被篡改、路径身份漂移或热 sidecar 出现，登记都会
+失败关闭，避免新旧 SQLite 静默分叉。
+
 第三步，显式登记已准备的 runtime/readiness 根；这会生成稳定、owner-only 的 installation state，
 后续 installed 模式发布必须验证它，不能仅靠 plist 文件存在：
 
@@ -140,7 +145,9 @@ bash scripts/deploy-production.sh \
 
 最后才由 P1.5d 的人工基础设施步骤安装并 bootstrap 三个 launchd plist。初始化和登记模式不要求
 launchd 已安装或 loaded；常规 `macos-lab + installed` 发布则反过来强制 installation state 与三个
-label 都存在。该区分避免首次安装陷入“必须先停一个尚未安装的 daemon”的循环依赖。
+label 都存在。installed dry-run 同样逐个只读核对三个 label 已 loaded 以及 installation、runtime、
+prepared sentinel、plist 和 generation 前置条件，但不会 bootout。该区分避免首次安装陷入“必须
+先停一个尚未安装的 daemon”的循环依赖。
 
 ## 中断恢复
 
@@ -205,9 +212,11 @@ sudoers 一样 fail closed，并要求独立人工验收/安装。plist 安装�
 `--register-lab-installation` 持久化新的文件 hash 与 inode；普通发布既不会偷偷替换 plist，也不会
 在 checkout 后才因旧 installation state 失败。Linux profile 的 systemd 规则保持不变。
 
-交接本身也有独立的 `0600` 持久事务记录：在第一次 bootout 前 fsync operation id、原 loaded label、
-已停止/已恢复集合与阶段。崩溃恢复以 launchctl 当前状态和该记录共同判断，允许“只恢复了一部分”
-的合法中间态；仍 loaded 的 label 会重新停下，最终只恢复原集合。generation marker 在 handoff
+交接本身也有独立的 `0600` 持久事务记录：在第一次 bootout 前 fsync operation id、已解析验证的
+exact target/ref、action、release profile、lifecycle、installation identity、原 loaded label、
+已停止/已恢复集合与阶段。未完成 operation 不可换 target 重入。崩溃恢复以 launchctl 当前状态和
+该记录共同判断，允许“只恢复了一部分”的合法中间态；仍 loaded 的 label 会重新停下，最终只恢复
+原集合。generation marker 在 handoff
 记录尚未 completed 时仅允许记录内某个 label 以 provisional 身份启动并发布 readiness，普通 daemon
 验收仍失败关闭；三个 label 全部恢复并通过稳定窗口后，handoff 才 completed，并发布按 handoff
 operation id 命名且绑定 marker operation、environment generation 与 code SHA 的不可变证明。下一次
@@ -223,9 +232,12 @@ label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 
 daemon restore 路径。恢复创建新的有界 deadline；超时命令在独立进程组运行并终止整组，不能遗留
 uv 子进程或无限期留下停止状态。
 
-这四个非秘钥部署控制项和 `LAB_TRUSTED_GIT_PATH` 可以放在 repo `.env`。stdlib bootstrap 只读取
-这份 allowlist，不 source/eval 文件，也不读取或打印 Tushare、通知等秘钥；显式进程环境/命令参数
-优先于 `.env`。`.env` 必须是当前用户所有的真实单链接 `0600` 文件，否则发布失败关闭。
+以下非秘钥部署控制项可以放在 repo `.env`：`RQUANT_DEPLOY_UV`、单命令/整体 timeout、
+generation GC 宽限期/最小剩余磁盘、`RQUANT_RELEASE_PROFILE`、`RQUANT_LAB_LIFECYCLE_MODE` 与
+`LAB_TRUSTED_GIT_PATH`。stdlib bootstrap 只读取这份 allowlist，不 source/eval 文件，也不读取或
+打印 Tushare、通知等秘钥；显式进程环境/命令参数优先于 `.env`。任何部署命名空间内的未知拼写、
+缺少 `=`、非法值或重复控制项都失败关闭，普通非部署环境项被忽略。`.env` 必须是当前用户所有的
+真实单链接 `0600` 文件，否则发布失败关闭。
 
 ## 预演与审计
 
@@ -248,7 +260,8 @@ authority 以 `0600`
 流程，而不是复制、修改或删除 JSON。每个 intent 的 immutable plan、stage history 和操作结果还会
 写入 `logs/production-deploy.jsonl`；完成 intent 在下一次发布开始前按 operation id 归档。
 macOS 还使用同一稳定私有根中的 `rquant.lab-install.json`、活动
-`rquant.lab-handoff.json` 与每次完成后的
+`rquant.lab-handoff.json`、每个未完成 operation 的
+`rquant.lab-handoff.<operation-id>.json` 与每次完成后的
 `rquant.lab-handoff.<operation-id>.completed.json`，分别绑定显式安装状态、可恢复 launchd 交接和
 当前 generation 的不可变交接证明；它们都不是人工补写的开关。
 

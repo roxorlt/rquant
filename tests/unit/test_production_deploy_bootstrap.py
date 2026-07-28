@@ -328,7 +328,7 @@ def _command(
     python: Path,
     lock_path: Path,
     *,
-    target: str = "v0.99.0",
+    target: str | None = None,
     mode: str = "deploy",
     recovery_action: str | None = None,
     operation_id: str | None = None,
@@ -379,7 +379,7 @@ def _command(
                 str(inherited_lock_fd),
             ]
         )
-    command.extend(["--", "--target", target])
+    command.extend(["--", "--target", target or _git(checkout, "rev-parse", "HEAD")])
     return command
 
 
@@ -398,14 +398,35 @@ def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
 
 
 def _install_lab_handoff(module: ModuleType, root: Path, lock_path: Path) -> None:
+    from rquant.lab_daemon import prepare_lab_runtime_layout
+
     runtime_root = root / "data" / "lab-runtime"
-    runtime_root.mkdir(parents=True, mode=0o700, exist_ok=True)
-    runtime_root.chmod(0o700)
+    directories = {
+        "lab command spool": runtime_root / "commands",
+        "lab claim spool": runtime_root / "claims",
+        "lab report spool": runtime_root / "reports",
+        "lab worker artifact root": runtime_root / "worker-artifacts",
+        "lab final artifact root": runtime_root / "final-artifacts",
+        "lab artifact commit spool": runtime_root / "artifact-commits",
+        "lab daemon lock root": runtime_root / "locks",
+        "lab finalizer state root": runtime_root / "finalizer-state",
+        "lab readiness root": runtime_root / "readiness",
+    }
+    files = {"lab jobs SQLite": runtime_root / "lab_jobs.sqlite3"}
+    prepare_lab_runtime_layout(
+        runtime_root,
+        checkout_root=root,
+        managed_directories=directories,
+        managed_files=files,
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
     module._write_lab_installation_state(
         root=root,
         lock_path=lock_path,
         runtime_root=runtime_root,
         readiness_root=runtime_root / "readiness",
+        expected_commit="a" * 40,
     )
 
 
@@ -418,27 +439,191 @@ def test_lab_handoff_dry_run_models_labels_without_stopping_daemons(
     _install_lab_handoff(module, root, lock_path)
     calls: list[list[str]] = []
     monkeypatch.setattr(module.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        module,
-        "_launchctl",
-        lambda arguments, **_kwargs: calls.append(arguments),
-    )
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, stdout="state = running\n", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     handoff = module._LabLaunchdHandoff(
         root=root,
         lock_path=lock_path,
         timeout_seconds=1,
     )
 
-    handoff.prepare(dry_run=True)
+    handoff.prepare(
+        dry_run=True,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
+    )
     handoff.restore()
 
-    assert calls == []
+    assert calls == [["print", f"gui/{os.getuid()}/{label}"] for label in module.LAB_LAUNCHD_LABELS]
     payload = json.loads(capsys.readouterr().err)
     assert payload == {
         "lab_daemon_handoff": "planned",
         "labels": list(module.LAB_LAUNCHD_LABELS),
         "stopped": False,
     }
+
+
+def test_lab_handoff_dry_run_requires_every_installed_label_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(tuple(arguments))
+        label = arguments[-1].rsplit("/", 1)[-1]
+        return subprocess.CompletedProcess(
+            arguments,
+            0 if label != module.LAB_LAUNCHD_LABELS[-1] else 113,
+            stdout="state = running\n" if label != module.LAB_LAUNCHD_LABELS[-1] else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    try:
+        with pytest.raises(module.DeployBootstrapError, match="all installed"):
+            handoff.prepare(
+                dry_run=True,
+                target_ref="a" * 40,
+                target_sha="a" * 40,
+                action="deploy",
+            )
+    finally:
+        handoff.close()
+
+    assert not [call for call in calls if call[0] in {"bootout", "bootstrap"}]
+
+
+def test_lab_handoff_rejects_invalid_or_changed_target_before_bootout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(tuple(arguments))
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            durable = json.loads(
+                module._stable_record_path(lock_path, "lab-handoff").read_text(encoding="utf-8")
+            )
+            assert durable["target_ref"] == durable["target_sha"] == "a" * 40
+            assert durable["action"] == "deploy"
+            assert durable["release_profile"] == "macos-lab"
+            assert durable["lifecycle_mode"] == "installed"
+            assert durable["installation_identity"]["sha256"]
+            loaded.remove(label)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    invalid = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    try:
+        with pytest.raises(module.DeployBootstrapError, match="exact target"):
+            invalid.prepare(
+                dry_run=False,
+                target_ref="not-a-target",
+                target_sha="short",
+                action="deploy",
+                now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+    finally:
+        invalid.close()
+    assert not [call for call in calls if call[0] == "bootout"]
+
+    first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    first.prepare(
+        dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    first.close()
+    bootouts = sum(call[0] == "bootout" for call in calls)
+    resumed = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    try:
+        with pytest.raises(module.DeployBootstrapError, match="binding changed"):
+            resumed.prepare(
+                dry_run=False,
+                target_ref="b" * 40,
+                target_sha="b" * 40,
+                action="deploy",
+                now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+    finally:
+        resumed.close()
+    assert sum(call[0] == "bootout" for call in calls) == bootouts
+
+
+def test_recovery_target_binding_is_verified_before_launchd_handoff(
+    tmp_path: Path,
+) -> None:
+    module, _root, lock_path = _handoff_fixture(tmp_path)
+    target = "b" * 40
+    previous = "a" * 40
+    module._atomic_private_json(
+        lock_path.with_name(f"{lock_path.stem}.intent.json"),
+        {
+            "schema_version": 1,
+            "operation_id": "c" * 32,
+            "previous_sha": previous,
+            "target_sha": target,
+            "target_ref": "v0.99.1",
+            "stage": "timers_stopped",
+        },
+        absent=True,
+    )
+
+    module._verify_recovery_target_binding(
+        lock_path=lock_path,
+        target_ref="v0.99.1",
+        target_sha=target,
+        action="resume",
+    )
+    module._verify_recovery_target_binding(
+        lock_path=lock_path,
+        target_ref=previous,
+        target_sha=previous,
+        action="rollback",
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="recorded deployment intent"):
+        module._verify_recovery_target_binding(
+            lock_path=lock_path,
+            target_ref="d" * 40,
+            target_sha="d" * 40,
+            action="resume",
+        )
 
 
 def test_lab_handoff_restores_all_managed_daemons_and_verifies_readiness(
@@ -486,6 +671,9 @@ def test_lab_handoff_restores_all_managed_daemons_and_verifies_readiness(
 
     handoff.prepare(
         dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
         now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
     assert loaded == set()
@@ -535,6 +723,9 @@ def test_lab_handoff_fails_before_bootout_when_any_managed_daemon_is_missing(
         with pytest.raises(module.DeployBootstrapError, match="all installed"):
             handoff.prepare(
                 dry_run=False,
+                target_ref="a" * 40,
+                target_sha="a" * 40,
+                action="deploy",
                 now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
             )
     finally:
@@ -588,6 +779,9 @@ def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wa
     )
     handoff.prepare(
         dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
         now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
@@ -644,6 +838,9 @@ def test_lab_handoff_command_timeout_restores_already_stopped_daemons(
     with pytest.raises(module.DeployBootstrapError, match="timed out"):
         handoff.prepare(
             dry_run=False,
+            target_ref="a" * 40,
+            target_sha="a" * 40,
+            action="deploy",
             now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
         )
     handoff.restore()
@@ -757,6 +954,9 @@ def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
     with pytest.raises(module.DeployBootstrapError, match="protected"):
         handoff.prepare(
             dry_run=False,
+            target_ref="a" * 40,
+            target_sha="a" * 40,
+            action="deploy",
             now=datetime(2026, 7, 27, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
         )
     handoff.restore()
@@ -773,7 +973,12 @@ def test_lab_handoff_requires_explicit_installation_state(
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
 
     with pytest.raises(module.DeployBootstrapError, match="installation state"):
-        handoff.prepare(dry_run=True)
+        handoff.prepare(
+            dry_run=True,
+            target_ref="a" * 40,
+            target_sha="a" * 40,
+            action="deploy",
+        )
 
 
 def test_lab_handoff_recovery_accepts_partial_loaded_state(
@@ -814,6 +1019,7 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     operation_id = "e" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     module._atomic_private_json(
         module._stable_record_path(lock_path, "lab-handoff"),
         {
@@ -826,12 +1032,24 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
             "stopped_labels": list(module.LAB_LAUNCHD_LABELS),
             "restarted_labels": [module.LAB_LAUNCHD_LABELS[0]],
             "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": "a" * 40,
+            "target_sha": "a" * 40,
+            "action": "deploy",
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": module._lab_installation_identity(
+                lock_path,
+                installation,
+            ),
         },
     )
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
 
     handoff.prepare(
         dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
         now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
     assert loaded == set()
@@ -892,7 +1110,13 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     now = datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 
     first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
-    first.prepare(dry_run=False, now=now)
+    first.prepare(
+        dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
+        now=now,
+    )
     first_operation = first.operation_id
     first.restore()
     first_proof = module._completed_handoff_path(lock_path, first_operation)
@@ -903,7 +1127,13 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     module._atomic_private_json(first.record_path, interrupted_active)
 
     second = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
-    second.prepare(dry_run=False, now=now)
+    second.prepare(
+        dry_run=False,
+        target_ref="f" * 40,
+        target_sha="f" * 40,
+        action="deploy",
+        now=now,
+    )
     assert second.operation_id != first_operation
     assert json.loads(first_proof.read_text(encoding="utf-8")) == first_payload
     second.restore()
@@ -955,6 +1185,9 @@ def test_lab_handoff_restore_gets_fresh_overall_budget(
     )
     handoff.prepare(
         dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
         now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
     handoff.deadline = time.monotonic() - 1
@@ -976,7 +1209,17 @@ def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
             raise module.DeployBootstrapError("target readiness failed")
 
     class RecoveryHandoff:
-        def prepare(self, *, dry_run: bool, now: datetime | None = None) -> None:
+        def prepare(
+            self,
+            *,
+            dry_run: bool,
+            target_ref: str,
+            target_sha: str,
+            action: str,
+            now: datetime | None = None,
+        ) -> None:
+            assert target_ref == target_sha == "f" * 40
+            assert action == "rollback"
             del dry_run, now
             events.append("target-daemons-stopped")
 
@@ -999,6 +1242,7 @@ def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
         deploy_code=0,
         recovery_handoff_factory=lambda: recovery_handoff,
         rollback=rollback,
+        recovery_target_sha="f" * 40,
         now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
@@ -1039,6 +1283,35 @@ def test_deploy_control_dotenv_reader_is_allowlisted_and_never_evaluates_shell(
         "RQUANT_LAB_LIFECYCLE_MODE": "uninstalled",
     }
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("RQUANT_DEPLOY_COMMAND_TIMEOUT_SECOND=30\n", "unknown deployment dotenv key"),
+        ("RQUANT_LAB_LIFECYCLE_MOD=installed\n", "unknown deployment dotenv key"),
+        ("RQUANT_RELEASE_GENERATION_MIN_FREE_BYTE=1\n", "unknown deployment dotenv key"),
+        ("LAB_TRUSTED_GIT_PAT=/usr/bin/git\n", "unknown deployment dotenv key"),
+        ("RQUANT_DEPLOY_UV\n", "requires '='"),
+        ("RQUANT_DEPLOY_UV='/opt/homebrew/bin/uv\n", "value is invalid"),
+        (
+            "RQUANT_DEPLOY_UV=/opt/homebrew/bin/uv\nRQUANT_DEPLOY_UV=/usr/local/bin/uv\n",
+            "duplicate deployment dotenv key",
+        ),
+    ],
+)
+def test_deploy_control_dotenv_fails_closed_for_namespaced_typos_and_malformed_lines(
+    tmp_path: Path,
+    payload: str,
+    message: str,
+) -> None:
+    module = _bootstrap_module()
+    env_path = tmp_path / ".env"
+    env_path.write_text("TUSHARE_TOKEN\n" + payload, encoding="utf-8")
+    env_path.chmod(0o600)
+
+    with pytest.raises(module.DeployBootstrapError, match=message):
+        module._read_deploy_controls(env_path)
 
 
 def test_bootstrap_applies_repo_dotenv_deploy_timeout_controls(tmp_path: Path) -> None:
@@ -1136,7 +1409,7 @@ def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     assert not second_run.exists()
 
 
-def test_deploy_bootstrap_dry_run_uses_shared_generation_without_stopping(
+def test_installed_deploy_bootstrap_dry_run_fails_when_launchd_labels_are_not_loaded(
     tmp_path: Path,
 ) -> None:
     checkout, python, lock_path, _commit = _checkout(tmp_path)
@@ -1157,10 +1430,8 @@ def test_deploy_bootstrap_dry_run_uses_shared_generation_without_stopping(
     finally:
         os.close(daemon_lock)
 
-    assert result.returncode == 0, result.stderr
-    plan = json.loads(result.stderr)
-    assert plan["lab_daemon_handoff"] == "planned"
-    assert plan["stopped"] is False
+    assert result.returncode == 2
+    assert "all installed Lab launchd daemons must be loaded" in result.stderr
 
 
 def test_initialize_generation_publishes_first_marker_without_importing_deployer(
@@ -1247,9 +1518,83 @@ def test_register_lab_installation_requires_explicit_prepared_runtime(
         timeout=20,
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2
+    assert "prepared sentinel" in result.stderr
     installation = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
-    assert json.loads(installation.read_text(encoding="utf-8"))["runtime_root"] == str(runtime_root)
+    assert not installation.exists()
+
+    from rquant.lab_daemon import prepare_lab_runtime_layout
+
+    directories = {
+        "lab command spool": runtime_root / "commands",
+        "lab claim spool": runtime_root / "claims",
+        "lab report spool": runtime_root / "reports",
+        "lab worker artifact root": runtime_root / "worker-artifacts",
+        "lab final artifact root": runtime_root / "final-artifacts",
+        "lab artifact commit spool": runtime_root / "artifact-commits",
+        "lab daemon lock root": runtime_root / "locks",
+        "lab finalizer state root": runtime_root / "finalizer-state",
+        "lab readiness root": readiness_root,
+    }
+    prepare_lab_runtime_layout(
+        runtime_root,
+        checkout_root=checkout,
+        managed_directories=directories,
+        managed_files={"lab jobs SQLite": runtime_root / "lab_jobs.sqlite3"},
+        legacy_paths={},
+        mutation_guard=lambda: commit,
+    )
+    accepted = subprocess.run(
+        command,
+        cwd=checkout,
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(installation.read_text(encoding="utf-8"))["prepared_commit"] == commit
+
+
+def test_lab_installation_registration_rejects_tampered_prepared_sentinel(
+    tmp_path: Path,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    runtime_root = root / "data" / "lab-runtime"
+    readiness_root = runtime_root / "readiness"
+    runtime_root.mkdir(parents=True, mode=0o700)
+    runtime_root.chmod(0o700)
+    readiness_root.mkdir(mode=0o700)
+    readiness_root.chmod(0o700)
+    sentinel = runtime_root / ".prepared.json"
+    sentinel.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checkout_root": str(root),
+                "runtime_root": str(runtime_root),
+                "prepared_commit": "a" * 40,
+                "managed_directories": {},
+                "managed_files": {},
+                "migration_sources": {},
+                "runtime_device": runtime_root.stat().st_dev,
+                "runtime_inode": runtime_root.stat().st_ino + 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    sentinel.chmod(0o600)
+
+    with pytest.raises(module.DeployBootstrapError, match="prepared sentinel"):
+        module._write_lab_installation_state(
+            root=root,
+            lock_path=lock_path,
+            runtime_root=runtime_root,
+            readiness_root=readiness_root,
+            expected_commit="a" * 40,
+        )
 
 
 def test_initialize_generation_accepts_uv_style_symlinked_python(

@@ -75,7 +75,12 @@
   generation，再恢复并验收旧 daemon；子命令超时会终止完整进程组，避免遗留 uv。普通代码发布
   明确拒绝 `deploy/launchd` 变更，plist 更新必须走独立安装并重登记 installation state。部署入口
   以 allowlist、无 eval 的方式读取 repo `.env` 中非秘钥控制项；真实最小 uv console entry 会在
-  freeze 后从最终 generation 实际执行。Lab SQLite 迁移同时拒绝热 `-journal` sidecar。
+  freeze 后从最终 generation 实际执行。Lab SQLite 迁移同时拒绝热 `-journal` sidecar。handoff
+  在 bootout 前绑定已验证 target/action/profile/lifecycle/installation identity，恢复只能读取 marker
+  operation 对应的版本化记录；installed dry-run 会核对三个 loaded label。Lab runtime prepare 新增
+  绑定路径、身份、commit 与 legacy 来源的私有 durable sentinel，登记不再接受空目录或分叉旧库；
+  generation 初始化 uv 构建也纳入单命令/整体 timeout 和进程组终止。部署命名空间内未知、缺等号、
+  非法或重复 `.env` 控制项统一失败关闭。
 
 - **不可变 uv 代际与 macOS Lab 发布验收**：release authority 现在用真实 `uv sync --frozen`
   在独立 generation 目录构建小型环境，并只接受绑定到已验证系统解释器或代际内部目标的 uv

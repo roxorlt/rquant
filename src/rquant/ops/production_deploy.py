@@ -230,6 +230,10 @@ class SubprocessRunner:
             overall_timeout_seconds=self._overall_timeout_seconds,
         )
 
+    @property
+    def deadline_monotonic(self) -> float:
+        return self._deadline
+
     def run(
         self,
         args: list[str],
@@ -1097,6 +1101,12 @@ def deploy(
                     git_path=effective_config.git_path,
                     writable=not effective_config.dry_run,
                     uv_path=Path(effective_config.uv_bin),
+                    command_timeout_seconds=effective_config.command_timeout_seconds,
+                    overall_deadline_monotonic=getattr(
+                        effective_runner,
+                        "deadline_monotonic",
+                        None,
+                    ),
                 )
                 if effective_config.recovery_action is None:
                     generation_authority.verify(expected_commit=effective_config.startup_generation)

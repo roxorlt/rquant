@@ -28,6 +28,9 @@ from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
 
 _CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_LAB_RUNTIME_PREPARED_SCHEMA_VERSION = 1
+_LAB_RUNTIME_PREPARED_FILENAME = ".prepared.json"
+_LAB_RUNTIME_PREPARED_MAX_BYTES = 1024 * 1024
 
 
 class LabDaemonConfigurationError(RuntimeError):
@@ -118,9 +121,213 @@ def ensure_private_directory(
     return require_private_directory(candidate, label=label)
 
 
+def lab_runtime_prepared_path(runtime_root: Path) -> Path:
+    root = _canonical_absolute_path(runtime_root, label="lab runtime root")
+    return root / _LAB_RUNTIME_PREPARED_FILENAME
+
+
+def _runtime_identity_payload(path: Path, observed: os.stat_result) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+        "mode": stat.S_IMODE(observed.st_mode),
+    }
+
+
+def _write_runtime_prepared_sentinel(
+    root: Path,
+    payload: dict[str, object],
+    *,
+    mutation_guard: Callable[[], object],
+) -> None:
+    root_observed = root.lstat()
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = f".{_LAB_RUNTIME_PREPARED_FILENAME}.{uuid4().hex}.tmp"
+    descriptor = -1
+    try:
+        opened_root = os.fstat(root_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != (
+            root_observed.st_dev,
+            root_observed.st_ino,
+        ):
+            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        mutation_guard()
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_fd,
+        )
+        encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise LabDaemonConfigurationError("lab runtime prepared sentinel write failed")
+            offset += written
+        os.fsync(descriptor)
+        _validate_private_regular_identity(
+            os.fstat(descriptor),
+            label="lab runtime prepared sentinel",
+        )
+        mutation_guard()
+        active_root = root.lstat()
+        if (active_root.st_dev, active_root.st_ino) != (
+            root_observed.st_dev,
+            root_observed.st_ino,
+        ):
+            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        os.replace(
+            temporary,
+            _LAB_RUNTIME_PREPARED_FILENAME,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        os.fsync(root_fd)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(temporary, dir_fd=root_fd)
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+
+
+def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
+    sentinel = lab_runtime_prepared_path(root)
+    descriptor = -1
+    try:
+        before = sentinel.lstat()
+        descriptor = os.open(sentinel, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        _validate_private_regular_identity(opened, label="lab runtime prepared sentinel")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise LabDaemonConfigurationError("lab runtime prepared sentinel identity changed")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, _LAB_RUNTIME_PREPARED_MAX_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _LAB_RUNTIME_PREPARED_MAX_BYTES:
+                raise LabDaemonConfigurationError("lab runtime prepared sentinel is too large")
+        after = sentinel.lstat()
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_nlink,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+        ):
+            raise LabDaemonConfigurationError("lab runtime prepared sentinel identity changed")
+        payload = json.loads(b"".join(chunks))
+        if not isinstance(payload, dict):
+            raise LabDaemonConfigurationError("lab runtime prepared sentinel is malformed")
+        return payload
+    except LabDaemonConfigurationError:
+        raise
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise LabDaemonConfigurationError("lab runtime prepared sentinel is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def verify_lab_runtime_prepared(
+    runtime_root: Path,
+    *,
+    checkout_root: Path,
+    expected_commit: str,
+    managed_directories: Mapping[str, Path],
+    managed_files: Mapping[str, Path],
+    legacy_paths: Mapping[Path, Path],
+) -> dict[str, object]:
+    root = require_private_directory(runtime_root, label="lab runtime root")
+    checkout = _canonical_absolute_path(checkout_root, label="checkout root")
+    root_observed = root.lstat()
+    payload = _read_runtime_prepared_sentinel(root)
+    recorded_files = payload.get("managed_files")
+    expected_directories: dict[str, dict[str, object]] = {}
+    for label, raw_path in managed_directories.items():
+        path = require_private_directory(raw_path, label=label)
+        if path.parent != root:
+            raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
+        expected_directories[label] = _runtime_identity_payload(path, path.lstat())
+    expected_files: dict[str, dict[str, object]] = {}
+    for label, raw_path in managed_files.items():
+        path = _canonical_absolute_path(raw_path, label=label)
+        if path.parent != root:
+            raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
+        if os.path.lexists(path):
+            observed = path.lstat()
+            _validate_private_regular_identity(observed, label=label)
+            recorded = recorded_files.get(label) if isinstance(recorded_files, dict) else None
+            if isinstance(recorded, dict) and recorded.get("exists") is False:
+                expected_files[label] = {"path": str(path), "exists": False}
+            else:
+                expected_files[label] = {
+                    **_runtime_identity_payload(path, observed),
+                    "exists": True,
+                }
+        else:
+            expected_files[label] = {"path": str(path), "exists": False}
+    migration_sources: dict[str, dict[str, object]] = {}
+    for target, raw_source in legacy_paths.items():
+        source = _canonical_absolute_path(raw_source, label=f"legacy {target.name}")
+        if os.path.lexists(source):
+            raise LabDaemonConfigurationError(f"legacy {source.name} still exists")
+        migration_sources[str(target)] = {
+            "source": str(source),
+        }
+    expected = {
+        "schema_version": _LAB_RUNTIME_PREPARED_SCHEMA_VERSION,
+        "checkout_root": str(checkout),
+        "runtime_root": str(root),
+        "runtime_device": root_observed.st_dev,
+        "runtime_inode": root_observed.st_ino,
+        "prepared_commit": expected_commit,
+        "managed_directories": expected_directories,
+        "managed_files": expected_files,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise LabDaemonConfigurationError("lab runtime prepared sentinel binding changed")
+    recorded_sources = payload.get("migration_sources")
+    if not isinstance(recorded_sources, dict) or set(recorded_sources) != set(migration_sources):
+        raise LabDaemonConfigurationError("lab runtime prepared sentinel migration binding changed")
+    for target, expected_source in migration_sources.items():
+        recorded = recorded_sources.get(target)
+        if (
+            not isinstance(recorded, dict)
+            or set(recorded) != {"source", "migrated"}
+            or recorded.get("source") != expected_source["source"]
+            or not isinstance(recorded.get("migrated"), bool)
+        ):
+            raise LabDaemonConfigurationError(
+                "lab runtime prepared sentinel migration binding changed"
+            )
+    return payload
+
+
 def prepare_lab_runtime_layout(
     runtime_root: Path,
     *,
+    checkout_root: Path,
     managed_directories: Mapping[str, Path],
     managed_files: Mapping[str, Path],
     legacy_paths: Mapping[Path, Path],
@@ -132,6 +339,7 @@ def prepare_lab_runtime_layout(
         mutation_guard=mutation_guard,
     )
     targets = {**managed_directories, **managed_files}
+    migration_payload: dict[str, dict[str, object]] = {}
     for label, target_value in targets.items():
         target = _canonical_absolute_path(target_value, label=label)
         if target.parent != root:
@@ -140,6 +348,7 @@ def prepare_lab_runtime_layout(
         if legacy is None:
             continue
         legacy = _canonical_absolute_path(legacy, label=f"legacy {label}")
+        migration_payload[str(target)] = {"source": str(legacy), "migrated": False}
         target_exists = os.path.lexists(target)
         legacy_exists = os.path.lexists(legacy)
         if target_exists and legacy_exists:
@@ -207,6 +416,7 @@ def prepare_lab_runtime_layout(
             )
             os.fsync(source_fd)
             os.fsync(target_fd)
+            migration_payload[str(target)]["migrated"] = True
         except OSError as exc:
             raise LabDaemonConfigurationError(f"legacy {label} could not be migrated") from exc
         finally:
@@ -217,6 +427,41 @@ def prepare_lab_runtime_layout(
     for label, path in managed_files.items():
         if os.path.lexists(path):
             _validate_private_regular_identity(path.lstat(), label=label)
+    prepared_commit = str(mutation_guard())
+    if _CODE_SHA.fullmatch(prepared_commit) is None:
+        raise LabDaemonConfigurationError("lab runtime prepared commit must be a full SHA")
+    checkout = _canonical_absolute_path(checkout_root, label="checkout root")
+    root_observed = root.lstat()
+    directory_payload = {
+        label: _runtime_identity_payload(Path(path), Path(path).lstat())
+        for label, path in managed_directories.items()
+    }
+    file_payload: dict[str, dict[str, object]] = {}
+    for label, raw_path in managed_files.items():
+        path = Path(raw_path)
+        if os.path.lexists(path):
+            file_payload[label] = {
+                **_runtime_identity_payload(path, path.lstat()),
+                "exists": True,
+            }
+        else:
+            file_payload[label] = {"path": str(path), "exists": False}
+    _write_runtime_prepared_sentinel(
+        root,
+        {
+            "schema_version": _LAB_RUNTIME_PREPARED_SCHEMA_VERSION,
+            "checkout_root": str(checkout),
+            "runtime_root": str(root),
+            "runtime_device": root_observed.st_dev,
+            "runtime_inode": root_observed.st_ino,
+            "prepared_commit": prepared_commit,
+            "managed_directories": directory_payload,
+            "managed_files": file_payload,
+            "migration_sources": migration_payload,
+            "prepared_at": datetime.now(UTC).isoformat(),
+        },
+        mutation_guard=mutation_guard,
+    )
     return root
 
 

@@ -48,8 +48,10 @@ P1.5d 安装 launchd 前必须在主 checkout 重建自有、物理、非 symlin
 目录为当前用户所有且 mode `0700`、锁文件 mode `0600`。随后运行
 `deploy-production.sh --initialize-generation --target <exact-ref>`；该 stdlib-only 模式在同一
 独占锁内核对精确 target/origin-main、tracked clean、锁文件 hash、包版本、ABI 和物理 venv，
-执行 frozen sync 与 preflight 后才初始化 marker。中断后只能以显式 `--recover-generation` 的
-`resume` 或 `rollback` 动作恢复，详见 `docs/production-release.md`。P1.5b 不安装 launchd，也不
+执行 frozen sync 与 preflight 后才初始化 marker。初始化中断后必须原样重跑同一个
+`--initialize-generation --target <the-same-recorded-exact-target>`；`--recover-generation` 仅用于
+已经持久化常规 deployment intent 的发布，不得用于初始化恢复，详见
+`docs/production-release.md`。P1.5b 不安装 launchd，也不
 修改现有主 checkout。隔离 worktree 可继续复用链接 `.venv` 运行测试，但正式 daemon 会在读取
 配置或创建运行时目录前拒绝这种 runtime。
 

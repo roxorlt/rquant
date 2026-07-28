@@ -798,10 +798,11 @@ def test_private_lab_runtime_layout_migrates_without_chmoding_shared_data(
 
     lab_daemon.prepare_lab_runtime_layout(
         runtime,
+        checkout_root=tmp_path,
         managed_directories={"commands": commands, "readiness": runtime / "readiness"},
         managed_files={"lab jobs SQLite": database},
         legacy_paths={database: legacy_database, commands: legacy_commands},
-        mutation_guard=lambda: "verified",
+        mutation_guard=lambda: "a" * 40,
     )
 
     assert stat.S_IMODE(data.stat().st_mode) == 0o755
@@ -813,6 +814,17 @@ def test_private_lab_runtime_layout_migrates_without_chmoding_shared_data(
     assert stat.S_IMODE((runtime / "readiness").stat().st_mode) == 0o700
     assert not legacy_database.exists()
     assert not legacy_commands.exists()
+    prepared = lab_daemon.verify_lab_runtime_prepared(
+        runtime,
+        checkout_root=tmp_path,
+        expected_commit="a" * 40,
+        managed_directories={"commands": commands, "readiness": runtime / "readiness"},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={database: legacy_database, commands: legacy_commands},
+    )
+    assert prepared["runtime_root"] == str(runtime)
+    assert prepared["migration_sources"][str(database)]["source"] == str(legacy_database)
+    assert prepared["migration_sources"][str(database)]["migrated"] is True
 
 
 def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Path) -> None:
@@ -830,10 +842,11 @@ def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Pat
     with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="both exist"):
         lab_daemon.prepare_lab_runtime_layout(
             runtime,
+            checkout_root=tmp_path,
             managed_directories={"commands": target},
             managed_files={},
             legacy_paths={target: legacy},
-            mutation_guard=lambda: "verified",
+            mutation_guard=lambda: "a" * 40,
         )
 
 
@@ -859,10 +872,11 @@ def test_private_lab_runtime_layout_refuses_live_legacy_sqlite_sidecars(
     ):
         lab_daemon.prepare_lab_runtime_layout(
             runtime,
+            checkout_root=tmp_path,
             managed_directories={"commands": runtime / "commands"},
             managed_files={"lab jobs SQLite": database},
             legacy_paths={database: legacy_database},
-            mutation_guard=lambda: "verified",
+            mutation_guard=lambda: "a" * 40,
         )
 
     assert legacy_database.read_bytes() == b"sqlite"
@@ -892,15 +906,68 @@ def test_private_lab_runtime_layout_refuses_hot_legacy_sqlite_journal(
     ):
         lab_daemon.prepare_lab_runtime_layout(
             runtime,
+            checkout_root=tmp_path,
             managed_directories={"commands": runtime / "commands"},
             managed_files={"lab jobs SQLite": database},
             legacy_paths={database: legacy_database},
-            mutation_guard=lambda: "verified",
+            mutation_guard=lambda: "a" * 40,
         )
 
     assert legacy_database.read_bytes() == b"sqlite"
     assert legacy_journal.read_bytes() == b"hot-journal"
     assert not database.exists()
+
+
+def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o755)
+    runtime = data / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    commands = runtime / "commands"
+    legacy_database = data / "lab_jobs.sqlite3"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": commands},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={database: legacy_database},
+        mutation_guard=lambda: "b" * 40,
+    )
+    sentinel = lab_daemon.lab_runtime_prepared_path(runtime)
+    payload = json.loads(sentinel.read_text(encoding="utf-8"))
+    payload["prepared_commit"] = "c" * 40
+    sentinel.chmod(0o600)
+    sentinel.write_text(json.dumps(payload), encoding="utf-8")
+    sentinel.chmod(0o600)
+
+    with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="prepared sentinel"):
+        lab_daemon.verify_lab_runtime_prepared(
+            runtime,
+            checkout_root=tmp_path,
+            expected_commit="b" * 40,
+            managed_directories={"commands": commands},
+            managed_files={"lab jobs SQLite": database},
+            legacy_paths={database: legacy_database},
+        )
+
+    payload["prepared_commit"] = "b" * 40
+    sentinel.write_text(json.dumps(payload), encoding="utf-8")
+    sentinel.chmod(0o600)
+    legacy_database.write_bytes(b"split")
+    legacy_database.chmod(0o600)
+    with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="legacy.*still exists"):
+        lab_daemon.verify_lab_runtime_prepared(
+            runtime,
+            checkout_root=tmp_path,
+            expected_commit="b" * 40,
+            managed_directories={"commands": commands},
+            managed_files={"lab jobs SQLite": database},
+            legacy_paths={database: legacy_database},
+        )
 
 
 def test_private_directory_runtime_ensure_creates_only_private_leaf(tmp_path: Path) -> None:

@@ -14,8 +14,10 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
+import time
 import tomllib
 from collections.abc import Callable
 from contextlib import suppress
@@ -1134,6 +1136,8 @@ class ReleaseGenerationAuthority:
         minimum_free_bytes: int | None = None,
         uv_path: Path | None = None,
         environment_builder: Callable[[Path], None] | None = None,
+        command_timeout_seconds: float = 900,
+        overall_deadline_monotonic: float | None = None,
     ) -> None:
         self.repo = _canonical(repo, label="release checkout")
         self.lock_path = _canonical(lock_path, label="deployment lock")
@@ -1154,6 +1158,20 @@ class ReleaseGenerationAuthority:
             else _trusted_executable_binding(self.uv_path, label="release uv")
         )
         self._environment_builder = environment_builder
+        if (
+            not math.isfinite(command_timeout_seconds)
+            or command_timeout_seconds <= 0
+            or command_timeout_seconds > 7200
+        ):
+            raise ReleaseGenerationError("release environment command timeout is invalid")
+        self.command_timeout_seconds = command_timeout_seconds
+        self.overall_deadline_monotonic = (
+            time.monotonic() + 1800
+            if overall_deadline_monotonic is None
+            else overall_deadline_monotonic
+        )
+        if not math.isfinite(self.overall_deadline_monotonic):
+            raise ReleaseGenerationError("release environment overall deadline is invalid")
         self.writable = writable
         self._mutation_hook = mutation_hook or (lambda _stage: None)
         self.gc_grace_seconds = _nonnegative_float_setting(
@@ -1194,16 +1212,33 @@ class ReleaseGenerationAuthority:
             [str(self.uv_path), "sync", "--frozen", "--active"],
         )
         for command in commands:
+            remaining = self.overall_deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise ReleaseGenerationError("immutable release environment build timed out")
             try:
-                result = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     cwd=self.repo,
                     env=environment,
-                    check=False,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=900,
+                    start_new_session=True,
                 )
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=min(self.command_timeout_seconds, remaining)
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate()
+                    raise ReleaseGenerationError(
+                        "immutable release environment build timed out"
+                    ) from exc
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except ReleaseGenerationError:
+                raise
             except (OSError, subprocess.SubprocessError) as exc:
                 raise ReleaseGenerationError("immutable release environment build failed") from exc
             if result.returncode != 0:
@@ -1786,7 +1821,11 @@ class ReleaseGenerationAuthority:
         completed_name = (
             f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.completed.json"
         )
-        handoff_name = self.handoff_path.name if provisional_label is not None else completed_name
+        handoff_name = (
+            f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.json"
+            if provisional_label is not None
+            else completed_name
+        )
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         try:
             try:

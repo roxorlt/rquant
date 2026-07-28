@@ -3050,6 +3050,7 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
     directories, files, legacy = _lab_runtime_layout()
     prepare_lab_runtime_layout(
         settings.lab_runtime_dir_resolved,
+        checkout_root=Path(args.expected_checkout_root),
         managed_directories=directories,
         managed_files=files,
         legacy_paths=legacy,

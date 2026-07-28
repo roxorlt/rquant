@@ -706,7 +706,7 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         operation_id=intent.operation_id,
         transaction_kind="deployment",
     )
-    handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
+    handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{handoff_operation}.json")
     payload = {
         "schema_version": 1,
         "operation_id": handoff_operation,
@@ -735,7 +735,8 @@ def test_deployment_marker_requires_completed_launchd_handoff(
     completed_path.chmod(0o600)
     authority.verify(expected_commit=commit)
 
-    handoff_path.write_text(
+    active_handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
+    active_handoff_path.write_text(
         json.dumps(
             {
                 **payload,
@@ -746,8 +747,101 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         ),
         encoding="utf-8",
     )
-    handoff_path.chmod(0o600)
+    active_handoff_path.chmod(0o600)
     authority.verify(expected_commit=commit)
+    os.close(lock_fd)
+
+
+def test_generation_environment_build_timeout_kills_uv_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uv_name = shutil.which("uv")
+    assert uv_name is not None
+    uv_path = Path(uv_name).resolve(strict=True)
+    repo, lock_path, _commit, _python = _generation(tmp_path)
+    uv_cache = tmp_path / "uv-cache"
+    monkeypatch.setenv("UV_CACHE_DIR", str(uv_cache))
+    descendant_marker = tmp_path / "uv-builder-descendant-survived"
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "rquant"\nversion = "0.99.0"\n'
+        '\n[build-system]\nrequires = []\nbuild-backend = "backend"\n'
+        'backend-path = ["."]\n',
+        encoding="utf-8",
+    )
+    (repo / "backend.py").write_text(
+        "import subprocess, sys, time\n"
+        "def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):\n"
+        "    del wheel_directory, config_settings, metadata_directory\n"
+        "    subprocess.Popen([sys.executable, '-c', "
+        f'"import pathlib,time;time.sleep(2);pathlib.Path({str(descendant_marker)!r})'
+        ".write_text('alive')\"])\n"
+        "    time.sleep(30)\n"
+        "build_editable = build_wheel\n",
+        encoding="utf-8",
+    )
+    (repo / "uv.lock").unlink()
+    subprocess.run(
+        [str(uv_path), "lock", "--python", sys.executable],
+        cwd=repo,
+        env={**os.environ, "UV_CACHE_DIR": str(uv_cache)},
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    subprocess.run(
+        [str(TRUSTED_GIT), "add", "backend.py", "pyproject.toml", "uv.lock"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        [
+            str(TRUSTED_GIT),
+            "-c",
+            "user.name=rQuant Tests",
+            "-c",
+            "user.email=tests@rquant.invalid",
+            "commit",
+            "-qm",
+            "add hanging tiny build backend",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    python = repo / ".venv" / "bin" / "python"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        writable=True,
+        uv_path=uv_path,
+        command_timeout_seconds=1.0,
+        overall_deadline_monotonic=time.monotonic() + 1.5,
+    )
+    initialization = authority.begin_initialization(target_sha=commit)
+
+    with pytest.raises(ReleaseGenerationError, match="timed out"):
+        authority.publish(
+            expected_commit=commit,
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
+    time.sleep(2.2)
+
+    assert not descendant_marker.exists()
     os.close(lock_fd)
 
 
