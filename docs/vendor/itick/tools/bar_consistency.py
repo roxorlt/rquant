@@ -204,8 +204,16 @@ def report(data_dir: Path, date: str) -> None:
         try:
             ref = adapter.stk_mins(ts_code, freq="1min",
                                    start_date=f"{day} 09:00:00", end_date=f"{day} 15:30:00")
+            if ref is None or ref.empty:
+                # 当日盘后早时段 stk_mins 可能未出数,退到 rt_min_daily(当日全序列,收盘即有)
+                ref = adapter.rt_min_daily([ts_code], freq="1min")
+                ref = ref[ref["ts_code"] == ts_code]
+                print("> 参照源:rt_min_daily(stk_mins 当日尚无数据)\n")
         except Exception as exc:  # noqa: BLE001
-            print(f"> tushare stk_mins 拉取失败：{exc}\n")
+            print(f"> tushare 分钟参照拉取失败：{exc}\n")
+            continue
+        if ref is None or ref.empty:
+            print("> 两个参照源当日均无数据,跳过比对(可次日手动重跑 report)\n")
             continue
         ref = ref.set_index(pd.to_datetime(ref["trade_time"]).dt.tz_localize(CST))
         joined = bars.join(ref[["open", "high", "low", "close", "vol"]],

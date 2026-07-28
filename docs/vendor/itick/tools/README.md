@@ -1,7 +1,9 @@
 # iTick 证伪测试工具
 
 > **☁️ 云端已部署（2026-07-28）**：脚本与 token 已在 `82.156.0.68:~/itick_probe/`，crontab 每个交易日
-> `09:10 run_collect.sh 开录` → `15:12 pkill 停录` → `17:40 run_report.sh 出报告`（`report-YYYY-MM-DD.md`）。
+> `09:10 run_collect.sh 开录` → `15:12 pkill 停录` → `15:20 run_report.sh 出报告并直推 PushDeer`
+> （摘要推手机，完整报告在云端 `report-YYYY-MM-DD.md`；当日 stk_mins 未出数时自动退 rt_min_daily 做参照）。
+> 判定按 **1 个交易日** 出结论（一票否决项单日足够）；cron 留着零成本继续积累断线/开盘稳定性样本。
 > 测试标的：600519（主板高流动）/ 300750（创业板）/ 003040（低流动小票）。
 > WS 握手已冒烟验证通过（connected → authenticated → subscribe Successfully）。
 > 白名单：iTick 控制台已加 82.156.0.68。token 在云端 `~/itick_probe/.env` 与本地 rQuant `.env`（均不进 git）。
