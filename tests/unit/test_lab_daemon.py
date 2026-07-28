@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from datetime import UTC, datetime, timedelta
@@ -953,7 +954,80 @@ def test_prepared_sentinel_read_rejects_runtime_root_replacement(
 
     with pytest.raises(
         lab_daemon.LabDaemonConfigurationError,
-        match="runtime root identity changed",
+        match="runtime root (?:ancestor )?identity changed",
+    ):
+        lab_daemon._read_runtime_prepared_sentinel_record(runtime)
+
+
+def test_prepared_sentinel_rejects_symlink_in_runtime_ancestor_chain(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    physical_parent = tmp_path / "physical"
+    runtime = physical_parent / "lab-runtime"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": runtime / "commands"},
+        managed_files={},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical_parent, target_is_directory=True)
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="ancestor|physical path|symlink",
+    ):
+        lab_daemon._read_runtime_prepared_sentinel_record(alias / "lab-runtime")
+
+
+def test_prepared_sentinel_read_rejects_ancestor_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+
+    authority_root = tmp_path / "authority"
+    runtime = authority_root / "lab-runtime"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": runtime / "commands"},
+        managed_files={},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    sentinel_identity = lab_daemon.lab_runtime_prepared_path(runtime).stat()
+    displaced = tmp_path / "authority.displaced"
+    original_read = os.read
+    swapped = False
+
+    def replace_ancestor(descriptor: int, size: int) -> bytes:
+        nonlocal swapped
+        opened = os.fstat(descriptor)
+        if not swapped and (opened.st_dev, opened.st_ino) == (
+            sentinel_identity.st_dev,
+            sentinel_identity.st_ino,
+        ):
+            swapped = True
+            authority_root.rename(displaced)
+            authority_root.mkdir(mode=0o700)
+            replacement = authority_root / "lab-runtime"
+            replacement.mkdir(mode=0o700)
+            shutil.copy2(
+                displaced / "lab-runtime" / ".prepared.json",
+                replacement / ".prepared.json",
+            )
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(lab_daemon.os, "read", replace_ancestor)
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="ancestor|runtime root identity changed",
     ):
         lab_daemon._read_runtime_prepared_sentinel_record(runtime)
 
@@ -1002,7 +1076,7 @@ def test_first_sqlite_registration_rejects_runtime_root_replacement(
 
     with pytest.raises(
         lab_daemon.LabDaemonConfigurationError,
-        match="runtime root identity changed",
+        match="runtime root (?:ancestor )?identity changed",
     ):
         lab_daemon.register_lab_runtime_managed_file(
             runtime,
@@ -1012,6 +1086,52 @@ def test_first_sqlite_registration_rejects_runtime_root_replacement(
         )
 
     assert sentinel.read_bytes() == sentinel_before
+
+
+def test_first_sqlite_registration_opens_database_from_trusted_runtime_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": runtime / "commands"},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    database.write_bytes(b"sqlite-authority")
+    database.chmod(0o600)
+    original_open = os.open
+    database_opened_from_runtime_fd = False
+
+    def trace_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal database_opened_from_runtime_fd
+        if path == database.name and dir_fd is not None:
+            database_opened_from_runtime_fd = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(lab_daemon.os, "open", trace_open)
+
+    registered = lab_daemon.register_lab_runtime_managed_file(
+        runtime,
+        label="lab jobs SQLite",
+        path=database,
+        mutation_guard=lambda: "b" * 40,
+    )
+
+    assert database_opened_from_runtime_fd
+    assert registered["managed_files"]["lab jobs SQLite"]["inode"] == database.stat().st_ino
 
 
 def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Path) -> None:

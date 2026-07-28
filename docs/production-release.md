@@ -50,6 +50,11 @@
    接管；旧 operation id、target/ref、profile、lifecycle 与 installation identity 必须和 deployment
    intent 完全一致。每次 `launchctl print` 都按 command timeout 与当前整体/readiness 剩余时间的
    较小值执行，剩余预算为零时不再发起命令。
+   接管前还必须确认旧 operation id 正是 intent 当前记录的 `handoff_operation_id`；验证通过后 deployer
+   才能把 intent rebind 到新 operation。完成 handoff 的 proof、operation record 与 stable record 若因
+   崩溃只写入一部分，下次发布会在锁内验证全 binding 后幂等补齐；不一致 proof 一律阻断。显式
+   resume/rollback 自身的 readiness 失败时，rollback 会沿已验证的 supersede 链停止 target daemon、
+   恢复 previous generation 并重新验收旧 daemon。
 6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回 intent 记录的
    previous commit、恢复锁定依赖并按同一服务/timer 合同切回。只有旧 checkout、旧依赖、
    精确服务集合、第二次 preflight 与 timer 原状态全部恢复后，才由 previous checkout 的隔离

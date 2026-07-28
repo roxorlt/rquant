@@ -19,6 +19,11 @@ crash-persistent 提交协议，再从环境 selector 解析已封存的不可�
 preflight，再导入 `rquant.cli`。共享发布锁 fd 会保留到 daemon 退出，runtime guard 每个副作用
 边界同时复验 clean SHA、发布代际和锁 inode。
 
+Python runtime authority 会从文件系统根开始逐层 `openat(O_NOFOLLOW)` 声明的 runtime path，保留
+并复核每一级目录 FD 的 device/inode/type/mode/owner。sentinel 从最终 trusted runtime-root FD
+读取，首次 SQLite 登记也只从同一 FD 打开并 `fstat` 数据库对象；路径中的 symlink、任一 ancestor
+rename/replacement 或声明路径与物理路径漂移都会失败关闭。
+
 ## 发布互斥
 
 主 checkout `/Users/roxor/brain/30-projects/rQuant` 的锁固定为：
@@ -39,6 +44,13 @@ daemon 持共享锁；`scripts/deploy-production.sh` 另持稳定的 sibling han
 operation。接管只允许 `deploy -> resume/rollback`，并从不可变 deployment intent 精确复核旧 target/ref、
 新恢复目标、release profile、lifecycle 与 installation identity；任一漂移都会在 launchd mutation 前
 失败关闭。
+
+handoff 完成状态按 `completed proof -> operation record -> stable active record` 顺序原子发布。若任一写
+边界崩溃，下次启动先只读校验三份记录的 operation、target、label、profile、installation、supersede
+链和 generation binding；完全一致才在 handoff 锁内补齐后两份记录。proof 缺字段、伪造 generation
+或任一 binding 漂移都不会触发收敛。接管旧 operation 前还要求其 id 等于 deployment intent 当前
+`handoff_operation_id`，deployer 只能在验证后 rebind。显式 resume/rollback 的 readiness 若失败，
+自动 rollback 可以继续 supersede 当前 recovery operation，并复核每一跳 action 与 intent binding。
 
 同目录的 `rQuant.complete.json` 不是单独完成凭证。daemon 必须同时核对 completed intent、
 `rQuant.commit.json`、`rQuant.environment.json` 和环境 manifest；commit record 精确绑定 marker、

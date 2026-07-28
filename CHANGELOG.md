@@ -69,6 +69,13 @@
 
 ### Fixed
 
+- **Lab daemon 第八轮恢复与路径权威加固**：完成 handoff 采用可恢复的
+  `proof -> operation -> stable` 提交协议，崩溃后只在三份记录 binding 完全一致时幂等收敛，
+  伪造 proof 失败关闭。resume/rollback 接管前精确绑定 deployment intent 的 handoff operation、
+  target、profile 与 installation identity，readiness 失败可沿已验证 supersede 链自动恢复 previous
+  generation。runtime sentinel 与首次 SQLite 登记现在从 `/` 开始逐层 `openat(O_NOFOLLOW)` 固定完整
+  ancestor 链，并从同一 trusted runtime-root FD 读取 sentinel、打开并登记数据库。
+
 - **Lab daemon 第七轮发布边界加固**：resume/rollback 现在以新 handoff operation 显式接管遗留
   deploy operation，并用 deployment intent 复核原 target/ref、profile、lifecycle 与 installation
   identity。runtime sentinel 和首次 SQLite 登记从已验证 runtime-root dir FD 读取并复核父目录项；

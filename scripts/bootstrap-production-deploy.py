@@ -1072,6 +1072,93 @@ def _operation_handoff_path(lock_path: Path, operation_id: str) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.lab-handoff.{operation_id}.json")
 
 
+_HANDOFF_COMPLETION_BINDING_FIELDS = (
+    "schema_version",
+    "operation_id",
+    "checkout_root",
+    "labels",
+    "loaded_labels",
+    "stopped_labels",
+    "restarted_labels",
+    "target_ref",
+    "target_sha",
+    "action",
+    "release_profile",
+    "lifecycle_mode",
+    "installation_identity",
+    "supersedes_operation_id",
+)
+
+
+def _validated_completed_handoff_proof(
+    *,
+    root: Path,
+    lock_path: Path,
+    active: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    operation_id = str(active.get("operation_id", ""))
+    if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+        raise DeployBootstrapError("Lab launchd handoff operation is invalid")
+    completed_path = _completed_handoff_path(lock_path, operation_id)
+    if not completed_path.exists():
+        return None
+    proof = _private_json(completed_path, label="completed Lab launchd handoff proof")
+    operation = _private_json(
+        _operation_handoff_path(lock_path, operation_id),
+        label="Lab launchd handoff operation record",
+    )
+    assert proof is not None and operation is not None
+    expected_labels = list(LAB_LAUNCHD_LABELS)
+    proof_invalid = (
+        proof.get("schema_version") != LAB_HANDOFF_SCHEMA_VERSION
+        or proof.get("operation_id") != operation_id
+        or proof.get("checkout_root") != str(root)
+        or proof.get("stage") != "completed"
+        or proof.get("labels") != expected_labels
+        or proof.get("loaded_labels") != expected_labels
+        or proof.get("restarted_labels") != expected_labels
+        or re.fullmatch(r"[0-9a-f]{32}", str(proof.get("generation_operation_id", ""))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(proof.get("environment_generation_id", ""))) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(proof.get("code_sha", ""))) is None
+    )
+    if proof_invalid:
+        raise DeployBootstrapError("completed Lab handoff proof binding is invalid")
+    for record in (active, operation):
+        if any(
+            record.get(field) != proof.get(field) for field in _HANDOFF_COMPLETION_BINDING_FIELDS
+        ):
+            raise DeployBootstrapError("completed Lab handoff proof binding changed")
+        if record.get("stage") == "completed" and record != proof:
+            raise DeployBootstrapError("completed Lab handoff proof binding changed")
+    return proof, operation
+
+
+def _converge_completed_handoff_state(*, root: Path, lock_path: Path) -> bool:
+    """Finish a crash-interrupted proof -> operation -> stable commit sequence."""
+    stable_path = _stable_record_path(lock_path, "lab-handoff")
+    active = _private_json(
+        stable_path,
+        label="Lab launchd handoff state",
+        missing_ok=True,
+    )
+    if active is None:
+        return False
+    validated = _validated_completed_handoff_proof(
+        root=root,
+        lock_path=lock_path,
+        active=active,
+    )
+    if validated is None:
+        return False
+    proof, operation = validated
+    operation_path = _operation_handoff_path(lock_path, str(proof["operation_id"]))
+    if operation != proof:
+        _atomic_private_json(operation_path, proof)
+    if active != proof:
+        _atomic_private_json(stable_path, proof)
+    return True
+
+
 def _incomplete_handoff_payload(
     *,
     root: Path,
@@ -1094,21 +1181,97 @@ def _incomplete_handoff_payload(
         or not stage
     ):
         raise DeployBootstrapError("Lab launchd handoff state is invalid")
-    completed_path = _completed_handoff_path(lock_path, operation_id)
+    completed = _validated_completed_handoff_proof(
+        root=root,
+        lock_path=lock_path,
+        active=payload,
+    )
+    if completed is not None:
+        return None
     if stage != "completed":
-        if completed_path.exists():
-            raise DeployBootstrapError("incomplete Lab handoff conflicts with completed proof")
         return payload
-    if not completed_path.exists():
+    if completed is None:
         raise DeployBootstrapError("completed Lab launchd handoff proof is missing")
-    completed = _private_json(completed_path, label="completed Lab launchd handoff proof")
-    if completed.get("operation_id") != operation_id or completed.get("stage") != "completed":
-        raise DeployBootstrapError("completed Lab launchd handoff proof is invalid")
-    return None
+    raise AssertionError("unreachable")
 
 
 def _incomplete_handoff_exists(*, root: Path, lock_path: Path) -> bool:
     return _incomplete_handoff_payload(root=root, lock_path=lock_path) is not None
+
+
+def _deployment_intent_for_handoff(
+    *,
+    lock_path: Path,
+    expected_handoff_operation_id: str,
+) -> dict[str, object]:
+    try:
+        intent = _private_json(
+            lock_path.with_name(f"{lock_path.stem}.intent.json"),
+            label="deployment intent",
+        )
+    except DeployBootstrapError as exc:
+        raise DeployBootstrapError("deployment intent handoff binding is unavailable") from exc
+    assert intent is not None
+    try:
+        schema_version = int(intent["schema_version"])
+        operation_id = str(intent["operation_id"])
+        previous_sha = str(intent["previous_sha"])
+        target_sha = str(intent["target_sha"])
+        target_ref = str(intent["target_ref"])
+        stage = str(intent["stage"])
+        handoff_operation_id = str(intent["handoff_operation_id"])
+        handoff_labels = tuple(str(value) for value in intent["handoff_labels"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeployBootstrapError("deployment intent handoff binding is malformed") from exc
+    if (
+        schema_version != 1
+        or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+        or re.fullmatch(r"[0-9a-f]{40}", previous_sha) is None
+        or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None
+        or not target_ref
+        or not stage
+        or handoff_operation_id != expected_handoff_operation_id
+        or handoff_labels != LAB_LAUNCHD_LABELS
+    ):
+        raise DeployBootstrapError("deployment intent handoff binding changed")
+    return intent
+
+
+def _validate_superseded_handoff_binding(
+    *,
+    payload: dict[str, object],
+    intent: dict[str, object],
+    release_profile: str,
+    lifecycle_mode: str,
+    installation_identity: dict[str, object],
+) -> None:
+    source_action = str(payload.get("action", ""))
+    operation_id = str(payload.get("operation_id", ""))
+    source_supersedes = str(payload.get("supersedes_operation_id", ""))
+    if source_action == "rollback":
+        expected_sha = str(intent["previous_sha"])
+        allowed_refs = {expected_sha}
+    elif source_action in {"deploy", "resume"}:
+        expected_sha = str(intent["target_sha"])
+        allowed_refs = {expected_sha, str(intent["target_ref"])}
+    else:
+        raise DeployBootstrapError("superseded Lab handoff binding changed")
+    source_chain_invalid = (source_action == "deploy" and source_supersedes != "") or (
+        source_action != "deploy"
+        and (
+            re.fullmatch(r"[0-9a-f]{32}", source_supersedes) is None
+            or source_supersedes == operation_id
+        )
+    )
+    if (
+        payload.get("target_sha") != expected_sha
+        or payload.get("target_ref") not in allowed_refs
+        or payload.get("release_profile") != release_profile
+        or payload.get("lifecycle_mode") != lifecycle_mode
+        or payload.get("installation_identity") != installation_identity
+        or source_chain_invalid
+    ):
+        raise DeployBootstrapError("superseded Lab handoff binding changed")
 
 
 def _superseding_handoff_operation_id(
@@ -1116,6 +1279,8 @@ def _superseding_handoff_operation_id(
     root: Path,
     lock_path: Path,
     recovery_action: str,
+    release_profile: str,
+    lifecycle_mode: str,
 ) -> str:
     if recovery_action not in {"resume", "rollback"}:
         raise DeployBootstrapError("Lab handoff supersession requires a recovery action")
@@ -1126,11 +1291,24 @@ def _superseding_handoff_operation_id(
     action = payload.get("action")
     if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
         raise DeployBootstrapError("incomplete Lab handoff operation is invalid")
-    if action == "deploy":
-        return operation_id
     if action == recovery_action:
         return ""
-    raise DeployBootstrapError("incomplete Lab handoff action conflicts with recovery")
+    if recovery_action == "resume" and action != "deploy":
+        raise DeployBootstrapError("incomplete Lab handoff action conflicts with recovery")
+    intent = _deployment_intent_for_handoff(
+        lock_path=lock_path,
+        expected_handoff_operation_id=operation_id,
+    )
+    installation = _read_lab_installation_state(root=root, lock_path=lock_path)
+    installation_identity = _lab_installation_identity(lock_path, installation)
+    _validate_superseded_handoff_binding(
+        payload=payload,
+        intent=intent,
+        release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
+        installation_identity=installation_identity,
+    )
+    return operation_id
 
 
 def _lab_installation_identity(lock_path: Path, payload: dict[str, object]) -> dict[str, object]:
@@ -1281,6 +1459,8 @@ class _LabLaunchdHandoff:
     def _load_incomplete_record(self) -> bool:
         if not self.record_path.exists():
             return False
+        if _converge_completed_handoff_state(root=self.root, lock_path=self.lock_path):
+            return False
         payload = _private_json(self.record_path, label="Lab launchd handoff state")
         structurally_invalid = (
             payload.get("schema_version") != LAB_HANDOFF_SCHEMA_VERSION
@@ -1295,19 +1475,6 @@ class _LabLaunchdHandoff:
         operation_id = str(payload.get("operation_id", ""))
         if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
             raise DeployBootstrapError("Lab launchd handoff operation is invalid")
-        completed_path = _completed_handoff_path(self.lock_path, operation_id)
-        if completed_path.exists():
-            completed = _private_json(
-                completed_path,
-                label="completed Lab launchd handoff proof",
-            )
-            if (
-                completed.get("operation_id") != operation_id
-                or completed.get("stage") != "completed"
-                or set(completed.get("restarted_labels", ())) != set(LAB_LAUNCHD_LABELS)
-            ):
-                raise DeployBootstrapError("completed Lab launchd handoff proof is invalid")
-            return False
         if payload.get("stage") == "completed":
             raise DeployBootstrapError("completed Lab launchd handoff proof is missing")
         labels = [str(value) for value in payload["labels"]]
@@ -1331,29 +1498,28 @@ class _LabLaunchdHandoff:
             or payload.get("supersedes_operation_id", "") != self.supersedes_operation_id
         )
         if binding_changed and payload.get("operation_id") == self.supersedes_operation_id:
-            intent = _private_json(
-                self.lock_path.with_name(f"{self.lock_path.stem}.intent.json"),
-                label="deployment intent",
+            intent = _deployment_intent_for_handoff(
+                lock_path=self.lock_path,
+                expected_handoff_operation_id=self.supersedes_operation_id,
             )
-            assert intent is not None
             _verify_recovery_target_binding(
                 lock_path=self.lock_path,
                 target_ref=self.target_ref,
                 target_sha=self.target_sha,
                 action=self.action,
             )
-            superseded_binding_changed = (
-                payload.get("action") != "deploy"
-                or self.action not in {"resume", "rollback"}
-                or payload.get("target_ref") != intent.get("target_ref")
-                or payload.get("target_sha") != intent.get("target_sha")
-                or payload.get("release_profile") != self.release_profile
-                or payload.get("lifecycle_mode") != self.lifecycle_mode
-                or payload.get("installation_identity") != self.installation_identity
-                or payload.get("supersedes_operation_id", "") != ""
-            )
-            if superseded_binding_changed:
+            if self.action not in {"resume", "rollback"} or (
+                self.action == "resume" and payload.get("action") != "deploy"
+            ):
                 raise DeployBootstrapError("superseded Lab handoff binding changed")
+            assert self.installation_identity is not None
+            _validate_superseded_handoff_binding(
+                payload=payload,
+                intent=intent,
+                release_profile=self.release_profile,
+                lifecycle_mode=self.lifecycle_mode,
+                installation_identity=self.installation_identity,
+            )
             self.superseding_partial = True
             self.loaded = labels
             return False
@@ -2370,6 +2536,8 @@ def main(argv: list[str] | None = None) -> int:
                         root=root,
                         lock_path=lock_path,
                         recovery_action=handoff_action,
+                        release_profile=args.release_profile,
+                        lifecycle_mode=args.lab_lifecycle_mode,
                     )
                     if args.recover_generation and installed_handoff
                     else ""

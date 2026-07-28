@@ -146,6 +146,123 @@ def _filesystem_identity(observed: os.stat_result) -> tuple[int, int, int, int, 
     )
 
 
+def _directory_filesystem_identity(observed: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_uid,
+    )
+
+
+class _TrustedRuntimeRoot:
+    """Descriptor-bound, no-symlink authority for one declared runtime root."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        descriptors: list[int],
+        names: list[str],
+        identities: list[tuple[int, int, int, int]],
+    ) -> None:
+        self.path = path
+        self._descriptors = descriptors
+        self._names = names
+        self._identities = identities
+
+    @classmethod
+    def open(cls, path: Path) -> _TrustedRuntimeRoot:
+        candidate = _canonical_absolute_path(path, label="lab runtime root")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        names: list[str] = []
+        identities: list[tuple[int, int, int, int]] = []
+        try:
+            root_fd = os.open(os.sep, flags)
+            descriptors.append(root_fd)
+            identities.append(_directory_filesystem_identity(os.fstat(root_fd)))
+            parent_fd = root_fd
+            for name in candidate.parts[1:]:
+                active = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISLNK(active.st_mode) or not stat.S_ISDIR(active.st_mode):
+                    raise LabDaemonConfigurationError(
+                        "lab runtime root ancestor chain contains a symlink or non-directory"
+                    )
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+                opened = os.fstat(descriptor)
+                if _directory_filesystem_identity(active) != _directory_filesystem_identity(opened):
+                    os.close(descriptor)
+                    raise LabDaemonConfigurationError("lab runtime root ancestor identity changed")
+                descriptors.append(descriptor)
+                names.append(name)
+                identities.append(_directory_filesystem_identity(opened))
+                parent_fd = descriptor
+            authority = cls(
+                path=candidate,
+                descriptors=descriptors,
+                names=names,
+                identities=identities,
+            )
+            _validate_private_directory_identity(
+                os.fstat(authority.root_fd),
+                label="lab runtime root",
+            )
+            authority.assert_current()
+            return authority
+        except BaseException as exc:
+            for descriptor in reversed(descriptors):
+                with suppress(OSError):
+                    os.close(descriptor)
+            if isinstance(exc, LabDaemonConfigurationError):
+                raise
+            if isinstance(exc, OSError):
+                raise LabDaemonConfigurationError(
+                    "lab runtime root ancestor chain could not be opened safely"
+                ) from exc
+            raise
+
+    @property
+    def root_fd(self) -> int:
+        if not self._descriptors:
+            raise LabDaemonConfigurationError("lab runtime root authority is closed")
+        return self._descriptors[-1]
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        observed = os.fstat(self.root_fd)
+        return observed.st_dev, observed.st_ino
+
+    def assert_current(self) -> None:
+        if not self._descriptors:
+            raise LabDaemonConfigurationError("lab runtime root authority is closed")
+        try:
+            for index, descriptor in enumerate(self._descriptors):
+                opened = os.fstat(descriptor)
+                if _directory_filesystem_identity(opened) != self._identities[index]:
+                    raise LabDaemonConfigurationError("lab runtime root ancestor identity changed")
+                if index == 0:
+                    continue
+                active = os.stat(
+                    self._names[index - 1],
+                    dir_fd=self._descriptors[index - 1],
+                    follow_symlinks=False,
+                )
+                if _directory_filesystem_identity(active) != self._identities[index]:
+                    raise LabDaemonConfigurationError("lab runtime root ancestor identity changed")
+            _validate_private_directory_identity(
+                os.fstat(self.root_fd),
+                label="lab runtime root",
+            )
+        except OSError as exc:
+            raise LabDaemonConfigurationError("lab runtime root ancestor identity changed") from exc
+
+    def close(self) -> None:
+        descriptors, self._descriptors = self._descriptors, []
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _reject_sqlite_sidecars(path: Path, *, label: str) -> None:
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = path.with_name(f"{path.name}{suffix}")
@@ -153,6 +270,17 @@ def _reject_sqlite_sidecars(path: Path, *, label: str) -> None:
             raise LabDaemonConfigurationError(
                 f"checkpoint and remove {label} SQLite sidecars before preparing Lab runtime"
             )
+
+
+def _reject_sqlite_sidecars_at(root_fd: int, name: str, *, label: str) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            os.stat(f"{name}{suffix}", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise LabDaemonConfigurationError(
+            f"checkpoint and remove {label} SQLite sidecars before preparing Lab runtime"
+        )
 
 
 def _write_runtime_prepared_sentinel(
@@ -163,18 +291,25 @@ def _write_runtime_prepared_sentinel(
     lock_descriptor: int | None = None,
     expected_identity: tuple[int, int] | None = None,
     expected_root_identity: tuple[int, int] | None = None,
+    root_authority: _TrustedRuntimeRoot | None = None,
 ) -> None:
+    owned_authority = root_authority is None
+    authority = root_authority or _TrustedRuntimeRoot.open(root)
     owned_lock = lock_descriptor is None
-    if lock_descriptor is None:
-        lock_descriptor = _open_runtime_prepared_lock(root, create=True)
-    root_observed = root.lstat()
-    root_fd = os.open(
-        root,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
-    temporary = f".{_LAB_RUNTIME_PREPARED_FILENAME}.{uuid4().hex}.tmp"
+    root_fd = -1
+    temporary = ""
     descriptor = -1
     try:
+        if lock_descriptor is None:
+            lock_descriptor = _open_runtime_prepared_lock(
+                root,
+                create=True,
+                root_authority=authority,
+            )
+        authority.assert_current()
+        root_fd = authority.root_fd
+        root_observed = os.fstat(root_fd)
+        temporary = f".{_LAB_RUNTIME_PREPARED_FILENAME}.{uuid4().hex}.tmp"
         opened_root = os.fstat(root_fd)
         if (
             expected_root_identity is not None
@@ -210,12 +345,7 @@ def _write_runtime_prepared_sentinel(
             label="lab runtime prepared sentinel",
         )
         mutation_guard()
-        active_root = root.lstat()
-        if (active_root.st_dev, active_root.st_ino) != (
-            root_observed.st_dev,
-            root_observed.st_ino,
-        ):
-            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        authority.assert_current()
         if expected_identity is not None:
             try:
                 active_sentinel = os.stat(
@@ -238,25 +368,33 @@ def _write_runtime_prepared_sentinel(
             dst_dir_fd=root_fd,
         )
         os.fsync(root_fd)
+        authority.assert_current()
     except BaseException:
-        with suppress(OSError):
-            os.unlink(temporary, dir_fd=root_fd)
+        if root_fd >= 0 and temporary:
+            with suppress(OSError):
+                os.unlink(temporary, dir_fd=root_fd)
         raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        os.close(root_fd)
-        if owned_lock:
+        if owned_lock and lock_descriptor is not None:
             os.close(lock_descriptor)
+        if owned_authority:
+            authority.close()
 
 
-def _open_runtime_prepared_lock(root: Path, *, create: bool) -> int:
-    root_fd = os.open(
-        root,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
+def _open_runtime_prepared_lock(
+    root: Path,
+    *,
+    create: bool,
+    root_authority: _TrustedRuntimeRoot | None = None,
+) -> int:
+    owned_authority = root_authority is None
+    authority = root_authority or _TrustedRuntimeRoot.open(root)
+    root_fd = authority.root_fd
     descriptor = -1
     try:
+        authority.assert_current()
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         if create:
             flags |= os.O_CREAT
@@ -288,43 +426,38 @@ def _open_runtime_prepared_lock(root: Path, *, create: bool) -> int:
         ):
             raise LabDaemonConfigurationError("lab runtime prepared lock identity changed")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        authority.assert_current()
         return descriptor
-    except OSError as exc:
+    except BaseException as exc:
         if descriptor >= 0:
             os.close(descriptor)
+        if isinstance(exc, LabDaemonConfigurationError):
+            raise
+        if not isinstance(exc, OSError):
+            raise
         raise LabDaemonConfigurationError("lab runtime prepared lock is unavailable") from exc
     finally:
-        os.close(root_fd)
+        if owned_authority:
+            authority.close()
 
 
 def _read_runtime_prepared_sentinel_record(
     root: Path,
+    *,
+    root_authority: _TrustedRuntimeRoot | None = None,
 ) -> tuple[dict[str, object], tuple[int, int], tuple[int, int]]:
     candidate = _canonical_absolute_path(root, label="lab runtime root")
-    parent_fd = -1
-    root_fd = -1
+    owned_authority = root_authority is None
+    authority: _TrustedRuntimeRoot | None = None
     descriptor = -1
     try:
-        before_root = candidate.lstat()
-        _validate_private_directory_identity(before_root, label="lab runtime root")
-        parent_fd = os.open(
-            candidate.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        active_root = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
-        root_fd = os.open(
-            candidate.name,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_fd,
-        )
+        authority = root_authority or _TrustedRuntimeRoot.open(candidate)
+        if authority.path != candidate:
+            raise LabDaemonConfigurationError("lab runtime root physical path changed")
+        authority.assert_current()
+        root_fd = authority.root_fd
         opened_root = os.fstat(root_fd)
-        _validate_private_directory_identity(active_root, label="lab runtime root")
-        _validate_private_directory_identity(opened_root, label="lab runtime root")
-        root_identity = (before_root.st_dev, before_root.st_ino)
-        if _filesystem_identity(active_root) != _filesystem_identity(
-            before_root
-        ) or _filesystem_identity(opened_root) != _filesystem_identity(before_root):
-            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        root_identity = (opened_root.st_dev, opened_root.st_ino)
         descriptor = os.open(
             _LAB_RUNTIME_PREPARED_FILENAME,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -355,14 +488,7 @@ def _read_runtime_prepared_sentinel_record(
             total += len(chunk)
             if total > _LAB_RUNTIME_PREPARED_MAX_BYTES:
                 raise LabDaemonConfigurationError("lab runtime prepared sentinel is too large")
-        final_root = os.fstat(root_fd)
-        final_root_entry = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
-        _validate_private_directory_identity(final_root, label="lab runtime root")
-        _validate_private_directory_identity(final_root_entry, label="lab runtime root")
-        if _filesystem_identity(final_root) != _filesystem_identity(
-            before_root
-        ) or _filesystem_identity(final_root_entry) != _filesystem_identity(before_root):
-            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        authority.assert_current()
         after = os.stat(
             _LAB_RUNTIME_PREPARED_FILENAME,
             dir_fd=root_fd,
@@ -393,10 +519,8 @@ def _read_runtime_prepared_sentinel_record(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if root_fd >= 0:
-            os.close(root_fd)
-        if parent_fd >= 0:
-            os.close(parent_fd)
+        if owned_authority and authority is not None:
+            authority.close()
 
 
 def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
@@ -506,26 +630,62 @@ def register_lab_runtime_managed_file(
     """Atomically bind the first scheduler-created SQLite inode to runtime authority."""
     if owner != "scheduler":
         raise LabDaemonConfigurationError("only the scheduler owner may register Lab files")
-    root = require_private_directory(runtime_root, label="lab runtime root")
+    root = _canonical_absolute_path(runtime_root, label="lab runtime root")
     candidate = _canonical_absolute_path(path, label=label)
     if candidate.parent != root:
         raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
-    _reject_sqlite_sidecars(candidate, label=label)
-    observed = candidate.lstat()
-    _validate_private_regular_identity(observed, label=label)
-    lock_descriptor = _open_runtime_prepared_lock(root, create=False)
+    authority = _TrustedRuntimeRoot.open(root)
+    lock_descriptor = -1
+    database_descriptor = -1
     try:
-        payload, sentinel_identity, root_identity = _read_runtime_prepared_sentinel_record(root)
+        authority.assert_current()
+        _reject_sqlite_sidecars_at(authority.root_fd, candidate.name, label=label)
+        lock_descriptor = _open_runtime_prepared_lock(
+            root,
+            create=False,
+            root_authority=authority,
+        )
+        payload, sentinel_identity, root_identity = _read_runtime_prepared_sentinel_record(
+            root,
+            root_authority=authority,
+        )
         files = payload.get("managed_files")
         recorded = files.get(label) if isinstance(files, dict) else None
         if recorded != {"path": str(candidate), "exists": False}:
             raise LabDaemonConfigurationError(
                 f"{label} cannot be registered from its current prepared state"
             )
+        try:
+            database_descriptor = os.open(
+                candidate.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=authority.root_fd,
+            )
+            observed = os.fstat(database_descriptor)
+            active = os.stat(
+                candidate.name,
+                dir_fd=authority.root_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise LabDaemonConfigurationError(f"{label} could not be opened safely") from exc
+        _validate_private_regular_identity(observed, label=label)
+        _validate_private_regular_identity(active, label=label)
+        if _filesystem_identity(observed) != _filesystem_identity(active):
+            raise LabDaemonConfigurationError(f"{label} identity changed before registration")
         mutation_guard()
-        current = candidate.lstat()
+        authority.assert_current()
+        current = os.fstat(database_descriptor)
+        active = os.stat(
+            candidate.name,
+            dir_fd=authority.root_fd,
+            follow_symlinks=False,
+        )
         _validate_private_regular_identity(current, label=label)
-        if (current.st_dev, current.st_ino) != (observed.st_dev, observed.st_ino):
+        _validate_private_regular_identity(active, label=label)
+        if _filesystem_identity(current) != _filesystem_identity(observed) or _filesystem_identity(
+            active
+        ) != _filesystem_identity(observed):
             raise LabDaemonConfigurationError(f"{label} identity changed before registration")
         updated_files = dict(files)
         updated_files[label] = {
@@ -540,10 +700,15 @@ def register_lab_runtime_managed_file(
             lock_descriptor=lock_descriptor,
             expected_identity=sentinel_identity,
             expected_root_identity=root_identity,
+            root_authority=authority,
         )
         return updated
     finally:
-        os.close(lock_descriptor)
+        if database_descriptor >= 0:
+            os.close(database_descriptor)
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        authority.close()
 
 
 def prepare_lab_runtime_layout(

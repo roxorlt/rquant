@@ -1372,6 +1372,8 @@ def test_recovery_supersedes_recorded_deploy_handoff_from_partial_stage(
             "target_sha": "b" * 40,
             "target_ref": "v0.99.1",
             "stage": "services_transitioning",
+            "handoff_operation_id": old_operation,
+            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
         },
         absent=True,
     )
@@ -1420,6 +1422,8 @@ def test_recovery_supersedes_recorded_deploy_handoff_from_partial_stage(
         root=root,
         lock_path=lock_path,
         recovery_action=action,
+        release_profile="macos-lab",
+        lifecycle_mode="installed",
     )
     assert supersedes == old_operation
     recovery = module._LabLaunchdHandoff(
@@ -1474,6 +1478,8 @@ def test_recovery_rejects_superseded_deploy_handoff_binding_drift(
             "target_sha": "b" * 40,
             "target_ref": "v0.99.1",
             "stage": "services_transitioning",
+            "handoff_operation_id": old_operation,
+            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
         },
         absent=True,
     )
@@ -1511,22 +1517,79 @@ def test_recovery_rejects_superseded_deploy_handoff_binding_drift(
             stderr="",
         ),
     )
-    recovery = module._LabLaunchdHandoff(
-        root=root,
-        lock_path=lock_path,
-        timeout_seconds=1,
-        supersedes_operation_id=old_operation,
+    with pytest.raises(module.DeployBootstrapError, match="superseded.*binding"):
+        module._superseding_handoff_operation_id(
+            root=root,
+            lock_path=lock_path,
+            recovery_action="resume",
+            release_profile="macos-lab",
+            lifecycle_mode="installed",
+        )
+
+
+@pytest.mark.parametrize("intent_state", ["missing", "different-operation"])
+def test_supersede_requires_matching_immutable_intent_before_launchd_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    intent_state: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    old_operation = "7" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": old_operation,
+            "checkout_root": str(root),
+            "stage": "stopping",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": [module.LAB_LAUNCHD_LABELS[0]],
+            "restarted_labels": [],
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": "v0.99.1",
+            "target_sha": "b" * 40,
+            "action": "deploy",
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": module._lab_installation_identity(lock_path, installation),
+            "supersedes_operation_id": "",
+        },
+    )
+    if intent_state != "missing":
+        module._atomic_private_json(
+            lock_path.with_name(f"{lock_path.stem}.intent.json"),
+            {
+                "schema_version": 1,
+                "operation_id": "8" * 32,
+                "previous_sha": "a" * 40,
+                "target_sha": "b" * 40,
+                "target_ref": "v0.99.1",
+                "stage": "services_transitioning",
+                "handoff_operation_id": "9" * 32,
+                "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
+            },
+            absent=True,
+        )
+    launchctl_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: launchctl_calls.append(arguments),
     )
 
-    with pytest.raises(module.DeployBootstrapError, match="superseded.*binding"):
-        recovery.prepare(
-            dry_run=False,
-            target_ref="v0.99.1",
-            target_sha="b" * 40,
-            action="resume",
-            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    with pytest.raises(module.DeployBootstrapError, match="deployment intent.*handoff"):
+        module._superseding_handoff_operation_id(
+            root=root,
+            lock_path=lock_path,
+            recovery_action="resume",
+            release_profile="macos-lab",
+            lifecycle_mode="installed",
         )
-    recovery.close()
+
+    assert launchctl_calls == []
 
 
 def test_superseding_rollback_stops_partial_target_labels_before_previous_restore(
@@ -1571,6 +1634,8 @@ def test_superseding_rollback_stops_partial_target_labels_before_previous_restor
             "target_sha": "b" * 40,
             "target_ref": "b" * 40,
             "stage": "services_transitioning",
+            "handoff_operation_id": target_operation,
+            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
         },
         absent=True,
     )
@@ -1679,7 +1744,6 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     first_payload = json.loads(first_proof.read_text(encoding="utf-8"))
     interrupted_active = dict(first_payload)
     interrupted_active["stage"] = "restarting"
-    interrupted_active["restarted_labels"] = []
     module._atomic_private_json(first.record_path, interrupted_active)
 
     second = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
@@ -1698,6 +1762,111 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     assert first_payload["environment_generation_id"] == "b" * 64
     assert first_payload["code_sha"] == "c" * 40
     assert module._completed_handoff_path(lock_path, second.operation_id).is_file()
+
+
+@pytest.mark.parametrize("crash_after_write", [1, 2, 3])
+def test_completed_handoff_crash_boundaries_converge_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_after_write: int,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    handoff.installation = installation
+    handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
+    handoff.operation_id = "1" * 32
+    handoff.loaded = list(module.LAB_LAUNCHD_LABELS)
+    handoff.stopped = list(module.LAB_LAUNCHD_LABELS)
+    handoff.restarted = list(module.LAB_LAUNCHD_LABELS)
+    handoff.target_ref = "a" * 40
+    handoff.target_sha = "a" * 40
+    handoff.action = "deploy"
+    handoff._record("restarting")
+    completed_paths = {
+        module._completed_handoff_path(lock_path, handoff.operation_id),
+        module._operation_handoff_path(lock_path, handoff.operation_id),
+        handoff.record_path,
+    }
+    real_atomic = module._atomic_private_json
+    completed_writes = 0
+
+    class SimulatedCrashError(RuntimeError):
+        pass
+
+    def crash_after_boundary(path: Path, payload: dict[str, object], **kwargs: object) -> None:
+        nonlocal completed_writes
+        real_atomic(path, payload, **kwargs)
+        if path in completed_paths and payload.get("stage") == "completed":
+            completed_writes += 1
+            if completed_writes == crash_after_write:
+                raise SimulatedCrashError
+
+    monkeypatch.setattr(module, "_atomic_private_json", crash_after_boundary)
+    with pytest.raises(SimulatedCrashError):
+        handoff._record("completed", generation=_READINESS_A)
+    monkeypatch.setattr(module, "_atomic_private_json", real_atomic)
+
+    module._converge_completed_handoff_state(root=root, lock_path=lock_path)
+    proof = module._private_json(
+        module._completed_handoff_path(lock_path, handoff.operation_id),
+        label="completed Lab launchd handoff proof",
+    )
+    assert proof is not None
+    assert module._private_json(handoff.record_path, label="Lab handoff state") == proof
+    assert (
+        module._private_json(
+            module._operation_handoff_path(lock_path, handoff.operation_id),
+            label="Lab handoff operation",
+        )
+        == proof
+    )
+
+
+def test_completed_handoff_convergence_rejects_forged_proof_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
+    handoff.operation_id = "2" * 32
+    handoff.loaded = list(module.LAB_LAUNCHD_LABELS)
+    handoff.stopped = list(module.LAB_LAUNCHD_LABELS)
+    handoff.restarted = list(module.LAB_LAUNCHD_LABELS)
+    handoff.target_ref = "a" * 40
+    handoff.target_sha = "a" * 40
+    handoff.action = "deploy"
+    handoff._record("restarting")
+    stable_before = handoff.record_path.read_bytes()
+    operation_path = module._operation_handoff_path(lock_path, handoff.operation_id)
+    operation_before = operation_path.read_bytes()
+    forged = module._private_json(operation_path, label="Lab handoff operation")
+    assert forged is not None
+    forged.update(
+        {
+            "stage": "completed",
+            "target_sha": "f" * 40,
+            "generation_operation_id": _READINESS_A[0],
+            "environment_generation_id": _READINESS_A[1],
+            "code_sha": _READINESS_A[2],
+        }
+    )
+    module._atomic_private_json(
+        module._completed_handoff_path(lock_path, handoff.operation_id),
+        forged,
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="completed.*binding"):
+        module._converge_completed_handoff_state(root=root, lock_path=lock_path)
+
+    assert handoff.record_path.read_bytes() == stable_before
+    assert operation_path.read_bytes() == operation_before
 
 
 def test_successful_lab_handoff_restore_uses_original_overall_deadline(
@@ -1810,6 +1979,108 @@ def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
         "previous-generation-restored",
         "previous-daemons-ready",
     ]
+
+
+@pytest.mark.parametrize("source_action", ["resume", "rollback"])
+def test_recovery_readiness_failure_rolls_back_through_superseded_handoff_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_action: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    source_operation = "4" * 32
+    prior_operation = "3" * 32
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    source_ref = "v0.99.1" if source_action == "resume" else "a" * 40
+    source_sha = "b" * 40 if source_action == "resume" else "a" * 40
+    module._atomic_private_json(
+        lock_path.with_name(f"{lock_path.stem}.intent.json"),
+        {
+            "schema_version": 1,
+            "operation_id": "5" * 32,
+            "previous_sha": "a" * 40,
+            "target_sha": "b" * 40,
+            "target_ref": "v0.99.1",
+            "stage": "services_transitioning",
+            "handoff_operation_id": source_operation,
+            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
+        },
+        absent=True,
+    )
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": source_operation,
+            "checkout_root": str(root),
+            "stage": "restarting",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": list(module.LAB_LAUNCHD_LABELS),
+            "restarted_labels": list(module.LAB_LAUNCHD_LABELS),
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": source_ref,
+            "target_sha": source_sha,
+            "action": source_action,
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": module._lab_installation_identity(lock_path, installation),
+            "supersedes_operation_id": prior_operation,
+        },
+    )
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        elif command == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
+
+    class FailedTargetHandoff:
+        def restore(self) -> None:
+            raise module.DeployBootstrapError("target readiness failed")
+
+    rollback_handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=source_operation,
+    )
+
+    result = module._complete_installed_rollout(
+        target_handoff=FailedTargetHandoff(),
+        deploy_code=0,
+        recovery_handoff_factory=lambda: rollback_handoff,
+        rollback=lambda _handoff: 0,
+        recovery_target_sha="a" * 40,
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result == 1
+    persisted = module._private_json(rollback_handoff.record_path, label="Lab handoff state")
+    assert persisted is not None
+    assert persisted["stage"] == "completed"
+    assert persisted["action"] == "rollback"
+    assert persisted["supersedes_operation_id"] == source_operation
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
 
 
 def test_deploy_control_dotenv_reader_is_allowlisted_and_never_evaluates_shell(
