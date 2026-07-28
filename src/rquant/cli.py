@@ -3025,7 +3025,12 @@ def _lab_runtime_layout() -> tuple[dict[str, Path], dict[str, Path], dict[Path, 
     return directories, files, legacy
 
 
-def _verify_prepared_lab_runtime(checkout_root: Path, code_sha: str) -> None:
+def _verify_prepared_lab_runtime(
+    checkout_root: Path,
+    code_sha: str,
+    *,
+    allow_uninitialized_database: bool = False,
+) -> None:
     from rquant.config import settings
     from rquant.lab_daemon import verify_lab_runtime_prepared
 
@@ -3037,6 +3042,9 @@ def _verify_prepared_lab_runtime(checkout_root: Path, code_sha: str) -> None:
         managed_directories=directories,
         managed_files=files,
         legacy_paths=legacy,
+        allow_missing_files=(
+            frozenset({"lab jobs SQLite"}) if allow_uninitialized_database else frozenset()
+        ),
     )
 
 
@@ -3092,7 +3100,11 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         trusted_git_path,
         **generation_binding,
     )
-    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
+    _verify_prepared_lab_runtime(
+        Path(args.expected_checkout_root),
+        code_sha,
+        allow_uninitialized_database=True,
+    )
     readiness = _lab_daemon_readiness_context(
         args,
         label="com.roxor.rquant-lab-scheduler",
@@ -3108,6 +3120,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         LabDaemonLock,
         ensure_private_directory,
         prepare_private_sqlite_path,
+        register_lab_runtime_managed_file,
         require_unique_runtime_paths,
     )
     from rquant.lab_job_protocol import LabCommandSpool
@@ -3166,6 +3179,14 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
             create=True,
             mutation_guard=runtime_guard.verify,
         )
+        if sqlite_authority.created:
+            register_lab_runtime_managed_file(
+                settings.lab_runtime_dir_resolved,
+                label="lab jobs SQLite",
+                path=settings.lab_jobs_path_resolved,
+                mutation_guard=runtime_guard.verify,
+            )
+        _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
         artifact_store = None
         try:
             artifact_store = LabJobArtifactStore(

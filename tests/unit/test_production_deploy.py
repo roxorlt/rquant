@@ -705,6 +705,7 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
         timeout_seconds: float,
         check: bool,
         pass_fds: tuple[int, ...] = (),
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         captured.update(
             args=args,
@@ -712,6 +713,7 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
             timeout_seconds=timeout_seconds,
             check=check,
             pass_fds=pass_fds,
+            env=env,
         )
         return subprocess.CompletedProcess(
             args,
@@ -1421,6 +1423,33 @@ def test_subprocess_runner_preserves_failed_command_diagnostics(tmp_path: Path) 
                 "import sys; print('diagnostic-from-command', file=sys.stderr); sys.exit(7)",
             ]
         )
+
+
+def test_subprocess_runner_marks_mutating_git_for_process_group_write_locking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, str]] = []
+
+    def fake_run_process_group(
+        args: list[str],
+        *,
+        cwd: Path,
+        timeout_seconds: float,
+        check: bool,
+        pass_fds: tuple[int, ...] = (),
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout_seconds, check, pass_fds
+        captured.append(env)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(production_deploy, "_run_process_group", fake_run_process_group)
+    runner = SubprocessRunner(tmp_path)
+
+    runner.run(["/usr/bin/git", "reset", "--hard", "a" * 40])
+
+    assert captured[0]["GIT_OPTIONAL_LOCKS"] == "1"
 
 
 def test_subprocess_runner_bounds_each_command_and_overall_rollout(tmp_path: Path) -> None:

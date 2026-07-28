@@ -78,6 +78,72 @@ def _tiny_test_venv(checkout: Path, *, symlink_python: bool = False) -> Path:
     return python
 
 
+def _prepare_fake_lab_runtime(checkout: Path) -> None:
+    runtime = checkout / "data" / "lab-runtime"
+    runtime.mkdir(parents=True, mode=0o700)
+    runtime.chmod(0o700)
+    directory_names = {
+        "lab command spool": "commands",
+        "lab claim spool": "claims",
+        "lab report spool": "reports",
+        "lab worker artifact root": "worker-artifacts",
+        "lab final artifact root": "final-artifacts",
+        "lab artifact commit spool": "artifact-commits",
+        "lab daemon lock root": "locks",
+        "lab finalizer state root": "finalizer-state",
+        "lab readiness root": "readiness",
+    }
+    directory_bindings: dict[str, dict[str, object]] = {}
+    for label, name in directory_names.items():
+        path = runtime / name
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+        observed = path.stat()
+        directory_bindings[label] = {
+            "path": str(path),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "mode": 0o700,
+        }
+    database = runtime / "lab_jobs.sqlite3"
+    database.write_bytes(b"")
+    database.chmod(0o600)
+    database_observed = database.stat()
+    root_observed = runtime.stat()
+    sentinel = runtime / ".prepared.json"
+    sentinel.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "checkout_root": str(checkout),
+                "runtime_root": str(runtime),
+                "runtime_device": root_observed.st_dev,
+                "runtime_inode": root_observed.st_ino,
+                "runtime_authority_id": "a" * 32,
+                "prepared_by_commit": "0" * 40,
+                "managed_directories": directory_bindings,
+                "managed_files": {
+                    "lab jobs SQLite": {
+                        "path": str(database),
+                        "device": database_observed.st_dev,
+                        "inode": database_observed.st_ino,
+                        "mode": 0o600,
+                        "exists": True,
+                    }
+                },
+                "migration_sources": {},
+                "prepared_at": "2026-07-28T00:00:00+00:00",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    sentinel.chmod(0o600)
+    lock = runtime / ".prepared.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+
+
 def _runtime_checkout(
     tmp_path: Path,
     *,
@@ -183,6 +249,7 @@ def _runtime_checkout(
         )
     finally:
         os.close(lock_fd)
+    _prepare_fake_lab_runtime(checkout)
     return checkout, executable, marker
 
 
@@ -255,6 +322,38 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
         str(_deployment_lock_path(checkout).parent / "checkout.venvs")
     )
     assert runtime["prefix"] != str(checkout / ".venv")
+
+
+def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effects(
+    tmp_path: Path,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    future_data = tmp_path / "future-data"
+    future_parquet = tmp_path / "future-parquet"
+    future_logs = tmp_path / "future-logs"
+    dotenv = checkout / ".env"
+    dotenv.write_text(
+        "\n".join(
+            (
+                f"DATA_DIR={future_data}",
+                f"DUCKDB_PATH={future_data / 'rquant.duckdb'}",
+                f"PARQUET_DIR={future_parquet}",
+                f"LOG_DIR={future_logs}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dotenv.chmod(0o600)
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode != 0
+    assert "prepared sentinel" in result.stderr.lower()
+    assert not marker.exists()
+    assert not future_data.exists()
+    assert not future_parquet.exists()
+    assert not future_logs.exists()
 
 
 def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(

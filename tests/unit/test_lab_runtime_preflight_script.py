@@ -177,6 +177,8 @@ def _invoke(
                 str(lock_fd),
                 "--python-path",
                 str(checkout / ".venv" / "bin" / "python"),
+                "--lab-daemon-command",
+                "lab-runtime-prepare",
                 *arguments,
             ],
             cwd=checkout,

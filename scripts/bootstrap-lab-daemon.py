@@ -101,6 +101,7 @@ def _run_preflight(
     lock_fd: int,
     python_path: Path,
     provisional_handoff_label: str | None,
+    daemon_command: str,
 ) -> None:
     command = [
         sys.executable,
@@ -119,6 +120,8 @@ def _run_preflight(
         str(lock_fd),
         "--python-path",
         str(python_path),
+        "--lab-daemon-command",
+        daemon_command,
     ]
     if provisional_handoff_label is not None:
         command.extend(["--provisional-handoff-label", provisional_handoff_label])
@@ -156,6 +159,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
+        daemon_argv = list(args.daemon_argv)
+        if daemon_argv and daemon_argv[0] == "--":
+            daemon_argv.pop(0)
+        if not daemon_argv or daemon_argv[0] not in {
+            "lab-scheduler",
+            "lab-worker",
+            "lab-finalizer",
+        }:
+            raise BootstrapError("formal Lab daemon command is missing or invalid")
         root = _canonical(args.expected_checkout_root, label="expected checkout root")
         _physical_directory(root, label="expected checkout root")
         if Path.cwd().resolve(strict=True) != root:
@@ -197,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             lock_fd=args.deployment_lock_fd,
             python_path=Path(sys.executable),
             provisional_handoff_label=args.provisional_handoff_label,
+            daemon_command=daemon_argv[0],
         )
         try:
             _load_release_authority(
@@ -230,11 +243,6 @@ def main(argv: list[str] | None = None) -> int:
         sys.path[:] = [str(src), str(site_packages), *stdlib_paths]
         sys.prefix = str(venv)
         sys.exec_prefix = str(venv)
-        daemon_argv = list(args.daemon_argv)
-        if daemon_argv and daemon_argv[0] == "--":
-            daemon_argv.pop(0)
-        if not daemon_argv:
-            raise BootstrapError("daemon command is missing")
         sys.argv = [str(launcher), *daemon_argv]
 
         from rquant.cli import main as rquant_main

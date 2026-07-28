@@ -131,6 +131,7 @@ def _authority(
     gc_grace_seconds: float | None = None,
     minimum_free_bytes: int | None = None,
     uv_path: Path | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> ReleaseGenerationAuthority:
     def copy_fixture_environment(destination: Path) -> None:
         shutil.copytree(repo / ".venv", destination, dirs_exist_ok=True, symlinks=True)
@@ -147,6 +148,7 @@ def _authority(
         minimum_free_bytes=minimum_free_bytes,
         uv_path=uv_path,
         environment_builder=(None if uv_path is not None else copy_fixture_environment),
+        cancellation_check=cancellation_check,
     )
 
 
@@ -996,6 +998,56 @@ def test_environment_generation_can_resume_after_rename_before_manifest(
     )
 
     assert recovered.verify(expected_commit=commit) == marker
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_environment_tree_publication_checks_shared_deadline_and_cancellation(
+    tmp_path: Path,
+    cancelled: bool,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    cancellation = False
+    authority: ReleaseGenerationAuthority
+
+    def build(destination: Path) -> None:
+        nonlocal cancellation
+        shutil.copytree(repo / ".venv", destination, dirs_exist_ok=True, symlinks=True)
+        for index in range(40):
+            payload = destination / "lib" / f"payload-{index}.txt"
+            payload.write_text(str(index), encoding="utf-8")
+            payload.chmod(0o600)
+        if cancelled:
+            cancellation = True
+        else:
+            authority.overall_deadline_monotonic = time.monotonic() - 1
+
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        writable=True,
+        environment_builder=build,
+        cancellation_check=lambda: cancellation,
+        minimum_free_bytes=0,
+    )
+    initialization = authority.begin_initialization(target_sha=commit)
+
+    with pytest.raises(ReleaseGenerationError, match="cancelled|timed out"):
+        authority.publish(
+            expected_commit=commit,
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+        )
+
+    environment_root = environment_root_for_lock(lock_path)
+    assert not environment_selector_path_for_lock(lock_path).exists()
+    assert not [path for path in environment_root.iterdir() if path.name.endswith(".building")]
+    assert not [path for path in environment_root.iterdir() if not path.name.startswith(".")]
     os.close(lock_fd)
 
 

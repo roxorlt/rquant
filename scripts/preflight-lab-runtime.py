@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -17,6 +18,18 @@ sys.dont_write_bytecode = True
 
 EXECUTABLE_SUFFIXES = frozenset({".pyc", ".pyo", ".so", ".dylib", ".pyd"})
 GIT_TIMEOUT_SECONDS = 5
+LAB_RUNTIME_PREPARED_SCHEMA_VERSION = 2
+LAB_RUNTIME_DIRECTORY_DEFAULTS = {
+    "lab command spool": ("LAB_JOB_COMMAND_DIR", "commands"),
+    "lab claim spool": ("LAB_JOB_CLAIM_DIR", "claims"),
+    "lab report spool": ("LAB_JOB_REPORT_DIR", "reports"),
+    "lab worker artifact root": ("LAB_WORKER_ARTIFACT_DIR", "worker-artifacts"),
+    "lab final artifact root": ("LAB_FINAL_ARTIFACT_DIR", "final-artifacts"),
+    "lab artifact commit spool": ("LAB_ARTIFACT_COMMIT_DIR", "artifact-commits"),
+    "lab daemon lock root": ("LAB_DAEMON_LOCK_DIR", "locks"),
+    "lab finalizer state root": ("LAB_FINALIZER_STATE_DIR", "finalizer-state"),
+    "lab readiness root": ("LAB_READINESS_DIR", "readiness"),
+}
 
 
 class PreflightError(RuntimeError):
@@ -196,6 +209,190 @@ def _runtime_artifacts(checkout: Path) -> tuple[Path, ...]:
     return tuple(sorted(set(found)))
 
 
+def _dotenv_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    observed = path.lstat()
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise PreflightError("checkout .env must be an owned private regular file")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise PreflightError("checkout .env is unreadable") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def _configured_path(
+    values: dict[str, str],
+    key: str,
+    default: Path,
+    *,
+    label: str,
+) -> Path:
+    raw = os.environ.get(key, values.get(key, ""))
+    path = Path(raw) if raw else default
+    if not path.is_absolute() or path != Path(os.path.abspath(path)):
+        raise PreflightError(f"{label} must be an absolute canonical path")
+    return path
+
+
+def _private_runtime_directory(path: Path, *, label: str) -> os.stat_result:
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise PreflightError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) != 0o700
+        or path.resolve(strict=True) != path
+    ):
+        raise PreflightError(f"{label} must be an owned physical 0700 directory")
+    return observed
+
+
+def _private_runtime_file(path: Path, *, label: str) -> os.stat_result:
+    try:
+        before = path.lstat()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise PreflightError(f"{label} is unavailable") from exc
+    try:
+        opened = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+        != (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink)
+    ):
+        raise PreflightError(f"{label} must be an owned physical 0600 file")
+    return opened
+
+
+def _verify_prepared_lab_runtime(
+    checkout: Path,
+    *,
+    daemon_command: str,
+) -> None:
+    if daemon_command == "lab-runtime-prepare":
+        return
+    values = _dotenv_values(checkout / ".env")
+    data_dir = _configured_path(values, "DATA_DIR", checkout / "data", label="DATA_DIR")
+    runtime_root = _configured_path(
+        values,
+        "LAB_RUNTIME_DIR",
+        data_dir / "lab-runtime",
+        label="Lab runtime root",
+    )
+    if not os.path.lexists(runtime_root):
+        raise PreflightError("Lab runtime prepared sentinel root is unavailable")
+    root_identity = _private_runtime_directory(runtime_root, label="Lab runtime root")
+    sentinel = runtime_root / ".prepared.json"
+    _private_runtime_file(sentinel, label="Lab runtime prepared sentinel")
+    try:
+        payload = json.loads(sentinel.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PreflightError("Lab runtime prepared sentinel is malformed") from exc
+    authority_id = payload.get("runtime_authority_id") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != LAB_RUNTIME_PREPARED_SCHEMA_VERSION
+        or payload.get("checkout_root") != str(checkout)
+        or payload.get("runtime_root") != str(runtime_root)
+        or payload.get("runtime_device") != root_identity.st_dev
+        or payload.get("runtime_inode") != root_identity.st_ino
+        or not isinstance(authority_id, str)
+        or len(authority_id) != 32
+        or any(character not in "0123456789abcdef" for character in authority_id)
+    ):
+        raise PreflightError("Lab runtime prepared sentinel binding changed")
+    directories = payload.get("managed_directories")
+    files = payload.get("managed_files")
+    migrations = payload.get("migration_sources")
+    if (
+        not isinstance(directories, dict)
+        or set(directories) != set(LAB_RUNTIME_DIRECTORY_DEFAULTS)
+        or not isinstance(files, dict)
+        or set(files) != {"lab jobs SQLite"}
+        or not isinstance(migrations, dict)
+    ):
+        raise PreflightError("Lab runtime prepared sentinel layout is incomplete")
+    for label, (key, default_name) in LAB_RUNTIME_DIRECTORY_DEFAULTS.items():
+        path = _configured_path(values, key, runtime_root / default_name, label=label)
+        observed = _private_runtime_directory(path, label=label)
+        if path.parent != runtime_root or directories.get(label) != {
+            "path": str(path),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "mode": 0o700,
+        }:
+            raise PreflightError("Lab runtime prepared sentinel directory changed")
+    database = _configured_path(
+        values,
+        "LAB_JOBS_PATH",
+        runtime_root / "lab_jobs.sqlite3",
+        label="Lab jobs SQLite",
+    )
+    binding = files.get("lab jobs SQLite")
+    if database.parent != runtime_root or not isinstance(binding, dict):
+        raise PreflightError("Lab runtime prepared sentinel database binding changed")
+    for suffix in ("-wal", "-shm", "-journal"):
+        if os.path.lexists(database.with_name(f"{database.name}{suffix}")):
+            raise PreflightError("Lab runtime SQLite sidecar blocks daemon startup")
+    if binding.get("exists") is True:
+        observed = _private_runtime_file(database, label="Lab jobs SQLite")
+        expected_binding = {
+            "path": str(database),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "mode": 0o600,
+            "exists": True,
+        }
+        if binding != expected_binding:
+            raise PreflightError("Lab runtime prepared sentinel database changed")
+    elif binding == {"path": str(database), "exists": False}:
+        if os.path.lexists(database):
+            raise PreflightError("Lab runtime database exists but is not registered")
+        if daemon_command != "lab-scheduler":
+            raise PreflightError("Lab runtime database is not initialized")
+    else:
+        raise PreflightError("Lab runtime prepared sentinel database binding changed")
+    for target, migration in migrations.items():
+        if (
+            not isinstance(migration, dict)
+            or set(migration) != {"source", "migrated"}
+            or Path(target).parent != runtime_root
+            or os.path.lexists(Path(str(migration.get("source", ""))))
+        ):
+            raise PreflightError("Lab runtime legacy migration binding changed")
+
+
 def _assert_generation_lock(path: Path, descriptor: int) -> None:
     try:
         opened = os.fstat(descriptor)
@@ -232,6 +429,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-lock-fd", required=True, type=int)
     parser.add_argument("--python-path", required=True)
     parser.add_argument("--provisional-handoff-label")
+    parser.add_argument(
+        "--lab-daemon-command",
+        choices=("lab-scheduler", "lab-worker", "lab-finalizer", "lab-runtime-prepare"),
+        required=True,
+    )
     args = parser.parse_args(argv)
     try:
         git_path, git_identity = _trusted_git(args.trusted_git_path)
@@ -256,6 +458,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"{len(artifacts)} artifact(s); manually verify and remove only these "
                 f"repository entries, then rerun: {preview}"
             )
+        _verify_prepared_lab_runtime(
+            checkout,
+            daemon_command=args.lab_daemon_command,
+        )
         lock_path = Path(args.deployment_lock_path)
         _assert_generation_lock(lock_path, args.deployment_lock_fd)
         try:

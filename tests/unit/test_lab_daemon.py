@@ -826,6 +826,93 @@ def test_private_lab_runtime_layout_migrates_without_chmoding_shared_data(
     assert prepared["migration_sources"][str(database)]["source"] == str(legacy_database)
     assert prepared["migration_sources"][str(database)]["migrated"] is True
 
+    sentinel_before = lab_daemon.lab_runtime_prepared_path(runtime).read_bytes()
+    upgraded_release = lab_daemon.verify_lab_runtime_prepared(
+        runtime,
+        checkout_root=tmp_path,
+        expected_commit="b" * 40,
+        managed_directories={"commands": commands, "readiness": runtime / "readiness"},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={database: legacy_database, commands: legacy_commands},
+    )
+    assert upgraded_release["runtime_authority_id"] == prepared["runtime_authority_id"]
+    assert lab_daemon.lab_runtime_prepared_path(runtime).read_bytes() == sentinel_before
+
+
+def test_prepared_runtime_requires_owner_registration_of_first_sqlite_identity(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    commands = runtime / "commands"
+    directories = {"commands": commands}
+    files = {"lab jobs SQLite": database}
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories=directories,
+        managed_files=files,
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+
+    database.write_bytes(b"sqlite-authority")
+    database.chmod(0o600)
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="not registered",
+    ):
+        lab_daemon.verify_lab_runtime_prepared(
+            runtime,
+            checkout_root=tmp_path,
+            expected_commit="b" * 40,
+            managed_directories=directories,
+            managed_files=files,
+            legacy_paths={},
+        )
+
+    registered = lab_daemon.register_lab_runtime_managed_file(
+        runtime,
+        label="lab jobs SQLite",
+        path=database,
+        mutation_guard=lambda: "b" * 40,
+    )
+    observed = database.lstat()
+    assert registered["managed_files"]["lab jobs SQLite"] == {
+        "path": str(database),
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+        "mode": 0o600,
+        "exists": True,
+    }
+    lab_daemon.verify_lab_runtime_prepared(
+        runtime,
+        checkout_root=tmp_path,
+        expected_commit="b" * 40,
+        managed_directories=directories,
+        managed_files=files,
+        legacy_paths={},
+    )
+
+    displaced = runtime / "lab_jobs.displaced.sqlite3"
+    database.rename(displaced)
+    database.write_bytes(b"replacement")
+    database.chmod(0o600)
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="prepared sentinel binding changed",
+    ):
+        lab_daemon.verify_lab_runtime_prepared(
+            runtime,
+            checkout_root=tmp_path,
+            expected_commit="b" * 40,
+            managed_directories=directories,
+            managed_files=files,
+            legacy_paths={},
+        )
+
 
 def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Path) -> None:
     from rquant import lab_daemon
@@ -1010,7 +1097,8 @@ def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
     )
     sentinel = lab_daemon.lab_runtime_prepared_path(runtime)
     payload = json.loads(sentinel.read_text(encoding="utf-8"))
-    payload["prepared_commit"] = "c" * 40
+    authority_id = payload["runtime_authority_id"]
+    payload["runtime_authority_id"] = "invalid"
     sentinel.chmod(0o600)
     sentinel.write_text(json.dumps(payload), encoding="utf-8")
     sentinel.chmod(0o600)
@@ -1025,7 +1113,7 @@ def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
             legacy_paths={database: legacy_database},
         )
 
-    payload["prepared_commit"] = "b" * 40
+    payload["runtime_authority_id"] = authority_id
     sentinel.write_text(json.dumps(payload), encoding="utf-8")
     sentinel.chmod(0o600)
     legacy_database.write_bytes(b"split")
@@ -1038,6 +1126,7 @@ def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
             managed_directories={"commands": commands},
             managed_files={"lab jobs SQLite": database},
             legacy_paths={database: legacy_database},
+            allow_missing_files=frozenset({"lab jobs SQLite"}),
         )
 
 

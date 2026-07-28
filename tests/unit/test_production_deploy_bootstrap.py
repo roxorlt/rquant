@@ -404,7 +404,11 @@ def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
 
 
 def _install_lab_handoff(module: ModuleType, root: Path, lock_path: Path) -> None:
-    from rquant.lab_daemon import prepare_lab_runtime_layout
+    from rquant.lab_daemon import (
+        prepare_lab_runtime_layout,
+        prepare_private_sqlite_path,
+        register_lab_runtime_managed_file,
+    )
 
     runtime_root = root / "data" / "lab-runtime"
     directories = {
@@ -427,6 +431,21 @@ def _install_lab_handoff(module: ModuleType, root: Path, lock_path: Path) -> Non
         legacy_paths={},
         mutation_guard=lambda: "a" * 40,
     )
+    authority = prepare_private_sqlite_path(
+        files["lab jobs SQLite"],
+        label="lab jobs SQLite",
+        create=True,
+        mutation_guard=lambda: "a" * 40,
+    )
+    try:
+        register_lab_runtime_managed_file(
+            runtime_root,
+            label="lab jobs SQLite",
+            path=files["lab jobs SQLite"],
+            mutation_guard=lambda: "a" * 40,
+        )
+    finally:
+        authority.close()
     module._write_lab_installation_state(
         root=root,
         lock_path=lock_path,
@@ -589,6 +608,64 @@ def test_lab_handoff_rejects_invalid_or_changed_target_before_bootout(
     finally:
         resumed.close()
     assert sum(call[0] == "bootout" for call in calls) == bootouts
+
+
+def test_incomplete_handoff_resume_is_deferred_without_writes_in_protected_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(tuple(arguments))
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if arguments[0] == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if arguments[0] == "bootout":
+            loaded.remove(label)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    first.prepare(
+        dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    first.close()
+    calls_before = list(calls)
+    durable_before = module._stable_record_path(lock_path, "lab-handoff").read_bytes()
+
+    resumed = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    try:
+        with pytest.raises(module.DeployDeferredError, match="protected") as deferred:
+            resumed.prepare(
+                dry_run=False,
+                target_ref="a" * 40,
+                target_sha="a" * 40,
+                action="deploy",
+                now=datetime(2026, 7, 29, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+    finally:
+        resumed.close()
+
+    assert calls == calls_before
+    assert deferred.value.exit_code == 75
+    assert module._stable_record_path(lock_path, "lab-handoff").read_bytes() == durable_before
 
 
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
@@ -1745,7 +1822,9 @@ def test_register_lab_installation_requires_explicit_prepared_runtime(
     )
 
     assert accepted.returncode == 0, accepted.stderr
-    assert json.loads(installation.read_text(encoding="utf-8"))["prepared_commit"] == commit
+    installation_payload = json.loads(installation.read_text(encoding="utf-8"))
+    assert installation_payload["registered_by_commit"] == commit
+    assert installation_payload["prepared_authority"]["runtime_authority_id"]
 
 
 def test_register_lab_installation_dry_run_never_rewrites_installation_state(
@@ -1815,6 +1894,144 @@ def test_register_lab_installation_dry_run_never_rewrites_installation_state(
     )
 
 
+def test_register_lab_installation_dry_run_never_creates_missing_lock(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path, install_state=False)
+    runtime_root = checkout / "data" / "lab-runtime"
+    readiness_root = runtime_root / "readiness"
+    from rquant.lab_daemon import prepare_lab_runtime_layout
+
+    directories = {
+        "lab command spool": runtime_root / "commands",
+        "lab claim spool": runtime_root / "claims",
+        "lab report spool": runtime_root / "reports",
+        "lab worker artifact root": runtime_root / "worker-artifacts",
+        "lab final artifact root": runtime_root / "final-artifacts",
+        "lab artifact commit spool": runtime_root / "artifact-commits",
+        "lab daemon lock root": runtime_root / "locks",
+        "lab finalizer state root": runtime_root / "finalizer-state",
+        "lab readiness root": readiness_root,
+    }
+    prepare_lab_runtime_layout(
+        runtime_root,
+        checkout_root=checkout,
+        managed_directories=directories,
+        managed_files={"lab jobs SQLite": runtime_root / "lab_jobs.sqlite3"},
+        legacy_paths={},
+        mutation_guard=lambda: commit,
+    )
+    command = _command(checkout, python, lock_path, target=commit, mode="register")
+    separator = command.index("--")
+    command[separator:separator] = [
+        "--lab-runtime-root",
+        str(runtime_root),
+        "--lab-readiness-root",
+        str(readiness_root),
+    ]
+    command.append("--dry-run")
+    lock_path.unlink()
+    before = {
+        path.relative_to(lock_path.parent).as_posix(): (
+            path.lstat().st_ino,
+            path.lstat().st_mtime_ns,
+            path.read_bytes() if path.is_file() else b"",
+        )
+        for path in lock_path.parent.rglob("*")
+    }
+
+    result = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    after = {
+        path.relative_to(lock_path.parent).as_posix(): (
+            path.lstat().st_ino,
+            path.lstat().st_mtime_ns,
+            path.read_bytes() if path.is_file() else b"",
+        )
+        for path in lock_path.parent.rglob("*")
+    }
+    assert result.returncode == 2
+    assert "lock" in result.stderr.lower()
+    assert not lock_path.exists()
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("mode", "command"),
+    [("resume", "merge"), ("rollback", "reset")],
+)
+def test_generation_checkout_mutations_use_process_group_and_git_write_locking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    command: str,
+) -> None:
+    module = _bootstrap_module()
+    repo = tmp_path / "rquant"
+    repo.mkdir()
+    current = "a" * 40 if mode == "resume" else "b" * 40
+    target = "b" * 40 if mode == "resume" else "a" * 40
+    process_calls: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setattr(module, "_git_head", lambda *_args, **_kwargs: current)
+    monkeypatch.setattr(
+        module,
+        "_git_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    def fake_process_group(
+        arguments: list[str],
+        *,
+        cwd: Path,
+        timeout_seconds: float,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        assert cwd == repo
+        assert timeout_seconds > 0
+        process_calls.append((arguments, env))
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(module, "_run_process_group", fake_process_group)
+
+    module._prepare_generation_checkout(
+        root=repo,
+        git_path=Path("/usr/bin/git"),
+        target_commit=target,
+        mode=mode,
+        overall_deadline_monotonic=time.monotonic() + 10,
+    )
+
+    assert len(process_calls) == 1
+    arguments, environment = process_calls[0]
+    assert arguments[1] == command
+    assert environment["GIT_OPTIONAL_LOCKS"] == "1"
+
+
+def test_read_only_git_verification_disables_optional_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _bootstrap_module()
+    captured: list[dict[str, str]] = []
+
+    def fake_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess([], 0, "a" * 40 + "\n", "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module._git_run(tmp_path, Path("/usr/bin/git"), "rev-parse", "HEAD")
+
+    assert captured == [{**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}]
+
+
 def test_lab_installation_registration_rejects_tampered_prepared_sentinel(
     tmp_path: Path,
 ) -> None:
@@ -1829,10 +2046,11 @@ def test_lab_installation_registration_rejects_tampered_prepared_sentinel(
     sentinel.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "checkout_root": str(root),
                 "runtime_root": str(runtime_root),
-                "prepared_commit": "a" * 40,
+                "runtime_authority_id": "a" * 32,
+                "prepared_by_commit": "a" * 40,
                 "managed_directories": {},
                 "managed_files": {},
                 "migration_sources": {},

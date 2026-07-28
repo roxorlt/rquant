@@ -28,8 +28,9 @@ from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
 
 _CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_LAB_RUNTIME_PREPARED_SCHEMA_VERSION = 1
+_LAB_RUNTIME_PREPARED_SCHEMA_VERSION = 2
 _LAB_RUNTIME_PREPARED_FILENAME = ".prepared.json"
+_LAB_RUNTIME_PREPARED_LOCK_FILENAME = ".prepared.lock"
 _LAB_RUNTIME_PREPARED_MAX_BYTES = 1024 * 1024
 
 
@@ -149,7 +150,12 @@ def _write_runtime_prepared_sentinel(
     payload: dict[str, object],
     *,
     mutation_guard: Callable[[], object],
+    lock_descriptor: int | None = None,
+    expected_identity: tuple[int, int] | None = None,
 ) -> None:
+    owned_lock = lock_descriptor is None
+    if lock_descriptor is None:
+        lock_descriptor = _open_runtime_prepared_lock(root, create=True)
     root_observed = root.lstat()
     root_fd = os.open(
         root,
@@ -190,6 +196,21 @@ def _write_runtime_prepared_sentinel(
             root_observed.st_ino,
         ):
             raise LabDaemonConfigurationError("lab runtime root identity changed")
+        if expected_identity is not None:
+            try:
+                active_sentinel = os.stat(
+                    _LAB_RUNTIME_PREPARED_FILENAME,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise LabDaemonConfigurationError(
+                    "lab runtime prepared sentinel changed during update"
+                ) from exc
+            if (active_sentinel.st_dev, active_sentinel.st_ino) != expected_identity:
+                raise LabDaemonConfigurationError(
+                    "lab runtime prepared sentinel changed during update"
+                )
         os.replace(
             temporary,
             _LAB_RUNTIME_PREPARED_FILENAME,
@@ -205,9 +226,60 @@ def _write_runtime_prepared_sentinel(
         if descriptor >= 0:
             os.close(descriptor)
         os.close(root_fd)
+        if owned_lock:
+            os.close(lock_descriptor)
 
 
-def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
+def _open_runtime_prepared_lock(root: Path, *, create: bool) -> int:
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = -1
+    try:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        if create:
+            flags |= os.O_CREAT
+        descriptor = os.open(
+            _LAB_RUNTIME_PREPARED_LOCK_FILENAME,
+            flags,
+            0o600,
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(descriptor)
+        active = os.stat(
+            _LAB_RUNTIME_PREPARED_LOCK_FILENAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        _validate_private_regular_identity(opened, label="lab runtime prepared lock")
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_nlink,
+        ) != (
+            active.st_dev,
+            active.st_ino,
+            active.st_mode,
+            active.st_uid,
+            active.st_nlink,
+        ):
+            raise LabDaemonConfigurationError("lab runtime prepared lock identity changed")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise LabDaemonConfigurationError("lab runtime prepared lock is unavailable") from exc
+    finally:
+        os.close(root_fd)
+
+
+def _read_runtime_prepared_sentinel_record(
+    root: Path,
+) -> tuple[dict[str, object], tuple[int, int]]:
     sentinel = lab_runtime_prepared_path(root)
     descriptor = -1
     try:
@@ -248,7 +320,7 @@ def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
         payload = json.loads(b"".join(chunks))
         if not isinstance(payload, dict):
             raise LabDaemonConfigurationError("lab runtime prepared sentinel is malformed")
-        return payload
+        return payload, (opened.st_dev, opened.st_ino)
     except LabDaemonConfigurationError:
         raise
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -256,6 +328,11 @@ def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
+    payload, _identity = _read_runtime_prepared_sentinel_record(root)
+    return payload
 
 
 def verify_lab_runtime_prepared(
@@ -266,6 +343,7 @@ def verify_lab_runtime_prepared(
     managed_directories: Mapping[str, Path],
     managed_files: Mapping[str, Path],
     legacy_paths: Mapping[Path, Path],
+    allow_missing_files: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     root = require_private_directory(runtime_root, label="lab runtime root")
     checkout = _canonical_absolute_path(checkout_root, label="checkout root")
@@ -285,19 +363,28 @@ def verify_lab_runtime_prepared(
             raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
         if "sqlite" in label.casefold() or path.suffix.casefold() in {".db", ".sqlite3"}:
             _reject_sqlite_sidecars(path, label=label)
-        if os.path.lexists(path):
+        recorded = recorded_files.get(label) if isinstance(recorded_files, dict) else None
+        if not isinstance(recorded, dict):
+            raise LabDaemonConfigurationError("lab runtime prepared sentinel file binding changed")
+        if recorded.get("exists") is False:
+            if os.path.lexists(path):
+                raise LabDaemonConfigurationError(
+                    f"{label} exists but is not registered in the prepared sentinel"
+                )
+            if label not in allow_missing_files:
+                raise LabDaemonConfigurationError(
+                    f"{label} is not initialized in the prepared sentinel"
+                )
+            expected_files[label] = {"path": str(path), "exists": False}
+        elif os.path.lexists(path):
             observed = path.lstat()
             _validate_private_regular_identity(observed, label=label)
-            recorded = recorded_files.get(label) if isinstance(recorded_files, dict) else None
-            if isinstance(recorded, dict) and recorded.get("exists") is False:
-                expected_files[label] = {"path": str(path), "exists": False}
-            else:
-                expected_files[label] = {
-                    **_runtime_identity_payload(path, observed),
-                    "exists": True,
-                }
+            expected_files[label] = {
+                **_runtime_identity_payload(path, observed),
+                "exists": True,
+            }
         else:
-            expected_files[label] = {"path": str(path), "exists": False}
+            raise LabDaemonConfigurationError(f"{label} registered file is unavailable")
     migration_sources: dict[str, dict[str, object]] = {}
     for target, raw_source in legacy_paths.items():
         source = _canonical_absolute_path(raw_source, label=f"legacy {target.name}")
@@ -312,10 +399,14 @@ def verify_lab_runtime_prepared(
         "runtime_root": str(root),
         "runtime_device": root_observed.st_dev,
         "runtime_inode": root_observed.st_ino,
-        "prepared_commit": expected_commit,
         "managed_directories": expected_directories,
         "managed_files": expected_files,
     }
+    if _CODE_SHA.fullmatch(expected_commit) is None:
+        raise LabDaemonConfigurationError("lab runtime release commit must be a full SHA")
+    authority_id = payload.get("runtime_authority_id")
+    if not isinstance(authority_id, str) or re.fullmatch(r"[0-9a-f]{32}", authority_id) is None:
+        raise LabDaemonConfigurationError("lab runtime prepared authority is invalid")
     if any(payload.get(key) != value for key, value in expected.items()):
         raise LabDaemonConfigurationError("lab runtime prepared sentinel binding changed")
     recorded_sources = payload.get("migration_sources")
@@ -333,6 +424,56 @@ def verify_lab_runtime_prepared(
                 "lab runtime prepared sentinel migration binding changed"
             )
     return payload
+
+
+def register_lab_runtime_managed_file(
+    runtime_root: Path,
+    *,
+    label: str,
+    path: Path,
+    mutation_guard: Callable[[], object],
+    owner: str = "scheduler",
+) -> dict[str, object]:
+    """Atomically bind the first scheduler-created SQLite inode to runtime authority."""
+    if owner != "scheduler":
+        raise LabDaemonConfigurationError("only the scheduler owner may register Lab files")
+    root = require_private_directory(runtime_root, label="lab runtime root")
+    candidate = _canonical_absolute_path(path, label=label)
+    if candidate.parent != root:
+        raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
+    _reject_sqlite_sidecars(candidate, label=label)
+    observed = candidate.lstat()
+    _validate_private_regular_identity(observed, label=label)
+    lock_descriptor = _open_runtime_prepared_lock(root, create=False)
+    try:
+        payload, sentinel_identity = _read_runtime_prepared_sentinel_record(root)
+        files = payload.get("managed_files")
+        recorded = files.get(label) if isinstance(files, dict) else None
+        if recorded != {"path": str(candidate), "exists": False}:
+            raise LabDaemonConfigurationError(
+                f"{label} cannot be registered from its current prepared state"
+            )
+        mutation_guard()
+        current = candidate.lstat()
+        _validate_private_regular_identity(current, label=label)
+        if (current.st_dev, current.st_ino) != (observed.st_dev, observed.st_ino):
+            raise LabDaemonConfigurationError(f"{label} identity changed before registration")
+        updated_files = dict(files)
+        updated_files[label] = {
+            **_runtime_identity_payload(candidate, current),
+            "exists": True,
+        }
+        updated = {**payload, "managed_files": updated_files}
+        _write_runtime_prepared_sentinel(
+            root,
+            updated,
+            mutation_guard=mutation_guard,
+            lock_descriptor=lock_descriptor,
+            expected_identity=sentinel_identity,
+        )
+        return updated
+    finally:
+        os.close(lock_descriptor)
 
 
 def prepare_lab_runtime_layout(
@@ -468,7 +609,8 @@ def prepare_lab_runtime_layout(
             "runtime_root": str(root),
             "runtime_device": root_observed.st_dev,
             "runtime_inode": root_observed.st_ino,
-            "prepared_commit": prepared_commit,
+            "runtime_authority_id": uuid4().hex,
+            "prepared_by_commit": prepared_commit,
             "managed_directories": directory_payload,
             "managed_files": file_payload,
             "migration_sources": migration_payload,
@@ -945,6 +1087,7 @@ class LabSqliteAuthority:
         database_descriptor: int,
         parent_identity: os.stat_result,
         database_identity: os.stat_result,
+        created: bool,
     ) -> None:
         self.path = path
         self.label = label
@@ -952,6 +1095,7 @@ class LabSqliteAuthority:
         self._database_descriptor = database_descriptor
         self._parent_identity = parent_identity
         self._database_identity = database_identity
+        self.created = created
 
     @staticmethod
     def _identity(observed: os.stat_result) -> tuple[int, int]:
@@ -1079,6 +1223,7 @@ def prepare_private_sqlite_path(
         os.close(parent_descriptor)
         raise
     descriptor = -1
+    created = False
     try:
         try:
             observed = os.stat(candidate.name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -1090,6 +1235,7 @@ def prepare_private_sqlite_path(
                 if mutation_guard is not None:
                     mutation_guard()
                 descriptor = os.open(candidate.name, flags, 0o600, dir_fd=parent_descriptor)
+                created = True
             except OSError as exc:
                 raise LabDaemonConfigurationError(
                     f"{label} could not be created atomically"
@@ -1120,6 +1266,7 @@ def prepare_private_sqlite_path(
             database_descriptor=descriptor,
             parent_identity=opened_parent,
             database_identity=current,
+            created=created,
         )
         authority.assert_current()
         parent_descriptor = -1

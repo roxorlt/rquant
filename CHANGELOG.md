@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **Lab runtime authority 与发布代际解耦**：prepared sentinel 现在绑定长期稳定的私有运行目录
+  authority，而 release commit 仅作审计，真实 `rquant.cli` daemon 可在同一数据权威上完成 A→B
+  升级。首次 Lab SQLite 仅允许 scheduler 原子创建并登记 inode，worker/finalizer 拒绝未登记或被
+  替换的数据库；stdlib preflight 在导入 Settings/CLI 前验证完整 sentinel，缺失时不创建配置目录。
+  不完整 launchd handoff 在交易保护窗口统一以 75 延期；generation 扫描、冻结和 manifest 哈希
+  共享整体 deadline/cancellation。Git 写操作统一由有界进程组执行，超时终止后代，registration
+  dry-run 不创建锁且只读 Git 显式使用 `GIT_OPTIONAL_LOCKS=0`。
+
 - **Lab 发布恢复第三轮边界加固**：installed finalizer 继承外层 generation/handoff 锁，不再
   二次争抢非阻塞 handoff 锁；普通发布在停止 daemon 前有界 fetch 并解析精确新 tag/SHA，恢复则
   只使用 immutable intent 中记录的 commit。部分 launchd 恢复会先停净目标残余 label，再以新

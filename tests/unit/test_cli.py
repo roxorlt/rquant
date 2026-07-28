@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from rquant.cli import build_parser
+from rquant.lab_daemon import ensure_private_directory as _real_ensure_private_directory
+from rquant.lab_daemon import verify_lab_runtime_prepared as _real_verify_lab_runtime_prepared
 
 _LAB_EXPECTED_ROOT = "/tmp/rquant-expected"
 _LAB_TRUSTED_GIT = "/usr/bin/git"
@@ -34,8 +36,9 @@ _LAB_GENERATION_ARGUMENTS = [
 
 
 class _FakeLabSqliteAuthority:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, created: bool = False) -> None:
         self.path = path
+        self.created = created
 
     def close(self) -> None:
         pass
@@ -3904,8 +3907,13 @@ class TestLabSchedulerCli:
             "prepare_private_sqlite_path",
             lambda path, *, label, create, mutation_guard: (
                 calls.append(f"sqlite:{path.name}:{label}:{create}")
-                or _FakeLabSqliteAuthority(path)
+                or _FakeLabSqliteAuthority(path, created=True)
             ),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "register_lab_runtime_managed_file",
+            lambda _root, *, label, **_kwargs: calls.append(f"register:{label}"),
         )
         monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
@@ -3920,6 +3928,7 @@ class TestLabSchedulerCli:
 
         assert result == 0
         assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:True" in calls
+        assert "register:lab jobs SQLite" in calls
         assert "initialize" in calls
         assert "claim_spool:claims" in calls
         assert "report_spool:reports" in calls
@@ -4157,6 +4166,103 @@ class TestLabWorkerCli:
         assert "spool:claims" in calls
         assert "spool:reports" in calls
         assert calls[-2:] == ["worker:worker-a", "run_once"]
+
+    def test_real_cli_worker_starts_across_a_to_b_with_one_runtime_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import argparse
+
+        from rquant import lab_daemon, lab_shard_protocol, lab_worker
+        from rquant.cli import _lab_runtime_layout, cmd_lab_worker
+        from rquant.config import settings
+
+        current = {"sha": "a" * 40}
+        data = tmp_path / "data"
+        runtime = data / "lab-runtime"
+        managed = {
+            "lab_runtime_dir": runtime,
+            "lab_jobs_path": runtime / "lab_jobs.sqlite3",
+            "lab_job_command_dir": runtime / "commands",
+            "lab_job_claim_dir": runtime / "claims",
+            "lab_job_report_dir": runtime / "reports",
+            "lab_worker_artifact_dir": runtime / "worker-artifacts",
+            "lab_final_artifact_dir": runtime / "final-artifacts",
+            "lab_artifact_commit_dir": runtime / "artifact-commits",
+            "lab_daemon_lock_dir": runtime / "locks",
+            "lab_finalizer_state_dir": runtime / "finalizer-state",
+            "lab_readiness_dir": runtime / "readiness",
+        }
+        monkeypatch.setattr(settings, "data_dir", data)
+        for field, path in managed.items():
+            monkeypatch.setattr(settings, field, path)
+        monkeypatch.setattr(
+            lab_daemon,
+            "ensure_private_directory",
+            _real_ensure_private_directory,
+        )
+        directories, files, legacy = _lab_runtime_layout()
+        runtime.mkdir(parents=True, mode=0o700)
+        database = files["lab jobs SQLite"]
+        database.write_bytes(b"")
+        database.chmod(0o600)
+        lab_daemon.prepare_lab_runtime_layout(
+            runtime,
+            checkout_root=Path(_LAB_EXPECTED_ROOT),
+            managed_directories=directories,
+            managed_files=files,
+            legacy_paths=legacy,
+            mutation_guard=lambda: "a" * 40,
+        )
+        authority_id = json.loads(
+            lab_daemon.lab_runtime_prepared_path(runtime).read_text(encoding="utf-8")
+        )["runtime_authority_id"]
+
+        class MinimalSpool:
+            def __init__(self, _path: Path, *, mutation_guard: object) -> None:
+                assert callable(mutation_guard)
+
+        class MinimalWorker:
+            def __init__(self, **kwargs: object) -> None:
+                self.verify = kwargs["verified_code_sha_provider"]
+
+            def run_once(self) -> SimpleNamespace:
+                assert callable(self.verify)
+                assert self.verify() == current["sha"]
+                return SimpleNamespace(status="idle", model_dump_json=lambda: "{}")
+
+        monkeypatch.setattr(
+            lab_daemon,
+            "require_lab_runtime_binding",
+            lambda _root, _git: current["sha"],
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "verify_lab_runtime_prepared",
+            _real_verify_lab_runtime_prepared,
+        )
+        monkeypatch.setattr(lab_shard_protocol, "LabClaimSpool", MinimalSpool)
+        monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", MinimalSpool)
+        monkeypatch.setattr(lab_worker, "LabWorker", MinimalWorker)
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        args = argparse.Namespace(
+            worker_id="worker-a",
+            once=True,
+            expected_checkout_root=_LAB_EXPECTED_ROOT,
+            trusted_git_path=_LAB_TRUSTED_GIT,
+        )
+
+        assert cmd_lab_worker(args) == 0
+        current["sha"] = "b" * 40
+        assert cmd_lab_worker(args) == 0
+
+        assert (
+            json.loads(lab_daemon.lab_runtime_prepared_path(runtime).read_text(encoding="utf-8"))[
+                "runtime_authority_id"
+            ]
+            == authority_id
+        )
 
     def test_cmd_lab_worker_forever_installs_both_stop_signals(
         self,

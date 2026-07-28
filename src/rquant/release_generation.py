@@ -448,12 +448,19 @@ def _object_key(identity: PathIdentity) -> tuple[int, int, int, int]:
     return identity.device, identity.inode, identity.mode, identity.owner
 
 
-def _hash_file(path: Path, *, label: str) -> str:
+def _hash_file(
+    path: Path,
+    *,
+    label: str,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     _identity(path, label=label, directory=False)
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
+                if checkpoint is not None:
+                    checkpoint()
                 digest.update(chunk)
     except OSError as exc:
         raise ReleaseGenerationError(f"{label} cannot be read") from exc
@@ -802,9 +809,12 @@ def _private_tree_size(
     system_python: Path,
     system_python_identity: PathIdentity,
     system_python_sha256: str,
+    checkpoint: Callable[[], None] | None = None,
 ) -> int:
     total = 0
     for current_root, directory_names, file_names in os.walk(root):
+        if checkpoint is not None:
+            checkpoint()
         current = Path(current_root)
         observed_root = current.lstat()
         if (
@@ -814,6 +824,8 @@ def _private_tree_size(
         ):
             raise ReleaseGenerationError("source release venv contains an unsafe directory")
         for name in (*directory_names, *file_names):
+            if checkpoint is not None:
+                checkpoint()
             path = current / name
             observed = path.lstat()
             if observed.st_uid != os.getuid():
@@ -825,6 +837,7 @@ def _private_tree_size(
                     system_python=system_python,
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
+                    checkpoint=checkpoint,
                 )
                 continue
             if stat.S_ISREG(observed.st_mode):
@@ -836,7 +849,14 @@ def _private_tree_size(
     return total
 
 
-def _remove_private_tree_at(parent_fd: int, name: str) -> int:
+def _remove_private_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> int:
+    if checkpoint is not None:
+        checkpoint()
     descriptor = os.open(
         name,
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -854,6 +874,8 @@ def _remove_private_tree_at(parent_fd: int, name: str) -> int:
             raise ReleaseGenerationError("orphan environment generation is unsafe")
         os.fchmod(descriptor, 0o700)
         for child_name in os.listdir(descriptor):
+            if checkpoint is not None:
+                checkpoint()
             child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(child.st_mode):
                 if child.st_uid != os.getuid():
@@ -863,7 +885,11 @@ def _remove_private_tree_at(parent_fd: int, name: str) -> int:
                 os.unlink(child_name, dir_fd=descriptor)
                 continue
             if stat.S_ISDIR(child.st_mode) and not stat.S_ISLNK(child.st_mode):
-                reclaimed += _remove_private_tree_at(descriptor, child_name)
+                reclaimed += _remove_private_tree_at(
+                    descriptor,
+                    child_name,
+                    checkpoint=checkpoint,
+                )
                 continue
             if (
                 not stat.S_ISREG(child.st_mode)
@@ -899,7 +925,10 @@ def _environment_entry(
     system_python: Path,
     system_python_identity: PathIdentity,
     system_python_sha256: str,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    if checkpoint is not None:
+        checkpoint()
     observed = path.lstat()
     relative = path.relative_to(root).as_posix()
     if stat.S_ISLNK(observed.st_mode):
@@ -924,7 +953,12 @@ def _environment_entry(
             if (
                 resolved != system_python
                 or PathIdentity.capture(resolved_observed) != system_python_identity
-                or _hash_file(resolved, label="system Python") != system_python_sha256
+                or _hash_file(
+                    resolved,
+                    label="system Python",
+                    checkpoint=checkpoint,
+                )
+                != system_python_sha256
             ):
                 raise ReleaseGenerationError("environment generation Python symlink target changed")
         elif relative == "lib64" and not resolved.is_relative_to(root):
@@ -948,7 +982,11 @@ def _environment_entry(
         if observed.st_nlink != 1:
             raise ReleaseGenerationError("environment generation contains a hardlink")
         kind = "file"
-        digest = _hash_file(path, label=f"environment file {relative}")
+        digest = _hash_file(
+            path,
+            label=f"environment file {relative}",
+            checkpoint=checkpoint,
+        )
         size = observed.st_size
     else:
         raise ReleaseGenerationError("environment generation contains an unsafe object")
@@ -971,10 +1009,15 @@ def _freeze_environment(
     system_python: Path,
     system_python_identity: PathIdentity,
     system_python_sha256: str,
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
     for current_root, directory_names, file_names in os.walk(root, topdown=False):
+        if checkpoint is not None:
+            checkpoint()
         current = Path(current_root)
         for name in file_names:
+            if checkpoint is not None:
+                checkpoint()
             path = current / name
             observed = path.lstat()
             if stat.S_ISLNK(observed.st_mode):
@@ -990,6 +1033,8 @@ def _freeze_environment(
                 raise ReleaseGenerationError("environment generation contains a symlink")
             path.chmod(0o500 if observed.st_mode & stat.S_IXUSR else 0o400)
         for name in directory_names:
+            if checkpoint is not None:
+                checkpoint()
             path = current / name
             observed = path.lstat()
             if stat.S_ISLNK(observed.st_mode):
@@ -1011,9 +1056,13 @@ def _rebind_environment_console_scripts(
     staging_path: Path,
     final_path: Path,
     source_venv: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
     bin_path = staging_path / "bin"
     for path in bin_path.iterdir():
+        if checkpoint is not None:
+            checkpoint()
         observed = path.lstat()
         if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
             continue
@@ -1048,17 +1097,25 @@ def _environment_manifest(
     system_python_identity: PathIdentity,
     system_python_sha256: str,
     uv_binding: dict[str, object] | None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     entry_arguments = {
         "system_python": system_python,
         "system_python_identity": system_python_identity,
         "system_python_sha256": system_python_sha256,
     }
-    entries = [_environment_entry(root, root, **entry_arguments)]
-    entries.extend(
-        _environment_entry(path, root, **entry_arguments)
-        for path in sorted(root.rglob("*"), key=lambda value: value.as_posix())
-    )
+    entries = [_environment_entry(root, root, checkpoint=checkpoint, **entry_arguments)]
+    paths: list[Path] = []
+    for current_root, directory_names, file_names in os.walk(root):
+        if checkpoint is not None:
+            checkpoint()
+        current = Path(current_root)
+        for name in (*directory_names, *file_names):
+            if checkpoint is not None:
+                checkpoint()
+            paths.append(current / name)
+    for path in sorted(paths, key=lambda value: value.as_posix()):
+        entries.append(_environment_entry(path, root, checkpoint=checkpoint, **entry_arguments))
     return {
         "schema_version": ENVIRONMENT_SCHEMA_VERSION,
         "operation_id": operation_id,
@@ -1074,7 +1131,12 @@ def _environment_manifest(
     }
 
 
-def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
+def _verify_environment_manifest(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
     if int(manifest.get("schema_version", 0)) != ENVIRONMENT_SCHEMA_VERSION or manifest.get(
         "environment_path"
     ) != str(root):
@@ -1119,6 +1181,8 @@ def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
             raise ReleaseGenerationError("environment generation uv binding changed")
     expected_paths: set[str] = set()
     for entry in entries:
+        if checkpoint is not None:
+            checkpoint()
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise ReleaseGenerationError("environment generation manifest is malformed")
         relative = str(entry["path"])
@@ -1132,11 +1196,19 @@ def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
             system_python=system_python,
             system_python_identity=system_identity,
             system_python_sha256=system_sha256,
+            checkpoint=checkpoint,
         )
         if observed != entry:
             raise ReleaseGenerationError("environment generation content changed")
     actual_paths = {"."}
-    actual_paths.update(path.relative_to(root).as_posix() for path in root.rglob("*"))
+    for current_root, directory_names, file_names in os.walk(root):
+        if checkpoint is not None:
+            checkpoint()
+        current = Path(current_root)
+        for name in (*directory_names, *file_names):
+            if checkpoint is not None:
+                checkpoint()
+            actual_paths.add((current / name).relative_to(root).as_posix())
     if actual_paths != expected_paths:
         raise ReleaseGenerationError("environment generation namespace changed")
 
@@ -1158,6 +1230,7 @@ class ReleaseGenerationAuthority:
         environment_builder: Callable[[Path], None] | None = None,
         command_timeout_seconds: float = 900,
         overall_deadline_monotonic: float | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> None:
         self.repo = _canonical(repo, label="release checkout")
         self.lock_path = _canonical(lock_path, label="deployment lock")
@@ -1178,6 +1251,7 @@ class ReleaseGenerationAuthority:
             else _trusted_executable_binding(self.uv_path, label="release uv")
         )
         self._environment_builder = environment_builder
+        self._cancellation_check = cancellation_check or (lambda: False)
         if (
             not math.isfinite(command_timeout_seconds)
             or command_timeout_seconds <= 0
@@ -1223,11 +1297,20 @@ class ReleaseGenerationAuthority:
             environment_builder=self._environment_builder,
             command_timeout_seconds=self.command_timeout_seconds,
             overall_deadline_monotonic=overall_deadline_monotonic,
+            cancellation_check=self._cancellation_check,
         )
 
+    def _checkpoint(self) -> None:
+        if self._cancellation_check():
+            raise ReleaseGenerationError("immutable release environment build was cancelled")
+        if time.monotonic() >= self.overall_deadline_monotonic:
+            raise ReleaseGenerationError("immutable release environment build timed out")
+
     def _build_environment(self, destination: Path, *, system_python: Path) -> None:
+        self._checkpoint()
         if self._environment_builder is not None:
             self._environment_builder(destination)
+            self._checkpoint()
             return
         if self.uv_path is None:
             raise ReleaseGenerationError("writable generation authority requires release uv")
@@ -1249,6 +1332,7 @@ class ReleaseGenerationAuthority:
             [str(self.uv_path), "sync", "--frozen", "--active"],
         )
         for command in commands:
+            self._checkpoint()
             remaining = self.overall_deadline_monotonic - time.monotonic()
             if remaining <= 0:
                 raise ReleaseGenerationError("immutable release environment build timed out")
@@ -1321,8 +1405,12 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("release checkout commit does not match marker")
         uv_lock = self.repo / "uv.lock"
         pyproject = self.repo / "pyproject.toml"
-        uv_hash = _hash_file(uv_lock, label="uv.lock")
-        pyproject_hash = _hash_file(pyproject, label="pyproject.toml")
+        uv_hash = _hash_file(uv_lock, label="uv.lock", checkpoint=self._checkpoint)
+        pyproject_hash = _hash_file(
+            pyproject,
+            label="pyproject.toml",
+            checkpoint=self._checkpoint,
+        )
         try:
             package_version = str(
                 tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
@@ -1332,7 +1420,7 @@ class ReleaseGenerationAuthority:
         if selector.commit != commit or str(manifest.get("commit")) != commit:
             raise ReleaseGenerationError("environment generation commit is stale")
         venv = _canonical(Path(selector.environment_path), label="release environment")
-        _verify_environment_manifest(venv, manifest)
+        _verify_environment_manifest(venv, manifest, checkpoint=self._checkpoint)
         venv_identity = _identity(venv, label="release venv", directory=True)
         selected_python = venv / "bin" / "python"
         try:
@@ -1569,6 +1657,7 @@ class ReleaseGenerationAuthority:
             retained = self._retained_environment_ids(environment_fd)
             cutoff = datetime.now(UTC).timestamp() - self.gc_grace_seconds
             for name in sorted(os.listdir(environment_fd)):
+                self._checkpoint()
                 generation_match = GENERATION_ID_PATTERN.fullmatch(name)
                 building_match = BUILDING_GENERATION_PATTERN.fullmatch(name)
                 if generation_match is None and building_match is None:
@@ -1598,7 +1687,11 @@ class ReleaseGenerationAuthority:
                     raise ReleaseGenerationError("release environment root identity changed")
                 if generation_match is not None:
                     self._remove_orphan_environment_manifest(generation_id)
-                reclaimed += _remove_private_tree_at(environment_fd, name)
+                reclaimed += _remove_private_tree_at(
+                    environment_fd,
+                    name,
+                    checkpoint=self._checkpoint,
+                )
                 os.fsync(environment_fd)
                 deleted += 1
             free_after = shutil.disk_usage(self.environment_root).free
@@ -1798,7 +1891,11 @@ class ReleaseGenerationAuthority:
         self._assert_lock()
         selector, _identity_value = self._read_selector()
         manifest, _manifest_identity = self._read_environment_manifest(selector)
-        _verify_environment_manifest(Path(selector.environment_path), manifest)
+        _verify_environment_manifest(
+            Path(selector.environment_path),
+            manifest,
+            checkpoint=self._checkpoint,
+        )
         self._assert_lock()
         return selector
 
@@ -2224,6 +2321,7 @@ class ReleaseGenerationAuthority:
         transaction_kind: str,
         previous_generation_id: str,
     ) -> tuple[EnvironmentSelector, dict[str, Any]]:
+        self._checkpoint()
         source_venv = self.repo / ".venv"
         _identity(source_venv, label="source release venv", directory=True)
         if not self.python_path.is_relative_to(source_venv):
@@ -2236,6 +2334,7 @@ class ReleaseGenerationAuthority:
             system_python=system_python,
             system_python_identity=system_python_identity,
             system_python_sha256=system_python_sha256,
+            checkpoint=self._checkpoint,
         )
         self.garbage_collect_environments(
             reason=f"pre-publish:{transaction_kind}",
@@ -2271,8 +2370,15 @@ class ReleaseGenerationAuthority:
             else:
                 os.mkdir(staging_name, 0o700, dir_fd=environment_fd)
                 try:
+                    self._checkpoint()
                     self._build_environment(staging_path, system_python=system_python)
-                    _rebind_environment_console_scripts(staging_path, final_path, source_venv)
+                    _rebind_environment_console_scripts(
+                        staging_path,
+                        final_path,
+                        source_venv,
+                        checkpoint=self._checkpoint,
+                    )
+                    self._checkpoint()
                     self._mutation_hook("environment_staged")
                     active_environment = _identity(
                         self.environment_root,
@@ -2297,6 +2403,7 @@ class ReleaseGenerationAuthority:
                         system_python=system_python,
                         system_python_identity=system_python_identity,
                         system_python_sha256=system_python_sha256,
+                        checkpoint=self._checkpoint,
                     )
                 except BaseException:
                     if staging_path.exists() and not staging_path.is_symlink():
@@ -2310,6 +2417,7 @@ class ReleaseGenerationAuthority:
                     system_python=system_python,
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
+                    checkpoint=self._checkpoint,
                 )
                 active_environment = _identity(
                     self.environment_root,
@@ -2333,6 +2441,7 @@ class ReleaseGenerationAuthority:
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
                     uv_binding=self.uv_binding,
+                    checkpoint=self._checkpoint,
                 )
                 manifest_hash = _payload_hash(manifest)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)
@@ -2358,7 +2467,11 @@ class ReleaseGenerationAuthority:
                     or str(manifest.get("generation_id")) != generation_id
                 ):
                     raise ReleaseGenerationError("existing environment generation is stale")
-                _verify_environment_manifest(final_path, manifest)
+                _verify_environment_manifest(
+                    final_path,
+                    manifest,
+                    checkpoint=self._checkpoint,
+                )
                 manifest_hash = _payload_hash(manifest)
             selector = EnvironmentSelector(
                 schema_version=ENVIRONMENT_SCHEMA_VERSION,

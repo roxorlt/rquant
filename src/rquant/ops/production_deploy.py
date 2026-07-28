@@ -189,6 +189,7 @@ def _run_process_group(
     timeout_seconds: float,
     check: bool,
     pass_fds: tuple[int, ...] = (),
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         args,
@@ -198,6 +199,7 @@ def _run_process_group(
         text=True,
         start_new_session=True,
         pass_fds=pass_fds,
+        env=env,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
@@ -260,12 +262,19 @@ class SubprocessRunner:
         remaining = self._deadline - monotonic_time.monotonic()
         if remaining <= 0:
             raise DeployError("deployment overall timeout expired")
+        environment = os.environ.copy()
+        if args and Path(args[0]).name == "git":
+            mutating_commands = {"checkout", "fetch", "merge", "pull", "reset", "switch"}
+            subcommand = next((value for value in args[1:] if not value.startswith("-")), "")
+            environment["GIT_OPTIONAL_LOCKS"] = "1" if subcommand in mutating_commands else "0"
+            environment["GIT_TERMINAL_PROMPT"] = "0"
         try:
             return _run_process_group(
                 args,
                 cwd=self._cwd,
                 timeout_seconds=min(self._command_timeout_seconds, remaining),
                 check=check,
+                env=environment,
             )
         except subprocess.TimeoutExpired as exc:
             raise DeployError(f"command timed out: {shlex.join(args)}") from exc

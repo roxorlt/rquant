@@ -339,6 +339,7 @@ def _run_preflight(
     deployment_lock_path: Path,
     deployment_lock_fd: int,
     handoff_label: str | None = None,
+    daemon_command: str,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
     command = [
@@ -358,6 +359,8 @@ def _run_preflight(
         str(deployment_lock_fd),
         "--python-path",
         str(python),
+        "--lab-daemon-command",
+        daemon_command,
     ]
     if handoff_label is not None:
         command.extend(["--provisional-handoff-label", handoff_label])
@@ -464,6 +467,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_path=deployment_lock_path,
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
+            daemon_command=daemon_argv[1],
         )
         try:
             release_module = _load_release_authority(release_authority_path)
@@ -526,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_path=deployment_lock_path,
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
+            daemon_command=daemon_argv[1],
         )
         final_root, final_venv, final_python, final_runtime_identities = _require_runtime_root(
             args.expected_checkout_root
@@ -568,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_path=deployment_lock_path,
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
+            daemon_command=daemon_argv[1],
         )
         rebound_executable, rebound_executable_identity = _validate_daemon_argv(
             root,

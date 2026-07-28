@@ -33,6 +33,12 @@ class DeployBootstrapError(RuntimeError):
     pass
 
 
+class DeployDeferredError(DeployBootstrapError):
+    """A write-capable deployment must wait for the protected window to end."""
+
+    exit_code = 75
+
+
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 LAB_LAUNCHD_LABELS = (
     "com.roxor.rquant-lab-scheduler",
@@ -46,9 +52,9 @@ UV_CANDIDATES = (
     Path("/usr/local/bin/uv"),
     Path.home() / ".local" / "bin" / "uv",
 )
-LAB_INSTALL_SCHEMA_VERSION = 1
+LAB_INSTALL_SCHEMA_VERSION = 2
 LAB_HANDOFF_SCHEMA_VERSION = 1
-LAB_RUNTIME_PREPARED_SCHEMA_VERSION = 1
+LAB_RUNTIME_PREPARED_SCHEMA_VERSION = 2
 LAB_RUNTIME_PREPARED_FILENAME = ".prepared.json"
 LAB_RUNTIME_DIRECTORY_LABELS = frozenset(
     {
@@ -366,16 +372,21 @@ def _acquire_lock(
     *,
     shared: bool = False,
     timeout_seconds: float = 0,
+    create: bool = True,
 ) -> int:
     expected = root.parent / ".rquant-deploy" / f"{root.name}.lock"
     if lock_path != expected:
         raise DeployBootstrapError("deployment lock does not match checkout binding")
     try:
-        lock_path.parent.mkdir(mode=0o700, exist_ok=True)
+        if create:
+            lock_path.parent.mkdir(mode=0o700, exist_ok=True)
         _physical_directory(lock_path.parent, label="deployment authority root", private=True)
+        flags = (os.O_RDONLY if not create and shared else os.O_RDWR) | getattr(os, "O_NOFOLLOW", 0)
+        if create:
+            flags |= os.O_CREAT
         descriptor = os.open(
             lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            flags,
             0o600,
         )
         opened = os.fstat(descriptor)
@@ -511,6 +522,7 @@ def _run_process_group(
     *,
     cwd: Path,
     timeout_seconds: float,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         arguments,
@@ -519,6 +531,7 @@ def _run_process_group(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        env=env,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
@@ -628,6 +641,7 @@ def _verify_lab_runtime_prepared(
     runtime_root: Path,
     readiness_root: Path,
     expected_commit: str,
+    allow_uninitialized_database: bool = False,
 ) -> dict[str, object]:
     if re.fullmatch(r"[0-9a-f]{40}", expected_commit) is None:
         raise DeployBootstrapError("Lab runtime prepared sentinel commit is invalid")
@@ -647,9 +661,11 @@ def _verify_lab_runtime_prepared(
         or payload.get("runtime_root") != str(runtime_root)
         or payload.get("runtime_device") != runtime_identity.st_dev
         or payload.get("runtime_inode") != runtime_identity.st_ino
-        or payload.get("prepared_commit") != expected_commit
     ):
         raise DeployBootstrapError("Lab runtime prepared sentinel binding changed")
+    authority_id = payload.get("runtime_authority_id")
+    if not isinstance(authority_id, str) or re.fullmatch(r"[0-9a-f]{32}", authority_id) is None:
+        raise DeployBootstrapError("Lab runtime prepared authority is invalid")
     directories = payload.get("managed_directories")
     files = payload.get("managed_files")
     migrations = payload.get("migration_sources")
@@ -703,9 +719,13 @@ def _verify_lab_runtime_prepared(
         elif binding != {"path": str(path), "exists": False}:
             raise DeployBootstrapError("Lab runtime prepared sentinel file changed")
         elif os.path.lexists(path):
-            observed = _physical_file(path, label=label)
-            if stat.S_IMODE(observed.st_mode) != 0o600:
-                raise DeployBootstrapError("Lab runtime prepared sentinel file changed")
+            raise DeployBootstrapError(
+                "Lab runtime database exists but is not registered in the prepared sentinel"
+            )
+        elif not allow_uninitialized_database:
+            raise DeployBootstrapError(
+                "Lab runtime database is not initialized in the prepared sentinel"
+            )
     for target, binding in migrations.items():
         if not isinstance(binding, dict) or set(binding) != {"source", "migrated"}:
             raise DeployBootstrapError("Lab runtime prepared sentinel migration is invalid")
@@ -714,12 +734,10 @@ def _verify_lab_runtime_prepared(
         if target_path.parent != runtime_root or os.path.lexists(source):
             raise DeployBootstrapError("Lab legacy runtime source still exists")
     return {
-        "path": str(sentinel),
-        "sha256": hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
-        "device": sentinel_identity.st_dev,
-        "inode": sentinel_identity.st_ino,
+        "runtime_authority_id": authority_id,
+        "runtime_root": str(runtime_root),
+        "runtime_device": runtime_identity.st_dev,
+        "runtime_inode": runtime_identity.st_ino,
     }
 
 
@@ -744,6 +762,7 @@ def _write_lab_installation_state(
         runtime_root=runtime,
         readiness_root=readiness_root,
         expected_commit=expected_commit,
+        allow_uninitialized_database=True,
     )
     plists: dict[str, dict[str, object]] = {}
     for label in LAB_LAUNCHD_LABELS:
@@ -762,8 +781,8 @@ def _write_lab_installation_state(
         "plists": plists,
         "runtime_root": str(runtime),
         "readiness_root": str(readiness_root),
-        "prepared_commit": expected_commit,
-        "prepared_sentinel": prepared,
+        "registered_by_commit": expected_commit,
+        "prepared_authority": prepared,
         "installed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
     }
     if publish:
@@ -806,9 +825,9 @@ def _read_lab_installation_state(*, root: Path, lock_path: Path) -> dict[str, ob
         root=root,
         runtime_root=runtime_root,
         readiness_root=readiness_root,
-        expected_commit=str(payload.get("prepared_commit", "")),
+        expected_commit=str(payload.get("registered_by_commit", "")),
     )
-    if payload.get("prepared_sentinel") != prepared:
+    if payload.get("prepared_authority") != prepared:
         raise DeployBootstrapError("Lab runtime prepared sentinel binding changed")
     return payload
 
@@ -1231,6 +1250,10 @@ class _LabLaunchdHandoff:
         self.target_ref = target_ref
         self.target_sha = target_sha
         self.action = action
+        if self.enabled and not dry_run and _is_protected_handoff_window(now):
+            raise DeployDeferredError(
+                "Lab daemon handoff is deferred during the protected 09:15-15:10 window"
+            )
         self.root_fd, self.lock_fd = _acquire_handoff_lock(self.root, self.lock_path)
         if self.enabled:
             self.installation = _read_lab_installation_state(
@@ -1263,10 +1286,6 @@ class _LabLaunchdHandoff:
         if not self.enabled:
             return
         resumed = self._load_incomplete_record()
-        if _is_protected_handoff_window(now) and not resumed:
-            raise DeployBootstrapError(
-                "Lab daemon handoff is forbidden during the protected 09:15-15:10 window"
-            )
         if not resumed:
             self.operation_id = secrets.token_hex(16)
             loaded = [label for label in LAB_LAUNCHD_LABELS if self._is_loaded(label)]
@@ -1410,9 +1429,37 @@ def _git_run(
             capture_output=True,
             text=text,
             timeout=timeout_seconds,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("deployment checkout cannot be verified") from exc
+
+
+def _run_git_mutation(
+    repo: Path,
+    git_path: Path,
+    *arguments: str,
+    overall_deadline_monotonic: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    timeout_seconds = 10.0
+    if overall_deadline_monotonic is not None:
+        remaining = overall_deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise DeployBootstrapError("deployment overall timeout expired")
+        timeout_seconds = min(timeout_seconds, remaining)
+    try:
+        result = _run_process_group(
+            [str(git_path), *arguments],
+            cwd=repo,
+            timeout_seconds=timeout_seconds,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "1", "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeployBootstrapError("deployment checkout mutation failed") from exc
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout or "no command output").strip()
+        raise DeployBootstrapError(f"deployment checkout mutation failed: {diagnostic[:1000]}")
+    return result
 
 
 def _git_output(
@@ -1628,6 +1675,7 @@ def _fetch_generation_target(
             [str(git_path), "fetch", "--tags", "origin", "main"],
             cwd=repo,
             timeout_seconds=min(command_timeout_seconds, remaining),
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "1", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("deployment target fetch failed") from exc
@@ -1857,7 +1905,7 @@ def _prepare_generation_checkout(
         if allowed.returncode != 0:
             raise DeployBootstrapError("resume target is not a fast-forward from current HEAD")
         if current != target_commit:
-            _git_run(
+            _run_git_mutation(
                 root,
                 git_path,
                 "merge",
@@ -1880,7 +1928,7 @@ def _prepare_generation_checkout(
         if allowed.returncode != 0:
             raise DeployBootstrapError("rollback target is not an ancestor of current HEAD")
         if current != target_commit:
-            _git_run(
+            _run_git_mutation(
                 root,
                 git_path,
                 "reset",
@@ -2165,6 +2213,7 @@ def main(argv: list[str] | None = None) -> int:
                 root,
                 lock_path,
                 shared=dry_run,
+                create=not (dry_run and args.register_lab_installation),
                 timeout_seconds=(
                     LAUNCHD_HANDOFF_TIMEOUT_SECONDS
                     if handoff is not None and handoff.stopped
@@ -2608,6 +2657,9 @@ def main(argv: list[str] | None = None) -> int:
                 recovery_target_sha=rollback_target,
             )
         return finish(deploy_code)
+    except DeployDeferredError as exc:
+        print(f"Production deploy bootstrap deferred: {exc}", file=sys.stderr)
+        return finish(exc.exit_code)
     except Exception as exc:
         expected = isinstance(exc, (DeployBootstrapError, OSError, subprocess.SubprocessError))
         if generation_error_type is not None and isinstance(exc, generation_error_type):

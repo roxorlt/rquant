@@ -127,10 +127,13 @@ LOCK=/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
   -- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare
 ```
 
-准备命令最后以原子 `0600` 的 `lab-runtime/.prepared.json` 固化 checkout SHA、runtime 根身份、
-全部托管目录/文件和每个 legacy 迁移来源。它不会把一个空的 `0700` 目录当作已准备环境；旧
-`lab_jobs.sqlite3` 在迁移后重新出现、sentinel 被篡改、路径身份漂移或热 sidecar 出现，登记都会
-失败关闭，避免新旧 SQLite 静默分叉。
+准备命令最后以原子 `0600` 的 `lab-runtime/.prepared.json` 固化稳定 runtime authority id、
+checkout 路径、runtime 根身份、全部托管目录/文件和每个 legacy 迁移来源；执行时的 release
+commit 仅作为 `prepared_by_commit` 审计信息，不参与后续 A→B daemon 准入。首次安装可以把尚未
+创建的 `lab_jobs.sqlite3` 明确记录为 uninitialized，但只有 scheduler 能在持有私有 authority 锁时
+原子创建数据库并把 inode 登记回 sentinel；worker/finalizer 在登记完成前失败关闭。数据库登记后
+若被删除或替换，所有 daemon 都会拒绝启动。旧库在迁移后重新出现、sentinel 被篡改、路径身份
+漂移或热 sidecar 出现同样会失败关闭，避免新旧 SQLite 静默分叉。
 
 第三步，显式登记已准备的 runtime/readiness 根；这会生成稳定、owner-only 的 installation state，
 后续 installed 模式发布必须验证它，不能仅靠 plist 文件存在：
