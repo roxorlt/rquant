@@ -668,7 +668,18 @@ def _recover_locked(
     action = config.recovery_action
     if action not in {"resume", "rollback"}:
         raise PolicyError("recovery action must be resume or rollback")
-    intent = authority.read_deployment_intent()
+    if config.prepared_intent_operation_id:
+        prepared = authority.read_prepared_deployment_intent()
+        if (
+            prepared.operation_id != config.prepared_intent_operation_id
+            or prepared.stage != "planned"
+        ):
+            raise PolicyError("prepared recovery intent binding is invalid")
+        intent = authority.adopt_prepared_deployment_intent(
+            operation_id=config.prepared_intent_operation_id
+        )
+    else:
+        intent = authority.read_deployment_intent()
     if intent.stage == "completed":
         raise PolicyError("deployment intent is already completed")
     if config.dry_run:

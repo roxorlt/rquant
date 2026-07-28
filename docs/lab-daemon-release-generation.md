@@ -46,6 +46,12 @@ operation。接管只允许 `deploy -> resume/rollback`，并从不可变 deploy
 新恢复目标、release profile、lifecycle 与 installation identity；任一漂移都会在 launchd mutation 前
 失败关闭。
 
+若只写完 typed `.intent.prepared.json` 就中断，恢复不会要求人工补记录：bootstrap 在 handoff 锁内
+严格解析 prepared intent，幂等生成其原始 `deploy/planned` 根 operation 后再执行显式 resume/rollback。
+deployer 接管前的失败清理只恢复 previous daemon 并落 `aborted`，不会把旧代际伪装成新 target 的
+completed handoff。intent 永久保存初始 handoff operation，所有 rebound 和 supersede 必须从该根
+连续；authority JSON 对任意层重复键一律失败关闭。
+
 handoff 完成状态按 `completed proof -> operation record -> stable active record` 顺序原子发布。若任一写
 边界崩溃，下次启动先只读校验三份记录的 operation、target、label、profile、installation、supersede
 链和 generation binding；完全一致才在 handoff 锁内补齐后两份记录。proof 缺字段、伪造 generation

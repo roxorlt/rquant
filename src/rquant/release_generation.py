@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -26,6 +27,19 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+
+def _load_strict_json() -> tuple[type[ValueError], Callable[[str | bytes | bytearray], Any]]:
+    path = Path(__file__).resolve().parents[2] / "scripts" / "strict_json.py"
+    spec = importlib.util.spec_from_file_location("_rquant_strict_json", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("strict JSON authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.StrictJsonError, module.strict_json_loads
+
+
+StrictJsonError, strict_json_loads = _load_strict_json()
 
 MARKER_SCHEMA_VERSION = 1
 INTENT_SCHEMA_VERSION = 1
@@ -337,7 +351,7 @@ class LabHandoffRecord:
             ):
                 raise ReleaseGenerationError("completed Lab handoff proof is invalid")
             return
-        allowed_stages = {"planned", "stopping", "stopped", "restarting"}
+        allowed_stages = {"planned", "stopping", "stopped", "restarting", "aborted"}
         if self.stage not in allowed_stages:
             raise ReleaseGenerationError("partial Lab handoff stage is invalid")
         if self.stage == "planned" and (self.stopped_labels or self.restarted_labels):
@@ -348,6 +362,12 @@ class LabHandoffRecord:
             raise ReleaseGenerationError("stopped Lab handoff state is invalid")
         if self.stage == "restarting" and self.stopped_labels != self.labels:
             raise ReleaseGenerationError("restarting Lab handoff state is invalid")
+        if self.stage == "aborted" and (
+            self.action != "deploy"
+            or self.supersedes_operation_id
+            or self.restarted_labels != self.labels
+        ):
+            raise ReleaseGenerationError("aborted Lab handoff state is invalid")
 
 
 @dataclass(frozen=True)
@@ -513,6 +533,7 @@ class DeploymentIntent:
     active_timers: tuple[str, ...]
     restarted_services: tuple[str, ...]
     handoff_operation_id: str
+    initial_handoff_operation_id: str
     handoff_labels: tuple[str, ...]
     marker_generation: str
     previous_generation_id: str
@@ -524,6 +545,7 @@ class DeploymentIntent:
         values = asdict(self)
         if not self.handoff_operation_id:
             values.pop("handoff_operation_id")
+            values.pop("initial_handoff_operation_id")
         if not self.handoff_labels:
             values.pop("handoff_labels")
         payload = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
@@ -566,6 +588,7 @@ class DeploymentIntent:
             active_timers=tuple(active_timers),
             restarted_services=(),
             handoff_operation_id=handoff_operation_id,
+            initial_handoff_operation_id=handoff_operation_id,
             handoff_labels=tuple(handoff_labels),
             marker_generation=marker_generation,
             previous_generation_id=previous_generation_id,
@@ -589,6 +612,7 @@ class DeploymentIntent:
             "active_timers",
             "restarted_services",
             "handoff_operation_id",
+            "initial_handoff_operation_id",
             "handoff_labels",
             "marker_generation",
             "previous_generation_id",
@@ -659,6 +683,7 @@ class DeploymentIntent:
             active_timers=tuple(payload["active_timers"]),
             restarted_services=tuple(payload["restarted_services"]),
             handoff_operation_id=payload["handoff_operation_id"],
+            initial_handoff_operation_id=payload["initial_handoff_operation_id"],
             handoff_labels=tuple(payload["handoff_labels"]),
             marker_generation=payload["marker_generation"],
             previous_generation_id=payload["previous_generation_id"],
@@ -693,6 +718,12 @@ class DeploymentIntent:
             r"[0-9a-f]{32}", intent.handoff_operation_id
         ):
             raise ReleaseGenerationError("deployment handoff operation is invalid")
+        if intent.initial_handoff_operation_id and not re.fullmatch(
+            r"[0-9a-f]{32}", intent.initial_handoff_operation_id
+        ):
+            raise ReleaseGenerationError("deployment initial handoff operation is invalid")
+        if bool(intent.initial_handoff_operation_id) != bool(intent.handoff_labels):
+            raise ReleaseGenerationError("deployment initial handoff binding is incomplete")
         if bool(intent.handoff_operation_id) != bool(intent.handoff_labels):
             raise ReleaseGenerationError("deployment handoff binding is incomplete")
         try:
@@ -734,7 +765,7 @@ class DeploymentIntent:
             value for value in intent.stage_history if value["stage"] == "handoff_rebound"
         ]
         if rebound_events:
-            current_operation = rebound_events[0]["previous_handoff_operation_id"]
+            current_operation = intent.initial_handoff_operation_id
             for event in rebound_events:
                 if (
                     event["previous_handoff_operation_id"] != current_operation
@@ -746,6 +777,8 @@ class DeploymentIntent:
                 current_operation = event["handoff_operation_id"]
             if current_operation != intent.handoff_operation_id:
                 raise ReleaseGenerationError("deployment handoff rebound history is stale")
+        elif intent.handoff_operation_id != intent.initial_handoff_operation_id:
+            raise ReleaseGenerationError("deployment initial handoff binding changed")
         return intent
 
     def advance(
@@ -1040,6 +1073,8 @@ def validate_lab_handoff_supersede_chain(
     checkout_root: str,
     expected_labels: tuple[str, ...],
 ) -> None:
+    if record.operation_id != intent.handoff_operation_id:
+        raise ReleaseGenerationError("Lab handoff supersede chain is stale")
     current = record
     seen = {record.operation_id}
     for ancestor in ancestors:
@@ -1050,10 +1085,15 @@ def validate_lab_handoff_supersede_chain(
             checkout_root=checkout_root,
             expected_labels=expected_labels,
         )
+        allowed_ancestor_actions = {
+            "resume": {"deploy"},
+            "rollback": {"deploy", "resume", "rollback"},
+        }.get(current.action, set())
         if (
             current.action == "deploy"
             or current.supersedes_operation_id != ancestor.operation_id
             or ancestor.operation_id in seen
+            or ancestor.action not in allowed_ancestor_actions
         ):
             raise ReleaseGenerationError("Lab handoff supersede chain is discontinuous")
         seen.add(ancestor.operation_id)
@@ -1067,6 +1107,8 @@ def validate_lab_handoff_supersede_chain(
     )
     if current.action != "deploy" or current.supersedes_operation_id:
         raise ReleaseGenerationError("Lab handoff supersede chain has no deploy root")
+    if current.operation_id != intent.initial_handoff_operation_id:
+        raise ReleaseGenerationError("Lab handoff supersede chain root is stale")
     if record.action == "deploy" and ancestors:
         raise ReleaseGenerationError("deploy handoff cannot have a supersede chain")
     if record.action != "deploy" and not ancestors:
@@ -1352,10 +1394,10 @@ def _python_facts(python_path: Path) -> tuple[str, str]:
             text=True,
             timeout=10,
         )
-        payload = json.loads(result.stdout)
+        payload = strict_json_loads(result.stdout)
         version = str(payload["version"])
         abi = f"{payload['cache_tag']}:{payload['soabi']}"
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError) as exc:
+    except (OSError, subprocess.SubprocessError, StrictJsonError, KeyError) as exc:
         raise ReleaseGenerationError("release Python ABI cannot be verified") from exc
     if not version or abi == ":":
         raise ReleaseGenerationError("release Python ABI is incomplete")
@@ -1441,10 +1483,10 @@ def _verify_temporary_payload(
             if total > MAX_MARKER_BYTES:
                 raise ReleaseGenerationError("temporary release marker is too large")
         observed_payload = b"".join(chunks)
-        observed_marker = ReleaseGenerationMarker.from_payload(json.loads(observed_payload))
+        observed_marker = ReleaseGenerationMarker.from_payload(strict_json_loads(observed_payload))
     except ReleaseGenerationError:
         raise
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, StrictJsonError) as exc:
         raise ReleaseGenerationError("temporary release marker cannot be verified") from exc
     if (
         len(observed_payload) != len(expected_payload)
@@ -1497,7 +1539,7 @@ def _read_private_json(
             raise ReleaseGenerationError(f"private deployment record {name} identity changed")
         if checkpoint is not None:
             checkpoint()
-        payload = json.loads(b"".join(chunks))
+        payload = strict_json_loads(b"".join(chunks))
         if checkpoint is not None:
             checkpoint()
         if not isinstance(payload, dict):
@@ -1509,7 +1551,9 @@ def _read_private_json(
         raise ReleaseGenerationRecordMissingError(
             f"private deployment record {name} is missing"
         ) from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except StrictJsonError as exc:
+        raise ReleaseGenerationError(f"private deployment record {name} is invalid: {exc}") from exc
+    except OSError as exc:
         raise ReleaseGenerationError(f"private deployment record {name} cannot be read") from exc
     finally:
         if descriptor >= 0:
@@ -1571,7 +1615,7 @@ def _write_private_json(
         if checkpoint is not None:
             checkpoint()
         observed_payload = b"".join(observed_chunks)
-        parsed = json.loads(observed_payload)
+        parsed = strict_json_loads(observed_payload)
         if checkpoint is not None:
             checkpoint()
         if (
@@ -2662,10 +2706,10 @@ class ReleaseGenerationAuthority:
             if PathIdentity.capture(opened) != PathIdentity.capture(active):
                 raise ReleaseGenerationError("release generation marker identity changed")
             self._assert_root(root_fd, root_identity)
-            return ReleaseGenerationMarker.from_payload(json.loads(payload))
+            return ReleaseGenerationMarker.from_payload(strict_json_loads(payload))
         except FileNotFoundError as exc:
             raise ReleaseGenerationError("release generation marker is missing") from exc
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, StrictJsonError) as exc:
             raise ReleaseGenerationError("release generation marker cannot be read") from exc
         finally:
             if descriptor >= 0:
@@ -2926,7 +2970,7 @@ class ReleaseGenerationAuthority:
                 active_payload,
                 completed=active_completed,
             )
-            if active.operation_id == record.operation_id and record != active:
+            if active.operation_id != record.operation_id or record != active:
                 raise ReleaseGenerationError("active Lab handoff record is inconsistent")
             ancestors: list[LabHandoffRecord] = []
             superseded_operation_id = record.supersedes_operation_id

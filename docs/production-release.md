@@ -52,6 +52,11 @@
    接管；旧 operation id、target/ref、profile、lifecycle 与 installation identity 必须和 deployment
    intent 完全一致。每次 `launchctl print` 都按 command timeout 与当前整体/readiness 剩余时间的
    较小值执行，剩余预算为零时不再发起命令。
+   若进程在 typed prepared intent 已落盘、deployer 尚未接管时失败，cleanup 只在核对 prepared
+   target、原始 handoff operation、labels 与 previous generation 后恢复旧 daemon，并把原 operation
+   记为 `aborted`；它绝不写 completed proof。若崩溃发生在首个 handoff record 前，仅存的
+   `.intent.prepared.json` 仍是正式恢复入口：显式 resume/rollback 会在 handoff 锁内幂等物化原始
+   `deploy/planned` 根记录，再由 deployer 原子晋升 intent。所有 authority JSON 都拒绝重复键。
    接管前还必须确认旧 operation id 正是 intent 当前记录的 `handoff_operation_id`；验证通过后 deployer
    才能把 intent rebind 到新 operation。完成 handoff 的 proof、operation record 与 stable record 若因
    崩溃只写入一部分，下次发布会在锁内验证全 binding 后幂等补齐；不一致 proof 一律阻断。显式
@@ -61,6 +66,9 @@
    到 typed deployment intent、当前 marker、environment selector 和 commit record。bootstrap 与
    deployer 使用 release authority 中同一份 changed-files、service/timer、generation 与 stage-history
    policy；任何损坏、越权或自相矛盾的 intent 都会在首个 launchd mutation 之前失败关闭。
+   supersede 链以 intent 永久保存的初始 handoff operation 为根；每次 rebound 的 previous id 必须
+   与上一跳完全相等。proof、按 operation 命名的记录和 stable active 也必须使用同一 operation id，
+   daemon 不接受“旧 proof + 新 active”组合。
    completed handoff proof 已落盘但事务仍为 `awaiting_readiness`，或 intent 已 completed 但 commit
    record 尚未落盘时，显式 `resume` 会幂等继续 readiness finalizer/commit；同 SHA 或空 diff 若仍有
    incomplete handoff，则返回结构化 `recovery_required`，不会误报 `already_current`。

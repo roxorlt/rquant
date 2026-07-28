@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **Lab daemon 第十三轮 prepared 恢复与 handoff 链加固**：deployer 接管前失败只会在核对
+  typed prepared intent 后恢复 previous daemon，并将原 deploy handoff 标记为 `aborted`；不会再用
+  新 target/action 为旧代际生成 completed proof。仅有 `.intent.prepared.json` 的崩溃状态现可由
+  显式 resume/rollback 在 handoff 锁内物化原始 deploy 根记录、原子晋升 intent 并继续事务。
+  deployment intent 永久保存初始 handoff operation，rebound 历史必须从该锚点逐跳连续；daemon
+  authority 要求 proof、operation、stable active 使用同一 operation 且内容一致。authority 与
+  stdlib bootstrap 统一使用拒绝任意层重复键的 strict JSON 解码，消除重复字段覆盖歧义。
+
 - **Lab daemon 第十二轮统一事务权威与崩溃恢复**：bootstrap 在第一次 launchd bootout 前持久化
   typed prepared intent，deployer 在独占 generation lock 下原子接管，不再重复 fetch/diff/plan。
   `awaiting_readiness + completed proof + 无 commit` 与 `completed intent + 无 commit` 两个崩溃窗可由

@@ -789,6 +789,81 @@ def test_installed_deployer_consumes_precreated_typed_intent_without_refetch(
     assert not [call for call in runner.calls if call[0:3] == ("git", "cat-file", "-t")]
 
 
+@pytest.mark.parametrize("recovery_action", ("resume", "rollback"))
+def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
+    tmp_path: Path,
+    recovery_action: str,
+) -> None:
+    class PreparedOnlyAuthority(FakeGenerationAuthority):
+        def __init__(self, prepared: DeploymentIntent) -> None:
+            super().__init__()
+            self.prepared = prepared
+            self.intent = None
+
+        def read_deployment_intent(self) -> DeploymentIntent:
+            assert self.intent is not None, "active intent must not be read before adoption"
+            return self.intent
+
+        def read_prepared_deployment_intent(self) -> DeploymentIntent:
+            return self.prepared
+
+        def adopt_prepared_deployment_intent(self, *, operation_id: str) -> DeploymentIntent:
+            assert operation_id == self.prepared.operation_id
+            self.intent = self.prepared
+            self.events.append(("intent_adopted", operation_id))
+            return self.prepared
+
+    original_handoff = "d" * 32
+    recovery_handoff = "e" * 32
+    prepared = DeploymentIntent.create(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref="v0.13.2",
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="f" * 64,
+        handoff_operation_id=original_handoff,
+        handoff_labels=LAB_LAUNCHD_HANDOFF_LABELS,
+    )
+    authority = PreparedOnlyAuthority(prepared)
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+            "lab_lifecycle_mode": "installed",
+            "target": (
+                prepared.target_ref if recovery_action == "resume" else prepared.previous_sha
+            ),
+            "recovery_action": recovery_action,
+            "handoff_operation_id": recovery_handoff,
+            "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
+            "handoff_lock_fd": 9,
+            "prepared_intent_operation_id": prepared.operation_id,
+        }
+    )
+    responses = _base_responses()
+    expected_target = prepared.target_sha if recovery_action == "resume" else prepared.previous_sha
+    responses[("git", "rev-parse", "HEAD")] = (0, f"{expected_target}\n")
+
+    result = deploy(
+        config,
+        runner=FakeRunner(responses),
+        generation_authority=authority,
+        generation_finalizer=FakeGenerationFinalizer(),
+    )
+
+    assert result.status == "recovered"
+    assert authority.events[0] == ("intent_adopted", prepared.operation_id)
+    assert authority.intent is not None
+    assert authority.intent.initial_handoff_operation_id == original_handoff
+    assert authority.intent.handoff_operation_id == recovery_handoff
+
+
 def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

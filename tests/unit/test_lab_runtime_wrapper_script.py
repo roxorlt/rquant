@@ -23,6 +23,7 @@ PREFLIGHT = ROOT / "scripts" / "preflight-lab-runtime.py"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-lab-daemon.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
+STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 _ORIGINAL_OS_WALK = os.walk
 
 
@@ -195,6 +196,7 @@ def _runtime_checkout(
     shutil.copy2(WRAPPER, scripts / WRAPPER.name)
     shutil.copy2(PREFLIGHT, scripts / PREFLIGHT.name)
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
+    shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
@@ -476,7 +478,7 @@ def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effe
     )
 
 
-def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(
+def test_lab_runtime_wrapper_rejects_different_active_handoff_operation(
     tmp_path: Path,
 ) -> None:
     checkout, executable, marker = _runtime_checkout(tmp_path)
@@ -567,11 +569,12 @@ def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(
 
     result = _run_wrapper(checkout, executable, marker)
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert marker.is_file()
+    assert result.returncode == 1
+    assert "handoff" in result.stderr.lower()
+    assert not marker.is_file()
 
 
-def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
+def test_normal_wrapper_rejects_stale_active_handoff_after_rollback_rebind(
     tmp_path: Path,
 ) -> None:
     checkout, executable, marker = _runtime_checkout(tmp_path)
@@ -681,8 +684,9 @@ def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
 
     result = _run_wrapper(checkout, executable, marker)
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert marker.is_file()
+    assert result.returncode == 1
+    assert "handoff" in result.stderr.lower()
+    assert not marker.is_file()
 
 
 def test_lab_runtime_wrapper_executes_verified_uv_style_python_symlink(

@@ -24,6 +24,7 @@ from rquant.release_generation import (
     ReleaseGenerationCommit,
     ReleaseGenerationError,
     ReleaseGenerationMarker,
+    _read_private_json,
     _write_private_json,
     commit_path_for_lock,
     environment_manifest_path_for_lock,
@@ -417,6 +418,51 @@ def test_completed_deployment_intent_cannot_rebind_handoff() -> None:
             handoff_operation_id="e" * 32,
             handoff_labels=("com.roxor.rquant-lab-scheduler",),
         )
+
+
+def test_deployment_intent_persists_original_handoff_operation() -> None:
+    original_operation = "1" * 32
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id=original_operation,
+        handoff_labels=("scheduler",),
+    )
+
+    assert intent.initial_handoff_operation_id == original_operation
+
+
+def test_deployment_intent_rebound_history_must_anchor_original_operation() -> None:
+    original_operation = "1" * 32
+    recovering = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id=original_operation,
+        handoff_labels=("scheduler",),
+    ).advance(stage="recovery_started")
+    rebound = recovering.rebind_handoff(
+        handoff_operation_id="2" * 32,
+        handoff_labels=("scheduler",),
+    )
+    payload = json.loads(json.dumps(asdict(rebound)))
+    payload["stage_history"][2]["previous_handoff_operation_id"] = "9" * 32
+
+    with pytest.raises(ReleaseGenerationError, match="rebound history"):
+        DeploymentIntent.from_payload(payload)
 
 
 def test_deployment_handoff_rebind_requires_adjacent_recovery_and_new_operation() -> None:
@@ -1253,6 +1299,161 @@ def test_handoff_supersede_chain_rejects_binding_drift_at_every_ancestor(
             checkout_root="/private/runtime/rquant",
             expected_labels=("scheduler", "worker", "finalizer"),
         )
+
+
+@pytest.mark.parametrize(
+    ("current_action", "ancestor_action"),
+    (
+        ("resume", "resume"),
+        ("resume", "rollback"),
+    ),
+)
+def test_handoff_supersede_chain_rejects_forbidden_action_edges(
+    current_action: str,
+    ancestor_action: str,
+) -> None:
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id="3" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
+    )
+    installation = LabInstallationIdentity(
+        path="/private/runtime/install.json",
+        sha256="e" * 64,
+        device=1,
+        inode=2,
+    )
+    root = _handoff_record(
+        operation_id="1" * 32,
+        action="deploy",
+        target_sha=intent.target_sha,
+        supersedes_operation_id="",
+        installation=installation,
+    )
+    ancestor = _handoff_record(
+        operation_id="2" * 32,
+        action=ancestor_action,
+        target_sha=(intent.previous_sha if ancestor_action == "rollback" else intent.target_sha),
+        supersedes_operation_id=root.operation_id,
+        installation=installation,
+    )
+    current = _handoff_record(
+        operation_id="3" * 32,
+        action=current_action,
+        target_sha=(intent.previous_sha if current_action == "rollback" else intent.target_sha),
+        supersedes_operation_id=ancestor.operation_id,
+        installation=installation,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="action|supersede chain"):
+        validate_lab_handoff_supersede_chain(
+            record=current,
+            ancestors=(ancestor, root),
+            intent=intent,
+            installation_identity=installation,
+            checkout_root="/private/runtime/rquant",
+            expected_labels=("scheduler", "worker", "finalizer"),
+        )
+
+
+@pytest.mark.parametrize("ancestor_action", ("resume", "rollback"))
+def test_handoff_supersede_chain_allows_valid_rollback_edges(
+    ancestor_action: str,
+) -> None:
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id="1" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
+    ).advance(stage="recovery_started")
+    intent = intent.rebind_handoff(
+        handoff_operation_id="2" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
+    ).advance(stage="recovery_started")
+    intent = intent.rebind_handoff(
+        handoff_operation_id="3" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
+    )
+    installation = LabInstallationIdentity(
+        path="/private/runtime/install.json",
+        sha256="e" * 64,
+        device=1,
+        inode=2,
+    )
+    root = _handoff_record(
+        operation_id="1" * 32,
+        action="deploy",
+        target_sha=intent.target_sha,
+        supersedes_operation_id="",
+        installation=installation,
+    )
+    resumed = _handoff_record(
+        operation_id="2" * 32,
+        action=ancestor_action,
+        target_sha=(intent.target_sha if ancestor_action == "resume" else intent.previous_sha),
+        supersedes_operation_id=root.operation_id,
+        installation=installation,
+    )
+    rolled_back = _handoff_record(
+        operation_id="3" * 32,
+        action="rollback",
+        target_sha=intent.previous_sha,
+        supersedes_operation_id=resumed.operation_id,
+        installation=installation,
+    )
+
+    validate_lab_handoff_supersede_chain(
+        record=rolled_back,
+        ancestors=(resumed, root),
+        intent=intent,
+        installation_identity=installation,
+        checkout_root="/private/runtime/rquant",
+        expected_labels=("scheduler", "worker", "finalizer"),
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"schema_version":1,"schema_version":2}',
+        b'{"outer":{"operation_id":"a","operation_id":"b"}}',
+    ),
+)
+def test_private_authority_json_rejects_duplicate_keys(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    root = tmp_path / "authority"
+    root.mkdir(mode=0o700)
+    record = root / "record.json"
+    record.write_bytes(payload)
+    record.chmod(0o600)
+    root_fd = os.open(root, os.O_RDONLY)
+    try:
+        with pytest.raises(ReleaseGenerationError, match="duplicate JSON key"):
+            _read_private_json(
+                root_fd=root_fd,
+                root_path=root,
+                name=record.name,
+                maximum_bytes=4096,
+            )
+    finally:
+        os.close(root_fd)
 
 
 def test_initialization_sentinel_cannot_be_recreated_by_deleting_marker(

@@ -34,10 +34,11 @@ from rquant.release_generation import (
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-production-deploy.py"
 AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
+STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 PRODUCTION_DEPLOYER = ROOT / "src" / "rquant" / "ops" / "production_deploy.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 _ORIGINAL_OS_WALK = os.walk
-_READINESS_A = ("a" * 32, "b" * 64, "c" * 40)
+_READINESS_A = ("a" * 32, "b" * 64, "a" * 40)
 
 
 def _handoff_deployment_intent(
@@ -269,6 +270,7 @@ def _checkout(
     ops.mkdir(parents=True)
     scripts.mkdir()
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
+    shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(AUTHORITY, package / AUTHORITY.name)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (ops / "__init__.py").write_text("", encoding="utf-8")
@@ -572,6 +574,9 @@ def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
     authority = root / "src" / "rquant" / "release_generation.py"
     authority.parent.mkdir(parents=True)
     shutil.copy2(AUTHORITY, authority)
+    scripts = root / "scripts"
+    scripts.mkdir()
+    shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     launchd = root / "deploy" / "launchd"
     launchd.mkdir(parents=True)
     for label in module.LAB_LAUNCHD_LABELS:
@@ -856,6 +861,386 @@ def test_lab_handoff_persists_typed_intent_before_first_bootout(
         handoff.close()
 
     assert handoff.prepared_intent_operation_id == prepared_operation
+
+
+@pytest.mark.parametrize("recovery_action", ("resume", "rollback"))
+def test_prepared_only_transaction_is_detected_and_materialized_for_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_action: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    original_operation = "1" * 32
+    prepared = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=original_operation,
+        operation_id="2" * 32,
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        stage="planned",
+    )
+    prepared_path = lock_path.with_name(f"{lock_path.stem}.intent.prepared.json")
+    module._atomic_private_json(prepared_path, asdict(prepared), absent=True)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    pending = module._incomplete_handoff_payload(root=root, lock_path=lock_path)
+    assert pending is not None
+    assert pending["stage"] == "prepared"
+    assert pending["operation_id"] == original_operation
+
+    recovery = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=original_operation,
+    )
+    try:
+        recovery_target = (
+            prepared.target_sha if recovery_action == "resume" else prepared.previous_sha
+        )
+        recovery.prepare(
+            dry_run=False,
+            target_ref=(prepared.target_ref if recovery_action == "resume" else recovery_target),
+            target_sha=recovery_target,
+            action=recovery_action,
+            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    finally:
+        recovery.close()
+
+    root_record = module._private_json(
+        module._operation_handoff_path(lock_path, original_operation),
+        label="materialized prepared handoff",
+    )
+    assert root_record is not None
+    assert root_record["action"] == "deploy"
+    assert root_record["stage"] == "planned"
+    assert recovery.prepared_intent_operation_id == prepared.operation_id
+
+
+def test_prepared_only_recovery_preserves_prior_completed_active_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        elif command == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
+    prior = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    prior.prepare(
+        dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=prior.operation_id,
+        generation=_READINESS_A,
+    )
+    prior.restore()
+    prior_proof = module._completed_handoff_path(lock_path, prior.operation_id)
+    prior_bytes = prior_proof.read_bytes()
+
+    original_operation = "1" * 32
+    prepared = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=original_operation,
+        operation_id="2" * 32,
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        stage="planned",
+    )
+    module._atomic_private_json(
+        lock_path.with_name(f"{lock_path.stem}.intent.prepared.json"),
+        asdict(prepared),
+        absent=True,
+    )
+
+    pending = module._incomplete_handoff_payload(root=root, lock_path=lock_path)
+    assert pending is not None and pending["stage"] == "prepared"
+    recovery = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=original_operation,
+    )
+    try:
+        recovery.prepare(
+            dry_run=False,
+            target_ref=prepared.target_ref,
+            target_sha=prepared.target_sha,
+            action="resume",
+            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    finally:
+        recovery.close()
+
+    assert prior_proof.read_bytes() == prior_bytes
+    root_record = module._private_json(
+        module._operation_handoff_path(lock_path, original_operation),
+        label="materialized prepared handoff",
+    )
+    assert root_record is not None and root_record["stage"] == "planned"
+
+
+def test_pre_deployer_abort_restores_previous_without_completed_target_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    previous_sha = "a" * 40
+    target_sha = "b" * 40
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        elif command == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+
+    def persist(
+        handoff_operation_id: str,
+        handoff_labels: tuple[str, ...],
+    ) -> tuple[str, str]:
+        intent = _handoff_deployment_intent(
+            module,
+            handoff_operation_id=handoff_operation_id,
+            operation_id="3" * 32,
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+            target_ref=target_sha,
+            stage="planned",
+        )
+        assert handoff_labels == tuple(module.LAB_LAUNCHD_LABELS)
+        module._atomic_private_json(
+            lock_path.with_name(f"{lock_path.stem}.intent.prepared.json"),
+            asdict(intent),
+            absent=True,
+        )
+        return intent.operation_id, intent.handoff_operation_id
+
+    handoff.prepare(
+        dry_run=False,
+        target_ref=target_sha,
+        target_sha=target_sha,
+        action="deploy",
+        prepare_intent=persist,
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    monkeypatch.setattr(
+        module,
+        "_wait_for_lab_readiness",
+        lambda **_kwargs: ("4" * 32, "8" * 64, previous_sha),
+    )
+
+    handoff.abort_prepared()
+
+    active = module._private_json(handoff.record_path, label="aborted handoff")
+    assert active is not None
+    assert active["stage"] == "aborted"
+    assert active["action"] == "deploy"
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    assert not module._completed_handoff_path(lock_path, handoff.operation_id).exists()
+
+
+def test_prepared_abort_restores_partial_stop_after_prepare_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    bootouts = 0
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal bootouts
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            bootouts += 1
+            if bootouts == 2:
+                raise module.DeployBootstrapError("injected partial stop")
+            loaded.remove(label)
+        elif command == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+
+    def persist(
+        handoff_operation_id: str,
+        _handoff_labels: tuple[str, ...],
+    ) -> tuple[str, str]:
+        intent = _handoff_deployment_intent(
+            module,
+            handoff_operation_id=handoff_operation_id,
+            operation_id="3" * 32,
+            previous_sha="a" * 40,
+            target_sha="b" * 40,
+            target_ref="b" * 40,
+            stage="planned",
+        )
+        module._atomic_private_json(
+            lock_path.with_name(f"{lock_path.stem}.intent.prepared.json"),
+            asdict(intent),
+            absent=True,
+        )
+        return intent.operation_id, intent.handoff_operation_id
+
+    with pytest.raises(module.DeployBootstrapError, match="partial stop"):
+        handoff.prepare(
+            dry_run=False,
+            target_ref="b" * 40,
+            target_sha="b" * 40,
+            action="deploy",
+            prepare_intent=persist,
+            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    monkeypatch.setattr(
+        module,
+        "_wait_for_lab_readiness",
+        lambda **_kwargs: ("4" * 32, "8" * 64, "a" * 40),
+    )
+
+    handoff.abort_prepared()
+
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    active = module._private_json(handoff.record_path, label="aborted partial handoff")
+    assert active is not None and active["stage"] == "aborted"
+    module._validate_handoff_record_shape(
+        root=root,
+        lock_path=lock_path,
+        payload=active,
+        operation_id=handoff.operation_id,
+        completed=False,
+    )
+    assert not module._completed_handoff_path(lock_path, handoff.operation_id).exists()
+
+
+def test_handoff_never_completes_with_readiness_from_a_different_code_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        elif command == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    handoff.prepare(
+        dry_run=False,
+        target_ref="b" * 40,
+        target_sha="b" * 40,
+        action="deploy",
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    monkeypatch.setattr(
+        module,
+        "_wait_for_lab_readiness",
+        lambda **_kwargs: ("4" * 32, "8" * 64, "a" * 40),
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="different code generation"):
+        handoff.restore()
+
+    assert not module._completed_handoff_path(lock_path, handoff.operation_id).exists()
 
 
 def test_incomplete_handoff_resume_is_deferred_without_writes_in_protected_window(
@@ -1593,29 +1978,34 @@ def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
     tmp_path: Path,
 ) -> None:
-    module, _root, lock_path = _handoff_fixture(tmp_path)
+    module, root, lock_path = _handoff_fixture(tmp_path)
     target = "b" * 40
     previous = "a" * 40
     module._atomic_private_json(
         lock_path.with_name(f"{lock_path.stem}.intent.json"),
-        {
-            "schema_version": 1,
-            "operation_id": "c" * 32,
-            "previous_sha": previous,
-            "target_sha": target,
-            "target_ref": "v0.99.1",
-            "stage": "timers_stopped",
-        },
+        asdict(
+            _handoff_deployment_intent(
+                module,
+                handoff_operation_id="d" * 32,
+                operation_id="c" * 32,
+                previous_sha=previous,
+                target_sha=target,
+                target_ref="v0.99.1",
+                stage="timers_stopped",
+            )
+        ),
         absent=True,
     )
 
     module._verify_recovery_target_binding(
+        root=root,
         lock_path=lock_path,
         target_ref="v0.99.1",
         target_sha=target,
         action="resume",
     )
     module._verify_recovery_target_binding(
+        root=root,
         lock_path=lock_path,
         target_ref=previous,
         target_sha=previous,
@@ -1624,6 +2014,7 @@ def test_recovery_target_binding_is_verified_before_launchd_handoff(
 
     with pytest.raises(module.DeployBootstrapError, match="recorded deployment intent"):
         module._verify_recovery_target_binding(
+            root=root,
             lock_path=lock_path,
             target_ref="d" * 40,
             target_sha="d" * 40,
@@ -2625,12 +3016,9 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
     loaded = set(module.LAB_LAUNCHD_LABELS)
-    expectations = iter(
-        [
-            ("a" * 32, "b" * 64, "c" * 40),
-            ("d" * 32, "e" * 64, "f" * 40),
-        ]
-    )
+    first_generation = ("a" * 32, "b" * 64, "c" * 40)
+    second_generation = ("d" * 32, "e" * 64, "f" * 40)
+    expectations = iter([first_generation, second_generation])
 
     def fake_launchctl(
         arguments: list[str],
@@ -2676,7 +3064,7 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
         module,
         lock_path,
         handoff_operation_id=first_operation,
-        generation=_READINESS_A,
+        generation=first_generation,
     )
     first.restore()
     first_proof = module._completed_handoff_path(lock_path, first_operation)
@@ -2701,7 +3089,7 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
         module,
         lock_path,
         handoff_operation_id=second.operation_id,
-        generation=("d" * 32, "e" * 64, "f" * 40),
+        generation=second_generation,
     )
     second.restore()
 
@@ -3448,6 +3836,26 @@ def test_deploy_control_dotenv_reader_is_allowlisted_and_never_evaluates_shell(
         "RQUANT_LAB_LIFECYCLE_MODE": "uninstalled",
     }
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        '{"schema_version":1,"schema_version":2}',
+        '{"outer":{"operation_id":"a","operation_id":"b"}}',
+    ),
+)
+def test_bootstrap_private_json_rejects_duplicate_keys(
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    module = _bootstrap_module()
+    record = tmp_path / "record.json"
+    record.write_text(payload, encoding="utf-8")
+    record.chmod(0o600)
+
+    with pytest.raises(module.DeployBootstrapError, match="duplicate JSON key"):
+        module._private_json(record, label="duplicate record")
 
 
 def test_bootstrap_dotenv_and_prepared_sentinel_reads_use_openat_bound_descriptors(
