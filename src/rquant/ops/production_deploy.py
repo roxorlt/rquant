@@ -629,6 +629,8 @@ def _execute_transaction(
         phase="publish",
     )
     intent = _advance_intent(config, authority, intent, "marker_published")
+    if config.lab_lifecycle_mode == "installed" and intent.handoff_operation_id:
+        return _advance_intent(config, authority, intent, "awaiting_readiness")
     intent = _advance_intent(config, authority, intent, "completed")
     finalizer.finalize(
         expected_commit=target_sha,

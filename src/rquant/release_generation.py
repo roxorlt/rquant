@@ -122,7 +122,8 @@ SERVICE_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 _DEPLOYMENT_STAGE_PATTERN = re.compile(
     r"(?:planned|initializing|recovery_started|timers_stopped|services_transitioning|"
-    r"services_ready|post_restart_preflight_ready|timers_restored|marker_published|completed|"
+    r"services_ready|post_restart_preflight_ready|timers_restored|marker_published|"
+    r"awaiting_readiness|completed|"
     r"handoff_rebound|(?:deploy|resume|rollback)_(?:checkout|dependencies|preflight)_ready)"
 )
 _TARGET_REF_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
@@ -498,12 +499,17 @@ class DeploymentIntent:
             )
         ):
             raise ReleaseGenerationError("deployment intent stage history is invalid")
-        effective_stages = [
-            value["stage"] for value in intent.stage_history if value["stage"] != "handoff_rebound"
-        ]
-        if not effective_stages or effective_stages[-1] != intent.stage:
+        history_stages = [value["stage"] for value in intent.stage_history]
+        semantic_stages = [stage for stage in history_stages if stage != "handoff_rebound"]
+        if not semantic_stages or semantic_stages[-1] != intent.stage:
             raise ReleaseGenerationError("deployment intent stage history is inconsistent")
-        _validate_deployment_stage_sequence(effective_stages)
+        if (
+            intent.handoff_operation_id
+            and intent.stage == "completed"
+            and "awaiting_readiness" not in semantic_stages
+        ):
+            raise ReleaseGenerationError("installed deployment skipped readiness")
+        _validate_deployment_stage_sequence(history_stages)
         return intent
 
     def advance(
@@ -512,10 +518,14 @@ class DeploymentIntent:
         stage: str,
         restarted_services: tuple[str, ...] | None = None,
     ) -> DeploymentIntent:
-        effective_stages = [
-            value["stage"] for value in self.stage_history if value["stage"] != "handoff_rebound"
-        ]
-        _validate_deployment_stage_sequence([*effective_stages, stage])
+        if (
+            stage == "completed"
+            and self.handoff_operation_id
+            and self.stage != "awaiting_readiness"
+        ):
+            raise ReleaseGenerationError("installed deployment must await readiness")
+        history_stages = [value["stage"] for value in self.stage_history]
+        _validate_deployment_stage_sequence([*history_stages, stage])
         timestamp = datetime.now(UTC).isoformat()
         return replace(
             self,
@@ -535,6 +545,11 @@ class DeploymentIntent:
     ) -> DeploymentIntent:
         if re.fullmatch(r"[0-9a-f]{32}", handoff_operation_id) is None or not handoff_labels:
             raise ReleaseGenerationError("deployment handoff binding is invalid")
+        if self.stage in {"initializing", "completed"}:
+            raise ReleaseGenerationError("completed deployment cannot rebind its handoff")
+        _validate_deployment_stage_sequence(
+            [*[value["stage"] for value in self.stage_history], "handoff_rebound"]
+        )
         timestamp = datetime.now(UTC).isoformat()
         return replace(
             self,
@@ -551,7 +566,14 @@ class DeploymentIntent:
 def _validate_deployment_stage_sequence(stages: list[str]) -> None:
     if not stages or stages[0] not in {"planned", "initializing"}:
         raise ReleaseGenerationError("deployment intent stage history is invalid")
-    for previous, current in zip(stages, stages[1:], strict=False):
+    previous = stages[0]
+    for current in stages[1:]:
+        if current == "handoff_rebound":
+            if previous in {"initializing", "completed"}:
+                raise ReleaseGenerationError(
+                    f"deployment intent stage transition is invalid: {previous} -> {current}"
+                )
+            continue
         if previous == "initializing":
             allowed = {"completed"}
         elif previous == "completed":
@@ -581,6 +603,8 @@ def _validate_deployment_stage_sequence(stages: list[str]) -> None:
         elif previous == "timers_restored":
             allowed = {"marker_published"}
         elif previous == "marker_published":
+            allowed = {"awaiting_readiness", "completed"}
+        elif previous == "awaiting_readiness":
             allowed = {"completed"}
         else:
             allowed = set()
@@ -588,6 +612,7 @@ def _validate_deployment_stage_sequence(stages: list[str]) -> None:
             raise ReleaseGenerationError(
                 f"deployment intent stage transition is invalid: {previous} -> {current}"
             )
+        previous = current
 
 
 @dataclass(frozen=True)
@@ -2553,16 +2578,23 @@ class ReleaseGenerationAuthority:
             operation_id=published.operation_id,
             transaction_kind=published.transaction_kind,
         )
-        if transaction.stage != "completed":
+        provisional = (
+            provisional_handoff_label is not None
+            and published.transaction_kind == "deployment"
+            and transaction.stage == "awaiting_readiness"
+        )
+        if transaction.stage != "completed" and not provisional:
             raise ReleaseGenerationError("release transaction is not completed")
         self._verify_deployment_handoff(
             transaction,
             provisional_label=provisional_handoff_label,
         )
-        try:
-            committed = self._read_commit_record()
-        except ReleaseGenerationError as exc:
-            raise ReleaseGenerationError("release generation commit record is missing") from exc
+        committed: ReleaseGenerationCommit | None = None
+        if not provisional:
+            try:
+                committed = self._read_commit_record()
+            except ReleaseGenerationError as exc:
+                raise ReleaseGenerationError("release generation commit record is missing") from exc
         selector, _selector_identity = self._read_selector()
         manifest, _manifest_identity = self._read_environment_manifest(selector)
         current = self._facts(
@@ -2576,7 +2608,7 @@ class ReleaseGenerationAuthority:
             if published.venv_identity != current.venv_identity:
                 raise ReleaseGenerationError("release venv identity no longer matches marker")
             raise ReleaseGenerationError("release generation marker is stale")
-        if (
+        if committed is not None and (
             committed.operation_id != published.operation_id
             or committed.transaction_kind != published.transaction_kind
             or committed.commit != published.commit

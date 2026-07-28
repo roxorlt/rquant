@@ -48,6 +48,10 @@ def _complete_deployment_intent(
         transaction_kind="deployment",
     )
     authority.update_deployment_intent(operation_id=operation_id, stage="marker_published")
+    authority.update_deployment_intent(
+        operation_id=operation_id,
+        stage="awaiting_readiness",
+    )
     authority.update_deployment_intent(operation_id=operation_id, stage="completed")
     authority.commit_generation(
         operation_id=operation_id,

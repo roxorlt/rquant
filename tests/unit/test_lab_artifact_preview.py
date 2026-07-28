@@ -23,6 +23,18 @@ def _fd_count() -> int:
     return len(tuple(Path("/dev/fd").iterdir()))
 
 
+def _non_sqlite_control_entries(root: Path, database: Path) -> tuple[Path, ...]:
+    sqlite_control_paths = {
+        database.with_name(f"{database.name}-shm"),
+        database.with_name(f"{database.name}-wal"),
+    }
+    return tuple(
+        sorted(
+            path.relative_to(root) for path in root.rglob("*") if path not in sqlite_control_paths
+        )
+    )
+
+
 def _preview_parquet_rows(
     tmp_path: Path,
     table: pa.Table,
@@ -68,7 +80,7 @@ def test_preview_reads_only_verified_sealed_report_metrics_and_bounded_parquet(
 ) -> None:
     scenario = _sealed_scenario(tmp_path)
     database_before = scenario.store.path.read_bytes()
-    root_entries_before = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")))
+    root_entries_before = _non_sqlite_control_entries(tmp_path, scenario.store.path)
     preview = ArtifactPreviewReader(
         reader=LabJobReader(scenario.store.path),
         artifact_root=tmp_path / "job-artifacts",
@@ -86,9 +98,7 @@ def test_preview_reads_only_verified_sealed_report_metrics_and_bounded_parquet(
     assert len(preview.table.columns) <= 1
     assert len(preview.table.rows) <= 1
     assert scenario.store.path.read_bytes() == database_before
-    assert tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))) == (
-        root_entries_before
-    )
+    assert _non_sqlite_control_entries(tmp_path, scenario.store.path) == root_entries_before
 
 
 def test_preview_rejects_non_succeeded_or_unsealed_job_before_filesystem_access(

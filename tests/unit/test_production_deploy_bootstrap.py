@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +76,7 @@ def _handoff_deployment_intent(
         "post_restart_preflight_ready",
         "timers_restored",
         "marker_published",
+        "awaiting_readiness",
         "completed",
     )
     if stage not in stages:
@@ -1048,6 +1049,269 @@ def test_installed_target_policy_rejects_privileged_launchd_diff_before_bootout(
     assert launchctl_calls == []
     assert not run_marker.exists()
     assert _git(checkout, "rev-parse", "HEAD") == previous
+
+
+def test_installed_already_current_returns_before_handoff_or_launchd_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    checkout, python, lock_path, current = _checkout(tmp_path)
+    module = _bootstrap_module()
+    launchctl_calls: list[list[str]] = []
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: (
+            launchctl_calls.append(arguments)
+            or subprocess.CompletedProcess(arguments, 0, stdout="state = running\n", stderr="")
+        ),
+    )
+    monkeypatch.chdir(checkout)
+
+    result = module.main(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=current,
+            lifecycle_mode="installed",
+        )[4:]
+    )
+
+    assert result == 0
+    assert not [call for call in launchctl_calls if call[0] in {"bootout", "bootstrap"}]
+    assert not module._stable_record_path(lock_path, "lab-handoff").exists()
+    assert not list(lock_path.parent.glob(f"{lock_path.stem}.lab-handoff.*"))
+    assert '"status": "already_current"' in capsys.readouterr().out
+
+
+def test_installed_empty_change_plan_returns_before_handoff_or_intent_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path)
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "empty release",
+    )
+    target = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "push", "-q", "origin", "main")
+    _git(checkout, "reset", "--hard", previous)
+    module = _bootstrap_module()
+    launchctl_calls: list[list[str]] = []
+    intent_path = intent_path_for_lock(lock_path)
+    intent_before = intent_path.read_bytes() if intent_path.exists() else None
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: (
+            launchctl_calls.append(arguments)
+            or subprocess.CompletedProcess(arguments, 0, stdout="state = running\n", stderr="")
+        ),
+    )
+    monkeypatch.chdir(checkout)
+
+    result = module.main(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=target,
+            lifecycle_mode="installed",
+        )[4:]
+    )
+
+    assert result == 0
+    assert _git(checkout, "rev-parse", "HEAD") == previous
+    assert not [call for call in launchctl_calls if call[0] in {"bootout", "bootstrap"}]
+    assert (intent_path.read_bytes() if intent_path.exists() else None) == intent_before
+    assert not list(lock_path.parent.glob(f"{lock_path.stem}.lab-handoff*"))
+
+
+def test_installed_rollout_commits_only_after_generation_bound_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
+    target = _commit_next_release(checkout)
+    _git(checkout, "reset", "--hard", previous)
+    module = _bootstrap_module()
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    observed_stages: list[str] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.remove(label)
+        elif action == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    def ready(**_kwargs: object) -> tuple[str, str, str]:
+        payload = module._private_json(
+            intent_path_for_lock(lock_path),
+            label="deployment intent before Lab readiness",
+        )
+        assert payload is not None
+        observed_stages.append(str(payload["stage"]))
+        assert not commit_path_for_lock(lock_path).exists()
+        return module._release_readiness_expectation(lock_path)
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", ready)
+    monkeypatch.chdir(checkout)
+    prior_modules = {
+        name: value
+        for name, value in sys.modules.items()
+        if name == "rquant" or name.startswith("rquant.")
+    }
+    for name in prior_modules:
+        sys.modules.pop(name, None)
+    try:
+        result = module.main(
+            _command(
+                checkout,
+                python,
+                lock_path,
+                target=target,
+                lifecycle_mode="installed",
+            )[4:]
+        )
+    finally:
+        for name in tuple(sys.modules):
+            if name == "rquant" or name.startswith("rquant."):
+                sys.modules.pop(name, None)
+        sys.modules.update(prior_modules)
+
+    assert result == 0
+    assert observed_stages == ["awaiting_readiness"]
+    completed = DeploymentIntent.from_payload(
+        json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    committed = ReleaseGenerationCommit.from_payload(
+        json.loads(commit_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    assert completed.stage == "completed"
+    assert committed.transaction_sha256 == completed.content_hash()
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+
+
+def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
+    target = _commit_next_release(checkout)
+    _git(checkout, "reset", "--hard", previous)
+    module = _bootstrap_module()
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    readiness_calls = 0
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.remove(label)
+        elif action == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    def ready(**_kwargs: object) -> tuple[str, str, str]:
+        nonlocal readiness_calls
+        readiness_calls += 1
+        intent = module._private_json(
+            intent_path_for_lock(lock_path),
+            label="deployment intent before Lab readiness",
+        )
+        assert intent is not None and intent["stage"] == "awaiting_readiness"
+        expected = module._release_readiness_expectation(lock_path)
+        if readiness_calls == 1:
+            assert expected[2] == target
+            raise module.DeployBootstrapError("target daemon readiness failed")
+        assert expected[2] == previous
+        return expected
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", ready)
+    monkeypatch.chdir(checkout)
+    prior_modules = {
+        name: value
+        for name, value in sys.modules.items()
+        if name == "rquant" or name.startswith("rquant.")
+    }
+    for name in prior_modules:
+        sys.modules.pop(name, None)
+    try:
+        result = module.main(
+            _command(
+                checkout,
+                python,
+                lock_path,
+                target=target,
+                lifecycle_mode="installed",
+            )[4:]
+        )
+    finally:
+        for name in tuple(sys.modules):
+            if name == "rquant" or name.startswith("rquant."):
+                sys.modules.pop(name, None)
+        sys.modules.update(prior_modules)
+
+    assert result == 1
+    assert readiness_calls == 2
+    assert _git(checkout, "rev-parse", "HEAD") == previous
+    marker = ReleaseGenerationMarker.from_payload(
+        json.loads(marker_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    completed = DeploymentIntent.from_payload(
+        json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    committed = ReleaseGenerationCommit.from_payload(
+        json.loads(commit_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    assert marker.commit == previous
+    assert completed.stage == "completed"
+    assert any(item["stage"] == "recovery_started" for item in completed.stage_history)
+    assert any(item["stage"] == "handoff_rebound" for item in completed.stage_history)
+    assert committed.transaction_sha256 == completed.content_hash()
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
 
 
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
@@ -2136,6 +2400,8 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     first_payload = json.loads(first_proof.read_text(encoding="utf-8"))
     interrupted_active = dict(first_payload)
     interrupted_active["stage"] = "restarting"
+    for field in ("generation_operation_id", "environment_generation_id", "code_sha"):
+        interrupted_active.pop(field)
     module._atomic_private_json(first.record_path, interrupted_active)
 
     second = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
@@ -2337,6 +2603,79 @@ def test_completed_handoff_convergence_cross_checks_generation_authority(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda payload: payload.update({"unexpected": "value"}),
+        lambda payload: payload.update({"schema_version": True}),
+        lambda payload: payload.update({"stopped_labels": []}),
+        lambda payload: payload.update(
+            {
+                "installation_identity": {
+                    **payload["installation_identity"],
+                    "sha256": "f" * 64,
+                }
+            }
+        ),
+        lambda payload: payload.update({"supersedes_operation_id": "e" * 32}),
+        lambda payload: payload.update(
+            {
+                "action": "rollback",
+                "target_ref": "9" * 40,
+                "target_sha": "9" * 40,
+                "code_sha": "9" * 40,
+                "supersedes_operation_id": "e" * 32,
+            }
+        ),
+    ),
+    ids=(
+        "extra-field",
+        "bool-schema",
+        "incomplete-stopped-labels",
+        "stale-installation-identity",
+        "deploy-with-supersede",
+        "rollback-with-missing-chain",
+    ),
+)
+def test_completed_handoff_proof_is_exact_and_bound_to_current_installation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[dict[str, object]], None],
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
+    handoff.operation_id = "2" * 32
+    handoff.loaded = list(module.LAB_LAUNCHD_LABELS)
+    handoff.stopped = list(module.LAB_LAUNCHD_LABELS)
+    handoff.restarted = list(module.LAB_LAUNCHD_LABELS)
+    handoff.target_ref = _READINESS_A[2]
+    handoff.target_sha = _READINESS_A[2]
+    handoff.action = "deploy"
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=handoff.operation_id,
+    )
+    handoff._record("completed", generation=_READINESS_A)
+    proof_path = module._completed_handoff_path(lock_path, handoff.operation_id)
+    proof = module._private_json(proof_path, label="completed Lab handoff proof")
+    assert proof is not None
+    mutation(proof)
+    for path in (
+        proof_path,
+        module._operation_handoff_path(lock_path, handoff.operation_id),
+        handoff.record_path,
+    ):
+        module._atomic_private_json(path, proof)
+
+    with pytest.raises(module.DeployBootstrapError, match="handoff|installation|binding"):
+        module._converge_completed_handoff_state(root=root, lock_path=lock_path)
+
+
+@pytest.mark.parametrize(
     "intent_mutation",
     [
         {"changed_files": ["deploy/systemd/rquant-monitor.service"]},
@@ -2497,11 +2836,16 @@ def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
         events.append("previous-generation-restored")
         return 0
 
+    def finalize(_handoff: object) -> None:
+        assert _handoff is recovery_handoff
+        events.append("rollback-committed")
+
     result = module._complete_installed_rollout(
         target_handoff=TargetHandoff(),
         deploy_code=0,
         recovery_handoff_factory=lambda: recovery_handoff,
         rollback=rollback,
+        finalize_readiness=finalize,
         recovery_target_sha="f" * 40,
         now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
@@ -2512,14 +2856,35 @@ def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
         "target-daemons-stopped",
         "previous-generation-restored",
         "previous-daemons-ready",
+        "rollback-committed",
     ]
 
 
-@pytest.mark.parametrize("previous_ready", (True, False))
-def test_nonzero_deployer_exit_never_restores_target_or_replays_rollback(
-    capsys: pytest.CaptureFixture[str],
-    previous_ready: bool,
-) -> None:
+def test_successful_target_readiness_is_finalized_before_rollout_returns() -> None:
+    module = _bootstrap_module()
+    events: list[str] = []
+
+    class TargetHandoff:
+        def restore(self) -> None:
+            events.append("target-ready")
+
+    target = TargetHandoff()
+    result = module._complete_installed_rollout(
+        target_handoff=target,
+        deploy_code=0,
+        recovery_handoff_factory=lambda: pytest.fail("recovery must not run"),
+        rollback=lambda _handoff: pytest.fail("rollback must not run"),
+        finalize_readiness=lambda handoff: events.append(
+            "transaction-completed" if handoff is target else "wrong-target"
+        ),
+        recovery_target_sha="f" * 40,
+    )
+
+    assert result == 0
+    assert events == ["target-ready", "transaction-completed"]
+
+
+def test_nonzero_deployer_exit_uses_formal_rollback_before_previous_readiness() -> None:
     module = _bootstrap_module()
     events: list[str] = []
 
@@ -2530,41 +2895,141 @@ def test_nonzero_deployer_exit_never_restores_target_or_replays_rollback(
         def close(self) -> None:
             events.append("target-closed")
 
-    class PreviousHandoff:
+    class RecoveryHandoff:
         def prepare(self, **kwargs: object) -> None:
             assert kwargs["target_ref"] == kwargs["target_sha"] == "f" * 40
             assert kwargs["action"] == "rollback"
-            events.append("previous-prepare")
+            events.append("recovery-prepare")
 
         def restore(self) -> None:
-            events.append("previous-verify")
-            if not previous_ready:
-                raise module.DeployBootstrapError("previous generation is not ready")
+            events.append("previous-ready")
 
         def close(self) -> None:
-            events.append("previous-closed")
+            events.append("recovery-closed")
+
+    recovery = RecoveryHandoff()
+
+    def rollback(handoff: object) -> int:
+        assert handoff is recovery
+        events.append("formal-rollback")
+        return 0
+
+    def finalize(handoff: object) -> None:
+        assert handoff is recovery
+        events.append("rollback-committed")
 
     result = module._complete_installed_rollout(
         target_handoff=TargetHandoff(),
         deploy_code=1,
-        recovery_handoff_factory=PreviousHandoff,
-        rollback=lambda _handoff: pytest.fail("deployer rollback must not be replayed"),
+        recovery_handoff_factory=lambda: recovery,
+        rollback=rollback,
+        finalize_readiness=finalize,
         recovery_target_sha="f" * 40,
         now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
     assert result == 1
-    assert events[:3] == ["target-closed", "previous-prepare", "previous-verify"]
-    if previous_ready:
-        assert events == ["target-closed", "previous-prepare", "previous-verify"]
-    else:
-        assert events == [
-            "target-closed",
-            "previous-prepare",
-            "previous-verify",
-            "previous-closed",
-        ]
-        assert "previous generation is not ready" in capsys.readouterr().err
+    assert events == [
+        "target-closed",
+        "recovery-prepare",
+        "formal-rollback",
+        "previous-ready",
+        "rollback-committed",
+    ]
+
+
+def test_nonzero_deployer_uses_real_superseding_handoff_recovery_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.remove(label)
+        elif action == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    now = datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    target = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    target.prepare(
+        dry_run=False,
+        target_ref="b" * 40,
+        target_sha="b" * 40,
+        action="deploy",
+        now=now,
+    )
+    deployment_operation = "7" * 32
+    intent = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=target.operation_id,
+        operation_id=deployment_operation,
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        stage="awaiting_readiness",
+    )
+    module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent), absent=True)
+    recovery = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=target.operation_id,
+    )
+    monkeypatch.setattr(
+        module,
+        "_wait_for_lab_readiness",
+        lambda **_kwargs: (deployment_operation, "8" * 64, "a" * 40),
+    )
+
+    def rollback(active: object) -> int:
+        assert active is recovery
+        rebound = intent.rebind_handoff(
+            handoff_operation_id=recovery.operation_id,
+            handoff_labels=tuple(module.LAB_LAUNCHD_LABELS),
+        )
+        module._atomic_private_json(intent_path_for_lock(lock_path), asdict(rebound))
+        return 0
+
+    def finalize(active: object) -> None:
+        assert active is recovery
+        proof = module._private_json(
+            module._completed_handoff_path(lock_path, recovery.operation_id),
+            label="completed rollback handoff proof",
+        )
+        assert proof is not None
+        assert proof["action"] == "rollback"
+        assert proof["supersedes_operation_id"] == target.operation_id
+
+    result = module._complete_installed_rollout(
+        target_handoff=target,
+        deploy_code=1,
+        recovery_handoff_factory=lambda: recovery,
+        rollback=rollback,
+        finalize_readiness=finalize,
+        recovery_target_sha="a" * 40,
+        now=now,
+    )
+
+    assert result == 1
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
 
 
 @pytest.mark.parametrize("source_action", ["resume", "rollback"])
@@ -2657,6 +3122,7 @@ def test_recovery_readiness_failure_rolls_back_through_superseded_handoff_chain(
         deploy_code=0,
         recovery_handoff_factory=lambda: rollback_handoff,
         rollback=lambda _handoff: 0,
+        finalize_readiness=lambda _handoff: None,
         recovery_target_sha="a" * 40,
         now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
@@ -2964,7 +3430,7 @@ def test_normal_deploy_fetches_before_resolving_first_seen_annotated_tag(
     assert _git(checkout, "rev-parse", "v1.0.0^{commit}") == target
 
 
-def test_installed_deploy_bootstrap_dry_run_fails_when_launchd_labels_are_not_loaded(
+def test_installed_already_current_dry_run_does_not_require_loaded_labels(
     tmp_path: Path,
 ) -> None:
     checkout, python, lock_path, _commit = _checkout(tmp_path)
@@ -2985,8 +3451,8 @@ def test_installed_deploy_bootstrap_dry_run_fails_when_launchd_labels_are_not_lo
     finally:
         os.close(daemon_lock)
 
-    assert result.returncode == 2
-    assert "all installed Lab launchd daemons must be loaded" in result.stderr
+    assert result.returncode == 0
+    assert '"status": "already_current"' in result.stdout
 
 
 def test_initialize_generation_publishes_first_marker_without_importing_deployer(

@@ -69,6 +69,15 @@
 
 ### Fixed
 
+- **Lab daemon 第十一次 readiness 两阶段提交加固**：installed 发布在环境 marker 落盘后进入
+  `awaiting_readiness`，仅允许 launchd daemon 以 provisional authority 启动；三个 label 的
+  generation-bound readiness 全部稳定后，才把 deployment intent 置为 `completed` 并写入与最终
+  intent hash 一致的 commit record。readiness 或 deployer 失败统一走带 supersede/rebind 证据的
+  正式 rollback，再恢复 previous marker 与 labels；同 SHA 或空 change plan 在 handoff、intent 和
+  launchd mutation 前直接返回 `already_current`。completed handoff proof 现严格校验精确字段与
+  JSON 类型、完整 stopped/restarted labels、当前 installation identity、action/supersede 链以及
+  intent/marker/selector/commit 三方权威一致性；完成态 intent 禁止再次 rebind。
+
 - **Lab daemon 第十轮部署事务与 SQLite 首建回滚加固**：installed 发布现在会在
   launchd bootout 前完成 exact target 拉取、快进校验和共享 changed-files/privileged
   策略分类；deployer 非零退出时不再恢复或完成目标 handoff，只验证 deployer 已回滚的

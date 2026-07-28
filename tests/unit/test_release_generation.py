@@ -65,6 +65,7 @@ def _advance_deployment_intent(
         "post_restart_preflight_ready",
         "timers_restored",
         "marker_published",
+        "awaiting_readiness",
         "completed",
     )
     current = authority.read_deployment_intent()
@@ -131,6 +132,104 @@ def test_deployment_intent_rejects_illegal_planned_to_completed_transition() -> 
     intent = DeploymentIntent.from_payload(_deployment_intent_payload())
     with pytest.raises(ReleaseGenerationError, match="transition"):
         intent.advance(stage="completed")
+
+
+def test_deployment_intent_requires_readiness_before_installed_completion() -> None:
+    intent = DeploymentIntent.from_payload(_deployment_intent_payload())
+    for stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "awaiting_readiness",
+    ):
+        intent = intent.advance(stage=stage)
+
+    assert intent.stage == "awaiting_readiness"
+    assert intent.advance(stage="completed").stage == "completed"
+
+
+def test_installed_deployment_intent_cannot_skip_readiness_stage() -> None:
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id="e" * 32,
+        handoff_labels=("com.roxor.rquant-lab-scheduler",),
+    )
+    for stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+    ):
+        intent = intent.advance(stage=stage)
+
+    with pytest.raises(ReleaseGenerationError, match="readiness"):
+        intent.advance(stage="completed")
+
+
+def test_completed_deployment_intent_cannot_rebind_handoff() -> None:
+    intent = DeploymentIntent.from_payload(_deployment_intent_payload())
+    for stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "completed",
+    ):
+        intent = intent.advance(stage=stage)
+
+    with pytest.raises(ReleaseGenerationError, match="completed.*handoff|handoff.*completed"):
+        intent.rebind_handoff(
+            handoff_operation_id="e" * 32,
+            handoff_labels=("com.roxor.rquant-lab-scheduler",),
+        )
+
+
+def test_deployment_intent_history_does_not_hide_illegal_rebound_transition() -> None:
+    intent = DeploymentIntent.from_payload(_deployment_intent_payload())
+    for stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "completed",
+    ):
+        intent = intent.advance(stage=stage)
+    payload = json.loads(json.dumps(asdict(intent)))
+    rebound_at = "2999-01-01T00:00:00+00:00"
+    payload["updated_at"] = rebound_at
+    payload["stage_history"].append({"stage": "handoff_rebound", "timestamp": rebound_at})
+
+    with pytest.raises(ReleaseGenerationError, match="transition|history"):
+        DeploymentIntent.from_payload(payload)
 
 
 @pytest.fixture(autouse=True)
@@ -838,11 +937,7 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         operation_id=intent.operation_id,
         transaction_kind="deployment",
     )
-    _advance_deployment_intent(authority, intent, target_stage="completed")
-    authority.commit_generation(
-        operation_id=intent.operation_id,
-        transaction_kind="deployment",
-    )
+    _advance_deployment_intent(authority, intent, target_stage="awaiting_readiness")
     handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{handoff_operation}.json")
     payload = {
         "schema_version": 1,
@@ -856,7 +951,7 @@ def test_deployment_marker_requires_completed_launchd_handoff(
     handoff_path.write_text(json.dumps(payload), encoding="utf-8")
     handoff_path.chmod(0o600)
 
-    with pytest.raises(ReleaseGenerationError, match="handoff is not completed"):
+    with pytest.raises(ReleaseGenerationError, match="transaction.*completed|handoff.*completed"):
         authority.verify(expected_commit=commit)
     authority.verify(expected_commit=commit, provisional_handoff_label=labels[0])
 
@@ -870,6 +965,14 @@ def test_deployment_marker_requires_completed_launchd_handoff(
     )
     completed_path.write_text(json.dumps(payload), encoding="utf-8")
     completed_path.chmod(0o600)
+    authority.update_deployment_intent(
+        operation_id=intent.operation_id,
+        stage="completed",
+    )
+    authority.commit_generation(
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
     authority.verify(expected_commit=commit)
 
     active_handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")

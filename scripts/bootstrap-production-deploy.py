@@ -890,10 +890,6 @@ def _release_readiness_expectation(lock_path: Path) -> tuple[str, str, str]:
         lock_path.with_name(f"{lock_path.stem}.complete.json"),
         label="release generation marker",
     )
-    committed = _private_json(
-        lock_path.with_name(f"{lock_path.stem}.commit.json"),
-        label="release generation commit",
-    )
     operation_id = str(marker.get("operation_id", ""))
     generation_id = str(marker.get("environment_generation_id", ""))
     code_sha = str(marker.get("commit", ""))
@@ -902,9 +898,6 @@ def _release_readiness_expectation(lock_path: Path) -> tuple[str, str, str]:
         or len(generation_id) != 64
         or TARGET_PATTERN.fullmatch(code_sha) is None
         or code_sha.startswith("v")
-        or committed.get("operation_id") != operation_id
-        or committed.get("environment_generation_id") != generation_id
-        or committed.get("commit") != code_sha
     ):
         raise DeployBootstrapError("release readiness generation is inconsistent")
     transaction_kind = str(marker.get("transaction_kind", ""))
@@ -919,8 +912,27 @@ def _release_readiness_expectation(lock_path: Path) -> tuple[str, str, str]:
         lock_path.with_name(record_name),
         label="release generation transaction",
     )
-    if transaction.get("operation_id") != operation_id or transaction.get("stage") != "completed":
+    stage = transaction.get("stage")
+    provisional = transaction_kind == "deployment" and stage == "awaiting_readiness"
+    if transaction.get("operation_id") != operation_id or (
+        stage != "completed" and not provisional
+    ):
         raise DeployBootstrapError("release readiness transaction is incomplete")
+    committed = _private_json(
+        lock_path.with_name(f"{lock_path.stem}.commit.json"),
+        label="release generation commit",
+        missing_ok=provisional,
+    )
+    if provisional:
+        if committed is not None:
+            raise DeployBootstrapError("provisional release readiness has an early commit")
+    elif (
+        committed is None
+        or committed.get("operation_id") != operation_id
+        or committed.get("environment_generation_id") != generation_id
+        or committed.get("commit") != code_sha
+    ):
+        raise DeployBootstrapError("release readiness generation is inconsistent")
     return operation_id, generation_id, code_sha
 
 
@@ -1094,6 +1106,94 @@ _HANDOFF_COMPLETION_BINDING_FIELDS = (
     "environment_generation_id",
     "code_sha",
 )
+_HANDOFF_BASE_FIELDS = {*_HANDOFF_BASE_BINDING_FIELDS, "stage", "updated_at"}
+_HANDOFF_COMPLETION_FIELDS = {
+    *_HANDOFF_COMPLETION_BINDING_FIELDS,
+    "stage",
+    "updated_at",
+}
+
+
+def _validate_handoff_record_shape(
+    *,
+    root: Path,
+    lock_path: Path,
+    payload: dict[str, object],
+    operation_id: str,
+    completed: bool,
+) -> None:
+    expected_fields = _HANDOFF_COMPLETION_FIELDS if completed else _HANDOFF_BASE_FIELDS
+    expected_labels = list(LAB_LAUNCHD_LABELS)
+    installation = _read_lab_installation_state(root=root, lock_path=lock_path)
+    installation_identity = _lab_installation_identity(lock_path, installation)
+    recorded_installation = payload.get("installation_identity")
+    string_fields = {
+        "operation_id",
+        "checkout_root",
+        "stage",
+        "updated_at",
+        "target_ref",
+        "target_sha",
+        "action",
+        "release_profile",
+        "lifecycle_mode",
+        "supersedes_operation_id",
+    }
+    if completed:
+        string_fields.update({"generation_operation_id", "environment_generation_id", "code_sha"})
+    if (
+        type(payload) is not dict
+        or set(payload) != expected_fields
+        or type(payload.get("schema_version")) is not int
+        or any(type(payload.get(field)) is not str for field in string_fields)
+        or any(
+            type(payload.get(field)) is not list
+            or any(type(value) is not str for value in payload[field])
+            for field in ("labels", "loaded_labels", "stopped_labels", "restarted_labels")
+        )
+        or type(recorded_installation) is not dict
+        or set(recorded_installation) != {"path", "sha256", "device", "inode"}
+        or type(recorded_installation.get("path")) is not str
+        or type(recorded_installation.get("sha256")) is not str
+        or type(recorded_installation.get("device")) is not int
+        or type(recorded_installation.get("inode")) is not int
+    ):
+        raise DeployBootstrapError("completed Lab handoff proof fields are malformed")
+    try:
+        updated_at = datetime.fromisoformat(str(payload["updated_at"]))
+    except ValueError as exc:
+        raise DeployBootstrapError("completed Lab handoff timestamp is malformed") from exc
+    action = payload["action"]
+    supersedes = payload["supersedes_operation_id"]
+    chain_invalid = (action == "deploy" and supersedes != "") or (
+        action in {"resume", "rollback"}
+        and (re.fullmatch(r"[0-9a-f]{32}", supersedes) is None or supersedes == operation_id)
+    )
+    if (
+        payload["schema_version"] != LAB_HANDOFF_SCHEMA_VERSION
+        or payload["operation_id"] != operation_id
+        or payload["checkout_root"] != str(root)
+        or payload["labels"] != expected_labels
+        or payload["loaded_labels"] != expected_labels
+        or payload["stopped_labels"] != expected_labels
+        or not set(payload["restarted_labels"]).issubset(expected_labels)
+        or payload["release_profile"] != "macos-lab"
+        or payload["lifecycle_mode"] != "installed"
+        or payload["installation_identity"] != installation_identity
+        or action not in {"deploy", "resume", "rollback"}
+        or chain_invalid
+        or updated_at.tzinfo is None
+        or updated_at.utcoffset() is None
+    ):
+        raise DeployBootstrapError("completed Lab handoff proof binding is invalid")
+    if completed and (
+        payload["stage"] != "completed"
+        or payload["restarted_labels"] != expected_labels
+        or re.fullmatch(r"[0-9a-f]{32}", payload["generation_operation_id"]) is None
+        or re.fullmatch(r"[0-9a-f]{64}", payload["environment_generation_id"]) is None
+        or re.fullmatch(r"[0-9a-f]{40}", payload["code_sha"]) is None
+    ):
+        raise DeployBootstrapError("completed Lab handoff proof binding is invalid")
 
 
 def _typed_deployment_intent_for_handoff(
@@ -1125,6 +1225,49 @@ def _typed_deployment_intent_for_handoff(
     return authority_module, intent
 
 
+def _validate_handoff_supersede_chain(
+    *,
+    root: Path,
+    lock_path: Path,
+    proof: dict[str, object],
+    intent: object,
+) -> None:
+    if proof["action"] == "deploy":
+        return
+    superseded_operation_id = str(proof["supersedes_operation_id"])
+    seen_operations = {str(proof["operation_id"])}
+    superseded: dict[str, object] | None = None
+    while superseded_operation_id:
+        if superseded_operation_id in seen_operations:
+            raise DeployBootstrapError("completed Lab handoff supersede chain is cyclic")
+        seen_operations.add(superseded_operation_id)
+        superseded = _private_json(
+            _operation_handoff_path(lock_path, superseded_operation_id),
+            label="superseded Lab launchd handoff operation",
+        )
+        assert superseded is not None
+        _validate_handoff_record_shape(
+            root=root,
+            lock_path=lock_path,
+            payload=superseded,
+            operation_id=superseded_operation_id,
+            completed=superseded.get("stage") == "completed",
+        )
+        if superseded["action"] == "deploy":
+            break
+        superseded_operation_id = str(superseded["supersedes_operation_id"])
+    if superseded is None:
+        raise DeployBootstrapError("completed Lab handoff supersede chain is missing")
+    installation = _read_lab_installation_state(root=root, lock_path=lock_path)
+    _validate_superseded_handoff_binding(
+        payload=superseded,
+        intent=intent,
+        release_profile=str(proof["release_profile"]),
+        lifecycle_mode=str(proof["lifecycle_mode"]),
+        installation_identity=_lab_installation_identity(lock_path, installation),
+    )
+
+
 def _validate_completed_handoff_generation_authority(
     *,
     root: Path,
@@ -1139,6 +1282,12 @@ def _validate_completed_handoff_generation_authority(
         lifecycle_mode=str(proof["lifecycle_mode"]),
     )
     try:
+        _validate_handoff_supersede_chain(
+            root=root,
+            lock_path=lock_path,
+            proof=proof,
+            intent=intent,
+        )
         marker_payload = _private_json(
             lock_path.with_name(f"{lock_path.stem}.complete.json"),
             label="release generation marker",
@@ -1179,7 +1328,7 @@ def _validate_completed_handoff_generation_authority(
         raise DeployBootstrapError("completed Lab handoff generation binding is invalid") from exc
 
 
-def _validated_completed_handoff_proof(
+def _read_strict_completed_handoff_proof(
     *,
     root: Path,
     lock_path: Path,
@@ -1197,27 +1346,21 @@ def _validated_completed_handoff_proof(
         label="Lab launchd handoff operation record",
     )
     assert proof is not None and operation is not None
-    expected_labels = list(LAB_LAUNCHD_LABELS)
-    proof_invalid = (
-        proof.get("schema_version") != LAB_HANDOFF_SCHEMA_VERSION
-        or proof.get("operation_id") != operation_id
-        or proof.get("checkout_root") != str(root)
-        or proof.get("stage") != "completed"
-        or proof.get("labels") != expected_labels
-        or proof.get("loaded_labels") != expected_labels
-        or proof.get("restarted_labels") != expected_labels
-        or re.fullmatch(r"[0-9a-f]{32}", str(proof.get("generation_operation_id", ""))) is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(proof.get("environment_generation_id", ""))) is None
-        or re.fullmatch(r"[0-9a-f]{40}", str(proof.get("code_sha", ""))) is None
-    )
-    if proof_invalid:
-        raise DeployBootstrapError("completed Lab handoff proof binding is invalid")
-    _validate_completed_handoff_generation_authority(
+    _validate_handoff_record_shape(
         root=root,
         lock_path=lock_path,
-        proof=proof,
+        payload=proof,
+        operation_id=operation_id,
+        completed=True,
     )
     for record in (active, operation):
+        _validate_handoff_record_shape(
+            root=root,
+            lock_path=lock_path,
+            payload=record,
+            operation_id=operation_id,
+            completed=record.get("stage") == "completed",
+        )
         fields = (
             _HANDOFF_COMPLETION_BINDING_FIELDS
             if record.get("stage") == "completed"
@@ -1227,6 +1370,28 @@ def _validated_completed_handoff_proof(
             raise DeployBootstrapError("completed Lab handoff proof binding changed")
         if record.get("stage") == "completed" and record != proof:
             raise DeployBootstrapError("completed Lab handoff proof binding changed")
+    return proof, operation
+
+
+def _validated_completed_handoff_proof(
+    *,
+    root: Path,
+    lock_path: Path,
+    active: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    validated = _read_strict_completed_handoff_proof(
+        root=root,
+        lock_path=lock_path,
+        active=active,
+    )
+    if validated is None:
+        return None
+    proof, operation = validated
+    _validate_completed_handoff_generation_authority(
+        root=root,
+        lock_path=lock_path,
+        proof=proof,
+    )
     return proof, operation
 
 
@@ -1767,37 +1932,129 @@ class _LabLaunchdHandoff:
             self.root_fd = -1
 
 
+def _finalize_installed_readiness(
+    *,
+    root: Path,
+    lock_path: Path,
+    python_path: Path,
+    git_path: Path,
+    uv_path: Path,
+    handoff: _LabLaunchdHandoff,
+    command_timeout_seconds: float,
+    overall_deadline_monotonic: float,
+) -> None:
+    root_fd = -1
+    handoff_lock_fd = -1
+    generation_lock_fd = -1
+    try:
+        root_fd, handoff_lock_fd = _acquire_handoff_lock(root, lock_path)
+        generation_lock_fd = _acquire_lock(
+            root,
+            lock_path,
+            timeout_seconds=min(
+                LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+                max(0.0, overall_deadline_monotonic - time.monotonic()),
+            ),
+        )
+        active = _private_json(
+            _stable_record_path(lock_path, "lab-handoff"),
+            label="Lab launchd handoff state",
+        )
+        assert active is not None
+        validated = _read_strict_completed_handoff_proof(
+            root=root,
+            lock_path=lock_path,
+            active=active,
+        )
+        if validated is None:
+            raise DeployBootstrapError("completed Lab handoff proof is missing")
+        proof, _operation = validated
+        authority_module = _load_release_authority(
+            root / "src" / "rquant" / "release_generation.py"
+        )
+        authority = authority_module.ReleaseGenerationAuthority(
+            repo=root,
+            lock_path=lock_path,
+            lock_fd=generation_lock_fd,
+            python_path=python_path,
+            git_path=git_path,
+            writable=True,
+            uv_path=uv_path,
+            command_timeout_seconds=command_timeout_seconds,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        intent = authority.read_deployment_intent()
+        if (
+            intent.handoff_operation_id != handoff.operation_id
+            or intent.handoff_labels != tuple(LAB_LAUNCHD_LABELS)
+            or proof["generation_operation_id"] != intent.operation_id
+        ):
+            raise DeployBootstrapError("ready Lab handoff does not match deployment intent")
+        action = str(proof["action"])
+        expected_commit = intent.previous_sha if action == "rollback" else intent.target_sha
+        allowed_refs = (
+            {intent.previous_sha}
+            if action == "rollback"
+            else {intent.target_sha, intent.target_ref}
+        )
+        if (
+            proof["target_ref"] not in allowed_refs
+            or proof["target_sha"] != expected_commit
+            or proof["code_sha"] != expected_commit
+        ):
+            raise DeployBootstrapError("ready Lab handoff target binding changed")
+        _validate_handoff_supersede_chain(
+            root=root,
+            lock_path=lock_path,
+            proof=proof,
+            intent=intent,
+        )
+        if intent.stage == "awaiting_readiness":
+            marker = authority.verify(
+                expected_commit=expected_commit,
+                provisional_handoff_label=LAB_LAUNCHD_LABELS[0],
+            )
+            if proof["environment_generation_id"] != marker.environment_generation_id:
+                raise DeployBootstrapError("ready Lab handoff generation binding changed")
+            intent = authority.update_deployment_intent(
+                operation_id=intent.operation_id,
+                stage="completed",
+            )
+        elif intent.stage != "completed":
+            raise DeployBootstrapError("deployment intent is not awaiting Lab readiness")
+        authority.commit_generation(
+            operation_id=intent.operation_id,
+            transaction_kind="deployment",
+        )
+        _validate_completed_handoff_generation_authority(
+            root=root,
+            lock_path=lock_path,
+            proof=proof,
+        )
+    except DeployBootstrapError:
+        raise
+    except Exception as exc:
+        raise DeployBootstrapError("Lab readiness generation commit failed") from exc
+    finally:
+        if generation_lock_fd >= 0:
+            os.close(generation_lock_fd)
+        if handoff_lock_fd >= 0:
+            os.close(handoff_lock_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 def _complete_installed_rollout(
     *,
     target_handoff: object,
     deploy_code: int,
     recovery_handoff_factory: Callable[[], object],
     rollback: Callable[[object], int],
+    finalize_readiness: Callable[[object], None],
     recovery_target_sha: str,
     now: datetime | None = None,
 ) -> int:
-    if deploy_code != 0:
-        target_handoff.close()
-        previous_handoff = recovery_handoff_factory()
-        try:
-            previous_handoff.prepare(
-                dry_run=False,
-                target_ref=recovery_target_sha,
-                target_sha=recovery_target_sha,
-                action="rollback",
-                now=now,
-            )
-            previous_handoff.restore()
-        except Exception as exc:
-            previous_handoff.close()
-            print(
-                f"FAILED: deployer exited {deploy_code}; previous Lab readiness failed: {exc}",
-                file=sys.stderr,
-            )
-        return deploy_code
-    try:
-        target_handoff.restore()
-    except DeployBootstrapError as readiness_error:
+    def restore_previous() -> None:
         recovery_handoff = recovery_handoff_factory()
         try:
             recovery_handoff.prepare(
@@ -1810,12 +2067,35 @@ def _complete_installed_rollout(
             rollback_code = rollback(recovery_handoff)
             if rollback_code != 0:
                 raise DeployBootstrapError(
-                    "Lab readiness failed and previous generation rollback failed"
+                    "previous generation rollback did not complete successfully"
                 )
             recovery_handoff.restore()
+            finalize_readiness(recovery_handoff)
         except Exception:
             recovery_handoff.close()
             raise
+
+    if deploy_code != 0:
+        target_handoff.close()
+        try:
+            restore_previous()
+        except Exception as exc:
+            print(
+                f"FAILED: deployer exited {deploy_code}; formal rollback failed: {exc}",
+                file=sys.stderr,
+            )
+        return deploy_code
+    try:
+        target_handoff.restore()
+        finalize_readiness(target_handoff)
+    except DeployBootstrapError as readiness_error:
+        try:
+            restore_previous()
+        except Exception as rollback_error:
+            raise DeployBootstrapError(
+                "Lab readiness failed "
+                f"({readiness_error}) and previous generation rollback failed: {rollback_error}"
+            ) from rollback_error
         print(
             f"FAILED: target Lab readiness failed and rolled back: {readiness_error}",
             file=sys.stderr,
@@ -2085,7 +2365,7 @@ def _validate_target_deployment_policy(
     release_profile: str,
     lifecycle_mode: str,
     overall_deadline_monotonic: float,
-) -> object:
+) -> tuple[str, object]:
     previous_sha = _git_head(
         root,
         git_path,
@@ -2114,11 +2394,12 @@ def _validate_target_deployment_policy(
     ).splitlines()
     module = _load_release_authority(root / "src" / "rquant" / "release_generation.py")
     try:
-        return module.validate_deployment_change_policy(
+        plan = module.validate_deployment_change_policy(
             changed,
             release_profile=release_profile,
             lifecycle_mode=lifecycle_mode,
         )
+        return previous_sha, plan
     except module.ReleaseGenerationError as exc:
         raise DeployBootstrapError(f"deployment target policy rejected: {exc}") from exc
 
@@ -2666,7 +2947,7 @@ def main(argv: list[str] | None = None) -> int:
             if installed_handoff and not (
                 args.initialize_generation or args.register_lab_installation
             ):
-                _validate_target_deployment_policy(
+                previous_sha, target_plan = _validate_target_deployment_policy(
                     root=root,
                     git_path=git_path,
                     target_sha=target_sha,
@@ -2674,6 +2955,18 @@ def main(argv: list[str] | None = None) -> int:
                     lifecycle_mode=args.lab_lifecycle_mode,
                     overall_deadline_monotonic=overall_deadline_monotonic,
                 )
+                if previous_sha == target_sha or not target_plan.changed_files:
+                    print(
+                        json.dumps(
+                            {
+                                "previous_sha": previous_sha,
+                                "status": "already_current",
+                                "target_sha": target_sha,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return finish(0)
         if args.finalize_generation:
             if args.inherited_lock_fd is None:
                 raise DeployBootstrapError("finalizer requires inherited generation lock")
@@ -3161,11 +3454,26 @@ def main(argv: list[str] | None = None) -> int:
                         os.close(lock_fd)
                         lock_fd = -1
 
+            def finalize_readiness(active_handoff: object) -> None:
+                if not isinstance(active_handoff, _LabLaunchdHandoff):
+                    raise DeployBootstrapError("Lab readiness finalizer is not bound")
+                _finalize_installed_readiness(
+                    root=root,
+                    lock_path=lock_path,
+                    python_path=python_path,
+                    git_path=git_path,
+                    uv_path=uv_path,
+                    handoff=active_handoff,
+                    command_timeout_seconds=args.command_timeout_seconds,
+                    overall_deadline_monotonic=active_handoff.deadline,
+                )
+
             return _complete_installed_rollout(
                 target_handoff=target_handoff,
                 deploy_code=deploy_code,
                 recovery_handoff_factory=recovery_handoff_factory,
                 rollback=rollback_after_readiness,
+                finalize_readiness=finalize_readiness,
                 recovery_target_sha=rollback_target,
             )
         return finish(deploy_code)

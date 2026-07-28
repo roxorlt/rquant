@@ -710,18 +710,21 @@ def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
     )
     runner = FakeRunner(responses)
     authority = FakeGenerationAuthority()
+    finalizer = FakeGenerationFinalizer()
 
     result = deploy(
         config,
         runner=runner,
         generation_authority=authority,
-        generation_finalizer=FakeGenerationFinalizer(),
+        generation_finalizer=finalizer,
     )
 
     assert result.status == "deployed"
     assert result.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
     assert authority.intent is not None
+    assert authority.intent.stage == "awaiting_readiness"
     assert authority.intent.restart_services == ()
+    assert [call[3] for call in finalizer.calls] == ["publish"]
     assert not any("systemctl" in command for command in runner.calls)
 
 
