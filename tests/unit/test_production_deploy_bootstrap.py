@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
@@ -18,8 +19,15 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from rquant.release_generation import (
+    DeploymentIntent,
+    EnvironmentSelector,
+    PathIdentity,
     ReleaseGenerationAuthority,
+    ReleaseGenerationCommit,
+    ReleaseGenerationMarker,
     commit_path_for_lock,
+    environment_selector_path_for_lock,
+    intent_path_for_lock,
     marker_path_for_lock,
 )
 
@@ -30,6 +38,109 @@ PRODUCTION_DEPLOYER = ROOT / "src" / "rquant" / "ops" / "production_deploy.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 _ORIGINAL_OS_WALK = os.walk
 _READINESS_A = ("a" * 32, "b" * 64, "c" * 40)
+
+
+def _handoff_deployment_intent(
+    module: ModuleType,
+    *,
+    handoff_operation_id: str,
+    operation_id: str,
+    previous_sha: str,
+    target_sha: str,
+    target_ref: str,
+    stage: str,
+) -> DeploymentIntent:
+    intent = DeploymentIntent.create(
+        previous_sha=previous_sha,
+        target_sha=target_sha,
+        target_ref=target_ref,
+        changed_files=("src/rquant/preflight.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="7" * 64,
+        previous_generation_id="8" * 64,
+        handoff_operation_id=handoff_operation_id,
+        handoff_labels=tuple(module.LAB_LAUNCHD_LABELS),
+        operation_id=operation_id,
+    )
+    return intent if stage == "planned" else intent.advance(stage=stage)
+
+
+def _publish_handoff_generation_authority(
+    module: ModuleType,
+    lock_path: Path,
+    *,
+    handoff_operation_id: str,
+    generation: tuple[str, str, str] = _READINESS_A,
+    target_ref: str | None = None,
+    action: str = "deploy",
+) -> DeploymentIntent:
+    generation_operation_id, environment_generation_id, code_sha = generation
+    previous_sha = "9" * 40
+    previous_generation_id = "8" * 64
+    selected_target = code_sha if action != "rollback" else previous_sha
+    intent = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=handoff_operation_id,
+        operation_id=generation_operation_id,
+        previous_sha=previous_sha,
+        target_sha=code_sha,
+        target_ref=target_ref or code_sha,
+        stage="completed",
+    )
+    identity = PathIdentity(device=1, inode=2, mode=0o40700, owner=os.getuid(), links=1)
+    marker = ReleaseGenerationMarker(
+        schema_version=1,
+        operation_id=generation_operation_id,
+        transaction_kind="deployment",
+        commit=selected_target,
+        uv_lock_sha256="1" * 64,
+        pyproject_sha256="2" * 64,
+        package_version="0.99.0",
+        python_version="3.12.0",
+        python_abi="cpython-test",
+        venv_path="/private/tmp/rquant-test-venv",
+        venv_identity=identity,
+        pyvenv_cfg_sha256="3" * 64,
+        python_path="/private/tmp/rquant-test-venv/bin/python",
+        python_identity=identity,
+        site_packages_path="/private/tmp/rquant-test-venv/lib/python3.12/site-packages",
+        site_packages_identity=identity,
+        environment_generation_id=environment_generation_id,
+        previous_generation_id=previous_generation_id,
+        environment_manifest_sha256="4" * 64,
+        published_at="2026-07-28T00:00:00+00:00",
+    )
+    selector = EnvironmentSelector(
+        schema_version=1,
+        operation_id=generation_operation_id,
+        transaction_kind="deployment",
+        commit=selected_target,
+        generation_id=environment_generation_id,
+        previous_generation_id=previous_generation_id,
+        environment_path=marker.venv_path,
+        manifest_name=f"rquant.lock.venv-{environment_generation_id}.manifest.json",
+        manifest_sha256=marker.environment_manifest_sha256,
+        published_at=marker.published_at,
+    )
+    committed = ReleaseGenerationCommit(
+        schema_version=1,
+        operation_id=generation_operation_id,
+        transaction_kind="deployment",
+        commit=selected_target,
+        marker_sha256=marker.content_hash(),
+        transaction_sha256=intent.content_hash(),
+        environment_generation_id=environment_generation_id,
+        previous_generation_id=previous_generation_id,
+        environment_manifest_sha256=marker.environment_manifest_sha256,
+        committed_at="2026-07-28T00:00:01+00:00",
+    )
+    module._atomic_private_json(marker_path_for_lock(lock_path), asdict(marker))
+    module._atomic_private_json(environment_selector_path_for_lock(lock_path), asdict(selector))
+    module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent))
+    module._atomic_private_json(commit_path_for_lock(lock_path), asdict(committed))
+    return intent
 
 
 @pytest.fixture(autouse=True)
@@ -413,6 +524,9 @@ def _command(
 def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
     module = _bootstrap_module()
     root = tmp_path / "rquant"
+    authority = root / "src" / "rquant" / "release_generation.py"
+    authority.parent.mkdir(parents=True)
+    shutil.copy2(AUTHORITY, authority)
     launchd = root / "deploy" / "launchd"
     launchd.mkdir(parents=True)
     for label in module.LAB_LAUNCHD_LABELS:
@@ -1365,16 +1479,17 @@ def test_recovery_supersedes_recorded_deploy_handoff_from_partial_stage(
     installation_identity = module._lab_installation_identity(lock_path, installation)
     module._atomic_private_json(
         lock_path.with_name(f"{lock_path.stem}.intent.json"),
-        {
-            "schema_version": 1,
-            "operation_id": "c" * 32,
-            "previous_sha": "a" * 40,
-            "target_sha": "b" * 40,
-            "target_ref": "v0.99.1",
-            "stage": "services_transitioning",
-            "handoff_operation_id": old_operation,
-            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
-        },
+        asdict(
+            _handoff_deployment_intent(
+                module,
+                handoff_operation_id=old_operation,
+                operation_id="c" * 32,
+                previous_sha="a" * 40,
+                target_sha="b" * 40,
+                target_ref="v0.99.1",
+                stage="services_transitioning",
+            )
+        ),
         absent=True,
     )
     module._atomic_private_json(
@@ -1471,16 +1586,17 @@ def test_recovery_rejects_superseded_deploy_handoff_binding_drift(
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     module._atomic_private_json(
         lock_path.with_name(f"{lock_path.stem}.intent.json"),
-        {
-            "schema_version": 1,
-            "operation_id": "c" * 32,
-            "previous_sha": "a" * 40,
-            "target_sha": "b" * 40,
-            "target_ref": "v0.99.1",
-            "stage": "services_transitioning",
-            "handoff_operation_id": old_operation,
-            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
-        },
+        asdict(
+            _handoff_deployment_intent(
+                module,
+                handoff_operation_id=old_operation,
+                operation_id="c" * 32,
+                previous_sha="a" * 40,
+                target_sha="b" * 40,
+                target_ref="v0.99.1",
+                stage="services_transitioning",
+            )
+        ),
         absent=True,
     )
     payload: dict[str, object] = {
@@ -1561,16 +1677,17 @@ def test_supersede_requires_matching_immutable_intent_before_launchd_mutation(
     if intent_state != "missing":
         module._atomic_private_json(
             lock_path.with_name(f"{lock_path.stem}.intent.json"),
-            {
-                "schema_version": 1,
-                "operation_id": "8" * 32,
-                "previous_sha": "a" * 40,
-                "target_sha": "b" * 40,
-                "target_ref": "v0.99.1",
-                "stage": "services_transitioning",
-                "handoff_operation_id": "9" * 32,
-                "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
-            },
+            asdict(
+                _handoff_deployment_intent(
+                    module,
+                    handoff_operation_id="9" * 32,
+                    operation_id="8" * 32,
+                    previous_sha="a" * 40,
+                    target_sha="b" * 40,
+                    target_ref="v0.99.1",
+                    stage="services_transitioning",
+                )
+            ),
             absent=True,
         )
     launchctl_calls: list[list[str]] = []
@@ -1627,16 +1744,17 @@ def test_superseding_rollback_stops_partial_target_labels_before_previous_restor
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     module._atomic_private_json(
         lock_path.with_name(f"{lock_path.stem}.intent.json"),
-        {
-            "schema_version": 1,
-            "operation_id": "c" * 32,
-            "previous_sha": "a" * 40,
-            "target_sha": "b" * 40,
-            "target_ref": "b" * 40,
-            "stage": "services_transitioning",
-            "handoff_operation_id": target_operation,
-            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
-        },
+        asdict(
+            _handoff_deployment_intent(
+                module,
+                handoff_operation_id=target_operation,
+                operation_id="c" * 32,
+                previous_sha="a" * 40,
+                target_sha="b" * 40,
+                target_ref="b" * 40,
+                stage="services_transitioning",
+            )
+        ),
         absent=True,
     )
     module._atomic_private_json(
@@ -1733,12 +1851,18 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     first.prepare(
         dry_run=False,
-        target_ref="a" * 40,
-        target_sha="a" * 40,
+        target_ref="c" * 40,
+        target_sha="c" * 40,
         action="deploy",
         now=now,
     )
     first_operation = first.operation_id
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=first_operation,
+        generation=_READINESS_A,
+    )
     first.restore()
     first_proof = module._completed_handoff_path(lock_path, first_operation)
     first_payload = json.loads(first_proof.read_text(encoding="utf-8"))
@@ -1756,6 +1880,12 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     )
     assert second.operation_id != first_operation
     assert json.loads(first_proof.read_text(encoding="utf-8")) == first_payload
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=second.operation_id,
+        generation=("d" * 32, "e" * 64, "f" * 40),
+    )
     second.restore()
 
     assert first_payload["generation_operation_id"] == "a" * 32
@@ -1781,10 +1911,15 @@ def test_completed_handoff_crash_boundaries_converge_idempotently(
     handoff.loaded = list(module.LAB_LAUNCHD_LABELS)
     handoff.stopped = list(module.LAB_LAUNCHD_LABELS)
     handoff.restarted = list(module.LAB_LAUNCHD_LABELS)
-    handoff.target_ref = "a" * 40
-    handoff.target_sha = "a" * 40
+    handoff.target_ref = _READINESS_A[2]
+    handoff.target_sha = _READINESS_A[2]
     handoff.action = "deploy"
     handoff._record("restarting")
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=handoff.operation_id,
+    )
     completed_paths = {
         module._completed_handoff_path(lock_path, handoff.operation_id),
         module._operation_handoff_path(lock_path, handoff.operation_id),
@@ -1839,10 +1974,15 @@ def test_completed_handoff_convergence_rejects_forged_proof_without_mutation(
     handoff.loaded = list(module.LAB_LAUNCHD_LABELS)
     handoff.stopped = list(module.LAB_LAUNCHD_LABELS)
     handoff.restarted = list(module.LAB_LAUNCHD_LABELS)
-    handoff.target_ref = "a" * 40
-    handoff.target_sha = "a" * 40
+    handoff.target_ref = _READINESS_A[2]
+    handoff.target_sha = _READINESS_A[2]
     handoff.action = "deploy"
     handoff._record("restarting")
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=handoff.operation_id,
+    )
     stable_before = handoff.record_path.read_bytes()
     operation_path = module._operation_handoff_path(lock_path, handoff.operation_id)
     operation_before = operation_path.read_bytes()
@@ -1867,6 +2007,132 @@ def test_completed_handoff_convergence_rejects_forged_proof_without_mutation(
 
     assert handoff.record_path.read_bytes() == stable_before
     assert operation_path.read_bytes() == operation_before
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    [
+        ("generation_operation_id", "d" * 32),
+        ("environment_generation_id", "e" * 64),
+        ("code_sha", "f" * 40),
+    ],
+)
+def test_completed_handoff_convergence_cross_checks_generation_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    forged: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
+    handoff.operation_id = "2" * 32
+    handoff.loaded = list(module.LAB_LAUNCHD_LABELS)
+    handoff.stopped = list(module.LAB_LAUNCHD_LABELS)
+    handoff.restarted = list(module.LAB_LAUNCHD_LABELS)
+    handoff.target_ref = _READINESS_A[2]
+    handoff.target_sha = _READINESS_A[2]
+    handoff.action = "deploy"
+    handoff._record("restarting")
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=handoff.operation_id,
+    )
+    stable_before = handoff.record_path.read_bytes()
+    operation_path = module._operation_handoff_path(lock_path, handoff.operation_id)
+    operation_before = operation_path.read_bytes()
+    proof = module._private_json(operation_path, label="Lab handoff operation")
+    assert proof is not None
+    proof.update(
+        {
+            "stage": "completed",
+            "generation_operation_id": _READINESS_A[0],
+            "environment_generation_id": _READINESS_A[1],
+            "code_sha": _READINESS_A[2],
+        }
+    )
+    proof[field] = forged
+    module._atomic_private_json(
+        module._completed_handoff_path(lock_path, handoff.operation_id),
+        proof,
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="generation|authority|binding"):
+        module._converge_completed_handoff_state(root=root, lock_path=lock_path)
+
+    assert handoff.record_path.read_bytes() == stable_before
+    assert operation_path.read_bytes() == operation_before
+
+
+@pytest.mark.parametrize(
+    "intent_mutation",
+    [
+        {"changed_files": ["deploy/systemd/rquant-monitor.service"]},
+        {"restart_services": ["rquant-monitor.service"]},
+        {"active_services": ["rquant-monitor.service"]},
+        {"marker_generation": "not-a-generation"},
+        {"stage_history": [{"stage": "completed", "timestamp": "not-a-date"}]},
+    ],
+)
+def test_handoff_supersede_rejects_invalid_typed_intent_before_launchd_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    intent_mutation: dict[str, object],
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    old_operation = "6" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": old_operation,
+            "checkout_root": str(root),
+            "stage": "stopping",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": [module.LAB_LAUNCHD_LABELS[0]],
+            "restarted_labels": [],
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": _READINESS_A[2],
+            "target_sha": _READINESS_A[2],
+            "action": "deploy",
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": module._lab_installation_identity(lock_path, installation),
+            "supersedes_operation_id": "",
+        },
+    )
+    intent = _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=old_operation,
+    )
+    intent_payload = asdict(intent)
+    intent_payload.update(intent_mutation)
+    module._atomic_private_json(intent_path_for_lock(lock_path), intent_payload)
+    launchctl_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: launchctl_calls.append(arguments),
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="intent|policy|classification"):
+        module._superseding_handoff_operation_id(
+            root=root,
+            lock_path=lock_path,
+            recovery_action="resume",
+            release_profile="macos-lab",
+            lifecycle_mode="installed",
+        )
+
+    assert launchctl_calls == []
 
 
 def test_successful_lab_handoff_restore_uses_original_overall_deadline(
@@ -1998,16 +2264,17 @@ def test_recovery_readiness_failure_rolls_back_through_superseded_handoff_chain(
     source_sha = "b" * 40 if source_action == "resume" else "a" * 40
     module._atomic_private_json(
         lock_path.with_name(f"{lock_path.stem}.intent.json"),
-        {
-            "schema_version": 1,
-            "operation_id": "5" * 32,
-            "previous_sha": "a" * 40,
-            "target_sha": "b" * 40,
-            "target_ref": "v0.99.1",
-            "stage": "services_transitioning",
-            "handoff_operation_id": source_operation,
-            "handoff_labels": list(module.LAB_LAUNCHD_LABELS),
-        },
+        asdict(
+            _handoff_deployment_intent(
+                module,
+                handoff_operation_id=source_operation,
+                operation_id="5" * 32,
+                previous_sha="a" * 40,
+                target_sha="b" * 40,
+                target_ref="v0.99.1",
+                stage="services_transitioning",
+            )
+        ),
         absent=True,
     )
     module._atomic_private_json(

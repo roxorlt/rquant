@@ -3119,8 +3119,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         LabDaemonConfigurationError,
         LabDaemonLock,
         ensure_private_directory,
-        prepare_private_sqlite_path,
-        register_lab_runtime_managed_file,
+        prepare_lab_runtime_sqlite_authority,
         require_unique_runtime_paths,
     )
     from rquant.lab_job_protocol import LabCommandSpool
@@ -3173,19 +3172,12 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         "scheduler",
         mutation_guard=runtime_guard.verify,
     ):
-        sqlite_authority = prepare_private_sqlite_path(
-            settings.lab_jobs_path_resolved,
+        sqlite_authority = prepare_lab_runtime_sqlite_authority(
+            settings.lab_runtime_dir_resolved,
             label="lab jobs SQLite",
-            create=True,
+            path=settings.lab_jobs_path_resolved,
             mutation_guard=runtime_guard.verify,
         )
-        if sqlite_authority.created:
-            register_lab_runtime_managed_file(
-                settings.lab_runtime_dir_resolved,
-                label="lab jobs SQLite",
-                path=settings.lab_jobs_path_resolved,
-                mutation_guard=runtime_guard.verify,
-            )
         _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
         artifact_store = None
         try:

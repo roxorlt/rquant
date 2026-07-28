@@ -51,6 +51,11 @@ handoff 完成状态按 `completed proof -> operation record -> stable active re
 或任一 binding 漂移都不会触发收敛。接管旧 operation 前还要求其 id 等于 deployment intent 当前
 `handoff_operation_id`，deployer 只能在验证后 rebind。显式 resume/rollback 的 readiness 若失败，
 自动 rollback 可以继续 supersede 当前 recovery operation，并复核每一跳 action 与 intent binding。
+其中 completed proof 的 `generation_operation_id`、`environment_generation_id` 与 `code_sha` 并非
+仅做格式检查：它们必须分别匹配 typed deployment intent、当前 generation marker/environment
+selector/commit record 的真实权威值。bootstrap 与生产 deployer 共同调用 release authority 中的
+changed-files、service/timer、generation 与 stage-history 校验，因此损坏或越权 intent 会在任何
+`launchctl bootout/bootstrap` 前失败关闭。
 
 同目录的 `rQuant.complete.json` 不是单独完成凭证。daemon 必须同时核对 completed intent、
 `rQuant.commit.json`、`rQuant.environment.json` 和环境 manifest；commit record 精确绑定 marker、
@@ -63,6 +68,12 @@ checkpoint；目录 fsync 后到达的取消会返回失败，但保留已落盘
 不会把未持久化状态报告为成功。marker 可以先于 intent completion
 出现，但 commit record 只能在 intent=`completed` 后发布，因此任何中断代际都不会被 daemon
 接受。回滚以相同协议选择 previous commit 的不可变 generation。
+
+Lab runtime prepared sentinel 绑定长期稳定的 runtime-root device/inode。scheduler 首次创建
+`lab_jobs.sqlite3` 时，从同一个已验证 root dir FD 读取 sentinel、用 `openat(O_NOFOLLOW)` 创建数据库，
+并在仍持有该 FD 与 prepared lock 时登记数据库 inode；worker/finalizer 不具备首次登记权限。root
+ancestor 在验证后发生 rename/replacement 时，创建与登记都会失败关闭，replacement namespace 不会
+收到数据库写入。
 
 发布环境 GC 只在同一 generation 独占锁内运行。它保留当前 selector、marker、commit、active
 intent 的 resume/rollback 目标，以及按私有 manifest 判定的紧邻上一代；只删除超过宽限期、

@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **Lab daemon 第九轮完成证明与数据权威加固**：completed handoff proof 的 deployment operation、
+  immutable environment generation 与 code SHA 现在分别与 typed deployment intent、当前 marker、
+  environment selector 和 commit record 交叉验证，任一字段伪造均阻断收敛。bootstrap 与生产部署器
+  复用同一份纯 `DeploymentIntent` 解析、changed-files 分类以及 service/timer/generation/history
+  一致性策略，恶意或损坏 intent 会在任何 launchd mutation 前失败关闭。scheduler 首次创建
+  `lab_jobs.sqlite3` 时持续持有同一个 trusted runtime-root FD，并在 `openat` 创建前核对 sentinel
+  记录的 device/inode，再原子登记数据库身份；ancestor 替换不会向新命名空间写库。
+
 - **Lab daemon 第八轮恢复与路径权威加固**：完成 handoff 采用可恢复的
   `proof -> operation -> stable` 提交协议，崩溃后只在三份记录 binding 完全一致时幂等收敛，
   伪造 proof 失败关闭。resume/rollback 接管前精确绑定 deployment intent 的 handoff operation、

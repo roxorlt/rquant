@@ -649,6 +649,11 @@ def register_lab_runtime_managed_file(
             root,
             root_authority=authority,
         )
+        if authority.identity != (
+            payload.get("runtime_device"),
+            payload.get("runtime_inode"),
+        ):
+            raise LabDaemonConfigurationError("lab runtime prepared root identity changed")
         files = payload.get("managed_files")
         recorded = files.get(label) if isinstance(files, dict) else None
         if recorded != {"path": str(candidate), "exists": False}:
@@ -706,6 +711,97 @@ def register_lab_runtime_managed_file(
     finally:
         if database_descriptor >= 0:
             os.close(database_descriptor)
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        authority.close()
+
+
+def prepare_lab_runtime_sqlite_authority(
+    runtime_root: Path,
+    *,
+    label: str,
+    path: Path,
+    mutation_guard: Callable[[], object],
+    owner: str = "scheduler",
+) -> LabSqliteAuthority:
+    """Open or first-create/register SQLite under one retained runtime-root authority."""
+    if owner != "scheduler":
+        raise LabDaemonConfigurationError("only the scheduler owner may prepare Lab SQLite")
+    root = _canonical_absolute_path(runtime_root, label="lab runtime root")
+    candidate = _canonical_absolute_path(path, label=label)
+    if candidate.parent != root:
+        raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
+    authority = _TrustedRuntimeRoot.open(root)
+    lock_descriptor = -1
+    sqlite_authority: LabSqliteAuthority | None = None
+    try:
+        authority.assert_current()
+        lock_descriptor = _open_runtime_prepared_lock(
+            root,
+            create=False,
+            root_authority=authority,
+        )
+        payload, sentinel_identity, root_identity = _read_runtime_prepared_sentinel_record(
+            root,
+            root_authority=authority,
+        )
+        if authority.identity != (
+            payload.get("runtime_device"),
+            payload.get("runtime_inode"),
+        ):
+            raise LabDaemonConfigurationError("lab runtime prepared root identity changed")
+        files = payload.get("managed_files")
+        recorded = files.get(label) if isinstance(files, dict) else None
+        if not isinstance(recorded, dict) or recorded.get("path") != str(candidate):
+            raise LabDaemonConfigurationError(f"{label} prepared sentinel registration is invalid")
+        needs_registration = recorded == {"path": str(candidate), "exists": False}
+        if not needs_registration and recorded.get("exists") is not True:
+            raise LabDaemonConfigurationError(f"{label} prepared sentinel registration is invalid")
+        _reject_sqlite_sidecars_at(authority.root_fd, candidate.name, label=label)
+
+        def guarded_mutation() -> object:
+            authority.assert_current()
+            result = mutation_guard()
+            authority.assert_current()
+            return result
+
+        guarded_mutation()
+        parent_descriptor = os.dup(authority.root_fd)
+        sqlite_authority = _prepare_private_sqlite_from_parent(
+            candidate,
+            label=label,
+            create=needs_registration,
+            mutation_guard=guarded_mutation if needs_registration else None,
+            parent_descriptor=parent_descriptor,
+            parent_identity=os.fstat(parent_descriptor),
+        )
+        authority.assert_current()
+        observed = os.fstat(sqlite_authority._database_descriptor)
+        if needs_registration:
+            updated_files = dict(files)
+            updated_files[label] = {
+                **_runtime_identity_payload(candidate, observed),
+                "exists": True,
+            }
+            _write_runtime_prepared_sentinel(
+                root,
+                {**payload, "managed_files": updated_files},
+                mutation_guard=guarded_mutation,
+                lock_descriptor=lock_descriptor,
+                expected_identity=sentinel_identity,
+                expected_root_identity=root_identity,
+                root_authority=authority,
+            )
+        elif recorded != {
+            **_runtime_identity_payload(candidate, observed),
+            "exists": True,
+        }:
+            raise LabDaemonConfigurationError(f"{label} prepared identity changed")
+        result, sqlite_authority = sqlite_authority, None
+        return result
+    finally:
+        if sqlite_authority is not None:
+            sqlite_authority.close()
         if lock_descriptor >= 0:
             os.close(lock_descriptor)
         authority.close()
@@ -1416,47 +1512,15 @@ class LabSqliteAuthority:
         self.close()
 
 
-def prepare_private_sqlite_path(
-    path: Path,
+def _prepare_private_sqlite_from_parent(
+    candidate: Path,
     *,
     label: str,
     create: bool,
-    mutation_guard: Callable[[], object] | None = None,
+    mutation_guard: Callable[[], object] | None,
+    parent_descriptor: int,
+    parent_identity: os.stat_result,
 ) -> LabSqliteAuthority:
-    """Create or verify the daemon SQLite authority without following links."""
-    candidate = _canonical_absolute_path(path, label=label)
-    parent = candidate.parent
-    try:
-        if parent.resolve(strict=True) != parent:
-            raise LabDaemonConfigurationError(f"{label} parent must be canonical")
-        parent_stat = parent.lstat()
-    except FileNotFoundError as exc:
-        raise LabDaemonConfigurationError(f"{label} parent directory does not exist") from exc
-    if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
-        raise LabDaemonConfigurationError(f"{label} parent must be a real directory")
-    if parent_stat.st_uid != os.getuid() or parent_stat.st_mode & 0o077:
-        raise LabDaemonConfigurationError(
-            f"{label} parent must be owned by this user with private mode 0700"
-        )
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        parent_descriptor = os.open(parent, directory_flags)
-    except OSError as exc:
-        raise LabDaemonConfigurationError(f"{label} parent could not be opened safely") from exc
-    try:
-        opened_parent = os.fstat(parent_descriptor)
-        active_parent = parent.lstat()
-        _validate_private_directory_identity(opened_parent, label=f"{label} parent")
-        _validate_private_directory_identity(active_parent, label=f"{label} parent")
-        expected_identity = (parent_stat.st_dev, parent_stat.st_ino)
-        if (opened_parent.st_dev, opened_parent.st_ino) != expected_identity or (
-            active_parent.st_dev,
-            active_parent.st_ino,
-        ) != expected_identity:
-            raise LabDaemonConfigurationError(f"{label} parent identity changed")
-    except BaseException:
-        os.close(parent_descriptor)
-        raise
     descriptor = -1
     created = False
     try:
@@ -1499,7 +1563,7 @@ def prepare_private_sqlite_path(
             label=label,
             parent_descriptor=parent_descriptor,
             database_descriptor=descriptor,
-            parent_identity=opened_parent,
+            parent_identity=parent_identity,
             database_identity=current,
             created=created,
         )
@@ -1513,6 +1577,57 @@ def prepare_private_sqlite_path(
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
         raise
+
+
+def prepare_private_sqlite_path(
+    path: Path,
+    *,
+    label: str,
+    create: bool,
+    mutation_guard: Callable[[], object] | None = None,
+) -> LabSqliteAuthority:
+    """Create or verify the daemon SQLite authority without following links."""
+    candidate = _canonical_absolute_path(path, label=label)
+    parent = candidate.parent
+    try:
+        if parent.resolve(strict=True) != parent:
+            raise LabDaemonConfigurationError(f"{label} parent must be canonical")
+        parent_stat = parent.lstat()
+    except FileNotFoundError as exc:
+        raise LabDaemonConfigurationError(f"{label} parent directory does not exist") from exc
+    if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
+        raise LabDaemonConfigurationError(f"{label} parent must be a real directory")
+    if parent_stat.st_uid != os.getuid() or parent_stat.st_mode & 0o077:
+        raise LabDaemonConfigurationError(
+            f"{label} parent must be owned by this user with private mode 0700"
+        )
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_descriptor = os.open(parent, directory_flags)
+    except OSError as exc:
+        raise LabDaemonConfigurationError(f"{label} parent could not be opened safely") from exc
+    try:
+        opened_parent = os.fstat(parent_descriptor)
+        active_parent = parent.lstat()
+        _validate_private_directory_identity(opened_parent, label=f"{label} parent")
+        _validate_private_directory_identity(active_parent, label=f"{label} parent")
+        expected_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        if (opened_parent.st_dev, opened_parent.st_ino) != expected_identity or (
+            active_parent.st_dev,
+            active_parent.st_ino,
+        ) != expected_identity:
+            raise LabDaemonConfigurationError(f"{label} parent identity changed")
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+    return _prepare_private_sqlite_from_parent(
+        candidate,
+        label=label,
+        create=create,
+        mutation_guard=mutation_guard,
+        parent_descriptor=parent_descriptor,
+        parent_identity=opened_parent,
+    )
 
 
 def _decode_secret(value: object, *, label: str) -> bytes:

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import fnmatch
 import json
 import math
 import os
@@ -30,100 +29,30 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from rquant.release_generation import (
+    ALL_LONG_RUNNING_SERVICES as _ALL_LONG_RUNNING_SERVICES,
+)
+from rquant.release_generation import (
+    LAB_LAUNCHD_HANDOFF_LABELS,
+    LINUX_RELEASE_PROFILE,
+    MACOS_LAB_RELEASE_PROFILE,
+    RELEASE_PROFILES,
+    DeploymentChangePlan,
     DeploymentIntent,
     ReleaseGenerationAuthority,
     ReleaseGenerationError,
+    validate_deployment_intent_policy,
+)
+from rquant.release_generation import (
+    build_deployment_change_plan as build_change_plan,
+)
+from rquant.release_generation import (
+    deployment_timers_for_services as _timers_for_services,
 )
 
+ALL_LONG_RUNNING_SERVICES = _ALL_LONG_RUNNING_SERVICES
+ChangePlan = DeploymentChangePlan
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
-
-ALL_LONG_RUNNING_SERVICES = (
-    "rquant-canvas.service",
-    "rquant-dashboard.service",
-    "rquant-monitor.service",
-    "rquant-nl-screen.service",
-    "rquant-panorama-auth.service",
-    "rquant-panorama.service",
-    "rquant-surge-watch.service",
-)
-LAB_LAUNCHD_HANDOFF_LABELS = (
-    "com.roxor.rquant-lab-scheduler",
-    "com.roxor.rquant-lab-worker",
-    "com.roxor.rquant-lab-finalizer",
-)
-LINUX_RELEASE_PROFILE = "linux-production"
-MACOS_LAB_RELEASE_PROFILE = "macos-lab"
-RELEASE_PROFILES = (LINUX_RELEASE_PROFILE, MACOS_LAB_RELEASE_PROFILE)
-
-SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
-    "rquant-monitor.service": (
-        "rquant-monitor.timer",
-        "rquant-monitor-watchdog.timer",
-    ),
-    "rquant-surge-watch.service": ("rquant-surge-watch.timer",),
-}
-
-PRIVILEGED_PREFIXES = (
-    "deploy/launchd/",
-    "deploy/systemd/",
-    "deploy/nginx/",
-    "deploy/frp/",
-    "deploy/sudoers/",
-)
-
-NO_RESTART_SOURCE_PATTERNS = (
-    "src/rquant/__init__.py",
-    "src/rquant/cli.py",
-    "src/rquant/preflight.py",
-    "src/rquant/ops/*",
-)
-
-SHARED_RUNTIME_PATTERNS = (
-    "src/rquant/config.py",
-    "src/rquant/storage/*",
-)
-
-SERVICE_PATTERNS: dict[str, tuple[str, ...]] = {
-    "rquant-canvas.service": (
-        "src/rquant/dashboard/nl_canvas.py",
-        "src/rquant/llm/*",
-        "src/rquant/screen/*",
-        "src/rquant/presets.py",
-    ),
-    "rquant-dashboard.service": (
-        "src/rquant/dashboard/app.py",
-        "src/rquant/health.py",
-        "src/rquant/risk/*",
-        "src/rquant/state.py",
-    ),
-    "rquant-monitor.service": (
-        "src/rquant/monitor.py",
-        "src/rquant/notify/*",
-        "src/rquant/risk/*",
-        "src/rquant/state.py",
-        "src/rquant/presets.py",
-        "src/rquant/screen/*",
-        "src/rquant/indicator.py",
-    ),
-    "rquant-nl-screen.service": (
-        "src/rquant/dashboard/nl_screen.py",
-        "src/rquant/llm/*",
-        "src/rquant/screen/*",
-        "src/rquant/presets.py",
-        "src/rquant/state.py",
-    ),
-    "rquant-panorama-auth.service": ("src/rquant/panorama_auth.py",),
-    "rquant-panorama.service": (
-        "src/rquant/dashboard/market_panorama.py",
-        "src/rquant/panorama_*",
-    ),
-    "rquant-surge-watch.service": (
-        "src/rquant/surge_watch.py",
-        "src/rquant/intraday_*",
-        "src/rquant/notify/*",
-    ),
-}
 
 
 class PolicyError(RuntimeError):
@@ -397,14 +326,6 @@ class IsolatedGenerationFinalizer:
 
 
 @dataclass(frozen=True)
-class ChangePlan:
-    changed_files: tuple[str, ...]
-    blocked_files: tuple[str, ...]
-    restart_services: tuple[str, ...]
-    handoff_daemons: tuple[str, ...] = LAB_LAUNCHD_HANDOFF_LABELS
-
-
-@dataclass(frozen=True)
 class DeployConfig:
     repo: Path
     target: str
@@ -454,10 +375,6 @@ def is_protected_market_window(now: datetime) -> bool:
     return time(9, 15) <= local.time().replace(tzinfo=None) <= time(15, 10)
 
 
-def _matches(path: str, patterns: tuple[str, ...]) -> bool:
-    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
-
-
 def validate_release_profile(release_profile: str, platform_name: str) -> str:
     expected_platform = {
         LINUX_RELEASE_PROFILE: "linux",
@@ -468,45 +385,6 @@ def validate_release_profile(release_profile: str, platform_name: str) -> str:
             f"release profile {release_profile!r} is invalid for platform {platform_name!r}"
         )
     return release_profile
-
-
-def build_change_plan(
-    changed_files: list[str] | tuple[str, ...],
-    *,
-    release_profile: str = LINUX_RELEASE_PROFILE,
-) -> ChangePlan:
-    files = tuple(sorted({path.strip() for path in changed_files if path.strip()}))
-    blocked = tuple(
-        path for path in files if any(path.startswith(prefix) for prefix in PRIVILEGED_PREFIXES)
-    )
-    if release_profile == MACOS_LAB_RELEASE_PROFILE:
-        # Runtime guards bind to the exact checkout SHA, so every local checkout
-        # transition requires an orderly handoff even for non-Python changes.
-        handoff = LAB_LAUNCHD_HANDOFF_LABELS if files else ()
-        return ChangePlan(files, blocked, (), handoff)
-    if release_profile != LINUX_RELEASE_PROFILE:
-        raise PolicyError(f"unknown release profile: {release_profile!r}")
-
-    services: set[str] = set()
-
-    for path in files:
-        if path in {"pyproject.toml", "uv.lock"} or _matches(path, SHARED_RUNTIME_PATTERNS):
-            services.update(ALL_LONG_RUNNING_SERVICES)
-            continue
-        if _matches(path, NO_RESTART_SOURCE_PATTERNS):
-            continue
-        matched = False
-        for service, patterns in SERVICE_PATTERNS.items():
-            if _matches(path, patterns):
-                services.add(service)
-                matched = True
-        if path.startswith("src/rquant/") and not matched:
-            services.update(ALL_LONG_RUNNING_SERVICES)
-
-    ordered_services = tuple(
-        service for service in ALL_LONG_RUNNING_SERVICES if service in services
-    )
-    return ChangePlan(files, blocked, ordered_services, ())
 
 
 def _stdout(runner: Runner, args: list[str]) -> str:
@@ -634,11 +512,6 @@ def _active_units(
             )
         active.append(unit)
     return tuple(active)
-
-
-def _timers_for_services(services: tuple[str, ...]) -> tuple[str, ...]:
-    selected = {timer for service in services for timer in SERVICE_TIMERS.get(service, ())}
-    return tuple(sorted(selected))
 
 
 def _stop_timers(runner: Runner, timers: tuple[str, ...]) -> None:
@@ -797,20 +670,19 @@ def _recover_locked(
         allowed_refs.add(intent.target_ref)
     if config.target not in allowed_refs:
         raise PolicyError("recovery target does not match the recorded deployment intent")
-    plan = build_change_plan(intent.changed_files, release_profile=config.release_profile)
-    if plan.blocked_files or plan.restart_services != intent.restart_services:
-        raise PolicyError("recorded deployment intent no longer matches change classification")
+    try:
+        plan = validate_deployment_intent_policy(
+            intent,
+            release_profile=config.release_profile,
+            lifecycle_mode=config.lab_lifecycle_mode,
+        )
+    except ReleaseGenerationError as exc:
+        raise PolicyError("recorded deployment intent no longer matches deployment policy") from exc
     requires_handoff = config.lab_lifecycle_mode == "installed" and bool(plan.handoff_daemons)
     if (intent.restart_services or requires_handoff) and is_protected_market_window(config.now):
         raise ProtectedWindowError(
             "deployment recovery requires service restarts during the protected 09:15-15:10 window"
         )
-    if not set(intent.active_services).issubset(intent.restart_services):
-        raise PolicyError("recorded active service plan is invalid")
-    if not set(intent.restarted_services).issubset(intent.active_services):
-        raise PolicyError("recorded restarted service state is invalid")
-    if not set(intent.active_timers).issubset(_timers_for_services(intent.restart_services)):
-        raise PolicyError("recorded active timer plan is invalid")
     if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
         intent = authority.rebind_deployment_handoff(
             operation_id=intent.operation_id,

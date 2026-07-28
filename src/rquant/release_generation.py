@@ -7,6 +7,7 @@ load it by physical file path before importing the :mod:`rquant` package.
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import hashlib
 import json
 import math
@@ -38,6 +39,93 @@ DEFAULT_GENERATION_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
 GENERATION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 BUILDING_GENERATION_PATTERN = re.compile(r"\.([0-9a-f]{64})\.[0-9a-f]{16}\.building")
 _VENV_RELATIVE_SYMLINKS = frozenset({"bin/python3", "lib64"})
+ALL_LONG_RUNNING_SERVICES = (
+    "rquant-canvas.service",
+    "rquant-dashboard.service",
+    "rquant-monitor.service",
+    "rquant-nl-screen.service",
+    "rquant-panorama-auth.service",
+    "rquant-panorama.service",
+    "rquant-surge-watch.service",
+)
+LAB_LAUNCHD_HANDOFF_LABELS = (
+    "com.roxor.rquant-lab-scheduler",
+    "com.roxor.rquant-lab-worker",
+    "com.roxor.rquant-lab-finalizer",
+)
+LINUX_RELEASE_PROFILE = "linux-production"
+MACOS_LAB_RELEASE_PROFILE = "macos-lab"
+RELEASE_PROFILES = (LINUX_RELEASE_PROFILE, MACOS_LAB_RELEASE_PROFILE)
+SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
+    "rquant-monitor.service": (
+        "rquant-monitor.timer",
+        "rquant-monitor-watchdog.timer",
+    ),
+    "rquant-surge-watch.service": ("rquant-surge-watch.timer",),
+}
+PRIVILEGED_PREFIXES = (
+    "deploy/launchd/",
+    "deploy/systemd/",
+    "deploy/nginx/",
+    "deploy/frp/",
+    "deploy/sudoers/",
+)
+NO_RESTART_SOURCE_PATTERNS = (
+    "src/rquant/__init__.py",
+    "src/rquant/cli.py",
+    "src/rquant/preflight.py",
+    "src/rquant/ops/*",
+)
+SHARED_RUNTIME_PATTERNS = (
+    "src/rquant/config.py",
+    "src/rquant/storage/*",
+)
+SERVICE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "rquant-canvas.service": (
+        "src/rquant/dashboard/nl_canvas.py",
+        "src/rquant/llm/*",
+        "src/rquant/screen/*",
+        "src/rquant/presets.py",
+    ),
+    "rquant-dashboard.service": (
+        "src/rquant/dashboard/app.py",
+        "src/rquant/health.py",
+        "src/rquant/risk/*",
+        "src/rquant/state.py",
+    ),
+    "rquant-monitor.service": (
+        "src/rquant/monitor.py",
+        "src/rquant/notify/*",
+        "src/rquant/risk/*",
+        "src/rquant/state.py",
+        "src/rquant/presets.py",
+        "src/rquant/screen/*",
+        "src/rquant/indicator.py",
+    ),
+    "rquant-nl-screen.service": (
+        "src/rquant/dashboard/nl_screen.py",
+        "src/rquant/llm/*",
+        "src/rquant/screen/*",
+        "src/rquant/presets.py",
+        "src/rquant/state.py",
+    ),
+    "rquant-panorama-auth.service": ("src/rquant/panorama_auth.py",),
+    "rquant-panorama.service": (
+        "src/rquant/dashboard/market_panorama.py",
+        "src/rquant/panorama_*",
+    ),
+    "rquant-surge-watch.service": (
+        "src/rquant/surge_watch.py",
+        "src/rquant/intraday_*",
+        "src/rquant/notify/*",
+    ),
+}
+_DEPLOYMENT_STAGE_PATTERN = re.compile(
+    r"(?:planned|initializing|recovery_started|timers_stopped|services_transitioning|"
+    r"services_ready|post_restart_preflight_ready|timers_restored|marker_published|completed|"
+    r"handoff_rebound|(?:deploy|resume|rollback)_(?:checkout|dependencies|preflight)_ready)"
+)
+_TARGET_REF_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 
 
 class ReleaseGenerationError(RuntimeError):
@@ -70,6 +158,60 @@ class GenerationGcMetrics:
     free_bytes_after: int
     required_free_bytes: int
     retained_generation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DeploymentChangePlan:
+    changed_files: tuple[str, ...]
+    blocked_files: tuple[str, ...]
+    restart_services: tuple[str, ...]
+    handoff_daemons: tuple[str, ...] = LAB_LAUNCHD_HANDOFF_LABELS
+
+
+def _matches_deployment_path(path: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
+def build_deployment_change_plan(
+    changed_files: list[str] | tuple[str, ...],
+    *,
+    release_profile: str = LINUX_RELEASE_PROFILE,
+) -> DeploymentChangePlan:
+    files = tuple(sorted({path.strip() for path in changed_files if path.strip()}))
+    blocked = tuple(
+        path for path in files if any(path.startswith(prefix) for prefix in PRIVILEGED_PREFIXES)
+    )
+    if release_profile == MACOS_LAB_RELEASE_PROFILE:
+        handoff = LAB_LAUNCHD_HANDOFF_LABELS if files else ()
+        return DeploymentChangePlan(files, blocked, (), handoff)
+    if release_profile != LINUX_RELEASE_PROFILE:
+        raise ReleaseGenerationError(f"unknown release profile: {release_profile!r}")
+    services: set[str] = set()
+    for path in files:
+        if path in {"pyproject.toml", "uv.lock"} or _matches_deployment_path(
+            path,
+            SHARED_RUNTIME_PATTERNS,
+        ):
+            services.update(ALL_LONG_RUNNING_SERVICES)
+            continue
+        if _matches_deployment_path(path, NO_RESTART_SOURCE_PATTERNS):
+            continue
+        matched = False
+        for service, patterns in SERVICE_PATTERNS.items():
+            if _matches_deployment_path(path, patterns):
+                services.add(service)
+                matched = True
+        if path.startswith("src/rquant/") and not matched:
+            services.update(ALL_LONG_RUNNING_SERVICES)
+    ordered_services = tuple(
+        service for service in ALL_LONG_RUNNING_SERVICES if service in services
+    )
+    return DeploymentChangePlan(files, blocked, ordered_services, ())
+
+
+def deployment_timers_for_services(services: tuple[str, ...]) -> tuple[str, ...]:
+    selected = {timer for service in services for timer in SERVICE_TIMERS.get(service, ())}
+    return tuple(sorted(selected))
 
 
 @dataclass(frozen=True)
@@ -203,6 +345,14 @@ class DeploymentIntent:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> DeploymentIntent:
+        raw_history = payload.get("stage_history")
+        if not isinstance(raw_history, (list, tuple)) or not raw_history:
+            raise ReleaseGenerationError("deployment intent stage history is malformed")
+        if any(
+            not isinstance(value, dict) or set(value) != {"stage", "timestamp"}
+            for value in raw_history
+        ):
+            raise ReleaseGenerationError("deployment intent stage history is malformed")
         try:
             intent = cls(
                 schema_version=int(payload["schema_version"]),
@@ -227,17 +377,33 @@ class DeploymentIntent:
                         "stage": str(value["stage"]),
                         "timestamp": str(value["timestamp"]),
                     }
-                    for value in payload["stage_history"]
+                    for value in raw_history
                 ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ReleaseGenerationError("deployment intent is malformed") from exc
-        if intent.schema_version != INTENT_SCHEMA_VERSION or len(intent.operation_id) != 32:
+        if (
+            intent.schema_version != INTENT_SCHEMA_VERSION
+            or re.fullmatch(r"[0-9a-f]{32}", intent.operation_id) is None
+        ):
             raise ReleaseGenerationError("deployment intent schema or operation id is invalid")
         for label, value in (("previous", intent.previous_sha), ("target", intent.target_sha)):
             if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
                 raise ReleaseGenerationError(f"deployment intent {label} SHA is invalid")
-        if intent.previous_generation_id and len(intent.previous_generation_id) != 64:
+        if _TARGET_REF_PATTERN.fullmatch(intent.target_ref) is None:
+            raise ReleaseGenerationError("deployment intent target ref is invalid")
+        initialization = intent.stage_history[0]["stage"] == "initializing"
+        if (
+            intent.marker_generation
+            and re.fullmatch(r"[0-9a-f]{64}", intent.marker_generation) is None
+        ):
+            raise ReleaseGenerationError("deployment intent marker generation is invalid")
+        if not initialization and not intent.marker_generation:
+            raise ReleaseGenerationError("deployment intent marker generation is invalid")
+        if (
+            intent.previous_generation_id
+            and re.fullmatch(r"[0-9a-f]{64}", intent.previous_generation_id) is None
+        ):
             raise ReleaseGenerationError("deployment intent previous generation is invalid")
         if intent.handoff_operation_id and not re.fullmatch(
             r"[0-9a-f]{32}", intent.handoff_operation_id
@@ -245,6 +411,35 @@ class DeploymentIntent:
             raise ReleaseGenerationError("deployment handoff operation is invalid")
         if bool(intent.handoff_operation_id) != bool(intent.handoff_labels):
             raise ReleaseGenerationError("deployment handoff binding is incomplete")
+        try:
+            created_at = datetime.fromisoformat(intent.created_at)
+            updated_at = datetime.fromisoformat(intent.updated_at)
+            history_times = [
+                datetime.fromisoformat(value["timestamp"]) for value in intent.stage_history
+            ]
+        except ValueError as exc:
+            raise ReleaseGenerationError("deployment intent stage history is malformed") from exc
+        if (
+            created_at.tzinfo is None
+            or created_at.utcoffset() is None
+            or updated_at.tzinfo is None
+            or updated_at.utcoffset() is None
+            or any(value.tzinfo is None or value.utcoffset() is None for value in history_times)
+            or history_times != sorted(history_times)
+            or intent.stage_history[0]["stage"] not in {"planned", "initializing"}
+            or intent.stage_history[0]["timestamp"] != intent.created_at
+            or intent.stage_history[-1]["timestamp"] != intent.updated_at
+            or any(
+                _DEPLOYMENT_STAGE_PATTERN.fullmatch(value["stage"]) is None
+                for value in intent.stage_history
+            )
+        ):
+            raise ReleaseGenerationError("deployment intent stage history is invalid")
+        effective_stages = [
+            value["stage"] for value in intent.stage_history if value["stage"] != "handoff_rebound"
+        ]
+        if not effective_stages or effective_stages[-1] != intent.stage:
+            raise ReleaseGenerationError("deployment intent stage history is inconsistent")
         return intent
 
     def advance(
@@ -378,6 +573,120 @@ class ReleaseGenerationCommit:
         ):
             raise ReleaseGenerationError("release generation commit record is invalid")
         return record
+
+
+def validate_deployment_intent_policy(
+    intent: DeploymentIntent,
+    *,
+    release_profile: str,
+    lifecycle_mode: str,
+    expected_handoff_operation_id: str | None = None,
+) -> DeploymentChangePlan:
+    if lifecycle_mode not in {"installed", "uninstalled"}:
+        raise ReleaseGenerationError("deployment lifecycle mode is invalid")
+    plan = build_deployment_change_plan(
+        intent.changed_files,
+        release_profile=release_profile,
+    )
+    if plan.blocked_files:
+        raise ReleaseGenerationError("deployment intent contains privileged changed files")
+    if (
+        intent.changed_files != plan.changed_files
+        or intent.restart_services != plan.restart_services
+    ):
+        raise ReleaseGenerationError("deployment intent change classification is inconsistent")
+    for values in (
+        intent.restart_services,
+        intent.active_services,
+        intent.active_timers,
+        intent.restarted_services,
+    ):
+        if len(values) != len(set(values)):
+            raise ReleaseGenerationError("deployment intent service state contains duplicates")
+    if not set(intent.active_services).issubset(intent.restart_services):
+        raise ReleaseGenerationError("deployment intent active service state is invalid")
+    if not set(intent.restarted_services).issubset(intent.active_services):
+        raise ReleaseGenerationError("deployment intent restarted service state is invalid")
+    if not set(intent.active_timers).issubset(
+        deployment_timers_for_services(intent.restart_services)
+    ):
+        raise ReleaseGenerationError("deployment intent active timer state is invalid")
+    expected_labels = (
+        plan.handoff_daemons
+        if lifecycle_mode == "installed" and release_profile == MACOS_LAB_RELEASE_PROFILE
+        else ()
+    )
+    if intent.handoff_labels != expected_labels or bool(intent.handoff_operation_id) != bool(
+        expected_labels
+    ):
+        raise ReleaseGenerationError("deployment intent handoff policy is inconsistent")
+    if (
+        expected_handoff_operation_id is not None
+        and intent.handoff_operation_id != expected_handoff_operation_id
+    ):
+        raise ReleaseGenerationError("deployment intent handoff operation changed")
+    return plan
+
+
+def validate_completed_deployment_authority(
+    *,
+    intent: DeploymentIntent,
+    marker: ReleaseGenerationMarker,
+    selector: EnvironmentSelector,
+    committed: ReleaseGenerationCommit,
+    handoff_operation_id: str,
+    handoff_labels: tuple[str, ...],
+    generation_operation_id: str,
+    environment_generation_id: str,
+    code_sha: str,
+    action: str,
+    target_ref: str,
+    target_sha: str,
+    release_profile: str,
+    lifecycle_mode: str,
+) -> None:
+    validate_deployment_intent_policy(
+        intent,
+        release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
+        expected_handoff_operation_id=handoff_operation_id,
+    )
+    expected_code_sha = intent.previous_sha if action == "rollback" else intent.target_sha
+    allowed_target_refs = (
+        {intent.previous_sha} if action == "rollback" else {intent.target_sha, intent.target_ref}
+    )
+    if (
+        action not in {"deploy", "resume", "rollback"}
+        or intent.stage != "completed"
+        or intent.handoff_labels != handoff_labels
+        or target_ref not in allowed_target_refs
+        or target_sha != expected_code_sha
+        or code_sha != expected_code_sha
+        or generation_operation_id != intent.operation_id
+        or environment_generation_id != marker.environment_generation_id
+    ):
+        raise ReleaseGenerationError("completed deployment handoff binding is stale")
+    if (
+        marker.transaction_kind != "deployment"
+        or selector.transaction_kind != "deployment"
+        or committed.transaction_kind != "deployment"
+        or marker.operation_id != intent.operation_id
+        or selector.operation_id != intent.operation_id
+        or committed.operation_id != intent.operation_id
+        or marker.commit != code_sha
+        or selector.commit != code_sha
+        or committed.commit != code_sha
+        or selector.generation_id != environment_generation_id
+        or committed.environment_generation_id != environment_generation_id
+        or marker.previous_generation_id != intent.previous_generation_id
+        or selector.previous_generation_id != intent.previous_generation_id
+        or committed.previous_generation_id != intent.previous_generation_id
+        or marker.environment_manifest_sha256 != selector.manifest_sha256
+        or committed.environment_manifest_sha256 != selector.manifest_sha256
+        or committed.marker_sha256 != marker.content_hash()
+        or committed.transaction_sha256 != intent.content_hash()
+    ):
+        raise ReleaseGenerationError("completed deployment generation authority is inconsistent")
 
 
 def marker_path_for_lock(lock_path: Path) -> Path:

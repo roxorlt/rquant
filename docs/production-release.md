@@ -55,6 +55,10 @@
    崩溃只写入一部分，下次发布会在锁内验证全 binding 后幂等补齐；不一致 proof 一律阻断。显式
    resume/rollback 自身的 readiness 失败时，rollback 会沿已验证的 supersede 链停止 target daemon、
    恢复 previous generation 并重新验收旧 daemon。
+   completed proof 还必须把 generation operation、environment generation 与 code SHA 逐项交叉绑定
+   到 typed deployment intent、当前 marker、environment selector 和 commit record。bootstrap 与
+   deployer 使用 release authority 中同一份 changed-files、service/timer、generation 与 stage-history
+   policy；任何损坏、越权或自相矛盾的 intent 都会在首个 launchd mutation 之前失败关闭。
 6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回 intent 记录的
    previous commit、恢复锁定依赖并按同一服务/timer 合同切回。只有旧 checkout、旧依赖、
    精确服务集合、第二次 preflight 与 timer 原状态全部恢复后，才由 previous checkout 的隔离

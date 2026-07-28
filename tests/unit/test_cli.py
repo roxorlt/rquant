@@ -3736,8 +3736,8 @@ class TestLabSchedulerCli:
         )
         monkeypatch.setattr(
             lab_daemon,
-            "prepare_private_sqlite_path",
-            lambda path, *, label, create, mutation_guard: _FakeLabSqliteAuthority(path),
+            "prepare_lab_runtime_sqlite_authority",
+            lambda _root, *, label, path, mutation_guard: _FakeLabSqliteAuthority(path),
         )
         monkeypatch.setattr(
             lab_daemon.LabAuthorityKeyring,
@@ -3904,16 +3904,11 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(lab_scheduler, "LabScheduler", FakeScheduler)
         monkeypatch.setattr(
             lab_daemon,
-            "prepare_private_sqlite_path",
-            lambda path, *, label, create, mutation_guard: (
-                calls.append(f"sqlite:{path.name}:{label}:{create}")
+            "prepare_lab_runtime_sqlite_authority",
+            lambda _root, *, label, path, mutation_guard: (
+                calls.append(f"sqlite:{path.name}:{label}:True")
                 or _FakeLabSqliteAuthority(path, created=True)
             ),
-        )
-        monkeypatch.setattr(
-            lab_daemon,
-            "register_lab_runtime_managed_file",
-            lambda _root, *, label, **_kwargs: calls.append(f"register:{label}"),
         )
         monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
@@ -3928,7 +3923,6 @@ class TestLabSchedulerCli:
 
         assert result == 0
         assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:True" in calls
-        assert "register:lab jobs SQLite" in calls
         assert "initialize" in calls
         assert "claim_spool:claims" in calls
         assert "report_spool:reports" in calls
