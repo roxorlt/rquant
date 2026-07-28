@@ -78,7 +78,10 @@
   dry-run 不创建锁且只读 Git 显式使用 `GIT_OPTIONAL_LOCKS=0`。daemon wrapper 会在创建 generation
   lock 命名空间前纯只读验证 sentinel；stdlib `.env` 路径解析与 Settings 的受支持子集保持一致，
   不可安全等价解析时失败关闭。installed handoff 在交易保护窗口于 fetch 前延期，保证 refs 与
-  `FETCH_HEAD` 不变；uv 轮询、manifest 分块处理及 GC 记录扫描都能及时响应取消和整体 deadline。
+  `FETCH_HEAD` 不变；本地 installation/prepared authority 会在任何 fetch 或 lock 创建前只读复核，
+  incomplete handoff 的 dry-run 也执行同一门禁。`.env`/sentinel 改为 descriptor-bound openat 读取，
+  所有只读 Git helper 关闭 optional locks；uv 轮询、manifest/selector 持久化边界及 GC 记录扫描
+  都能及时响应取消和整体 deadline。
 
 - **Lab 发布恢复第三轮边界加固**：installed finalizer 继承外层 generation/handoff 锁，不再
   二次争抢非阻塞 handoff 锁；普通发布在停止 daemon 前有界 fetch 并解析精确新 tag/SHA，恢复则

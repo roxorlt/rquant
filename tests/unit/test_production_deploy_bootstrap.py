@@ -101,6 +101,27 @@ def _git(checkout: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+    if not root.exists():
+        return ()
+    snapshot: list[tuple[object, ...]] = []
+    for candidate in sorted(root.rglob("*")):
+        observed = candidate.lstat()
+        payload = candidate.read_bytes() if candidate.is_file() else b""
+        snapshot.append(
+            (
+                str(candidate.relative_to(root)),
+                observed.st_dev,
+                observed.st_ino,
+                observed.st_mode,
+                observed.st_mtime_ns,
+                observed.st_size,
+                payload,
+            )
+        )
+    return tuple(snapshot)
+
+
 def _checkout(
     tmp_path: Path,
     *,
@@ -668,9 +689,11 @@ def test_incomplete_handoff_resume_is_deferred_without_writes_in_protected_windo
     assert module._stable_record_path(lock_path, "lab-handoff").read_bytes() == durable_before
 
 
+@pytest.mark.parametrize("dry_run", (False, True))
 def test_protected_incomplete_handoff_defers_before_fetch_or_ref_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
 ) -> None:
     checkout, python, lock_path, commit = _checkout(tmp_path)
     module = _bootstrap_module()
@@ -716,14 +739,19 @@ def test_protected_incomplete_handoff_defers_before_fetch_or_ref_mutation(
 
     refs_before = snapshot(refs)
     fetch_before = None if not fetch_head.exists() else (fetch_head.read_bytes(), fetch_head.stat())
+    authority_before = _tree_snapshot(lock_path.parent)
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: True)
     monkeypatch.chdir(checkout)
+    command = _command(checkout, python, lock_path, lifecycle_mode="installed")[4:]
+    if dry_run:
+        command.append("--dry-run")
 
-    result = module.main(_command(checkout, python, lock_path, lifecycle_mode="installed")[4:])
+    result = module.main(command)
 
     assert result == 75
     assert snapshot(refs) == refs_before
+    assert _tree_snapshot(lock_path.parent) == authority_before
     if fetch_before is None:
         assert not fetch_head.exists()
     else:
@@ -735,6 +763,64 @@ def test_protected_incomplete_handoff_defers_before_fetch_or_ref_mutation(
             observed.st_mtime_ns,
             observed.st_size,
         )
+
+
+def test_installed_bootstrap_missing_installation_fails_before_any_namespace_or_git_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, _commit = _checkout(
+        tmp_path,
+        publish_marker=False,
+        install_state=False,
+    )
+    shutil.rmtree(lock_path.parent)
+    module = _bootstrap_module()
+    index = checkout / ".git" / "index"
+    index_before = (index.read_bytes(), index.stat())
+    git_before = _tree_snapshot(checkout / ".git")
+    tree_before = _tree_snapshot(tmp_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.chdir(checkout)
+
+    result = module.main(_command(checkout, python, lock_path, lifecycle_mode="installed")[4:])
+
+    assert result == 2
+    assert not lock_path.parent.exists()
+    assert _tree_snapshot(checkout / ".git") == git_before
+    assert _tree_snapshot(tmp_path) == tree_before
+    index_after = index.stat()
+    assert index.read_bytes() == index_before[0]
+    assert (index_after.st_ino, index_after.st_mtime_ns) == (
+        index_before[1].st_ino,
+        index_before[1].st_mtime_ns,
+    )
+
+
+def test_installed_bootstrap_tampered_prepared_sentinel_fails_before_fetch_or_handoff_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, _commit = _checkout(tmp_path)
+    module = _bootstrap_module()
+    installation = module._read_lab_installation_state(root=checkout, lock_path=lock_path)
+    runtime_root = Path(str(installation["runtime_root"]))
+    sentinel = runtime_root / module.LAB_RUNTIME_PREPARED_FILENAME
+    sentinel.write_text("{}\n", encoding="utf-8")
+    sentinel.chmod(0o600)
+    git_before = _tree_snapshot(checkout / ".git")
+    authority_before = _tree_snapshot(lock_path.parent)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.chdir(checkout)
+
+    result = module.main(_command(checkout, python, lock_path, lifecycle_mode="installed")[4:])
+
+    assert result == 2
+    assert _tree_snapshot(checkout / ".git") == git_before
+    assert _tree_snapshot(lock_path.parent) == authority_before
+    assert not lock_path.with_name(f"{lock_path.stem}.handoff.lock").exists()
 
 
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
@@ -1515,6 +1601,42 @@ def test_deploy_control_dotenv_reader_is_allowlisted_and_never_evaluates_shell(
         "RQUANT_LAB_LIFECYCLE_MODE": "uninstalled",
     }
     assert not marker.exists()
+
+
+def test_bootstrap_dotenv_and_prepared_sentinel_reads_use_openat_bound_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, _python, lock_path, _commit = _checkout(tmp_path)
+    module = _bootstrap_module()
+    dotenv = checkout / ".env"
+    dotenv.write_text("RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS=30\n", encoding="utf-8")
+    dotenv.chmod(0o600)
+    installation = module._read_lab_installation_state(root=checkout, lock_path=lock_path)
+    sentinel = Path(str(installation["runtime_root"])) / module.LAB_RUNTIME_PREPARED_FILENAME
+    original_open = os.open
+    observed: list[tuple[object, int | None]] = []
+
+    def capture_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path in {dotenv, dotenv.name, sentinel, sentinel.name}:
+            observed.append((path, dir_fd))
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", capture_open)
+
+    assert module._read_deploy_controls(dotenv)["RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS"] == "30"
+    assert module._private_json(sentinel, label="Lab runtime prepared sentinel")
+    assert any(path == dotenv.name and dir_fd is not None for path, dir_fd in observed)
+    assert any(path == sentinel.name and dir_fd is not None for path, dir_fd in observed)
+    assert all(path not in {dotenv, sentinel} for path, _dir_fd in observed)
 
 
 @pytest.mark.parametrize(

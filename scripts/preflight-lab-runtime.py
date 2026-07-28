@@ -41,7 +41,6 @@ LAB_RUNTIME_PATH_KEYS = frozenset(
 )
 _DOTENV_ASSIGNMENT = re.compile(
     r"^(?:export[ \t]+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(?P<value>.*)$",
-    re.IGNORECASE,
 )
 
 
@@ -246,8 +245,12 @@ def _runtime_artifacts(checkout: Path) -> tuple[Path, ...]:
 
 def _related_lab_key(raw_line: str) -> str | None:
     candidate = raw_line.strip()
-    if candidate.casefold().startswith("export "):
-        candidate = candidate[7:].lstrip()
+    export_match = re.match(r"export[ \t]+", candidate)
+    ambiguous_export = re.match(r"export[ \t]+", candidate, flags=re.IGNORECASE)
+    if export_match is not None:
+        candidate = candidate[export_match.end() :]
+    elif ambiguous_export is not None:
+        candidate = candidate[ambiguous_export.end() :]
     match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", candidate)
     if match is None:
         return None
@@ -275,21 +278,111 @@ def _parse_dotenv_value(raw: str, *, key: str) -> str:
     return parsed
 
 
-def _dotenv_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    observed = path.lstat()
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or stat.S_ISLNK(observed.st_mode)
-        or observed.st_uid != os.getuid()
-        or observed.st_nlink != 1
-        or stat.S_IMODE(observed.st_mode) != 0o600
-    ):
-        raise PreflightError("checkout .env must be an owned private regular file")
+def _path_identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_uid,
+        observed.st_nlink,
+    )
+
+
+def _read_bound_private_file(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int | None,
+    private_parent: bool,
+    missing_ok: bool = False,
+) -> tuple[bytes | None, os.stat_result | None]:
+    parent = path.parent
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
+        before_parent = parent.lstat()
+        if (
+            not stat.S_ISDIR(before_parent.st_mode)
+            or stat.S_ISLNK(before_parent.st_mode)
+            or before_parent.st_uid != os.getuid()
+            or before_parent.st_mode & 0o022
+            or (private_parent and stat.S_IMODE(before_parent.st_mode) != 0o700)
+            or parent.resolve(strict=True) != parent
+        ):
+            raise PreflightError(f"{label} parent is unsafe")
+        root_fd = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except PreflightError:
+        raise
+    except OSError as exc:
+        raise PreflightError(f"{label} parent is unavailable") from exc
+    descriptor = -1
+    try:
+        opened_parent = os.fstat(root_fd)
+        if _path_identity(opened_parent) != _path_identity(before_parent):
+            raise PreflightError(f"{label} parent identity changed")
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                return None, None
+            raise
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (maximum_bytes is not None and opened.st_size > maximum_bytes)
+        ):
+            raise PreflightError(f"{label} must be an owned physical 0600 file")
+        payload: bytes | None = None
+        if maximum_bytes is not None:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise PreflightError(f"{label} is too large")
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+        active = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+        rebound_parent = parent.lstat()
+        if _path_identity(active) != _path_identity(opened) or _path_identity(
+            rebound_parent
+        ) != _path_identity(opened_parent):
+            raise PreflightError(f"{label} identity changed")
+        return payload, opened
+    except PreflightError:
+        raise
+    except OSError as exc:
+        raise PreflightError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+
+
+def _dotenv_values(path: Path) -> dict[str, str]:
+    encoded, _identity_value = _read_bound_private_file(
+        path,
+        label="checkout .env",
+        maximum_bytes=1024 * 1024,
+        private_parent=False,
+        missing_ok=True,
+    )
+    if encoded is None:
+        return {}
+    try:
+        lines = encoded.decode("utf-8").splitlines()
+    except UnicodeError as exc:
         raise PreflightError("checkout .env is unreadable") from exc
     exact_values: dict[str, str] = {}
     for line in lines:
@@ -346,25 +439,13 @@ def _private_runtime_directory(path: Path, *, label: str) -> os.stat_result:
 
 
 def _private_runtime_file(path: Path, *, label: str) -> os.stat_result:
-    try:
-        before = path.lstat()
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as exc:
-        raise PreflightError(f"{label} is unavailable") from exc
-    try:
-        opened = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    if (
-        not stat.S_ISREG(opened.st_mode)
-        or stat.S_ISLNK(opened.st_mode)
-        or opened.st_uid != os.getuid()
-        or opened.st_nlink != 1
-        or stat.S_IMODE(opened.st_mode) != 0o600
-        or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
-        != (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink)
-    ):
-        raise PreflightError(f"{label} must be an owned physical 0600 file")
+    _payload, opened = _read_bound_private_file(
+        path,
+        label=label,
+        maximum_bytes=None,
+        private_parent=True,
+    )
+    assert opened is not None
     return opened
 
 
@@ -387,10 +468,16 @@ def _verify_prepared_lab_runtime(
         raise PreflightError("Lab runtime prepared sentinel root is unavailable")
     root_identity = _private_runtime_directory(runtime_root, label="Lab runtime root")
     sentinel = runtime_root / ".prepared.json"
-    _private_runtime_file(sentinel, label="Lab runtime prepared sentinel")
+    encoded, _sentinel_identity = _read_bound_private_file(
+        sentinel,
+        label="Lab runtime prepared sentinel",
+        maximum_bytes=1024 * 1024,
+        private_parent=True,
+    )
+    assert encoded is not None
     try:
-        payload = json.loads(sentinel.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise PreflightError("Lab runtime prepared sentinel is malformed") from exc
     authority_id = payload.get("runtime_authority_id") if isinstance(payload, dict) else None
     if (

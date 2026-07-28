@@ -370,6 +370,54 @@ def test_detect_verified_code_commit_uses_explicit_trusted_git(
     assert not marker.exists()
 
 
+def test_research_manifest_readonly_git_preserves_index_and_disables_optional_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.research_manifest as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["/usr/bin/git", "init", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["/usr/bin/git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "user.name=rquant-ci",
+            "-c",
+            "user.email=rquant@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    index = repo / ".git" / "index"
+    before = (index.read_bytes(), index.stat())
+    original_run = subprocess.run
+    environments: list[dict[str, str]] = []
+
+    def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        if isinstance(command, list) and command and command[0] == "/usr/bin/git":
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            environments.append(environment)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", capture_run)
+
+    assert module.detect_verified_code_commit(repo, trusted_git_path=Path("/usr/bin/git"))
+    after = index.stat()
+    assert environments
+    assert all(environment["GIT_OPTIONAL_LOCKS"] == "0" for environment in environments)
+    assert index.read_bytes() == before[0]
+    assert (after.st_ino, after.st_mtime_ns) == (before[1].st_ino, before[1].st_mtime_ns)
+
+
 def test_trusted_git_binding_rejects_symlink(tmp_path: Path) -> None:
     from rquant.research_manifest import bind_trusted_git_executable
 

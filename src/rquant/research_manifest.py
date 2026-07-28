@@ -103,6 +103,7 @@ def _run_trusted_git(
         text=text,
         timeout=3,
         check=False,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
     )
     if bind_trusted_git_executable(binding.path) != binding:
         raise ValueError("trusted Git executable identity changed")

@@ -318,6 +318,7 @@ def _git_commit(root: Path, *, git_path: Path, git_identity: _PathIdentity) -> s
             capture_output=True,
             text=True,
             timeout=5,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise WrapperError("checkout commit cannot be verified") from exc

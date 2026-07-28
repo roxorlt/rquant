@@ -114,59 +114,101 @@ def _physical_directory(path: Path, *, label: str, private: bool = False) -> os.
     return observed
 
 
-def _read_deploy_controls(path: Path) -> dict[str, str]:
-    try:
-        before = path.lstat()
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        raise DeployBootstrapError("deployment dotenv cannot be inspected") from exc
+def _identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_uid,
+        observed.st_nlink,
+    )
+
+
+def _read_bound_private_file(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+    private_parent: bool,
+    missing_ok: bool = False,
+) -> bytes | None:
+    parent = path.parent
+    before_parent = _physical_directory(
+        parent,
+        label=f"{label} parent",
+        private=private_parent,
+    )
+    root_fd = -1
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        root_fd = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(root_fd)
+        if _identity(opened_parent) != _identity(before_parent):
+            raise DeployBootstrapError(f"{label} parent identity changed")
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or stat.S_ISLNK(before.st_mode)
             or opened.st_uid != os.getuid()
             or opened.st_nlink != 1
             or stat.S_IMODE(opened.st_mode) != 0o600
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size > maximum_bytes
         ):
-            raise DeployBootstrapError("deployment dotenv has unsafe identity")
+            raise DeployBootstrapError(f"{label} has unsafe identity")
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(descriptor, 64 * 1024)
+            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total))
             if not chunk:
                 break
             total += len(chunk)
-            if total > 1024 * 1024:
-                raise DeployBootstrapError("deployment dotenv is too large")
+            if total > maximum_bytes:
+                raise DeployBootstrapError(f"{label} is too large")
             chunks.append(chunk)
-        after = path.lstat()
-        if (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_mode,
-            opened.st_uid,
-            opened.st_nlink,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_uid,
-            after.st_nlink,
+        active = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+        rebound_parent = parent.lstat()
+        if _identity(active) != _identity(opened) or _identity(rebound_parent) != _identity(
+            opened_parent
         ):
-            raise DeployBootstrapError("deployment dotenv identity changed")
-        payload = b"".join(chunks).decode("utf-8")
+            raise DeployBootstrapError(f"{label} identity changed")
+        return b"".join(chunks)
     except DeployBootstrapError:
         raise
-    except (OSError, UnicodeError) as exc:
-        raise DeployBootstrapError("deployment dotenv cannot be read") from exc
+    except OSError as exc:
+        raise DeployBootstrapError(f"{label} cannot be read") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _read_deploy_controls(path: Path) -> dict[str, str]:
+    encoded = _read_bound_private_file(
+        path,
+        label="deployment dotenv",
+        maximum_bytes=1024 * 1024,
+        private_parent=False,
+        missing_ok=True,
+    )
+    if encoded is None:
+        return {}
+    try:
+        payload = encoded.decode("utf-8")
+    except UnicodeError as exc:
+        raise DeployBootstrapError("deployment dotenv cannot be read") from exc
     lines = payload.splitlines()
     controls: dict[str, str] = {}
     for line_number, raw_line in enumerate(lines, start=1):
@@ -554,18 +596,25 @@ def _generation_lock_is_held(root: Path, lock_path: Path) -> bool:
     return False
 
 
-def _private_json(path: Path, *, label: str) -> dict[str, object]:
-    observed = _physical_file(path, label=label)
-    if stat.S_IMODE(observed.st_mode) != 0o600 or observed.st_size > 1024 * 1024:
-        raise DeployBootstrapError(f"{label} must have mode 0600")
+def _private_json(
+    path: Path,
+    *,
+    label: str,
+    missing_ok: bool = False,
+) -> dict[str, object] | None:
     try:
-        payload = path.read_bytes()
-        active = path.lstat()
+        payload = _read_bound_private_file(
+            path,
+            label=label,
+            maximum_bytes=1024 * 1024,
+            private_parent=True,
+            missing_ok=missing_ok,
+        )
+        if payload is None:
+            return None
         parsed = json.loads(payload)
-    except (OSError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise DeployBootstrapError(f"{label} is invalid") from exc
-    if (active.st_dev, active.st_ino) != (observed.st_dev, observed.st_ino):
-        raise DeployBootstrapError(f"{label} identity changed")
     if not isinstance(parsed, dict):
         raise DeployBootstrapError(f"{label} is invalid")
     return parsed
@@ -792,9 +841,13 @@ def _write_lab_installation_state(
 
 def _read_lab_installation_state(*, root: Path, lock_path: Path) -> dict[str, object]:
     path = _stable_record_path(lock_path, "lab-install")
-    if not path.exists():
+    payload = _private_json(
+        path,
+        label="Lab launchd installation state",
+        missing_ok=True,
+    )
+    if payload is None:
         raise DeployBootstrapError("Lab launchd installation state is missing")
-    payload = _private_json(path, label="Lab launchd installation state")
     if (
         payload.get("schema_version") != LAB_INSTALL_SCHEMA_VERSION
         or payload.get("checkout_root") != str(root)
@@ -1013,9 +1066,13 @@ def _operation_handoff_path(lock_path: Path, operation_id: str) -> Path:
 
 def _incomplete_handoff_exists(*, root: Path, lock_path: Path) -> bool:
     path = _stable_record_path(lock_path, "lab-handoff")
-    if not path.exists():
+    payload = _private_json(
+        path,
+        label="Lab launchd handoff state",
+        missing_ok=True,
+    )
+    if payload is None:
         return False
-    payload = _private_json(path, label="Lab launchd handoff state")
     operation_id = str(payload.get("operation_id", ""))
     stage = str(payload.get("stage", ""))
     if (
@@ -2175,12 +2232,18 @@ def main(argv: list[str] | None = None) -> int:
             and not (args.initialize_generation or args.register_lab_installation)
             and not args.finalize_generation
         )
+        if installed_handoff:
+            _read_lab_installation_state(root=root, lock_path=lock_path)
         incomplete_handoff = (
             _incomplete_handoff_exists(root=root, lock_path=lock_path)
-            if installed_handoff and not dry_run
+            if installed_handoff
             else False
         )
-        if installed_handoff and not dry_run and _is_protected_handoff_window():
+        if (
+            installed_handoff
+            and _is_protected_handoff_window()
+            and (incomplete_handoff or not dry_run)
+        ):
             detail = (
                 "incomplete Lab daemon handoff recovery"
                 if incomplete_handoff

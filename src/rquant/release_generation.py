@@ -508,6 +508,7 @@ def _git_output(repo: Path, git_path: Path, *arguments: str) -> str:
             capture_output=True,
             text=True,
             timeout=10,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReleaseGenerationError("release generation Git verification failed") from exc
@@ -523,14 +524,16 @@ def _assert_tracked_clean(repo: Path, git_path: Path) -> None:
             capture_output=True,
             text=True,
             timeout=10,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
         diff = subprocess.run(
-            [str(git_path), "diff-index", "--quiet", "HEAD", "--"],
+            [str(git_path), "diff", "--quiet", "HEAD", "--"],
             cwd=repo,
             check=False,
             capture_output=True,
             text=True,
             timeout=10,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReleaseGenerationError("tracked checkout verification failed") from exc
@@ -806,6 +809,8 @@ def _write_private_json(
             os.replace(temporary_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
         published = True
         os.fsync(root_fd)
+        if checkpoint is not None:
+            checkpoint()
         active = (root_path / name).lstat()
         if PathIdentity.capture(os.fstat(descriptor)) != PathIdentity.capture(active):
             raise ReleaseGenerationError(f"private deployment record {name} publish changed")
@@ -2611,6 +2616,7 @@ class ReleaseGenerationAuthority:
                     require_absent=selector_identity is None,
                     expected_identity=selector_identity,
                     maximum_bytes=MAX_MARKER_BYTES,
+                    checkpoint=self._checkpoint,
                 )
                 self._assert_root(root_fd, root_identity)
             finally:

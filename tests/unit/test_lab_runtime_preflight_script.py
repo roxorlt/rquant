@@ -148,6 +148,87 @@ def _lock_path(checkout: Path) -> Path:
     return checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock"
 
 
+def _prepare_lab_runtime(checkout: Path) -> Path:
+    from rquant.lab_daemon import (
+        prepare_lab_runtime_layout,
+        prepare_private_sqlite_path,
+        register_lab_runtime_managed_file,
+    )
+
+    runtime_root = checkout / "data" / "lab-runtime"
+    directories = {
+        label: runtime_root / default_name
+        for label, (_key, default_name) in {
+            "lab command spool": ("LAB_JOB_COMMAND_DIR", "commands"),
+            "lab claim spool": ("LAB_JOB_CLAIM_DIR", "claims"),
+            "lab report spool": ("LAB_JOB_REPORT_DIR", "reports"),
+            "lab worker artifact root": ("LAB_WORKER_ARTIFACT_DIR", "worker-artifacts"),
+            "lab final artifact root": ("LAB_FINAL_ARTIFACT_DIR", "final-artifacts"),
+            "lab artifact commit spool": ("LAB_ARTIFACT_COMMIT_DIR", "artifact-commits"),
+            "lab daemon lock root": ("LAB_DAEMON_LOCK_DIR", "locks"),
+            "lab finalizer state root": ("LAB_FINALIZER_STATE_DIR", "finalizer-state"),
+            "lab readiness root": ("LAB_READINESS_DIR", "readiness"),
+        }.items()
+    }
+    database = runtime_root / "lab_jobs.sqlite3"
+    prepare_lab_runtime_layout(
+        runtime_root,
+        checkout_root=checkout,
+        managed_directories=directories,
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    authority = prepare_private_sqlite_path(
+        database,
+        label="lab jobs SQLite",
+        create=True,
+        mutation_guard=lambda: "a" * 40,
+    )
+    try:
+        register_lab_runtime_managed_file(
+            runtime_root,
+            label="lab jobs SQLite",
+            path=database,
+            mutation_guard=lambda: "a" * 40,
+        )
+    finally:
+        authority.close()
+    return runtime_root
+
+
+def _replace_path_during_read(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target: Path,
+    replacement: Path,
+) -> None:
+    displaced = target.with_name(f"{target.name}.displaced")
+    original_read_text = Path.read_text
+    original_os_read = os.read
+    swapped = False
+
+    def swap() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        target.rename(displaced)
+        target.symlink_to(replacement)
+
+    def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path == target:
+            swap()
+        return original_read_text(path, *args, **kwargs)
+
+    def guarded_os_read(descriptor: int, size: int) -> bytes:
+        swap()
+        return original_os_read(descriptor, size)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    monkeypatch.setattr(os, "read", guarded_os_read)
+
+
 def _invoke(
     checkout: Path,
     *,
@@ -467,6 +548,90 @@ def test_stdlib_dotenv_rejects_unsupported_lab_path_syntax(
 
     with pytest.raises(namespace["PreflightError"], match="unsupported"):
         namespace["_dotenv_values"](dotenv)
+
+
+@pytest.mark.parametrize("keyword", ("EXPORT", "Export", "eXport"))
+def test_stdlib_dotenv_rejects_ambiguous_nonlowercase_export_like_python_dotenv(
+    tmp_path: Path,
+    keyword: str,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    ambiguous = tmp_path / "ambiguous-data"
+    configured_data = tmp_path / "configured-data"
+    dotenv = checkout / ".env"
+    dotenv.write_text(
+        "\n".join(
+            (
+                "TUSHARE_TOKEN_MAIN=" + "x" * 32,
+                f"{keyword} DATA_DIR='{ambiguous}'",
+                f"data_dir='{configured_data}'",
+                f"DUCKDB_PATH='{configured_data / 'rquant.duckdb'}'",
+                f"PARQUET_DIR='{tmp_path / 'parquet'}'",
+                f"LOG_DIR='{tmp_path / 'logs'}'",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dotenv.chmod(0o600)
+    configured = Settings(_env_file=dotenv)
+    namespace = runpy.run_path(str(SCRIPT))
+
+    assert configured.data_dir == configured_data
+    with pytest.raises(namespace["PreflightError"], match="unsupported DATA_DIR"):
+        namespace["_dotenv_values"](dotenv)
+
+
+def test_stdlib_dotenv_read_is_descriptor_bound_across_symlink_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    dotenv = checkout / ".env"
+    dotenv.write_text(f"DATA_DIR='{tmp_path / 'data'}'\n", encoding="utf-8")
+    dotenv.chmod(0o600)
+    replacement = tmp_path / "external.env"
+    replacement.write_bytes(dotenv.read_bytes())
+    replacement.chmod(0o600)
+    namespace = runpy.run_path(str(SCRIPT))
+    _replace_path_during_read(
+        monkeypatch,
+        target=dotenv,
+        replacement=replacement,
+    )
+
+    with pytest.raises(namespace["PreflightError"], match="identity changed"):
+        namespace["_dotenv_values"](dotenv)
+
+    assert replacement.read_text(encoding="utf-8") == f"DATA_DIR='{tmp_path / 'data'}'\n"
+
+
+def test_prepared_sentinel_read_is_descriptor_bound_across_symlink_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, _package = _checkout(tmp_path)
+    runtime_root = _prepare_lab_runtime(checkout)
+    sentinel = runtime_root / ".prepared.json"
+    replacement = tmp_path / "external-prepared.json"
+    replacement.write_bytes(sentinel.read_bytes())
+    replacement.chmod(0o600)
+    namespace = runpy.run_path(str(SCRIPT))
+    _replace_path_during_read(
+        monkeypatch,
+        target=sentinel,
+        replacement=replacement,
+    )
+
+    with pytest.raises(namespace["PreflightError"], match="identity changed"):
+        namespace["_verify_prepared_lab_runtime"](
+            checkout,
+            daemon_command="lab-scheduler",
+        )
+
+    assert replacement.read_bytes()
 
 
 def test_lab_runtime_preflight_detect_only_scan_survives_mid_walk_symlink_swap(

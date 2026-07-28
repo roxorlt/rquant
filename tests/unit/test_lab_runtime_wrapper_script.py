@@ -975,6 +975,43 @@ def test_lab_runtime_wrapper_ignores_fake_venv_git(
     assert not marker.exists()
 
 
+def test_lab_runtime_wrapper_readonly_git_preserves_index_and_disables_optional_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, _executable, _marker = _runtime_checkout(
+        tmp_path,
+        publish_generation=False,
+    )
+    namespace = runpy.run_path(str(WRAPPER))
+    git_path, git_identity = namespace["_require_trusted_git"](TRUSTED_GIT)
+    index = checkout / ".git" / "index"
+    before = (index.read_bytes(), index.stat())
+    original_run = subprocess.run
+    environments: list[dict[str, str]] = []
+
+    def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        if isinstance(command, list) and command and command[0] == str(TRUSTED_GIT):
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            environments.append(environment)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+
+    assert namespace["_git_commit"](
+        checkout,
+        git_path=git_path,
+        git_identity=git_identity,
+    )
+    after = index.stat()
+    assert environments
+    assert all(environment["GIT_OPTIONAL_LOCKS"] == "0" for environment in environments)
+    assert index.read_bytes() == before[0]
+    assert (after.st_ino, after.st_mtime_ns) == (before[1].st_ino, before[1].st_mtime_ns)
+
+
 def test_lab_runtime_wrapper_rejects_mismatched_daemon_root(tmp_path: Path) -> None:
     checkout, executable, marker = _runtime_checkout(tmp_path)
     other = tmp_path / "other"

@@ -511,6 +511,37 @@ def test_release_generation_rejects_tracked_source_drift(tmp_path: Path) -> None
     os.close(lock_fd)
 
 
+def test_release_generation_readonly_git_preserves_index_and_disables_optional_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.release_generation as module
+
+    repo, _lock_path, commit, _python = _generation(tmp_path)
+    index = repo / ".git" / "index"
+    before = (index.read_bytes(), index.stat())
+    original_run = subprocess.run
+    environments: list[dict[str, str]] = []
+
+    def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        if isinstance(command, list) and command and command[0] == str(TRUSTED_GIT):
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            environments.append(environment)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", capture_run)
+
+    assert module._git_output(repo, TRUSTED_GIT, "rev-parse", "HEAD") == commit
+    module._assert_tracked_clean(repo, TRUSTED_GIT)
+    after = index.stat()
+    assert environments
+    assert all(environment["GIT_OPTIONAL_LOCKS"] == "0" for environment in environments)
+    assert index.read_bytes() == before[0]
+    assert (after.st_ino, after.st_mtime_ns) == (before[1].st_ino, before[1].st_mtime_ns)
+
+
 def test_release_generation_marker_handles_short_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1136,6 +1167,117 @@ def test_large_manifest_serialization_is_cancellable_before_publish(
 
     assert not (lock_path.parent / "large.manifest.json").exists()
     assert not list(lock_path.parent.glob(".large.manifest.json.*.tmp"))
+    os.close(lock_fd)
+
+
+def test_manifest_publish_checks_cancellation_after_directory_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, lock_path, _commit, _python = _generation(tmp_path)
+    root_fd = os.open(lock_path.parent, os.O_RDONLY)
+    root_identity = os.fstat(root_fd)
+    cancelled = False
+    original_fsync = os.fsync
+
+    def checkpoint() -> None:
+        if cancelled:
+            raise ReleaseGenerationError("manifest publish cancelled")
+
+    def cancelling_fsync(descriptor: int) -> None:
+        nonlocal cancelled
+        original_fsync(descriptor)
+        observed = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) == (
+            root_identity.st_dev,
+            root_identity.st_ino,
+        ):
+            cancelled = True
+
+    monkeypatch.setattr(os, "fsync", cancelling_fsync)
+    payload = {"schema_version": 1, "entries": [{"path": "payload", "sha256": "a" * 64}]}
+    try:
+        with pytest.raises(ReleaseGenerationError, match="cancelled"):
+            _write_private_json(
+                root_fd=root_fd,
+                root_path=lock_path.parent,
+                name="durable.manifest.json",
+                payload=payload,
+                require_absent=True,
+                maximum_bytes=1024 * 1024,
+                checkpoint=checkpoint,
+            )
+    finally:
+        os.close(root_fd)
+
+    published = lock_path.parent / "durable.manifest.json"
+    assert json.loads(published.read_text(encoding="utf-8")) == payload
+    assert not list(lock_path.parent.glob(".durable.manifest.json.*.tmp"))
+
+
+def test_selector_publish_inherits_checkpoint_and_recovers_after_boundary_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    cancelled = False
+    selector_boundary_armed = False
+
+    def mutation_hook(stage: str) -> None:
+        nonlocal selector_boundary_armed
+        if stage == "environment_sealed":
+            selector_boundary_armed = True
+
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        mutation_hook=mutation_hook,
+        cancellation_check=lambda: cancelled,
+    )
+    initialization = authority.begin_initialization(target_sha=commit)
+    root_identity = lock_path.parent.stat()
+    original_fsync = os.fsync
+
+    def cancelling_selector_fsync(descriptor: int) -> None:
+        nonlocal cancelled, selector_boundary_armed
+        original_fsync(descriptor)
+        observed = os.fstat(descriptor)
+        if selector_boundary_armed and (observed.st_dev, observed.st_ino) == (
+            root_identity.st_dev,
+            root_identity.st_ino,
+        ):
+            selector_boundary_armed = False
+            cancelled = True
+
+    monkeypatch.setattr(os, "fsync", cancelling_selector_fsync)
+
+    with pytest.raises(ReleaseGenerationError, match="cancelled"):
+        authority._publish_environment(
+            expected_commit=commit,
+            operation_id=initialization.operation_id,
+            transaction_kind="initialization",
+            previous_generation_id="",
+        )
+
+    selector_path = environment_selector_path_for_lock(lock_path)
+    selector = json.loads(selector_path.read_text(encoding="utf-8"))
+    manifest = environment_manifest_path_for_lock(lock_path, selector["generation_id"])
+    assert manifest.is_file()
+    assert not marker_path_for_lock(lock_path).exists()
+
+    cancelled = False
+    recovered_selector, recovered_manifest = authority._publish_environment(
+        expected_commit=commit,
+        operation_id=initialization.operation_id,
+        transaction_kind="initialization",
+        previous_generation_id="",
+    )
+    assert recovered_selector.generation_id == selector["generation_id"]
+    assert recovered_manifest["generation_id"] == selector["generation_id"]
     os.close(lock_fd)
 
 

@@ -18,9 +18,10 @@
    bash scripts/deploy-production.sh --target v0.13.2
    ```
 
-5. 纯标准库 bootstrap 在创建或取得 generation/handoff lock 前先只读核对 prepared runtime
-   sentinel。macOS installed 发布还会先只读解析已有 handoff record 并执行交易时间门禁；窗口内
-   直接返回 75，既不 fetch，也不改 `FETCH_HEAD` 或 refs。窗口外才有界 fetch 并解析精确 target，
+5. 纯标准库 bootstrap 在创建或取得 generation/handoff lock 前先只读核对 installation state 及其
+   绑定的 prepared runtime sentinel。macOS installed 发布还会先只读解析已有 handoff record 并
+   执行交易时间门禁；缺失/不符时零写失败，incomplete handoff 即使是 dry-run 也在窗口内直接
+   返回 75，既不 fetch，也不改 `FETCH_HEAD`、refs 或 lock namespace。窗口外才有界 fetch 并解析精确 target，
    随后取得稳定 handoff lock，停止原先 loaded 的三个 Lab launchd daemon，确认其 shared
    generation lock 已释放后取得独占锁；Linux 无此本地 launchd 步骤。之后验证当前已提交代际，
    才导入项目
@@ -39,8 +40,9 @@
    `completed`，最后由 target authority 原子发布 commit record。daemon 只接受
    `marker + completed intent + commit record + selected environment manifest` 完整一致的代际；
    旧 coordinator 不能替新版本 marker schema 写标记。uv 等待以短轮询响应整体 deadline 或取消，
-   超时/取消会终止完整进程组；manifest 序列化、哈希、写入/fsync 与 GC manifest 扫描均在有界
-   分块边界 checkpoint。每个 durable stage 同时写入 intent
+   超时/取消会终止完整进程组；manifest 序列化、哈希、写入/fsync、selector rename/目录 fsync
+   与 GC manifest 扫描均在有界分块或持久化边界 checkpoint。目录 fsync 后发生的取消不会返回
+   成功，已经完整落盘的 manifest/selector 则作为可验证的重放状态保留。每个 durable stage 同时写入 intent
    时间线和 JSONL 审计。结束时先释放独占锁，再只恢复原先 loaded 的 Lab daemon，并验证
    launchd health 和 shared lock；恢复失败会使发布返回非零。dry-run 只输出 handoff 计划并持
    shared lock，不 bootout daemon。

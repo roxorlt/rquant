@@ -3,9 +3,11 @@
 ## 启动链路
 
 三个 Lab daemon 由 launchd 先运行 `scripts/run-lab-daemon.py`。wrapper 只使用标准库，并且在创建
-generation lock 目录或锁文件前，先以纯只读模式验证 prepared runtime sentinel。缺失、被替换或
-无法安全解析的 sentinel/相关 `.env` 路径配置会立即失败，仓库、Git index 和部署锁命名空间均不
-发生变化。通过该门禁后才完成物理 checkout、bootstrap virtualenv、可信 Git、console launcher
+generation lock 目录或锁文件前，先以纯只读模式验证 prepared runtime sentinel。`.env` 与 sentinel
+都从已验证父目录 FD 使用 `openat(O_NOFOLLOW)` 打开，再从同一文件 FD 读取并在结束时复核目录项
+身份；缺失、被替换或无法安全解析的 sentinel/相关 `.env` 路径配置会立即失败，仓库、Git index
+和部署锁命名空间均不发生变化。stdlib dotenv 只把精确小写 `export` 识别为关键字，混合大小写
+且指向 Lab 路径的歧义配置失败关闭。通过该门禁后才完成物理 checkout、bootstrap virtualenv、可信 Git、console launcher
 和 clean commit 校验，并取得该 checkout 唯一发布锁的共享锁。所有只读 Git 调用显式使用
 `GIT_OPTIONAL_LOCKS=0`。wrapper、只读 preflight 和隔离 bootstrap 都会验证
 crash-persistent 提交协议，再从环境 selector 解析已封存的不可变 venv，以该 generation 的 Python
@@ -37,7 +39,9 @@ intent content hash、operation id、commit 与环境 generation。部署器使�
 staging generation 中执行 `uv venv --relocatable` 与 `uv sync --frozen --active` 重建环境，不复制
 当前 `.venv`。它仅允许经验证的 `bin/python*` 与 `lib64` 链接：解释器必须绑定已验证的系统 Python，
 其他相对链接不得逃出 generation；随后封存权限并记录每个文件的 hash/身份。selector 只在完整
-manifest 可验后原子切换。marker 可以先于 intent completion
+manifest 可验后原子切换。manifest 和 selector 的文件 rename、文件/目录 fsync 都共享同一取消
+checkpoint；目录 fsync 后到达的取消会返回失败，但保留已落盘、可由下一次重放验证的完整记录，
+不会把未持久化状态报告为成功。marker 可以先于 intent completion
 出现，但 commit record 只能在 intent=`completed` 后发布，因此任何中断代际都不会被 daemon
 接受。回滚以相同协议选择 previous commit 的不可变 generation。
 
