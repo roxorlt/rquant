@@ -518,9 +518,73 @@ html{scroll-behavior:smooth}
   <div id="gapList"></div>
 </section>
 
+<!-- ============ 8b 平台框架 ============ -->
+<section id="s-sandbox">
+  <div class="sec-head"><span class="sec-num mono">08</span><h2 class="serif">平台框架与研究纪律</h2></div>
+  <p>这一节是「普通人最小 AI 量化系统」的落地——<strong>可靠的数据（数据字典）、固定的回测底座、AI 研究沙盒、实验协议</strong>四件套。核心思想一句话：<strong>AI 负责理解信息和写代码，固定的量化系统负责验证；AI 是没有签字权的研究员，不是基金经理。</strong></p>
+
+  <h3>① 数据字典：每个字段先登记再使用</h3>
+  <p>最容易出事的是「可用时间」这一列——它决定信号最早能在什么时刻计算完成，是<strong>未来函数的唯一防线</strong>。rQuant 实际字段示例：</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>字段</th><th>含义</th><th>单位</th><th>频率</th><th style="background:var(--poc-soft)">可用时间 ⚠️</th><th>复权</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">close</td><td>日收盘价</td><td>元</td><td>日</td><td style="background:var(--poc-soft)">收盘后，数据商落地 15:30–17:00（实测）</td><td>需明确口径</td></tr>
+        <tr><td class="mono">amount</td><td>日成交额</td><td><b>千元</b>（rQuant 踩过：与分钟 amount 的「元」差 1000 倍）</td><td>日</td><td style="background:var(--poc-soft)">同上</td><td>不适用</td></tr>
+        <tr><td class="mono">POC_yest</td><td>昨日 VP 峰位</td><td>元</td><td>日</td><td style="background:var(--poc-soft)"><b>T-1 分钟数据全部落地之后</b>——盘前 09:15 是否 100% 可得必须实测</td><td>不复权</td></tr>
+        <tr><td class="mono">bid1_vol</td><td>买一挂单量</td><td>⚠️股 or 手</td><td>3s / tick</td><td style="background:var(--poc-soft)">快照时刻 + 跨境网络延迟（iTick 证伪测试在测）</td><td>不适用</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">完整登记表共 8 列（另有「是否后期修订」「缺失语义」），任何字段缺一列不得进策略。见规格 §2。</p>
+
+  <h3>② 研究沙盒：AI 只能改这 7 个文件</h3>
+  <div class="grid g2" style="align-items:stretch">
+    <div class="card">
+      <div style="font-size:12px;letter-spacing:.1em;color:var(--down);font-weight:700;margin-bottom:8px">✍️ SANDBOX · AI 可写</div>
+      <div class="mono" style="font-size:13px;line-height:2;color:var(--tx-2)">
+research_sandbox/<br>
+├─ hypothesis.md <span class="pill p-new">研究假设卡</span><br>
+├─ data_dictionary.md <span class="pill p-new">字段登记</span><br>
+├─ factor.py <span class="pill p-new">因子/信号计算</span><br>
+├─ test_factor.py <span class="pill p-new">单元测试</span><br>
+├─ config.yaml <span class="pill p-new">策略参数</span><br>
+├─ experiment_log.csv <span class="pill p-new">所有实验含失败</span><br>
+└─ audit_report.md <span class="pill p-new">风险审计</span>
+      </div>
+    </div>
+    <div class="card">
+      <div style="font-size:12px;letter-spacing:.1em;color:var(--up);font-weight:700;margin-bottom:8px">🔒 ENGINE · AI 只读</div>
+      <p class="small" style="margin-bottom:10px">沙盒之外一律不可写。以下东西<strong>不是参数</strong>，不进 config.yaml，防止被 AI 当旋钮调优：</p>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        <span class="pill p-crit">成交价假设</span><span class="pill p-crit">调仓时间</span><span class="pill p-crit">手续费</span><span class="pill p-crit">印花税</span><span class="pill p-crit">滑点</span><span class="pill p-crit">涨跌停成交</span><span class="pill p-crit">停牌处理</span><span class="pill p-crit">容量限制</span>
+      </div>
+      <p class="small" style="margin-top:10px">修改引擎的唯一方式：人工 review + 在 experiment_log 记录理由 + <strong>重跑全部历史实验</strong>。每次「收益提升」先过审计：是不是成交规则被放松了？</p>
+    </div>
+  </div>
+
+  <h3>③ 实验协议：跑第一次回测之前定死</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>规则</th><th>为什么</th></tr></thead>
+      <tbody>
+        <tr><td><b>开发 / 验证 / 盲测三段切分</b>，盲测全程锁定只在最终决策前跑一次</td><td>验证集每看一次就消耗一次统计效力</td></tr>
+        <tr><td><b>一次实验只改一个变量</b>，跑之前先写「预期结果」</td><td>改两个就说不清哪个起作用；预期落空比结果好看更有信息量</td></tr>
+        <tr><td><b>失败的实验必须记录，不许删</b></td><td>删失败记录 = 自欺欺人的过拟合</td></tr>
+        <tr><td><b>累计实验超 30 次换盲测区间</b></td><td>多重检验问题——AI 一天能生成几十个策略，测得越多，偶然撞出漂亮曲线的概率越高。<b>AI 最大的优势是快，最大的风险也是快</b></td></tr>
+        <tr><td><b>8 条失败标准（K1–K8）预先定死</b></td><td>不是先证明有效，而是先规定「什么证据出现就承认无效」</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <p><strong>这套框架在迭代计划里是一条独立工作流（W2 平台脚手架）</strong>，不依赖任何策略结论，可以立即并行开工——沙盒目录、引擎冻结、实验日志都是纯结构搭建，不写一行策略代码。完整的并行矩阵（8 条工作流、依赖关系、冲突面检查）见规格 §9.4。</p>
+  </div>
+</section>
+
 <!-- ============ 8 可行性 ============ -->
 <section id="s-feas">
-  <div class="sec-head"><span class="sec-num mono">08</span><h2 class="serif">工程可行性</h2></div>
+  <div class="sec-head"><span class="sec-num mono">09</span><h2 class="serif">工程可行性</h2></div>
 
   <h3>存储：分级之后才可行</h3>
   <div class="tbl-wrap">
@@ -572,7 +636,7 @@ html{scroll-behavior:smooth}
 
 <!-- ============ 9 计划 ============ -->
 <section id="s-plan">
-  <div class="sec-head"><span class="sec-num mono">09</span><h2 class="serif">分阶段计划与闸门</h2></div>
+  <div class="sec-head"><span class="sec-num mono">10</span><h2 class="serif">分阶段计划与闸门</h2></div>
   <p>每个阶段都有一道<strong>不过就停</strong>的闸门。最重要的是 P0 和 P2——它们花的时间最少，否定得最彻底。</p>
   <div class="card" style="margin-top:16px" id="phases"></div>
 
@@ -584,7 +648,7 @@ html{scroll-behavior:smooth}
 
 <!-- ============ 10 决策 ============ -->
 <section id="s-decide">
-  <div class="sec-head"><span class="sec-num mono">10</span><h2 class="serif">需要你拍板的三件事</h2></div>
+  <div class="sec-head"><span class="sec-num mono">11</span><h2 class="serif">需要你拍板的三件事</h2></div>
   <div class="card">
     <div class="verdict">
       <span class="vmark v-mid mono">D1</span>
@@ -635,9 +699,10 @@ var SECTIONS=[
   {id:"s-hold",  t:"05 持仓决策矩阵",  n:15},
   {id:"s-seal",  t:"06 封单量监控",    n:14},
   {id:"s-gaps",  t:"07 全部 20 个缺口",n:20},
-  {id:"s-feas",  t:"08 工程可行性",    n:8},
-  {id:"s-plan",  t:"09 阶段与闸门",    n:7},
-  {id:"s-decide",t:"10 待你拍板",      n:3}
+  {id:"s-sandbox",t:"08 平台框架与纪律", n:12},
+  {id:"s-feas",  t:"09 工程可行性",    n:8},
+  {id:"s-plan",  t:"10 阶段与闸门",    n:7},
+  {id:"s-decide",t:"11 待你拍板",      n:3}
 ];
 var maxN=0; SECTIONS.forEach(function(s){ if(s.n>maxN) maxN=s.n; });
 var railList=document.getElementById("railList");
