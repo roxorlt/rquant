@@ -187,7 +187,7 @@ def prepare_lab_runtime_layout(
             if label in managed_files and (
                 "sqlite" in label.casefold() or legacy.suffix.casefold() in {".db", ".sqlite3"}
             ):
-                for suffix in ("-wal", "-shm"):
+                for suffix in ("-wal", "-shm", "-journal"):
                     try:
                         os.stat(
                             f"{legacy.name}{suffix}",

@@ -1783,14 +1783,21 @@ class ReleaseGenerationAuthority:
     ) -> None:
         if not transaction.handoff_operation_id:
             return
+        completed_name = (
+            f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.completed.json"
+        )
+        handoff_name = self.handoff_path.name if provisional_label is not None else completed_name
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         try:
-            payload, _identity_value = _read_private_json(
-                root_fd=root_fd,
-                root_path=self.lock_path.parent,
-                name=self.handoff_path.name,
-                maximum_bytes=MAX_INTENT_BYTES,
-            )
+            try:
+                payload, _identity_value = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=handoff_name,
+                    maximum_bytes=MAX_INTENT_BYTES,
+                )
+            except ReleaseGenerationRecordMissingError as exc:
+                raise ReleaseGenerationError("deployment handoff is not completed") from exc
             self._assert_root(root_fd, root_identity)
         finally:
             os.close(root_fd)
@@ -1804,6 +1811,13 @@ class ReleaseGenerationAuthority:
         ):
             raise ReleaseGenerationError("deployment handoff authority is stale")
         if payload.get("stage") == "completed" and set(restarted) == set(labels):
+            if (
+                payload.get("generation_operation_id") != transaction.operation_id
+                or payload.get("environment_generation_id")
+                != self._read_marker().environment_generation_id
+                or payload.get("code_sha") != self._read_marker().commit
+            ):
+                raise ReleaseGenerationError("deployment handoff generation binding is stale")
             return
         if provisional_label is not None and (
             provisional_label in labels and payload.get("stage") == "restarting"

@@ -198,6 +198,44 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
     assert uv_name is not None
     uv_path = Path(uv_name).resolve(strict=True)
     repo, lock_path, commit, _python = _generation(tmp_path)
+    package = repo / "src" / "rquant"
+    (package / "cli.py").write_text(
+        "def main():\n    print('tiny-rquant-ok')\n",
+        encoding="utf-8",
+    )
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + (
+            '\n[project.scripts]\nrquant = "rquant.cli:main"\n'
+            '\n[build-system]\nrequires = []\nbuild-backend = "backend"\n'
+            'backend-path = ["."]\n'
+        ),
+        encoding="utf-8",
+    )
+    (repo / "backend.py").write_text(
+        "from pathlib import Path\n"
+        "from zipfile import ZIP_DEFLATED, ZipFile\n"
+        "def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):\n"
+        "    del config_settings, metadata_directory\n"
+        "    name = 'rquant-0.99.0-py3-none-any.whl'\n"
+        "    target = Path(wheel_directory) / name\n"
+        "    dist = 'rquant-0.99.0.dist-info'\n"
+        "    with ZipFile(target, 'w', ZIP_DEFLATED) as wheel:\n"
+        "        wheel.write('src/rquant/__init__.py', 'rquant/__init__.py')\n"
+        "        wheel.write('src/rquant/cli.py', 'rquant/cli.py')\n"
+        "        wheel.writestr(dist + '/METADATA', "
+        "'Metadata-Version: 2.1\\nName: rquant\\nVersion: 0.99.0\\n')\n"
+        "        wheel.writestr(dist + '/WHEEL', "
+        "'Wheel-Version: 1.0\\nGenerator: rquant-test\\nRoot-Is-Purelib: true\\n'"
+        "'Tag: py3-none-any\\n')\n"
+        "        wheel.writestr(dist + '/entry_points.txt', "
+        "'[console_scripts]\\nrquant = rquant.cli:main\\n')\n"
+        "        wheel.writestr(dist + '/RECORD', '')\n"
+        "    return name\n"
+        "build_editable = build_wheel\n",
+        encoding="utf-8",
+    )
     shutil.rmtree(repo / ".venv")
     cache = tmp_path / "uv-cache"
     monkeypatch.setenv("UV_CACHE_DIR", str(cache))
@@ -218,7 +256,18 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
         capture_output=True,
         text=True,
     )
-    subprocess.run([str(TRUSTED_GIT), "add", "uv.lock"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            str(TRUSTED_GIT),
+            "add",
+            "backend.py",
+            "pyproject.toml",
+            "src/rquant/cli.py",
+            "uv.lock",
+        ],
+        cwd=repo,
+        check=True,
+    )
     subprocess.run(
         [
             str(TRUSTED_GIT),
@@ -271,6 +320,19 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
 
     assert initialized.environment_generation_id != deployed.environment_generation_id
     assert deployed.previous_generation_id == initialized.environment_generation_id
+    launcher = Path(deployed.venv_path) / "bin" / "rquant"
+    executed = subprocess.run(
+        [str(launcher)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert executed.stdout.strip() == "tiny-rquant-ok"
+    launcher_payload = launcher.read_bytes()
+    assert launcher_payload.startswith(b"#!")
+    assert b".building" not in launcher_payload
+    assert str(repo / ".venv").encode() not in launcher_payload
     manifest = json.loads(
         environment_manifest_path_for_lock(
             lock_path,
@@ -634,7 +696,7 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         operation_id=intent.operation_id,
         stage="timers_restored",
     )
-    authority.publish(
+    published = authority.publish(
         expected_commit=commit,
         operation_id=intent.operation_id,
         transaction_kind="deployment",
@@ -663,7 +725,27 @@ def test_deployment_marker_requires_completed_launchd_handoff(
 
     payload["restarted_labels"] = list(labels)
     payload["stage"] = "completed"
-    handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+    payload["generation_operation_id"] = intent.operation_id
+    payload["environment_generation_id"] = published.environment_generation_id
+    payload["code_sha"] = published.commit
+    completed_path = handoff_path.with_name(
+        f"{lock_path.stem}.lab-handoff.{handoff_operation}.completed.json"
+    )
+    completed_path.write_text(json.dumps(payload), encoding="utf-8")
+    completed_path.chmod(0o600)
+    authority.verify(expected_commit=commit)
+
+    handoff_path.write_text(
+        json.dumps(
+            {
+                **payload,
+                "operation_id": "e" * 32,
+                "restarted_labels": [],
+                "stage": "stopping",
+            }
+        ),
+        encoding="utf-8",
+    )
     handoff_path.chmod(0o600)
     authority.verify(expected_commit=commit)
     os.close(lock_fd)

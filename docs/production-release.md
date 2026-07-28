@@ -99,9 +99,22 @@ marker/sentinel/commit/selector；任一步中断时 daemon 都会失败关闭�
 完成、commit record 尚未发布的窄窗口，重复同一 target 的 initialize 只允许核验并补齐 commit
 record；完整初始化仍拒绝重放。
 
+初始化事务与普通部署 intent 是两套 lifecycle。初始化中断后，唯一受支持的续跑命令是原样重复
+同一精确 target 的初始化命令：
+
+```bash
+bash scripts/deploy-production.sh \
+  --initialize-generation \
+  --target <the-same-recorded-exact-target>
+```
+
+此时不得改用 `--recover-generation`；后者只恢复已经持久化 `rquant.intent.json` 的常规部署。
+初始化 sentinel 已完成且 commit record 完整时，上述命令会明确拒绝重放，而不是重新祝福当前状态。
+
 第二步，在 marker 已可验证但 launchd 尚未安装时，通过只读 stdlib wrapper 创建专用私有 runtime
 根并迁移旧 Lab 状态。默认目标是 `DATA_DIR/lab-runtime`，根和目录均为 `0700`，文件为 `0600`；
-共享的 `DATA_DIR` 可以保持现有 `0755`，命令不会 chmod 它。若旧 SQLite 仍存在 `-wal`/`-shm`，
+共享的 `DATA_DIR` 可以保持现有 `0755`，命令不会 chmod 它。若旧 SQLite 仍存在
+`-wal`/`-shm`/`-journal`，
 迁移会失败关闭，必须先在旧服务停机状态完成 SQLite checkpoint，再重新运行：
 
 ```bash
@@ -187,19 +200,32 @@ Linux profile 保持既有 systemd service/timer 计划；macOS profile 不运�
 worker、finalizer，而不按文件后缀猜测“这次改动大概无关”。交接在交易保护窗口外确认三个 label
 均已 loaded，各执行一次 bootout，部署完成后各 bootstrap 一次，不用重启循环掩盖故障。
 
+`deploy/launchd/*.plist` 属于受控基础设施，不进入普通代码发布：change plan 会像 systemd、nginx、
+sudoers 一样 fail closed，并要求独立人工验收/安装。plist 安装或更新后，必须重新运行
+`--register-lab-installation` 持久化新的文件 hash 与 inode；普通发布既不会偷偷替换 plist，也不会
+在 checkout 后才因旧 installation state 失败。Linux profile 的 systemd 规则保持不变。
+
 交接本身也有独立的 `0600` 持久事务记录：在第一次 bootout 前 fsync operation id、原 loaded label、
 已停止/已恢复集合与阶段。崩溃恢复以 launchctl 当前状态和该记录共同判断，允许“只恢复了一部分”
 的合法中间态；仍 loaded 的 label 会重新停下，最终只恢复原集合。generation marker 在 handoff
 记录尚未 completed 时仅允许记录内某个 label 以 provisional 身份启动并发布 readiness，普通 daemon
-验收仍失败关闭；三个 label 全部恢复并通过稳定窗口后，handoff 才 completed，marker 才正式可接受。
+验收仍失败关闭；三个 label 全部恢复并通过稳定窗口后，handoff 才 completed，并发布按 handoff
+operation id 命名且绑定 marker operation、environment generation 与 code SHA 的不可变证明。下一次
+发布可以更新活动 handoff 记录，但不能覆盖当前 generation 的 completed 证明。
 
 每个 Lab daemon 在持有同一 generation shared lock 后，以 `0600` 原子文件发布 label、PID、
 operation id、environment generation id、code SHA、启动时间和单调心跳。handoff 验收要求三个
 label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 PID 推进心跳；任一 label 缺失、
-代际错误、重启抖动或 shared lock 未保持都会在有界超时后触发失败/回滚。
+代际错误、重启抖动或 shared lock 未保持都会自动停止 target daemon、以独立恢复预算回滚到 intent
+记录的 previous generation，再恢复并验收旧 daemon；completed 证明只在最终稳定验收后发布。
 `RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS` 限制单次 Git/uv/preflight/launchctl 子命令，
 `RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS` 限制整个发布和 handoff；任何超时都会进入同一持久恢复与
-daemon restore 路径，不能无限期留下停止状态。
+daemon restore 路径。恢复创建新的有界 deadline；超时命令在独立进程组运行并终止整组，不能遗留
+uv 子进程或无限期留下停止状态。
+
+这四个非秘钥部署控制项和 `LAB_TRUSTED_GIT_PATH` 可以放在 repo `.env`。stdlib bootstrap 只读取
+这份 allowlist，不 source/eval 文件，也不读取或打印 Tushare、通知等秘钥；显式进程环境/命令参数
+优先于 `.env`。`.env` 必须是当前用户所有的真实单链接 `0600` 文件，否则发布失败关闭。
 
 ## 预演与审计
 
@@ -221,8 +247,10 @@ authority 以 `0600`
 目录 `fsync` 发布。它不是人工恢复开关；故障后只能运行上面的精确 initialize/resume/rollback
 流程，而不是复制、修改或删除 JSON。每个 intent 的 immutable plan、stage history 和操作结果还会
 写入 `logs/production-deploy.jsonl`；完成 intent 在下一次发布开始前按 operation id 归档。
-macOS 还使用同一稳定私有根中的 `rquant.lab-install.json` 和 `rquant.lab-handoff.json`，分别绑定
-显式安装状态和可恢复 launchd 交接；二者都不是人工补写的开关。
+macOS 还使用同一稳定私有根中的 `rquant.lab-install.json`、活动
+`rquant.lab-handoff.json` 与每次完成后的
+`rquant.lab-handoff.<operation-id>.completed.json`，分别绑定显式安装状态、可恢复 launchd 交接和
+当前 generation 的不可变交接证明；它们都不是人工补写的开关。
 
 ## 中断恢复决策
 

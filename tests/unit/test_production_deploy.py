@@ -6,6 +6,7 @@ import fcntl
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,6 +37,9 @@ class FakeRunner:
         self.responses = responses or {}
         self.calls: list[tuple[str, ...]] = []
         self.executed_calls: list[tuple[str, ...]] = []
+
+    def for_recovery(self) -> FakeRunner:
+        return self
 
     @staticmethod
     def _normalize(args: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -288,6 +292,20 @@ def test_change_plan_blocks_privileged_infrastructure() -> None:
         "deploy/systemd/rquant-monitor.service",
     )
     assert "rquant-monitor.service" in plan.restart_services
+
+
+def test_change_plan_blocks_launchd_plist_changes_for_separate_install_rollout() -> None:
+    plan = build_change_plan(
+        [
+            "deploy/launchd/com.roxor.rquant-lab-worker.plist",
+            "src/rquant/lab_daemon.py",
+        ],
+        release_profile="macos-lab",
+    )
+
+    assert plan.blocked_files == ("deploy/launchd/com.roxor.rquant-lab-worker.plist",)
+    assert plan.restart_services == ()
+    assert plan.handoff_daemons == LAB_LAUNCHD_HANDOFF_LABELS
 
 
 def test_change_plan_keeps_preflight_only_release_restart_free() -> None:
@@ -1231,6 +1249,32 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
     assert '"status": "rolled_back"' in audit
 
 
+def test_failed_target_uses_fresh_runner_budget_for_rollback(tmp_path: Path) -> None:
+    recovery_runner = FakeRunner(_base_responses())
+
+    class ExpiringRunner(SequenceRunner):
+        def for_recovery(self) -> FakeRunner:
+            return recovery_runner
+
+    runner = ExpiringRunner(
+        _base_responses(),
+        command=("rquant", "preflight"),
+        sequence=[(1, "target failed")],
+    )
+    authority = FakeGenerationAuthority()
+
+    with pytest.raises(DeployError, match="rolled back"):
+        deploy(
+            _config(tmp_path),
+            runner=runner,
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
+
+    assert ("git", "reset", "--hard", _sha("a")) not in runner.calls
+    assert ("git", "reset", "--hard", _sha("a")) in recovery_runner.calls
+
+
 def test_failed_merge_attempt_still_restores_previous_head(tmp_path: Path) -> None:
     responses = _base_responses()
     responses[("git", "merge", "--ff-only", _sha("b"))] = (1, "merge failed")
@@ -1299,6 +1343,42 @@ def test_subprocess_runner_bounds_each_command_and_overall_rollout(tmp_path: Pat
 
     with pytest.raises(DeployError, match="timed out"):
         runner.run([sys.executable, "-c", "import time; time.sleep(1)"])
+
+
+def test_subprocess_runner_timeout_terminates_descendant_process_group(tmp_path: Path) -> None:
+    marker = tmp_path / "descendant-survived"
+    runner = SubprocessRunner(
+        tmp_path,
+        command_timeout_seconds=0.1,
+        overall_timeout_seconds=0.2,
+    )
+    program = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c',"
+        f'"import time,pathlib;time.sleep(0.4);'
+        f"pathlib.Path({str(marker)!r}).write_text('alive')\"]);"
+        "time.sleep(5)"
+    )
+
+    with pytest.raises(DeployError, match="timed out"):
+        runner.run([sys.executable, "-c", program])
+    time.sleep(0.6)
+
+    assert not marker.exists()
+
+
+def test_subprocess_runner_recovery_budget_is_independent(tmp_path: Path) -> None:
+    runner = SubprocessRunner(
+        tmp_path,
+        command_timeout_seconds=0.1,
+        overall_timeout_seconds=0.1,
+    )
+    time.sleep(0.12)
+
+    recovery = runner.for_recovery()
+    completed = recovery.run([sys.executable, "-c", "print('recovered')"])
+
+    assert completed.stdout.strip() == "recovered"
 
 
 def test_real_git_repository_deploys_annotated_fast_forward_tag(

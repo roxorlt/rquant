@@ -29,6 +29,7 @@ AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 PRODUCTION_DEPLOYER = ROOT / "src" / "rquant" / "ops" / "production_deploy.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 _ORIGINAL_OS_WALK = os.walk
+_READINESS_A = ("a" * 32, "b" * 64, "c" * 40)
 
 
 @pytest.fixture(autouse=True)
@@ -476,7 +477,7 @@ def test_lab_handoff_restores_all_managed_daemons_and_verifies_readiness(
 
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
-    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     handoff = module._LabLaunchdHandoff(
         root=root,
         lock_path=lock_path,
@@ -595,6 +596,9 @@ def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wa
 
     assert loaded == set(module.LAB_LAUNCHD_LABELS)
     assert handoff.lock_fd == -1
+    assert not module._completed_handoff_path(lock_path, handoff.operation_id).exists()
+    persisted = json.loads(handoff.record_path.read_text(encoding="utf-8"))
+    assert persisted["stage"] == "restarting"
 
 
 def test_lab_handoff_command_timeout_restores_already_stopped_daemons(
@@ -634,7 +638,7 @@ def test_lab_handoff_command_timeout_restores_already_stopped_daemons(
 
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
-    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=0.1)
 
     with pytest.raises(module.DeployBootstrapError, match="timed out"):
@@ -808,7 +812,7 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
 
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
-    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     operation_id = "e" * 32
     module._atomic_private_json(
         module._stable_record_path(lock_path, "lab-handoff"),
@@ -840,6 +844,245 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
     assert persisted["operation_id"] == operation_id
     assert persisted["stage"] == "completed"
     assert persisted["restarted_labels"] == list(module.LAB_LAUNCHD_LABELS)
+
+
+def test_completed_handoff_proof_survives_consecutive_installed_releases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    expectations = iter(
+        [
+            ("a" * 32, "b" * 64, "c" * 40),
+            ("d" * 32, "e" * 64, "f" * 40),
+        ]
+    )
+
+    def fake_launchctl(
+        arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, timeout_seconds
+        action = arguments[0]
+        if action == "print":
+            label = arguments[-1].rsplit("/", 1)[-1]
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.remove(arguments[-1].rsplit("/", 1)[-1])
+        else:
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(
+        module,
+        "_wait_for_lab_readiness",
+        lambda **_kwargs: next(expectations),
+    )
+    now = datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    first.prepare(dry_run=False, now=now)
+    first_operation = first.operation_id
+    first.restore()
+    first_proof = module._completed_handoff_path(lock_path, first_operation)
+    first_payload = json.loads(first_proof.read_text(encoding="utf-8"))
+    interrupted_active = dict(first_payload)
+    interrupted_active["stage"] = "restarting"
+    interrupted_active["restarted_labels"] = []
+    module._atomic_private_json(first.record_path, interrupted_active)
+
+    second = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    second.prepare(dry_run=False, now=now)
+    assert second.operation_id != first_operation
+    assert json.loads(first_proof.read_text(encoding="utf-8")) == first_payload
+    second.restore()
+
+    assert first_payload["generation_operation_id"] == "a" * 32
+    assert first_payload["environment_generation_id"] == "b" * 64
+    assert first_payload["code_sha"] == "c" * 40
+    assert module._completed_handoff_path(lock_path, second.operation_id).is_file()
+
+
+def test_lab_handoff_restore_gets_fresh_overall_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, timeout_seconds
+        action = arguments[0]
+        if action == "print":
+            label = arguments[-1].rsplit("/", 1)[-1]
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.remove(arguments[-1].rsplit("/", 1)[-1])
+        else:
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
+    handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=0.1,
+        overall_timeout_seconds=0.1,
+    )
+    handoff.prepare(
+        dry_run=False,
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    handoff.deadline = time.monotonic() - 1
+
+    handoff.restore()
+
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+
+
+def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
+    tmp_path: Path,
+) -> None:
+    module = _bootstrap_module()
+    events: list[str] = []
+
+    class TargetHandoff:
+        def restore(self) -> None:
+            events.append("target-readiness-failed")
+            raise module.DeployBootstrapError("target readiness failed")
+
+    class RecoveryHandoff:
+        def prepare(self, *, dry_run: bool, now: datetime | None = None) -> None:
+            del dry_run, now
+            events.append("target-daemons-stopped")
+
+        def restore(self) -> None:
+            events.append("previous-daemons-ready")
+
+        def close(self) -> None:
+            events.append("recovery-closed")
+
+    recovery_handoff = RecoveryHandoff()
+
+    def rollback(_handoff: object) -> int:
+        assert _handoff is recovery_handoff
+        assert events[-1] == "target-daemons-stopped"
+        events.append("previous-generation-restored")
+        return 0
+
+    result = module._complete_installed_rollout(
+        target_handoff=TargetHandoff(),
+        deploy_code=0,
+        recovery_handoff_factory=lambda: recovery_handoff,
+        rollback=rollback,
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result == 1
+    assert events == [
+        "target-readiness-failed",
+        "target-daemons-stopped",
+        "previous-generation-restored",
+        "previous-daemons-ready",
+    ]
+
+
+def test_deploy_control_dotenv_reader_is_allowlisted_and_never_evaluates_shell(
+    tmp_path: Path,
+) -> None:
+    module = _bootstrap_module()
+    marker = tmp_path / "must-not-exist"
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "TUSHARE_TOKEN='secret'\n"
+        "RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS=17\n"
+        "RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS='91'\n"
+        "RQUANT_LAB_LIFECYCLE_MODE=uninstalled\n"
+        "RQUANT_DEPLOY_UV=/opt/homebrew/bin/uv\n"
+        "LAB_TRUSTED_GIT_PATH=/usr/bin/git\n"
+        f"UNRELATED=$({marker})\n",
+        encoding="utf-8",
+    )
+    env_path.chmod(0o600)
+
+    controls = module._read_deploy_controls(env_path)
+
+    assert controls == {
+        "LAB_TRUSTED_GIT_PATH": "/usr/bin/git",
+        "RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS": "17",
+        "RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS": "91",
+        "RQUANT_DEPLOY_UV": "/opt/homebrew/bin/uv",
+        "RQUANT_LAB_LIFECYCLE_MODE": "uninstalled",
+    }
+    assert not marker.exists()
+
+
+def test_bootstrap_applies_repo_dotenv_deploy_timeout_controls(tmp_path: Path) -> None:
+    checkout, python, lock_path, _commit = _checkout(tmp_path)
+    dotenv = checkout / ".env"
+    dotenv.write_text(
+        "RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS=0\nRQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS=60\n",
+        encoding="utf-8",
+    )
+    dotenv.chmod(0o600)
+
+    result = subprocess.run(
+        _command(checkout, python, lock_path),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert "deployment timeout configuration is invalid" in result.stderr
+
+
+def test_bootstrap_frozen_sync_timeout_terminates_uv_process_group(tmp_path: Path) -> None:
+    module = _bootstrap_module()
+    marker = tmp_path / "uv-descendant-survived"
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        f'"import pathlib,time;time.sleep(0.4);'
+        f"pathlib.Path({str(marker)!r}).write_text('alive')\"])\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o700)
+
+    with pytest.raises(module.DeployBootstrapError, match="could not run"):
+        module._run_frozen_sync(tmp_path, fake_uv, timeout_seconds=0.1)
+    time.sleep(0.6)
+
+    assert not marker.exists()
 
 
 def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(

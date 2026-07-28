@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fcntl
 import hashlib
 import importlib.util
@@ -12,11 +13,13 @@ import math
 import os
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +48,15 @@ UV_CANDIDATES = (
 )
 LAB_INSTALL_SCHEMA_VERSION = 1
 LAB_HANDOFF_SCHEMA_VERSION = 1
+DEPLOY_CONTROL_KEYS = frozenset(
+    {
+        "LAB_TRUSTED_GIT_PATH",
+        "RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS",
+        "RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS",
+        "RQUANT_DEPLOY_UV",
+        "RQUANT_LAB_LIFECYCLE_MODE",
+    }
+)
 
 
 def _canonical(raw: str, *, label: str) -> Path:
@@ -69,6 +81,109 @@ def _physical_directory(path: Path, *, label: str, private: bool = False) -> os.
     ):
         raise DeployBootstrapError(f"{label} has unsafe identity")
     return observed
+
+
+def _read_deploy_controls(path: Path) -> dict[str, str]:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise DeployBootstrapError("deployment dotenv cannot be inspected") from exc
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise DeployBootstrapError("deployment dotenv has unsafe identity")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 1024 * 1024:
+                raise DeployBootstrapError("deployment dotenv is too large")
+            chunks.append(chunk)
+        after = path.lstat()
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_nlink,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+        ):
+            raise DeployBootstrapError("deployment dotenv identity changed")
+        payload = b"".join(chunks).decode("utf-8")
+    except DeployBootstrapError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise DeployBootstrapError("deployment dotenv cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    lines = payload.splitlines()
+    controls: dict[str, str] = {}
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if key not in DEPLOY_CONTROL_KEYS:
+            continue
+        if key in controls:
+            raise DeployBootstrapError(f"duplicate deployment dotenv key: {key}")
+        raw_value = raw_value.strip()
+        if raw_value.startswith(("'", '"')):
+            try:
+                value = ast.literal_eval(raw_value)
+            except (SyntaxError, ValueError) as exc:
+                raise DeployBootstrapError(
+                    f"deployment dotenv value is invalid on line {line_number}"
+                ) from exc
+            if not isinstance(value, str):
+                raise DeployBootstrapError(
+                    f"deployment dotenv value is invalid on line {line_number}"
+                )
+        else:
+            if re.fullmatch(r"[A-Za-z0-9_./:+-]*", raw_value) is None:
+                raise DeployBootstrapError(
+                    f"deployment dotenv value is unsafe on line {line_number}"
+                )
+            value = raw_value
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise DeployBootstrapError(f"deployment dotenv value is unsafe on line {line_number}")
+        controls[key] = value
+    return controls
+
+
+def _deploy_timeout(raw: str, *, default: float, label: str) -> float:
+    try:
+        value = float(raw) if raw else default
+    except ValueError as exc:
+        raise DeployBootstrapError(f"{label} is invalid") from exc
+    if not math.isfinite(value):
+        raise DeployBootstrapError(f"{label} is invalid")
+    return value
 
 
 def _physical_file(path: Path, *, label: str, executable: bool = False) -> os.stat_result:
@@ -331,6 +446,30 @@ def _launchctl(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("Lab launchd handoff command failed") from exc
+
+
+def _run_process_group(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        arguments,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
 def _generation_lock_is_held(root: Path, lock_path: Path) -> bool:
@@ -604,7 +743,7 @@ def _wait_for_lab_readiness(
     lock_path: Path,
     timeout_seconds: float,
     stability_seconds: float = LAUNCHD_READINESS_STABILITY_SECONDS,
-) -> None:
+) -> tuple[str, str, str]:
     deadline = time.monotonic() + timeout_seconds
     expected = _release_readiness_expectation(lock_path)
     installation = _read_lab_installation_state(root=root, lock_path=lock_path)
@@ -662,9 +801,15 @@ def _wait_for_lab_readiness(
                 lock_path,
             )
         ):
-            return
+            return expected
         time.sleep(min(0.1, max(0.01, stability_seconds / 4)))
     raise DeployBootstrapError("Lab daemons did not reach generation-bound stable readiness")
+
+
+def _completed_handoff_path(lock_path: Path, operation_id: str) -> Path:
+    if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+        raise DeployBootstrapError("Lab launchd handoff operation is invalid")
+    return lock_path.with_name(f"{lock_path.stem}.lab-handoff.{operation_id}.completed.json")
 
 
 class _LabLaunchdHandoff:
@@ -722,7 +867,12 @@ class _LabLaunchdHandoff:
             raise DeployBootstrapError("Lab launchd handoff overall timeout expired")
         return min(self.timeout_seconds, remaining)
 
-    def _record(self, stage: str) -> None:
+    def _record(
+        self,
+        stage: str,
+        *,
+        generation: tuple[str, str, str] | None = None,
+    ) -> None:
         if not self.enabled:
             return
         payload: dict[str, object] = {
@@ -736,6 +886,30 @@ class _LabLaunchdHandoff:
             "restarted_labels": list(self.restarted),
             "updated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         }
+        if stage == "completed":
+            if generation is None:
+                raise DeployBootstrapError("completed Lab handoff lacks generation binding")
+            operation_id, generation_id, code_sha = generation
+            payload.update(
+                {
+                    "generation_operation_id": operation_id,
+                    "environment_generation_id": generation_id,
+                    "code_sha": code_sha,
+                }
+            )
+        if stage == "completed":
+            completed_path = _completed_handoff_path(self.lock_path, self.operation_id)
+            if completed_path.exists():
+                if (
+                    _private_json(
+                        completed_path,
+                        label="completed Lab launchd handoff proof",
+                    )
+                    != payload
+                ):
+                    raise DeployBootstrapError("completed Lab launchd handoff proof changed")
+            else:
+                _atomic_private_json(completed_path, payload)
         _atomic_private_json(self.record_path, payload)
 
     def _load_incomplete_record(self) -> bool:
@@ -753,6 +927,21 @@ class _LabLaunchdHandoff:
             raise DeployBootstrapError("Lab launchd handoff state is invalid")
         if payload.get("stage") == "completed":
             return False
+        operation_id = str(payload.get("operation_id", ""))
+        if re.fullmatch(r"[0-9a-f]{32}", operation_id) is not None:
+            completed_path = _completed_handoff_path(self.lock_path, operation_id)
+            if completed_path.exists():
+                completed = _private_json(
+                    completed_path,
+                    label="completed Lab launchd handoff proof",
+                )
+                if (
+                    completed.get("operation_id") != operation_id
+                    or completed.get("stage") != "completed"
+                    or set(completed.get("restarted_labels", ())) != set(LAB_LAUNCHD_LABELS)
+                ):
+                    raise DeployBootstrapError("completed Lab launchd handoff proof is invalid")
+                return False
         labels = [str(value) for value in payload["labels"]]
         loaded_labels = [str(value) for value in payload["loaded_labels"]]
         stopped = [str(value) for value in payload["stopped_labels"]]
@@ -807,11 +996,11 @@ class _LabLaunchdHandoff:
             return
         if not self.enabled:
             return
-        if _is_protected_handoff_window(now):
+        resumed = self._load_incomplete_record()
+        if _is_protected_handoff_window(now) and not resumed:
             raise DeployBootstrapError(
                 "Lab daemon handoff is forbidden during the protected 09:15-15:10 window"
             )
-        resumed = self._load_incomplete_record()
         if not resumed:
             self.operation_id = secrets.token_hex(16)
             loaded = [label for label in LAB_LAUNCHD_LABELS if self._is_loaded(label)]
@@ -841,6 +1030,7 @@ class _LabLaunchdHandoff:
         self._record("stopped")
 
     def restore(self) -> None:
+        self.deadline = time.monotonic() + self.overall_timeout_seconds
         errors: list[str] = []
         if self.enabled:
             for label in self.loaded:
@@ -863,14 +1053,14 @@ class _LabLaunchdHandoff:
                     errors.append(str(exc))
             if self.loaded and not errors:
                 try:
-                    _wait_for_lab_readiness(
+                    generation = _wait_for_lab_readiness(
                         root=self.root,
                         domain=self.domain,
                         labels=list(self.loaded),
                         lock_path=self.lock_path,
                         timeout_seconds=self._remaining(),
                     )
-                    self._record("completed")
+                    self._record("completed", generation=generation)
                 except DeployBootstrapError as exc:
                     errors.append(str(exc))
         if self.lock_fd >= 0:
@@ -881,6 +1071,45 @@ class _LabLaunchdHandoff:
             self.root_fd = -1
         if errors:
             raise DeployBootstrapError("; ".join(errors))
+
+    def close(self) -> None:
+        if self.lock_fd >= 0:
+            os.close(self.lock_fd)
+            self.lock_fd = -1
+        if self.root_fd >= 0:
+            os.close(self.root_fd)
+            self.root_fd = -1
+
+
+def _complete_installed_rollout(
+    *,
+    target_handoff: object,
+    deploy_code: int,
+    recovery_handoff_factory: Callable[[], object],
+    rollback: Callable[[object], int],
+    now: datetime | None = None,
+) -> int:
+    try:
+        target_handoff.restore()
+    except DeployBootstrapError as readiness_error:
+        recovery_handoff = recovery_handoff_factory()
+        try:
+            recovery_handoff.prepare(dry_run=False, now=now)
+            rollback_code = rollback(recovery_handoff)
+            if rollback_code != 0:
+                raise DeployBootstrapError(
+                    "Lab readiness failed and previous generation rollback failed"
+                )
+            recovery_handoff.restore()
+        except Exception:
+            recovery_handoff.close()
+            raise
+        print(
+            f"FAILED: target Lab readiness failed and rolled back: {readiness_error}",
+            file=sys.stderr,
+        )
+        return 1
+    return deploy_code
 
 
 def _git_run(
@@ -1029,17 +1258,14 @@ def _generation_target(deploy_argv: list[str]) -> str:
     return str(parser.parse_args(values).target)
 
 
-def _run_generation_preflight(root: Path) -> None:
+def _run_generation_preflight(root: Path, *, timeout_seconds: float = 300) -> None:
     launcher = root / ".venv" / "bin" / "rquant"
     _physical_file(launcher, label="rquant preflight launcher", executable=True)
     try:
-        result = subprocess.run(
+        result = _run_process_group(
             [str(launcher), "preflight"],
             cwd=root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=300,
+            timeout_seconds=timeout_seconds,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("generation preflight could not run") from exc
@@ -1048,15 +1274,17 @@ def _run_generation_preflight(root: Path) -> None:
         raise DeployBootstrapError(f"generation preflight failed: {diagnostic[:1000]}")
 
 
-def _run_frozen_sync(root: Path, uv_path: Path) -> None:
+def _run_frozen_sync(
+    root: Path,
+    uv_path: Path,
+    *,
+    timeout_seconds: float = 900,
+) -> None:
     try:
-        result = subprocess.run(
+        result = _run_process_group(
             [str(uv_path), "sync", "--frozen"],
             cwd=root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=900,
+            timeout_seconds=timeout_seconds,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("frozen dependency sync could not run") from exc
@@ -1148,10 +1376,20 @@ def _normalized_deploy_argv(values: list[str]) -> list[str]:
     return normalized
 
 
+def _replace_deployment_target(values: list[str], target: str) -> list[str]:
+    replaced = list(values)
+    try:
+        index = replaced.index("--target")
+        replaced[index + 1] = target
+    except (ValueError, IndexError) as exc:
+        raise DeployBootstrapError("deployment target argument is missing") from exc
+    return replaced
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
-    parser.add_argument("--trusted-git-path", required=True)
+    parser.add_argument("--trusted-git-path", default="")
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--python-path", required=True)
     parser.add_argument("--uv-path", default="")
@@ -1163,8 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host-platform", choices=("linux", "darwin"), required=True)
     parser.add_argument(
         "--lab-lifecycle-mode",
-        choices=("uninstalled", "installed"),
-        default="uninstalled",
+        default="",
     )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--initialize-generation", action="store_true")
@@ -1178,8 +1415,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inherited-lock-fd", type=int)
     parser.add_argument("--lab-runtime-root")
     parser.add_argument("--lab-readiness-root")
-    parser.add_argument("--command-timeout-seconds", type=float, default=300)
-    parser.add_argument("--overall-timeout-seconds", type=float, default=1800)
+    parser.add_argument("--command-timeout-seconds", default="")
+    parser.add_argument("--overall-timeout-seconds", default="")
     args, deploy_argv = parser.parse_known_args(argv)
     lock_fd = -1
     generation_error_type: type[BaseException] | None = None
@@ -1205,6 +1442,33 @@ def main(argv: list[str] | None = None) -> int:
         _physical_directory(root, label="deployment checkout")
         if Path.cwd().resolve(strict=True) != root:
             raise DeployBootstrapError("working directory does not match deployment checkout")
+        controls = _read_deploy_controls(root / ".env")
+        args.trusted_git_path = (
+            args.trusted_git_path or controls.get("LAB_TRUSTED_GIT_PATH") or "/usr/bin/git"
+        )
+        args.uv_path = args.uv_path or controls.get("RQUANT_DEPLOY_UV", "")
+        args.command_timeout_seconds = _deploy_timeout(
+            str(args.command_timeout_seconds)
+            or controls.get("RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS", ""),
+            default=300,
+            label="deployment command timeout",
+        )
+        args.overall_timeout_seconds = _deploy_timeout(
+            str(args.overall_timeout_seconds)
+            or controls.get("RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS", ""),
+            default=1800,
+            label="deployment overall timeout",
+        )
+        if args.host_platform == "linux":
+            if args.lab_lifecycle_mode not in {"", "uninstalled"}:
+                raise DeployBootstrapError("Linux deployment cannot enable Lab lifecycle")
+            args.lab_lifecycle_mode = "uninstalled"
+        else:
+            args.lab_lifecycle_mode = (
+                args.lab_lifecycle_mode or controls.get("RQUANT_LAB_LIFECYCLE_MODE") or "installed"
+            )
+        if args.lab_lifecycle_mode not in {"uninstalled", "installed"}:
+            raise DeployBootstrapError("Lab lifecycle mode is invalid")
         lock_path = _canonical(args.deployment_lock_path, label="deployment lock")
         git_path = _canonical(args.trusted_git_path, label="trusted Git")
         _trusted_git(git_path)
@@ -1318,10 +1582,17 @@ def main(argv: list[str] | None = None) -> int:
                             raise generation_error_type(
                                 "release generation initialization already completed"
                             ) from exc
-                        _run_frozen_sync(root, uv_path)
+                        _run_frozen_sync(
+                            root,
+                            uv_path,
+                            timeout_seconds=args.command_timeout_seconds,
+                        )
                         _verify_current_generation_checkout(root, git_path, commit)
                         _verify_generation_runtime(root, python_path)
-                        _run_generation_preflight(root)
+                        _run_generation_preflight(
+                            root,
+                            timeout_seconds=args.command_timeout_seconds,
+                        )
                         authority.commit_generation(
                             operation_id=initialization.operation_id,
                             transaction_kind="initialization",
@@ -1339,10 +1610,17 @@ def main(argv: list[str] | None = None) -> int:
                     raise generation_error_type(
                         "release generation initialization already completed"
                     )
-            _run_frozen_sync(root, uv_path)
+            _run_frozen_sync(
+                root,
+                uv_path,
+                timeout_seconds=args.command_timeout_seconds,
+            )
             _verify_current_generation_checkout(root, git_path, commit)
             _verify_generation_runtime(root, python_path)
-            _run_generation_preflight(root)
+            _run_generation_preflight(
+                root,
+                timeout_seconds=args.command_timeout_seconds,
+            )
             authority.publish(
                 expected_commit=commit,
                 operation_id=initialization.operation_id,
@@ -1433,7 +1711,10 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 raise DeployBootstrapError("finalizer does not match ready deployment intent")
             _verify_current_generation_checkout(root, git_path, expected_commit)
-            _run_generation_preflight(root)
+            _run_generation_preflight(
+                root,
+                timeout_seconds=args.command_timeout_seconds,
+            )
             if args.finalize_phase == "publish":
                 result = authority.publish(
                     expected_commit=expected_commit,
@@ -1490,15 +1771,22 @@ def main(argv: list[str] | None = None) -> int:
         deploy_argv = _normalized_deploy_argv(deploy_argv)
         if args.recover_generation:
             deploy_argv.extend(["--recovery-action", str(args.recovery_action)])
-        if handoff is not None and handoff.enabled and not dry_run:
-            deploy_argv.extend(["--lab-handoff-operation-id", handoff.operation_id])
-            for label in handoff.loaded:
-                deploy_argv.extend(["--lab-handoff-label", label])
-        return finish(
-            int(
+
+        def invoke_deployer(
+            values: list[str],
+            *,
+            startup_generation: str,
+            active_handoff: _LabLaunchdHandoff | None,
+        ) -> int:
+            arguments = list(values)
+            if active_handoff is not None and active_handoff.enabled and not dry_run:
+                arguments.extend(["--lab-handoff-operation-id", active_handoff.operation_id])
+                for label in active_handoff.loaded:
+                    arguments.extend(["--lab-handoff-label", label])
+            return int(
                 deploy_main(
                     [
-                        *deploy_argv,
+                        *arguments,
                         "--repo",
                         str(root),
                         "--deployment-lock-path",
@@ -1506,7 +1794,7 @@ def main(argv: list[str] | None = None) -> int:
                         "--deployment-lock-fd",
                         str(lock_fd),
                         "--startup-generation",
-                        commit,
+                        startup_generation,
                         "--trusted-git-path",
                         str(git_path),
                         "--python-path",
@@ -1526,7 +1814,68 @@ def main(argv: list[str] | None = None) -> int:
                     ]
                 )
             )
+
+        deploy_code = invoke_deployer(
+            deploy_argv,
+            startup_generation=commit,
+            active_handoff=handoff,
         )
+        if handoff is not None and handoff.enabled and not dry_run:
+            target_handoff = handoff
+            handoff = None
+            rollback_target = commit
+            if args.recover_generation:
+                rollback_target = authority.read_deployment_intent().previous_sha
+            if lock_fd >= 0:
+                os.close(lock_fd)
+                lock_fd = -1
+
+            def recovery_handoff_factory() -> _LabLaunchdHandoff:
+                return _LabLaunchdHandoff(
+                    root=root,
+                    lock_path=lock_path,
+                    timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+                    overall_timeout_seconds=args.overall_timeout_seconds,
+                    release_profile=args.release_profile,
+                    lifecycle_mode=args.lab_lifecycle_mode,
+                )
+
+            def rollback_after_readiness(
+                recovery_handoff: object,
+            ) -> int:
+                nonlocal lock_fd
+                if not rollback_target or not isinstance(recovery_handoff, _LabLaunchdHandoff):
+                    raise DeployBootstrapError("Lab readiness rollback is not bound")
+                if _git_head(root, git_path) == rollback_target:
+                    return 0
+                lock_fd = _acquire_lock(
+                    root,
+                    lock_path,
+                    timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+                )
+                recovery_values = _replace_deployment_target(
+                    deploy_argv,
+                    rollback_target,
+                )
+                recovery_values.extend(["--recovery-action", "rollback"])
+                try:
+                    return invoke_deployer(
+                        recovery_values,
+                        startup_generation=_git_head(root, git_path),
+                        active_handoff=recovery_handoff,
+                    )
+                finally:
+                    if lock_fd >= 0:
+                        os.close(lock_fd)
+                        lock_fd = -1
+
+            return _complete_installed_rollout(
+                target_handoff=target_handoff,
+                deploy_code=deploy_code,
+                recovery_handoff_factory=recovery_handoff_factory,
+                rollback=rollback_after_readiness,
+            )
+        return finish(deploy_code)
     except Exception as exc:
         expected = isinstance(exc, (DeployBootstrapError, OSError, subprocess.SubprocessError))
         if generation_error_type is not None and isinstance(exc, generation_error_type):

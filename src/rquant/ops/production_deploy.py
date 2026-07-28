@@ -14,13 +14,14 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
 import time as monotonic_time
 import tomllib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time
 from pathlib import Path
@@ -63,6 +64,7 @@ SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
 }
 
 PRIVILEGED_PREFIXES = (
+    "deploy/launchd/",
     "deploy/systemd/",
     "deploy/nginx/",
     "deploy/frp/",
@@ -171,6 +173,41 @@ class GenerationFinalizer(Protocol):
     ) -> object: ...
 
 
+def _run_process_group(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+    check: bool,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        pass_fds=pass_fds,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            args,
+            output=stdout,
+            stderr=stderr,
+        )
+    return completed
+
+
 class SubprocessRunner:
     def __init__(
         self,
@@ -183,7 +220,15 @@ class SubprocessRunner:
             raise PolicyError("deployment timeout configuration is invalid")
         self._cwd = cwd
         self._command_timeout_seconds = command_timeout_seconds
+        self._overall_timeout_seconds = overall_timeout_seconds
         self._deadline = monotonic_time.monotonic() + overall_timeout_seconds
+
+    def for_recovery(self) -> SubprocessRunner:
+        return SubprocessRunner(
+            self._cwd,
+            command_timeout_seconds=self._command_timeout_seconds,
+            overall_timeout_seconds=self._overall_timeout_seconds,
+        )
 
     def run(
         self,
@@ -195,13 +240,11 @@ class SubprocessRunner:
         if remaining <= 0:
             raise DeployError("deployment overall timeout expired")
         try:
-            return subprocess.run(
+            return _run_process_group(
                 args,
                 cwd=self._cwd,
+                timeout_seconds=min(self._command_timeout_seconds, remaining),
                 check=check,
-                capture_output=True,
-                text=True,
-                timeout=min(self._command_timeout_seconds, remaining),
             )
         except subprocess.TimeoutExpired as exc:
             raise DeployError(f"command timed out: {shlex.join(args)}") from exc
@@ -210,6 +253,16 @@ class SubprocessRunner:
             raise DeployError(
                 f"command failed ({exc.returncode}): {shlex.join(args)}: {diagnostic[:1000]}"
             ) from exc
+
+
+def _fresh_recovery_runner(runner: Runner) -> Runner:
+    factory = getattr(runner, "for_recovery", None)
+    if not callable(factory):
+        raise DeployError("deployment recovery requires a fresh bounded runner")
+    recovered = factory()
+    if not hasattr(recovered, "run"):
+        raise DeployError("deployment recovery runner is invalid")
+    return recovered
 
 
 class IsolatedGenerationFinalizer:
@@ -263,13 +316,11 @@ class IsolatedGenerationFinalizer:
             expected_commit,
         ]
         try:
-            completed = subprocess.run(
+            completed = _run_process_group(
                 command,
                 cwd=config.repo,
+                timeout_seconds=config.command_timeout_seconds,
                 check=True,
-                capture_output=True,
-                text=True,
-                timeout=config.command_timeout_seconds,
                 pass_fds=(config.lock_fd,),
             )
             payload = json.loads(completed.stdout)
@@ -682,7 +733,8 @@ def _recover_locked(
     plan = build_change_plan(intent.changed_files, release_profile=config.release_profile)
     if plan.blocked_files or plan.restart_services != intent.restart_services:
         raise PolicyError("recorded deployment intent no longer matches change classification")
-    if (intent.restart_services or plan.handoff_daemons) and is_protected_market_window(config.now):
+    requires_handoff = config.lab_lifecycle_mode == "installed" and bool(plan.handoff_daemons)
+    if (intent.restart_services or requires_handoff) and is_protected_market_window(config.now):
         raise ProtectedWindowError(
             "deployment recovery requires service restarts during the protected 09:15-15:10 window"
         )
@@ -788,7 +840,10 @@ def _deploy_locked(
     if change_plan.blocked_files:
         joined = ", ".join(change_plan.blocked_files)
         raise PolicyError(f"privileged infrastructure changes require a separate rollout: {joined}")
-    if (change_plan.restart_services or change_plan.handoff_daemons) and is_protected_market_window(
+    requires_handoff = config.lab_lifecycle_mode == "installed" and bool(
+        change_plan.handoff_daemons
+    )
+    if (change_plan.restart_services or requires_handoff) and is_protected_market_window(
         config.now
     ):
         raise ProtectedWindowError(
@@ -845,6 +900,7 @@ def _deploy_locked(
             )
         except Exception as exc:
             try:
+                recovery_runner = _fresh_recovery_runner(runner)
                 recovery = _advance_intent(
                     config,
                     generation_authority,
@@ -854,7 +910,7 @@ def _deploy_locked(
                 generation_authority.invalidate()
                 completed = _execute_transaction(
                     config,
-                    runner,
+                    recovery_runner,
                     generation_authority,
                     generation_finalizer,
                     recovery,

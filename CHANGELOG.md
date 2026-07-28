@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **连续 macOS Lab 发布与失败恢复**：completed launchd handoff 改为按 operation 持久化并精确
+  绑定 marker operation、不可变 venv generation 与 code SHA，后续 A→B 发布不再覆盖当前代际的
+  daemon 证明。新代际 readiness 失败会停止 target daemon、用独立有界预算自动回滚 previous
+  generation，再恢复并验收旧 daemon；子命令超时会终止完整进程组，避免遗留 uv。普通代码发布
+  明确拒绝 `deploy/launchd` 变更，plist 更新必须走独立安装并重登记 installation state。部署入口
+  以 allowlist、无 eval 的方式读取 repo `.env` 中非秘钥控制项；真实最小 uv console entry 会在
+  freeze 后从最终 generation 实际执行。Lab SQLite 迁移同时拒绝热 `-journal` sidecar。
+
 - **不可变 uv 代际与 macOS Lab 发布验收**：release authority 现在用真实 `uv sync --frozen`
   在独立 generation 目录构建小型环境，并只接受绑定到已验证系统解释器或代际内部目标的 uv
   symlink；marker、selector、commit 与 intent 精确持久化 `previous_generation_id`，GC 不再用

@@ -870,6 +870,39 @@ def test_private_lab_runtime_layout_refuses_live_legacy_sqlite_sidecars(
     assert not database.exists()
 
 
+def test_private_lab_runtime_layout_refuses_hot_legacy_sqlite_journal(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o755)
+    legacy_database = data / "lab_jobs.sqlite3"
+    legacy_database.write_bytes(b"sqlite")
+    legacy_database.chmod(0o600)
+    legacy_journal = data / "lab_jobs.sqlite3-journal"
+    legacy_journal.write_bytes(b"hot-journal")
+    legacy_journal.chmod(0o600)
+    runtime = data / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="checkpoint.*SQLite sidecars",
+    ):
+        lab_daemon.prepare_lab_runtime_layout(
+            runtime,
+            managed_directories={"commands": runtime / "commands"},
+            managed_files={"lab jobs SQLite": database},
+            legacy_paths={database: legacy_database},
+            mutation_guard=lambda: "verified",
+        )
+
+    assert legacy_database.read_bytes() == b"sqlite"
+    assert legacy_journal.read_bytes() == b"hot-journal"
+    assert not database.exists()
+
+
 def test_private_directory_runtime_ensure_creates_only_private_leaf(tmp_path: Path) -> None:
     path = tmp_path / "runtime" / "commands"
     prior_umask = os.umask(0o022)
