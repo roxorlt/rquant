@@ -30,17 +30,19 @@ daemon 持共享锁；`scripts/deploy-production.sh` 另持稳定的 sibling han
 
 同目录的 `rQuant.complete.json` 不是单独完成凭证。daemon 必须同时核对 completed intent、
 `rQuant.commit.json`、`rQuant.environment.json` 和环境 manifest；commit record 精确绑定 marker、
-intent content hash、operation id、commit 与环境 generation。部署器在 target `uv sync --frozen`
-后把实际环境复制到 `rQuant.venvs/<generation-id>`，拒绝 symlink/hardlink，封存权限并记录每个文件
-的 hash/身份；selector 只在完整 manifest 可验后原子切换。marker 可以先于 intent completion
+intent content hash、operation id、commit 与环境 generation。部署器使用物理绑定的 uv，在新的
+staging generation 中执行 `uv venv --relocatable` 与 `uv sync --frozen --active` 重建环境，不复制
+当前 `.venv`。它仅允许经验证的 `bin/python*` 与 `lib64` 链接：解释器必须绑定已验证的系统 Python，
+其他相对链接不得逃出 generation；随后封存权限并记录每个文件的 hash/身份。selector 只在完整
+manifest 可验后原子切换。marker 可以先于 intent completion
 出现，但 commit record 只能在 intent=`completed` 后发布，因此任何中断代际都不会被 daemon
 接受。回滚以相同协议选择 previous commit 的不可变 generation。
 
 发布环境 GC 只在同一 generation 独占锁内运行。它保留当前 selector、marker、commit、active
 intent 的 resume/rollback 目标，以及按私有 manifest 判定的紧邻上一代；只删除超过宽限期、
 严格位于 generation root、无 symlink/hardlink 且不再被引用的完成或失败目录。只读树先受控解冻
-再按 descriptor 删除。每次扫描记录到 `rQuant.generation-gc.jsonl`，并在复制前验证
-`源环境大小 + RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES` 的磁盘预算；不足时不创建 staging。
+再按 descriptor 删除。每次扫描记录到 `rQuant.generation-gc.jsonl`，并在构建前验证 generation
+预算与 `RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES`；不足时不创建 staging。
 
 ## P1.5d 安装要求
 

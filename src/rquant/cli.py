@@ -3025,6 +3025,21 @@ def _lab_runtime_layout() -> tuple[dict[str, Path], dict[str, Path], dict[Path, 
     return directories, files, legacy
 
 
+def _verify_prepared_lab_runtime(checkout_root: Path, code_sha: str) -> None:
+    from rquant.config import settings
+    from rquant.lab_daemon import verify_lab_runtime_prepared
+
+    directories, files, legacy = _lab_runtime_layout()
+    verify_lab_runtime_prepared(
+        settings.lab_runtime_dir_resolved,
+        checkout_root=checkout_root,
+        expected_commit=code_sha,
+        managed_directories=directories,
+        managed_files=files,
+        legacy_paths=legacy,
+    )
+
+
 def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
     """Create/migrate the dedicated private Lab runtime namespace once."""
     from rquant.config import settings
@@ -3077,6 +3092,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         trusted_git_path,
         **generation_binding,
     )
+    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     readiness = _lab_daemon_readiness_context(
         args,
         label="com.roxor.rquant-lab-scheduler",
@@ -3256,6 +3272,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         trusted_git_path,
         **generation_binding,
     )
+    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     readiness = _lab_daemon_readiness_context(
         args,
         label="com.roxor.rquant-lab-worker",
@@ -3370,6 +3387,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         trusted_git_path,
         **generation_binding,
     )
+    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     readiness = _lab_daemon_readiness_context(
         args,
         label="com.roxor.rquant-lab-finalizer",

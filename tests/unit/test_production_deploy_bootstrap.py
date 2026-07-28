@@ -215,11 +215,10 @@ def _checkout(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    subprocess.run(
-        [str(TRUSTED_GIT), "update-ref", "refs/remotes/origin/main", commit],
-        cwd=checkout,
-        check=True,
-    )
+    remote = tmp_path / "origin.git"
+    subprocess.run([str(TRUSTED_GIT), "init", "-q", "--bare", str(remote)], check=True)
+    _git(checkout, "remote", "add", "origin", str(remote))
+    _git(checkout, "push", "-q", "-u", "origin", "main")
     lock_root = tmp_path / ".rquant-deploy"
     lock_root.mkdir(mode=0o700)
     lock_path = lock_root / "rquant.lock"
@@ -279,7 +278,7 @@ def _commit_next_release(checkout: Path) -> str:
         "next generation",
     )
     commit = _git(checkout, "rev-parse", "HEAD")
-    _git(checkout, "update-ref", "refs/remotes/origin/main", commit)
+    _git(checkout, "push", "-q", "origin", "main")
     return commit
 
 
@@ -291,6 +290,8 @@ def _begin_intent(
     previous: str,
     target: str,
     target_ref: str | None = None,
+    handoff_operation_id: str = "",
+    handoff_labels: tuple[str, ...] = (),
 ) -> str:
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -317,6 +318,8 @@ def _begin_intent(
             restart_services=(),
             active_services=(),
             active_timers=(),
+            handoff_operation_id=handoff_operation_id,
+            handoff_labels=handoff_labels,
         )
         return intent.operation_id
     finally:
@@ -333,6 +336,7 @@ def _command(
     recovery_action: str | None = None,
     operation_id: str | None = None,
     inherited_lock_fd: int | None = None,
+    inherited_handoff_lock_fd: int | None = None,
     finalize_phase: str = "publish",
     lifecycle_mode: str = "uninstalled",
 ) -> list[str]:
@@ -379,6 +383,8 @@ def _command(
                 str(inherited_lock_fd),
             ]
         )
+        if inherited_handoff_lock_fd is not None:
+            command.extend(["--inherited-handoff-lock-fd", str(inherited_handoff_lock_fd)])
     command.extend(["--", "--target", target or _git(checkout, "rev-parse", "HEAD")])
     return command
 
@@ -1064,6 +1070,85 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
     assert persisted["restarted_labels"] == list(module.LAB_LAUNCHD_LABELS)
 
 
+def test_superseding_rollback_stops_partial_target_labels_before_previous_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    target_operation = "b" * 32
+    loaded = {module.LAB_LAUNCHD_LABELS[1]}
+    calls: list[tuple[str, str]] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        calls.append((action, label))
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.remove(label)
+        elif action == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": target_operation,
+            "checkout_root": str(root),
+            "stage": "restarting",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": list(module.LAB_LAUNCHD_LABELS),
+            "restarted_labels": [module.LAB_LAUNCHD_LABELS[1]],
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": "b" * 40,
+            "target_sha": "b" * 40,
+            "action": "deploy",
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": module._lab_installation_identity(
+                lock_path,
+                installation,
+            ),
+            "supersedes_operation_id": "",
+        },
+    )
+    rollback = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=target_operation,
+    )
+
+    rollback.prepare(
+        dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="rollback",
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert loaded == set()
+    assert ("bootout", module.LAB_LAUNCHD_LABELS[1]) in calls
+    persisted = json.loads(rollback.record_path.read_text(encoding="utf-8"))
+    assert persisted["supersedes_operation_id"] == target_operation
+    assert persisted["loaded_labels"] == list(module.LAB_LAUNCHD_LABELS)
+
+
 def test_completed_handoff_proof_survives_consecutive_installed_releases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1144,7 +1229,7 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
     assert module._completed_handoff_path(lock_path, second.operation_id).is_file()
 
 
-def test_lab_handoff_restore_gets_fresh_overall_budget(
+def test_successful_lab_handoff_restore_uses_original_overall_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1192,9 +1277,10 @@ def test_lab_handoff_restore_gets_fresh_overall_budget(
     )
     handoff.deadline = time.monotonic() - 1
 
-    handoff.restore()
+    with pytest.raises(module.DeployBootstrapError, match="overall timeout"):
+        handoff.restore()
 
-    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    assert loaded == set()
 
 
 def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
@@ -1358,6 +1444,59 @@ def test_bootstrap_frozen_sync_timeout_terminates_uv_process_group(tmp_path: Pat
     assert not marker.exists()
 
 
+def test_generation_preflight_is_clipped_by_end_to_end_deadline(tmp_path: Path) -> None:
+    module = _bootstrap_module()
+    launcher = tmp_path / ".venv" / "bin" / "rquant"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(5)\n", encoding="utf-8")
+    launcher.chmod(0o700)
+
+    started = time.monotonic()
+    with pytest.raises(module.DeployBootstrapError, match="preflight.*timeout"):
+        module._run_generation_preflight(
+            tmp_path,
+            timeout_seconds=5,
+            overall_deadline_monotonic=time.monotonic() + 0.1,
+        )
+
+    assert time.monotonic() - started < 1
+
+
+def test_env_example_is_strictly_parseable_for_mac_and_linux_profiles(
+    tmp_path: Path,
+) -> None:
+    module = _bootstrap_module()
+    env_path = tmp_path / ".env"
+    env_path.write_bytes((ROOT / ".env.example").read_bytes())
+    env_path.chmod(0o600)
+
+    controls = module._read_deploy_controls(env_path)
+    module._validate_profile_controls(
+        controls,
+        release_profile="macos-lab",
+        host_platform="darwin",
+    )
+    module._validate_profile_controls(
+        controls,
+        release_profile="linux-production",
+        host_platform="linux",
+    )
+
+    assert controls.get("RQUANT_RELEASE_PROFILE", "") == ""
+
+
+def test_generation_docs_describe_rebuilt_venv_and_initialize_restart_contract() -> None:
+    lab_doc = (ROOT / "docs" / "lab-daemon-release-generation.md").read_text(encoding="utf-8")
+    production_doc = (ROOT / "docs" / "production-release.md").read_text(encoding="utf-8")
+
+    assert "uv venv --relocatable" in production_doc
+    assert "uv sync --frozen --active" in production_doc
+    assert "把实际环境复制到" not in lab_doc
+    assert "把实际环境复制到" not in production_doc
+    assert "--initialize-generation --target <the-same-recorded-exact-target>" in lab_doc
+    assert "不得改用 `--recover-generation`" in production_doc
+
+
 def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     tmp_path: Path,
 ) -> None:
@@ -1407,6 +1546,57 @@ def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     assert "generation is active" in second.stderr
     assert not second_import.exists()
     assert not second_run.exists()
+
+
+def test_normal_deploy_fetches_before_resolving_first_seen_annotated_tag(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path)
+    (checkout / "pyproject.toml").write_text(
+        '[project]\nname = "rquant"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    (checkout / "uv.lock").write_text("version = 2\n", encoding="utf-8")
+    _git(checkout, "add", "pyproject.toml", "uv.lock")
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "commit",
+        "-qm",
+        "tagged release",
+    )
+    target = _git(checkout, "rev-parse", "HEAD")
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "tag",
+        "-a",
+        "v1.0.0",
+        "-m",
+        "v1.0.0",
+    )
+    _git(checkout, "push", "origin", "main", "refs/tags/v1.0.0")
+    _git(checkout, "reset", "--hard", previous)
+    _git(checkout, "tag", "-d", "v1.0.0")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", previous)
+
+    result = subprocess.run(
+        _command(checkout, python, lock_path, target="v1.0.0"),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(checkout, "rev-parse", "v1.0.0^{commit}") == target
 
 
 def test_installed_deploy_bootstrap_dry_run_fails_when_launchd_labels_are_not_loaded(
@@ -1556,6 +1746,73 @@ def test_register_lab_installation_requires_explicit_prepared_runtime(
 
     assert accepted.returncode == 0, accepted.stderr
     assert json.loads(installation.read_text(encoding="utf-8"))["prepared_commit"] == commit
+
+
+def test_register_lab_installation_dry_run_never_rewrites_installation_state(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path, install_state=False)
+    runtime_root = checkout / "data" / "lab-runtime"
+    readiness_root = runtime_root / "readiness"
+    from rquant.lab_daemon import prepare_lab_runtime_layout
+
+    directories = {
+        "lab command spool": runtime_root / "commands",
+        "lab claim spool": runtime_root / "claims",
+        "lab report spool": runtime_root / "reports",
+        "lab worker artifact root": runtime_root / "worker-artifacts",
+        "lab final artifact root": runtime_root / "final-artifacts",
+        "lab artifact commit spool": runtime_root / "artifact-commits",
+        "lab daemon lock root": runtime_root / "locks",
+        "lab finalizer state root": runtime_root / "finalizer-state",
+        "lab readiness root": readiness_root,
+    }
+    prepare_lab_runtime_layout(
+        runtime_root,
+        checkout_root=checkout,
+        managed_directories=directories,
+        managed_files={"lab jobs SQLite": runtime_root / "lab_jobs.sqlite3"},
+        legacy_paths={},
+        mutation_guard=lambda: commit,
+    )
+    command = _command(checkout, python, lock_path, target=commit, mode="register")
+    separator = command.index("--")
+    command[separator:separator] = [
+        "--lab-runtime-root",
+        str(runtime_root),
+        "--lab-readiness-root",
+        str(readiness_root),
+    ]
+    created = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert created.returncode == 0, created.stderr
+    installation = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
+    before = installation.read_bytes()
+    before_stat = installation.stat()
+    dry_run_command = [*command, "--dry-run"]
+
+    preview = subprocess.run(
+        dry_run_command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    after_stat = installation.stat()
+    assert preview.returncode == 0, preview.stderr
+    assert installation.read_bytes() == before
+    assert (after_stat.st_ino, after_stat.st_mtime_ns) == (
+        before_stat.st_ino,
+        before_stat.st_mtime_ns,
+    )
 
 
 def test_lab_installation_registration_rejects_tampered_prepared_sentinel(
@@ -2042,6 +2299,56 @@ def test_recovery_target_remains_pinned_when_origin_main_advances(tmp_path: Path
     assert _git(checkout, "rev-parse", "HEAD") == target
 
 
+def test_recovery_uses_recorded_commit_after_tag_deleted_and_origin_rewritten(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
+    target = _commit_next_release(checkout)
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "tag",
+        "-a",
+        "v0.99.1",
+        "-m",
+        "v0.99.1",
+    )
+    _git(checkout, "reset", "--hard", previous)
+    _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=previous,
+        target=target,
+        target_ref="v0.99.1",
+    )
+    _git(checkout, "tag", "-d", "v0.99.1")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", previous)
+    marker_path_for_lock(lock_path).unlink()
+
+    result = subprocess.run(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target="v0.99.1",
+            mode="recover",
+            recovery_action="resume",
+        ),
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(checkout, "rev-parse", "HEAD") == target
+
+
 def test_target_checkout_authority_publishes_its_marker_schema(tmp_path: Path) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path)
     authority_path = checkout / "src" / "rquant" / "release_generation.py"
@@ -2118,6 +2425,72 @@ def test_target_checkout_authority_publishes_its_marker_schema(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     marker = json.loads(marker_path_for_lock(lock_path).read_text(encoding="utf-8"))
     assert marker["schema_version"] == 2
+
+
+def test_installed_publish_finalizer_inherits_outer_handoff_without_relocking(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path)
+    labels = tuple(_bootstrap_module().LAB_LAUNCHD_LABELS)
+    handoff_operation_id = "d" * 32
+    operation_id = _begin_intent(
+        checkout,
+        python,
+        lock_path,
+        previous=commit,
+        target=commit,
+        handoff_operation_id=handoff_operation_id,
+        handoff_labels=labels,
+    )
+    update_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(update_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ReleaseGenerationAuthority(
+            repo=checkout,
+            lock_path=lock_path,
+            lock_fd=update_fd,
+            python_path=python,
+            git_path=TRUSTED_GIT,
+            writable=True,
+        ).update_deployment_intent(
+            operation_id=operation_id,
+            stage="timers_restored",
+        )
+    finally:
+        os.close(update_fd)
+    marker_path_for_lock(lock_path).unlink()
+    generation_fd = os.open(lock_path, os.O_RDWR)
+    handoff_path = lock_path.with_name(f"{lock_path.stem}.handoff.lock")
+    handoff_fd = os.open(handoff_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(generation_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handoff_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            _command(
+                checkout,
+                python,
+                lock_path,
+                target=commit,
+                mode="finalize",
+                recovery_action="deploy",
+                operation_id=operation_id,
+                inherited_lock_fd=generation_fd,
+                inherited_handoff_lock_fd=handoff_fd,
+                lifecycle_mode="installed",
+            ),
+            cwd=checkout,
+            pass_fds=(generation_fd, handoff_fd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    finally:
+        os.close(handoff_fd)
+        os.close(generation_fd)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "generation_publish"
 
 
 def test_rollback_uses_previous_checkout_marker_schema(tmp_path: Path) -> None:

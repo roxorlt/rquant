@@ -15,6 +15,13 @@ TRUSTED_GIT = "/usr/bin/git"
 GENERATION = "1" * 40
 
 
+@pytest.fixture(autouse=True)
+def _prepared_lab_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rquant import lab_daemon
+
+    monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
+
+
 class _FakeSqliteAuthority:
     def __init__(self, path: Path, calls: list[str] | None = None) -> None:
         self.path = path
@@ -233,6 +240,49 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     assert "spool:artifact-commits" in calls
     assert "store:final-artifacts" in calls
     assert calls[-4:] == ["run_once", "store_close", "sqlite_close", "unlock"]
+
+
+def test_finalizer_requires_prepared_runtime_before_state_or_sqlite_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+    from rquant.config import settings
+
+    monkeypatch.setattr(
+        lab_daemon,
+        "require_lab_runtime_binding",
+        lambda _root, _git: "1" * 40,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "verify_lab_runtime_prepared",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            LabDaemonConfigurationError("prepared sentinel missing")
+        ),
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "ensure_private_directory",
+        lambda *_args, **_kwargs: pytest.fail(
+            "finalizer touched state before prepared sentinel validation"
+        ),
+    )
+    monkeypatch.setattr(settings, "lab_finalizer_authority_key_id", "active")
+    monkeypatch.setattr(settings, "lab_finalizer_authority_key_path", Path("/tmp/key"))
+    monkeypatch.setattr(
+        settings,
+        "lab_finalizer_authority_keyring_path",
+        Path("/tmp/keyring"),
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="prepared sentinel"):
+        cmd_lab_finalizer(
+            argparse.Namespace(
+                once=True,
+                expected_checkout_root=EXPECTED_ROOT,
+                trusted_git_path=TRUSTED_GIT,
+            )
+        )
 
 
 def test_finalizer_forever_installs_both_stop_signals(

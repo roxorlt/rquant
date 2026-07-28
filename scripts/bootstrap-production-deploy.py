@@ -212,6 +212,28 @@ def _read_deploy_controls(path: Path) -> dict[str, str]:
     return controls
 
 
+def _validate_profile_controls(
+    controls: dict[str, str],
+    *,
+    release_profile: str,
+    host_platform: str,
+) -> None:
+    expected_platform = {
+        "linux-production": "linux",
+        "macos-lab": "darwin",
+    }.get(release_profile)
+    if expected_platform != host_platform:
+        raise DeployBootstrapError("release profile does not match host platform")
+    configured_profile = controls.get("RQUANT_RELEASE_PROFILE", "")
+    if configured_profile and configured_profile != release_profile:
+        raise DeployBootstrapError("release profile does not match repo dotenv")
+    lifecycle = controls.get("RQUANT_LAB_LIFECYCLE_MODE", "")
+    if lifecycle and lifecycle not in {"uninstalled", "installed"}:
+        raise DeployBootstrapError("Lab lifecycle mode is invalid")
+    if host_platform == "linux" and lifecycle not in {"", "uninstalled"}:
+        raise DeployBootstrapError("Linux deployment cannot enable Lab lifecycle")
+
+
 def _deploy_timeout(raw: str, *, default: float, label: str) -> float:
     try:
         value = float(raw) if raw else default
@@ -662,6 +684,11 @@ def _verify_lab_runtime_prepared(
         path = _canonical(str(binding.get("path", "")), label=label)
         if path.parent != runtime_root:
             raise DeployBootstrapError("Lab runtime prepared sentinel path escaped runtime root")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if os.path.lexists(path.with_name(f"{path.name}{suffix}")):
+                raise DeployBootstrapError(
+                    "checkpoint and remove Lab SQLite sidecars before registration"
+                )
         exists = bool(binding.get("exists"))
         if exists:
             observed = _physical_file(path, label=label)
@@ -703,6 +730,7 @@ def _write_lab_installation_state(
     runtime_root: Path,
     readiness_root: Path,
     expected_commit: str,
+    publish: bool = True,
 ) -> dict[str, object]:
     runtime = runtime_root.resolve(strict=True)
     if runtime != runtime_root or runtime in {root, root / "data"}:
@@ -738,7 +766,8 @@ def _write_lab_installation_state(
         "prepared_sentinel": prepared,
         "installed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
     }
-    _atomic_private_json(_stable_record_path(lock_path, "lab-install"), payload)
+    if publish:
+        _atomic_private_json(_stable_record_path(lock_path, "lab-install"), payload)
     return payload
 
 
@@ -986,6 +1015,7 @@ class _LabLaunchdHandoff:
         lock_path: Path,
         timeout_seconds: float,
         overall_timeout_seconds: float = 1800,
+        overall_deadline_monotonic: float | None = None,
         release_profile: str = "macos-lab",
         lifecycle_mode: str = "installed",
         supersedes_operation_id: str = "",
@@ -1002,7 +1032,14 @@ class _LabLaunchdHandoff:
         self.lock_path = lock_path
         self.timeout_seconds = timeout_seconds
         self.overall_timeout_seconds = overall_timeout_seconds
-        self.deadline = 0.0
+        computed_deadline = time.monotonic() + overall_timeout_seconds
+        self.deadline = (
+            computed_deadline
+            if overall_deadline_monotonic is None
+            else min(computed_deadline, overall_deadline_monotonic)
+        )
+        if not math.isfinite(self.deadline):
+            raise DeployBootstrapError("Lab launchd handoff deadline is invalid")
         self.domain = f"gui/{os.getuid()}"
         self.plists = {
             label: root / "deploy" / "launchd" / f"{label}.plist" for label in LAB_LAUNCHD_LABELS
@@ -1033,13 +1070,12 @@ class _LabLaunchdHandoff:
         self.target_ref = ""
         self.target_sha = ""
         self.action = ""
+        self.superseding_partial = False
         self.record_path = _stable_record_path(lock_path, "lab-handoff")
         self.lock_fd = -1
         self.root_fd = -1
 
     def _remaining(self) -> float:
-        if self.deadline <= 0:
-            self.deadline = time.monotonic() + self.overall_timeout_seconds
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise DeployBootstrapError("Lab launchd handoff overall timeout expired")
@@ -1133,19 +1169,6 @@ class _LabLaunchdHandoff:
             return False
         if payload.get("stage") == "completed":
             raise DeployBootstrapError("completed Lab launchd handoff proof is missing")
-        binding_changed = (
-            payload.get("target_ref") != self.target_ref
-            or payload.get("target_sha") != self.target_sha
-            or payload.get("action") != self.action
-            or payload.get("release_profile") != self.release_profile
-            or payload.get("lifecycle_mode") != self.lifecycle_mode
-            or payload.get("installation_identity") != self.installation_identity
-            or payload.get("supersedes_operation_id", "") != self.supersedes_operation_id
-        )
-        if binding_changed and payload.get("operation_id") == self.supersedes_operation_id:
-            return False
-        if binding_changed:
-            raise DeployBootstrapError("Lab launchd handoff binding changed")
         labels = [str(value) for value in payload["labels"]]
         loaded_labels = [str(value) for value in payload["loaded_labels"]]
         stopped = [str(value) for value in payload["stopped_labels"]]
@@ -1157,6 +1180,21 @@ class _LabLaunchdHandoff:
             or not set(restarted).issubset(labels)
         ):
             raise DeployBootstrapError("Lab launchd handoff state is invalid")
+        binding_changed = (
+            payload.get("target_ref") != self.target_ref
+            or payload.get("target_sha") != self.target_sha
+            or payload.get("action") != self.action
+            or payload.get("release_profile") != self.release_profile
+            or payload.get("lifecycle_mode") != self.lifecycle_mode
+            or payload.get("installation_identity") != self.installation_identity
+            or payload.get("supersedes_operation_id", "") != self.supersedes_operation_id
+        )
+        if binding_changed and payload.get("operation_id") == self.supersedes_operation_id:
+            self.superseding_partial = True
+            self.loaded = labels
+            return False
+        if binding_changed:
+            raise DeployBootstrapError("Lab launchd handoff binding changed")
         self.operation_id = operation_id
         self.loaded = labels
         self.stopped = stopped
@@ -1193,7 +1231,6 @@ class _LabLaunchdHandoff:
         self.target_ref = target_ref
         self.target_sha = target_sha
         self.action = action
-        self.deadline = time.monotonic() + self.overall_timeout_seconds
         self.root_fd, self.lock_fd = _acquire_handoff_lock(self.root, self.lock_path)
         if self.enabled:
             self.installation = _read_lab_installation_state(
@@ -1233,12 +1270,16 @@ class _LabLaunchdHandoff:
         if not resumed:
             self.operation_id = secrets.token_hex(16)
             loaded = [label for label in LAB_LAUNCHD_LABELS if self._is_loaded(label)]
-            if set(loaded) != set(LAB_LAUNCHD_LABELS):
+            if not self.superseding_partial and set(loaded) != set(LAB_LAUNCHD_LABELS):
                 raise DeployBootstrapError(
                     "all installed Lab launchd daemons must be loaded before deployment"
                 )
-            self.loaded = loaded
-            self.stopped = []
+            self.loaded = list(LAB_LAUNCHD_LABELS) if self.superseding_partial else loaded
+            self.stopped = (
+                [label for label in self.loaded if label not in loaded]
+                if self.superseding_partial
+                else []
+            )
             self.restarted = []
             self._record("planned")
         for label, plist in self.plists.items():
@@ -1259,7 +1300,6 @@ class _LabLaunchdHandoff:
         self._record("stopped")
 
     def restore(self) -> None:
-        self.deadline = time.monotonic() + self.overall_timeout_seconds
         errors: list[str] = []
         if self.enabled:
             for label in self.loaded:
@@ -1354,7 +1394,14 @@ def _git_run(
     *arguments: str,
     check: bool = True,
     text: bool = True,
+    overall_deadline_monotonic: float | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    timeout_seconds = 10.0
+    if overall_deadline_monotonic is not None:
+        remaining = overall_deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise DeployBootstrapError("deployment overall timeout expired")
+        timeout_seconds = min(timeout_seconds, remaining)
     try:
         return subprocess.run(
             [str(git_path), *arguments],
@@ -1362,24 +1409,58 @@ def _git_run(
             check=check,
             capture_output=True,
             text=text,
-            timeout=10,
+            timeout=timeout_seconds,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("deployment checkout cannot be verified") from exc
 
 
-def _git_output(repo: Path, git_path: Path, *arguments: str) -> str:
-    result = _git_run(repo, git_path, *arguments)
+def _git_output(
+    repo: Path,
+    git_path: Path,
+    *arguments: str,
+    overall_deadline_monotonic: float | None = None,
+) -> str:
+    result = _git_run(
+        repo,
+        git_path,
+        *arguments,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     assert isinstance(result.stdout, str)
     return result.stdout.strip()
 
 
-def _git_head(repo: Path, git_path: Path) -> str:
-    return _git_output(repo, git_path, "rev-parse", "--verify", "HEAD^{commit}")
+def _git_head(
+    repo: Path,
+    git_path: Path,
+    *,
+    overall_deadline_monotonic: float | None = None,
+) -> str:
+    return _git_output(
+        repo,
+        git_path,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
 
 
-def _tracked_checkout_is_clean(repo: Path, git_path: Path) -> None:
-    status = _git_output(repo, git_path, "status", "--porcelain=v1", "--untracked-files=no")
+def _tracked_checkout_is_clean(
+    repo: Path,
+    git_path: Path,
+    *,
+    overall_deadline_monotonic: float | None = None,
+) -> None:
+    status = _git_output(
+        repo,
+        git_path,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     diff = _git_run(
         repo,
         git_path,
@@ -1388,24 +1469,66 @@ def _tracked_checkout_is_clean(repo: Path, git_path: Path) -> None:
         "HEAD",
         "--",
         check=False,
+        overall_deadline_monotonic=overall_deadline_monotonic,
     )
     if status or diff.returncode != 0:
         raise DeployBootstrapError("tracked deployment checkout is dirty")
 
 
-def _tracked_file_bytes(repo: Path, git_path: Path, commit: str, relative: str) -> bytes:
-    result = _git_run(repo, git_path, "show", f"{commit}:{relative}", text=False)
+def _tracked_file_bytes(
+    repo: Path,
+    git_path: Path,
+    commit: str,
+    relative: str,
+    *,
+    overall_deadline_monotonic: float | None = None,
+) -> bytes:
+    result = _git_run(
+        repo,
+        git_path,
+        "show",
+        f"{commit}:{relative}",
+        text=False,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     assert isinstance(result.stdout, bytes)
     return result.stdout
 
 
-def _verify_generation_target(repo: Path, git_path: Path, target: str) -> str:
+def _verify_generation_target(
+    repo: Path,
+    git_path: Path,
+    target: str,
+    *,
+    overall_deadline_monotonic: float | None = None,
+) -> str:
     if TARGET_PATTERN.fullmatch(target) is None:
         raise DeployBootstrapError("generation target must be a SemVer tag or full SHA")
-    if _git_output(repo, git_path, "rev-parse", "--abbrev-ref", "HEAD") != "main":
+    if (
+        _git_output(
+            repo,
+            git_path,
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        != "main"
+    ):
         raise DeployBootstrapError("generation checkout must be on main")
-    _tracked_checkout_is_clean(repo, git_path)
-    commit = _git_output(repo, git_path, "rev-parse", "--verify", f"{target}^{{commit}}")
+    _tracked_checkout_is_clean(
+        repo,
+        git_path,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
+    commit = _git_output(
+        repo,
+        git_path,
+        "rev-parse",
+        "--verify",
+        f"{target}^{{commit}}",
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     allowed = _git_run(
         repo,
         git_path,
@@ -1414,13 +1537,31 @@ def _verify_generation_target(repo: Path, git_path: Path, target: str) -> str:
         commit,
         "origin/main",
         check=False,
+        overall_deadline_monotonic=overall_deadline_monotonic,
     )
     if allowed.returncode != 0:
         raise DeployBootstrapError("generation target is not contained in origin/main")
-    if target.startswith("v") and _git_output(repo, git_path, "cat-file", "-t", target) != "tag":
+    if (
+        target.startswith("v")
+        and _git_output(
+            repo,
+            git_path,
+            "cat-file",
+            "-t",
+            target,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        != "tag"
+    ):
         raise DeployBootstrapError("generation SemVer target must be an annotated tag")
 
-    pyproject_payload = _tracked_file_bytes(repo, git_path, commit, "pyproject.toml")
+    pyproject_payload = _tracked_file_bytes(
+        repo,
+        git_path,
+        commit,
+        "pyproject.toml",
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     try:
         package_version = str(tomllib.loads(pyproject_payload.decode())["project"]["version"])
     except (UnicodeDecodeError, KeyError, tomllib.TOMLDecodeError) as exc:
@@ -1434,9 +1575,9 @@ def _verify_recovery_target_binding(
     *,
     lock_path: Path,
     target_ref: str,
-    target_sha: str,
     action: str,
-) -> None:
+    target_sha: str | None = None,
+) -> str:
     intent = _private_json(
         lock_path.with_name(f"{lock_path.stem}.intent.json"),
         label="deployment intent",
@@ -1465,16 +1606,95 @@ def _verify_recovery_target_binding(
     allowed_refs = {expected_sha} if action == "rollback" else {expected_sha, recorded_ref}
     if (
         action not in {"resume", "rollback"}
-        or target_sha != expected_sha
+        or (target_sha is not None and target_sha != expected_sha)
         or target_ref not in allowed_refs
     ):
         raise DeployBootstrapError("recovery target does not match recorded deployment intent")
+    return expected_sha
 
 
-def _verify_current_generation_checkout(repo: Path, git_path: Path, commit: str) -> None:
-    if _git_head(repo, git_path) != commit:
+def _fetch_generation_target(
+    repo: Path,
+    git_path: Path,
+    *,
+    command_timeout_seconds: float,
+    overall_deadline_monotonic: float,
+) -> None:
+    remaining = overall_deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise DeployBootstrapError("deployment overall timeout expired before Git fetch")
+    try:
+        result = _run_process_group(
+            [str(git_path), "fetch", "--tags", "origin", "main"],
+            cwd=repo,
+            timeout_seconds=min(command_timeout_seconds, remaining),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeployBootstrapError("deployment target fetch failed") from exc
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout or "no command output").strip()
+        raise DeployBootstrapError(f"deployment target fetch failed: {diagnostic[:1000]}")
+
+
+def _verify_recorded_recovery_commit(
+    repo: Path,
+    git_path: Path,
+    commit: str,
+    *,
+    overall_deadline_monotonic: float,
+) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise DeployBootstrapError("recorded recovery commit is invalid")
+    if (
+        _git_output(
+            repo,
+            git_path,
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        != "main"
+    ):
+        raise DeployBootstrapError("generation checkout must be on main")
+    _tracked_checkout_is_clean(
+        repo,
+        git_path,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
+    resolved = _git_output(
+        repo,
+        git_path,
+        "rev-parse",
+        "--verify",
+        f"{commit}^{{commit}}",
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
+    if resolved != commit:
+        raise DeployBootstrapError("recorded recovery commit identity changed")
+
+
+def _verify_current_generation_checkout(
+    repo: Path,
+    git_path: Path,
+    commit: str,
+    *,
+    overall_deadline_monotonic: float | None = None,
+) -> None:
+    if (
+        _git_head(
+            repo,
+            git_path,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        != commit
+    ):
         raise DeployBootstrapError("generation target does not match current HEAD")
-    _tracked_checkout_is_clean(repo, git_path)
+    _tracked_checkout_is_clean(
+        repo,
+        git_path,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     for relative in ("uv.lock", "pyproject.toml"):
         path = repo / relative
         _physical_file(path, label=relative)
@@ -1482,17 +1702,34 @@ def _verify_current_generation_checkout(repo: Path, git_path: Path, commit: str)
             working = path.read_bytes()
         except OSError as exc:
             raise DeployBootstrapError(f"{relative} cannot be read") from exc
-        tracked = _tracked_file_bytes(repo, git_path, commit, relative)
+        tracked = _tracked_file_bytes(
+            repo,
+            git_path,
+            commit,
+            relative,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
         if hashlib.sha256(working).digest() != hashlib.sha256(tracked).digest():
             raise DeployBootstrapError(f"{relative} does not match generation target")
 
 
-def _verify_generation_runtime(root: Path, python_path: Path) -> None:
+def _verify_generation_runtime(
+    root: Path,
+    python_path: Path,
+    *,
+    overall_deadline_monotonic: float | None = None,
+) -> None:
     venv = root / ".venv"
     _physical_directory(venv, label="release venv")
     if not python_path.is_relative_to(venv):
         raise DeployBootstrapError("deployment Python is outside release venv")
     _physical_file(venv / "pyvenv.cfg", label="pyvenv.cfg")
+    timeout_seconds = 10.0
+    if overall_deadline_monotonic is not None:
+        remaining = overall_deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise DeployBootstrapError("deployment overall timeout expired")
+        timeout_seconds = min(timeout_seconds, remaining)
     try:
         result = subprocess.run(
             [
@@ -1510,7 +1747,7 @@ def _verify_generation_runtime(root: Path, python_path: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout_seconds,
         )
         facts = json.loads(result.stdout)
         version = str(facts["version"])
@@ -1536,15 +1773,27 @@ def _generation_target(deploy_argv: list[str]) -> str:
     return str(parsed.target)
 
 
-def _run_generation_preflight(root: Path, *, timeout_seconds: float = 300) -> None:
+def _run_generation_preflight(
+    root: Path,
+    *,
+    timeout_seconds: float = 300,
+    overall_deadline_monotonic: float | None = None,
+) -> None:
     launcher = root / ".venv" / "bin" / "rquant"
     _physical_file(launcher, label="rquant preflight launcher", executable=True)
+    if overall_deadline_monotonic is not None:
+        remaining = overall_deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise DeployBootstrapError("generation preflight overall timeout expired")
+        timeout_seconds = min(timeout_seconds, remaining)
     try:
         result = _run_process_group(
             [str(launcher), "preflight"],
             cwd=root,
             timeout_seconds=timeout_seconds,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise DeployBootstrapError("generation preflight overall timeout expired") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("generation preflight could not run") from exc
     if result.returncode != 0:
@@ -1583,8 +1832,13 @@ def _prepare_generation_checkout(
     git_path: Path,
     target_commit: str,
     mode: str,
+    overall_deadline_monotonic: float | None = None,
 ) -> None:
-    current = _git_head(root, git_path)
+    current = _git_head(
+        root,
+        git_path,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
     if mode == "initialize":
         if current != target_commit:
             raise DeployBootstrapError("initial generation target does not match current HEAD")
@@ -1598,11 +1852,19 @@ def _prepare_generation_checkout(
             current,
             target_commit,
             check=False,
+            overall_deadline_monotonic=overall_deadline_monotonic,
         )
         if allowed.returncode != 0:
             raise DeployBootstrapError("resume target is not a fast-forward from current HEAD")
         if current != target_commit:
-            _git_run(root, git_path, "merge", "--ff-only", target_commit)
+            _git_run(
+                root,
+                git_path,
+                "merge",
+                "--ff-only",
+                target_commit,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
         return
     if mode == "rollback":
         allowed = _git_run(
@@ -1613,11 +1875,19 @@ def _prepare_generation_checkout(
             target_commit,
             current,
             check=False,
+            overall_deadline_monotonic=overall_deadline_monotonic,
         )
         if allowed.returncode != 0:
             raise DeployBootstrapError("rollback target is not an ancestor of current HEAD")
         if current != target_commit:
-            _git_run(root, git_path, "reset", "--hard", target_commit)
+            _git_run(
+                root,
+                git_path,
+                "reset",
+                "--hard",
+                target_commit,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
         return
     raise DeployBootstrapError("unknown generation control mode")
 
@@ -1650,6 +1920,28 @@ def _assert_inherited_lock(root: Path, lock_path: Path, descriptor: int) -> int:
         or stat.S_IMODE(opened.st_mode) != 0o600
     ):
         raise DeployBootstrapError("inherited generation lock identity changed")
+    return descriptor
+
+
+def _assert_inherited_handoff_lock(root: Path, lock_path: Path, descriptor: int) -> int:
+    expected = root.parent / ".rquant-deploy" / f"{root.name}.lock"
+    handoff_path = lock_path.with_name(f"{lock_path.stem}.handoff.lock")
+    if lock_path != expected or descriptor < 0:
+        raise DeployBootstrapError("inherited Lab handoff lock binding is invalid")
+    try:
+        opened = os.fstat(descriptor)
+        active = handoff_path.lstat()
+    except OSError as exc:
+        raise DeployBootstrapError("inherited Lab handoff lock is unavailable") from exc
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
+        != (active.st_dev, active.st_ino, active.st_mode, active.st_uid, active.st_nlink)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise DeployBootstrapError("inherited Lab handoff lock identity changed")
     return descriptor
 
 
@@ -1697,21 +1989,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--finalize-phase", choices=("publish", "commit"))
     parser.add_argument("--operation-id")
     parser.add_argument("--inherited-lock-fd", type=int)
+    parser.add_argument("--inherited-handoff-lock-fd", type=int)
     parser.add_argument("--lab-runtime-root")
     parser.add_argument("--lab-readiness-root")
     parser.add_argument("--command-timeout-seconds", default="")
     parser.add_argument("--overall-timeout-seconds", default="")
+    parser.add_argument("--overall-deadline-monotonic", type=float)
     args, deploy_argv = parser.parse_known_args(argv)
     lock_fd = -1
+    handoff_lock_fd = -1
     generation_error_type: type[BaseException] | None = None
     missing_record_type: type[BaseException] | None = None
     handoff: _LabLaunchdHandoff | None = None
 
     def finish(return_code: int) -> int:
-        nonlocal handoff, lock_fd
+        nonlocal handoff, handoff_lock_fd, lock_fd
         if lock_fd >= 0:
             os.close(lock_fd)
             lock_fd = -1
+        if handoff_lock_fd >= 0:
+            os.close(handoff_lock_fd)
+            handoff_lock_fd = -1
         if handoff is not None:
             try:
                 handoff.restore()
@@ -1759,9 +2057,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.lab_lifecycle_mode not in {"uninstalled", "installed"}:
             raise DeployBootstrapError("Lab lifecycle mode is invalid")
-        configured_profile = controls.get("RQUANT_RELEASE_PROFILE", "")
-        if configured_profile and configured_profile != args.release_profile:
-            raise DeployBootstrapError("release profile does not match repo dotenv")
+        _validate_profile_controls(
+            controls,
+            release_profile=args.release_profile,
+            host_platform=args.host_platform,
+        )
         if args.recover_generation != (args.recovery_action is not None):
             raise DeployBootstrapError(
                 "--recovery-action is required only with --recover-generation"
@@ -1774,7 +2074,14 @@ def main(argv: list[str] | None = None) -> int:
         uv_path, _uv_binding = _resolve_uv_path(args.uv_path)
         if not 0 < args.command_timeout_seconds <= args.overall_timeout_seconds <= 7200:
             raise DeployBootstrapError("deployment timeout configuration is invalid")
-        overall_deadline_monotonic = time.monotonic() + args.overall_timeout_seconds
+        computed_deadline = time.monotonic() + args.overall_timeout_seconds
+        overall_deadline_monotonic = (
+            computed_deadline
+            if args.overall_deadline_monotonic is None
+            else min(computed_deadline, args.overall_deadline_monotonic)
+        )
+        if not math.isfinite(overall_deadline_monotonic):
+            raise DeployBootstrapError("deployment overall deadline is invalid")
         dry_run = "--dry-run" in _normalized_deploy_argv(deploy_argv)
         if sys.platform == "darwin":
             actual_platform = "darwin"
@@ -1788,19 +2095,53 @@ def main(argv: list[str] | None = None) -> int:
             raise DeployBootstrapError("release profile does not match host platform")
         deploy_values = _normalized_deploy_argv(deploy_argv)
         target_ref = _generation_target(deploy_values)
-        target_sha = _verify_generation_target(root, git_path, target_ref)
         handoff_action = str(args.recovery_action or "deploy")
         if args.recover_generation:
-            _verify_recovery_target_binding(
+            target_sha = _verify_recovery_target_binding(
                 lock_path=lock_path,
                 target_ref=target_ref,
-                target_sha=target_sha,
                 action=handoff_action,
+            )
+            _verify_recorded_recovery_commit(
+                root,
+                git_path,
+                target_sha,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
+        elif args.finalize_generation:
+            if re.fullmatch(r"[0-9a-f]{40}", target_ref) is None:
+                raise DeployBootstrapError("finalizer target must be a full commit SHA")
+            target_sha = target_ref
+        else:
+            if not (args.initialize_generation or args.register_lab_installation):
+                _fetch_generation_target(
+                    root,
+                    git_path,
+                    command_timeout_seconds=args.command_timeout_seconds,
+                    overall_deadline_monotonic=overall_deadline_monotonic,
+                )
+            target_sha = _verify_generation_target(
+                root,
+                git_path,
+                target_ref,
+                overall_deadline_monotonic=overall_deadline_monotonic,
             )
         if args.finalize_generation:
             if args.inherited_lock_fd is None:
                 raise DeployBootstrapError("finalizer requires inherited generation lock")
             lock_fd = _assert_inherited_lock(root, lock_path, args.inherited_lock_fd)
+            if args.lab_lifecycle_mode == "installed":
+                if args.inherited_handoff_lock_fd is None:
+                    raise DeployBootstrapError("finalizer requires inherited Lab handoff lock")
+                handoff_lock_fd = _assert_inherited_handoff_lock(
+                    root,
+                    lock_path,
+                    args.inherited_handoff_lock_fd,
+                )
+            elif args.inherited_handoff_lock_fd is not None:
+                raise DeployBootstrapError(
+                    "inherited Lab handoff lock requires installed lifecycle"
+                )
         else:
             if dry_run and (args.initialize_generation or args.recover_generation):
                 raise DeployBootstrapError("generation initialization/recovery cannot be a dry-run")
@@ -1810,6 +2151,7 @@ def main(argv: list[str] | None = None) -> int:
                     lock_path=lock_path,
                     timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
                     overall_timeout_seconds=args.overall_timeout_seconds,
+                    overall_deadline_monotonic=overall_deadline_monotonic,
                     release_profile=args.release_profile,
                     lifecycle_mode=args.lab_lifecycle_mode,
                 )
@@ -1840,6 +2182,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.finalize_phase,
                 args.operation_id,
                 args.inherited_lock_fd,
+                args.inherited_handoff_lock_fd,
             )
         )
         if args.finalize_generation and (
@@ -1847,6 +2190,7 @@ def main(argv: list[str] | None = None) -> int:
             or args.finalize_phase is None
             or args.operation_id is None
             or args.inherited_lock_fd is None
+            or (args.lab_lifecycle_mode == "installed" and args.inherited_handoff_lock_fd is None)
         ):
             raise DeployBootstrapError(
                 "finalize action and operation id are required only with finalizer mode"
@@ -1857,12 +2201,13 @@ def main(argv: list[str] | None = None) -> int:
             _generation_target(deploy_argv) if generation_mode or args.finalize_generation else ""
         )
         if args.initialize_generation:
-            commit = _verify_generation_target(root, git_path, target)
+            commit = target_sha
             _prepare_generation_checkout(
                 root=root,
                 git_path=git_path,
                 target_commit=commit,
                 mode="initialize",
+                overall_deadline_monotonic=overall_deadline_monotonic,
             )
             _physical_file(authority_path, label="release generation authority")
             authority_module = _load_release_authority(authority_path)
@@ -1900,11 +2245,21 @@ def main(argv: list[str] | None = None) -> int:
                             timeout_seconds=args.command_timeout_seconds,
                             overall_deadline_monotonic=overall_deadline_monotonic,
                         )
-                        _verify_current_generation_checkout(root, git_path, commit)
-                        _verify_generation_runtime(root, python_path)
+                        _verify_current_generation_checkout(
+                            root,
+                            git_path,
+                            commit,
+                            overall_deadline_monotonic=overall_deadline_monotonic,
+                        )
+                        _verify_generation_runtime(
+                            root,
+                            python_path,
+                            overall_deadline_monotonic=overall_deadline_monotonic,
+                        )
                         _run_generation_preflight(
                             root,
                             timeout_seconds=args.command_timeout_seconds,
+                            overall_deadline_monotonic=overall_deadline_monotonic,
                         )
                         authority.commit_generation(
                             operation_id=initialization.operation_id,
@@ -1929,11 +2284,21 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.command_timeout_seconds,
                 overall_deadline_monotonic=overall_deadline_monotonic,
             )
-            _verify_current_generation_checkout(root, git_path, commit)
-            _verify_generation_runtime(root, python_path)
+            _verify_current_generation_checkout(
+                root,
+                git_path,
+                commit,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
+            _verify_generation_runtime(
+                root,
+                python_path,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
             _run_generation_preflight(
                 root,
                 timeout_seconds=args.command_timeout_seconds,
+                overall_deadline_monotonic=overall_deadline_monotonic,
             )
             authority.publish(
                 expected_commit=commit,
@@ -1954,13 +2319,25 @@ def main(argv: list[str] | None = None) -> int:
             return finish(0)
 
         if args.register_lab_installation:
-            commit = _verify_generation_target(root, git_path, target)
-            if commit != _git_head(root, git_path):
+            commit = target_sha
+            if commit != _git_head(
+                root,
+                git_path,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            ):
                 raise DeployBootstrapError(
                     "Lab installation registration target must be the current checkout"
                 )
-            _tracked_checkout_is_clean(root, git_path)
-            _verify_generation_runtime(root, python_path)
+            _tracked_checkout_is_clean(
+                root,
+                git_path,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
+            _verify_generation_runtime(
+                root,
+                python_path,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
             _physical_file(authority_path, label="release generation authority")
             authority_module = _load_release_authority(authority_path)
             generation_error_type = authority_module.ReleaseGenerationError
@@ -1988,18 +2365,38 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_root=runtime_root,
                 readiness_root=readiness_root,
                 expected_commit=commit,
+                publish=not dry_run,
             )
             print(
                 json.dumps(
-                    {"commit": commit, "status": "lab_installation_registered"},
+                    {
+                        "commit": commit,
+                        "status": (
+                            "lab_installation_registration_planned"
+                            if dry_run
+                            else "lab_installation_registered"
+                        ),
+                    },
                     sort_keys=True,
                 )
             )
             return finish(0)
 
-        commit = _git_head(root, git_path)
-        _tracked_checkout_is_clean(root, git_path)
-        _verify_generation_runtime(root, python_path)
+        commit = _git_head(
+            root,
+            git_path,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        _tracked_checkout_is_clean(
+            root,
+            git_path,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        _verify_generation_runtime(
+            root,
+            python_path,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
         _physical_file(authority_path, label="release generation authority")
         authority_module = _load_release_authority(authority_path)
         generation_error_type = authority_module.ReleaseGenerationError
@@ -2029,10 +2426,16 @@ def main(argv: list[str] | None = None) -> int:
                 or intent.stage != expected_stage
             ):
                 raise DeployBootstrapError("finalizer does not match ready deployment intent")
-            _verify_current_generation_checkout(root, git_path, expected_commit)
+            _verify_current_generation_checkout(
+                root,
+                git_path,
+                expected_commit,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
             _run_generation_preflight(
                 root,
                 timeout_seconds=args.command_timeout_seconds,
+                overall_deadline_monotonic=overall_deadline_monotonic,
             )
             if args.finalize_phase == "publish":
                 result = authority.publish(
@@ -2096,10 +2499,12 @@ def main(argv: list[str] | None = None) -> int:
             *,
             startup_generation: str,
             active_handoff: _LabLaunchdHandoff | None,
+            overall_deadline: float,
         ) -> int:
             arguments = list(values)
             if active_handoff is not None and active_handoff.enabled and not dry_run:
                 arguments.extend(["--lab-handoff-operation-id", active_handoff.operation_id])
+                arguments.extend(["--lab-handoff-lock-fd", str(active_handoff.lock_fd)])
                 for label in active_handoff.loaded:
                     arguments.extend(["--lab-handoff-label", label])
             return int(
@@ -2130,6 +2535,8 @@ def main(argv: list[str] | None = None) -> int:
                         str(args.command_timeout_seconds),
                         "--overall-timeout-seconds",
                         str(args.overall_timeout_seconds),
+                        "--overall-deadline-monotonic",
+                        str(overall_deadline),
                     ]
                 )
             )
@@ -2138,6 +2545,7 @@ def main(argv: list[str] | None = None) -> int:
             deploy_argv,
             startup_generation=commit,
             active_handoff=handoff,
+            overall_deadline=overall_deadline_monotonic,
         )
         if handoff is not None and handoff.enabled and not dry_run:
             target_handoff = handoff
@@ -2166,8 +2574,6 @@ def main(argv: list[str] | None = None) -> int:
                 nonlocal lock_fd
                 if not rollback_target or not isinstance(recovery_handoff, _LabLaunchdHandoff):
                     raise DeployBootstrapError("Lab readiness rollback is not bound")
-                if _git_head(root, git_path) == rollback_target:
-                    return 0
                 lock_fd = _acquire_lock(
                     root,
                     lock_path,
@@ -2181,8 +2587,13 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     return invoke_deployer(
                         recovery_values,
-                        startup_generation=_git_head(root, git_path),
+                        startup_generation=_git_head(
+                            root,
+                            git_path,
+                            overall_deadline_monotonic=recovery_handoff.deadline,
+                        ),
                         active_handoff=recovery_handoff,
+                        overall_deadline=recovery_handoff.deadline,
                     )
                 finally:
                     if lock_fd >= 0:
@@ -2209,6 +2620,9 @@ def main(argv: list[str] | None = None) -> int:
         if lock_fd >= 0:
             os.close(lock_fd)
             lock_fd = -1
+        if handoff_lock_fd >= 0:
+            os.close(handoff_lock_fd)
+            handoff_lock_fd = -1
         if handoff is not None:
             try:
                 handoff.restore()

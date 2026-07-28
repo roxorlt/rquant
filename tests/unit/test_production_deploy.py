@@ -167,6 +167,21 @@ class FakeGenerationAuthority:
         self.events.append(("stage", stage))
         return self.intent
 
+    def rebind_deployment_handoff(
+        self,
+        *,
+        operation_id: str,
+        handoff_operation_id: str,
+        handoff_labels: tuple[str, ...],
+    ) -> DeploymentIntent:
+        assert self.intent is not None and self.intent.operation_id == operation_id
+        self.intent = self.intent.rebind_handoff(
+            handoff_operation_id=handoff_operation_id,
+            handoff_labels=handoff_labels,
+        )
+        self.events.append(("handoff", handoff_operation_id))
+        return self.intent
+
 
 class FakeGenerationFinalizer:
     def __init__(self, *, crash: bool = False, crash_phase: str = "publish") -> None:
@@ -648,6 +663,7 @@ def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
             "lab_lifecycle_mode": "installed",
             "handoff_operation_id": "d" * 32,
             "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
+            "handoff_lock_fd": 9,
         }
     )
     runner = FakeRunner(responses)
@@ -665,6 +681,79 @@ def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
     assert authority.intent is not None
     assert authority.intent.restart_services == ()
     assert not any("systemctl" in command for command in runner.calls)
+
+
+def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_root = tmp_path.parent / ".rquant-deploy"
+    lock_root.mkdir(mode=0o700, exist_ok=True)
+    generation_lock = lock_root / f"{tmp_path.name}.lock"
+    handoff_lock = lock_root / f"{tmp_path.name}.handoff.lock"
+    generation_fd = os.open(generation_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    handoff_fd = os.open(handoff_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(generation_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(handoff_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    captured: dict[str, object] = {}
+    operation_id = "c" * 32
+
+    def fake_process_group(
+        args: list[str],
+        *,
+        cwd: Path,
+        timeout_seconds: float,
+        check: bool,
+        pass_fds: tuple[int, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        captured.update(
+            args=args,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            check=check,
+            pass_fds=pass_fds,
+        )
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=f'{{"commit":"{_sha("b")}","operation_id":"{operation_id}"}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(production_deploy, "_run_process_group", fake_process_group)
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "lock_path": generation_lock,
+            "lock_fd": generation_fd,
+            "handoff_lock_fd": handoff_fd,
+            "python_path": Path(sys.executable),
+            "git_path": Path("/usr/bin/git"),
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+            "lab_lifecycle_mode": "installed",
+            "handoff_operation_id": "d" * 32,
+            "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
+        }
+    )
+    try:
+        result = production_deploy.IsolatedGenerationFinalizer(config).finalize(
+            expected_commit=_sha("b"),
+            operation_id=operation_id,
+            action="deploy",
+            phase="publish",
+        )
+    finally:
+        os.close(handoff_fd)
+        os.close(generation_fd)
+
+    arguments = captured["args"]
+    assert isinstance(arguments, list)
+    assert "--finalize-generation" in arguments
+    assert arguments[arguments.index("--inherited-handoff-lock-fd") + 1] == str(handoff_fd)
+    assert captured["pass_fds"] == (generation_fd, handoff_fd)
+    assert result["commit"] == _sha("b")
 
 
 @pytest.mark.parametrize(
@@ -1379,6 +1468,36 @@ def test_subprocess_runner_recovery_budget_is_independent(tmp_path: Path) -> Non
     completed = recovery.run([sys.executable, "-c", "print('recovered')"])
 
     assert completed.stdout.strip() == "recovered"
+
+
+def test_isolated_finalizer_recovery_uses_fresh_recovery_deadline(tmp_path: Path) -> None:
+    baseline = _config(tmp_path)
+    original = production_deploy.IsolatedGenerationFinalizer(
+        DeployConfig(
+            **{
+                **baseline.__dict__,
+                "lock_path": tmp_path / "deploy.lock",
+                "lock_fd": 7,
+                "python_path": Path(sys.executable),
+                "overall_deadline_monotonic": time.monotonic() - 1,
+            }
+        )
+    )
+    recovered = original.for_recovery(time.monotonic() + 30)
+
+    assert recovered._config.overall_deadline_monotonic > time.monotonic()
+
+
+def test_subprocess_runner_uses_inherited_end_to_end_deadline(tmp_path: Path) -> None:
+    runner = SubprocessRunner(
+        tmp_path,
+        command_timeout_seconds=5,
+        overall_timeout_seconds=5,
+        overall_deadline_monotonic=time.monotonic() - 0.01,
+    )
+
+    with pytest.raises(DeployError, match="overall timeout"):
+        runner.run([sys.executable, "-c", "raise SystemExit(0)"])
 
 
 def test_real_git_repository_deploys_annotated_fast_forward_tag(

@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import re
 import shlex
@@ -22,7 +23,7 @@ import time as monotonic_time
 import tomllib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time
 from pathlib import Path
 from typing import Protocol
@@ -161,6 +162,14 @@ class GenerationAuthority(Protocol):
         restarted_services: tuple[str, ...] | None = None,
     ) -> DeploymentIntent: ...
 
+    def rebind_deployment_handoff(
+        self,
+        *,
+        operation_id: str,
+        handoff_operation_id: str,
+        handoff_labels: tuple[str, ...],
+    ) -> DeploymentIntent: ...
+
 
 class GenerationFinalizer(Protocol):
     def finalize(
@@ -215,13 +224,21 @@ class SubprocessRunner:
         *,
         command_timeout_seconds: float = 300,
         overall_timeout_seconds: float = 1800,
+        overall_deadline_monotonic: float | None = None,
     ) -> None:
         if not 0 < command_timeout_seconds <= overall_timeout_seconds <= 7200:
             raise PolicyError("deployment timeout configuration is invalid")
         self._cwd = cwd
         self._command_timeout_seconds = command_timeout_seconds
         self._overall_timeout_seconds = overall_timeout_seconds
-        self._deadline = monotonic_time.monotonic() + overall_timeout_seconds
+        computed_deadline = monotonic_time.monotonic() + overall_timeout_seconds
+        self._deadline = (
+            computed_deadline
+            if overall_deadline_monotonic is None
+            else min(computed_deadline, overall_deadline_monotonic)
+        )
+        if not math.isfinite(self._deadline):
+            raise PolicyError("deployment overall deadline is invalid")
 
     def for_recovery(self) -> SubprocessRunner:
         return SubprocessRunner(
@@ -275,6 +292,14 @@ class IsolatedGenerationFinalizer:
             raise PolicyError("isolated generation finalizer binding is incomplete")
         self._config = config
 
+    def for_recovery(self, overall_deadline_monotonic: float) -> IsolatedGenerationFinalizer:
+        return IsolatedGenerationFinalizer(
+            replace(
+                self._config,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
+        )
+
     def finalize(
         self,
         *,
@@ -287,6 +312,15 @@ class IsolatedGenerationFinalizer:
         assert config.lock_fd is not None
         assert config.lock_path is not None
         assert config.python_path is not None
+        if config.lab_lifecycle_mode == "installed" and config.handoff_lock_fd is None:
+            raise PolicyError("installed finalizer requires inherited Lab handoff lock")
+        remaining = (
+            config.overall_deadline_monotonic - monotonic_time.monotonic()
+            if config.overall_deadline_monotonic is not None
+            else config.command_timeout_seconds
+        )
+        if remaining <= 0:
+            raise DeployError("deployment overall timeout expired before generation finalizer")
         command = [
             str(config.python_path),
             "-I",
@@ -306,6 +340,8 @@ class IsolatedGenerationFinalizer:
             config.release_profile,
             "--host-platform",
             config.platform_name,
+            "--lab-lifecycle-mode",
+            config.lab_lifecycle_mode,
             "--finalize-generation",
             "--inherited-lock-fd",
             str(config.lock_fd),
@@ -315,17 +351,27 @@ class IsolatedGenerationFinalizer:
             action,
             "--finalize-phase",
             phase,
-            "--",
-            "--target",
-            expected_commit,
         ]
+        pass_fds = [config.lock_fd]
+        if config.handoff_lock_fd is not None:
+            command.extend(["--inherited-handoff-lock-fd", str(config.handoff_lock_fd)])
+            pass_fds.append(config.handoff_lock_fd)
+        command.extend(
+            [
+                "--overall-deadline-monotonic",
+                str(config.overall_deadline_monotonic or (monotonic_time.monotonic() + remaining)),
+                "--",
+                "--target",
+                expected_commit,
+            ]
+        )
         try:
             completed = _run_process_group(
                 command,
                 cwd=config.repo,
-                timeout_seconds=config.command_timeout_seconds,
+                timeout_seconds=min(config.command_timeout_seconds, remaining),
                 check=True,
-                pass_fds=(config.lock_fd,),
+                pass_fds=tuple(pass_fds),
             )
             payload = json.loads(completed.stdout)
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -354,6 +400,7 @@ class DeployConfig:
     audit_path: Path | None = None
     lock_path: Path | None = None
     lock_fd: int | None = None
+    handoff_lock_fd: int | None = None
     startup_generation: str | None = None
     python_path: Path | None = None
     git_path: Path = Path("/usr/bin/git")
@@ -362,6 +409,7 @@ class DeployConfig:
     platform_name: str = "linux"
     command_timeout_seconds: float = 300
     overall_timeout_seconds: float = 1800
+    overall_deadline_monotonic: float | None = None
     handoff_operation_id: str = ""
     handoff_labels: tuple[str, ...] = ()
     lab_lifecycle_mode: str = "uninstalled"
@@ -748,6 +796,12 @@ def _recover_locked(
         raise PolicyError("recorded restarted service state is invalid")
     if not set(intent.active_timers).issubset(_timers_for_services(intent.restart_services)):
         raise PolicyError("recorded active timer plan is invalid")
+    if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
+        intent = authority.rebind_deployment_handoff(
+            operation_id=intent.operation_id,
+            handoff_operation_id=config.handoff_operation_id,
+            handoff_labels=config.handoff_labels,
+        )
     git = str(config.git_path)
     branch = _stdout(runner, [git, "rev-parse", "--abbrev-ref", "HEAD"])
     if branch != "main":
@@ -905,18 +959,33 @@ def _deploy_locked(
         except Exception as exc:
             try:
                 recovery_runner = _fresh_recovery_runner(runner)
+                recovery_finalizer = generation_finalizer
+                recovery_authority = generation_authority
+                recovery_deadline = getattr(
+                    recovery_runner,
+                    "deadline_monotonic",
+                    None,
+                )
+                if isinstance(generation_finalizer, IsolatedGenerationFinalizer):
+                    if not isinstance(recovery_deadline, float):
+                        raise DeployError("deployment recovery deadline is unavailable")
+                    recovery_finalizer = generation_finalizer.for_recovery(recovery_deadline)
+                if isinstance(generation_authority, ReleaseGenerationAuthority):
+                    if not isinstance(recovery_deadline, float):
+                        raise DeployError("deployment recovery deadline is unavailable")
+                    recovery_authority = generation_authority.for_recovery(recovery_deadline)
                 recovery = _advance_intent(
                     config,
-                    generation_authority,
-                    generation_authority.read_deployment_intent(),
+                    recovery_authority,
+                    recovery_authority.read_deployment_intent(),
                     "recovery_started",
                 )
-                generation_authority.invalidate()
+                recovery_authority.invalidate()
                 completed = _execute_transaction(
                     config,
                     recovery_runner,
-                    generation_authority,
-                    generation_finalizer,
+                    recovery_authority,
+                    recovery_finalizer,
                     recovery,
                     action="rollback",
                 )
@@ -1041,9 +1110,10 @@ def deploy(
         if (
             re.fullmatch(r"[0-9a-f]{32}", config.handoff_operation_id) is None
             or config.handoff_labels != LAB_LAUNCHD_HANDOFF_LABELS
+            or config.handoff_lock_fd is None
         ):
             raise PolicyError("macOS Lab deployment requires a persisted launchd handoff")
-    elif config.handoff_operation_id or config.handoff_labels:
+    elif config.handoff_operation_id or config.handoff_labels or config.handoff_lock_fd is not None:
         raise PolicyError("launchd handoff binding is only valid for macOS Lab deployment")
     repo = config.repo.resolve()
     effective_config = DeployConfig(
@@ -1056,6 +1126,7 @@ def deploy(
         audit_path=config.audit_path,
         lock_path=config.lock_path,
         lock_fd=config.lock_fd,
+        handoff_lock_fd=config.handoff_lock_fd,
         startup_generation=config.startup_generation,
         python_path=config.python_path,
         git_path=config.git_path,
@@ -1064,6 +1135,7 @@ def deploy(
         platform_name=config.platform_name,
         command_timeout_seconds=config.command_timeout_seconds,
         overall_timeout_seconds=config.overall_timeout_seconds,
+        overall_deadline_monotonic=config.overall_deadline_monotonic,
         handoff_operation_id=config.handoff_operation_id,
         handoff_labels=config.handoff_labels,
         lab_lifecycle_mode=config.lab_lifecycle_mode,
@@ -1072,6 +1144,7 @@ def deploy(
         repo,
         command_timeout_seconds=effective_config.command_timeout_seconds,
         overall_timeout_seconds=effective_config.overall_timeout_seconds,
+        overall_deadline_monotonic=effective_config.overall_deadline_monotonic,
     )
     lock_path = effective_config.lock_path or (repo.parent / ".rquant-deploy" / f"{repo.name}.lock")
     if effective_config.lock_fd is not None:
@@ -1089,6 +1162,34 @@ def deploy(
             or stat.S_IMODE(opened.st_mode) != 0o600
         ):
             raise PolicyError("inherited deployment generation lock identity changed")
+        if effective_config.handoff_lock_fd is not None:
+            handoff_path = lock_path.with_name(f"{lock_path.stem}.handoff.lock")
+            try:
+                handoff_opened = os.fstat(effective_config.handoff_lock_fd)
+                handoff_active = handoff_path.lstat()
+            except OSError as exc:
+                raise PolicyError("inherited Lab handoff lock is unavailable") from exc
+            if (
+                (
+                    handoff_opened.st_dev,
+                    handoff_opened.st_ino,
+                    handoff_opened.st_mode,
+                    handoff_opened.st_uid,
+                    handoff_opened.st_nlink,
+                )
+                != (
+                    handoff_active.st_dev,
+                    handoff_active.st_ino,
+                    handoff_active.st_mode,
+                    handoff_active.st_uid,
+                    handoff_active.st_nlink,
+                )
+                or not stat.S_ISREG(handoff_opened.st_mode)
+                or handoff_opened.st_uid != os.getuid()
+                or handoff_opened.st_nlink != 1
+                or stat.S_IMODE(handoff_opened.st_mode) != 0o600
+            ):
+                raise PolicyError("inherited Lab handoff lock identity changed")
         if generation_authority is None:
             if effective_config.startup_generation is None or effective_config.python_path is None:
                 raise PolicyError("release generation binding is incomplete")
@@ -1145,6 +1246,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--deployment-lock-path", type=Path, required=True)
     parser.add_argument("--deployment-lock-fd", type=int, required=True)
+    parser.add_argument("--lab-handoff-lock-fd", type=int)
     parser.add_argument("--startup-generation", required=True)
     parser.add_argument("--trusted-git-path", type=Path, required=True)
     parser.add_argument("--python-path", type=Path, required=True)
@@ -1154,6 +1256,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--platform-name", choices=("linux", "darwin"), required=True)
     parser.add_argument("--command-timeout-seconds", type=float, default=300)
     parser.add_argument("--overall-timeout-seconds", type=float, default=1800)
+    parser.add_argument("--overall-deadline-monotonic", type=float)
     parser.add_argument("--lab-handoff-operation-id", default="")
     parser.add_argument("--lab-handoff-label", action="append", default=[])
     parser.add_argument(
@@ -1174,6 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
         rquant_bin=".venv/bin/rquant",
         lock_path=args.deployment_lock_path,
         lock_fd=args.deployment_lock_fd,
+        handoff_lock_fd=args.lab_handoff_lock_fd,
         startup_generation=args.startup_generation,
         python_path=args.python_path,
         git_path=args.trusted_git_path,
@@ -1182,6 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
         platform_name=args.platform_name,
         command_timeout_seconds=args.command_timeout_seconds,
         overall_timeout_seconds=args.overall_timeout_seconds,
+        overall_deadline_monotonic=args.overall_deadline_monotonic,
         handoff_operation_id=args.lab_handoff_operation_id,
         handoff_labels=tuple(args.lab_handoff_label),
         lab_lifecycle_mode=args.lab_lifecycle_mode,

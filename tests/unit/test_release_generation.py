@@ -845,6 +845,27 @@ def test_generation_environment_build_timeout_kills_uv_process_group(
     os.close(lock_fd)
 
 
+def test_generation_authority_recovery_rebinds_environment_deadline(tmp_path: Path) -> None:
+    repo, lock_path, _commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        writable=True,
+        environment_builder=lambda _destination: None,
+        overall_deadline_monotonic=time.monotonic() - 1,
+    )
+
+    recovered = authority.for_recovery(time.monotonic() + 30)
+
+    assert recovered.overall_deadline_monotonic > time.monotonic()
+    os.close(lock_fd)
+
+
 def test_environment_generation_is_immutable_and_content_bound(tmp_path: Path) -> None:
     repo, lock_path, commit, python = _generation(tmp_path)
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)

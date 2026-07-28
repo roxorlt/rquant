@@ -264,6 +264,26 @@ class DeploymentIntent:
             stage_history=(*self.stage_history, {"stage": stage, "timestamp": timestamp}),
         )
 
+    def rebind_handoff(
+        self,
+        *,
+        handoff_operation_id: str,
+        handoff_labels: tuple[str, ...],
+    ) -> DeploymentIntent:
+        if re.fullmatch(r"[0-9a-f]{32}", handoff_operation_id) is None or not handoff_labels:
+            raise ReleaseGenerationError("deployment handoff binding is invalid")
+        timestamp = datetime.now(UTC).isoformat()
+        return replace(
+            self,
+            handoff_operation_id=handoff_operation_id,
+            handoff_labels=tuple(handoff_labels),
+            updated_at=timestamp,
+            stage_history=(
+                *self.stage_history,
+                {"stage": "handoff_rebound", "timestamp": timestamp},
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class EnvironmentSelector:
@@ -1188,6 +1208,23 @@ class ReleaseGenerationAuthority:
         if self.writable:
             self._assert_exclusive_lock()
 
+    def for_recovery(self, overall_deadline_monotonic: float) -> ReleaseGenerationAuthority:
+        return ReleaseGenerationAuthority(
+            repo=self.repo,
+            lock_path=self.lock_path,
+            lock_fd=self.lock_fd,
+            python_path=self.python_path,
+            git_path=self.git_path,
+            writable=self.writable,
+            mutation_hook=self._mutation_hook,
+            gc_grace_seconds=self.gc_grace_seconds,
+            minimum_free_bytes=self.minimum_free_bytes,
+            uv_path=self.uv_path,
+            environment_builder=self._environment_builder,
+            command_timeout_seconds=self.command_timeout_seconds,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+
     def _build_environment(self, destination: Path, *, system_python: Path) -> None:
         if self._environment_builder is not None:
             self._environment_builder(destination)
@@ -1821,10 +1858,8 @@ class ReleaseGenerationAuthority:
         completed_name = (
             f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.completed.json"
         )
-        handoff_name = (
+        provisional_name = (
             f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.json"
-            if provisional_label is not None
-            else completed_name
         )
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         try:
@@ -1832,11 +1867,23 @@ class ReleaseGenerationAuthority:
                 payload, _identity_value = _read_private_json(
                     root_fd=root_fd,
                     root_path=self.lock_path.parent,
-                    name=handoff_name,
+                    name=completed_name,
                     maximum_bytes=MAX_INTENT_BYTES,
                 )
             except ReleaseGenerationRecordMissingError as exc:
-                raise ReleaseGenerationError("deployment handoff is not completed") from exc
+                if provisional_label is None:
+                    raise ReleaseGenerationError("deployment handoff is not completed") from exc
+                try:
+                    payload, _identity_value = _read_private_json(
+                        root_fd=root_fd,
+                        root_path=self.lock_path.parent,
+                        name=provisional_name,
+                        maximum_bytes=MAX_INTENT_BYTES,
+                    )
+                except ReleaseGenerationRecordMissingError as provisional_exc:
+                    raise ReleaseGenerationError(
+                        "deployment handoff is not completed"
+                    ) from provisional_exc
             self._assert_root(root_fd, root_identity)
         finally:
             os.close(root_fd)
@@ -2061,6 +2108,39 @@ class ReleaseGenerationAuthority:
             stage=stage,
             restarted_services=restarted_services,
         )
+
+    def rebind_deployment_handoff(
+        self,
+        *,
+        operation_id: str,
+        handoff_operation_id: str,
+        handoff_labels: tuple[str, ...],
+    ) -> DeploymentIntent:
+        if not self.writable:
+            raise ReleaseGenerationError("read-only generation authority cannot update intent")
+        self._assert_lock()
+        current, identity = self._read_intent_record(self.intent_path)
+        if current.operation_id != operation_id:
+            raise ReleaseGenerationError("deployment intent operation id changed")
+        updated = current.rebind_handoff(
+            handoff_operation_id=handoff_operation_id,
+            handoff_labels=handoff_labels,
+        )
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            self._assert_root(root_fd, root_identity)
+            _write_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=self.intent_path.name,
+                payload=asdict(updated),
+                require_absent=False,
+                expected_identity=identity,
+            )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+        return updated
 
     def begin_initialization(self, *, target_sha: str) -> DeploymentIntent:
         if not self.writable:

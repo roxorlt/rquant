@@ -3725,6 +3725,7 @@ class TestLabSchedulerCli:
             "require_lab_runtime_binding",
             lambda _root, _git: "1" * 40,
         )
+        monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
@@ -3787,6 +3788,39 @@ class TestLabSchedulerCli:
         )
 
         assert args.once is False
+
+    def test_scheduler_requires_prepared_runtime_before_creating_managed_paths(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+
+        from rquant import lab_daemon
+        from rquant.cli import cmd_lab_scheduler
+
+        monkeypatch.setattr(
+            lab_daemon,
+            "verify_lab_runtime_prepared",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                lab_daemon.LabDaemonConfigurationError("prepared sentinel missing")
+            ),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "ensure_private_directory",
+            lambda *_args, **_kwargs: pytest.fail(
+                "scheduler created a directory before prepared sentinel validation"
+            ),
+        )
+
+        with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="prepared sentinel"):
+            cmd_lab_scheduler(
+                argparse.Namespace(
+                    once=True,
+                    expected_checkout_root=_LAB_EXPECTED_ROOT,
+                    trusted_git_path=_LAB_TRUSTED_GIT,
+                )
+            )
 
     def test_cmd_lab_scheduler_once_initializes_ticks_and_releases(
         self,
@@ -3986,6 +4020,7 @@ class TestLabWorkerCli:
             "require_lab_runtime_binding",
             lambda _root, _git: "1" * 40,
         )
+        monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
         monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
@@ -4028,6 +4063,40 @@ class TestLabWorkerCli:
         )
 
         assert args.command == "lab-runtime-prepare"
+
+    def test_worker_requires_prepared_runtime_before_creating_spools(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+
+        from rquant import lab_daemon
+        from rquant.cli import cmd_lab_worker
+
+        monkeypatch.setattr(
+            lab_daemon,
+            "verify_lab_runtime_prepared",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                lab_daemon.LabDaemonConfigurationError("prepared sentinel missing")
+            ),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "ensure_private_directory",
+            lambda *_args, **_kwargs: pytest.fail(
+                "worker created a spool before prepared sentinel validation"
+            ),
+        )
+
+        with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="prepared sentinel"):
+            cmd_lab_worker(
+                argparse.Namespace(
+                    worker_id="worker-a",
+                    once=True,
+                    expected_checkout_root=_LAB_EXPECTED_ROOT,
+                    trusted_git_path=_LAB_TRUSTED_GIT,
+                )
+            )
 
     @pytest.mark.parametrize(
         ("status", "expected_exit"),

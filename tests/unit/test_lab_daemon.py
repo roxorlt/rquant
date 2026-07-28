@@ -918,6 +918,77 @@ def test_private_lab_runtime_layout_refuses_hot_legacy_sqlite_journal(
     assert not database.exists()
 
 
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_private_lab_runtime_layout_refuses_hot_target_sqlite_sidecars(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    from rquant import lab_daemon
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o755)
+    runtime = data / "lab-runtime"
+    runtime.mkdir(mode=0o700)
+    database = runtime / "lab_jobs.sqlite3"
+    database.write_bytes(b"sqlite")
+    database.chmod(0o600)
+    sidecar = Path(f"{database}{suffix}")
+    sidecar.write_bytes(b"hot")
+    sidecar.chmod(0o600)
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="checkpoint.*SQLite sidecars",
+    ):
+        lab_daemon.prepare_lab_runtime_layout(
+            runtime,
+            checkout_root=tmp_path,
+            managed_directories={"commands": runtime / "commands"},
+            managed_files={"lab jobs SQLite": database},
+            legacy_paths={},
+            mutation_guard=lambda: "a" * 40,
+        )
+
+    assert sidecar.read_bytes() == b"hot"
+    assert not lab_daemon.lab_runtime_prepared_path(runtime).exists()
+
+
+def test_prepared_runtime_verification_rejects_new_target_sqlite_sidecar(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    commands = runtime / "commands"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": commands},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    database.write_bytes(b"sqlite")
+    database.chmod(0o600)
+    wal = Path(f"{database}-wal")
+    wal.write_bytes(b"hot")
+    wal.chmod(0o600)
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="checkpoint.*SQLite sidecars",
+    ):
+        lab_daemon.verify_lab_runtime_prepared(
+            runtime,
+            checkout_root=tmp_path,
+            expected_commit="a" * 40,
+            managed_directories={"commands": commands},
+            managed_files={"lab jobs SQLite": database},
+            legacy_paths={},
+        )
+
+
 def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
     tmp_path: Path,
 ) -> None:

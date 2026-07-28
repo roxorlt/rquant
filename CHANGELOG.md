@@ -69,6 +69,15 @@
 
 ### Fixed
 
+- **Lab 发布恢复第三轮边界加固**：installed finalizer 继承外层 generation/handoff 锁，不再
+  二次争抢非阻塞 handoff 锁；普通发布在停止 daemon 前有界 fetch 并解析精确新 tag/SHA，恢复则
+  只使用 immutable intent 中记录的 commit。部分 launchd 恢复会先停净目标残余 label，再以新
+  handoff operation 原子重绑 intent/marker；单一整体 deadline 贯穿 bootstrap、handoff、deployer
+  与 finalizer，失败恢复另获独立有界预算。scheduler、worker、finalizer 在任何目录、密钥或
+  SQLite I/O 前验证 prepared runtime sentinel，目标库的 WAL/SHM/journal 均失败关闭；安装登记
+  dry-run 保持 state 字节与时间不变。通用 `.env.example` 不再固定平台 profile/lifecycle，并统一
+  不可变 venv 为 uv 在新 generation 中重建的文档口径。
+
 - **连续 macOS Lab 发布与失败恢复**：completed launchd handoff 改为按 operation 持久化并精确
   绑定 marker operation、不可变 venv generation 与 code SHA，后续 A→B 发布不再覆盖当前代际的
   daemon 证明。新代际 readiness 失败会停止 target daemon、用独立有界预算自动回滚 previous

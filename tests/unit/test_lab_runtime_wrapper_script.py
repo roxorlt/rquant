@@ -349,6 +349,103 @@ def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(
     assert marker.is_file()
 
 
+def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
+    tmp_path: Path,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    lock_path = _deployment_lock_path(checkout)
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    labels = (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    )
+    target_handoff = "a" * 32
+    rollback_handoff = "c" * 32
+    authority = ReleaseGenerationAuthority(
+        repo=checkout,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=checkout / ".venv" / "bin" / "python",
+        git_path=TRUSTED_GIT,
+        writable=True,
+        environment_builder=lambda destination: shutil.copytree(
+            checkout / ".venv",
+            destination,
+            dirs_exist_ok=True,
+            symlinks=True,
+        ),
+    )
+    current = authority.verify(expected_commit=commit)
+    intent = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha=commit,
+        target_ref=commit,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation=current.content_hash(),
+        previous_generation_id=current.environment_generation_id,
+        handoff_operation_id=target_handoff,
+        handoff_labels=labels,
+    )
+    authority.rebind_deployment_handoff(
+        operation_id=intent.operation_id,
+        handoff_operation_id=rollback_handoff,
+        handoff_labels=labels,
+    )
+    authority.invalidate()
+    authority.update_deployment_intent(operation_id=intent.operation_id, stage="timers_restored")
+    published = authority.publish(
+        expected_commit=commit,
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
+    authority.commit_generation(
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    os.close(lock_fd)
+    proof = {
+        "schema_version": 1,
+        "operation_id": rollback_handoff,
+        "labels": list(labels),
+        "loaded_labels": list(labels),
+        "stopped_labels": list(labels),
+        "restarted_labels": list(labels),
+        "stage": "completed",
+        "generation_operation_id": intent.operation_id,
+        "environment_generation_id": published.environment_generation_id,
+        "code_sha": commit,
+    }
+    proof_path = lock_path.with_name(
+        f"{lock_path.stem}.lab-handoff.{rollback_handoff}.completed.json"
+    )
+    proof_path.write_text(json.dumps(proof), encoding="utf-8")
+    proof_path.chmod(0o600)
+    active_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
+    active_path.write_text(
+        json.dumps({**proof, "operation_id": target_handoff, "stage": "restarting"}),
+        encoding="utf-8",
+    )
+    active_path.chmod(0o600)
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.is_file()
+
+
 def test_lab_runtime_wrapper_executes_verified_uv_style_python_symlink(
     tmp_path: Path,
 ) -> None:

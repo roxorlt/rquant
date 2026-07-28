@@ -135,6 +135,15 @@ def _runtime_identity_payload(path: Path, observed: os.stat_result) -> dict[str,
     }
 
 
+def _reject_sqlite_sidecars(path: Path, *, label: str) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = path.with_name(f"{path.name}{suffix}")
+        if os.path.lexists(sidecar):
+            raise LabDaemonConfigurationError(
+                f"checkpoint and remove {label} SQLite sidecars before preparing Lab runtime"
+            )
+
+
 def _write_runtime_prepared_sentinel(
     root: Path,
     payload: dict[str, object],
@@ -274,6 +283,8 @@ def verify_lab_runtime_prepared(
         path = _canonical_absolute_path(raw_path, label=label)
         if path.parent != root:
             raise LabDaemonConfigurationError(f"{label} must be inside lab runtime root")
+        if "sqlite" in label.casefold() or path.suffix.casefold() in {".db", ".sqlite3"}:
+            _reject_sqlite_sidecars(path, label=label)
         if os.path.lexists(path):
             observed = path.lstat()
             _validate_private_regular_identity(observed, label=label)
@@ -425,6 +436,9 @@ def prepare_lab_runtime_layout(
     for label, path in managed_directories.items():
         ensure_private_directory(path, label=label, mutation_guard=mutation_guard)
     for label, path in managed_files.items():
+        candidate = _canonical_absolute_path(path, label=label)
+        if "sqlite" in label.casefold() or candidate.suffix.casefold() in {".db", ".sqlite3"}:
+            _reject_sqlite_sidecars(candidate, label=label)
         if os.path.lexists(path):
             _validate_private_regular_identity(path.lstat(), label=label)
     prepared_commit = str(mutation_guard())
