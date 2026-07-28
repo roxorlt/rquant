@@ -98,6 +98,37 @@ def test_daemon_readiness_rejects_invalid_generation_before_namespace_creation(
     assert not lock_path.with_name("rquant.lab-readiness").exists()
 
 
+def test_daemon_readiness_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    authority_root = tmp_path / "authority"
+    authority_root.mkdir(mode=0o700)
+    lock_path = authority_root / "rquant.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    publisher = LabDaemonReadinessPublisher(
+        deployment_lock_path=lock_path,
+        deployment_lock_fd=lock_fd,
+        label="com.roxor.rquant-lab-worker",
+        operation_id="a" * 32,
+        environment_generation_id="b" * 64,
+        code_sha="c" * 40,
+        heartbeat_interval_seconds=1,
+    )
+    try:
+        publisher.publish_once()
+        original = publisher.path.read_text(encoding="utf-8").lstrip()
+        publisher.path.write_text('{"label":"forged",' + original[1:], encoding="utf-8")
+        publisher.path.chmod(0o600)
+
+        with pytest.raises(LabDaemonConfigurationError, match="heartbeat is invalid"):
+            LabDaemonReadinessPublisher.read(
+                deployment_lock_path=lock_path,
+                label="com.roxor.rquant-lab-worker",
+            )
+    finally:
+        publisher.close()
+        os.close(lock_fd)
+
+
 def test_authority_keyring_loads_active_and_rotated_keys(tmp_path: Path) -> None:
     active = tmp_path / "active.key"
     ring = tmp_path / "keyring.json"
@@ -128,6 +159,23 @@ def test_authority_keyring_loads_active_and_rotated_keys(tmp_path: Path) -> None
         key_id="previous", secret=b"b" * 32
     )
     assert keys.verification_key("missing") is None
+
+
+def test_authority_keyring_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    active = tmp_path / "active.key"
+    ring = tmp_path / "keyring.json"
+    _write_private(active, "61" * 32 + "\n")
+    _write_private(
+        ring,
+        '{"schema_version":1,"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n',
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="duplicate|valid JSON"):
+        LabAuthorityKeyring.load(
+            active_key_id="active",
+            active_key_path=active,
+            verification_keyring_path=ring,
+        )
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o606])
@@ -873,7 +921,6 @@ def test_prepared_runtime_requires_owner_registration_of_first_sqlite_identity(
             managed_files=files,
             legacy_paths={},
         )
-
     registered = lab_daemon.register_lab_runtime_managed_file(
         runtime,
         label="lab jobs SQLite",
@@ -911,6 +958,38 @@ def test_prepared_runtime_requires_owner_registration_of_first_sqlite_identity(
             expected_commit="b" * 40,
             managed_directories=directories,
             managed_files=files,
+            legacy_paths={},
+        )
+
+
+def test_prepared_runtime_sentinel_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    commands = runtime / "commands"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": commands},
+        managed_files={},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    sentinel = lab_daemon.lab_runtime_prepared_path(runtime)
+    original = sentinel.read_text(encoding="utf-8").lstrip()
+    sentinel.write_text(
+        '{"schema_version":2,' + original[1:],
+        encoding="utf-8",
+    )
+    sentinel.chmod(0o600)
+
+    with pytest.raises(LabDaemonConfigurationError, match="duplicate|malformed|unavailable"):
+        lab_daemon.verify_lab_runtime_prepared(
+            runtime,
+            checkout_root=tmp_path,
+            expected_commit="a" * 40,
+            managed_directories={"commands": commands},
+            managed_files={},
             legacy_paths={},
         )
 
@@ -2200,6 +2279,19 @@ def test_finalizer_corrupt_state_blocks_before_reader_access(tmp_path: Path) -> 
     with pytest.raises(LabDaemonConfigurationError, match="state is corrupt"):
         daemon.run_once()
     assert reads == 0
+
+
+def test_finalizer_state_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    state_dir = _private_state_dir(tmp_path)
+    store = LabFinalizerStateStore(state_dir)
+    store.save(LabFinalizerDaemonState(cycle=3))
+    state_path = state_dir / "state.json"
+    original = state_path.read_text(encoding="utf-8").lstrip()
+    state_path.write_text('{"schema_version":1,' + original[1:], encoding="utf-8")
+    state_path.chmod(0o600)
+
+    with pytest.raises(LabDaemonConfigurationError, match="state is corrupt"):
+        store.load()
 
 
 @pytest.mark.parametrize(

@@ -564,6 +564,43 @@ def test_stdlib_preflight_requires_nonempty_data_dir_like_settings(
         )
 
 
+def test_stdlib_preflight_rejects_duplicate_prepared_sentinel_keys(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    runtime = _prepare_lab_runtime(checkout)
+    dotenv = checkout / ".env"
+    dotenv.write_text(
+        "\n".join(
+            (
+                "TUSHARE_TOKEN_MAIN=" + "x" * 32,
+                f"DATA_DIR='{checkout / 'data'}'",
+                f"DUCKDB_PATH='{checkout / 'data' / 'rquant.duckdb'}'",
+                f"PARQUET_DIR='{tmp_path / 'parquet'}'",
+                f"LOG_DIR='{tmp_path / 'logs'}'",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dotenv.chmod(0o600)
+    sentinel = runtime / ".prepared.json"
+    original = sentinel.read_text(encoding="utf-8").lstrip()
+    sentinel.write_text(
+        '{"schema_version":2,' + original[1:],
+        encoding="utf-8",
+    )
+    sentinel.chmod(0o600)
+    namespace = runpy.run_path(str(SCRIPT))
+
+    with pytest.raises(namespace["PreflightError"], match="duplicate|malformed"):
+        namespace["_verify_prepared_lab_runtime"](
+            checkout,
+            daemon_command="lab-scheduler",
+        )
+
+
 @pytest.mark.parametrize(
     ("key", "default_name", "settings_property"),
     (

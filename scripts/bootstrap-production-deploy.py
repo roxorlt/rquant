@@ -1249,6 +1249,7 @@ def _validate_handoff_supersede_chain(
         raise DeployBootstrapError("completed Lab handoff proof is malformed") from exc
     superseded_operation_id = current.supersedes_operation_id
     ancestors: list[object] = []
+    completed_proofs: list[object] = [current]
     seen_operations = {current.operation_id}
     while superseded_operation_id:
         if superseded_operation_id in seen_operations:
@@ -1267,6 +1268,23 @@ def _validate_handoff_supersede_chain(
         except authority_module.ReleaseGenerationError as exc:
             raise DeployBootstrapError("superseded Lab handoff record is malformed") from exc
         ancestors.append(ancestor)
+        ancestor_proof = _private_json(
+            _completed_handoff_path(lock_path, str(ancestor.operation_id)),
+            label="superseded completed Lab handoff proof",
+            missing_ok=True,
+        )
+        if ancestor_proof is not None:
+            try:
+                completed_proofs.append(
+                    authority_module.LabHandoffRecord.from_payload(
+                        ancestor_proof,
+                        completed=True,
+                    )
+                )
+            except authority_module.ReleaseGenerationError as exc:
+                raise DeployBootstrapError(
+                    "superseded completed Lab handoff proof is malformed"
+                ) from exc
         superseded_operation_id = ancestor.supersedes_operation_id
     try:
         authority_module.validate_lab_handoff_supersede_chain(
@@ -1276,6 +1294,7 @@ def _validate_handoff_supersede_chain(
             installation_identity=installation_identity,
             checkout_root=str(root),
             expected_labels=tuple(LAB_LAUNCHD_LABELS),
+            completed_proofs=tuple(completed_proofs),
         )
     except authority_module.ReleaseGenerationError as exc:
         raise DeployBootstrapError("completed Lab handoff supersede chain is invalid") from exc
@@ -1676,10 +1695,6 @@ def _superseding_handoff_operation_id(
         ):
             raise DeployBootstrapError("prepared Lab handoff binding changed")
         return operation_id
-    if recovery_action == "resume" and action not in {"deploy", recovery_action}:
-        raise DeployBootstrapError("incomplete Lab handoff action conflicts with recovery")
-    if str(intent.handoff_operation_id) != operation_id:
-        raise DeployBootstrapError("deployment intent handoff operation changed")
     installation = _read_lab_installation_state(root=root, lock_path=lock_path)
     installation_identity = _lab_installation_identity(lock_path, installation)
     _validate_superseded_handoff_binding(
@@ -1689,8 +1704,52 @@ def _superseding_handoff_operation_id(
         lifecycle_mode=lifecycle_mode,
         installation_identity=installation_identity,
     )
+    intent_handoff_operation = str(intent.handoff_operation_id)
+    source_supersedes = str(payload.get("supersedes_operation_id", ""))
+    pending_rebind = (
+        operation_id != intent_handoff_operation
+        and action == recovery_action
+        and source_supersedes == intent_handoff_operation
+    )
+    if operation_id != intent_handoff_operation and not pending_rebind:
+        raise DeployBootstrapError("deployment intent handoff operation changed")
+    if pending_rebind:
+        operation_payload = _private_json(
+            _operation_handoff_path(lock_path, operation_id),
+            label="incomplete Lab handoff operation",
+        )
+        if operation_payload != payload:
+            raise DeployBootstrapError("incomplete Lab handoff operation changed")
+        ancestor_payload = _private_json(
+            _operation_handoff_path(lock_path, intent_handoff_operation),
+            label="superseded Lab handoff operation",
+        )
+        assert ancestor_payload is not None
+        ancestor = _validate_handoff_record_shape(
+            root=root,
+            lock_path=lock_path,
+            payload=ancestor_payload,
+            operation_id=intent_handoff_operation,
+            completed=ancestor_payload.get("stage") == "completed",
+        )
+        try:
+            _authority_module.validate_lab_handoff_supersede_action(
+                action=str(action),
+                superseded_action=str(ancestor.action),
+            )
+        except _authority_module.ReleaseGenerationError as exc:
+            raise DeployBootstrapError(
+                "incomplete Lab handoff action conflicts with recovery"
+            ) from exc
     if action == recovery_action:
-        return str(payload.get("supersedes_operation_id", ""))
+        return source_supersedes
+    try:
+        _authority_module.validate_lab_handoff_supersede_action(
+            action=recovery_action,
+            superseded_action=str(action),
+        )
+    except _authority_module.ReleaseGenerationError as exc:
+        raise DeployBootstrapError("incomplete Lab handoff action conflicts with recovery") from exc
     return operation_id
 
 
@@ -1893,6 +1952,8 @@ class _LabLaunchdHandoff:
     ) -> None:
         if not self.enabled:
             return
+        stopped = set(self.stopped)
+        restarted = set(self.restarted)
         payload: dict[str, object] = {
             "schema_version": LAB_HANDOFF_SCHEMA_VERSION,
             "operation_id": self.operation_id,
@@ -1900,8 +1961,8 @@ class _LabLaunchdHandoff:
             "stage": stage,
             "labels": list(self.loaded),
             "loaded_labels": list(self.loaded),
-            "stopped_labels": list(self.stopped),
-            "restarted_labels": list(self.restarted),
+            "stopped_labels": [label for label in self.loaded if label in stopped],
+            "restarted_labels": [label for label in self.loaded if label in restarted],
             "updated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
             "target_ref": self.target_ref,
             "target_sha": self.target_sha,
@@ -1922,6 +1983,16 @@ class _LabLaunchdHandoff:
                     "code_sha": code_sha,
                 }
             )
+        authority_module = _load_release_authority(
+            self.root / "src" / "rquant" / "release_generation.py"
+        )
+        try:
+            authority_module.LabHandoffRecord.from_payload(
+                payload,
+                completed=stage == "completed",
+            )
+        except authority_module.ReleaseGenerationError as exc:
+            raise DeployBootstrapError("Lab handoff record state is invalid") from exc
         if stage == "completed":
             completed_path = _completed_handoff_path(self.lock_path, self.operation_id)
             if completed_path.exists():
@@ -2104,7 +2175,7 @@ class _LabLaunchdHandoff:
                 )
                 self.prepared_intent_operation_id = prepared_operation
                 self.operation_id = effective_handoff_operation
-            self._record("planned")
+            self._record("stopping" if self.stopped else "planned")
         elif prepare_intent is not None:
             prepared_operation, effective_handoff_operation = prepare_intent(
                 self.operation_id,
@@ -2117,6 +2188,8 @@ class _LabLaunchdHandoff:
             _physical_file(plist, label=f"Lab launchd plist {label}")
             if not self._is_loaded(label):
                 continue
+            if label in self.restarted:
+                self.restarted.remove(label)
             self._record("stopping")
             _launchctl(
                 ["bootout", f"{self.domain}/{label}"],
@@ -2125,8 +2198,6 @@ class _LabLaunchdHandoff:
             )
             if label not in self.stopped:
                 self.stopped.append(label)
-            if label in self.restarted:
-                self.restarted.remove(label)
             self._record("stopping")
         self._record("stopped")
 
@@ -2218,7 +2289,14 @@ class _LabLaunchdHandoff:
                     raise DeployBootstrapError(
                         "Lab readiness belongs to a different code generation"
                     )
-                self._record("completed", generation=generation)
+                if set(self.stopped) == set(self.loaded):
+                    self._record("completed", generation=generation)
+                elif self.action == "deploy" and not self.supersedes_operation_id:
+                    self._record("aborted")
+                else:
+                    raise DeployBootstrapError(
+                        "partial Lab handoff cannot publish a completed proof"
+                    )
             except DeployBootstrapError as exc:
                 errors.append(str(exc))
         self.close()

@@ -69,6 +69,15 @@
 
 ### Fixed
 
+- **Lab daemon 第十四轮 handoff authority 收敛**：daemon 与 bootstrap 现共用同一份
+  handoff record、action edge、supersede chain 和 intent rebound history 校验；provisional
+  recovery 必须逐跳证明 physical operation 链与 intent 的 A→B→C rebound 完全一致，并读取核对
+  链内已有 completed proof。handoff 的 planned/stopping/stopped/restarting/aborted partial 状态
+  采用明确 stopped/restarted 子集不变量，writer 在每次 durable publish 前自校验。若 recovery
+  operation 已落盘而 intent 尚停在上一 operation，重试可验证 successor 绑定并由 deployer 幂等
+  rebind。prepared sentinel、authority keyring、readiness、finalizer state、release authority 与
+  stdlib preflight/bootstrap 的 JSON 读取统一拒绝任意层重复键。
+
 - **Lab daemon 第十三轮 prepared 恢复与 handoff 链加固**：deployer 接管前失败只会在核对
   typed prepared intent 后恢复 previous daemon，并将原 deploy handoff 标记为 `aborted`；不会再用
   新 target/action 为旧代际生成 completed proof。仅有 `.intent.prepared.json` 的崩溃状态现可由

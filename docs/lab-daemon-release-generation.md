@@ -52,6 +52,13 @@ deployer 接管前的失败清理只恢复 previous daemon 并落 `aborted`，�
 completed handoff。intent 永久保存初始 handoff operation，所有 rebound 和 supersede 必须从该根
 连续；authority JSON 对任意层重复键一律失败关闭。
 
+每个 partial handoff record 在落盘前都由 release authority 校验：`planned` 不得声称已经停止或
+恢复 label，`stopping` 只允许 stopped 子集且 restarted 为空，`stopped` 必须覆盖全部 label，
+`restarting` 允许在早期 abort/recovery 中保存 stopped/restarted 子集，`aborted` 则要求全部 label
+已恢复且不生成 completed proof。若 recovery operation B 已写入而 intent 仍绑定 A，重试只在
+`B.supersedes_operation_id == A`、action edge 和 immutable target/install binding 均成立时继续，
+随后由持 generation 独占锁的 deployer 追加 A→B rebound；其他 operation 错配失败关闭。
+
 handoff 完成状态按 `completed proof -> operation record -> stable active record` 顺序原子发布。若任一写
 边界崩溃，下次启动先只读校验三份记录的 operation、target、label、profile、installation、supersede
 链和 generation binding；完全一致才在 handoff 锁内补齐后两份记录。proof 缺字段、伪造 generation
@@ -67,6 +74,9 @@ mutation。
 selector/commit record 的真实权威值。bootstrap 与生产 deployer 共同调用 release authority 中的
 changed-files、service/timer、generation 与 stage-history 校验，因此损坏或越权 intent 会在任何
 `launchctl bootout/bootstrap` 前失败关闭。
+物理 supersede 链还必须与 intent 的完整 rebound 序列逐跳相等，不能省略或插入隐藏 operation。
+provisional daemon 会读取链内每一份已有 completed proof，并要求它与同 operation record 内容完全
+一致；旧 proof 与新 partial active 只有在该 proof 是合法 ancestor 时才可继续启动。
 
 同目录的 `rQuant.complete.json` 不是单独完成凭证。daemon 必须同时核对 completed intent、
 `rQuant.commit.json`、`rQuant.environment.json` 和环境 manifest；commit record 精确绑定 marker、

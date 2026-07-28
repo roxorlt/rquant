@@ -74,6 +74,41 @@ def _handoff_record(
     return LabHandoffRecord.from_payload(payload, completed=True)
 
 
+def _partial_handoff_record(
+    *,
+    operation_id: str,
+    action: str,
+    target_sha: str,
+    supersedes_operation_id: str,
+    installation: LabInstallationIdentity,
+    stage: str,
+    stopped_labels: tuple[str, ...] = (),
+    restarted_labels: tuple[str, ...] = (),
+) -> LabHandoffRecord:
+    labels = ("scheduler", "worker", "finalizer")
+    return LabHandoffRecord.from_payload(
+        {
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "checkout_root": "/private/runtime/rquant",
+            "labels": list(labels),
+            "loaded_labels": list(labels),
+            "stopped_labels": list(stopped_labels),
+            "restarted_labels": list(restarted_labels),
+            "target_ref": target_sha,
+            "target_sha": target_sha,
+            "action": action,
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": asdict(installation),
+            "supersedes_operation_id": supersedes_operation_id,
+            "stage": stage,
+            "updated_at": "2026-07-28T00:00:00+00:00",
+        },
+        completed=False,
+    )
+
+
 def _marker_payload() -> dict[str, object]:
     identity = asdict(PathIdentity(device=1, inode=2, mode=0o100500, owner=os.getuid(), links=1))
     return {
@@ -1428,6 +1463,151 @@ def test_handoff_supersede_chain_allows_valid_rollback_edges(
 
 
 @pytest.mark.parametrize(
+    ("stage", "stopped", "restarted"),
+    (
+        ("planned", (), ()),
+        ("stopping", ("scheduler",), ()),
+        ("stopped", ("scheduler", "worker", "finalizer"), ()),
+        ("restarting", ("scheduler",), ("scheduler",)),
+        (
+            "aborted",
+            ("scheduler",),
+            ("scheduler", "worker", "finalizer"),
+        ),
+    ),
+)
+def test_partial_handoff_state_model_accepts_crash_recoverable_states(
+    stage: str,
+    stopped: tuple[str, ...],
+    restarted: tuple[str, ...],
+) -> None:
+    installation = LabInstallationIdentity(
+        path="/private/runtime/install.json",
+        sha256="e" * 64,
+        device=1,
+        inode=2,
+    )
+
+    record = _partial_handoff_record(
+        operation_id="1" * 32,
+        action="deploy",
+        target_sha="b" * 40,
+        supersedes_operation_id="",
+        installation=installation,
+        stage=stage,
+        stopped_labels=stopped,
+        restarted_labels=restarted,
+    )
+
+    assert record.stage == stage
+
+
+@pytest.mark.parametrize(
+    ("stage", "stopped", "restarted"),
+    (
+        ("planned", ("scheduler",), ()),
+        ("stopping", ("scheduler",), ("scheduler",)),
+        ("stopped", ("scheduler",), ()),
+        ("restarting", (), ("unknown",)),
+        ("aborted", ("scheduler",), ("scheduler",)),
+    ),
+)
+def test_partial_handoff_state_model_rejects_inconsistent_subsets(
+    stage: str,
+    stopped: tuple[str, ...],
+    restarted: tuple[str, ...],
+) -> None:
+    installation = LabInstallationIdentity(
+        path="/private/runtime/install.json",
+        sha256="e" * 64,
+        device=1,
+        inode=2,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="handoff state|binding"):
+        _partial_handoff_record(
+            operation_id="1" * 32,
+            action="deploy",
+            target_sha="b" * 40,
+            supersedes_operation_id="",
+            installation=installation,
+            stage=stage,
+            stopped_labels=stopped,
+            restarted_labels=restarted,
+        )
+
+
+@pytest.mark.parametrize("physical_middle", (None, "d" * 32))
+def test_handoff_supersede_chain_exactly_matches_intent_rebound_history(
+    physical_middle: str | None,
+) -> None:
+    labels = ("scheduler", "worker", "finalizer")
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id="1" * 32,
+        handoff_labels=labels,
+    ).advance(stage="recovery_started")
+    intent = intent.rebind_handoff(
+        handoff_operation_id="2" * 32,
+        handoff_labels=labels,
+    ).advance(stage="recovery_started")
+    intent = intent.rebind_handoff(
+        handoff_operation_id="3" * 32,
+        handoff_labels=labels,
+    )
+    installation = LabInstallationIdentity(
+        path="/private/runtime/install.json",
+        sha256="e" * 64,
+        device=1,
+        inode=2,
+    )
+    root = _handoff_record(
+        operation_id="1" * 32,
+        action="deploy",
+        target_sha=intent.target_sha,
+        supersedes_operation_id="",
+        installation=installation,
+    )
+    ancestors = (root,)
+    supersedes = root.operation_id
+    if physical_middle is not None:
+        hidden = _handoff_record(
+            operation_id=physical_middle,
+            action="rollback",
+            target_sha=intent.previous_sha,
+            supersedes_operation_id=root.operation_id,
+            installation=installation,
+        )
+        ancestors = (hidden, root)
+        supersedes = hidden.operation_id
+    current = _handoff_record(
+        operation_id="3" * 32,
+        action="rollback",
+        target_sha=intent.previous_sha,
+        supersedes_operation_id=supersedes,
+        installation=installation,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="history|chain"):
+        validate_lab_handoff_supersede_chain(
+            record=current,
+            ancestors=ancestors,
+            intent=intent,
+            installation_identity=installation,
+            checkout_root="/private/runtime/rquant",
+            expected_labels=labels,
+        )
+
+
+@pytest.mark.parametrize(
     "payload",
     (
         b'{"schema_version":1,"schema_version":2}',
@@ -1631,6 +1811,124 @@ def test_deployment_marker_requires_completed_launchd_handoff(
     active_handoff_path.chmod(0o600)
     with pytest.raises(ReleaseGenerationError, match="handoff.*record|proof"):
         authority.verify(expected_commit=commit)
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize("tamper_ancestor_proof", (False, True))
+def test_provisional_handoff_validates_completed_ancestor_proof(
+    tmp_path: Path,
+    tamper_ancestor_proof: bool,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    initialized = _publish_initialized(authority, commit=commit)
+    labels = (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    )
+    root_operation = "d" * 32
+    recovery_operation = "e" * 32
+    intent = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha=commit,
+        target_ref=commit,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation=initialized.content_hash(),
+        previous_generation_id=initialized.environment_generation_id,
+        handoff_operation_id=root_operation,
+        handoff_labels=labels,
+    )
+    intent = authority.update_deployment_intent(
+        operation_id=intent.operation_id,
+        stage="recovery_started",
+    )
+    intent = authority.rebind_deployment_handoff(
+        operation_id=intent.operation_id,
+        handoff_operation_id=recovery_operation,
+        handoff_labels=labels,
+    )
+    authority.invalidate()
+    _advance_deployment_intent(authority, intent, target_stage="timers_restored")
+    marker = authority.publish(
+        expected_commit=commit,
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    _advance_deployment_intent(authority, intent, target_stage="awaiting_readiness")
+    installation = _write_lab_installation(repo, lock_path)
+    root_payload = {
+        "schema_version": 1,
+        "operation_id": root_operation,
+        "checkout_root": str(repo),
+        "labels": list(labels),
+        "loaded_labels": list(labels),
+        "stopped_labels": list(labels),
+        "restarted_labels": list(labels),
+        "target_ref": commit,
+        "target_sha": commit,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": installation,
+        "supersedes_operation_id": "",
+        "stage": "completed",
+        "updated_at": "2026-07-28T00:00:00+00:00",
+        "generation_operation_id": intent.operation_id,
+        "environment_generation_id": marker.environment_generation_id,
+        "code_sha": commit,
+    }
+    proof_payload = dict(root_payload)
+    if tamper_ancestor_proof:
+        proof_payload["updated_at"] = "2026-07-28T00:00:01+00:00"
+    recovery_payload = {
+        "schema_version": 1,
+        "operation_id": recovery_operation,
+        "checkout_root": str(repo),
+        "labels": list(labels),
+        "loaded_labels": list(labels),
+        "stopped_labels": list(labels),
+        "restarted_labels": [labels[0]],
+        "target_ref": commit,
+        "target_sha": commit,
+        "action": "resume",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": installation,
+        "supersedes_operation_id": root_operation,
+        "stage": "restarting",
+        "updated_at": "2026-07-28T00:00:02+00:00",
+    }
+    records = {
+        lock_path.with_name(f"{lock_path.stem}.lab-handoff.{root_operation}.json"): root_payload,
+        lock_path.with_name(
+            f"{lock_path.stem}.lab-handoff.{root_operation}.completed.json"
+        ): proof_payload,
+        lock_path.with_name(
+            f"{lock_path.stem}.lab-handoff.{recovery_operation}.json"
+        ): recovery_payload,
+        lock_path.with_name(f"{lock_path.stem}.lab-handoff.json"): recovery_payload,
+    }
+    for path, payload in records.items():
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.chmod(0o600)
+
+    if tamper_ancestor_proof:
+        with pytest.raises(ReleaseGenerationError, match="proof|inconsistent"):
+            authority.verify(
+                expected_commit=commit,
+                provisional_handoff_label=labels[0],
+            )
+    else:
+        authority.verify(
+            expected_commit=commit,
+            provisional_handoff_label=labels[0],
+        )
     os.close(lock_fd)
 
 

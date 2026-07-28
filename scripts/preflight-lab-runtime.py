@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import json
 import os
 import re
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -46,6 +46,22 @@ _DOTENV_ASSIGNMENT = re.compile(
 
 class PreflightError(RuntimeError):
     pass
+
+
+def _load_strict_json() -> tuple[
+    type[ValueError],
+    Callable[[str | bytes | bytearray], object],
+]:
+    path = Path(__file__).resolve().with_name("strict_json.py")
+    spec = importlib.util.spec_from_file_location("_rquant_preflight_strict_json", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("strict JSON authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.StrictJsonError, module.strict_json_loads
+
+
+StrictJsonError, strict_json_loads = _load_strict_json()
 
 
 @dataclass(frozen=True)
@@ -479,8 +495,8 @@ def _verify_prepared_lab_runtime(
     )
     assert encoded is not None
     try:
-        payload = json.loads(encoded.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        payload = strict_json_loads(encoded.decode("utf-8"))
+    except (UnicodeError, StrictJsonError) as exc:
         raise PreflightError("Lab runtime prepared sentinel is malformed") from exc
     authority_id = payload.get("runtime_authority_id") if isinstance(payload, dict) else None
     if (

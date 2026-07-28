@@ -864,6 +864,66 @@ def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
     assert authority.intent.handoff_operation_id == recovery_handoff
 
 
+def test_recovery_rebinds_persisted_successor_after_bootstrap_crash(
+    tmp_path: Path,
+) -> None:
+    original_handoff = "d" * 32
+    recovery_handoff = "e" * 32
+    authority = FakeGenerationAuthority()
+    authority.intent = DeploymentIntent.create(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref="v0.13.2",
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="f" * 64,
+        handoff_operation_id=original_handoff,
+        handoff_labels=LAB_LAUNCHD_HANDOFF_LABELS,
+    )
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+            "lab_lifecycle_mode": "installed",
+            "target": authority.intent.target_ref,
+            "recovery_action": "resume",
+            "handoff_operation_id": recovery_handoff,
+            "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
+            "handoff_lock_fd": 9,
+        }
+    )
+    responses = _base_responses()
+    responses[("git", "rev-parse", "HEAD")] = (0, f"{authority.intent.target_sha}\n")
+
+    result = deploy(
+        config,
+        runner=FakeRunner(responses),
+        generation_authority=authority,
+        generation_finalizer=FakeGenerationFinalizer(),
+    )
+
+    assert result.status == "recovered"
+    assert authority.intent is not None
+    assert authority.intent.initial_handoff_operation_id == original_handoff
+    assert authority.intent.handoff_operation_id == recovery_handoff
+    rebounds = [
+        event for event in authority.intent.stage_history if event["stage"] == "handoff_rebound"
+    ]
+    assert rebounds == [
+        {
+            "stage": "handoff_rebound",
+            "timestamp": rebounds[0]["timestamp"],
+            "previous_handoff_operation_id": original_handoff,
+            "handoff_operation_id": recovery_handoff,
+        }
+    ]
+
+
 def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

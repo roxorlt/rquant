@@ -67,8 +67,9 @@
    deployer 使用 release authority 中同一份 changed-files、service/timer、generation 与 stage-history
    policy；任何损坏、越权或自相矛盾的 intent 都会在首个 launchd mutation 之前失败关闭。
    supersede 链以 intent 永久保存的初始 handoff operation 为根；每次 rebound 的 previous id 必须
-   与上一跳完全相等。proof、按 operation 命名的记录和 stable active 也必须使用同一 operation id，
-   daemon 不接受“旧 proof + 新 active”组合。
+   与上一跳完全相等，物理 operation 链不得隐藏或遗漏 rebound 节点。proof、按 operation 命名的
+   记录和 stable active 必须内容一致；provisional 新 active 仅可引用 supersede 链内经验证的旧
+   completed proof，无合法链的 operation 错配会被 daemon 拒绝。
    completed handoff proof 已落盘但事务仍为 `awaiting_readiness`，或 intent 已 completed 但 commit
    record 尚未落盘时，显式 `resume` 会幂等继续 readiness finalizer/commit；同 SHA 或空 diff 若仍有
    incomplete handoff，则返回结构化 `recovery_required`，不会误报 `already_current`。

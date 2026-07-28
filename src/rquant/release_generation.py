@@ -343,8 +343,8 @@ class LabHandoffRecord:
         if completed:
             if (
                 self.stage != "completed"
-                or self.stopped_labels != self.labels
-                or self.restarted_labels != self.labels
+                or set(self.stopped_labels) != label_set
+                or set(self.restarted_labels) != label_set
                 or re.fullmatch(r"[0-9a-f]{32}", self.generation_operation_id) is None
                 or re.fullmatch(r"[0-9a-f]{64}", self.environment_generation_id) is None
                 or re.fullmatch(r"[0-9a-f]{40}", self.code_sha) is None
@@ -356,16 +356,16 @@ class LabHandoffRecord:
             raise ReleaseGenerationError("partial Lab handoff stage is invalid")
         if self.stage == "planned" and (self.stopped_labels or self.restarted_labels):
             raise ReleaseGenerationError("planned Lab handoff state is invalid")
+        if self.stage == "stopping" and self.restarted_labels:
+            raise ReleaseGenerationError("stopping Lab handoff state is invalid")
         if self.stage == "stopped" and (
-            self.stopped_labels != self.labels or self.restarted_labels
+            set(self.stopped_labels) != label_set or self.restarted_labels
         ):
             raise ReleaseGenerationError("stopped Lab handoff state is invalid")
-        if self.stage == "restarting" and self.stopped_labels != self.labels:
-            raise ReleaseGenerationError("restarting Lab handoff state is invalid")
         if self.stage == "aborted" and (
             self.action != "deploy"
             or self.supersedes_operation_id
-            or self.restarted_labels != self.labels
+            or set(self.restarted_labels) != label_set
         ):
             raise ReleaseGenerationError("aborted Lab handoff state is invalid")
 
@@ -1072,9 +1072,21 @@ def validate_lab_handoff_supersede_chain(
     installation_identity: LabInstallationIdentity,
     checkout_root: str,
     expected_labels: tuple[str, ...],
+    completed_proofs: tuple[LabHandoffRecord, ...] = (),
 ) -> None:
     if record.operation_id != intent.handoff_operation_id:
         raise ReleaseGenerationError("Lab handoff supersede chain is stale")
+    physical_chain = (record, *ancestors)
+    history_chain = (
+        intent.initial_handoff_operation_id,
+        *(
+            event["handoff_operation_id"]
+            for event in intent.stage_history
+            if event["stage"] == "handoff_rebound"
+        ),
+    )
+    if tuple(item.operation_id for item in reversed(physical_chain)) != history_chain:
+        raise ReleaseGenerationError("Lab handoff supersede chain does not match rebound history")
     current = record
     seen = {record.operation_id}
     for ancestor in ancestors:
@@ -1085,17 +1097,16 @@ def validate_lab_handoff_supersede_chain(
             checkout_root=checkout_root,
             expected_labels=expected_labels,
         )
-        allowed_ancestor_actions = {
-            "resume": {"deploy"},
-            "rollback": {"deploy", "resume", "rollback"},
-        }.get(current.action, set())
         if (
             current.action == "deploy"
             or current.supersedes_operation_id != ancestor.operation_id
             or ancestor.operation_id in seen
-            or ancestor.action not in allowed_ancestor_actions
         ):
             raise ReleaseGenerationError("Lab handoff supersede chain is discontinuous")
+        validate_lab_handoff_supersede_action(
+            action=current.action,
+            superseded_action=ancestor.action,
+        )
         seen.add(ancestor.operation_id)
         current = ancestor
     validate_lab_handoff_record_authority(
@@ -1113,6 +1124,31 @@ def validate_lab_handoff_supersede_chain(
         raise ReleaseGenerationError("deploy handoff cannot have a supersede chain")
     if record.action != "deploy" and not ancestors:
         raise ReleaseGenerationError("recovery handoff supersede chain is missing")
+    records_by_operation = {item.operation_id: item for item in physical_chain}
+    seen_proofs: set[str] = set()
+    for proof in completed_proofs:
+        operation = records_by_operation.get(proof.operation_id)
+        if (
+            operation is None
+            or proof.operation_id in seen_proofs
+            or operation.stage != "completed"
+            or proof != operation
+        ):
+            raise ReleaseGenerationError("completed Lab handoff proof records are inconsistent")
+        seen_proofs.add(proof.operation_id)
+
+
+def validate_lab_handoff_supersede_action(
+    *,
+    action: str,
+    superseded_action: str,
+) -> None:
+    allowed_ancestor_actions = {
+        "resume": {"deploy"},
+        "rollback": {"deploy", "resume", "rollback"},
+    }.get(action, set())
+    if superseded_action not in allowed_ancestor_actions:
+        raise ReleaseGenerationError("Lab handoff supersede action edge is invalid")
 
 
 def validate_ready_deployment_handoff_authority(
@@ -2988,6 +3024,23 @@ class ReleaseGenerationAuthority:
                 )
                 ancestors.append(ancestor)
                 superseded_operation_id = ancestor.supersedes_operation_id
+            completed_proofs: list[LabHandoffRecord] = []
+            for chain_record in (record, *ancestors):
+                try:
+                    proof_payload, _proof_identity = _read_private_json(
+                        root_fd=root_fd,
+                        root_path=self.lock_path.parent,
+                        name=(
+                            f"{self.lock_path.stem}.lab-handoff."
+                            f"{chain_record.operation_id}.completed.json"
+                        ),
+                        maximum_bytes=MAX_INTENT_BYTES,
+                    )
+                except ReleaseGenerationRecordMissingError:
+                    continue
+                completed_proofs.append(
+                    LabHandoffRecord.from_payload(proof_payload, completed=True)
+                )
             self._assert_root(root_fd, root_identity)
         finally:
             os.close(root_fd)
@@ -3000,6 +3053,7 @@ class ReleaseGenerationAuthority:
             installation_identity=installation,
             checkout_root=str(self.repo),
             expected_labels=transaction.handoff_labels,
+            completed_proofs=tuple(completed_proofs),
         )
         if records_completed:
             validate_ready_deployment_handoff_authority(
