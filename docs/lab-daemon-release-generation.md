@@ -34,7 +34,8 @@ rename/replacement 或声明路径与物理路径漂移都会失败关闭。
 
 daemon 持共享锁；`scripts/deploy-production.sh` 另持稳定的 sibling handoff lock。macOS 正式
 发布会在交易保护窗口外记录当时 loaded 的三个 Lab label，逐个 `bootout`，有界等待 shared lock
-释放后再取得 generation 独占锁。事务成功或已回滚后，部署器只 `bootstrap` 原先 loaded 的 label，
+前先持久化严格 typed 的 prepared deployment intent；释放后再取得 generation 独占锁并原子接管该
+intent，deployer 不重新 fetch 或重算 plan。事务成功或已回滚后，部署器只 `bootstrap` 原先 loaded 的 label，
 并验证 launchd health 与 shared lock 已重新取得；每个 `launchctl print` 的超时取 command timeout
 与当前整体/readiness 剩余预算的较小值，预算耗尽立即失败。任一步超时都返回失败，不会无限等待。dry-run
 仅以共享锁核对并输出 handoff 计划，不停止 daemon。`launchctl` 始终由当前用户执行，sudoers
@@ -51,6 +52,10 @@ handoff 完成状态按 `completed proof -> operation record -> stable active re
 或任一 binding 漂移都不会触发收敛。接管旧 operation 前还要求其 id 等于 deployment intent 当前
 `handoff_operation_id`，deployer 只能在验证后 rebind。显式 resume/rollback 的 readiness 若失败，
 自动 rollback 可以继续 supersede 当前 recovery operation，并复核每一跳 action 与 intent binding。
+partial-stop operation 的 stopped labels 可以是声明 labels 的合法子集，但阶段必须匹配；最终 proof
+会验证完整 supersede 链每一跳的 target/ref/profile/lifecycle/installation binding。completed proof
+后若崩溃在 intent completion 或 commit record 边界，显式 resume 会幂等补齐，且不会重复 launchd
+mutation。
 其中 completed proof 的 `generation_operation_id`、`environment_generation_id` 与 `code_sha` 并非
 仅做格式检查：它们必须分别匹配 typed deployment intent、当前 generation marker/environment
 selector/commit record 的真实权威值。bootstrap 与生产 deployer 共同调用 release authority 中的
@@ -68,6 +73,10 @@ checkpoint；目录 fsync 后到达的取消会返回失败，但保留已落盘
 不会把未持久化状态报告为成功。marker 可以先于 intent completion
 出现，但 commit record 只能在 intent=`completed` 后发布，因此任何中断代际都不会被 daemon
 接受。回滚以相同协议选择 previous commit 的不可变 generation。
+
+安装状态重复登记只有在物理 binding 完全相同时才是幂等操作，并保留原 descriptor inode；已有
+deployment handoff 后若 plist/runtime/installation identity 改变，普通 registration 失败关闭，必须
+走单独受控 installation authority 迁移，不能覆盖旧 completed proof。
 
 Lab runtime prepared sentinel 绑定长期稳定的 runtime-root device/inode。scheduler 首次创建
 `lab_jobs.sqlite3` 时，从同一个已验证 root dir FD 读取 sentinel、用 `openat(O_NOFOLLOW)` 创建数据库，

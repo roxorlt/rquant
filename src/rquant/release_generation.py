@@ -22,7 +22,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator
 from contextlib import suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ MARKER_SCHEMA_VERSION = 1
 INTENT_SCHEMA_VERSION = 1
 COMMIT_SCHEMA_VERSION = 1
 ENVIRONMENT_SCHEMA_VERSION = 1
+LAB_HANDOFF_SCHEMA_VERSION = 1
 MAX_MARKER_BYTES = 32 * 1024
 MAX_INTENT_BYTES = 128 * 1024
 MAX_ENVIRONMENT_MANIFEST_BYTES = 64 * 1024 * 1024
@@ -149,6 +150,205 @@ class PathIdentity:
     def capture(cls, value: os.stat_result) -> PathIdentity:
         return cls(value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_nlink)
 
+    @classmethod
+    def from_payload(cls, payload: object, *, label: str) -> PathIdentity:
+        fields = {"device", "inode", "mode", "owner", "links"}
+        if (
+            type(payload) is not dict
+            or set(payload) != fields
+            or any(type(payload[field]) is not int for field in fields)
+        ):
+            raise ReleaseGenerationError(f"{label} identity is malformed")
+        return cls(
+            device=payload["device"],
+            inode=payload["inode"],
+            mode=payload["mode"],
+            owner=payload["owner"],
+            links=payload["links"],
+        )
+
+
+@dataclass(frozen=True)
+class LabInstallationIdentity:
+    path: str
+    sha256: str
+    device: int
+    inode: int
+
+    @classmethod
+    def from_payload(cls, payload: object) -> LabInstallationIdentity:
+        expected_fields = {"path", "sha256", "device", "inode"}
+        if (
+            type(payload) is not dict
+            or set(payload) != expected_fields
+            or type(payload["path"]) is not str
+            or type(payload["sha256"]) is not str
+            or type(payload["device"]) is not int
+            or type(payload["inode"]) is not int
+            or re.fullmatch(r"[0-9a-f]{64}", payload["sha256"]) is None
+        ):
+            raise ReleaseGenerationError("Lab installation identity is malformed")
+        return cls(**payload)
+
+
+@dataclass(frozen=True)
+class LabHandoffRecord:
+    schema_version: int
+    operation_id: str
+    checkout_root: str
+    labels: tuple[str, ...]
+    loaded_labels: tuple[str, ...]
+    stopped_labels: tuple[str, ...]
+    restarted_labels: tuple[str, ...]
+    target_ref: str
+    target_sha: str
+    action: str
+    release_profile: str
+    lifecycle_mode: str
+    installation_identity: LabInstallationIdentity
+    supersedes_operation_id: str
+    stage: str
+    updated_at: str
+    generation_operation_id: str = ""
+    environment_generation_id: str = ""
+    code_sha: str = ""
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: object,
+        *,
+        completed: bool,
+    ) -> LabHandoffRecord:
+        base_fields = {
+            "schema_version",
+            "operation_id",
+            "checkout_root",
+            "labels",
+            "loaded_labels",
+            "stopped_labels",
+            "restarted_labels",
+            "target_ref",
+            "target_sha",
+            "action",
+            "release_profile",
+            "lifecycle_mode",
+            "installation_identity",
+            "supersedes_operation_id",
+            "stage",
+            "updated_at",
+        }
+        completion_fields = {
+            "generation_operation_id",
+            "environment_generation_id",
+            "code_sha",
+        }
+        expected_fields = base_fields | (completion_fields if completed else set())
+        string_fields = expected_fields - {
+            "schema_version",
+            "labels",
+            "loaded_labels",
+            "stopped_labels",
+            "restarted_labels",
+            "installation_identity",
+        }
+        list_fields = {"labels", "loaded_labels", "stopped_labels", "restarted_labels"}
+        if (
+            type(payload) is not dict
+            or set(payload) != expected_fields
+            or type(payload["schema_version"]) is not int
+            or any(type(payload[field]) is not str for field in string_fields)
+            or any(
+                type(payload[field]) is not list
+                or any(type(value) is not str for value in payload[field])
+                for field in list_fields
+            )
+        ):
+            raise ReleaseGenerationError("Lab handoff record fields are malformed")
+        try:
+            updated_at = datetime.fromisoformat(payload["updated_at"])
+        except ValueError as exc:
+            raise ReleaseGenerationError("Lab handoff timestamp is malformed") from exc
+        record = cls(
+            schema_version=payload["schema_version"],
+            operation_id=payload["operation_id"],
+            checkout_root=payload["checkout_root"],
+            labels=tuple(payload["labels"]),
+            loaded_labels=tuple(payload["loaded_labels"]),
+            stopped_labels=tuple(payload["stopped_labels"]),
+            restarted_labels=tuple(payload["restarted_labels"]),
+            target_ref=payload["target_ref"],
+            target_sha=payload["target_sha"],
+            action=payload["action"],
+            release_profile=payload["release_profile"],
+            lifecycle_mode=payload["lifecycle_mode"],
+            installation_identity=LabInstallationIdentity.from_payload(
+                payload["installation_identity"]
+            ),
+            supersedes_operation_id=payload["supersedes_operation_id"],
+            stage=payload["stage"],
+            updated_at=payload["updated_at"],
+            generation_operation_id=(payload["generation_operation_id"] if completed else ""),
+            environment_generation_id=(payload["environment_generation_id"] if completed else ""),
+            code_sha=payload["code_sha"] if completed else "",
+        )
+        record.validate(completed=completed, updated_at=updated_at)
+        return record
+
+    def validate(self, *, completed: bool, updated_at: datetime) -> None:
+        label_set = set(self.labels)
+        chain_invalid = (self.action == "deploy" and self.supersedes_operation_id != "") or (
+            self.action in {"resume", "rollback"}
+            and (
+                re.fullmatch(r"[0-9a-f]{32}", self.supersedes_operation_id) is None
+                or self.supersedes_operation_id == self.operation_id
+            )
+        )
+        if (
+            self.schema_version != LAB_HANDOFF_SCHEMA_VERSION
+            or re.fullmatch(r"[0-9a-f]{32}", self.operation_id) is None
+            or re.fullmatch(r"[0-9a-f]{40}", self.target_sha) is None
+            or _TARGET_REF_PATTERN.fullmatch(self.target_ref) is None
+            or self.action not in {"deploy", "resume", "rollback"}
+            or self.release_profile not in RELEASE_PROFILES
+            or self.lifecycle_mode not in {"installed", "uninstalled"}
+            or self.release_profile != MACOS_LAB_RELEASE_PROFILE
+            or self.lifecycle_mode != "installed"
+            or not self.labels
+            or len(self.labels) != len(label_set)
+            or self.loaded_labels != self.labels
+            or not set(self.stopped_labels).issubset(label_set)
+            or not set(self.restarted_labels).issubset(label_set)
+            or len(self.stopped_labels) != len(set(self.stopped_labels))
+            or len(self.restarted_labels) != len(set(self.restarted_labels))
+            or chain_invalid
+            or updated_at.tzinfo is None
+            or updated_at.utcoffset() is None
+        ):
+            raise ReleaseGenerationError("Lab handoff record binding is invalid")
+        if completed:
+            if (
+                self.stage != "completed"
+                or self.stopped_labels != self.labels
+                or self.restarted_labels != self.labels
+                or re.fullmatch(r"[0-9a-f]{32}", self.generation_operation_id) is None
+                or re.fullmatch(r"[0-9a-f]{64}", self.environment_generation_id) is None
+                or re.fullmatch(r"[0-9a-f]{40}", self.code_sha) is None
+            ):
+                raise ReleaseGenerationError("completed Lab handoff proof is invalid")
+            return
+        allowed_stages = {"planned", "stopping", "stopped", "restarting"}
+        if self.stage not in allowed_stages:
+            raise ReleaseGenerationError("partial Lab handoff stage is invalid")
+        if self.stage == "planned" and (self.stopped_labels or self.restarted_labels):
+            raise ReleaseGenerationError("planned Lab handoff state is invalid")
+        if self.stage == "stopped" and (
+            self.stopped_labels != self.labels or self.restarted_labels
+        ):
+            raise ReleaseGenerationError("stopped Lab handoff state is invalid")
+        if self.stage == "restarting" and self.stopped_labels != self.labels:
+            raise ReleaseGenerationError("restarting Lab handoff state is invalid")
+
 
 @dataclass(frozen=True)
 class GenerationGcMetrics:
@@ -261,31 +461,42 @@ class ReleaseGenerationMarker:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ReleaseGenerationMarker:
-        try:
-            return cls(
-                schema_version=int(payload["schema_version"]),
-                operation_id=str(payload["operation_id"]),
-                transaction_kind=str(payload["transaction_kind"]),
-                commit=str(payload["commit"]),
-                uv_lock_sha256=str(payload["uv_lock_sha256"]),
-                pyproject_sha256=str(payload["pyproject_sha256"]),
-                package_version=str(payload["package_version"]),
-                python_version=str(payload["python_version"]),
-                python_abi=str(payload["python_abi"]),
-                venv_path=str(payload["venv_path"]),
-                venv_identity=PathIdentity(**payload["venv_identity"]),
-                pyvenv_cfg_sha256=str(payload["pyvenv_cfg_sha256"]),
-                python_path=str(payload["python_path"]),
-                python_identity=PathIdentity(**payload["python_identity"]),
-                site_packages_path=str(payload["site_packages_path"]),
-                site_packages_identity=PathIdentity(**payload["site_packages_identity"]),
-                environment_generation_id=str(payload["environment_generation_id"]),
-                previous_generation_id=str(payload["previous_generation_id"]),
-                environment_manifest_sha256=str(payload["environment_manifest_sha256"]),
-                published_at=str(payload["published_at"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ReleaseGenerationError("release generation marker is malformed") from exc
+        identity_fields = {"venv_identity", "python_identity", "site_packages_identity"}
+        expected_fields = {field.name for field in fields(cls)}
+        string_fields = expected_fields - {"schema_version", *identity_fields}
+        if (
+            type(payload) is not dict
+            or set(payload) != expected_fields
+            or type(payload["schema_version"]) is not int
+            or any(type(payload[field]) is not str for field in string_fields)
+        ):
+            raise ReleaseGenerationError("release generation marker is malformed")
+        return cls(
+            schema_version=payload["schema_version"],
+            operation_id=payload["operation_id"],
+            transaction_kind=payload["transaction_kind"],
+            commit=payload["commit"],
+            uv_lock_sha256=payload["uv_lock_sha256"],
+            pyproject_sha256=payload["pyproject_sha256"],
+            package_version=payload["package_version"],
+            python_version=payload["python_version"],
+            python_abi=payload["python_abi"],
+            venv_path=payload["venv_path"],
+            venv_identity=PathIdentity.from_payload(payload["venv_identity"], label="release venv"),
+            pyvenv_cfg_sha256=payload["pyvenv_cfg_sha256"],
+            python_path=payload["python_path"],
+            python_identity=PathIdentity.from_payload(
+                payload["python_identity"], label="release Python"
+            ),
+            site_packages_path=payload["site_packages_path"],
+            site_packages_identity=PathIdentity.from_payload(
+                payload["site_packages_identity"], label="release site-packages"
+            ),
+            environment_generation_id=payload["environment_generation_id"],
+            previous_generation_id=payload["previous_generation_id"],
+            environment_manifest_sha256=payload["environment_manifest_sha256"],
+            published_at=payload["published_at"],
+        )
 
 
 @dataclass(frozen=True)
@@ -418,14 +629,23 @@ class DeploymentIntent:
         raw_history = payload["stage_history"]
         if type(raw_history) is not list or not raw_history:
             raise ReleaseGenerationError("deployment intent stage history is malformed")
-        if any(
-            type(value) is not dict
-            or set(value) != {"stage", "timestamp"}
-            or type(value["stage"]) is not str
-            or type(value["timestamp"]) is not str
-            for value in raw_history
-        ):
-            raise ReleaseGenerationError("deployment intent stage history is malformed")
+        for value in raw_history:
+            if type(value) is not dict or type(value.get("stage")) is not str:
+                raise ReleaseGenerationError("deployment intent stage history is malformed")
+            expected_history_fields = (
+                {
+                    "stage",
+                    "timestamp",
+                    "previous_handoff_operation_id",
+                    "handoff_operation_id",
+                }
+                if value["stage"] == "handoff_rebound"
+                else {"stage", "timestamp"}
+            )
+            if set(value) != expected_history_fields or any(
+                type(value[field]) is not str for field in expected_history_fields
+            ):
+                raise ReleaseGenerationError("deployment intent stage history is malformed")
         intent = cls(
             schema_version=payload["schema_version"],
             operation_id=payload["operation_id"],
@@ -510,6 +730,22 @@ class DeploymentIntent:
         ):
             raise ReleaseGenerationError("installed deployment skipped readiness")
         _validate_deployment_stage_sequence(history_stages)
+        rebound_events = [
+            value for value in intent.stage_history if value["stage"] == "handoff_rebound"
+        ]
+        if rebound_events:
+            current_operation = rebound_events[0]["previous_handoff_operation_id"]
+            for event in rebound_events:
+                if (
+                    event["previous_handoff_operation_id"] != current_operation
+                    or event["handoff_operation_id"] == current_operation
+                    or re.fullmatch(r"[0-9a-f]{32}", event["handoff_operation_id"]) is None
+                    or re.fullmatch(r"[0-9a-f]{32}", event["previous_handoff_operation_id"]) is None
+                ):
+                    raise ReleaseGenerationError("deployment handoff rebound history is invalid")
+                current_operation = event["handoff_operation_id"]
+            if current_operation != intent.handoff_operation_id:
+                raise ReleaseGenerationError("deployment handoff rebound history is stale")
         return intent
 
     def advance(
@@ -545,8 +781,17 @@ class DeploymentIntent:
     ) -> DeploymentIntent:
         if re.fullmatch(r"[0-9a-f]{32}", handoff_operation_id) is None or not handoff_labels:
             raise ReleaseGenerationError("deployment handoff binding is invalid")
-        if self.stage in {"initializing", "completed"}:
+        if self.stage == "completed":
             raise ReleaseGenerationError("completed deployment cannot rebind its handoff")
+        if (
+            self.stage != "recovery_started"
+            or self.stage_history[-1]["stage"] != "recovery_started"
+        ):
+            raise ReleaseGenerationError("deployment handoff rebind requires adjacent recovery")
+        if handoff_operation_id == self.handoff_operation_id:
+            raise ReleaseGenerationError("deployment handoff operation must change")
+        if tuple(handoff_labels) != self.handoff_labels:
+            raise ReleaseGenerationError("deployment handoff labels cannot change during recovery")
         _validate_deployment_stage_sequence(
             [*[value["stage"] for value in self.stage_history], "handoff_rebound"]
         )
@@ -558,7 +803,12 @@ class DeploymentIntent:
             updated_at=timestamp,
             stage_history=(
                 *self.stage_history,
-                {"stage": "handoff_rebound", "timestamp": timestamp},
+                {
+                    "stage": "handoff_rebound",
+                    "timestamp": timestamp,
+                    "previous_handoff_operation_id": self.handoff_operation_id,
+                    "handoff_operation_id": handoff_operation_id,
+                },
             ),
         )
 
@@ -567,12 +817,14 @@ def _validate_deployment_stage_sequence(stages: list[str]) -> None:
     if not stages or stages[0] not in {"planned", "initializing"}:
         raise ReleaseGenerationError("deployment intent stage history is invalid")
     previous = stages[0]
+    raw_previous = stages[0]
     for current in stages[1:]:
         if current == "handoff_rebound":
-            if previous in {"initializing", "completed"}:
+            if raw_previous != "recovery_started":
                 raise ReleaseGenerationError(
-                    f"deployment intent stage transition is invalid: {previous} -> {current}"
+                    f"deployment intent stage transition is invalid: {raw_previous} -> {current}"
                 )
+            raw_previous = current
             continue
         if previous == "initializing":
             allowed = {"completed"}
@@ -613,6 +865,7 @@ def _validate_deployment_stage_sequence(stages: list[str]) -> None:
                 f"deployment intent stage transition is invalid: {previous} -> {current}"
             )
         previous = current
+        raw_previous = current
 
 
 @dataclass(frozen=True)
@@ -630,21 +883,17 @@ class EnvironmentSelector:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> EnvironmentSelector:
-        try:
-            selector = cls(
-                schema_version=int(payload["schema_version"]),
-                operation_id=str(payload["operation_id"]),
-                transaction_kind=str(payload["transaction_kind"]),
-                commit=str(payload["commit"]),
-                generation_id=str(payload["generation_id"]),
-                previous_generation_id=str(payload["previous_generation_id"]),
-                environment_path=str(payload["environment_path"]),
-                manifest_name=str(payload["manifest_name"]),
-                manifest_sha256=str(payload["manifest_sha256"]),
-                published_at=str(payload["published_at"]),
+        expected_fields = {field.name for field in fields(cls)}
+        if (
+            type(payload) is not dict
+            or set(payload) != expected_fields
+            or type(payload["schema_version"]) is not int
+            or any(
+                type(payload[field]) is not str for field in expected_fields - {"schema_version"}
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ReleaseGenerationError("environment selector is malformed") from exc
+        ):
+            raise ReleaseGenerationError("environment selector is malformed")
+        selector = cls(**payload)
         if (
             selector.schema_version != ENVIRONMENT_SCHEMA_VERSION
             or len(selector.operation_id) != 32
@@ -675,21 +924,17 @@ class ReleaseGenerationCommit:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ReleaseGenerationCommit:
-        try:
-            record = cls(
-                schema_version=int(payload["schema_version"]),
-                operation_id=str(payload["operation_id"]),
-                transaction_kind=str(payload["transaction_kind"]),
-                commit=str(payload["commit"]),
-                marker_sha256=str(payload["marker_sha256"]),
-                transaction_sha256=str(payload["transaction_sha256"]),
-                environment_generation_id=str(payload["environment_generation_id"]),
-                previous_generation_id=str(payload["previous_generation_id"]),
-                environment_manifest_sha256=str(payload["environment_manifest_sha256"]),
-                committed_at=str(payload["committed_at"]),
+        expected_fields = {field.name for field in fields(cls)}
+        if (
+            type(payload) is not dict
+            or set(payload) != expected_fields
+            or type(payload["schema_version"]) is not int
+            or any(
+                type(payload[field]) is not str for field in expected_fields - {"schema_version"}
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ReleaseGenerationError("release generation commit record is malformed") from exc
+        ):
+            raise ReleaseGenerationError("release generation commit record is malformed")
+        record = cls(**payload)
         if (
             record.schema_version != COMMIT_SCHEMA_VERSION
             or len(record.operation_id) != 32
@@ -760,6 +1005,127 @@ def validate_deployment_intent_policy(
     return plan
 
 
+def validate_lab_handoff_record_authority(
+    *,
+    record: LabHandoffRecord,
+    intent: DeploymentIntent,
+    installation_identity: LabInstallationIdentity,
+    checkout_root: str,
+    expected_labels: tuple[str, ...],
+) -> None:
+    expected_sha = intent.previous_sha if record.action == "rollback" else intent.target_sha
+    allowed_refs = (
+        {intent.previous_sha}
+        if record.action == "rollback"
+        else {intent.target_sha, intent.target_ref}
+    )
+    if (
+        record.checkout_root != checkout_root
+        or record.labels != expected_labels
+        or record.installation_identity != installation_identity
+        or record.target_sha != expected_sha
+        or record.target_ref not in allowed_refs
+        or record.release_profile != MACOS_LAB_RELEASE_PROFILE
+        or record.lifecycle_mode != "installed"
+    ):
+        raise ReleaseGenerationError("Lab handoff record does not match deployment intent")
+
+
+def validate_lab_handoff_supersede_chain(
+    *,
+    record: LabHandoffRecord,
+    ancestors: tuple[LabHandoffRecord, ...],
+    intent: DeploymentIntent,
+    installation_identity: LabInstallationIdentity,
+    checkout_root: str,
+    expected_labels: tuple[str, ...],
+) -> None:
+    current = record
+    seen = {record.operation_id}
+    for ancestor in ancestors:
+        validate_lab_handoff_record_authority(
+            record=current,
+            intent=intent,
+            installation_identity=installation_identity,
+            checkout_root=checkout_root,
+            expected_labels=expected_labels,
+        )
+        if (
+            current.action == "deploy"
+            or current.supersedes_operation_id != ancestor.operation_id
+            or ancestor.operation_id in seen
+        ):
+            raise ReleaseGenerationError("Lab handoff supersede chain is discontinuous")
+        seen.add(ancestor.operation_id)
+        current = ancestor
+    validate_lab_handoff_record_authority(
+        record=current,
+        intent=intent,
+        installation_identity=installation_identity,
+        checkout_root=checkout_root,
+        expected_labels=expected_labels,
+    )
+    if current.action != "deploy" or current.supersedes_operation_id:
+        raise ReleaseGenerationError("Lab handoff supersede chain has no deploy root")
+    if record.action == "deploy" and ancestors:
+        raise ReleaseGenerationError("deploy handoff cannot have a supersede chain")
+    if record.action != "deploy" and not ancestors:
+        raise ReleaseGenerationError("recovery handoff supersede chain is missing")
+
+
+def validate_ready_deployment_handoff_authority(
+    *,
+    intent: DeploymentIntent,
+    marker: ReleaseGenerationMarker,
+    selector: EnvironmentSelector,
+    handoff_operation_id: str,
+    handoff_labels: tuple[str, ...],
+    generation_operation_id: str,
+    environment_generation_id: str,
+    code_sha: str,
+    action: str,
+    target_ref: str,
+    target_sha: str,
+    release_profile: str,
+    lifecycle_mode: str,
+    allowed_intent_stages: tuple[str, ...] = ("awaiting_readiness", "completed"),
+) -> None:
+    validate_deployment_intent_policy(
+        intent,
+        release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
+        expected_handoff_operation_id=handoff_operation_id,
+    )
+    expected_code_sha = intent.previous_sha if action == "rollback" else intent.target_sha
+    allowed_target_refs = (
+        {intent.previous_sha} if action == "rollback" else {intent.target_sha, intent.target_ref}
+    )
+    if (
+        action not in {"deploy", "resume", "rollback"}
+        or intent.stage not in allowed_intent_stages
+        or intent.handoff_labels != handoff_labels
+        or target_ref not in allowed_target_refs
+        or target_sha != expected_code_sha
+        or code_sha != expected_code_sha
+        or generation_operation_id != intent.operation_id
+        or environment_generation_id != marker.environment_generation_id
+    ):
+        raise ReleaseGenerationError("completed deployment handoff binding is stale")
+    if (
+        marker.transaction_kind != "deployment"
+        or selector.transaction_kind != "deployment"
+        or marker.operation_id != intent.operation_id
+        or selector.operation_id != intent.operation_id
+        or marker.commit != code_sha
+        or selector.commit != code_sha
+        or selector.generation_id != environment_generation_id
+        or marker.previous_generation_id != intent.previous_generation_id
+        or selector.previous_generation_id != intent.previous_generation_id
+        or marker.environment_manifest_sha256 != selector.manifest_sha256
+    ):
+        raise ReleaseGenerationError("ready deployment generation authority is inconsistent")
+
+
 def validate_completed_deployment_authority(
     *,
     intent: DeploymentIntent,
@@ -777,43 +1143,28 @@ def validate_completed_deployment_authority(
     release_profile: str,
     lifecycle_mode: str,
 ) -> None:
-    validate_deployment_intent_policy(
-        intent,
+    validate_ready_deployment_handoff_authority(
+        intent=intent,
+        marker=marker,
+        selector=selector,
+        handoff_operation_id=handoff_operation_id,
+        handoff_labels=handoff_labels,
+        generation_operation_id=generation_operation_id,
+        environment_generation_id=environment_generation_id,
+        code_sha=code_sha,
+        action=action,
+        target_ref=target_ref,
+        target_sha=target_sha,
         release_profile=release_profile,
         lifecycle_mode=lifecycle_mode,
-        expected_handoff_operation_id=handoff_operation_id,
-    )
-    expected_code_sha = intent.previous_sha if action == "rollback" else intent.target_sha
-    allowed_target_refs = (
-        {intent.previous_sha} if action == "rollback" else {intent.target_sha, intent.target_ref}
+        allowed_intent_stages=("completed",),
     )
     if (
-        action not in {"deploy", "resume", "rollback"}
-        or intent.stage != "completed"
-        or intent.handoff_labels != handoff_labels
-        or target_ref not in allowed_target_refs
-        or target_sha != expected_code_sha
-        or code_sha != expected_code_sha
-        or generation_operation_id != intent.operation_id
-        or environment_generation_id != marker.environment_generation_id
-    ):
-        raise ReleaseGenerationError("completed deployment handoff binding is stale")
-    if (
-        marker.transaction_kind != "deployment"
-        or selector.transaction_kind != "deployment"
-        or committed.transaction_kind != "deployment"
-        or marker.operation_id != intent.operation_id
-        or selector.operation_id != intent.operation_id
+        committed.transaction_kind != "deployment"
         or committed.operation_id != intent.operation_id
-        or marker.commit != code_sha
-        or selector.commit != code_sha
         or committed.commit != code_sha
-        or selector.generation_id != environment_generation_id
         or committed.environment_generation_id != environment_generation_id
-        or marker.previous_generation_id != intent.previous_generation_id
-        or selector.previous_generation_id != intent.previous_generation_id
         or committed.previous_generation_id != intent.previous_generation_id
-        or marker.environment_manifest_sha256 != selector.manifest_sha256
         or committed.environment_manifest_sha256 != selector.manifest_sha256
         or committed.marker_sha256 != marker.content_hash()
         or committed.transaction_sha256 != intent.content_hash()
@@ -827,6 +1178,10 @@ def marker_path_for_lock(lock_path: Path) -> Path:
 
 def intent_path_for_lock(lock_path: Path) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.intent.json")
+
+
+def prepared_intent_path_for_lock(lock_path: Path) -> Path:
+    return lock_path.with_name(f"{lock_path.stem}.intent.prepared.json")
 
 
 def initialization_path_for_lock(lock_path: Path) -> Path:
@@ -1755,6 +2110,7 @@ class ReleaseGenerationAuthority:
         self.lock_path = _canonical(lock_path, label="deployment lock")
         self.marker_path = marker_path_for_lock(self.lock_path)
         self.intent_path = intent_path_for_lock(self.lock_path)
+        self.prepared_intent_path = prepared_intent_path_for_lock(self.lock_path)
         self.initialization_path = initialization_path_for_lock(self.lock_path)
         self.commit_path = commit_path_for_lock(self.lock_path)
         self.handoff_path = self.lock_path.with_name(f"{self.lock_path.stem}.lab-handoff.json")
@@ -2502,62 +2858,124 @@ class ReleaseGenerationAuthority:
         self,
         transaction: DeploymentIntent,
         *,
+        marker: ReleaseGenerationMarker,
+        selector: EnvironmentSelector,
         provisional_label: str | None,
     ) -> None:
         if not transaction.handoff_operation_id:
             return
-        completed_name = (
-            f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.completed.json"
-        )
-        provisional_name = (
-            f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.json"
-        )
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         try:
-            try:
-                payload, _identity_value = _read_private_json(
+            install_name = f"{self.lock_path.stem}.lab-install.json"
+            installation_payload, installation_file_identity = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=install_name,
+                maximum_bytes=MAX_INTENT_BYTES,
+            )
+            installation = LabInstallationIdentity(
+                path=str(self.lock_path.with_name(install_name)),
+                sha256=hashlib.sha256(
+                    json.dumps(
+                        installation_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+                device=installation_file_identity.device,
+                inode=installation_file_identity.inode,
+            )
+            operation_name = (
+                f"{self.lock_path.stem}.lab-handoff.{transaction.handoff_operation_id}.json"
+            )
+            operation_payload, _operation_identity = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=operation_name,
+                maximum_bytes=MAX_INTENT_BYTES,
+            )
+            active_payload, _active_identity = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=f"{self.lock_path.stem}.lab-handoff.json",
+                maximum_bytes=MAX_INTENT_BYTES,
+            )
+            records_completed = operation_payload.get("stage") == "completed"
+            if provisional_label is None and not records_completed:
+                raise ReleaseGenerationError("deployment handoff record is not completed")
+            if records_completed:
+                proof_payload, _proof_identity = _read_private_json(
                     root_fd=root_fd,
                     root_path=self.lock_path.parent,
-                    name=completed_name,
+                    name=(
+                        f"{self.lock_path.stem}.lab-handoff."
+                        f"{transaction.handoff_operation_id}.completed.json"
+                    ),
                     maximum_bytes=MAX_INTENT_BYTES,
                 )
-            except ReleaseGenerationRecordMissingError as exc:
-                if provisional_label is None:
-                    raise ReleaseGenerationError("deployment handoff is not completed") from exc
-                try:
-                    payload, _identity_value = _read_private_json(
-                        root_fd=root_fd,
-                        root_path=self.lock_path.parent,
-                        name=provisional_name,
-                        maximum_bytes=MAX_INTENT_BYTES,
-                    )
-                except ReleaseGenerationRecordMissingError as provisional_exc:
+                record = LabHandoffRecord.from_payload(proof_payload, completed=True)
+                operation = LabHandoffRecord.from_payload(operation_payload, completed=True)
+                if record != operation:
                     raise ReleaseGenerationError(
-                        "deployment handoff is not completed"
-                    ) from provisional_exc
+                        "completed Lab handoff proof records are inconsistent"
+                    )
+            else:
+                record = LabHandoffRecord.from_payload(operation_payload, completed=False)
+            active_completed = active_payload.get("stage") == "completed"
+            active = LabHandoffRecord.from_payload(
+                active_payload,
+                completed=active_completed,
+            )
+            if active.operation_id == record.operation_id and record != active:
+                raise ReleaseGenerationError("active Lab handoff record is inconsistent")
+            ancestors: list[LabHandoffRecord] = []
+            superseded_operation_id = record.supersedes_operation_id
+            while superseded_operation_id:
+                ancestor_payload, _ancestor_identity = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=(f"{self.lock_path.stem}.lab-handoff.{superseded_operation_id}.json"),
+                    maximum_bytes=MAX_INTENT_BYTES,
+                )
+                ancestor_completed = ancestor_payload.get("stage") == "completed"
+                ancestor = LabHandoffRecord.from_payload(
+                    ancestor_payload,
+                    completed=ancestor_completed,
+                )
+                ancestors.append(ancestor)
+                superseded_operation_id = ancestor.supersedes_operation_id
             self._assert_root(root_fd, root_identity)
         finally:
             os.close(root_fd)
-        labels = tuple(str(value) for value in payload.get("labels", ()))
-        restarted = tuple(str(value) for value in payload.get("restarted_labels", ()))
-        if (
-            payload.get("schema_version") != 1
-            or payload.get("operation_id") != transaction.handoff_operation_id
-            or labels != transaction.handoff_labels
-            or not set(restarted).issubset(labels)
-        ):
-            raise ReleaseGenerationError("deployment handoff authority is stale")
-        if payload.get("stage") == "completed" and set(restarted) == set(labels):
-            if (
-                payload.get("generation_operation_id") != transaction.operation_id
-                or payload.get("environment_generation_id")
-                != self._read_marker().environment_generation_id
-                or payload.get("code_sha") != self._read_marker().commit
-            ):
-                raise ReleaseGenerationError("deployment handoff generation binding is stale")
+        if record.operation_id != transaction.handoff_operation_id:
+            raise ReleaseGenerationError("deployment handoff operation is stale")
+        validate_lab_handoff_supersede_chain(
+            record=record,
+            ancestors=tuple(ancestors),
+            intent=transaction,
+            installation_identity=installation,
+            checkout_root=str(self.repo),
+            expected_labels=transaction.handoff_labels,
+        )
+        if records_completed:
+            validate_ready_deployment_handoff_authority(
+                intent=transaction,
+                marker=marker,
+                selector=selector,
+                handoff_operation_id=record.operation_id,
+                handoff_labels=record.labels,
+                generation_operation_id=record.generation_operation_id,
+                environment_generation_id=record.environment_generation_id,
+                code_sha=record.code_sha,
+                action=record.action,
+                target_ref=record.target_ref,
+                target_sha=record.target_sha,
+                release_profile=record.release_profile,
+                lifecycle_mode=record.lifecycle_mode,
+            )
             return
         if provisional_label is not None and (
-            provisional_label in labels and payload.get("stage") == "restarting"
+            provisional_label in record.restarted_labels and record.stage == "restarting"
         ):
             return
         raise ReleaseGenerationError("deployment handoff is not completed")
@@ -2585,8 +3003,11 @@ class ReleaseGenerationAuthority:
         )
         if transaction.stage != "completed" and not provisional:
             raise ReleaseGenerationError("release transaction is not completed")
+        selector, _selector_identity = self._read_selector()
         self._verify_deployment_handoff(
             transaction,
+            marker=published,
+            selector=selector,
             provisional_label=provisional_handoff_label,
         )
         committed: ReleaseGenerationCommit | None = None
@@ -2595,7 +3016,6 @@ class ReleaseGenerationAuthority:
                 committed = self._read_commit_record()
             except ReleaseGenerationError as exc:
                 raise ReleaseGenerationError("release generation commit record is missing") from exc
-        selector, _selector_identity = self._read_selector()
         manifest, _manifest_identity = self._read_environment_manifest(selector)
         current = self._facts(
             expected_commit=expected_commit,
@@ -2749,6 +3169,73 @@ class ReleaseGenerationAuthority:
         self._assert_lock()
         intent, _identity_value = self._read_intent_record(self.intent_path)
         return intent
+
+    def read_prepared_deployment_intent(self) -> DeploymentIntent:
+        self._assert_lock()
+        intent, _identity_value = self._read_intent_record(self.prepared_intent_path)
+        return intent
+
+    def adopt_prepared_deployment_intent(self, *, operation_id: str) -> DeploymentIntent:
+        if not self.writable:
+            raise ReleaseGenerationError("read-only generation authority cannot adopt intent")
+        self._assert_lock()
+        try:
+            current, current_identity = self._read_intent_record(self.intent_path)
+        except ReleaseGenerationRecordMissingError:
+            current = None
+            current_identity = None
+        if current is not None and current.operation_id == operation_id:
+            try:
+                self._read_intent_record(self.prepared_intent_path)
+            except ReleaseGenerationRecordMissingError:
+                return current
+            raise ReleaseGenerationError("adopted deployment intent left a prepared record")
+        prepared, prepared_identity = self._read_intent_record(self.prepared_intent_path)
+        if prepared.operation_id != operation_id or prepared.stage != "planned":
+            raise ReleaseGenerationError("prepared deployment intent binding changed")
+        if current is not None and current.stage != "completed":
+            raise ReleaseGenerationError("an incomplete deployment intent already exists")
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            self._assert_root(root_fd, root_identity)
+            if current is not None:
+                assert current_identity is not None
+                archive = self.intent_path.with_name(
+                    f"{self.intent_path.stem}.{current.operation_id}.completed.json"
+                )
+                if archive.exists() or archive.is_symlink():
+                    archived, _archived_identity = self._read_intent_record(archive)
+                    if archived != current:
+                        raise ReleaseGenerationError("completed deployment intent archive changed")
+                    os.unlink(self.intent_path.name, dir_fd=root_fd)
+                else:
+                    if PathIdentity.capture(self.intent_path.lstat()) != current_identity:
+                        raise ReleaseGenerationError("completed deployment intent changed")
+                    os.rename(
+                        self.intent_path.name,
+                        archive.name,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
+                    )
+                os.fsync(root_fd)
+            if PathIdentity.capture(self.prepared_intent_path.lstat()) != prepared_identity:
+                raise ReleaseGenerationError("prepared deployment intent changed")
+            os.rename(
+                self.prepared_intent_path.name,
+                self.intent_path.name,
+                src_dir_fd=root_fd,
+                dst_dir_fd=root_fd,
+            )
+            os.fsync(root_fd)
+            self._assert_root(root_fd, root_identity)
+        except OSError as exc:
+            raise ReleaseGenerationError("prepared deployment intent cannot be adopted") from exc
+        finally:
+            os.close(root_fd)
+        adopted, _identity_value = self._read_intent_record(self.intent_path)
+        if adopted != prepared:
+            raise ReleaseGenerationError("adopted deployment intent changed")
+        return adopted
 
     def update_deployment_intent(
         self,

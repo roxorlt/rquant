@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import fcntl
+import hashlib
 import json
 import os
 import runpy
@@ -299,6 +300,62 @@ def _deployment_lock_path(checkout: Path) -> Path:
     return checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock"
 
 
+def _write_lab_installation(
+    checkout: Path,
+    lock_path: Path,
+    labels: tuple[str, ...],
+) -> dict[str, object]:
+    path = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
+    payload = {
+        "schema_version": 2,
+        "checkout_root": str(checkout),
+        "labels": list(labels),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    path.write_bytes(encoded)
+    path.chmod(0o600)
+    observed = path.stat()
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+    }
+
+
+def _handoff_payload(
+    *,
+    checkout: Path,
+    labels: tuple[str, ...],
+    installation_identity: dict[str, object],
+    operation_id: str,
+    target_sha: str,
+    action: str = "deploy",
+    supersedes_operation_id: str = "",
+    stage: str,
+    stopped_labels: tuple[str, ...],
+    restarted_labels: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "checkout_root": str(checkout),
+        "labels": list(labels),
+        "loaded_labels": list(labels),
+        "stopped_labels": list(stopped_labels),
+        "restarted_labels": list(restarted_labels),
+        "target_ref": target_sha,
+        "target_sha": target_sha,
+        "action": action,
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": installation_identity,
+        "supersedes_operation_id": supersedes_operation_id,
+        "stage": stage,
+        "updated_at": "2026-07-28T00:00:00+00:00",
+    }
+
+
 def _run_wrapper(
     checkout: Path,
     executable: Path,
@@ -438,6 +495,7 @@ def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(
         "com.roxor.rquant-lab-worker",
         "com.roxor.rquant-lab-finalizer",
     )
+    installation_identity = _write_lab_installation(checkout, lock_path, labels)
     handoff_a = "a" * 32
     authority = ReleaseGenerationAuthority(
         repo=checkout,
@@ -474,26 +532,34 @@ def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(
         expected_commit=commit,
     )
     os.close(lock_fd)
-    provisional = {
-        "schema_version": 1,
-        "operation_id": handoff_a,
-        "labels": list(labels),
-        "loaded_labels": list(labels),
-        "stopped_labels": list(labels),
-        "restarted_labels": [],
-        "stage": "restarting",
-    }
+    provisional = _handoff_payload(
+        checkout=checkout,
+        labels=labels,
+        installation_identity=installation_identity,
+        operation_id=handoff_a,
+        target_sha=commit,
+        stage="restarting",
+        stopped_labels=labels,
+        restarted_labels=labels,
+    )
     operation_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{handoff_a}.json")
     operation_path.write_text(json.dumps(provisional), encoding="utf-8")
     operation_path.chmod(0o600)
     active_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
     active_path.write_text(
         json.dumps(
-            {
-                **provisional,
-                "operation_id": "b" * 32,
-                "stage": "stopping",
-            }
+            _handoff_payload(
+                checkout=checkout,
+                labels=labels,
+                installation_identity=installation_identity,
+                operation_id="b" * 32,
+                target_sha=commit,
+                action="resume",
+                supersedes_operation_id=handoff_a,
+                stage="stopping",
+                stopped_labels=labels[:1],
+                restarted_labels=(),
+            )
         ),
         encoding="utf-8",
     )
@@ -524,6 +590,7 @@ def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
         "com.roxor.rquant-lab-worker",
         "com.roxor.rquant-lab-finalizer",
     )
+    installation_identity = _write_lab_installation(checkout, lock_path, labels)
     target_handoff = "a" * 32
     rollback_handoff = "c" * 32
     authority = ReleaseGenerationAuthority(
@@ -554,6 +621,10 @@ def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
         handoff_operation_id=target_handoff,
         handoff_labels=labels,
     )
+    authority.update_deployment_intent(
+        operation_id=intent.operation_id,
+        stage="recovery_started",
+    )
     authority.rebind_deployment_handoff(
         operation_id=intent.operation_id,
         handoff_operation_id=rollback_handoff,
@@ -567,13 +638,18 @@ def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
     )
     os.close(lock_fd)
     proof = {
-        "schema_version": 1,
-        "operation_id": rollback_handoff,
-        "labels": list(labels),
-        "loaded_labels": list(labels),
-        "stopped_labels": list(labels),
-        "restarted_labels": list(labels),
-        "stage": "completed",
+        **_handoff_payload(
+            checkout=checkout,
+            labels=labels,
+            installation_identity=installation_identity,
+            operation_id=rollback_handoff,
+            target_sha=commit,
+            action="rollback",
+            supersedes_operation_id=target_handoff,
+            stage="completed",
+            stopped_labels=labels,
+            restarted_labels=labels,
+        ),
         "generation_operation_id": intent.operation_id,
         "environment_generation_id": published.environment_generation_id,
         "code_sha": commit,
@@ -583,11 +659,24 @@ def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
     )
     proof_path.write_text(json.dumps(proof), encoding="utf-8")
     proof_path.chmod(0o600)
-    active_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
-    active_path.write_text(
-        json.dumps({**proof, "operation_id": target_handoff, "stage": "restarting"}),
-        encoding="utf-8",
+    operation_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{rollback_handoff}.json")
+    operation_path.write_text(json.dumps(proof), encoding="utf-8")
+    operation_path.chmod(0o600)
+    ancestor = _handoff_payload(
+        checkout=checkout,
+        labels=labels,
+        installation_identity=installation_identity,
+        operation_id=target_handoff,
+        target_sha=commit,
+        stage="restarting",
+        stopped_labels=labels,
+        restarted_labels=labels[:1],
     )
+    ancestor_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{target_handoff}.json")
+    ancestor_path.write_text(json.dumps(ancestor), encoding="utf-8")
+    ancestor_path.chmod(0o600)
+    active_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
+    active_path.write_text(json.dumps(ancestor), encoding="utf-8")
     active_path.chmod(0o600)
 
     result = _run_wrapper(checkout, executable, marker)

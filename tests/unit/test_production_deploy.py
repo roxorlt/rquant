@@ -152,6 +152,15 @@ class FakeGenerationAuthority:
         assert self.intent is not None
         return self.intent
 
+    def read_prepared_deployment_intent(self) -> DeploymentIntent:
+        assert self.intent is not None
+        return self.intent
+
+    def adopt_prepared_deployment_intent(self, *, operation_id: str) -> DeploymentIntent:
+        assert self.intent is not None and self.intent.operation_id == operation_id
+        self.events.append(("intent_adopted", operation_id))
+        return self.intent
+
     def update_deployment_intent(
         self,
         *,
@@ -726,6 +735,58 @@ def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
     assert authority.intent.restart_services == ()
     assert [call[3] for call in finalizer.calls] == ["publish"]
     assert not any("systemctl" in command for command in runner.calls)
+
+
+def test_installed_deployer_consumes_precreated_typed_intent_without_refetch(
+    tmp_path: Path,
+) -> None:
+    baseline = _config(tmp_path)
+    handoff_operation_id = "d" * 32
+    authority = FakeGenerationAuthority()
+    authority.intent = DeploymentIntent.create(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref=baseline.target,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="e" * 64,
+        handoff_operation_id=handoff_operation_id,
+        handoff_labels=LAB_LAUNCHD_HANDOFF_LABELS,
+    )
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+            "lab_lifecycle_mode": "installed",
+            "handoff_operation_id": handoff_operation_id,
+            "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
+            "handoff_lock_fd": 9,
+            "prepared_intent_operation_id": authority.intent.operation_id,
+        }
+    )
+    runner = FakeRunner(_base_responses())
+    finalizer = FakeGenerationFinalizer()
+
+    result = deploy(
+        config,
+        runner=runner,
+        generation_authority=authority,
+        generation_finalizer=finalizer,
+    )
+
+    assert result.status == "deployed"
+    assert authority.events[:2] == [
+        ("intent_adopted", authority.intent.operation_id),
+        ("invalidate", None),
+    ]
+    assert not [event for event in authority.events if event[0] == "intent"]
+    assert not [call for call in runner.calls if call[0:2] == ("git", "fetch")]
+    assert not [call for call in runner.calls if call[0:3] == ("git", "diff", "--name-only")]
+    assert not [call for call in runner.calls if call[0:3] == ("git", "cat-file", "-t")]
 
 
 def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(

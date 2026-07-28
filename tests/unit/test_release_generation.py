@@ -16,8 +16,14 @@ import pytest
 
 from rquant.release_generation import (
     DeploymentIntent,
+    EnvironmentSelector,
+    LabHandoffRecord,
+    LabInstallationIdentity,
+    PathIdentity,
     ReleaseGenerationAuthority,
+    ReleaseGenerationCommit,
     ReleaseGenerationError,
+    ReleaseGenerationMarker,
     _write_private_json,
     commit_path_for_lock,
     environment_manifest_path_for_lock,
@@ -26,11 +32,123 @@ from rquant.release_generation import (
     initialization_path_for_lock,
     intent_path_for_lock,
     marker_path_for_lock,
+    prepared_intent_path_for_lock,
+    validate_lab_handoff_supersede_chain,
 )
 
 _ORIGINAL_OS_WALK = os.walk
 
 TRUSTED_GIT = Path("/usr/bin/git")
+
+
+def _handoff_record(
+    *,
+    operation_id: str,
+    action: str,
+    target_sha: str,
+    supersedes_operation_id: str,
+    installation: LabInstallationIdentity,
+) -> LabHandoffRecord:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "checkout_root": "/private/runtime/rquant",
+        "labels": ["scheduler", "worker", "finalizer"],
+        "loaded_labels": ["scheduler", "worker", "finalizer"],
+        "stopped_labels": ["scheduler", "worker", "finalizer"],
+        "restarted_labels": ["scheduler", "worker", "finalizer"],
+        "target_ref": target_sha,
+        "target_sha": target_sha,
+        "action": action,
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": asdict(installation),
+        "supersedes_operation_id": supersedes_operation_id,
+        "stage": "completed",
+        "updated_at": "2026-07-28T00:00:00+00:00",
+        "generation_operation_id": "d" * 32,
+        "environment_generation_id": "e" * 64,
+        "code_sha": target_sha,
+    }
+    return LabHandoffRecord.from_payload(payload, completed=True)
+
+
+def _marker_payload() -> dict[str, object]:
+    identity = asdict(PathIdentity(device=1, inode=2, mode=0o100500, owner=os.getuid(), links=1))
+    return {
+        "schema_version": 1,
+        "operation_id": "a" * 32,
+        "transaction_kind": "deployment",
+        "commit": "b" * 40,
+        "uv_lock_sha256": "c" * 64,
+        "pyproject_sha256": "d" * 64,
+        "package_version": "0.99.0",
+        "python_version": "3.12.0",
+        "python_abi": "cpython-312",
+        "venv_path": "/private/runtime/venv",
+        "venv_identity": identity,
+        "pyvenv_cfg_sha256": "e" * 64,
+        "python_path": "/private/runtime/venv/bin/python",
+        "python_identity": identity,
+        "site_packages_path": "/private/runtime/venv/lib/python3.12/site-packages",
+        "site_packages_identity": identity,
+        "environment_generation_id": "f" * 64,
+        "previous_generation_id": "0" * 64,
+        "environment_manifest_sha256": "1" * 64,
+        "published_at": "2026-07-28T00:00:00+00:00",
+    }
+
+
+def _selector_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation_id": "a" * 32,
+        "transaction_kind": "deployment",
+        "commit": "b" * 40,
+        "generation_id": "c" * 64,
+        "previous_generation_id": "d" * 64,
+        "environment_path": "/private/runtime/generation",
+        "manifest_name": "manifest.json",
+        "manifest_sha256": "e" * 64,
+        "published_at": "2026-07-28T00:00:00+00:00",
+    }
+
+
+def _commit_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation_id": "a" * 32,
+        "transaction_kind": "deployment",
+        "commit": "b" * 40,
+        "marker_sha256": "c" * 64,
+        "transaction_sha256": "d" * 64,
+        "environment_generation_id": "e" * 64,
+        "previous_generation_id": "f" * 64,
+        "environment_manifest_sha256": "0" * 64,
+        "committed_at": "2026-07-28T00:00:00+00:00",
+    }
+
+
+def _write_lab_installation(repo: Path, lock_path: Path) -> dict[str, object]:
+    path = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
+    payload = {
+        "schema_version": 2,
+        "checkout_root": str(repo),
+        "labels": ["fixture"],
+    }
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    path.chmod(0o600)
+    observed = path.stat()
+    return asdict(
+        LabInstallationIdentity(
+            path=str(path),
+            sha256=hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            device=observed.st_dev,
+            inode=observed.st_ino,
+        )
+    )
 
 
 def _deployment_intent_payload() -> dict[str, object]:
@@ -117,6 +235,99 @@ def test_deployment_intent_payload_rejects_non_json_exact_types(
 
     with pytest.raises(ReleaseGenerationError, match="intent.*malformed|type|field"):
         DeploymentIntent.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("record_type", "payload_factory", "mutation"),
+    [
+        (
+            ReleaseGenerationMarker,
+            _marker_payload,
+            lambda payload: payload.update({"unexpected": "value"}),
+        ),
+        (
+            ReleaseGenerationMarker,
+            _marker_payload,
+            lambda payload: payload.pop("python_abi"),
+        ),
+        (
+            ReleaseGenerationMarker,
+            _marker_payload,
+            lambda payload: payload.update({"schema_version": True}),
+        ),
+        (
+            ReleaseGenerationMarker,
+            _marker_payload,
+            lambda payload: payload.update({"operation_id": 123}),
+        ),
+        (
+            EnvironmentSelector,
+            _selector_payload,
+            lambda payload: payload.update({"unexpected": "value"}),
+        ),
+        (
+            EnvironmentSelector,
+            _selector_payload,
+            lambda payload: payload.pop("manifest_name"),
+        ),
+        (
+            EnvironmentSelector,
+            _selector_payload,
+            lambda payload: payload.update({"schema_version": True}),
+        ),
+        (
+            EnvironmentSelector,
+            _selector_payload,
+            lambda payload: payload.update({"generation_id": 123}),
+        ),
+        (
+            ReleaseGenerationCommit,
+            _commit_payload,
+            lambda payload: payload.update({"unexpected": "value"}),
+        ),
+        (
+            ReleaseGenerationCommit,
+            _commit_payload,
+            lambda payload: payload.pop("transaction_sha256"),
+        ),
+        (
+            ReleaseGenerationCommit,
+            _commit_payload,
+            lambda payload: payload.update({"schema_version": True}),
+        ),
+        (
+            ReleaseGenerationCommit,
+            _commit_payload,
+            lambda payload: payload.update({"committed_at": 123}),
+        ),
+    ],
+    ids=(
+        "marker-extra",
+        "marker-missing",
+        "marker-bool-schema",
+        "marker-string-coercion",
+        "selector-extra",
+        "selector-missing",
+        "selector-bool-schema",
+        "selector-string-coercion",
+        "commit-extra",
+        "commit-missing",
+        "commit-bool-schema",
+        "commit-string-coercion",
+    ),
+)
+def test_generation_authority_records_require_exact_json_fields_and_types(
+    record_type: type[ReleaseGenerationMarker]
+    | type[EnvironmentSelector]
+    | type[ReleaseGenerationCommit],
+    payload_factory: Callable[[], dict[str, object]],
+    mutation: Callable[[dict[str, object]], object],
+) -> None:
+    payload = payload_factory()
+    mutation(payload)
+
+    with pytest.raises(ReleaseGenerationError, match="malformed|invalid"):
+        record_type.from_payload(payload)
 
 
 def test_deployment_intent_rejects_illegal_planned_to_completed_transition() -> None:
@@ -206,6 +417,67 @@ def test_completed_deployment_intent_cannot_rebind_handoff() -> None:
             handoff_operation_id="e" * 32,
             handoff_labels=("com.roxor.rquant-lab-scheduler",),
         )
+
+
+def test_deployment_handoff_rebind_requires_adjacent_recovery_and_new_operation() -> None:
+    labels = ("com.roxor.rquant-lab-scheduler",)
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+        handoff_operation_id="e" * 32,
+        handoff_labels=labels,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="recovery"):
+        intent.rebind_handoff(
+            handoff_operation_id="f" * 32,
+            handoff_labels=labels,
+        )
+
+    recovering = intent.advance(stage="recovery_started")
+    with pytest.raises(ReleaseGenerationError, match="operation"):
+        recovering.rebind_handoff(
+            handoff_operation_id="e" * 32,
+            handoff_labels=labels,
+        )
+
+    rebound = recovering.rebind_handoff(
+        handoff_operation_id="f" * 32,
+        handoff_labels=labels,
+    )
+    assert rebound.handoff_operation_id == "f" * 32
+    assert rebound.stage_history[-1] == {
+        "stage": "handoff_rebound",
+        "timestamp": rebound.updated_at,
+        "previous_handoff_operation_id": "e" * 32,
+        "handoff_operation_id": "f" * 32,
+    }
+
+
+def test_deployment_intent_rejects_unbound_or_nonadjacent_rebound_history() -> None:
+    payload = _deployment_intent_payload()
+    recovery_at = "2999-01-01T00:00:00+00:00"
+    rebound_at = "2999-01-01T00:00:01+00:00"
+    payload["stage"] = "recovery_started"
+    payload["updated_at"] = rebound_at
+    payload["handoff_operation_id"] = "f" * 32
+    payload["handoff_labels"] = ["com.roxor.rquant-lab-scheduler"]
+    payload["stage_history"].extend(
+        [
+            {"stage": "recovery_started", "timestamp": recovery_at},
+            {"stage": "handoff_rebound", "timestamp": rebound_at},
+        ]
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="rebound|history"):
+        DeploymentIntent.from_payload(payload)
 
 
 def test_deployment_intent_history_does_not_hide_illegal_rebound_transition() -> None:
@@ -834,6 +1106,155 @@ def test_deployment_intent_pins_plan_before_marker_invalidation(tmp_path: Path) 
     os.close(lock_fd)
 
 
+def test_prepared_deployment_intent_is_adopted_without_replanning(tmp_path: Path) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    _publish_initialized(authority, commit=commit)
+    current = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/old.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+    )
+    for stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "completed",
+    ):
+        current = authority.update_deployment_intent(
+            operation_id=current.operation_id,
+            stage=stage,
+        )
+    prepared = DeploymentIntent.create(
+        previous_sha="b" * 40,
+        target_sha="c" * 40,
+        target_ref="c" * 40,
+        changed_files=("src/rquant/new.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="3" * 64,
+        previous_generation_id="4" * 64,
+        handoff_operation_id="5" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
+        operation_id="6" * 32,
+    )
+    prepared_path = prepared_intent_path_for_lock(lock_path)
+    prepared_path.write_text(json.dumps(asdict(prepared)), encoding="utf-8")
+    prepared_path.chmod(0o600)
+
+    adopted = authority.adopt_prepared_deployment_intent(
+        operation_id=prepared.operation_id,
+    )
+
+    assert adopted == prepared
+    assert authority.read_deployment_intent() == prepared
+    assert not prepared_path.exists()
+    archive = intent_path_for_lock(lock_path).with_name(
+        f"{intent_path_for_lock(lock_path).stem}.{current.operation_id}.completed.json"
+    )
+    assert DeploymentIntent.from_payload(json.loads(archive.read_text())) == current
+    assert (
+        authority.adopt_prepared_deployment_intent(operation_id=prepared.operation_id) == prepared
+    )
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("target_sha", "f" * 40),
+        ("target_ref", "f" * 40),
+        ("release_profile", "linux-production"),
+        ("lifecycle_mode", "uninstalled"),
+        (
+            "installation_identity",
+            {
+                "path": "/private/runtime/install.json",
+                "sha256": "f" * 64,
+                "device": 1,
+                "inode": 2,
+            },
+        ),
+    ),
+)
+def test_handoff_supersede_chain_rejects_binding_drift_at_every_ancestor(
+    field: str,
+    value: object,
+) -> None:
+    installation = LabInstallationIdentity(
+        path="/private/runtime/install.json",
+        sha256="1" * 64,
+        device=1,
+        inode=2,
+    )
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="2" * 64,
+        previous_generation_id="3" * 64,
+        handoff_operation_id="c" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
+    )
+    root = _handoff_record(
+        operation_id="8" * 32,
+        action="deploy",
+        target_sha=intent.target_sha,
+        supersedes_operation_id="",
+        installation=installation,
+    )
+    middle_payload = asdict(
+        _handoff_record(
+            operation_id="9" * 32,
+            action="resume",
+            target_sha=intent.target_sha,
+            supersedes_operation_id=root.operation_id,
+            installation=installation,
+        )
+    )
+    middle_payload["labels"] = list(middle_payload["labels"])
+    middle_payload["loaded_labels"] = list(middle_payload["loaded_labels"])
+    middle_payload["stopped_labels"] = list(middle_payload["stopped_labels"])
+    middle_payload["restarted_labels"] = list(middle_payload["restarted_labels"])
+    middle_payload["installation_identity"] = asdict(installation)
+    middle_payload[field] = value
+    current = _handoff_record(
+        operation_id="c" * 32,
+        action="rollback",
+        target_sha=intent.previous_sha,
+        supersedes_operation_id="9" * 32,
+        installation=installation,
+    )
+
+    with pytest.raises(ReleaseGenerationError):
+        middle = LabHandoffRecord.from_payload(middle_payload, completed=True)
+        validate_lab_handoff_supersede_chain(
+            record=current,
+            ancestors=(middle, root),
+            intent=intent,
+            installation_identity=installation,
+            checkout_root="/private/runtime/rquant",
+            expected_labels=("scheduler", "worker", "finalizer"),
+        )
+
+
 def test_initialization_sentinel_cannot_be_recreated_by_deleting_marker(
     tmp_path: Path,
 ) -> None:
@@ -938,33 +1359,50 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         transaction_kind="deployment",
     )
     _advance_deployment_intent(authority, intent, target_stage="awaiting_readiness")
+    installation_identity = _write_lab_installation(repo, lock_path)
     handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{handoff_operation}.json")
     payload = {
         "schema_version": 1,
         "operation_id": handoff_operation,
+        "checkout_root": str(repo),
         "labels": list(labels),
         "loaded_labels": list(labels),
         "stopped_labels": list(labels),
-        "restarted_labels": [],
+        "restarted_labels": [labels[0]],
+        "target_ref": commit,
+        "target_sha": commit,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": installation_identity,
+        "supersedes_operation_id": "",
         "stage": "restarting",
+        "updated_at": "2026-07-28T00:00:00+00:00",
     }
     handoff_path.write_text(json.dumps(payload), encoding="utf-8")
     handoff_path.chmod(0o600)
+    active_handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
+    active_handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+    active_handoff_path.chmod(0o600)
 
     with pytest.raises(ReleaseGenerationError, match="transaction.*completed|handoff.*completed"):
         authority.verify(expected_commit=commit)
     authority.verify(expected_commit=commit, provisional_handoff_label=labels[0])
 
-    payload["restarted_labels"] = list(labels)
-    payload["stage"] = "completed"
-    payload["generation_operation_id"] = intent.operation_id
-    payload["environment_generation_id"] = published.environment_generation_id
-    payload["code_sha"] = published.commit
+    payload = {
+        **payload,
+        "restarted_labels": list(labels),
+        "stage": "completed",
+        "generation_operation_id": intent.operation_id,
+        "environment_generation_id": published.environment_generation_id,
+        "code_sha": published.commit,
+    }
     completed_path = handoff_path.with_name(
         f"{lock_path.stem}.lab-handoff.{handoff_operation}.completed.json"
     )
-    completed_path.write_text(json.dumps(payload), encoding="utf-8")
-    completed_path.chmod(0o600)
+    for path in (handoff_path, completed_path, active_handoff_path):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.chmod(0o600)
     authority.update_deployment_intent(
         operation_id=intent.operation_id,
         stage="completed",
@@ -975,7 +1413,6 @@ def test_deployment_marker_requires_completed_launchd_handoff(
     )
     authority.verify(expected_commit=commit)
 
-    active_handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
     active_handoff_path.write_text(
         json.dumps(
             {
@@ -983,12 +1420,16 @@ def test_deployment_marker_requires_completed_launchd_handoff(
                 "operation_id": "e" * 32,
                 "restarted_labels": [],
                 "stage": "stopping",
+                "generation_operation_id": intent.operation_id,
+                "environment_generation_id": published.environment_generation_id,
+                "code_sha": published.commit,
             }
         ),
         encoding="utf-8",
     )
     active_handoff_path.chmod(0o600)
-    authority.verify(expected_commit=commit)
+    with pytest.raises(ReleaseGenerationError, match="handoff.*record|proof"):
+        authority.verify(expected_commit=commit)
     os.close(lock_fd)
 
 

@@ -22,14 +22,16 @@
    绑定的 prepared runtime sentinel。macOS installed 发布还会先只读解析已有 handoff record 并
    执行交易时间门禁；缺失/不符时零写失败，incomplete handoff 即使是 dry-run 也在窗口内直接
    返回 75，既不 fetch，也不改 `FETCH_HEAD`、refs 或 lock namespace。窗口外才有界 fetch 并解析精确 target，
-   随后取得稳定 handoff lock，停止原先 loaded 的三个 Lab launchd daemon，确认其 shared
+   随后取得稳定 handoff lock，在第一次 `bootout` 前原子写入 typed prepared deployment intent，
+   其中固定 previous/target/ref、完整 change plan、当前 marker/environment generation、handoff
+   operation 与 installation identity；再停止原先 loaded 的三个 Lab launchd daemon，确认其 shared
    generation lock 已释放后取得独占锁；Linux 无此本地 launchd 步骤。之后验证当前已提交代际，
    才导入项目
    deployer。bootstrap 与 deployer 的所有 Git 子命令都固定使用已验证的绝对
    `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`；所有只读核对显式设置
    `GIT_OPTIONAL_LOCKS=0`。部署器依次执行：tracked 工作区检查、target/main 归属与快进检查、
-   diff 风险分类、快照实际 active 的受影响服务及
-   timer、原子落盘 deployment intent、使旧 marker 失效、暂停原先 active 的相关 timer、
+   diff 风险分类、接管 bootstrap 已验证的 prepared intent（不再 fetch、重算 diff 或重建 plan）、
+   快照实际 active 的受影响服务及 timer、使旧 marker 失效、暂停原先 active 的相关 timer、
    `git merge --ff-only <exact-sha>`、用物理绑定的 uv 执行 frozen sync、第一次 preflight、按 intent 的精确集合
    重启服务、第二次 preflight、恢复原先 active 的 timer。最后由 target checkout 的隔离 stdlib
    bootstrap 重新加载 target authority。它在 operation id + commit 唯一命名的 staging 目录中
@@ -59,6 +61,9 @@
    到 typed deployment intent、当前 marker、environment selector 和 commit record。bootstrap 与
    deployer 使用 release authority 中同一份 changed-files、service/timer、generation 与 stage-history
    policy；任何损坏、越权或自相矛盾的 intent 都会在首个 launchd mutation 之前失败关闭。
+   completed handoff proof 已落盘但事务仍为 `awaiting_readiness`，或 intent 已 completed 但 commit
+   record 尚未落盘时，显式 `resume` 会幂等继续 readiness finalizer/commit；同 SHA 或空 diff 若仍有
+   incomplete handoff，则返回结构化 `recovery_required`，不会误报 `already_current`。
 6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回 intent 记录的
    previous commit、恢复锁定依赖并按同一服务/timer 合同切回。只有旧 checkout、旧依赖、
    精确服务集合、第二次 preflight 与 timer 原状态全部恢复后，才由 previous checkout 的隔离
@@ -233,8 +238,11 @@ worker、finalizer，而不按文件后缀猜测“这次改动大概无关”�
 
 `deploy/launchd/*.plist` 属于受控基础设施，不进入普通代码发布：change plan 会像 systemd、nginx、
 sudoers 一样 fail closed，并要求独立人工验收/安装。plist 安装或更新后，必须重新运行
-`--register-lab-installation` 持久化新的文件 hash 与 inode；普通发布既不会偷偷替换 plist，也不会
-在 checkout 后才因旧 installation state 失败。Linux profile 的 systemd 规则保持不变。
+`--register-lab-installation` 持久化新的文件 hash 与 inode；对完全相同的安装重复登记保持原文件
+inode/bytes 不变，避免使既有 completed proof 失效。若已经存在 deployment handoff authority，plist、
+runtime root 或 installation identity 的变更会要求单独受控迁移，不允许普通 re-registration 覆盖；
+尚未产生 deployment handoff 的首次安装基线可归档旧 descriptor 后更新。普通发布既不会偷偷替换
+plist，也不会在 checkout 后才因旧 installation state 失败。Linux profile 的 systemd 规则保持不变。
 
 交接本身也有独立的 `0600` 持久事务记录：在第一次 bootout 前 fsync operation id、已解析验证的
 exact target/ref、action、release profile、lifecycle、installation identity、原 loaded label、

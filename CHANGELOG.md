@@ -69,12 +69,20 @@
 
 ### Fixed
 
+- **Lab daemon 第十二轮统一事务权威与崩溃恢复**：bootstrap 在第一次 launchd bootout 前持久化
+  typed prepared intent，deployer 在独占 generation lock 下原子接管，不再重复 fetch/diff/plan。
+  `awaiting_readiness + completed proof + 无 commit` 与 `completed intent + 无 commit` 两个崩溃窗可由
+  显式 resume 幂等收敛；有 incomplete handoff 的同 SHA/空 diff 返回 `recovery_required`。daemon 与
+  bootstrap 共用严格 handoff/installation/supersede validator，支持合法 partial-stop 子集并逐跳拒绝
+  target/profile/installation 漂移；marker/selector/commit 与 handoff/history 均执行 exact JSON 合约。
+  相同 installation 重登记不再改写 authority inode，已有 deployment proof 的安装变更必须走独立迁移。
+
 - **Lab daemon 第十一次 readiness 两阶段提交加固**：installed 发布在环境 marker 落盘后进入
   `awaiting_readiness`，仅允许 launchd daemon 以 provisional authority 启动；三个 label 的
   generation-bound readiness 全部稳定后，才把 deployment intent 置为 `completed` 并写入与最终
   intent hash 一致的 commit record。readiness 或 deployer 失败统一走带 supersede/rebind 证据的
-  正式 rollback，再恢复 previous marker 与 labels；同 SHA 或空 change plan 在 handoff、intent 和
-  launchd mutation 前直接返回 `already_current`。completed handoff proof 现严格校验精确字段与
+  正式 rollback，再恢复 previous marker 与 labels；无遗留事务的同 SHA 或空 change plan 在 handoff、
+  intent 和 launchd mutation 前直接返回 `already_current`。completed handoff proof 现严格校验精确字段与
   JSON 类型、完整 stopped/restarted labels、当前 installation identity、action/supersede 链以及
   intent/marker/selector/commit 三方权威一致性；完成态 intent 禁止再次 rebind。
 

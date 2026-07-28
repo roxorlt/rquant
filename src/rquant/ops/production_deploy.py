@@ -83,6 +83,10 @@ class GenerationAuthority(Protocol):
 
     def read_deployment_intent(self) -> DeploymentIntent: ...
 
+    def read_prepared_deployment_intent(self) -> DeploymentIntent: ...
+
+    def adopt_prepared_deployment_intent(self, *, operation_id: str) -> DeploymentIntent: ...
+
     def update_deployment_intent(
         self,
         *,
@@ -349,6 +353,7 @@ class DeployConfig:
     handoff_operation_id: str = ""
     handoff_labels: tuple[str, ...] = ()
     lab_lifecycle_mode: str = "uninstalled"
+    prepared_intent_operation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -687,12 +692,6 @@ def _recover_locked(
         raise ProtectedWindowError(
             "deployment recovery requires service restarts during the protected 09:15-15:10 window"
         )
-    if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
-        intent = authority.rebind_deployment_handoff(
-            operation_id=intent.operation_id,
-            handoff_operation_id=config.handoff_operation_id,
-            handoff_labels=config.handoff_labels,
-        )
     git = str(config.git_path)
     branch = _stdout(runner, [git, "rev-parse", "--abbrev-ref", "HEAD"])
     if branch != "main":
@@ -701,6 +700,12 @@ def _recover_locked(
     if dirty:
         raise PolicyError("tracked production worktree changes must be resolved before recovery")
     intent = _advance_intent(config, authority, intent, "recovery_started")
+    if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
+        intent = authority.rebind_deployment_handoff(
+            operation_id=intent.operation_id,
+            handoff_operation_id=config.handoff_operation_id,
+            handoff_labels=config.handoff_labels,
+        )
     authority.invalidate()
     completed = _execute_transaction(
         config,
@@ -746,50 +751,81 @@ def _deploy_locked(
     if dirty:
         raise PolicyError("tracked production worktree changes must be resolved before deploy")
 
-    runner.run([git, "fetch", "--tags", "origin", "main"])
-    if target.startswith("v"):
-        tag_type = _stdout(runner, [git, "cat-file", "-t", target])
-        if tag_type != "tag":
-            raise PolicyError("SemVer target must be an annotated tag")
-    target_sha = _stdout(runner, [git, "rev-parse", "--verify", f"{target}^{{commit}}"])
-    if target.startswith("v"):
-        pyproject = _stdout(runner, [git, "show", f"{target_sha}:pyproject.toml"])
+    prepared_intent: DeploymentIntent | None = None
+    if config.prepared_intent_operation_id:
+        if generation_authority is None or generation_finalizer is None:
+            raise PolicyError("prepared deployment intent requires generation authority")
+        prepared_intent = generation_authority.read_prepared_deployment_intent()
         try:
-            package_version = str(tomllib.loads(pyproject)["project"]["version"])
-        except (KeyError, tomllib.TOMLDecodeError) as exc:
-            raise PolicyError("target pyproject.toml has no readable project version") from exc
-        if package_version != target[1:]:
-            raise PolicyError(f"tag {target} disagrees with package version {package_version}")
-    _check_ancestor(
-        runner,
-        git_path,
-        target_sha,
-        "origin/main",
-        "target is not contained in origin/main",
-    )
-    previous_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
-
-    if previous_sha == target_sha:
-        result = DeployResult("already_current", previous_sha, target_sha, target, (), (), ())
-        _append_audit(config, result)
-        return result
-
-    _check_ancestor(
-        runner,
-        git_path,
-        previous_sha,
-        target_sha,
-        "target is not a fast-forward from the deployed commit",
-    )
-    changed_output = _stdout(runner, [git, "diff", "--name-only", f"{previous_sha}..{target_sha}"])
-    try:
-        change_plan = validate_deployment_change_policy(
-            changed_output.splitlines(),
-            release_profile=config.release_profile,
-            lifecycle_mode=config.lab_lifecycle_mode,
+            change_plan = validate_deployment_intent_policy(
+                prepared_intent,
+                release_profile=config.release_profile,
+                lifecycle_mode=config.lab_lifecycle_mode,
+                expected_handoff_operation_id=config.handoff_operation_id,
+            )
+        except ReleaseGenerationError as exc:
+            raise PolicyError("prepared deployment intent is invalid") from exc
+        previous_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
+        target_sha = prepared_intent.target_sha
+        if (
+            config.dry_run
+            or config.lab_lifecycle_mode != "installed"
+            or prepared_intent.operation_id != config.prepared_intent_operation_id
+            or prepared_intent.stage != "planned"
+            or prepared_intent.previous_sha != previous_sha
+            or prepared_intent.target_ref != target
+            or previous_sha == target_sha
+            or not change_plan.changed_files
+        ):
+            raise PolicyError("prepared deployment intent binding is invalid")
+    else:
+        runner.run([git, "fetch", "--tags", "origin", "main"])
+        if target.startswith("v"):
+            tag_type = _stdout(runner, [git, "cat-file", "-t", target])
+            if tag_type != "tag":
+                raise PolicyError("SemVer target must be an annotated tag")
+        target_sha = _stdout(runner, [git, "rev-parse", "--verify", f"{target}^{{commit}}"])
+        if target.startswith("v"):
+            pyproject = _stdout(runner, [git, "show", f"{target_sha}:pyproject.toml"])
+            try:
+                package_version = str(tomllib.loads(pyproject)["project"]["version"])
+            except (KeyError, tomllib.TOMLDecodeError) as exc:
+                raise PolicyError("target pyproject.toml has no readable project version") from exc
+            if package_version != target[1:]:
+                raise PolicyError(f"tag {target} disagrees with package version {package_version}")
+        _check_ancestor(
+            runner,
+            git_path,
+            target_sha,
+            "origin/main",
+            "target is not contained in origin/main",
         )
-    except ReleaseGenerationError as exc:
-        raise PolicyError(str(exc)) from exc
+        previous_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
+
+        if previous_sha == target_sha:
+            result = DeployResult("already_current", previous_sha, target_sha, target, (), (), ())
+            _append_audit(config, result)
+            return result
+
+        _check_ancestor(
+            runner,
+            git_path,
+            previous_sha,
+            target_sha,
+            "target is not a fast-forward from the deployed commit",
+        )
+        changed_output = _stdout(
+            runner,
+            [git, "diff", "--name-only", f"{previous_sha}..{target_sha}"],
+        )
+        try:
+            change_plan = validate_deployment_change_policy(
+                changed_output.splitlines(),
+                release_profile=config.release_profile,
+                lifecycle_mode=config.lab_lifecycle_mode,
+            )
+        except ReleaseGenerationError as exc:
+            raise PolicyError(str(exc)) from exc
     requires_handoff = config.lab_lifecycle_mode == "installed" and bool(
         change_plan.handoff_daemons
     )
@@ -816,28 +852,33 @@ def _deploy_locked(
     if generation_authority is not None:
         if generation_finalizer is None:
             raise PolicyError("formal deployment requires isolated target generation authority")
-        active_services = _active_units(
-            runner,
-            change_plan.restart_services,
-            label="service",
-        )
-        active_timers = _active_units(
-            runner,
-            _timers_for_services(change_plan.restart_services),
-            label="timer",
-        )
-        intent = generation_authority.begin_deployment_intent(
-            previous_sha=previous_sha,
-            target_sha=target_sha,
-            target_ref=target,
-            changed_files=change_plan.changed_files,
-            restart_services=change_plan.restart_services,
-            active_services=active_services,
-            active_timers=active_timers,
-            handoff_operation_id=config.handoff_operation_id,
-            handoff_labels=config.handoff_labels,
-        )
-        _append_intent_audit(config, intent, event="planned")
+        if prepared_intent is None:
+            active_services = _active_units(
+                runner,
+                change_plan.restart_services,
+                label="service",
+            )
+            active_timers = _active_units(
+                runner,
+                _timers_for_services(change_plan.restart_services),
+                label="timer",
+            )
+            intent = generation_authority.begin_deployment_intent(
+                previous_sha=previous_sha,
+                target_sha=target_sha,
+                target_ref=target,
+                changed_files=change_plan.changed_files,
+                restart_services=change_plan.restart_services,
+                active_services=active_services,
+                active_timers=active_timers,
+                handoff_operation_id=config.handoff_operation_id,
+                handoff_labels=config.handoff_labels,
+            )
+            _append_intent_audit(config, intent, event="planned")
+        else:
+            intent = generation_authority.adopt_prepared_deployment_intent(
+                operation_id=prepared_intent.operation_id,
+            )
         generation_authority.invalidate()
         try:
             completed = _execute_transaction(
@@ -1031,6 +1072,7 @@ def deploy(
         handoff_operation_id=config.handoff_operation_id,
         handoff_labels=config.handoff_labels,
         lab_lifecycle_mode=config.lab_lifecycle_mode,
+        prepared_intent_operation_id=config.prepared_intent_operation_id,
     )
     effective_runner = runner or SubprocessRunner(
         repo,
@@ -1151,6 +1193,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overall-timeout-seconds", type=float, default=1800)
     parser.add_argument("--overall-deadline-monotonic", type=float)
     parser.add_argument("--lab-handoff-operation-id", default="")
+    parser.add_argument("--prepared-intent-operation-id", default="")
     parser.add_argument("--lab-handoff-label", action="append", default=[])
     parser.add_argument(
         "--lab-lifecycle-mode",
@@ -1183,6 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
         handoff_operation_id=args.lab_handoff_operation_id,
         handoff_labels=tuple(args.lab_handoff_label),
         lab_lifecycle_mode=args.lab_lifecycle_mode,
+        prepared_intent_operation_id=args.prepared_intent_operation_id,
     )
     try:
         result = deploy(config)
