@@ -28,6 +28,7 @@ from rquant.lab_job_protocol import (
     _LabOwnedIsolationRecord,
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity
+from rquant.strict_json import strict_model_validate_json
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_SHA_PATTERN = r"^[0-9a-f]{40}$"
@@ -467,7 +468,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 self._scan_cursor_path,
                 self.root,
             )
-            cursor = LabArtifactCommitScanCursor.model_validate_json(payload)
+            cursor = strict_model_validate_json(LabArtifactCommitScanCursor, payload)
             if cursor.model_dump_json().encode("utf-8") != payload:
                 raise ValueError("artifact scan cursor JSON is not canonical")
             return cursor
@@ -636,7 +637,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             self.quarantine_dir,
             allowed_link_counts=allowed_link_counts,
         )
-        evidence = LabArtifactConflictEvidence.model_validate_json(payload)
+        evidence = strict_model_validate_json(LabArtifactConflictEvidence, payload)
         if evidence.model_dump_json().encode("utf-8") != payload:
             raise InvalidCommandEnvelopeError(
                 f"artifact conflict evidence is not canonical: {path.name}"
@@ -1022,7 +1023,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     payload_path,
                     self.quarantine_dir,
                 )
-                envelope = LabArtifactCommitEnvelope.model_validate_json(payload)
+                envelope = strict_model_validate_json(LabArtifactCommitEnvelope, payload)
             except (InvalidCommandEnvelopeError, ValueError):
                 continue
             if (str(envelope.request_id), envelope.content_hash) != (
@@ -1038,7 +1039,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                         metadata_path,
                         self.quarantine_dir,
                     )
-                    record = LabQuarantinedArtifactCommit.model_validate_json(metadata)
+                    record = strict_model_validate_json(LabQuarantinedArtifactCommit, metadata)
                     if (
                         record.path == payload_path
                         and hashlib.sha256(record.reason.encode("utf-8")).hexdigest()[:16]
@@ -1071,7 +1072,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     metadata_path,
                     self.quarantine_dir,
                 )
-                record = LabQuarantinedArtifactCommit.model_validate_json(metadata)
+                record = strict_model_validate_json(LabQuarantinedArtifactCommit, metadata)
             except (InvalidCommandEnvelopeError, ValueError):
                 continue
             if (
@@ -1233,7 +1234,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         )
         try:
             _sequence, filename_request_id = self._pending_name_parts(candidate.name)
-            envelope = LabArtifactCommitEnvelope.model_validate_json(payload)
+            envelope = strict_model_validate_json(LabArtifactCommitEnvelope, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid artifact commit envelope {candidate.name}: {exc}",
@@ -1326,7 +1327,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
         filename_request_id = self._ack_request_id(candidate.name)
         try:
-            receipt = LabArtifactCommitReceipt.model_validate_json(payload)
+            receipt = strict_model_validate_json(LabArtifactCommitReceipt, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid artifact commit receipt {candidate.name}: {exc}"

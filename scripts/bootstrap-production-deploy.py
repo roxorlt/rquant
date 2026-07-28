@@ -40,6 +40,11 @@ class DeployDeferredError(DeployBootstrapError):
     exit_code = 75
 
 
+class _ProcessGroupSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+
+
 def _load_strict_json() -> tuple[type[ValueError], Callable[[str | bytes | bytearray], object]]:
     path = Path(__file__).resolve().with_name("strict_json.py")
     spec = importlib.util.spec_from_file_location("_rquant_bootstrap_strict_json", path)
@@ -589,6 +594,21 @@ def _run_process_group(
         start_new_session=True,
         env=env,
     )
+    previous_handlers: dict[int, object] = {}
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        raise _ProcessGroupSignal(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(signum)
+        if previous is signal.SIG_IGN:
+            continue
+        try:
+            signal.signal(signum, forward_signal)
+        except ValueError:
+            break
+        previous_handlers[signum] = previous
+    caught_signal: _ProcessGroupSignal | None = None
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -596,6 +616,30 @@ def _run_process_group(
             os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         raise
+    except _ProcessGroupSignal as exc:
+        caught_signal = exc
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with suppress(OSError, subprocess.SubprocessError):
+            process.communicate(timeout=5)
+        stdout = stderr = ""
+    except BaseException:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with suppress(OSError, subprocess.SubprocessError):
+            process.communicate(timeout=5)
+        raise
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+    if caught_signal is not None:
+        previous = previous_handlers[caught_signal.signum]
+        if callable(previous):
+            previous(caught_signal.signum, None)
+            raise InterruptedError(f"process runner interrupted by signal {caught_signal.signum}")
+        signal.signal(caught_signal.signum, signal.SIG_DFL)
+        os.kill(os.getpid(), caught_signal.signum)
+        raise SystemExit(128 + caught_signal.signum)
     return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
@@ -904,9 +948,11 @@ def _read_lab_installation_state(*, root: Path, lock_path: Path) -> dict[str, ob
         raise DeployBootstrapError("Lab launchd installation state is invalid")
     for label in LAB_LAUNCHD_LABELS:
         expected = plists.get(label)
-        path = root / "deploy" / "launchd" / f"{label}.plist"
+        if not isinstance(expected, dict):
+            raise DeployBootstrapError("Lab launchd installation state is invalid")
+        path = _canonical(str(expected.get("path", "")), label=f"Lab launchd plist {label}")
         observed = _physical_file(path, label=f"Lab launchd plist {label}")
-        if not isinstance(expected, dict) or expected != {
+        if expected != {
             "path": str(path),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "device": observed.st_dev,
@@ -1129,6 +1175,153 @@ def _operation_handoff_path(lock_path: Path, operation_id: str) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.lab-handoff.{operation_id}.json")
 
 
+def _label_bootout_intent_path(lock_path: Path, operation_id: str, label: str) -> Path:
+    label_digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+    return lock_path.with_name(
+        f"{lock_path.stem}.lab-handoff.{operation_id}.{label_digest}.bootout.json"
+    )
+
+
+def _label_bootout_intent_payload(
+    *,
+    operation_id: str,
+    label: str,
+    domain: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "label": label,
+        "domain": domain,
+        "action": "bootout",
+    }
+
+
+def _verify_label_bootout_intent(
+    *,
+    lock_path: Path,
+    operation_id: str,
+    label: str,
+    domain: str,
+    create: bool,
+) -> None:
+    path = _label_bootout_intent_path(lock_path, operation_id, label)
+    expected = _label_bootout_intent_payload(
+        operation_id=operation_id,
+        label=label,
+        domain=domain,
+    )
+    existing = _private_json(path, label="Lab label bootout intent", missing_ok=True)
+    if existing is None:
+        if not create:
+            raise DeployBootstrapError(
+                f"unloaded Lab label lacks durable bootout evidence: {label}"
+            )
+        _atomic_private_json(path, expected, absent=True)
+        existing = _private_json(path, label="Lab label bootout intent")
+    if existing != expected:
+        raise DeployBootstrapError("Lab label bootout intent binding changed")
+
+
+def _validate_physical_handoff_chain(
+    *,
+    root: Path,
+    lock_path: Path,
+    payload: dict[str, object],
+    intent: object,
+    allow_pending_rebind: bool,
+) -> tuple[object, tuple[object, ...], object]:
+    authority_module = _load_release_authority(root / "src" / "rquant" / "release_generation.py")
+    operation_value = payload.get("operation_id")
+    if type(operation_value) is not str:
+        raise DeployBootstrapError("incomplete Lab handoff operation is invalid")
+    current = _validate_handoff_record_shape(
+        root=root,
+        lock_path=lock_path,
+        payload=payload,
+        operation_id=operation_value,
+        completed=payload.get("stage") == "completed",
+        authority_module=authority_module,
+    )
+    operation_payload = _private_json(
+        _operation_handoff_path(lock_path, current.operation_id),
+        label="incomplete Lab handoff operation",
+        missing_ok=True,
+    )
+    if operation_payload is not None and operation_payload != payload:
+        raise DeployBootstrapError("incomplete Lab handoff operation changed")
+    validation_intent = intent
+    if current.operation_id != intent.handoff_operation_id:
+        if (
+            not allow_pending_rebind
+            or current.supersedes_operation_id != intent.handoff_operation_id
+        ):
+            raise DeployBootstrapError("deployment intent handoff operation changed")
+        try:
+            validation_intent = intent.rebind_handoff(
+                handoff_operation_id=current.operation_id,
+                handoff_labels=tuple(current.labels),
+            )
+        except authority_module.ReleaseGenerationError as exc:
+            raise DeployBootstrapError("pending Lab handoff rebound is invalid") from exc
+    ancestors: list[object] = []
+    completed_proofs: list[object] = []
+    superseded_operation = current.supersedes_operation_id
+    seen = {current.operation_id}
+    while superseded_operation:
+        if superseded_operation in seen:
+            raise DeployBootstrapError("Lab handoff supersede chain contains a cycle")
+        seen.add(superseded_operation)
+        ancestor_payload = _private_json(
+            _operation_handoff_path(lock_path, superseded_operation),
+            label="superseded Lab handoff operation",
+        )
+        assert ancestor_payload is not None
+        ancestor = _validate_handoff_record_shape(
+            root=root,
+            lock_path=lock_path,
+            payload=ancestor_payload,
+            operation_id=superseded_operation,
+            completed=ancestor_payload.get("stage") == "completed",
+            authority_module=authority_module,
+        )
+        ancestors.append(ancestor)
+        proof_payload = _private_json(
+            _completed_handoff_path(lock_path, superseded_operation),
+            label="superseded completed Lab handoff proof",
+            missing_ok=True,
+        )
+        if proof_payload is not None:
+            try:
+                completed_proofs.append(
+                    authority_module.LabHandoffRecord.from_payload(
+                        proof_payload,
+                        completed=True,
+                    )
+                )
+            except authority_module.ReleaseGenerationError as exc:
+                raise DeployBootstrapError(
+                    "superseded completed Lab handoff proof is malformed"
+                ) from exc
+        superseded_operation = ancestor.supersedes_operation_id
+    installation = _read_lab_installation_state(root=root, lock_path=lock_path)
+    try:
+        authority_module.validate_lab_handoff_supersede_chain(
+            record=current,
+            ancestors=tuple(ancestors),
+            intent=validation_intent,
+            installation_identity=authority_module.LabInstallationIdentity.from_payload(
+                _lab_installation_identity(lock_path, installation)
+            ),
+            checkout_root=str(root),
+            expected_labels=tuple(LAB_LAUNCHD_LABELS),
+            completed_proofs=tuple(completed_proofs),
+        )
+    except authority_module.ReleaseGenerationError as exc:
+        raise DeployBootstrapError("superseded Lab handoff binding chain is invalid") from exc
+    return current, tuple(ancestors), validation_intent
+
+
 _HANDOFF_BASE_BINDING_FIELDS = (
     "schema_version",
     "operation_id",
@@ -1166,8 +1359,11 @@ def _validate_handoff_record_shape(
     payload: dict[str, object],
     operation_id: str,
     completed: bool,
+    authority_module: ModuleType | None = None,
 ) -> object:
-    authority_module = _load_release_authority(root / "src" / "rquant" / "release_generation.py")
+    authority_module = authority_module or _load_release_authority(
+        root / "src" / "rquant" / "release_generation.py"
+    )
     installation = _read_lab_installation_state(root=root, lock_path=lock_path)
     try:
         record = authority_module.LabHandoffRecord.from_payload(
@@ -1697,15 +1893,22 @@ def _superseding_handoff_operation_id(
         return operation_id
     installation = _read_lab_installation_state(root=root, lock_path=lock_path)
     installation_identity = _lab_installation_identity(lock_path, installation)
-    _validate_superseded_handoff_binding(
+    record, _ancestors, validation_intent = _validate_physical_handoff_chain(
+        root=root,
+        lock_path=lock_path,
         payload=payload,
         intent=intent,
+        allow_pending_rebind=True,
+    )
+    _validate_superseded_handoff_binding(
+        payload=payload,
+        intent=validation_intent,
         release_profile=release_profile,
         lifecycle_mode=lifecycle_mode,
         installation_identity=installation_identity,
     )
     intent_handoff_operation = str(intent.handoff_operation_id)
-    source_supersedes = str(payload.get("supersedes_operation_id", ""))
+    source_supersedes = str(record.supersedes_operation_id)
     pending_rebind = (
         operation_id != intent_handoff_operation
         and action == recovery_action
@@ -1713,34 +1916,6 @@ def _superseding_handoff_operation_id(
     )
     if operation_id != intent_handoff_operation and not pending_rebind:
         raise DeployBootstrapError("deployment intent handoff operation changed")
-    if pending_rebind:
-        operation_payload = _private_json(
-            _operation_handoff_path(lock_path, operation_id),
-            label="incomplete Lab handoff operation",
-        )
-        if operation_payload != payload:
-            raise DeployBootstrapError("incomplete Lab handoff operation changed")
-        ancestor_payload = _private_json(
-            _operation_handoff_path(lock_path, intent_handoff_operation),
-            label="superseded Lab handoff operation",
-        )
-        assert ancestor_payload is not None
-        ancestor = _validate_handoff_record_shape(
-            root=root,
-            lock_path=lock_path,
-            payload=ancestor_payload,
-            operation_id=intent_handoff_operation,
-            completed=ancestor_payload.get("stage") == "completed",
-        )
-        try:
-            _authority_module.validate_lab_handoff_supersede_action(
-                action=str(action),
-                superseded_action=str(ancestor.action),
-            )
-        except _authority_module.ReleaseGenerationError as exc:
-            raise DeployBootstrapError(
-                "incomplete Lab handoff action conflicts with recovery"
-            ) from exc
     if action == recovery_action:
         return source_supersedes
     try:
@@ -1842,6 +2017,9 @@ class _LabLaunchdHandoff:
         if remaining <= 0:
             raise DeployBootstrapError("Lab launchd handoff overall timeout expired")
         return min(self.timeout_seconds, remaining)
+
+    def _after_label_transition_stage(self, _stage: str, _label: str) -> None:
+        """Fault-injection boundary for one durable launchd label transition."""
 
     def _materialize_prepared_root(self) -> None:
         if not self.supersedes_operation_id:
@@ -2131,6 +2309,16 @@ class _LabLaunchdHandoff:
                 self.lock_path,
                 self.installation,
             )
+            installed_plists = self.installation.get("plists")
+            if not isinstance(installed_plists, dict):
+                raise DeployBootstrapError("Lab launchd installation state is invalid")
+            self.plists = {
+                label: _canonical(
+                    str(installed_plists[label]["path"]),
+                    label=f"installed Lab launchd plist {label}",
+                )
+                for label in LAB_LAUNCHD_LABELS
+            }
         if dry_run:
             if self.enabled:
                 loaded = [label for label in LAB_LAUNCHD_LABELS if self._is_loaded(label)]
@@ -2186,19 +2374,46 @@ class _LabLaunchdHandoff:
             self.prepared_intent_operation_id = prepared_operation
         for label, plist in self.plists.items():
             _physical_file(plist, label=f"Lab launchd plist {label}")
-            if not self._is_loaded(label):
+            physically_loaded = self._is_loaded(label)
+            if not physically_loaded:
+                if label not in self.stopped:
+                    _verify_label_bootout_intent(
+                        lock_path=self.lock_path,
+                        operation_id=self.operation_id,
+                        label=label,
+                        domain=self.domain,
+                        create=False,
+                    )
+                    self.stopped.append(label)
+                    self._record("stopping")
+                    self._after_label_transition_stage("state_recorded", label)
                 continue
+            if label in self.stopped and label not in self.restarted:
+                raise DeployBootstrapError(
+                    f"Lab label is loaded despite a durable stopped state: {label}"
+                )
             if label in self.restarted:
                 self.restarted.remove(label)
+            self._after_label_transition_stage("before_intent", label)
+            _verify_label_bootout_intent(
+                lock_path=self.lock_path,
+                operation_id=self.operation_id,
+                label=label,
+                domain=self.domain,
+                create=True,
+            )
+            self._after_label_transition_stage("intent_published", label)
             self._record("stopping")
             _launchctl(
                 ["bootout", f"{self.domain}/{label}"],
                 check=True,
                 timeout_seconds=self._remaining(),
             )
+            self._after_label_transition_stage("bootout_complete", label)
             if label not in self.stopped:
                 self.stopped.append(label)
             self._record("stopping")
+            self._after_label_transition_stage("state_recorded", label)
         self._record("stopped")
 
     def _restart_loaded_labels(self) -> list[str]:

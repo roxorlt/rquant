@@ -3083,6 +3083,38 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lab_launchd_install(args: argparse.Namespace) -> int:
+    """Materialize and optionally load generation-bound Lab LaunchAgents."""
+    from rquant.lab_launchd_install import LabLaunchdInstaller
+
+    result = LabLaunchdInstaller(
+        checkout_root=Path(args.expected_checkout_root),
+        deployment_lock_path=Path(args.deployment_lock_path),
+        launch_agents_dir=Path(args.launch_agents_dir),
+        trusted_git_path=Path(args.trusted_git_path),
+        worker_id=args.worker_id,
+    ).install(activate=not args.no_activate)
+    logger.info(
+        "Lab launchd installer prepared generation "
+        f"{result.environment_generation_id[:12]} ({result.code_sha[:12]})"
+    )
+    return 0
+
+
+def cmd_lab_launchd_uninstall(args: argparse.Namespace) -> int:
+    """Unload and remove only the exact recorded Lab LaunchAgents."""
+    from rquant.lab_launchd_install import LabLaunchdInstaller
+
+    LabLaunchdInstaller(
+        checkout_root=Path(args.expected_checkout_root),
+        deployment_lock_path=Path(args.deployment_lock_path),
+        launch_agents_dir=Path(args.launch_agents_dir),
+        trusted_git_path=Path(args.trusted_git_path),
+    ).uninstall(deactivate=not args.no_deactivate)
+    logger.info("Lab launchd installation removed")
+    return 0
+
+
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
     from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
@@ -5190,6 +5222,24 @@ def build_parser() -> argparse.ArgumentParser:
     lab_runtime_prepare_p.add_argument("--deployment-operation-id")
     lab_runtime_prepare_p.add_argument("--deployment-environment-generation")
 
+    for command_name, help_text in (
+        ("lab-launchd-install", "安装并加载 generation-bound Strategy Lab LaunchAgents"),
+        ("lab-launchd-uninstall", "卸载精确登记的 Strategy Lab LaunchAgents"),
+    ):
+        launchd_p = sub.add_parser(command_name, help=help_text)
+        launchd_p.add_argument("--expected-checkout-root", required=True)
+        launchd_p.add_argument("--trusted-git-path", default="/usr/bin/git")
+        launchd_p.add_argument("--deployment-lock-path", required=True)
+        launchd_p.add_argument(
+            "--launch-agents-dir",
+            default=str(Path.home() / "Library" / "LaunchAgents"),
+        )
+        if command_name == "lab-launchd-install":
+            launchd_p.add_argument("--worker-id", default="rquant-mac-primary")
+            launchd_p.add_argument("--no-activate", action="store_true")
+        else:
+            launchd_p.add_argument("--no-deactivate", action="store_true")
+
     lab_scheduler_p = sub.add_parser(
         "lab-scheduler",
         help="运行 Strategy Lab 持久任务控制面",
@@ -5370,6 +5420,8 @@ def main() -> int:
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
         "lab-runtime-prepare": cmd_lab_runtime_prepare,
+        "lab-launchd-install": cmd_lab_launchd_install,
+        "lab-launchd-uninstall": cmd_lab_launchd_uninstall,
         "lab-scheduler": cmd_lab_scheduler,
         "lab-worker": cmd_lab_worker,
         "lab-finalizer": cmd_lab_finalizer,
@@ -5399,6 +5451,8 @@ def main() -> int:
         "data-audit",
         "lab-run",
         "lab-runtime-prepare",
+        "lab-launchd-install",
+        "lab-launchd-uninstall",
         "lab-scheduler",
         "lab-worker",
         "lab-finalizer",

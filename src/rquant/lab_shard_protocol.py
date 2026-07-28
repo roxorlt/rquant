@@ -36,6 +36,7 @@ from rquant.lab_result_digest import (
     CURRENT_CONTENT_DIGEST_ALGORITHM,
     CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
 )
+from rquant.strict_json import strict_json_loads, strict_model_validate_json
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _SPOOL_NAME = re.compile(
@@ -156,7 +157,7 @@ def _reject_constant(_: str) -> object:
 
 def _canonical_json_object(raw: str, *, field: str) -> str:
     try:
-        value = json.loads(
+        value = strict_json_loads(
             raw,
             parse_float=_reject_float,
             parse_constant=_reject_constant,
@@ -865,7 +866,7 @@ class LabClaimSpool(_TypedSpoolBase):
             self.root,
         )
         try:
-            return LabPendingClaimCursor.model_validate_json(payload)
+            return strict_model_validate_json(LabPendingClaimCursor, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid durable pending claim cursor: {exc}"
@@ -958,7 +959,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 f"consumed claim token does not match basename {candidate.name}"
             )
         try:
-            receipt = LabClaimDeliveryReceipt.model_validate_json(payload)
+            receipt = strict_model_validate_json(LabClaimDeliveryReceipt, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid consumed claim receipt {candidate.name}: {exc}"
@@ -982,7 +983,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 f"revoked claim token does not match basename {candidate.name}"
             )
         try:
-            revocation = LabClaimRevocation.model_validate_json(payload)
+            revocation = strict_model_validate_json(LabClaimRevocation, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid claim revocation {candidate.name}: {exc}"
@@ -1015,7 +1016,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 f"execution admission token does not match basename {candidate.name}"
             )
         try:
-            admission = LabExecutionAdmission.model_validate_json(payload)
+            admission = strict_model_validate_json(LabExecutionAdmission, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid execution admission {candidate.name}: {exc}"
@@ -1189,7 +1190,7 @@ class LabClaimSpool(_TypedSpoolBase):
         if match is None:
             raise InvalidCommandEnvelopeError(f"invalid current claim basename: {candidate.name}")
         try:
-            marker = LabClaimHighWater.model_validate_json(payload)
+            marker = strict_model_validate_json(LabClaimHighWater, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid current claim marker {candidate.name}: {exc}"
@@ -1216,7 +1217,7 @@ class LabClaimSpool(_TypedSpoolBase):
         if match is None:
             raise InvalidCommandEnvelopeError(f"invalid retired claim basename: {candidate.name}")
         try:
-            marker = LabRetiredClaimAuthority.model_validate_json(payload)
+            marker = strict_model_validate_json(LabRetiredClaimAuthority, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid retired claim marker {candidate.name}: {exc}"
@@ -1792,7 +1793,7 @@ class LabClaimSpool(_TypedSpoolBase):
         )
         try:
             _sequence, filename_token = self._message_name_parts(candidate.name)
-            claim = LabShardClaim.model_validate_json(payload)
+            claim = strict_model_validate_json(LabShardClaim, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid shard claim {candidate.name}: {exc}",
@@ -1912,7 +1913,7 @@ class LabReportSpool(_TypedSpoolBase):
         )
         try:
             _sequence, filename_id = self._message_name_parts(candidate.name)
-            report = LabWorkerReport.model_validate_json(payload)
+            report = strict_model_validate_json(LabWorkerReport, payload)
             if payload != report.canonical_json().encode("utf-8"):
                 raise ValueError("worker report JSON is not canonical")
         except Exception as exc:
@@ -1989,7 +1990,7 @@ class LabReportSpool(_TypedSpoolBase):
         candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
         filename_id = self._ack_message_id(candidate.name)
         try:
-            receipt = LabReportReceipt.model_validate_json(payload)
+            receipt = strict_model_validate_json(LabReportReceipt, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid report receipt {candidate.name}: {exc}"

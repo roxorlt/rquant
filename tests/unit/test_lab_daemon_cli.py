@@ -56,6 +56,35 @@ def test_parser_registers_finalizer_and_keeps_legacy_lab_run() -> None:
     assert legacy.command == "lab-run"
 
 
+def test_parser_registers_generation_bound_launchd_install_lifecycle() -> None:
+    parser = build_parser()
+    install = parser.parse_args(
+        [
+            "lab-launchd-install",
+            "--expected-checkout-root",
+            EXPECTED_ROOT,
+            "--deployment-lock-path",
+            "/tmp/.rquant-deploy/rquant.lock",
+            "--no-activate",
+        ]
+    )
+    uninstall = parser.parse_args(
+        [
+            "lab-launchd-uninstall",
+            "--expected-checkout-root",
+            EXPECTED_ROOT,
+            "--deployment-lock-path",
+            "/tmp/.rquant-deploy/rquant.lock",
+            "--no-deactivate",
+        ]
+    )
+
+    assert install.command == "lab-launchd-install"
+    assert install.no_activate is True
+    assert uninstall.command == "lab-launchd-uninstall"
+    assert uninstall.no_deactivate is True
+
+
 def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

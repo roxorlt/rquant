@@ -10,6 +10,7 @@ import fcntl
 import fnmatch
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tarfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator
@@ -45,6 +47,7 @@ MARKER_SCHEMA_VERSION = 1
 INTENT_SCHEMA_VERSION = 1
 COMMIT_SCHEMA_VERSION = 1
 ENVIRONMENT_SCHEMA_VERSION = 1
+RELEASE_CODE_DIRECTORY = "release"
 LAB_HANDOFF_SCHEMA_VERSION = 1
 MAX_MARKER_BYTES = 32 * 1024
 MAX_INTENT_BYTES = 128 * 1024
@@ -1282,6 +1285,11 @@ def environment_manifest_path_for_lock(lock_path: Path, generation_id: str) -> P
     return lock_path.with_name(f"{lock_path.stem}.venv-{generation_id}.manifest.json")
 
 
+def generation_code_root(environment_path: Path) -> Path:
+    """Return the immutable source/config authority inside one environment generation."""
+    return environment_path / RELEASE_CODE_DIRECTORY
+
+
 def _canonical(path: Path, *, label: str) -> Path:
     if not path.is_absolute() or path != Path(os.path.abspath(path)):
         raise ReleaseGenerationError(f"{label} must be an absolute canonical path")
@@ -1413,6 +1421,123 @@ def _assert_tracked_clean(repo: Path, git_path: Path) -> None:
         raise ReleaseGenerationError("tracked checkout verification failed") from exc
     if status.stdout or diff.returncode != 0:
         raise ReleaseGenerationError("tracked checkout is dirty")
+
+
+_RELEASE_CODE_EXACT_FILES = frozenset(
+    {
+        ".env.example",
+        "pyproject.toml",
+        "uv.lock",
+        "scripts/bootstrap-lab-daemon.py",
+        "scripts/preflight-lab-runtime.py",
+        "scripts/run-lab-daemon.py",
+        "scripts/strict_json.py",
+    }
+)
+
+
+def _release_code_member(path: str) -> bool:
+    return (
+        path in _RELEASE_CODE_EXACT_FILES
+        or path.startswith("src/rquant/")
+        or (path.startswith("deploy/launchd/com.roxor.rquant-lab-") and path.endswith(".plist"))
+    )
+
+
+def _release_code_directory(path: str) -> bool:
+    prefixes = (
+        "src",
+        "src/rquant",
+        "scripts",
+        "deploy",
+        "deploy/launchd",
+    )
+    return path in prefixes
+
+
+def _write_private_payload(path: Path, payload: bytes, *, executable: bool = False) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o700 if executable else 0o600,
+    )
+    try:
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _materialize_release_code(
+    *,
+    repo: Path,
+    git_path: Path,
+    expected_commit: str,
+    destination: Path,
+    checkpoint: Callable[[], None],
+) -> None:
+    """Extract a non-recursive exact-commit runtime payload into a private generation."""
+    listing = _git_output(repo, git_path, "ls-tree", "-r", "--name-only", expected_commit)
+    members = tuple(path for path in listing.splitlines() if _release_code_member(path))
+    required = {"pyproject.toml", "uv.lock"}
+    if not required.issubset(members) or not any(
+        path.startswith("src/rquant/") for path in members
+    ):
+        raise ReleaseGenerationError("release code payload is incomplete")
+    checkpoint()
+    try:
+        result = subprocess.run(
+            [str(git_path), "archive", "--format=tar", expected_commit, "--", *members],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            timeout=30,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReleaseGenerationError("exact release code payload could not be exported") from exc
+    checkpoint()
+    destination.mkdir(mode=0o700)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+            for member in archive.getmembers():
+                checkpoint()
+                relative = Path(member.name)
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or not (
+                        _release_code_member(relative.as_posix())
+                        or (member.isdir() and _release_code_directory(relative.as_posix()))
+                    )
+                    or member.issym()
+                    or member.islnk()
+                    or not (member.isdir() or member.isfile())
+                ):
+                    raise ReleaseGenerationError("release code archive contains an unsafe member")
+                target = destination / relative
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    target.chmod(0o700)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ReleaseGenerationError("release code archive member is unreadable")
+                _write_private_payload(
+                    target,
+                    extracted.read(),
+                    executable=bool(member.mode & stat.S_IXUSR),
+                )
+        dotenv = repo / ".env"
+        if os.path.lexists(dotenv):
+            observed = _identity(dotenv, label="release .env", directory=False)
+            if stat.S_IMODE(observed.mode) != 0o600:
+                raise ReleaseGenerationError("release .env must have mode 0600")
+            _write_private_payload(destination / ".env", dotenv.read_bytes())
+    except BaseException:
+        raise
+    checkpoint()
 
 
 def _python_facts(python_path: Path) -> tuple[str, str]:
@@ -2182,6 +2307,7 @@ class ReleaseGenerationAuthority:
         minimum_free_bytes: int | None = None,
         uv_path: Path | None = None,
         environment_builder: Callable[[Path], None] | None = None,
+        immutable_code_root: Path | None = None,
         command_timeout_seconds: float = 900,
         overall_deadline_monotonic: float | None = None,
         cancellation_check: Callable[[], bool] | None = None,
@@ -2206,6 +2332,11 @@ class ReleaseGenerationAuthority:
             else _trusted_executable_binding(self.uv_path, label="release uv")
         )
         self._environment_builder = environment_builder
+        self.immutable_code_root = (
+            None
+            if immutable_code_root is None
+            else _canonical(immutable_code_root, label="immutable release code root")
+        )
         self._cancellation_check = cancellation_check or (lambda: False)
         if (
             not math.isfinite(command_timeout_seconds)
@@ -2250,6 +2381,7 @@ class ReleaseGenerationAuthority:
             minimum_free_bytes=self.minimum_free_bytes,
             uv_path=self.uv_path,
             environment_builder=self._environment_builder,
+            immutable_code_root=self.immutable_code_root,
             command_timeout_seconds=self.command_timeout_seconds,
             overall_deadline_monotonic=overall_deadline_monotonic,
             cancellation_check=self._cancellation_check,
@@ -2372,11 +2504,18 @@ class ReleaseGenerationAuthority:
     ) -> ReleaseGenerationMarker:
         if len(expected_commit) != 40 or any(c not in "0123456789abcdef" for c in expected_commit):
             raise ReleaseGenerationError("release commit must be a lowercase full SHA")
-        commit = _git_output(self.repo, self.git_path, "rev-parse", "--verify", "HEAD^{commit}")
-        if commit != expected_commit:
-            raise ReleaseGenerationError("release checkout commit does not match marker")
-        uv_lock = self.repo / "uv.lock"
-        pyproject = self.repo / "pyproject.toml"
+        venv = _canonical(Path(selector.environment_path), label="release environment")
+        code_root = generation_code_root(venv)
+        _identity(code_root, label="immutable release code root", directory=True)
+        if self.immutable_code_root is not None and self.immutable_code_root != code_root:
+            raise ReleaseGenerationError("immutable release code selector is stale")
+        commit = expected_commit
+        if self.immutable_code_root is None:
+            commit = _git_output(self.repo, self.git_path, "rev-parse", "--verify", "HEAD^{commit}")
+            if commit != expected_commit:
+                raise ReleaseGenerationError("release checkout commit does not match marker")
+        uv_lock = code_root / "uv.lock"
+        pyproject = code_root / "pyproject.toml"
         uv_hash = _hash_file(uv_lock, label="uv.lock", checkpoint=self._checkpoint)
         pyproject_hash = _hash_file(
             pyproject,
@@ -2391,7 +2530,6 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("package version cannot be verified") from exc
         if selector.commit != commit or str(manifest.get("commit")) != commit:
             raise ReleaseGenerationError("environment generation commit is stale")
-        venv = _canonical(Path(selector.environment_path), label="release environment")
         _verify_environment_manifest(venv, manifest, checkpoint=self._checkpoint)
         venv_identity = _identity(venv, label="release venv", directory=True)
         selected_python = venv / "bin" / "python"
@@ -3137,7 +3275,10 @@ class ReleaseGenerationAuthority:
             or committed.environment_manifest_sha256 != published.environment_manifest_sha256
         ):
             raise ReleaseGenerationError("release generation commit record is stale")
-        _assert_tracked_clean(self.repo, self.git_path)
+        if self.immutable_code_root is None:
+            if _hash_file(self.repo / "uv.lock", label="uv.lock") != published.uv_lock_sha256:
+                raise ReleaseGenerationError("uv.lock no longer matches release marker")
+            _assert_tracked_clean(self.repo, self.git_path)
         self._assert_lock()
         return published
 
@@ -3523,6 +3664,13 @@ class ReleaseGenerationAuthority:
                         staging_path,
                         final_path,
                         source_venv,
+                        checkpoint=self._checkpoint,
+                    )
+                    _materialize_release_code(
+                        repo=self.repo,
+                        git_path=self.git_path,
+                        expected_commit=expected_commit,
+                        destination=generation_code_root(staging_path),
                         checkpoint=self._checkpoint,
                     )
                     self._checkpoint()

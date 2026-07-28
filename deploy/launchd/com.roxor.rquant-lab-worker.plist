@@ -6,28 +6,28 @@
     <string>com.roxor.rquant-lab-worker</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/python</string>
+        <string>__RQUANT_GENERATION_PYTHON__</string>
         <string>-I</string>
         <string>-S</string>
-        <string>/Users/roxor/brain/30-projects/rQuant/scripts/run-lab-daemon.py</string>
+        <string>__RQUANT_CODE_ROOT__/scripts/run-lab-daemon.py</string>
         <string>--expected-checkout-root</string>
-        <string>/Users/roxor/brain/30-projects/rQuant</string>
+        <string>__RQUANT_CODE_ROOT__</string>
+        <string>--expected-code-root</string>
+        <string>__RQUANT_CODE_ROOT__</string>
+        <string>--expected-commit</string>
+        <string>__RQUANT_COMMIT__</string>
         <string>--trusted-git-path</string>
-        <string>/usr/bin/git</string>
+        <string>__RQUANT_TRUSTED_GIT__</string>
         <string>--deployment-lock-path</string>
-        <string>/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock</string>
+        <string>__RQUANT_DEPLOYMENT_LOCK__</string>
         <string>--</string>
-        <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin/rquant</string>
+        <string>__RQUANT_LAUNCHER__</string>
         <string>lab-worker</string>
-        <string>--expected-checkout-root</string>
-        <string>/Users/roxor/brain/30-projects/rQuant</string>
-        <string>--trusted-git-path</string>
-        <string>/usr/bin/git</string>
         <string>--worker-id</string>
-        <string>rquant-mac-primary</string>
+        <string>__RQUANT_WORKER_ID__</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/roxor/brain/30-projects/rQuant</string>
+    <string>__RQUANT_CODE_ROOT__</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -44,17 +44,17 @@
     <key>Umask</key>
     <integer>63</integer>
     <key>StandardOutPath</key>
-    <string>/Users/roxor/brain/30-projects/rQuant/logs/launchd-lab-worker-stdout.log</string>
+    <string>__RQUANT_STDOUT__</string>
     <key>StandardErrorPath</key>
-    <string>/Users/roxor/brain/30-projects/rQuant/logs/launchd-lab-worker-stderr.log</string>
+    <string>__RQUANT_STDERR__</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/roxor/brain/30-projects/rQuant/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
         <key>PYTHONDONTWRITEBYTECODE</key>
         <string>1</string>
         <key>RQUANT_TRUSTED_GIT_PATH</key>
-        <string>/usr/bin/git</string>
+        <string>__RQUANT_TRUSTED_GIT__</string>
         <key>RQUANT_RELEASE_HANDOFF_MANAGED</key>
         <string>1</string>
     </dict>

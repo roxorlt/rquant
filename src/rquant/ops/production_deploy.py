@@ -67,6 +67,11 @@ class DeployError(RuntimeError):
     """The rollout failed after repository mutation began."""
 
 
+class _ProcessGroupSignal(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+
+
 class Runner(Protocol):
     def run(
         self,
@@ -134,6 +139,21 @@ def _run_process_group(
         pass_fds=pass_fds,
         env=env,
     )
+    previous_handlers: dict[int, object] = {}
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        raise _ProcessGroupSignal(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(signum)
+        if previous is signal.SIG_IGN:
+            continue
+        try:
+            signal.signal(signum, forward_signal)
+        except ValueError:
+            break
+        previous_handlers[signum] = previous
+    caught_signal: _ProcessGroupSignal | None = None
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -141,6 +161,30 @@ def _run_process_group(
             os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         raise
+    except _ProcessGroupSignal as exc:
+        caught_signal = exc
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with suppress(OSError, subprocess.SubprocessError):
+            process.communicate(timeout=5)
+        stdout = stderr = ""
+    except BaseException:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with suppress(OSError, subprocess.SubprocessError):
+            process.communicate(timeout=5)
+        raise
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+    if caught_signal is not None:
+        previous = previous_handlers[caught_signal.signum]
+        if callable(previous):
+            previous(caught_signal.signum, None)
+            raise InterruptedError(f"process runner interrupted by signal {caught_signal.signum}")
+        signal.signal(caught_signal.signum, signal.SIG_DFL)
+        os.kill(os.getpid(), caught_signal.signum)
+        raise SystemExit(128 + caught_signal.signum)
     completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     if check and completed.returncode != 0:
         raise subprocess.CalledProcessError(

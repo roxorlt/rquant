@@ -102,6 +102,7 @@ def _run_preflight(
     python_path: Path,
     provisional_handoff_label: str | None,
     daemon_command: str,
+    immutable_generation: bool = False,
 ) -> None:
     command = [
         sys.executable,
@@ -125,6 +126,8 @@ def _run_preflight(
     ]
     if provisional_handoff_label is not None:
         command.extend(["--provisional-handoff-label", provisional_handoff_label])
+    if immutable_generation:
+        command.append("--immutable-generation")
     result = subprocess.run(
         command,
         cwd=root,
@@ -148,7 +151,8 @@ def _load_release_authority(path: Path) -> ModuleType:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--expected-checkout-root", required=True)
+    parser.add_argument("--expected-checkout-root")
+    parser.add_argument("--expected-code-root")
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-runtime-root", required=True)
     parser.add_argument("--trusted-git-path", required=True)
@@ -168,10 +172,14 @@ def main(argv: list[str] | None = None) -> int:
             "lab-finalizer",
         }:
             raise BootstrapError("formal Lab daemon command is missing or invalid")
-        root = _canonical(args.expected_checkout_root, label="expected checkout root")
-        _physical_directory(root, label="expected checkout root")
+        immutable_generation = args.expected_code_root is not None
+        raw_root = args.expected_code_root if immutable_generation else args.expected_checkout_root
+        if raw_root is None:
+            raise BootstrapError("expected source root is required")
+        root = _canonical(raw_root, label="expected source root")
+        _physical_directory(root, label="expected source root")
         if Path.cwd().resolve(strict=True) != root:
-            raise BootstrapError("working directory does not match expected checkout root")
+            raise BootstrapError("working directory does not match expected source root")
         venv = _canonical(args.expected_runtime_root, label="expected runtime generation")
         expected_environment_root = Path(args.deployment_lock_path).with_name(
             f"{Path(args.deployment_lock_path).stem}.venvs"
@@ -210,12 +218,14 @@ def main(argv: list[str] | None = None) -> int:
             python_path=Path(sys.executable),
             provisional_handoff_label=args.provisional_handoff_label,
             daemon_command=daemon_argv[0],
+            immutable_generation=immutable_generation,
         )
         try:
             _load_release_authority(
                 root / "src" / "rquant" / "release_generation.py"
             ).ReleaseGenerationAuthority(
                 repo=root,
+                immutable_code_root=(root if immutable_generation else None),
                 lock_path=lock_path,
                 lock_fd=args.deployment_lock_fd,
                 python_path=Path(sys.executable),

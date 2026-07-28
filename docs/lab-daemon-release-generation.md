@@ -2,7 +2,15 @@
 
 ## 启动链路
 
-三个 Lab daemon 由 launchd 先运行 `scripts/run-lab-daemon.py`。wrapper 只使用标准库，并且在创建
+三个 Lab daemon 由 launchd 使用 active generation 自带的 Python 运行该 generation 内封存的
+`release/scripts/run-lab-daemon.py`。wrapper、preflight、bootstrap、`src/rquant`、三份 plist 模板和
+私有 `.env` 副本都来自 exact-SHA release payload；`WorkingDirectory`、launcher 与 `PYTHONPATH`
+只指向该不可变 generation。mutable checkout 被修改、重命名或移走，不会改变已激活 daemon 的
+代码权威。release payload 由 `git archive <exact-sha>` 的显式 allowlist 生成，不复制 generation
+存储根本身，因此不会递归自包含；完整环境 manifest 会对代码和 venv 一并哈希，GC/rollback 继续
+保留 marker、commit、intent 或 previous generation 引用的旧代际。
+
+wrapper 只使用标准库，并且在创建
 generation lock 目录或锁文件前，先以纯只读模式验证 prepared runtime sentinel。`DATA_DIR` 必须
 显式且非空，其他 Lab 路径沿用 Settings 的逐项默认语义。`.env` 从已验证父目录 FD、sentinel 从
 已验证 runtime-root dir FD 使用 `openat(O_NOFOLLOW)` 打开，再从同一文件 FD 读取并在结束时复核目录项
@@ -117,8 +125,16 @@ P1.5d 安装 launchd 前必须在主 checkout 重建自有、物理、非 symlin
 执行 frozen sync 与 preflight 后才初始化 marker。初始化中断后必须原样重跑同一个
 `--initialize-generation --target <the-same-recorded-exact-target>`；`--recover-generation` 仅用于
 已经持久化常规 deployment intent 的发布，不得用于初始化恢复，详见
-`docs/production-release.md`。P1.5b 不安装 launchd，也不
-修改现有主 checkout。隔离 worktree 可继续复用链接 `.venv` 运行测试，但正式 daemon 会在读取
+`docs/production-release.md`。
+
+P1.5b 已实现并用临时目录/fake launchctl 验证 `rquant lab-launchd-install` 与
+`rquant lab-launchd-uninstall`：安装器在 generation 独占锁下验证 current marker/selector/manifest，
+从 generation 内模板原子生成 owner-only plist，执行 `plistlib` 与 `plutil -lint`，幂等复跑不替换
+相同 inode；失败会恢复安装前内容，卸载只删除 installation state 精确绑定且 hash 未变的文件。
+P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `launchctl bootstrap/kickstart`；
+这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
+
+隔离 worktree 可继续复用链接 `.venv` 运行测试，但正式 daemon 会在读取
 配置或创建运行时目录前拒绝这种 runtime。
 
 该锁约束所有受控部署。具有同一 UID 且绕过 deployer 直接改写 checkout 的进程不属于本地权限

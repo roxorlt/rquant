@@ -10,20 +10,27 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHD_DIR = ROOT / "deploy" / "launchd"
 WORKING_DIRECTORY = "/Users/roxor/brain/30-projects/rQuant"
-PYTHON = f"{WORKING_DIRECTORY}/.venv/bin/python"
-WRAPPER = f"{WORKING_DIRECTORY}/scripts/run-lab-daemon.py"
-EXECUTABLE = f"{WORKING_DIRECTORY}/.venv/bin/rquant"
+PYTHON = "__RQUANT_GENERATION_PYTHON__"
+CODE_ROOT = "__RQUANT_CODE_ROOT__"
+WRAPPER = f"{CODE_ROOT}/scripts/run-lab-daemon.py"
+EXECUTABLE = "__RQUANT_LAUNCHER__"
 TRUSTED_GIT = "/usr/bin/git"
-DEPLOYMENT_LOCK = "/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock"
-EXPECTED_ROOT_ARGUMENTS = ["--expected-checkout-root", WORKING_DIRECTORY]
-TRUSTED_GIT_ARGUMENTS = ["--trusted-git-path", TRUSTED_GIT]
-DEPLOYMENT_LOCK_ARGUMENTS = ["--deployment-lock-path", DEPLOYMENT_LOCK]
+EXPECTED_ROOT_ARGUMENTS = ["--expected-checkout-root", CODE_ROOT]
+EXPECTED_CODE_ARGUMENTS = [
+    "--expected-code-root",
+    CODE_ROOT,
+    "--expected-commit",
+    "__RQUANT_COMMIT__",
+]
+TRUSTED_GIT_ARGUMENTS = ["--trusted-git-path", "__RQUANT_TRUSTED_GIT__"]
+DEPLOYMENT_LOCK_ARGUMENTS = ["--deployment-lock-path", "__RQUANT_DEPLOYMENT_LOCK__"]
 WRAPPER_ARGUMENTS = [
     PYTHON,
     "-I",
     "-S",
     WRAPPER,
     *EXPECTED_ROOT_ARGUMENTS,
+    *EXPECTED_CODE_ARGUMENTS,
     *TRUSTED_GIT_ARGUMENTS,
     *DEPLOYMENT_LOCK_ARGUMENTS,
     "--",
@@ -64,24 +71,22 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
         *WRAPPER_ARGUMENTS,
         EXECUTABLE,
         command,
-        *EXPECTED_ROOT_ARGUMENTS,
-        *TRUSTED_GIT_ARGUMENTS,
     ]
     assert document["ProgramArguments"][: len(expected_prefix)] == expected_prefix
-    assert document["WorkingDirectory"] == WORKING_DIRECTORY
+    assert document["WorkingDirectory"] == CODE_ROOT
     assert document["RunAtLoad"] is True
     assert document["KeepAlive"] == {"SuccessfulExit": False}
     assert document["ThrottleInterval"] >= 10
     assert document["ExitTimeOut"] >= 30
     assert document["ProcessType"] == "Background"
     assert document["Umask"] == 0o077
-    assert document["StandardOutPath"].startswith(f"{WORKING_DIRECTORY}/logs/")
-    assert document["StandardErrorPath"].startswith(f"{WORKING_DIRECTORY}/logs/")
+    assert document["StandardOutPath"] == "__RQUANT_STDOUT__"
+    assert document["StandardErrorPath"] == "__RQUANT_STDERR__"
     assert document.get("EnvironmentVariables", {}) == {
-        "PATH": f"{WORKING_DIRECTORY}/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "RQUANT_RELEASE_HANDOFF_MANAGED": "1",
-        "RQUANT_TRUSTED_GIT_PATH": TRUSTED_GIT,
+        "RQUANT_TRUSTED_GIT_PATH": "__RQUANT_TRUSTED_GIT__",
     }
     serialized = path.read_text(encoding="utf-8")
     assert "SECRET" not in serialized
@@ -97,54 +102,17 @@ def test_lab_worker_launchd_uses_configured_stable_identity() -> None:
         *WRAPPER_ARGUMENTS,
         EXECUTABLE,
         "lab-worker",
-        *EXPECTED_ROOT_ARGUMENTS,
-        *TRUSTED_GIT_ARGUMENTS,
         "--worker-id",
-        "rquant-mac-primary",
+        "__RQUANT_WORKER_ID__",
     ]
 
 
-@pytest.mark.skipif(
-    not Path(EXECUTABLE).is_file()
-    or not Path(WRAPPER).is_file()
-    or not Path(WORKING_DIRECTORY).is_dir(),
-    reason="owner Mac launchd runtime is unavailable",
-)
-def test_lab_launchd_exact_runtime_rejects_editable_import_from_other_worktree(
-    tmp_path: Path,
-) -> None:
-    path = LAUNCHD_DIR / "com.roxor.rquant-lab-worker.plist"
-    with path.open("rb") as stream:
-        document = plistlib.load(stream)
-    editable_site = tmp_path / "editable-site"
-    editable_site.mkdir()
-    (editable_site / "rquant-editable.pth").write_text(
-        f"{ROOT / 'src'}\n",
-        encoding="utf-8",
-    )
-    bootstrap_site = tmp_path / "bootstrap-site"
-    bootstrap_site.mkdir()
-    (bootstrap_site / "sitecustomize.py").write_text(
-        f"import site\nsite.addsitedir({str(editable_site)!r})\n",
-        encoding="utf-8",
-    )
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(bootstrap_site)
-    environment["LAB_SCHEDULER_WORKER_IDS"] = "rquant-mac-primary"
-    environment["__PYVENV_LAUNCHER__"] = f"{WORKING_DIRECTORY}/.venv/bin/python"
-
-    result = subprocess.run(
-        [*document["ProgramArguments"], "--once"],
-        cwd=document["WorkingDirectory"],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-
-    assert result.returncode != 0
-    assert "environment injection" in result.stdout + result.stderr
+def test_lab_launchd_templates_do_not_bind_mutable_checkout_runtime() -> None:
+    for path in LAUNCHD_DIR.glob("com.roxor.rquant-lab-*.plist"):
+        serialized = path.read_text(encoding="utf-8")
+        assert f"{WORKING_DIRECTORY}/.venv" not in serialized
+        assert f"{WORKING_DIRECTORY}/scripts" not in serialized
+        assert "__RQUANT_CODE_ROOT__" in serialized
 
 
 @pytest.mark.skipif(

@@ -181,7 +181,31 @@ bash scripts/deploy-production.sh \
   --target <same-exact-semver-tag-or-full-sha>
 ```
 
-最后才由 P1.5d 的人工基础设施步骤安装并 bootstrap 三个 launchd plist。初始化和登记模式不要求
+第四步才由 P1.5d 的人工基础设施步骤调用已在 P1.5b 实现并测试的 generation-bound 安装器：
+
+```bash
+"<active-generation>/bin/rquant" lab-launchd-install \
+  --expected-checkout-root "${ROOT}" \
+  --trusted-git-path /usr/bin/git \
+  --deployment-lock-path "${LOCK}" \
+  --launch-agents-dir "${HOME}/Library/LaunchAgents" \
+  --worker-id rquant-mac-primary
+```
+
+恢复/卸载仅允许针对本安装状态精确绑定且未被人工修改的 plist：
+
+```bash
+"<active-generation>/bin/rquant" lab-launchd-uninstall \
+  --expected-checkout-root "${ROOT}" \
+  --trusted-git-path /usr/bin/git \
+  --deployment-lock-path "${LOCK}" \
+  --launch-agents-dir "${HOME}/Library/LaunchAgents"
+```
+
+安装器会从 active immutable generation 内的模板原子 materialize 三份 `0600` plist，运行
+`plistlib`/`plutil` 校验，随后按 label bootout/bootstrap/kickstart；复跑相同 generation 幂等，失败
+恢复旧 plist。P1.5b 只交付并测试了该能力，**尚未在本机安装或加载**；P1.5d 才执行上述命令并做
+真实 launchd readiness/rollback 演练。初始化和登记模式不要求
 launchd 已安装或 loaded；常规 `macos-lab + installed` 发布则反过来强制 installation state 与三个
 label 都存在。installed dry-run 同样逐个只读核对三个 label 已 loaded 以及 installation、runtime、
 prepared sentinel、plist 和 generation 前置条件，但不会 bootout。该区分避免首次安装陷入“必须

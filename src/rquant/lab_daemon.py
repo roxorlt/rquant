@@ -602,7 +602,11 @@ def verify_lab_runtime_prepared(
         }
     expected = {
         "schema_version": _LAB_RUNTIME_PREPARED_SCHEMA_VERSION,
-        "checkout_root": str(checkout),
+        "checkout_root": (
+            payload.get("checkout_root")
+            if checkout.name == "release" and checkout.parent.name != ""
+            else str(checkout)
+        ),
         "runtime_root": str(root),
         "runtime_device": root_observed.st_dev,
         "runtime_inode": root_observed.st_ino,
@@ -1122,12 +1126,18 @@ def _verify_deployment_generation(
     lock_path: Path,
     lock_fd: int,
 ) -> None:
-    expected_lock = (
-        expected_checkout_root.parent / ".rquant-deploy" / f"{expected_checkout_root.name}.lock"
-    )
     candidate = _canonical_absolute_path(lock_path, label="deployment generation lock")
-    if candidate != expected_lock:
-        raise LabDaemonConfigurationError("deployment generation lock path mismatch")
+    environment_root = candidate.with_name(f"{candidate.stem}.venvs")
+    immutable_code_root = (
+        expected_checkout_root.name == "release"
+        and expected_checkout_root.parent.parent == environment_root
+    )
+    if not immutable_code_root:
+        expected_lock = (
+            expected_checkout_root.parent / ".rquant-deploy" / f"{expected_checkout_root.name}.lock"
+        )
+        if candidate != expected_lock:
+            raise LabDaemonConfigurationError("deployment generation lock path mismatch")
     if _CODE_SHA.fullmatch(expected_generation) is None or lock_fd < 0:
         raise LabDaemonConfigurationError("deployment generation binding is invalid")
     try:
@@ -1156,6 +1166,25 @@ def require_lab_runtime_binding(
     deployment_generation_fd: int | None = None,
 ) -> str:
     """Read and verify all live process identities before daemon I/O starts."""
+    expected_candidate = _canonical_absolute_path(
+        expected_checkout_root,
+        label="expected checkout root",
+    )
+    if (
+        deployment_generation is not None
+        and deployment_lock_path is not None
+        and deployment_generation_fd is not None
+        and expected_candidate.name == "release"
+        and expected_candidate.parent.parent
+        == Path(deployment_lock_path).with_name(f"{Path(deployment_lock_path).stem}.venvs")
+    ):
+        return _require_immutable_lab_runtime_binding(
+            expected_candidate,
+            trusted_git_path=trusted_git_path,
+            deployment_generation=deployment_generation,
+            deployment_lock_path=Path(deployment_lock_path),
+            deployment_generation_fd=int(deployment_generation_fd),
+        )
     expected, _expected_venv = _require_physical_checkout_virtualenv(
         expected_checkout_root,
     )
@@ -1271,6 +1300,74 @@ def require_lab_runtime_binding(
             lock_fd=int(deployment_generation_fd),
         )
     return verified
+
+
+def _require_immutable_lab_runtime_binding(
+    code_root: Path,
+    *,
+    trusted_git_path: Path,
+    deployment_generation: str,
+    deployment_lock_path: Path,
+    deployment_generation_fd: int,
+) -> str:
+    import rquant
+    from rquant.release_generation import ReleaseGenerationAuthority
+    from rquant.research_manifest import bind_trusted_git_executable
+
+    if _CODE_SHA.fullmatch(deployment_generation) is None:
+        raise LabDaemonConfigurationError("deployment generation SHA mismatch")
+    try:
+        observed_root = code_root.lstat()
+        if (
+            not stat.S_ISDIR(observed_root.st_mode)
+            or stat.S_ISLNK(observed_root.st_mode)
+            or observed_root.st_uid != os.getuid()
+            or observed_root.st_mode & 0o077
+            or code_root.resolve(strict=True) != code_root
+        ):
+            raise LabDaemonConfigurationError("immutable release code root is unsafe")
+        generation = code_root.parent
+        package_file = Path(str(rquant.__file__)).resolve(strict=True)
+        if not package_file.is_relative_to((code_root / "src" / "rquant").resolve(strict=True)):
+            raise LabDaemonConfigurationError("rquant imported outside immutable release code")
+        if Path.cwd().resolve(strict=True) != code_root:
+            raise LabDaemonConfigurationError("immutable release working directory mismatch")
+        if Path(sys.prefix) != generation or Path(sys.executable) != generation / "bin" / "python":
+            raise LabDaemonConfigurationError("immutable release interpreter mismatch")
+        launcher = _canonical_absolute_path(Path(sys.argv[0]), label="runtime launcher")
+        if launcher != generation / "bin" / "rquant":
+            raise LabDaemonConfigurationError("immutable release launcher mismatch")
+        _verify_deployment_generation(
+            expected_checkout_root=code_root,
+            expected_generation=deployment_generation,
+            lock_path=deployment_lock_path,
+            lock_fd=deployment_generation_fd,
+        )
+        trusted_git = bind_trusted_git_executable(trusted_git_path)
+        command = sys.argv[1] if len(sys.argv) > 1 else ""
+        provisional = {
+            "lab-scheduler": "com.roxor.rquant-lab-scheduler",
+            "lab-worker": "com.roxor.rquant-lab-worker",
+            "lab-finalizer": "com.roxor.rquant-lab-finalizer",
+        }.get(command)
+        marker = ReleaseGenerationAuthority(
+            repo=code_root,
+            immutable_code_root=code_root,
+            lock_path=deployment_lock_path,
+            lock_fd=deployment_generation_fd,
+            python_path=Path(sys.executable),
+            git_path=trusted_git.path,
+        ).verify(
+            expected_commit=deployment_generation,
+            provisional_handoff_label=provisional,
+        )
+    except LabDaemonConfigurationError:
+        raise
+    except Exception as exc:
+        raise LabDaemonConfigurationError("immutable Lab runtime binding failed") from exc
+    if marker.commit != deployment_generation or Path(marker.venv_path) != generation:
+        raise LabDaemonConfigurationError("immutable release generation authority is stale")
+    return deployment_generation
 
 
 @dataclass(frozen=True)

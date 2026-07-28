@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.research_run_spec import ResearchRunSpec
+from rquant.strict_json import strict_model_validate_json
 
 _LabSpoolFileType = Literal[
     "regular",
@@ -1268,7 +1269,7 @@ class LabCommandSpool:
             container / "evidence.json",
             container,
         )
-        evidence = _LabOwnedEntryIsolationEvidence.model_validate_json(payload)
+        evidence = strict_model_validate_json(_LabOwnedEntryIsolationEvidence, payload)
         if evidence.canonical_json_bytes() != payload:
             raise InvalidCommandEnvelopeError(
                 f"owned isolation evidence is not canonical: {container.name}"
@@ -1868,7 +1869,7 @@ class LabCommandSpool:
                 file_identity=identity,
             ) from exc
         try:
-            envelope = LabCommandEnvelope.model_validate_json(payload)
+            envelope = strict_model_validate_json(LabCommandEnvelope, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command envelope {candidate.name}: {exc}",
@@ -1991,7 +1992,7 @@ class LabCommandSpool:
         candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
         filename_request_id = self._ack_request_id(candidate.name)
         try:
-            receipt = LabCommandReceipt.model_validate_json(payload)
+            receipt = strict_model_validate_json(LabCommandReceipt, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command receipt {candidate.name}: {exc}"
@@ -2086,7 +2087,7 @@ class LabCommandSpool:
                 )
                 try:
                     _sequence, filename_request_id = self._pending_name_parts(normalized.name)
-                    envelope = LabCommandEnvelope.model_validate_json(payload)
+                    envelope = strict_model_validate_json(LabCommandEnvelope, payload)
                 except (InvalidCommandEnvelopeError, ValueError):
                     envelope = None
                     filename_request_id = None

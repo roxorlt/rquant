@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -30,6 +31,8 @@ from rquant.ops.production_deploy import (
     validate_target,
 )
 from rquant.release_generation import DeploymentIntent
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeRunner:
@@ -1915,3 +1918,39 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(
     assert git("rev-parse", "HEAD") == target_sha
     assert not fake_git_called.exists()
     assert '"status": "deployed"' in config.audit_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("signum", (signal.SIGTERM, signal.SIGINT))
+def test_subprocess_runner_reaps_process_group_before_signal_releases_parent(
+    tmp_path: Path,
+    signum: signal.Signals,
+) -> None:
+    ready = tmp_path / "ready"
+    late_mutation = tmp_path / "late-mutation"
+    child_program = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        "subprocess.Popen([sys.executable,'-c',"
+        '"import sys,time; from pathlib import Path; time.sleep(.25); '
+        "Path(sys.argv[1]).write_text('late')\",sys.argv[2]]); "
+        "Path(sys.argv[1]).write_text('ready'); time.sleep(.6)"
+    )
+    harness = (
+        "import sys; from pathlib import Path; "
+        "from rquant.ops.production_deploy import _run_process_group; "
+        f"_run_process_group([sys.executable,'-c',{child_program!r},"
+        "sys.argv[1],sys.argv[2]],cwd=Path(sys.argv[3]),timeout_seconds=10,check=True)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", harness, str(ready), str(late_mutation), str(tmp_path)],
+        cwd=ROOT,
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+
+    os.kill(process.pid, signum)
+    process.wait(timeout=5)
+    time.sleep(0.8)
+
+    assert not late_mutation.exists()

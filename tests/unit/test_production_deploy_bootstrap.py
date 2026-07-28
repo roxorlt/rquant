@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -272,6 +273,7 @@ def _checkout(
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(AUTHORITY, package / AUTHORITY.name)
+    shutil.copy2(ROOT / "src" / "rquant" / "strict_json.py", package / "strict_json.py")
     (package / "__init__.py").write_text("", encoding="utf-8")
     (ops / "__init__.py").write_text("", encoding="utf-8")
     if real_deployer:
@@ -574,6 +576,7 @@ def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
     authority = root / "src" / "rquant" / "release_generation.py"
     authority.parent.mkdir(parents=True)
     shutil.copy2(AUTHORITY, authority)
+    shutil.copy2(ROOT / "src" / "rquant" / "strict_json.py", authority.parent)
     scripts = root / "scripts"
     scripts.mkdir()
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
@@ -2244,6 +2247,78 @@ def test_lab_handoff_command_timeout_restores_already_stopped_daemons(
     assert loaded == set(module.LAB_LAUNCHD_LABELS)
 
 
+@pytest.mark.parametrize("label_index", range(3))
+@pytest.mark.parametrize(
+    "crash_stage",
+    ("before_intent", "intent_published", "bootout_complete", "state_recorded"),
+)
+def test_lab_handoff_bootout_transition_is_crash_recoverable_at_every_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label_index: int,
+    crash_stage: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    target_label = module.LAB_LAUNCHD_LABELS[label_index]
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if action == "bootout":
+            loaded.discard(label)
+        elif action == "bootstrap":
+            loaded.add(Path(arguments[-1]).stem)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    class CrashHandoff(module._LabLaunchdHandoff):
+        crashed = False
+
+        def _after_label_transition_stage(self, stage: str, label: str) -> None:
+            if not self.crashed and stage == crash_stage and label == target_label:
+                self.crashed = True
+                raise RuntimeError(f"crash:{stage}:{label}")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
+    first = CrashHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    with pytest.raises(RuntimeError, match=f"crash:{crash_stage}"):
+        first.prepare(
+            dry_run=False,
+            target_ref="a" * 40,
+            target_sha="a" * 40,
+            action="deploy",
+            now=datetime(2026, 7, 29, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    first.close()
+
+    resumed = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    resumed.prepare(
+        dry_run=False,
+        target_ref="a" * 40,
+        target_sha="a" * 40,
+        action="deploy",
+        now=datetime(2026, 7, 29, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert loaded == set()
+    assert set(resumed.stopped) == set(module.LAB_LAUNCHD_LABELS)
+    resumed.restore()
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+
+
 def test_lab_handoff_readiness_verifies_every_label_and_stable_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2613,6 +2688,91 @@ def test_recovery_supersedes_recorded_deploy_handoff_from_partial_stage(
     assert persisted["supersedes_operation_id"] == old_operation
 
 
+@pytest.mark.parametrize("ancestor_state", ("missing", "corrupt"))
+def test_recovery_validates_active_physical_supersede_chain_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor_state: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    operation_a = "a" * 32
+    operation_b = "b" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    installation_identity = module._lab_installation_identity(lock_path, installation)
+    intent = (
+        _handoff_deployment_intent(
+            module,
+            handoff_operation_id=operation_a,
+            operation_id="c" * 32,
+            previous_sha="8" * 40,
+            target_sha="9" * 40,
+            target_ref="v0.99.1",
+            stage="services_transitioning",
+        )
+        .advance(stage="recovery_started")
+        .rebind_handoff(
+            handoff_operation_id=operation_b,
+            handoff_labels=tuple(module.LAB_LAUNCHD_LABELS),
+        )
+    )
+    module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent), absent=True)
+    active = {
+        "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+        "operation_id": operation_b,
+        "checkout_root": str(root),
+        "stage": "stopping",
+        "labels": list(module.LAB_LAUNCHD_LABELS),
+        "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+        "stopped_labels": [module.LAB_LAUNCHD_LABELS[0]],
+        "restarted_labels": [],
+        "updated_at": "2026-07-29T00:00:00+00:00",
+        "target_ref": "v0.99.1",
+        "target_sha": "9" * 40,
+        "action": "resume",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": installation_identity,
+        "supersedes_operation_id": operation_a,
+    }
+    module._atomic_private_json(
+        module._operation_handoff_path(lock_path, operation_b),
+        active,
+        absent=True,
+    )
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        active,
+        absent=True,
+    )
+    if ancestor_state == "corrupt":
+        ancestor = {**active, "operation_id": operation_a, "action": "deploy"}
+        ancestor["supersedes_operation_id"] = "d" * 32
+        module._atomic_private_json(
+            module._operation_handoff_path(lock_path, operation_a),
+            ancestor,
+            absent=True,
+        )
+    launchctl_calls: list[list[str]] = []
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: launchctl_calls.append(arguments),
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="handoff|supersede"):
+        module._superseding_handoff_operation_id(
+            root=root,
+            lock_path=lock_path,
+            recovery_action="rollback",
+            release_profile="macos-lab",
+            lifecycle_mode="installed",
+        )
+
+    assert launchctl_calls == []
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (
@@ -2775,6 +2935,28 @@ def test_same_action_recovery_validates_intent_and_preserves_supersede_chain(
     previous_sha = "a" * 40
     target_sha = "b" * 40
     target_ref = target_sha if action == "resume" else previous_sha
+    ancestor = {
+        "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+        "operation_id": previous_operation,
+        "checkout_root": str(root),
+        "stage": "stopping",
+        "labels": list(module.LAB_LAUNCHD_LABELS),
+        "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+        "stopped_labels": [module.LAB_LAUNCHD_LABELS[0]],
+        "restarted_labels": [],
+        "updated_at": "2026-07-28T00:00:00+00:00",
+        "target_ref": target_sha,
+        "target_sha": target_sha,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": installation_identity,
+        "supersedes_operation_id": "",
+    }
+    module._atomic_private_json(
+        module._operation_handoff_path(lock_path, previous_operation),
+        ancestor,
+    )
     module._atomic_private_json(
         module._stable_record_path(lock_path, "lab-handoff"),
         {
@@ -2796,15 +2978,33 @@ def test_same_action_recovery_validates_intent_and_preserves_supersede_chain(
             "supersedes_operation_id": previous_operation,
         },
     )
-    intent = _handoff_deployment_intent(
-        module,
-        handoff_operation_id=current_operation,
-        operation_id="c" * 32,
+    intent = DeploymentIntent.create(
         previous_sha=previous_sha,
         target_sha=target_sha,
         target_ref=target_sha,
-        stage="services_transitioning",
+        changed_files=("src/rquant/preflight.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="7" * 64,
+        previous_generation_id="8" * 64,
+        handoff_operation_id=previous_operation,
+        handoff_labels=tuple(module.LAB_LAUNCHD_LABELS),
+        operation_id="c" * 32,
     )
+    intent = intent.advance(stage="recovery_started")
+    intent = intent.rebind_handoff(
+        handoff_operation_id=current_operation,
+        handoff_labels=tuple(module.LAB_LAUNCHD_LABELS),
+    )
+    for next_stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+    ):
+        intent = intent.advance(stage=next_stage)
     module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent))
     monkeypatch.setattr(module.sys, "platform", "darwin")
 
@@ -5445,6 +5645,49 @@ def test_missing_generation_is_controlled_exit_without_traceback(tmp_path: Path)
     assert result.returncode == 2
     assert "marker is missing" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("signum", (signal.SIGTERM, signal.SIGINT))
+def test_bootstrap_process_runner_reaps_group_before_signal_exit(
+    tmp_path: Path,
+    signum: signal.Signals,
+) -> None:
+    ready = tmp_path / "ready"
+    late_mutation = tmp_path / "late-mutation"
+    child_program = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        "subprocess.Popen([sys.executable,'-c',"
+        '"import sys,time; from pathlib import Path; time.sleep(.25); '
+        "Path(sys.argv[1]).write_text('late')\",sys.argv[2]]); "
+        "Path(sys.argv[1]).write_text('ready'); time.sleep(.6)"
+    )
+    harness = f"""
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("bootstrap", {str(BOOTSTRAP)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._run_process_group(
+    [sys.executable, "-c", {child_program!r}, sys.argv[1], sys.argv[2]],
+    cwd=Path(sys.argv[3]),
+    timeout_seconds=10,
+)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", harness, str(ready), str(late_mutation), str(tmp_path)],
+        cwd=ROOT,
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+
+    os.kill(process.pid, signum)
+    process.wait(timeout=5)
+    time.sleep(0.8)
+
+    assert not late_mutation.exists()
 
 
 def test_dirty_release_authority_is_rejected_before_project_import(tmp_path: Path) -> None:

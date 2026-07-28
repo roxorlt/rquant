@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ from rquant.release_generation import (
     environment_manifest_path_for_lock,
     environment_root_for_lock,
     environment_selector_path_for_lock,
+    generation_code_root,
     initialization_path_for_lock,
     intent_path_for_lock,
     marker_path_for_lock,
@@ -2066,6 +2068,70 @@ def test_environment_generation_is_immutable_and_content_bound(tmp_path: Path) -
     selected_python.chmod(0o500)
     with pytest.raises(ReleaseGenerationError, match="environment generation"):
         authority.verify(expected_commit=commit)
+    os.close(lock_fd)
+
+
+def test_generation_code_authority_survives_checkout_removal(tmp_path: Path) -> None:
+    repo, lock_path, _commit, python = _generation(tmp_path)
+    (repo / "scripts").mkdir()
+    shutil.copy2(
+        Path(__file__).resolve().parents[2] / "scripts" / "strict_json.py", repo / "scripts"
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[2] / "src" / "rquant" / "release_generation.py",
+        repo / "src" / "rquant" / "release_generation.py",
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[2] / "src" / "rquant" / "strict_json.py",
+        repo / "src" / "rquant" / "strict_json.py",
+    )
+    subprocess.run([str(TRUSTED_GIT), "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        [
+            str(TRUSTED_GIT),
+            "-c",
+            "user.name=rQuant Tests",
+            "-c",
+            "user.email=tests@rquant.invalid",
+            "commit",
+            "-qm",
+            "runtime authority",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    marker = _publish_initialized(_authority(repo, lock_path, lock_fd, python), commit=commit)
+    code_root = generation_code_root(Path(marker.venv_path))
+    authority_path = code_root / "src" / "rquant" / "release_generation.py"
+    original_repo = repo.with_name("removed-checkout")
+    repo.rename(original_repo)
+
+    spec = importlib.util.spec_from_file_location("_immutable_release_authority", authority_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    verified = module.ReleaseGenerationAuthority(
+        repo=code_root,
+        immutable_code_root=code_root,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=Path(marker.python_path),
+        git_path=TRUSTED_GIT,
+    ).verify(expected_commit=commit)
+
+    assert verified.commit == commit
+    assert authority_path.is_file()
+    assert not repo.exists()
     os.close(lock_fd)
 
 

@@ -308,6 +308,46 @@ def _acquire_deployment_generation(root: Path, raw_path: str) -> tuple[Path, int
         raise WrapperError("deployment generation lock is unavailable") from exc
 
 
+def _acquire_immutable_generation(code_root: Path, raw_path: str) -> tuple[Path, int]:
+    path = _canonical_absolute(raw_path, label="deployment generation lock")
+    expected_environment_root = path.with_name(f"{path.stem}.venvs")
+    if code_root.name != "release" or code_root.parent.parent != expected_environment_root:
+        raise WrapperError("immutable code root does not match deployment generation storage")
+    try:
+        parent = path.parent
+        _require_owned_directory(parent, label="deployment authority root")
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(descriptor)
+            active = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(parent_fd)
+        if (
+            _PathIdentity.capture(opened) != _PathIdentity.capture(active)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise WrapperError("deployment generation lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        os.set_inheritable(descriptor, True)
+        return path, descriptor
+    except BlockingIOError as exc:
+        raise WrapperError("deployment generation is currently being updated") from exc
+    except OSError as exc:
+        raise WrapperError("deployment generation lock is unavailable") from exc
+
+
 def _git_commit(root: Path, *, git_path: Path, git_identity: _PathIdentity) -> str:
     _assert_trusted_git(git_path, git_identity)
     try:
@@ -341,6 +381,7 @@ def _run_preflight(
     deployment_lock_fd: int,
     handoff_label: str | None = None,
     daemon_command: str,
+    immutable_generation: bool = False,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
     command = [
@@ -365,6 +406,8 @@ def _run_preflight(
     ]
     if handoff_label is not None:
         command.extend(["--provisional-handoff-label", handoff_label])
+    if immutable_generation:
+        command.append("--immutable-generation")
     result = subprocess.run(
         command,
         cwd=root,
@@ -383,25 +426,126 @@ def _run_prepared_sentinel_preflight(
     preflight: Path,
     root: Path,
     daemon_command: str,
+    immutable_generation: bool = False,
 ) -> None:
+    command = [
+        str(python),
+        "-I",
+        "-S",
+        str(preflight),
+        "--checkout-root",
+        str(root),
+        "--lab-daemon-command",
+        daemon_command,
+        "--prepared-sentinel-only",
+    ]
+    if immutable_generation:
+        command.append("--immutable-generation")
     result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-S",
-            str(preflight),
-            "--checkout-root",
-            str(root),
-            "--lab-daemon-command",
-            daemon_command,
-            "--prepared-sentinel-only",
-        ],
+        command,
         cwd=root,
         check=False,
         timeout=15,
     )
     if result.returncode != 0:
         raise WrapperError("Lab runtime prepared sentinel preflight failed")
+
+
+def _immutable_generation_main(args: argparse.Namespace, daemon_argv: list[str]) -> int:
+    code_root = _canonical_absolute(args.expected_code_root, label="immutable code root")
+    _require_owned_directory(code_root, label="immutable code root")
+    generation = code_root.parent
+    _require_owned_directory(generation, label="selected release environment")
+    python = generation / "bin" / "python"
+    launcher = generation / "bin" / "rquant"
+    if Path(sys.executable) != python:
+        raise WrapperError("wrapper is not running with the selected release Python")
+    if Path(__file__) != code_root / "scripts" / "run-lab-daemon.py":
+        raise WrapperError("wrapper is outside the immutable release generation")
+    if len(daemon_argv) < 2 or Path(daemon_argv[0]) != launcher:
+        raise WrapperError("daemon launcher is outside the immutable release generation")
+    if daemon_argv[1] not in _HANDOFF_LABELS:
+        raise WrapperError("formal Lab daemon command is missing or invalid")
+    _run_prepared_sentinel_preflight(
+        python=python,
+        preflight=code_root / "scripts" / "preflight-lab-runtime.py",
+        root=code_root,
+        daemon_command=daemon_argv[1],
+        immutable_generation=True,
+    )
+    lock_path, lock_fd = _acquire_immutable_generation(code_root, args.deployment_lock_path)
+    trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
+    expected_commit = args.expected_commit
+    if len(expected_commit) != 40 or any(c not in "0123456789abcdef" for c in expected_commit):
+        raise WrapperError("immutable generation commit is invalid")
+    handoff_label = _HANDOFF_LABELS[daemon_argv[1]]
+    _run_preflight(
+        python=python,
+        preflight=code_root / "scripts" / "preflight-lab-runtime.py",
+        root=code_root,
+        expected_commit=expected_commit,
+        git_path=trusted_git,
+        git_identity=trusted_git_identity,
+        deployment_lock_path=lock_path,
+        deployment_lock_fd=lock_fd,
+        handoff_label=handoff_label,
+        daemon_command=daemon_argv[1],
+        immutable_generation=True,
+    )
+    release_module = _load_release_authority(code_root / "src" / "rquant" / "release_generation.py")
+    marker = release_module.ReleaseGenerationAuthority(
+        repo=code_root,
+        immutable_code_root=code_root,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=trusted_git,
+    ).verify(expected_commit=expected_commit, provisional_handoff_label=handoff_label)
+    if Path(marker.venv_path) != generation or Path(marker.python_path) != python:
+        raise WrapperError("selected immutable release generation changed")
+    os.set_inheritable(lock_fd, True)
+    os.execv(
+        python,
+        [
+            str(python),
+            "-I",
+            "-S",
+            str(code_root / "scripts" / "bootstrap-lab-daemon.py"),
+            "--expected-code-root",
+            str(code_root),
+            "--expected-commit",
+            expected_commit,
+            "--expected-runtime-root",
+            str(generation),
+            "--trusted-git-path",
+            str(trusted_git),
+            "--deployment-lock-path",
+            str(lock_path),
+            "--deployment-lock-fd",
+            str(lock_fd),
+            "--expected-launcher",
+            str(launcher),
+            "--provisional-handoff-label",
+            handoff_label,
+            "--",
+            *daemon_argv[1:],
+            "--expected-checkout-root",
+            str(code_root),
+            "--trusted-git-path",
+            str(trusted_git),
+            "--deployment-generation",
+            expected_commit,
+            "--deployment-lock-path",
+            str(lock_path),
+            "--deployment-generation-fd",
+            str(lock_fd),
+            "--deployment-operation-id",
+            marker.operation_id,
+            "--deployment-environment-generation",
+            marker.environment_generation_id,
+        ],
+    )
+    return 1
 
 
 def _load_release_authority(path: Path) -> ModuleType:
@@ -442,12 +586,21 @@ def _selected_release_runtime(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
+    parser.add_argument("--expected-code-root")
+    parser.add_argument("--expected-commit")
     parser.add_argument("--trusted-git-path", required=True)
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     generation_lock_fd = -1
     try:
+        daemon_argv = list(args.daemon_argv)
+        if daemon_argv and daemon_argv[0] == "--":
+            daemon_argv.pop(0)
+        if args.expected_code_root is not None:
+            if args.expected_commit is None:
+                raise WrapperError("immutable generation requires an exact commit")
+            return _immutable_generation_main(args, daemon_argv)
         root, venv, python, runtime_identities = _require_runtime_root(args.expected_checkout_root)
         trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
         for variable in _PYTHON_INJECTION_VARIABLES:
@@ -466,9 +619,6 @@ def main(argv: list[str] | None = None) -> int:
             release_authority_path,
             label="release generation authority",
         )
-        daemon_argv = list(args.daemon_argv)
-        if daemon_argv and daemon_argv[0] == "--":
-            daemon_argv.pop(0)
         executable, executable_identity = _validate_daemon_argv(
             root,
             venv,

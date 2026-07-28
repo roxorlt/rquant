@@ -23,6 +23,7 @@ PREFLIGHT = ROOT / "scripts" / "preflight-lab-runtime.py"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-lab-daemon.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
+CANONICAL_STRICT_JSON = ROOT / "src" / "rquant" / "strict_json.py"
 STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 _ORIGINAL_OS_WALK = os.walk
 
@@ -115,8 +116,8 @@ def _tiny_test_venv(checkout: Path, *, symlink_python: bool = False) -> Path:
     return python
 
 
-def _prepare_fake_lab_runtime(checkout: Path) -> None:
-    runtime = checkout / "data" / "lab-runtime"
+def _prepare_fake_lab_runtime(checkout: Path, *, data_dir: Path | None = None) -> None:
+    runtime = (checkout / "data" if data_dir is None else data_dir) / "lab-runtime"
     runtime.mkdir(parents=True, mode=0o700)
     runtime.chmod(0o700)
     directory_names = {
@@ -187,6 +188,7 @@ def _runtime_checkout(
     symlink_python: bool = False,
     publish_generation: bool = True,
     prepare_runtime: bool = True,
+    runtime_data_dir: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     checkout = tmp_path / "checkout"
     scripts = checkout / "scripts"
@@ -198,6 +200,7 @@ def _runtime_checkout(
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
+    shutil.copy2(CANONICAL_STRICT_JSON, package / CANONICAL_STRICT_JSON.name)
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
         "/.env\n/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
@@ -211,7 +214,8 @@ def _runtime_checkout(
     )
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     dotenv = checkout / ".env"
-    dotenv.write_text(f"DATA_DIR='{checkout / 'data'}'\n", encoding="utf-8")
+    configured_data_dir = checkout / "data" if runtime_data_dir is None else runtime_data_dir
+    dotenv.write_text(f"DATA_DIR='{configured_data_dir}'\n", encoding="utf-8")
     dotenv.chmod(0o600)
     (package / "cli.py").write_text(
         "from __future__ import annotations\n"
@@ -294,7 +298,7 @@ def _runtime_checkout(
         finally:
             os.close(lock_fd)
     if prepare_runtime:
-        _prepare_fake_lab_runtime(checkout)
+        _prepare_fake_lab_runtime(checkout, data_dir=configured_data_dir)
     return checkout, executable, marker
 
 
@@ -423,6 +427,71 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
         str(_deployment_lock_path(checkout).parent / "checkout.venvs")
     )
     assert runtime["prefix"] != str(checkout / ".venv")
+
+
+def test_immutable_generation_wrapper_ignores_mutated_checkout_code(tmp_path: Path) -> None:
+    checkout, _executable, _marker = _runtime_checkout(
+        tmp_path,
+        runtime_data_dir=tmp_path / "runtime-data",
+    )
+    marker = tmp_path / "daemon-after-checkout-removal.json"
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    published = json.loads(
+        marker_path_for_lock(_deployment_lock_path(checkout)).read_text(encoding="utf-8")
+    )
+    generation = Path(str(published["venv_path"]))
+    code_root = generation / "release"
+    checkout.rename(tmp_path / "removed-checkout")
+    environment = os.environ.copy()
+    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
+        environment.pop(variable, None)
+    environment.update(
+        {
+            "LAB_WRAPPER_MARKER": str(marker),
+            "LAB_RUNTIME_IDENTITY_MARKER": str(marker.with_suffix(".runtime.json")),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            str(generation / "bin" / "python"),
+            "-I",
+            "-S",
+            str(code_root / "scripts" / "run-lab-daemon.py"),
+            "--expected-checkout-root",
+            str(code_root),
+            "--expected-code-root",
+            str(code_root),
+            "--expected-commit",
+            commit,
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
+            "--",
+            str(generation / "bin" / "rquant"),
+            "lab-worker",
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ],
+        cwd=code_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(marker.read_text(encoding="utf-8"))[0] == "lab-worker"
 
 
 def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effects(

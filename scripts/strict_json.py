@@ -1,28 +1,16 @@
-"""Strict JSON decoding shared by stdlib-only release authorities."""
+"""Load the canonical strict JSON decoder without importing the rquant package."""
 
 from __future__ import annotations
 
-import json
-from typing import Any
+import importlib.util
+from pathlib import Path
 
+_IMPLEMENTATION = Path(__file__).resolve().parents[1] / "src" / "rquant" / "strict_json.py"
+_SPEC = importlib.util.spec_from_file_location("_rquant_strict_json_impl", _IMPLEMENTATION)
+if _SPEC is None or _SPEC.loader is None:
+    raise RuntimeError("strict JSON implementation cannot be loaded")
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
 
-class StrictJsonError(ValueError):
-    """JSON is syntactically invalid or contains an ambiguous object."""
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise StrictJsonError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def strict_json_loads(payload: str | bytes | bytearray) -> Any:
-    """Decode JSON while rejecting duplicate object keys at every depth."""
-
-    try:
-        return json.loads(payload, object_pairs_hook=_unique_object)
-    except json.JSONDecodeError as exc:
-        raise StrictJsonError(str(exc)) from exc
+StrictJsonError = _MODULE.StrictJsonError
+strict_json_loads = _MODULE.strict_json_loads

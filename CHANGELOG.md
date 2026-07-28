@@ -12,8 +12,18 @@
   clean 40 位 Git SHA 执行分片；新增只读 SQLite 的 `lab-finalizer`，有界聚合 ready job 并仅向
   commit spool 发布结果。三个 daemon 均使用私有单实例进程锁、SIGINT/SIGTERM 协作停止、
   有界 poll/batch 与失败关闭的路径/密钥权限检查。新增三份仅供后续人工安装的 macOS launchd
-  plist（本阶段未 load/bootstrap），固定主 checkout、`Umask=077`、失败重启节流和独立日志；
-  环境模板补齐全部路径、轮换 keyring、worker allowlist 及轮询参数。
+  plist 模板（本阶段未 load/bootstrap），固定不可变 release generation、`Umask=077`、失败重启
+  节流和独立日志；新增幂等 `lab-launchd-install`/`lab-launchd-uninstall`，只从当前已验证 generation
+  原子生成、校验并精确恢复三份 LaunchAgent。环境模板补齐全部路径、轮换 keyring、worker
+  allowlist 及轮询参数；真实 Mac 安装与启动仍留给 P1.5d。
+
+- **Strategy Lab P1.5b 运行权威收口**：release generation 现在封存 exact-SHA 的 `src/rquant`、daemon
+  stdlib bootstrap/preflight、launchd 模板及私有配置副本，daemon 不再从可变 checkout 导入或执行
+  代码。macOS handoff 为每个 label 在 `bootout` 前持久化绑定 operation 的 evidence，崩溃重试只会
+  归因本 operation 已卸载的 label；恢复前逐跳验证物理 supersede 记录与 intent rebound 历史。
+  bootstrap/deployer 在 SIGINT、SIGTERM、timeout 或其他异常下先终止并回收完整子进程组再释放锁。
+  command、claim、report 与 artifact commit/receipt 的全部持久 JSON 入口统一拒绝重复键，损坏记录
+  只能按协议隔离或失败关闭。
 
 - **Strategy Lab durable job center typed backend foundation**：`LabJobReader` 新增只读、稳定
   keyset 分页的任务筛选和有界详情聚合，统一返回进度、phase、心跳陈旧、首个 accepted failure、

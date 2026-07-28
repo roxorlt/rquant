@@ -1360,3 +1360,64 @@ def test_symlink_load_identity_prevents_quarantine_of_replacement(tmp_path: Path
     assert symlink.read_text(encoding="utf-8") == "replacement"
     assert victim.read_text(encoding="utf-8") == "external"
     assert tuple(spool.quarantine_dir.glob("*.symlink.bad.json")) == ()
+
+
+def test_command_spool_rejects_duplicate_keys_in_pending_and_ack(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    envelope = _submit_envelope()
+    pending = spool.publish(envelope)
+    pending.path.write_bytes(
+        pending.path.read_bytes().replace(
+            b'"schema_version":1',
+            b'"schema_version":999,"schema_version":1',
+            1,
+        )
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        spool.load(pending.path)
+
+    pending.path.write_bytes(envelope.model_dump_json().encode("utf-8"))
+    receipt = LabCommandReceipt(
+        request_id=envelope.request_id,
+        content_hash=envelope.content_hash,
+        job_id=envelope.command.job_id,
+        status="applied",
+        reason="submitted",
+        job_version=0,
+    )
+    acknowledged = spool.ack(spool.load(pending.path), receipt)
+    acknowledged.path.write_bytes(
+        acknowledged.path.read_bytes().replace(
+            b'"status":"applied"',
+            b'"status":"rejected","status":"applied"',
+            1,
+        )
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        spool.load_receipt(acknowledged.path)
+
+
+def test_command_spool_rejects_nested_duplicate_key_during_quarantine_scan(
+    tmp_path: Path,
+) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    envelope = _submit_envelope()
+    pending = spool.publish(envelope)
+    pending.path.write_bytes(
+        pending.path.read_bytes().replace(
+            b'"command_type":"submit"',
+            b'"command_type":"cancel","command_type":"submit"',
+            1,
+        )
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(pending.path)
+    quarantined = spool.quarantine(
+        captured.value.file_identity or pending.path,
+        reason="duplicate_json_key",
+    )
+    assert quarantined.path.exists()
+    assert spool.pending() == ()

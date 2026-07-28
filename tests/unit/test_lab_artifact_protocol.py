@@ -1664,3 +1664,63 @@ def test_commit_conflict_retention_bounds_legacy_partial_files_without_touching_
     assert outside.read_text(encoding="utf-8") == "keep"
     assert lookalike.read_text(encoding="utf-8") == "unowned"
     assert len(bounded.conflict_evidence()) == 1
+
+
+def test_artifact_commit_spool_rejects_duplicate_keys_in_pending_and_ack(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "commits")
+    envelope = _envelope(tmp_path)
+    pending = spool.publish(envelope)
+    assert isinstance(pending, LabArtifactCommitSpoolEntry)
+    pending.path.write_bytes(
+        pending.path.read_bytes().replace(
+            b'"schema_version":2',
+            b'"schema_version":999,"schema_version":2',
+            1,
+        )
+    )
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        spool.load(pending.path)
+
+    pending.path.write_bytes(envelope.model_dump_json().encode("utf-8"))
+    receipt = LabArtifactCommitReceipt(
+        request_id=envelope.request_id,
+        content_hash=envelope.content_hash,
+        job_id=envelope.commit.job_id,
+        status="accepted",
+        reason="complete",
+        accepted_at=datetime(2026, 7, 29, tzinfo=UTC),
+    )
+    acknowledged = spool.ack(spool.load(pending.path), receipt)
+    acknowledged.path.write_bytes(
+        acknowledged.path.read_bytes().replace(
+            b'"status":"accepted"',
+            b'"status":"rejected","status":"accepted"',
+            1,
+        )
+    )
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        spool.load_receipt(acknowledged.path)
+
+
+def test_artifact_cursor_recovery_rejects_nested_duplicate_keys(tmp_path: Path) -> None:
+    root = tmp_path / "commits"
+    spool = LabArtifactCommitSpool(root)
+    pending = spool.publish(_envelope(tmp_path))
+    assert isinstance(pending, LabArtifactCommitSpoolEntry)
+    assert spool.fair_pending_paths(limit=1) == (pending.path,)
+    cursor = spool._scan_cursor_path
+    cursor.write_bytes(
+        cursor.read_bytes().replace(
+            b'"schema_version":1',
+            b'"schema_version":999,"schema_version":1',
+            1,
+        )
+    )
+
+    restarted = LabArtifactCommitSpool(root)
+
+    assert restarted.fair_pending_paths(limit=1) == (pending.path,)
+    isolated = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
+    assert len(isolated) == 1

@@ -311,6 +311,7 @@ def _read_bound_private_file(
     maximum_bytes: int | None,
     private_parent: bool,
     missing_ok: bool = False,
+    allowed_modes: frozenset[int] = frozenset({0o600}),
 ) -> tuple[bytes | None, os.stat_result | None]:
     parent = path.parent
     try:
@@ -352,10 +353,10 @@ def _read_bound_private_file(
             not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != os.getuid()
             or opened.st_nlink != 1
-            or stat.S_IMODE(opened.st_mode) != 0o600
+            or stat.S_IMODE(opened.st_mode) not in allowed_modes
             or (maximum_bytes is not None and opened.st_size > maximum_bytes)
         ):
-            raise PreflightError(f"{label} must be an owned physical 0600 file")
+            raise PreflightError(f"{label} must be an owned physical private file")
         payload: bytes | None = None
         if maximum_bytes is not None:
             chunks: list[bytes] = []
@@ -386,13 +387,14 @@ def _read_bound_private_file(
         os.close(root_fd)
 
 
-def _dotenv_values(path: Path) -> dict[str, str]:
+def _dotenv_values(path: Path, *, immutable: bool = False) -> dict[str, str]:
     encoded, _identity_value = _read_bound_private_file(
         path,
         label="checkout .env",
         maximum_bytes=1024 * 1024,
         private_parent=False,
         missing_ok=True,
+        allowed_modes=frozenset({0o400}) if immutable else frozenset({0o600}),
     )
     if encoded is None:
         return {}
@@ -472,10 +474,12 @@ def _verify_prepared_lab_runtime(
     checkout: Path,
     *,
     daemon_command: str,
+    bind_checkout: bool = True,
+    immutable_config: bool = False,
 ) -> None:
     if daemon_command == "lab-runtime-prepare":
         return
-    values = _dotenv_values(checkout / ".env")
+    values = _dotenv_values(checkout / ".env", immutable=immutable_config)
     data_dir = _configured_path(values, "DATA_DIR", None, label="DATA_DIR")
     runtime_root = _configured_path(
         values,
@@ -502,7 +506,7 @@ def _verify_prepared_lab_runtime(
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != LAB_RUNTIME_PREPARED_SCHEMA_VERSION
-        or payload.get("checkout_root") != str(checkout)
+        or (bind_checkout and payload.get("checkout_root") != str(checkout))
         or payload.get("runtime_root") != str(runtime_root)
         or payload.get("runtime_device") != root_identity.st_dev
         or payload.get("runtime_inode") != root_identity.st_ino
@@ -609,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python-path")
     parser.add_argument("--provisional-handoff-label")
     parser.add_argument("--prepared-sentinel-only", action="store_true")
+    parser.add_argument("--immutable-generation", action="store_true")
     parser.add_argument(
         "--lab-daemon-command",
         choices=("lab-scheduler", "lab-worker", "lab-finalizer", "lab-runtime-prepare"),
@@ -621,6 +626,8 @@ def main(argv: list[str] | None = None) -> int:
             _verify_prepared_lab_runtime(
                 checkout,
                 daemon_command=args.lab_daemon_command,
+                bind_checkout=not args.immutable_generation,
+                immutable_config=args.immutable_generation,
             )
             print("Lab runtime preflight: verified prepared sentinel")
             return 0
@@ -640,7 +647,30 @@ def main(argv: list[str] | None = None) -> int:
         _verify_prepared_lab_runtime(
             checkout,
             daemon_command=args.lab_daemon_command,
+            bind_checkout=not args.immutable_generation,
+            immutable_config=args.immutable_generation,
         )
+        if args.immutable_generation:
+            lock_path = Path(args.deployment_lock_path)
+            _assert_generation_lock(lock_path, args.deployment_lock_fd)
+            try:
+                _load_release_authority(
+                    checkout / "src" / "rquant" / "release_generation.py"
+                ).ReleaseGenerationAuthority(
+                    repo=checkout,
+                    immutable_code_root=checkout,
+                    lock_path=lock_path,
+                    lock_fd=args.deployment_lock_fd,
+                    python_path=Path(args.python_path),
+                    git_path=git_path,
+                ).verify(
+                    expected_commit=args.expected_commit,
+                    provisional_handoff_label=args.provisional_handoff_label,
+                )
+            except Exception as exc:
+                raise PreflightError(f"release generation marker is invalid: {exc}") from exc
+            print("Lab runtime preflight: verified immutable release generation")
+            return 0
         checkout = _checkout_root(
             args.checkout_root,
             git_path=git_path,

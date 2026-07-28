@@ -1336,3 +1336,51 @@ print(entry.path.name)
     assert tuple(int(entry.path.name.split("-", 1)[0]) for entry in pending) == tuple(
         sorted(int(name.split("-", 1)[0]) for name in names)
     )
+
+
+def test_claim_and_report_spools_reject_duplicate_keys_in_pending_and_receipts(
+    tmp_path: Path,
+) -> None:
+    claim_spool = LabClaimSpool(tmp_path / "claims")
+    claim = _claim()
+    claim_entry = claim_spool.publish(claim)
+    claim_entry.path.write_bytes(
+        claim_entry.path.read_bytes().replace(
+            b'"schema_version":1',
+            b'"schema_version":999,"schema_version":1',
+            1,
+        )
+    )
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        claim_spool.load(claim_entry.path)
+
+    report_spool = LabReportSpool(tmp_path / "reports")
+    report = _report(claim, LabShardHeartbeat(lease_extension_seconds=10))
+    report_entry = report_spool.publish(report)
+    report_entry.path.write_bytes(
+        report_entry.path.read_bytes().replace(
+            b'"report_type":"heartbeat"',
+            b'"report_type":"shard_failed","report_type":"heartbeat"',
+            1,
+        )
+    )
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        report_spool.load(report_entry.path)
+
+    report_entry.path.write_bytes(report.canonical_json().encode("utf-8"))
+    receipt = LabReportReceipt.from_report(
+        report,
+        status="accepted",
+        reason="heartbeat_extended",
+        accepted_at=NOW + timedelta(seconds=6),
+    )
+    acknowledged = report_spool.ack(report_spool.load(report_entry.path), receipt)
+    acknowledged.path.write_bytes(
+        acknowledged.path.read_bytes().replace(
+            b'"status":"accepted"',
+            b'"status":"rejected","status":"accepted"',
+            1,
+        )
+    )
+    with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
+        report_spool.load_receipt(acknowledged.path)
