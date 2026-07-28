@@ -9,7 +9,7 @@ from typing import Any, Protocol, TypeVar
 
 class StrictJsonModel(Protocol):
     @classmethod
-    def model_validate(cls, value: object) -> StrictJsonModel: ...
+    def model_validate_json(cls, value: str | bytes | bytearray) -> StrictJsonModel: ...
 
 
 ModelT = TypeVar("ModelT", bound=StrictJsonModel)
@@ -50,4 +50,12 @@ def strict_json_loads(
 def strict_model_validate_json(model: type[ModelT], payload: str | bytes | bytearray) -> ModelT:
     """Strictly decode one persistent JSON record before Pydantic validation."""
 
-    return model.model_validate(strict_json_loads(payload))
+    decoded = strict_json_loads(payload)
+    canonical = json.dumps(
+        decoded,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return model.model_validate_json(canonical)

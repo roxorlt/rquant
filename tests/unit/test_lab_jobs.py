@@ -2292,6 +2292,159 @@ def test_get_job_and_list_shards_reject_the_same_corrupt_shard_rows_without_mode
         reader.list_shards(job.job_id)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "parameters"),
+    [
+        ("payload_json = ?", ('{"hold_days":"bad","hold_days":1}',)),
+        (
+            "status = 'failed', failure_json = ?, finished_at = ?",
+            ('{"reason":false,"reason":"failed"}', NOW.isoformat(timespec="microseconds")),
+        ),
+        (
+            "status = 'checkpointed', checkpoint_json = ?",
+            ('{"cursor":{"page":false,"page":1}}',),
+        ),
+    ],
+)
+def test_shard_udf_and_readers_reject_duplicate_persisted_json_keys(
+    tmp_path: Path,
+    mutation: str,
+    parameters: tuple[object, ...],
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="n-shape-replay",
+        adapter_version="v1",
+        plan_hash="a" * 64,
+        payload_json='{"hold_days":1}',
+        work_plan=LabShardWorkPlan(
+            phase="strategy_replay",
+            work_unit_name="parameter_case",
+            work_units=1,
+            static_duration_ms=1_000,
+        ),
+    )
+    shard = store.plan_job(
+        job.job_id,
+        (definition,),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )[0]
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE lab_shard SET {mutation} WHERE shard_id = ?",
+            (*parameters, str(shard.shard_id)),
+        )
+
+    reader = LabJobReader(store.path)
+    with pytest.raises(InvalidStoredJobError):
+        reader.get_job(job.job_id)
+    with pytest.raises(InvalidStoredJobError):
+        reader.list_shards(job.job_id)
+
+
+def test_job_reader_rejects_duplicate_spec_keys_even_when_second_value_is_valid(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    valid = job.spec.model_dump_json(round_trip=True)
+    duplicate = valid.replace(
+        '"schema_version":2',
+        '"schema_version":false,"schema_version":2',
+        1,
+    )
+    with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        connection.execute(
+            "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+            (duplicate, str(job.job_id)),
+        )
+
+    reader = LabJobReader(store.path)
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        reader.get_job(job.job_id)
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        reader.list_jobs()
+
+
+@pytest.mark.parametrize("column", ("command_json", "receipt_json"))
+def test_command_reader_and_replay_reject_nested_duplicate_persisted_json(
+    tmp_path: Path,
+    column: str,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    envelope = _submit()
+    store.apply_command(envelope, lease=lease, now=NOW)
+    with sqlite3.connect(store.path) as connection:
+        stored = str(
+            connection.execute(
+                f"SELECT {column} FROM lab_command WHERE request_id = ?",
+                (str(envelope.request_id),),
+            ).fetchone()[0]
+        )
+        if column == "command_json":
+            duplicate = stored.replace(
+                '"schema_version":1',
+                '"schema_version":false,"schema_version":1',
+                1,
+            )
+        else:
+            duplicate = stored.replace(
+                '"job_version":0',
+                '"job_version":false,"job_version":0',
+                1,
+            )
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE lab_command SET {column} = ? WHERE request_id = ?",
+            (duplicate, str(envelope.request_id)),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="stored lab command"):
+        LabJobReader(store.path).get_command(envelope.request_id)
+    with pytest.raises(InvalidStoredJobError, match="stored lab command"):
+        store.apply_command(envelope, lease=lease, now=NOW + timedelta(seconds=1))
+
+
+def test_shard_udf_and_readers_reject_noncanonical_payload_bytes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="n-shape-replay",
+        adapter_version="v1",
+        plan_hash="a" * 64,
+        payload_json='{"hold_days":1}',
+        work_plan=LabShardWorkPlan(
+            phase="strategy_replay",
+            work_unit_name="parameter_case",
+            work_units=1,
+            static_duration_ms=1_000,
+        ),
+    )
+    shard = store.plan_job(job.job_id, (definition,), lease=lease, now=NOW)[0]
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_shard SET payload_json = ? WHERE shard_id = ?",
+            ('{ "hold_days": 1 }', str(shard.shard_id)),
+        )
+
+    reader = LabJobReader(store.path)
+    with pytest.raises(InvalidStoredJobError):
+        reader.get_job(job.job_id)
+    with pytest.raises(InvalidStoredJobError):
+        reader.list_shards(job.job_id)
+
+
 def test_new_v1_submit_is_durably_rejected_and_replays_same_receipt(tmp_path: Path) -> None:
     store = _store(tmp_path)
     lease = _lease(store)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import ctypes
 import fcntl
 import hashlib
 import importlib.util
@@ -15,6 +16,7 @@ import re
 import secrets
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -468,9 +470,10 @@ def _acquire_lock(
                 fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise
-                time.sleep(0.05)
+                time.sleep(min(0.05, remaining))
         os.set_inheritable(descriptor, True)
         return descriptor
     except BlockingIOError as exc:
@@ -567,15 +570,124 @@ def _launchctl(
     timeout_seconds: float,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        result = _run_process_group(
             ["/bin/launchctl", *arguments],
-            check=check,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+            cwd=Path("/"),
+            timeout_seconds=timeout_seconds,
         )
+        if check and result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                result.args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("Lab launchd handoff command failed") from exc
+
+
+def _descendant_processes(root_pid: int, *, timeout_seconds: float) -> set[int]:
+    if timeout_seconds <= 0:
+        raise TimeoutError("process containment deadline expired")
+    deadline = time.monotonic() + timeout_seconds
+    children: dict[int, set[int]] = {}
+    if sys.platform == "darwin":
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            libproc.proc_listallpids.restype = ctypes.c_int
+            libproc.proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            libproc.proc_pidinfo.restype = ctypes.c_int
+            capacity = max(256, libproc.proc_listallpids(None, 0) * 2)
+            pids = (ctypes.c_int * capacity)()
+            count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+            if count < 0:
+                raise OSError(ctypes.get_errno(), "proc_listallpids")
+            for pid in pids[:count]:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("process descendant inventory timed out")
+                buffer = ctypes.create_string_buffer(256)
+                size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
+                if size < 16:
+                    continue
+                _flags, _status, _xstatus, observed_pid, parent = struct.unpack_from(
+                    "=IIIII", buffer.raw
+                )
+                if observed_pid == pid:
+                    children.setdefault(parent, set()).add(pid)
+        except (OSError, ValueError) as exc:
+            raise DeployBootstrapError("process descendant inventory failed") from exc
+    elif sys.platform.startswith("linux"):
+        try:
+            for entry in Path("/proc").iterdir():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("process descendant inventory timed out")
+                if not entry.name.isdigit():
+                    continue
+                stat_fields = (entry / "stat").read_text(encoding="ascii").split()
+                if len(stat_fields) > 3:
+                    children.setdefault(int(stat_fields[3]), set()).add(int(entry.name))
+        except OSError as exc:
+            raise DeployBootstrapError("process descendant inventory failed") from exc
+    else:
+        raise DeployBootstrapError("process descendant inventory is unsupported on this platform")
+    descendants: set[int] = set()
+    pending = list(children.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children.get(pid, ()))
+    return descendants
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    descendants: set[int],
+    *,
+    deadline: float,
+) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        descendants.update(_descendant_processes(process.pid, timeout_seconds=min(0.5, remaining)))
+    for pid in sorted(descendants, reverse=True):
+        with suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DeployBootstrapError("process containment deadline expired before reap")
+    try:
+        process.communicate(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        raise DeployBootstrapError("process group could not be reaped") from exc
+    while descendants:
+        alive: set[int] = set()
+        for pid in descendants:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError as exc:
+                raise DeployBootstrapError(
+                    "process descendant containment is unverifiable"
+                ) from exc
+            alive.add(pid)
+        if not alive:
+            return
+        if time.monotonic() >= deadline:
+            raise DeployBootstrapError("detached process descendants survived cleanup")
+        descendants = alive
+        time.sleep(min(0.01, deadline - time.monotonic()))
 
 
 def _run_process_group(
@@ -608,26 +720,34 @@ def _run_process_group(
         except ValueError:
             break
         previous_handlers[signum] = previous
+    hard_deadline = time.monotonic() + timeout_seconds
+    cleanup_reserve = min(0.25, max(0.02, timeout_seconds * 0.25))
+    execution_deadline = hard_deadline - cleanup_reserve
+    descendants: set[int] = set()
     caught_signal: _ProcessGroupSignal | None = None
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        while True:
+            remaining = execution_deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(arguments, timeout_seconds)
+            descendants.update(
+                _descendant_processes(process.pid, timeout_seconds=min(0.2, remaining))
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= execution_deadline:
+                    raise
     except subprocess.TimeoutExpired:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        _terminate_process_tree(process, descendants, deadline=hard_deadline)
         raise
     except _ProcessGroupSignal as exc:
         caught_signal = exc
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with suppress(OSError, subprocess.SubprocessError):
-            process.communicate(timeout=5)
+        _terminate_process_tree(process, descendants, deadline=hard_deadline)
         stdout = stderr = ""
     except BaseException:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with suppress(OSError, subprocess.SubprocessError):
-            process.communicate(timeout=5)
+        _terminate_process_tree(process, descendants, deadline=hard_deadline)
         raise
     finally:
         for signum, previous in previous_handlers.items():
@@ -1258,7 +1378,10 @@ def _validate_physical_handoff_chain(
         ):
             raise DeployBootstrapError("deployment intent handoff operation changed")
         try:
-            validation_intent = intent.rebind_handoff(
+            rebound_base = intent
+            if intent.stage_history[-1]["stage"] != "recovery_started":
+                rebound_base = intent.advance(stage="recovery_started")
+            validation_intent = rebound_base.rebind_handoff(
                 handoff_operation_id=current.operation_id,
                 handoff_labels=tuple(current.labels),
             )
@@ -1853,6 +1976,60 @@ def _validate_superseded_handoff_binding(
         raise DeployBootstrapError("superseded Lab handoff binding changed")
 
 
+def _persist_rebound_handoff_intent(
+    *,
+    root: Path,
+    lock_path: Path,
+    predecessor_operation_id: str,
+    successor_operation_id: str,
+    release_profile: str,
+    lifecycle_mode: str,
+) -> object:
+    authority_module, intent = _typed_deployment_intent_for_handoff(
+        root=root,
+        lock_path=lock_path,
+        expected_handoff_operation_id=None,
+        release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
+        allow_prepared=True,
+        prefer_prepared=os.path.lexists(
+            lock_path.with_name(f"{lock_path.stem}.intent.prepared.json")
+        ),
+    )
+    if intent.handoff_operation_id == successor_operation_id:
+        return intent
+    if intent.handoff_operation_id != predecessor_operation_id:
+        raise DeployBootstrapError("deployment intent rebound predecessor changed")
+    try:
+        if intent.stage_history[-1]["stage"] != "recovery_started":
+            intent = intent.advance(stage="recovery_started")
+        rebound = intent.rebind_handoff(
+            handoff_operation_id=successor_operation_id,
+            handoff_labels=tuple(LAB_LAUNCHD_LABELS),
+        )
+    except authority_module.ReleaseGenerationError as exc:
+        raise DeployBootstrapError("deployment intent handoff rebound is invalid") from exc
+    prepared_path = lock_path.with_name(f"{lock_path.stem}.intent.prepared.json")
+    intent_path = (
+        prepared_path
+        if os.path.lexists(prepared_path)
+        else lock_path.with_name(f"{lock_path.stem}.intent.json")
+    )
+    _atomic_private_json(intent_path, asdict(rebound))
+    _verified_module, verified = _typed_deployment_intent_for_handoff(
+        root=root,
+        lock_path=lock_path,
+        expected_handoff_operation_id=successor_operation_id,
+        release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
+        allow_prepared=True,
+        prefer_prepared=intent_path == prepared_path,
+    )
+    if asdict(verified) != asdict(rebound):
+        raise DeployBootstrapError("deployment intent handoff rebound did not persist")
+    return verified
+
+
 def _superseding_handoff_operation_id(
     *,
     root: Path,
@@ -1900,6 +2077,16 @@ def _superseding_handoff_operation_id(
         intent=intent,
         allow_pending_rebind=True,
     )
+    if validation_intent != intent:
+        validation_intent = _persist_rebound_handoff_intent(
+            root=root,
+            lock_path=lock_path,
+            predecessor_operation_id=str(intent.handoff_operation_id),
+            successor_operation_id=operation_id,
+            release_profile=release_profile,
+            lifecycle_mode=lifecycle_mode,
+        )
+        intent = validation_intent
     _validate_superseded_handoff_binding(
         payload=payload,
         intent=validation_intent,
@@ -2020,6 +2207,9 @@ class _LabLaunchdHandoff:
 
     def _after_label_transition_stage(self, _stage: str, _label: str) -> None:
         """Fault-injection boundary for one durable launchd label transition."""
+
+    def _after_handoff_successor_published(self) -> None:
+        """Fault-injection boundary before the matching intent rebound."""
 
     def _materialize_prepared_root(self) -> None:
         if not self.supersedes_operation_id:
@@ -2319,6 +2509,14 @@ class _LabLaunchdHandoff:
                 )
                 for label in LAB_LAUNCHD_LABELS
             }
+            if action in {"resume", "rollback"} and not self.supersedes_operation_id:
+                self.supersedes_operation_id = _superseding_handoff_operation_id(
+                    root=self.root,
+                    lock_path=self.lock_path,
+                    recovery_action=action,
+                    release_profile=self.release_profile,
+                    lifecycle_mode=self.lifecycle_mode,
+                )
         if dry_run:
             if self.enabled:
                 loaded = [label for label in LAB_LAUNCHD_LABELS if self._is_loaded(label)]
@@ -2364,6 +2562,8 @@ class _LabLaunchdHandoff:
                 self.prepared_intent_operation_id = prepared_operation
                 self.operation_id = effective_handoff_operation
             self._record("stopping" if self.stopped else "planned")
+            if self.supersedes_operation_id:
+                self._after_handoff_successor_published()
         elif prepare_intent is not None:
             prepared_operation, effective_handoff_operation = prepare_intent(
                 self.operation_id,
@@ -2372,6 +2572,15 @@ class _LabLaunchdHandoff:
             if effective_handoff_operation != self.operation_id:
                 raise DeployBootstrapError("prepared deployment handoff operation changed")
             self.prepared_intent_operation_id = prepared_operation
+        if self.supersedes_operation_id:
+            _persist_rebound_handoff_intent(
+                root=self.root,
+                lock_path=self.lock_path,
+                predecessor_operation_id=self.supersedes_operation_id,
+                successor_operation_id=self.operation_id,
+                release_profile=self.release_profile,
+                lifecycle_mode=self.lifecycle_mode,
+            )
         for label, plist in self.plists.items():
             _physical_file(plist, label=f"Lab launchd plist {label}")
             physically_loaded = self._is_loaded(label)
@@ -3715,17 +3924,6 @@ def main(argv: list[str] | None = None) -> int:
             if dry_run and (args.initialize_generation or args.recover_generation):
                 raise DeployBootstrapError("generation initialization/recovery cannot be a dry-run")
             if not (args.initialize_generation or args.register_lab_installation):
-                supersedes_operation_id = (
-                    _superseding_handoff_operation_id(
-                        root=root,
-                        lock_path=lock_path,
-                        recovery_action=handoff_action,
-                        release_profile=args.release_profile,
-                        lifecycle_mode=args.lab_lifecycle_mode,
-                    )
-                    if args.recover_generation and installed_handoff
-                    else ""
-                )
                 handoff = _LabLaunchdHandoff(
                     root=root,
                     lock_path=lock_path,
@@ -3734,7 +3932,7 @@ def main(argv: list[str] | None = None) -> int:
                     overall_deadline_monotonic=overall_deadline_monotonic,
                     release_profile=args.release_profile,
                     lifecycle_mode=args.lab_lifecycle_mode,
-                    supersedes_operation_id=supersedes_operation_id,
+                    supersedes_operation_id="",
                 )
                 prepare_intent = None
                 if handoff.enabled and handoff_action == "deploy" and not dry_run:

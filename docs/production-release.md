@@ -57,8 +57,10 @@
    记为 `aborted`；它绝不写 completed proof。若崩溃发生在首个 handoff record 前，仅存的
    `.intent.prepared.json` 仍是正式恢复入口：显式 resume/rollback 会在 handoff 锁内幂等物化原始
    `deploy/planned` 根记录，再由 deployer 原子晋升 intent。所有 authority JSON 都拒绝重复键。
-   接管前还必须确认旧 operation id 正是 intent 当前记录的 `handoff_operation_id`；验证通过后 deployer
-   才能把 intent rebind 到新 operation。完成 handoff 的 proof、operation record 与 stable record 若因
+   接管前还必须确认旧 operation id 正是 intent 当前记录的 `handoff_operation_id`；bootstrap 在仍持
+   handoff 锁且首个 bootout 之前验证 exact successor 与完整物理链，原子 rebind intent 并重读确认，
+   deployer 只消费该持久 binding。相反 action 重试因此会形成 A→B→C，而不会把历史压成 A→C。
+   完成 handoff 的 proof、operation record 与 stable record 若因
    崩溃只写入一部分，下次发布会在锁内验证全 binding 后幂等补齐；不一致 proof 一律阻断。显式
    resume/rollback 自身的 readiness 失败时，rollback 会沿已验证的 supersede 链停止 target daemon、
    恢复 previous generation 并重新验收旧 daemon。
@@ -203,8 +205,13 @@ bash scripts/deploy-production.sh \
 ```
 
 安装器会从 active immutable generation 内的模板原子 materialize 三份 `0600` plist，运行
-`plistlib`/`plutil` 校验，随后按 label bootout/bootstrap/kickstart；复跑相同 generation 幂等，失败
-恢复旧 plist。P1.5b 只交付并测试了该能力，**尚未在本机安装或加载**；P1.5d 才执行上述命令并做
+`plistlib`/`plutil` 校验。它先以独立 installation/handoff transaction lock 和已登记 installation
+identity 串行化，bootout 原 loaded label 并确认其 generation shared lock 已释放，之后才取得
+generation exclusive lock。每个 plist 与 local/registered state 的原 inode 都通过同文件系统
+quarantine rename 和 fsync journal 保护；任一写入、bootstrap、kickstart 或 bootout 失败都会恢复
+原 bytes/inode、两份状态与精确 loaded 集合。未登记的同名 plist 即使内容合法、权限为 `0600` 也
+视为 foreign file，绝不覆盖。复跑相同 generation 幂等，成功卸载则同时移除 local 与 registered
+installation authority，重新安装前必须重新登记。P1.5b 只交付并测试了该能力，**尚未在本机安装或加载**；P1.5d 才执行上述命令并做
 真实 launchd readiness/rollback 演练。初始化和登记模式不要求
 launchd 已安装或 loaded；常规 `macos-lab + installed` 发布则反过来强制 installation state 与三个
 label 都存在。installed dry-run 同样逐个只读核对三个 label 已 loaded 以及 installation、runtime、

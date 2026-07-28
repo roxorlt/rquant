@@ -1381,7 +1381,22 @@ def _trusted_executable_binding(path: Path, *, label: str) -> dict[str, object]:
     }
 
 
-def _git_output(repo: Path, git_path: Path, *arguments: str) -> str:
+def _blocking_timeout(
+    cap_seconds: float,
+    timeout_provider: Callable[[float], float] | None,
+) -> float:
+    timeout = cap_seconds if timeout_provider is None else timeout_provider(cap_seconds)
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > cap_seconds:
+        raise ReleaseGenerationError("release generation command timeout is invalid")
+    return timeout
+
+
+def _git_output(
+    repo: Path,
+    git_path: Path,
+    *arguments: str,
+    timeout_provider: Callable[[float], float] | None = None,
+) -> str:
     try:
         result = subprocess.run(
             [str(git_path), *arguments],
@@ -1389,7 +1404,7 @@ def _git_output(repo: Path, git_path: Path, *arguments: str) -> str:
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_blocking_timeout(10, timeout_provider),
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1397,7 +1412,12 @@ def _git_output(repo: Path, git_path: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def _assert_tracked_clean(repo: Path, git_path: Path) -> None:
+def _assert_tracked_clean(
+    repo: Path,
+    git_path: Path,
+    *,
+    timeout_provider: Callable[[float], float] | None = None,
+) -> None:
     try:
         status = subprocess.run(
             [str(git_path), "status", "--porcelain=v1", "--untracked-files=no"],
@@ -1405,7 +1425,7 @@ def _assert_tracked_clean(repo: Path, git_path: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_blocking_timeout(10, timeout_provider),
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
         diff = subprocess.run(
@@ -1414,7 +1434,7 @@ def _assert_tracked_clean(repo: Path, git_path: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_blocking_timeout(10, timeout_provider),
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1475,9 +1495,18 @@ def _materialize_release_code(
     expected_commit: str,
     destination: Path,
     checkpoint: Callable[[], None],
+    timeout_provider: Callable[[float], float] | None = None,
 ) -> None:
     """Extract a non-recursive exact-commit runtime payload into a private generation."""
-    listing = _git_output(repo, git_path, "ls-tree", "-r", "--name-only", expected_commit)
+    listing = _git_output(
+        repo,
+        git_path,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        expected_commit,
+        timeout_provider=timeout_provider,
+    )
     members = tuple(path for path in listing.splitlines() if _release_code_member(path))
     required = {"pyproject.toml", "uv.lock"}
     if not required.issubset(members) or not any(
@@ -1491,7 +1520,7 @@ def _materialize_release_code(
             cwd=repo,
             check=True,
             capture_output=True,
-            timeout=30,
+            timeout=_blocking_timeout(30, timeout_provider),
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1540,7 +1569,11 @@ def _materialize_release_code(
     checkpoint()
 
 
-def _python_facts(python_path: Path) -> tuple[str, str]:
+def _python_facts(
+    python_path: Path,
+    *,
+    timeout_provider: Callable[[float], float] | None = None,
+) -> tuple[str, str]:
     program = (
         "import json,sys,sysconfig;"
         "print(json.dumps({'version': '.'.join(map(str, sys.version_info[:3])),"
@@ -1553,7 +1586,7 @@ def _python_facts(python_path: Path) -> tuple[str, str]:
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_blocking_timeout(10, timeout_provider),
         )
         payload = strict_json_loads(result.stdout)
         version = str(payload["version"])
@@ -1583,7 +1616,11 @@ def _verified_interpreter(path: Path, *, label: str) -> tuple[Path, PathIdentity
     return resolved, PathIdentity.capture(observed), _hash_file(resolved, label=label)
 
 
-def _venv_system_interpreter(python_path: Path) -> tuple[Path, PathIdentity, str]:
+def _venv_system_interpreter(
+    python_path: Path,
+    *,
+    timeout_provider: Callable[[float], float] | None = None,
+) -> tuple[Path, PathIdentity, str]:
     try:
         result = subprocess.run(
             [
@@ -1596,7 +1633,7 @@ def _venv_system_interpreter(python_path: Path) -> tuple[Path, PathIdentity, str
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_blocking_timeout(10, timeout_provider),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReleaseGenerationError("deployment system Python cannot be discovered") from exc
@@ -1889,6 +1926,7 @@ def _private_tree_size(
     system_python_identity: PathIdentity,
     system_python_sha256: str,
     checkpoint: Callable[[], None] | None = None,
+    timeout_provider: Callable[[float], float] | None = None,
 ) -> int:
     total = 0
     for current_root, directory_names, file_names in os.walk(root):
@@ -1917,6 +1955,7 @@ def _private_tree_size(
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
                     checkpoint=checkpoint,
+                    timeout_provider=timeout_provider,
                 )
                 continue
             if stat.S_ISREG(observed.st_mode):
@@ -2005,13 +2044,17 @@ def _environment_entry(
     system_python_identity: PathIdentity,
     system_python_sha256: str,
     checkpoint: Callable[[], None] | None = None,
+    timeout_provider: Callable[[float], float] | None = None,
 ) -> dict[str, Any]:
     if checkpoint is not None:
         checkpoint()
     observed = path.lstat()
     relative = path.relative_to(root).as_posix()
     if stat.S_ISLNK(observed.st_mode):
-        version, _abi = _python_facts(system_python)
+        version, _abi = _python_facts(
+            system_python,
+            timeout_provider=timeout_provider,
+        )
         major_minor = ".".join(version.split(".")[:2])
         allowed = _VENV_RELATIVE_SYMLINKS | {
             "bin/python",
@@ -2089,6 +2132,7 @@ def _freeze_environment(
     system_python_identity: PathIdentity,
     system_python_sha256: str,
     checkpoint: Callable[[], None] | None = None,
+    timeout_provider: Callable[[float], float] | None = None,
 ) -> None:
     for current_root, directory_names, file_names in os.walk(root, topdown=False):
         if checkpoint is not None:
@@ -2106,6 +2150,7 @@ def _freeze_environment(
                     system_python=system_python,
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
+                    timeout_provider=timeout_provider,
                 )
                 continue
             if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
@@ -2123,6 +2168,7 @@ def _freeze_environment(
                     system_python=system_python,
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
+                    timeout_provider=timeout_provider,
                 )
                 continue
             if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
@@ -2177,11 +2223,13 @@ def _environment_manifest(
     system_python_sha256: str,
     uv_binding: dict[str, object] | None,
     checkpoint: Callable[[], None] | None = None,
+    timeout_provider: Callable[[float], float] | None = None,
 ) -> dict[str, Any]:
     entry_arguments = {
         "system_python": system_python,
         "system_python_identity": system_python_identity,
         "system_python_sha256": system_python_sha256,
+        "timeout_provider": timeout_provider,
     }
     entries = [_environment_entry(root, root, checkpoint=checkpoint, **entry_arguments)]
     paths: list[Path] = []
@@ -2215,6 +2263,7 @@ def _verify_environment_manifest(
     manifest: dict[str, Any],
     *,
     checkpoint: Callable[[], None] | None = None,
+    timeout_provider: Callable[[float], float] | None = None,
 ) -> None:
     if int(manifest.get("schema_version", 0)) != ENVIRONMENT_SCHEMA_VERSION or manifest.get(
         "environment_path"
@@ -2276,6 +2325,7 @@ def _verify_environment_manifest(
             system_python_identity=system_identity,
             system_python_sha256=system_sha256,
             checkpoint=checkpoint,
+            timeout_provider=timeout_provider,
         )
         if observed != entry:
             raise ReleaseGenerationError("environment generation content changed")
@@ -2392,6 +2442,14 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("immutable release environment build was cancelled")
         if time.monotonic() >= self.overall_deadline_monotonic:
             raise ReleaseGenerationError("immutable release environment build timed out")
+
+    def _remaining_command_timeout(self, cap_seconds: float) -> float:
+        self._checkpoint()
+        remaining = self.overall_deadline_monotonic - time.monotonic()
+        timeout = min(cap_seconds, self.command_timeout_seconds, remaining)
+        if timeout <= 0:
+            raise ReleaseGenerationError("immutable release environment build timed out")
+        return timeout
 
     def _build_environment(self, destination: Path, *, system_python: Path) -> None:
         self._checkpoint()
@@ -2511,7 +2569,14 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("immutable release code selector is stale")
         commit = expected_commit
         if self.immutable_code_root is None:
-            commit = _git_output(self.repo, self.git_path, "rev-parse", "--verify", "HEAD^{commit}")
+            commit = _git_output(
+                self.repo,
+                self.git_path,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+                timeout_provider=self._remaining_command_timeout,
+            )
             if commit != expected_commit:
                 raise ReleaseGenerationError("release checkout commit does not match marker")
         uv_lock = code_root / "uv.lock"
@@ -2530,7 +2595,12 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("package version cannot be verified") from exc
         if selector.commit != commit or str(manifest.get("commit")) != commit:
             raise ReleaseGenerationError("environment generation commit is stale")
-        _verify_environment_manifest(venv, manifest, checkpoint=self._checkpoint)
+        _verify_environment_manifest(
+            venv,
+            manifest,
+            checkpoint=self._checkpoint,
+            timeout_provider=self._remaining_command_timeout,
+        )
         venv_identity = _identity(venv, label="release venv", directory=True)
         selected_python = venv / "bin" / "python"
         try:
@@ -2557,7 +2627,10 @@ class ReleaseGenerationAuthority:
                 label="release venv Python",
                 directory=False,
             )
-        version, abi = _python_facts(selected_python)
+        version, abi = _python_facts(
+            selected_python,
+            timeout_provider=self._remaining_command_timeout,
+        )
         major_minor = ".".join(version.split(".")[:2])
         site_packages = venv / "lib" / f"python{major_minor}" / "site-packages"
         site_identity = _identity(
@@ -3023,6 +3096,7 @@ class ReleaseGenerationAuthority:
             Path(selector.environment_path),
             manifest,
             checkpoint=self._checkpoint,
+            timeout_provider=self._remaining_command_timeout,
         )
         self._assert_lock()
         return selector
@@ -3278,7 +3352,11 @@ class ReleaseGenerationAuthority:
         if self.immutable_code_root is None:
             if _hash_file(self.repo / "uv.lock", label="uv.lock") != published.uv_lock_sha256:
                 raise ReleaseGenerationError("uv.lock no longer matches release marker")
-            _assert_tracked_clean(self.repo, self.git_path)
+            _assert_tracked_clean(
+                self.repo,
+                self.git_path,
+                timeout_provider=self._remaining_command_timeout,
+            )
         self._assert_lock()
         return published
 
@@ -3430,7 +3508,10 @@ class ReleaseGenerationAuthority:
                 return current
             raise ReleaseGenerationError("adopted deployment intent left a prepared record")
         prepared, prepared_identity = self._read_intent_record(self.prepared_intent_path)
-        if prepared.operation_id != operation_id or prepared.stage != "planned":
+        if prepared.operation_id != operation_id or prepared.stage not in {
+            "planned",
+            "recovery_started",
+        }:
             raise ReleaseGenerationError("prepared deployment intent binding changed")
         if current is not None and current.stage != "completed":
             raise ReleaseGenerationError("an incomplete deployment intent already exists")
@@ -3614,7 +3695,8 @@ class ReleaseGenerationAuthority:
         if not self.python_path.is_relative_to(source_venv):
             raise ReleaseGenerationError("deployment Python is outside source release venv")
         system_python, system_python_identity, system_python_sha256 = _venv_system_interpreter(
-            self.python_path
+            self.python_path,
+            timeout_provider=self._remaining_command_timeout,
         )
         source_bytes = _private_tree_size(
             source_venv,
@@ -3622,6 +3704,7 @@ class ReleaseGenerationAuthority:
             system_python_identity=system_python_identity,
             system_python_sha256=system_python_sha256,
             checkpoint=self._checkpoint,
+            timeout_provider=self._remaining_command_timeout,
         )
         self.garbage_collect_environments(
             reason=f"pre-publish:{transaction_kind}",
@@ -3672,6 +3755,7 @@ class ReleaseGenerationAuthority:
                         expected_commit=expected_commit,
                         destination=generation_code_root(staging_path),
                         checkpoint=self._checkpoint,
+                        timeout_provider=self._remaining_command_timeout,
                     )
                     self._checkpoint()
                     self._mutation_hook("environment_staged")
@@ -3699,6 +3783,7 @@ class ReleaseGenerationAuthority:
                         system_python_identity=system_python_identity,
                         system_python_sha256=system_python_sha256,
                         checkpoint=self._checkpoint,
+                        timeout_provider=self._remaining_command_timeout,
                     )
                 except BaseException:
                     if staging_path.exists() and not staging_path.is_symlink():
@@ -3713,6 +3798,7 @@ class ReleaseGenerationAuthority:
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
                     checkpoint=self._checkpoint,
+                    timeout_provider=self._remaining_command_timeout,
                 )
                 active_environment = _identity(
                     self.environment_root,
@@ -3737,6 +3823,7 @@ class ReleaseGenerationAuthority:
                     system_python_sha256=system_python_sha256,
                     uv_binding=self.uv_binding,
                     checkpoint=self._checkpoint,
+                    timeout_provider=self._remaining_command_timeout,
                 )
                 manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)
@@ -3767,6 +3854,7 @@ class ReleaseGenerationAuthority:
                     final_path,
                     manifest,
                     checkpoint=self._checkpoint,
+                    timeout_provider=self._remaining_command_timeout,
                 )
                 manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
             selector = EnvironmentSelector(
@@ -3834,7 +3922,11 @@ class ReleaseGenerationAuthority:
         if not self.writable:
             raise ReleaseGenerationError("read-only generation authority cannot publish")
         self._assert_lock()
-        _assert_tracked_clean(self.repo, self.git_path)
+        _assert_tracked_clean(
+            self.repo,
+            self.git_path,
+            timeout_provider=self._remaining_command_timeout,
+        )
         transaction = self._transaction_record(
             operation_id=operation_id,
             transaction_kind=transaction_kind,

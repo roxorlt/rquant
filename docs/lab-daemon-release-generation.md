@@ -65,13 +65,16 @@ completed handoff。intent 永久保存初始 handoff operation，所有 rebound
 `restarting` 允许在早期 abort/recovery 中保存 stopped/restarted 子集，`aborted` 则要求全部 label
 已恢复且不生成 completed proof。若 recovery operation B 已写入而 intent 仍绑定 A，重试只在
 `B.supersedes_operation_id == A`、action edge 和 immutable target/install binding 均成立时继续，
-随后由持 generation 独占锁的 deployer 追加 A→B rebound；其他 operation 错配失败关闭。
+bootstrap 会在仍持 handoff 锁、尚未执行任何 `launchctl` mutation 时原子追加并重读验证 A→B
+rebound，之后 deployer 只消费这个已持久化 binding；其他 operation 错配失败关闭。若此时相反
+action 再接管，则必须先收敛 A→B，再生成 B→C，不能把物理链压缩成 A→C。
 
 handoff 完成状态按 `completed proof -> operation record -> stable active record` 顺序原子发布。若任一写
 边界崩溃，下次启动先只读校验三份记录的 operation、target、label、profile、installation、supersede
 链和 generation binding；完全一致才在 handoff 锁内补齐后两份记录。proof 缺字段、伪造 generation
 或任一 binding 漂移都不会触发收敛。接管旧 operation 前还要求其 id 等于 deployment intent 当前
-`handoff_operation_id`，deployer 只能在验证后 rebind。显式 resume/rollback 的 readiness 若失败，
+`handoff_operation_id`；successor 与完整物理链通过验证后，bootstrap 必须在 mutation 前完成 durable
+rebind，deployer 不再拥有延迟写回的分裂权威。显式 resume/rollback 的 readiness 若失败，
 自动 rollback 可以继续 supersede 当前 recovery operation，并复核每一跳 action 与 intent binding。
 partial-stop operation 的 stopped labels 可以是声明 labels 的合法子集，但阶段必须匹配；最终 proof
 会验证完整 supersede 链每一跳的 target/ref/profile/lifecycle/installation binding。completed proof
@@ -128,9 +131,13 @@ P1.5d 安装 launchd 前必须在主 checkout 重建自有、物理、非 symlin
 `docs/production-release.md`。
 
 P1.5b 已实现并用临时目录/fake launchctl 验证 `rquant lab-launchd-install` 与
-`rquant lab-launchd-uninstall`：安装器在 generation 独占锁下验证 current marker/selector/manifest，
-从 generation 内模板原子生成 owner-only plist，执行 `plistlib` 与 `plutil -lint`，幂等复跑不替换
-相同 inode；失败会恢复安装前内容，卸载只删除 installation state 精确绑定且 hash 未变的文件。
+`rquant lab-launchd-uninstall`：安装器先取得与发布 handoff 共用的独立安装事务锁，只接受已登记
+installation state 精确授权的文件身份；随后停止登记为 loaded 的 label、有界确认 daemon 共享锁释放，
+才取得 generation 独占锁并验证 current marker/selector/manifest。每次安装或卸载先 fsync 一份
+identity-bound transaction journal，再用同文件系统 rename 保存原 inode；plist、local state、registered
+state 和原 loaded label 在任一边界失败后都按 journal 精确恢复。首次安装遇到任何未登记的同名文件
+都会失败关闭且保持其 bytes/inode 不变；幂等复跑不替换相同 inode。卸载只有在全部精确 managed
+label 确认 unload 后才移除文件和两份状态，任一 bootout 失败则完整恢复。
 P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `launchctl bootstrap/kickstart`；
 这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
 

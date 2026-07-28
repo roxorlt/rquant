@@ -853,18 +853,19 @@ def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
     expected_target = prepared.target_sha if recovery_action == "resume" else prepared.previous_sha
     responses[("git", "rev-parse", "HEAD")] = (0, f"{expected_target}\n")
 
-    result = deploy(
-        config,
-        runner=FakeRunner(responses),
-        generation_authority=authority,
-        generation_finalizer=FakeGenerationFinalizer(),
-    )
+    with pytest.raises(PolicyError, match="durably committed"):
+        deploy(
+            config,
+            runner=FakeRunner(responses),
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
 
-    assert result.status == "recovered"
     assert authority.events[0] == ("intent_adopted", prepared.operation_id)
     assert authority.intent is not None
     assert authority.intent.initial_handoff_operation_id == original_handoff
-    assert authority.intent.handoff_operation_id == recovery_handoff
+    assert authority.intent.handoff_operation_id == original_handoff
+    assert ("invalidate", None) not in authority.events
 
 
 def test_recovery_rebinds_persisted_successor_after_bootstrap_crash(
@@ -903,28 +904,21 @@ def test_recovery_rebinds_persisted_successor_after_bootstrap_crash(
     responses = _base_responses()
     responses[("git", "rev-parse", "HEAD")] = (0, f"{authority.intent.target_sha}\n")
 
-    result = deploy(
-        config,
-        runner=FakeRunner(responses),
-        generation_authority=authority,
-        generation_finalizer=FakeGenerationFinalizer(),
-    )
+    with pytest.raises(PolicyError, match="durably committed"):
+        deploy(
+            config,
+            runner=FakeRunner(responses),
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
 
-    assert result.status == "recovered"
     assert authority.intent is not None
     assert authority.intent.initial_handoff_operation_id == original_handoff
-    assert authority.intent.handoff_operation_id == recovery_handoff
-    rebounds = [
+    assert authority.intent.handoff_operation_id == original_handoff
+    assert not [
         event for event in authority.intent.stage_history if event["stage"] == "handoff_rebound"
     ]
-    assert rebounds == [
-        {
-            "stage": "handoff_rebound",
-            "timestamp": rebounds[0]["timestamp"],
-            "previous_handoff_operation_id": original_handoff,
-            "handoff_operation_id": recovery_handoff,
-        }
-    ]
+    assert ("invalidate", None) not in authority.events
 
 
 def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
@@ -1798,6 +1792,30 @@ def test_subprocess_runner_timeout_terminates_descendant_process_group(tmp_path:
     assert not marker.exists()
 
 
+def test_process_runner_timeout_contains_detached_grandchild(tmp_path: Path) -> None:
+    marker = tmp_path / "detached-grandchild-survived"
+    grandchild = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(.3); Path(sys.argv[1]).write_text('late')"
+    )
+    child = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r},sys.argv[1]],"
+        "start_new_session=True); time.sleep(5)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        production_deploy._run_process_group(
+            [sys.executable, "-c", child, str(marker)],
+            cwd=tmp_path,
+            timeout_seconds=0.2,
+            check=True,
+        )
+    time.sleep(0.5)
+
+    assert not marker.exists()
+
+
 def test_subprocess_runner_recovery_budget_is_independent(tmp_path: Path) -> None:
     runner = SubprocessRunner(
         tmp_path,
@@ -1931,7 +1949,7 @@ def test_subprocess_runner_reaps_process_group_before_signal_releases_parent(
         "import subprocess,sys,time; from pathlib import Path; "
         "subprocess.Popen([sys.executable,'-c',"
         '"import sys,time; from pathlib import Path; time.sleep(.25); '
-        "Path(sys.argv[1]).write_text('late')\",sys.argv[2]]); "
+        "Path(sys.argv[1]).write_text('late')\",sys.argv[2]],start_new_session=True); "
         "Path(sys.argv[1]).write_text('ready'); time.sleep(.6)"
     )
     harness = (
@@ -1954,3 +1972,56 @@ def test_subprocess_runner_reaps_process_group_before_signal_releases_parent(
     time.sleep(0.8)
 
     assert not late_mutation.exists()
+
+
+def test_process_runner_base_exception_contains_detached_grandchild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "base-exception-grandchild-survived"
+    grandchild = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(.3); Path(sys.argv[1]).write_text('late')"
+    )
+    child = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r},sys.argv[1]],"
+        "start_new_session=True); time.sleep(5)"
+    )
+    real_popen = subprocess.Popen
+
+    class SimulatedRunnerCrash(BaseException):
+        pass
+
+    class CrashProxy:
+        def __init__(self, process: subprocess.Popen[str]) -> None:
+            self._process = process
+            self.pid = process.pid
+            self.returncode: int | None = None
+            self.crashed = False
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            if not self.crashed:
+                self.crashed = True
+                time.sleep(0.08)
+                raise SimulatedRunnerCrash
+            result = self._process.communicate(*args, **kwargs)
+            self.returncode = self._process.returncode
+            return result
+
+    monkeypatch.setattr(
+        production_deploy.subprocess,
+        "Popen",
+        lambda *args, **kwargs: CrashProxy(real_popen(*args, **kwargs)),
+    )
+
+    with pytest.raises(SimulatedRunnerCrash):
+        production_deploy._run_process_group(
+            [sys.executable, "-c", child, str(marker)],
+            cwd=tmp_path,
+            timeout_seconds=0.5,
+            check=True,
+        )
+    time.sleep(0.5)
+
+    assert not marker.exists()

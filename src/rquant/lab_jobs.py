@@ -67,6 +67,7 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
+from rquant.strict_json import strict_json_loads, strict_model_validate_json
 
 if TYPE_CHECKING:
     from rquant.lab_artifacts import LabVerifiedSealedBinding
@@ -1469,7 +1470,7 @@ def _canonical_shard_payload(value: str) -> str:
     def reject_constant(_value: str) -> object:
         raise ValueError("non-finite shard payload values are not allowed")
 
-    parsed = json.loads(
+    parsed = strict_json_loads(
         value,
         parse_float=reject_float,
         parse_constant=reject_constant,
@@ -1483,6 +1484,22 @@ def _canonical_shard_payload(value: str) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _canonical_stored_json_object(value: str, *, field: str) -> str:
+    parsed = strict_json_loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field} must encode a JSON object")
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if value != canonical:
+        raise ValueError(f"{field} JSON is not canonical")
+    return canonical
 
 
 def _sqlite_shard_row_valid(
@@ -1586,7 +1603,11 @@ def _sqlite_shard_row_valid(
         ):
             raise ValueError("invalid shard result manifest hash")
         failure_json = str(failure_json_value) if failure_json_value is not None else None
-        str(checkpoint_json_value) if checkpoint_json_value is not None else None
+        checkpoint_json = str(checkpoint_json_value) if checkpoint_json_value is not None else None
+        if failure_json is not None:
+            _canonical_stored_json_object(failure_json, field="lab_shard.failure_json")
+        if checkpoint_json is not None:
+            _canonical_stored_json_object(checkpoint_json, field="lab_shard.checkpoint_json")
 
         phase = str(phase_value) if phase_value is not None else None
         work_unit_name = str(work_unit_name_value) if work_unit_name_value is not None else None
@@ -1643,7 +1664,9 @@ def _sqlite_shard_row_valid(
             ):
                 raise ValueError("legacy shard identity mismatch")
         else:
-            canonical_payload = _canonical_shard_payload(payload_json.strip())
+            canonical_payload = _canonical_shard_payload(payload_json)
+            if payload_json != canonical_payload:
+                raise ValueError("shard payload JSON is not canonical")
             canonical_payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
             if payload_hash != canonical_payload_hash:
                 raise ValueError("shard payload hash mismatch")
@@ -1752,8 +1775,8 @@ def _command_record_from_row(
             row["request_id"],
             field="lab_command.request_id",
         )
-        envelope = LabCommandEnvelope.model_validate_json(str(row["command_json"]))
-        receipt = LabCommandReceipt.model_validate_json(str(row["receipt_json"]))
+        envelope = strict_model_validate_json(LabCommandEnvelope, str(row["command_json"]))
+        receipt = strict_model_validate_json(LabCommandReceipt, str(row["receipt_json"]))
         content_hash = str(row["content_hash"])
         command_type = str(row["command_type"])
         job_id = _canonical_uuid_text(row["job_id"], field="lab_command.job_id")
@@ -1800,7 +1823,7 @@ def _command_record_from_row(
 
 
 def _receipt_job_version_from_json(payload: str) -> int | None:
-    return LabCommandReceipt.model_validate_json(payload).job_version
+    return strict_model_validate_json(LabCommandReceipt, payload).job_version
 
 
 def _worker_report_record_from_row(
@@ -1810,8 +1833,8 @@ def _worker_report_record_from_row(
 ) -> LabWorkerReportRecord:
     stored_id = str(row["report_id"])
     try:
-        report = LabWorkerReport.model_validate_json(str(row["report_json"]))
-        receipt = LabReportReceipt.model_validate_json(str(row["receipt_json"]))
+        report = strict_model_validate_json(LabWorkerReport, str(row["report_json"]))
+        receipt = strict_model_validate_json(LabReportReceipt, str(row["receipt_json"]))
         report_id = _canonical_uuid_text(
             row["report_id"],
             field="lab_worker_report.report_id",
@@ -1892,8 +1915,14 @@ def _artifact_commit_record_from_row(
             row["request_id"],
             field="lab_artifact_commit.request_id",
         )
-        envelope = LabArtifactCommitEnvelope.model_validate_json(str(row["commit_json"]))
-        receipt = LabArtifactCommitReceipt.model_validate_json(str(row["receipt_json"]))
+        envelope = strict_model_validate_json(
+            LabArtifactCommitEnvelope,
+            str(row["commit_json"]),
+        )
+        receipt = strict_model_validate_json(
+            LabArtifactCommitReceipt,
+            str(row["receipt_json"]),
+        )
         if expected_request_id is not None and request_id != expected_request_id:
             raise ValueError("artifact commit request id does not match lookup key")
         if not (envelope.request_id == receipt.request_id == request_id):
@@ -1938,7 +1967,10 @@ def _result_artifact_evidence_from_row(
     from rquant.lab_artifacts import LabArtifactIndexEvidence
 
     try:
-        evidence = LabArtifactIndexEvidence.model_validate_json(str(row["evidence_json"]))
+        evidence = strict_model_validate_json(
+            LabArtifactIndexEvidence,
+            str(row["evidence_json"]),
+        )
         if expected_job_id is not None and evidence.job_id != expected_job_id:
             raise ValueError("artifact evidence job id mismatch")
         if (
@@ -3200,7 +3232,7 @@ class LabJobReader:
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> LabJobRecord:
         try:
-            spec = ResearchRunSpec.model_validate_json(str(row["spec_json"]))
+            spec = strict_model_validate_json(ResearchRunSpec, str(row["spec_json"]))
             stored_hash = str(row["spec_hash"])
             stored_job_type = ResearchJobType(str(row["job_type"]))
             stored_resource = ResourceClass(str(row["resource_class"]))
@@ -3337,6 +3369,20 @@ class LabJobReader:
     @staticmethod
     def _shard_from_row(row: sqlite3.Row) -> LabShardRecord:
         try:
+            payload_json = str(row["payload_json"])
+            failure_json = str(row["failure_json"]) if row["failure_json"] is not None else None
+            checkpoint_json = (
+                str(row["checkpoint_json"]) if row["checkpoint_json"] is not None else None
+            )
+            if (
+                str(row["adapter_id"]) != "legacy-v2"
+                and _canonical_shard_payload(payload_json) != payload_json
+            ):
+                raise ValueError("shard payload JSON is not canonical")
+            if failure_json is not None:
+                _canonical_stored_json_object(failure_json, field="lab_shard.failure_json")
+            if checkpoint_json is not None:
+                _canonical_stored_json_object(checkpoint_json, field="lab_shard.checkpoint_json")
             record = LabShardRecord(
                 shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
                 job_id=_canonical_uuid_text(row["job_id"], field="lab_shard.job_id"),
@@ -3357,13 +3403,11 @@ class LabJobReader:
                     field="lab_shard.scheduler_fencing_token",
                     minimum=1,
                 ),
-                checkpoint_json=(
-                    str(row["checkpoint_json"]) if row["checkpoint_json"] is not None else None
-                ),
+                checkpoint_json=checkpoint_json,
                 plan_hash=str(row["plan_hash"]),
                 adapter_id=str(row["adapter_id"]),
                 adapter_version=str(row["adapter_version"]),
-                payload_json=str(row["payload_json"]),
+                payload_json=payload_json,
                 payload_hash=str(row["payload_hash"]),
                 phase=(str(row["phase"]) if row["phase"] is not None else None),
                 work_unit_name=(
@@ -3427,9 +3471,7 @@ class LabJobReader:
                     if row["result_manifest_hash"] is not None
                     else None
                 ),
-                failure_json=(
-                    str(row["failure_json"]) if row["failure_json"] is not None else None
-                ),
+                failure_json=failure_json,
                 finished_at=(
                     _load_time(str(row["finished_at"])) if row["finished_at"] is not None else None
                 ),
@@ -3744,7 +3786,7 @@ class LabJobReader:
         try:
             padding = "=" * (-len(cursor) % 4)
             payload = urlsafe_b64decode(f"{cursor}{padding}".encode("ascii"))
-            value = json.loads(payload)
+            value = strict_json_loads(payload)
             if (
                 not isinstance(value, list)
                 or len(value) != 2
@@ -3790,7 +3832,7 @@ class LabJobReader:
         try:
             padding = "=" * (-len(cursor) % 4)
             payload = urlsafe_b64decode(f"{cursor}{padding}".encode("ascii"))
-            value = _LabJobListCursor.model_validate_json(payload)
+            value = strict_model_validate_json(_LabJobListCursor, payload)
             canonical = (
                 urlsafe_b64encode(_canonical_model_json(value).encode("ascii"))
                 .decode("ascii")
@@ -3960,8 +4002,9 @@ class LabJobReader:
             raise InvalidStoredJobError("job summary result index conflicts with result state")
         if has_result_index:
             try:
-                evidence = LabArtifactIndexEvidence.model_validate_json(
-                    str(row["result_evidence_json"])
+                evidence = strict_model_validate_json(
+                    LabArtifactIndexEvidence,
+                    str(row["result_evidence_json"]),
                 )
             except Exception as exc:
                 raise InvalidStoredJobError("job summary result evidence is not canonical") from exc

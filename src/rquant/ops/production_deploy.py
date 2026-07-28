@@ -8,6 +8,7 @@ services outside the protected market window, run preflight checks, and roll bac
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import json
 import math
@@ -16,6 +17,7 @@ import re
 import shlex
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time as monotonic_time
@@ -120,6 +122,107 @@ class GenerationFinalizer(Protocol):
     ) -> object: ...
 
 
+def _descendant_processes(root_pid: int, *, timeout_seconds: float) -> set[int]:
+    if timeout_seconds <= 0:
+        raise TimeoutError("process containment deadline expired")
+    deadline = monotonic_time.monotonic() + timeout_seconds
+    children: dict[int, set[int]] = {}
+    if sys.platform == "darwin":
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            libproc.proc_listallpids.restype = ctypes.c_int
+            libproc.proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            libproc.proc_pidinfo.restype = ctypes.c_int
+            capacity = max(256, libproc.proc_listallpids(None, 0) * 2)
+            pids = (ctypes.c_int * capacity)()
+            count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+            if count < 0:
+                raise OSError(ctypes.get_errno(), "proc_listallpids")
+            for pid in pids[:count]:
+                if monotonic_time.monotonic() >= deadline:
+                    raise TimeoutError("process descendant inventory timed out")
+                buffer = ctypes.create_string_buffer(256)
+                size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
+                if size < 16:
+                    continue
+                _flags, _status, _xstatus, observed_pid, parent = struct.unpack_from(
+                    "=IIIII", buffer.raw
+                )
+                if observed_pid == pid:
+                    children.setdefault(parent, set()).add(pid)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("process descendant inventory failed") from exc
+    elif sys.platform.startswith("linux"):
+        try:
+            for entry in Path("/proc").iterdir():
+                if monotonic_time.monotonic() >= deadline:
+                    raise TimeoutError("process descendant inventory timed out")
+                if not entry.name.isdigit():
+                    continue
+                stat_fields = (entry / "stat").read_text(encoding="ascii").split()
+                if len(stat_fields) > 3:
+                    children.setdefault(int(stat_fields[3]), set()).add(int(entry.name))
+        except OSError as exc:
+            raise RuntimeError("process descendant inventory failed") from exc
+    else:
+        raise RuntimeError("process descendant inventory is unsupported on this platform")
+    descendants: set[int] = set()
+    pending = list(children.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        pending.extend(children.get(pid, ()))
+    return descendants
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    descendants: set[int],
+    *,
+    deadline: float,
+) -> None:
+    remaining = deadline - monotonic_time.monotonic()
+    if remaining > 0:
+        descendants.update(_descendant_processes(process.pid, timeout_seconds=min(0.5, remaining)))
+    for pid in sorted(descendants, reverse=True):
+        with suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    remaining = deadline - monotonic_time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("process containment deadline expired before reap")
+    try:
+        process.communicate(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("process group could not be reaped") from exc
+    while descendants:
+        alive: set[int] = set()
+        for pid in descendants:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError as exc:
+                raise RuntimeError("process descendant containment is unverifiable") from exc
+            alive.add(pid)
+        if not alive:
+            return
+        if monotonic_time.monotonic() >= deadline:
+            raise RuntimeError("detached process descendants survived cleanup")
+        descendants = alive
+        monotonic_time.sleep(min(0.01, deadline - monotonic_time.monotonic()))
+
+
 def _run_process_group(
     args: list[str],
     *,
@@ -154,25 +257,33 @@ def _run_process_group(
             break
         previous_handlers[signum] = previous
     caught_signal: _ProcessGroupSignal | None = None
+    hard_deadline = monotonic_time.monotonic() + timeout_seconds
+    cleanup_reserve = min(0.25, max(0.02, timeout_seconds * 0.25))
+    execution_deadline = hard_deadline - cleanup_reserve
+    descendants: set[int] = set()
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        while True:
+            remaining = execution_deadline - monotonic_time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(args, timeout_seconds)
+            descendants.update(
+                _descendant_processes(process.pid, timeout_seconds=min(0.2, remaining))
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if monotonic_time.monotonic() >= execution_deadline:
+                    raise
     except subprocess.TimeoutExpired:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        _terminate_process_tree(process, descendants, deadline=hard_deadline)
         raise
     except _ProcessGroupSignal as exc:
         caught_signal = exc
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with suppress(OSError, subprocess.SubprocessError):
-            process.communicate(timeout=5)
+        _terminate_process_tree(process, descendants, deadline=hard_deadline)
         stdout = stderr = ""
     except BaseException:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with suppress(OSError, subprocess.SubprocessError):
-            process.communicate(timeout=5)
+        _terminate_process_tree(process, descendants, deadline=hard_deadline)
         raise
     finally:
         for signum, previous in previous_handlers.items():
@@ -714,10 +825,10 @@ def _recover_locked(
         raise PolicyError("recovery action must be resume or rollback")
     if config.prepared_intent_operation_id:
         prepared = authority.read_prepared_deployment_intent()
-        if (
-            prepared.operation_id != config.prepared_intent_operation_id
-            or prepared.stage != "planned"
-        ):
+        if prepared.operation_id != config.prepared_intent_operation_id or prepared.stage not in {
+            "planned",
+            "recovery_started",
+        }:
             raise PolicyError("prepared recovery intent binding is invalid")
         intent = authority.adopt_prepared_deployment_intent(
             operation_id=config.prepared_intent_operation_id
@@ -756,11 +867,7 @@ def _recover_locked(
         raise PolicyError("tracked production worktree changes must be resolved before recovery")
     intent = _advance_intent(config, authority, intent, "recovery_started")
     if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
-        intent = authority.rebind_deployment_handoff(
-            operation_id=intent.operation_id,
-            handoff_operation_id=config.handoff_operation_id,
-            handoff_labels=config.handoff_labels,
-        )
+        raise PolicyError("deployment handoff rebound was not durably committed before mutation")
     authority.invalidate()
     completed = _execute_transaction(
         config,
@@ -826,7 +933,7 @@ def _deploy_locked(
             config.dry_run
             or config.lab_lifecycle_mode != "installed"
             or prepared_intent.operation_id != config.prepared_intent_operation_id
-            or prepared_intent.stage != "planned"
+            or prepared_intent.stage not in {"planned", "recovery_started"}
             or prepared_intent.previous_sha != previous_sha
             or prepared_intent.target_ref != target
             or previous_sha == target_sha

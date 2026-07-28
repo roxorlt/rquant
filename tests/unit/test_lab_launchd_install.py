@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -118,6 +120,42 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     os.close(lock_fd)
     launch_agents = tmp_path / "LaunchAgents"
     launch_agents.mkdir(mode=0o700)
+    runtime_root = tmp_path / "data" / "lab-runtime"
+    readiness_root = runtime_root / "readiness"
+    readiness_root.mkdir(parents=True, mode=0o700)
+    runtime_root.chmod(0o700)
+    readiness_root.chmod(0o700)
+    registered = {
+        "schema_version": 2,
+        "checkout_root": str(repo),
+        "labels": list(LAB_LAUNCHD_LABELS),
+        "plists": {},
+        "runtime_root": str(runtime_root),
+        "readiness_root": str(readiness_root),
+        "registered_by_commit": commit,
+        "prepared_authority": {
+            "runtime_authority_id": "a" * 64,
+            "runtime_root": str(runtime_root),
+            "runtime_device": runtime_root.stat().st_dev,
+            "runtime_inode": runtime_root.stat().st_ino,
+        },
+        "installed_at": "2026-07-29T00:00:00+00:00",
+    }
+    for label in LAB_LAUNCHD_LABELS:
+        path = repo / "deploy" / "launchd" / f"{label}.plist"
+        observed = path.stat()
+        registered["plists"][label] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+        }
+    registration = lock.with_name(f"{lock.stem}.lab-install.json")
+    registration.write_text(
+        json.dumps(registered, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    registration.chmod(0o600)
     return repo, lock, launch_agents, commit
 
 
@@ -125,12 +163,21 @@ class _Runner:
     def __init__(self, *, fail_on: str | None = None) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.fail_on = fail_on
+        self.loaded: set[str] = set()
 
     def __call__(self, command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         del timeout
         self.calls.append(tuple(command))
         if self.fail_on is not None and self.fail_on in " ".join(command):
             return subprocess.CompletedProcess(command, 1, "", "failed")
+        action = command[1] if len(command) > 1 else ""
+        label = command[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(command, 0 if label in self.loaded else 113, "", "")
+        if action == "bootout":
+            self.loaded.discard(label)
+        elif action == "bootstrap":
+            self.loaded.add(Path(command[-1]).stem)
         return subprocess.CompletedProcess(command, 0, "", "")
 
 
@@ -145,6 +192,38 @@ class _FailFirstKickstartRunner(_Runner):
         if command[1:2] == ["kickstart"] and not self.failed:
             self.failed = True
             return subprocess.CompletedProcess(command, 1, "", "failed")
+        return super().__call__(command, timeout=1)
+
+
+class _LaunchdStateRunner(_Runner):
+    def __init__(
+        self,
+        *,
+        loaded: set[str],
+        fail_bootout: str | None = None,
+        after_bootout: dict[str, Callable[[], None]] | None = None,
+    ) -> None:
+        super().__init__()
+        self.loaded = loaded
+        self.fail_bootout = fail_bootout
+        self.after_bootout = after_bootout or {}
+
+    def __call__(self, command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        assert timeout > 0
+        self.calls.append(tuple(command))
+        action = command[1] if len(command) > 1 else ""
+        label = command[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(command, 0 if label in self.loaded else 113, "", "")
+        if action == "bootout":
+            if label == self.fail_bootout:
+                return subprocess.CompletedProcess(command, 1, "", "busy")
+            self.loaded.discard(label)
+            callback = self.after_bootout.get(label)
+            if callback is not None:
+                callback()
+        elif action in {"bootstrap", "kickstart"}:
+            self.loaded.add(Path(command[-1]).stem if action == "bootstrap" else label)
         return subprocess.CompletedProcess(command, 0, "", "")
 
 
@@ -182,6 +261,23 @@ def test_installer_materializes_generation_bound_plists_and_is_idempotent(tmp_pa
         path.name: (path.read_bytes(), path.stat().st_ino) for path in launch_agents.glob("*.plist")
     } == before
     assert any(call[:2] == ("/bin/launchctl", "bootstrap") for call in runner.calls)
+    local_state = json.loads(
+        lock.with_name(f"{lock.stem}.lab-local-install.json").read_text(encoding="utf-8")
+    )
+    registered = json.loads(
+        lock.with_name(f"{lock.stem}.lab-install.json").read_text(encoding="utf-8")
+    )
+    for label in LAB_LAUNCHD_LABELS:
+        name = f"{label}.plist"
+        path = launch_agents / name
+        identity = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "device": path.stat().st_dev,
+            "inode": path.stat().st_ino,
+        }
+        assert local_state["plists"][name] == identity
+        assert registered["plists"][label] == identity
 
 
 def test_installer_rejects_symlink_destination_without_touching_external(tmp_path: Path) -> None:
@@ -191,7 +287,7 @@ def test_installer_rejects_symlink_destination_without_touching_external(tmp_pat
     target = launch_agents / f"{LAB_LAUNCHD_LABELS[0]}.plist"
     target.symlink_to(external)
 
-    with pytest.raises(LabLaunchdInstallError, match="symlink|physical"):
+    with pytest.raises(LabLaunchdInstallError, match="symlink|physical|foreign"):
         LabLaunchdInstaller(
             checkout_root=repo,
             deployment_lock_path=lock,
@@ -201,6 +297,29 @@ def test_installer_rejects_symlink_destination_without_touching_external(tmp_pat
         ).install(activate=False)
 
     assert external.read_text(encoding="utf-8") == "external"
+
+
+@pytest.mark.parametrize("label", LAB_LAUNCHD_LABELS)
+def test_first_install_rejects_foreign_regular_plist_without_replacing_identity(
+    tmp_path: Path,
+    label: str,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    foreign = launch_agents / f"{label}.plist"
+    foreign.write_bytes(b"foreign\n")
+    foreign.chmod(0o600)
+    before = (foreign.read_bytes(), foreign.stat().st_ino)
+
+    with pytest.raises(LabLaunchdInstallError, match="foreign|registered|installation"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=_Runner(),
+        ).install(activate=False)
+
+    assert (foreign.read_bytes(), foreign.stat().st_ino) == before
 
 
 def test_installer_activation_failure_restores_previous_plists(tmp_path: Path) -> None:
@@ -227,6 +346,51 @@ def test_installer_activation_failure_restores_previous_plists(tmp_path: Path) -
     assert {path.name: path.read_bytes() for path in launch_agents.glob("*.plist")} == before
 
 
+def test_installer_failure_restores_exact_plist_and_state_inodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+    local_state = lock.with_name(f"{lock.stem}.lab-local-install.json")
+    managed = [
+        *launch_agents.glob("*.plist"),
+        local_state,
+        lock.with_name(f"{lock.stem}.lab-install.json"),
+    ]
+    before = {path: (path.read_bytes(), path.stat().st_ino) for path in managed}
+    original_payload = LabLaunchdInstaller._plist_payload
+
+    def changed_payload(
+        self: LabLaunchdInstaller,
+        marker: object,
+        code_root: Path,
+        label: str,
+    ) -> bytes:
+        return original_payload(self, marker, code_root, label) + b"\n"
+
+    monkeypatch.setattr(LabLaunchdInstaller, "_plist_payload", changed_payload)
+    runner = _FailFirstKickstartRunner()
+    runner.loaded = set(LAB_LAUNCHD_LABELS)
+
+    with pytest.raises(LabLaunchdInstallError, match="kickstart"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=runner,
+        ).install(activate=True)
+
+    assert {path: (path.read_bytes(), path.stat().st_ino) for path in managed} == before
+
+
 def test_installer_activation_failure_restores_previously_loaded_labels(tmp_path: Path) -> None:
     repo, lock, launch_agents, _commit = _fixture(tmp_path)
     LabLaunchdInstaller(
@@ -237,6 +401,7 @@ def test_installer_activation_failure_restores_previously_loaded_labels(tmp_path
         runner=_Runner(),
     ).install(activate=False)
     runner = _FailFirstKickstartRunner()
+    runner.loaded = set(LAB_LAUNCHD_LABELS)
 
     with pytest.raises(LabLaunchdInstallError, match="kickstart"):
         LabLaunchdInstaller(
@@ -269,12 +434,229 @@ def test_uninstall_refuses_modified_plist_and_removes_exact_installation(tmp_pat
     )
     installer.install(activate=False)
     changed = launch_agents / f"{LAB_LAUNCHD_LABELS[0]}.plist"
+    original = changed.read_bytes()
     changed.chmod(0o600)
     changed.write_bytes(changed.read_bytes() + b"\n")
     with pytest.raises(LabLaunchdInstallError, match="changed"):
         installer.uninstall(deactivate=False)
+    changed.write_bytes(original)
     installer.install(activate=False)
 
     installer.uninstall(deactivate=True)
 
     assert not list(launch_agents.glob("*.plist"))
+
+
+def test_uninstall_bootout_failure_preserves_files_states_and_loaded_labels(
+    tmp_path: Path,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    )
+    installer.install(activate=False)
+    state_paths = (
+        lock.with_name(f"{lock.stem}.lab-local-install.json"),
+        lock.with_name(f"{lock.stem}.lab-install.json"),
+    )
+    before_files = {
+        path.name: (path.read_bytes(), path.stat().st_ino) for path in launch_agents.glob("*.plist")
+    }
+    before_states = {
+        path: (path.read_bytes(), path.stat().st_ino) for path in state_paths if path.exists()
+    }
+    loaded = set(LAB_LAUNCHD_LABELS)
+    failing = _LaunchdStateRunner(
+        loaded=loaded,
+        fail_bootout=LAB_LAUNCHD_LABELS[1],
+    )
+
+    with pytest.raises(LabLaunchdInstallError, match="bootout"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=failing,
+        ).uninstall(deactivate=True)
+
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_ino) for path in launch_agents.glob("*.plist")
+    } == before_files
+    assert {
+        path: (path.read_bytes(), path.stat().st_ino) for path in state_paths if path.exists()
+    } == before_states
+    assert loaded == set(LAB_LAUNCHD_LABELS)
+
+
+def test_install_requires_registered_authority_before_creating_plists(tmp_path: Path) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    registration = lock.with_name(f"{lock.stem}.lab-install.json")
+    registration.unlink()
+
+    with pytest.raises(LabLaunchdInstallError, match="registered|authority"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=_Runner(),
+        ).install(activate=False)
+
+    assert not list(launch_agents.glob("*.plist"))
+
+
+@pytest.mark.parametrize(
+    "fault_stage",
+    [
+        "transaction-prepared",
+        *(f"plist-installed:{label}.plist" for label in LAB_LAUNCHD_LABELS),
+        "registered-state-installed",
+        "local-state-installed",
+    ],
+)
+def test_interrupted_install_journal_restores_exact_authority_on_next_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stage: str,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    registration = lock.with_name(f"{lock.stem}.lab-install.json")
+    registered_before = (registration.read_bytes(), registration.stat().st_ino)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash(stage: str) -> None:
+        if stage == fault_stage:
+            raise SimulatedCrash
+
+    interrupted = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+        mutation_hook=crash,
+    )
+    monkeypatch.setattr(interrupted, "_recover_transaction", lambda: None)
+    with pytest.raises(SimulatedCrash):
+        interrupted.install(activate=False)
+
+    journal = lock.with_name(f"{lock.stem}.lab-install-transaction.json")
+    assert journal.is_file()
+
+    completed = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+
+    assert completed.code_sha
+    assert not journal.exists()
+    assert registered_before != (registration.read_bytes(), registration.stat().st_ino)
+    registered = json.loads(registration.read_text(encoding="utf-8"))
+    for label in LAB_LAUNCHD_LABELS:
+        path = launch_agents / f"{label}.plist"
+        assert registered["plists"][label]["inode"] == path.stat().st_ino
+
+
+def test_installation_transaction_lock_serializes_installer_and_handoff(
+    tmp_path: Path,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    owner = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    )
+    held = owner._acquire_installation_lock()
+    try:
+        with pytest.raises(LabLaunchdInstallError, match="transaction.*active"):
+            LabLaunchdInstaller(
+                checkout_root=repo,
+                deployment_lock_path=lock,
+                launch_agents_dir=launch_agents,
+                trusted_git_path=TRUSTED_GIT,
+                runner=_Runner(),
+                command_timeout_seconds=0.05,
+                overall_timeout_seconds=0.05,
+            ).install(activate=False)
+        assert not list(launch_agents.glob("*.plist"))
+    finally:
+        os.close(held)
+
+    owner.install(activate=False)
+    assert len(list(launch_agents.glob("*.plist"))) == len(LAB_LAUNCHD_LABELS)
+
+
+def test_uninstall_removes_local_and_registered_authority_only_after_unload(
+    tmp_path: Path,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    runner = _Runner()
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=runner,
+    )
+    installer.install(activate=True)
+
+    installer.uninstall(deactivate=True)
+
+    assert not list(launch_agents.glob("*.plist"))
+    assert not lock.with_name(f"{lock.stem}.lab-local-install.json").exists()
+    assert not lock.with_name(f"{lock.stem}.lab-install.json").exists()
+    assert not lock.with_name(f"{lock.stem}.lab-install-transaction.json").exists()
+    assert not runner.loaded
+
+
+def test_rerun_stops_daemons_before_waiting_for_generation_exclusive_lock(
+    tmp_path: Path,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+    held: dict[str, int] = {}
+    for label in LAB_LAUNCHD_LABELS:
+        descriptor = os.open(lock, os.O_RDONLY)
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        held[label] = descriptor
+    loaded = set(LAB_LAUNCHD_LABELS)
+    runner = _LaunchdStateRunner(
+        loaded=loaded,
+        after_bootout={
+            label: (lambda item=label: os.close(held.pop(item))) for label in LAB_LAUNCHD_LABELS
+        },
+    )
+    try:
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=runner,
+            command_timeout_seconds=1,
+        ).install(activate=True)
+    finally:
+        for descriptor in held.values():
+            os.close(descriptor)
+
+    first_bootout = next(i for i, call in enumerate(runner.calls) if call[1:2] == ("bootout",))
+    assert first_bootout >= 0
+    assert loaded == set(LAB_LAUNCHD_LABELS)

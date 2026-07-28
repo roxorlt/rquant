@@ -2444,6 +2444,33 @@ def test_lab_readiness_launchctl_timeout_uses_current_remaining_deadline(
     assert observed_timeouts == [pytest.approx(0.75)]
 
 
+def test_generation_lock_wait_never_sleeps_past_remaining_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _bootstrap_module()
+    root = tmp_path / "rquant"
+    root.mkdir()
+    lock_root = tmp_path / ".rquant-deploy"
+    lock_root.mkdir(mode=0o700)
+    lock_path = lock_root / "rquant.lock"
+    held = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monotonic_values = iter((100.0, 100.001, 100.011))
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+
+    try:
+        with pytest.raises(module.DeployBootstrapError, match="generation is active"):
+            module._acquire_lock(root, lock_path, timeout_seconds=0.01)
+    finally:
+        os.close(held)
+
+    assert sleeps == [pytest.approx(0.009)]
+
+
 def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3281,6 +3308,15 @@ def test_recovery_retry_recognizes_persisted_successor_before_intent_rebind(
     )
 
     assert supersedes == original_operation
+    rebound = DeploymentIntent.from_payload(
+        json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    assert rebound.handoff_operation_id == recovery_operation
+    assert [
+        item["handoff_operation_id"]
+        for item in rebound.stage_history
+        if item["stage"] == "handoff_rebound"
+    ] == [recovery_operation]
     loaded = set(module.LAB_LAUNCHD_LABELS)
 
     def fake_launchctl(
@@ -3318,6 +3354,247 @@ def test_recovery_retry_recognizes_persisted_successor_before_intent_rebind(
 
     assert recovery.operation_id == recovery_operation
     assert recovery.supersedes_operation_id == original_operation
+
+
+def test_opposite_recovery_persists_exact_a_b_c_chain_before_first_bootout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    operation_a = "a" * 32
+    operation_b = "b" * 32
+    intent = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=operation_a,
+        operation_id="d" * 32,
+        previous_sha="1" * 40,
+        target_sha="2" * 40,
+        target_ref="2" * 40,
+        stage="planned",
+    ).advance(stage="recovery_started")
+    module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent), absent=True)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    labels = list(module.LAB_LAUNCHD_LABELS)
+    operation_a_payload = {
+        "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+        "operation_id": operation_a,
+        "checkout_root": str(root),
+        "stage": "stopping",
+        "labels": labels,
+        "loaded_labels": labels,
+        "stopped_labels": labels[:1],
+        "restarted_labels": [],
+        "updated_at": "2026-07-28T00:00:00+00:00",
+        "target_ref": intent.target_ref,
+        "target_sha": intent.target_sha,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": module._lab_installation_identity(lock_path, installation),
+        "supersedes_operation_id": "",
+    }
+    operation_b_payload = {
+        **operation_a_payload,
+        "operation_id": operation_b,
+        "stage": "planned",
+        "stopped_labels": [],
+        "action": "resume",
+        "supersedes_operation_id": operation_a,
+    }
+    module._atomic_private_json(
+        module._operation_handoff_path(lock_path, operation_a), operation_a_payload
+    )
+    module._atomic_private_json(
+        module._operation_handoff_path(lock_path, operation_b), operation_b_payload
+    )
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"), operation_b_payload
+    )
+
+    supersedes = module._superseding_handoff_operation_id(
+        root=root,
+        lock_path=lock_path,
+        recovery_action="rollback",
+        release_profile="macos-lab",
+        lifecycle_mode="installed",
+    )
+    assert supersedes == operation_b
+    after_b = DeploymentIntent.from_payload(
+        json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+    )
+    assert after_b.handoff_operation_id == operation_b
+
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    observed_before_bootout: list[DeploymentIntent] = []
+
+    def fake_launchctl(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(arguments, 0, "state = running\n", "")
+        if action == "bootout":
+            observed_before_bootout.append(
+                DeploymentIntent.from_payload(
+                    json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+                )
+            )
+            loaded.discard(label)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    rollback = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=supersedes,
+    )
+    try:
+        rollback.prepare(
+            dry_run=False,
+            target_ref=intent.previous_sha,
+            target_sha=intent.previous_sha,
+            action="rollback",
+            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    finally:
+        rollback.close()
+
+    assert observed_before_bootout
+    operation_c = observed_before_bootout[0].handoff_operation_id
+    assert operation_c not in {operation_a, operation_b}
+    rebounds = [
+        item["handoff_operation_id"]
+        for item in observed_before_bootout[0].stage_history
+        if item["stage"] == "handoff_rebound"
+    ]
+    assert rebounds == [operation_b, operation_c]
+
+
+def test_opposite_retry_recovers_physical_successor_before_intent_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    operation_a = "a" * 32
+    intent = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=operation_a,
+        operation_id="d" * 32,
+        previous_sha="1" * 40,
+        target_sha="2" * 40,
+        target_ref="2" * 40,
+        stage="services_transitioning",
+    )
+    module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent), absent=True)
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    labels = list(module.LAB_LAUNCHD_LABELS)
+    operation_a_payload = {
+        "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+        "operation_id": operation_a,
+        "checkout_root": str(root),
+        "stage": "stopping",
+        "labels": labels,
+        "loaded_labels": labels,
+        "stopped_labels": [],
+        "restarted_labels": [],
+        "updated_at": "2026-07-29T00:00:00+00:00",
+        "target_ref": intent.target_ref,
+        "target_sha": intent.target_sha,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": module._lab_installation_identity(lock_path, installation),
+        "supersedes_operation_id": "",
+    }
+    module._atomic_private_json(
+        module._operation_handoff_path(lock_path, operation_a), operation_a_payload
+    )
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"), operation_a_payload
+    )
+    loaded = set(labels)
+
+    def fake_launchctl(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                "state = running\n" if label in loaded else "",
+                "",
+            )
+        if action == "bootout":
+            loaded.discard(label)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    class CrashAfterSuccessor(module._LabLaunchdHandoff):
+        def _after_handoff_successor_published(self) -> None:
+            raise RuntimeError("crash after physical successor")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    first = CrashAfterSuccessor(root=root, lock_path=lock_path, timeout_seconds=1)
+    with pytest.raises(RuntimeError, match="physical successor"):
+        first.prepare(
+            dry_run=False,
+            target_ref=intent.target_ref,
+            target_sha=intent.target_sha,
+            action="resume",
+            now=datetime(2026, 7, 29, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    first.close()
+    operation_b = str(
+        json.loads(
+            module._stable_record_path(lock_path, "lab-handoff").read_text(encoding="utf-8")
+        )["operation_id"]
+    )
+    assert operation_b != operation_a
+    assert (
+        DeploymentIntent.from_payload(
+            json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+        ).handoff_operation_id
+        == operation_a
+    )
+
+    observed_before_bootout: list[DeploymentIntent] = []
+
+    def observe_launchctl(
+        arguments: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if arguments[0] == "bootout":
+            observed_before_bootout.append(
+                DeploymentIntent.from_payload(
+                    json.loads(intent_path_for_lock(lock_path).read_text(encoding="utf-8"))
+                )
+            )
+        return fake_launchctl(arguments, **kwargs)
+
+    monkeypatch.setattr(module, "_launchctl", observe_launchctl)
+    rollback = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    try:
+        rollback.prepare(
+            dry_run=False,
+            target_ref=intent.previous_sha,
+            target_sha=intent.previous_sha,
+            action="rollback",
+            now=datetime(2026, 7, 29, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    finally:
+        rollback.close()
+
+    assert observed_before_bootout
+    rebound = observed_before_bootout[0]
+    assert rebound.handoff_operation_id not in {operation_a, operation_b}
+    assert [
+        event["handoff_operation_id"]
+        for event in rebound.stage_history
+        if event["stage"] == "handoff_rebound"
+    ] == [operation_b, rebound.handoff_operation_id]
 
 
 def test_handoff_writer_rejects_invalid_partial_state_before_publication(
@@ -4299,6 +4576,30 @@ def test_bootstrap_frozen_sync_timeout_terminates_uv_process_group(tmp_path: Pat
     with pytest.raises(module.DeployBootstrapError, match="could not run"):
         module._run_frozen_sync(tmp_path, fake_uv, timeout_seconds=0.1)
     time.sleep(0.6)
+
+    assert not marker.exists()
+
+
+def test_bootstrap_runner_timeout_contains_detached_grandchild(tmp_path: Path) -> None:
+    module = _bootstrap_module()
+    marker = tmp_path / "detached-grandchild-survived"
+    grandchild = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(.3); Path(sys.argv[1]).write_text('late')"
+    )
+    child = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r},sys.argv[1]],"
+        "start_new_session=True); time.sleep(5)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        module._run_process_group(
+            [sys.executable, "-c", child, str(marker)],
+            cwd=tmp_path,
+            timeout_seconds=0.2,
+        )
+    time.sleep(0.5)
 
     assert not marker.exists()
 
@@ -5658,7 +5959,7 @@ def test_bootstrap_process_runner_reaps_group_before_signal_exit(
         "import subprocess,sys,time; from pathlib import Path; "
         "subprocess.Popen([sys.executable,'-c',"
         '"import sys,time; from pathlib import Path; time.sleep(.25); '
-        "Path(sys.argv[1]).write_text('late')\",sys.argv[2]]); "
+        "Path(sys.argv[1]).write_text('late')\",sys.argv[2]],start_new_session=True); "
         "Path(sys.argv[1]).write_text('ready'); time.sleep(.6)"
     )
     harness = f"""
@@ -5688,6 +5989,59 @@ module._run_process_group(
     time.sleep(0.8)
 
     assert not late_mutation.exists()
+
+
+def test_bootstrap_runner_base_exception_contains_detached_grandchild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _bootstrap_module()
+    marker = tmp_path / "base-exception-grandchild-survived"
+    grandchild = (
+        "import sys,time; from pathlib import Path; "
+        "time.sleep(.3); Path(sys.argv[1]).write_text('late')"
+    )
+    child = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r},sys.argv[1]],"
+        "start_new_session=True); time.sleep(5)"
+    )
+    real_popen = subprocess.Popen
+
+    class SimulatedRunnerCrash(BaseException):
+        pass
+
+    class CrashProxy:
+        def __init__(self, process: subprocess.Popen[str]) -> None:
+            self._process = process
+            self.pid = process.pid
+            self.returncode: int | None = None
+            self.crashed = False
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            if not self.crashed:
+                self.crashed = True
+                time.sleep(0.08)
+                raise SimulatedRunnerCrash
+            result = self._process.communicate(*args, **kwargs)
+            self.returncode = self._process.returncode
+            return result
+
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: CrashProxy(real_popen(*args, **kwargs)),
+    )
+
+    with pytest.raises(SimulatedRunnerCrash):
+        module._run_process_group(
+            [sys.executable, "-c", child, str(marker)],
+            cwd=tmp_path,
+            timeout_seconds=0.5,
+        )
+    time.sleep(0.5)
+
+    assert not marker.exists()
 
 
 def test_dirty_release_authority_is_rejected_before_project_import(tmp_path: Path) -> None:

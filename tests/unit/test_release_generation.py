@@ -1098,6 +1098,63 @@ def test_release_generation_readonly_git_preserves_index_and_disables_optional_l
     assert (after.st_ino, after.st_mtime_ns) == (before[1].st_ino, before[1].st_mtime_ns)
 
 
+def test_release_generation_blocking_probes_refresh_shared_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.release_generation as module
+
+    repo, _lock_path, commit, python = _generation(tmp_path)
+    destination = tmp_path / "release-code"
+    original_run = subprocess.run
+    observed_timeouts: list[float] = []
+    granted = iter((0.09, 0.08, 0.07, 0.06, 0.05, 0.04))
+
+    def remaining(cap: float) -> float:
+        value = next(granted)
+        assert value <= cap
+        return value
+
+    def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[object]:
+        observed_timeouts.append(float(kwargs["timeout"]))
+        command = args[0]
+        if isinstance(command, list) and command and command[0] == str(python):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                '{"cache_tag":"cpython-312","soabi":"cpython-312-darwin","version":"3.12.13"}\n',
+                "",
+            )
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", capture_run)
+
+    assert (
+        module._git_output(
+            repo,
+            TRUSTED_GIT,
+            "rev-parse",
+            "HEAD",
+            timeout_provider=remaining,
+        )
+        == commit
+    )
+    module._assert_tracked_clean(repo, TRUSTED_GIT, timeout_provider=remaining)
+    module._materialize_release_code(
+        repo=repo,
+        git_path=TRUSTED_GIT,
+        expected_commit=commit,
+        destination=destination,
+        checkpoint=lambda: None,
+        timeout_provider=remaining,
+    )
+    version, abi = module._python_facts(python, timeout_provider=remaining)
+
+    assert version.startswith(f"{sys.version_info.major}.{sys.version_info.minor}.")
+    assert abi != ":"
+    assert observed_timeouts == [0.09, 0.08, 0.07, 0.06, 0.05, 0.04]
+
+
 def test_release_generation_marker_handles_short_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

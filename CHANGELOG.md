@@ -79,6 +79,16 @@
 
 ### Fixed
 
+- **Strategy Lab P1.5b 恢复、安装与持久数据边界加固**：recovery successor 的完整物理
+  supersede 链会先原子写回 typed deployment intent 并重读确认，之后才允许任何 launchd mutation，
+  相反 action 重试仍保持精确 A→B→C history。launchd 安装/卸载改用独立且与 handoff 兼容的事务锁，
+  先有界释放 daemon shared generation lock，再进入 generation 独占区；identity-bound journal 以
+  同文件系统 rename 保留 plist/local/registered state 原 inode，并在每个失败边界恢复原 loaded
+  集合。foreign 首装文件与任一 bootout 失败均失败关闭。部署子进程在 SIGINT、SIGTERM、timeout
+  或异常时递归收容 detached descendants，Git/archive/Python ABI/launchctl/锁等待统一受同一整体
+  deadline 限制。Lab SQLite 中 spec、shard payload、failure、checkpoint、command、receipt 与 event
+  等持久 JSON 全部拒绝顶层和嵌套重复键，并要求 canonical bytes/hash，损坏内容不能进入列表或详情。
+
 - **Lab daemon 第十四轮 handoff authority 收敛**：daemon 与 bootstrap 现共用同一份
   handoff record、action edge、supersede chain 和 intent rebound history 校验；provisional
   recovery 必须逐跳证明 physical operation 链与 intent 的 A→B→C rebound 完全一致，并读取核对
