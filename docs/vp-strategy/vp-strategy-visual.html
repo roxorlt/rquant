@@ -469,8 +469,9 @@ html{scroll-behavior:smooth}
     </div>
   </div>
 
-  <div class="note">
-    <p><strong>为什么预警时是「挂涨停价排队」而不是直接砸盘。</strong>封板的时候涨停价上还压着巨量买单，这时挂涨停价卖出<strong>能立刻成交且一分钱不让</strong>。等封单真崩了再挂，前面已经排了几千手，根本轮不到你。这是 A 股涨停板机制里的一个具体优势，原策略完全没利用。</p>
+  <div class="note crit">
+    <p><strong>一处已纠正的机制错误（v0.3）。</strong>本页上一版写的是「预警时先挂涨停价卖单<b>排队</b>，等封单崩了再挂就排不上队」——<b>这是错的</b>。封板意味着涨停价上压着巨量<b>买单</b>、卖侧无人挂单，此时挂涨停价卖单会<b>立即成交</b>，根本不存在队列。排队机制只真实存在于两个场景：封板时想<b>买入</b>（买单排在封单队尾），和<b>跌停时卖出</b>（卖单排在跌停卖队列）。</p>
+    <p style="margin-top:8px"><strong>正确的逻辑是：封单还在时卖出 = 保证以当日最高价（涨停价）即时成交；封单崩了才卖 = 只能追着下坠的对手价卖。</strong>所以这个状态机权衡的是「持有博次日溢价」与「炸板瞬间的滑点损失」，40% / 70% 两条线就是这个权衡的量化表达。唯一的时序风险是卖单发出的一瞬封单恰好被撤光——所以卖出动作自带「3 秒未成交撤单转对手价」的保护。</p>
   </div>
 
   <div class="note">
@@ -481,6 +482,32 @@ html{scroll-behavior:smooth}
   <div class="note crit">
     <p><strong>仍然成立的红线：绝不用分钟线去「猜」实时封单量。</strong>日频历史用来验证因子有没有用，实时数据用来盘中执行，两者不能互相替代。硬凑一个「近似封单量」出来，会得到一个看起来能跑、实际全是噪声的指标。</p>
   </div>
+  <h3>A2 只是一个代表——同类盘口级子策略共 13 个</h3>
+  <p>对每个决策分支问同一句话：「这个判断在盘口层面靠什么确认？触发后的动作怎么保证成交？」把买入、持仓、竞价、风控的全部分支过一遍，推导出 13 个子策略。<strong>最右一列就是「哪里必须上 tick/L2 数据」的答案</strong>——分钟线做不了的，标了红。</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th style="width:40px">#</th><th>母分支</th><th>子策略</th><th>一句话逻辑</th><th>数据要求</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">S1</td><td>A1/A2</td><td><b>封单衰减监控</b></td><td>上面这个状态机</td><td>盘口 bid1 快照</td></tr>
+        <tr><td class="mono">S2</td><td>A2</td><td><b>炸板确认</b></td><td>跌离涨停须持续 ≥10 秒才算炸板，防瞬时砸穿误判</td><td><span class="pill p-crit">tick 级</span></td></tr>
+        <tr><td class="mono">S3</td><td>A3</td><td><b>假突破回落监控</b></td><td>突破 VAH 后回落且委买撤单率升高 → 撤销止损抬升</td><td><span class="pill p-crit">五档+撤单率</span></td></tr>
+        <tr><td class="mono">S4</td><td>A4</td><td><b>压单墙监控</b></td><td>卖一~卖五持续堆积不撤 → 提前减仓，不等 10:30</td><td>五档卖盘</td></tr>
+        <tr><td class="mono">S5</td><td>A5/B1</td><td><b>破位执行追价保护</b></td><td>清仓单 3 秒未成交 → 撤单按对手价追，循环到成交</td><td>盘口+委托回报</td></tr>
+        <tr><td class="mono">S6</td><td>A5</td><td><b>闪崩防误触发</b></td><td>跌破 POC 须持续 ≥10 秒才触发清仓（对称于 S2）</td><td><span class="pill p-crit">tick 级</span></td></tr>
+        <tr><td class="mono">S7</td><td>买入 E2/E3</td><td><b>买点承接确认</b></td><td>缩量回踩时委买厚度不足 = 「无人接」而非「抛压衰竭」→ 放弃买入</td><td><span class="pill p-crit">五档+逐笔方向</span></td></tr>
+        <tr><td class="mono">S8</td><td>执行层</td><td><b>委托生命周期状态机</b></td><td>部分成交怎么补、超时怎么追、废单怎么报警</td><td>券商回报</td></tr>
+        <tr><td class="mono">S9</td><td>C2</td><td><b>大单派发监控</b></td><td>主动卖大单占比超阈值 → 把尾盘清仓提前触发</td><td><span class="pill p-crit">逐笔+方向</span></td></tr>
+        <tr><td class="mono">S10</td><td>集合竞价</td><td><b>竞价虚挂检测</b></td><td>9:20 前的大买单在不可撤时点前撤掉 → 该票当日降权</td><td><span class="pill p-crit">竞价盘口序列</span></td></tr>
+        <tr><td class="mono">S11</td><td>跌停持仓</td><td><b>跌停排队与打开监控</b></td><td>卖一封单衰减过半 → 撤排队单改市价（这里才有真正的排队）</td><td>盘口 ask1</td></tr>
+        <tr><td class="mono">S12</td><td>系统</td><td><b>数据断流降级</b></td><td>盘口静默超 30 秒 → 自动关闭 S1–S11，推送降级通知</td><td>—</td></tr>
+        <tr><td class="mono">S13</td><td>停牌</td><td><b>复牌重估条件单</b></td><td>复牌竞价按预设价带挂单，复牌 5 分钟内重评全部条件</td><td>停复牌事件流</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <p><strong>这张表同时回答了「分钟数据够不够」。</strong>标红的 S2/S3/S6/S7/S9/S10 用分钟线根本做不了——它们就是必须上 tick/L2 的铁证。分钟拟合只属于<b>回测层</b>（历史 tick 对零售不可得，没有别的选择）；<b>实时层</b>的盘中 VP 和全部执行子策略必须 tick/盘口直构，分钟只作断流后的降级路径，且两层的系统性偏差必须被量化（P1 对照 + P5 影子模式持续监控）。</p>
+  </div>
+
 </section>
 
 <!-- ============ 7 缺口 ============ -->
@@ -925,8 +952,8 @@ renderSlot("A");
 /* ---------- 封单模拟器 ---------- */
 var SEAL_STATES=[
   {k:"SEALED",nm:"封板持有",act:"零动作。封单充足，享受涨停溢价，继续持有到次日。",lo:75,hi:100},
-  {k:"WARN",  nm:"预警 · 挂涨停价排队",act:"在涨停价挂出卖单排队，<b>不砸盘</b>。此时涨停价上还压着巨量买单，挂涨停价能立刻成交且一分钱不让——等封单真崩了再挂就排不上队了。",lo:30,hi:75},
-  {k:"FLUSH", nm:"撤单转市价",act:"撤掉涨停价挂单，改以买一价 / 对手价卖出剩余仓位的 50%。封单已经衰减超过 70%，再等就要跟着炸板一起往下走。",lo:10,hi:30},
+  {k:"WARN",  nm:"预警 · 部分止盈",act:"<b>立即以涨停价卖出 50%</b>——封单还在，这笔卖单与封单即时成交，零滑点。带保护：3 秒未成交（说明封单恰在这瞬间被撤光）就撤单改对手价。若封单量回升到峰值的 75% 以上，剩余仓位回到「封板持有」。",lo:30,hi:75},
+  {k:"FLUSH", nm:"出清",act:"剩余仓位以对手价卖出。封单已衰减超过 70% 或已确认炸板，再等下去面对的是正在下坠的价格。",lo:10,hi:30},
   {k:"DUMP",  nm:"清仓",act:"封板彻底崩溃，市价清掉全部剩余仓位。同时该票当日拉黑，不再产生任何买入信号。",lo:0,hi:10}
 ];
 var stFlow=document.getElementById("stFlow");
