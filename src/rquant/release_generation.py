@@ -209,6 +209,23 @@ def build_deployment_change_plan(
     return DeploymentChangePlan(files, blocked, ordered_services, ())
 
 
+def validate_deployment_change_policy(
+    changed_files: list[str] | tuple[str, ...],
+    *,
+    release_profile: str,
+    lifecycle_mode: str,
+) -> DeploymentChangePlan:
+    """Classify one target with the same fail-closed policy used by recovery."""
+    if lifecycle_mode not in {"installed", "uninstalled"}:
+        raise ReleaseGenerationError("deployment lifecycle mode is invalid")
+    plan = build_deployment_change_plan(changed_files, release_profile=release_profile)
+    if plan.blocked_files:
+        raise ReleaseGenerationError("deployment contains privileged changed files")
+    if lifecycle_mode != "installed" and plan.handoff_daemons:
+        return replace(plan, handoff_daemons=())
+    return plan
+
+
 def deployment_timers_for_services(services: tuple[str, ...]) -> tuple[str, ...]:
     selected = {timer for service in services for timer in SERVICE_TIMERS.get(service, ())}
     return tuple(sorted(selected))
@@ -318,6 +335,8 @@ class DeploymentIntent:
         operation_id: str | None = None,
         stage: str = "planned",
     ) -> DeploymentIntent:
+        if stage not in {"planned", "initializing"}:
+            raise ReleaseGenerationError("deployment intent initial stage is invalid")
         for label, value in (("previous", previous_sha), ("target", target_sha)):
             if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
                 raise ReleaseGenerationError(f"deployment intent {label} SHA is invalid")
@@ -345,43 +364,87 @@ class DeploymentIntent:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> DeploymentIntent:
-        raw_history = payload.get("stage_history")
-        if not isinstance(raw_history, (list, tuple)) or not raw_history:
+        expected_fields = {
+            "schema_version",
+            "operation_id",
+            "previous_sha",
+            "target_sha",
+            "target_ref",
+            "stage",
+            "changed_files",
+            "restart_services",
+            "active_services",
+            "active_timers",
+            "restarted_services",
+            "handoff_operation_id",
+            "handoff_labels",
+            "marker_generation",
+            "previous_generation_id",
+            "created_at",
+            "updated_at",
+            "stage_history",
+        }
+        if type(payload) is not dict or set(payload) != expected_fields:
+            raise ReleaseGenerationError("deployment intent fields are malformed")
+        if type(payload["schema_version"]) is not int:
+            raise ReleaseGenerationError("deployment intent schema type is malformed")
+        string_fields = expected_fields - {
+            "schema_version",
+            "changed_files",
+            "restart_services",
+            "active_services",
+            "active_timers",
+            "restarted_services",
+            "handoff_labels",
+            "stage_history",
+        }
+        if any(type(payload[field]) is not str for field in string_fields):
+            raise ReleaseGenerationError("deployment intent string field is malformed")
+        list_fields = (
+            "changed_files",
+            "restart_services",
+            "active_services",
+            "active_timers",
+            "restarted_services",
+            "handoff_labels",
+        )
+        if any(
+            type(payload[field]) is not list
+            or any(type(value) is not str for value in payload[field])
+            for field in list_fields
+        ):
+            raise ReleaseGenerationError("deployment intent list field is malformed")
+        raw_history = payload["stage_history"]
+        if type(raw_history) is not list or not raw_history:
             raise ReleaseGenerationError("deployment intent stage history is malformed")
         if any(
-            not isinstance(value, dict) or set(value) != {"stage", "timestamp"}
+            type(value) is not dict
+            or set(value) != {"stage", "timestamp"}
+            or type(value["stage"]) is not str
+            or type(value["timestamp"]) is not str
             for value in raw_history
         ):
             raise ReleaseGenerationError("deployment intent stage history is malformed")
-        try:
-            intent = cls(
-                schema_version=int(payload["schema_version"]),
-                operation_id=str(payload["operation_id"]),
-                previous_sha=str(payload["previous_sha"]),
-                target_sha=str(payload["target_sha"]),
-                target_ref=str(payload["target_ref"]),
-                stage=str(payload["stage"]),
-                changed_files=tuple(str(value) for value in payload["changed_files"]),
-                restart_services=tuple(str(value) for value in payload["restart_services"]),
-                active_services=tuple(str(value) for value in payload["active_services"]),
-                active_timers=tuple(str(value) for value in payload["active_timers"]),
-                restarted_services=tuple(str(value) for value in payload["restarted_services"]),
-                handoff_operation_id=str(payload.get("handoff_operation_id", "")),
-                handoff_labels=tuple(str(value) for value in payload.get("handoff_labels", ())),
-                marker_generation=str(payload["marker_generation"]),
-                previous_generation_id=str(payload.get("previous_generation_id", "")),
-                created_at=str(payload["created_at"]),
-                updated_at=str(payload["updated_at"]),
-                stage_history=tuple(
-                    {
-                        "stage": str(value["stage"]),
-                        "timestamp": str(value["timestamp"]),
-                    }
-                    for value in raw_history
-                ),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ReleaseGenerationError("deployment intent is malformed") from exc
+        intent = cls(
+            schema_version=payload["schema_version"],
+            operation_id=payload["operation_id"],
+            previous_sha=payload["previous_sha"],
+            target_sha=payload["target_sha"],
+            target_ref=payload["target_ref"],
+            stage=payload["stage"],
+            changed_files=tuple(payload["changed_files"]),
+            restart_services=tuple(payload["restart_services"]),
+            active_services=tuple(payload["active_services"]),
+            active_timers=tuple(payload["active_timers"]),
+            restarted_services=tuple(payload["restarted_services"]),
+            handoff_operation_id=payload["handoff_operation_id"],
+            handoff_labels=tuple(payload["handoff_labels"]),
+            marker_generation=payload["marker_generation"],
+            previous_generation_id=payload["previous_generation_id"],
+            created_at=payload["created_at"],
+            updated_at=payload["updated_at"],
+            stage_history=tuple(dict(value) for value in raw_history),
+        )
         if (
             intent.schema_version != INTENT_SCHEMA_VERSION
             or re.fullmatch(r"[0-9a-f]{32}", intent.operation_id) is None
@@ -440,6 +503,7 @@ class DeploymentIntent:
         ]
         if not effective_stages or effective_stages[-1] != intent.stage:
             raise ReleaseGenerationError("deployment intent stage history is inconsistent")
+        _validate_deployment_stage_sequence(effective_stages)
         return intent
 
     def advance(
@@ -448,6 +512,10 @@ class DeploymentIntent:
         stage: str,
         restarted_services: tuple[str, ...] | None = None,
     ) -> DeploymentIntent:
+        effective_stages = [
+            value["stage"] for value in self.stage_history if value["stage"] != "handoff_rebound"
+        ]
+        _validate_deployment_stage_sequence([*effective_stages, stage])
         timestamp = datetime.now(UTC).isoformat()
         return replace(
             self,
@@ -478,6 +546,48 @@ class DeploymentIntent:
                 {"stage": "handoff_rebound", "timestamp": timestamp},
             ),
         )
+
+
+def _validate_deployment_stage_sequence(stages: list[str]) -> None:
+    if not stages or stages[0] not in {"planned", "initializing"}:
+        raise ReleaseGenerationError("deployment intent stage history is invalid")
+    for previous, current in zip(stages, stages[1:], strict=False):
+        if previous == "initializing":
+            allowed = {"completed"}
+        elif previous == "completed":
+            allowed = set()
+        elif current == "recovery_started" and previous != "initializing":
+            allowed = {"recovery_started"}
+        elif previous in {"planned", "recovery_started"}:
+            allowed = {"timers_stopped"}
+        elif previous == "timers_stopped":
+            allowed = {
+                "deploy_checkout_ready",
+                "resume_checkout_ready",
+                "rollback_checkout_ready",
+            }
+        elif previous.endswith("_checkout_ready"):
+            allowed = {previous.replace("_checkout_ready", "_dependencies_ready")}
+        elif previous.endswith("_dependencies_ready"):
+            allowed = {previous.replace("_dependencies_ready", "_preflight_ready")}
+        elif previous == "post_restart_preflight_ready":
+            allowed = {"timers_restored"}
+        elif previous.endswith("_preflight_ready"):
+            allowed = {"services_transitioning"}
+        elif previous == "services_transitioning":
+            allowed = {"services_transitioning", "services_ready"}
+        elif previous == "services_ready":
+            allowed = {"post_restart_preflight_ready"}
+        elif previous == "timers_restored":
+            allowed = {"marker_published"}
+        elif previous == "marker_published":
+            allowed = {"completed"}
+        else:
+            allowed = set()
+        if current not in allowed:
+            raise ReleaseGenerationError(
+                f"deployment intent stage transition is invalid: {previous} -> {current}"
+            )
 
 
 @dataclass(frozen=True)
@@ -582,14 +692,11 @@ def validate_deployment_intent_policy(
     lifecycle_mode: str,
     expected_handoff_operation_id: str | None = None,
 ) -> DeploymentChangePlan:
-    if lifecycle_mode not in {"installed", "uninstalled"}:
-        raise ReleaseGenerationError("deployment lifecycle mode is invalid")
-    plan = build_deployment_change_plan(
+    plan = validate_deployment_change_policy(
         intent.changed_files,
         release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
     )
-    if plan.blocked_files:
-        raise ReleaseGenerationError("deployment intent contains privileged changed files")
     if (
         intent.changed_files != plan.changed_files
         or intent.restart_services != plan.restart_services

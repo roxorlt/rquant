@@ -1100,7 +1100,7 @@ def _typed_deployment_intent_for_handoff(
     *,
     root: Path,
     lock_path: Path,
-    expected_handoff_operation_id: str,
+    expected_handoff_operation_id: str | None,
     release_profile: str,
     lifecycle_mode: str,
 ) -> tuple[ModuleType, object]:
@@ -1361,6 +1361,15 @@ def _superseding_handoff_operation_id(
 ) -> str:
     if recovery_action not in {"resume", "rollback"}:
         raise DeployBootstrapError("Lab handoff supersession requires a recovery action")
+    _authority_module, intent = _typed_deployment_intent_for_handoff(
+        root=root,
+        lock_path=lock_path,
+        expected_handoff_operation_id=None,
+        release_profile=release_profile,
+        lifecycle_mode=lifecycle_mode,
+    )
+    if str(intent.stage) == "completed":
+        raise DeployBootstrapError("deployment intent is already completed")
     payload = _incomplete_handoff_payload(root=root, lock_path=lock_path)
     if payload is None:
         return ""
@@ -1368,17 +1377,10 @@ def _superseding_handoff_operation_id(
     action = payload.get("action")
     if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
         raise DeployBootstrapError("incomplete Lab handoff operation is invalid")
-    if action == recovery_action:
-        return ""
-    if recovery_action == "resume" and action != "deploy":
+    if recovery_action == "resume" and action not in {"deploy", recovery_action}:
         raise DeployBootstrapError("incomplete Lab handoff action conflicts with recovery")
-    intent = _deployment_intent_for_handoff(
-        root=root,
-        lock_path=lock_path,
-        expected_handoff_operation_id=operation_id,
-        release_profile=release_profile,
-        lifecycle_mode=lifecycle_mode,
-    )
+    if str(intent.handoff_operation_id) != operation_id:
+        raise DeployBootstrapError("deployment intent handoff operation changed")
     installation = _read_lab_installation_state(root=root, lock_path=lock_path)
     installation_identity = _lab_installation_identity(lock_path, installation)
     _validate_superseded_handoff_binding(
@@ -1388,6 +1390,8 @@ def _superseding_handoff_operation_id(
         lifecycle_mode=lifecycle_mode,
         installation_identity=installation_identity,
     )
+    if action == recovery_action:
+        return str(payload.get("supersedes_operation_id", ""))
     return operation_id
 
 
@@ -1772,6 +1776,25 @@ def _complete_installed_rollout(
     recovery_target_sha: str,
     now: datetime | None = None,
 ) -> int:
+    if deploy_code != 0:
+        target_handoff.close()
+        previous_handoff = recovery_handoff_factory()
+        try:
+            previous_handoff.prepare(
+                dry_run=False,
+                target_ref=recovery_target_sha,
+                target_sha=recovery_target_sha,
+                action="rollback",
+                now=now,
+            )
+            previous_handoff.restore()
+        except Exception as exc:
+            previous_handoff.close()
+            print(
+                f"FAILED: deployer exited {deploy_code}; previous Lab readiness failed: {exc}",
+                file=sys.stderr,
+            )
+        return deploy_code
     try:
         target_handoff.restore()
     except DeployBootstrapError as readiness_error:
@@ -2052,6 +2075,52 @@ def _verify_recovery_target_binding(
     ):
         raise DeployBootstrapError("recovery target does not match recorded deployment intent")
     return expected_sha
+
+
+def _validate_target_deployment_policy(
+    *,
+    root: Path,
+    git_path: Path,
+    target_sha: str,
+    release_profile: str,
+    lifecycle_mode: str,
+    overall_deadline_monotonic: float,
+) -> object:
+    previous_sha = _git_head(
+        root,
+        git_path,
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    )
+    if previous_sha != target_sha:
+        fast_forward = _git_run(
+            root,
+            git_path,
+            "merge-base",
+            "--is-ancestor",
+            previous_sha,
+            target_sha,
+            check=False,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        if fast_forward.returncode != 0:
+            raise DeployBootstrapError("generation target is not a fast-forward")
+    changed = _git_output(
+        root,
+        git_path,
+        "diff",
+        "--name-only",
+        f"{previous_sha}..{target_sha}",
+        overall_deadline_monotonic=overall_deadline_monotonic,
+    ).splitlines()
+    module = _load_release_authority(root / "src" / "rquant" / "release_generation.py")
+    try:
+        return module.validate_deployment_change_policy(
+            changed,
+            release_profile=release_profile,
+            lifecycle_mode=lifecycle_mode,
+        )
+    except module.ReleaseGenerationError as exc:
+        raise DeployBootstrapError(f"deployment target policy rejected: {exc}") from exc
 
 
 def _fetch_generation_target(
@@ -2594,6 +2663,17 @@ def main(argv: list[str] | None = None) -> int:
                 target_ref,
                 overall_deadline_monotonic=overall_deadline_monotonic,
             )
+            if installed_handoff and not (
+                args.initialize_generation or args.register_lab_installation
+            ):
+                _validate_target_deployment_policy(
+                    root=root,
+                    git_path=git_path,
+                    target_sha=target_sha,
+                    release_profile=args.release_profile,
+                    lifecycle_mode=args.lab_lifecycle_mode,
+                    overall_deadline_monotonic=overall_deadline_monotonic,
+                )
         if args.finalize_generation:
             if args.inherited_lock_fd is None:
                 raise DeployBootstrapError("finalizer requires inherited generation lock")

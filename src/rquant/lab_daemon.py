@@ -799,6 +799,14 @@ def prepare_lab_runtime_sqlite_authority(
             raise LabDaemonConfigurationError(f"{label} prepared identity changed")
         result, sqlite_authority = sqlite_authority, None
         return result
+    except BaseException:
+        if sqlite_authority is not None:
+            try:
+                sqlite_authority.discard_created()
+            finally:
+                sqlite_authority.close()
+                sqlite_authority = None
+        raise
     finally:
         if sqlite_authority is not None:
             sqlite_authority.close()
@@ -1494,6 +1502,33 @@ class LabSqliteAuthority:
             raise
         return connection
 
+    def discard_created(self) -> None:
+        """Remove only the inode this authority created, through its retained parent."""
+        if not self.created:
+            return
+        if self._parent_descriptor < 0 or self._database_descriptor < 0:
+            raise LabDaemonConfigurationError(f"{self.label} authority is closed")
+        opened = os.fstat(self._database_descriptor)
+        try:
+            active = os.stat(
+                self.path.name,
+                dir_fd=self._parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise LabDaemonConfigurationError(
+                f"{self.label} created database cannot be safely removed"
+            ) from exc
+        if self._identity(opened) != self._identity(self._database_identity) or self._identity(
+            active
+        ) != self._identity(self._database_identity):
+            raise LabDaemonConfigurationError(
+                f"{self.label} created database identity changed before cleanup"
+            )
+        os.unlink(self.path.name, dir_fd=self._parent_descriptor)
+        os.fsync(self._parent_descriptor)
+        self.created = False
+
     def close(self) -> None:
         database_descriptor, self._database_descriptor = self._database_descriptor, -1
         parent_descriptor, self._parent_descriptor = self._parent_descriptor, -1
@@ -1572,6 +1607,22 @@ def _prepare_private_sqlite_from_parent(
         descriptor = -1
         return authority
     except BaseException:
+        if created and descriptor >= 0 and parent_descriptor >= 0:
+            opened = os.fstat(descriptor)
+            try:
+                active = os.stat(
+                    candidate.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                active = None
+            if active is not None and (active.st_dev, active.st_ino) == (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                os.unlink(candidate.name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
         if descriptor >= 0:
             os.close(descriptor)
         if parent_descriptor >= 0:

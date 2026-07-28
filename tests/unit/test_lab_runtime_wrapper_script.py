@@ -25,6 +25,37 @@ RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 _ORIGINAL_OS_WALK = os.walk
 
 
+def _complete_deployment_intent(
+    authority: ReleaseGenerationAuthority,
+    *,
+    operation_id: str,
+    expected_commit: str,
+) -> object:
+    for stage in (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+    ):
+        authority.update_deployment_intent(operation_id=operation_id, stage=stage)
+    published = authority.publish(
+        expected_commit=expected_commit,
+        operation_id=operation_id,
+        transaction_kind="deployment",
+    )
+    authority.update_deployment_intent(operation_id=operation_id, stage="marker_published")
+    authority.update_deployment_intent(operation_id=operation_id, stage="completed")
+    authority.commit_generation(
+        operation_id=operation_id,
+        transaction_kind="deployment",
+    )
+    return published
+
+
 @pytest.fixture(autouse=True)
 def _remove_immutable_test_generations(
     tmp_path: Path,
@@ -433,16 +464,10 @@ def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(
         handoff_labels=labels,
     )
     authority.invalidate()
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="timers_restored")
-    authority.publish(
+    _complete_deployment_intent(
+        authority,
+        operation_id=intent.operation_id,
         expected_commit=commit,
-        operation_id=intent.operation_id,
-        transaction_kind="deployment",
-    )
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
-    authority.commit_generation(
-        operation_id=intent.operation_id,
-        transaction_kind="deployment",
     )
     os.close(lock_fd)
     provisional = {
@@ -531,16 +556,10 @@ def test_rollback_rebinds_marker_to_superseding_handoff_for_normal_wrapper(
         handoff_labels=labels,
     )
     authority.invalidate()
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="timers_restored")
-    published = authority.publish(
+    published = _complete_deployment_intent(
+        authority,
+        operation_id=intent.operation_id,
         expected_commit=commit,
-        operation_id=intent.operation_id,
-        transaction_kind="deployment",
-    )
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
-    authority.commit_generation(
-        operation_id=intent.operation_id,
-        transaction_kind="deployment",
     )
     os.close(lock_fd)
     proof = {

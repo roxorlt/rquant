@@ -229,6 +229,48 @@ def _sha(char: str) -> str:
     return char * 40
 
 
+def _advance_fake_intent_to(
+    authority: FakeGenerationAuthority,
+    *,
+    target_stage: str,
+    action: str = "deploy",
+    restarted_services: tuple[str, ...] | None = None,
+) -> DeploymentIntent:
+    assert authority.intent is not None
+    stages = (
+        "timers_stopped",
+        f"{action}_checkout_ready",
+        f"{action}_dependencies_ready",
+        f"{action}_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "completed",
+    )
+    current_stage = authority.intent.stage
+    start = (
+        0 if current_stage in {"planned", "recovery_started"} else stages.index(current_stage) + 1
+    )
+    for stage in stages[start:]:
+        authority.update_deployment_intent(
+            operation_id=authority.intent.operation_id,
+            stage=stage,
+            restarted_services=restarted_services if stage == target_stage else None,
+        )
+        if stage == target_stage:
+            assert authority.intent is not None
+            return authority.intent
+    raise AssertionError("fixture target stage precedes current stage")
+
+
+def _complete_deployment_intent(authority: FakeGenerationAuthority) -> DeploymentIntent:
+    _advance_fake_intent_to(authority, target_stage="completed")
+    assert authority.intent is not None
+    return authority.intent
+
+
 def _base_responses(target: str = "v0.13.2") -> dict[tuple[str, ...], tuple[int, str]]:
     old_sha = _sha("a")
     new_sha = _sha("b")
@@ -882,6 +924,42 @@ def test_intent_is_durable_before_marker_invalidation(tmp_path: Path) -> None:
     ]
 
 
+def test_completed_recovery_intent_is_an_explicit_noop_without_external_mutation(
+    tmp_path: Path,
+) -> None:
+    authority = FakeGenerationAuthority()
+    authority.begin_deployment_intent(
+        previous_sha=_sha("a"),
+        target_sha=_sha("b"),
+        target_ref="v0.13.2",
+        changed_files=("src/rquant/preflight.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+    )
+    completed = _complete_deployment_intent(authority)
+    events_before = list(authority.events)
+    runner = FakeRunner()
+    finalizer = FakeGenerationFinalizer()
+    baseline = _config(tmp_path)
+    config = DeployConfig(**{**baseline.__dict__, "recovery_action": "resume"})
+
+    with pytest.raises(PolicyError, match="completed|already"):
+        deploy(
+            config,
+            runner=runner,
+            generation_authority=authority,
+            generation_finalizer=finalizer,
+        )
+
+    assert authority.intent == completed
+    assert authority.events == events_before
+    assert runner.calls == []
+    assert finalizer.calls == []
+
+
 def test_recovery_uses_recorded_plan_after_origin_advances(tmp_path: Path) -> None:
     authority = FakeGenerationAuthority()
     authority.begin_deployment_intent(
@@ -894,9 +972,9 @@ def test_recovery_uses_recorded_plan_after_origin_advances(tmp_path: Path) -> No
         active_timers=("rquant-monitor.timer",),
         marker_generation="marker-a",
     )
-    authority.update_deployment_intent(
-        operation_id=authority.intent.operation_id,
-        stage="services_transitioning",
+    _advance_fake_intent_to(
+        authority,
+        target_stage="services_transitioning",
         restarted_services=("rquant-monitor.service",),
     )
     responses = {
@@ -931,7 +1009,7 @@ def test_recovery_records_start_and_invalidates_before_first_external_mutation(
     tmp_path: Path,
 ) -> None:
     authority = FakeGenerationAuthority()
-    intent = authority.begin_deployment_intent(
+    authority.begin_deployment_intent(
         previous_sha=_sha("a"),
         target_sha=_sha("b"),
         target_ref="v0.13.2",
@@ -941,9 +1019,9 @@ def test_recovery_records_start_and_invalidates_before_first_external_mutation(
         active_timers=("rquant-monitor.timer",),
         marker_generation="marker-a",
     )
-    authority.update_deployment_intent(
-        operation_id=intent.operation_id,
-        stage="services_transitioning",
+    _advance_fake_intent_to(
+        authority,
+        target_stage="services_transitioning",
     )
 
     class OrderedRecoveryRunner(FakeRunner):
@@ -1191,9 +1269,9 @@ def test_recovery_after_partial_service_restart_completes_services_before_marker
         active_timers=("rquant-monitor.timer", "rquant-surge-watch.timer"),
         marker_generation="marker-a",
     )
-    authority.update_deployment_intent(
-        operation_id=intent.operation_id,
-        stage="services_transitioning",
+    _advance_fake_intent_to(
+        authority,
+        target_stage="services_transitioning",
         restarted_services=("rquant-monitor.service",),
     )
     responses = {

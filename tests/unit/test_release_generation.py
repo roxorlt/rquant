@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,106 @@ from rquant.release_generation import (
 _ORIGINAL_OS_WALK = os.walk
 
 TRUSTED_GIT = Path("/usr/bin/git")
+
+
+def _deployment_intent_payload() -> dict[str, object]:
+    intent = DeploymentIntent.create(
+        previous_sha="a" * 40,
+        target_sha="b" * 40,
+        target_ref="b" * 40,
+        changed_files=("src/rquant/preflight.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation="c" * 64,
+        previous_generation_id="d" * 64,
+    )
+    return json.loads(json.dumps(asdict(intent)))
+
+
+def _advance_deployment_intent(
+    authority: ReleaseGenerationAuthority,
+    intent: DeploymentIntent,
+    *,
+    target_stage: str,
+    action: str = "deploy",
+) -> DeploymentIntent:
+    stages = (
+        "timers_stopped",
+        f"{action}_checkout_ready",
+        f"{action}_dependencies_ready",
+        f"{action}_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "completed",
+    )
+    current = authority.read_deployment_intent()
+    if current.operation_id != intent.operation_id or target_stage not in stages:
+        raise AssertionError("invalid deployment intent fixture transition")
+    start = (
+        0 if current.stage in {"planned", "recovery_started"} else stages.index(current.stage) + 1
+    )
+    for stage in stages[start:]:
+        current = authority.update_deployment_intent(
+            operation_id=current.operation_id,
+            stage=stage,
+        )
+        if stage == target_stage:
+            return current
+    raise AssertionError("fixture target stage precedes current stage")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.update({"unexpected": "value"}),
+        lambda payload: payload.pop("previous_generation_id"),
+        lambda payload: payload.update({"schema_version": True}),
+        lambda payload: payload.update({"schema_version": "1"}),
+        lambda payload: payload.update({"changed_files": "src/rquant/preflight.py"}),
+        lambda payload: payload.update({"changed_files": [1]}),
+        lambda payload: payload.update({"handoff_operation_id": None}),
+        lambda payload: payload["stage_history"][0].update({"timestamp": 1}),
+        lambda payload: payload["stage_history"][0].update({"extra": "value"}),
+    ],
+    ids=(
+        "extra-field",
+        "missing-field",
+        "bool-schema",
+        "string-schema",
+        "string-list",
+        "non-string-list-item",
+        "null-string",
+        "non-string-timestamp",
+        "extra-history-field",
+    ),
+)
+def test_deployment_intent_payload_rejects_non_json_exact_types(
+    mutation: Callable[[dict[str, object]], object],
+) -> None:
+    payload = _deployment_intent_payload()
+    mutation(payload)
+
+    with pytest.raises(ReleaseGenerationError, match="intent.*malformed|type|field"):
+        DeploymentIntent.from_payload(payload)
+
+
+def test_deployment_intent_rejects_illegal_planned_to_completed_transition() -> None:
+    payload = _deployment_intent_payload()
+    completed_at = "2999-01-01T00:00:00+00:00"
+    payload["stage"] = "completed"
+    payload["updated_at"] = completed_at
+    payload["stage_history"].append({"stage": "completed", "timestamp": completed_at})
+
+    with pytest.raises(ReleaseGenerationError, match="transition|history"):
+        DeploymentIntent.from_payload(payload)
+
+    intent = DeploymentIntent.from_payload(_deployment_intent_payload())
+    with pytest.raises(ReleaseGenerationError, match="transition"):
+        intent.advance(stage="completed")
 
 
 @pytest.fixture(autouse=True)
@@ -311,9 +412,10 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
         active_timers=(),
     )
     authority.invalidate()
-    authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="timers_restored",
+    _advance_deployment_intent(
+        authority,
+        deployment,
+        target_stage="timers_restored",
     )
     deployed = authority.publish(
         expected_commit=commit,
@@ -726,16 +828,17 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         handoff_labels=labels,
     )
     authority.invalidate()
-    authority.update_deployment_intent(
-        operation_id=intent.operation_id,
-        stage="timers_restored",
+    _advance_deployment_intent(
+        authority,
+        intent,
+        target_stage="timers_restored",
     )
     published = authority.publish(
         expected_commit=commit,
         operation_id=intent.operation_id,
         transaction_kind="deployment",
     )
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
+    _advance_deployment_intent(authority, intent, target_stage="completed")
     authority.commit_generation(
         operation_id=intent.operation_id,
         transaction_kind="deployment",
@@ -1495,9 +1598,10 @@ def test_selector_switch_without_marker_never_accepts_the_new_environment(
         active_timers=(),
     )
     authority.invalidate()
-    deployment = authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="timers_restored",
+    deployment = _advance_deployment_intent(
+        authority,
+        deployment,
+        target_stage="timers_restored",
     )
 
     def interrupt(stage: str) -> None:
@@ -1528,10 +1632,7 @@ def test_selector_switch_without_marker_never_accepts_the_new_environment(
         operation_id=deployment.operation_id,
         transaction_kind="deployment",
     )
-    authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="completed",
-    )
+    _advance_deployment_intent(authority, deployment, target_stage="completed")
     authority.commit_generation(
         operation_id=deployment.operation_id,
         transaction_kind="deployment",
@@ -1556,19 +1657,17 @@ def _archive_completed_deployment(
         active_timers=(),
     )
     authority.invalidate()
-    authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="timers_restored",
+    _advance_deployment_intent(
+        authority,
+        deployment,
+        target_stage="timers_restored",
     )
     authority.publish(
         expected_commit=commit,
         operation_id=deployment.operation_id,
         transaction_kind="deployment",
     )
-    authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="completed",
-    )
+    _advance_deployment_intent(authority, deployment, target_stage="completed")
     authority.commit_generation(
         operation_id=deployment.operation_id,
         transaction_kind="deployment",
@@ -1793,13 +1892,13 @@ def test_generation_gc_uses_exact_previous_id_not_newer_orphan_mtime(tmp_path: P
         check=True,
         capture_output=True,
     )
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="timers_restored")
+    _advance_deployment_intent(authority, intent, target_stage="timers_restored")
     second = authority.publish(
         expected_commit=second_commit,
         operation_id=intent.operation_id,
         transaction_kind="deployment",
     )
-    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
+    _advance_deployment_intent(authority, intent, target_stage="completed")
     authority.commit_generation(
         operation_id=intent.operation_id,
         transaction_kind="deployment",
@@ -1974,18 +2073,22 @@ def test_rollback_selects_a_verified_immutable_previous_environment(
         operation_id=deployment.operation_id,
         stage="recovery_started",
     )
-    authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="timers_restored",
+    _advance_deployment_intent(
+        authority,
+        deployment,
+        target_stage="timers_restored",
+        action="rollback",
     )
     marker = authority.publish(
         expected_commit=previous,
         operation_id=deployment.operation_id,
         transaction_kind="deployment",
     )
-    authority.update_deployment_intent(
-        operation_id=deployment.operation_id,
-        stage="completed",
+    _advance_deployment_intent(
+        authority,
+        deployment,
+        target_stage="completed",
+        action="rollback",
     )
     authority.commit_generation(
         operation_id=deployment.operation_id,

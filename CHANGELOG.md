@@ -69,6 +69,14 @@
 
 ### Fixed
 
+- **Lab daemon 第十轮部署事务与 SQLite 首建回滚加固**：installed 发布现在会在
+  launchd bootout 前完成 exact target 拉取、快进校验和共享 changed-files/privileged
+  策略分类；deployer 非零退出时不再恢复或完成目标 handoff，只验证 deployer 已回滚的
+  previous generation 并原样返回退出码。recovery 使用严格 JSON `DeploymentIntent`
+  合约和合法阶段状态机，完成态拒绝重放，同 action 重入保留并验证 supersede 链。
+  scheduler 首次创建 Lab SQLite 后若 runtime identity 或 sentinel 登记失败，会通过保留的
+  parent FD 仅删除本次新建 inode 并 fsync，既有数据库绝不删除。
+
 - **Lab daemon 第九轮完成证明与数据权威加固**：completed handoff proof 的 deployment operation、
   immutable environment generation 与 code SHA 现在分别与 typed deployment intent、当前 marker、
   environment selector 和 commit record 交叉验证，任一字段伪造均阻断收敛。bootstrap 与生产部署器

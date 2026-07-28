@@ -1246,6 +1246,89 @@ def test_atomic_first_sqlite_prepare_rejects_ancestor_replacement_without_databa
     assert not (displaced / "lab-runtime" / database.name).exists()
 
 
+def test_atomic_first_sqlite_prepare_removes_created_database_when_registration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+
+    parent = tmp_path / "authority"
+    runtime = parent / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": runtime / "commands"},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    displaced = tmp_path / "authority.displaced"
+    original_write = lab_daemon._write_runtime_prepared_sentinel
+
+    def replace_ancestor_before_registration(*args: object, **kwargs: object) -> object:
+        parent.rename(displaced)
+        parent.mkdir(mode=0o700)
+        replacement = parent / "lab-runtime"
+        replacement.mkdir(mode=0o700)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lab_daemon,
+        "_write_runtime_prepared_sentinel",
+        replace_ancestor_before_registration,
+    )
+
+    with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="identity|ancestor"):
+        lab_daemon.prepare_lab_runtime_sqlite_authority(
+            runtime,
+            label="lab jobs SQLite",
+            path=database,
+            mutation_guard=lambda: "b" * 40,
+        )
+
+    assert not (displaced / "lab-runtime" / database.name).exists()
+    assert not database.exists()
+
+
+def test_atomic_sqlite_registration_failure_never_unlinks_existing_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": runtime / "commands"},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    database.write_bytes(b"existing-database")
+    database.chmod(0o600)
+    before = (database.read_bytes(), database.stat().st_ino)
+    monkeypatch.setattr(
+        lab_daemon,
+        "_write_runtime_prepared_sentinel",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            lab_daemon.LabDaemonConfigurationError("registration failed")
+        ),
+    )
+
+    with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="registration failed"):
+        lab_daemon.prepare_lab_runtime_sqlite_authority(
+            runtime,
+            label="lab jobs SQLite",
+            path=database,
+            mutation_guard=lambda: "b" * 40,
+        )
+
+    assert (database.read_bytes(), database.stat().st_ino) == before
+
+
 def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Path) -> None:
     from rquant import lab_daemon
 

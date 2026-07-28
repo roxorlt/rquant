@@ -40,10 +40,9 @@ from rquant.release_generation import (
     DeploymentIntent,
     ReleaseGenerationAuthority,
     ReleaseGenerationError,
+    build_deployment_change_plan,
+    validate_deployment_change_policy,
     validate_deployment_intent_policy,
-)
-from rquant.release_generation import (
-    build_deployment_change_plan as build_change_plan,
 )
 from rquant.release_generation import (
     deployment_timers_for_services as _timers_for_services,
@@ -51,6 +50,7 @@ from rquant.release_generation import (
 
 ALL_LONG_RUNNING_SERVICES = _ALL_LONG_RUNNING_SERVICES
 ChangePlan = DeploymentChangePlan
+build_change_plan = build_deployment_change_plan
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 
@@ -662,6 +662,8 @@ def _recover_locked(
     if action not in {"resume", "rollback"}:
         raise PolicyError("recovery action must be resume or rollback")
     intent = authority.read_deployment_intent()
+    if intent.stage == "completed":
+        raise PolicyError("deployment intent is already completed")
     if config.dry_run:
         raise PolicyError("recovery does not support dry-run")
     expected_target = intent.target_sha if action == "resume" else intent.previous_sha
@@ -778,13 +780,14 @@ def _deploy_locked(
         "target is not a fast-forward from the deployed commit",
     )
     changed_output = _stdout(runner, [git, "diff", "--name-only", f"{previous_sha}..{target_sha}"])
-    change_plan = build_change_plan(
-        changed_output.splitlines(),
-        release_profile=config.release_profile,
-    )
-    if change_plan.blocked_files:
-        joined = ", ".join(change_plan.blocked_files)
-        raise PolicyError(f"privileged infrastructure changes require a separate rollout: {joined}")
+    try:
+        change_plan = validate_deployment_change_policy(
+            changed_output.splitlines(),
+            release_profile=config.release_profile,
+            lifecycle_mode=config.lab_lifecycle_mode,
+        )
+    except ReleaseGenerationError as exc:
+        raise PolicyError(str(exc)) from exc
     requires_handoff = config.lab_lifecycle_mode == "installed" and bool(
         change_plan.handoff_daemons
     )

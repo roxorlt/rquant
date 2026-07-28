@@ -64,7 +64,27 @@ def _handoff_deployment_intent(
         handoff_labels=tuple(module.LAB_LAUNCHD_LABELS),
         operation_id=operation_id,
     )
-    return intent if stage == "planned" else intent.advance(stage=stage)
+    if stage == "planned":
+        return intent
+    stages = (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+        "marker_published",
+        "completed",
+    )
+    if stage not in stages:
+        raise AssertionError(f"unsupported fixture deployment stage: {stage}")
+    for next_stage in stages:
+        intent = intent.advance(stage=next_stage)
+        if next_stage == stage:
+            return intent
+    raise AssertionError("unreachable")
 
 
 def _publish_handoff_generation_authority(
@@ -456,6 +476,30 @@ def _begin_intent(
         return intent.operation_id
     finally:
         os.close(lock_fd)
+
+
+def _advance_generation_intent(
+    authority: ReleaseGenerationAuthority,
+    *,
+    operation_id: str,
+    target_stage: str,
+) -> None:
+    stages = (
+        "timers_stopped",
+        "deploy_checkout_ready",
+        "deploy_dependencies_ready",
+        "deploy_preflight_ready",
+        "services_transitioning",
+        "services_ready",
+        "post_restart_preflight_ready",
+        "timers_restored",
+    )
+    if target_stage not in stages:
+        raise AssertionError("unsupported generation fixture stage")
+    for stage in stages:
+        authority.update_deployment_intent(operation_id=operation_id, stage=stage)
+        if stage == target_stage:
+            return
 
 
 def _command(
@@ -935,6 +979,75 @@ def test_installed_bootstrap_tampered_prepared_sentinel_fails_before_fetch_or_ha
     assert _tree_snapshot(checkout / ".git") == git_before
     assert _tree_snapshot(lock_path.parent) == authority_before
     assert not lock_path.with_name(f"{lock_path.stem}.handoff.lock").exists()
+
+
+def test_installed_target_policy_rejects_privileged_launchd_diff_before_bootout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, previous = _checkout(tmp_path)
+    module = _bootstrap_module()
+    plist = checkout / "deploy" / "launchd" / f"{module.LAB_LAUNCHD_LABELS[0]}.plist"
+    plist.write_text(
+        "<?xml version='1.0'?><plist version='1.0'><dict><key>Changed</key>"
+        "<true/></dict></plist>\n",
+        encoding="utf-8",
+    )
+    _git(checkout, "add", str(plist.relative_to(checkout)))
+    _git(
+        checkout,
+        "-c",
+        "user.name=rQuant Tests",
+        "-c",
+        "user.email=tests@rquant.invalid",
+        "commit",
+        "-qm",
+        "change launchd infrastructure",
+    )
+    target = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "push", "-q", "origin", "main")
+    _git(checkout, "reset", "--hard", previous)
+    installation = module._private_json(
+        module._stable_record_path(lock_path, "lab-install"),
+        label="Lab launchd installation state",
+    )
+    assert installation is not None
+    module._write_lab_installation_state(
+        root=checkout,
+        lock_path=lock_path,
+        runtime_root=Path(str(installation["runtime_root"])),
+        readiness_root=Path(str(installation["readiness_root"])),
+        expected_commit=previous,
+    )
+    launchctl_calls: list[list[str]] = []
+    run_marker = tmp_path / "deployer-ran"
+    monkeypatch.setenv("RUN_MARKER", str(run_marker))
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: (
+            launchctl_calls.append(arguments)
+            or subprocess.CompletedProcess(arguments, 0, stdout="state = running\n", stderr="")
+        ),
+    )
+    monkeypatch.chdir(checkout)
+
+    result = module.main(
+        _command(
+            checkout,
+            python,
+            lock_path,
+            target=target,
+            lifecycle_mode="installed",
+        )[4:]
+    )
+
+    assert result == 2
+    assert launchctl_calls == []
+    assert not run_marker.exists()
+    assert _git(checkout, "rev-parse", "HEAD") == previous
 
 
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
@@ -1709,6 +1822,161 @@ def test_supersede_requires_matching_immutable_intent_before_launchd_mutation(
     assert launchctl_calls == []
 
 
+@pytest.mark.parametrize("action", ("resume", "rollback"))
+def test_same_action_recovery_validates_intent_and_preserves_supersede_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    current_operation = "6" * 32
+    previous_operation = "5" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    installation_identity = module._lab_installation_identity(lock_path, installation)
+    previous_sha = "a" * 40
+    target_sha = "b" * 40
+    target_ref = target_sha if action == "resume" else previous_sha
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": current_operation,
+            "checkout_root": str(root),
+            "stage": "stopping",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": [module.LAB_LAUNCHD_LABELS[0]],
+            "restarted_labels": [],
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": target_ref,
+            "target_sha": target_ref,
+            "action": action,
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": installation_identity,
+            "supersedes_operation_id": previous_operation,
+        },
+    )
+    intent = _handoff_deployment_intent(
+        module,
+        handoff_operation_id=current_operation,
+        operation_id="c" * 32,
+        previous_sha=previous_sha,
+        target_sha=target_sha,
+        target_ref=target_sha,
+        stage="services_transitioning",
+    )
+    module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent))
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+
+    supersedes = module._superseding_handoff_operation_id(
+        root=root,
+        lock_path=lock_path,
+        recovery_action=action,
+        release_profile="macos-lab",
+        lifecycle_mode="installed",
+    )
+
+    assert supersedes == previous_operation
+
+
+def test_same_action_recovery_rejects_invalid_typed_intent_before_launchd_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    operation_id = "6" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": operation_id,
+            "checkout_root": str(root),
+            "stage": "stopping",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": [],
+            "restarted_labels": [],
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": "b" * 40,
+            "target_sha": "b" * 40,
+            "action": "resume",
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": module._lab_installation_identity(lock_path, installation),
+            "supersedes_operation_id": "5" * 32,
+        },
+    )
+    intent = asdict(
+        _handoff_deployment_intent(
+            module,
+            handoff_operation_id=operation_id,
+            operation_id="c" * 32,
+            previous_sha="a" * 40,
+            target_sha="b" * 40,
+            target_ref="b" * 40,
+            stage="services_transitioning",
+        )
+    )
+    intent["changed_files"] = ["deploy/launchd/com.roxor.rquant-lab-worker.plist"]
+    module._atomic_private_json(intent_path_for_lock(lock_path), intent)
+    launchctl_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: launchctl_calls.append(arguments),
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="intent|policy|privileged"):
+        module._superseding_handoff_operation_id(
+            root=root,
+            lock_path=lock_path,
+            recovery_action="resume",
+            release_profile="macos-lab",
+            lifecycle_mode="installed",
+        )
+
+    assert launchctl_calls == []
+
+
+def test_completed_recovery_intent_is_rejected_without_mutating_generation_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    operation_id = "6" * 32
+    _publish_handoff_generation_authority(
+        module,
+        lock_path,
+        handoff_operation_id=operation_id,
+    )
+    marker = marker_path_for_lock(lock_path)
+    committed = commit_path_for_lock(lock_path)
+    before = (marker.read_bytes(), committed.read_bytes())
+    launchctl_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: launchctl_calls.append(arguments),
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="completed|already"):
+        module._superseding_handoff_operation_id(
+            root=root,
+            lock_path=lock_path,
+            recovery_action="resume",
+            release_profile="macos-lab",
+            lifecycle_mode="installed",
+        )
+
+    assert (marker.read_bytes(), committed.read_bytes()) == before
+    assert launchctl_calls == []
+
+
 def test_superseding_rollback_stops_partial_target_labels_before_previous_restore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2245,6 +2513,58 @@ def test_readiness_failure_stops_target_then_rolls_back_and_restores_previous(
         "previous-generation-restored",
         "previous-daemons-ready",
     ]
+
+
+@pytest.mark.parametrize("previous_ready", (True, False))
+def test_nonzero_deployer_exit_never_restores_target_or_replays_rollback(
+    capsys: pytest.CaptureFixture[str],
+    previous_ready: bool,
+) -> None:
+    module = _bootstrap_module()
+    events: list[str] = []
+
+    class TargetHandoff:
+        def restore(self) -> None:
+            pytest.fail("failed deploy must not restore or complete the target handoff")
+
+        def close(self) -> None:
+            events.append("target-closed")
+
+    class PreviousHandoff:
+        def prepare(self, **kwargs: object) -> None:
+            assert kwargs["target_ref"] == kwargs["target_sha"] == "f" * 40
+            assert kwargs["action"] == "rollback"
+            events.append("previous-prepare")
+
+        def restore(self) -> None:
+            events.append("previous-verify")
+            if not previous_ready:
+                raise module.DeployBootstrapError("previous generation is not ready")
+
+        def close(self) -> None:
+            events.append("previous-closed")
+
+    result = module._complete_installed_rollout(
+        target_handoff=TargetHandoff(),
+        deploy_code=1,
+        recovery_handoff_factory=PreviousHandoff,
+        rollback=lambda _handoff: pytest.fail("deployer rollback must not be replayed"),
+        recovery_target_sha="f" * 40,
+        now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result == 1
+    assert events[:3] == ["target-closed", "previous-prepare", "previous-verify"]
+    if previous_ready:
+        assert events == ["target-closed", "previous-prepare", "previous-verify"]
+    else:
+        assert events == [
+            "target-closed",
+            "previous-prepare",
+            "previous-verify",
+            "previous-closed",
+        ]
+        assert "previous generation is not ready" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("source_action", ["resume", "rollback"])
@@ -3577,9 +3897,10 @@ def test_target_checkout_authority_publishes_its_marker_schema(tmp_path: Path) -
             git_path=TRUSTED_GIT,
             writable=True,
         )
-        update_authority.update_deployment_intent(
+        _advance_generation_intent(
+            update_authority,
             operation_id=operation_id,
-            stage="timers_restored",
+            target_stage="timers_restored",
         )
     finally:
         os.close(update_fd)
@@ -3631,16 +3952,18 @@ def test_installed_publish_finalizer_inherits_outer_handoff_without_relocking(
     update_fd = os.open(lock_path, os.O_RDWR)
     try:
         fcntl.flock(update_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ReleaseGenerationAuthority(
+        authority = ReleaseGenerationAuthority(
             repo=checkout,
             lock_path=lock_path,
             lock_fd=update_fd,
             python_path=python,
             git_path=TRUSTED_GIT,
             writable=True,
-        ).update_deployment_intent(
+        )
+        _advance_generation_intent(
+            authority,
             operation_id=operation_id,
-            stage="timers_restored",
+            target_stage="timers_restored",
         )
     finally:
         os.close(update_fd)
