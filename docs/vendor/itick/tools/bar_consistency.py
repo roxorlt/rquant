@@ -43,8 +43,16 @@ def collect(symbols: str, out_dir: Path, token: str) -> None:
     day = datetime.now(CST).strftime("%Y-%m-%d")
     raw_path = out_dir / f"raw-{day}.jsonl"
     evt_path = out_dir / f"events-{day}.jsonl"
-    raw_f = raw_path.open("a", encoding="utf-8")
+    # buffering=1 行缓冲:pkill/timeout 的 SIGTERM 杀进程时不丢缓冲区里的消息
+    raw_f = raw_path.open("a", encoding="utf-8", buffering=1)
     stop = threading.Event()
+
+    def _graceful(signum, _frame):  # noqa: ANN001
+        stop.set()
+        raw_f.flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _graceful)
 
     def log_event(kind: str, detail: str) -> None:
         with evt_path.open("a", encoding="utf-8") as f:
