@@ -1,0 +1,252 @@
+<!-- source: https://docs.itick.org/zh-cn/rest-api/stocks/stock-kline.md -->
+<!-- fetched: 2026-07-28 | locale: zh-cn | mode: md | slug: rest-api/stocks/stock-kline -->
+
+---
+title: 历史K线查询
+description: 全球股票的完整K线数据，覆盖A股、美股、港股等全球市场数千只股票。包含开盘价、最高价、最低价、收盘价及成交量等标准OHLC字段，支持从分钟线到月线的多时间周期查询，提供复权因子确保数据准确性。
+keywords: 实时K线API, 分钟线接口, 股票图表数据, TradingView数据源, 行情软件API, OHLCV数据, 实时分钟线, 图表库数据接口, 高并发行情API, A股K线, 港股历史行情, 美股OHLC接口
+---
+
+# 股票 API - 历史K线查询
+
+GET /stock/kline?region={region}&code={code}&kType={kType}&limit={limit}&et={et}
+
+## 请求参数
+
+| 参数名称 | 描述                                                                                                 | 必填  |
+| -------- | ---------------------------------------------------------------------------------------------------- | ----- |
+| region   | 市场代码 HK、SZ、SH、US、SG、JP、TW、IN、TH、DE、MX、MY、TR、ES、NL、GB、ID、VN、IT              | true  |
+| exchange | 上市交易所（可选）。相同市场存在多个股票产品时，可通过 exchange 区分查询；为空时返回主要上市交易所信息。exchange 字典可参考接口 [产品清单](/zh-cn/rest-api/basics/symbol-list) 返回的股票清单 | false |
+| code     | 产品代码 700                                                                                         | true  |
+| kType    | K线类型(1 分钟K，2 5分钟K，3 15分钟K，4 30分钟K，5 1小时K，6 2小时K，7 4小时K，8 日K，9 周K，10 月K) | true  |
+| limit    | K线数量                                                                                              | true  |
+| et       | 截止时间戳 (为空时默认为当前时间戳)                                                                  | false |
+
+## 响应参数
+
+| 响应参数 | 参数类型 | 描述     |
+| -------- | -------- | -------- |
+| t        | number   | 时间戳   |
+| o        | number   | 开盘价   |
+| h        | number   | 最高价   |
+| l        | number   | 最低价   |
+| c        | number   | 收盘价   |
+| v        | number   | 成交数量 |
+| tu       | number   | 成交额   |
+
+## 代码示例
+
+```python
+import requests
+
+url = "https://api.itick.org/stock/kline?region=HK&code=700&kType=2&limit=10"
+
+headers = {
+"accept": "application/json"
+"token": "your_token"
+}
+
+response = requests.get(url, headers=headers)
+
+print(response.text)
+
+```
+
+```java
+OkHttpClient client = new OkHttpClient();
+
+Request request = new Request.Builder()
+.url("https://api.itick.org/stock/kline?region=HK&code=700&kType=2&limit=10")
+.get()
+.addHeader("accept", "application/json")
+.addHeader("token", "your_token")
+.build();
+
+Response response = client.newCall(request).execute();
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"io"
+)
+
+func main() {
+
+	url := "https://api.itick.org/stock/kline?region=HK&code=700&kType=2&limit=10"
+
+	req, _ := http.NewRequest("GET", url, nil)
+
+	req.Header.Add("accept", "application/json")
+	req.Header.Add("token", "your_token")
+
+	res, _ := http.DefaultClient.Do(req)
+
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+
+	fmt.Println(string(body))
+
+}
+```
+
+```javascript
+const https = require('https');
+
+const options = {
+  method: 'GET',
+  hostname: 'api.itick.org',
+  path: '/stock/kline?region=HK&code=700&kType=2&limit=10',
+  headers: {
+    'accept': 'application/json',
+    'token': '{token}'
+  }
+};
+
+const req = https.request(options, function (res) {
+  const chunks = [];
+
+  res.on('data', function (chunk) {
+    chunks.push(chunk);
+  });
+
+  res.on('end', function () {
+    const body = Buffer.concat(chunks);
+    console.log(body.toString());
+  });
+});
+
+req.end();
+```
+
+```bash
+curl --location 'https://api.itick.org/stock/kline?region=HK&code=700&kType=2&limit=10' \
+--header 'accept: application/json' \
+--header 'token: {token}'
+```
+
+## 响应结果
+
+```json
+{
+  "code": 0,
+  "msg": null,
+  "data": [
+    {
+      "tu": 56119888070.5,
+      "c": 534.5,
+      "t": 1741239000000,
+      "v": 104799385,
+      "h": 536,
+      "l": 534.5,
+      "o": 535
+    }
+  ]
+}
+```
+
+## SDK示例
+
+### Python SDK
+
+```python
+from itick.sdk import Client
+
+token = "your_api_token"
+client = Client(token)
+
+kline = client.get_stock_kline("HK", "700", 2, 10)
+print(kline)
+```
+
+### Java SDK
+
+```java
+import io.itick.sdk.Client;
+
+public class Main {
+    public static void main(String[] args) {
+        try {
+            String token = "your_api_token";
+            Client client = new Client(token);
+
+            var kline = client.getStockKline("HK", "700", 2, 10, null);
+            System.out.println(kline);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+### Go SDK
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"io.github.itick/sdk"
+)
+
+func main() {
+	token := "your_api_token"
+	client := sdk.NewClient(token)
+
+	kline, err := client.GetStockKline("HK", "700", 2, 10, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Stock Kline: %+v\n", kline)
+}
+```
+
+### Node.js SDK
+
+```javascript
+import { StockClient } from "@itick/node-sdk";
+
+const token = process.env.ITICK_TOKEN;
+const client = new StockClient(token);
+
+const res = await client.getKline({
+  region: "HK",
+  code: "700",
+  interval: "5m",
+  limit: 10,
+});
+console.log(res);
+```
+
+### JavaScript Browser SDK
+
+```javascript
+import { StockClient } from "@itick/browser-sdk";
+
+const token = process.env.ITICK_TOKEN;
+const client = new StockClient(token);
+
+const res = await client.getKline({
+  region: "HK",
+  code: "700",
+  interval: "5m",
+  limit: 10,
+});
+console.log(res);
+```
+
+### MCP Server
+
+通过 MCP Server 调用股票历史K线 API：
+
+```python
+# 使用 MCP 工具 stockKline
+# 对应 REST API: GET /stock/kline
+```
+
+详细配置请参考 [MCP Server 文档](https://docs.itick.org/zh-cn/sdk/mcp-server)。
