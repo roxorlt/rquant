@@ -162,7 +162,7 @@ def _runtime_checkout(
     shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
-        "/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
+        "/.env\n/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
         encoding="utf-8",
     )
     marker = checkout / "daemon.json"
@@ -172,6 +172,9 @@ def _runtime_checkout(
         encoding="utf-8",
     )
     (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    dotenv = checkout / ".env"
+    dotenv.write_text(f"DATA_DIR='{checkout / 'data'}'\n", encoding="utf-8")
+    dotenv.chmod(0o600)
     (package / "cli.py").write_text(
         "from __future__ import annotations\n"
         "import json, os, sys, time\n"

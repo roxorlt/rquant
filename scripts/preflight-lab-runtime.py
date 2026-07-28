@@ -408,7 +408,7 @@ def _dotenv_values(path: Path) -> dict[str, str]:
 def _configured_path(
     values: dict[str, str],
     key: str,
-    default: Path,
+    default: Path | None,
     *,
     label: str,
 ) -> Path:
@@ -416,7 +416,10 @@ def _configured_path(
     for environment_key, environment_value in os.environ.items():
         if environment_key.casefold() == key.casefold():
             raw = environment_value
+    if not raw and default is None:
+        raise PreflightError(f"{label} is required")
     path = Path(raw) if raw else default
+    assert path is not None
     if not path.is_absolute() or path != Path(os.path.abspath(path)):
         raise PreflightError(f"{label} must be an absolute canonical path")
     return path
@@ -457,7 +460,7 @@ def _verify_prepared_lab_runtime(
     if daemon_command == "lab-runtime-prepare":
         return
     values = _dotenv_values(checkout / ".env")
-    data_dir = _configured_path(values, "DATA_DIR", checkout / "data", label="DATA_DIR")
+    data_dir = _configured_path(values, "DATA_DIR", None, label="DATA_DIR")
     runtime_root = _configured_path(
         values,
         "LAB_RUNTIME_DIR",

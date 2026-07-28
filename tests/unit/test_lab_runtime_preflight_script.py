@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from rquant.config import Settings
 from rquant.release_generation import ReleaseGenerationAuthority
@@ -529,6 +530,101 @@ def test_stdlib_dotenv_lab_paths_match_settings_supported_subset(
         assert configured.data_dir == data
 
 
+@pytest.mark.parametrize("data_assignment", (None, "DATA_DIR="))
+def test_stdlib_preflight_requires_nonempty_data_dir_like_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    data_assignment: str | None,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _prepare_lab_runtime(checkout)
+    dotenv = checkout / ".env"
+    lines = [
+        "TUSHARE_TOKEN_MAIN=" + "x" * 32,
+        f"DUCKDB_PATH='{checkout / 'data' / 'rquant.duckdb'}'",
+        f"PARQUET_DIR='{tmp_path / 'parquet'}'",
+        f"LOG_DIR='{tmp_path / 'logs'}'",
+    ]
+    if data_assignment is not None:
+        lines.append(data_assignment)
+    dotenv.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    dotenv.chmod(0o600)
+    for key in tuple(os.environ):
+        if key.casefold() == "data_dir":
+            monkeypatch.delenv(key, raising=False)
+    namespace = runpy.run_path(str(SCRIPT))
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=dotenv)
+    with pytest.raises(namespace["PreflightError"], match="DATA_DIR is required"):
+        namespace["_verify_prepared_lab_runtime"](
+            checkout,
+            daemon_command="lab-scheduler",
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "default_name", "settings_property"),
+    (
+        ("LAB_RUNTIME_DIR", "lab-runtime", "lab_runtime_dir_resolved"),
+        ("LAB_JOBS_PATH", "lab_jobs.sqlite3", "lab_jobs_path_resolved"),
+        ("LAB_JOB_COMMAND_DIR", "commands", "lab_job_command_dir_resolved"),
+        ("LAB_JOB_CLAIM_DIR", "claims", "lab_job_claim_dir_resolved"),
+        ("LAB_JOB_REPORT_DIR", "reports", "lab_job_report_dir_resolved"),
+        ("LAB_WORKER_ARTIFACT_DIR", "worker-artifacts", "lab_worker_artifact_dir_resolved"),
+        ("LAB_FINAL_ARTIFACT_DIR", "final-artifacts", "lab_final_artifact_dir_resolved"),
+        ("LAB_ARTIFACT_COMMIT_DIR", "artifact-commits", "lab_artifact_commit_dir_resolved"),
+        ("LAB_DAEMON_LOCK_DIR", "locks", "lab_daemon_lock_dir_resolved"),
+        ("LAB_FINALIZER_STATE_DIR", "finalizer-state", "lab_finalizer_state_dir_resolved"),
+        ("LAB_READINESS_DIR", "readiness", "lab_readiness_dir_resolved"),
+    ),
+)
+def test_stdlib_preflight_optional_lab_path_defaults_match_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    default_name: str,
+    settings_property: str,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    data = tmp_path / "data"
+    dotenv = checkout / ".env"
+    dotenv.write_text(
+        "\n".join(
+            (
+                "TUSHARE_TOKEN_MAIN=" + "x" * 32,
+                f"DATA_DIR='{data}'",
+                f"DUCKDB_PATH='{data / 'rquant.duckdb'}'",
+                f"PARQUET_DIR='{tmp_path / 'parquet'}'",
+                f"LOG_DIR='{tmp_path / 'logs'}'",
+                f"{key}=",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dotenv.chmod(0o600)
+    for environment_key in tuple(os.environ):
+        if environment_key.casefold() in {"data_dir", key.casefold()}:
+            monkeypatch.delenv(environment_key, raising=False)
+    namespace = runpy.run_path(str(SCRIPT))
+    values = namespace["_dotenv_values"](dotenv)
+    configured = Settings(_env_file=dotenv)
+    runtime_root = configured.lab_runtime_dir_resolved
+    default = data / default_name if key == "LAB_RUNTIME_DIR" else runtime_root / default_name
+
+    observed = namespace["_configured_path"](
+        values,
+        key,
+        default,
+        label=key,
+    )
+
+    assert observed == getattr(configured, settings_property)
+
+
 @pytest.mark.parametrize(
     "line",
     (
@@ -619,6 +715,7 @@ def test_prepared_sentinel_read_is_descriptor_bound_across_symlink_replacement(
     replacement.write_bytes(sentinel.read_bytes())
     replacement.chmod(0o600)
     namespace = runpy.run_path(str(SCRIPT))
+    monkeypatch.setenv("DATA_DIR", str(checkout / "data"))
     _replace_path_during_read(
         monkeypatch,
         target=sentinel,

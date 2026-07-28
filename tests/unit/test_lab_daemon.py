@@ -914,6 +914,106 @@ def test_prepared_runtime_requires_owner_registration_of_first_sqlite_identity(
         )
 
 
+def test_prepared_sentinel_read_rejects_runtime_root_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    commands = runtime / "commands"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": commands},
+        managed_files={},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    sentinel = lab_daemon.lab_runtime_prepared_path(runtime)
+    sentinel_identity = sentinel.stat()
+    displaced = tmp_path / "lab-runtime.displaced"
+    original_read = os.read
+    swapped = False
+
+    def replace_root(descriptor: int, size: int) -> bytes:
+        nonlocal swapped
+        opened = os.fstat(descriptor)
+        if not swapped and (opened.st_dev, opened.st_ino) == (
+            sentinel_identity.st_dev,
+            sentinel_identity.st_ino,
+        ):
+            swapped = True
+            runtime.rename(displaced)
+            runtime.mkdir(mode=0o700)
+            (displaced / sentinel.name).rename(runtime / sentinel.name)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(lab_daemon.os, "read", replace_root)
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="runtime root identity changed",
+    ):
+        lab_daemon._read_runtime_prepared_sentinel_record(runtime)
+
+
+def test_first_sqlite_registration_rejects_runtime_root_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+
+    runtime = tmp_path / "lab-runtime"
+    commands = runtime / "commands"
+    database = runtime / "lab_jobs.sqlite3"
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        checkout_root=tmp_path,
+        managed_directories={"commands": commands},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={},
+        mutation_guard=lambda: "a" * 40,
+    )
+    database.write_bytes(b"sqlite-authority")
+    database.chmod(0o600)
+    sentinel = lab_daemon.lab_runtime_prepared_path(runtime)
+    sentinel_before = sentinel.read_bytes()
+    sentinel_identity = sentinel.stat()
+    displaced = tmp_path / "lab-runtime.displaced"
+    original_read = os.read
+    swapped = False
+
+    def replace_root(descriptor: int, size: int) -> bytes:
+        nonlocal swapped
+        opened = os.fstat(descriptor)
+        if not swapped and (opened.st_dev, opened.st_ino) == (
+            sentinel_identity.st_dev,
+            sentinel_identity.st_ino,
+        ):
+            swapped = True
+            runtime.rename(displaced)
+            runtime.mkdir(mode=0o700)
+            (displaced / sentinel.name).rename(runtime / sentinel.name)
+            (displaced / database.name).rename(runtime / database.name)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(lab_daemon.os, "read", replace_root)
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="runtime root identity changed",
+    ):
+        lab_daemon.register_lab_runtime_managed_file(
+            runtime,
+            label="lab jobs SQLite",
+            path=database,
+            mutation_guard=lambda: "b" * 40,
+        )
+
+    assert sentinel.read_bytes() == sentinel_before
+
+
 def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Path) -> None:
     from rquant import lab_daemon
 

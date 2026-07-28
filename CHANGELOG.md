@@ -69,6 +69,13 @@
 
 ### Fixed
 
+- **Lab daemon 第七轮发布边界加固**：resume/rollback 现在以新 handoff operation 显式接管遗留
+  deploy operation，并用 deployment intent 复核原 target/ref、profile、lifecycle 与 installation
+  identity。runtime sentinel 和首次 SQLite 登记从已验证 runtime-root dir FD 读取并复核父目录项；
+  stdlib preflight 对缺失或空 `DATA_DIR` 失败关闭，其他 Lab 路径默认值继续与 Settings 一致。
+  launchd readiness 的每次查询使用当前剩余 deadline，部署 Runner 以显式 trusted Git 路径而非
+  basename 区分只读和写命令。
+
 - **Lab runtime authority 与发布代际解耦**：prepared sentinel 现在绑定长期稳定的私有运行目录
   authority，而 release commit 仅作审计，真实 `rquant.cli` daemon 可在同一数据权威上完成 A→B
   升级。首次 Lab SQLite 仅允许 scheduler 原子创建并登记 inode，worker/finalizer 拒绝未登记或被

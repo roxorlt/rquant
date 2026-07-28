@@ -1170,6 +1170,47 @@ def test_lab_handoff_readiness_verifies_every_label_and_stable_generation(
     assert all(count >= 2 for count in counts.values())
 
 
+def test_lab_readiness_launchctl_timeout_uses_current_remaining_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+    observed_timeouts: list[float] = []
+    monotonic_values = iter((100.0, 100.1, 100.25))
+
+    class StopReadinessError(RuntimeError):
+        pass
+
+    def stop_after_first_print(
+        _arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del check
+        observed_timeouts.append(timeout_seconds)
+        raise StopReadinessError
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(module, "_release_readiness_expectation", lambda _path: _READINESS_A)
+    monkeypatch.setattr(module, "_launchctl", stop_after_first_print)
+
+    with pytest.raises(StopReadinessError):
+        module._wait_for_lab_readiness(
+            root=root,
+            domain=f"gui/{os.getuid()}",
+            labels=[module.LAB_LAUNCHD_LABELS[0]],
+            lock_path=lock_path,
+            timeout_seconds=1.0,
+            stability_seconds=0,
+        )
+
+    assert observed_timeouts == [pytest.approx(0.75)]
+
+
 def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1302,6 +1343,192 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
     assert persisted["restarted_labels"] == list(module.LAB_LAUNCHD_LABELS)
 
 
+@pytest.mark.parametrize(
+    ("action", "recovery_ref", "recovery_sha"),
+    (
+        ("resume", "v0.99.1", "b" * 40),
+        ("rollback", "a" * 40, "a" * 40),
+    ),
+)
+def test_recovery_supersedes_recorded_deploy_handoff_from_partial_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    recovery_ref: str,
+    recovery_sha: str,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    old_operation = "b" * 32
+    loaded = {module.LAB_LAUNCHD_LABELS[1]}
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    installation_identity = module._lab_installation_identity(lock_path, installation)
+    module._atomic_private_json(
+        lock_path.with_name(f"{lock_path.stem}.intent.json"),
+        {
+            "schema_version": 1,
+            "operation_id": "c" * 32,
+            "previous_sha": "a" * 40,
+            "target_sha": "b" * 40,
+            "target_ref": "v0.99.1",
+            "stage": "services_transitioning",
+        },
+        absent=True,
+    )
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        {
+            "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+            "operation_id": old_operation,
+            "checkout_root": str(root),
+            "stage": "restarting",
+            "labels": list(module.LAB_LAUNCHD_LABELS),
+            "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+            "stopped_labels": list(module.LAB_LAUNCHD_LABELS),
+            "restarted_labels": [module.LAB_LAUNCHD_LABELS[1]],
+            "updated_at": "2026-07-28T00:00:00+00:00",
+            "target_ref": "v0.99.1",
+            "target_sha": "b" * 40,
+            "action": "deploy",
+            "release_profile": "macos-lab",
+            "lifecycle_mode": "installed",
+            "installation_identity": installation_identity,
+            "supersedes_operation_id": "",
+        },
+    )
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    supersedes = module._superseding_handoff_operation_id(
+        root=root,
+        lock_path=lock_path,
+        recovery_action=action,
+    )
+    assert supersedes == old_operation
+    recovery = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=supersedes,
+    )
+    try:
+        recovery.prepare(
+            dry_run=False,
+            target_ref=recovery_ref,
+            target_sha=recovery_sha,
+            action=action,
+            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    finally:
+        recovery.close()
+
+    assert recovery.operation_id != old_operation
+    assert loaded == set()
+    persisted = json.loads(recovery.record_path.read_text(encoding="utf-8"))
+    assert persisted["action"] == action
+    assert persisted["supersedes_operation_id"] == old_operation
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("target_sha", "d" * 40),
+        ("target_ref", "v0.99.2"),
+        ("release_profile", "linux-production"),
+        ("installation_identity", {"path": "/tampered"}),
+    ),
+)
+def test_recovery_rejects_superseded_deploy_handoff_binding_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: object,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    old_operation = "b" * 32
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    module._atomic_private_json(
+        lock_path.with_name(f"{lock_path.stem}.intent.json"),
+        {
+            "schema_version": 1,
+            "operation_id": "c" * 32,
+            "previous_sha": "a" * 40,
+            "target_sha": "b" * 40,
+            "target_ref": "v0.99.1",
+            "stage": "services_transitioning",
+        },
+        absent=True,
+    )
+    payload: dict[str, object] = {
+        "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+        "operation_id": old_operation,
+        "checkout_root": str(root),
+        "stage": "stopping",
+        "labels": list(module.LAB_LAUNCHD_LABELS),
+        "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+        "stopped_labels": [module.LAB_LAUNCHD_LABELS[0]],
+        "restarted_labels": [],
+        "updated_at": "2026-07-28T00:00:00+00:00",
+        "target_ref": "v0.99.1",
+        "target_sha": "b" * 40,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": module._lab_installation_identity(lock_path, installation),
+        "supersedes_operation_id": "",
+    }
+    payload[field] = replacement
+    module._atomic_private_json(
+        module._stable_record_path(lock_path, "lab-handoff"),
+        payload,
+    )
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        module,
+        "_launchctl",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments,
+            113,
+            stdout="",
+            stderr="",
+        ),
+    )
+    recovery = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+        supersedes_operation_id=old_operation,
+    )
+
+    with pytest.raises(module.DeployBootstrapError, match="superseded.*binding"):
+        recovery.prepare(
+            dry_run=False,
+            target_ref="v0.99.1",
+            target_sha="b" * 40,
+            action="resume",
+            now=datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    recovery.close()
+
+
 def test_superseding_rollback_stops_partial_target_labels_before_previous_restore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1335,6 +1562,18 @@ def test_superseding_rollback_stops_partial_target_labels_before_previous_restor
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    module._atomic_private_json(
+        lock_path.with_name(f"{lock_path.stem}.intent.json"),
+        {
+            "schema_version": 1,
+            "operation_id": "c" * 32,
+            "previous_sha": "a" * 40,
+            "target_sha": "b" * 40,
+            "target_ref": "b" * 40,
+            "stage": "services_transitioning",
+        },
+        absent=True,
+    )
     module._atomic_private_json(
         module._stable_record_path(lock_path, "lab-handoff"),
         {

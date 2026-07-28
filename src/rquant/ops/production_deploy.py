@@ -224,13 +224,18 @@ class SubprocessRunner:
         self,
         cwd: Path,
         *,
+        trusted_git_path: Path = Path("/usr/bin/git"),
         command_timeout_seconds: float = 300,
         overall_timeout_seconds: float = 1800,
         overall_deadline_monotonic: float | None = None,
     ) -> None:
         if not 0 < command_timeout_seconds <= overall_timeout_seconds <= 7200:
             raise PolicyError("deployment timeout configuration is invalid")
+        trusted_git = Path(trusted_git_path)
+        if not trusted_git.is_absolute() or trusted_git != Path(os.path.abspath(trusted_git)):
+            raise PolicyError("trusted Git path must be absolute and canonical")
         self._cwd = cwd
+        self._trusted_git_path = trusted_git
         self._command_timeout_seconds = command_timeout_seconds
         self._overall_timeout_seconds = overall_timeout_seconds
         computed_deadline = monotonic_time.monotonic() + overall_timeout_seconds
@@ -245,6 +250,7 @@ class SubprocessRunner:
     def for_recovery(self) -> SubprocessRunner:
         return SubprocessRunner(
             self._cwd,
+            trusted_git_path=self._trusted_git_path,
             command_timeout_seconds=self._command_timeout_seconds,
             overall_timeout_seconds=self._overall_timeout_seconds,
         )
@@ -263,7 +269,7 @@ class SubprocessRunner:
         if remaining <= 0:
             raise DeployError("deployment overall timeout expired")
         environment = os.environ.copy()
-        if args and Path(args[0]).name == "git":
+        if args and Path(args[0]) == self._trusted_git_path:
             mutating_commands = {"checkout", "fetch", "merge", "pull", "reset", "switch"}
             subcommand = next((value for value in args[1:] if not value.startswith("-")), "")
             environment["GIT_OPTIONAL_LOCKS"] = "1" if subcommand in mutating_commands else "0"
@@ -1151,6 +1157,7 @@ def deploy(
     )
     effective_runner = runner or SubprocessRunner(
         repo,
+        trusted_git_path=effective_config.git_path,
         command_timeout_seconds=effective_config.command_timeout_seconds,
         overall_timeout_seconds=effective_config.overall_timeout_seconds,
         overall_deadline_monotonic=effective_config.overall_deadline_monotonic,

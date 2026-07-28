@@ -1452,6 +1452,39 @@ def test_subprocess_runner_marks_mutating_git_for_process_group_write_locking(
     assert captured[0]["GIT_OPTIONAL_LOCKS"] == "1"
 
 
+def test_subprocess_runner_uses_explicit_trusted_git_binding_for_lock_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, str]] = []
+    trusted_git = tmp_path / "tools" / "git-2.48"
+
+    def fake_run_process_group(
+        args: list[str],
+        *,
+        cwd: Path,
+        timeout_seconds: float,
+        check: bool,
+        pass_fds: tuple[int, ...] = (),
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout_seconds, check, pass_fds
+        captured.append(env)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    monkeypatch.setattr(production_deploy, "_run_process_group", fake_run_process_group)
+    runner = SubprocessRunner(tmp_path, trusted_git_path=trusted_git)
+
+    runner.run([str(trusted_git), "rev-parse", "HEAD"])
+    runner.run([str(trusted_git), "fetch", "origin", "main"])
+    runner.run([str(tmp_path / "other" / "git-2.48"), "rev-parse", "HEAD"])
+
+    assert captured[0]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert captured[1]["GIT_OPTIONAL_LOCKS"] == "1"
+    assert "GIT_OPTIONAL_LOCKS" not in captured[2]
+
+
 def test_subprocess_runner_bounds_each_command_and_overall_rollout(tmp_path: Path) -> None:
     runner = SubprocessRunner(
         tmp_path,

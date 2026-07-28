@@ -136,6 +136,16 @@ def _runtime_identity_payload(path: Path, observed: os.stat_result) -> dict[str,
     }
 
 
+def _filesystem_identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_uid,
+        observed.st_nlink,
+    )
+
+
 def _reject_sqlite_sidecars(path: Path, *, label: str) -> None:
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = path.with_name(f"{path.name}{suffix}")
@@ -152,6 +162,7 @@ def _write_runtime_prepared_sentinel(
     mutation_guard: Callable[[], object],
     lock_descriptor: int | None = None,
     expected_identity: tuple[int, int] | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
     owned_lock = lock_descriptor is None
     if lock_descriptor is None:
@@ -165,6 +176,15 @@ def _write_runtime_prepared_sentinel(
     descriptor = -1
     try:
         opened_root = os.fstat(root_fd)
+        if (
+            expected_root_identity is not None
+            and (
+                root_observed.st_dev,
+                root_observed.st_ino,
+            )
+            != expected_root_identity
+        ):
+            raise LabDaemonConfigurationError("lab runtime root identity changed")
         if (opened_root.st_dev, opened_root.st_ino) != (
             root_observed.st_dev,
             root_observed.st_ino,
@@ -279,15 +299,48 @@ def _open_runtime_prepared_lock(root: Path, *, create: bool) -> int:
 
 def _read_runtime_prepared_sentinel_record(
     root: Path,
-) -> tuple[dict[str, object], tuple[int, int]]:
-    sentinel = lab_runtime_prepared_path(root)
+) -> tuple[dict[str, object], tuple[int, int], tuple[int, int]]:
+    candidate = _canonical_absolute_path(root, label="lab runtime root")
+    parent_fd = -1
+    root_fd = -1
     descriptor = -1
     try:
-        before = sentinel.lstat()
-        descriptor = os.open(sentinel, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        before_root = candidate.lstat()
+        _validate_private_directory_identity(before_root, label="lab runtime root")
+        parent_fd = os.open(
+            candidate.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        active_root = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
+        root_fd = os.open(
+            candidate.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        opened_root = os.fstat(root_fd)
+        _validate_private_directory_identity(active_root, label="lab runtime root")
+        _validate_private_directory_identity(opened_root, label="lab runtime root")
+        root_identity = (before_root.st_dev, before_root.st_ino)
+        if _filesystem_identity(active_root) != _filesystem_identity(
+            before_root
+        ) or _filesystem_identity(opened_root) != _filesystem_identity(before_root):
+            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        descriptor = os.open(
+            _LAB_RUNTIME_PREPARED_FILENAME,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
         opened = os.fstat(descriptor)
         _validate_private_regular_identity(opened, label="lab runtime prepared sentinel")
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        active_sentinel = os.stat(
+            _LAB_RUNTIME_PREPARED_FILENAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if (opened.st_dev, opened.st_ino) != (
+            active_sentinel.st_dev,
+            active_sentinel.st_ino,
+        ):
             raise LabDaemonConfigurationError("lab runtime prepared sentinel identity changed")
         chunks: list[bytes] = []
         total = 0
@@ -302,7 +355,19 @@ def _read_runtime_prepared_sentinel_record(
             total += len(chunk)
             if total > _LAB_RUNTIME_PREPARED_MAX_BYTES:
                 raise LabDaemonConfigurationError("lab runtime prepared sentinel is too large")
-        after = sentinel.lstat()
+        final_root = os.fstat(root_fd)
+        final_root_entry = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
+        _validate_private_directory_identity(final_root, label="lab runtime root")
+        _validate_private_directory_identity(final_root_entry, label="lab runtime root")
+        if _filesystem_identity(final_root) != _filesystem_identity(
+            before_root
+        ) or _filesystem_identity(final_root_entry) != _filesystem_identity(before_root):
+            raise LabDaemonConfigurationError("lab runtime root identity changed")
+        after = os.stat(
+            _LAB_RUNTIME_PREPARED_FILENAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
         if (
             opened.st_dev,
             opened.st_ino,
@@ -320,7 +385,7 @@ def _read_runtime_prepared_sentinel_record(
         payload = json.loads(b"".join(chunks))
         if not isinstance(payload, dict):
             raise LabDaemonConfigurationError("lab runtime prepared sentinel is malformed")
-        return payload, (opened.st_dev, opened.st_ino)
+        return payload, (opened.st_dev, opened.st_ino), root_identity
     except LabDaemonConfigurationError:
         raise
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -328,10 +393,14 @@ def _read_runtime_prepared_sentinel_record(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def _read_runtime_prepared_sentinel(root: Path) -> dict[str, object]:
-    payload, _identity = _read_runtime_prepared_sentinel_record(root)
+    payload, _identity, _root_identity = _read_runtime_prepared_sentinel_record(root)
     return payload
 
 
@@ -446,7 +515,7 @@ def register_lab_runtime_managed_file(
     _validate_private_regular_identity(observed, label=label)
     lock_descriptor = _open_runtime_prepared_lock(root, create=False)
     try:
-        payload, sentinel_identity = _read_runtime_prepared_sentinel_record(root)
+        payload, sentinel_identity, root_identity = _read_runtime_prepared_sentinel_record(root)
         files = payload.get("managed_files")
         recorded = files.get(label) if isinstance(files, dict) else None
         if recorded != {"path": str(candidate), "exists": False}:
@@ -470,6 +539,7 @@ def register_lab_runtime_managed_file(
             mutation_guard=mutation_guard,
             lock_descriptor=lock_descriptor,
             expected_identity=sentinel_identity,
+            expected_root_identity=root_identity,
         )
         return updated
     finally:

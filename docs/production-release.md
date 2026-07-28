@@ -46,6 +46,10 @@
    时间线和 JSONL 审计。结束时先释放独占锁，再只恢复原先 loaded 的 Lab daemon，并验证
    launchd health 和 shared lock；恢复失败会使发布返回非零。dry-run 只输出 handoff 计划并持
    shared lock，不 bootout daemon。
+   遗留在任一 stage 的 `action=deploy` handoff 由 resume/rollback 以新的 superseding operation
+   接管；旧 operation id、target/ref、profile、lifecycle 与 installation identity 必须和 deployment
+   intent 完全一致。每次 `launchctl print` 都按 command timeout 与当前整体/readiness 剩余时间的
+   较小值执行，剩余预算为零时不再发起命令。
 6. 更新依赖、preflight 或服务健康检查失败时，自动 `git reset --hard` 回 intent 记录的
    previous commit、恢复锁定依赖并按同一服务/timer 合同切回。只有旧 checkout、旧依赖、
    精确服务集合、第二次 preflight 与 timer 原状态全部恢复后，才由 previous checkout 的隔离

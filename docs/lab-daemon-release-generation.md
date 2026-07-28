@@ -3,8 +3,9 @@
 ## 启动链路
 
 三个 Lab daemon 由 launchd 先运行 `scripts/run-lab-daemon.py`。wrapper 只使用标准库，并且在创建
-generation lock 目录或锁文件前，先以纯只读模式验证 prepared runtime sentinel。`.env` 与 sentinel
-都从已验证父目录 FD 使用 `openat(O_NOFOLLOW)` 打开，再从同一文件 FD 读取并在结束时复核目录项
+generation lock 目录或锁文件前，先以纯只读模式验证 prepared runtime sentinel。`DATA_DIR` 必须
+显式且非空，其他 Lab 路径沿用 Settings 的逐项默认语义。`.env` 从已验证父目录 FD、sentinel 从
+已验证 runtime-root dir FD 使用 `openat(O_NOFOLLOW)` 打开，再从同一文件 FD 读取并在结束时复核目录项
 身份；缺失、被替换或无法安全解析的 sentinel/相关 `.env` 路径配置会立即失败，仓库、Git index
 和部署锁命名空间均不发生变化。stdlib dotenv 只把精确小写 `export` 识别为关键字，混合大小写
 且指向 Lab 路径的歧义配置失败关闭。通过该门禁后才完成物理 checkout、bootstrap virtualenv、可信 Git、console launcher
@@ -29,9 +30,15 @@ preflight，再导入 `rquant.cli`。共享发布锁 fd 会保留到 daemon 退�
 daemon 持共享锁；`scripts/deploy-production.sh` 另持稳定的 sibling handoff lock。macOS 正式
 发布会在交易保护窗口外记录当时 loaded 的三个 Lab label，逐个 `bootout`，有界等待 shared lock
 释放后再取得 generation 独占锁。事务成功或已回滚后，部署器只 `bootstrap` 原先 loaded 的 label，
-并验证 launchd health 与 shared lock 已重新取得；任一步超时都返回失败，不会无限等待。dry-run
+并验证 launchd health 与 shared lock 已重新取得；每个 `launchctl print` 的超时取 command timeout
+与当前整体/readiness 剩余预算的较小值，预算耗尽立即失败。任一步超时都返回失败，不会无限等待。dry-run
 仅以共享锁核对并输出 handoff 计划，不停止 daemon。`launchctl` 始终由当前用户执行，sudoers
 不授予它。由此一次进程只能看到一个完整 Git 代际，且常驻 KeepAlive 不再永久阻塞部署。
+
+若常规发布在任一 handoff stage 中断，resume/rollback 以新的 operation 显式记录被接管的旧 deploy
+operation。接管只允许 `deploy -> resume/rollback`，并从不可变 deployment intent 精确复核旧 target/ref、
+新恢复目标、release profile、lifecycle 与 installation identity；任一漂移都会在 launchd mutation 前
+失败关闭。
 
 同目录的 `rQuant.complete.json` 不是单独完成凭证。daemon 必须同时核对 completed intent、
 `rQuant.commit.json`、`rQuant.environment.json` 和环境 manifest；commit record 精确绑定 marker、
