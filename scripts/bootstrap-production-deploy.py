@@ -1011,6 +1011,33 @@ def _operation_handoff_path(lock_path: Path, operation_id: str) -> Path:
     return lock_path.with_name(f"{lock_path.stem}.lab-handoff.{operation_id}.json")
 
 
+def _incomplete_handoff_exists(*, root: Path, lock_path: Path) -> bool:
+    path = _stable_record_path(lock_path, "lab-handoff")
+    if not path.exists():
+        return False
+    payload = _private_json(path, label="Lab launchd handoff state")
+    operation_id = str(payload.get("operation_id", ""))
+    stage = str(payload.get("stage", ""))
+    if (
+        payload.get("schema_version") != LAB_HANDOFF_SCHEMA_VERSION
+        or payload.get("checkout_root") != str(root)
+        or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+        or not stage
+    ):
+        raise DeployBootstrapError("Lab launchd handoff state is invalid")
+    completed_path = _completed_handoff_path(lock_path, operation_id)
+    if stage != "completed":
+        if completed_path.exists():
+            raise DeployBootstrapError("incomplete Lab handoff conflicts with completed proof")
+        return True
+    if not completed_path.exists():
+        raise DeployBootstrapError("completed Lab launchd handoff proof is missing")
+    completed = _private_json(completed_path, label="completed Lab launchd handoff proof")
+    if completed.get("operation_id") != operation_id or completed.get("stage") != "completed":
+        raise DeployBootstrapError("completed Lab launchd handoff proof is invalid")
+    return False
+
+
 def _lab_installation_identity(lock_path: Path, payload: dict[str, object]) -> dict[str, object]:
     path = _stable_record_path(lock_path, "lab-install")
     observed = _physical_file(path, label="Lab launchd installation state")
@@ -2142,6 +2169,26 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise DeployBootstrapError("release profile does not match host platform")
         deploy_values = _normalized_deploy_argv(deploy_argv)
+        installed_handoff = (
+            args.release_profile == "macos-lab"
+            and args.lab_lifecycle_mode == "installed"
+            and not (args.initialize_generation or args.register_lab_installation)
+            and not args.finalize_generation
+        )
+        incomplete_handoff = (
+            _incomplete_handoff_exists(root=root, lock_path=lock_path)
+            if installed_handoff and not dry_run
+            else False
+        )
+        if installed_handoff and not dry_run and _is_protected_handoff_window():
+            detail = (
+                "incomplete Lab daemon handoff recovery"
+                if incomplete_handoff
+                else "Lab daemon handoff"
+            )
+            raise DeployDeferredError(
+                f"{detail} is deferred during the protected 09:15-15:10 window"
+            )
         target_ref = _generation_target(deploy_values)
         handoff_action = str(args.recovery_action or "deploy")
         if args.recover_generation:

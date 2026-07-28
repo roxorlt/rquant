@@ -18,12 +18,16 @@
    bash scripts/deploy-production.sh --target v0.13.2
    ```
 
-5. 纯标准库 bootstrap 先取得稳定 handoff lock。macOS 上它在交易保护窗口外有界停止原先 loaded
-   的三个 Lab launchd daemon，确认其 shared generation lock 已释放后取得独占锁；Linux 无此
-   本地 launchd 步骤。之后验证当前已提交代际，才导入项目
+5. 纯标准库 bootstrap 在创建或取得 generation/handoff lock 前先只读核对 prepared runtime
+   sentinel。macOS installed 发布还会先只读解析已有 handoff record 并执行交易时间门禁；窗口内
+   直接返回 75，既不 fetch，也不改 `FETCH_HEAD` 或 refs。窗口外才有界 fetch 并解析精确 target，
+   随后取得稳定 handoff lock，停止原先 loaded 的三个 Lab launchd daemon，确认其 shared
+   generation lock 已释放后取得独占锁；Linux 无此本地 launchd 步骤。之后验证当前已提交代际，
+   才导入项目
    deployer。bootstrap 与 deployer 的所有 Git 子命令都固定使用已验证的绝对
-   `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`。部署器依次执行：tracked 工作区检查、
-   `git fetch`、target/main 归属与快进检查、diff 风险分类、快照实际 active 的受影响服务及
+   `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`；所有只读核对显式设置
+   `GIT_OPTIONAL_LOCKS=0`。部署器依次执行：tracked 工作区检查、target/main 归属与快进检查、
+   diff 风险分类、快照实际 active 的受影响服务及
    timer、原子落盘 deployment intent、使旧 marker 失效、暂停原先 active 的相关 timer、
    `git merge --ff-only <exact-sha>`、用物理绑定的 uv 执行 frozen sync、第一次 preflight、按 intent 的精确集合
    重启服务、第二次 preflight、恢复原先 active 的 timer。最后由 target checkout 的隔离 stdlib
@@ -34,7 +38,9 @@
    发布绑定 operation id、target 和环境 manifest 的 marker。旧 coordinator 再把 intent 推进为
    `completed`，最后由 target authority 原子发布 commit record。daemon 只接受
    `marker + completed intent + commit record + selected environment manifest` 完整一致的代际；
-   旧 coordinator 不能替新版本 marker schema 写标记。每个 durable stage 同时写入 intent
+   旧 coordinator 不能替新版本 marker schema 写标记。uv 等待以短轮询响应整体 deadline 或取消，
+   超时/取消会终止完整进程组；manifest 序列化、哈希、写入/fsync 与 GC manifest 扫描均在有界
+   分块边界 checkpoint。每个 durable stage 同时写入 intent
    时间线和 JSONL 审计。结束时先释放独占锁，再只恢复原先 loaded 的 Lab daemon，并验证
    launchd health 和 shared lock；恢复失败会使发布返回非零。dry-run 只输出 handoff 计划并持
    shared lock，不 bootout daemon。

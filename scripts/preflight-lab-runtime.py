@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -30,6 +31,18 @@ LAB_RUNTIME_DIRECTORY_DEFAULTS = {
     "lab finalizer state root": ("LAB_FINALIZER_STATE_DIR", "finalizer-state"),
     "lab readiness root": ("LAB_READINESS_DIR", "readiness"),
 }
+LAB_RUNTIME_PATH_KEYS = frozenset(
+    {
+        "DATA_DIR",
+        "LAB_RUNTIME_DIR",
+        "LAB_JOBS_PATH",
+        *(key for key, _default in LAB_RUNTIME_DIRECTORY_DEFAULTS.values()),
+    }
+)
+_DOTENV_ASSIGNMENT = re.compile(
+    r"^(?:export[ \t]+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(?P<value>.*)$",
+    re.IGNORECASE,
+)
 
 
 class PreflightError(RuntimeError):
@@ -110,6 +123,11 @@ def _git_command(
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
+            env={
+                **os.environ,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PreflightError("Git checkout verification failed closed") from exc
@@ -119,15 +137,39 @@ def _git_command(
     return result
 
 
+def _physical_checkout_root(raw: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute() or path != Path(os.path.abspath(path)):
+        raise PreflightError("checkout root must be an absolute canonical path")
+    try:
+        if path.resolve(strict=True) != path:
+            raise PreflightError("checkout root must be a physical directory")
+        observed = path.lstat()
+    except OSError as exc:
+        raise PreflightError("checkout root is unavailable") from exc
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.getuid()
+    ):
+        raise PreflightError("checkout root must be an owned physical directory")
+    package_root = path / "src" / "rquant"
+    try:
+        package_root.lstat()
+    except OSError as exc:
+        raise PreflightError("src/rquant is unavailable") from exc
+    if not package_root.is_dir() or package_root.is_symlink():
+        raise PreflightError("src/rquant must be a physical directory")
+    return path
+
+
 def _checkout_root(
     raw: str,
     *,
     git_path: Path,
     git_identity: _ExecutableIdentity,
 ) -> Path:
-    path = Path(raw)
-    if not path.is_absolute() or path != Path(os.path.abspath(path)):
-        raise PreflightError("checkout root must be an absolute canonical path")
+    path = _physical_checkout_root(raw)
     top_level = _git_command(
         path,
         ["rev-parse", "--show-toplevel"],
@@ -136,13 +178,6 @@ def _checkout_root(
     ).stdout.strip()
     if Path(top_level) != path:
         raise PreflightError("checkout root does not match Git top-level")
-    package_root = path / "src" / "rquant"
-    try:
-        package_root.lstat()
-    except OSError as exc:
-        raise PreflightError("src/rquant is unavailable") from exc
-    if not package_root.is_dir() or package_root.is_symlink():
-        raise PreflightError("src/rquant must be a physical directory")
     return path
 
 
@@ -209,6 +244,37 @@ def _runtime_artifacts(checkout: Path) -> tuple[Path, ...]:
     return tuple(sorted(set(found)))
 
 
+def _related_lab_key(raw_line: str) -> str | None:
+    candidate = raw_line.strip()
+    if candidate.casefold().startswith("export "):
+        candidate = candidate[7:].lstrip()
+    match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", candidate)
+    if match is None:
+        return None
+    key = match.group(1).upper()
+    return key if key in LAB_RUNTIME_PATH_KEYS else None
+
+
+def _parse_dotenv_value(raw: str, *, key: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] in {"'", '"'}:
+        quote = value[0]
+        closing = value.find(quote, 1)
+        if closing < 0:
+            raise PreflightError(f"checkout .env has unsupported {key} quoting")
+        parsed = value[1:closing]
+        trailing = value[closing + 1 :].strip()
+        if trailing and not trailing.startswith("#"):
+            raise PreflightError(f"checkout .env has unsupported {key} syntax")
+    else:
+        parsed = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if any(character in parsed for character in ("\\", "$", "\n", "\r")):
+        raise PreflightError(f"checkout .env has unsupported {key} expansion or escape")
+    return parsed
+
+
 def _dotenv_values(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -225,20 +291,24 @@ def _dotenv_values(path: Path) -> dict[str, str]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         raise PreflightError("checkout .env is unreadable") from exc
-    values: dict[str, str] = {}
+    exact_values: dict[str, str] = {}
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if "=" not in stripped:
+        assignment = _DOTENV_ASSIGNMENT.fullmatch(stripped)
+        if assignment is None:
+            related = _related_lab_key(stripped)
+            if related is not None:
+                raise PreflightError(f"checkout .env has unsupported {related} syntax")
             continue
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        if key:
-            values[key] = value
+        source_key = assignment.group("key")
+        key = source_key.upper()
+        if key in LAB_RUNTIME_PATH_KEYS:
+            exact_values[source_key] = _parse_dotenv_value(assignment.group("value"), key=key)
+    values: dict[str, str] = {}
+    for source_key, value in exact_values.items():
+        values[source_key.upper()] = value
     return values
 
 
@@ -249,7 +319,10 @@ def _configured_path(
     *,
     label: str,
 ) -> Path:
-    raw = os.environ.get(key, values.get(key, ""))
+    raw = values.get(key.upper(), "")
+    for environment_key, environment_value in os.environ.items():
+        if environment_key.casefold() == key.casefold():
+            raw = environment_value
     path = Path(raw) if raw else default
     if not path.is_absolute() or path != Path(os.path.abspath(path)):
         raise PreflightError(f"{label} must be an absolute canonical path")
@@ -423,12 +496,13 @@ def _load_release_authority(path: Path) -> ModuleType:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkout-root", required=True)
-    parser.add_argument("--expected-commit", required=True)
-    parser.add_argument("--trusted-git-path", required=True)
-    parser.add_argument("--deployment-lock-path", required=True)
-    parser.add_argument("--deployment-lock-fd", required=True, type=int)
-    parser.add_argument("--python-path", required=True)
+    parser.add_argument("--expected-commit")
+    parser.add_argument("--trusted-git-path")
+    parser.add_argument("--deployment-lock-path")
+    parser.add_argument("--deployment-lock-fd", type=int)
+    parser.add_argument("--python-path")
     parser.add_argument("--provisional-handoff-label")
+    parser.add_argument("--prepared-sentinel-only", action="store_true")
     parser.add_argument(
         "--lab-daemon-command",
         choices=("lab-scheduler", "lab-worker", "lab-finalizer", "lab-runtime-prepare"),
@@ -436,7 +510,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.prepared_sentinel_only:
+            checkout = _physical_checkout_root(args.checkout_root)
+            _verify_prepared_lab_runtime(
+                checkout,
+                daemon_command=args.lab_daemon_command,
+            )
+            print("Lab runtime preflight: verified prepared sentinel")
+            return 0
+        if any(
+            value is None
+            for value in (
+                args.expected_commit,
+                args.trusted_git_path,
+                args.deployment_lock_path,
+                args.deployment_lock_fd,
+                args.python_path,
+            )
+        ):
+            raise PreflightError("complete runtime verification arguments are required")
         git_path, git_identity = _trusted_git(args.trusted_git_path)
+        checkout = _physical_checkout_root(args.checkout_root)
+        _verify_prepared_lab_runtime(
+            checkout,
+            daemon_command=args.lab_daemon_command,
+        )
         checkout = _checkout_root(
             args.checkout_root,
             git_path=git_path,
@@ -458,10 +556,6 @@ def main(argv: list[str] | None = None) -> int:
                 f"{len(artifacts)} artifact(s); manually verify and remove only these "
                 f"repository entries, then rerun: {preview}"
             )
-        _verify_prepared_lab_runtime(
-            checkout,
-            daemon_command=args.lab_daemon_command,
-        )
         lock_path = Path(args.deployment_lock_path)
         _assert_generation_lock(lock_path, args.deployment_lock_fd)
         try:

@@ -148,6 +148,8 @@ def _runtime_checkout(
     tmp_path: Path,
     *,
     symlink_python: bool = False,
+    publish_generation: bool = True,
+    prepare_runtime: bool = True,
 ) -> tuple[Path, Path, Path]:
     checkout = tmp_path / "checkout"
     scripts = checkout / "scripts"
@@ -217,39 +219,41 @@ def _runtime_checkout(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    lock_path = _deployment_lock_path(checkout)
-    lock_path.parent.mkdir(mode=0o700)
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        authority = ReleaseGenerationAuthority(
-            repo=checkout,
-            lock_path=lock_path,
-            lock_fd=lock_fd,
-            python_path=python,
-            git_path=TRUSTED_GIT,
-            writable=True,
-            environment_builder=lambda destination: shutil.copytree(
-                checkout / ".venv",
-                destination,
-                dirs_exist_ok=True,
-                symlinks=True,
-            ),
-        )
-        initialization = authority.begin_initialization(target_sha=commit)
-        authority.publish(
-            expected_commit=commit,
-            operation_id=initialization.operation_id,
-            transaction_kind="initialization",
-        )
-        authority.complete_initialization(operation_id=initialization.operation_id)
-        authority.commit_generation(
-            operation_id=initialization.operation_id,
-            transaction_kind="initialization",
-        )
-    finally:
-        os.close(lock_fd)
-    _prepare_fake_lab_runtime(checkout)
+    if publish_generation:
+        lock_path = _deployment_lock_path(checkout)
+        lock_path.parent.mkdir(mode=0o700)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            authority = ReleaseGenerationAuthority(
+                repo=checkout,
+                lock_path=lock_path,
+                lock_fd=lock_fd,
+                python_path=python,
+                git_path=TRUSTED_GIT,
+                writable=True,
+                environment_builder=lambda destination: shutil.copytree(
+                    checkout / ".venv",
+                    destination,
+                    dirs_exist_ok=True,
+                    symlinks=True,
+                ),
+            )
+            initialization = authority.begin_initialization(target_sha=commit)
+            authority.publish(
+                expected_commit=commit,
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
+            authority.complete_initialization(operation_id=initialization.operation_id)
+            authority.commit_generation(
+                operation_id=initialization.operation_id,
+                transaction_kind="initialization",
+            )
+        finally:
+            os.close(lock_fd)
+    if prepare_runtime:
+        _prepare_fake_lab_runtime(checkout)
     return checkout, executable, marker
 
 
@@ -327,7 +331,11 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
 def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effects(
     tmp_path: Path,
 ) -> None:
-    checkout, executable, marker = _runtime_checkout(tmp_path)
+    checkout, executable, marker = _runtime_checkout(
+        tmp_path,
+        publish_generation=False,
+        prepare_runtime=False,
+    )
     future_data = tmp_path / "future-data"
     future_parquet = tmp_path / "future-parquet"
     future_logs = tmp_path / "future-logs"
@@ -335,7 +343,7 @@ def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effe
     dotenv.write_text(
         "\n".join(
             (
-                f"DATA_DIR={future_data}",
+                f"export data_dir = '{future_data}' # Settings-compatible path",
                 f"DUCKDB_PATH={future_data / 'rquant.duckdb'}",
                 f"PARQUET_DIR={future_parquet}",
                 f"LOG_DIR={future_logs}",
@@ -345,6 +353,11 @@ def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effe
         encoding="utf-8",
     )
     dotenv.chmod(0o600)
+    index = checkout / ".git" / "index"
+    index_before = index.read_bytes()
+    index_stat_before = index.stat()
+    lock_root = _deployment_lock_path(checkout).parent
+    tree_before = tuple(sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")))
 
     result = _run_wrapper(checkout, executable, marker)
 
@@ -354,6 +367,18 @@ def test_lab_runtime_wrapper_missing_prepared_sentinel_has_zero_config_side_effe
     assert not future_data.exists()
     assert not future_parquet.exists()
     assert not future_logs.exists()
+    assert not lock_root.exists()
+    assert index.read_bytes() == index_before
+    index_stat_after = index.stat()
+    assert (index_stat_after.st_dev, index_stat_after.st_ino) == (
+        index_stat_before.st_dev,
+        index_stat_before.st_ino,
+    )
+    assert index_stat_after.st_mtime_ns == index_stat_before.st_mtime_ns
+    assert (
+        tuple(sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")))
+        == tree_before
+    )
 
 
 def test_lab_runtime_wrapper_reads_provisional_handoff_for_marker_operation(

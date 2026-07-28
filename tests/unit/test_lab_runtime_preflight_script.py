@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from rquant.config import Settings
 from rquant.release_generation import ReleaseGenerationAuthority
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -356,6 +357,116 @@ def test_lab_runtime_preflight_symlink_swap_never_deletes_external_bytecode(
     assert "manual" in result.stderr.lower()
     assert (package / "__pycache__").is_symlink()
     assert victim.read_bytes() == b"external bytecode must survive"
+
+
+def test_lab_runtime_preflight_readonly_git_disables_optional_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, _package = _checkout(tmp_path)
+    namespace = runpy.run_path(str(SCRIPT))
+    git_path, git_identity = namespace["_trusted_git"](str(TRUSTED_GIT))
+    observed_environments: list[dict[str, str]] = []
+    original_run = subprocess.run
+
+    def capture_git_environment(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        observed_environments.append(environment)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", capture_git_environment)
+
+    namespace["_git_command"](
+        checkout,
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        git_path=git_path,
+        git_identity=git_identity,
+    )
+
+    assert observed_environments
+    assert all(values["GIT_OPTIONAL_LOCKS"] == "0" for values in observed_environments)
+    assert all(values["GIT_TERMINAL_PROMPT"] == "0" for values in observed_environments)
+
+
+@pytest.mark.parametrize(
+    ("data_line", "duplicate_lines"),
+    (
+        ("export DATA_DIR = '{data}' # exported upper-case", ()),
+        ('data_dir = "{data}" # lower-case Settings key', ()),
+        (
+            'data_dir = "{data}" # lower-case Settings key',
+            ("DATA_DIR = '{superseded}'", 'data_dir = "{data}"'),
+        ),
+    ),
+)
+def test_stdlib_dotenv_lab_paths_match_settings_supported_subset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    data_line: str,
+    duplicate_lines: tuple[str, ...],
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    data = tmp_path / "configured-data"
+    dotenv = checkout / ".env"
+    dotenv.write_text(
+        "\n".join(
+            (
+                "TUSHARE_TOKEN_MAIN=" + "x" * 32,
+                data_line.format(data=data),
+                f"duckdb_path = '{data / 'rquant.duckdb'}'",
+                f"PARQUET_DIR = '{tmp_path / 'parquet'}'",
+                f"LOG_DIR = '{tmp_path / 'logs'}'",
+                *(
+                    line.format(data=data, superseded=tmp_path / "superseded")
+                    for line in duplicate_lines
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dotenv.chmod(0o600)
+    namespace = runpy.run_path(str(SCRIPT))
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    monkeypatch.delenv("data_dir", raising=False)
+
+    values = namespace["_dotenv_values"](dotenv)
+    preflight_path = namespace["_configured_path"](
+        values,
+        "DATA_DIR",
+        checkout / "data",
+        label="DATA_DIR",
+    )
+    configured = Settings(_env_file=dotenv)
+
+    assert preflight_path == configured.data_dir
+    if not duplicate_lines:
+        assert configured.data_dir == data
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "DATA_DIR=${HOME}/rquant-data",
+        r"LAB_RUNTIME_DIR='C:\\unsafe-escape'",
+        "export DATA_DIR /tmp/rquant-data",
+    ),
+)
+def test_stdlib_dotenv_rejects_unsupported_lab_path_syntax(
+    tmp_path: Path,
+    line: str,
+) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(f"{line}\n", encoding="utf-8")
+    dotenv.chmod(0o600)
+    namespace = runpy.run_path(str(SCRIPT))
+
+    with pytest.raises(namespace["PreflightError"], match="unsupported"):
+        namespace["_dotenv_values"](dotenv)
 
 
 def test_lab_runtime_preflight_detect_only_scan_survives_mid_walk_symlink_swap(

@@ -2,9 +2,12 @@
 
 ## 启动链路
 
-三个 Lab daemon 由 launchd 先运行 `scripts/run-lab-daemon.py`。wrapper 只使用标准库，完成
-物理 checkout、bootstrap virtualenv、可信 Git、console launcher 和 clean commit 校验，并取得该
-checkout 唯一发布锁的共享锁。wrapper、只读 preflight 和隔离 bootstrap 都会验证
+三个 Lab daemon 由 launchd 先运行 `scripts/run-lab-daemon.py`。wrapper 只使用标准库，并且在创建
+generation lock 目录或锁文件前，先以纯只读模式验证 prepared runtime sentinel。缺失、被替换或
+无法安全解析的 sentinel/相关 `.env` 路径配置会立即失败，仓库、Git index 和部署锁命名空间均不
+发生变化。通过该门禁后才完成物理 checkout、bootstrap virtualenv、可信 Git、console launcher
+和 clean commit 校验，并取得该 checkout 唯一发布锁的共享锁。所有只读 Git 调用显式使用
+`GIT_OPTIONAL_LOCKS=0`。wrapper、只读 preflight 和隔离 bootstrap 都会验证
 crash-persistent 提交协议，再从环境 selector 解析已封存的不可变 venv，以该 generation 的 Python
 执行 `-I -S` bootstrap，而不是执行 checkout 中可变 `.venv` 的 console script。
 
@@ -42,7 +45,9 @@ manifest 可验后原子切换。marker 可以先于 intent completion
 intent 的 resume/rollback 目标，以及按私有 manifest 判定的紧邻上一代；只删除超过宽限期、
 严格位于 generation root、无 symlink/hardlink 且不再被引用的完成或失败目录。只读树先受控解冻
 再按 descriptor 删除。每次扫描记录到 `rQuant.generation-gc.jsonl`，并在构建前验证 generation
-预算与 `RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES`；不足时不创建 staging。
+预算与 `RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES`；不足时不创建 staging。uv 子进程以短轮询检查
+整体 deadline/cancellation，取消后终止完整进程组；manifest 编码、哈希、写入、fsync 和 GC 对
+retained/orphan 记录的读取也按有界块执行 checkpoint，因此不会等到单个长步骤结束才响应取消。
 
 ## P1.5d 安装要求
 

@@ -376,6 +376,33 @@ def _run_preflight(
     _assert_trusted_git(git_path, git_identity)
 
 
+def _run_prepared_sentinel_preflight(
+    *,
+    python: Path,
+    preflight: Path,
+    root: Path,
+    daemon_command: str,
+) -> None:
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-S",
+            str(preflight),
+            "--checkout-root",
+            str(root),
+            "--lab-daemon-command",
+            daemon_command,
+            "--prepared-sentinel-only",
+        ],
+        cwd=root,
+        check=False,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise WrapperError("Lab runtime prepared sentinel preflight failed")
+
+
 def _load_release_authority(path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location("_rquant_release_generation", path)
     if spec is None or spec.loader is None:
@@ -422,10 +449,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root, venv, python, runtime_identities = _require_runtime_root(args.expected_checkout_root)
         trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
-        deployment_lock_path, generation_lock_fd = _acquire_deployment_generation(
-            root,
-            args.deployment_lock_path,
-        )
         for variable in _PYTHON_INJECTION_VARIABLES:
             if os.environ.get(variable):
                 raise WrapperError(f"Python environment injection is not allowed: {variable}")
@@ -450,6 +473,16 @@ def main(argv: list[str] | None = None) -> int:
             venv,
             trusted_git,
             daemon_argv,
+        )
+        _run_prepared_sentinel_preflight(
+            python=python,
+            preflight=preflight,
+            root=root,
+            daemon_command=daemon_argv[1],
+        )
+        deployment_lock_path, generation_lock_fd = _acquire_deployment_generation(
+            root,
+            args.deployment_lock_path,
         )
         handoff_label = _HANDOFF_LABELS.get(daemon_argv[1])
         expected_commit = _git_commit(

@@ -17,6 +17,7 @@ from rquant.release_generation import (
     DeploymentIntent,
     ReleaseGenerationAuthority,
     ReleaseGenerationError,
+    _write_private_json,
     commit_path_for_lock,
     environment_manifest_path_for_lock,
     environment_root_for_lock,
@@ -1048,6 +1049,149 @@ def test_environment_tree_publication_checks_shared_deadline_and_cancellation(
     assert not environment_selector_path_for_lock(lock_path).exists()
     assert not [path for path in environment_root.iterdir() if path.name.endswith(".building")]
     assert not [path for path in environment_root.iterdir() if not path.name.startswith(".")]
+    os.close(lock_fd)
+
+
+def test_real_uv_wait_poll_cancellation_kills_process_group(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, _commit, python = _generation(tmp_path)
+    child_marker = tmp_path / "uv-child-survived"
+    uv = tmp_path / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', \"import time; "
+        f"time.sleep(0.8); open({str(child_marker)!r}, 'w').write('alive')\"])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o700)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    started = time.monotonic()
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        writable=True,
+        uv_path=uv,
+        minimum_free_bytes=0,
+        command_timeout_seconds=10,
+        cancellation_check=lambda: time.monotonic() - started >= 0.15,
+    )
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    with pytest.raises(ReleaseGenerationError, match="cancelled"):
+        authority._build_environment(destination, system_python=Path(sys.executable).resolve())
+
+    time.sleep(1)
+    assert not child_marker.exists()
+    os.close(lock_fd)
+
+
+def test_large_manifest_serialization_is_cancellable_before_publish(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, _commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    checks = 0
+
+    def cancelled() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 8
+
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        cancellation_check=cancelled,
+    )
+    manifest = {
+        "schema_version": 1,
+        "entries": [
+            {"path": f"lib/payload-{index}.bin", "sha256": "a" * 64} for index in range(20_000)
+        ],
+    }
+    root_fd = os.open(lock_path.parent, os.O_RDONLY)
+    try:
+        with pytest.raises(ReleaseGenerationError, match="cancelled"):
+            _write_private_json(
+                root_fd=root_fd,
+                root_path=lock_path.parent,
+                name="large.manifest.json",
+                payload=manifest,
+                require_absent=True,
+                maximum_bytes=64 * 1024 * 1024,
+                checkpoint=authority._checkpoint,
+            )
+    finally:
+        os.close(root_fd)
+
+    assert not (lock_path.parent / "large.manifest.json").exists()
+    assert not list(lock_path.parent.glob(".large.manifest.json.*.tmp"))
+    os.close(lock_fd)
+
+
+def test_generation_gc_cancellation_brackets_orphan_manifest_read(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, _commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    root = environment_root_for_lock(lock_path)
+    root.mkdir(mode=0o700)
+    orphan = "f" * 64
+    candidate = root / orphan
+    candidate.mkdir(mode=0o700)
+    payload = candidate / "payload"
+    payload.write_text("orphan", encoding="utf-8")
+    payload.chmod(0o400)
+    candidate.chmod(0o500)
+    manifest = environment_manifest_path_for_lock(lock_path, orphan)
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generation_id": orphan,
+                "environment_path": str(candidate),
+                "entries": [{"path": "."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    old = time.time() - 3600
+    os.utime(candidate, (old, old))
+    cancel = False
+
+    def interrupt_after_manifest_read(stage: str) -> None:
+        nonlocal cancel
+        if stage == "before_environment_gc_manifest_delete":
+            cancel = True
+
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        mutation_hook=interrupt_after_manifest_read,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+        cancellation_check=lambda: cancel,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="cancelled"):
+        authority.garbage_collect_environments(reason="cancel-orphan-read")
+
+    assert candidate.is_dir()
+    assert manifest.is_file()
     os.close(lock_fd)
 
 

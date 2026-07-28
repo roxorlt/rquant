@@ -19,7 +19,7 @@ import stat
 import subprocess
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -604,9 +604,16 @@ def _venv_system_interpreter(python_path: Path) -> tuple[Path, PathIdentity, str
     return _verified_interpreter(Path(raw_path), label="deployment system Python")
 
 
-def _write_all(descriptor: int, payload: bytes) -> None:
+def _write_all(
+    descriptor: int,
+    payload: bytes,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
     offset = 0
     while offset < len(payload):
+        if checkpoint is not None:
+            checkpoint()
         try:
             written = os.write(descriptor, payload[offset:])
         except OSError as exc:
@@ -654,9 +661,12 @@ def _read_private_json(
     root_path: Path,
     name: str,
     maximum_bytes: int,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], PathIdentity]:
     descriptor = -1
     try:
+        if checkpoint is not None:
+            checkpoint()
         descriptor = os.open(
             name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -673,6 +683,8 @@ def _read_private_json(
         chunks: list[bytes] = []
         total = 0
         while True:
+            if checkpoint is not None:
+                checkpoint()
             chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total))
             if not chunk:
                 break
@@ -684,7 +696,11 @@ def _read_private_json(
         identity = PathIdentity.capture(opened)
         if identity != PathIdentity.capture(active):
             raise ReleaseGenerationError(f"private deployment record {name} identity changed")
+        if checkpoint is not None:
+            checkpoint()
         payload = json.loads(b"".join(chunks))
+        if checkpoint is not None:
+            checkpoint()
         if not isinstance(payload, dict):
             raise ReleaseGenerationError(f"private deployment record {name} is malformed")
         return payload, identity
@@ -710,10 +726,8 @@ def _write_private_json(
     require_absent: bool,
     expected_identity: PathIdentity | None = None,
     maximum_bytes: int = MAX_INTENT_BYTES,
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
-    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    if len(encoded) > maximum_bytes:
-        raise ReleaseGenerationError(f"private deployment record {name} is too large")
     temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     descriptor = -1
     published = False
@@ -724,16 +738,51 @@ def _write_private_json(
             0o600,
             dir_fd=root_fd,
         )
-        _write_all(descriptor, encoded)
+        expected_digest = hashlib.sha256()
+        expected_size = 0
+        for chunk in _canonical_json_chunks(payload, checkpoint=checkpoint):
+            expected_size += len(chunk)
+            if expected_size + 1 > maximum_bytes:
+                raise ReleaseGenerationError(f"private deployment record {name} is too large")
+            expected_digest.update(chunk)
+            _write_all(descriptor, chunk, checkpoint=checkpoint)
+        expected_digest.update(b"\n")
+        expected_size += 1
+        _write_all(descriptor, b"\n", checkpoint=checkpoint)
+        if checkpoint is not None:
+            checkpoint()
         os.fsync(descriptor)
+        if checkpoint is not None:
+            checkpoint()
         os.lseek(descriptor, 0, os.SEEK_SET)
-        observed = os.read(descriptor, maximum_bytes + 1)
+        observed_chunks: list[bytes] = []
+        observed_digest = hashlib.sha256()
+        observed_size = 0
+        while True:
+            if checkpoint is not None:
+                checkpoint()
+            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - observed_size))
+            if not chunk:
+                break
+            observed_chunks.append(chunk)
+            observed_digest.update(chunk)
+            observed_size += len(chunk)
+            if observed_size > maximum_bytes:
+                raise ReleaseGenerationError(f"private deployment record {name} is too large")
+        if checkpoint is not None:
+            checkpoint()
+        observed_payload = b"".join(observed_chunks)
+        parsed = json.loads(observed_payload)
+        if checkpoint is not None:
+            checkpoint()
         if (
-            observed != encoded
-            or hashlib.sha256(observed).digest() != hashlib.sha256(encoded).digest()
-            or not isinstance(json.loads(observed), dict)
+            observed_size != expected_size
+            or observed_digest.digest() != expected_digest.digest()
+            or not isinstance(parsed, dict)
         ):
             raise ReleaseGenerationError(f"private deployment record {name} verification failed")
+        if checkpoint is not None:
+            checkpoint()
         if require_absent:
             try:
                 os.link(
@@ -772,9 +821,33 @@ def _write_private_json(
             os.close(descriptor)
 
 
-def _payload_hash(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+def _canonical_json_chunks(
+    payload: dict[str, Any],
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> Iterator[bytes]:
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
+    for encoded_text in encoder.iterencode(payload):
+        if checkpoint is not None:
+            checkpoint()
+        encoded = encoded_text.encode()
+        for offset in range(0, len(encoded), 64 * 1024):
+            if checkpoint is not None:
+                checkpoint()
+            yield encoded[offset : offset + 64 * 1024]
+
+
+def _payload_hash(
+    payload: dict[str, Any],
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    for chunk in _canonical_json_chunks(payload, checkpoint=checkpoint):
+        digest.update(chunk)
+    if checkpoint is not None:
+        checkpoint()
+    return digest.hexdigest()
 
 
 def _environment_generation_id(*, operation_id: str, commit: str) -> str:
@@ -1346,17 +1419,27 @@ class ReleaseGenerationAuthority:
                     text=True,
                     start_new_session=True,
                 )
-                try:
-                    stdout, stderr = process.communicate(
-                        timeout=min(self.command_timeout_seconds, remaining)
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.communicate()
-                    raise ReleaseGenerationError(
-                        "immutable release environment build timed out"
-                    ) from exc
+                command_deadline = min(
+                    time.monotonic() + self.command_timeout_seconds,
+                    self.overall_deadline_monotonic,
+                )
+                while True:
+                    try:
+                        self._checkpoint()
+                    except ReleaseGenerationError:
+                        self._kill_environment_process_group(process)
+                        raise
+                    poll_remaining = command_deadline - time.monotonic()
+                    if poll_remaining <= 0:
+                        self._kill_environment_process_group(process)
+                        raise ReleaseGenerationError(
+                            "immutable release environment build timed out"
+                        )
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.1, poll_remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
                 result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             except ReleaseGenerationError:
                 raise
@@ -1367,6 +1450,13 @@ class ReleaseGenerationAuthority:
                 raise ReleaseGenerationError(
                     f"immutable release environment build failed: {diagnostic[:1000]}"
                 )
+
+    @staticmethod
+    def _kill_environment_process_group(process: subprocess.Popen[str]) -> None:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with suppress(OSError, subprocess.SubprocessError):
+            process.communicate(timeout=5)
 
     def _assert_lock(self) -> None:
         try:
@@ -1496,6 +1586,7 @@ class ReleaseGenerationAuthority:
         *,
         maximum_bytes: int,
     ) -> dict[str, Any] | None:
+        self._checkpoint()
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         try:
             try:
@@ -1504,23 +1595,28 @@ class ReleaseGenerationAuthority:
                     root_path=self.lock_path.parent,
                     name=path.name,
                     maximum_bytes=maximum_bytes,
+                    checkpoint=self._checkpoint,
                 )
             except ReleaseGenerationRecordMissingError:
                 self._assert_root(root_fd, root_identity)
+                self._checkpoint()
                 return None
             self._assert_root(root_fd, root_identity)
+            self._checkpoint()
             return payload
         finally:
             os.close(root_fd)
 
     def _retained_environment_ids(self, environment_fd: int) -> set[str]:
         del environment_fd
+        self._checkpoint()
         retained: set[str] = set()
         selector_payload = self._optional_private_payload(
             self.environment_selector_path,
             maximum_bytes=MAX_MARKER_BYTES,
         )
         if selector_payload is not None:
+            self._checkpoint()
             selector = EnvironmentSelector.from_payload(selector_payload)
             retained.update(
                 value
@@ -1532,6 +1628,7 @@ class ReleaseGenerationAuthority:
             maximum_bytes=MAX_MARKER_BYTES,
         )
         if marker_payload is not None:
+            self._checkpoint()
             marker = ReleaseGenerationMarker.from_payload(marker_payload)
             retained.update(
                 value
@@ -1546,6 +1643,7 @@ class ReleaseGenerationAuthority:
             maximum_bytes=MAX_MARKER_BYTES,
         )
         if commit_payload is not None:
+            self._checkpoint()
             commit_record = ReleaseGenerationCommit.from_payload(commit_payload)
             retained.update(
                 value
@@ -1559,6 +1657,7 @@ class ReleaseGenerationAuthority:
             payload = self._optional_private_payload(path, maximum_bytes=MAX_INTENT_BYTES)
             if payload is None:
                 continue
+            self._checkpoint()
             intent = DeploymentIntent.from_payload(payload)
             if intent.previous_generation_id:
                 retained.add(intent.previous_generation_id)
@@ -1566,6 +1665,7 @@ class ReleaseGenerationAuthority:
                 _environment_generation_id(operation_id=intent.operation_id, commit=commit)
                 for commit in (intent.previous_sha, intent.target_sha)
             )
+        self._checkpoint()
         return retained
 
     def _append_generation_gc_audit(self, payload: dict[str, Any]) -> None:
@@ -1606,6 +1706,7 @@ class ReleaseGenerationAuthority:
             os.close(root_fd)
 
     def _remove_orphan_environment_manifest(self, generation_id: str) -> None:
+        self._checkpoint()
         manifest_path = environment_manifest_path_for_lock(self.lock_path, generation_id)
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         try:
@@ -1615,15 +1716,19 @@ class ReleaseGenerationAuthority:
                     root_path=self.lock_path.parent,
                     name=manifest_path.name,
                     maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                    checkpoint=self._checkpoint,
                 )
             except ReleaseGenerationRecordMissingError:
                 self._assert_root(root_fd, root_identity)
+                self._checkpoint()
                 return
+            self._checkpoint()
             if payload.get("generation_id") != generation_id or payload.get(
                 "environment_path"
             ) != str(self.environment_root / generation_id):
                 raise ReleaseGenerationError("orphan environment manifest binding changed")
             self._mutation_hook("before_environment_gc_manifest_delete")
+            self._checkpoint()
             active = manifest_path.lstat()
             if PathIdentity.capture(active) != identity:
                 raise ReleaseGenerationError("orphan environment manifest identity changed")
@@ -1654,7 +1759,9 @@ class ReleaseGenerationAuthority:
         deleted = 0
         reclaimed = 0
         try:
+            self._checkpoint()
             retained = self._retained_environment_ids(environment_fd)
+            self._checkpoint()
             cutoff = datetime.now(UTC).timestamp() - self.gc_grace_seconds
             for name in sorted(os.listdir(environment_fd)):
                 self._checkpoint()
@@ -1873,11 +1980,12 @@ class ReleaseGenerationAuthority:
                 root_path=self.lock_path.parent,
                 name=selector.manifest_name,
                 maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                checkpoint=self._checkpoint,
             )
             self._assert_root(root_fd, root_identity)
         finally:
             os.close(root_fd)
-        if _payload_hash(payload) != selector.manifest_sha256:
+        if _payload_hash(payload, checkpoint=self._checkpoint) != selector.manifest_sha256:
             raise ReleaseGenerationError("environment generation manifest hash changed")
         if (
             str(payload.get("operation_id")) != selector.operation_id
@@ -2361,6 +2469,7 @@ class ReleaseGenerationAuthority:
                             root_path=self.lock_path.parent,
                             name=manifest_path.name,
                             maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                            checkpoint=self._checkpoint,
                         )
                         self._assert_root(root_fd, root_identity)
                     finally:
@@ -2443,7 +2552,7 @@ class ReleaseGenerationAuthority:
                     uv_binding=self.uv_binding,
                     checkpoint=self._checkpoint,
                 )
-                manifest_hash = _payload_hash(manifest)
+                manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)
                 try:
                     self._assert_root(root_fd, root_identity)
@@ -2454,6 +2563,7 @@ class ReleaseGenerationAuthority:
                         payload=manifest,
                         require_absent=True,
                         maximum_bytes=MAX_ENVIRONMENT_MANIFEST_BYTES,
+                        checkpoint=self._checkpoint,
                     )
                     self._assert_root(root_fd, root_identity)
                 finally:
@@ -2472,7 +2582,7 @@ class ReleaseGenerationAuthority:
                     manifest,
                     checkpoint=self._checkpoint,
                 )
-                manifest_hash = _payload_hash(manifest)
+                manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
             selector = EnvironmentSelector(
                 schema_version=ENVIRONMENT_SCHEMA_VERSION,
                 operation_id=operation_id,

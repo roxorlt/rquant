@@ -668,6 +668,75 @@ def test_incomplete_handoff_resume_is_deferred_without_writes_in_protected_windo
     assert module._stable_record_path(lock_path, "lab-handoff").read_bytes() == durable_before
 
 
+def test_protected_incomplete_handoff_defers_before_fetch_or_ref_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path)
+    module = _bootstrap_module()
+    handoff = {
+        "schema_version": module.LAB_HANDOFF_SCHEMA_VERSION,
+        "operation_id": "a" * 32,
+        "checkout_root": str(checkout),
+        "stage": "stopped",
+        "labels": list(module.LAB_LAUNCHD_LABELS),
+        "loaded_labels": list(module.LAB_LAUNCHD_LABELS),
+        "stopped_labels": list(module.LAB_LAUNCHD_LABELS),
+        "restarted_labels": [],
+        "updated_at": "2026-07-28T00:00:00+00:00",
+        "target_ref": commit,
+        "target_sha": commit,
+        "action": "deploy",
+        "release_profile": "macos-lab",
+        "lifecycle_mode": "installed",
+        "installation_identity": module._lab_installation_identity(
+            lock_path,
+            module._read_lab_installation_state(root=checkout, lock_path=lock_path),
+        ),
+        "supersedes_operation_id": "",
+    }
+    module._atomic_private_json(module._stable_record_path(lock_path, "lab-handoff"), handoff)
+    fetch_head = checkout / ".git" / "FETCH_HEAD"
+    refs = checkout / ".git" / "refs"
+
+    def snapshot(path: Path) -> tuple[tuple[str, bytes, int, int, int], ...]:
+        return tuple(
+            sorted(
+                (
+                    str(candidate.relative_to(path)),
+                    candidate.read_bytes(),
+                    candidate.stat().st_ino,
+                    candidate.stat().st_mtime_ns,
+                    candidate.stat().st_size,
+                )
+                for candidate in path.rglob("*")
+                if candidate.is_file()
+            )
+        )
+
+    refs_before = snapshot(refs)
+    fetch_before = None if not fetch_head.exists() else (fetch_head.read_bytes(), fetch_head.stat())
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: True)
+    monkeypatch.chdir(checkout)
+
+    result = module.main(_command(checkout, python, lock_path, lifecycle_mode="installed")[4:])
+
+    assert result == 75
+    assert snapshot(refs) == refs_before
+    if fetch_before is None:
+        assert not fetch_head.exists()
+    else:
+        payload, observed = fetch_before
+        after = fetch_head.stat()
+        assert fetch_head.read_bytes() == payload
+        assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
+            observed.st_ino,
+            observed.st_mtime_ns,
+            observed.st_size,
+        )
+
+
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
     tmp_path: Path,
 ) -> None:
