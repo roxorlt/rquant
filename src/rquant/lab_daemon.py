@@ -118,6 +118,108 @@ def ensure_private_directory(
     return require_private_directory(candidate, label=label)
 
 
+def prepare_lab_runtime_layout(
+    runtime_root: Path,
+    *,
+    managed_directories: Mapping[str, Path],
+    managed_files: Mapping[str, Path],
+    legacy_paths: Mapping[Path, Path],
+    mutation_guard: Callable[[], object],
+) -> Path:
+    root = ensure_private_directory(
+        runtime_root,
+        label="lab runtime root",
+        mutation_guard=mutation_guard,
+    )
+    targets = {**managed_directories, **managed_files}
+    for label, target_value in targets.items():
+        target = _canonical_absolute_path(target_value, label=label)
+        if target.parent != root:
+            raise LabDaemonConfigurationError(f"{label} must be a direct child of lab runtime root")
+        legacy = legacy_paths.get(target)
+        if legacy is None:
+            continue
+        legacy = _canonical_absolute_path(legacy, label=f"legacy {label}")
+        target_exists = os.path.lexists(target)
+        legacy_exists = os.path.lexists(legacy)
+        if target_exists and legacy_exists:
+            raise LabDaemonConfigurationError(f"legacy and target {label} both exist")
+        if target_exists or not legacy_exists:
+            continue
+        parent_observed = legacy.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_observed.st_mode)
+            or stat.S_ISLNK(parent_observed.st_mode)
+            or parent_observed.st_uid != os.getuid()
+            or parent_observed.st_mode & 0o022
+        ):
+            raise LabDaemonConfigurationError(f"legacy {label} parent is unsafe")
+        legacy_observed = legacy.lstat()
+        if label in managed_directories:
+            _validate_private_directory_identity(legacy_observed, label=f"legacy {label}")
+        else:
+            _validate_private_regular_identity(legacy_observed, label=f"legacy {label}")
+        source_fd = os.open(
+            legacy.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        target_fd = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            mutation_guard()
+            active = os.stat(legacy.name, dir_fd=source_fd, follow_symlinks=False)
+            if (
+                active.st_dev,
+                active.st_ino,
+                active.st_mode,
+                active.st_uid,
+                active.st_nlink,
+            ) != (
+                legacy_observed.st_dev,
+                legacy_observed.st_ino,
+                legacy_observed.st_mode,
+                legacy_observed.st_uid,
+                legacy_observed.st_nlink,
+            ):
+                raise LabDaemonConfigurationError(f"legacy {label} identity changed")
+            if label in managed_files and (
+                "sqlite" in label.casefold() or legacy.suffix.casefold() in {".db", ".sqlite3"}
+            ):
+                for suffix in ("-wal", "-shm"):
+                    try:
+                        os.stat(
+                            f"{legacy.name}{suffix}",
+                            dir_fd=source_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    raise LabDaemonConfigurationError(
+                        "checkpoint and remove legacy SQLite sidecars before migration"
+                    )
+            os.rename(
+                legacy.name,
+                target.name,
+                src_dir_fd=source_fd,
+                dst_dir_fd=target_fd,
+            )
+            os.fsync(source_fd)
+            os.fsync(target_fd)
+        except OSError as exc:
+            raise LabDaemonConfigurationError(f"legacy {label} could not be migrated") from exc
+        finally:
+            os.close(target_fd)
+            os.close(source_fd)
+    for label, path in managed_directories.items():
+        ensure_private_directory(path, label=label, mutation_guard=mutation_guard)
+    for label, path in managed_files.items():
+        if os.path.lexists(path):
+            _validate_private_regular_identity(path.lstat(), label=label)
+    return root
+
+
 def require_unique_runtime_paths(paths: Mapping[str, Path]) -> None:
     """Reject distinct configured paths that resolve to one live filesystem object."""
     identities: dict[tuple[int, int], tuple[str, Path]] = {}
@@ -865,6 +967,7 @@ class LabDaemonReadinessPublisher:
         environment_generation_id: str,
         code_sha: str,
         heartbeat_interval_seconds: float,
+        readiness_root: Path | None = None,
         mutation_guard: Callable[[], object] | None = None,
         monotonic_provider: Callable[[], float] = time.monotonic,
         now_provider: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -892,7 +995,10 @@ class LabDaemonReadinessPublisher:
         self.mutation_guard = mutation_guard
         self.monotonic_provider = monotonic_provider
         self.now_provider = now_provider
-        self.root = self.lock_path.with_name(f"{self.lock_path.stem}.lab-readiness")
+        self.root = _canonical_absolute_path(
+            readiness_root or self.lock_path.with_name(f"{self.lock_path.stem}.lab-readiness"),
+            label="lab daemon readiness root",
+        )
         self.path = self.root / f"{label}.json"
         self.started_at = self.now_provider()
         self._stop = Event()
@@ -1013,12 +1119,21 @@ class LabDaemonReadinessPublisher:
         return heartbeat
 
     @classmethod
-    def read(cls, *, deployment_lock_path: Path, label: str) -> LabDaemonReadiness:
+    def read(
+        cls,
+        *,
+        deployment_lock_path: Path,
+        label: str,
+        readiness_root: Path | None = None,
+    ) -> LabDaemonReadiness:
         lock_path = _canonical_absolute_path(
             deployment_lock_path,
             label="deployment generation lock",
         )
-        root = lock_path.with_name(f"{lock_path.stem}.lab-readiness")
+        root = _canonical_absolute_path(
+            readiness_root or lock_path.with_name(f"{lock_path.stem}.lab-readiness"),
+            label="lab daemon readiness root",
+        )
         require_private_directory(root, label="lab daemon readiness root")
         root_stat = root.lstat()
         root_fd = os.open(

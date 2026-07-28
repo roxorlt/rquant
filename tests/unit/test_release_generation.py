@@ -18,6 +18,7 @@ from rquant.release_generation import (
     ReleaseGenerationAuthority,
     ReleaseGenerationError,
     commit_path_for_lock,
+    environment_manifest_path_for_lock,
     environment_root_for_lock,
     environment_selector_path_for_lock,
     initialization_path_for_lock,
@@ -270,7 +271,57 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
 
     assert initialized.environment_generation_id != deployed.environment_generation_id
     assert deployed.previous_generation_id == initialized.environment_generation_id
+    manifest = json.loads(
+        environment_manifest_path_for_lock(
+            lock_path,
+            deployed.environment_generation_id,
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["uv_binding"]["physical_path"] == str(uv_path)
+    assert manifest["uv_binding"]["sha256"] == hashlib.sha256(uv_path.read_bytes()).hexdigest()
     os.close(lock_fd)
+
+
+def test_console_entry_points_are_rebound_from_staging_to_final_generation(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def console_entry_point_environment(destination: Path) -> None:
+        shutil.copytree(repo / ".venv", destination, dirs_exist_ok=True, symlinks=True)
+        launcher = destination / "bin" / "rquant"
+        launcher.write_text(
+            f"#!{destination / 'bin' / 'python'}\nfrom rquant.cli import main\nmain()\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        writable=True,
+        environment_builder=console_entry_point_environment,
+    )
+    try:
+        marker = _publish_initialized(authority, commit=commit)
+    finally:
+        os.close(lock_fd)
+
+    generation = Path(marker.venv_path)
+    launcher = generation / "bin" / "rquant"
+    assert launcher.read_text(encoding="utf-8").splitlines()[0] == (
+        f"#!{generation / 'bin' / 'python'}"
+    )
+    for path in (generation / "bin").iterdir():
+        if path.is_file() and not path.is_symlink():
+            payload = path.read_bytes()
+            assert b".building" not in payload
+            assert str(repo / ".venv").encode() not in payload
 
 
 def test_environment_builder_rejects_non_whitelisted_symlink(tmp_path: Path) -> None:
@@ -548,6 +599,73 @@ def test_marker_is_rejected_until_intent_and_commit_record_are_complete(
         transaction_kind="initialization",
     )
     assert authority.verify(expected_commit=commit) == marker
+    os.close(lock_fd)
+
+
+def test_deployment_marker_requires_completed_launchd_handoff(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    initialized = _publish_initialized(authority, commit=commit)
+    labels = (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    )
+    handoff_operation = "d" * 32
+    intent = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha=commit,
+        target_ref=commit,
+        changed_files=("src/rquant/lab_daemon.py",),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+        marker_generation=initialized.content_hash(),
+        previous_generation_id=initialized.environment_generation_id,
+        handoff_operation_id=handoff_operation,
+        handoff_labels=labels,
+    )
+    authority.invalidate()
+    authority.update_deployment_intent(
+        operation_id=intent.operation_id,
+        stage="timers_restored",
+    )
+    authority.publish(
+        expected_commit=commit,
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    authority.update_deployment_intent(operation_id=intent.operation_id, stage="completed")
+    authority.commit_generation(
+        operation_id=intent.operation_id,
+        transaction_kind="deployment",
+    )
+    handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
+    payload = {
+        "schema_version": 1,
+        "operation_id": handoff_operation,
+        "labels": list(labels),
+        "loaded_labels": list(labels),
+        "stopped_labels": list(labels),
+        "restarted_labels": [],
+        "stage": "restarting",
+    }
+    handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+    handoff_path.chmod(0o600)
+
+    with pytest.raises(ReleaseGenerationError, match="handoff is not completed"):
+        authority.verify(expected_commit=commit)
+    authority.verify(expected_commit=commit, provisional_handoff_label=labels[0])
+
+    payload["restarted_labels"] = list(labels)
+    payload["stage"] = "completed"
+    handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+    handoff_path.chmod(0o600)
+    authority.verify(expected_commit=commit)
     os.close(lock_fd)
 
 

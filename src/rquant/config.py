@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     backfill_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
     backfill_planner_memory_limit_mb: int = Field(default=2_048, ge=256)
     backfill_planner_threads: int = Field(default=2, ge=1, le=4)
+    lab_runtime_dir: Path | None = None
     lab_jobs_path: Path | None = None
     lab_job_command_dir: Path | None = None
     lab_job_claim_dir: Path | None = None
@@ -62,6 +63,7 @@ class Settings(BaseSettings):
     lab_artifact_commit_dir: Path | None = None
     lab_daemon_lock_dir: Path | None = None
     lab_finalizer_state_dir: Path | None = None
+    lab_readiness_dir: Path | None = None
     lab_trusted_git_path: Path = Path("/usr/bin/git")
     lab_finalizer_authority_key_id: str = ""
     lab_finalizer_authority_key_path: Path | None = None
@@ -197,6 +199,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "lab_jobs_path",
+        "lab_runtime_dir",
         "lab_job_command_dir",
         "lab_job_claim_dir",
         "lab_job_report_dir",
@@ -205,6 +208,7 @@ class Settings(BaseSettings):
         "lab_artifact_commit_dir",
         "lab_daemon_lock_dir",
         "lab_finalizer_state_dir",
+        "lab_readiness_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
         "lab_trusted_git_path",
@@ -216,6 +220,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "lab_jobs_path",
+        "lab_runtime_dir",
         "lab_job_command_dir",
         "lab_job_claim_dir",
         "lab_job_report_dir",
@@ -224,6 +229,7 @@ class Settings(BaseSettings):
         "lab_artifact_commit_dir",
         "lab_daemon_lock_dir",
         "lab_finalizer_state_dir",
+        "lab_readiness_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
         "lab_trusted_git_path",
@@ -338,8 +344,12 @@ class Settings(BaseSettings):
             < self.lab_finalizer_failure_cooldown_seconds
         ):
             raise ValueError("lab finalizer cooldown maximum must not be below its base")
+        lab_runtime_root = _canonical_absolute_path(
+            self.lab_runtime_dir or self.data_dir / "lab-runtime",
+            label="lab runtime root",
+        )
         lab_path = _canonical_absolute_path(
-            self.lab_jobs_path or self.data_dir / "lab_jobs.sqlite3",
+            self.lab_jobs_path or lab_runtime_root / "lab_jobs.sqlite3",
             label="lab jobs path",
         )
         existing_database_paths = (
@@ -374,36 +384,40 @@ class Settings(BaseSettings):
             raise ValueError("lab jobs path must differ from all existing database paths")
         managed_dirs = (
             _canonical_absolute_path(
-                self.lab_job_command_dir or self.data_dir / "lab_job_commands",
+                self.lab_job_command_dir or lab_runtime_root / "commands",
                 label="lab command spool",
             ),
             _canonical_absolute_path(
-                self.lab_job_claim_dir or self.data_dir / "lab_shard_claims",
+                self.lab_job_claim_dir or lab_runtime_root / "claims",
                 label="lab claim spool",
             ),
             _canonical_absolute_path(
-                self.lab_job_report_dir or self.data_dir / "lab_worker_reports",
+                self.lab_job_report_dir or lab_runtime_root / "reports",
                 label="lab report spool",
             ),
             _canonical_absolute_path(
-                self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts",
+                self.lab_worker_artifact_dir or lab_runtime_root / "worker-artifacts",
                 label="lab worker artifact root",
             ),
             _canonical_absolute_path(
-                self.lab_final_artifact_dir or self.data_dir / "lab_final_artifacts",
+                self.lab_final_artifact_dir or lab_runtime_root / "final-artifacts",
                 label="lab final artifact root",
             ),
             _canonical_absolute_path(
-                self.lab_artifact_commit_dir or self.data_dir / "lab_artifact_commits",
+                self.lab_artifact_commit_dir or lab_runtime_root / "artifact-commits",
                 label="lab artifact commit spool",
             ),
             _canonical_absolute_path(
-                self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks",
+                self.lab_daemon_lock_dir or lab_runtime_root / "locks",
                 label="lab daemon lock root",
             ),
             _canonical_absolute_path(
-                self.lab_finalizer_state_dir or self.data_dir / "lab_finalizer_state",
+                self.lab_finalizer_state_dir or lab_runtime_root / "finalizer-state",
                 label="lab finalizer state root",
+            ),
+            _canonical_absolute_path(
+                self.lab_readiness_dir or lab_runtime_root / "readiness",
+                label="lab readiness root",
             ),
         )
         existing_managed_dirs = (
@@ -436,6 +450,18 @@ class Settings(BaseSettings):
                         "lab database/managed/key paths must not alias or nest "
                         f"(nested paths): {left} <> {right}"
                     )
+        for existing in existing_database_paths + existing_managed_dirs + key_paths:
+            if _paths_alias_or_nest(lab_runtime_root, existing):
+                raise ValueError(
+                    "lab runtime root must not alias or nest another storage path "
+                    f"(nested paths): {lab_runtime_root} <> {existing}"
+                )
+        if lab_path.parent != lab_runtime_root or any(
+            path.parent != lab_runtime_root for path in managed_dirs
+        ):
+            raise ValueError(
+                "lab database and managed directories must be direct children of lab runtime root"
+            )
         workers = self.lab_scheduler_worker_id_list
         if len(set(workers)) != len(workers):
             raise ValueError("lab scheduler worker ids must be unique")
@@ -471,40 +497,48 @@ class Settings(BaseSettings):
 
     @property
     def lab_jobs_path_resolved(self) -> Path:
-        path = self.lab_jobs_path or self.data_dir / "lab_jobs.sqlite3"
+        path = self.lab_jobs_path or self.lab_runtime_dir_resolved / "lab_jobs.sqlite3"
         return path
 
     @property
+    def lab_runtime_dir_resolved(self) -> Path:
+        return self.lab_runtime_dir or self.data_dir / "lab-runtime"
+
+    @property
     def lab_job_command_dir_resolved(self) -> Path:
-        return self.lab_job_command_dir or self.data_dir / "lab_job_commands"
+        return self.lab_job_command_dir or self.lab_runtime_dir_resolved / "commands"
 
     @property
     def lab_job_claim_dir_resolved(self) -> Path:
-        return self.lab_job_claim_dir or self.data_dir / "lab_shard_claims"
+        return self.lab_job_claim_dir or self.lab_runtime_dir_resolved / "claims"
 
     @property
     def lab_job_report_dir_resolved(self) -> Path:
-        return self.lab_job_report_dir or self.data_dir / "lab_worker_reports"
+        return self.lab_job_report_dir or self.lab_runtime_dir_resolved / "reports"
 
     @property
     def lab_worker_artifact_dir_resolved(self) -> Path:
-        return self.lab_worker_artifact_dir or self.data_dir / "lab_worker_artifacts"
+        return self.lab_worker_artifact_dir or self.lab_runtime_dir_resolved / "worker-artifacts"
 
     @property
     def lab_final_artifact_dir_resolved(self) -> Path:
-        return self.lab_final_artifact_dir or self.data_dir / "lab_final_artifacts"
+        return self.lab_final_artifact_dir or self.lab_runtime_dir_resolved / "final-artifacts"
 
     @property
     def lab_artifact_commit_dir_resolved(self) -> Path:
-        return self.lab_artifact_commit_dir or self.data_dir / "lab_artifact_commits"
+        return self.lab_artifact_commit_dir or self.lab_runtime_dir_resolved / "artifact-commits"
 
     @property
     def lab_daemon_lock_dir_resolved(self) -> Path:
-        return self.lab_daemon_lock_dir or self.data_dir / "lab_daemon_locks"
+        return self.lab_daemon_lock_dir or self.lab_runtime_dir_resolved / "locks"
 
     @property
     def lab_finalizer_state_dir_resolved(self) -> Path:
-        return self.lab_finalizer_state_dir or self.data_dir / "lab_finalizer_state"
+        return self.lab_finalizer_state_dir or self.lab_runtime_dir_resolved / "finalizer-state"
+
+    @property
+    def lab_readiness_dir_resolved(self) -> Path:
+        return self.lab_readiness_dir or self.lab_runtime_dir_resolved / "readiness"
 
     @property
     def lab_scheduler_worker_id_list(self) -> tuple[str, ...]:

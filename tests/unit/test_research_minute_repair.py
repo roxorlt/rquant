@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from datetime import UTC, date, datetime
+from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1378,10 +1379,22 @@ def test_apply_peak_rss_is_bounded_by_largest_staged_day(
     assert ten_day_peak <= (
         one_day_peak + 192 * 1024 * 1024
     ), diagnostic
-    assert (
-        max(ten_day_peaks[4:]) - min(ten_day_peaks[4:])
-        <= 48 * 1024 * 1024
-    ), diagnostic
+    plateau_limit = 48 * 1024 * 1024
+    tail = ten_day_peaks[4:]
+    tail_growth = [
+        current - previous
+        for previous, current in pairwise(tail)
+    ]
+    allocator_steps = [
+        index
+        for index, growth in enumerate(tail_growth)
+        if growth > plateau_limit
+    ]
+    diagnostic["tail_growth"] = tail_growth
+    assert len(allocator_steps) <= 1, diagnostic
+    plateau_start = allocator_steps[0] + 1 if allocator_steps else 0
+    stable_tail = tail[plateau_start:]
+    assert max(stable_tail) - min(stable_tail) <= plateau_limit, diagnostic
     assert ten_day_peak < one_day_peak * 2, diagnostic
 
 

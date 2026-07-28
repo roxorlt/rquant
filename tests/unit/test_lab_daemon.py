@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -774,6 +775,99 @@ def test_private_directory_gate_requires_exact_mode_0700(
 
     with pytest.raises(LabDaemonConfigurationError, match="mode 0700"):
         require_private_directory(root, label="lab managed root")
+
+
+def test_private_lab_runtime_layout_migrates_without_chmoding_shared_data(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o755)
+    data.chmod(0o755)
+    legacy_database = data / "lab_jobs.sqlite3"
+    legacy_database.write_bytes(b"sqlite")
+    legacy_database.chmod(0o600)
+    legacy_commands = data / "lab_job_commands"
+    legacy_commands.mkdir(mode=0o700)
+    (legacy_commands / "pending.json").write_text("{}", encoding="utf-8")
+    (legacy_commands / "pending.json").chmod(0o600)
+    runtime = data / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+    commands = runtime / "commands"
+
+    lab_daemon.prepare_lab_runtime_layout(
+        runtime,
+        managed_directories={"commands": commands, "readiness": runtime / "readiness"},
+        managed_files={"lab jobs SQLite": database},
+        legacy_paths={database: legacy_database, commands: legacy_commands},
+        mutation_guard=lambda: "verified",
+    )
+
+    assert stat.S_IMODE(data.stat().st_mode) == 0o755
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
+    assert database.read_bytes() == b"sqlite"
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    assert (commands / "pending.json").read_text(encoding="utf-8") == "{}"
+    assert stat.S_IMODE(commands.stat().st_mode) == 0o700
+    assert stat.S_IMODE((runtime / "readiness").stat().st_mode) == 0o700
+    assert not legacy_database.exists()
+    assert not legacy_commands.exists()
+
+
+def test_private_lab_runtime_layout_refuses_legacy_target_conflict(tmp_path: Path) -> None:
+    from rquant import lab_daemon
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o755)
+    runtime = data / "lab-runtime"
+    runtime.mkdir(mode=0o700)
+    target = runtime / "commands"
+    target.mkdir(mode=0o700)
+    legacy = data / "lab_job_commands"
+    legacy.mkdir(mode=0o700)
+
+    with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="both exist"):
+        lab_daemon.prepare_lab_runtime_layout(
+            runtime,
+            managed_directories={"commands": target},
+            managed_files={},
+            legacy_paths={target: legacy},
+            mutation_guard=lambda: "verified",
+        )
+
+
+def test_private_lab_runtime_layout_refuses_live_legacy_sqlite_sidecars(
+    tmp_path: Path,
+) -> None:
+    from rquant import lab_daemon
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o755)
+    legacy_database = data / "lab_jobs.sqlite3"
+    legacy_database.write_bytes(b"sqlite")
+    legacy_database.chmod(0o600)
+    legacy_wal = data / "lab_jobs.sqlite3-wal"
+    legacy_wal.write_bytes(b"live-wal")
+    legacy_wal.chmod(0o600)
+    runtime = data / "lab-runtime"
+    database = runtime / "lab_jobs.sqlite3"
+
+    with pytest.raises(
+        lab_daemon.LabDaemonConfigurationError,
+        match="checkpoint.*SQLite sidecars",
+    ):
+        lab_daemon.prepare_lab_runtime_layout(
+            runtime,
+            managed_directories={"commands": runtime / "commands"},
+            managed_files={"lab jobs SQLite": database},
+            legacy_paths={database: legacy_database},
+            mutation_guard=lambda: "verified",
+        )
+
+    assert legacy_database.read_bytes() == b"sqlite"
+    assert legacy_wal.read_bytes() == b"live-wal"
+    assert not database.exists()
 
 
 def test_private_directory_runtime_ensure_creates_only_private_leaf(tmp_path: Path) -> None:

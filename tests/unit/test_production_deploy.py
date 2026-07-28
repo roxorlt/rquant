@@ -627,6 +627,9 @@ def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
             **baseline.__dict__,
             "release_profile": "macos-lab",
             "platform_name": "darwin",
+            "lab_lifecycle_mode": "installed",
+            "handoff_operation_id": "d" * 32,
+            "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
         }
     )
     runner = FakeRunner(responses)
@@ -1285,6 +1288,17 @@ def test_subprocess_runner_preserves_failed_command_diagnostics(tmp_path: Path) 
                 "import sys; print('diagnostic-from-command', file=sys.stderr); sys.exit(7)",
             ]
         )
+
+
+def test_subprocess_runner_bounds_each_command_and_overall_rollout(tmp_path: Path) -> None:
+    runner = SubprocessRunner(
+        tmp_path,
+        command_timeout_seconds=0.05,
+        overall_timeout_seconds=0.1,
+    )
+
+    with pytest.raises(DeployError, match="timed out"):
+        runner.run([sys.executable, "-c", "import time; time.sleep(1)"])
 
 
 def test_real_git_repository_deploys_annotated_fast_forward_tag(

@@ -231,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--deployment-lock-fd", required=True, type=int)
     parser.add_argument("--python-path", required=True)
+    parser.add_argument("--provisional-handoff-label")
     args = parser.parse_args(argv)
     try:
         git_path, git_identity = _trusted_git(args.trusted_git_path)
@@ -266,7 +267,10 @@ def main(argv: list[str] | None = None) -> int:
                 lock_fd=args.deployment_lock_fd,
                 python_path=Path(args.python_path),
                 git_path=git_path,
-            ).verify(expected_commit=args.expected_commit)
+            ).verify(
+                expected_commit=args.expected_commit,
+                provisional_handoff_label=args.provisional_handoff_label,
+            )
         except Exception as exc:
             raise PreflightError(f"release generation marker is invalid: {exc}") from exc
         print("Lab runtime preflight: verified complete release generation")

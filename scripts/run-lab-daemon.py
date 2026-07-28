@@ -17,7 +17,14 @@ from types import ModuleType
 
 sys.dont_write_bytecode = True
 
-_ALLOWED_DAEMONS = frozenset({"lab-scheduler", "lab-worker", "lab-finalizer"})
+_ALLOWED_DAEMONS = frozenset(
+    {"lab-scheduler", "lab-worker", "lab-finalizer", "lab-runtime-prepare"}
+)
+_HANDOFF_LABELS = {
+    "lab-scheduler": "com.roxor.rquant-lab-scheduler",
+    "lab-worker": "com.roxor.rquant-lab-worker",
+    "lab-finalizer": "com.roxor.rquant-lab-finalizer",
+}
 _PYTHON_INJECTION_VARIABLES = (
     "PYTHONHOME",
     "PYTHONINSPECT",
@@ -331,27 +338,31 @@ def _run_preflight(
     git_identity: _PathIdentity,
     deployment_lock_path: Path,
     deployment_lock_fd: int,
+    handoff_label: str | None = None,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
+    command = [
+        str(python),
+        "-I",
+        "-S",
+        str(preflight),
+        "--checkout-root",
+        str(root),
+        "--expected-commit",
+        expected_commit,
+        "--trusted-git-path",
+        str(git_path),
+        "--deployment-lock-path",
+        str(deployment_lock_path),
+        "--deployment-lock-fd",
+        str(deployment_lock_fd),
+        "--python-path",
+        str(python),
+    ]
+    if handoff_label is not None:
+        command.extend(["--provisional-handoff-label", handoff_label])
     result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-S",
-            str(preflight),
-            "--checkout-root",
-            str(root),
-            "--expected-commit",
-            expected_commit,
-            "--trusted-git-path",
-            str(git_path),
-            "--deployment-lock-path",
-            str(deployment_lock_path),
-            "--deployment-lock-fd",
-            str(deployment_lock_fd),
-            "--python-path",
-            str(python),
-        ],
+        command,
         cwd=root,
         check=False,
         timeout=15,
@@ -437,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
             trusted_git,
             daemon_argv,
         )
+        handoff_label = _HANDOFF_LABELS.get(daemon_argv[1])
         expected_commit = _git_commit(
             root,
             git_path=trusted_git,
@@ -451,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
             git_identity=trusted_git_identity,
             deployment_lock_path=deployment_lock_path,
             deployment_lock_fd=generation_lock_fd,
+            handoff_label=handoff_label,
         )
         try:
             release_module = _load_release_authority(release_authority_path)
@@ -460,7 +473,10 @@ def main(argv: list[str] | None = None) -> int:
                 lock_fd=generation_lock_fd,
                 python_path=python,
                 git_path=trusted_git,
-            ).verify(expected_commit=expected_commit)
+            ).verify(
+                expected_commit=expected_commit,
+                provisional_handoff_label=handoff_label,
+            )
         except Exception as exc:
             raise WrapperError(f"release generation marker is invalid: {exc}") from exc
         selected_venv, selected_python, selected_launcher, selected_identities = (
@@ -509,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
             git_identity=trusted_git_identity,
             deployment_lock_path=deployment_lock_path,
             deployment_lock_fd=generation_lock_fd,
+            handoff_label=handoff_label,
         )
         final_root, final_venv, final_python, final_runtime_identities = _require_runtime_root(
             args.expected_checkout_root
@@ -550,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             git_identity=trusted_git_identity,
             deployment_lock_path=deployment_lock_path,
             deployment_lock_fd=generation_lock_fd,
+            handoff_label=handoff_label,
         )
         rebound_executable, rebound_executable_identity = _validate_daemon_argv(
             root,
@@ -584,7 +602,10 @@ def main(argv: list[str] | None = None) -> int:
             lock_fd=generation_lock_fd,
             python_path=selected_python,
             git_path=trusted_git,
-        ).verify(expected_commit=expected_commit)
+        ).verify(
+            expected_commit=expected_commit,
+            provisional_handoff_label=handoff_label,
+        )
         (
             final_selected_venv,
             final_selected_python,
@@ -625,6 +646,11 @@ def main(argv: list[str] | None = None) -> int:
                 str(generation_lock_fd),
                 "--expected-launcher",
                 str(selected_launcher),
+                *(
+                    ["--provisional-handoff-label", handoff_label]
+                    if handoff_label is not None
+                    else []
+                ),
                 "--",
                 *daemon_argv[1:],
                 "--deployment-generation",

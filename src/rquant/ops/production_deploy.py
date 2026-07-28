@@ -17,6 +17,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time as monotonic_time
 import tomllib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -171,8 +172,18 @@ class GenerationFinalizer(Protocol):
 
 
 class SubprocessRunner:
-    def __init__(self, cwd: Path) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        command_timeout_seconds: float = 300,
+        overall_timeout_seconds: float = 1800,
+    ) -> None:
+        if not 0 < command_timeout_seconds <= overall_timeout_seconds <= 7200:
+            raise PolicyError("deployment timeout configuration is invalid")
         self._cwd = cwd
+        self._command_timeout_seconds = command_timeout_seconds
+        self._deadline = monotonic_time.monotonic() + overall_timeout_seconds
 
     def run(
         self,
@@ -180,6 +191,9 @@ class SubprocessRunner:
         *,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        remaining = self._deadline - monotonic_time.monotonic()
+        if remaining <= 0:
+            raise DeployError("deployment overall timeout expired")
         try:
             return subprocess.run(
                 args,
@@ -187,7 +201,10 @@ class SubprocessRunner:
                 check=check,
                 capture_output=True,
                 text=True,
+                timeout=min(self._command_timeout_seconds, remaining),
             )
+        except subprocess.TimeoutExpired as exc:
+            raise DeployError(f"command timed out: {shlex.join(args)}") from exc
         except subprocess.CalledProcessError as exc:
             diagnostic = (exc.stderr or exc.stdout or "no command output").strip()
             raise DeployError(
@@ -252,7 +269,7 @@ class IsolatedGenerationFinalizer:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=config.command_timeout_seconds,
                 pass_fds=(config.lock_fd,),
             )
             payload = json.loads(completed.stdout)
@@ -288,6 +305,11 @@ class DeployConfig:
     recovery_action: str | None = None
     release_profile: str = LINUX_RELEASE_PROFILE
     platform_name: str = "linux"
+    command_timeout_seconds: float = 300
+    overall_timeout_seconds: float = 1800
+    handoff_operation_id: str = ""
+    handoff_labels: tuple[str, ...] = ()
+    lab_lifecycle_mode: str = "uninstalled"
 
 
 @dataclass(frozen=True)
@@ -807,6 +829,8 @@ def _deploy_locked(
             restart_services=change_plan.restart_services,
             active_services=active_services,
             active_timers=active_timers,
+            handoff_operation_id=config.handoff_operation_id,
+            handoff_labels=config.handoff_labels,
         )
         _append_intent_audit(config, intent, event="planned")
         generation_authority.invalidate()
@@ -942,6 +966,25 @@ def deploy(
     generation_finalizer: GenerationFinalizer | None = None,
 ) -> DeployResult:
     validate_release_profile(config.release_profile, config.platform_name)
+    if config.lab_lifecycle_mode not in {"uninstalled", "installed"}:
+        raise PolicyError("Lab lifecycle mode is invalid")
+    if (
+        config.release_profile != MACOS_LAB_RELEASE_PROFILE
+        and config.lab_lifecycle_mode != "uninstalled"
+    ):
+        raise PolicyError("Lab lifecycle is only valid for the macOS release profile")
+    if (
+        config.release_profile == MACOS_LAB_RELEASE_PROFILE
+        and config.lab_lifecycle_mode == "installed"
+        and not config.dry_run
+    ):
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", config.handoff_operation_id) is None
+            or config.handoff_labels != LAB_LAUNCHD_HANDOFF_LABELS
+        ):
+            raise PolicyError("macOS Lab deployment requires a persisted launchd handoff")
+    elif config.handoff_operation_id or config.handoff_labels:
+        raise PolicyError("launchd handoff binding is only valid for macOS Lab deployment")
     repo = config.repo.resolve()
     effective_config = DeployConfig(
         repo=repo,
@@ -959,8 +1002,17 @@ def deploy(
         recovery_action=config.recovery_action,
         release_profile=config.release_profile,
         platform_name=config.platform_name,
+        command_timeout_seconds=config.command_timeout_seconds,
+        overall_timeout_seconds=config.overall_timeout_seconds,
+        handoff_operation_id=config.handoff_operation_id,
+        handoff_labels=config.handoff_labels,
+        lab_lifecycle_mode=config.lab_lifecycle_mode,
     )
-    effective_runner = runner or SubprocessRunner(repo)
+    effective_runner = runner or SubprocessRunner(
+        repo,
+        command_timeout_seconds=effective_config.command_timeout_seconds,
+        overall_timeout_seconds=effective_config.overall_timeout_seconds,
+    )
     lock_path = effective_config.lock_path or (repo.parent / ".rquant-deploy" / f"{repo.name}.lock")
     if effective_config.lock_fd is not None:
         try:
@@ -1034,6 +1086,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recovery-action", choices=("resume", "rollback"))
     parser.add_argument("--release-profile", choices=RELEASE_PROFILES, required=True)
     parser.add_argument("--platform-name", choices=("linux", "darwin"), required=True)
+    parser.add_argument("--command-timeout-seconds", type=float, default=300)
+    parser.add_argument("--overall-timeout-seconds", type=float, default=1800)
+    parser.add_argument("--lab-handoff-operation-id", default="")
+    parser.add_argument("--lab-handoff-label", action="append", default=[])
+    parser.add_argument(
+        "--lab-lifecycle-mode",
+        choices=("uninstalled", "installed"),
+        default="uninstalled",
+    )
     return parser
 
 
@@ -1053,6 +1114,11 @@ def main(argv: list[str] | None = None) -> int:
         recovery_action=args.recovery_action,
         release_profile=args.release_profile,
         platform_name=args.platform_name,
+        command_timeout_seconds=args.command_timeout_seconds,
+        overall_timeout_seconds=args.overall_timeout_seconds,
+        handoff_operation_id=args.lab_handoff_operation_id,
+        handoff_labels=tuple(args.lab_handoff_label),
+        lab_lifecycle_mode=args.lab_lifecycle_mode,
     )
     try:
         result = deploy(config)

@@ -3887,8 +3887,8 @@ class TestLabSchedulerCli:
         assert result == 0
         assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:True" in calls
         assert "initialize" in calls
-        assert "claim_spool:lab_shard_claims" in calls
-        assert "report_spool:lab_worker_reports" in calls
+        assert "claim_spool:claims" in calls
+        assert "report_spool:reports" in calls
         assert calls[-2:] == ["run_once", "release"]
 
     def test_cmd_lab_scheduler_forever_installs_cooperative_signal_handlers(
@@ -3991,6 +3991,7 @@ class TestLabWorkerCli:
             "ensure_private_directory",
             lambda path, *, label, mutation_guard: path,
         )
+        monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
         monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
         monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-a")
         monkeypatch.setattr(settings, "lab_trusted_git_path", Path(_LAB_TRUSTED_GIT))
@@ -4013,6 +4014,20 @@ class TestLabWorkerCli:
         assert args.command == "lab-worker"
         assert args.worker_id == "worker-a"
         assert args.once is True
+
+    def test_parser_accepts_one_shot_lab_runtime_prepare(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "lab-runtime-prepare",
+                "--expected-checkout-root",
+                _LAB_EXPECTED_ROOT,
+                "--trusted-git-path",
+                _LAB_TRUSTED_GIT,
+                *_LAB_GENERATION_ARGUMENTS,
+            ]
+        )
+
+        assert args.command == "lab-runtime-prepare"
 
     @pytest.mark.parametrize(
         ("status", "expected_exit"),
@@ -4070,8 +4085,8 @@ class TestLabWorkerCli:
         )
 
         assert result == expected_exit
-        assert "spool:lab_shard_claims" in calls
-        assert "spool:lab_worker_reports" in calls
+        assert "spool:claims" in calls
+        assert "spool:reports" in calls
         assert calls[-2:] == ["worker:worker-a", "run_once"]
 
     def test_cmd_lab_worker_forever_installs_both_stop_signals(

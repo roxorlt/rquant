@@ -25,10 +25,12 @@
    `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`。部署器依次执行：tracked 工作区检查、
    `git fetch`、target/main 归属与快进检查、diff 风险分类、快照实际 active 的受影响服务及
    timer、原子落盘 deployment intent、使旧 marker 失效、暂停原先 active 的相关 timer、
-   `git merge --ff-only <exact-sha>`、`uv sync --frozen`、第一次 preflight、按 intent 的精确集合
+   `git merge --ff-only <exact-sha>`、用物理绑定的 uv 执行 frozen sync、第一次 preflight、按 intent 的精确集合
    重启服务、第二次 preflight、恢复原先 active 的 timer。最后由 target checkout 的隔离 stdlib
-   bootstrap 重新加载 target authority。它把同步完成的 `.venv` 复制到 operation id + commit
-   唯一命名的 owner-only 不可变环境目录，生成全量内容 manifest 并原子切换环境 selector，然后
+   bootstrap 重新加载 target authority。它在 operation id + commit 唯一命名的 staging 目录中
+   直接构建 owner-only 不可变环境，把 console script 中精确指向 staging/source interpreter 的
+   shebang 重绑到最终 generation 物理解释器，确认产物不再含 staging/source 路径后再冻结目录、
+   生成全量内容 manifest 并原子切换环境 selector，然后
    发布绑定 operation id、target 和环境 manifest 的 marker。旧 coordinator 再把 intent 推进为
    `completed`，最后由 target authority 原子发布 commit record。daemon 只接受
    `marker + completed intent + commit record + selected environment manifest` 完整一致的代际；
@@ -77,8 +79,8 @@ sudo -n -l /usr/bin/systemctl stop rquant-monitor.timer
 最后两条只检查白名单授权，不会重启服务或停止 timer。正式安装后，Codex 仅通过
 `scripts/deploy-production.sh --target <exact-ref>` 部署。
 
-P1.5d 首次安装 Lab launchd 前还需在主 checkout 建立自有物理 `.venv`。完成目标 checkout 后，
-只能用下面的显式模式创建第一个 marker：
+P1.5d 首次安装 Lab launchd 前还需在主 checkout 建立自有物理 `.venv`。安装状态不从仓库中存在
+plist 推断，必须按下面四个阶段显式完成。首先在目标 checkout 创建第一个 marker：
 
 ```bash
 bash scripts/deploy-production.sh \
@@ -96,6 +98,36 @@ target preflight，随后构建不可变环境并按 marker、completed sentinel
 marker/sentinel/commit/selector；任一步中断时 daemon 都会失败关闭。若中断发生在 sentinel 已
 完成、commit record 尚未发布的窄窗口，重复同一 target 的 initialize 只允许核验并补齐 commit
 record；完整初始化仍拒绝重放。
+
+第二步，在 marker 已可验证但 launchd 尚未安装时，通过只读 stdlib wrapper 创建专用私有 runtime
+根并迁移旧 Lab 状态。默认目标是 `DATA_DIR/lab-runtime`，根和目录均为 `0700`，文件为 `0600`；
+共享的 `DATA_DIR` 可以保持现有 `0755`，命令不会 chmod 它。若旧 SQLite 仍存在 `-wal`/`-shm`，
+迁移会失败关闭，必须先在旧服务停机状态完成 SQLite checkpoint，再重新运行：
+
+```bash
+ROOT=/Users/roxor/brain/30-projects/rQuant
+LOCK=/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
+"${ROOT}/.venv/bin/python" -I -S "${ROOT}/scripts/run-lab-daemon.py" \
+  --expected-checkout-root "${ROOT}" \
+  --trusted-git-path /usr/bin/git \
+  --deployment-lock-path "${LOCK}" \
+  -- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare
+```
+
+第三步，显式登记已准备的 runtime/readiness 根；这会生成稳定、owner-only 的 installation state，
+后续 installed 模式发布必须验证它，不能仅靠 plist 文件存在：
+
+```bash
+bash scripts/deploy-production.sh \
+  --register-lab-installation \
+  --lab-runtime-root "${ROOT}/data/lab-runtime" \
+  --lab-readiness-root "${ROOT}/data/lab-runtime/readiness" \
+  --target <same-exact-semver-tag-or-full-sha>
+```
+
+最后才由 P1.5d 的人工基础设施步骤安装并 bootstrap 三个 launchd plist。初始化和登记模式不要求
+launchd 已安装或 loaded；常规 `macos-lab + installed` 发布则反过来强制 installation state 与三个
+label 都存在。该区分避免首次安装陷入“必须先停一个尚未安装的 daemon”的循环依赖。
 
 ## 中断恢复
 
@@ -138,10 +170,14 @@ sync、partial restart、post-preflight、timer 恢复、环境封存、marker/c
 才会解冻删除。扫描、删除数、回收字节、前后磁盘与保留集合写入 owner-only
 `<lock-stem>.generation-gc.jsonl`。磁盘预算不足时发布在复制前失败，不会留下完整 staging。
 
-不可变 venv 由 `uv sync --frozen --python <verified-system-python>` 在新的 generation 目录内直接
-构建，不复制现用的几百 MB 环境。允许的 symlink 仅限 uv 的 `bin/python*` 与 `lib64` 结构：
+不可变 venv 由物理绑定的 uv 在新的 generation 目录内执行 `uv venv --relocatable` 与
+`uv sync --frozen --active`，不复制现用的几百 MB 环境。`RQUANT_DEPLOY_UV` 可指定绝对路径；
+留空时仅探测 `/opt/homebrew/bin/uv`、`/usr/local/bin/uv` 和 `~/.local/bin/uv`。Homebrew symlink
+链会被解析到物理 target，并把路径、owner、mode、inode 与内容 hash 写入 generation manifest；
+不使用 `PATH` 中的 uv。允许的 symlink 仅限 uv 的 `bin/python*` 与 `lib64` 结构：
 Python 链必须最终绑定 marker 中已校验的 system interpreter，其他相对链接必须留在同一 generation；
-任意额外链接、越界链接或解释器身份漂移均失败关闭。
+任意额外链接、越界链接或解释器身份漂移均失败关闭。冻结前会重写精确指向 staging/source
+`bin/python*` 的 console-script shebang，并扫描确认最终环境不再含临时或源 venv 路径。
 
 ## Linux 与 macOS 发布 profile
 
@@ -151,10 +187,19 @@ Linux profile 保持既有 systemd service/timer 计划；macOS profile 不运�
 worker、finalizer，而不按文件后缀猜测“这次改动大概无关”。交接在交易保护窗口外确认三个 label
 均已 loaded，各执行一次 bootout，部署完成后各 bootstrap 一次，不用重启循环掩盖故障。
 
+交接本身也有独立的 `0600` 持久事务记录：在第一次 bootout 前 fsync operation id、原 loaded label、
+已停止/已恢复集合与阶段。崩溃恢复以 launchctl 当前状态和该记录共同判断，允许“只恢复了一部分”
+的合法中间态；仍 loaded 的 label 会重新停下，最终只恢复原集合。generation marker 在 handoff
+记录尚未 completed 时仅允许记录内某个 label 以 provisional 身份启动并发布 readiness，普通 daemon
+验收仍失败关闭；三个 label 全部恢复并通过稳定窗口后，handoff 才 completed，marker 才正式可接受。
+
 每个 Lab daemon 在持有同一 generation shared lock 后，以 `0600` 原子文件发布 label、PID、
 operation id、environment generation id、code SHA、启动时间和单调心跳。handoff 验收要求三个
 label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 PID 推进心跳；任一 label 缺失、
 代际错误、重启抖动或 shared lock 未保持都会在有界超时后触发失败/回滚。
+`RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS` 限制单次 Git/uv/preflight/launchctl 子命令，
+`RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS` 限制整个发布和 handoff；任何超时都会进入同一持久恢复与
+daemon restore 路径，不能无限期留下停止状态。
 
 ## 预演与审计
 
@@ -176,6 +221,8 @@ authority 以 `0600`
 目录 `fsync` 发布。它不是人工恢复开关；故障后只能运行上面的精确 initialize/resume/rollback
 流程，而不是复制、修改或删除 JSON。每个 intent 的 immutable plan、stage history 和操作结果还会
 写入 `logs/production-deploy.jsonl`；完成 intent 在下一次发布开始前按 operation id 归档。
+macOS 还使用同一稳定私有根中的 `rquant.lab-install.json` 和 `rquant.lab-handoff.json`，分别绑定
+显式安装状态和可恢复 launchd 交接；二者都不是人工补写的开关。
 
 ## 中断恢复决策
 

@@ -100,26 +100,30 @@ def _run_preflight(
     lock_path: Path,
     lock_fd: int,
     python_path: Path,
+    provisional_handoff_label: str | None,
 ) -> None:
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(preflight),
+        "--checkout-root",
+        str(root),
+        "--expected-commit",
+        commit,
+        "--trusted-git-path",
+        str(git_path),
+        "--deployment-lock-path",
+        str(lock_path),
+        "--deployment-lock-fd",
+        str(lock_fd),
+        "--python-path",
+        str(python_path),
+    ]
+    if provisional_handoff_label is not None:
+        command.extend(["--provisional-handoff-label", provisional_handoff_label])
     result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-S",
-            str(preflight),
-            "--checkout-root",
-            str(root),
-            "--expected-commit",
-            commit,
-            "--trusted-git-path",
-            str(git_path),
-            "--deployment-lock-path",
-            str(lock_path),
-            "--deployment-lock-fd",
-            str(lock_fd),
-            "--python-path",
-            str(python_path),
-        ],
+        command,
         cwd=root,
         check=False,
         timeout=15,
@@ -148,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--deployment-lock-fd", required=True, type=int)
     parser.add_argument("--expected-launcher", required=True)
+    parser.add_argument("--provisional-handoff-label")
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
@@ -191,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
             lock_path=lock_path,
             lock_fd=args.deployment_lock_fd,
             python_path=Path(sys.executable),
+            provisional_handoff_label=args.provisional_handoff_label,
         )
         try:
             _load_release_authority(
@@ -201,7 +207,10 @@ def main(argv: list[str] | None = None) -> int:
                 lock_fd=args.deployment_lock_fd,
                 python_path=Path(sys.executable),
                 git_path=_canonical(args.trusted_git_path, label="trusted Git path"),
-            ).verify(expected_commit=args.expected_commit)
+            ).verify(
+                expected_commit=args.expected_commit,
+                provisional_handoff_label=args.provisional_handoff_label,
+            )
         except Exception as exc:
             raise BootstrapError(f"release generation marker is invalid: {exc}") from exc
         _assert_generation_lock(lock_path, args.deployment_lock_fd)

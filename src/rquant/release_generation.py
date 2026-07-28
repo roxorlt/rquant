@@ -139,6 +139,8 @@ class DeploymentIntent:
     active_services: tuple[str, ...]
     active_timers: tuple[str, ...]
     restarted_services: tuple[str, ...]
+    handoff_operation_id: str
+    handoff_labels: tuple[str, ...]
     marker_generation: str
     previous_generation_id: str
     created_at: str
@@ -146,7 +148,12 @@ class DeploymentIntent:
     stage_history: tuple[dict[str, str], ...]
 
     def content_hash(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        values = asdict(self)
+        if not self.handoff_operation_id:
+            values.pop("handoff_operation_id")
+        if not self.handoff_labels:
+            values.pop("handoff_labels")
+        payload = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(payload).hexdigest()
 
     @classmethod
@@ -162,6 +169,9 @@ class DeploymentIntent:
         active_timers: tuple[str, ...],
         marker_generation: str = "",
         previous_generation_id: str = "",
+        handoff_operation_id: str = "",
+        handoff_labels: tuple[str, ...] = (),
+        operation_id: str | None = None,
         stage: str = "planned",
     ) -> DeploymentIntent:
         for label, value in (("previous", previous_sha), ("target", target_sha)):
@@ -170,7 +180,7 @@ class DeploymentIntent:
         timestamp = datetime.now(UTC).isoformat()
         return cls(
             schema_version=INTENT_SCHEMA_VERSION,
-            operation_id=secrets.token_hex(16),
+            operation_id=operation_id or secrets.token_hex(16),
             previous_sha=previous_sha,
             target_sha=target_sha,
             target_ref=target_ref,
@@ -180,6 +190,8 @@ class DeploymentIntent:
             active_services=tuple(active_services),
             active_timers=tuple(active_timers),
             restarted_services=(),
+            handoff_operation_id=handoff_operation_id,
+            handoff_labels=tuple(handoff_labels),
             marker_generation=marker_generation,
             previous_generation_id=previous_generation_id,
             created_at=timestamp,
@@ -202,6 +214,8 @@ class DeploymentIntent:
                 active_services=tuple(str(value) for value in payload["active_services"]),
                 active_timers=tuple(str(value) for value in payload["active_timers"]),
                 restarted_services=tuple(str(value) for value in payload["restarted_services"]),
+                handoff_operation_id=str(payload.get("handoff_operation_id", "")),
+                handoff_labels=tuple(str(value) for value in payload.get("handoff_labels", ())),
                 marker_generation=str(payload["marker_generation"]),
                 previous_generation_id=str(payload.get("previous_generation_id", "")),
                 created_at=str(payload["created_at"]),
@@ -223,6 +237,12 @@ class DeploymentIntent:
                 raise ReleaseGenerationError(f"deployment intent {label} SHA is invalid")
         if intent.previous_generation_id and len(intent.previous_generation_id) != 64:
             raise ReleaseGenerationError("deployment intent previous generation is invalid")
+        if intent.handoff_operation_id and not re.fullmatch(
+            r"[0-9a-f]{32}", intent.handoff_operation_id
+        ):
+            raise ReleaseGenerationError("deployment handoff operation is invalid")
+        if bool(intent.handoff_operation_id) != bool(intent.handoff_labels):
+            raise ReleaseGenerationError("deployment handoff binding is incomplete")
         return intent
 
     def advance(
@@ -416,6 +436,38 @@ def _hash_file(path: Path, *, label: str) -> str:
     except OSError as exc:
         raise ReleaseGenerationError(f"{label} cannot be read") from exc
     return digest.hexdigest()
+
+
+def _trusted_executable_binding(path: Path, *, label: str) -> dict[str, object]:
+    canonical = _canonical(path, label=label)
+    try:
+        observed = canonical.lstat()
+    except OSError as exc:
+        raise ReleaseGenerationError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid not in {0, os.getuid()}
+        or observed.st_mode & 0o022
+        or not observed.st_mode & stat.S_IXUSR
+        or canonical.resolve(strict=True) != canonical
+    ):
+        raise ReleaseGenerationError(f"{label} has unsafe identity")
+    digest = hashlib.sha256()
+    try:
+        with canonical.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        active = canonical.lstat()
+    except OSError as exc:
+        raise ReleaseGenerationError(f"{label} cannot be read") from exc
+    if PathIdentity.capture(active) != PathIdentity.capture(observed):
+        raise ReleaseGenerationError(f"{label} identity changed while reading")
+    return {
+        "physical_path": str(canonical),
+        "identity": asdict(PathIdentity.capture(observed)),
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _git_output(repo: Path, git_path: Path, *arguments: str) -> str:
@@ -933,6 +985,36 @@ def _freeze_environment(
     root.chmod(0o500)
 
 
+def _rebind_environment_console_scripts(
+    staging_path: Path,
+    final_path: Path,
+    source_venv: Path,
+) -> None:
+    bin_path = staging_path / "bin"
+    for path in bin_path.iterdir():
+        observed = path.lstat()
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+            continue
+        payload = path.read_bytes()
+        lines = payload.splitlines(keepends=True)
+        if lines and lines[0].startswith(b"#!"):
+            interpreter = lines[0][2:].rstrip(b"\r\n")
+            for root in (staging_path, source_venv):
+                source_bin = str(root / "bin").encode() + b"/"
+                if interpreter.startswith(source_bin):
+                    name = interpreter[len(source_bin) :]
+                    if name.startswith(b"python") and b"/" not in name:
+                        suffix = lines[0][2 + len(interpreter) :]
+                        lines[0] = b"#!" + str(final_path / "bin").encode() + b"/" + name + suffix
+                        path.write_bytes(b"".join(lines))
+                    break
+        rebound = path.read_bytes()
+        if str(staging_path).encode() in rebound or str(source_venv).encode() in rebound:
+            raise ReleaseGenerationError(
+                "environment console script retains a staging or source path"
+            )
+
+
 def _environment_manifest(
     root: Path,
     *,
@@ -943,6 +1025,7 @@ def _environment_manifest(
     system_python: Path,
     system_python_identity: PathIdentity,
     system_python_sha256: str,
+    uv_binding: dict[str, object] | None,
 ) -> dict[str, Any]:
     entry_arguments = {
         "system_python": system_python,
@@ -964,6 +1047,7 @@ def _environment_manifest(
         "system_python_path": str(system_python),
         "system_python_identity": asdict(system_python_identity),
         "system_python_sha256": system_python_sha256,
+        "uv_binding": uv_binding or {},
         "entries": entries,
     }
 
@@ -995,6 +1079,22 @@ def _verify_environment_manifest(root: Path, manifest: dict[str, Any]) -> None:
         or system_sha256 != expected_system_sha256
     ):
         raise ReleaseGenerationError("environment generation interpreter changed")
+    uv_binding = manifest.get("uv_binding", {})
+    if not isinstance(uv_binding, dict):
+        raise ReleaseGenerationError("environment generation uv binding is malformed")
+    if uv_binding:
+        try:
+            uv_path = Path(str(uv_binding["physical_path"]))
+            uv_identity = PathIdentity(**uv_binding["identity"])
+            uv_sha256 = str(uv_binding["sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseGenerationError("environment generation uv binding is malformed") from exc
+        observed_uv = _trusted_executable_binding(uv_path, label="release uv")
+        if (
+            PathIdentity(**observed_uv["identity"]) != uv_identity
+            or observed_uv["sha256"] != uv_sha256
+        ):
+            raise ReleaseGenerationError("environment generation uv binding changed")
     expected_paths: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
@@ -1041,12 +1141,18 @@ class ReleaseGenerationAuthority:
         self.intent_path = intent_path_for_lock(self.lock_path)
         self.initialization_path = initialization_path_for_lock(self.lock_path)
         self.commit_path = commit_path_for_lock(self.lock_path)
+        self.handoff_path = self.lock_path.with_name(f"{self.lock_path.stem}.lab-handoff.json")
         self.environment_selector_path = environment_selector_path_for_lock(self.lock_path)
         self.environment_root = environment_root_for_lock(self.lock_path)
         self.lock_fd = lock_fd
         self.python_path = _canonical(python_path, label="release Python")
         self.git_path = _canonical(git_path, label="trusted Git")
         self.uv_path = None if uv_path is None else _canonical(uv_path, label="release uv")
+        self.uv_binding = (
+            None
+            if self.uv_path is None
+            else _trusted_executable_binding(self.uv_path, label="release uv")
+        )
         self._environment_builder = environment_builder
         self.writable = writable
         self._mutation_hook = mutation_hook or (lambda _stage: None)
@@ -1070,29 +1176,41 @@ class ReleaseGenerationAuthority:
             return
         if self.uv_path is None:
             raise ReleaseGenerationError("writable generation authority requires release uv")
-        try:
-            result = subprocess.run(
-                [
-                    str(self.uv_path),
-                    "sync",
-                    "--frozen",
-                    "--python",
-                    str(system_python),
-                ],
-                cwd=self.repo,
-                env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(destination)},
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=900,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ReleaseGenerationError("immutable release environment build failed") from exc
-        if result.returncode != 0:
-            diagnostic = (result.stderr or result.stdout or "no command output").strip()
-            raise ReleaseGenerationError(
-                f"immutable release environment build failed: {diagnostic[:1000]}"
-            )
+        environment = {
+            **os.environ,
+            "VIRTUAL_ENV": str(destination),
+            "UV_PROJECT_ENVIRONMENT": str(destination),
+        }
+        commands = (
+            [
+                str(self.uv_path),
+                "venv",
+                "--allow-existing",
+                "--relocatable",
+                "--python",
+                str(system_python),
+                str(destination),
+            ],
+            [str(self.uv_path), "sync", "--frozen", "--active"],
+        )
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=self.repo,
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ReleaseGenerationError("immutable release environment build failed") from exc
+            if result.returncode != 0:
+                diagnostic = (result.stderr or result.stdout or "no command output").strip()
+                raise ReleaseGenerationError(
+                    f"immutable release environment build failed: {diagnostic[:1000]}"
+                )
 
     def _assert_lock(self) -> None:
         try:
@@ -1657,7 +1775,48 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("release transaction operation id changed")
         return record
 
-    def verify(self, *, expected_commit: str) -> ReleaseGenerationMarker:
+    def _verify_deployment_handoff(
+        self,
+        transaction: DeploymentIntent,
+        *,
+        provisional_label: str | None,
+    ) -> None:
+        if not transaction.handoff_operation_id:
+            return
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            payload, _identity_value = _read_private_json(
+                root_fd=root_fd,
+                root_path=self.lock_path.parent,
+                name=self.handoff_path.name,
+                maximum_bytes=MAX_INTENT_BYTES,
+            )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
+        labels = tuple(str(value) for value in payload.get("labels", ()))
+        restarted = tuple(str(value) for value in payload.get("restarted_labels", ()))
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("operation_id") != transaction.handoff_operation_id
+            or labels != transaction.handoff_labels
+            or not set(restarted).issubset(labels)
+        ):
+            raise ReleaseGenerationError("deployment handoff authority is stale")
+        if payload.get("stage") == "completed" and set(restarted) == set(labels):
+            return
+        if provisional_label is not None and (
+            provisional_label in labels and payload.get("stage") == "restarting"
+        ):
+            return
+        raise ReleaseGenerationError("deployment handoff is not completed")
+
+    def verify(
+        self,
+        *,
+        expected_commit: str,
+        provisional_handoff_label: str | None = None,
+    ) -> ReleaseGenerationMarker:
         self._assert_lock()
         published = self._read_marker()
         if published.schema_version != MARKER_SCHEMA_VERSION:
@@ -1670,6 +1829,10 @@ class ReleaseGenerationAuthority:
         )
         if transaction.stage != "completed":
             raise ReleaseGenerationError("release transaction is not completed")
+        self._verify_deployment_handoff(
+            transaction,
+            provisional_label=provisional_handoff_label,
+        )
         try:
             committed = self._read_commit_record()
         except ReleaseGenerationError as exc:
@@ -1771,6 +1934,8 @@ class ReleaseGenerationAuthority:
         active_timers: tuple[str, ...],
         marker_generation: str = "",
         previous_generation_id: str = "",
+        handoff_operation_id: str = "",
+        handoff_labels: tuple[str, ...] = (),
     ) -> DeploymentIntent:
         if not self.writable:
             raise ReleaseGenerationError("read-only generation authority cannot create intent")
@@ -1816,6 +1981,8 @@ class ReleaseGenerationAuthority:
             active_timers=active_timers,
             marker_generation=marker_generation,
             previous_generation_id=previous_generation_id,
+            handoff_operation_id=handoff_operation_id,
+            handoff_labels=handoff_labels,
         )
         self._create_intent_record(self.intent_path, intent)
         return intent
@@ -1972,21 +2139,7 @@ class ReleaseGenerationAuthority:
                 os.mkdir(staging_name, 0o700, dir_fd=environment_fd)
                 try:
                     self._build_environment(staging_path, system_python=system_python)
-                    final_python = final_path / "bin" / "python"
-                    bin_path = staging_path / "bin"
-                    for path in bin_path.iterdir():
-                        if not path.is_file() or path.is_symlink():
-                            continue
-                        payload = path.read_bytes()
-                        lines = payload.splitlines(keepends=True)
-                        if (
-                            lines
-                            and lines[0].startswith(b"#!")
-                            and str(source_venv).encode() in lines[0]
-                        ):
-                            suffix = b"\n" if lines[0].endswith(b"\n") else b""
-                            lines[0] = b"#!" + str(final_python).encode() + suffix
-                            path.write_bytes(b"".join(lines))
+                    _rebind_environment_console_scripts(staging_path, final_path, source_venv)
                     self._mutation_hook("environment_staged")
                     active_environment = _identity(
                         self.environment_root,
@@ -2046,6 +2199,7 @@ class ReleaseGenerationAuthority:
                     system_python=system_python,
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
+                    uv_binding=self.uv_binding,
                 )
                 manifest_hash = _payload_hash(manifest)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)

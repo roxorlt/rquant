@@ -1,5 +1,6 @@
 """Config 层单测：确保 .env 能正确加载、字段校验生效。"""
 
+import stat
 import unicodedata
 from pathlib import Path
 
@@ -86,14 +87,14 @@ class TestSettings:
             lab_worker_artifact_dir="",
         )
 
-        assert configured.lab_jobs_path_resolved == (tmp_path / "data" / "lab_jobs.sqlite3")
-        assert configured.lab_job_command_dir_resolved == (tmp_path / "data" / "lab_job_commands")
-        assert configured.lab_job_claim_dir_resolved == (tmp_path / "data" / "lab_shard_claims")
-        assert configured.lab_job_report_dir_resolved == (tmp_path / "data" / "lab_worker_reports")
-        assert configured.lab_worker_artifact_dir_resolved == (
-            tmp_path / "data" / "lab_worker_artifacts"
-        )
-        assert configured.lab_jobs_path_resolved.parent.is_dir()
+        runtime = tmp_path / "data" / "lab-runtime"
+        assert configured.lab_runtime_dir_resolved == runtime
+        assert configured.lab_jobs_path_resolved == runtime / "lab_jobs.sqlite3"
+        assert configured.lab_job_command_dir_resolved == runtime / "commands"
+        assert configured.lab_job_claim_dir_resolved == runtime / "claims"
+        assert configured.lab_job_report_dir_resolved == runtime / "reports"
+        assert configured.lab_worker_artifact_dir_resolved == (runtime / "worker-artifacts")
+        assert not runtime.exists()
         assert not configured.lab_job_command_dir_resolved.exists()
         assert not configured.lab_job_claim_dir_resolved.exists()
         assert not configured.lab_job_report_dir_resolved.exists()
@@ -125,8 +126,37 @@ class TestSettings:
     ) -> None:
         configured = Settings(**_settings_values(tmp_path))
 
-        assert configured.lab_jobs_path_resolved.parent == configured.data_dir
-        assert configured.data_dir.stat().st_mode & 0o777 == 0o700
+        assert configured.lab_jobs_path_resolved.parent == configured.lab_runtime_dir_resolved
+        assert configured.lab_runtime_dir_resolved == configured.data_dir / "lab-runtime"
+
+    def test_lab_runtime_defaults_do_not_chmod_or_write_shared_data_parent(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(mode=0o755)
+        data_dir.chmod(0o755)
+
+        configured = Settings(**_settings_values(tmp_path))
+
+        assert stat.S_IMODE(data_dir.stat().st_mode) == 0o755
+        assert not configured.lab_runtime_dir_resolved.exists()
+        assert configured.lab_jobs_path_resolved == (
+            configured.lab_runtime_dir_resolved / "lab_jobs.sqlite3"
+        )
+        assert configured.lab_job_command_dir_resolved == (
+            configured.lab_runtime_dir_resolved / "commands"
+        )
+        assert configured.lab_finalizer_state_dir_resolved == (
+            configured.lab_runtime_dir_resolved / "finalizer-state"
+        )
+
+    def test_lab_managed_path_must_be_inside_private_runtime_root(self, tmp_path: Path) -> None:
+        with pytest.raises(ValidationError, match="direct children"):
+            Settings(
+                **_settings_values(tmp_path),
+                lab_job_command_dir=tmp_path / "outside-commands",
+            )
 
     @pytest.mark.parametrize(
         "field",

@@ -2977,6 +2977,7 @@ def _lab_daemon_readiness_context(
     environment_generation = getattr(args, "deployment_environment_generation", None)
     if not isinstance(operation_id, str) or not isinstance(environment_generation, str):
         raise RuntimeError("incomplete Lab deployment readiness binding")
+    from rquant.config import settings
     from rquant.lab_daemon import LabDaemonReadinessPublisher
 
     verify = getattr(runtime_guard, "verify", None)
@@ -2990,8 +2991,72 @@ def _lab_daemon_readiness_context(
         environment_generation_id=environment_generation,
         code_sha=code_sha,
         heartbeat_interval_seconds=2,
+        readiness_root=settings.lab_readiness_dir_resolved,
         mutation_guard=verify,
     )
+
+
+def _lab_runtime_layout() -> tuple[dict[str, Path], dict[str, Path], dict[Path, Path]]:
+    from rquant.config import settings
+
+    directories = {
+        "lab command spool": settings.lab_job_command_dir_resolved,
+        "lab claim spool": settings.lab_job_claim_dir_resolved,
+        "lab report spool": settings.lab_job_report_dir_resolved,
+        "lab worker artifact root": settings.lab_worker_artifact_dir_resolved,
+        "lab final artifact root": settings.lab_final_artifact_dir_resolved,
+        "lab artifact commit spool": settings.lab_artifact_commit_dir_resolved,
+        "lab daemon lock root": settings.lab_daemon_lock_dir_resolved,
+        "lab finalizer state root": settings.lab_finalizer_state_dir_resolved,
+        "lab readiness root": settings.lab_readiness_dir_resolved,
+    }
+    files = {"lab jobs SQLite": settings.lab_jobs_path_resolved}
+    legacy = {
+        settings.lab_jobs_path_resolved: settings.data_dir / "lab_jobs.sqlite3",
+        settings.lab_job_command_dir_resolved: settings.data_dir / "lab_job_commands",
+        settings.lab_job_claim_dir_resolved: settings.data_dir / "lab_shard_claims",
+        settings.lab_job_report_dir_resolved: settings.data_dir / "lab_worker_reports",
+        settings.lab_worker_artifact_dir_resolved: settings.data_dir / "lab_worker_artifacts",
+        settings.lab_final_artifact_dir_resolved: settings.data_dir / "lab_final_artifacts",
+        settings.lab_artifact_commit_dir_resolved: settings.data_dir / "lab_artifact_commits",
+        settings.lab_daemon_lock_dir_resolved: settings.data_dir / "lab_daemon_locks",
+        settings.lab_finalizer_state_dir_resolved: settings.data_dir / "lab_finalizer_state",
+    }
+    return directories, files, legacy
+
+
+def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
+    """Create/migrate the dedicated private Lab runtime namespace once."""
+    from rquant.config import settings
+    from rquant.lab_daemon import (
+        LabRuntimeGuard,
+        prepare_lab_runtime_layout,
+        require_lab_runtime_binding,
+    )
+
+    trusted_git_path = Path(args.trusted_git_path)
+    generation_binding = _lab_deployment_generation_binding(args)
+    code_sha = require_lab_runtime_binding(
+        Path(args.expected_checkout_root),
+        trusted_git_path,
+        **generation_binding,
+    )
+    runtime_guard = LabRuntimeGuard(
+        Path(args.expected_checkout_root),
+        code_sha,
+        trusted_git_path,
+        **generation_binding,
+    )
+    directories, files, legacy = _lab_runtime_layout()
+    prepare_lab_runtime_layout(
+        settings.lab_runtime_dir_resolved,
+        managed_directories=directories,
+        managed_files=files,
+        legacy_paths=legacy,
+        mutation_guard=runtime_guard.verify,
+    )
+    logger.info(f"Lab runtime 已就绪: {settings.lab_runtime_dir_resolved}")
+    return 0
 
 
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
@@ -5081,6 +5146,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="任务 spec JSON 路径（launch_background_run 生成）",
     )
 
+    lab_runtime_prepare_p = sub.add_parser(
+        "lab-runtime-prepare",
+        help="首次安装时创建并迁移私有 Lab runtime 根目录",
+    )
+    lab_runtime_prepare_p.add_argument("--expected-checkout-root", required=True)
+    lab_runtime_prepare_p.add_argument("--trusted-git-path", required=True)
+    lab_runtime_prepare_p.add_argument("--deployment-generation", required=True)
+    lab_runtime_prepare_p.add_argument("--deployment-lock-path", required=True)
+    lab_runtime_prepare_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_runtime_prepare_p.add_argument("--deployment-operation-id")
+    lab_runtime_prepare_p.add_argument("--deployment-environment-generation")
+
     lab_scheduler_p = sub.add_parser(
         "lab-scheduler",
         help="运行 Strategy Lab 持久任务控制面",
@@ -5260,6 +5337,7 @@ def main() -> int:
         "preflight": cmd_preflight,
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
+        "lab-runtime-prepare": cmd_lab_runtime_prepare,
         "lab-scheduler": cmd_lab_scheduler,
         "lab-worker": cmd_lab_worker,
         "lab-finalizer": cmd_lab_finalizer,
@@ -5288,6 +5366,7 @@ def main() -> int:
         "preflight",
         "data-audit",
         "lab-run",
+        "lab-runtime-prepare",
         "lab-scheduler",
         "lab-worker",
         "lab-finalizer",

@@ -230,8 +230,8 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     assert result == 0
     assert "reader:lab_jobs.sqlite3:5000" in calls
     assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:False" in calls
-    assert "spool:lab_artifact_commits" in calls
-    assert "store:lab_final_artifacts" in calls
+    assert "spool:artifact-commits" in calls
+    assert "store:final-artifacts" in calls
     assert calls[-4:] == ["run_once", "store_close", "sqlite_close", "unlock"]
 
 

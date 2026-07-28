@@ -74,7 +74,11 @@
   symlink；marker、selector、commit 与 intent 精确持久化 `previous_generation_id`，GC 不再用
   mtime 猜回滚代际。发布新增显式 `linux-production` / `macos-lab` profile，macOS 只走 launchctl
   handoff；三项 Lab daemon 按 PID、operation、generation、SHA 与递增单调心跳独立通过稳定窗口
-  后才算恢复健康。
+  后才算恢复健康。console-script shebang 在冻结前从 staging/source 解释器精确重绑到最终物理
+  generation；uv 仅接受显式绝对路径或受控 Homebrew 候选，并把物理 target 身份写入 manifest。
+  launchd installation 与 handoff 分别以私有持久记录审计，支持部分恢复后续跑；单命令和整体发布
+  均有硬超时。Lab SQLite、spool、artifact、lock、finalizer state 与 readiness 默认迁到独立
+  `DATA_DIR/lab-runtime` 私有根，不再要求修改共享 `DATA_DIR` 权限。
 
 - **发布代际保留与 Lab daemon 部署交接**：active deployment intent 只有在活动记录真实
   `ENOENT` 时才允许读取对应 completed archive，损坏、宽松权限或身份替换均失败关闭。
