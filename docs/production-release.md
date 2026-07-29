@@ -322,8 +322,12 @@ token 再脱离的程序不在证明范围。Linux 使用 child subreaper、`/pr
 parent graph 和每次运行的唯一 token 是补充证据。在
 SIGINT/SIGTERM/timeout/BaseException 时先停止生成源，再反复终止并复核原进程组、立即脱离的
 `setsid` 后代与 cleanup 期间新 fork；任一 tracker、inventory、PID identity 或已发现后代存活检查无法
-完成时失败关闭，不释放成功权威。连续信号由一次性 latch 合并，避免 cleanup 被嵌套信号异常打断；
-Darwin tracker 在线程退出后才关闭 kqueue，Linux subreaper 恢复失败也会作为发布失败上报。
+完成时失败关闭，不释放成功权威。连续信号由一次性 latch 合并，避免 cleanup 被嵌套信号异常打断。
+POSIX 标准 SIGINT/SIGTERM 在阻塞窗口内只形成 pending set：相同信号会合并，同时 pending 的不同
+标准信号不保留真实到达顺序。仲裁器优先保留进入阻塞窗口前已经 latch 的首信号；若只能观察到
+同时 pending 的集合，则采用确定性的 SIGINT、SIGTERM 顺序选取一个重放，其余仅作为已合并的后续
+中断，不宣称还原真实先后。Darwin tracker 在线程退出后才关闭 kqueue，Linux subreaper 恢复失败
+也会作为发布失败上报。
 
 所有持久 release/deployment/installation/handoff/runtime/protocol JSON 共用同一 canonical UTF-8
 编码：`ensure_ascii=false`、排序键、紧凑分隔符、禁止 NaN。release、deployment、installation、

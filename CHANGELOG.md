@@ -84,7 +84,10 @@
   Darwin 因内核不提供可靠的 fork-child 跟踪，调用方声明可能后台化时会在 `Popen` 前失败关闭，
   其余可信且声明不后台化的发布命令仍使用进程身份、管道证据和进程组做生命周期清理。cleanup
   独立执行 kill/reap、tracker 关闭与信号处理器恢复并汇总异常；执行本身失败时保留原始异常，
-  将 cleanup 错误作为结构化证据附着，不再把概率扫描描述成安全沙箱。
+  将 cleanup 错误作为结构化证据附着，不再把概率扫描描述成安全沙箱。signal arbiter 在任何 tracker、
+  pipe 或 `Popen` 创建前安装，并把原 handler 恢复与最终解阻塞分成两阶段；若已有首信号，解阻塞
+  边界的后续信号只能作为次要证据。POSIX 阻塞窗口内同时 pending 的 SIGINT/SIGTERM 不承诺真实
+  到达顺序，确定性地按 SIGINT、SIGTERM 选取一个重放。
   launchd 安装 transaction authority 使用 inode/hash CAS 和可恢复 update-backup；plist 校验与读取
   改为 `openat(O_NOFOLLOW)` 后在同一 descriptor 上读/hash/fstat，并复核活动路径 inode。
   Lab SQLite 升级到 schema v6，以 mutation epoch 和 trigger 让 `list_jobs`/finalization candidate 在账本

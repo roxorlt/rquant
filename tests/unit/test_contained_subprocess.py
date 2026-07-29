@@ -365,6 +365,313 @@ def test_signal_latch_install_failure_restores_handlers_and_mask(
     assert observed_handlers == before_handlers
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+@pytest.mark.parametrize(
+    ("failure", "fail_on_install"),
+    (
+        (OSError("first handler install boom"), 1),
+        (ValueError("non-main-thread handler install boom"), 1),
+        (ValueError("second handler install boom"), 2),
+    ),
+)
+def test_signal_arbiter_install_fails_before_tracker_pipe_or_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    fail_on_install: int,
+) -> None:
+    real_signal = contained.signal.signal
+    watched = (signal.SIGINT, signal.SIGTERM)
+    before_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    installs = 0
+    resource_calls: list[str] = []
+
+    def failing_install(signum: int, handler: object) -> object:
+        nonlocal installs
+        installing_latch = isinstance(
+            getattr(handler, "__self__", None), contained._ContainedSignalLatch
+        )
+        if installing_latch:
+            installs += 1
+            if installs == fail_on_install:
+                raise failure
+        return real_signal(signum, handler)  # type: ignore[arg-type]
+
+    def forbidden_tracker_factory() -> _FakeKernelTracker:
+        resource_calls.append("tracker")
+        raise AssertionError("tracker created before signal authority")
+
+    def forbidden_pipe() -> tuple[int, int]:
+        resource_calls.append("pipe")
+        raise AssertionError("pipe created before signal authority")
+
+    def forbidden_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[str]:
+        resource_calls.append("popen")
+        raise AssertionError("Popen called before signal authority")
+
+    monkeypatch.setattr(contained.signal, "signal", failing_install)
+    monkeypatch.setattr(contained.os, "pipe", forbidden_pipe)
+    monkeypatch.setattr(contained.subprocess, "Popen", forbidden_popen)
+    try:
+        with pytest.raises(type(failure)) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                kernel_tracker_factory=forbidden_tracker_factory,
+                may_spawn_background_descendants=False,
+            )
+        observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        observed_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    finally:
+        for signum, previous in before_handlers.items():
+            real_signal(signum, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, before_mask)
+
+    assert caught.value is failure
+    assert resource_calls == []
+    assert observed_mask == before_mask
+    assert observed_handlers == before_handlers
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_pre_spawn_preparation_failure_restores_signal_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watched = (signal.SIGINT, signal.SIGTERM)
+    before_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    primary = OSError("token generation boom")
+    resource_calls: list[str] = []
+
+    def fail_token_generation(_size: int) -> str:
+        raise primary
+
+    def forbidden_tracker_factory() -> _FakeKernelTracker:
+        resource_calls.append("tracker")
+        raise AssertionError("tracker created after preparation failure")
+
+    monkeypatch.setattr(contained.secrets, "token_hex", fail_token_generation)
+    try:
+        with pytest.raises(OSError) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                kernel_tracker_factory=forbidden_tracker_factory,
+                may_spawn_background_descendants=False,
+            )
+        observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        observed_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before_mask)
+        for signum, previous in before_handlers.items():
+            signal.signal(signum, previous)
+
+    assert caught.value is primary
+    assert resource_calls == []
+    assert observed_mask == before_mask
+    assert observed_handlers == before_handlers
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+@pytest.mark.parametrize("boundary", ("after_final_sigpending", "sig_setmask"))
+def test_unlatched_restore_boundary_signal_propagates_original_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    real_signal = contained.signal.signal
+    real_sigpending = contained.signal.sigpending
+    real_sigmask = contained.signal.pthread_sigmask
+    watched = (signal.SIGINT, signal.SIGTERM)
+    before_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    latch = contained._ContainedSignalLatch()
+    injected = False
+    queued_for_unmask: list[int] = []
+    primary = InterruptedError(f"{boundary} original handler")
+
+    def previous_handler(_signum: int, _frame: object) -> None:
+        raise primary
+
+    for signum in watched:
+        real_signal(signum, previous_handler)
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+
+    def sigpending_with_boundary_delivery() -> set[signal.Signals]:
+        nonlocal injected
+        pending = real_sigpending()
+        if boundary == "after_final_sigpending" and not injected and signal.SIGTERM not in pending:
+            injected = True
+            queued_for_unmask.append(signal.SIGTERM)
+        return pending
+
+    def sigmask_with_boundary_delivery(how: int, mask: object) -> set[signal.Signals]:
+        nonlocal injected
+        if how == signal.SIG_SETMASK and (
+            queued_for_unmask or (boundary == "sig_setmask" and not injected)
+        ):
+            if boundary == "sig_setmask":
+                injected = True
+            queued_for_unmask.clear()
+            handler = signal.getsignal(signal.SIGTERM)
+            assert handler is previous_handler
+            handler(signal.SIGTERM, None)
+        return real_sigmask(how, mask)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(contained.signal, "sigpending", sigpending_with_boundary_delivery)
+    monkeypatch.setattr(contained.signal, "pthread_sigmask", sigmask_with_boundary_delivery)
+    try:
+        restoration = contained._restore_signal_handlers_atomically(
+            previous_handlers,
+            active_signals,
+            latch,
+        )
+        with pytest.raises(InterruptedError) as caught:
+            restoration.release()
+    finally:
+        monkeypatch.setattr(contained.signal, "pthread_sigmask", real_sigmask)
+        signal.pthread_sigmask(signal.SIG_SETMASK, before_mask)
+        for signum, previous in before_handlers.items():
+            real_signal(signum, previous)
+
+    assert caught.value is primary
+    assert injected
+    assert latch.first_signum is None
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_restore_boundary_signal_latched_by_failed_handler_is_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_signal = contained.signal.signal
+    real_sigmask = contained.signal.pthread_sigmask
+    watched = (signal.SIGINT, signal.SIGTERM)
+    before_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    latch = contained._ContainedSignalLatch()
+    restore_failure = OSError("handler restore boom")
+    replayed = InterruptedError("boundary signal replayed by original handler")
+    injected = False
+
+    def previous_handler(_signum: int, _frame: object) -> None:
+        raise replayed
+
+    for signum in watched:
+        real_signal(signum, previous_handler)
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+
+    def fail_sigterm_restore(signum: int, handler: object) -> object:
+        if signum == signal.SIGTERM and handler is previous_handler:
+            raise restore_failure
+        return real_signal(signum, handler)  # type: ignore[arg-type]
+
+    def sigmask_with_boundary_delivery(how: int, mask: object) -> set[signal.Signals]:
+        nonlocal injected
+        if how == signal.SIG_SETMASK and not injected:
+            injected = True
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+        return real_sigmask(how, mask)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(contained.signal, "signal", fail_sigterm_restore)
+    monkeypatch.setattr(contained.signal, "pthread_sigmask", sigmask_with_boundary_delivery)
+    try:
+        with pytest.raises(InterruptedError) as caught:
+            contained._finish_signal_restoration(
+                previous_handlers,
+                active_signals,
+                latch,
+                [],
+                primary_exception=None,
+                error_label="contained subprocess cleanup failures",
+            )
+    finally:
+        monkeypatch.setattr(contained.signal, "pthread_sigmask", real_sigmask)
+        signal.pthread_sigmask(signal.SIG_SETMASK, before_mask)
+        for signum, previous in before_handlers.items():
+            real_signal(signum, previous)
+
+    assert caught.value is replayed
+    assert injected
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert restore_failure in cleanup_group.exceptions
+
+
+def test_latched_first_signal_survives_helper_return_boundary_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_restore = contained._restore_signal_handlers_atomically
+    real_signal = contained.signal.signal
+    watched = (signal.SIGINT, signal.SIGTERM)
+    before_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    restored = False
+    later = InterruptedError("helper return boundary signal")
+
+    def first_handler(_signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signal.SIGTERM)
+
+    def later_handler(_signum: int, _frame: object) -> None:
+        raise later
+
+    real_signal(signal.SIGTERM, first_handler)
+    real_signal(signal.SIGINT, later_handler)
+
+    def restore_then_interrupt(
+        previous_handlers: dict[int, object],
+        active_signals: frozenset[int],
+        latch: contained._ContainedSignalLatch,
+    ) -> object:
+        nonlocal restored
+        latch.handle(signal.SIGTERM, None)
+        restoration = real_restore(previous_handlers, active_signals, latch)
+        restored = True
+        release = restoration.release
+
+        def release_with_queued_interrupt() -> None:
+            release()
+            later_handler(signal.SIGINT, None)
+
+        restoration.release = release_with_queued_interrupt  # type: ignore[method-assign]
+        return restoration
+
+    monkeypatch.setattr(contained, "_restore_signal_handlers_atomically", restore_then_interrupt)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                may_spawn_background_descendants=False,
+            )
+    finally:
+        for signum, previous in before_handlers.items():
+            real_signal(signum, previous)
+
+    assert restored
+    assert caught.value.code == 128 + signal.SIGTERM
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert later in cleanup_group.exceptions
+
+
 def test_signal_after_communicate_returns_is_latched_before_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -424,9 +731,10 @@ def test_signal_during_partial_handler_restore_is_replayed_after_atomic_cleanup(
 ) -> None:
     tracker = _CloseFailingKernelTracker()
     real_signal = contained.signal.signal
-    real_kill = contained.os.kill
+    real_sigpending = contained.signal.sigpending
     before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
     replayed: list[int] = []
+    queued_signals: set[int] = set()
     restoration_calls = 0
     injected = False
 
@@ -439,6 +747,8 @@ def test_signal_during_partial_handler_restore_is_replayed_after_atomic_cleanup(
     def signal_with_restore_race(signum: int, handler: object) -> object:
         nonlocal restoration_calls, injected
         result = real_signal(signum, handler)  # type: ignore[arg-type]
+        if handler is signal.SIG_IGN:
+            queued_signals.discard(signum)
         installing_latch = isinstance(
             getattr(handler, "__self__", None), contained._ContainedSignalLatch
         )
@@ -446,17 +756,16 @@ def test_signal_during_partial_handler_restore_is_replayed_after_atomic_cleanup(
             restoration_calls += 1
             if restoration_calls == 1 and not injected:
                 injected = True
-                try:
-                    real_kill(contained.os.getpid(), signal.SIGINT)
-                except KeyboardInterrupt:
-                    real_kill(contained.os.getpid(), signal.SIGTERM)
-                    raise
-                real_kill(contained.os.getpid(), signal.SIGTERM)
+                queued_signals.update((signal.SIGINT, signal.SIGTERM))
         return result
+
+    def deterministic_pending() -> set[signal.Signals]:
+        return {*real_sigpending(), *(signal.Signals(signum) for signum in queued_signals)}
 
     for signum in before:
         real_signal(signum, previous_handler)
     monkeypatch.setattr(contained.signal, "signal", signal_with_restore_race)
+    monkeypatch.setattr(contained.signal, "sigpending", deterministic_pending)
     try:
         with pytest.raises(KeyboardInterrupt) as caught:
             contained.run_contained(
@@ -487,10 +796,11 @@ def test_signal_restore_arbitration_runs_after_process_deadline_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_signal = contained.signal.signal
-    real_kill = contained.os.kill
+    real_sigpending = contained.signal.sigpending
     before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
     replayed: list[int] = []
     latch = contained._ContainedSignalLatch()
+    queued_signals: set[int] = set()
     injected = False
 
     def previous_handler(signum: int, _frame: object) -> None:
@@ -503,18 +813,25 @@ def test_signal_restore_arbitration_runs_after_process_deadline_expires(
     def signal_with_pending_delivery(signum: int, handler: object) -> object:
         nonlocal injected
         result = real_signal(signum, handler)  # type: ignore[arg-type]
+        if handler is signal.SIG_IGN:
+            queued_signals.discard(signum)
         if handler is previous_handler and not injected:
             injected = True
-            real_kill(contained.os.getpid(), signal.SIGINT)
+            queued_signals.add(signal.SIGINT)
         return result
 
+    def deterministic_pending() -> set[signal.Signals]:
+        return {*real_sigpending(), *(signal.Signals(signum) for signum in queued_signals)}
+
     monkeypatch.setattr(contained.signal, "signal", signal_with_pending_delivery)
+    monkeypatch.setattr(contained.signal, "sigpending", deterministic_pending)
     try:
         errors = contained._restore_signal_handlers_atomically(
             previous_handlers,
             active_signals,
             latch,
         )
+        errors.release()
     finally:
         for signum, previous in before.items():
             real_signal(signum, previous)
