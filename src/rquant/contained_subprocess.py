@@ -37,11 +37,15 @@ class _ContainedSignalLatch:
     def __init__(self) -> None:
         self.first_signum: int | None = None
         self._raised = False
+        self._deferred = False
+
+    def defer(self) -> None:
+        self._deferred = True
 
     def handle(self, signum: int, _frame: object) -> None:
         if self.first_signum is None:
             self.first_signum = signum
-        if self._raised:
+        if self._deferred or self._raised:
             return
         self._raised = True
         raise _ContainedSignal(self.first_signum)
@@ -1097,7 +1101,6 @@ def run_contained(
             break
         previous_handlers[signum] = previous
 
-    caught_signal: _ContainedSignal | None = None
     body_completed = False
     known: dict[int, ProcessIdentity] = {}
     known_lock = threading.Lock()
@@ -1250,8 +1253,7 @@ def run_contained(
         except BaseException as exc:
             cleanup_errors.append(exc)
         raise
-    except _ContainedSignal as exc:
-        caught_signal = exc
+    except _ContainedSignal:
         tracker_stop.set()
         if tracker_last_inventory is not None:
             last_inventory = tracker_last_inventory
@@ -1290,13 +1292,12 @@ def run_contained(
             cleanup_errors.append(exc)
         raise
     finally:
+        signal_latch.defer()
         primary_exception = sys.exception()
-        if primary_exception is None and caught_signal is not None:
-            primary_exception = caught_signal
         if gate_write >= 0:
             try:
                 os.close(gate_write)
-            except OSError as exc:
+            except BaseException as exc:
                 cleanup_errors.append(exc)
         if tracker_thread is not None:
             try:
@@ -1314,29 +1315,44 @@ def run_contained(
                 cleanup_errors.append(exc)
         if not body_completed or cleanup_errors:
             _close_file_descriptors(darwin_pipe_anchor_fds)
+        cleanup_group: BaseExceptionGroup | None = None
         if cleanup_errors:
             details = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
             cleanup_group = BaseExceptionGroup(
                 "contained subprocess cleanup failures",
                 cleanup_errors,
             )
-            if primary_exception is not None:
+            if primary_exception is not None and signal_latch.first_signum is None:
                 primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
                 primary_exception.add_note(f"contained subprocess cleanup also failed: {details}")
-            else:
+            elif signal_latch.first_signum is None:
                 raise ContainedProcessError(
                     f"contained subprocess cleanup failed: {details}"
                 ) from cleanup_group
-
-    if caught_signal is not None:
-        _close_file_descriptors(darwin_pipe_anchor_fds)
-        previous = previous_handlers[caught_signal.signum]
-        if callable(previous):
-            previous(caught_signal.signum, None)
-            raise InterruptedError(f"process runner interrupted by signal {caught_signal.signum}")
-        signal.signal(caught_signal.signum, signal.SIG_DFL)
-        os.kill(os.getpid(), caught_signal.signum)
-        raise SystemExit(128 + caught_signal.signum)
+        if signal_latch.first_signum is not None:
+            _close_file_descriptors(darwin_pipe_anchor_fds)
+            signum = signal_latch.first_signum
+            previous = previous_handlers[signum]
+            if callable(previous):
+                try:
+                    previous(signum, None)
+                except BaseException as replay_error:
+                    if cleanup_group is not None:
+                        replay_error.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                        replay_error.add_note("contained subprocess cleanup also failed")
+                    raise
+                interrupted = InterruptedError(f"process runner interrupted by signal {signum}")
+                if cleanup_group is not None:
+                    interrupted.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                    interrupted.add_note("contained subprocess cleanup also failed")
+                raise interrupted
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            terminated = SystemExit(128 + signum)
+            if cleanup_group is not None:
+                terminated.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                terminated.add_note("contained subprocess cleanup also failed")
+            raise terminated
     try:
         remaining = deadline_monotonic - clock()
         if remaining <= 0:

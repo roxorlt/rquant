@@ -1969,6 +1969,7 @@ class LabDaemonReadinessPublisher:
         self.path = self.root / f"{label}.json"
         self.started_at = self.now_provider()
         self._stop = Event()
+        self._thread_entered = Event()
         self._thread: Thread | None = None
         self._thread_state = "created"
         self._daemon_authority_lease_fd = -1
@@ -2167,27 +2168,50 @@ class LabDaemonReadinessPublisher:
                 logger.exception("lab daemon readiness heartbeat failed")
                 self._stop.set()
 
+    def _thread_main(self) -> None:
+        self._thread_entered.set()
+        self._run()
+
+    def _stop_started_thread(self, thread: Thread) -> None:
+        self._stop.set()
+        thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
+        if thread.is_alive():
+            raise RuntimeError("daemon readiness publisher did not stop within its deadline")
+        self._thread = None
+        self._thread_state = "stopped"
+        self._release_authority_lease()
+
+    @staticmethod
+    def _attach_cleanup_error(primary: BaseException, cleanup_error: BaseException) -> None:
+        cleanup_group = BaseExceptionGroup(
+            "daemon readiness startup cleanup failures",
+            [cleanup_error],
+        )
+        primary.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+        primary.add_note("daemon readiness startup cleanup also failed")
+
     def start(self) -> LabDaemonReadiness:
         if self._thread_state != "created":
             raise RuntimeError("daemon readiness publisher is already started")
         heartbeat = self.publish_once()
-        thread = Thread(target=self._run, name=f"readiness-{self.label}", daemon=True)
+        thread = Thread(target=self._thread_main, name=f"readiness-{self.label}", daemon=True)
         self._thread = thread
+        self._thread_state = "starting"
         try:
             thread.start()
+            if not self._thread_entered.wait(timeout=max(1.0, self.heartbeat_interval_seconds * 2)):
+                raise RuntimeError("daemon readiness publisher thread did not start")
         except BaseException as primary_exception:
-            self._thread = None
-            self._thread_state = "stopped"
             self._stop.set()
             try:
-                self._release_authority_lease()
+                if self._thread_entered.is_set() or thread.is_alive():
+                    self._stop_started_thread(thread)
+                else:
+                    self._thread = None
+                    self._thread_state = "stopped"
+                    self._release_authority_lease()
             except BaseException as cleanup_error:
-                cleanup_group = BaseExceptionGroup(
-                    "daemon readiness startup cleanup failures",
-                    [cleanup_error],
-                )
-                primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-                primary_exception.add_note("daemon readiness startup cleanup also failed")
+                self._attach_cleanup_error(primary_exception, cleanup_error)
             raise
         self._thread_state = "started"
         return heartbeat
@@ -2206,17 +2230,16 @@ class LabDaemonReadinessPublisher:
             self._thread_state = "stopped"
             self._release_authority_lease()
             return
-        if self._thread_state == "created":
+        if self._thread_state == "created" or (
+            self._thread_state == "starting"
+            and not self._thread_entered.is_set()
+            and not thread.is_alive()
+        ):
             self._thread = None
             self._thread_state = "stopped"
             self._release_authority_lease()
             return
-        thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
-        if thread.is_alive():
-            raise RuntimeError("daemon readiness publisher did not stop within its deadline")
-        self._thread = None
-        self._thread_state = "stopped"
-        self._release_authority_lease()
+        self._stop_started_thread(thread)
 
     def __enter__(self) -> LabDaemonReadinessPublisher:
         try:

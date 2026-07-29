@@ -529,6 +529,130 @@ def test_signal_is_replayed_when_process_cleanup_fails(
     assert replayed == [signal.SIGTERM]
 
 
+@pytest.mark.parametrize(
+    "phase",
+    ("gate_close", "tracker_join", "kernel_close", "handler_restore"),
+)
+def test_first_signal_arriving_during_cleanup_is_replayed_after_all_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+    real_close = contained.os.close
+    real_kill = contained.os.kill
+    real_pipe = contained.os.pipe
+    real_signal = contained.signal.signal
+    gate_write = -1
+    gate_cleanup_armed = False
+    emitted = False
+    replayed: list[int] = []
+
+    def emit_two_signals() -> None:
+        nonlocal emitted
+        if emitted:
+            return
+        emitted = True
+        first_error: BaseException | None = None
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            handler = signal.getsignal(signum)
+            assert callable(handler)
+            try:
+                handler(signum, None)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    class CleanupTracker(_CloseFailingKernelTracker):
+        def close(self) -> None:
+            if phase == "kernel_close":
+                emit_two_signals()
+            super().close()
+
+    class CleanupThread:
+        def __init__(self, **_kwargs: object) -> None:
+            self.alive = False
+
+        def start(self) -> None:
+            self.alive = True
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+            if phase == "tracker_join":
+                emit_two_signals()
+            self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    tracker = CleanupTracker()
+
+    def recording_pipe() -> tuple[int, int]:
+        nonlocal gate_write
+        descriptors = real_pipe()
+        if gate_write < 0:
+            gate_write = descriptors[1]
+        return descriptors
+
+    def interrupting_write(descriptor: int, payload: bytes) -> int:
+        nonlocal gate_cleanup_armed
+        if phase == "gate_close" and descriptor == gate_write:
+            gate_cleanup_armed = True
+            raise RuntimeError("gate write boom")
+        return original_write(descriptor, payload)
+
+    original_write = contained.os.write
+
+    def close_with_signal(descriptor: int) -> None:
+        if phase == "gate_close" and gate_cleanup_armed and descriptor == gate_write:
+            emit_two_signals()
+        real_close(descriptor)
+
+    def signal_with_cleanup_interrupt(signum: int, handler: object) -> object:
+        installing_latch = isinstance(
+            getattr(handler, "__self__", None), contained._ContainedSignalLatch
+        )
+        if phase == "handler_restore" and not installing_latch:
+            emit_two_signals()
+        return real_signal(signum, handler)  # type: ignore[arg-type]
+
+    def record_replay(pid: int, signum: int) -> None:
+        if pid == contained.os.getpid():
+            replayed.append(signum)
+            return
+        real_kill(pid, signum)
+
+    monkeypatch.setattr(contained.os, "pipe", recording_pipe)
+    monkeypatch.setattr(contained.os, "write", interrupting_write)
+    monkeypatch.setattr(contained.os, "close", close_with_signal)
+    monkeypatch.setattr(contained.os, "kill", record_replay)
+    monkeypatch.setattr(contained.signal, "signal", signal_with_cleanup_interrupt)
+    if phase == "tracker_join":
+        monkeypatch.setattr(contained.threading, "Thread", CleanupThread)
+
+    try:
+        with pytest.raises(SystemExit) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                kernel_tracker_factory=lambda: tracker,
+                may_spawn_background_descendants=False,
+            )
+    finally:
+        for signum, previous in before.items():
+            real_signal(signum, previous)
+
+    assert caught.value.code == 128 + signal.SIGTERM
+    assert replayed == [signal.SIGTERM]
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert any("close boom" in str(error) for error in cleanup_group.exceptions)
+    assert {signum: signal.getsignal(signum) for signum in before} == before
+
+
 def test_kernel_tracker_close_failure_restores_signal_handlers(tmp_path: Path) -> None:
     tracker = _CloseFailingKernelTracker()
     before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}

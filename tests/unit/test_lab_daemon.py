@@ -240,6 +240,94 @@ def test_readiness_thread_start_failure_preserves_error_and_releases_lease(
         os.close(deployment_lock_fd)
 
 
+@pytest.mark.parametrize(
+    "label",
+    (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    ),
+)
+def test_readiness_start_interrupt_after_thread_entry_keeps_authority_until_thread_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
+    from rquant import lab_daemon
+
+    authority = tmp_path / "authority"
+    authority.mkdir(mode=0o700)
+    deployment_lock_path = authority / "rquant.lock"
+    deployment_lock_fd = os.open(deployment_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_root = tmp_path / "runtime" / "locks"
+    lock_root.parent.mkdir(mode=0o700)
+    lock_name = label.rsplit("-", 1)[-1]
+    first = LabDaemonLock(lock_root, lock_name)
+    second = LabDaemonLock(lock_root, lock_name)
+    entered = threading.Event()
+    release = threading.Event()
+    fake_threads: list[object] = []
+    first.acquire()
+    publisher = LabDaemonReadinessPublisher(
+        deployment_lock_path=deployment_lock_path,
+        deployment_lock_fd=deployment_lock_fd,
+        daemon_authority_lease_fd=first.duplicate_authority_lease(),
+        label=label,
+        operation_id="a" * 32,
+        environment_generation_id="b" * 64,
+        code_sha="c" * 40,
+        heartbeat_interval_seconds=0.1,
+    )
+
+    def blocked_run() -> None:
+        entered.set()
+        release.wait(timeout=5)
+
+    publisher._run = blocked_run  # type: ignore[method-assign]
+
+    class StartedThenInterruptedThread:
+        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
+            assert callable(target)
+            self._inner = threading.Thread(target=target, name=name, daemon=daemon)
+            fake_threads.append(self)
+
+        def start(self) -> None:
+            self._inner.start()
+            assert entered.wait(timeout=1)
+            raise KeyboardInterrupt("interrupt after thread entry")
+
+        def join(self, *, timeout: float) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self._inner.is_alive()
+
+    monkeypatch.setattr(lab_daemon, "Thread", StartedThenInterruptedThread)
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            publisher.start()
+        first.release()
+        assert publisher._thread is fake_threads[0]
+        assert publisher._daemon_authority_lease_fd >= 0
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert any("did not stop" in str(error) for error in cleanup_group.exceptions)
+        with pytest.raises(LabDaemonConfigurationError, match="already running"):
+            second.acquire()
+    finally:
+        release.set()
+        for fake in fake_threads:
+            fake._inner.join(timeout=2)  # type: ignore[attr-defined]
+        publisher.close()
+        first.release()
+        second.release()
+        os.close(deployment_lock_fd)
+
+    second.acquire()
+    second.release()
+    publisher.close()
+
+
 def test_daemon_readiness_rejects_invalid_generation_before_namespace_creation(
     tmp_path: Path,
 ) -> None:
